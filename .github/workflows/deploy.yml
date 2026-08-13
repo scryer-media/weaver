@@ -370,6 +370,24 @@ jobs:
               failures=$((failures + 1))
             fi
           }
+          # Same, but the test must also print `marker`. A tripwire that skips
+          # itself still exits 0, so without this a lane that stopped emulating
+          # the feature set under test would go green while testing nothing.
+          # The test command MUST pass --nocapture or libtest swallows the
+          # marker and the grep can never match.
+          run_sde_expect() {
+            marker="$1"; shift
+            if out="$(sde64 ${{ matrix.sde_arch }} -- "$@" 2>&1)"; then
+              printf '%s\n' "$out"
+              if ! printf '%s\n' "$out" | grep -qF "$marker"; then
+                echo "::error::expected marker not found: $marker" >&2
+                failures=$((failures + 1))
+              fi
+            else
+              printf '%s\n' "$out"
+              failures=$((failures + 1))
+            fi
+          }
           while IFS= read -r bin; do
             echo "::group::$(basename "$bin")"
             case "$(basename "$bin")" in
@@ -394,6 +412,17 @@ jobs:
                 run_sde "$bin" simd::tests::avx512_vbmi2_block_handles_dot_stuffed_line_start --exact --test-threads=1
                 run_sde "$bin" simd::tests::avx512_vbmi2_block_preserves_trailing_cr_state --exact --test-threads=1
                 run_sde "$bin" simd::tests::avx2_active_kernel_required_matches_scalar --ignored --exact --test-threads=1
+                # The VBMI2 tripwire: on the SPR lane the emulated CPUID must
+                # activate the VBMI2 tier in the *portable* build, so this lane
+                # deliberately carries no +bmi/-C target-feature flags beyond
+                # matrix.rustflags -- adding any would let the build satisfy the
+                # feature gate without CPUID and blind the tripwire.
+                if [ "${{ matrix.name }}" = "spr-gfni-avx512" ]; then
+                  run_sde_expect "vbmi2-tripwire: VBMI2 tier ACTIVE" \
+                    "$bin" simd::tests::vbmi2_active_kernel_required_matches_scalar --exact --test-threads=1 --nocapture
+                else
+                  run_sde "$bin" simd::tests::vbmi2_active_kernel_required_matches_scalar --exact --test-threads=1 --nocapture
+                fi
                 run_sde "$bin" simd::tests::forced_tier_kernels_match_scalar_with_line_hints --exact --test-threads=1
                 run_sde "$bin" simd::tests::dispatch_kernel_matches_scalar_on_adversarial_streams --exact --test-threads=1
                 run_sde "$bin" simd::tests::dispatch_kernel_matches_scalar_across_chunk_splits --exact --test-threads=1

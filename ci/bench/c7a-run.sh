@@ -188,16 +188,20 @@ assert_bundle_present() {
 }
 
 # ── (a) CPU feature assertion ────────────────────────────────────────────────
-REQUIRED_FEATURES="avx512f avx512bw avx512vl avx512vbmi avx512vbmi2 gfni vpclmulqdq vaes"
+# The BMI/POPCNT/LZCNT half is not decorative: the decoder's VBMI2 tier gates
+# on all nine features (see vbmi2_tier_available()), so a box missing them
+# silently benchmarks the AVX2 tier instead.
+REQUIRED_FEATURES="avx512f avx512bw avx512vl avx512vbmi avx512vbmi2 gfni vpclmulqdq vaes bmi1 bmi2 popcnt lzcnt"
 assert_cpu_features() {
   log "Asserting CPU features: ${REQUIRED_FEATURES}"
   [ -r /proc/cpuinfo ] || die "/proc/cpuinfo unreadable"
   local flags missing="" f
   flags="$(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2- || true)"
   [ -n "$flags" ] || die "could not read CPU flags"
-  # Linux spells VBMI2 as avx512_vbmi2 in /proc/cpuinfo — normalize (see
-  # c7a-bootstrap.sh assert_cpu_features).
+  # Linux spells VBMI2 as avx512_vbmi2 and LZCNT as abm in /proc/cpuinfo —
+  # normalize (see c7a-bootstrap.sh assert_cpu_features).
   case " $flags " in *" avx512_vbmi2 "*) flags="$flags avx512vbmi2" ;; esac
+  case " $flags " in *" abm "*) flags="$flags lzcnt" ;; esac
   for f in $REQUIRED_FEATURES; do
     case " $flags " in *" $f "*) : ;; *) missing="$missing $f" ;; esac
   done

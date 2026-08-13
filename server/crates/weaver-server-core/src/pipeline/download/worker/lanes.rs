@@ -137,7 +137,7 @@ impl Pipeline {
                 .metrics
                 .download_lane_parks_proof_failure_total
                 .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::ServerQuota => 0,
+            LaneParkReason::Capacity | LaneParkReason::ServerQuota => 0,
             LaneParkReason::Error => self
                 .metrics
                 .download_lane_parks_error_total
@@ -496,6 +496,37 @@ impl Pipeline {
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.owned_lane.event");
         match event {
             OwnedDownloadLaneEvent::AcquireFailed { lease, error } => {
+                if error.is_capacity_admission() {
+                    let DownloadBatchLease {
+                        job_id,
+                        lane_mode,
+                        spillover_loan_kind,
+                        works,
+                        ..
+                    } = lease;
+                    debug!(
+                        job_id = job_id.0,
+                        works = works.len(),
+                        error = %error,
+                        "owned blocking lane capacity unavailable; returning work to scheduler"
+                    );
+                    crate::runtime::perf_probe::record_value(
+                        "download.owned_lane.acquire_failed_capacity_requeue",
+                        1,
+                    );
+                    for work in works {
+                        self.restore_owned_lane_unrequested_work(work);
+                    }
+                    self.handle_download_lane_parked(DownloadLaneParked {
+                        job_id,
+                        mode: lane_mode,
+                        spillover_loan_kind,
+                        reason: LaneParkReason::Capacity,
+                        release_connection_slot: true,
+                        release_ip_replacement_burst: false,
+                    });
+                    return;
+                }
                 debug!(
                     job_id = lease.job_id.0,
                     works = lease.works.len(),

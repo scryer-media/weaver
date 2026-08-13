@@ -15,6 +15,10 @@ use crate::types::Response;
 const MAX_CONTROL_LINE: usize = 16 * 1024;
 const MAX_ARTICLE_RESERVE: usize = 16 * 1024 * 1024;
 const OUTPUT_BATCH_TARGET: usize = 512 * 1024;
+/// How many bytes of leading junk may precede `=ybegin` before the article is
+/// declared header-less. Bounded so a 222 response whose body never contains a
+/// yEnc header cannot make the header scan run for the whole article.
+const MAX_HEADER_SCAN_BYTES: usize = 64 * 1024;
 
 #[cfg(unix)]
 fn thread_cpu_time() -> Option<Duration> {
@@ -175,6 +179,8 @@ pub struct FusedYencArticleDecoder {
     response: Option<Response>,
     line_buf: Vec<u8>,
     metadata: Option<YencMetadata>,
+    /// Bytes of non-`=ybegin` lines skipped while scanning for the yEnc header.
+    junk_before_ybegin_bytes: usize,
     yend_line: Option<Vec<u8>>,
     decode_state: DecodeState,
     output: Vec<u8>,
@@ -191,6 +197,7 @@ impl FusedYencArticleDecoder {
             response: None,
             line_buf: Vec::with_capacity(256),
             metadata: None,
+            junk_before_ybegin_bytes: 0,
             yend_line: None,
             decode_state: DecodeState::new(),
             output: Vec::new(),
@@ -337,7 +344,29 @@ impl FusedYencArticleDecoder {
             return Ok(true);
         }
 
-        let metadata = header::parse_ybegin_line(&self.line_buf)?;
+        // SABnzbd and nzbget scan the body for `=ybegin` instead of demanding it
+        // on the first line, so leading junk (stray headers, banners, blank
+        // lines) does not kill an otherwise decodable article. Skip whole lines
+        // until one of them is a real `=ybegin` control line.
+        if !header::is_control_line(&self.line_buf, b"=ybegin") {
+            // An NNTP multiline terminator ends the article: there is no
+            // `=ybegin` to find, so fail now instead of waiting forever for a
+            // header that will never arrive.
+            if self.line_buf == b".\r\n" || self.line_buf == b".\n" {
+                return Err(YencError::MissingHeader.into());
+            }
+            self.junk_before_ybegin_bytes = self
+                .junk_before_ybegin_bytes
+                .saturating_add(self.line_buf.len());
+            if self.junk_before_ybegin_bytes > MAX_HEADER_SCAN_BYTES {
+                return Err(YencError::MissingHeader.into());
+            }
+            self.line_buf.clear();
+            return Ok(true);
+        }
+
+        let mut metadata = header::parse_ybegin_line(&self.line_buf)?;
+        metadata.defects.junk_before_ybegin = self.junk_before_ybegin_bytes > 0;
         self.line_buf.clear();
         let needs_ypart = metadata.part.is_some();
         self.decode_state
@@ -387,7 +416,7 @@ impl FusedYencArticleDecoder {
             return Ok(false);
         }
 
-        if self.line_buf.starts_with(b"=yend ") {
+        if header::is_control_line(&self.line_buf, b"=yend") {
             self.yend_line = Some(std::mem::take(&mut self.line_buf));
             self.state = FusedArticleState::NntpTerminator;
             return Ok(true);
@@ -503,8 +532,13 @@ impl FusedYencArticleDecoder {
         let Ok(expected) = usize::try_from(expected) else {
             return;
         };
-        let reserve = expected.min(OUTPUT_BATCH_TARGET);
-        if reserve == 0 || expected > MAX_ARTICLE_RESERVE || reserve <= self.output.capacity() {
+        // Clamp, do not bail: an article whose declared size exceeds the cap is
+        // exactly the one that most needs a head start, and skipping the
+        // reservation entirely left it growing from zero one doubling at a
+        // time. The cap bounds a lying header's damage; it is not a reason to
+        // reserve nothing.
+        let reserve = expected.min(MAX_ARTICLE_RESERVE).min(OUTPUT_BATCH_TARGET);
+        if reserve == 0 || reserve <= self.output.capacity() {
             return;
         }
 
@@ -581,7 +615,15 @@ fn expected_decoded_size(metadata: &YencMetadata) -> Option<u64> {
     match (metadata.begin, metadata.end) {
         (Some(begin), Some(end)) if end >= begin => Some(end - begin + 1),
         (Some(_), Some(_)) => None,
-        _ if metadata.part.is_none() => Some(metadata.size),
+        // A single-part article's `=ybegin size=` is the decoded length -- but
+        // only when the poster actually declared one. The `0` placeholder for a
+        // missing or mangled `size=` means "unknown", not "empty article".
+        _ if metadata.part.is_none()
+            && !metadata.defects.missing_size
+            && !metadata.defects.invalid_size =>
+        {
+            Some(metadata.size)
+        }
         _ => None,
     }
 }
@@ -591,7 +633,9 @@ mod tests {
     use super::*;
     use crate::codec::{NntpCodec, NntpFrame, StreamChunk};
     use tokio_util::codec::Decoder;
-    use weaver_yenc::{DecodedArticle, StreamingArticleDecoder, encode, encode_part};
+    use weaver_yenc::{
+        CrcVerification, DecodedArticle, StreamingArticleDecoder, encode, encode_part,
+    };
 
     fn transcript(article: &[u8], leftover: &[u8]) -> Vec<u8> {
         let mut bytes = b"222 <test@local> body follows\r\n".to_vec();
@@ -690,6 +734,8 @@ mod tests {
             actual.result.expected_file_crc
         );
         assert_eq!(expected.result.has_trailer, actual.result.has_trailer);
+        assert_eq!(expected.result.crc_status, actual.result.crc_status);
+        assert_eq!(expected.result.defects, actual.result.defects);
 
         let expected_meta = &expected.result.metadata;
         let actual_meta = &actual.result.metadata;
@@ -700,6 +746,67 @@ mod tests {
         assert_eq!(expected_meta.total, actual_meta.total);
         assert_eq!(expected_meta.begin, actual_meta.begin);
         assert_eq!(expected_meta.end, actual_meta.end);
+        assert_eq!(expected_meta.defects, actual_meta.defects);
+    }
+
+    /// Body of the split-point acceptance guard: the fused decoder must agree
+    /// with the streaming path, and must leave the pipelined bytes after the
+    /// NNTP terminator untouched, for *every* chunk boundary in the transcript.
+    fn assert_fused_matches_at_every_split_point(article: &[u8], leftover: &[u8]) {
+        let transcript = transcript(article, leftover);
+        let (expected, expected_leftover) = decode_current(&transcript);
+        assert_eq!(expected_leftover, leftover);
+
+        for split in 0..=transcript.len() {
+            let (actual, actual_leftover) =
+                decode_fused_with_chunks(&transcript, &[split, transcript.len() - split]);
+            assert_same_article(&expected, &actual);
+            assert_eq!(expected_leftover, actual_leftover, "split at {split}");
+        }
+    }
+
+    /// Payload used by the broken-poster corpus: escape-heavy, dot-stuffable,
+    /// and long enough to straddle several encoded lines.
+    const BROKEN_POSTER_BODY: &[u8] = b"\x04broken poster body = with escapes\r\n\0\x04";
+
+    /// Build a single-part article with caller-supplied `=ybegin`/`=yend` lines
+    /// wrapped around a genuinely valid encoded body, so header damage is the
+    /// only variable under test. `yend` receives the true decoded size and CRC.
+    fn broken_poster_article(
+        prologue: &[u8],
+        ybegin: &[u8],
+        yend: impl FnOnce(u64, u32) -> Vec<u8>,
+    ) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        encode(BROKEN_POSTER_BODY, &mut encoded, 16, "ignored.bin").unwrap();
+
+        // Keep only the encoded payload between the generated header/trailer.
+        let body_start = encoded
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .expect("generated article has a header line")
+            + 2;
+        let body_end = encoded
+            .windows(b"\r\n=yend ".len())
+            .rposition(|window| window == b"\r\n=yend ")
+            .expect("generated article has a trailer")
+            + 2;
+        let body = encoded[body_start..body_end].to_vec();
+
+        let mut crc = weaver_yenc::crc::Crc32::new();
+        crc.update(BROKEN_POSTER_BODY);
+
+        let mut article = Vec::new();
+        article.extend_from_slice(prologue);
+        article.extend_from_slice(ybegin);
+        article.extend_from_slice(&body);
+        article.extend_from_slice(&yend(BROKEN_POSTER_BODY.len() as u64, crc.finalize()));
+        dot_stuff_lines(&article)
+    }
+
+    /// The well-formed `=yend` for [`broken_poster_article`].
+    fn healthy_yend(size: u64, crc: u32) -> Vec<u8> {
+        format!("=yend size={size} crc32={crc:08x}\r\n").into_bytes()
     }
 
     #[test]
@@ -850,6 +957,407 @@ mod tests {
 
         assert_same_article(&expected, &actual);
         assert_eq!(expected_leftover, actual_leftover);
+    }
+
+    // ── Broken-poster corpus, verified at every split point ──────────────
+    //
+    // Each of these decodes in SABnzbd/nzbget and used to hard-fail in the
+    // fused path. The every-split-point sweep is the acceptance guard: the
+    // fused decoder must agree with the streaming path *and* leave the next
+    // pipelined response's bytes in `src` no matter where the chunk boundary
+    // lands.
+
+    /// D6: `=ybegin` is scanned for, not required on the first body line --
+    /// including junk that contains `=` and partial `=yb` prefixes.
+    #[test]
+    fn fused_tolerates_leading_junk_at_every_split_point() {
+        let prologue = b"Subject: leftover = header\r\n\
+                         =yb\r\n\
+                         =ybegi partial\r\n\
+                         =ybeginner notes\r\n\
+                         \r\n";
+        let article = broken_poster_article(
+            prologue,
+            b"=ybegin line=16 size=38 name=junk.bin\r\n",
+            healthy_yend,
+        );
+
+        assert_fused_matches_at_every_split_point(&article, b"223 <next@local> follows\r\n");
+
+        let (decoded, _) = decode_fused_with_chunks(
+            &transcript(&article, b"223 <next@local> follows\r\n"),
+            &[usize::MAX],
+        );
+        assert_eq!(decoded.to_data(), BROKEN_POSTER_BODY);
+        assert!(decoded.result.defects.junk_before_ybegin);
+        assert_eq!(decoded.result.crc_status, CrcVerification::Verified);
+    }
+
+    /// D7: `line=`/`size=`/`name=` are all optional -- reference decoders do
+    /// not even parse `line=`. Every combination the references tolerate.
+    #[test]
+    fn fused_tolerates_every_missing_ybegin_field_combination_at_every_split_point() {
+        for line_field in [None, Some("line=16")] {
+            for size_field in [None, Some("size=38")] {
+                for name_field in [None, Some("name=missing.bin")] {
+                    let mut ybegin = String::from("=ybegin");
+                    for field in [line_field, size_field, name_field].into_iter().flatten() {
+                        ybegin.push(' ');
+                        ybegin.push_str(field);
+                    }
+                    ybegin.push_str(" \r\n");
+
+                    let article = broken_poster_article(b"", ybegin.as_bytes(), |size, crc| {
+                        format!("=yend size={size} crc32={crc:08x}\r\n").into_bytes()
+                    });
+                    assert_fused_matches_at_every_split_point(&article, b"223 next\r\n");
+                }
+            }
+        }
+    }
+
+    /// D7 continued: a `=ybegin` whose numeric fields are unparseable degrades
+    /// exactly like one that omitted them.
+    #[test]
+    fn fused_tolerates_unparseable_ybegin_numbers_at_every_split_point() {
+        let article = broken_poster_article(
+            b"",
+            b"=ybegin line=abc size=-1000 name=neg.bin\r\n",
+            healthy_yend,
+        );
+        assert_fused_matches_at_every_split_point(&article, b"223 next\r\n");
+    }
+
+    /// D8: `=ypart end=` past the `=ybegin size=` file size. The part length
+    /// (end - begin + 1) is still checked against the decoded byte count.
+    #[test]
+    fn fused_tolerates_ypart_end_past_declared_size_at_every_split_point() {
+        let size = BROKEN_POSTER_BODY.len() as u64;
+        let article = broken_poster_article(
+            b"",
+            // size=10 is far below end=38: a classic broken multi-part poster.
+            format!("=ybegin part=1 total=2 line=16 size=10 name=over.bin\r\n=ypart begin=1 end={size}\r\n")
+                .as_bytes(),
+            |size, crc| format!("=yend size={size} part=1 pcrc32={crc:08x}\r\n").into_bytes(),
+        );
+
+        assert_fused_matches_at_every_split_point(&article, b"221 head\r\n");
+
+        let (decoded, _) =
+            decode_fused_with_chunks(&transcript(&article, b"221 head\r\n"), &[usize::MAX]);
+        assert!(decoded.result.defects.ypart_end_exceeds_size);
+        assert_eq!(decoded.to_data(), BROKEN_POSTER_BODY);
+    }
+
+    /// The healthy direction (`end` well inside `size`) stays defect-free.
+    #[test]
+    fn fused_multipart_end_below_declared_size_is_clean_at_every_split_point() {
+        let size = BROKEN_POSTER_BODY.len() as u64;
+        let article = broken_poster_article(
+            b"",
+            format!(
+                "=ybegin part=1 total=2 line=16 size=100000 name=under.bin\r\n=ypart begin=1 end={size}\r\n"
+            )
+            .as_bytes(),
+            |size, crc| format!("=yend size={size} part=1 pcrc32={crc:08x}\r\n").into_bytes(),
+        );
+
+        assert_fused_matches_at_every_split_point(&article, b"221 head\r\n");
+
+        let (decoded, _) =
+            decode_fused_with_chunks(&transcript(&article, b"221 head\r\n"), &[usize::MAX]);
+        assert!(!decoded.result.defects.any());
+        assert_eq!(decoded.result.crc_status, CrcVerification::Verified);
+    }
+
+    /// D9: a mangled `crc32=` is treated as absent, leaving the article decoded
+    /// but explicitly *unverified* -- never silently "valid".
+    #[test]
+    fn fused_tolerates_garbage_crc_at_every_split_point() {
+        for garbage in ["nothex", "", "DEADBEEFDEADBEEF0", "1234ZZZZ", "0x1234"] {
+            let article = broken_poster_article(
+                b"",
+                b"=ybegin line=16 size=38 name=badcrc.bin\r\n",
+                |size, _crc| format!("=yend size={size} crc32={garbage}\r\n").into_bytes(),
+            );
+
+            assert_fused_matches_at_every_split_point(&article, b"223 next\r\n");
+
+            let (decoded, _) =
+                decode_fused_with_chunks(&transcript(&article, b"223 next\r\n"), &[usize::MAX]);
+            assert_eq!(decoded.to_data(), BROKEN_POSTER_BODY, "crc32={garbage:?}");
+            assert!(decoded.result.defects.invalid_crc32, "crc32={garbage:?}");
+            assert_eq!(
+                decoded.result.crc_status,
+                CrcVerification::Unverified,
+                "crc32={garbage:?} must not read as verified"
+            );
+            assert_eq!(decoded.result.expected_file_crc, None);
+        }
+    }
+
+    /// An over-long but parseable CRC keeps its low 32 bits, as sabctools does
+    /// deliberately for posters that emit wide hashes -- and still verifies.
+    #[test]
+    fn fused_truncates_over_long_crc_and_still_verifies() {
+        let article = broken_poster_article(
+            b"",
+            b"=ybegin line=16 size=38 name=widecrc.bin\r\n",
+            |size, crc| format!("=yend size={size} crc32=AAAAAAAA{crc:08x}\r\n").into_bytes(),
+        );
+
+        assert_fused_matches_at_every_split_point(&article, b"223 next\r\n");
+
+        let (decoded, _) =
+            decode_fused_with_chunks(&transcript(&article, b"223 next\r\n"), &[usize::MAX]);
+        assert_eq!(decoded.result.crc_status, CrcVerification::Verified);
+        assert!(!decoded.result.defects.invalid_crc32);
+    }
+
+    /// D10: one byte-wise parser behind every entry point, so tab separators
+    /// and mixed-case field names behave identically in the fused path.
+    #[test]
+    fn fused_tolerates_tab_and_case_field_variants_at_every_split_point() {
+        for ybegin in [
+            b"=ybegin\tline=16\tsize=38\tname=tabs.bin\r\n".as_slice(),
+            b"=ybegin LINE=16 Size=38 NaMe=case.bin\r\n".as_slice(),
+            b"=ybegin  line=16   size=38   name=spaces.bin\r\n".as_slice(),
+        ] {
+            let article = broken_poster_article(b"", ybegin, healthy_yend);
+            assert_fused_matches_at_every_split_point(&article, b"223 next\r\n");
+        }
+    }
+
+    /// A 222 body that never contains `=ybegin` must fail cleanly at the NNTP
+    /// terminator instead of waiting forever for a header that is not coming.
+    #[test]
+    fn fused_reports_missing_header_when_body_has_no_ybegin() {
+        let mut bytes = b"222 <test@local> body follows\r\n".to_vec();
+        bytes.extend_from_slice(b"not a yenc article at all\r\n");
+        bytes.extend_from_slice(b"=yb still not one\r\n");
+        bytes.extend_from_slice(b".\r\n");
+
+        let mut src = BytesMut::from(bytes.as_slice());
+        let mut decoder = FusedYencArticleDecoder::new();
+        let err = decoder.decode_available(&mut src).unwrap_err();
+
+        assert!(matches!(
+            err,
+            FusedYencError::Yenc(YencError::MissingHeader)
+        ));
+    }
+
+    // ── B7: the fused path shares the kernel's stop rule ─────────────────
+
+    /// Drive the fused decoder to completion and fail if it does not reject the
+    /// transcript, at every split point.
+    fn assert_fused_rejects_at_every_split_point(article: &[u8], expected_reason: &str) {
+        let transcript = transcript(article, b"223 next\r\n");
+
+        for split in 0..=transcript.len() {
+            let mut decoder = FusedYencArticleDecoder::new();
+            let mut src = BytesMut::new();
+            let mut error = None;
+
+            for chunk in [&transcript[..split], &transcript[split..]] {
+                src.extend_from_slice(chunk);
+                match decoder.decode_available(&mut src) {
+                    Ok(Some(_)) => panic!("split {split}: fused decoder accepted the article"),
+                    Ok(None) => {}
+                    Err(err) => {
+                        error = Some(err);
+                        break;
+                    }
+                }
+            }
+
+            let error = error
+                .unwrap_or_else(|| panic!("split {split}: fused decoder accepted the article"));
+            assert!(
+                error.to_string().contains(expected_reason),
+                "split {split}: error {error} does not mention {expected_reason:?}"
+            );
+        }
+    }
+
+    /// A `\r\n=y…` line that is not `=yend`: the kernel stops there, so the
+    /// article cannot decode past it in any entry point.
+    #[test]
+    fn fused_rejects_stray_control_line_in_body_at_every_split_point() {
+        for stray in [
+            b"=yfoo\r\n".as_slice(),
+            b"=yend\r\n".as_slice(),
+            b"=y\r\n".as_slice(),
+        ] {
+            let base = broken_poster_article(
+                b"",
+                b"=ybegin line=16 size=38 name=stray.bin\r\n",
+                healthy_yend,
+            );
+            let yend_at = base
+                .windows(b"=yend ".len())
+                .rposition(|window| window == b"=yend ")
+                .expect("article has a trailer");
+
+            let mut article = base[..yend_at].to_vec();
+            article.extend_from_slice(stray);
+            article.extend_from_slice(&base[yend_at..]);
+
+            assert_fused_rejects_at_every_split_point(
+                &article,
+                "unexpected trailing line after yEnc body",
+            );
+        }
+    }
+
+    /// A dot-stuffed trailer (`\r\n.=yend `): the kernel strips the one leading
+    /// `.` at line start, so this really is the trailer.
+    #[test]
+    fn fused_finds_dot_prefixed_trailer_at_every_split_point() {
+        let base = broken_poster_article(
+            b"",
+            b"=ybegin line=16 size=38 name=dotyend.bin\r\n",
+            healthy_yend,
+        );
+        let yend_at = base
+            .windows(b"=yend ".len())
+            .rposition(|window| window == b"=yend ")
+            .expect("article has a trailer");
+
+        let mut article = base[..yend_at].to_vec();
+        article.push(b'.');
+        article.extend_from_slice(&base[yend_at..]);
+
+        assert_fused_matches_at_every_split_point(&article, b"223 next\r\n");
+
+        let (decoded, _) =
+            decode_fused_with_chunks(&transcript(&article, b"223 next\r\n"), &[usize::MAX]);
+        assert_eq!(decoded.to_data(), BROKEN_POSTER_BODY);
+        assert!(decoded.result.has_trailer);
+        assert_eq!(decoded.result.crc_status, CrcVerification::Verified);
+    }
+
+    // ── E19: pre-reservation for oversized articles ──────────────────────
+
+    /// An article whose declared size exceeds the 16 MiB cap used to get *no*
+    /// pre-reservation at all. It must reserve a batch and grow from there.
+    #[test]
+    fn fused_reserves_output_for_articles_larger_than_the_cap() {
+        for size in [OUTPUT_BATCH_TARGET as u64, MAX_ARTICLE_RESERVE as u64 * 2] {
+            let mut bytes = b"222 <test@local> body follows\r\n".to_vec();
+            bytes.extend_from_slice(
+                format!("=ybegin line=128 size={size} name=huge.bin\r\n").as_bytes(),
+            );
+
+            let mut src = BytesMut::from(bytes.as_slice());
+            let mut decoder = FusedYencArticleDecoder::new();
+            assert!(decoder.decode_available(&mut src).unwrap().is_none());
+            assert_eq!(
+                decoder.output.capacity(),
+                OUTPUT_BATCH_TARGET,
+                "size={size} reserved {}",
+                decoder.output.capacity()
+            );
+        }
+    }
+
+    // ── E12: decoded batches are delivered as they are produced ──────────
+
+    /// The decoder's batches are its streaming contract: draining them as they
+    /// appear must reproduce the buffered article exactly, in order, wherever
+    /// the chunk boundary lands.
+    #[test]
+    fn fused_batches_drain_in_order_at_every_split_point() {
+        let original = b"\x04batched body with = escapes \0\r\n";
+        let mut article = Vec::new();
+        encode(original, &mut article, 8, "batches.bin").unwrap();
+        let article = dot_stuff_lines(&article);
+        let transcript = transcript(&article, b"223 next\r\n");
+
+        for split in 0..=transcript.len() {
+            let mut decoder = FusedYencArticleDecoder::new();
+            let mut src = BytesMut::new();
+            let mut delivered: Vec<Box<[u8]>> = Vec::new();
+            let mut article = None;
+
+            for chunk in [&transcript[..split], &transcript[split..]] {
+                src.extend_from_slice(chunk);
+                if article.is_none() {
+                    article = decoder.decode_available(&mut src).unwrap();
+                    // Whatever the decoder finished with belongs at the end of
+                    // the delivered sequence, after everything drained earlier.
+                    match article.as_mut() {
+                        Some(article) => delivered.extend(std::mem::take(&mut article.chunks)),
+                        None => delivered.extend(decoder.drain_output_chunks()),
+                    }
+                }
+            }
+
+            let mut article = article.expect("fused decoder did not finish");
+            let streamed: Vec<u8> = delivered.iter().flat_map(|c| c.iter().copied()).collect();
+            article.chunks = delivered;
+            assert_eq!(streamed, original.as_slice(), "split {split}");
+            assert_eq!(article.to_data(), streamed, "split {split}");
+        }
+    }
+
+    /// The same, for an article large enough to cross the batch target: the
+    /// batches really do arrive before the article is finished.
+    #[test]
+    fn fused_delivers_multiple_batches_before_the_article_finishes() {
+        let mut original = Vec::with_capacity(2 * OUTPUT_BATCH_TARGET + 123);
+        for idx in 0..(2 * OUTPUT_BATCH_TARGET + 123) {
+            original.push((idx % 251) as u8);
+        }
+
+        let mut article = Vec::new();
+        encode(&original, &mut article, 128, "batched.bin").unwrap();
+        let transcript = transcript(&article, b"223 next\r\n");
+
+        for chunk_len in [4 * 1024usize, 64 * 1024, 700 * 1024] {
+            let mut decoder = FusedYencArticleDecoder::new();
+            let mut src = BytesMut::new();
+            let mut delivered: Vec<Box<[u8]>> = Vec::new();
+            let mut finished = None;
+            let mut delivered_before_finish = 0usize;
+
+            for chunk in transcript.chunks(chunk_len) {
+                src.extend_from_slice(chunk);
+                if finished.is_some() {
+                    continue;
+                }
+                finished = decoder.decode_available(&mut src).unwrap();
+                match finished.as_mut() {
+                    Some(article) => delivered.extend(std::mem::take(&mut article.chunks)),
+                    None => {
+                        delivered.extend(decoder.drain_output_chunks());
+                        delivered_before_finish = delivered.len();
+                    }
+                }
+            }
+
+            assert!(finished.is_some(), "chunk_len {chunk_len}: never finished");
+            // The point of the streaming design: whole batches are available
+            // while the article is still arriving, not only at the end.
+            assert!(
+                delivered_before_finish >= 1
+                    && delivered.len() > delivered_before_finish
+                    && delivered.len() >= 3,
+                "chunk_len {chunk_len}: {delivered_before_finish} of {} batches arrived \
+                 before the article finished",
+                delivered.len()
+            );
+            let lens: Vec<usize> = delivered[..delivered.len() - 1]
+                .iter()
+                .map(|chunk| chunk.len())
+                .collect();
+            assert!(
+                lens.iter().all(|&len| len == OUTPUT_BATCH_TARGET),
+                "chunk_len {chunk_len}: ragged batches {lens:?}"
+            );
+            let streamed: Vec<u8> = delivered.iter().flat_map(|c| c.iter().copied()).collect();
+            assert_eq!(streamed, original, "chunk_len {chunk_len}");
+        }
     }
 
     #[test]

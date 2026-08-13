@@ -223,8 +223,42 @@ async fn probe_completion_inconclusive_restores_queues_without_health_damage() {
     assert!(matches!(state.status, JobStatus::Downloading));
     assert_eq!(state.failed_bytes, 10);
     assert_eq!(state.last_health_probe_failed_bytes, 10);
+    assert_eq!(state.next_health_probe_failed_bytes, 11);
     assert!(state.held_segments.is_empty());
     assert_eq!(state.download_queue.len(), 3);
+}
+
+#[tokio::test]
+async fn inconclusive_final_probe_still_enforces_critical_health() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30027);
+    let spec = standalone_job_spec(
+        "Probe Inconclusive Critical",
+        &[
+            ("critical-a.bin".to_string(), 100),
+            ("critical-b.bin".to_string(), 100),
+            ("critical-c.bin".to_string(), 100),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    pipeline.jobs.get_mut(&job_id).unwrap().failed_bytes = 50;
+
+    pipeline.activate_health_probes(job_id);
+    pipeline.handle_probe_update(ProbeUpdate {
+        job_id,
+        total: 0,
+        missed: 0,
+        done: true,
+        inconclusive: true,
+    });
+
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert!(!pipeline.pending_completion_checks.contains(&job_id));
 }
 
 #[test]

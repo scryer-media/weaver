@@ -122,6 +122,7 @@ fn encode_data(input: &[u8], output: &mut Vec<u8>, line_length: usize) {
 mod tests {
     use super::*;
     use crate::decode;
+    use crate::types::CrcVerification;
 
     #[test]
     fn encode_simple() {
@@ -146,7 +147,7 @@ mod tests {
 
         assert_eq!(result.bytes_written, original.len());
         assert_eq!(&decoded[..result.bytes_written], original.as_slice());
-        assert!(result.crc_valid);
+        assert_eq!(result.crc_status, CrcVerification::Verified);
     }
 
     #[test]
@@ -160,7 +161,7 @@ mod tests {
 
         assert_eq!(result.bytes_written, 256);
         assert_eq!(&decoded[..256], &original[..]);
-        assert!(result.crc_valid);
+        assert_eq!(result.crc_status, CrcVerification::Verified);
     }
 
     #[test]
@@ -174,7 +175,7 @@ mod tests {
 
         assert_eq!(result.bytes_written, 512);
         assert_eq!(&decoded[..512], &original[..]);
-        assert!(result.crc_valid);
+        assert_eq!(result.crc_status, CrcVerification::Verified);
     }
 
     #[test]
@@ -195,7 +196,7 @@ mod tests {
 
         assert_eq!(result.bytes_written, original.len());
         assert_eq!(&decoded[..result.bytes_written], &original[..]);
-        assert!(result.crc_valid);
+        assert_eq!(result.crc_status, CrcVerification::Verified);
     }
 
     #[test]
@@ -210,7 +211,7 @@ mod tests {
 
         assert_eq!(result.bytes_written, original.len());
         assert_eq!(&decoded[..result.bytes_written], &original[..]);
-        assert!(result.crc_valid);
+        assert_eq!(result.crc_status, CrcVerification::Verified);
     }
 
     #[test]
@@ -224,7 +225,7 @@ mod tests {
 
         assert_eq!(result.bytes_written, original.len());
         assert_eq!(&decoded[..result.bytes_written], &original[..]);
-        assert!(result.crc_valid);
+        assert_eq!(result.crc_status, CrcVerification::Verified);
     }
 
     #[test]
@@ -270,8 +271,9 @@ mod tests {
         assert_eq!(result1.metadata.total, Some(2));
         assert_eq!(result1.metadata.begin, Some(1));
         assert_eq!(result1.metadata.end, Some(500));
-        // For multi-part, CRC is checked against pcrc32.
-        // Our encoder writes pcrc32 so crc_valid should be checked.
+        // For multi-part, CRC is checked against pcrc32, and our encoder writes
+        // one -- so this really is a verification, not an absent-CRC pass.
+        assert_eq!(result1.crc_status, CrcVerification::Verified);
 
         // Decode part 2.
         let mut decoded2 = vec![0u8; 1024];
@@ -299,10 +301,10 @@ mod tests {
         let mut encoded = Vec::new();
         encode(original, &mut encoded, 128, "empty.bin").unwrap();
 
-        let mut decoded = vec![0u8; 64];
+        let mut decoded = vec![0u8; crate::decode::max_decoded_len(encoded.len())];
         let result = decode::decode(&encoded, &mut decoded).unwrap();
         assert_eq!(result.bytes_written, 0);
-        assert!(result.crc_valid);
+        assert_eq!(result.crc_status, CrcVerification::Verified);
     }
 
     #[test]
@@ -323,7 +325,7 @@ mod tests {
         let result = decode::decode(&encoded, &mut decoded).unwrap();
         assert_eq!(result.bytes_written, original.len());
         assert_eq!(&decoded[..result.bytes_written], &original[..]);
-        assert!(result.crc_valid);
+        assert_eq!(result.crc_status, CrcVerification::Verified);
     }
 
     #[test]
@@ -333,11 +335,16 @@ mod tests {
             let mut encoded = Vec::new();
             encode(&original, &mut encoded, 128, "byte.bin").unwrap();
 
-            let mut decoded = vec![0u8; 64];
+            let mut decoded = vec![0u8; crate::decode::max_decoded_len(encoded.len())];
             let result = decode::decode(&encoded, &mut decoded).unwrap();
             assert_eq!(result.bytes_written, 1, "failed for byte {}", b);
             assert_eq!(decoded[0], b, "mismatch for byte {}", b);
-            assert!(result.crc_valid, "CRC invalid for byte {}", b);
+            assert_eq!(
+                result.crc_status,
+                CrcVerification::Verified,
+                "CRC not verified for byte {}",
+                b
+            );
         }
     }
 }

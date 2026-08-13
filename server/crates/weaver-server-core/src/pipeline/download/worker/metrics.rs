@@ -305,8 +305,9 @@ impl Pipeline {
                     segment_id,
                     raw_size: raw_size as u64,
                     yenc_layout,
-                    crc_valid: result.crc_valid,
-                    part_crc_verified: result.expected_part_crc.is_some() && result.crc_valid,
+                    crc_valid: crate::pipeline::crc_not_mismatched(result.crc_status),
+                    part_crc_verified: result.expected_part_crc.is_some()
+                        && crate::pipeline::crc_not_mismatched(result.crc_status),
                     part_crc: result.part_crc,
                     expected_file_crc: result.expected_file_crc,
                     data,

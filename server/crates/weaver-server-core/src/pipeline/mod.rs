@@ -730,7 +730,7 @@ pub(super) struct DownloadLaneParked {
 pub(super) enum OwnedDownloadLaneEvent {
     AcquireFailed {
         lease: DownloadBatchLease,
-        error: String,
+        error: weaver_nntp::client::BlockingBodyLaneAcquireError,
     },
     BatchComplete {
         results: Vec<DownloadResult>,
@@ -1240,6 +1240,17 @@ pub(super) struct TerminalPostProcessingDone {
         crate::post_processing::service::RunExecutionReport,
         crate::post_processing::service::PostProcessingServiceError,
     >,
+}
+
+/// Map a yEnc CRC outcome onto the pipeline's `crc_valid` flag.
+///
+/// `crc_valid` here means "not known bad", which is what the CRC-error metric
+/// and the segment event are counting. An article whose `=yend` carried no
+/// usable `crc32=`/`pcrc32=` is *unverifiable*, not corrupt, and must not be
+/// reported as a CRC failure — use [`weaver_yenc::CrcVerification::Verified`]
+/// directly wherever real verification is the question.
+pub(super) fn crc_not_mismatched(status: weaver_yenc::CrcVerification) -> bool {
+    status != weaver_yenc::CrcVerification::Mismatch
 }
 
 /// Result of a decode task.

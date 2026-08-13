@@ -279,9 +279,7 @@ impl Pipeline {
                 JobStatus::Downloading,
                 Some("downloading"),
             );
-            if !inconclusive {
-                self.check_health(job_id);
-            }
+            self.check_health(job_id);
             if self.jobs.contains_key(&job_id)
                 && !self.job_has_pending_download_pipeline_work(job_id)
             {

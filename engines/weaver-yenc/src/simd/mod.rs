@@ -286,6 +286,13 @@ fn decode_kernel(
     // and require destination capacity at least as large as the encoded input.
     // Keep those branch-free hot loops for callers with that headroom, while
     // preserving this crate's stronger safe-API contract for compact buffers.
+    //
+    // This fallback is a documented, deliberate ~10x slowdown, not a hidden
+    // one: the whole-article entry points (`decode`, `decode_nntp`,
+    // `decode_with_options`) reject an undersized `output` with a typed
+    // `BufferTooSmall` before they ever reach here, so the only way to land on
+    // this branch is to call `decode_body`/`decode_chunk` directly, whose docs
+    // spell the trade-off out. See `crate::decode::max_decoded_len`.
     if output.len() < input.len() {
         return decode_kernel_scalar(
             input,
@@ -359,24 +366,7 @@ fn dispatch_x86_decode_kernel() -> DecodeKernelFn {
 
     static DISPATCH: OnceLock<DecodeKernelFn> = OnceLock::new();
     *DISPATCH.get_or_init(|| {
-        if is_x86_feature_detected!("avx512vbmi2")
-            && is_x86_feature_detected!("avx512vl")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx2")
-            // The VBMI2 kernels also compile their scalar mask math with the
-            // BMI/POPCNT/LZCNT sets (every VBMI2-capable CPU has them; the
-            // portable build otherwise leaves ~20% on the table vs the same
-            // build with these features — measured 45.6 -> 36.6 us realshape
-            // on Zen 4; the haswell package lane already enables them
-            // globally, so this buys its win on the portable lane). Detect
-            // them so the unsafe contract stays honest rather than
-            // architecture-implied.
-            && is_x86_feature_detected!("bmi1")
-            && is_x86_feature_detected!("bmi2")
-            && is_x86_feature_detected!("popcnt")
-            && is_x86_feature_detected!("lzcnt")
-        {
+        if vbmi2_tier_available() {
             decode_kernel_avx512_vbmi2 as DecodeKernelFn
         } else if is_x86_feature_detected!("avx2")
             // decode_kernel_avx2's attribute already carries the BMI sets;
@@ -413,8 +403,39 @@ fn dispatch_x86_decode_kernel() -> DecodeKernelFn {
     })
 }
 
+/// The complete feature set the AVX-512 VBMI2 decode tier requires.
+///
+/// This is the single source of truth for "the VBMI2 tier is usable here": the
+/// dispatcher above gates on it, and the per-tier differential tests gate their
+/// VBMI2 legs on the same predicate, so a tier that CI thinks it exercised can
+/// never be one the dispatcher would have declined (or vice versa).
+///
+/// It is wider than the AVX-512 subsets the kernels name in `#[target_feature]`
+/// because those kernels also compile their scalar mask math with the
+/// BMI/POPCNT/LZCNT sets. Every VBMI2-capable CPU has them, but the portable
+/// build otherwise leaves ~20% on the table versus the same build with the
+/// features enabled globally (measured 45.6 -> 36.6 us realshape on Zen 4).
+/// Detecting them keeps the unsafe contract honest rather than
+/// architecture-implied.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn vbmi2_tier_available() -> bool {
+    is_x86_feature_detected!("avx512vbmi2")
+        && is_x86_feature_detected!("avx512vl")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("bmi1")
+        && is_x86_feature_detected!("bmi2")
+        && is_x86_feature_detected!("popcnt")
+        && is_x86_feature_detected!("lzcnt")
+}
+
+// Bit hack that resolves consecutive '=' escape runs. Inlined explicitly: this
+// and `final_state_after_block` are called once per 64-byte block from every
+// tier kernel, so leaving them to fat LTO made the BMI-widening win a
+// link-time-configuration accident rather than a property of the code.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-// Bit hack that resolves consecutive '=' escape runs.
+#[inline]
 fn fix_eq_mask(mask: u64, mask_shift1: u64) -> u64 {
     let start = mask & !mask_shift1;
     let even = 0x5555_5555_5555_5555u64;
@@ -423,6 +444,7 @@ fn fix_eq_mask(mask: u64, mask_shift1: u64) -> u64 {
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline]
 fn final_state_after_block(
     raw_breaks: u64,
     raw_cr: u64,

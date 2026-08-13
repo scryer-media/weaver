@@ -1,7 +1,7 @@
 use crate::crc::Crc32;
 use crate::error::YencError;
 use crate::header;
-use crate::types::{DecodeResult, YencMetadata};
+use crate::types::{CrcVerification, DecodeResult, YencHeaderDefects, YencMetadata};
 
 /// Decoder state equivalent to rapidyenc's public `RapidYencDecoderState`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,10 +47,37 @@ pub struct DecodeOptions {
     pub dot_unstuffing: bool,
 }
 
+/// Upper bound on the decoded length of `input_len` encoded bytes.
+///
+/// yEnc never expands: escapes are two bytes in and one byte out, line breaks
+/// and NNTP dot-stuffing only shrink the stream. So `input.len()` is both a
+/// sufficient and the smallest always-sufficient output size, and it is the
+/// size the whole-article entry points require — see [`decode`].
+pub const fn max_decoded_len(input_len: usize) -> usize {
+    input_len
+}
+
 /// Decode a complete yEnc article (headers + data + trailer) from `input` into `output`.
 ///
-/// Returns metadata and CRC verification results. The caller provides the output
-/// buffer, which must be large enough to hold the decoded data.
+/// Returns metadata and CRC verification results.
+///
+/// # Output buffer contract
+///
+/// `output` must be at least [`max_decoded_len`]`(input.len())` bytes. A
+/// smaller buffer is rejected up front with [`YencError::BufferTooSmall`] —
+/// deliberately, and even when the decoded data would have fit: the SIMD
+/// kernels store full vector widths and only the byte-at-a-time scalar kernel
+/// can honour a compact destination, so accepting an undersized buffer here
+/// would silently trade an order of magnitude of throughput for a saved
+/// allocation. The byte-level [`decode_body`]/[`decode_chunk`] entry points do
+/// accept compact buffers, with that cost documented.
+///
+/// Do **not** size `output` from [`crate::YencMetadata::size`]. That field is
+/// `0` whenever the poster omitted or mangled `size=` (see
+/// [`crate::YencHeaderDefects::missing_size`] and
+/// [`crate::YencHeaderDefects::invalid_size`]), and it describes the whole
+/// *file* rather than this article's part. Size from `input.len()`, or use
+/// [`decode_nntp_append`], which sizes itself.
 pub fn decode(input: &[u8], output: &mut [u8]) -> Result<DecodeResult, YencError> {
     decode_with_options(input, output, DecodeOptions::default())
 }
@@ -64,6 +91,8 @@ pub fn decode(input: &[u8], output: &mut [u8]) -> Result<DecodeResult, YencError
 ///
 /// Headers (`=ybegin`, `=ypart`) are not affected by dot-stuffing (they start
 /// with `=`, not `.`), so header parsing works on raw data without changes.
+///
+/// `output` is subject to the same [`max_decoded_len`] contract as [`decode`].
 pub fn decode_nntp(input: &[u8], output: &mut [u8]) -> Result<DecodeResult, YencError> {
     decode_with_options(
         input,
@@ -154,26 +183,118 @@ fn validate_ypart_decoded_size(
 ) -> Result<(), YencError> {
     if metadata.part.is_some()
         && let (Some(begin), Some(end)) = (metadata.begin, metadata.end)
+        // Checked arithmetic: `end < begin` is rejected at parse time, but the
+        // metadata is public and callers can hand us anything, and malformed
+        // input must never panic.
+        && let Some(expected_size) = end.checked_sub(begin).and_then(|len| len.checked_add(1))
+        && bytes_written as u64 != expected_size
     {
-        let expected_size = end - begin + 1;
-        if bytes_written as u64 != expected_size {
-            return Err(YencError::SizeMismatch {
-                expected: expected_size,
-                actual: bytes_written as u64,
-            });
-        }
+        return Err(YencError::SizeMismatch {
+            expected: expected_size,
+            actual: bytes_written as u64,
+        });
     }
 
     Ok(())
 }
 
+/// Shared post-decode validation for every article entry point (whole-buffer,
+/// streaming, and the fused NNTP decoder), so all three agree on which
+/// inconsistencies fail an article and which are merely recorded.
+fn finalize_decode(
+    metadata: YencMetadata,
+    yend: Option<header::YendFields>,
+    bytes_written: usize,
+    part_crc: u32,
+) -> Result<DecodeResult, YencError> {
+    let (expected_part_crc, expected_file_crc, yend_size, yend_defects, has_trailer) = match yend {
+        Some(yend) => (yend.pcrc32, yend.crc32, yend.size, yend.defects, true),
+        None => (None, None, None, YencHeaderDefects::default(), false),
+    };
+    let defects = metadata.defects.merged(yend_defects);
+
+    // Validate decoded size against =yend size (like NZBGet's dsInvalidSize).
+    if let Some(expected_size) = yend_size
+        && bytes_written as u64 != expected_size
+    {
+        return Err(YencError::SizeMismatch {
+            expected: expected_size,
+            actual: bytes_written as u64,
+        });
+    }
+
+    validate_ypart_decoded_size(&metadata, bytes_written)?;
+
+    // For single-part articles, also validate =ybegin size vs =yend size --
+    // but only when =ybegin actually declared a usable size. A poster who
+    // omitted or mangled `size=` gives us nothing to cross-check against, and
+    // the placeholder 0 must not be read as a real declaration.
+    if metadata.part.is_none()
+        && !defects.missing_size
+        && !defects.invalid_size
+        && let Some(expected_size) = yend_size
+        && metadata.size != expected_size
+    {
+        return Err(YencError::SizeMismatch {
+            expected: metadata.size,
+            actual: expected_size,
+        });
+    }
+
+    // For single-part articles, the `crc32` field in =yend is the part CRC.
+    // For multi-part articles, `pcrc32` is the part CRC.
+    let expected_crc_to_check = if metadata.part.is_some() {
+        expected_part_crc
+    } else {
+        // For single-part, crc32 is the file CRC which equals the part CRC.
+        expected_file_crc
+    };
+
+    let crc_status = match expected_crc_to_check {
+        Some(expected) if expected != part_crc => {
+            return Err(YencError::CrcMismatch {
+                expected,
+                actual: part_crc,
+            });
+        }
+        Some(_) => CrcVerification::Verified,
+        // No usable expected CRC: either none was posted or it was unparseable
+        // and dropped. Either way nothing was verified, and `crc_status` says
+        // exactly that rather than reporting success.
+        None => CrcVerification::Unverified,
+    };
+
+    Ok(DecodeResult {
+        metadata,
+        bytes_written,
+        part_crc,
+        expected_part_crc,
+        expected_file_crc,
+        crc_status,
+        has_trailer,
+        defects,
+    })
+}
+
 /// Decode a complete yEnc article with custom options.
+///
+/// `output` is subject to the same [`max_decoded_len`] contract as [`decode`].
 pub fn decode_with_options(
     input: &[u8],
     output: &mut [u8],
     options: DecodeOptions,
 ) -> Result<DecodeResult, YencError> {
-    let parsed = header::parse_headers(input)?;
+    // Checked before any parsing so the contract is a property of the call, not
+    // of how compressible this particular article happened to be.
+    let needed = max_decoded_len(input.len());
+    if output.len() < needed {
+        return Err(YencError::BufferTooSmall {
+            needed,
+            available: output.len(),
+        });
+    }
+
+    let parsed = header::parse_headers_with_options(input, options)?;
 
     let data_end = parsed.data_end.max(parsed.data_start);
     let data = &input[parsed.data_start..data_end];
@@ -189,62 +310,7 @@ pub fn decode_with_options(
 
     let part_crc = crc.finalize();
 
-    // Extract expected CRC values from =yend.
-    let (expected_part_crc, expected_file_crc, yend_size) = match &parsed.yend {
-        Some(yend) => (yend.pcrc32, yend.crc32, yend.size),
-        None => (None, None, None),
-    };
-
-    // Validate decoded size against =yend size (like NZBGet's dsInvalidSize).
-    if let Some(expected_size) = yend_size
-        && bytes_written as u64 != expected_size
-    {
-        return Err(YencError::SizeMismatch {
-            expected: expected_size,
-            actual: bytes_written as u64,
-        });
-    }
-
-    validate_ypart_decoded_size(&parsed.metadata, bytes_written)?;
-
-    // For single-part articles, also validate =ybegin size vs =yend size.
-    if parsed.metadata.part.is_none()
-        && let Some(expected_size) = yend_size
-        && parsed.metadata.size != expected_size
-    {
-        return Err(YencError::SizeMismatch {
-            expected: parsed.metadata.size,
-            actual: expected_size,
-        });
-    }
-
-    // For single-part articles, the `crc32` field in =yend is the part CRC.
-    // For multi-part articles, `pcrc32` is the part CRC.
-    let expected_crc_to_check = if parsed.metadata.part.is_some() {
-        expected_part_crc
-    } else {
-        // For single-part, crc32 is the file CRC which equals the part CRC.
-        expected_file_crc
-    };
-
-    if let Some(expected) = expected_crc_to_check
-        && part_crc != expected
-    {
-        return Err(YencError::CrcMismatch {
-            expected,
-            actual: part_crc,
-        });
-    }
-
-    Ok(DecodeResult {
-        metadata: parsed.metadata,
-        bytes_written,
-        part_crc,
-        expected_part_crc,
-        expected_file_crc,
-        crc_valid: true,
-        has_trailer: parsed.yend.is_some(),
-    })
+    finalize_decode(parsed.metadata, parsed.yend, bytes_written, part_crc)
 }
 
 /// Result of incrementally decoding a full NNTP yEnc article.
@@ -278,57 +344,13 @@ pub fn finish_streaming_result(
     let bytes_written = decode_state.bytes_decoded as usize;
     let part_crc = decode_state.finalize_crc();
 
-    let (expected_part_crc, expected_file_crc, yend_size, has_trailer) = if let Some(yend) = yend {
-        (yend.pcrc32, yend.crc32, yend.size, true)
-    } else {
-        (None, None, None, false)
-    };
-
-    if let Some(expected_size) = yend_size
-        && bytes_written as u64 != expected_size
-    {
-        return Err(YencError::SizeMismatch {
-            expected: expected_size,
-            actual: bytes_written as u64,
-        });
-    }
-
-    validate_ypart_decoded_size(&metadata, bytes_written)?;
-
-    if metadata.part.is_none()
-        && let Some(expected_size) = yend_size
-        && metadata.size != expected_size
-    {
-        return Err(YencError::SizeMismatch {
-            expected: metadata.size,
-            actual: expected_size,
-        });
-    }
-
-    let expected_crc_to_check = if metadata.part.is_some() {
-        expected_part_crc
-    } else {
-        expected_file_crc
-    };
-    if let Some(expected) = expected_crc_to_check
-        && part_crc != expected
-    {
-        return Err(YencError::CrcMismatch {
-            expected,
-            actual: part_crc,
-        });
-    }
-
-    Ok(DecodeResult {
-        metadata,
-        bytes_written,
-        part_crc,
-        expected_part_crc,
-        expected_file_crc,
-        crc_valid: true,
-        has_trailer,
-    })
+    finalize_decode(metadata, yend, bytes_written, part_crc)
 }
+
+/// How much leading junk may precede `=ybegin` before the article is declared
+/// header-less. Bounded so a body that never contains a yEnc header cannot make
+/// the streaming decoder buffer without limit.
+pub(crate) const MAX_HEADER_SCAN_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamingStage {
@@ -427,23 +449,56 @@ impl StreamingArticleDecoder {
         let expected = match (metadata.begin, metadata.end) {
             (Some(begin), Some(end)) if end >= begin => end - begin + 1,
             (Some(_), Some(_)) => return,
-            _ if metadata.part.is_none() => metadata.size,
+            // Only trust `=ybegin size=` when the poster declared one: the `0`
+            // placeholder for a missing/mangled field means "unknown".
+            _ if metadata.part.is_none()
+                && !metadata.defects.missing_size
+                && !metadata.defects.invalid_size =>
+            {
+                metadata.size
+            }
             _ => return,
         };
         let Ok(expected) = usize::try_from(expected) else {
             return;
         };
-        if expected == 0 || expected > MAX_ARTICLE_RESERVE || expected <= output.capacity() {
+        // Clamp, do not bail: an article whose declared size is *larger* than
+        // the cap is exactly the one that most needs a head start, and skipping
+        // the reservation entirely left it growing from zero one doubling at a
+        // time. The cap bounds a lying header's damage; it is not a reason to
+        // reserve nothing.
+        let reserve = expected.min(MAX_ARTICLE_RESERVE);
+        if reserve == 0 || reserve <= output.capacity() {
             return;
         }
 
-        output.reserve_exact(expected - output.capacity());
+        output.reserve_exact(reserve - output.capacity());
     }
 
     pub fn finish(mut self, output: Vec<u8>) -> Result<DecodedArticle, YencError> {
         let metadata = self.metadata.take().ok_or(YencError::MissingHeader)?;
 
-        let yend = if let Some(yend_line) = self.yend_line.take() {
+        // `process_trailer` only ever sees complete lines, so an article that
+        // ends on its `=yend` with no terminator leaves the trailer sitting in
+        // `pending`. The whole-buffer path parses that trailer; recover it here
+        // (and reject a non-`=yend` control line with the same error
+        // `process_trailer` would have raised) so the two agree.
+        let trailer_line = self.yend_line.take();
+        let trailer_line = match trailer_line {
+            Some(line) => Some(line),
+            None if self.stage == StreamingStage::Trailer && !self.pending.is_empty() => {
+                if !header::is_control_line(&self.pending, b"=yend") {
+                    return Err(YencError::InvalidHeader {
+                        field: "=yend".to_string(),
+                        reason: "unexpected trailing line after yEnc body".to_string(),
+                    });
+                }
+                Some(std::mem::take(&mut self.pending))
+            }
+            None => None,
+        };
+
+        let yend = if let Some(yend_line) = trailer_line {
             let mut scratch = self.header_bytes;
             scratch.extend_from_slice(b"x\r\n");
             scratch.extend_from_slice(&yend_line);
@@ -470,6 +525,13 @@ impl StreamingArticleDecoder {
                     .set_line_length_hint(Some(parsed.metadata.line_length));
                 self.metadata = Some(parsed.metadata);
                 self.stage = StreamingStage::Body;
+            }
+            // `=ybegin` is scanned for, not required on line 1: keep buffering
+            // leading junk lines until one of them is the real header.
+            Err(YencError::MissingHeader) => {
+                if self.header_bytes.len() > MAX_HEADER_SCAN_BYTES {
+                    return Err(YencError::MissingHeader);
+                }
             }
             Err(YencError::MissingField(field)) if field == "=ypart" => {}
             Err(err) => return Err(err),
@@ -504,7 +566,7 @@ impl StreamingArticleDecoder {
         };
 
         let line = self.pending.drain(..line_len).collect::<Vec<_>>();
-        if line.starts_with(b"=yend ") {
+        if header::is_control_line(&line, b"=yend") {
             self.yend_line = Some(line);
             self.stage = StreamingStage::Finished;
         } else if !line.iter().all(|b| matches!(b, b'\r' | b'\n')) {
@@ -568,6 +630,16 @@ fn next_line_len(buf: &[u8]) -> Option<usize> {
 /// Decode raw yEnc-encoded data (no headers/trailers) from `input` into `output`.
 ///
 /// Updates the CRC hasher with decoded bytes. Returns the number of bytes written.
+///
+/// # Output buffer contract
+///
+/// Unlike the whole-article [`decode`] entry points, this accepts an `output`
+/// shorter than [`max_decoded_len`]`(input.len())`: a caller that already knows
+/// the exact decoded length (a fixed-size part, a preallocated slot) should not
+/// have to over-allocate. The cost is explicit rather than free — a compact
+/// destination cannot take the SIMD kernels' full-width stores and runs the
+/// byte-at-a-time scalar kernel instead, roughly an order of magnitude slower.
+/// Overflow is a typed [`YencError::BufferTooSmall`], never a truncated write.
 pub fn decode_body(
     input: &[u8],
     output: &mut [u8],
@@ -674,6 +746,8 @@ impl Default for DecodeState {
 /// line position, CRC) carries over between calls.
 ///
 /// Returns the number of bytes written to `output`.
+///
+/// `output` follows the same compact-buffer contract as [`decode_body`].
 pub fn decode_chunk(
     input: &[u8],
     output: &mut [u8],
@@ -926,6 +1000,556 @@ mod tests {
 
         assert_eq!(decoded.data, original);
         assert_eq!(decoded.result.bytes_written, original.len());
+    }
+
+    // ── Broken-poster corpus: whole-buffer + streaming, every split point ──
+
+    /// NNTP dot-stuffing, as a real server applies it on the wire.
+    fn dot_stuff_lines(input: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(input.len());
+        let mut at_line_start = true;
+        for &byte in input {
+            if at_line_start && byte == b'.' {
+                output.push(b'.');
+            }
+            output.push(byte);
+            at_line_start = byte == b'\n';
+        }
+        output
+    }
+
+    /// Build a single-part article from caller-supplied header/trailer lines
+    /// around a genuinely valid, dot-stuffed encoded body.
+    fn broken_poster_article(
+        prologue: &[u8],
+        ybegin: &[u8],
+        yend: impl FnOnce(u64, u32) -> Vec<u8>,
+    ) -> Vec<u8> {
+        let mut crc = Crc32::new();
+        crc.update(TOLERANT_BODY);
+
+        let mut article = Vec::new();
+        article.extend_from_slice(prologue);
+        article.extend_from_slice(ybegin);
+        article.extend_from_slice(&encode_raw(TOLERANT_BODY));
+        article.extend_from_slice(b"\r\n");
+        article.extend_from_slice(&yend(TOLERANT_BODY.len() as u64, crc.finalize()));
+        dot_stuff_lines(&article)
+    }
+
+    /// Leading `\x04` encodes to `.`, so the body exercises dot-unstuffing too.
+    const TOLERANT_BODY: &[u8] = b"\x04tolerant poster body\r\n\0";
+
+    fn healthy_yend(size: u64, crc: u32) -> Vec<u8> {
+        format!("=yend size={size} crc32={crc:08x}\r\n").into_bytes()
+    }
+
+    /// Feed an article through `StreamingArticleDecoder` split at `split`.
+    fn decode_streaming_split(article: &[u8], split: usize) -> Result<DecodedArticle, YencError> {
+        let mut decoder = StreamingArticleDecoder::new();
+        let mut output = Vec::new();
+        decoder.feed_chunk(&article[..split], &mut output)?;
+        decoder.feed_chunk(&article[split..], &mut output)?;
+        decoder.finish(output)
+    }
+
+    /// Every entry point must agree on a tolerated article, at every split
+    /// point of the streaming one.
+    fn assert_all_entry_points_agree(article: &[u8], expected_data: &[u8]) {
+        assert_entry_points_agree_at_splits(article, expected_data, 0..=article.len());
+    }
+
+    /// [`assert_all_entry_points_agree`] over a chosen set of split points, for
+    /// articles too large to sweep byte by byte.
+    fn assert_entry_points_agree_at_splits(
+        article: &[u8],
+        expected_data: &[u8],
+        splits: impl IntoIterator<Item = usize>,
+    ) {
+        let mut whole_out = vec![0u8; article.len() + 64];
+        let whole = decode_nntp(article, &mut whole_out).expect("whole-buffer decode");
+        assert_eq!(&whole_out[..whole.bytes_written], expected_data);
+
+        for split in splits {
+            let streamed = decode_streaming_split(article, split)
+                .unwrap_or_else(|err| panic!("split {split}: {err}"));
+            assert_eq!(streamed.data, expected_data, "split {split}");
+            assert_eq!(streamed.result.bytes_written, whole.bytes_written);
+            assert_eq!(
+                streamed.result.has_trailer, whole.has_trailer,
+                "split {split}"
+            );
+            assert_eq!(streamed.result.part_crc, whole.part_crc);
+            assert_eq!(
+                streamed.result.crc_status, whole.crc_status,
+                "split {split}"
+            );
+            assert_eq!(streamed.result.defects, whole.defects, "split {split}");
+            assert_eq!(streamed.result.metadata.name, whole.metadata.name);
+            assert_eq!(streamed.result.metadata.size, whole.metadata.size);
+            assert_eq!(
+                streamed.result.metadata.line_length,
+                whole.metadata.line_length
+            );
+        }
+    }
+
+    /// Every entry point must reject a broken article the same way, at every
+    /// split point of the streaming one.
+    fn assert_all_entry_points_reject(article: &[u8], expected_reason: &str) {
+        let mut whole_out = vec![0u8; max_decoded_len(article.len())];
+        let whole =
+            decode_nntp(article, &mut whole_out).expect_err("whole-buffer decode must fail");
+        assert!(
+            whole.to_string().contains(expected_reason),
+            "whole-buffer error {whole} does not mention {expected_reason:?}"
+        );
+
+        for split in 0..=article.len() {
+            let err = decode_streaming_split(article, split)
+                .err()
+                .unwrap_or_else(|| panic!("split {split}: streaming decode must fail"));
+            assert!(
+                err.to_string().contains(expected_reason),
+                "split {split}: error {err} does not mention {expected_reason:?}"
+            );
+        }
+    }
+
+    // ── B7: line-layer trailer detection vs the SIMD kernel's stop rule ──
+    //
+    // The kernel stops the body at a literal CRLF (optionally one NNTP-stuffed
+    // `.`) followed by *any* `=y`. The whole-buffer path used to scan for
+    // `=yend ` lines instead, which disagreed with the streaming and fused
+    // decoders on the three inputs below.
+
+    /// A `\r\n=y…` line that is not `=yend`. The kernel stops there, so the
+    /// article cannot decode past it — the line scan used to step over the
+    /// line, decode it as body data, and carry on to the real `=yend`.
+    #[test]
+    fn stray_control_line_in_body_is_rejected_by_every_entry_point() {
+        for stray in [
+            b"=yfoo\r\n".as_slice(),
+            b"=ypart begin=1 end=2\r\n".as_slice(),
+            // `=yend` with no separator is deliberately not a control line
+            // (both reference decoders require the trailing space), but the
+            // kernel still stops at its `=y`.
+            b"=yend\r\n".as_slice(),
+            b"=y\r\n".as_slice(),
+        ] {
+            let mut article = Vec::new();
+            article.extend_from_slice(b"=ybegin line=128 size=24 name=stray.bin\r\n");
+            article.extend_from_slice(&encode_raw(TOLERANT_BODY));
+            article.extend_from_slice(b"\r\n");
+            article.extend_from_slice(stray);
+            article.extend_from_slice(b"=yend size=24\r\n");
+            let article = dot_stuff_lines(&article);
+
+            assert_all_entry_points_reject(&article, "unexpected trailing line after yEnc body");
+        }
+    }
+
+    /// An article truncated in the middle of its control line: `\r\n=y` and
+    /// nothing more. Every entry point rejects it rather than one of them
+    /// silently reporting a complete, trailer-less article.
+    #[test]
+    fn truncated_control_line_is_rejected_by_every_entry_point() {
+        let mut article = Vec::new();
+        article.extend_from_slice(b"=ybegin line=128 size=24 name=trunc.bin\r\n");
+        article.extend_from_slice(&encode_raw(TOLERANT_BODY));
+        let article = dot_stuff_lines(&article);
+        let mut article = article;
+        article.extend_from_slice(b"\r\n=y");
+
+        assert_all_entry_points_reject(&article, "unexpected trailing line after yEnc body");
+    }
+
+    /// A bare `\n=yend ` is *not* a trailer: the kernel reaches its line-start
+    /// state only through a literal CRLF, so the would-be trailer is body data
+    /// everywhere. The whole-buffer path used to accept it, decoding 24 bytes
+    /// with a verified CRC where the streaming path decoded the trailer text
+    /// into the payload.
+    #[test]
+    fn bare_lf_trailer_is_body_data_in_every_entry_point() {
+        let mut article = Vec::new();
+        article.extend_from_slice(b"=ybegin line=128 size=12 name=barelf.bin\n");
+        let body_start = article.len();
+        article.extend_from_slice(&encode_raw(b"bare lf body"));
+        article.extend_from_slice(b"\n=yend size=12\n");
+
+        let expected = reference_decode_body(&article[body_start..], true).unwrap();
+        assert!(expected.len() > 12, "the trailer must land in the payload");
+        assert_all_entry_points_agree(&article, &expected);
+
+        let mut out = vec![0u8; max_decoded_len(article.len())];
+        let result = decode_nntp(&article, &mut out).unwrap();
+        assert!(!result.has_trailer);
+        assert_eq!(result.crc_status, CrcVerification::Unverified);
+    }
+
+    /// A dot-stuffed trailer (`\r\n.=yend `). The kernel strips the one leading
+    /// `.` at line start in raw mode before looking for `=y`, so this really is
+    /// the trailer; the line scan used to miss it entirely.
+    #[test]
+    fn dot_prefixed_trailer_is_found_by_every_entry_point() {
+        let base = broken_poster_article(
+            b"",
+            b"=ybegin line=128 size=24 name=dotyend.bin\r\n",
+            healthy_yend,
+        );
+        let yend_at = base
+            .windows(b"=yend ".len())
+            .rposition(|window| window == b"=yend ")
+            .expect("article has a trailer");
+
+        let mut article = base[..yend_at].to_vec();
+        article.push(b'.');
+        article.extend_from_slice(&base[yend_at..]);
+
+        assert_all_entry_points_agree(&article, TOLERANT_BODY);
+
+        let mut out = vec![0u8; max_decoded_len(article.len())];
+        let result = decode_nntp(&article, &mut out).unwrap();
+        assert!(result.has_trailer);
+        assert_eq!(result.crc_status, CrcVerification::Verified);
+    }
+
+    /// An article that ends on its `=yend` with no line terminator. The
+    /// whole-buffer path always parsed that trailer; `process_trailer` only
+    /// ever sees complete lines, so the streaming decoder now recovers it at
+    /// `finish` instead of reporting a trailer-less article.
+    #[test]
+    fn unterminated_trailer_is_parsed_by_every_entry_point() {
+        let base = broken_poster_article(
+            b"",
+            b"=ybegin line=128 size=24 name=noeol.bin\r\n",
+            healthy_yend,
+        );
+        let article = base[..base.len() - 2].to_vec();
+        assert!(
+            !matches!(article.last(), Some(b'\r' | b'\n')),
+            "the trailer's own CRLF must be the thing that was dropped"
+        );
+
+        assert_all_entry_points_agree(&article, TOLERANT_BODY);
+
+        let mut out = vec![0u8; max_decoded_len(article.len())];
+        let result = decode_nntp(&article, &mut out).unwrap();
+        assert!(result.has_trailer);
+        assert_eq!(result.crc_status, CrcVerification::Verified);
+    }
+
+    /// The whole-buffer `=ybegin` scan is bounded at the same 64 KiB the
+    /// streaming and fused decoders use, so all three call the same articles
+    /// header-less. The article is too large to sweep byte by byte, so this
+    /// checks the boundary on both sides at a spread of split points.
+    #[test]
+    fn leading_junk_scan_bound_agrees_across_entry_points() {
+        const JUNK_LINE: &[u8] = b"this line is not a yenc header at all\r\n";
+        let lines_at_cap = MAX_HEADER_SCAN_BYTES / JUNK_LINE.len();
+        assert!(lines_at_cap * JUNK_LINE.len() <= MAX_HEADER_SCAN_BYTES);
+
+        for (lines, expect_decode) in [(lines_at_cap, true), (lines_at_cap + 1, false)] {
+            let prologue = JUNK_LINE.repeat(lines);
+            let article = broken_poster_article(
+                &prologue,
+                b"=ybegin line=128 size=24 name=deepjunk.bin\r\n",
+                healthy_yend,
+            );
+            let splits = [
+                0,
+                1,
+                prologue.len() - 1,
+                prologue.len(),
+                prologue.len() + 1,
+                article.len() - 1,
+                article.len(),
+            ];
+
+            if expect_decode {
+                assert_entry_points_agree_at_splits(&article, TOLERANT_BODY, splits);
+            } else {
+                let mut out = vec![0u8; max_decoded_len(article.len())];
+                assert!(
+                    matches!(
+                        decode_nntp(&article, &mut out),
+                        Err(YencError::MissingHeader)
+                    ),
+                    "whole-buffer accepted {lines} junk lines"
+                );
+                for split in splits {
+                    assert!(
+                        matches!(
+                            decode_streaming_split(&article, split),
+                            Err(YencError::MissingHeader)
+                        ),
+                        "streaming accepted {lines} junk lines at split {split}"
+                    );
+                }
+            }
+        }
+    }
+
+    // ── B8: the output-buffer contract ──────────────────────────────────
+
+    /// The whole-article entry points reject an undersized destination with a
+    /// typed error instead of silently dropping to the scalar kernel.
+    #[test]
+    fn article_decode_rejects_undersized_output_instead_of_degrading() {
+        let article = broken_poster_article(
+            b"",
+            b"=ybegin line=128 size=24 name=sized.bin\r\n",
+            healthy_yend,
+        );
+
+        // Exactly the trap the docs used to invite: size the destination from
+        // `metadata.size`, which a poster is free to omit entirely.
+        let mut undeclared = vec![0u8; 0];
+        assert!(matches!(
+            decode_nntp(&article, &mut undeclared),
+            Err(YencError::BufferTooSmall { .. })
+        ));
+
+        // Even a buffer that *would* have held the decoded bytes is rejected:
+        // the contract is a property of the call, not of how compressible this
+        // particular article turned out to be.
+        let mut just_enough = vec![0u8; TOLERANT_BODY.len()];
+        assert!(matches!(
+            decode_nntp(&article, &mut just_enough),
+            Err(YencError::BufferTooSmall { .. })
+        ));
+
+        let mut sized = vec![0u8; max_decoded_len(article.len())];
+        let result = decode_nntp(&article, &mut sized).unwrap();
+        assert_eq!(&sized[..result.bytes_written], TOLERANT_BODY);
+    }
+
+    /// The byte-level API keeps the compact-buffer fallback, and it still
+    /// produces the same bytes as the SIMD path.
+    #[test]
+    fn body_decode_compact_buffer_matches_the_simd_path() {
+        let encoded = encode_raw(TOLERANT_BODY);
+
+        let mut compact = vec![0u8; TOLERANT_BODY.len()];
+        let mut compact_crc = Crc32::new();
+        let compact_written = decode_body(
+            &encoded,
+            &mut compact,
+            &mut compact_crc,
+            DecodeOptions::default(),
+        )
+        .unwrap();
+
+        let mut roomy = vec![0u8; max_decoded_len(encoded.len())];
+        let mut roomy_crc = Crc32::new();
+        let roomy_written = decode_body(
+            &encoded,
+            &mut roomy,
+            &mut roomy_crc,
+            DecodeOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(compact_written, roomy_written);
+        assert_eq!(&compact[..compact_written], &roomy[..roomy_written]);
+        assert_eq!(compact_crc.finalize(), roomy_crc.finalize());
+    }
+
+    // ── E19: pre-reservation for oversized articles ─────────────────────
+
+    /// An article whose declared size exceeds the 16 MiB reservation cap used
+    /// to get *no* pre-reservation at all, so the one article that most needed
+    /// a head start grew from zero one doubling at a time.
+    #[test]
+    fn streaming_reserves_the_cap_for_articles_larger_than_it() {
+        const CAP: usize = 16 * 1024 * 1024;
+
+        // Metadata-driven: the header declares 32 MiB, the body is one byte.
+        let mut decoder = StreamingArticleDecoder::new();
+        let mut output = Vec::new();
+        decoder
+            .feed_chunk(
+                b"=ybegin line=128 size=33554432 name=huge.bin\r\nA",
+                &mut output,
+            )
+            .unwrap();
+        assert!(
+            output.capacity() >= CAP,
+            "oversized article reserved only {}",
+            output.capacity()
+        );
+
+        // A declared size under the cap still reserves exactly what it needs.
+        let mut decoder = StreamingArticleDecoder::new();
+        let mut small = Vec::new();
+        decoder
+            .feed_chunk(
+                b"=ybegin line=128 size=1048576 name=small.bin\r\nA",
+                &mut small,
+            )
+            .unwrap();
+        assert!(small.capacity() >= 1024 * 1024);
+        assert!(small.capacity() < CAP);
+    }
+
+    /// D6: junk before `=ybegin`, including `=`-bearing and partial-prefix junk.
+    #[test]
+    fn tolerates_leading_junk_before_ybegin_at_every_split_point() {
+        let article = broken_poster_article(
+            b"Path: news.example\r\n=yb\r\n=ybegi partial\r\n=ybeginner notes\r\n\r\n",
+            b"=ybegin line=128 size=24 name=junk.bin\r\n",
+            healthy_yend,
+        );
+
+        assert_all_entry_points_agree(&article, TOLERANT_BODY);
+
+        let mut out = vec![0u8; article.len() + 64];
+        let result = decode_nntp(&article, &mut out).unwrap();
+        assert!(result.defects.junk_before_ybegin);
+        assert_eq!(result.crc_status, CrcVerification::Verified);
+        assert_eq!(result.metadata.name, "junk.bin");
+    }
+
+    /// D7: every combination of missing `line=`/`size=`/`name=`.
+    #[test]
+    fn tolerates_every_missing_ybegin_field_combination_at_every_split_point() {
+        for line_field in [None, Some("line=128")] {
+            for size_field in [None, Some("size=24")] {
+                for name_field in [None, Some("name=missing.bin")] {
+                    let mut ybegin = String::from("=ybegin");
+                    for field in [line_field, size_field, name_field].into_iter().flatten() {
+                        ybegin.push(' ');
+                        ybegin.push_str(field);
+                    }
+                    ybegin.push_str(" \r\n");
+
+                    let article = broken_poster_article(b"", ybegin.as_bytes(), healthy_yend);
+                    assert_all_entry_points_agree(&article, TOLERANT_BODY);
+
+                    let mut out = vec![0u8; article.len() + 64];
+                    let result = decode_nntp(&article, &mut out).unwrap();
+                    assert_eq!(result.defects.missing_line, line_field.is_none());
+                    assert_eq!(result.defects.missing_size, size_field.is_none());
+                    assert_eq!(result.defects.missing_name, name_field.is_none());
+                    // A missing =ybegin size= must not be cross-checked against
+                    // the =yend size= as if it had been declared as 0.
+                    assert_eq!(result.crc_status, CrcVerification::Verified);
+                }
+            }
+        }
+    }
+
+    /// D9: garbage `crc32=` leaves the article decoded but explicitly
+    /// unverified -- it must never read back as "verified".
+    #[test]
+    fn tolerates_garbage_crc32_at_every_split_point() {
+        for garbage in ["nothex", "", "  ", "DEADBEEFDEADBEEF0", "1234ZZZZ", "0x99"] {
+            let article = broken_poster_article(
+                b"",
+                b"=ybegin line=128 size=24 name=badcrc.bin\r\n",
+                |size, _crc| format!("=yend size={size} crc32={garbage}\r\n").into_bytes(),
+            );
+
+            assert_all_entry_points_agree(&article, TOLERANT_BODY);
+
+            let mut out = vec![0u8; article.len() + 64];
+            let result = decode_nntp(&article, &mut out).unwrap();
+            assert!(result.defects.invalid_crc32, "crc32={garbage:?}");
+            assert_eq!(result.expected_file_crc, None, "crc32={garbage:?}");
+            assert_eq!(
+                result.crc_status,
+                CrcVerification::Unverified,
+                "crc32={garbage:?}"
+            );
+        }
+    }
+
+    /// D8: `=ypart end=` past `=ybegin size=`, and the healthy inverse.
+    #[test]
+    fn tolerates_ypart_end_past_declared_size_at_every_split_point() {
+        for (declared_size, expect_defect) in [(10u64, true), (100_000u64, false)] {
+            let end = TOLERANT_BODY.len();
+            let article = broken_poster_article(
+                b"",
+                format!(
+                    "=ybegin part=1 total=2 line=128 size={declared_size} name=part.bin\r\n\
+                     =ypart begin=1 end={end}\r\n"
+                )
+                .as_bytes(),
+                |size, crc| format!("=yend size={size} part=1 pcrc32={crc:08x}\r\n").into_bytes(),
+            );
+
+            assert_all_entry_points_agree(&article, TOLERANT_BODY);
+
+            let mut out = vec![0u8; article.len() + 64];
+            let result = decode_nntp(&article, &mut out).unwrap();
+            assert_eq!(result.defects.ypart_end_exceeds_size, expect_defect);
+            assert_eq!(result.crc_status, CrcVerification::Verified);
+        }
+    }
+
+    /// D10: tab and case variants of field names behave identically on the
+    /// whole-buffer, streaming, and `parse_ybegin_line` entry points.
+    #[test]
+    fn tolerates_tab_and_case_field_variants_at_every_split_point() {
+        for ybegin in [
+            b"=ybegin\tline=128\tsize=24\tname=tabs.bin\r\n".as_slice(),
+            b"=ybegin LINE=128 Size=24 NaMe=case.bin\r\n".as_slice(),
+            b"=ybegin  line=128    size=24  name=spaces.bin\r\n".as_slice(),
+        ] {
+            let article = broken_poster_article(b"", ybegin, healthy_yend);
+            assert_all_entry_points_agree(&article, TOLERANT_BODY);
+
+            let mut out = vec![0u8; article.len() + 64];
+            let result = decode_nntp(&article, &mut out).unwrap();
+            assert_eq!(result.metadata.size, 24);
+            assert_eq!(result.metadata.line_length, 128);
+            assert_eq!(result.crc_status, CrcVerification::Verified);
+        }
+    }
+
+    /// A real CRC mismatch must still fail: tolerance is about *absent* data,
+    /// not about accepting corrupt data.
+    #[test]
+    fn genuine_crc_mismatch_still_fails_after_tolerance_changes() {
+        let article = broken_poster_article(
+            b"junk line\r\n",
+            b"=ybegin name=mismatch.bin\r\n",
+            |size, _crc| format!("=yend size={size} crc32=deadbeef\r\n").into_bytes(),
+        );
+
+        let mut out = vec![0u8; article.len() + 64];
+        let err = decode_nntp(&article, &mut out).unwrap_err();
+        assert!(matches!(
+            err,
+            YencError::CrcMismatch {
+                expected: 0xDEADBEEF,
+                ..
+            }
+        ));
+    }
+
+    /// A body with no `=ybegin` at all is still a hard failure, and the
+    /// streaming decoder must not buffer without bound while looking for one.
+    #[test]
+    fn header_scan_is_bounded_and_still_reports_missing_header() {
+        let mut junk = Vec::new();
+        while junk.len() <= MAX_HEADER_SCAN_BYTES + 4096 {
+            junk.extend_from_slice(b"this line is not a yenc header at all\r\n");
+        }
+
+        let mut decoder = StreamingArticleDecoder::new();
+        let mut output = Vec::new();
+        let err = decoder
+            .feed_chunk(&junk, &mut output)
+            .expect_err("unbounded junk must not be buffered forever");
+        assert!(matches!(err, YencError::MissingHeader));
+
+        let mut out = vec![0u8; max_decoded_len(junk.len())];
+        assert!(matches!(
+            decode_nntp(&junk, &mut out),
+            Err(YencError::MissingHeader)
+        ));
     }
 
     #[test]
@@ -1194,7 +1818,7 @@ mod tests {
 
         assert_eq!(result.bytes_written, original.len());
         assert_eq!(&output[..result.bytes_written], original.as_slice());
-        assert!(result.crc_valid);
+        assert_eq!(result.crc_status, CrcVerification::Verified);
         assert_eq!(result.metadata.name, "test.bin");
         assert_eq!(result.metadata.size, original.len() as u64);
     }
@@ -1257,7 +1881,7 @@ mod tests {
         assert_eq!(result.part_crc, part_crc);
         assert_eq!(result.expected_part_crc, Some(part_crc));
         assert_eq!(result.expected_file_crc, Some(0xDEADBEEF));
-        assert!(result.crc_valid);
+        assert_eq!(result.crc_status, CrcVerification::Verified);
     }
 
     #[test]
@@ -1287,7 +1911,9 @@ mod tests {
 
         assert_eq!(result.expected_part_crc, None);
         assert_eq!(result.expected_file_crc, Some(0xA3BDCA2D));
-        assert!(result.crc_valid);
+        // Multi-part checks `pcrc32`; the poster misspelled it, so the file
+        // `crc32` is carried but nothing about this part was verified.
+        assert_eq!(result.crc_status, CrcVerification::Unverified);
     }
 
     #[test]
@@ -1330,8 +1956,9 @@ mod tests {
 
         assert_eq!(result.bytes_written, original.len());
         assert_eq!(&output[..result.bytes_written], original.as_slice());
-        // No CRC to validate.
-        assert!(result.crc_valid);
+        // No trailer, so no CRC to validate -- and that must not read back as
+        // a successful verification.
+        assert_eq!(result.crc_status, CrcVerification::Unverified);
     }
 
     #[test]

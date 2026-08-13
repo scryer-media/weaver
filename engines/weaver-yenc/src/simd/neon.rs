@@ -265,23 +265,23 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
             if neon64_any(any) {
                 // Fused bit-weight reduction: lane 0 → specials mask, lane 1 →
                 // `=` mask (oracle lines 102-125).
-                let merged = vpaddq_u8(
-                    vpaddq_u8(
-                        vpaddq_u8(
+                let merged = neon64_addp(
+                    neon64_addp(
+                        neon64_addp(
                             vandq_u8(cmp_a, constants.bit_weights),
                             vandq_u8(cmp_b, constants.bit_weights),
                         ),
-                        vpaddq_u8(
+                        neon64_addp(
                             vandq_u8(cmp_c, constants.bit_weights),
                             vandq_u8(cmp_d, constants.bit_weights),
                         ),
                     ),
-                    vpaddq_u8(
-                        vpaddq_u8(
+                    neon64_addp(
+                        neon64_addp(
                             vandq_u8(eq_a, constants.bit_weights),
                             vandq_u8(eq_b, constants.bit_weights),
                         ),
-                        vpaddq_u8(
+                        neon64_addp(
                             vandq_u8(eq_c, constants.bit_weights),
                             vandq_u8(eq_d, constants.bit_weights),
                         ),
@@ -660,6 +660,40 @@ unsafe fn neon64_any(v: std::arch::aarch64::uint8x16_t) -> bool {
     unsafe { vget_lane_u64::<0>(vreinterpret_u64_u32(vqmovn_u64(vreinterpretq_u64_u8(v)))) != 0 }
 }
 
+/// The oracle's `vpaddq_u8` (decoder_neon64.cc:102-125, 240-250), which clang
+/// emits as a single `addp.16b`.
+///
+/// Rust's `core::arch::aarch64::vpaddq_u8` is *generic IR* (two shufflevectors
+/// plus an add), not the `llvm.aarch64.neon.addp` intrinsic; the AArch64 backend
+/// pattern-matches `add(uzp1(a,b), uzp2(a,b))` back into `addp`. Every use in
+/// this file feeds it `cmp & bit_weights` operands, whose set bits are provably
+/// disjoint, so InstCombine rewrites the `add` into an `or disjoint` — and the
+/// backend has no `or(uzp1, uzp2)` pattern. The result is a 3-instruction
+/// `uzp1`/`uzp2`/`orr` expansion of every pairwise add: 21 instructions where
+/// the oracle emits 7, on every window that contains a special character.
+/// Verified in the emitted asm for both `SEARCH_END` instantiations.
+///
+/// Spelling it as `asm!` restores the oracle's instruction exactly. `pure` +
+/// `nomem` keeps it CSE-able and hoistable, so scheduling is unaffected.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neon64_addp(
+    a: std::arch::aarch64::uint8x16_t,
+    b: std::arch::aarch64::uint8x16_t,
+) -> std::arch::aarch64::uint8x16_t {
+    let out: std::arch::aarch64::uint8x16_t;
+    unsafe {
+        std::arch::asm!(
+            "addp {out:v}.16b, {a:v}.16b, {b:v}.16b",
+            out = lateout(vreg) out,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
 /// `vsriq_n_u16::<8>` on byte vectors: per 16-bit lane, keep `hi`'s high byte
 /// and take `lo`'s high byte as the low byte (oracle decoder_neon64.cc:220).
 #[cfg(target_arch = "aarch64")]
@@ -791,13 +825,13 @@ pub(super) unsafe fn neon64_compare_mask64(
     use std::arch::aarch64::*;
 
     let merged = unsafe {
-        vpaddq_u8(
-            vpaddq_u8(
-                vpaddq_u8(
+        neon64_addp(
+            neon64_addp(
+                neon64_addp(
                     vandq_u8(vectors[0], bit_weights),
                     vandq_u8(vectors[1], bit_weights),
                 ),
-                vpaddq_u8(
+                neon64_addp(
                     vandq_u8(vectors[2], bit_weights),
                     vandq_u8(vectors[3], bit_weights),
                 ),
@@ -1107,23 +1141,23 @@ pub(super) unsafe fn decode_neon64_span_block(
     // lane 0 of `merged` holds the specials bits, lane 1 the '=' bits.
     let (mask, eq) = if has_specials {
         let merged = unsafe {
-            vpaddq_u8(
-                vpaddq_u8(
-                    vpaddq_u8(
+            neon64_addp(
+                neon64_addp(
+                    neon64_addp(
                         vandq_u8(cmp_a, constants.bit_weights),
                         vandq_u8(cmp_b, constants.bit_weights),
                     ),
-                    vpaddq_u8(
+                    neon64_addp(
                         vandq_u8(cmp_c, constants.bit_weights),
                         vandq_u8(cmp_d, constants.bit_weights),
                     ),
                 ),
-                vpaddq_u8(
-                    vpaddq_u8(
+                neon64_addp(
+                    neon64_addp(
                         vandq_u8(eq_a, constants.bit_weights),
                         vandq_u8(eq_b, constants.bit_weights),
                     ),
-                    vpaddq_u8(
+                    neon64_addp(
                         vandq_u8(eq_c, constants.bit_weights),
                         vandq_u8(eq_d, constants.bit_weights),
                     ),
@@ -1165,23 +1199,23 @@ pub(super) unsafe fn decode_neon64_span_block(
         let dot_c = unsafe { vceqq_u8(c, constants.dot) };
         let dot_d = unsafe { vceqq_u8(d, constants.dot) };
         let merged = unsafe {
-            vpaddq_u8(
-                vpaddq_u8(
-                    vpaddq_u8(
+            neon64_addp(
+                neon64_addp(
+                    neon64_addp(
                         vandq_u8(cr_a, constants.bit_weights),
                         vandq_u8(cr_b, constants.bit_weights),
                     ),
-                    vpaddq_u8(
+                    neon64_addp(
                         vandq_u8(cr_c, constants.bit_weights),
                         vandq_u8(cr_d, constants.bit_weights),
                     ),
                 ),
-                vpaddq_u8(
-                    vpaddq_u8(
+                neon64_addp(
+                    neon64_addp(
                         vandq_u8(dot_a, constants.bit_weights),
                         vandq_u8(dot_b, constants.bit_weights),
                     ),
-                    vpaddq_u8(
+                    neon64_addp(
                         vandq_u8(dot_c, constants.bit_weights),
                         vandq_u8(dot_d, constants.bit_weights),
                     ),

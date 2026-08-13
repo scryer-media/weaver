@@ -227,10 +227,8 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 });
             }
             Err(error) => {
-                let _ = event_tx.blocking_send(OwnedDownloadLaneEvent::AcquireFailed {
-                    lease,
-                    error: error.to_string(),
-                });
+                let _ =
+                    event_tx.blocking_send(OwnedDownloadLaneEvent::AcquireFailed { lease, error });
                 crate::runtime::perf_probe::record(
                     "download.fetch_body.owned",
                     fetch_started.elapsed(),

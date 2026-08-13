@@ -68,6 +68,45 @@ pub struct NntpClient {
     soft_timeout: Duration,
 }
 
+/// Why a synchronous owned BODY lane could not be acquired.
+///
+/// Capacity outcomes are separated from server availability and transport
+/// failures so callers can return leased work to the scheduler without
+/// tearing down healthy cached lanes or consuming a download retry.
+#[derive(Debug)]
+pub enum BlockingBodyLaneAcquireError {
+    ProviderCapacity(NntpError),
+    LocalCapacity,
+    NoEligibleServer,
+    Other(NntpError),
+}
+
+impl BlockingBodyLaneAcquireError {
+    fn from_connect_error(error: NntpError) -> Self {
+        if matches!(error, NntpError::TooManyConnections) {
+            Self::ProviderCapacity(error)
+        } else {
+            Self::Other(error)
+        }
+    }
+
+    pub fn is_capacity_admission(&self) -> bool {
+        matches!(self, Self::ProviderCapacity(_) | Self::LocalCapacity)
+    }
+}
+
+impl std::fmt::Display for BlockingBodyLaneAcquireError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProviderCapacity(error) | Self::Other(error) => error.fmt(formatter),
+            Self::LocalCapacity => formatter.write_str("blocking BODY lane capacity is saturated"),
+            Self::NoEligibleServer => formatter.write_str("no eligible blocking BODY server"),
+        }
+    }
+}
+
+impl std::error::Error for BlockingBodyLaneAcquireError {}
+
 /// A BODY fetch that was streamed and decoded inline.
 #[derive(Debug)]
 pub struct DecodedBody {
@@ -2038,7 +2077,7 @@ impl NntpClient {
         &self,
         groups: &[String],
         exclude: &[usize],
-    ) -> Result<crate::blocking::BlockingBodyLane> {
+    ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
         self.try_acquire_blocking_body_lane_with_estimate(groups, exclude, 0)
     }
 
@@ -2057,20 +2096,32 @@ impl NntpClient {
         groups: &[String],
         exclude: &[usize],
         requested_body_bytes: u64,
-    ) -> Result<crate::blocking::BlockingBodyLane> {
+    ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
         let selection = self.blocking_body_server_selection(exclude, requested_body_bytes);
-        if selection.eligible.is_empty()
-            && let Some(rejection) = selection.quota_blocked
-        {
-            return Err(NntpError::quota_blocked(rejection));
+        if selection.eligible.is_empty() {
+            return Err(match selection.quota_blocked {
+                Some(rejection) => {
+                    BlockingBodyLaneAcquireError::Other(NntpError::quota_blocked(rejection))
+                }
+                None => BlockingBodyLaneAcquireError::NoEligibleServer,
+            });
         }
+
+        let mut saw_local_capacity = false;
+        let mut provider_capacity_error = None;
+        let mut other_error = None;
         for server in selection.eligible {
             let permit = match self.pool.try_acquire_blocking_permit(server) {
                 Ok(permit) => permit,
-                Err(_) => continue,
+                Err(_) => {
+                    saw_local_capacity = true;
+                    continue;
+                }
             };
-            let (config, excluded_ips, address_offset) =
-                self.pool.blocking_connect_plan(server, &[])?;
+            let (config, excluded_ips, address_offset) = self
+                .pool
+                .blocking_connect_plan(server, &[])
+                .map_err(BlockingBodyLaneAcquireError::Other)?;
             if !supports_blocking_tls_body_lane(&config) {
                 continue;
             }
@@ -2095,11 +2146,28 @@ impl NntpClient {
                         elapsed_ms = started.elapsed().as_millis(),
                         "blocking BODY lane connect failed"
                     );
-                    continue;
+                    match BlockingBodyLaneAcquireError::from_connect_error(error) {
+                        BlockingBodyLaneAcquireError::ProviderCapacity(error) => {
+                            provider_capacity_error = Some(error);
+                        }
+                        BlockingBodyLaneAcquireError::Other(error) => {
+                            other_error = Some(error);
+                        }
+                        BlockingBodyLaneAcquireError::LocalCapacity
+                        | BlockingBodyLaneAcquireError::NoEligibleServer => unreachable!(),
+                    }
                 }
             }
         }
-        Err(NntpError::PoolExhausted)
+        if let Some(error) = provider_capacity_error {
+            Err(BlockingBodyLaneAcquireError::ProviderCapacity(error))
+        } else if let Some(error) = other_error {
+            Err(BlockingBodyLaneAcquireError::Other(error))
+        } else if saw_local_capacity {
+            Err(BlockingBodyLaneAcquireError::LocalCapacity)
+        } else {
+            Err(BlockingBodyLaneAcquireError::NoEligibleServer)
+        }
     }
 
     pub fn has_blocking_body_lane_candidate(&self, exclude: &[usize]) -> bool {
@@ -3647,6 +3715,21 @@ mod tests {
         assert_eq!(health.server(0).consecutive_failures, 0);
     }
 
+    #[test]
+    fn blocking_lane_preserves_provider_capacity_rejection() {
+        let error =
+            NntpError::from_status(crate::types::StatusCode::new(502), "Too many connections");
+        let error = BlockingBodyLaneAcquireError::from_connect_error(error);
+
+        assert!(
+            matches!(
+                error,
+                BlockingBodyLaneAcquireError::ProviderCapacity(NntpError::TooManyConnections)
+            ),
+            "unexpected blocking lane error: {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn client_shutdown() {
         let config = NntpClientConfig::single(
@@ -4131,7 +4214,7 @@ mod tests {
             .expect("blocking selection must surface the same quota block");
         assert!(matches!(
             blocking,
-            NntpError::QuotaBlocked(rejection)
+            BlockingBodyLaneAcquireError::Other(NntpError::QuotaBlocked(rejection))
                 if rejection.stable_server_id == StableServerId(1_001)
                     && rejection.retry_at == Some(earlier)
         ));

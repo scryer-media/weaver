@@ -50,11 +50,16 @@ die(){ printf '\033[1;31m[avx512-prof:FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 assert_vbmi2_box() {
   [ -r /proc/cpuinfo ] || die "no /proc/cpuinfo"
   local flags; flags="$(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2-)"
+  # Linux spells LZCNT as 'abm' in /proc/cpuinfo; normalize so the loop below
+  # can name the same nine features the dispatcher's vbmi2_tier_available()
+  # gates on. Omitting the BMI family here made this gate looser than the
+  # dispatcher: a box could pass it and still be demoted to the AVX2 tier.
+  case " $flags " in *" abm "*) flags="$flags lzcnt" ;; esac
   local f
-  for f in avx2 avx512f avx512vl avx512bw; do
+  for f in avx2 avx512f avx512vl avx512bw bmi1 bmi2 popcnt lzcnt; do
     case " $flags " in
       *" $f "*) : ;;
-      *) die "CPU missing '$f' — not an AVX-512 box." ;;
+      *) die "CPU missing '$f' — weaver would NOT dispatch the VBMI2 tier." ;;
     esac
   done
   # Linux /proc/cpuinfo spells VBMI2 as 'avx512_vbmi2' (underscore) on modern

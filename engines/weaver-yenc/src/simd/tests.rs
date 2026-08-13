@@ -186,16 +186,7 @@ unsafe fn avx512_vbmi2_block_with_state(
     initial_state: DecoderState,
     dot_unstuffing: bool,
 ) -> Option<(Vec<u8>, KernelState)> {
-    if !(is_x86_feature_detected!("avx512vbmi2")
-        && is_x86_feature_detected!("avx512vl")
-        && is_x86_feature_detected!("avx512bw")
-        && is_x86_feature_detected!("avx512f")
-        && is_x86_feature_detected!("avx2")
-        && is_x86_feature_detected!("bmi1")
-        && is_x86_feature_detected!("bmi2")
-        && is_x86_feature_detected!("popcnt")
-        && is_x86_feature_detected!("lzcnt"))
-    {
+    if !vbmi2_tier_available() {
         return None;
     }
 
@@ -1617,6 +1608,104 @@ fn avx2_active_kernel_required_matches_scalar() {
     }
 }
 
+/// Marker printed when the VBMI2 tier really is the dispatched one. The SDE
+/// lane greps stdout for this exact string, so a host (or an emulator profile)
+/// that silently stops exposing the VBMI2 feature set fails CI instead of
+/// turning the tripwire into a no-op skip.
+///
+/// The lane MUST pass `--nocapture`: libtest swallows a passing test's output
+/// otherwise and the grep can never match.
+#[cfg(target_arch = "x86_64")]
+const VBMI2_TRIPWIRE_ACTIVE: &str =
+    "vbmi2-tripwire: VBMI2 tier ACTIVE (dispatcher selected the VBMI2 kernel)";
+
+#[cfg(target_arch = "x86_64")]
+const VBMI2_TRIPWIRE_SKIPPED: &str =
+    "vbmi2-tripwire: SKIPPED (host does not expose the full VBMI2 tier feature set)";
+
+/// VBMI2 analogue of [`avx2_active_kernel_required_matches_scalar`].
+///
+/// Two failures this catches that a per-tier differential test cannot:
+///
+///  * the feature set says the VBMI2 tier is usable but `decode_kernel` routes
+///    to a lower tier — a dispatch regression that leaves every VBMI2 box
+///    running AVX2 while all the forced-tier tests stay green;
+///  * the SDE lane stops emulating one of the nine gating features, which would
+///    otherwise downgrade this test to a silent skip (the lane's `--nocapture`
+///    grep for [`VBMI2_TRIPWIRE_ACTIVE`] is what turns that into a failure).
+///
+/// On a host without the tier this is a visible skip, matching the crate's
+/// existing skip-visibility convention.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn vbmi2_active_kernel_required_matches_scalar() {
+    if !vbmi2_tier_available() {
+        eprintln!("{VBMI2_TRIPWIRE_SKIPPED}");
+        return;
+    }
+
+    assert!(
+        std::ptr::fn_addr_eq(
+            dispatch_x86_decode_kernel(),
+            decode_kernel_avx512_vbmi2 as DecodeKernelFn,
+        ),
+        "the VBMI2 tier is available on this host but the dispatcher selected a \
+         different kernel"
+    );
+
+    let payload: Vec<u8> = (0..4096)
+        .map(|index| ((index * 31 + 17) & 0xff) as u8)
+        .collect();
+    let body = encoded_body_for(&payload, 128);
+    for hint in [None, Some(128u32), Some(64)] {
+        for &(dot, preserve, search_end) in &[(true, false, false), (true, true, true)] {
+            let mut reference = vec![0u8; body.len() + 64];
+            let mut reference_state = KernelState::body_with_line_length(hint);
+            let reference_outcome = decode_kernel_scalar(
+                &body,
+                &mut reference,
+                &mut reference_state,
+                dot,
+                preserve,
+                search_end,
+            )
+            .unwrap();
+            reference.truncate(reference_outcome.written);
+
+            // Deliberately the *dispatched* kernel, not `decode_kernel_avx512_vbmi2`
+            // directly: this is the tripwire's whole point.
+            let mut output = vec![0u8; body.len() + 64];
+            let mut state = KernelState::body_with_line_length(hint);
+            let outcome = unsafe {
+                dispatch_x86_decode_kernel()(
+                    &body,
+                    &mut output,
+                    &mut state,
+                    dot,
+                    preserve,
+                    search_end,
+                )
+            }
+            .unwrap();
+            output.truncate(outcome.written);
+
+            assert_eq!(
+                (output, outcome.consumed, outcome.end, state),
+                (
+                    reference.clone(),
+                    reference_outcome.consumed,
+                    reference_outcome.end,
+                    reference_state,
+                ),
+                "active VBMI2 kernel hint={hint:?} dot={dot} preserve={preserve} \
+                 search_end={search_end}"
+            );
+        }
+    }
+
+    eprintln!("{VBMI2_TRIPWIRE_ACTIVE}");
+}
+
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn forced_tier_kernels_match_scalar_with_line_hints() {
@@ -1658,15 +1747,7 @@ fn forced_tier_kernels_match_scalar_with_line_hints() {
         ),
         (
             "avx512-vbmi2",
-            is_x86_feature_detected!("avx512vbmi2")
-                && is_x86_feature_detected!("avx512vl")
-                && is_x86_feature_detected!("avx512bw")
-                && is_x86_feature_detected!("avx512f")
-                && is_x86_feature_detected!("avx2")
-                && is_x86_feature_detected!("bmi1")
-                && is_x86_feature_detected!("bmi2")
-                && is_x86_feature_detected!("popcnt")
-                && is_x86_feature_detected!("lzcnt"),
+            vbmi2_tier_available(),
             decode_kernel_avx512_vbmi2 as KernelFn,
         ),
     ];
@@ -2090,15 +2171,7 @@ fn forced_tier_kernels() -> Vec<(&'static str, bool, TierKernelFn)> {
             ),
             (
                 "avx512-vbmi2",
-                is_x86_feature_detected!("avx512vbmi2")
-                    && is_x86_feature_detected!("avx512vl")
-                    && is_x86_feature_detected!("avx512bw")
-                    && is_x86_feature_detected!("avx512f")
-                    && is_x86_feature_detected!("avx2")
-                    && is_x86_feature_detected!("bmi1")
-                    && is_x86_feature_detected!("bmi2")
-                    && is_x86_feature_detected!("popcnt")
-                    && is_x86_feature_detected!("lzcnt"),
+                vbmi2_tier_available(),
                 decode_kernel_avx512_vbmi2 as TierKernelFn,
             ),
         ]

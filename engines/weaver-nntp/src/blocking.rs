@@ -966,12 +966,31 @@ impl BlockingNntpConnection {
         self.stream_yenc_article_with_estimate(message_id, 0)
     }
 
+    /// [`Self::stream_yenc_article`], calling `on_chunk` with each decoded
+    /// batch as it is produced rather than only once the article is complete.
+    ///
+    /// The batches handed to `on_chunk` are exactly the ones that end up in
+    /// [`FusedYencArticle::chunks`], in the same order, so a caller can hash or
+    /// write incrementally and still fall back to the buffered article.
+    pub fn stream_yenc_article_with_chunks<F>(
+        &mut self,
+        message_id: &str,
+        on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        self.stream_yenc_article_with_estimate_inner(message_id, 0, None, on_chunk)
+    }
+
     pub fn stream_yenc_article_with_estimate(
         &mut self,
         message_id: &str,
         estimated_body_bytes: u64,
     ) -> std::result::Result<FusedYencArticle, FusedYencError> {
-        self.stream_yenc_article_with_estimate_inner(message_id, estimated_body_bytes, None)
+        self.stream_yenc_article_with_estimate_inner(message_id, estimated_body_bytes, None, |_| {
+            Ok(())
+        })
     }
 
     fn stream_yenc_article_with_active_budget(
@@ -980,15 +999,24 @@ impl BlockingNntpConnection {
         estimated_body_bytes: u64,
         budget: &mut ActiveTransferBudget,
     ) -> std::result::Result<FusedYencArticle, FusedYencError> {
-        self.stream_yenc_article_with_estimate_inner(message_id, estimated_body_bytes, Some(budget))
+        self.stream_yenc_article_with_estimate_inner(
+            message_id,
+            estimated_body_bytes,
+            Some(budget),
+            |_| Ok(()),
+        )
     }
 
-    fn stream_yenc_article_with_estimate_inner(
+    fn stream_yenc_article_with_estimate_inner<F>(
         &mut self,
         message_id: &str,
         estimated_body_bytes: u64,
         budget: Option<&mut ActiveTransferBudget>,
-    ) -> std::result::Result<FusedYencArticle, FusedYencError> {
+        on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
         self.reserve_body(estimated_body_bytes)?;
         let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
         let initial = match self.send_command_with_active_budget(&cmd, budget.as_deref()) {
@@ -1024,26 +1052,42 @@ impl BlockingNntpConnection {
         } else {
             initial
         };
-        self.stream_yenc_article_response(initial, budget)
+        self.stream_yenc_article_response(initial, budget, on_chunk)
     }
 
     pub fn stream_next_yenc_article(
         &mut self,
     ) -> std::result::Result<FusedYencArticle, FusedYencError> {
-        self.stream_next_yenc_article_inner(None)
+        self.stream_next_yenc_article_inner(None, |_| Ok(()))
+    }
+
+    /// [`Self::stream_next_yenc_article`] with per-batch delivery; see
+    /// [`Self::stream_yenc_article_with_chunks`].
+    pub fn stream_next_yenc_article_with_chunks<F>(
+        &mut self,
+        on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        self.stream_next_yenc_article_inner(None, on_chunk)
     }
 
     fn stream_next_yenc_article_with_active_budget(
         &mut self,
         budget: &mut ActiveTransferBudget,
     ) -> std::result::Result<FusedYencArticle, FusedYencError> {
-        self.stream_next_yenc_article_inner(Some(budget))
+        self.stream_next_yenc_article_inner(Some(budget), |_| Ok(()))
     }
 
-    fn stream_next_yenc_article_inner(
+    fn stream_next_yenc_article_inner<F>(
         &mut self,
         budget: Option<&mut ActiveTransferBudget>,
-    ) -> std::result::Result<FusedYencArticle, FusedYencError> {
+        on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
         let initial = match self.read_response_with_active_budget(budget.as_deref()) {
             Ok(initial) => initial,
             Err(error) => {
@@ -1055,14 +1099,18 @@ impl BlockingNntpConnection {
             self.fail_body_pipeline();
             return Err(NntpError::AuthenticationRequired.into());
         }
-        self.stream_yenc_article_response(initial, budget)
+        self.stream_yenc_article_response(initial, budget, on_chunk)
     }
 
-    fn stream_yenc_article_response(
+    fn stream_yenc_article_response<F>(
         &mut self,
         initial: Response,
         mut budget: Option<&mut ActiveTransferBudget>,
-    ) -> std::result::Result<FusedYencArticle, FusedYencError> {
+        mut on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
         let mut decoder = match FusedYencArticleDecoder::from_body_response(initial) {
             Ok(decoder) => decoder,
             Err(error) => {
@@ -1081,12 +1129,14 @@ impl BlockingNntpConnection {
                 return Err(error);
             }
         };
-        decoder.set_profile_cpu(profile_cpu_timings_enabled());
+        let profile_cpu = profile_cpu_timings_enabled();
+        decoder.set_profile_cpu(profile_cpu);
         let mut read_calls = 0u64;
         let mut read_bytes = 0u64;
         let mut transport_read = TransportReadStats::default();
         let mut article_chunks = Vec::new();
         let mut throttle_wait = Duration::ZERO;
+        let mut output_callback_cpu = Duration::ZERO;
 
         loop {
             let payload_before = decoder.body_payload_bytes_consumed();
@@ -1121,13 +1171,23 @@ impl BlockingNntpConnection {
                 }
                 Ok(Some(mut article)) => {
                     let chunks = std::mem::take(&mut article.chunks);
-                    article_chunks.extend(chunks);
+                    if let Err(error) = crate::connection::deliver_fused_output_chunks(
+                        chunks,
+                        &mut article_chunks,
+                        &mut on_chunk,
+                        &mut output_callback_cpu,
+                        profile_cpu,
+                    ) {
+                        self.fail_body_pipeline();
+                        return Err(error);
+                    }
                     article.stats.read_calls = read_calls;
                     article.stats.read_bytes = read_bytes;
                     article.stats.transport_read = transport_read;
                     article.stats.throttle_wait = throttle_wait;
                     article.stats.leftover_bytes_after_terminator = self.read_buf.len() as u64;
                     article.stats.output_batches = article_chunks.len() as u64;
+                    article.stats.output_callback_cpu = output_callback_cpu;
                     article.chunks = article_chunks;
                     if let Some(lane_stats) = self.transport.lane_stats_mut() {
                         lane_stats.body_responses += 1;
@@ -1137,7 +1197,16 @@ impl BlockingNntpConnection {
                     return Ok(article);
                 }
                 Ok(None) => {
-                    article_chunks.extend(decoder.drain_output_chunks());
+                    if let Err(error) = crate::connection::deliver_fused_output_chunks(
+                        decoder.drain_output_chunks(),
+                        &mut article_chunks,
+                        &mut on_chunk,
+                        &mut output_callback_cpu,
+                        profile_cpu,
+                    ) {
+                        self.fail_body_pipeline();
+                        return Err(error);
+                    }
                 }
             }
 
@@ -2280,6 +2349,47 @@ mod tests {
         let _ = std::fs::remove_file(ca_path);
     }
 
+    /// E12: the blocking article reader had no chunk callback at all, so every
+    /// caller buffered the whole article and `output_callback_cpu` was
+    /// permanently zero. Decoded batches must now reach the callback as they
+    /// are produced, in order, and concatenate to the buffered article.
+    fn tls_lane_delivers_decoded_batches_to_chunk_callback(backend: NntpTlsBackend) {
+        // Two full 512 KiB batches plus a remainder.
+        let original: Vec<u8> = (0..(2 * 512 * 1024 + 123))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<batched@test>",
+            TestArticle::Body(original.clone()),
+        )]);
+        let mut conn = connect_with_backend(&config, backend);
+        conn.select_group("alt.test").unwrap();
+
+        let mut delivered: Vec<Vec<u8>> = Vec::new();
+        let article = conn
+            .stream_yenc_article_with_chunks("<batched@test>", |chunk| {
+                delivered.push(chunk.to_vec());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(delivered.len(), 3, "batch lengths {:?}", {
+            delivered.iter().map(Vec::len).collect::<Vec<_>>()
+        });
+        assert_eq!(delivered[0].len(), 512 * 1024);
+        assert_eq!(delivered[1].len(), 512 * 1024);
+        assert_eq!(delivered[2].len(), 123);
+
+        let streamed: Vec<u8> = delivered.concat();
+        assert_eq!(streamed, original);
+        assert_eq!(streamed, article.to_data());
+        assert_eq!(article.stats.output_batches as usize, delivered.len());
+
+        conn.quit().unwrap();
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
     fn tls_lane_reads_pipelined_body_responses(backend: NntpTlsBackend) {
         let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
             ("<one@test>", TestArticle::Body(b"first article".to_vec())),
@@ -2421,6 +2531,11 @@ mod tests {
     }
 
     #[test]
+    fn blocking_rustls_delivers_decoded_batches_to_chunk_callback() {
+        tls_lane_delivers_decoded_batches_to_chunk_callback(NntpTlsBackend::ManualRustls);
+    }
+
+    #[test]
     fn blocking_rustls_reads_large_pipelined_body_responses() {
         tls_lane_reads_large_pipelined_body_responses(NntpTlsBackend::ManualRustls);
     }
@@ -2548,7 +2663,7 @@ mod tests {
         let mut budget = ActiveTransferBudget::new(Duration::ZERO);
 
         let error = conn
-            .stream_yenc_article_response(initial, Some(&mut budget))
+            .stream_yenc_article_response(initial, Some(&mut budget), |_| Ok(()))
             .unwrap_err();
 
         assert!(matches!(
@@ -2581,6 +2696,13 @@ mod tests {
     fn blocking_s2n_fd_reads_pipelined_body_responses() {
         let _guard = s2n_test_guard();
         tls_lane_reads_pipelined_body_responses(NntpTlsBackend::S2n);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_s2n_delivers_decoded_batches_to_chunk_callback() {
+        let _guard = s2n_test_guard();
+        tls_lane_delivers_decoded_batches_to_chunk_callback(NntpTlsBackend::S2n);
     }
 
     #[cfg(not(windows))]

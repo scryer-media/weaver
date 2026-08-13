@@ -146,7 +146,14 @@ where
     (output, cpu)
 }
 
-fn deliver_fused_output_chunks<F>(
+/// Hand every decoded batch the fused decoder has produced to `on_chunk`, in
+/// order, before appending it to the article's own chunk list.
+///
+/// This is what makes the streaming design observable to a caller: batches are
+/// delivered as they are decoded, not once at article finish. Both the async
+/// and the blocking article readers route through here so neither can quietly
+/// stop firing the callback.
+pub(crate) fn deliver_fused_output_chunks<F>(
     chunks: Vec<Box<[u8]>>,
     article_chunks: &mut Vec<Box<[u8]>>,
     on_chunk: &mut F,
@@ -883,6 +890,9 @@ impl NntpConnection {
     ///
     /// The returned data retains NNTP dot-stuffing. Use with `weaver_yenc::decode_nntp`
     /// which handles unstuffing inline during decode, avoiding a separate pass.
+    /// Size its destination from `weaver_yenc::max_decoded_len` of the returned
+    /// data, never from the article's declared `=ybegin size=` — a poster is
+    /// free to omit that field, and an undersized destination is a typed error.
     pub async fn body_by_id_raw(&mut self, message_id: &str) -> Result<MultiLineResponse> {
         self.body_by_id_raw_with_estimate(message_id, 0).await
     }
@@ -3177,18 +3187,21 @@ mod tests {
         let mut conn = NntpConnection::connect(&scripted_plain_config(port))
             .await
             .unwrap();
-        let mut chunk_lens = Vec::new();
+        let mut delivered: Vec<Vec<u8>> = Vec::new();
         let article = conn
             .stream_yenc_article("<test@example.com>", |chunk| {
-                chunk_lens.push(chunk.len());
+                delivered.push(chunk.to_vec());
                 Ok(())
             })
             .await
             .unwrap();
 
         assert_eq!(article.to_data(), original);
+        let chunk_lens: Vec<usize> = delivered.iter().map(Vec::len).collect();
         assert_eq!(chunk_lens, vec![FUSED_YENC_OUTPUT_BATCH_TARGET, 123]);
         assert_eq!(article.stats.output_batches, 2);
+        // The callback sees the same bytes as the buffered article, in order.
+        assert_eq!(delivered.concat(), article.to_data());
     }
 
     #[tokio::test]

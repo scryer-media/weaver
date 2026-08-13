@@ -118,14 +118,16 @@ impl Pipeline {
                         let _cpu_scope =
                             crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
                         let send_started = Instant::now();
+                        let crc_valid =
+                            crate::pipeline::crc_not_mismatched(decode_result.crc_status);
                         let part_crc_verified =
-                            decode_result.expected_part_crc.is_some() && decode_result.crc_valid;
+                            decode_result.expected_part_crc.is_some() && crc_valid;
                         let _ = tx.blocking_send(DecodeDone::Success {
                             result: DecodeResult {
                                 segment_id,
                                 raw_size,
                                 yenc_layout,
-                                crc_valid: decode_result.crc_valid,
+                                crc_valid,
                                 part_crc_verified,
                                 part_crc: decode_result.part_crc,
                                 expected_file_crc: decode_result.expected_file_crc,
@@ -184,14 +186,16 @@ impl Pipeline {
                         let _cpu_scope =
                             crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
                         let send_started = Instant::now();
+                        let crc_valid =
+                            crate::pipeline::crc_not_mismatched(decode_result.crc_status);
                         let part_crc_verified =
-                            decode_result.expected_part_crc.is_some() && decode_result.crc_valid;
+                            decode_result.expected_part_crc.is_some() && crc_valid;
                         let _ = tx.blocking_send(DecodeDone::Success {
                             result: DecodeResult {
                                 segment_id,
                                 raw_size,
                                 yenc_layout,
-                                crc_valid: decode_result.crc_valid,
+                                crc_valid,
                                 part_crc_verified,
                                 part_crc: decode_result.part_crc,
                                 expected_file_crc: decode_result.expected_file_crc,
