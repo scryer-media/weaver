@@ -1234,6 +1234,7 @@ export function History() {
 
       <ConfirmDialog
         open={deleteConfirmId != null}
+        testId="history-delete-confirm"
         title={t("confirm.deleteHistory")}
         message={t("confirm.deleteHistoryMessage")}
         confirmLabel={t("confirm.deleteHistoryConfirm")}
@@ -1281,6 +1282,7 @@ export function History() {
 
       <ConfirmDialog
         open={deleteBatchConfirm}
+        testId="history-delete-batch-confirm"
         title={t("confirm.deleteHistoryBatch", { count: selectedCount })}
         message={t("confirm.deleteHistoryBatchMessage", { count: selectedCount })}
         confirmLabel={t("confirm.deleteHistoryConfirm")}
@@ -1311,6 +1313,7 @@ export function History() {
 
       <ConfirmDialog
         open={deleteAllConfirm}
+        testId="history-delete-all-confirm"
         title={t("confirm.deleteAllHistory")}
         message={t("confirm.deleteAllHistoryMessage")}
         confirmLabel={t("confirm.deleteHistoryConfirm")}

@@ -192,7 +192,7 @@ fn idempotency_conflicts_even_when_force_bypasses_duplicates() {
 }
 
 #[test]
-fn visible_history_deletion_does_not_forget_identity() {
+fn user_history_deletion_forgets_identity_and_allows_resubmission() {
     let db = Database::open_in_memory().unwrap();
     let original = spec(vec![vec![("one@example", 10)]]);
     let (job_id, _) = accepted(
@@ -202,10 +202,58 @@ fn visible_history_deletion_does_not_forget_identity() {
     db.activate_duplicate_admission(job_id).unwrap();
     db.insert_job_history(&history(job_id.0, "complete"))
         .unwrap();
-    assert!(db.delete_job_history(job_id.0).unwrap());
-    assert!(db.duplicate_snapshot(job_id).unwrap().is_some());
-    assert!(db.forget_duplicate_identity(job_id).unwrap());
+    assert!(
+        db.delete_job_history_and_forget_duplicate_identity(job_id.0)
+            .unwrap()
+    );
     assert!(db.duplicate_snapshot(job_id).unwrap().is_none());
+    assert!(db.forget_duplicate_identity(job_id).unwrap());
+    assert!(matches!(
+        db.admit_duplicate_submission(&request(&original, 10))
+            .unwrap(),
+        DuplicateAdmission::Accepted { .. }
+    ));
+}
+
+#[test]
+fn user_delete_all_history_forgets_only_history_identities() {
+    let db = Database::open_in_memory().unwrap();
+    let first_spec = spec(vec![vec![("one@example", 10)]]);
+    let second_spec = spec(vec![vec![("two@example", 10)]]);
+    let active_spec = spec(vec![vec![("three@example", 10)]]);
+
+    let (first, _) = accepted(
+        db.admit_duplicate_submission(&request(&first_spec, 11))
+            .unwrap(),
+    );
+    let (second, _) = accepted(
+        db.admit_duplicate_submission(&request(&second_spec, 12))
+            .unwrap(),
+    );
+    let (active, _) = accepted(
+        db.admit_duplicate_submission(&request(&active_spec, 13))
+            .unwrap(),
+    );
+    db.activate_duplicate_admission(first).unwrap();
+    db.activate_duplicate_admission(second).unwrap();
+    db.activate_duplicate_admission(active).unwrap();
+    db.insert_job_history(&history(first.0, "complete"))
+        .unwrap();
+    db.insert_job_history(&history(second.0, "failed")).unwrap();
+
+    assert_eq!(
+        db.delete_all_job_history_and_forget_duplicate_identities()
+            .unwrap(),
+        2
+    );
+    assert!(db.duplicate_snapshot(first).unwrap().is_none());
+    assert!(db.duplicate_snapshot(second).unwrap().is_none());
+    assert!(db.duplicate_snapshot(active).unwrap().is_some());
+    assert!(matches!(
+        db.admit_duplicate_submission(&request(&first_spec, 14))
+            .unwrap(),
+        DuplicateAdmission::Accepted { .. }
+    ));
 }
 
 #[test]

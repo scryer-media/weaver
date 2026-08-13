@@ -2082,6 +2082,22 @@ async fn forget_duplicate_identity_tx(tx: &mut SqlTx<'_>, job_id: JobId) -> Resu
     Ok(())
 }
 
+/// Records a permanent user-requested deletion before removing the durable
+/// identity, so duplicate backfill cannot recreate it from stale source data.
+pub(crate) async fn forget_duplicate_identity_for_history_delete_tx(
+    tx: &mut SqlTx<'_>,
+    job_id: JobId,
+) -> Result<(), StateError> {
+    tx.execute(
+        "INSERT INTO forgotten_duplicate_identities (job_id, forgotten_at)
+         VALUES ({}, {})
+         ON CONFLICT(job_id) DO UPDATE SET forgotten_at = excluded.forgotten_at",
+        &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(epoch_seconds())],
+    )
+    .await?;
+    forget_duplicate_identity_tx(tx, job_id).await
+}
+
 fn snapshot_from_row(
     row: crate::persistence::sql_runtime::SqlRow,
 ) -> Result<DuplicateJobSnapshot, StateError> {

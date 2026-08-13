@@ -190,7 +190,11 @@ unsafe fn avx512_vbmi2_block_with_state(
         && is_x86_feature_detected!("avx512vl")
         && is_x86_feature_detected!("avx512bw")
         && is_x86_feature_detected!("avx512f")
-        && is_x86_feature_detected!("avx2"))
+        && is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("bmi1")
+        && is_x86_feature_detected!("bmi2")
+        && is_x86_feature_detected!("popcnt")
+        && is_x86_feature_detected!("lzcnt"))
     {
         return None;
     }
@@ -1658,7 +1662,11 @@ fn forced_tier_kernels_match_scalar_with_line_hints() {
                 && is_x86_feature_detected!("avx512vl")
                 && is_x86_feature_detected!("avx512bw")
                 && is_x86_feature_detected!("avx512f")
-                && is_x86_feature_detected!("avx2"),
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("bmi1")
+                && is_x86_feature_detected!("bmi2")
+                && is_x86_feature_detected!("popcnt")
+                && is_x86_feature_detected!("lzcnt"),
             decode_kernel_avx512_vbmi2 as KernelFn,
         ),
     ];
@@ -2086,7 +2094,11 @@ fn forced_tier_kernels() -> Vec<(&'static str, bool, TierKernelFn)> {
                     && is_x86_feature_detected!("avx512vl")
                     && is_x86_feature_detected!("avx512bw")
                     && is_x86_feature_detected!("avx512f")
-                    && is_x86_feature_detected!("avx2"),
+                    && is_x86_feature_detected!("avx2")
+                    && is_x86_feature_detected!("bmi1")
+                    && is_x86_feature_detected!("bmi2")
+                    && is_x86_feature_detected!("popcnt")
+                    && is_x86_feature_detected!("lzcnt"),
                 decode_kernel_avx512_vbmi2 as TierKernelFn,
             ),
         ]

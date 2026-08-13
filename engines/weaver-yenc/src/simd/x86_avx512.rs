@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2")]
+#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2,bmi1,bmi2,popcnt,lzcnt")]
 pub(super) unsafe fn decode_kernel_avx512_vbmi2(
     input: &[u8],
     output: &mut [u8],
@@ -89,7 +89,7 @@ pub(super) unsafe fn decode_kernel_avx512_vbmi2(
 /// `escaped`, `esc_first`, `skip`, entry/exit state) is byte-identical to the
 /// AVX2 port, so both tiers share the same correctness envelope.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2")]
+#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn decode_kernel_avx512_raw<const SEARCH_END: bool>(
     input: &[u8],
@@ -401,7 +401,7 @@ unsafe fn decode_kernel_avx512_raw<const SEARCH_END: bool>(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2")]
+#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[inline]
 pub(super) unsafe fn try_decode_avx512_vbmi2_block(
     input: &[u8],
@@ -516,7 +516,7 @@ pub(super) unsafe fn try_decode_avx512_vbmi2_block(
 /// kernel structure (`decode_kernel_simd64_ssse3_line_aware`) at 512-bit
 /// width.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2")]
+#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2,bmi1,bmi2,popcnt,lzcnt")]
 pub(super) unsafe fn decode_kernel_simd64_vbmi2_line_aware(
     input: &[u8],
     output: &mut [u8],
@@ -602,7 +602,7 @@ pub(super) unsafe fn decode_kernel_simd64_vbmi2_line_aware(
 /// one 512-bit vector per 64-byte chunk, k-register masks, and full-width
 /// vpcompressb compaction.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2")]
+#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn try_decode_avx512_vbmi2_line(
     input: &[u8],

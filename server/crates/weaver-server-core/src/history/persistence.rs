@@ -1,6 +1,7 @@
 use crate::StateError;
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::history::{parse_history_metadata, public_history_attributes};
+use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, max_rows_for_tx};
 use sqlx::{Postgres, QueryBuilder, Sqlite};
@@ -154,73 +155,42 @@ impl Database {
         let datastore = self.datastore();
         let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_job_history_bundle", |tx| {
-                Box::pin(async move {
-                    let job_id = i64::try_from(job_id)
-                        .map_err(|_| StateError::Database("job id is too large".into()))?;
-                    let lock_sql = match tx {
-                        SqlTx::Postgres(_) => {
-                            "SELECT job_id FROM job_history WHERE job_id = {} FOR UPDATE"
-                        }
-                        SqlTx::Sqlite(_) => "SELECT job_id FROM job_history WHERE job_id = {}",
-                    };
-                    if tx
-                        .fetch_optional(lock_sql, &[SqlArg::I64(job_id)])
-                        .await?
-                        .is_none()
-                    {
-                        return Ok(false);
-                    }
-                    if tx
-                        .fetch_optional(
-                            "SELECT run_id FROM post_processing_runs
-                              WHERE job_id = {} AND status IN ('queued', 'starting', 'running')
-                              LIMIT 1",
-                            &[SqlArg::I64(job_id)],
-                        )
-                        .await?
-                        .is_some()
-                    {
-                        return Err(StateError::Conflict(
-                            "cannot delete history while post-processing is active".into(),
-                        ));
-                    }
-                    tx.execute(
-                        "UPDATE post_processing_runs SET rerun_of_run_id = NULL
-                          WHERE job_id <> {} AND rerun_of_run_id IN (
-                              SELECT run_id FROM post_processing_runs WHERE job_id = {}
-                          )",
-                        &[SqlArg::I64(job_id), SqlArg::I64(job_id)],
-                    )
-                    .await?;
-                    tx.execute(
-                        "DELETE FROM post_processing_runs WHERE job_id = {}",
-                        &[SqlArg::I64(job_id)],
-                    )
-                    .await?;
-                    tx.execute(
-                        "DELETE FROM post_processing_job_plans WHERE job_id = {}",
-                        &[SqlArg::I64(job_id)],
-                    )
-                    .await?;
-                    tx.execute(
-                        "DELETE FROM job_events WHERE job_id = {}",
-                        &[SqlArg::I64(job_id)],
-                    )
-                    .await?;
-                    tx.execute(
-                        "DELETE FROM job_history_attributes WHERE job_id = {}",
-                        &[SqlArg::I64(job_id)],
-                    )
-                    .await?;
-                    Ok(tx
-                        .execute(
-                            "DELETE FROM job_history WHERE job_id = {}",
-                            &[SqlArg::I64(job_id)],
-                        )
-                        .await?
-                        > 0)
-                })
+                Box::pin(async move { delete_job_history_bundle_tx(tx, JobId(job_id)).await })
             })
+            .await
+        });
+        if result.as_ref().is_ok_and(|changed| *changed) {
+            self.invalidate_job_history_cache(job_id);
+        }
+        result
+    }
+
+    /// Permanently removes visible history and the duplicate identity it owns.
+    /// Unlike scheduler-internal history cleanup, this records a tombstone so a
+    /// stale backfill cannot restore the identity after the delete commits.
+    pub fn delete_job_history_and_forget_duplicate_identity(
+        &self,
+        job_id: u64,
+    ) -> Result<bool, StateError> {
+        let datastore = self.datastore();
+        let result = self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(
+                &datastore,
+                "delete_job_history_and_duplicate_identity",
+                |tx| {
+                    Box::pin(async move {
+                        let job_id = JobId(job_id);
+                        if !delete_job_history_bundle_tx(tx, job_id).await? {
+                            return Ok(false);
+                        }
+                        crate::jobs::duplicate_persistence::forget_duplicate_identity_for_history_delete_tx(
+                            tx, job_id,
+                        )
+                        .await?;
+                        Ok(true)
+                    })
+                },
+            )
             .await
         });
         if result.as_ref().is_ok_and(|changed| *changed) {
@@ -233,85 +203,40 @@ impl Database {
         let datastore = self.datastore();
         let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_all_job_history_bundles", |tx| {
-                Box::pin(async move {
-                    let lock_sql = match tx {
-                        SqlTx::Postgres(_) => "SELECT job_id FROM job_history FOR UPDATE",
-                        SqlTx::Sqlite(_) => "SELECT job_id FROM job_history",
-                    };
-                    let history = tx.fetch_all(lock_sql, &[]).await?;
-                    if history.is_empty() {
-                        return Ok(0);
-                    }
-                    if tx
-                        .fetch_optional(
-                            "SELECT r.run_id FROM post_processing_runs r
-                              WHERE r.status IN ('queued', 'starting', 'running')
-                                AND EXISTS (
-                                    SELECT 1 FROM job_history h WHERE h.job_id = r.job_id
-                                )
-                              LIMIT 1",
-                            &[],
-                        )
-                        .await?
-                        .is_some()
-                    {
-                        return Err(StateError::Conflict(
-                            "cannot delete history while post-processing is active".into(),
-                        ));
-                    }
-                    tx.execute(
-                        "UPDATE post_processing_runs SET rerun_of_run_id = NULL
-                          WHERE NOT EXISTS (
-                              SELECT 1 FROM job_history h WHERE h.job_id = post_processing_runs.job_id
-                          ) AND rerun_of_run_id IN (
-                              SELECT source.run_id FROM post_processing_runs source
-                              WHERE EXISTS (
-                                  SELECT 1 FROM job_history h WHERE h.job_id = source.job_id
-                              )
-                          )",
-                        &[],
-                    )
-                    .await?;
-                    tx.execute(
-                        "DELETE FROM post_processing_runs
-                          WHERE EXISTS (
-                              SELECT 1 FROM job_history h
-                               WHERE h.job_id = post_processing_runs.job_id
-                          )",
-                        &[],
-                    )
-                    .await?;
-                    tx.execute(
-                        "DELETE FROM post_processing_job_plans
-                          WHERE EXISTS (
-                              SELECT 1 FROM job_history h
-                               WHERE h.job_id = post_processing_job_plans.job_id
-                          )",
-                        &[],
-                    )
-                    .await?;
-                    tx.execute(
-                        "DELETE FROM job_events
-                          WHERE EXISTS (
-                              SELECT 1 FROM job_history h WHERE h.job_id = job_events.job_id
-                          )",
-                        &[],
-                    )
-                    .await?;
-                    tx.execute(
-                        "DELETE FROM job_history_attributes
-                          WHERE EXISTS (
-                              SELECT 1 FROM job_history h
-                               WHERE h.job_id = job_history_attributes.job_id
-                          )",
-                        &[],
-                    )
-                    .await?;
-                    let changed = tx.execute("DELETE FROM job_history", &[]).await?;
-                    usize::try_from(changed)
-                        .map_err(|_| StateError::Database("history count is too large".into()))
-                })
+                Box::pin(async move { delete_all_job_history_bundles_tx(tx).await })
             })
+            .await
+        });
+        if result.as_ref().is_ok_and(|job_ids| !job_ids.is_empty()) {
+            self.clear_job_history_cache();
+        }
+        result.map(|job_ids| job_ids.len())
+    }
+
+    /// Permanently removes all visible history and each associated duplicate
+    /// identity in the same transaction.
+    pub fn delete_all_job_history_and_forget_duplicate_identities(
+        &self,
+    ) -> Result<usize, StateError> {
+        let datastore = self.datastore();
+        let result = self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(
+                &datastore,
+                "delete_all_job_history_and_duplicate_identities",
+                |tx| {
+                    Box::pin(async move {
+                        let job_ids = delete_all_job_history_bundles_tx(tx).await?;
+                        let changed = job_ids.len();
+                        for job_id in job_ids {
+                            crate::jobs::duplicate_persistence::forget_duplicate_identity_for_history_delete_tx(
+                                tx, job_id,
+                            )
+                            .await?;
+                        }
+                        Ok(changed)
+                    })
+                },
+            )
             .await
         });
         if result.as_ref().is_ok_and(|changed| *changed > 0) {
@@ -350,6 +275,163 @@ impl Database {
             Ok(())
         })
     }
+}
+
+async fn delete_job_history_bundle_tx(
+    tx: &mut SqlTx<'_>,
+    job_id: JobId,
+) -> Result<bool, StateError> {
+    let job_id =
+        i64::try_from(job_id.0).map_err(|_| StateError::Database("job id is too large".into()))?;
+    let lock_sql = match tx {
+        SqlTx::Postgres(_) => "SELECT job_id FROM job_history WHERE job_id = {} FOR UPDATE",
+        SqlTx::Sqlite(_) => "SELECT job_id FROM job_history WHERE job_id = {}",
+    };
+    if tx
+        .fetch_optional(lock_sql, &[SqlArg::I64(job_id)])
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    if tx
+        .fetch_optional(
+            "SELECT run_id FROM post_processing_runs
+              WHERE job_id = {} AND status IN ('queued', 'starting', 'running')
+              LIMIT 1",
+            &[SqlArg::I64(job_id)],
+        )
+        .await?
+        .is_some()
+    {
+        return Err(StateError::Conflict(
+            "cannot delete history while post-processing is active".into(),
+        ));
+    }
+    tx.execute(
+        "UPDATE post_processing_runs SET rerun_of_run_id = NULL
+          WHERE job_id <> {} AND rerun_of_run_id IN (
+              SELECT run_id FROM post_processing_runs WHERE job_id = {}
+          )",
+        &[SqlArg::I64(job_id), SqlArg::I64(job_id)],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM post_processing_runs WHERE job_id = {}",
+        &[SqlArg::I64(job_id)],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM post_processing_job_plans WHERE job_id = {}",
+        &[SqlArg::I64(job_id)],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM job_events WHERE job_id = {}",
+        &[SqlArg::I64(job_id)],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM job_history_attributes WHERE job_id = {}",
+        &[SqlArg::I64(job_id)],
+    )
+    .await?;
+    Ok(tx
+        .execute(
+            "DELETE FROM job_history WHERE job_id = {}",
+            &[SqlArg::I64(job_id)],
+        )
+        .await?
+        > 0)
+}
+
+async fn delete_all_job_history_bundles_tx(tx: &mut SqlTx<'_>) -> Result<Vec<JobId>, StateError> {
+    let lock_sql = match tx {
+        SqlTx::Postgres(_) => "SELECT job_id FROM job_history FOR UPDATE",
+        SqlTx::Sqlite(_) => "SELECT job_id FROM job_history",
+    };
+    let history = tx.fetch_all(lock_sql, &[]).await?;
+    if history.is_empty() {
+        return Ok(Vec::new());
+    }
+    let job_ids = history
+        .iter()
+        .map(|row| {
+            row.i64("job_id")
+                .and_then(|value| {
+                    u64::try_from(value)
+                        .map_err(|_| StateError::Database("job id is negative".into()))
+                })
+                .map(JobId)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if tx
+        .fetch_optional(
+            "SELECT r.run_id FROM post_processing_runs r
+              WHERE r.status IN ('queued', 'starting', 'running')
+                AND EXISTS (
+                    SELECT 1 FROM job_history h WHERE h.job_id = r.job_id
+                )
+              LIMIT 1",
+            &[],
+        )
+        .await?
+        .is_some()
+    {
+        return Err(StateError::Conflict(
+            "cannot delete history while post-processing is active".into(),
+        ));
+    }
+    tx.execute(
+        "UPDATE post_processing_runs SET rerun_of_run_id = NULL
+          WHERE NOT EXISTS (
+              SELECT 1 FROM job_history h WHERE h.job_id = post_processing_runs.job_id
+          ) AND rerun_of_run_id IN (
+              SELECT source.run_id FROM post_processing_runs source
+              WHERE EXISTS (
+                  SELECT 1 FROM job_history h WHERE h.job_id = source.job_id
+              )
+          )",
+        &[],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM post_processing_runs
+          WHERE EXISTS (
+              SELECT 1 FROM job_history h
+               WHERE h.job_id = post_processing_runs.job_id
+          )",
+        &[],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM post_processing_job_plans
+          WHERE EXISTS (
+              SELECT 1 FROM job_history h
+               WHERE h.job_id = post_processing_job_plans.job_id
+          )",
+        &[],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM job_events
+          WHERE EXISTS (
+              SELECT 1 FROM job_history h WHERE h.job_id = job_events.job_id
+          )",
+        &[],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM job_history_attributes
+          WHERE EXISTS (
+              SELECT 1 FROM job_history h
+               WHERE h.job_id = job_history_attributes.job_id
+          )",
+        &[],
+    )
+    .await?;
+    tx.execute("DELETE FROM job_history", &[]).await?;
+    Ok(job_ids)
 }
 
 fn job_history_args(entry: &JobHistoryRow) -> Vec<SqlArg> {

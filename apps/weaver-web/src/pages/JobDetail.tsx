@@ -607,6 +607,7 @@ export function JobDetail() {
 
       <ConfirmDialog
         open={showDeleteConfirm}
+        testId="job-history-delete-confirm"
         title={t("confirm.deleteHistory")}
         message={t("confirm.deleteHistoryMessage")}
         confirmLabel={t("confirm.deleteHistoryConfirm")}

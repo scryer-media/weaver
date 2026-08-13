@@ -576,8 +576,10 @@ impl Pipeline {
                     return;
                 }
                 let db = self.db.clone();
-                let delete_result =
-                    tokio::task::spawn_blocking(move || db.delete_job_history(job_id.0)).await;
+                let delete_result = tokio::task::spawn_blocking(move || {
+                    db.delete_job_history_and_forget_duplicate_identity(job_id.0)
+                })
+                .await;
                 match delete_result {
                     Ok(Ok(_)) => {}
                     Ok(Err(crate::StateError::Conflict(message))) => {
@@ -627,8 +629,10 @@ impl Pipeline {
                     Vec::new()
                 };
                 let db = self.db.clone();
-                let delete_result =
-                    tokio::task::spawn_blocking(move || db.delete_all_job_history()).await;
+                let delete_result = tokio::task::spawn_blocking(move || {
+                    db.delete_all_job_history_and_forget_duplicate_identities()
+                })
+                .await;
                 match delete_result {
                     Ok(Ok(_)) => {}
                     Ok(Err(crate::StateError::Conflict(message))) => {

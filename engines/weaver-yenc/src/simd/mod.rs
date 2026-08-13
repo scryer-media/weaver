@@ -364,9 +364,30 @@ fn dispatch_x86_decode_kernel() -> DecodeKernelFn {
             && is_x86_feature_detected!("avx512bw")
             && is_x86_feature_detected!("avx512f")
             && is_x86_feature_detected!("avx2")
+            // The VBMI2 kernels also compile their scalar mask math with the
+            // BMI/POPCNT/LZCNT sets (every VBMI2-capable CPU has them; the
+            // portable build otherwise leaves ~20% on the table vs the same
+            // build with these features — measured 45.6 -> 36.6 us realshape
+            // on Zen 4; the haswell package lane already enables them
+            // globally, so this buys its win on the portable lane). Detect
+            // them so the unsafe contract stays honest rather than
+            // architecture-implied.
+            && is_x86_feature_detected!("bmi1")
+            && is_x86_feature_detected!("bmi2")
+            && is_x86_feature_detected!("popcnt")
+            && is_x86_feature_detected!("lzcnt")
         {
             decode_kernel_avx512_vbmi2 as DecodeKernelFn
-        } else if is_x86_feature_detected!("avx2") {
+        } else if is_x86_feature_detected!("avx2")
+            // decode_kernel_avx2's attribute already carries the BMI sets;
+            // its gate must too, or a CPUID-masked host demoted out of the
+            // VBMI2 arm above would land on a kernel emitting andn/popcnt
+            // it never verified.
+            && is_x86_feature_detected!("bmi1")
+            && is_x86_feature_detected!("bmi2")
+            && is_x86_feature_detected!("popcnt")
+            && is_x86_feature_detected!("lzcnt")
+        {
             decode_kernel_avx2 as DecodeKernelFn
         } else if is_x86_feature_detected!("avx")
             && is_x86_feature_detected!("popcnt")
