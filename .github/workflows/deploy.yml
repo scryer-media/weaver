@@ -314,6 +314,23 @@ jobs:
           cache-bin: false
       - name: Run ARM-specific yEnc crate tests (NEON)
         run: cargo test --locked --no-fail-fast -p weaver-yenc
+      - name: Check out rapidyenc C oracle (pinned)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: animetosho/rapidyenc
+          ref: 27f435afa0a3a15995001219beca08de29f87a0f
+          path: .ci/rapidyenc
+          submodules: true
+      - name: Run C-oracle differential tests (must not skip)
+        env:
+          RAPIDYENC_ROOT: ${{ github.workspace }}/.ci/rapidyenc
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast -p weaver-yenc --test rapidyenc_decode_diff -- --nocapture 2>&1 | tee /tmp/rapidyenc-diff.log
+          if grep -q "skipping rapidyenc differential tests" /tmp/rapidyenc-diff.log; then
+            echo "::error::rapidyenc differentials skipped despite RAPIDYENC_ROOT being set"
+            exit 1
+          fi
 
   rust-test-sde:
     name: rust-test-sde-yenc-${{ matrix.name }}

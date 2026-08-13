@@ -251,7 +251,9 @@ fn finalize_decode(
         expected_part_crc
     } else {
         // For single-part, crc32 is the file CRC which equals the part CRC.
-        expected_file_crc
+        // A poster may emit only `pcrc32=` there (sabctools verifies it);
+        // fall back so a lone part CRC is checked rather than read as absent.
+        expected_file_crc.or(expected_part_crc)
     };
 
     let crc_status = match expected_crc_to_check {
@@ -570,7 +572,14 @@ impl StreamingArticleDecoder {
                     return Err(YencError::MissingHeader);
                 }
             }
-            Err(YencError::MissingField(field)) if field == "=ypart" => {}
+            Err(YencError::MissingField(field)) if field == "=ypart" => {
+                // A `part=` article whose `=ypart` never arrives would buffer
+                // the whole article here; bound the wait like the `=ybegin`
+                // scan above.
+                if self.header_bytes.len() > MAX_HEADER_SCAN_BYTES {
+                    return Err(YencError::MissingField(field));
+                }
+            }
             Err(err) => return Err(err),
         }
 
@@ -1952,6 +1961,84 @@ mod tests {
         assert_eq!(result.expected_part_crc, Some(part_crc));
         assert_eq!(result.expected_file_crc, Some(0xDEADBEEF));
         assert_eq!(result.crc_status, CrcVerification::Verified);
+    }
+
+    #[test]
+    fn decode_single_part_pcrc32_only_verifies() {
+        let original = b"Test data";
+        let encoded_data = encode_raw(original);
+        let mut hasher = crate::crc::Crc32::new();
+        hasher.update(original);
+        let crc = hasher.finalize();
+
+        let mut article = Vec::new();
+        article.extend_from_slice(
+            format!("=ybegin line=128 size={} name=test.bin\r\n", original.len()).as_bytes(),
+        );
+        article.extend_from_slice(&encoded_data);
+        article.extend_from_slice(
+            format!("\r\n=yend size={} pcrc32={crc:08x}\r\n", original.len()).as_bytes(),
+        );
+
+        let mut output = vec![0u8; 1024];
+        let result = decode(&article, &mut output).unwrap();
+
+        // sabctools verifies a lone `pcrc32=` on single-part articles; the
+        // absent file CRC must fall back to it instead of reading Unverified.
+        assert_eq!(result.expected_file_crc, None);
+        assert_eq!(result.expected_part_crc, Some(crc));
+        assert_eq!(result.crc_status, CrcVerification::Verified);
+    }
+
+    #[test]
+    fn decode_single_part_pcrc32_only_mismatch_errors() {
+        let original = b"Test data";
+        let encoded_data = encode_raw(original);
+
+        let mut article = Vec::new();
+        article.extend_from_slice(
+            format!("=ybegin line=128 size={} name=test.bin\r\n", original.len()).as_bytes(),
+        );
+        article.extend_from_slice(&encoded_data);
+        article.extend_from_slice(
+            format!("\r\n=yend size={} pcrc32=DEADBEEF\r\n", original.len()).as_bytes(),
+        );
+
+        let mut output = vec![0u8; 1024];
+        let err = decode(&article, &mut output).unwrap_err();
+        assert!(matches!(
+            err,
+            YencError::CrcMismatch {
+                expected: 0xDEADBEEF,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn streaming_part_without_ypart_bounds_header_buffering() {
+        let mut decoder = StreamingArticleDecoder::new();
+        let mut output = Vec::new();
+        decoder
+            .feed_chunk(
+                b"=ybegin part=1 total=2 line=128 size=100000 name=test.bin\r\n",
+                &mut output,
+            )
+            .unwrap();
+
+        // Junk lines instead of `=ypart`: the decoder scans forward, but must
+        // stop buffering once the header-scan bound is crossed instead of
+        // holding the whole article in memory.
+        let mut line = vec![b'a'; 4096];
+        line.extend_from_slice(b"\r\n");
+        let mut result = Ok(());
+        for _ in 0..(MAX_HEADER_SCAN_BYTES / line.len() + 2) {
+            result = decoder.feed_chunk(&line, &mut output);
+            if result.is_err() {
+                break;
+            }
+        }
+        assert!(matches!(result, Err(YencError::MissingField(f)) if f == "=ypart"));
     }
 
     #[test]

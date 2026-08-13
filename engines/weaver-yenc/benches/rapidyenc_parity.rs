@@ -11,7 +11,8 @@
 use std::env;
 use std::ffi::c_void;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use weaver_yenc::crc::Crc32;
 use weaver_yenc::decode::decode_rapidyenc;
 
