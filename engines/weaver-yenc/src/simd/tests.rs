@@ -2021,6 +2021,152 @@ fn neon_search_end_head_resolution_matches_scalar_across_chunk_entry() {
     }
 }
 
+/// The four ways a `\r\n=y` control sequence can sit relative to a 64-byte
+/// window edge, expressed as the splice offset relative to the boundary.
+///
+/// The SEARCH_END probe answers "does a trailer start in this window?" from the
+/// window's own 64 bytes; the last three shapes below run off the end of it and
+/// are only resolvable by the tail carry, tested against the *next* window.
+/// `-8` is the control: entirely inside one window.
+#[cfg(target_arch = "aarch64")]
+const WINDOW_EDGE_OFFSETS: [(i64, &str); 5] = [
+    (-8, "\\r\\n=y| entirely within the window"),
+    (-4, "\\r\\n=y| ending exactly on the boundary"),
+    (-3, "\\r\\n=|y  — `y` in the next window"),
+    (-2, "\\r\\n|=y  — `=y` in the next window"),
+    (-1, "\\r|\\n=y  — `\\n=y` in the next window"),
+];
+
+/// A control sequence straddling a 64-byte window edge at every alignment must
+/// still be found, and a *false* candidate at the same alignments (a line-start
+/// escape that is not `=y`) must resolve and resume decoding byte-identically.
+///
+/// `=\r\n=y` is included because an `=`-escaped CR still opens a line
+/// (`Eq` + `\r` -> `Cr`), so the tail classification has to stay byte-literal
+/// rather than vetoing escaped bytes.
+///
+/// Boundary 3968 is past the last window the flat loop can take on a 4096-byte
+/// body (`simd_limit` is 4029), so it exercises the post-loop carry flush.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn neon_search_end_carry_resolves_trailer_at_every_window_alignment() {
+    let base = search_end_body(4096, 128);
+    let cases: [(&[u8], RapidyencDecodeEnd); 3] = [
+        (b"\r\n=y", RapidyencDecodeEnd::Control),
+        // Legitimate line-start escape: a candidate that must NOT end.
+        (b"\r\n=Q", RapidyencDecodeEnd::None),
+        // Escaped CR still opens the line, so this IS a control sequence.
+        (b"=\r\n=y", RapidyencDecodeEnd::Control),
+    ];
+    let mut covered = 0usize;
+    for (seq, expected_end) in cases {
+        for boundary in [128usize, 192, 256, 320, 1024, 2048, 3968] {
+            for (delta, label) in WINDOW_EDGE_OFFSETS {
+                // Anchor on the trailing `\r\n=y`, so the `=\r\n=y` case lines
+                // its `\r` up with the boundary the same way the others do.
+                let at = (boundary as i64 + delta - (seq.len() as i64 - 4)) as usize;
+                let input = splice_at(&base, at, seq);
+                let simd = run_kernel_whole(&input, true, true, true, false, None).unwrap();
+                let reference = run_kernel_whole(&input, true, true, true, true, None).unwrap();
+                assert_eq!(
+                    reference.2, expected_end,
+                    "reference end for seq={seq:?} boundary={boundary} ({label})"
+                );
+                assert_eq!(simd, reference, "seq={seq:?} boundary={boundary} ({label})");
+                covered += 1;
+            }
+        }
+    }
+    assert_eq!(covered, 3 * 7 * 5);
+}
+
+/// The same window-edge alignments driven through the chunked entry, so the
+/// carry has to survive a kernel call boundary landing anywhere in or around
+/// the control sequence (each split also re-phases every later window).
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn neon_search_end_carry_survives_chunked_entry_at_every_split() {
+    let base = search_end_body(4096, 128);
+    let cases: [(&[u8], RapidyencDecodeEnd); 3] = [
+        (b"\r\n=y", RapidyencDecodeEnd::Control),
+        (b"\r\n=Q", RapidyencDecodeEnd::None),
+        (b"=\r\n=y", RapidyencDecodeEnd::Control),
+    ];
+    for (seq, expected_end) in cases {
+        for boundary in [1024usize, 2048] {
+            for (delta, label) in WINDOW_EDGE_OFFSETS {
+                let at = (boundary as i64 + delta - (seq.len() as i64 - 4)) as usize;
+                let input = splice_at(&base, at, seq);
+                // Splits immediately around the sequence, plus coarse splits
+                // that re-phase the windows by every residue mod 64.
+                let splits = (at.saturating_sub(6)..=at + seq.len() + 6)
+                    .chain((1..64).map(|k| 512 + k * 8))
+                    .filter(|&s| s < input.len());
+                for split in splits {
+                    let simd = run_kernel_split_once(&input, split, false);
+                    let reference = run_kernel_split_once(&input, split, true);
+                    assert_eq!(
+                        reference.2, expected_end,
+                        "reference end for seq={seq:?} boundary={boundary} split={split} ({label})"
+                    );
+                    assert_eq!(
+                        simd, reference,
+                        "seq={seq:?} boundary={boundary} split={split} ({label})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Every line of this body opens with a legitimate `=X` escape, so the scalar
+/// candidate test fires on essentially every window. Each one must resolve to
+/// "not an end" and resume the SIMD loop with byte-identical output — the shape
+/// that would silently fall back to the scalar drain if a false candidate broke
+/// out of the window loop.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn neon_search_end_line_start_escapes_are_not_trailers() {
+    fn line_start_escape_body(lines: usize, columns: usize) -> Vec<u8> {
+        let mut body = Vec::with_capacity(lines * (columns + 2));
+        for line in 0..lines {
+            // `=X` with X in `A..=Z`: never `y`, `=`, `.`, CR or LF.
+            body.push(b'=');
+            body.push(b'A' + (line % 26) as u8);
+            for col in 2..columns {
+                body.push(b'a' + ((line + col) % 26) as u8);
+            }
+            body.extend_from_slice(b"\r\n");
+        }
+        body
+    }
+
+    for columns in [40usize, 63, 64, 65, 128] {
+        let body = line_start_escape_body(96, columns);
+        let simd = run_kernel_whole(&body, true, true, true, false, None).unwrap();
+        let reference = run_kernel_whole(&body, true, true, true, true, None).unwrap();
+        assert_eq!(
+            reference.2,
+            RapidyencDecodeEnd::None,
+            "line-start escapes must not end the article (columns={columns})"
+        );
+        assert_eq!(simd, reference, "columns={columns}");
+
+        // Same body, but really terminated: the run of false candidates must
+        // not have disturbed the state the real trailer is found from.
+        let mut terminated = body.clone();
+        terminated.extend_from_slice(b"=ybegin line=128\r\n");
+        let simd = run_kernel_whole(&terminated, true, true, true, false, None).unwrap();
+        let reference = run_kernel_whole(&terminated, true, true, true, true, None).unwrap();
+        assert_eq!(
+            reference.2,
+            RapidyencDecodeEnd::Control,
+            "terminated body must report Control (columns={columns})"
+        );
+        assert_eq!(simd, reference, "terminated columns={columns}");
+    }
+}
+
 /// Special-free, line-structured body for the production-shape forced-tier
 /// differential: `columns` data bytes per line separated by `\r\n`, with no
 /// `=`, `.`, CR or LF outside those breaks, so the only escape or terminator in
