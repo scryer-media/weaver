@@ -581,6 +581,11 @@ impl Database {
         self.sql_services.datastore()
     }
 
+    /// Stable, non-sensitive name of the configured persistence engine.
+    pub fn engine_name(&self) -> &'static str {
+        self.datastore().engine().as_str()
+    }
+
     pub(crate) fn database_target(&self) -> &DatabaseTarget {
         &self.target
     }

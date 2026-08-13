@@ -455,13 +455,10 @@ impl NntpPool {
             Ok(connection) => Ok(connection),
             Err(error) => {
                 if matches!(error, NntpError::TooManyConnections) {
-                    let should_block = self.record_provider_capacity_rejection(ServerId(idx));
-                    if should_block {
-                        self.health
-                            .lock()
-                            .await
-                            .record_cooldown(idx, crate::health::CooldownReason::Capacity);
-                    }
+                    // Keep provider capacity learning independent from health:
+                    // existing authenticated lanes remain usable while the
+                    // adaptive admission ceiling converges.
+                    self.record_provider_capacity_rejection(ServerId(idx));
                 }
                 Err(error)
             }

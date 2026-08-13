@@ -435,18 +435,27 @@ impl FusedYencArticleDecoder {
     }
 
     fn process_nntp_terminator(&mut self, src: &mut BytesMut) -> Result<bool> {
-        if !self.consume_line_into_buffer(src)? {
-            return Ok(false);
-        }
+        loop {
+            if !self.consume_line_into_buffer(src)? {
+                return Ok(false);
+            }
 
-        if self.line_buf == b".\r\n" || self.line_buf == b".\n" {
-            self.stats.nntp_terminator_hits += 1;
-            self.stats.nntp_terminator_bytes += self.line_buf.len() as u64;
-            self.line_buf.clear();
-            return Ok(true);
-        }
+            if self.line_buf == b".\r\n" || self.line_buf == b".\n" {
+                self.stats.nntp_terminator_hits += 1;
+                self.stats.nntp_terminator_bytes += self.line_buf.len() as u64;
+                self.line_buf.clear();
+                return Ok(true);
+            }
+            // Some providers emit a blank line after the yEnc trailer before
+            // the NNTP dot terminator. It carries no article data and is safe
+            // to ignore while remaining strict about every non-blank line.
+            if self.line_buf.iter().all(|b| matches!(b, b'\r' | b'\n')) {
+                self.line_buf.clear();
+                continue;
+            }
 
-        Err(NntpError::MalformedMultilineTerminator.into())
+            return Err(NntpError::MalformedMultilineTerminator.into());
+        }
     }
 
     fn finish_article(&mut self) -> Result<FusedYencArticle> {
@@ -1390,5 +1399,29 @@ mod tests {
             err,
             FusedYencError::Nntp(NntpError::MalformedMultilineTerminator)
         ));
+    }
+
+    #[test]
+    fn fused_accepts_blank_line_before_nntp_terminator() {
+        let original = b"provider trailing blank";
+        let mut article = Vec::new();
+        encode(original, &mut article, 128, "blank.bin").unwrap();
+
+        let mut bytes = b"222 <test@local> body follows\r\n".to_vec();
+        bytes.extend_from_slice(&article);
+        bytes.extend_from_slice(b"\r\n.\r\n");
+
+        let mut src = BytesMut::from(bytes.as_slice());
+        let mut decoder = FusedYencArticleDecoder::new();
+        let decoded = decoder
+            .decode_available(&mut src)
+            .unwrap()
+            .expect("blank line before terminator remains decodable");
+        let payload = decoded
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(payload, original);
     }
 }

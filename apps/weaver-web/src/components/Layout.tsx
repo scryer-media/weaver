@@ -6,6 +6,7 @@ import {
   Clock3,
   FolderUp,
   Heart,
+  Info,
   ListOrdered,
   Menu,
   Monitor,
@@ -61,6 +62,7 @@ const navItems = [
   { to: "/", labelKey: "nav.jobs", icon: ListOrdered },
   { to: "/history", labelKey: "nav.history", icon: Clock3 },
   { to: "/monitoring", labelKey: "nav.monitoring", icon: Activity },
+  { to: "/system-info", labelKey: "nav.systemInfo", icon: Info },
   { to: "/logs", labelKey: "nav.logs", icon: ScrollText },
   { to: "/settings", labelKey: "nav.settings", icon: Settings },
 ];

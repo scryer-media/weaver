@@ -10,7 +10,6 @@ import { Progress } from "@/components/ui/progress";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { requestGraphqlClientRestart } from "@/graphql/client";
 import {
-  DISK_USAGE_QUERY,
   METRICS_PAGE_QUERY,
   METRICS_PAGE_SUBSCRIPTION,
   SERVER_HEALTH_QUERY,
@@ -32,14 +31,6 @@ import {
 } from "@/lib/metrics";
 import { STATUS_BG_CLASS, statusToken } from "@/lib/status-tokens";
 import { cn } from "@/lib/utils";
-
-interface DiskUsageEntry {
-  label: string;
-  path: string;
-  totalBytes: number;
-  usedBytes: number;
-  freeBytes: number;
-}
 
 interface ServerHealthEntry {
   host: string;
@@ -102,9 +93,6 @@ export function MetricsPage() {
     }
   }, [liveConnection.isDisconnected]);
 
-  const [{ data: diskData }, reexecuteDiskUsage] = useQuery<{ diskUsage: DiskUsageEntry[] }>({
-    query: DISK_USAGE_QUERY,
-  });
   const [{ data: serverHealthData }, reexecuteServerHealth] = useQuery<{
     serverHealth: ServerHealthEntry[];
   }>({ query: SERVER_HEALTH_QUERY });
@@ -115,12 +103,10 @@ export function MetricsPage() {
     }
     const id = window.setInterval(() => {
       reexecuteServerHealth({ requestPolicy: "network-only" });
-      reexecuteDiskUsage({ requestPolicy: "network-only" });
     }, 5000);
     return () => window.clearInterval(id);
-  }, [liveConnection.isDisconnected, reexecuteDiskUsage, reexecuteServerHealth]);
+  }, [liveConnection.isDisconnected, reexecuteServerHealth]);
 
-  const diskUsage = diskData?.diskUsage ?? [];
   const serverHealth = serverHealthData?.serverHealth ?? [];
 
   const counts = useMemo(() => {
@@ -275,57 +261,6 @@ export function MetricsPage() {
               ariaLabel={t("metrics.historySectionTitle")}
             />
           </div>
-
-          {diskUsage.length ? (
-            <SectionCard title={t("metrics.diskUsage")} description={t("metrics.diskUsageDesc")}>
-              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                {diskUsage.map((mount) => {
-                  const pct = mount.totalBytes > 0 ? (mount.usedBytes / mount.totalBytes) * 100 : 0;
-                  const barClass =
-                    pct >= 85
-                      ? "bg-status-failed"
-                      : pct >= 65
-                        ? "bg-status-paused"
-                        : "bg-status-downloading";
-                  return (
-                    <div
-                      key={mount.path}
-                      className="rounded-inner border border-border bg-background/40 p-4"
-                    >
-                      <div className="flex items-baseline justify-between gap-3">
-                        <span className="truncate text-[13px] font-semibold text-foreground">
-                          {mount.label}
-                        </span>
-                        <span className="shrink-0 text-[12px] tabular-nums text-muted-foreground">
-                          {Math.round(pct)}%
-                        </span>
-                      </div>
-                      <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground" title={mount.path}>
-                        {mount.path}
-                      </div>
-                      <div className="mt-3 h-2 overflow-hidden rounded-pill bg-secondary">
-                        <div
-                          className={cn("h-full rounded-pill transition-[width] duration-500 motion-reduce:transition-none", barClass)}
-                          style={{ width: `${Math.min(100, pct)}%` }}
-                        />
-                      </div>
-                      <div className="mt-2.5 flex items-center justify-between text-[12px]">
-                        <span className="font-medium text-foreground">
-                          {formatBytes(mount.usedBytes)}{" "}
-                          <span className="font-normal text-muted-foreground">
-                            / {formatBytes(mount.totalBytes)}
-                          </span>
-                        </span>
-                        <span className="text-muted-foreground">
-                          {formatBytes(mount.freeBytes)} {t("metrics.diskFree")}
-                        </span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </SectionCard>
-          ) : null}
 
           {serverHealth.length ? (
             <SectionCard

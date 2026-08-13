@@ -830,6 +830,92 @@ pub struct SystemStatus {
     pub summary: QueueSummary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum DeploymentEnvironmentGql {
+    Native,
+    Docker,
+    Container,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum OperatingSystemGql {
+    Linux,
+    Macos,
+    Windows,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum DatabaseEngineGql {
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum DecoderTierGql {
+    Avx512Vbmi2,
+    Avx2,
+    Avx,
+    Sse41,
+    Ssse3,
+    Sse2,
+    Neon,
+    Scalar,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct SystemComputeInfo {
+    pub physical_cores: u32,
+    pub logical_cores: u32,
+    pub cgroup_limit: Option<f64>,
+    pub decoder_tier: DecoderTierGql,
+    pub simd_features: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct SystemMemoryInfo {
+    pub total_bytes: u64,
+    pub available_at_startup_bytes: u64,
+    pub cgroup_limit_bytes: Option<u64>,
+    pub effective_limit_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct SystemStorageProfile {
+    pub storage_class: String,
+    pub filesystem: String,
+    pub startup_random_read_iops: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct DiskCapacity {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct ConfiguredStorage {
+    pub labels: Vec<String>,
+    pub path: String,
+    pub capacity: Option<DiskCapacity>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct SystemInfo {
+    pub version: String,
+    pub uptime_seconds: f64,
+    pub deployment: DeploymentEnvironmentGql,
+    pub operating_system: OperatingSystemGql,
+    pub architecture: String,
+    pub database_engine: DatabaseEngineGql,
+    pub compute: SystemComputeInfo,
+    pub memory: SystemMemoryInfo,
+    pub primary_storage: SystemStorageProfile,
+    pub configured_storage: Vec<ConfiguredStorage>,
+}
+
 /// Filesystem capacity for a configured storage directory (data / intermediate / complete).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct DiskUsage {

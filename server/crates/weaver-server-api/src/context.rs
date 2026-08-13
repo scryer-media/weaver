@@ -18,6 +18,12 @@ pub type WeaverSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 pub const GRAPHQL_MAX_COMPLEXITY: usize = 512;
 pub const GRAPHQL_MAX_DEPTH: usize = 16;
 
+#[derive(Clone)]
+pub struct SystemRuntimeContext {
+    pub profile: weaver_server_core::runtime::system_profile::SystemProfile,
+    pub started_at: std::time::Instant,
+}
+
 pub fn apply_graphql_query_guards<Query, Mutation, Subscription>(
     builder: SchemaBuilder<Query, Mutation, Subscription>,
 ) -> SchemaBuilder<Query, Mutation, Subscription> {
@@ -45,6 +51,7 @@ pub struct SchemaContext {
     pub watch_folder: WatchFolderService,
     pub schedules: weaver_server_core::bandwidth::schedule::SharedSchedules,
     pub log_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
+    pub system_runtime: SystemRuntimeContext,
     /// Live NNTP pool for per-server health metrics. `None` in contexts without a pool (tests).
     pub nntp_pool: Option<Arc<NntpPool>>,
     /// Whether to spawn the background history-delete worker. Always `true` in
@@ -125,6 +132,7 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     .data(context.schedules)
     .data(http_client)
     .data(context.log_buffer)
+    .data(context.system_runtime)
     .data(context.nntp_pool)
     .data(replay)
     .data(history_delete_manager)

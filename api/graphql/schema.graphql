@@ -46,9 +46,21 @@ input CategoryInput {
 	aliases: String! = ""
 }
 
+type ConfiguredStorage {
+	labels: [String!]!
+	path: String!
+	capacity: DiskCapacity
+	error: String
+}
+
 type CreateApiKeyResult {
 	key: ApiKey!
 	rawKey: String!
+}
+
+enum DatabaseEngineGql {
+	SQLITE
+	POSTGRES
 }
 
 """
@@ -57,6 +69,23 @@ Implement the DateTime<Utc> scalar
 The input/output is a string in RFC3339 format.
 """
 scalar DateTime
+
+enum DecoderTierGql {
+	AVX_512_VBMI_2
+	AVX_2
+	AVX
+	SSE_41
+	SSSE_3
+	SSE_2
+	NEON
+	SCALAR
+}
+
+enum DeploymentEnvironmentGql {
+	NATIVE
+	DOCKER
+	CONTAINER
+}
 
 type DirectoryBrowseEntry {
 	name: String!
@@ -67,6 +96,12 @@ type DirectoryBrowseResult {
 	currentPath: String!
 	parentPath: String
 	entries: [DirectoryBrowseEntry!]!
+}
+
+type DiskCapacity {
+	totalBytes: Int!
+	usedBytes: Int!
+	freeBytes: Int!
 }
 
 """
@@ -1004,6 +1039,13 @@ type MutationRoot {
 	createDirectory(path: String!, name: String!): DirectoryBrowseResult!
 }
 
+enum OperatingSystemGql {
+	LINUX
+	MACOS
+	WINDOWS
+	UNKNOWN
+}
+
 type ParsedEpisode {
 	season: Int
 	episodeNumbers: [Int!]!
@@ -1406,6 +1448,10 @@ type QueryRoot {
 	The running weaver binary version.
 	"""
 	version: String!
+	"""
+	Safe runtime and storage facts for the built-in troubleshooting UI.
+	"""
+	systemInfo: SystemInfo!
 	"""
 	System status facade for integrations.
 	"""
@@ -2091,6 +2137,34 @@ type SubscriptionRoot {
 	systemMetricsUpdates: SystemMetricsSnapshot!
 }
 
+type SystemComputeInfo {
+	physicalCores: Int!
+	logicalCores: Int!
+	cgroupLimit: Float
+	decoderTier: DecoderTierGql!
+	simdFeatures: [String!]!
+}
+
+type SystemInfo {
+	version: String!
+	uptimeSeconds: Float!
+	deployment: DeploymentEnvironmentGql!
+	operatingSystem: OperatingSystemGql!
+	architecture: String!
+	databaseEngine: DatabaseEngineGql!
+	compute: SystemComputeInfo!
+	memory: SystemMemoryInfo!
+	primaryStorage: SystemStorageProfile!
+	configuredStorage: [ConfiguredStorage!]!
+}
+
+type SystemMemoryInfo {
+	totalBytes: Int!
+	availableAtStartupBytes: Int!
+	cgroupLimitBytes: Int
+	effectiveLimitBytes: Int!
+}
+
 type SystemMetricsSnapshot {
 	metrics: Metrics!
 	globalState: GlobalQueueState!
@@ -2100,6 +2174,12 @@ type SystemStatus {
 	version: String!
 	globalState: GlobalQueueState!
 	summary: QueueSummary!
+}
+
+type SystemStorageProfile {
+	storageClass: String!
+	filesystem: String!
+	startupRandomReadIops: Float!
 }
 
 type TestConnectionResult {

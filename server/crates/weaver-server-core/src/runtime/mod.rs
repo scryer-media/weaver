@@ -1,5 +1,6 @@
 pub mod affinity;
 pub mod buffers;
+pub mod environment;
 pub(crate) mod file_cache;
 pub(crate) mod fs;
 pub mod log_buffer;

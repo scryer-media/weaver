@@ -37,6 +37,29 @@ fn main() {
             .file(src.join("decoder_neon64.cc"))
             .file("rapidyenc_shim.cc")
             .compile("rapidyenc_arm");
+
+        // CRC dispatch + the ARM kernels it installs (needed by the
+        // crc_probe example's rapidyenc lane). `crc_arm*.cc` self-stub when the
+        // required ISA extension is not enabled, so `flag_if_supported` is safe.
+        cc::Build::new()
+            .cpp(true)
+            .include(&root)
+            .define("YENC_DISABLE_CRCUTIL", "1")
+            .file(src.join("crc.cc"))
+            .compile("rapidyenc_crc");
+        cc::Build::new()
+            .cpp(true)
+            .include(&root)
+            .flag_if_supported("-march=armv8-a+crc")
+            .file(src.join("crc_arm.cc"))
+            .compile("rapidyenc_crc_arm");
+        cc::Build::new()
+            .cpp(true)
+            .include(&root)
+            .flag_if_supported("-march=armv8-a+crypto+crc")
+            .file(src.join("crc_arm_pmull.cc"))
+            .compile("rapidyenc_crc_arm_pmull");
+
         println!("cargo:rustc-cfg=rapidyenc_linked");
         return;
     }
@@ -63,6 +86,44 @@ fn main() {
         ),
     ];
     for (file, msvc_flag, gnu_flags) in groups {
+        let mut b = cc::Build::new();
+        b.cpp(true).include(&root).file(src.join(file));
+        if b.get_compiler().is_like_msvc() {
+            b.flag(msvc_flag);
+        } else {
+            for f in gnu_flags {
+                b.flag(f);
+            }
+        }
+        let name = file.trim_end_matches(".cc");
+        b.compile(&format!("rapidyenc_{name}"));
+    }
+
+    // CRC dispatch + its x86 folding kernels, for the crc_probe example's
+    // rapidyenc lane. `YENC_DISABLE_CRCUTIL` keeps the *generic* fallback as
+    // rapidyenc's own slice table instead of pulling in the whole crcutil-1.0
+    // tree; on any CPU with SSE4.1+SSSE3+PCLMUL the generic path is overwritten
+    // by crc_clmul_set_funcs() anyway (rapidyenc src/crc.cc:231-240).
+    cc::Build::new()
+        .cpp(true)
+        .include(&root)
+        .define("YENC_DISABLE_CRCUTIL", "1")
+        .file(src.join("crc.cc"))
+        .compile("rapidyenc_crc");
+
+    let crc_groups: [(&str, &str, &[&str]); 2] = [
+        (
+            "crc_folding.cc",
+            "/arch:SSE2",
+            &["-mssse3", "-msse4.1", "-mpclmul"],
+        ),
+        (
+            "crc_folding_256.cc",
+            "/arch:AVX2",
+            &["-mavx2", "-mvpclmulqdq", "-mpclmul"],
+        ),
+    ];
+    for (file, msvc_flag, gnu_flags) in crc_groups {
         let mut b = cc::Build::new();
         b.cpp(true).include(&root).file(src.join(file));
         if b.get_compiler().is_like_msvc() {

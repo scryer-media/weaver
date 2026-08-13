@@ -2286,15 +2286,12 @@ impl NntpClient {
 
     fn record_blocking_connect_failure(&self, server_idx: usize, error: &NntpError) {
         if matches!(error, NntpError::TooManyConnections) {
-            if self
-                .pool
-                .record_provider_capacity_rejection(ServerId(server_idx))
-            {
-                self.pool
-                    .health()
-                    .blocking_lock()
-                    .record_cooldown(server_idx, CooldownReason::Capacity);
-            }
+            // Provider admission pressure belongs to the adaptive connection
+            // limit, not server health. Cooling the whole server here also
+            // blocks already-established healthy lanes from refilling, which
+            // can strand a job after the limit has converged.
+            self.pool
+                .record_provider_capacity_rejection(ServerId(server_idx));
         } else if matches!(
             error,
             NntpError::AuthenticationFailed
@@ -3713,6 +3710,24 @@ mod tests {
         let health = client.pool().health().lock().await;
         assert_eq!(health.server(0).failure_count, 0);
         assert_eq!(health.server(0).consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn blocking_capacity_floor_never_cools_healthy_server() {
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_blocking_s2n_server(563, 2)],
+            max_idle_age: Duration::from_secs(30),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
+        });
+
+        client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
+        client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
+
+        assert_eq!(client.pool().effective_connections(ServerId(0)), Some(1));
+        let mut health = client.pool().health().lock().await;
+        assert_eq!(health.server(0).state(), &ServerState::Healthy);
+        assert!(health.is_available(0));
     }
 
     #[test]

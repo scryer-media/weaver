@@ -347,6 +347,138 @@ fn decode_kernel(
     }
 }
 
+/// The SIMD decode tier the production dispatcher selected on this host, as
+/// reported by [`selected_decoder_tier`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelectedDecoderTier {
+    Avx512Vbmi2,
+    Avx2,
+    Avx,
+    Sse41,
+    Ssse3,
+    Sse2,
+    Neon,
+    Scalar,
+}
+
+impl SelectedDecoderTier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Avx512Vbmi2 => "avx512-vbmi2",
+            Self::Avx2 => "avx2",
+            Self::Avx => "avx",
+            Self::Sse41 => "sse4.1",
+            Self::Ssse3 => "ssse3",
+            Self::Sse2 => "sse2",
+            Self::Neon => "neon",
+            Self::Scalar => "scalar",
+        }
+    }
+}
+
+/// The x86 decode tier this CPU dispatches to.
+///
+/// Split out of [`dispatch_x86_decode_kernel`] so the tier decision has one
+/// home: the dispatcher and the [`selected_decoder_tier`] reporting surface
+/// read the same answer and cannot drift.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum X86Tier {
+    Vbmi2,
+    Avx2,
+    Avx,
+    Sse41,
+    Ssse3,
+    Sse2,
+    Scalar,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_tier() -> X86Tier {
+    if vbmi2_tier_available() {
+        X86Tier::Vbmi2
+    } else if is_x86_feature_detected!("avx2")
+        // decode_kernel_avx2's attribute already carries the BMI sets;
+        // its gate must too, or a CPUID-masked host demoted out of the
+        // VBMI2 arm above would land on a kernel emitting andn/popcnt
+        // it never verified.
+        && is_x86_feature_detected!("bmi1")
+        && is_x86_feature_detected!("bmi2")
+        && is_x86_feature_detected!("popcnt")
+        && is_x86_feature_detected!("lzcnt")
+    {
+        X86Tier::Avx2
+    } else if is_x86_feature_detected!("avx")
+        && is_x86_feature_detected!("popcnt")
+        && is_x86_feature_detected!("sse4.1")
+        && is_x86_feature_detected!("ssse3")
+        && !x86_prefers_ssse3_over_sse41()
+        && !x86_prefers_sse2_over_ssse3()
+    {
+        X86Tier::Avx
+    } else if is_x86_feature_detected!("sse4.1")
+        && is_x86_feature_detected!("ssse3")
+        && !x86_prefers_ssse3_over_sse41()
+        && !x86_prefers_sse2_over_ssse3()
+    {
+        X86Tier::Sse41
+    } else if is_x86_feature_detected!("ssse3") && !x86_prefers_sse2_over_ssse3() {
+        X86Tier::Ssse3
+    } else if is_x86_feature_detected!("sse2") {
+        X86Tier::Sse2
+    } else {
+        X86Tier::Scalar
+    }
+}
+
+/// Return the exact SIMD tier selected by the production decoder dispatcher.
+pub fn selected_decoder_tier() -> SelectedDecoderTier {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match x86_tier() {
+            X86Tier::Vbmi2 => SelectedDecoderTier::Avx512Vbmi2,
+            X86Tier::Avx2 => SelectedDecoderTier::Avx2,
+            X86Tier::Avx => SelectedDecoderTier::Avx,
+            X86Tier::Sse41 => SelectedDecoderTier::Sse41,
+            X86Tier::Ssse3 => SelectedDecoderTier::Ssse3,
+            X86Tier::Sse2 => SelectedDecoderTier::Sse2,
+            X86Tier::Scalar => SelectedDecoderTier::Scalar,
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        SelectedDecoderTier::Neon
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        SelectedDecoderTier::Scalar
+    }
+}
+
+#[cfg(test)]
+mod selected_decoder_tier_tests {
+    use super::*;
+
+    #[test]
+    fn labels_are_stable_and_complete() {
+        let labels = [
+            SelectedDecoderTier::Avx512Vbmi2.as_str(),
+            SelectedDecoderTier::Avx2.as_str(),
+            SelectedDecoderTier::Avx.as_str(),
+            SelectedDecoderTier::Sse41.as_str(),
+            SelectedDecoderTier::Ssse3.as_str(),
+            SelectedDecoderTier::Sse2.as_str(),
+            SelectedDecoderTier::Neon.as_str(),
+            SelectedDecoderTier::Scalar.as_str(),
+        ];
+        let unique = labels.into_iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), labels.len());
+        assert!(unique.contains(selected_decoder_tier().as_str()));
+    }
+}
+
 /// Resolve the x86 decode tier once per process, not once per call.
 ///
 /// The `is_x86_feature_detected!` chain is cheap but not free (an atomic load
@@ -365,41 +497,14 @@ fn dispatch_x86_decode_kernel() -> DecodeKernelFn {
     use std::sync::OnceLock;
 
     static DISPATCH: OnceLock<DecodeKernelFn> = OnceLock::new();
-    *DISPATCH.get_or_init(|| {
-        if vbmi2_tier_available() {
-            decode_kernel_avx512_vbmi2 as DecodeKernelFn
-        } else if is_x86_feature_detected!("avx2")
-            // decode_kernel_avx2's attribute already carries the BMI sets;
-            // its gate must too, or a CPUID-masked host demoted out of the
-            // VBMI2 arm above would land on a kernel emitting andn/popcnt
-            // it never verified.
-            && is_x86_feature_detected!("bmi1")
-            && is_x86_feature_detected!("bmi2")
-            && is_x86_feature_detected!("popcnt")
-            && is_x86_feature_detected!("lzcnt")
-        {
-            decode_kernel_avx2 as DecodeKernelFn
-        } else if is_x86_feature_detected!("avx")
-            && is_x86_feature_detected!("popcnt")
-            && is_x86_feature_detected!("sse4.1")
-            && is_x86_feature_detected!("ssse3")
-            && !x86_prefers_ssse3_over_sse41()
-            && !x86_prefers_sse2_over_ssse3()
-        {
-            decode_kernel_avx as DecodeKernelFn
-        } else if is_x86_feature_detected!("sse4.1")
-            && is_x86_feature_detected!("ssse3")
-            && !x86_prefers_ssse3_over_sse41()
-            && !x86_prefers_sse2_over_ssse3()
-        {
-            decode_kernel_sse41 as DecodeKernelFn
-        } else if is_x86_feature_detected!("ssse3") && !x86_prefers_sse2_over_ssse3() {
-            decode_kernel_ssse3 as DecodeKernelFn
-        } else if is_x86_feature_detected!("sse2") {
-            decode_kernel_sse2 as DecodeKernelFn
-        } else {
-            decode_kernel_scalar as DecodeKernelFn
-        }
+    *DISPATCH.get_or_init(|| match x86_tier() {
+        X86Tier::Vbmi2 => decode_kernel_avx512_vbmi2 as DecodeKernelFn,
+        X86Tier::Avx2 => decode_kernel_avx2 as DecodeKernelFn,
+        X86Tier::Avx => decode_kernel_avx as DecodeKernelFn,
+        X86Tier::Sse41 => decode_kernel_sse41 as DecodeKernelFn,
+        X86Tier::Ssse3 => decode_kernel_ssse3 as DecodeKernelFn,
+        X86Tier::Sse2 => decode_kernel_sse2 as DecodeKernelFn,
+        X86Tier::Scalar => decode_kernel_scalar as DecodeKernelFn,
     })
 }
 

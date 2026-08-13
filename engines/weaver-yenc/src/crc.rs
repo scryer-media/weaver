@@ -84,6 +84,68 @@ impl Crc32 {
 
         self.hasher.finalize() as u32
     }
+
+    /// Return the CRC32 of everything fed since the last checkpoint and restart
+    /// from the initial state, so the next `update` begins a fresh segment.
+    ///
+    /// This is the segment-CRC checkpoint primitive: the returned value is a
+    /// standalone CRC32 over the bytes of the closed segment (standard
+    /// init/finalize, not a running prefix), which is what makes segments
+    /// composable with [`crc32_combine`] in any tiling — including block
+    /// tilings that straddle article boundaries.
+    ///
+    /// Any pending folded streak is finalized before the cut: [`Self::current`]
+    /// reads the carried post-xor value, and the restart clears the carried
+    /// state so the next large update re-enters the folding path from the CRC
+    /// init state rather than from the closed segment's value.
+    pub fn checkpoint(&mut self) -> u32 {
+        let crc = self.current();
+        self.restart();
+        crc
+    }
+
+    /// Discard all accumulated state and return to the initial CRC32 value.
+    fn restart(&mut self) {
+        self.hasher.reset();
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.folded = None;
+        }
+    }
+}
+
+/// Combine two CRC32 values as if their byte ranges were concatenated:
+/// given `crc_a` over `A`, `crc_b` over `B` and `len_b == B.len()`, returns the
+/// CRC32 of `A || B`.
+///
+/// This forwards to `crc-fast`'s `checksum_combine`, the CRC32 combine that
+/// already ships inside this crate's existing dependency set (Mark Adler's
+/// generalized GF(2) zeros-operator, the same math as the
+/// `par2_rs::checksum::Crc32CombineOp` used by the server pipeline's
+/// part-CRC -> file-CRC composition). No combine is implemented here; the
+/// two are pinned bit-identical for every `len_b >= 1` by
+/// `combine_matches_par2_rs_combine_op` in `tests/segment_combine.rs`.
+///
+/// `len_b == 0` is the identity: the CRC32 of an empty range is 0, so
+/// `crc32_combine(a, 0, 0) == a`. (`Crc32CombineOp` short-circuits to `a` for
+/// any `crc_b` at that length, which agrees on every well-formed input and
+/// differs only on a zero-length record carrying a non-zero CRC — malformed,
+/// and unreachable from [`crate::segment::SegmentedCrc32`], which never emits
+/// zero-length segments.)
+///
+/// The free function is used deliberately in preference to
+/// `crc_fast::Digest::combine`: the latter derives `len_b` from the digest's
+/// internal byte counter, which is not valid for a [`Crc32`] that has taken the
+/// folding path (see the type-level note above). Lengths are always passed
+/// explicitly here.
+#[inline]
+pub fn crc32_combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32 {
+    crc_fast::checksum_combine(
+        crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+        u64::from(crc_a),
+        u64::from(crc_b),
+        len_b,
+    ) as u32
 }
 
 impl Default for Crc32 {
@@ -425,6 +487,98 @@ mod tests {
                 "sequence {seq:?}"
             );
         }
+    }
+
+    #[test]
+    fn crc32_checkpoint_cuts_and_restarts_at_every_streak_state() {
+        const LEN: usize = 48 * 1024;
+        let mut data = Vec::with_capacity(LEN);
+        let mut seed = 0x2545_f491u32;
+        for _ in 0..LEN {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            data.push((seed >> 24) as u8);
+        }
+
+        // Each sequence bounces across VPCLMUL_MIN_UPDATE (256) so checkpoints
+        // land on a pending folded streak, on a digest-path streak, and on the
+        // hand-off in both directions.
+        let sequences: [&[usize]; 6] = [
+            &[4096, 300, 255, 1, 256, 7],
+            &[255, 256, 257, 4096],
+            &[1, 1, 8192, 1],
+            &[256, 256, 256, 256],
+            &[7, 300, 7, 4096, 255],
+            &[8192, 8192, 3],
+        ];
+
+        for seq in sequences {
+            // Checkpoint after every prefix of the sequence: each cut must
+            // return the CRC of the bytes since the previous cut, and the CRC
+            // must restart from the init state rather than carry that value.
+            for cut_after in 0..seq.len() {
+                let mut crc = Crc32::new();
+                let mut offset = 0usize;
+                let mut segment_start = 0usize;
+                let mut cut = false;
+                for (idx, &len) in seq.iter().enumerate() {
+                    crc.update(&data[offset..offset + len]);
+                    offset += len;
+                    if idx == cut_after {
+                        assert_eq!(
+                            crc.checkpoint(),
+                            crc_fast::crc32_iso_hdlc(&data[segment_start..offset]),
+                            "seq {seq:?} cut after {cut_after} segment [{segment_start},{offset})"
+                        );
+                        segment_start = offset;
+                        cut = true;
+                    }
+                }
+                assert!(cut, "seq {seq:?} never cut");
+                assert_eq!(
+                    crc.finalize(),
+                    crc_fast::crc32_iso_hdlc(&data[segment_start..offset]),
+                    "seq {seq:?} cut after {cut_after} tail [{segment_start},{offset})"
+                );
+            }
+        }
+    }
+
+    /// The x86 guard for the same interaction: a checkpoint taken while the
+    /// folded streak is carrying state must drop that state, so the next large
+    /// update re-enters the folding path from the CRC init value instead of
+    /// from the closed segment's CRC.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn crc32_checkpoint_clears_pending_folded_streak() {
+        if !x86_vpclmul::available() {
+            // Visible skip, same convention as the forced-kernel test below:
+            // on a host where the port is inactive this test executes nothing.
+            eprintln!(
+                "skipping crc32_checkpoint_clears_pending_folded_streak: VPCLMUL port unavailable on this CPU"
+            );
+            return;
+        }
+
+        let data: Vec<u8> = (0..8192u32).map(|idx| (idx * 31 + 17) as u8).collect();
+
+        let mut crc = Crc32::new();
+        crc.update(&data[..4096]);
+        assert!(
+            crc.folded.is_some(),
+            "a 4096-byte update must take the folding path when the port is active"
+        );
+
+        assert_eq!(crc.checkpoint(), crc_fast::crc32_iso_hdlc(&data[..4096]));
+        assert!(
+            crc.folded.is_none(),
+            "checkpoint must drop the carried folded value"
+        );
+        assert_eq!(crc.current(), 0, "restart must be the CRC init state");
+
+        // Re-entering the folding path after the cut must start from init.
+        crc.update(&data[4096..]);
+        assert!(crc.folded.is_some(), "the second streak must fold too");
+        assert_eq!(crc.finalize(), crc_fast::crc32_iso_hdlc(&data[4096..]));
     }
 
     #[cfg(target_arch = "x86_64")]

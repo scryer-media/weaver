@@ -406,26 +406,7 @@ fn complete_parent_for_category(
     categories: &[crate::categories::CategoryConfig],
     category: Option<&str>,
 ) -> Result<PathBuf, String> {
-    let Some(category) = category.filter(|category| !category.is_empty()) else {
-        return Ok(complete_dir.to_path_buf());
-    };
-
-    if let Some(custom_dest) = categories
-        .iter()
-        .find(|configured| configured.name.eq_ignore_ascii_case(category))
-        .and_then(|configured| configured.dest_dir.as_deref())
-        .filter(|destination| !destination.is_empty())
-    {
-        return Ok(PathBuf::from(custom_dest));
-    }
-
-    let category = crate::categories::validate_category_path_component(category)
-        .map_err(|error| format!("unsafe completion category: {error}"))?;
-    let parent = complete_dir.join(category);
-    if !parent.starts_with(complete_dir) {
-        return Err("unsafe completion category escaped the complete directory".to_string());
-    }
-    Ok(parent)
+    crate::categories::completion_parent(complete_dir, categories, category)
 }
 
 #[cfg(test)]

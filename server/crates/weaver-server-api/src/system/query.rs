@@ -1,7 +1,12 @@
 use super::*;
 use crate::observability::with_timed_config_read;
 use crate::system::metrics_history::{build_metrics_history, tier_for_range};
-use crate::system::types::MetricsHistoryRangeGql;
+use crate::system::types::{
+    ConfiguredStorage, DatabaseEngineGql, DecoderTierGql, DeploymentEnvironmentGql, DiskCapacity,
+    MetricsHistoryRangeGql, OperatingSystemGql, SystemComputeInfo, SystemInfo, SystemMemoryInfo,
+    SystemStorageProfile,
+};
+use std::path::PathBuf;
 use std::sync::Arc;
 use weaver_nntp::pool::NntpPool;
 
@@ -13,6 +18,80 @@ impl SystemQuery {
     /// The running weaver binary version.
     async fn version(&self) -> &str {
         env!("CARGO_PKG_VERSION")
+    }
+    /// Safe runtime and storage facts for the built-in troubleshooting UI.
+    #[graphql(guard = "ReadGuard")]
+    async fn system_info(&self, ctx: &Context<'_>) -> Result<SystemInfo> {
+        let runtime = ctx.data::<crate::context::SystemRuntimeContext>()?;
+        let config = ctx.data::<SharedConfig>()?;
+        let database = ctx.data::<Database>()?;
+        let storage_inputs = with_timed_config_read(config, "system.query.system_info", |cfg| {
+            configured_storage_inputs(cfg)
+        })
+        .await;
+        let configured_storage = tokio::task::spawn_blocking(move || {
+            storage_inputs
+                .into_iter()
+                .map(probe_configured_storage)
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+
+        let environment = weaver_server_core::runtime::environment::detect_runtime_environment();
+        let profile = &runtime.profile;
+        let simd = &profile.cpu.simd;
+        let mut simd_features = Vec::new();
+        if simd.sse42 {
+            simd_features.push("SSE 4.2".to_string());
+        }
+        if simd.avx2 {
+            simd_features.push("AVX2".to_string());
+        }
+        if simd.avx512 {
+            simd_features.push("AVX-512".to_string());
+        }
+        if simd.neon {
+            simd_features.push("NEON".to_string());
+        }
+
+        let effective_limit_bytes = profile
+            .memory
+            .cgroup_limit
+            .map(|limit| profile.memory.total_bytes.min(limit))
+            .unwrap_or(profile.memory.total_bytes);
+
+        Ok(SystemInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_seconds: runtime.started_at.elapsed().as_secs_f64(),
+            deployment: deployment_environment_gql(environment.deployment),
+            operating_system: operating_system_gql(environment.operating_system),
+            architecture: environment.architecture.to_string(),
+            database_engine: if database.engine_name() == "postgres" {
+                DatabaseEngineGql::Postgres
+            } else {
+                DatabaseEngineGql::Sqlite
+            },
+            compute: SystemComputeInfo {
+                physical_cores: u32::try_from(profile.cpu.physical_cores).unwrap_or(u32::MAX),
+                logical_cores: u32::try_from(profile.cpu.logical_cores).unwrap_or(u32::MAX),
+                cgroup_limit: profile.cpu.cgroup_limit,
+                decoder_tier: decoder_tier_gql(weaver_yenc::simd::selected_decoder_tier()),
+                simd_features,
+            },
+            memory: SystemMemoryInfo {
+                total_bytes: profile.memory.total_bytes,
+                available_at_startup_bytes: profile.memory.available_bytes,
+                cgroup_limit_bytes: profile.memory.cgroup_limit,
+                effective_limit_bytes,
+            },
+            primary_storage: SystemStorageProfile {
+                storage_class: storage_class_name(&profile.disk.storage_class).to_string(),
+                filesystem: filesystem_name(&profile.disk.filesystem),
+                startup_random_read_iops: profile.disk.random_read_iops,
+            },
+            configured_storage,
+        })
     }
     /// System status facade for integrations.
     #[graphql(guard = "ReadGuard")]
@@ -198,6 +277,166 @@ impl SystemQuery {
         .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
 
         Ok(usage)
+    }
+}
+
+#[derive(Debug)]
+struct ConfiguredStorageInput {
+    labels: Vec<String>,
+    path: PathBuf,
+    error: Option<String>,
+}
+
+fn configured_storage_inputs(
+    config: &weaver_server_core::settings::Config,
+) -> Vec<ConfiguredStorageInput> {
+    let complete_dir = PathBuf::from(config.complete_dir());
+    let mut inputs = Vec::new();
+    push_storage_input(&mut inputs, "Data", PathBuf::from(&config.data_dir));
+    push_storage_input(
+        &mut inputs,
+        "Intermediate downloads",
+        PathBuf::from(config.intermediate_dir()),
+    );
+    push_storage_input(&mut inputs, "Complete library", complete_dir.clone());
+
+    let mut categories = config.categories.iter().collect::<Vec<_>>();
+    categories.sort_by_key(|category| category.name.to_ascii_lowercase());
+    for category in categories {
+        let label = format!("Category: {}", category.name);
+        match weaver_server_core::categories::completion_parent(
+            &complete_dir,
+            &config.categories,
+            Some(&category.name),
+        ) {
+            Ok(path) => push_storage_input(&mut inputs, label, path),
+            Err(error) => inputs.push(ConfiguredStorageInput {
+                labels: vec![label],
+                path: category
+                    .dest_dir
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| complete_dir.join(&category.name)),
+                error: Some(error),
+            }),
+        }
+    }
+    inputs
+}
+
+fn push_storage_input(
+    inputs: &mut Vec<ConfiguredStorageInput>,
+    label: impl Into<String>,
+    path: PathBuf,
+) {
+    let label = label.into();
+    if let Some(existing) = inputs
+        .iter_mut()
+        .find(|input| input.error.is_none() && input.path == path)
+    {
+        existing.labels.push(label);
+    } else {
+        inputs.push(ConfiguredStorageInput {
+            labels: vec![label],
+            path,
+            error: None,
+        });
+    }
+}
+
+fn probe_configured_storage(input: ConfiguredStorageInput) -> ConfiguredStorage {
+    let path = input.path.display().to_string();
+    if let Some(error) = input.error {
+        return ConfiguredStorage {
+            labels: input.labels,
+            path,
+            capacity: None,
+            error: Some(error),
+        };
+    }
+
+    match weaver_server_core::operations::disk_space(&input.path) {
+        Some(space) => ConfiguredStorage {
+            labels: input.labels,
+            path,
+            capacity: Some(DiskCapacity {
+                total_bytes: space.total_bytes,
+                used_bytes: space.used_bytes(),
+                free_bytes: space.available_bytes,
+            }),
+            error: None,
+        },
+        None => ConfiguredStorage {
+            labels: input.labels,
+            path,
+            capacity: None,
+            error: Some("Filesystem capacity is unavailable for this path".to_string()),
+        },
+    }
+}
+
+fn deployment_environment_gql(
+    value: weaver_server_core::runtime::environment::DeploymentEnvironment,
+) -> DeploymentEnvironmentGql {
+    use weaver_server_core::runtime::environment::DeploymentEnvironment;
+    match value {
+        DeploymentEnvironment::Native => DeploymentEnvironmentGql::Native,
+        DeploymentEnvironment::Docker => DeploymentEnvironmentGql::Docker,
+        DeploymentEnvironment::Container => DeploymentEnvironmentGql::Container,
+    }
+}
+
+fn operating_system_gql(
+    value: weaver_server_core::runtime::environment::OperatingSystem,
+) -> OperatingSystemGql {
+    use weaver_server_core::runtime::environment::OperatingSystem;
+    match value {
+        OperatingSystem::Linux => OperatingSystemGql::Linux,
+        OperatingSystem::Macos => OperatingSystemGql::Macos,
+        OperatingSystem::Windows => OperatingSystemGql::Windows,
+        OperatingSystem::Unknown => OperatingSystemGql::Unknown,
+    }
+}
+
+fn decoder_tier_gql(value: weaver_yenc::simd::SelectedDecoderTier) -> DecoderTierGql {
+    use weaver_yenc::simd::SelectedDecoderTier;
+    match value {
+        SelectedDecoderTier::Avx512Vbmi2 => DecoderTierGql::Avx512Vbmi2,
+        SelectedDecoderTier::Avx2 => DecoderTierGql::Avx2,
+        SelectedDecoderTier::Avx => DecoderTierGql::Avx,
+        SelectedDecoderTier::Sse41 => DecoderTierGql::Sse41,
+        SelectedDecoderTier::Ssse3 => DecoderTierGql::Ssse3,
+        SelectedDecoderTier::Sse2 => DecoderTierGql::Sse2,
+        SelectedDecoderTier::Neon => DecoderTierGql::Neon,
+        SelectedDecoderTier::Scalar => DecoderTierGql::Scalar,
+    }
+}
+
+fn storage_class_name(
+    value: &weaver_server_core::runtime::system_profile::StorageClass,
+) -> &'static str {
+    use weaver_server_core::runtime::system_profile::StorageClass;
+    match value {
+        StorageClass::Ssd => "SSD",
+        StorageClass::Hdd => "HDD",
+        StorageClass::Network => "Network",
+        StorageClass::Unknown => "Unknown",
+    }
+}
+
+fn filesystem_name(value: &weaver_server_core::runtime::system_profile::FilesystemType) -> String {
+    use weaver_server_core::runtime::system_profile::FilesystemType;
+    match value {
+        FilesystemType::Ext4 => "ext4".to_string(),
+        FilesystemType::Xfs => "XFS".to_string(),
+        FilesystemType::Zfs => "ZFS".to_string(),
+        FilesystemType::Btrfs => "Btrfs".to_string(),
+        FilesystemType::Apfs => "APFS".to_string(),
+        FilesystemType::Ntfs => "NTFS".to_string(),
+        FilesystemType::Nfs => "NFS".to_string(),
+        FilesystemType::Smb => "SMB".to_string(),
+        FilesystemType::Unknown(name) if !name.is_empty() => name.clone(),
+        FilesystemType::Unknown(_) => "Unknown".to_string(),
     }
 }
 

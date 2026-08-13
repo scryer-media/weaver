@@ -27,10 +27,12 @@ pub mod decode;
 pub mod encode;
 pub mod error;
 pub mod header;
+pub mod segment;
 pub mod simd;
 pub mod types;
 
 // Convenience re-exports.
+pub use crc::crc32_combine;
 pub use decode::{
     DecodeOptions, DecodeState, DecodedArticle, RapidyencDecodeEnd, RapidyencDecodeProgress,
     RapidyencDecodeState, StreamingArticleDecoder, decode, decode_body,
@@ -41,4 +43,5 @@ pub use decode::{
 pub use encode::{encode, encode_part};
 pub use error::YencError;
 pub use header::extract_filename_from_subject;
+pub use segment::{Segment, SegmentedCrc32, combine_contiguous};
 pub use types::{CrcVerification, DecodeResult, YencHeaderDefects, YencMetadata};

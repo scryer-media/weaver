@@ -4,6 +4,7 @@
 #include <cstddef>   // size_t — implicit under MSVC, required under g++/clang
 #include <cstdint>
 #include "src/decoder.h"
+#include "src/crc.h"
 
 extern "C" void weaver_rapidyenc_decode_init(void) {
     RapidYenc::decoder_init();
@@ -30,4 +31,24 @@ extern "C" int weaver_rapidyenc_decode_end(
     *consumed = (unsigned long long)((const unsigned char*)s - (const unsigned char*)src);
     *written = (unsigned long long)((unsigned char*)d - (unsigned char*)dest);
     return (int)end;
+}
+
+// CRC32 counterpart, for the crc_probe attribution harness. `crc32_init()` is a
+// separate initializer from `decoder_init()` (it builds the slice table and then
+// installs the PCLMUL/VPCLMUL/ARM function pointers), so it must be called
+// before weaver_rapidyenc_crc32.
+extern "C" void weaver_rapidyenc_crc32_init(void) {
+    RapidYenc::crc32_init();
+}
+
+// `init` is the previous CRC in the finalized (post-xor) domain, matching
+// weaver's Crc32 and crc_fast; pass 0 for a fresh checksum.
+extern "C" uint32_t weaver_rapidyenc_crc32(const void* data, unsigned long long len, uint32_t init) {
+    return RapidYenc::crc32(data, (size_t)len, init);
+}
+
+// Which CRC kernel rapidyenc's own dispatch installed (YEncDecIsaLevel, see
+// rapidyenc src/common.h). Reported by the probe as rapidyenc-side attribution.
+extern "C" int weaver_rapidyenc_crc32_isa(void) {
+    return RapidYenc::crc32_isa_level();
 }

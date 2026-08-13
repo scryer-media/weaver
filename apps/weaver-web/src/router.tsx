@@ -76,6 +76,10 @@ export const router = createBrowserRouter([
         ...lazyNamedRoute(() => import("@/pages/MetricsPage"), "MetricsPage"),
       },
       {
+        path: "system-info",
+        ...lazyNamedRoute(() => import("@/pages/SystemInfoPage"), "SystemInfoPage"),
+      },
+      {
         path: "history",
         ...lazyNamedRoute(() => import("@/pages/History"), "History"),
       },

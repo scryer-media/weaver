@@ -19,6 +19,7 @@ pub(crate) async fn run(
     base_url: &str,
     log_ring_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let started_at = std::time::Instant::now();
     let security = RuntimeSecurityConfig::from_env()?;
     let data_dir = PathBuf::from(&config.data_dir);
     let intermediate_dir = PathBuf::from(config.intermediate_dir());
@@ -37,6 +38,7 @@ pub(crate) async fn run(
         buffers,
         write_buf_max,
     } = wiring::build_runtime_context(&data_dir);
+    let system_profile = profile.clone();
 
     // Detect server capabilities (pipelining, etc.) and build NNTP client.
     wiring::detect_server_capabilities(&mut config, &db).await;
@@ -177,6 +179,10 @@ pub(crate) async fn run(
         watch_folder: watch_folder.clone(),
         schedules: shared_schedules,
         log_buffer: log_ring_buffer,
+        system_runtime: weaver_server_api::SystemRuntimeContext {
+            profile: system_profile,
+            started_at,
+        },
         nntp_pool: Some(nntp_pool.clone()),
         spawn_history_delete_worker: true,
         post_processing_service: Some(post_processing_service),

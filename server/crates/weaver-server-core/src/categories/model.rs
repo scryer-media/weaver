@@ -90,6 +90,38 @@ pub fn resolve_submission_category(
     validate_category_path_component(input).map(Some)
 }
 
+/// Resolve the configured completion parent for a category.
+///
+/// Explicit destination overrides are trusted administrator input. Categories
+/// without an override remain constrained to a single safe path component
+/// beneath `complete_dir`.
+pub fn completion_parent(
+    complete_dir: &std::path::Path,
+    categories: &[CategoryConfig],
+    category: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
+    let Some(category) = category.filter(|category| !category.is_empty()) else {
+        return Ok(complete_dir.to_path_buf());
+    };
+
+    if let Some(custom_dest) = categories
+        .iter()
+        .find(|configured| configured.name.eq_ignore_ascii_case(category))
+        .and_then(|configured| configured.dest_dir.as_deref())
+        .filter(|destination| !destination.is_empty())
+    {
+        return Ok(std::path::PathBuf::from(custom_dest));
+    }
+
+    let category = validate_category_path_component(category)
+        .map_err(|error| format!("unsafe completion category: {error}"))?;
+    let parent = complete_dir.join(category);
+    if !parent.starts_with(complete_dir) {
+        return Err("unsafe completion category escaped the complete directory".to_string());
+    }
+    Ok(parent)
+}
+
 /// Simple case-insensitive glob matcher supporting `*` (any sequence) and `?` (any single char).
 fn glob_match_ci(pattern: &str, input: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();

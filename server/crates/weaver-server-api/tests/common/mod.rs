@@ -12,8 +12,8 @@ use tokio::task::JoinHandle;
 
 use weaver_server_api::auth::{CallerIdentity, CallerScope, LoginAuthCache};
 use weaver_server_api::{
-    RssService, SchemaContext, TestDbTaskHookGuard, WeaverSchema, build_schema,
-    install_test_db_task_hook,
+    RssService, SchemaContext, SystemRuntimeContext, TestDbTaskHookGuard, WeaverSchema,
+    build_schema, install_test_db_task_hook,
 };
 use weaver_server_core::auth::ApiKeyCache;
 use weaver_server_core::events::model::PipelineEvent;
@@ -224,6 +224,33 @@ impl TestHarness {
             schedules: shared_schedules,
             log_buffer:
                 weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
+            system_runtime: SystemRuntimeContext {
+                profile: weaver_server_core::runtime::system_profile::SystemProfile {
+                    cpu: weaver_server_core::runtime::system_profile::CpuProfile {
+                        physical_cores: 4,
+                        logical_cores: 8,
+                        simd: weaver_server_core::runtime::system_profile::SimdSupport::default(),
+                        cgroup_limit: None,
+                    },
+                    memory: weaver_server_core::runtime::system_profile::MemoryProfile {
+                        total_bytes: 8 * 1024 * 1024 * 1024,
+                        available_bytes: 4 * 1024 * 1024 * 1024,
+                        cgroup_limit: None,
+                    },
+                    disk: weaver_server_core::runtime::system_profile::DiskProfile {
+                        storage_class:
+                            weaver_server_core::runtime::system_profile::StorageClass::Unknown,
+                        filesystem:
+                            weaver_server_core::runtime::system_profile::FilesystemType::Unknown(
+                                String::new(),
+                            ),
+                        sequential_write_mbps: 0.0,
+                        random_read_iops: 0.0,
+                        same_filesystem: true,
+                    },
+                },
+                started_at: std::time::Instant::now(),
+            },
             nntp_pool: None,
             spawn_history_delete_worker,
             post_processing_service: None,

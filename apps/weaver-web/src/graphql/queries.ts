@@ -631,14 +631,43 @@ export const LIVE_METRICS_QUERY = gql`
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
-export const DISK_USAGE_QUERY = gql`
-  query DiskUsage {
-    diskUsage {
-      label
-      path
-      totalBytes
-      usedBytes
-      freeBytes
+export const SYSTEM_INFO_QUERY = gql`
+  query SystemInfo {
+    systemInfo {
+      version
+      uptimeSeconds
+      deployment
+      operatingSystem
+      architecture
+      databaseEngine
+      compute {
+        physicalCores
+        logicalCores
+        cgroupLimit
+        decoderTier
+        simdFeatures
+      }
+      memory {
+        totalBytes
+        availableAtStartupBytes
+        cgroupLimitBytes
+        effectiveLimitBytes
+      }
+      primaryStorage {
+        storageClass
+        filesystem
+        startupRandomReadIops
+      }
+      configuredStorage {
+        labels
+        path
+        error
+        capacity {
+          totalBytes
+          usedBytes
+          freeBytes
+        }
+      }
     }
   }
 `;

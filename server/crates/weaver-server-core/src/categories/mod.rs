@@ -6,6 +6,6 @@ pub mod repository;
 pub mod service;
 
 pub use model::{
-    CategoryConfig, CategoryValidationError, resolve_category, resolve_submission_category,
-    validate_category_path_component,
+    CategoryConfig, CategoryValidationError, completion_parent, resolve_category,
+    resolve_submission_category, validate_category_path_component,
 };
