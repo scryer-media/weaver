@@ -259,6 +259,7 @@ impl Pipeline {
             write_buffers: HashMap::new(),
             par2_runtime: HashMap::new(),
             live_par2: crate::pipeline::repair::live::LivePar2Registry::new(),
+            block_crcs: crate::pipeline::integrity::BlockCrcCollector::new(),
             direct_store: crate::pipeline::direct_store::wiring::DirectStoreRuntime::with_settings(
                 direct_store_settings,
             ),
@@ -1993,6 +1994,7 @@ mod disk_write_handle_cache_tests {
             part_crc: 0,
             part_crc_verified: false,
             yenc_name: String::new(),
+            segments: Vec::new(),
         }
     }
 

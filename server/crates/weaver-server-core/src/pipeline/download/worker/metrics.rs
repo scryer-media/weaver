@@ -312,6 +312,7 @@ impl Pipeline {
                     expected_file_crc: result.expected_file_crc,
                     data,
                     yenc_name: result.metadata.name,
+                    segments: result.segments,
                 }))
             }
             Err(weaver_nntp::client::DecodedBodyError::Nntp(error)) => {

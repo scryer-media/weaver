@@ -1,6 +1,9 @@
+use std::num::NonZeroU64;
+
 use crate::crc::Crc32;
 use crate::error::YencError;
 use crate::header;
+use crate::segment::{Segment, SegmentedCrc32};
 use crate::types::{CrcVerification, DecodeResult, YencHeaderDefects, YencMetadata};
 
 /// Decoder state equivalent to rapidyenc's public `RapidYencDecoderState`.
@@ -206,6 +209,7 @@ fn finalize_decode(
     yend: Option<header::YendFields>,
     bytes_written: usize,
     part_crc: u32,
+    segments: Vec<Segment>,
 ) -> Result<DecodeResult, YencError> {
     let (expected_part_crc, expected_file_crc, yend_size, yend_defects, has_trailer) = match yend {
         Some(yend) => (yend.pcrc32, yend.crc32, yend.size, yend.defects, true),
@@ -273,6 +277,7 @@ fn finalize_decode(
         crc_status,
         has_trailer,
         defects,
+        segments,
     })
 }
 
@@ -310,7 +315,26 @@ pub fn decode_with_options(
 
     let part_crc = crc.finalize();
 
-    finalize_decode(parsed.metadata, parsed.yend, bytes_written, part_crc)
+    // The whole-buffer entry has no chunk boundaries to checkpoint against and
+    // no PAR2 block size to checkpoint at, so it reports the same single
+    // segment a streaming decode with no segment plan would.
+    let segments = if bytes_written > 0 {
+        vec![Segment {
+            file_offset: parsed.metadata.article_file_offset(),
+            len: bytes_written as u64,
+            crc32: part_crc,
+        }]
+    } else {
+        Vec::new()
+    };
+
+    finalize_decode(
+        parsed.metadata,
+        parsed.yend,
+        bytes_written,
+        part_crc,
+        segments,
+    )
 }
 
 /// Result of incrementally decoding a full NNTP yEnc article.
@@ -342,9 +366,9 @@ pub fn finish_streaming_result(
     decode_state: DecodeState,
 ) -> Result<DecodeResult, YencError> {
     let bytes_written = decode_state.bytes_decoded as usize;
-    let part_crc = decode_state.finalize_crc();
+    let (part_crc, segments) = decode_state.finish_segments();
 
-    finalize_decode(metadata, yend, bytes_written, part_crc)
+    finalize_decode(metadata, yend, bytes_written, part_crc, segments)
 }
 
 /// How much leading junk may precede `=ybegin` before the article is declared
@@ -373,6 +397,7 @@ pub struct StreamingArticleDecoder {
     yend_line: Option<Vec<u8>>,
     decode_state: DecodeState,
     output_reserved: bool,
+    par2_block_size: Option<NonZeroU64>,
 }
 
 impl StreamingArticleDecoder {
@@ -385,7 +410,17 @@ impl StreamingArticleDecoder {
             yend_line: None,
             decode_state: DecodeState::new(),
             output_reserved: false,
+            par2_block_size: None,
         }
+    }
+
+    /// Checkpoint this article's CRC pass at multiples of `block_size` so its
+    /// [`DecodeResult::segments`] can be folded into PAR2 block CRC32s.
+    ///
+    /// Must be set before the yEnc header is consumed; `None` (the default) is
+    /// the pre-block-size policy of one segment per article.
+    pub fn set_par2_block_size(&mut self, block_size: Option<NonZeroU64>) {
+        self.par2_block_size = block_size;
     }
 
     /// Feed the next raw NNTP BODY chunk into the decoder.
@@ -523,6 +558,8 @@ impl StreamingArticleDecoder {
             Ok(parsed) => {
                 self.decode_state
                     .set_line_length_hint(Some(parsed.metadata.line_length));
+                self.decode_state
+                    .set_segment_plan(parsed.metadata.article_file_offset(), self.par2_block_size);
                 self.metadata = Some(parsed.metadata);
                 self.stage = StreamingStage::Body;
             }
@@ -689,8 +726,14 @@ pub struct DecodeState {
     /// If true, the previous chunk ended after a raw CR and needs the next byte
     /// to decide whether this is a real CRLF line boundary.
     pub(crate) cr_pending: bool,
-    /// Running CRC32 state.
-    pub(crate) crc: Crc32,
+    /// Running CRC32 state, checkpointed at PAR2 block boundaries.
+    ///
+    /// One pass serves both integrity families: the article `pcrc32` is the
+    /// fold of every segment, and the segments themselves are the block-aligned
+    /// evidence the collector assembles into block CRC32s. With no segment plan
+    /// declared this is a single segment and behaves exactly as the plain
+    /// [`Crc32`] it replaced.
+    pub(crate) crc: SegmentedCrc32,
     /// Trusted encoded-column line length hint from `=ybegin line=...`.
     pub(crate) line_length_hint: Option<usize>,
     /// Total bytes decoded so far across all chunks.
@@ -707,7 +750,7 @@ impl DecodeState {
             at_line_start: true,
             dot_pending: false,
             cr_pending: false,
-            crc: Crc32::new(),
+            crc: SegmentedCrc32::default(),
             line_length_hint: None,
             bytes_decoded: 0,
             crc_update_calls: 0,
@@ -721,15 +764,42 @@ impl DecodeState {
             .filter(|&value| value > 0);
     }
 
+    /// Declare where this article's decoded bytes land in the reconstructed
+    /// file, and the PAR2 block size to checkpoint the CRC pass at.
+    ///
+    /// The decoders call this once the yEnc header is parsed — `file_offset`
+    /// comes from the article's own `=ypart begin` (`0` for a single-part
+    /// article), and `block_size` is the recovery set's slice size, which is
+    /// only known once a PAR2 packet set has been parsed. Passing `None` is the
+    /// availability policy for an article decoded before then: one segment for
+    /// the whole article, never a delayed or repeated decode.
+    ///
+    /// Only meaningful before the first body byte is decoded; calling it later
+    /// would discard the CRC accumulated so far, so it is a no-op then.
+    pub fn set_segment_plan(&mut self, file_offset: u64, block_size: Option<NonZeroU64>) {
+        if !self.crc.is_empty() {
+            debug_assert!(
+                false,
+                "segment plan must be declared before the first decoded byte"
+            );
+            return;
+        }
+        self.crc = SegmentedCrc32::new(file_offset, block_size);
+    }
+
     /// Finalize and return the CRC32 of all decoded data. Consumes the state.
     pub fn finalize_crc(self) -> u32 {
-        self.crc.finalize()
+        self.crc.finish_article().0
+    }
+
+    /// Finalize and return both the article CRC32 and its segment records.
+    pub fn finish_segments(self) -> (u32, Vec<Segment>) {
+        self.crc.finish_article()
     }
 
     /// Get the current CRC32 value without consuming the state.
-    /// (clones the hasher internally)
     pub fn current_crc(&self) -> u32 {
-        self.crc.current()
+        self.crc.current_crc()
     }
 }
 

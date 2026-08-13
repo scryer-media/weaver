@@ -454,7 +454,16 @@ impl LivePar2Registry {
     /// are known complete.  This makes delayed metadata, partial boundaries,
     /// and conflicting/duplicate range handling fail safe without retaining
     /// decoded payloads in Weaver.
-    pub(crate) fn schedule_settle_reads(&mut self, job_id: JobId) {
+    /// `claimed` names `(file, slice)` pairs that in-stream block verification
+    /// already adjudicated from the decode pass's CRC segments. Those slices are
+    /// not read back: the settle pass exists for spans with no in-stream
+    /// verdict, and reading a span that already has one buys nothing the
+    /// download path did not already establish.
+    pub(crate) fn schedule_settle_reads(
+        &mut self,
+        job_id: JobId,
+        claimed: &HashSet<(NzbFileId, u32)>,
+    ) {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -485,7 +494,9 @@ impl LivePar2Registry {
                 let slices = set.slice_count_for_file(binding.length);
                 let strong = &strong;
                 (0..slices).filter_map(move |slice_index| {
-                    (!strong.contains(&(binding.par2_file_id, slice_index))).then_some(LiveRead {
+                    (!strong.contains(&(binding.par2_file_id, slice_index))
+                        && !claimed.contains(&(file_id, slice_index)))
+                    .then_some(LiveRead {
                         file_id,
                         offset: slice_index as u64 * set.slice_size,
                         len: (binding.length - slice_index as u64 * set.slice_size)

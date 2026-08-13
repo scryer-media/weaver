@@ -68,6 +68,7 @@ async fn recovery_async_handoff_resets_owned_lane_caches() {
         server_modes: Vec::new(),
         compatibility,
         effective_exclude_servers: Vec::new(),
+        par2_block_size: None,
         works: vec![work],
     };
 
@@ -2918,6 +2919,7 @@ async fn dispatch_downloads_respects_hard_write_byte_pressure() {
         part_crc: par2_rs::checksum::crc32(&vec![7u8; 4096]),
         part_crc_verified: true,
         yenc_name: "queued.bin".to_string(),
+        segments: Vec::new(),
     };
     let buffered_len = buffered.len_bytes();
     pipeline
@@ -4615,6 +4617,7 @@ async fn owned_download_lane_capacity_failure_requeues_without_async_fallback() 
         server_modes: Vec::new(),
         compatibility,
         effective_exclude_servers: Vec::new(),
+        par2_block_size: None,
         works: vec![work],
     };
     pipeline
@@ -5838,6 +5841,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
                 expected_file_crc: None,
                 data: DecodedChunk::from(payload.clone()),
                 yenc_name: filename.to_string(),
+                segments: Vec::new(),
             })),
             attempts: Vec::new(),
             lane_observation: None,

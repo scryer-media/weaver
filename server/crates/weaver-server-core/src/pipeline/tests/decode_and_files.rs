@@ -443,6 +443,7 @@ async fn queued_yenc_layout_mismatch_retries_before_decode_acceptance() {
                 expected_file_crc: None,
                 data: DecodedChunk::from(b"data".to_vec()),
                 yenc_name: filename.to_string(),
+                segments: Vec::new(),
             },
             source: SegmentSource {
                 source_server_idx: Some(1),
@@ -519,6 +520,7 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
                 expected_file_crc: None,
                 data: DecodedChunk::from(b"data".to_vec()),
                 yenc_name: filename.to_string(),
+                segments: Vec::new(),
             })),
             attempts: Vec::new(),
             lane_observation: None,
@@ -762,6 +764,7 @@ async fn fail_job_clears_write_backlog_accounting() {
         part_crc: par2_rs::checksum::crc32(&vec![3u8; 4096]),
         part_crc_verified: true,
         yenc_name: "stalled.bin".to_string(),
+        segments: Vec::new(),
     };
     let buffered_len = buffered.len_bytes();
     pipeline
@@ -1040,6 +1043,7 @@ async fn disk_write_failure_fails_job_before_commit() {
                 part_crc_verified: true,
                 part_crc: par2_rs::checksum::crc32(b"fail"),
                 expected_file_crc: None,
+                segments: Vec::new(),
                 data: DecodedChunk::from(b"fail".to_vec()),
                 yenc_name: "blocked.bin".to_string(),
             },
@@ -1323,6 +1327,7 @@ async fn completed_file_uses_decoded_size_when_raw_article_bytes_are_larger() {
                 part_crc_verified: true,
                 part_crc: par2_rs::checksum::crc32(payload),
                 expected_file_crc: Some(par2_rs::checksum::crc32(payload)),
+                segments: Vec::new(),
                 data: DecodedChunk::from(payload.to_vec()),
                 yenc_name: filename.to_string(),
             },
@@ -1867,6 +1872,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
         part_crc: par2_rs::checksum::crc32(&buffered_payload),
         part_crc_verified: true,
         yenc_name: "episode.bin".to_string(),
+        segments: Vec::new(),
     };
     let buffered_len = buffered.len_bytes();
     pipeline
@@ -1989,6 +1995,7 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
         part_crc: par2_rs::checksum::crc32(&original_payload[64..]),
         part_crc_verified: true,
         yenc_name: payload_filename.to_string(),
+        segments: Vec::new(),
     };
     let buffered_len = buffered.len_bytes();
     pipeline

@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::num::NonZeroU64;
 #[cfg(not(windows))]
 use std::os::fd::AsRawFd;
 #[cfg(not(windows))]
@@ -113,6 +114,7 @@ struct RawS2nConnection {
 
 pub struct BlockingBodyLane {
     conn: BlockingNntpConnection,
+    par2_block_size: Option<NonZeroU64>,
     server_id: ServerId,
     stable_server_id: StableServerId,
     remote_ip: IpAddr,
@@ -137,9 +139,20 @@ pub struct BlockingNntpConnection {
     poisoned: bool,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
+    /// PAR2 block size the next decoded article's CRC pass checkpoints at.
+    /// Set per fetch by the lane; see [`NntpConnection::set_par2_block_size`].
+    par2_block_size: Option<NonZeroU64>,
 }
 
 impl BlockingBodyLane {
+    /// Checkpoint the CRC pass of every article decoded on this lane at
+    /// multiples of the recovery set's PAR2 block size. Re-applied to the
+    /// connection on every fetch, so an owned lane reused by another job never
+    /// carries the previous job's grid.
+    pub fn set_par2_block_size(&mut self, block_size: Option<NonZeroU64>) {
+        self.par2_block_size = block_size;
+    }
+
     // These are independent lane identity, transfer policy, address-selection,
     // group, and ownership inputs at the engine boundary.
     #[allow(clippy::too_many_arguments)]
@@ -171,6 +184,7 @@ impl BlockingBodyLane {
                     let remote_ip = conn.remote_ip();
                     return Ok(Self {
                         conn,
+                        par2_block_size: None,
                         server_id,
                         stable_server_id,
                         remote_ip,
@@ -190,6 +204,7 @@ impl BlockingBodyLane {
             let remote_ip = conn.remote_ip();
             Ok(Self {
                 conn,
+                par2_block_size: None,
                 server_id,
                 stable_server_id,
                 remote_ip,
@@ -427,6 +442,7 @@ impl BlockingBodyLane {
         estimated_body_bytes: u64,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
         let mut budget = ActiveTransferBudget::new(self.soft_timeout);
+        self.conn.set_par2_block_size(self.par2_block_size);
         match self.conn.stream_yenc_article_with_active_budget(
             message_id,
             estimated_body_bytes,
@@ -442,6 +458,7 @@ impl BlockingBodyLane {
 
     fn read_next_decoded_body(&mut self) -> std::result::Result<DecodedBody, DecodedBodyError> {
         let mut budget = ActiveTransferBudget::new(self.soft_timeout);
+        self.conn.set_par2_block_size(self.par2_block_size);
         match self
             .conn
             .stream_next_yenc_article_with_active_budget(&mut budget)
@@ -534,6 +551,12 @@ impl BlockingBodyLane {
 }
 
 impl BlockingNntpConnection {
+    /// Declare the PAR2 block size for articles decoded on this connection from
+    /// now on. `None` is one segment per article.
+    pub fn set_par2_block_size(&mut self, block_size: Option<NonZeroU64>) {
+        self.par2_block_size = block_size;
+    }
+
     pub fn connect_with_ip_policy(
         config: &ServerConfig,
         excluded_ips: &[IpAddr],
@@ -626,6 +649,7 @@ impl BlockingNntpConnection {
             poisoned: false,
             transfer_control: None,
             body_accounting: VecDeque::new(),
+            par2_block_size: None,
         };
 
         let greeting = conn.read_response()?;
@@ -1131,6 +1155,7 @@ impl BlockingNntpConnection {
         };
         let profile_cpu = profile_cpu_timings_enabled();
         decoder.set_profile_cpu(profile_cpu);
+        decoder.set_par2_block_size(self.par2_block_size);
         let mut read_calls = 0u64;
         let mut read_bytes = 0u64;
         let mut transport_read = TransportReadStats::default();

@@ -9,6 +9,7 @@ pub mod download;
 mod extraction;
 mod health;
 mod infrastructure_retry;
+pub(crate) mod integrity;
 mod orchestrator;
 mod progress;
 mod repair;
@@ -260,6 +261,12 @@ pub(super) struct DownloadBatchLease {
     /// server ordering and lane acquisition use. Results keep reporting the
     /// compatibility (failure-only) excludes; retention stays job-derived.
     pub(super) effective_exclude_servers: Vec<usize>,
+    /// The job's PAR2 block size at the moment the batch was leased, if its
+    /// recovery set has been parsed. Every article decoded on this batch's lane
+    /// checkpoints its CRC pass on that grid; `None` means one segment per
+    /// article, which is what a batch leased before the PAR2 files arrived gets
+    /// and is never worth delaying a download for.
+    pub(super) par2_block_size: Option<std::num::NonZeroU64>,
     pub(super) works: Vec<DownloadWork>,
 }
 
@@ -1265,6 +1272,10 @@ pub(super) struct DecodeResult {
     pub(super) data: DecodedChunk,
     /// Original filename from the yEnc header (for swap detection observability).
     pub(super) yenc_name: String,
+    /// The decode pass's CRC32 segments, cut at PAR2 block boundaries when the
+    /// recovery set's block size was known to the decoder. [`Self::part_crc`] is
+    /// their fold, so they add evidence without changing any verdict.
+    pub(super) segments: Vec<weaver_yenc::Segment>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1519,6 +1530,9 @@ pub(super) struct BufferedDecodedSegment {
     pub(super) part_crc: u32,
     pub(super) part_crc_verified: bool,
     pub(super) yenc_name: String,
+    /// Block-aligned CRC32 segments carried from the decoder to the evidence
+    /// collector, which runs after the bytes are durable.
+    pub(super) segments: Vec<weaver_yenc::Segment>,
 }
 
 impl BufferedChunk for BufferedDecodedSegment {
@@ -1738,6 +1752,9 @@ pub struct Pipeline {
     pub(super) persisted_file_progress: HashMap<NzbFileId, u64>,
     /// Streaming checksum state for files whose decoded bytes have been observed in order.
     pub(super) file_hash_states: HashMap<NzbFileId, CompletedFileChecksumState>,
+    /// In-stream PAR2 block CRC32s assembled from the decode pass's segments.
+    /// See [`crate::pipeline::integrity`] for the verification policy.
+    pub(super) block_crcs: crate::pipeline::integrity::BlockCrcCollector,
     /// Decoded bytes for out-of-order persisted ranges waiting to be replayed into the streaming checksum.
     pub(super) deferred_file_hash_data: HashMap<NzbFileId, BTreeMap<u64, DeferredFileHashChunk>>,
     pub(super) deferred_file_hash_data_bytes: usize,

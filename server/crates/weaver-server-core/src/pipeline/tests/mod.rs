@@ -1784,6 +1784,14 @@ async fn submit_decoded_segment_with_part_crc_verified(
                 expected_file_crc,
                 data: DecodedChunk::from(data.to_vec()),
                 yenc_name: filename.to_string(),
+                // What a decoder with no PAR2 block size declared emits: one
+                // segment covering the whole article, based where `=ypart`
+                // places it.
+                segments: vec![weaver_yenc::Segment {
+                    file_offset: yenc_layout.begin.map_or(0, |begin| begin.saturating_sub(1)),
+                    len: data.len() as u64,
+                    crc32: par2_rs::checksum::crc32(data),
+                }],
             },
             SegmentSource {
                 source_server_idx: None,
@@ -1833,6 +1841,14 @@ async fn submit_decoded_segment_from_server(
                 expected_file_crc,
                 data: DecodedChunk::from(data.to_vec()),
                 yenc_name: filename.to_string(),
+                // What a decoder with no PAR2 block size declared emits: one
+                // segment covering the whole article, based where `=ypart`
+                // places it.
+                segments: vec![weaver_yenc::Segment {
+                    file_offset: yenc_layout.begin.map_or(0, |begin| begin.saturating_sub(1)),
+                    len: data.len() as u64,
+                    crc32: par2_rs::checksum::crc32(data),
+                }],
             },
             SegmentSource {
                 source_server_idx,

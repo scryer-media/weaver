@@ -1,0 +1,539 @@
+use std::collections::{BTreeMap, HashMap};
+
+use super::*;
+use crate::jobs::ids::JobId;
+
+const JOB: JobId = JobId(4242);
+
+fn file(index: u32) -> NzbFileId {
+    NzbFileId {
+        job_id: JOB,
+        file_index: index,
+    }
+}
+
+/// Deterministic xorshift64*: every fixture below is a pure function of a seed.
+struct Rng(u64);
+
+impl Rng {
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn range(&mut self, low: u64, high: u64) -> u64 {
+        low + self.next_u64() % (high - low + 1)
+    }
+}
+
+fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut rng = Rng(seed | 1);
+    (0..len).map(|_| (rng.next_u64() >> 33) as u8).collect()
+}
+
+fn direct_crc(data: &[u8]) -> u32 {
+    par2_rs::checksum::crc32(data)
+}
+
+fn block(size: u64) -> NonZeroU64 {
+    NonZeroU64::new(size).expect("non-zero block size")
+}
+
+/// Run one article's bytes through the real decoder's checkpointing CRC pass,
+/// returning what the decoder would hand the collector.
+fn decode_article_segments(
+    data: &[u8],
+    file_offset: u64,
+    block_size: Option<NonZeroU64>,
+    chunk: usize,
+) -> (u32, Vec<Segment>) {
+    let mut pass = weaver_yenc::SegmentedCrc32::new(file_offset, block_size);
+    for slice in data.chunks(chunk.max(1)) {
+        pass.update(slice);
+    }
+    pass.finish_article()
+}
+
+#[test]
+fn crc32_of_zeros_matches_a_direct_hash() {
+    for len in [
+        0u64, 1, 2, 3, 7, 8, 15, 16, 17, 63, 64, 255, 256, 1000, 4096, 65_537,
+    ] {
+        assert_eq!(
+            crc32_of_zeros(len),
+            direct_crc(&vec![0u8; len as usize]),
+            "len {len}"
+        );
+    }
+}
+
+#[test]
+fn fold_tiling_rejects_gaps_overlaps_and_short_tilings() {
+    let a = Segment {
+        file_offset: 0,
+        len: 10,
+        crc32: 0x1111_1111,
+    };
+    let gapped = Segment {
+        file_offset: 11,
+        len: 9,
+        crc32: 0x2222_2222,
+    };
+    let overlapping = Segment {
+        file_offset: 9,
+        len: 11,
+        crc32: 0x3333_3333,
+    };
+    let empty = Segment {
+        file_offset: 10,
+        len: 0,
+        crc32: 0,
+    };
+    assert_eq!(fold_tiling(&[], 0, 20), None);
+    assert_eq!(fold_tiling(&[a], 0, 10), Some(a.crc32));
+    assert_eq!(fold_tiling(&[a], 0, 20), None, "short tiling");
+    assert_eq!(fold_tiling(&[a, gapped], 0, 20), None, "gap");
+    assert_eq!(fold_tiling(&[a, overlapping], 0, 20), None, "overlap");
+    // A zero-length record must not be able to bridge anything: the combine
+    // operator's zero-length case is the identity on its first argument, so
+    // accepting one would discard the record that followed it.
+    assert_eq!(fold_tiling(&[a, empty], 0, 10), None, "zero-length record");
+}
+
+/// Gate 1 over the collector rather than the primitive: derived block CRC32s
+/// must equal a direct CRC over the block's bytes, for random files split into
+/// random articles at random offsets against random block sizes, including
+/// articles that straddle several boundaries and the short final block.
+#[test]
+fn derived_block_crcs_match_direct_over_random_article_tilings() {
+    let mut blocks_checked = 0usize;
+    let mut short_final_blocks = 0usize;
+    let mut multi_article_blocks = 0usize;
+    let mut straddle_histogram = [0usize; 8];
+
+    for seed in 0..48u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let block_size = block(match seed % 6 {
+            0 => 1,
+            1 => 64,
+            2 => 512,
+            3 => 1000,
+            4 => rng.range(2, 4096),
+            _ => rng.range(2, 400),
+        });
+        let file_len = rng.range(1, 30_000) as usize;
+        let payload = random_bytes(seed ^ 0xfeed_face, file_len);
+
+        // Random article tiling of the whole file.
+        let mut bounds = vec![0usize];
+        while *bounds.last().expect("seeded") < file_len {
+            let start = *bounds.last().expect("seeded");
+            let step = rng.range(1, 2500) as usize;
+            bounds.push((start + step).min(file_len));
+        }
+
+        let mut collector = BlockCrcCollector::new();
+        let file_id = file(seed as u32);
+        // Some articles arrive out of order, and a leading prefix of them
+        // arrives before the block size is known.
+        let mut order: Vec<usize> = (0..bounds.len() - 1).collect();
+        if seed % 3 == 0 {
+            order.reverse();
+        }
+        let pre_blocksize_count = (seed % 4) as usize;
+
+        for (position, &article) in order.iter().enumerate() {
+            let (start, end) = (bounds[article], bounds[article + 1]);
+            let known = position >= pre_blocksize_count;
+            let (part_crc, segments) = decode_article_segments(
+                &payload[start..end],
+                start as u64,
+                known.then_some(block_size),
+                rng.range(1, 700) as usize,
+            );
+            assert_eq!(part_crc, direct_crc(&payload[start..end]));
+            if known {
+                straddle_histogram[(segments.len() - 1).min(7)] += 1;
+            }
+            collector.note_article(
+                file_id,
+                block_size,
+                start as u64,
+                (end - start) as u64,
+                part_crc,
+                &segments,
+            );
+        }
+        collector.note_file_len(file_id, file_len as u64);
+
+        let size = block_size.get();
+        for (block_index, derived) in collector.derived_blocks(file_id) {
+            let start = u64::from(block_index) * size;
+            let end = (start + size).min(file_len as u64);
+            assert_eq!(
+                derived,
+                direct_crc(&payload[start as usize..end as usize]),
+                "seed {seed} block {block_index} [{start},{end}) size {size}"
+            );
+            blocks_checked += 1;
+            if end - start < size {
+                short_final_blocks += 1;
+            }
+            let spanning = bounds
+                .windows(2)
+                .filter(|w| (w[0] as u64) < end && (w[1] as u64) > start)
+                .count();
+            if spanning > 1 {
+                multi_article_blocks += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "derived_block_crcs: {blocks_checked} blocks, {short_final_blocks} short final, \
+         {multi_article_blocks} spanning >1 article, articles by boundaries straddled \
+         {straddle_histogram:?}"
+    );
+    assert!(blocks_checked > 500, "blocks checked {blocks_checked}");
+    assert!(short_final_blocks > 0, "no short final block was closed");
+    assert!(
+        multi_article_blocks > 0,
+        "no block was assembled from more than one article"
+    );
+    for straddled in 0..3usize {
+        assert!(
+            straddle_histogram[straddled] > 0,
+            "no article straddling {straddled} boundaries; {straddle_histogram:?}"
+        );
+    }
+}
+
+#[test]
+fn a_missing_article_leaves_its_blocks_unclaimed() {
+    let payload = random_bytes(0xa11, 4096);
+    let block_size = block(1024);
+    let file_id = file(0);
+    let mut collector = BlockCrcCollector::new();
+
+    // Feed everything except [1024, 2048): blocks 0 and 2..3 stay claimable
+    // (block 0 is covered by the first article), block 1 has a hole.
+    for (start, end) in [(0usize, 1024usize), (2048, 4096)] {
+        let (part_crc, segments) =
+            decode_article_segments(&payload[start..end], start as u64, Some(block_size), 97);
+        collector.note_article(
+            file_id,
+            block_size,
+            start as u64,
+            (end - start) as u64,
+            part_crc,
+            &segments,
+        );
+    }
+    collector.note_file_len(file_id, payload.len() as u64);
+
+    let derived: Vec<u32> = collector
+        .derived_blocks(file_id)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(derived, vec![0, 2, 3], "block 1 must stay unclaimed");
+}
+
+#[test]
+fn segments_contradicting_the_pipeline_placement_are_reduced_to_one_record() {
+    let payload = random_bytes(0xbad0, 2048);
+    let block_size = block(512);
+    let file_id = file(0);
+    let mut collector = BlockCrcCollector::new();
+
+    // The poster's `=ypart begin` claimed offset 0 while the pipeline placed the
+    // article at 1024: the segments were cut on a grid that does not exist.
+    let (part_crc, segments) = decode_article_segments(&payload[1024..], 0, Some(block_size), 64);
+    collector.note_article(file_id, block_size, 1024, 1024, part_crc, &segments);
+    collector.note_file_len(file_id, 2048);
+
+    assert_eq!(collector.rebased_articles(), 1);
+    // The whole-article record still tiles blocks 2 and 3's union, but neither
+    // block on its own, so nothing is claimed from a grid that was never real.
+    assert_eq!(collector.derived_blocks(file_id).count(), 0);
+
+    // The same article placed where its own segments say it is composes fully.
+    let mut honest = BlockCrcCollector::new();
+    honest.note_article(file_id, block_size, 0, 1024, part_crc, &segments);
+    honest.note_file_len(file_id, 1024);
+    assert_eq!(honest.rebased_articles(), 0);
+    assert_eq!(honest.derived_blocks(file_id).count(), 2);
+}
+
+#[test]
+fn pending_segments_are_retired_as_blocks_close() {
+    let payload = random_bytes(0xc0de, 8192);
+    let block_size = block(1024);
+    let file_id = file(0);
+    let mut collector = BlockCrcCollector::new();
+
+    for start in (0..8192).step_by(512) {
+        let end = start + 512;
+        let (part_crc, segments) =
+            decode_article_segments(&payload[start..end], start as u64, Some(block_size), 128);
+        collector.note_article(file_id, block_size, start as u64, 512, part_crc, &segments);
+    }
+    collector.note_file_len(file_id, 8192);
+
+    assert_eq!(collector.derived_blocks(file_id).count(), 8);
+    let entry = collector.files.get(&file_id).expect("file tracked");
+    assert!(
+        entry.pending.is_empty(),
+        "closed blocks must not retain their segments: {} left",
+        entry.pending.len()
+    );
+}
+
+// --- PAR2 fixture plumbing, matching the shape the live-PAR2 tests use. ---
+
+fn par2_file_id(filename: &str, data: &[u8]) -> par2_rs::FileId {
+    let mut input = Vec::new();
+    input.extend_from_slice(&par2_rs::checksum::md5(&data[..data.len().min(16 * 1024)]));
+    input.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    input.extend_from_slice(filename.as_bytes());
+    par2_rs::FileId::from_bytes(par2_rs::checksum::md5(&input))
+}
+
+fn slice_checksums(data: &[u8], slice_size: u64) -> Vec<par2_rs::SliceChecksum> {
+    let mut checksums = Vec::new();
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let end = (offset + slice_size as usize).min(data.len());
+        let mut state = par2_rs::SliceChecksumState::new();
+        state.update(&data[offset..end]);
+        let (crc32, md5) = state.finalize(Some(slice_size));
+        checksums.push(par2_rs::SliceChecksum { crc32, md5 });
+        offset = end;
+    }
+    checksums
+}
+
+fn fixture_set(filename: &str, data: &[u8], slice_size: u64) -> par2_rs::Par2FileSet {
+    let file_id = par2_file_id(filename, data);
+    let mut files = HashMap::new();
+    files.insert(
+        file_id,
+        par2_rs::FileDescription {
+            file_id,
+            hash_full: par2_rs::checksum::md5(data),
+            hash_16k: par2_rs::checksum::md5(&data[..data.len().min(16 * 1024)]),
+            length: data.len() as u64,
+            par2_name: filename.to_string(),
+            filename: filename.to_string(),
+        },
+    );
+    let mut slice_checksums_map = HashMap::new();
+    slice_checksums_map.insert(file_id, slice_checksums(data, slice_size));
+
+    par2_rs::Par2FileSet {
+        recovery_set_id: par2_rs::RecoverySetId::from_bytes([3; 16]),
+        slice_size,
+        recovery_file_ids: vec![file_id],
+        non_recovery_file_ids: Vec::new(),
+        files,
+        slice_checksums: slice_checksums_map,
+        recovery_slices: BTreeMap::new(),
+        creator: None,
+    }
+}
+
+/// Encode `payload` into multi-part yEnc articles and decode them back through
+/// the production streaming decoder with the recovery set's block size
+/// declared, so this exercises decode -> segments -> collector rather than a
+/// hand-built segment list.
+fn decode_articles_into(
+    collector: &mut BlockCrcCollector,
+    file_id: NzbFileId,
+    payload: &[u8],
+    article_len: usize,
+    block_size: NonZeroU64,
+    damage: &dyn Fn(usize, &mut Vec<u8>),
+) {
+    let total = payload.len().div_ceil(article_len) as u32;
+    for (index, chunk) in payload.chunks(article_len).enumerate() {
+        let begin = (index * article_len) as u64;
+        let mut part = chunk.to_vec();
+        damage(index, &mut part);
+
+        let mut article = Vec::new();
+        weaver_yenc::encode_part(
+            &part,
+            &mut article,
+            128,
+            "payload.bin",
+            index as u32 + 1,
+            total,
+            begin + 1,
+            begin + part.len() as u64,
+            payload.len() as u64,
+        )
+        .expect("encode");
+
+        let mut decoder = weaver_yenc::StreamingArticleDecoder::new();
+        decoder.set_par2_block_size(Some(block_size));
+        let mut output = Vec::new();
+        // Feed in awkward chunks: the segments must not depend on them.
+        for slice in article.chunks(37) {
+            decoder.feed_chunk(slice, &mut output).expect("feed");
+        }
+        let decoded = decoder.finish(output).expect("finish");
+
+        collector.note_article(
+            file_id,
+            block_size,
+            begin,
+            decoded.result.bytes_written as u64,
+            decoded.result.part_crc,
+            &decoded.result.segments,
+        );
+    }
+    collector.note_file_len(file_id, payload.len() as u64);
+}
+
+/// Gate 4: a damaged article flows decode -> segments -> collector -> verdicts,
+/// and the blocks it damaged are named exactly, with no read-back of any block.
+#[test]
+fn a_damaged_article_is_localised_to_exactly_its_blocks_with_no_read_back() {
+    // 9500 bytes over 1024-byte blocks: 9 full blocks and a 316-byte final one,
+    // with 700-byte articles so blocks and articles are mutually unaligned and
+    // one damaged article touches more than one block.
+    let payload = random_bytes(0xd00d, 9500);
+    let block_size = block(1024);
+    let par2_set = fixture_set("payload.bin", &payload, block_size.get());
+    let par2_file_id = par2_file_id("payload.bin", &payload);
+    let file_id = file(0);
+
+    // Article 3 covers [2100, 2800): blocks 2 ([2048,3072)) only.
+    // Article 8 covers [5600, 6300): blocks 5 ([5120,6144)) and 6.
+    let damaged_articles = [3usize, 8];
+    let mut collector = BlockCrcCollector::new();
+    decode_articles_into(
+        &mut collector,
+        file_id,
+        &payload,
+        700,
+        block_size,
+        &|index, part| {
+            if damaged_articles.contains(&index) {
+                part[0] ^= 0xff;
+            }
+        },
+    );
+
+    let verdicts = collector.verdicts_against(file_id, &par2_set, par2_file_id);
+    let damaged: Vec<u32> = verdicts
+        .iter()
+        .filter(|(_, verdict)| **verdict == BlockVerdict::Damaged)
+        .map(|(index, _)| *index)
+        .collect();
+    let intact: Vec<u32> = verdicts
+        .iter()
+        .filter(|(_, verdict)| **verdict == BlockVerdict::Intact)
+        .map(|(index, _)| *index)
+        .collect();
+
+    // Every block is claimed: the articles tile the file and the block size was
+    // known from the first one, so nothing is left for settle-time read-back.
+    assert_eq!(verdicts.len(), 10, "verdicts {verdicts:?}");
+    // Damage at [2100] and [5600] lands in blocks 2 and 5 respectively.
+    assert_eq!(damaged, vec![2, 5], "verdicts {verdicts:?}");
+    assert_eq!(
+        intact,
+        vec![0, 1, 3, 4, 6, 7, 8, 9],
+        "verdicts {verdicts:?}"
+    );
+    assert_eq!(collector.rebased_articles(), 0);
+
+    // The short final block ([9216, 9500), 316 real bytes) is among the intact
+    // verdicts, which is the zero-padding rule being applied: comparing the
+    // unpadded CRC against the IFSC entry would have called it damaged.
+    let final_block = 9u32;
+    let derived = collector
+        .derived_block_crc(file_id, final_block)
+        .expect("final block derived");
+    assert_eq!(derived, direct_crc(&payload[9216..]));
+    assert_ne!(
+        derived,
+        par2_set
+            .file_checksums(&par2_file_id)
+            .expect("IFSC")
+            .last()
+            .expect("final slice")
+            .crc32,
+        "the fixture's final slice must actually be zero-padded, or this \
+         assertion proves nothing"
+    );
+}
+
+/// The clean counterpart: with no damage every block is intact, and the derived
+/// verdicts agree with a direct CRC of every block.
+#[test]
+fn an_undamaged_download_claims_every_block_intact() {
+    let payload = random_bytes(0x5a5a, 7000);
+    let block_size = block(512);
+    let par2_set = fixture_set("payload.bin", &payload, block_size.get());
+    let par2_file_id = par2_file_id("payload.bin", &payload);
+    let file_id = file(0);
+
+    let mut collector = BlockCrcCollector::new();
+    decode_articles_into(
+        &mut collector,
+        file_id,
+        &payload,
+        333,
+        block_size,
+        &|_, _| {},
+    );
+
+    let verdicts = collector.verdicts_against(file_id, &par2_set, par2_file_id);
+    assert_eq!(verdicts.len(), 7000_u64.div_ceil(512) as usize);
+    assert!(
+        verdicts
+            .values()
+            .all(|verdict| *verdict == BlockVerdict::Intact),
+        "verdicts {verdicts:?}"
+    );
+}
+
+/// Articles decoded before the recovery set was parsed carry one segment each,
+/// so they claim only the blocks their own boundaries happen to tile, and the
+/// rest stay unclaimed for settle-time verification. Never delayed, never
+/// re-decoded.
+#[test]
+fn pre_block_size_articles_claim_only_what_they_tile() {
+    let payload = random_bytes(0x7e57, 4096);
+    let block_size = block(1024);
+    let file_id = file(0);
+    let mut collector = BlockCrcCollector::new();
+
+    // Two 1024-byte articles decoded before the block size was known: their own
+    // boundaries do tile blocks 0 and 1. Then a 2048-byte article covering
+    // blocks 2 and 3 as one segment: it tiles neither block alone.
+    for start in [0usize, 1024] {
+        let (part_crc, segments) =
+            decode_article_segments(&payload[start..start + 1024], start as u64, None, 100);
+        assert_eq!(segments.len(), 1);
+        collector.note_article(file_id, block_size, start as u64, 1024, part_crc, &segments);
+    }
+    let (part_crc, segments) = decode_article_segments(&payload[2048..], 2048, None, 100);
+    collector.note_article(file_id, block_size, 2048, 2048, part_crc, &segments);
+    collector.note_file_len(file_id, 4096);
+
+    let claimed: Vec<u32> = collector
+        .derived_blocks(file_id)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(claimed, vec![0, 1]);
+    for (index, derived) in collector.derived_blocks(file_id) {
+        let start = index as usize * 1024;
+        assert_eq!(derived, direct_crc(&payload[start..start + 1024]));
+    }
+}

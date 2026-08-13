@@ -1903,6 +1903,7 @@ impl Pipeline {
         // blocks, so its state for this job is retired rather than trusted —
         // the same stance `run_par2_repairer` takes for a conventional repair.
         self.live_par2.remove_job(job_id);
+        self.block_crcs.forget_job(job_id);
         // Announced from here rather than from a status transition: the set
         // never enters `JobStatus::Repairing` — that status carries the repair
         // concurrency queue, and this repair holds no slot in it — so the event

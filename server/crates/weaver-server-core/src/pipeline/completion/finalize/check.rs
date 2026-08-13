@@ -1154,6 +1154,7 @@ impl Pipeline {
             // Renames move the bytes live verification bound to a name, so the
             // job's live state is retired rather than re-resolved.
             self.live_par2.remove_job(job_id);
+            self.block_crcs.forget_job(job_id);
             info!(job_id = job_id.0, renamed, "PAR2 deobfuscation complete");
         }
 
@@ -1180,6 +1181,7 @@ impl Pipeline {
             // A repair rewrites bytes the live verifier never saw, so its
             // block state is retired rather than trusted afterwards.
             self.live_par2.remove_job(job_id);
+            self.block_crcs.forget_job(job_id);
         }
 
         let memory_limit = configured_par2_repair_memory_limit_bytes();

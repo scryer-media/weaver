@@ -456,8 +456,43 @@ impl Pipeline {
         }
     }
 
+    /// Whether this file's completed-file checksum can be produced without the
+    /// streamed MD5 *and* without reading the file back.
+    ///
+    /// The streamed per-file MD5 has exactly one consumer that turns it into a
+    /// decision: PAR2 committed-file evidence, which uses it to bind a finished
+    /// file to a recovery-set description by hash identity and admit it as a
+    /// repair source without a re-read. That consumer has a substitute — the
+    /// contiguous-assembly proof, which pairs the whole-file CRC32 this
+    /// pipeline already composes from part CRCs with a 16 KiB head read — and
+    /// the substitute needs the recovery set's per-slice checksums to derive the
+    /// expected whole-file CRC32 from. A set without them can serve neither the
+    /// substitute nor in-stream block verification, so the streamed hash stays.
+    ///
+    /// The whole-file CRC32 must also have been checked against the posted
+    /// `=yend crc32`: dropping the hash is only free where something else
+    /// already adjudicated the assembled file.
+    fn completed_file_md5_substitutable(&self, file_id: NzbFileId, crc_verified: bool) -> bool {
+        if !crc_verified {
+            return false;
+        }
+        self.par2_set(file_id.job_id)
+            .is_some_and(|set| !set.slice_checksums.is_empty())
+    }
+
     fn should_stream_md5_for_file(&self, file_id: NzbFileId) -> bool {
         if self.can_defer_completed_file_md5(file_id) {
+            return false;
+        }
+        // In-stream block verification replaced the whole-file hash as the
+        // download path's evidence: PAR2 block CRC32s are strictly finer than
+        // one MD5 over the whole file, and they cost nothing beyond the CRC
+        // pass the decoder already runs. The hash is kept only where no
+        // settle-time substitute can stand in for it -- see
+        // `completed_file_md5_substitutable` -- because its absence would
+        // otherwise be paid for with a whole-file re-read at completion.
+        let expected_file_crc_known = self.expected_file_crcs.contains_key(&file_id);
+        if self.completed_file_md5_substitutable(file_id, expected_file_crc_known) {
             return false;
         }
         let Some(state) = self.jobs.get(&file_id.job_id) else {
@@ -671,12 +706,26 @@ impl Pipeline {
                             all_parts_crc_verified: streamed.all_parts_crc_verified,
                         });
                     }
-                    if expected_file_crc
-                        .is_some_and(|expected_file_crc| streamed.crc32 == expected_file_crc)
-                        && self.can_defer_completed_file_md5(file_id)
-                    {
+                    let file_crc_matched = expected_file_crc
+                        .is_some_and(|expected_file_crc| streamed.crc32 == expected_file_crc);
+                    if file_crc_matched && self.can_defer_completed_file_md5(file_id) {
                         crate::runtime::perf_probe::record(
                             "download.file_hash.md5.deferred_no_par2_expected_crc",
+                            std::time::Duration::from_nanos(1),
+                        );
+                        return Ok(CompletedFileChecksum {
+                            md5: None,
+                            crc32: streamed.crc32,
+                            all_parts_crc_verified: streamed.all_parts_crc_verified,
+                        });
+                    }
+                    // The matching half of `should_stream_md5_for_file`: where
+                    // the hash was skipped because PAR2 evidence can be captured
+                    // from the composed whole-file CRC32 instead, completion must
+                    // not undo that saving by reading the file back for it.
+                    if self.completed_file_md5_substitutable(file_id, file_crc_matched) {
+                        crate::runtime::perf_probe::record(
+                            "download.file_hash.md5.deferred_to_par2_slice_evidence",
                             std::time::Duration::from_nanos(1),
                         );
                         return Ok(CompletedFileChecksum {
@@ -927,6 +976,7 @@ impl Pipeline {
         // job's live state is retired here for the same reason the yEnc hash
         // state is invalidated above.
         self.live_par2.remove_job(file_id.job_id);
+        self.block_crcs.forget_job(file_id.job_id);
 
         self.file_crc_recoveries.insert(
             file_id,
@@ -1283,6 +1333,7 @@ impl Pipeline {
             expected_file_crc,
             data,
             yenc_name,
+            segments,
         } = result;
 
         let job_id = segment_id.file_id.job_id;
@@ -1485,6 +1536,7 @@ impl Pipeline {
                 part_crc,
                 part_crc_verified,
                 yenc_name,
+                segments,
             };
 
             if is_file_crc_recovery {
@@ -1861,6 +1913,7 @@ impl Pipeline {
             part_crc,
             part_crc_verified,
             yenc_name,
+            segments,
         } = segment;
         let job_id = segment_id.file_id.job_id;
         let file_id = segment_id.file_id;
@@ -1918,6 +1971,18 @@ impl Pipeline {
                 // bytes than the first copy did, skipping the feed would leave
                 // a verdict describing content that is no longer on disk.
                 self.note_live_par2_segment(file_id, file_offset, &data);
+
+                // In-stream block verification, on the same durability seam and
+                // for the same reason: a verdict must describe the bytes that
+                // are on disk. Positional like live PAR2, so a duplicate replays
+                // to the same records rather than double-counting a stream.
+                self.note_block_crc_segments(
+                    file_id,
+                    file_offset,
+                    data.len_bytes() as u64,
+                    part_crc,
+                    &segments,
+                );
 
                 // The file hash is a *running* stream: every chunk must be fed
                 // once, in offset order. A duplicate's bytes were already fed
@@ -2044,6 +2109,10 @@ impl Pipeline {
                     // seam) belong to the completion-gate sweep, not to the
                     // download path.
                     self.note_live_par2_file_complete(file_id, total_bytes);
+
+                    // The file's length is what makes its short final block
+                    // closable: until now that block's extent was undecided.
+                    self.block_crcs.note_file_len(file_id, total_bytes);
 
                     let expected_file_crc = self.expected_file_crcs.get(&file_id).copied();
                     let file_checksum = match self

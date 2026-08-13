@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::net::IpAddr;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -329,6 +330,7 @@ pub struct BodyLaneLease {
     mode: BodyLaneMode,
     rtt_ewma: Option<Duration>,
     rtt_samples: VecDeque<Duration>,
+    par2_block_size: Option<NonZeroU64>,
 }
 
 struct DecodedBatchItem {
@@ -378,6 +380,17 @@ impl BodyLaneLease {
         self.conn
             .as_ref()
             .is_some_and(|conn| conn.capabilities().supports_pipelining())
+    }
+
+    /// Checkpoint the CRC pass of every article decoded on this lane at
+    /// multiples of the recovery set's PAR2 block size, so the decoder's
+    /// segment records fold into block CRC32s.
+    ///
+    /// A download batch belongs to one job, so the caller sets this once per
+    /// batch. It is re-applied to the pooled connection on every fetch, so a
+    /// connection returning to the pool never carries another job's grid.
+    pub fn set_par2_block_size(&mut self, block_size: Option<NonZeroU64>) {
+        self.par2_block_size = block_size;
     }
 
     pub fn park(self) {}
@@ -727,9 +740,11 @@ impl BodyLaneLease {
         estimated_body_bytes: u64,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
         let mut budget = ActiveTransferBudget::new(self.client.soft_timeout);
+        let par2_block_size = self.par2_block_size;
         let Some(conn) = self.conn.as_mut() else {
             return Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed));
         };
+        conn.set_par2_block_size(par2_block_size);
 
         let stream_result = conn
             .stream_yenc_article_with_active_budget(
@@ -973,6 +988,7 @@ impl NntpClient {
                 mode: BodyLaneMode::Sequential,
                 rtt_ewma: None,
                 rtt_samples: VecDeque::with_capacity(16),
+                par2_block_size: None,
             }),
             Ok(Err(error)) => {
                 if is_connection_error(&error) {

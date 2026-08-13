@@ -82,6 +82,8 @@ impl Segment {
 #[derive(Debug, Clone)]
 pub struct SegmentedCrc32 {
     crc: Crc32,
+    /// File offset of the first byte fed to this pass.
+    base_offset: u64,
     /// File offset of the first byte of the segment currently open.
     open_offset: u64,
     /// File offset one past the last byte fed.
@@ -91,6 +93,10 @@ pub struct SegmentedCrc32 {
     until_boundary: Option<u64>,
     block_size: Option<NonZeroU64>,
     segments: Vec<Segment>,
+    /// In-order combine-fold of every closed segment, i.e. the CRC32 over
+    /// `[base_offset, open_offset)`. Maintained at each cut so the whole-pass
+    /// CRC is available in O(1) without re-folding the segment list.
+    closed_crc: u32,
 }
 
 impl SegmentedCrc32 {
@@ -102,18 +108,59 @@ impl SegmentedCrc32 {
     pub fn new(file_offset: u64, block_size: Option<NonZeroU64>) -> Self {
         Self {
             crc: Crc32::new(),
+            base_offset: file_offset,
             open_offset: file_offset,
             cursor: file_offset,
             until_boundary: block_size.map(|size| bytes_to_next_boundary(file_offset, size)),
             block_size,
             segments: Vec::new(),
+            closed_crc: 0,
         }
+    }
+
+    /// File offset of the first byte this pass covers.
+    #[inline]
+    pub fn base_offset(&self) -> u64 {
+        self.base_offset
     }
 
     /// File offset one past the last byte fed so far.
     #[inline]
     pub fn cursor(&self) -> u64 {
         self.cursor
+    }
+
+    /// Bytes fed so far.
+    #[inline]
+    pub fn len(&self) -> u64 {
+        self.cursor - self.base_offset
+    }
+
+    /// Whether no bytes have been fed yet.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.cursor == self.base_offset
+    }
+
+    /// The PAR2 block size this pass checkpoints at, if one was declared.
+    #[inline]
+    pub fn block_size(&self) -> Option<NonZeroU64> {
+        self.block_size
+    }
+
+    /// CRC32 over every byte fed so far — the article `pcrc32` as of the
+    /// cursor, identical to what an unsegmented [`Crc32`] over the same bytes
+    /// would report.
+    ///
+    /// Closed segments are folded in as they are cut, so this is one combine
+    /// over the open segment rather than a re-fold of the whole list.
+    #[inline]
+    pub fn current_crc(&self) -> u32 {
+        crc32_combine(
+            self.closed_crc,
+            self.crc.current(),
+            self.cursor - self.open_offset,
+        )
     }
 
     /// Segments closed so far. The segment currently open is not included;
@@ -171,17 +218,42 @@ impl SegmentedCrc32 {
         self.segments
     }
 
+    /// Close the open segment and return both the CRC32 over everything fed
+    /// (the article `pcrc32`) and the segments in file order.
+    ///
+    /// This is the decoder-facing finish: the CRC is the value an unsegmented
+    /// pass would have produced, so checkpointing cannot move an article's
+    /// verdict, and the segments are the block-aligned evidence.
+    pub fn finish_article(mut self) -> (u32, Vec<Segment>) {
+        self.checkpoint();
+        // Every closed segment has been folded into `closed_crc`, and
+        // `checkpoint` just closed the last open one, so this is the whole-pass
+        // CRC without re-folding the list.
+        (self.closed_crc, self.segments)
+    }
+
     fn cut(&mut self) {
+        let len = self.cursor - self.open_offset;
         let crc32 = self.crc.checkpoint();
         self.segments.push(Segment {
             file_offset: self.open_offset,
-            len: self.cursor - self.open_offset,
+            len,
             crc32,
         });
+        self.closed_crc = crc32_combine(self.closed_crc, crc32, len);
         self.open_offset = self.cursor;
         self.until_boundary = self
             .block_size
             .map(|size| bytes_to_next_boundary(self.cursor, size));
+    }
+}
+
+impl Default for SegmentedCrc32 {
+    /// A pass over an article whose file offset is not yet known and with no
+    /// block grid: one segment based at offset 0, i.e. exactly an unsegmented
+    /// [`Crc32`] plus a byte counter.
+    fn default() -> Self {
+        Self::new(0, None)
     }
 }
 
@@ -277,6 +349,60 @@ mod tests {
     fn empty_pass_emits_no_segments() {
         let pass = SegmentedCrc32::new(0, NonZeroU64::new(1024));
         assert_eq!(pass.finish(), Vec::new());
+    }
+
+    #[test]
+    fn empty_pass_reports_the_empty_crc() {
+        let pass = SegmentedCrc32::new(4096, NonZeroU64::new(1024));
+        assert!(pass.is_empty());
+        assert_eq!(pass.current_crc(), direct(&[]));
+        assert_eq!(pass.finish_article(), (direct(&[]), Vec::new()));
+    }
+
+    /// The incrementally folded whole-pass CRC — what the decoder reports as the
+    /// article `pcrc32` — must equal the CRC of everything fed at every prefix,
+    /// whatever the block grid. This is what makes checkpointing invisible to
+    /// the article verdict: a segmented pass and an unsegmented one agree byte
+    /// for byte, at every point, not just at the end.
+    #[test]
+    fn running_and_final_article_crc_equal_an_unsegmented_pass() {
+        let data = random_bytes(0x9ec0, 20_000);
+        for block_size in [1u64, 7, 255, 256, 257, 1024, 4096, 19_999, 20_000, 65_536] {
+            let block_size = NonZeroU64::new(block_size).expect("non-zero");
+            for offset in [0u64, 1, 255, 1000, 4096] {
+                for schedule in [vec![1usize], vec![255, 1, 256], vec![4096, 7], vec![20_000]] {
+                    let mut pass = SegmentedCrc32::new(offset, Some(block_size));
+                    let mut fed = 0usize;
+                    let mut idx = 0usize;
+                    while fed < data.len() {
+                        let end = (fed + schedule[idx % schedule.len()]).min(data.len());
+                        pass.update(&data[fed..end]);
+                        fed = end;
+                        idx += 1;
+                        assert_eq!(
+                            pass.current_crc(),
+                            direct(&data[..fed]),
+                            "block {block_size} offset {offset} prefix {fed}"
+                        );
+                        assert_eq!(pass.len(), fed as u64);
+                        assert_eq!(pass.cursor(), offset + fed as u64);
+                    }
+                    assert_eq!(pass.base_offset(), offset);
+                    assert_eq!(pass.block_size(), Some(block_size));
+
+                    let (article_crc, segments) = pass.finish_article();
+                    assert_eq!(article_crc, direct(&data));
+                    // And the folded form agrees with the incremental one, so
+                    // the O(1) accumulator cannot drift from the segment list
+                    // it is supposed to summarise.
+                    assert_eq!(
+                        combine_contiguous(&segments).expect("segments tile").crc32,
+                        article_crc,
+                        "block {block_size} offset {offset}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

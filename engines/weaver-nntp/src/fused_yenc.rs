@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
@@ -187,6 +188,7 @@ pub struct FusedYencArticleDecoder {
     output_chunks: Vec<Box<[u8]>>,
     output_reserved: bool,
     profile_cpu: bool,
+    par2_block_size: Option<NonZeroU64>,
     stats: FusedYencArticleStats,
 }
 
@@ -204,6 +206,7 @@ impl FusedYencArticleDecoder {
             output_chunks: Vec::new(),
             output_reserved: false,
             profile_cpu: false,
+            par2_block_size: None,
             stats: FusedYencArticleStats::default(),
         }
     }
@@ -273,6 +276,17 @@ impl FusedYencArticleDecoder {
         self.state == FusedArticleState::Done
     }
 
+    /// Checkpoint the decode CRC pass at multiples of the recovery set's PAR2
+    /// block size, so the article's [`weaver_yenc::DecodeResult::segments`] fold
+    /// into block CRC32s without a second pass over the decoded bytes.
+    ///
+    /// Set before the article's yEnc header is consumed. `None` (the default)
+    /// is the pre-block-size policy: one segment per article, which composes
+    /// only where article boundaries happen to tile blocks.
+    pub fn set_par2_block_size(&mut self, block_size: Option<NonZeroU64>) {
+        self.par2_block_size = block_size;
+    }
+
     pub fn set_profile_cpu(&mut self, enabled: bool) {
         self.profile_cpu = enabled;
     }
@@ -340,7 +354,7 @@ impl FusedYencArticleDecoder {
             header::apply_ypart_line(&self.line_buf, metadata)?;
             self.line_buf.clear();
             self.reserve_output_if_known();
-            self.state = FusedArticleState::Body;
+            self.begin_body();
             return Ok(true);
         }
 
@@ -374,9 +388,20 @@ impl FusedYencArticleDecoder {
         self.metadata = Some(metadata);
         if !needs_ypart {
             self.reserve_output_if_known();
-            self.state = FusedArticleState::Body;
+            self.begin_body();
         }
         Ok(true)
+    }
+
+    /// Enter the body with the CRC pass anchored at this article's place in the
+    /// file, so its checkpoints land on PAR2 block boundaries rather than on
+    /// wire-chunk boundaries.
+    fn begin_body(&mut self) {
+        if let Some(metadata) = self.metadata.as_ref() {
+            self.decode_state
+                .set_segment_plan(metadata.article_file_offset(), self.par2_block_size);
+        }
+        self.state = FusedArticleState::Body;
     }
 
     fn process_body(&mut self, src: &mut BytesMut) -> Result<Option<FusedYencArticle>> {
@@ -668,6 +693,13 @@ mod tests {
     }
 
     fn decode_current(transcript: &[u8]) -> (DecodedArticle, Vec<u8>) {
+        decode_current_with_block_size(transcript, None)
+    }
+
+    fn decode_current_with_block_size(
+        transcript: &[u8],
+        par2_block_size: Option<NonZeroU64>,
+    ) -> (DecodedArticle, Vec<u8>) {
         let mut codec = NntpCodec::new();
         let mut src = BytesMut::from(transcript);
 
@@ -683,6 +715,7 @@ mod tests {
         codec.set_raw_multiline(true);
 
         let mut decoder = StreamingArticleDecoder::new();
+        decoder.set_par2_block_size(par2_block_size);
         let mut output = Vec::new();
         while let StreamChunk::Data(data) =
             codec.decode_streaming_raw_chunk(&mut src).unwrap().unwrap()
@@ -697,7 +730,16 @@ mod tests {
         transcript: &[u8],
         chunks: &[usize],
     ) -> (FusedYencArticle, Vec<u8>) {
+        decode_fused_with_chunks_and_block_size(transcript, chunks, None)
+    }
+
+    fn decode_fused_with_chunks_and_block_size(
+        transcript: &[u8],
+        chunks: &[usize],
+        par2_block_size: Option<NonZeroU64>,
+    ) -> (FusedYencArticle, Vec<u8>) {
         let mut decoder = FusedYencArticleDecoder::new();
+        decoder.set_par2_block_size(par2_block_size);
         let mut src = BytesMut::new();
         let mut offset = 0;
         let mut article = None;
@@ -745,6 +787,16 @@ mod tests {
         assert_eq!(expected.result.has_trailer, actual.result.has_trailer);
         assert_eq!(expected.result.crc_status, actual.result.crc_status);
         assert_eq!(expected.result.defects, actual.result.defects);
+        // Gate 3: checkpoint placement is a function of file offsets, so the
+        // two decoders must emit byte-identical segment records however the
+        // wire bytes were split -- not merely agree on the article CRC.
+        assert_eq!(expected.result.segments, actual.result.segments);
+        assert_eq!(
+            weaver_yenc::combine_contiguous(&actual.result.segments)
+                .map_or(0, |folded| folded.crc32),
+            actual.result.part_crc,
+            "article pcrc32 must be the fold of its own segments"
+        );
 
         let expected_meta = &expected.result.metadata;
         let actual_meta = &actual.result.metadata;
@@ -763,15 +815,45 @@ mod tests {
     /// NNTP terminator untouched, for *every* chunk boundary in the transcript.
     fn assert_fused_matches_at_every_split_point(article: &[u8], leftover: &[u8]) {
         let transcript = transcript(article, leftover);
-        let (expected, expected_leftover) = decode_current(&transcript);
-        assert_eq!(expected_leftover, leftover);
+        // Block sizes small enough that this corpus's articles straddle many
+        // boundaries, plus `None` for the pre-block-size policy. Every one of
+        // them is swept at every split point, so a checkpoint that moved with a
+        // chunk boundary cannot pass.
+        let mut multi_segment_cases = 0usize;
+        for par2_block_size in [
+            None,
+            NonZeroU64::new(1),
+            NonZeroU64::new(3),
+            NonZeroU64::new(7),
+            NonZeroU64::new(16),
+            NonZeroU64::new(64),
+        ] {
+            let (expected, expected_leftover) =
+                decode_current_with_block_size(&transcript, par2_block_size);
+            assert_eq!(expected_leftover, leftover);
+            if expected.result.segments.len() > 1 {
+                multi_segment_cases += 1;
+            }
 
-        for split in 0..=transcript.len() {
-            let (actual, actual_leftover) =
-                decode_fused_with_chunks(&transcript, &[split, transcript.len() - split]);
-            assert_same_article(&expected, &actual);
-            assert_eq!(expected_leftover, actual_leftover, "split at {split}");
+            for split in 0..=transcript.len() {
+                let (actual, actual_leftover) = decode_fused_with_chunks_and_block_size(
+                    &transcript,
+                    &[split, transcript.len() - split],
+                    par2_block_size,
+                );
+                assert_same_article(&expected, &actual);
+                assert_eq!(
+                    expected_leftover, actual_leftover,
+                    "split at {split} block size {par2_block_size:?}"
+                );
+            }
         }
+        // Non-vacuity: an article that never crossed a boundary would make the
+        // segment comparison above a comparison of one whole-article record.
+        assert!(
+            multi_segment_cases > 0,
+            "no block size made this article emit more than one segment"
+        );
     }
 
     /// Payload used by the broken-poster corpus: escape-heavy, dot-stuffable,

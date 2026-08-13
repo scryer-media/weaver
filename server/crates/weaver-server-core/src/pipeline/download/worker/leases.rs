@@ -225,6 +225,7 @@ impl Pipeline {
                 server_modes: Vec::new(),
                 compatibility,
                 effective_exclude_servers,
+                par2_block_size: self.par2_block_size(job_id),
                 works: vec![first],
             };
             self.rollback_download_batch_lease(lease);
@@ -257,6 +258,7 @@ impl Pipeline {
             server_modes: Vec::new(),
             compatibility,
             effective_exclude_servers,
+            par2_block_size: self.par2_block_size(job_id),
             works,
         };
         if lease.works.len() < IP_REPLACEMENT_TRIAL_SAMPLES {
@@ -344,6 +346,7 @@ impl Pipeline {
             server_modes,
             compatibility,
             effective_exclude_servers,
+            par2_block_size: self.par2_block_size(job_id),
             works,
         }
     }

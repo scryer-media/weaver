@@ -252,6 +252,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             server_modes,
             compatibility,
             effective_exclude_servers: _,
+            par2_block_size,
             works,
         } = lease;
         let server_idx = lane.server_id().0;
@@ -264,6 +265,10 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         );
         let is_recovery = compatibility.is_recovery;
         let exclude_servers = compatibility.exclude_servers.clone();
+        // Declared per batch, which is per job: this is the checkpoint grid
+        // every article decoded below cuts its CRC segments on. An owned lane
+        // outlives its batch, so it is re-declared rather than assumed.
+        lane.set_par2_block_size(par2_block_size);
 
         // Prefetch the next lease while this batch downloads. The refill
         // response then overlaps the batch instead of serializing at the

@@ -96,6 +96,24 @@ pub struct YencMetadata {
     pub defects: YencHeaderDefects,
 }
 
+impl YencMetadata {
+    /// Absolute offset of this article's first decoded byte within the file it
+    /// is part of: `=ypart begin` (1-based) mapped to a 0-based offset, and `0`
+    /// for a single-part article, whose bytes are the whole file.
+    ///
+    /// This is where the decoder anchors its CRC checkpoint grid. The poster's
+    /// `begin` is not trusted beyond that: an evidence collector reconciles the
+    /// segment base against the offset the article was actually placed at, and
+    /// a disagreement makes the segments tile nothing rather than publishing a
+    /// block verdict computed on a misplaced grid.
+    pub fn article_file_offset(&self) -> u64 {
+        match self.begin {
+            Some(begin) => begin.saturating_sub(1),
+            None => 0,
+        }
+    }
+}
+
 /// Result of decoding a yEnc article body.
 #[derive(Debug)]
 pub struct DecodeResult {
@@ -125,6 +143,17 @@ pub struct DecodeResult {
     /// Header damage that was tolerated while decoding this article, folding
     /// together `=ybegin`/`=ypart` and `=yend` defects.
     pub defects: YencHeaderDefects,
+    /// The decode pass's CRC32 segments, in file order, tiling exactly the
+    /// bytes this article decoded to.
+    ///
+    /// [`Self::part_crc`] is their in-order combine-fold, so this never changes
+    /// the article's own verdict; the records exist so an evidence collector
+    /// above the decoder can fold the segments tiling a PAR2 block — which may
+    /// span several articles — into that block's CRC32 without a second pass
+    /// over the bytes. A decode with no segment plan declared (see
+    /// [`crate::DecodeState::set_segment_plan`]) reports one segment covering
+    /// the whole article.
+    pub segments: Vec<crate::segment::Segment>,
 }
 
 #[cfg(test)]

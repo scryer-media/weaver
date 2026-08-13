@@ -686,6 +686,55 @@ impl Pipeline {
         self.live_par2.note_segment(file_id, file_offset, data);
     }
 
+    /// The recovery set's block size for a job, once its PAR2 packets have been
+    /// parsed. This is the checkpoint grid the decoder cuts CRC segments on.
+    pub(crate) fn par2_block_size(&self, job_id: JobId) -> Option<std::num::NonZeroU64> {
+        std::num::NonZeroU64::new(self.par2_set(job_id)?.slice_size)
+    }
+
+    /// Record a decoded article's block-aligned CRC segments against the file it
+    /// was placed in.
+    ///
+    /// `file_offset` and `decoded_len` are the pipeline's own placement, which
+    /// is authoritative over the poster's `=ypart begin`. Called after the bytes
+    /// are durable, on the same seam as live PAR2 verification, so a block
+    /// claimed here describes content that is actually on disk.
+    pub(crate) fn note_block_crc_segments(
+        &mut self,
+        file_id: NzbFileId,
+        file_offset: u64,
+        decoded_len: u64,
+        part_crc: u32,
+        segments: &[weaver_yenc::Segment],
+    ) {
+        let Some(block_size) = self.par2_block_size(file_id.job_id) else {
+            return;
+        };
+        self.block_crcs.note_article(
+            file_id,
+            block_size,
+            file_offset,
+            decoded_len,
+            part_crc,
+            segments,
+        );
+    }
+
+    /// In-stream block verdicts for a completed file, if the recovery set binds
+    /// it and the collector closed any blocks.
+    ///
+    /// Blocks absent from the result are *unclaimed*: settle-time verification
+    /// owns them, and reads and hashes them exactly as it did before.
+    pub(crate) fn block_crc_verdicts(
+        &self,
+        file_id: NzbFileId,
+    ) -> Option<std::collections::BTreeMap<u32, crate::pipeline::integrity::BlockVerdict>> {
+        let set = self.par2_set(file_id.job_id)?;
+        let (par2_file_id, ..) = self.resolve_live_par2_binding(file_id)?;
+        let verdicts = self.block_crcs.verdicts_against(file_id, set, par2_file_id);
+        (!verdicts.is_empty()).then_some(verdicts)
+    }
+
     pub(crate) fn note_live_par2_file_complete(&mut self, file_id: NzbFileId, received_bytes: u64) {
         self.bind_live_par2_file(file_id);
         self.live_par2.note_file_complete(file_id, received_bytes);
@@ -769,7 +818,8 @@ impl Pipeline {
     }
 
     pub(crate) async fn settle_live_par2_job(&mut self, job_id: JobId) {
-        self.live_par2.schedule_settle_reads(job_id);
+        let claimed = self.in_stream_claimed_slices(job_id);
+        self.live_par2.schedule_settle_reads(job_id, &claimed);
         self.run_live_par2_reads(job_id).await;
         let metrics = self.live_par2.metrics();
         debug!(
@@ -781,8 +831,39 @@ impl Pipeline {
             settle_reads = metrics.settle_reads,
             disk_read_bytes = metrics.disk_read_bytes,
             disk_read_budget_exhausted = metrics.disk_read_budget_exhausted,
+            blocks_claimed_in_stream = self.block_crcs.blocks_derived(),
+            articles_without_usable_segments = self.block_crcs.rebased_articles(),
             "live PAR2 settle diagnostics"
         );
+    }
+
+    /// `(file, slice)` pairs whose bytes in-stream block verification found
+    /// intact against the recovery set's IFSC CRC32.
+    ///
+    /// A block found *damaged* is deliberately not listed: settle-time
+    /// verification still reads it, so the authoritative pass sees the same
+    /// evidence it always did about bytes that are actually wrong. Only the
+    /// intact case is a read the download path already paid for.
+    pub(crate) fn in_stream_claimed_slices(
+        &self,
+        job_id: JobId,
+    ) -> std::collections::HashSet<(NzbFileId, u32)> {
+        let mut claimed = std::collections::HashSet::new();
+        let Some(state) = self.jobs.get(&job_id) else {
+            return claimed;
+        };
+        let file_ids: Vec<NzbFileId> = state.assembly.files().map(|file| file.file_id()).collect();
+        for file_id in file_ids {
+            let Some(verdicts) = self.block_crc_verdicts(file_id) else {
+                continue;
+            };
+            for (block_index, verdict) in verdicts {
+                if verdict == crate::pipeline::integrity::BlockVerdict::Intact {
+                    claimed.insert((file_id, block_index));
+                }
+            }
+        }
+        claimed
     }
 
     pub(crate) fn live_par2_strong_evidence(
