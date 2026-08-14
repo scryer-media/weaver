@@ -524,7 +524,7 @@ impl LivePar2Registry {
         &self,
         job_id: JobId,
     ) -> Option<HashMap<NzbFileId, FileId>> {
-        self.bindings_if_strong(job_id, true)
+        self.bindings_if_strong(job_id, true, &HashSet::new())
     }
 
     /// Bindings whose every slice carries a strong verdict — *including* slices
@@ -536,17 +536,26 @@ impl LivePar2Registry {
     /// adjudicated at all", which is what an evidence-fed session needs before
     /// it can report on sources it will never read. A slice proven bad is
     /// *resolved*; only a slice with no verdict has to be read.
+    ///
+    /// `in_stream_claimed` names `(par2 file, slice)` pairs the decode pass
+    /// already adjudicated from its own CRC segments. Those count as
+    /// adjudicated here for the same reason the settle pass does not read them
+    /// back: the verdict exists, so no read can add one. Without this the two
+    /// halves disagree — the settle pass would decline to read a claimed slice
+    /// and this gate would then reject the job for having no verdict on it.
     pub(crate) fn fully_adjudicated_bindings(
         &self,
         job_id: JobId,
+        in_stream_claimed: &HashSet<(FileId, u32)>,
     ) -> Option<HashMap<NzbFileId, FileId>> {
-        self.bindings_if_strong(job_id, false)
+        self.bindings_if_strong(job_id, false, in_stream_claimed)
     }
 
     fn bindings_if_strong(
         &self,
         job_id: JobId,
         require_valid: bool,
+        in_stream_claimed: &HashSet<(FileId, u32)>,
     ) -> Option<HashMap<NzbFileId, FileId>> {
         let job = self.jobs.get(&job_id)?;
         let session = job.session.as_ref()?;
@@ -559,6 +568,7 @@ impl LivePar2Registry {
                     && evidence.strength() == SliceEvidenceStrength::Crc32AndMd5
             })
             .map(|evidence| (evidence.file_id(), evidence.slice_index()))
+            .chain(in_stream_claimed.iter().copied())
             .collect::<HashSet<_>>();
         let mut by_par2_file = HashMap::<FileId, NzbFileId>::new();
         for (file_id, binding) in &job.bindings {

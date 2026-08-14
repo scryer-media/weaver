@@ -1097,6 +1097,46 @@ async fn completed_standalone_file_crc32_match_persists_completion_without_md5()
     assert!(!hashes.contains_key(&0));
 }
 
+#[tokio::test]
+async fn completed_par2_covered_file_skips_streamed_md5_without_posted_file_crc() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20018);
+    let filename = "payload.bin";
+    let payload = b"verified";
+    let spec = standalone_job_spec(
+        "Par2 Covered No Posted CRC",
+        &[(filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(filename, payload, 4, 0),
+        &[],
+    );
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    // No aggregate `=yend crc32` accompanies the post: the recovery set's
+    // IFSC checksums alone license the skip, so nothing streams a whole-file
+    // MD5 and nothing reads the file back for one at completion.
+    submit_decoded_segment(&mut pipeline, file_id, 0, 0, payload, filename, None).await;
+
+    let checksum = pipeline
+        .par2_runtime(job_id)
+        .and_then(|runtime| runtime.completed_checksums.get(&file_id))
+        .copied()
+        .expect("completed checksum recorded for par2-covered file");
+    assert!(checksum.md5.is_none());
+    assert_eq!(checksum.crc32, par2_rs::checksum::crc32(payload));
+    assert!(checksum.all_parts_crc_verified);
+    let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert!(!hashes.contains_key(&0));
+}
+
 #[test]
 fn completed_file_checksum_combines_batched_decoded_crc_once() {
     let decoded = DecodedChunk::from(vec![

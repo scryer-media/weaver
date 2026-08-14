@@ -1676,6 +1676,24 @@ unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool, const SEAR
                         // Terminator probe without a stuffed dot in the window
                         // (oracle decoder_sse_base.h:398-489): only `\r\n=y` is
                         // reachable — any `\r\n.` shape would have set `partial`.
+                        //
+                        // DELIBERATE ASYMMETRY WITH NEON — MEASURED, DO NOT
+                        // "FIX" BY SYMMETRY. See the matching note in
+                        // `x86_avx2::decode_kernel_avx2_raw` for the full 2026-08-13
+                        // A/B. This tier is the one the Synology DS1819+
+                        // (Denverton C3538, no AVX) dispatches to, and it was
+                        // measured there specifically because the searchEnd tax
+                        // is ~2x the oracle's ratio on that box. Porting NEON's
+                        // mask-space test + pending carry made it WORSE, not
+                        // better: until_end +6.3% realshape / +5.2% esc_only,
+                        // bench-shape +4.3% / +4.2%, with decode_only flat.
+                        // `esc_only` never reaches this branch, so that ~5% is
+                        // the carry's unconditional loop-top re-test on its own —
+                        // a narrow core pays for the serial scalar dependency
+                        // exactly where the vector work it removes was already
+                        // off the critical path. A carry-free variant (mask-space
+                        // gate only) measured neutral (realshape +0.4%, crlf
+                        // -2.1%, esc_only +2.3%). Neither adopted.
                         if SEARCH_END {
                             let tmp3a =
                                 _mm_loadu_si128(input.as_ptr().add(src + 3) as *const __m128i);

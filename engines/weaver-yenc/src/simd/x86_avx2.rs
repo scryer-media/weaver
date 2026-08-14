@@ -259,6 +259,35 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
                         // Terminator probe without a stuffed dot in the window
                         // (oracle decoder_avx2_base.h:344-421): only `\r\n=y` is
                         // reachable — any `\r\n.` shape would have set `partial`.
+                        //
+                        // DELIBERATE ASYMMETRY WITH NEON — MEASURED, DO NOT
+                        // "FIX" BY SYMMETRY. `neon.rs` replaced this forward
+                        // probe with a scalar mask-space candidate test plus a
+                        // 1-bit pending carry re-tested at the next loop top
+                        // (there the win came from deleting a whole next-window
+                        // load + `vext` chain, which x86 never had: the `+2/+3`
+                        // views here are plain overlapping loads). x86 keeps the
+                        // oracle-parity forward probe.
+                        //
+                        // 2026-08-13 A/B, both x86 tiers ported and measured on
+                        // two boxes (searchend_timing, min-of-2000, taskset-
+                        // pinned, interleaved, 5 fixtures; codex i5-1240P avx2
+                        // tier 10 rounds, Synology DS1819+ C3538 ssse3 tier 6
+                        // rounds). Faithful port (mask-space test + carry),
+                        // until_end lane, Δ vs this code:
+                        //     realshape  +10.7% (ADL)   +6.3% (Denverton)
+                        //     crlf_only   +8.7%         -1.0%
+                        //     esc_only    +4.6%         +5.2%
+                        // decode_only stayed flat, so the regression is entirely
+                        // the searchEnd path. `esc_only` never even reaches this
+                        // branch (`mask == mask_eq`), which localizes ~5% of the
+                        // Denverton loss to the carry's unconditional loop-top
+                        // re-test alone — the serial scalar dependency the
+                        // rewrite adds. A carry-free variant (same mask-space
+                        // gate, forward probe kept behind it, no loop-top test)
+                        // measured neutral: within ±2.5% on every fixture on both
+                        // boxes, no beyond-spread win on realshape. Neither was
+                        // adopted.
                         if SEARCH_END {
                             let tmp3a =
                                 _mm256_loadu_si256(input.as_ptr().add(src + 3) as *const __m256i);

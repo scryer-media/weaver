@@ -200,6 +200,53 @@ impl FileBlockCrcs {
     }
 }
 
+/// Turn one file's in-stream block verdicts into PAR2 slice evidence a repair
+/// session can be seeded with.
+///
+/// Only *intact* verdicts become evidence, and the omission is load-bearing.
+/// Seeding a contradiction invalidates the *source* the verdict names, and a
+/// source served by a handle is named only by file identity — so one damaged
+/// block would retire that file's other seeds along with it. A damaged block is
+/// instead left unclaimed, exactly as a block with no verdict is: settle-time
+/// verification reads it back, and the authoritative pass sees the evidence it
+/// always did about bytes that are actually wrong.
+///
+/// The attestation attached to each verdict is what makes a CRC32-only verdict
+/// admissible at all. It asserts that the block CRC32 covered the block's whole
+/// extent, over bytes already made durable, and that the same span carries the
+/// article-aligned yEnc `pcrc32` on an unrelated grid. It does not assert slice
+/// identity: repair still re-derives CRC32 and MD5 over every byte it consumes.
+pub(crate) fn slice_evidence_from_verdicts(
+    recovery_set_id: par2_rs::RecoverySetId,
+    par2_file_id: par2_rs::FileId,
+    file_length: u64,
+    block_size: u64,
+    verdicts: &BTreeMap<u32, BlockVerdict>,
+) -> Vec<par2_rs::SliceEvidence> {
+    if block_size == 0 {
+        return Vec::new();
+    }
+    verdicts
+        .iter()
+        .filter(|(_, verdict)| **verdict == BlockVerdict::Intact)
+        .filter_map(|(&block_index, _)| {
+            // Real bytes the block covers: a whole block, or the short
+            // remainder for the final one. PAR2's zero padding is not part of
+            // the file, so it is not part of the covered length.
+            let start = u64::from(block_index).checked_mul(block_size)?;
+            let covered = file_length.checked_sub(start)?.min(block_size);
+            let proof = par2_rs::InStreamCrc32Proof::try_new(covered, true, true, true).ok()?;
+            Some(par2_rs::SliceEvidence::from_in_stream_crc32(
+                recovery_set_id,
+                par2_file_id,
+                block_index,
+                true,
+                proof,
+            ))
+        })
+        .collect()
+}
+
 /// Assembles PAR2 block CRC32s per file from the decode pass's segments.
 #[derive(Debug, Default)]
 pub(crate) struct BlockCrcCollector {

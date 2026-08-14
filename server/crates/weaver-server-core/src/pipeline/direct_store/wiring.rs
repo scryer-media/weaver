@@ -1385,9 +1385,19 @@ impl Pipeline {
         working_dir: &std::path::Path,
         access: &std::sync::Arc<super::par2_access::DirectVolumeFileAccess>,
     ) -> Option<par2_rs::VerificationResult> {
-        self.live_par2.fully_adjudicated_bindings(job_id)?;
+        // Blocks the decode pass already adjudicated count as resolved here:
+        // the settle pass deliberately did not read them back, so requiring a
+        // read-derived verdict for them would reject every job that in-stream
+        // verification actually helped.
+        let in_stream = self.in_stream_slice_evidence(job_id);
+        let in_stream_claimed = in_stream
+            .iter()
+            .map(|evidence| (evidence.file_id(), evidence.slice_index()))
+            .collect::<std::collections::HashSet<_>>();
+        self.live_par2
+            .fully_adjudicated_bindings(job_id, &in_stream_claimed)?;
         let evidence = self.live_par2_strong_evidence(job_id);
-        if evidence.is_empty() {
+        if evidence.is_empty() && in_stream.is_empty() {
             return None;
         }
 
@@ -1418,6 +1428,14 @@ impl Pipeline {
         let par2_set = std::sync::Arc::clone(par2_set);
         let joined = tokio::task::spawn_blocking(move || {
             let outcome = pp_pool.install(|| {
+                // In-stream verdicts first: they cost no I/O, and where the
+                // live engine also settled a slice the two agree, so the
+                // second seed is a no-op rather than a contradiction.
+                for slice in in_stream {
+                    if let Err(error) = session.add_slice_evidence_for_file(slice) {
+                        return Err(format!("failed to seed in-stream slice evidence: {error}"));
+                    }
+                }
                 for (_, slice) in evidence {
                     // Keyed by FileId, not by path: a direct volume has no
                     // path to key on, and the path the live engine captured

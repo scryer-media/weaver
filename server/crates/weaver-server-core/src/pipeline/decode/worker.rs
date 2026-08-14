@@ -469,13 +469,26 @@ impl Pipeline {
     /// expected whole-file CRC32 from. A set without them can serve neither the
     /// substitute nor in-stream block verification, so the streamed hash stays.
     ///
-    /// The whole-file CRC32 must also have been checked against the posted
-    /// `=yend crc32`: dropping the hash is only free where something else
-    /// already adjudicated the assembled file.
-    fn completed_file_md5_substitutable(&self, file_id: NzbFileId, crc_verified: bool) -> bool {
-        if !crc_verified {
-            return false;
-        }
+    /// No posted `=yend crc32` is required. Two independent CRC alignments
+    /// already adjudicate every assembled byte on this path: the decoder
+    /// verifies each article's yEnc pcrc32, and PAR2 evidence checks the
+    /// recovery set's IFSC CRC32s — in stream on the slice grid, and again as
+    /// the composed whole-file CRC32 the contiguous-assembly proof carries.
+    /// Bytes no slice verdict vouches for are settled by read-back hashing,
+    /// and repair re-derives CRC32 and MD5 over every byte it consumes. The
+    /// aggregate `=yend` CRC is still checked whenever a poster supplies one,
+    /// but multipart posts routinely omit it, and holding the MD5 skip
+    /// hostage to it kept the hash alive on most real downloads.
+    ///
+    /// The whole-file MD5 defends nothing the CRCs leave open: a recovery set
+    /// travels with the payload it describes, so whoever can substitute the
+    /// payload can post a self-consistent set beside it and the MD5
+    /// comparison passes anyway; defending that would take an out-of-band
+    /// trust root no client has. Completing clean downloads on CRC evidence
+    /// is also the ecosystem default — mainstream clients rest on a single
+    /// combined CRC32 equality where this path demands two independent
+    /// alignments agree.
+    fn completed_file_md5_substitutable(&self, file_id: NzbFileId) -> bool {
         self.par2_set(file_id.job_id)
             .is_some_and(|set| !set.slice_checksums.is_empty())
     }
@@ -491,8 +504,7 @@ impl Pipeline {
         // settle-time substitute can stand in for it -- see
         // `completed_file_md5_substitutable` -- because its absence would
         // otherwise be paid for with a whole-file re-read at completion.
-        let expected_file_crc_known = self.expected_file_crcs.contains_key(&file_id);
-        if self.completed_file_md5_substitutable(file_id, expected_file_crc_known) {
+        if self.completed_file_md5_substitutable(file_id) {
             return false;
         }
         let Some(state) = self.jobs.get(&file_id.job_id) else {
@@ -723,9 +735,18 @@ impl Pipeline {
                     // the hash was skipped because PAR2 evidence can be captured
                     // from the composed whole-file CRC32 instead, completion must
                     // not undo that saving by reading the file back for it.
-                    if self.completed_file_md5_substitutable(file_id, file_crc_matched) {
+                    if self.completed_file_md5_substitutable(file_id) {
+                        // A poster-supplied aggregate `=yend crc32` that
+                        // disagrees while every article CRC passed means the
+                        // header lied about content the PAR2 block grid will
+                        // adjudicate; count that case separately.
+                        let label = if expected_file_crc.is_some() && !file_crc_matched {
+                            "download.file_hash.md5.deferred_to_par2_slice_evidence.file_crc_mismatch"
+                        } else {
+                            "download.file_hash.md5.deferred_to_par2_slice_evidence"
+                        };
                         crate::runtime::perf_probe::record(
-                            "download.file_hash.md5.deferred_to_par2_slice_evidence",
+                            label,
                             std::time::Duration::from_nanos(1),
                         );
                         return Ok(CompletedFileChecksum {

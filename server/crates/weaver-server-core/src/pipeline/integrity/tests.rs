@@ -537,3 +537,171 @@ fn pre_block_size_articles_claim_only_what_they_tile() {
         assert_eq!(derived, direct_crc(&payload[start..start + 1024]));
     }
 }
+
+/// Add `count` recovery slices over `data` so a fixture set can actually repair.
+fn with_recovery_slices(
+    mut set: par2_rs::Par2FileSet,
+    data: &[u8],
+    slice_size: u64,
+    count: u32,
+) -> par2_rs::Par2FileSet {
+    let slice_size = slice_size as usize;
+    let slice_count = data.len().div_ceil(slice_size);
+    let mut padded = data.to_vec();
+    padded.resize(slice_count * slice_size, 0);
+
+    let constants = par2_rs::input_slice_constants(slice_count);
+    for exponent in 0..count {
+        let mut recovery = vec![0u8; slice_size];
+        for (index, &constant) in constants.iter().enumerate() {
+            par2_rs::mul_acc_region(
+                par2_rs::gf_pow(constant, exponent),
+                &padded[index * slice_size..(index + 1) * slice_size],
+                &mut recovery,
+            );
+        }
+        set.recovery_slices.insert(
+            exponent,
+            par2_rs::RecoverySlice {
+                exponent,
+                data: bytes::Bytes::from(recovery).into(),
+            },
+        );
+    }
+    set
+}
+
+/// Gate 4, end to end: a damaged-article fixture flows decode -> segments ->
+/// collector -> verdicts -> slice evidence -> repair session -> repair.
+///
+/// The session is access-backed and never scans, so everything it concludes
+/// comes from the in-stream evidence alone. It must identify exactly the blocks
+/// the damaged articles touched, repair those from recovery data, and produce
+/// the true payload — with no MD5 computed anywhere on the download path.
+#[test]
+fn a_damaged_article_flows_from_evidence_through_a_session_to_repair() {
+    // The fixture of `a_damaged_article_is_localised_to_exactly_its_blocks_with_no_read_back`:
+    // 9500 bytes over 1024-byte blocks, 700-byte articles, damage in articles 3
+    // and 8, which lands in blocks 2 and 5.
+    let payload = random_bytes(0xd00d, 9500);
+    let block_size = block(1024);
+    let article_len = 700usize;
+    let damaged_articles = [3usize, 8];
+    let par2_file_id = par2_file_id("payload.bin", &payload);
+    let file_id = file(0);
+    let par2_set = with_recovery_slices(
+        fixture_set("payload.bin", &payload, block_size.get()),
+        &payload,
+        block_size.get(),
+        4,
+    );
+
+    let mut collector = BlockCrcCollector::new();
+    decode_articles_into(
+        &mut collector,
+        file_id,
+        &payload,
+        article_len,
+        block_size,
+        &|index, part| {
+            if damaged_articles.contains(&index) {
+                part[0] ^= 0xff;
+            }
+        },
+    );
+
+    // What actually landed: the same damage the decoder saw.
+    let mut stored = payload.clone();
+    for index in damaged_articles {
+        stored[index * article_len] ^= 0xff;
+    }
+
+    let verdicts = collector.verdicts_against(file_id, &par2_set, par2_file_id);
+    let evidence = super::slice_evidence_from_verdicts(
+        par2_set.recovery_set_id,
+        par2_file_id,
+        payload.len() as u64,
+        block_size.get(),
+        &verdicts,
+    );
+
+    // Settle-time scoping (gate 4's second half), expressed where this change
+    // owns it: the blocks seeded as evidence are exactly the blocks settle-time
+    // will not read, and they are exactly the intact ones. Nothing is both
+    // claimed and read back, and nothing is neither.
+    let seeded: Vec<u32> = evidence
+        .iter()
+        .map(par2_rs::SliceEvidence::slice_index)
+        .collect();
+    let unclaimed: Vec<u32> = verdicts
+        .iter()
+        .filter(|(_, verdict)| **verdict != BlockVerdict::Intact)
+        .map(|(index, _)| *index)
+        .collect();
+    assert_eq!(unclaimed, vec![2, 5], "verdicts {verdicts:?}");
+    assert_eq!(seeded, vec![0, 1, 3, 4, 6, 7, 8, 9]);
+    assert!(
+        seeded.iter().all(|index| !unclaimed.contains(index)),
+        "a block must never be both claimed in stream and read back"
+    );
+    // Every verdict is CRC32-only: no MD5 was computed on the download path.
+    assert!(evidence.iter().all(|slice| {
+        slice.strength() == par2_rs::SliceEvidenceStrength::Crc32Only
+            && slice.is_valid()
+            && slice.may_seed_repair_input()
+    }));
+
+    // Evidence -> session. The session is access-backed, so it never scans and
+    // reports exactly what the evidence established.
+    let working = tempfile::tempdir().expect("temp dir");
+    let mut access = par2_rs::MemoryFileAccess::new();
+    access.add_file(par2_file_id, stored.clone());
+    let mut options = par2_rs::Par2RepairSessionOptions::with_source_access(
+        working.path().to_path_buf(),
+        Vec::new(),
+        std::sync::Arc::new(access),
+    );
+    options.file_set = Some(par2_set.clone());
+    let mut session = par2_rs::Par2RepairSession::open(options).expect("open session");
+    for slice in evidence {
+        session
+            .add_slice_evidence_for_file(slice)
+            .expect("in-stream evidence seeds the session");
+    }
+
+    let assessment = session.analyze().expect("analyze");
+    assert_eq!(
+        assessment.status,
+        par2_rs::Par2RepairStatus::RepairPossible,
+        "the two damaged blocks must be repairable from recovery data"
+    );
+    assert_eq!(assessment.missing_blocks, 2);
+    assert_eq!(session.diagnostics().source_scan_passes, 0);
+    assert_eq!(session.diagnostics().scan.bytes_scanned, 0);
+
+    // The session names exactly the damaged blocks, from evidence alone.
+    let file = assessment
+        .verification
+        .files
+        .iter()
+        .find(|file| file.file_id == par2_file_id)
+        .expect("the protected file");
+    let missing: Vec<u32> = file
+        .valid_slices
+        .iter()
+        .enumerate()
+        .filter(|(_, valid)| !**valid)
+        .map(|(index, _)| index as u32)
+        .collect();
+    assert_eq!(missing, vec![2, 5], "valid_slices {:?}", file.valid_slices);
+
+    // Session -> repair. Repair re-derives CRC32 and MD5 over every byte it
+    // consumes, so this also proves the in-stream verdicts were truthful.
+    let outcome = session.repair().expect("repair from in-stream evidence");
+    assert_eq!(outcome.status, par2_rs::Par2RepairStatus::Repaired);
+    assert_eq!(
+        std::fs::read(working.path().join("payload.bin")).expect("repaired file"),
+        payload,
+        "repair must reproduce the true payload"
+    );
+}

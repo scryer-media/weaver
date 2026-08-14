@@ -866,6 +866,48 @@ impl Pipeline {
         claimed
     }
 
+    /// Every file's in-stream block verdicts for a job, shaped as PAR2 slice
+    /// evidence a repair session can be seeded with.
+    ///
+    /// Only *intact* verdicts become evidence — see
+    /// [`crate::pipeline::integrity::slice_evidence_from_verdicts`] for why the
+    /// damaged ones are deliberately withheld. That is the same split
+    /// [`Self::in_stream_claimed_slices`] makes for settle-time reads, so the
+    /// two stay consistent: a block is either claimed in stream and seeded
+    /// here, or unclaimed and read back.
+    pub(crate) fn in_stream_slice_evidence(&self, job_id: JobId) -> Vec<par2_rs::SliceEvidence> {
+        let Some(set) = self.par2_set(job_id) else {
+            return Vec::new();
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Vec::new();
+        };
+        let recovery_set_id = set.recovery_set_id;
+        let slice_size = set.slice_size;
+        let file_ids: Vec<NzbFileId> = state.assembly.files().map(|file| file.file_id()).collect();
+
+        let mut evidence = Vec::new();
+        for file_id in file_ids {
+            let Some(verdicts) = self.block_crc_verdicts(file_id) else {
+                continue;
+            };
+            let Some((par2_file_id, ..)) = self.resolve_live_par2_binding(file_id) else {
+                continue;
+            };
+            let Some(length) = set.file_description(&par2_file_id).map(|desc| desc.length) else {
+                continue;
+            };
+            evidence.extend(crate::pipeline::integrity::slice_evidence_from_verdicts(
+                recovery_set_id,
+                par2_file_id,
+                length,
+                slice_size,
+                &verdicts,
+            ));
+        }
+        evidence
+    }
+
     pub(crate) fn live_par2_strong_evidence(
         &mut self,
         job_id: JobId,
