@@ -16,8 +16,9 @@ use super::barrier::{
 };
 use super::plan::DirectSetPlan;
 use super::restart::{
-    CoverageRejection, DestinationProbe, ExpectedSet, ProbedDestination, complete_files,
-    coverage_skip_plan, refetch_floors, restore_job, restore_set, restore_set_with_probe,
+    CoverageRejection, DestinationProbe, DestinationRoots, ExpectedSet, ProbedDestination,
+    complete_files, coverage_skip_plan, refetch_floors, restore_job, restore_set,
+    restore_set_with_probe,
 };
 use super::router::{
     CrcRuns, DemotionReason, DirectSetRouter, HoldsScratch, SparseImage,
@@ -1429,16 +1430,44 @@ fn successive_barriers_advance_the_generation_and_replace_the_row() {
 // ---------------------------------------------------------------------------
 
 fn write_destination(dir: &Path, relative_path: &str, len: usize) {
+    if let Some(parent) = dir.join(relative_path).parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
     std::fs::write(dir.join(relative_path), vec![0u8; len]).unwrap();
+}
+
+/// A job's two roots, **deliberately on different paths** inside one temp dir.
+///
+/// The whole point of the split is that member payload and working data live
+/// apart, so a restart test that resolved a member claim against the working
+/// directory would pass against a single shared root and prove nothing. Here the
+/// staging root is the only place a `.direct.partial` is written, so a claim sent
+/// to the wrong root fails the probe.
+fn sample_roots(temp_dir: &Path) -> DestinationRoots {
+    let roots = DestinationRoots {
+        working_dir: temp_dir.join("intermediate").join("Silver Horizon"),
+        destination_dir: temp_dir
+            .join("complete")
+            .join(".weaver-staging")
+            .join(JOB.0.to_string()),
+    };
+    std::fs::create_dir_all(&roots.working_dir).unwrap();
+    std::fs::create_dir_all(&roots.destination_dir).unwrap();
+    roots
 }
 
 #[tokio::test]
 async fn restart_accepts_a_valid_row_and_yields_floors() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
+    let roots = sample_roots(temp_dir.path());
+    write_destination(
+        &roots.destination_dir,
+        "silver-horizon.mkv.f0.direct.partial",
+        60,
+    );
     let blob = encode(&sample_snapshot()).unwrap();
 
-    let snapshot = restore_set(temp_dir.path(), &blob, &sample_expected())
+    let snapshot = restore_set(&roots, &blob, &sample_expected())
         .await
         .unwrap();
     assert_eq!(snapshot.generation, 3);
@@ -1448,17 +1477,16 @@ async fn restart_accepts_a_valid_row_and_yields_floors() {
 #[tokio::test]
 async fn restart_accepts_a_destination_longer_than_the_claim() {
     let temp_dir = tempfile::tempdir().unwrap();
+    let roots = sample_roots(temp_dir.path());
     write_destination(
-        temp_dir.path(),
+        &roots.destination_dir,
         "silver-horizon.mkv.f0.direct.partial",
         4_096,
     );
     let blob = encode(&sample_snapshot()).unwrap();
 
     assert!(
-        restore_set(temp_dir.path(), &blob, &sample_expected())
-            .await
-            .is_ok(),
+        restore_set(&roots, &blob, &sample_expected()).await.is_ok(),
         "file length never implies coverage: a longer file is expected, not truncated"
     );
 }
@@ -1466,10 +1494,11 @@ async fn restart_accepts_a_destination_longer_than_the_claim() {
 #[tokio::test]
 async fn restart_refuses_a_missing_destination() {
     let temp_dir = tempfile::tempdir().unwrap();
+    let roots = sample_roots(temp_dir.path());
     let blob = encode(&sample_snapshot()).unwrap();
 
     assert_eq!(
-        restore_set(temp_dir.path(), &blob, &sample_expected()).await,
+        restore_set(&roots, &blob, &sample_expected()).await,
         Err(CoverageRejection::MissingDestination {
             path: "silver-horizon.mkv.f0.direct.partial".to_string(),
         })
@@ -1479,11 +1508,16 @@ async fn restart_refuses_a_missing_destination() {
 #[tokio::test]
 async fn restart_refuses_a_short_destination() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 59);
+    let roots = sample_roots(temp_dir.path());
+    write_destination(
+        &roots.destination_dir,
+        "silver-horizon.mkv.f0.direct.partial",
+        59,
+    );
     let blob = encode(&sample_snapshot()).unwrap();
 
     assert_eq!(
-        restore_set(temp_dir.path(), &blob, &sample_expected()).await,
+        restore_set(&roots, &blob, &sample_expected()).await,
         Err(CoverageRejection::ShortDestination {
             path: "silver-horizon.mkv.f0.direct.partial".to_string(),
             claimed: 60,
@@ -1495,7 +1529,12 @@ async fn restart_refuses_a_short_destination() {
 #[tokio::test]
 async fn restart_refuses_a_plan_digest_mismatch() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
+    let roots = sample_roots(temp_dir.path());
+    write_destination(
+        &roots.destination_dir,
+        "silver-horizon.mkv.f0.direct.partial",
+        60,
+    );
     let blob = encode(&sample_snapshot()).unwrap();
 
     let expected = ExpectedSet {
@@ -1503,7 +1542,7 @@ async fn restart_refuses_a_plan_digest_mismatch() {
         ..sample_expected()
     };
     assert_eq!(
-        restore_set(temp_dir.path(), &blob, &expected).await,
+        restore_set(&roots, &blob, &expected).await,
         Err(CoverageRejection::PlanDigestMismatch),
         "a plan-digest mismatch is a hard stop, never partial trust"
     );
@@ -1528,7 +1567,12 @@ async fn restart_refuses_a_row_written_under_different_member_facts() {
     assert_ne!(one, renamed, "so is a different member");
 
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
+    let roots = sample_roots(temp_dir.path());
+    write_destination(
+        &roots.destination_dir,
+        "silver-horizon.mkv.f0.direct.partial",
+        60,
+    );
     let blob = encode(&CoverageSnapshot {
         plan_digest: one,
         ..sample_snapshot()
@@ -1541,7 +1585,7 @@ async fn restart_refuses_a_row_written_under_different_member_facts() {
             ..sample_expected()
         };
         assert_eq!(
-            restore_set(temp_dir.path(), &blob, &expected).await,
+            restore_set(&roots, &blob, &expected).await,
             Err(CoverageRejection::PlanDigestMismatch),
             "a row written against different member facts ({label}) must still be refused"
         );
@@ -1552,7 +1596,7 @@ async fn restart_refuses_a_row_written_under_different_member_facts() {
         ..sample_expected()
     };
     assert!(
-        restore_set(temp_dir.path(), &blob, &expected).await.is_ok(),
+        restore_set(&roots, &blob, &expected).await.is_ok(),
         "non-vacuity: the same facts are accepted"
     );
 }
@@ -1560,12 +1604,17 @@ async fn restart_refuses_a_row_written_under_different_member_facts() {
 #[tokio::test]
 async fn restart_refuses_a_checkpoint_whose_probe_never_completed() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
+    let roots = sample_roots(temp_dir.path());
+    write_destination(
+        &roots.destination_dir,
+        "silver-horizon.mkv.f0.direct.partial",
+        60,
+    );
     let blob = encode(&sample_snapshot()).unwrap();
 
     // The probe panics — a bug in it, or a runtime torn down under it during
     // startup. "Could not check" must never come out as "checked, fine".
-    let rejection = restore_set_with_probe(temp_dir.path(), &blob, &sample_expected(), |_| {
+    let rejection = restore_set_with_probe(&roots, &blob, &sample_expected(), |_| {
         panic!("destination probe died");
     })
     .await
@@ -1580,12 +1629,17 @@ async fn restart_refuses_a_checkpoint_whose_probe_never_completed() {
 #[tokio::test]
 async fn restart_refuses_a_probe_that_skipped_destinations() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
+    let roots = sample_roots(temp_dir.path());
+    write_destination(
+        &roots.destination_dir,
+        "silver-horizon.mkv.f0.direct.partial",
+        60,
+    );
     let blob = encode(&sample_snapshot()).unwrap();
 
     // A probe that answers for nothing would otherwise walk an empty loop and
     // accept a checkpoint having validated zero destinations.
-    let rejection = restore_set_with_probe(temp_dir.path(), &blob, &sample_expected(), |_| {
+    let rejection = restore_set_with_probe(&roots, &blob, &sample_expected(), |_| {
         Vec::<ProbedDestination>::new()
     })
     .await
@@ -1598,14 +1652,23 @@ async fn restart_refuses_a_probe_that_skipped_destinations() {
 }
 
 #[tokio::test]
-async fn restart_probes_every_claimed_destination_under_the_working_directory() {
+async fn restart_probes_every_claimed_member_destination_under_the_staging_root() {
     let temp_dir = tempfile::tempdir().unwrap();
+    let roots = sample_roots(temp_dir.path());
     let blob = encode(&sample_snapshot()).unwrap();
-    let expected_path = temp_dir.path().join("silver-horizon.mkv.f0.direct.partial");
+    // The staging root, not the working directory: a member claim names payload,
+    // and payload is born on the complete volume.
+    let expected_path = roots
+        .destination_dir
+        .join("silver-horizon.mkv.f0.direct.partial");
+    assert!(
+        !expected_path.starts_with(&roots.working_dir),
+        "the two roots must be genuinely different for this to prove anything"
+    );
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&seen);
-    restore_set_with_probe(temp_dir.path(), &blob, &sample_expected(), move |probes| {
+    restore_set_with_probe(&roots, &blob, &sample_expected(), move |probes| {
         *recorded.lock().unwrap() = probes.clone();
         probes
             .into_iter()
@@ -1632,13 +1695,18 @@ async fn restart_probes_every_claimed_destination_under_the_working_directory() 
 #[tokio::test]
 async fn restart_refuses_a_flipped_file_index() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
+    let roots = sample_roots(temp_dir.path());
+    write_destination(
+        &roots.destination_dir,
+        "silver-horizon.mkv.f0.direct.partial",
+        60,
+    );
     let mut snapshot = sample_snapshot();
     snapshot.floors[0].file_index = 1;
     let blob = encode(&snapshot).unwrap();
 
     assert_eq!(
-        restore_set(temp_dir.path(), &blob, &sample_expected()).await,
+        restore_set(&roots, &blob, &sample_expected()).await,
         Err(CoverageRejection::FileIndexMismatch {
             volume_index: 0,
             expected: Some(0),
@@ -1655,7 +1723,7 @@ async fn restart_refuses_a_flipped_file_index() {
         ..sample_expected()
     };
     assert_eq!(
-        restore_set(temp_dir.path(), &blob, &expected).await,
+        restore_set(&roots, &blob, &expected).await,
         Err(CoverageRejection::FileIndexMismatch {
             volume_index: 0,
             expected: None,
@@ -1667,13 +1735,18 @@ async fn restart_refuses_a_flipped_file_index() {
 #[tokio::test]
 async fn restart_refuses_a_zero_generation_row() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
+    let roots = sample_roots(temp_dir.path());
+    write_destination(
+        &roots.destination_dir,
+        "silver-horizon.mkv.f0.direct.partial",
+        60,
+    );
     let mut snapshot = sample_snapshot();
     snapshot.generation = 0;
     let blob = encode(&snapshot).unwrap();
 
     assert_eq!(
-        restore_set(temp_dir.path(), &blob, &sample_expected()).await,
+        restore_set(&roots, &blob, &sample_expected()).await,
         Err(CoverageRejection::InvalidGeneration)
     );
 }
@@ -1681,7 +1754,12 @@ async fn restart_refuses_a_zero_generation_row() {
 #[tokio::test]
 async fn restart_deletes_every_row_it_refuses() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
+    let roots = sample_roots(temp_dir.path());
+    write_destination(
+        &roots.destination_dir,
+        "silver-horizon.mkv.f0.direct.partial",
+        60,
+    );
 
     let rows = HashMap::from([
         (SET.to_string(), encode(&sample_snapshot()).unwrap()),
@@ -1700,7 +1778,7 @@ async fn restart_deletes_every_row_it_refuses() {
     let outcome = restore_job(
         DirectStoreGate::Enabled,
         JOB,
-        temp_dir.path(),
+        &roots,
         rows,
         &expected,
         &mut recorder.clone(),
@@ -1727,6 +1805,7 @@ async fn restart_deletes_every_row_it_refuses() {
 #[tokio::test]
 async fn a_disabled_gate_ignores_rows_without_deleting_them() {
     let temp_dir = tempfile::tempdir().unwrap();
+    let roots = sample_roots(temp_dir.path());
     let rows = HashMap::from([(SET.to_string(), encode(&sample_snapshot()).unwrap())]);
     let expected = HashMap::from([(SET.to_string(), sample_expected())]);
 
@@ -1734,7 +1813,7 @@ async fn a_disabled_gate_ignores_rows_without_deleting_them() {
     let outcome = restore_job(
         DirectStoreGate::Disabled,
         JOB,
-        temp_dir.path(),
+        &roots,
         rows,
         &expected,
         &mut recorder.clone(),
@@ -2250,6 +2329,112 @@ fn envelope_plan() -> DirectSetPlan {
         volumes: [(0u32, 0u32), (1, 1)].into_iter().collect(),
         files: [(0u32, 0u32), (1, 1)].into_iter().collect(),
         working_dir: std::path::PathBuf::from("/tmp/silver-horizon"),
+        destination_dir: std::path::PathBuf::from("/tmp/complete/.weaver-staging/1"),
+    }
+}
+
+/// The split this plan exists to state: **payload** goes to the staging root on
+/// the complete volume, **working data** stays in the intermediate directory.
+///
+/// Both halves are asserted, because only asserting the first would pass for a
+/// change that moved the whole set — and moving the holds scratch onto the
+/// complete volume would put a write-once append log, read back one paged region
+/// at a time, on a network filesystem for no benefit at all.
+#[test]
+fn member_payload_resolves_under_the_staging_root_and_scratch_under_the_working_dir() {
+    let plan = envelope_plan();
+    assert_ne!(
+        plan.working_dir, plan.destination_dir,
+        "non-vacuity: a fixture whose roots are equal proves nothing"
+    );
+
+    for member in [
+        "Silver.Horizon.S01E05.mkv",
+        "Extras/Behind.The.Scenes.mkv",
+        "Extras\\Windows.Separated.mkv",
+    ] {
+        let partial = plan.destination_path(&plan.member_partial_path(member).unwrap());
+        let destination = plan.member_output_path(member).unwrap();
+        for path in [&partial, &destination] {
+            assert!(
+                path.starts_with(&plan.destination_dir),
+                "{member}: payload must be born on the complete volume, got {}",
+                path.display()
+            );
+            assert!(
+                !path.starts_with(&plan.working_dir),
+                "{member}: no payload path may resolve under the working directory, got {}",
+                path.display()
+            );
+        }
+    }
+
+    // Working data, every kind of it.
+    for (label, path) in [
+        ("holds scratch", plan.holds_scratch_path()),
+        ("envelope", plan.envelope_path(0)),
+        ("repair scratch", plan.repair_path(1)),
+    ] {
+        assert!(
+            path.starts_with(&plan.working_dir),
+            "{label} is working data and must stay in the intermediate directory, got {}",
+            path.display()
+        );
+        assert!(
+            !path.starts_with(&plan.destination_dir),
+            "{label} must not be written onto the complete volume, got {}",
+            path.display()
+        );
+    }
+}
+
+/// The tripwire for the rule a cross-device rename would break.
+///
+/// Direct-store performs exactly one rename — `finalize_direct_set` turning a
+/// member's `.direct.partial` into the member — and its two sides must resolve
+/// under the *same* root. A temp-then-rename whose temp is created in the
+/// working directory returns `EXDEV` the moment intermediate and complete are
+/// different filesystems, which is precisely the copy this split removes; a unit
+/// test cannot make two filesystems, but it can hold the derivation to the rule.
+#[test]
+fn the_commit_rename_never_crosses_a_root() {
+    let plan = envelope_plan();
+    for member in ["Silver.Horizon.S01E05.mkv", "Extras/Behind.The.Scenes.mkv"] {
+        let source = plan.destination_path(&plan.member_partial_path(member).unwrap());
+        let target = plan.member_output_path(member).unwrap();
+        assert_eq!(
+            source.parent().map(std::path::Path::to_path_buf),
+            target.parent().map(std::path::Path::to_path_buf),
+            "{member}: a commit is a rename, so its two sides must share a directory"
+        );
+    }
+}
+
+/// A destination key decides the root, and it is the key rather than the path
+/// text that decides it.
+#[test]
+fn a_barrier_destination_resolves_against_the_root_its_key_names() {
+    let plan = envelope_plan();
+    for volume_index in plan.volumes.keys().copied().collect::<Vec<_>>() {
+        let key = super::set::envelope_destination_key(volume_index);
+        assert!(plan.is_envelope_destination(key));
+        assert_eq!(
+            plan.barrier_destination_path(key, &plan.envelope_relative_path(volume_index)),
+            plan.envelope_path(volume_index),
+            "an envelope claim resolves in the working directory"
+        );
+    }
+    // Member ids are handed out from zero and never reach the envelope band.
+    let partial = plan
+        .member_partial_path("Silver.Horizon.S01E05.mkv")
+        .unwrap();
+    for member_id in [0u32, 1, 2, 4_096] {
+        assert!(!plan.is_envelope_destination(member_id));
+        assert_eq!(
+            plan.barrier_destination_path(member_id, &partial),
+            plan.destination_path(&partial),
+            "a member claim resolves in the staging root"
+        );
     }
 }
 
@@ -2268,6 +2453,7 @@ fn two_sets_of_one_job_never_share_a_derived_path() {
         volumes: [(0u32, 2u32), (1, 3)].into_iter().collect(),
         files: [(0u32, 2u32), (1, 3)].into_iter().collect(),
         working_dir: first.working_dir.clone(),
+        destination_dir: first.destination_dir.clone(),
     };
     // The set names sanitize to one stem, so without the discriminator every
     // set-derived path below would be equal.
@@ -2476,6 +2662,7 @@ fn destination_names_stay_inside_the_filename_ceiling_with_their_suffix() {
         volumes: [(0u32, 0u32), (7, 7)].into_iter().collect(),
         files: [(0u32, 0u32), (7, 7)].into_iter().collect(),
         working_dir: std::path::PathBuf::from("/tmp/silver-horizon"),
+        destination_dir: std::path::PathBuf::from("/tmp/complete/.weaver-staging/1"),
     };
 
     for volume_index in [0u32, 7, u32::MAX] {
@@ -4006,7 +4193,12 @@ fn coverage_skip_plan_skips_every_segment_of_a_complete_file() {
 #[tokio::test]
 async fn restart_refuses_a_row_claiming_a_volume_the_layout_has_no_facts_for() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
+    let roots = sample_roots(temp_dir.path());
+    write_destination(
+        &roots.destination_dir,
+        "silver-horizon.mkv.f0.direct.partial",
+        60,
+    );
     let blob = encode(&sample_snapshot()).unwrap();
 
     // The layout rebuild is tolerant of a missing volume — it contributes no
@@ -4017,7 +4209,7 @@ async fn restart_refuses_a_row_claiming_a_volume_the_layout_has_no_facts_for() {
         ..sample_expected()
     };
     assert_eq!(
-        restore_set(temp_dir.path(), &blob, &expected).await,
+        restore_set(&roots, &blob, &expected).await,
         Err(CoverageRejection::UnclassifiableVolume { volume_index: 0 }),
         "a row claiming coverage in a volume with no cached facts must be refused, not \
          accepted into a set that can never place those bytes"
@@ -4030,7 +4222,7 @@ async fn restart_refuses_a_row_claiming_a_volume_the_layout_has_no_facts_for() {
     unstarted.floors = vec![floor_entry(0, 0, 0, false)];
     let blob = encode(&unstarted).unwrap();
     assert!(
-        restore_set(temp_dir.path(), &blob, &expected).await.is_ok(),
+        restore_set(&roots, &blob, &expected).await.is_ok(),
         "a zero floor with no completion claims nothing and must not refuse the row"
     );
 }
@@ -4153,6 +4345,7 @@ fn rearm_router() -> DirectSetRouter {
         volumes: [(0u32, 0u32), (1u32, 1u32)].into_iter().collect(),
         files: [(0u32, 0u32), (1u32, 1u32)].into_iter().collect(),
         working_dir: std::path::PathBuf::from("/nonexistent"),
+        destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
     };
     let mut router = DirectSetRouter::new(plan);
     let facts = std::collections::BTreeMap::from([
@@ -4655,6 +4848,7 @@ fn straddle_router(member: &[u8], header_bytes: u64) -> (DirectSetRouter, u32) {
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
         working_dir: std::path::PathBuf::from("/nonexistent"),
+        destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
     };
     let mut router = DirectSetRouter::new(plan);
     let facts = std::collections::BTreeMap::from([(
@@ -5123,6 +5317,7 @@ fn encrypted_crypt_router_partial(
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
         working_dir: std::path::PathBuf::from("/nonexistent"),
+        destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
     };
     let mut router = DirectSetRouter::new(plan);
     // Before the layout, not after: admission runs from `sync_members`, which

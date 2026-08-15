@@ -421,6 +421,10 @@ impl Pipeline {
                 if let Some(budget) = extraction_budget {
                     let _ = tokio::task::spawn_blocking(move || budget.wait_for_idle()).await;
                 }
+                // Direct-store's member payload is written into the staging root
+                // through the cached-handle pool, so the handles have to go
+                // before the directory does.
+                crate::pipeline::close_cached_write_handles_under(&staging).await;
                 if let Err(e) = tokio::fs::remove_dir_all(&staging).await
                     && e.kind() != std::io::ErrorKind::NotFound
                 {

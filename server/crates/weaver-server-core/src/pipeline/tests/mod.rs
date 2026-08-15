@@ -339,10 +339,36 @@ async fn new_direct_pipeline_with(
     total_connections: usize,
     direct_store: Option<crate::settings::DirectStoreOverrides>,
 ) -> (Pipeline, PathBuf, PathBuf) {
-    let data_dir = temp_dir.path().join("data");
-    let intermediate_dir = temp_dir.path().join("intermediate");
-    let complete_dir = temp_dir.path().join("complete");
-    let db = Database::open(&temp_dir.path().join("weaver.db")).unwrap();
+    new_direct_pipeline_at_roots(
+        temp_dir.path().join("data"),
+        temp_dir.path().join("intermediate"),
+        temp_dir.path().join("complete"),
+        temp_dir.path().join("weaver.db"),
+        buffer_config,
+        total_connections,
+        direct_store,
+    )
+    .await
+}
+
+/// [`new_direct_pipeline_with`] with the three roots given explicitly.
+///
+/// Everything else here puts `intermediate` and `complete` under one `TempDir`,
+/// which puts them on one filesystem — and the whole class of question this
+/// exists for ("is the publish a rename or a byte copy?") is unobservable there.
+/// The cross-device probe at the end of `direct_store.rs` hands in two roots on
+/// genuinely different mounts.
+#[allow(clippy::too_many_arguments)]
+async fn new_direct_pipeline_at_roots(
+    data_dir: PathBuf,
+    intermediate_dir: PathBuf,
+    complete_dir: PathBuf,
+    db_path: PathBuf,
+    buffer_config: BufferPoolConfig,
+    total_connections: usize,
+    direct_store: Option<crate::settings::DirectStoreOverrides>,
+) -> (Pipeline, PathBuf, PathBuf) {
+    let db = Database::open(&db_path).unwrap();
     let config: SharedConfig = Arc::new(RwLock::new(Config {
         data_dir: data_dir.display().to_string(),
         intermediate_dir: Some(intermediate_dir.display().to_string()),

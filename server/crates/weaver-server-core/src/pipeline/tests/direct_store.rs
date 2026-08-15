@@ -76,6 +76,56 @@ fn single_member_store_set(
         .collect()
 }
 
+/// A job's **payload root**: `complete/.weaver-staging/<job_id>` under the
+/// harness's temp dir.
+///
+/// Direct-store member payload is born here rather than in the working
+/// directory, so completion publishes it by a same-volume rename exactly as it
+/// publishes a member the incremental extractor produced. Mirrors
+/// `Pipeline::deterministic_extraction_staging_dir` against the layout
+/// `new_direct_pipeline_with` configures.
+fn payload_root(temp_dir: &TempDir, job_id: JobId) -> PathBuf {
+    temp_dir
+        .path()
+        .join("complete")
+        .join(".weaver-staging")
+        .join(job_id.0.to_string())
+}
+
+/// The `.direct.partial` one member routes into, under the payload root.
+fn direct_partial(temp_dir: &TempDir, job_id: JobId, member_name: &str) -> PathBuf {
+    payload_root(temp_dir, job_id).join(format!("{member_name}.f0.direct.partial"))
+}
+
+/// A member sitting **unpublished** in the job's staging root.
+///
+/// The third place a finished member can legitimately be, and the one this
+/// harness gained when direct-store started writing payload onto the complete
+/// volume: `complete_dir/.weaver-staging/<job_id>/<member>` is where both direct
+/// finalization and the incremental extractor leave a member until the final
+/// move renames it into the output directory. The job id is wildcarded because
+/// one harness temp dir only ever runs one job.
+fn staging_member(complete_dir: &Path, member_name: &str) -> Option<Vec<u8>> {
+    std::fs::read_dir(complete_dir.join(".weaver-staging"))
+        .ok()?
+        .flatten()
+        .find_map(|entry| std::fs::read(entry.path().join(member_name)).ok())
+}
+
+/// Whether any `.direct.partial` is left at the top level of `root`.
+fn any_direct_partial(root: &Path) -> bool {
+    std::fs::read_dir(root)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".direct.partial")
+            })
+        })
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Quick Open: the cache is a hint, and direct-store never routes on one
 // ---------------------------------------------------------------------------
@@ -238,7 +288,7 @@ async fn a_forged_quick_open_member_never_reaches_the_router() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let arrivals = in_order_arrivals(volumes.len());
-    let (shape, working_dir) =
+    let (shape, _working_dir) =
         run_direct_store_routing_only(&temp_dir, JobId(41101), &volumes, &arrivals).await;
 
     assert!(
@@ -247,9 +297,7 @@ async fn a_forged_quick_open_member_never_reaches_the_router() {
          under its own reason, got {shape}"
     );
     assert!(
-        !working_dir
-            .join(format!("{forged_name}.f0.direct.partial"))
-            .exists(),
+        !direct_partial(&temp_dir, JobId(41101), forged_name).exists(),
         "no destination may be created for a member only the Quick Open cache claims"
     );
 }
@@ -507,15 +555,17 @@ async fn run_gate_with_password(
     let output_root =
         complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
     let completed = std::fs::read(output_root.join(member_name)).ok();
+    let staged = staging_member(&complete_dir, member_name);
     let left_behind = std::fs::read(working_dir.join(member_name)).ok();
     assert!(
-        completed.is_none() || left_behind.is_none(),
+        completed.is_none() || (staged.is_none() && left_behind.is_none()),
         "a finished member must exist in exactly one place"
     );
-    let (member, member_location) = match (completed, left_behind) {
-        (Some(bytes), _) => (Some(bytes), Some("complete")),
-        (None, Some(bytes)) => (Some(bytes), Some("working")),
-        (None, None) => (None, None),
+    let (member, member_location) = match (completed, staged, left_behind) {
+        (Some(bytes), _, _) => (Some(bytes), Some("complete")),
+        (None, Some(bytes), _) => (Some(bytes), Some("staging")),
+        (None, None, Some(bytes)) => (Some(bytes), Some("working")),
+        (None, None, None) => (None, None),
     };
     GateOutcome {
         member,
@@ -673,7 +723,7 @@ async fn direct_store_demotes_and_still_completes_when_the_member_checksum_is_wr
 
     let arrivals = in_order_arrivals(volumes.len());
     let temp_dir = tempfile::tempdir().unwrap();
-    let (shape, working_dir) =
+    let (shape, _working_dir) =
         run_direct_store_routing_only(&temp_dir, JobId(41005), &volumes, &arrivals).await;
 
     assert!(
@@ -681,13 +731,13 @@ async fn direct_store_demotes_and_still_completes_when_the_member_checksum_is_wr
         "the whole-member gate should have demoted the set, got {shape}"
     );
     assert!(
-        !working_dir.join(member_name).exists(),
+        !payload_root(&temp_dir, JobId(41005))
+            .join(member_name)
+            .exists(),
         "a member failing its whole-member gate must not be committed as if it passed"
     );
     assert!(
-        !working_dir
-            .join(format!("{member_name}.f0.direct.partial"))
-            .exists(),
+        !direct_partial(&temp_dir, JobId(41005), member_name).exists(),
         "demotion must delete the set's partial direct output"
     );
 }
@@ -818,9 +868,15 @@ async fn a_member_hiding_past_the_first_is_adopted_and_routes_direct() {
         (tail_name, tail.as_slice()),
     ] {
         assert_eq!(
-            std::fs::read(crate::pipeline::Pipeline::member_output_paths(&working_dir, name).0)
-                .ok()
-                .as_deref(),
+            std::fs::read(
+                crate::pipeline::Pipeline::member_output_paths(
+                    &payload_root(&temp_dir, JobId(41010)),
+                    name
+                )
+                .0
+            )
+            .ok()
+            .as_deref(),
             Some(expected),
             "{name} must be committed byte for byte"
         );
@@ -990,11 +1046,13 @@ async fn run_par2_direct_gate_with_password(
     let output_root =
         complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
     let completed = std::fs::read(output_root.join(member_name)).ok();
+    let staged = staging_member(&complete_dir, member_name);
     let left_behind = std::fs::read(working_dir.join(member_name)).ok();
-    let (member, member_location) = match (completed, left_behind) {
-        (Some(bytes), _) => (Some(bytes), Some("complete")),
-        (None, Some(bytes)) => (Some(bytes), Some("working")),
-        (None, None) => (None, None),
+    let (member, member_location) = match (completed, staged, left_behind) {
+        (Some(bytes), _, _) => (Some(bytes), Some("complete")),
+        (None, Some(bytes), _) => (Some(bytes), Some("staging")),
+        (None, None, Some(bytes)) => (Some(bytes), Some("working")),
+        (None, None, None) => (None, None),
     };
     Par2GateOutcome {
         member,
@@ -1199,6 +1257,7 @@ async fn run_damaged_par2_gate(
         status: job_status_for_assert(&pipeline, job_id),
         member: std::fs::read(output_root.join(member_name))
             .ok()
+            .or_else(|| staging_member(&complete_dir, member_name))
             .or_else(|| std::fs::read(working_dir.join(member_name)).ok()),
         volume_files,
         rearmed_after_demotion,
@@ -1372,7 +1431,11 @@ async fn a_duplicate_article_after_finalization_leaves_the_finished_output_alone
         shape.contains("Finalized"),
         "the set should have finalized before the duplicate arrives, got {shape}"
     );
-    let member_path = crate::pipeline::Pipeline::member_output_paths(&working_dir, member_name).0;
+    let member_path = crate::pipeline::Pipeline::member_output_paths(
+        &payload_root(&temp_dir, JobId(41014)),
+        member_name,
+    )
+    .0;
     let before = std::fs::read(&member_path).expect("the member is committed at finalization");
     assert_eq!(before, payload);
 
@@ -1393,9 +1456,7 @@ async fn a_duplicate_article_after_finalization_leaves_the_finished_output_alone
         );
     }
     assert!(
-        !working_dir
-            .join(format!("{member_name}.f0.direct.partial"))
-            .exists(),
+        !direct_partial(&temp_dir, JobId(41014), member_name).exists(),
         "a duplicate after finalization must not recreate the partial"
     );
 }
@@ -1543,11 +1604,7 @@ async fn a_demoted_set_materializes_its_covered_volumes_instead_of_refetching_th
 
     // The direct outputs are gone: a sparse half-written member would
     // masquerade as finished work, and the envelopes are scratch.
-    assert!(
-        !working_dir
-            .join(format!("{member_name}.f0.direct.partial"))
-            .exists()
-    );
+    assert!(!direct_partial(&temp_dir, JobId(41015), member_name).exists());
     for volume_index in 0..volumes.len() as u32 {
         assert!(
             !working_dir
@@ -1766,7 +1823,7 @@ async fn a_scratch_ceiling_breach_demotes_the_set() {
     pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41054);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
-    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
     submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
 
@@ -1775,11 +1832,7 @@ async fn a_scratch_ceiling_breach_demotes_the_set() {
         shape.contains("Demoted(HoldsScratchCeiling)"),
         "a scratch ceiling breach must demote with its own reason, got {shape}"
     );
-    assert!(
-        !working_dir
-            .join(format!("{member_name}.f0.direct.partial"))
-            .exists()
-    );
+    assert!(!direct_partial(&temp_dir, JobId(41054), member_name).exists());
 }
 
 #[tokio::test]
@@ -1910,9 +1963,7 @@ async fn direct_store_demotes_when_the_chain_closes_with_a_blake2_only_member() 
         "a member that resolves blake2-only when its chain closes must demote the set, got {shape}"
     );
     assert!(
-        !working_dir
-            .join(format!("{member_name}.f0.direct.partial"))
-            .exists(),
+        !direct_partial(&temp_dir, JobId(41021), member_name).exists(),
         "the demotion deletes the bytes routed while the member was provisional"
     );
 
@@ -1976,7 +2027,7 @@ async fn direct_store_demotes_a_volume_whose_yenc_whole_file_crc_disagrees() {
     pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41022);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
-    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
     // Volume 0's articles are internally consistent — each one's own yEnc part
     // CRC is right — but the trailer they declare for the whole file is not the
@@ -2024,11 +2075,7 @@ async fn direct_store_demotes_a_volume_whose_yenc_whole_file_crc_disagrees() {
         "a volume whose composed yEnc CRC32 disagrees with its trailer must demote \
          at volume completion, long before any member gate could run, got {shape}"
     );
-    assert!(
-        !working_dir
-            .join(format!("{member_name}.f0.direct.partial"))
-            .exists()
-    );
+    assert!(!direct_partial(&temp_dir, JobId(41022), member_name).exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -2236,9 +2283,15 @@ async fn a_rar4_set_routes_directly_because_the_format_is_read_not_assumed() {
         "a RAR4 store set is as routable as a RAR5 one, got {set:?}"
     );
     assert_eq!(
-        std::fs::read(crate::pipeline::Pipeline::member_output_paths(&working_dir, member_name).0)
-            .ok()
-            .as_deref(),
+        std::fs::read(
+            crate::pipeline::Pipeline::member_output_paths(
+                &payload_root(&temp_dir, JobId(41025)),
+                member_name
+            )
+            .0
+        )
+        .ok()
+        .as_deref(),
         Some(payload.as_slice()),
         "the routed RAR4 member must reproduce the payload byte for byte"
     );
@@ -2373,15 +2426,17 @@ async fn run_multi_member_gate(
         .iter()
         .map(|name| {
             let completed = std::fs::read(output_root.join(name)).ok();
+            let staged = staging_member(&complete_dir, name);
             let left_behind = std::fs::read(working_dir.join(name)).ok();
             assert!(
-                completed.is_none() || left_behind.is_none(),
+                completed.is_none() || (staged.is_none() && left_behind.is_none()),
                 "{name} must exist in exactly one place"
             );
-            match (completed, left_behind) {
-                (Some(bytes), _) => (name.to_string(), Some(bytes), Some("complete")),
-                (None, Some(bytes)) => (name.to_string(), Some(bytes), Some("working")),
-                (None, None) => (name.to_string(), None, None),
+            match (completed, staged, left_behind) {
+                (Some(bytes), _, _) => (name.to_string(), Some(bytes), Some("complete")),
+                (None, Some(bytes), _) => (name.to_string(), Some(bytes), Some("staging")),
+                (None, None, Some(bytes)) => (name.to_string(), Some(bytes), Some("working")),
+                (None, None, None) => (name.to_string(), None, None),
             }
         })
         .collect();
@@ -2673,9 +2728,15 @@ async fn a_recovery_record_set_routes_direct_and_its_envelopes_carry_the_recover
         "an -rr set routes and finalizes under envelope v2, got {set:?}"
     );
     assert_eq!(
-        std::fs::read(crate::pipeline::Pipeline::member_output_paths(&working_dir, member_name).0)
-            .ok()
-            .as_deref(),
+        std::fs::read(
+            crate::pipeline::Pipeline::member_output_paths(
+                &payload_root(&temp_dir, JobId(41045)),
+                member_name
+            )
+            .0
+        )
+        .ok()
+        .as_deref(),
         Some(payload.as_slice()),
         "the member must be byte-correct even with a recovery record between the parts"
     );
@@ -2921,9 +2982,15 @@ async fn payload_past_the_last_known_header_is_held_until_the_walk_proves_what_i
         (notes, notes_payload.as_slice()),
     ] {
         assert_eq!(
-            std::fs::read(crate::pipeline::Pipeline::member_output_paths(&working_dir, name).0)
-                .ok()
-                .as_deref(),
+            std::fs::read(
+                crate::pipeline::Pipeline::member_output_paths(
+                    &payload_root(&temp_dir, JobId(41047)),
+                    name
+                )
+                .0
+            )
+            .ok()
+            .as_deref(),
             Some(expected),
             "{name} must be byte-correct — its payload arrived before its header did"
         );
@@ -3062,9 +3129,7 @@ async fn a_member_that_turns_ineligible_after_routing_never_materializes_fabrica
         "the volume the demotion fired on covered nothing, so it is refetched whole"
     );
     assert!(
-        !working_dir
-            .join(format!("{member_name}.f0.direct.partial"))
-            .exists(),
+        !direct_partial(&temp_dir, JobId(41051), member_name).exists(),
         "the direct outputs are deleted once the volumes are real"
     );
 }
@@ -3087,9 +3152,9 @@ async fn a_partially_covered_volume_is_verified_before_it_is_materialized() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(41052);
     let (mut pipeline, working_dir, other_file_bytes) =
-        demote_mid_download(&temp_dir, job_id, &volumes, |_, working_dir| {
+        demote_mid_download(&temp_dir, job_id, &volumes, |_, _working_dir| {
             use std::io::{Seek, SeekFrom, Write};
-            let partial = working_dir.join(format!("{member_name}.f0.direct.partial"));
+            let partial = direct_partial(&temp_dir, JobId(41052), member_name);
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&partial)
@@ -3745,7 +3810,7 @@ async fn a_migration_that_cannot_read_its_partial_demotes_cleanly() {
         }
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
     }
-    let partial = working_dir.join(format!("{extra_name}.f0.direct.partial"));
+    let partial = direct_partial(&temp_dir, JobId(41094), extra_name);
     assert!(
         std::fs::metadata(&partial).is_ok_and(|metadata| metadata.len() > 0),
         "non-vacuity: the member must really have been adopted and routed before the \
@@ -4156,6 +4221,7 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
         complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
     let produced = std::fs::read(output_root.join(member_name))
         .ok()
+        .or_else(|| staging_member(&complete_dir, member_name))
         .or_else(|| std::fs::read(working_dir.join(member_name)).ok());
     assert_eq!(
         produced.as_deref(),
@@ -4527,8 +4593,13 @@ async fn direct_store_after_restart_with_password(
     pipeline
 }
 
-/// Reads the member out of wherever the gate left it, the same two candidate
+/// Reads the member out of wherever the gate left it, the same three candidate
 /// places every other differential here checks.
+///
+/// `staging` is the middle one and it is not hypothetical: both direct
+/// finalization and the incremental extractor write a member into the job's
+/// staging root, and it only reaches `complete` when the final move renames it
+/// out. A gate that stopped before the move leaves it there.
 fn member_after_gate(
     complete_dir: &Path,
     working_dir: &Path,
@@ -4538,11 +4609,13 @@ fn member_after_gate(
         complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
     match (
         std::fs::read(output_root.join(member_name)).ok(),
+        staging_member(complete_dir, member_name),
         std::fs::read(working_dir.join(member_name)).ok(),
     ) {
-        (Some(bytes), _) => (Some(bytes), Some("complete")),
-        (None, Some(bytes)) => (Some(bytes), Some("working")),
-        (None, None) => (None, None),
+        (Some(bytes), _, _) => (Some(bytes), Some("complete")),
+        (None, Some(bytes), _) => (Some(bytes), Some("staging")),
+        (None, None, Some(bytes)) => (Some(bytes), Some("working")),
+        (None, None, None) => (None, None),
     }
 }
 
@@ -4730,7 +4803,7 @@ async fn a_byte_corrupted_while_the_process_was_down_fails_the_member_gate() {
         direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
 
     // Flip a byte the checkpoint claims, while "the process is down".
-    let partial = working_dir.join(format!("{member_name}.f0.direct.partial"));
+    let partial = direct_partial(&temp_dir, JobId(41063), member_name);
     let mut bytes = std::fs::read(&partial).expect("volume 0 routed into the member partial");
     assert!(!bytes.is_empty(), "the partial must hold routed bytes");
     bytes[10] ^= 0xff;
@@ -4786,6 +4859,217 @@ async fn a_byte_corrupted_while_the_process_was_down_fails_the_member_gate() {
     );
 }
 
+/// The payload lands on the **complete** volume and the scratch does not.
+///
+/// The two are observed on a live job rather than derived from a plan, because
+/// the derivation is only half the claim: what matters operationally is which
+/// filesystem the bytes are actually written to as the articles arrive, and that
+/// they are still there — under the staging root — when finalization renames
+/// them into place.
+#[tokio::test]
+async fn a_direct_set_writes_payload_to_the_staging_root_and_scratch_to_the_working_dir() {
+    let member_name = "Silver.Horizon.S01E44.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 149) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    // Small enough that the first held payload pages out, so the scratch file
+    // this test is half about actually exists.
+    pipeline.direct_store.set_holds_budget(64);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(41120);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let staging = payload_root(&temp_dir, job_id);
+    assert!(
+        !staging.starts_with(&working_dir),
+        "non-vacuity: the harness must give the job two genuinely separate roots"
+    );
+
+    // Payload before the header, so the router has to hold it.
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    let scratch = working_dir.join(".weaver-holds.silver.horizon.f0");
+    assert!(
+        scratch.exists(),
+        "the paged holds must reach a scratch file in the intermediate directory"
+    );
+    assert!(
+        !staging.join(".weaver-holds.silver.horizon.f0").exists(),
+        "the holds scratch is working data and must never be written to the complete volume"
+    );
+
+    // Mid-flight: the derivation the live set is actually routing through.
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    {
+        let set = pipeline
+            .direct_store
+            .set(job_id, 0)
+            .expect("the set was admitted");
+        let members = set.router.member_partials();
+        assert!(!members.is_empty(), "non-vacuity: nothing routed");
+        for (_, name, relative) in members {
+            let partial = set.plan().destination_path(relative);
+            let destination = set
+                .plan()
+                .member_output_path(name)
+                .expect("the member resolves");
+            assert!(
+                partial.starts_with(&staging) && destination.starts_with(&staging),
+                "{name}: both sides of the commit rename must be under the staging root"
+            );
+            assert!(
+                !working_dir.join(relative).exists(),
+                "{name}: no payload byte may be written into the intermediate directory"
+            );
+        }
+        assert!(
+            set.plan().holds_scratch_path().starts_with(&working_dir)
+                && set.plan().envelope_path(0).starts_with(&working_dir),
+            "the set's working files stay in the intermediate directory"
+        );
+    }
+    assert!(
+        direct_envelopes_left(&working_dir) > 0,
+        "the envelopes are working data and belong beside the scratch"
+    );
+    assert_eq!(
+        direct_envelopes_left(&staging),
+        0,
+        "and none of them may be written to the complete volume"
+    );
+
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if (file_index, segment_number) == (0, 0) || (file_index, segment_number) == (0, 1) {
+            continue;
+        }
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Finalized"),
+        "the set must finalize, got {shape}"
+    );
+
+    assert_eq!(
+        std::fs::read(staging.join(member_name)).ok().as_deref(),
+        Some(payload.as_slice()),
+        "the committed member is in the staging root, ready to be published by rename"
+    );
+    assert!(
+        !working_dir.join(member_name).exists(),
+        "and nowhere in the intermediate directory"
+    );
+    assert!(
+        !any_direct_partial(&working_dir),
+        "no `.direct.partial` may ever have been created in the intermediate directory"
+    );
+}
+
+/// A restart re-derives the same destinations, in the same staging root.
+///
+/// The staging root is deterministic per job id, so the "after" pipeline builds
+/// it from the job id alone — before the job state exists — and has to arrive at
+/// the byte-identical path the "before" pipeline wrote into. If it did not, every
+/// destination claim in the checkpoint would fail its probe, the row would be
+/// deleted and the set would redownload from zero: safe, silent, and a complete
+/// loss of the resume.
+#[tokio::test]
+async fn a_restart_re_derives_its_destinations_in_the_same_staging_root() {
+    const ARTICLES: usize = 2;
+    let member_name = "Silver.Horizon.S01E45.mkv";
+    let payload: Vec<u8> = (0..4000u32).map(|index| (index % 239) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 2);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41121);
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1)];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+
+    let partial = direct_partial(&temp_dir, job_id, member_name);
+    let before = std::fs::read(&partial).expect("volume 0 routed into the member partial");
+    assert!(!before.is_empty(), "non-vacuity: nothing was routed");
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    // The row survived, which is only possible if the probe found the partial —
+    // and the probe joins the claim onto the root this pipeline re-derived.
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the restored job must carry its direct set");
+    assert!(
+        set.has_restart_seeded_coverage(),
+        "the checkpoint must have been accepted, not refused on a missing destination"
+    );
+    let staging = payload_root(&temp_dir, job_id);
+    for (_, name, relative) in set.router.member_partials() {
+        assert_eq!(
+            set.plan().destination_path(relative),
+            partial,
+            "{name}: the resumed run must re-derive the very path the previous one wrote"
+        );
+        assert!(
+            set.plan()
+                .member_output_path(name)
+                .expect("the member resolves")
+                .starts_with(&staging)
+        );
+    }
+    assert_eq!(
+        std::fs::read(&partial).ok(),
+        Some(before),
+        "and the bytes under it are the ones the checkpoint claims"
+    );
+
+    // Non-vacuity for the *skip*: a restore that re-derived a different root
+    // would refuse the row and requeue every segment of the set.
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        queued.len() < volumes.len() * ARTICLES,
+        "the accepted checkpoint must let the resumed job skip what it already has, got {queued:?}"
+    );
+
+    // And it finishes: the resumed run's own writes land beside the restored
+    // ones, in the same root, and the commit rename still never crosses.
+    for (file_index, segment_number) in queued {
+        dispatch_and_submit(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES,
+        )
+        .await;
+    }
+    drain_rar_refreshes(&mut pipeline).await;
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Finalized"),
+        "a resumed set must finish from its checkpoint, got {shape}"
+    );
+    assert_eq!(
+        std::fs::read(staging.join(member_name)).ok().as_deref(),
+        Some(payload.as_slice()),
+        "and commit the member in the staging root, byte for byte"
+    );
+    assert!(
+        !any_direct_partial(&working_dir) && !working_dir.join(member_name).exists(),
+        "a resumed run leaves no payload in the intermediate directory either"
+    );
+}
+
 /// With the gate off the rows are ignored, the job redownloads conventionally,
 /// and the direct-store files nothing claims are swept out of the way.
 #[tokio::test]
@@ -4801,7 +5085,7 @@ async fn a_restart_with_the_gate_off_redownloads_and_sweeps_the_orphans() {
     let working_dir =
         direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
 
-    let partial = working_dir.join(format!("{member_name}.f0.direct.partial"));
+    let partial = direct_partial(&temp_dir, JobId(41064), member_name);
     let envelope = working_dir.join("silver.horizon.f0.vol00000.envelope");
     assert!(partial.exists() && envelope.exists(), "non-vacuity");
 
@@ -4863,7 +5147,7 @@ async fn a_digest_mismatch_sweeps_the_sets_files_and_deletes_the_row() {
             .unwrap();
     }
 
-    let partial = working_dir.join(format!("{member_name}.f0.direct.partial"));
+    let partial = direct_partial(&temp_dir, JobId(41065), member_name);
     assert!(partial.exists(), "non-vacuity");
 
     let mut pipeline = direct_store_after_restart(
@@ -4935,8 +5219,8 @@ async fn a_member_first_seen_in_a_later_volume_still_restarts_from_its_checkpoin
 
     // Non-vacuity: the run really did discover the second member after the first
     // barrier existed, and really did route bytes for both.
-    let episode_partial = working_dir.join(format!("{episode}.f0.direct.partial"));
-    let notes_partial = working_dir.join(format!("{notes}.f0.direct.partial"));
+    let episode_partial = direct_partial(&temp_dir, JobId(41067), episode);
+    let notes_partial = direct_partial(&temp_dir, JobId(41067), notes);
     assert!(
         episode_partial.exists() && notes_partial.exists(),
         "both members must have routed before the restart"
@@ -4972,7 +5256,7 @@ async fn a_member_first_seen_in_a_later_volume_still_restarts_from_its_checkpoin
         .set(job_id, 0)
         .expect("the restored job must carry its direct set");
     let judgement = crate::pipeline::direct_store::restart::restore_set(
-        &working_dir,
+        &crate::pipeline::direct_store::restart::DestinationRoots::for_plan(set.plan()),
         &committed,
         &set.expected_set(),
     )
@@ -5104,8 +5388,8 @@ async fn a_restart_after_a_member_migration_keeps_its_checkpoint() {
 
     // Non-vacuity: the migration really ran, and it really did leave the routed
     // member's own destination alone.
-    let extra_partial = working_dir.join(format!("{extra_name}.f0.direct.partial"));
-    let store_partial = working_dir.join(format!("{store_name}.f0.direct.partial"));
+    let extra_partial = direct_partial(&temp_dir, JobId(41069), extra_name);
+    let store_partial = direct_partial(&temp_dir, JobId(41069), store_name);
     assert!(
         !extra_partial.exists(),
         "the migration must have deleted the migrated member's partial"
@@ -5154,7 +5438,7 @@ async fn a_restart_after_a_member_migration_keeps_its_checkpoint() {
         .set(job_id, 0)
         .expect("the restored job must carry its direct set");
     let judgement = crate::pipeline::direct_store::restart::restore_set(
-        &working_dir,
+        &crate::pipeline::direct_store::restart::DestinationRoots::for_plan(set.plan()),
         &committed,
         &set.expected_set(),
     )
@@ -6405,6 +6689,7 @@ async fn run_repairable_par2_gate_with_articles(
         status: job_status_for_assert(&pipeline, job_id),
         member: std::fs::read(output_root.join(member_name))
             .ok()
+            .or_else(|| staging_member(&complete_dir, member_name))
             .or_else(|| std::fs::read(working_dir.join(member_name)).ok()),
         volume_file_seen,
         repair_scratch_left: direct_scratch_left(&working_dir),
@@ -6777,7 +7062,7 @@ async fn a_second_damage_verdict_after_a_repair_demotes_instead_of_repairing_aga
     // volume reads its member bytes back out of. This is the shape the bound
     // exists for: a repair that did not leave the set verifiable, however it got
     // there.
-    let partial = std::fs::read_dir(&working_dir)
+    let partial = std::fs::read_dir(payload_root(&temp_dir, JobId(41103)))
         .unwrap()
         .flatten()
         .map(|entry| entry.path())
@@ -7790,10 +8075,11 @@ async fn a_finalized_set_does_not_stop_its_live_neighbour_repairing_while_direct
          have had anyway"
     );
     assert_eq!(
-        std::fs::read(working_dir.join(finalized_member)).ok(),
+        std::fs::read(payload_root(&temp_dir, job_id).join(finalized_member)).ok(),
         Some(finalized_payload.clone()),
-        "and its member must be committed at its destination, because that is \
-         what the retained image reads the member extents back out of"
+        "and its member must be committed at its destination — the staging root, \
+         not the working directory — because that is what the retained image \
+         reads the member extents back out of"
     );
 
     let par2_set = pipeline
@@ -8222,6 +8508,7 @@ async fn run_lost_article_gate(
         status: job_status_for_assert(&pipeline, job_id),
         member: std::fs::read(output_root.join(member_name))
             .ok()
+            .or_else(|| staging_member(&complete_dir, member_name))
             .or_else(|| std::fs::read(working_dir.join(member_name)).ok()),
         volume_file_seen,
         repair_scratch_left: direct_scratch_left(&working_dir),
@@ -8616,7 +8903,7 @@ async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads(
         working_dir
     };
 
-    let partial = working_dir.join(format!("{member_name}.f0.direct.partial"));
+    let partial = direct_partial(&temp_dir, JobId(41090), member_name);
     let envelope = working_dir.join("silver.horizon.f0.vol00000.envelope");
     assert!(
         partial.exists() && envelope.exists(),
@@ -8720,9 +9007,7 @@ async fn a_destination_that_cannot_be_marked_sparse_demotes_before_it_holds_a_ho
         "a destination that cannot be marked sparse must demote with its own reason, got {shape}"
     );
     assert!(
-        !working_dir
-            .join(format!("{member_name}.f0.direct.partial"))
-            .exists(),
+        !direct_partial(&temp_dir, JobId(41091), member_name).exists(),
         "the refused destination must not be left behind"
     );
     assert!(
@@ -9014,16 +9299,7 @@ async fn encrypted_routing_outcome(
     let volume_file_seen = volumes
         .iter()
         .any(|(filename, _)| working_dir.join(filename).exists());
-    let partial_seen = std::fs::read_dir(&working_dir)
-        .map(|entries| {
-            entries.flatten().any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".direct.partial")
-            })
-        })
-        .unwrap_or(false);
+    let partial_seen = any_direct_partial(&payload_root(&temp_dir, job_id));
     EncryptedRoutingOutcome {
         shape,
         volume_file_seen,
@@ -11305,13 +11581,7 @@ async fn an_encrypted_rar4_set_restarted_without_its_password_demotes_by_name() 
     // no plaintext prefix written under the old key is left to be mistaken for
     // this run's output.
     assert!(
-        !std::fs::read_dir(&working_dir)
-            .expect("working dir")
-            .filter_map(Result::ok)
-            .any(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".direct.partial")),
+        !any_direct_partial(&payload_root(&temp_dir, JobId(44061))),
         "a refused restore must sweep the partials the previous run wrote"
     );
 }
@@ -11720,16 +11990,7 @@ async fn hp_routing_outcome_named(
     let volume_file_seen = volumes
         .iter()
         .any(|(filename, _)| working_dir.join(filename).exists());
-    let partial_seen = std::fs::read_dir(&working_dir)
-        .map(|entries| {
-            entries.flatten().any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".direct.partial")
-            })
-        })
-        .unwrap_or(false);
+    let partial_seen = any_direct_partial(&payload_root(&temp_dir, job_id));
     EncryptedRoutingOutcome {
         shape,
         volume_file_seen,
@@ -11848,16 +12109,7 @@ async fn hp_fallback_outcome(
         volume_file_seen: volumes
             .iter()
             .any(|(filename, _)| working_dir.join(filename).exists()),
-        partial_seen: std::fs::read_dir(&working_dir)
-            .map(|entries| {
-                entries.flatten().any(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .ends_with(".direct.partial")
-                })
-            })
-            .unwrap_or(false),
+        partial_seen: any_direct_partial(&payload_root(&temp_dir, job_id)),
     };
 
     // Sampled as the refetch runs, not read at the end: a *successful* fallback
@@ -13433,6 +13685,426 @@ async fn out_of_order_arrival_does_not_trip_the_header_prefix_ceiling() {
             !state.contains("Demoted"),
             "the set must never demote on arrival order alone; after segment \
              {segment}: {state}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-device probe
+//
+// Every other test in this file puts the intermediate and complete directories
+// under one `TempDir`, so they share a filesystem and `rename(2)` between them
+// always succeeds. That hides the exact failure this subsystem cares about: on
+// the ordinary deployment — intermediate on local disk, complete on a NAS — a
+// publish rename across the two returns `EXDEV` and completion falls back to
+// copying every byte a second time.
+//
+// These probes run only when `WEAVER_XDEV_INTERMEDIATE` and
+// `WEAVER_XDEV_COMPLETE` name directories on two different filesystems, which is
+// what the container harness provides (two `--tmpfs` mounts). They print a
+// machine-readable evidence block — device and inode numbers at each stage — and
+// assert the verdict named by `WEAVER_XDEV_EXPECT` (`rename` or `copy`), so the
+// same source can be run against a tree that writes payload to the intermediate
+// filesystem and one that writes it to the complete filesystem, and each is held
+// to what it actually guarantees.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod cross_device {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// One file the probe found, with the two numbers that answer everything:
+    /// `dev` says which filesystem it is on, `ino` says whether a later file is
+    /// the *same* file (a rename) or a new one (a copy).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Found {
+        path: PathBuf,
+        dev: u64,
+        ino: u64,
+        len: u64,
+    }
+
+    fn roots() -> Option<(PathBuf, PathBuf)> {
+        let intermediate = std::env::var_os("WEAVER_XDEV_INTERMEDIATE")?;
+        let complete = std::env::var_os("WEAVER_XDEV_COMPLETE")?;
+        Some((PathBuf::from(intermediate), PathBuf::from(complete)))
+    }
+
+    fn dev_of(path: &Path) -> u64 {
+        std::fs::metadata(path)
+            .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()))
+            .dev()
+    }
+
+    /// Every regular file under `root`, deepest-first order irrelevant.
+    fn walk(root: &Path) -> Vec<Found> {
+        let mut out = Vec::new();
+        let mut queue = vec![root.to_path_buf()];
+        while let Some(dir) = queue.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    queue.push(path);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Ok(metadata) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                out.push(Found {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                    len: metadata.len(),
+                    path,
+                });
+            }
+        }
+        out.sort_by(|left, right| left.path.cmp(&right.path));
+        out
+    }
+
+    fn matching(root: &Path, predicate: impl Fn(&str) -> bool) -> Vec<Found> {
+        walk(root)
+            .into_iter()
+            .filter(|found| {
+                found
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(&predicate)
+            })
+            .collect()
+    }
+
+    fn report(stage: &str, found: &[Found]) {
+        if found.is_empty() {
+            println!("XDEV {stage} <none>");
+        }
+        for entry in found {
+            println!(
+                "XDEV {stage} dev={} ino={} len={} path={}",
+                entry.dev,
+                entry.ino,
+                entry.len,
+                entry.path.display()
+            );
+        }
+    }
+
+    fn fresh(root: &Path, tag: &str) -> PathBuf {
+        let dir = root.join(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The headline: where the payload is born, and whether the publish is a
+    /// rename or a byte copy.
+    #[tokio::test]
+    async fn direct_store_payload_and_publish_across_two_filesystems() {
+        let Some((intermediate_root, complete_root)) = roots() else {
+            println!("XDEV skipped: set WEAVER_XDEV_INTERMEDIATE and WEAVER_XDEV_COMPLETE");
+            return;
+        };
+        let expected = std::env::var("WEAVER_XDEV_EXPECT").unwrap_or_else(|_| "rename".to_string());
+
+        let intermediate_dir = fresh(&intermediate_root, "payload-intermediate");
+        let complete_dir = fresh(&complete_root, "payload-complete");
+        let data_dir = fresh(&intermediate_root, "payload-data");
+        let intermediate_dev = dev_of(&intermediate_dir);
+        let complete_dev = dev_of(&complete_dir);
+        println!("XDEV roots intermediate_dev={intermediate_dev} complete_dev={complete_dev}");
+        assert_ne!(
+            intermediate_dev, complete_dev,
+            "the harness must mount the two roots on different filesystems, or this probe \
+             proves nothing"
+        );
+
+        let member_name = "Silver.Horizon.S09E01.mkv";
+        let payload: Vec<u8> = (0..24_000u32).map(|index| (index % 251) as u8).collect();
+        let volumes = single_member_store_set(member_name, &payload, 3);
+
+        let (mut pipeline, _, _) = new_direct_pipeline_at_roots(
+            data_dir,
+            intermediate_dir.clone(),
+            complete_dir.clone(),
+            intermediate_dir.join("weaver.db"),
+            BufferPoolConfig {
+                small_count: 8,
+                medium_count: 4,
+                large_count: 2,
+            },
+            0,
+            None,
+        )
+        .await;
+        pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+        // Small enough that held payload pages out to the scratch file, so the
+        // working-data half of the split is observable too.
+        pipeline.direct_store.set_holds_budget(64);
+        pipeline.live_par2.set_enabled(false);
+
+        let job_id = JobId(49001);
+        let spec = direct_store_job_spec("Silver Horizon", &volumes);
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+        println!("XDEV working_dir path={}", working_dir.display());
+
+        // Payload before the header on volume 0, so something is held and paged.
+        submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+        submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+
+        // (1) Where is the payload while the job is still downloading?
+        let mid_intermediate =
+            matching(&intermediate_dir, |name| name.ends_with(".direct.partial"));
+        let mid_complete = matching(&complete_dir, |name| name.ends_with(".direct.partial"));
+        report("partial-in-intermediate", &mid_intermediate);
+        report("partial-in-complete", &mid_complete);
+
+        // (2) Working data must be on the intermediate filesystem either way.
+        let scratch = matching(&intermediate_dir, |name| name.starts_with(".weaver-holds."));
+        let envelopes = matching(&intermediate_dir, |name| name.ends_with(".envelope"));
+        report("holds-scratch", &scratch);
+        report("envelopes", &envelopes);
+        assert!(
+            !scratch.is_empty(),
+            "non-vacuity: the holds budget should have forced a scratch file"
+        );
+        for entry in scratch.iter().chain(envelopes.iter()) {
+            assert_eq!(
+                entry.dev,
+                intermediate_dev,
+                "working data must stay on the intermediate filesystem: {}",
+                entry.path.display()
+            );
+        }
+        assert!(
+            matching(&complete_dir, |name| name.starts_with(".weaver-holds.")
+                || name.ends_with(".envelope"))
+            .is_empty(),
+            "no working data may be written to the complete filesystem"
+        );
+
+        let partials: Vec<Found> = mid_intermediate
+            .iter()
+            .chain(mid_complete.iter())
+            .cloned()
+            .collect();
+        assert!(
+            !partials.is_empty(),
+            "non-vacuity: nothing routed into a member partial"
+        );
+        let born_dev = partials[0].dev;
+        println!(
+            "XDEV verdict payload-born-on={}",
+            if born_dev == complete_dev {
+                "complete"
+            } else {
+                "intermediate"
+            }
+        );
+
+        // Finish the download; the set finalizes and commits its member.
+        for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+            if (file_index, segment_number) == (0, 0) || (file_index, segment_number) == (0, 1) {
+                continue;
+            }
+            submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number)
+                .await;
+        }
+        drain_rar_refreshes(&mut pipeline).await;
+        let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+        assert!(
+            shape.contains("Finalized"),
+            "the set must finalize, got {shape}"
+        );
+
+        // (3) The committed member, immediately before completion publishes it.
+        let committed: Vec<Found> = walk(&intermediate_dir)
+            .into_iter()
+            .chain(walk(&complete_dir))
+            .filter(|found| {
+                found
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name == member_name)
+            })
+            .collect();
+        report("member-after-commit", &committed);
+        assert_eq!(
+            committed.len(),
+            1,
+            "the member must exist in exactly one place before the move"
+        );
+        let before_move = committed[0].clone();
+        assert_eq!(
+            before_move.len,
+            payload.len() as u64,
+            "and hold the whole member"
+        );
+
+        drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+        // (4) The published member.
+        let published: Vec<Found> = walk(&complete_dir)
+            .into_iter()
+            .filter(|found| {
+                found
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name == member_name)
+            })
+            .collect();
+        report("member-after-publish", &published);
+        assert_eq!(
+            published.len(),
+            1,
+            "the job must publish exactly one member"
+        );
+        let after_move = published[0].clone();
+        assert_eq!(
+            std::fs::read(&after_move.path).unwrap(),
+            payload,
+            "and it must be byte-correct"
+        );
+        assert_eq!(
+            after_move.dev, complete_dev,
+            "the published member is on the complete filesystem by definition"
+        );
+
+        // The verdict, and it needs no instrumentation: a rename keeps the
+        // inode, a copy cannot.
+        let verdict = if after_move.dev == before_move.dev && after_move.ino == before_move.ino {
+            "rename"
+        } else {
+            "copy"
+        };
+        println!(
+            "XDEV verdict publish={verdict} before=(dev={},ino={}) after=(dev={},ino={})",
+            before_move.dev, before_move.ino, after_move.dev, after_move.ino
+        );
+
+        // (5) Nothing of the payload may be left on the intermediate filesystem.
+        let leftovers = walk(&intermediate_dir)
+            .into_iter()
+            .filter(|found| {
+                found
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == member_name || name.ends_with(".direct.partial"))
+            })
+            .collect::<Vec<_>>();
+        report("payload-left-in-intermediate", &leftovers);
+        assert!(
+            leftovers.is_empty(),
+            "no payload may survive on the intermediate filesystem"
+        );
+
+        assert_eq!(
+            verdict, expected,
+            "publish verdict; set WEAVER_XDEV_EXPECT to the behaviour this tree guarantees"
+        );
+    }
+
+    /// The failure path: a cancelled job leaves nothing behind on the complete
+    /// filesystem.
+    #[tokio::test]
+    async fn a_cancelled_job_cleans_what_it_wrote_on_the_complete_filesystem() {
+        let Some((intermediate_root, complete_root)) = roots() else {
+            println!("XDEV skipped: set WEAVER_XDEV_INTERMEDIATE and WEAVER_XDEV_COMPLETE");
+            return;
+        };
+
+        let intermediate_dir = fresh(&intermediate_root, "cancel-intermediate");
+        let complete_dir = fresh(&complete_root, "cancel-complete");
+        let data_dir = fresh(&intermediate_root, "cancel-data");
+        assert_ne!(dev_of(&intermediate_dir), dev_of(&complete_dir));
+
+        let member_name = "Silver.Horizon.S09E02.mkv";
+        let payload: Vec<u8> = (0..24_000u32).map(|index| (index % 241) as u8).collect();
+        let volumes = single_member_store_set(member_name, &payload, 3);
+
+        let (mut pipeline, _, _) = new_direct_pipeline_at_roots(
+            data_dir,
+            intermediate_dir.clone(),
+            complete_dir.clone(),
+            intermediate_dir.join("weaver.db"),
+            BufferPoolConfig {
+                small_count: 8,
+                medium_count: 4,
+                large_count: 2,
+            },
+            0,
+            None,
+        )
+        .await;
+        pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+        pipeline.live_par2.set_enabled(false);
+
+        let job_id = JobId(49002);
+        let spec = direct_store_job_spec("Silver Horizon", &volumes);
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+        // Mid-store: routed, not finished.
+        submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+        submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+        let staging = complete_dir
+            .join(".weaver-staging")
+            .join(job_id.0.to_string());
+        println!(
+            "XDEV cancel staging_exists_before={} path={}",
+            staging.exists(),
+            staging.display()
+        );
+        report("cancel-before-complete", &walk(&complete_dir));
+        report("cancel-before-intermediate", &walk(&intermediate_dir));
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        pipeline
+            .handle_command(SchedulerCommand::CancelJob {
+                job_id,
+                origin: crate::jobs::handle::CancellationOrigin::User,
+                reply: reply_tx,
+            })
+            .await;
+        reply_rx.await.unwrap().unwrap();
+
+        // The cleanup is spawned; give it a bounded window to land.
+        for _ in 0..200 {
+            if !staging.exists() && !working_dir.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        report("cancel-after-complete", &walk(&complete_dir));
+        report("cancel-after-intermediate", &walk(&intermediate_dir));
+        println!(
+            "XDEV cancel staging_exists_after={} working_dir_exists_after={}",
+            staging.exists(),
+            working_dir.exists()
+        );
+        assert!(
+            !staging.exists(),
+            "a cancelled job must not leave its staging directory on the complete filesystem"
+        );
+        assert!(
+            walk(&complete_dir).is_empty(),
+            "and must leave no bytes there at all: {:?}",
+            walk(&complete_dir)
+        );
+        assert!(
+            !working_dir.exists(),
+            "nor its working directory on the intermediate filesystem"
         );
     }
 }

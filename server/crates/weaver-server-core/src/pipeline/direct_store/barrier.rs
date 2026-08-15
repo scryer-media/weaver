@@ -551,13 +551,22 @@ impl CoverageBarrier {
             .map(|destination| &destination.ranges)
     }
 
-    /// Destination paths touched since the last successful barrier, in member
-    /// order.
-    pub(crate) fn touched_destinations(&self) -> Vec<&str> {
+    /// Destination keys and their relative paths, for everything touched since
+    /// the last successful barrier, in member order.
+    ///
+    /// The key rides along because a relative path alone no longer says which
+    /// root it hangs off: member payload resolves under the job's staging root
+    /// and envelopes under its working directory, and the key band is what
+    /// separates them (see
+    /// [`super::plan::DirectSetPlan::barrier_destination_path`]).
+    pub(crate) fn touched_destinations(&self) -> Vec<(u32, &str)> {
         self.touched
             .iter()
-            .filter_map(|member_index| self.destinations.get(member_index))
-            .map(|destination| destination.relative_path.as_str())
+            .filter_map(|member_index| {
+                self.destinations
+                    .get(member_index)
+                    .map(|destination| (*member_index, destination.relative_path.as_str()))
+            })
             .collect()
     }
 

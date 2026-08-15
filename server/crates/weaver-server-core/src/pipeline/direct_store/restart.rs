@@ -31,8 +31,7 @@
 //! may be a symlink at all (`O_NOFOLLOW`, or an `is_symlink` refusal before the
 //! open), and once it refuses to write through one, no checkpoint can come to
 //! claim one either. Snapshot decoding independently refuses paths that escape
-//! the working directory lexically, so the probe is only ever handed
-//! job-relative paths.
+//! their root lexically, so the probe is only ever handed job-relative paths.
 //!
 //! A probe that cannot be completed is **not** a pass. "Could not check" is a
 //! refusal ([`CoverageRejection::ProbeFailed`]): accepting a checkpoint whose
@@ -54,7 +53,8 @@
 //! 4. turns each accepted row's floors into skipped segments
 //!    ([`coverage_skip_plan`]), exactly the way legacy floors feed the same
 //!    machinery;
-//! 5. sweeps the working directory of direct-store files nothing claims.
+//! 5. sweeps **both** of the job's roots — the working directory and the
+//!    staging root — of direct-store files nothing claims.
 //!
 //! A set with no accepted row is installed **fresh**: it redownloads and routes
 //! from zero, which is what an unwired restart already did, and its stale
@@ -210,10 +210,54 @@ pub(crate) struct RestoreOutcome {
     pub(crate) ignored: usize,
 }
 
+/// The two roots a direct set's destinations resolve against.
+///
+/// Envelopes are working data and live in the job's working directory; member
+/// payload lives in the job's staging root on the complete volume, so its commit
+/// rename and completion's publish are both same-filesystem. A checkpoint's
+/// claims mix the two, keyed by destination index, so restart has to carry both
+/// roots to probe them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DestinationRoots {
+    pub(crate) working_dir: PathBuf,
+    pub(crate) destination_dir: PathBuf,
+}
+
+impl DestinationRoots {
+    /// The roots a plan resolves its own derived paths against.
+    ///
+    /// Production code reaches the two roots through the plan itself; this is
+    /// for the tests that hand a plan's roots straight to [`restore_set`].
+    #[cfg(test)]
+    pub(crate) fn for_plan(plan: &DirectSetPlan) -> Self {
+        Self {
+            working_dir: plan.working_dir.clone(),
+            destination_dir: plan.destination_dir.clone(),
+        }
+    }
+
+    /// The root one claim's relative path hangs off, decided by the destination
+    /// key band rather than by the path text — see
+    /// [`super::set::envelope_volume_for_key`]. `volumes` is the plan's volume
+    /// set, which is what makes the classification exact.
+    fn resolve(
+        &self,
+        destination_key: u32,
+        relative_path: &str,
+        volumes: &HashSet<u32>,
+    ) -> PathBuf {
+        if volumes.contains(&super::set::envelope_volume_for_key(destination_key)) {
+            self.working_dir.join(relative_path)
+        } else {
+            self.destination_dir.join(relative_path)
+        }
+    }
+}
+
 /// One destination the checkpoint claims, ready to be probed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DestinationProbe {
-    /// Absolute path: the working directory joined with the claim's path.
+    /// Absolute path: the claim's own root joined with the claim's path.
     pub(super) path: PathBuf,
     /// The claim's path, for messages.
     pub(super) relative_path: String,
@@ -250,17 +294,17 @@ fn probe_destination_lengths(probes: Vec<DestinationProbe>) -> Vec<ProbedDestina
 ///
 /// The fs probes run on the blocking pool; the decision itself is pure.
 pub(crate) async fn restore_set(
-    working_dir: &Path,
+    roots: &DestinationRoots,
     blob: &[u8],
     expected: &ExpectedSet,
 ) -> Result<CoverageSnapshot, CoverageRejection> {
-    restore_set_with_probe(working_dir, blob, expected, probe_destination_lengths).await
+    restore_set_with_probe(roots, blob, expected, probe_destination_lengths).await
 }
 
 /// [`restore_set`] with the destination probe injected, so the failure modes of
 /// probing — a panic, a torn-down runtime, a short answer — are testable.
 pub(super) async fn restore_set_with_probe<F>(
-    working_dir: &Path,
+    roots: &DestinationRoots,
     blob: &[u8],
     expected: &ExpectedSet,
     probe: F,
@@ -308,11 +352,17 @@ where
         }
     }
 
+    // A volume's envelope key is derived from the volume index, which is a
+    // layout coordinate and therefore the same on every run; a member key is an
+    // in-run counter but always in the low band. So the plan's volume set is
+    // enough to send each claim to the root it was written under, without
+    // trusting the blob's own idea of which is which.
+    let volumes: HashSet<u32> = expected.volume_files.keys().copied().collect();
     let probes: Vec<DestinationProbe> = snapshot
         .destinations
         .iter()
         .map(|claim| DestinationProbe {
-            path: working_dir.join(&claim.relative_path),
+            path: roots.resolve(claim.member_index, &claim.relative_path, &volumes),
             relative_path: claim.relative_path.clone(),
             claimed: claim.claimed_len(),
         })
@@ -373,7 +423,7 @@ where
 pub(crate) async fn restore_job<P: CoveragePersist + ?Sized>(
     gate: DirectStoreGate,
     job_id: JobId,
-    working_dir: &Path,
+    roots: &DestinationRoots,
     rows: HashMap<String, Vec<u8>>,
     expected: &HashMap<String, ExpectedSet>,
     persist: &mut P,
@@ -392,7 +442,7 @@ pub(crate) async fn restore_job<P: CoveragePersist + ?Sized>(
     for set_name in set_names {
         let blob = rows.get(&set_name).expect("set name came from rows");
         let result = match expected.get(&set_name) {
-            Some(expected_set) => restore_set(working_dir, blob, expected_set).await,
+            Some(expected_set) => restore_set(roots, blob, expected_set).await,
             None => Err(CoverageRejection::UnknownSet),
         };
         match result {
@@ -558,12 +608,23 @@ impl Pipeline {
         working_dir: &Path,
     ) -> DirectRestore {
         let gate = self.direct_store.gate();
+        // Deterministic, and it has to be: this runs before the job state
+        // exists, so `state.staging_dir` cannot be consulted — and a resumed set
+        // must derive exactly the destinations the previous run wrote, or every
+        // claim fails the probe. `Pipeline::extraction_staging_dir` can only
+        // ever hand out this same path for a live job, so the live seam
+        // (`ensure_direct_sets`) and this one agree by construction.
+        let destination_dir = self.deterministic_extraction_staging_dir(job_id);
+        let roots = DestinationRoots {
+            working_dir: working_dir.to_path_buf(),
+            destination_dir: destination_dir.clone(),
+        };
         // Discovery is pure planning over the spec, so it runs whatever the gate
         // says: the sweep below needs to know which files direct-store *could*
         // own in this working directory even when nothing will route into them,
         // and those are the files a previously enabled binary wrote over the same
         // spec.
-        let (planned, refused) = DirectSetPlan::discover(spec, working_dir);
+        let (planned, refused) = DirectSetPlan::discover(spec, working_dir, &destination_dir);
         if gate.is_enabled() {
             // The same counters the live admission seam emits. Restoring a job is
             // an admission decision too, and a set refused here is one whose
@@ -652,7 +713,7 @@ impl Pipeline {
         }
 
         let mut persist = DatabaseCoveragePersist::new(self.db.clone());
-        let outcome = restore_job(gate, job_id, working_dir, rows, &expected, &mut persist).await;
+        let outcome = restore_job(gate, job_id, &roots, rows, &expected, &mut persist).await;
         for (set_name, rejection) in &outcome.rejected {
             crate::runtime::perf_probe::record_owned(
                 "direct_store.restart.rejected".to_string(),
@@ -736,7 +797,7 @@ impl Pipeline {
                     claimed.insert(plan.envelope_path(*volume_index));
                 }
                 for (_, _, partial) in set.router.member_partials() {
-                    claimed.insert(working_dir.join(partial));
+                    claimed.insert(plan.destination_path(partial));
                 }
                 // Holds scratch is deliberately **not** claimed, not even by a
                 // set whose checkpoint was accepted. Its regions are named by an
@@ -775,14 +836,9 @@ impl Pipeline {
                 owned.insert(plan.repair_path(*volume_index));
             }
         }
-        for set in result.sets.iter() {
+        for set in result.sets.iter().chain(restored.values()) {
             for (_, _, partial) in set.router.member_partials() {
-                owned.insert(working_dir.join(partial));
-            }
-        }
-        for set in restored.values() {
-            for (_, _, partial) in set.router.member_partials() {
-                owned.insert(working_dir.join(partial));
+                owned.insert(set.plan().destination_path(partial));
             }
         }
 
@@ -798,7 +854,7 @@ impl Pipeline {
             .iter()
             .any(|file| matches!(file.role, weaver_model::files::FileRole::RarVolume { .. }));
         if could_have_routed {
-            result.swept = sweep_orphan_direct_files(working_dir, &claimed, &owned).await;
+            result.swept = sweep_orphan_direct_files(&roots, &claimed, &owned).await;
         }
 
         // The restart ledger, in the four numbers that separate "resumed" from
@@ -905,26 +961,50 @@ impl Pipeline {
 ///   header, so a set whose cached facts no longer rebuild has no way to name
 ///   its own partials — and the suffix is a two-part one this codebase invented,
 ///   not an extension an archive plausibly carries.
+///
+/// # Both roots
+///
+/// Member payload lives in the staging root and everything else in the working
+/// directory, so both are walked. The working directory is still walked for
+/// `.direct.partial` as well, and deliberately: a job checkpointed by a build
+/// that wrote payload there has partials sitting in it that no plan will ever
+/// name again, and this is what clears them.
+///
+/// The holds-scratch prefix rule applies to the working directory **only**. It
+/// is a name match rather than a plan match, and the staging root is shared with
+/// the incremental extractor's output — a member an archive happened to call
+/// `.weaver-holds.something` is a file a user's archive can contain, and the
+/// working directory is the one place nothing but this subsystem writes such a
+/// name.
 async fn sweep_orphan_direct_files(
-    working_dir: &Path,
+    roots: &DestinationRoots,
     claimed: &HashSet<PathBuf>,
     owned: &HashSet<PathBuf>,
 ) -> usize {
-    let root = working_dir.to_path_buf();
+    let roots = roots.clone();
     let claimed = claimed.clone();
     let owned = owned.clone();
-    tokio::task::spawn_blocking(move || sweep_orphan_direct_files_blocking(&root, &claimed, &owned))
-        .await
-        .unwrap_or(0)
+    tokio::task::spawn_blocking(move || {
+        let mut swept =
+            sweep_orphan_direct_files_blocking(&roots.working_dir, true, &claimed, &owned);
+        if roots.destination_dir != roots.working_dir {
+            swept +=
+                sweep_orphan_direct_files_blocking(&roots.destination_dir, false, &claimed, &owned);
+        }
+        swept
+    })
+    .await
+    .unwrap_or(0)
 }
 
 fn sweep_orphan_direct_files_blocking(
-    working_dir: &Path,
+    root: &Path,
+    sweep_holds_scratch: bool,
     claimed: &HashSet<PathBuf>,
     owned: &HashSet<PathBuf>,
 ) -> usize {
     let mut swept = 0usize;
-    let mut queue = vec![(working_dir.to_path_buf(), 0usize)];
+    let mut queue = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = queue.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -951,7 +1031,7 @@ fn sweep_orphan_direct_files_blocking(
             };
             let is_direct = owned.contains(&path)
                 || name.ends_with(DIRECT_PARTIAL_SUFFIX)
-                || (depth == 0 && name.starts_with(HOLDS_SCRATCH_PREFIX));
+                || (sweep_holds_scratch && depth == 0 && name.starts_with(HOLDS_SCRATCH_PREFIX));
             if !is_direct || claimed.contains(&path) {
                 continue;
             }

@@ -165,8 +165,15 @@ impl Pipeline {
                         tokio::spawn(async move {
                             // Close cached write handles first: the working-dir
                             // path may be reused verbatim by a re-added job, and a
-                            // stale handle would swallow its writes.
+                            // stale handle would swallow its writes. The staging
+                            // root gets the same treatment — direct-store writes
+                            // member payload there through the same pool, and its
+                            // path is deterministic per job id, so a re-added job
+                            // can reuse that one verbatim too.
                             crate::pipeline::close_cached_write_handles_under(&working_dir).await;
+                            if let Some(staging) = staging_dir.as_deref() {
+                                crate::pipeline::close_cached_write_handles_under(staging).await;
+                            }
                             if let Err(e) = tokio::fs::remove_dir_all(&working_dir).await
                                 && e.kind() != std::io::ErrorKind::NotFound
                             {

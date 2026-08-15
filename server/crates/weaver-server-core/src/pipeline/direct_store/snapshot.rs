@@ -60,6 +60,25 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 ///   ones written by an unreleased build of the same branch, and the refusal
 ///   costs exactly one redownload of a set that was mid-flight across a
 ///   developer's rebuild. The v3 note below is the one that reaches users.
+/// - 6: `DestinationClaim::relative_path` **changed meaning** for a member
+///   claim. It was relative to the job's working directory; it is now relative
+///   to the job's staging root, `complete_dir/.weaver-staging/<job_id>`, because
+///   member payload is written straight onto the complete volume so its commit
+///   rename and completion's publish are both same-filesystem. Envelope claims
+///   are unchanged and still working-directory-relative.
+///
+///   This is the case this constant's doc has always described as a bump: a
+///   field that kept its type and changed what it means. Nothing about the
+///   *bytes* would tell a v5 reader apart from a v6 one, so trusting a v5 row
+///   would have restart probing the working directory for files the run before
+///   it wrote — and, worse, a v5 row that happened to find something there
+///   would claim coverage in a file the new run never writes to. Refusing costs
+///   one redownload; there is no upgrade path worth writing, because the bytes
+///   the old row describes are on the wrong filesystem for the new layout
+///   anyway and the restart sweep deletes them.
+///
+///   Operationally it costs nothing today: the direct-store gate defaults off,
+///   so a shipped install has no rows to refuse.
 ///
 /// # The v3 refusal is a release note
 ///
@@ -69,7 +88,7 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 /// redownload per set that was mid-download across the upgrade — but it is
 /// user-visible traffic and belongs in the notes rather than in a support
 /// thread.
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 5;
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 6;
 
 const FRAME_HEADER_LEN: usize = 6;
 
@@ -90,11 +109,15 @@ impl DestinationExtent {
 ///
 /// Keyed by **member identity**, not by the final sanitized path: sanitized
 /// destinations are only committed in archive order at finalization, so the
-/// path here is the working-directory-relative partial and the member index is
-/// the stable identity.
+/// path here is the relative partial and the member index is the stable
+/// identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DestinationClaim {
     pub(crate) member_index: u32,
+    /// Relative to the claim's **own root**, which the destination key decides:
+    /// the staging root for a member payload file, the working directory for a
+    /// volume envelope. See [`super::restart::DestinationRoots`] and schema
+    /// version 6 above.
     pub(crate) relative_path: String,
     /// Sorted, disjoint, coalesced.
     pub(crate) extents: Vec<DestinationExtent>,
@@ -322,8 +345,8 @@ fn validate(snapshot: &CoverageSnapshot) -> Result<(), SnapshotError> {
             ));
         }
         previous_member = Some(claim.member_index);
-        // A claimed path is joined onto the working directory at restart, so a
-        // row that escaped the working directory — or that a hostile blob wrote
+        // A claimed path is joined onto one of the job's two roots at restart,
+        // so a row that escaped its root — or that a hostile blob wrote
         // deliberately — would have restart probing, and the writer, outside
         // the job. The house validator is the same one RAR extraction gates
         // member paths with: no absolute paths, no `..`, no root or prefix

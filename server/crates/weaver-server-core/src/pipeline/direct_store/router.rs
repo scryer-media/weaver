@@ -3549,7 +3549,7 @@ impl DirectSetRouter {
         if member.crypt.is_some() {
             return Err(refuse(self));
         }
-        let partial = self.plan.working_dir.join(&member.relative_partial);
+        let partial = self.plan.destination_path(&member.relative_partial);
 
         // Every extent the member ever had bytes written for, by volume, in
         // physical order within each — so the envelope is written the way it is
@@ -3622,8 +3622,8 @@ impl DirectSetRouter {
         self.rebuild_member_order();
         self.migrated.extend(spans);
         // The partial is deleted rather than left behind: everything still in
-        // the working directory when the job completes is moved into its output,
-        // so a stray `.direct.partial` beside the extracted member would ship.
+        // the staging root when the job completes is moved into its output, so
+        // a stray `.direct.partial` beside the extracted member would ship.
         // Its bytes are in `migrated` already, so this cannot lose them, and a
         // failure to unlink is not worth demoting a set over — the restart sweep
         // knows the suffix.

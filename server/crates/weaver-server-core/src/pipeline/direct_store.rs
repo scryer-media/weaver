@@ -101,6 +101,53 @@
 //!   here.
 //! - **The metric families** this subsystem publishes, under `direct_store.*`.
 //!
+//! # Which filesystem the payload is written to
+//!
+//! Member payload is written into the job's **staging root**,
+//! `complete_dir/.weaver-staging/<job_id>` — the same root the incremental RAR
+//! extractor writes its members into, and the root completion publishes from by
+//! rename. Everything else this subsystem writes — the per-volume envelopes, the
+//! holds scratch, the repair scratch, and the volume files a demotion
+//! reconstructs — stays in the job's working (intermediate) directory. The split
+//! is stated once, on [`plan::DirectSetPlan`], and every derived path follows it.
+//!
+//! The alternative — payload in the working directory — cost a full byte copy on
+//! the ordinary split-volume install (intermediate on local disk, complete on a
+//! NAS): the publish rename returned `EXDEV` and completion fell back to
+//! `move_path_with_copy_fallback`, so the release was written to the destination
+//! volume a second time after being written to the intermediate one. Writing it
+//! straight to the staging root means the stream lands on the destination volume
+//! **exactly once**, which is the whole point of direct-store.
+//!
+//! ## The write pattern operators should know about
+//!
+//! That "once" changes *how* the destination volume is written, not just how
+//! often, and the difference is worth knowing before pointing `complete_dir` at
+//! a network filesystem:
+//!
+//! - **Sparse and out of order.** A member partial is created at zero length and
+//!   written at whatever logical offsets the wire delivers, so it is a sparse
+//!   file with holes that fill in as articles arrive. Conventional extraction
+//!   writes its output front to back. NFS and SMB both support this, but a
+//!   filesystem that does not implement holes materializes zeros instead — which
+//!   is the same exposure the Windows sparse rule already handles, now on the
+//!   complete volume rather than the intermediate one.
+//! - **Small positioned writes, for the whole download.** Where extraction
+//!   writes a member in large sequential runs once the volumes are on disk,
+//!   direct-store issues one positioned write per decoded span for the duration
+//!   of the download. On a high-latency mount that is many more round trips than
+//!   a single sequential pass, against the *same* total bytes.
+//! - **fsync per barrier, per destination.** The coverage barrier fsyncs every
+//!   destination it touched — members and envelopes — at most every 256 MiB of
+//!   dirty bytes or 5 s. The member half of that now lands on the complete
+//!   volume.
+//!
+//! None of it is new I/O; it is the same bytes, moved to the volume they were
+//! always destined for and written once instead of twice. But an operator whose
+//! complete volume is a slow or latency-bound mount is now seeing the download's
+//! write pattern on it rather than the extractor's, and that is the trade the
+//! feature makes.
+//!
 //! # Two checkpoint systems
 //!
 //! `pipeline::extraction::rar::checkpoint` (`extraction_chunks`) covers the

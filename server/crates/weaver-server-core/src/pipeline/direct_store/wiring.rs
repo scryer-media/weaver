@@ -544,10 +544,20 @@ impl Pipeline {
         if !self.direct_store.gate().is_enabled() {
             return;
         }
+        // Deterministic rather than `extraction_staging_dir`, and deliberately
+        // so: the restore seam derives the very same root before the job state
+        // (and therefore `state.staging_dir`) exists, and the two must agree
+        // byte for byte or a resumed set would probe destinations it never
+        // wrote. `state.staging_dir` is only ever this path anyway — see
+        // `Pipeline::extraction_staging_dir` — and it is recorded on the state
+        // at the first prepared destination, which is what makes completion
+        // sweep the root and the failure paths delete it.
+        let destination_dir = self.deterministic_extraction_staging_dir(job_id);
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
-        let (admitted, refused) = DirectSetPlan::discover(&state.spec, &state.working_dir);
+        let (admitted, refused) =
+            DirectSetPlan::discover(&state.spec, &state.working_dir, &destination_dir);
         let password = state.spec.password.clone();
         for (set_name, refusal) in refused {
             crate::runtime::perf_probe::record_owned(
@@ -2273,7 +2283,7 @@ impl Pipeline {
         if set.is_demoted() || !set.router.has_stale_gaps() {
             return;
         }
-        let working_dir = set.plan().working_dir.clone();
+        let destination_dir = set.plan().destination_dir.clone();
         let set_name = set.set_name().to_string();
         let runs = set.router.stale_gap_read_plan();
         if runs.is_empty() {
@@ -2289,7 +2299,7 @@ impl Pipeline {
         );
 
         let read_runs = runs.clone();
-        let read_dir = working_dir.clone();
+        let read_dir = destination_dir;
         let checksums =
             tokio::task::spawn_blocking(move || read_restart_seeded_runs(&read_dir, &read_runs))
                 .await;
@@ -2709,7 +2719,7 @@ impl Pipeline {
         if set.is_demoted() || set.is_finalized() || !set.has_restart_seeded_coverage() {
             return;
         }
-        let working_dir = set.plan().working_dir.clone();
+        let destination_dir = set.plan().destination_dir.clone();
         let set_name = set.set_name().to_string();
         let runs = set.router.restart_read_plan();
         if runs.is_empty() {
@@ -2725,7 +2735,7 @@ impl Pipeline {
         );
 
         let read_runs = runs.clone();
-        let read_dir = working_dir.clone();
+        let read_dir = destination_dir;
         let checksums =
             tokio::task::spawn_blocking(move || read_restart_seeded_runs(&read_dir, &read_runs))
                 .await;
@@ -2828,7 +2838,10 @@ impl Pipeline {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return Vec::new();
         };
-        let working_dir = set.plan().working_dir.clone();
+        // Borrowed, never cloned (nit): this runs once per routed batch, and a
+        // plan carries two maps sized by the set's volume count — 2 000 of them
+        // on the sets this subsystem is sized for.
+        let plan = set.plan();
         let partials: HashMap<u32, String> = set
             .router
             .member_partials()
@@ -2838,9 +2851,14 @@ impl Pipeline {
 
         let mut grouped: HashMap<PathBuf, Vec<(u64, Vec<u8>)>> = HashMap::new();
         for span in spans {
-            let relative = match span.destination {
+            // The two roots part company here, and this is the seam the whole
+            // split exists for: member payload is written straight into the
+            // job's staging root on the **complete** volume, so the commit
+            // rename and completion's publish are both same-filesystem, while
+            // an envelope is working data and stays in the intermediate dir.
+            let path = match span.destination {
                 DirectDestination::Member { member_id } => match partials.get(&member_id) {
-                    Some(path) => path.clone(),
+                    Some(relative) => plan.destination_path(relative),
                     None => continue,
                 },
                 // Envelope v2: one file per volume, written at true physical
@@ -2849,12 +2867,10 @@ impl Pipeline {
                 // holes on every platform that gives them for free. Windows
                 // needs `FSCTL_SET_SPARSE` at creation to get the same, which a
                 // later pass adds.
-                DirectDestination::Envelope { volume_index } => {
-                    set.plan().envelope_relative_path(volume_index)
-                }
+                DirectDestination::Envelope { volume_index } => plan.envelope_path(volume_index),
             };
             grouped
-                .entry(working_dir.join(relative))
+                .entry(path)
                 .or_default()
                 .push((span.destination_offset, span.bytes.clone()));
         }
@@ -2896,11 +2912,18 @@ impl Pipeline {
     /// RAR4 stores paths with `\` separators, and the destination is derived
     /// through `resolve_member_path`, which rewrites them to `/`. Recording the
     /// raw name left the two disagreeing for any RAR4 member with a directory
-    /// component: completion resolved `work\sample.mkv` against the working
-    /// directory, found nothing on disk, declared the member a stale extracted
+    /// component: completion resolved `work\sample.mkv` against the job's
+    /// roots, found nothing on disk, declared the member a stale extracted
     /// record and re-ran conventional extraction — which then failed with "no
     /// on-disk RAR volumes", because direct finalization had deliberately never
     /// written any. A flat RAR4 member has no separator and so never showed it.
+    ///
+    /// The name is relative to the **staging root**, which is where the commit
+    /// rename put the file and where the incremental extractor writes the
+    /// members it produces — so completion resolves a direct member and an
+    /// extracted one through exactly the same root
+    /// (`Pipeline::resolve_job_input_path` tries the working dir and then the
+    /// staging dir, and only the second can match a direct member).
     fn record_direct_extracted(&mut self, job_id: JobId, name: String) {
         let name = DirectSetPlan::destination_relative_name(&name).unwrap_or(name);
         self.direct_store
@@ -2938,6 +2961,16 @@ impl Pipeline {
         job_id: JobId,
         batches: &crate::pipeline::orchestrator::DirectWriteBatches,
     ) -> Result<(), PathBuf> {
+        // The choke point every direct write passes through, and the one place
+        // that reliably runs for a **restored** set as well as a freshly
+        // admitted one (`install_restored` marks the job examined, so
+        // `ensure_direct_sets` returns early for it). Registering the staging
+        // root on the job state here is what makes the rest of the pipeline
+        // treat direct output like extraction output: `start_move_to_complete`
+        // only sweeps a staging dir the state names, and the cancel and fail
+        // paths only `remove_dir_all` one the state names. Idempotent and
+        // cached after the first call — see `Pipeline::extraction_staging_dir`.
+        let _ = self.extraction_staging_dir(job_id);
         let marking = self.direct_store.sparse_marking();
         for (path, _) in batches {
             if self
@@ -3328,7 +3361,6 @@ impl Pipeline {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
         };
-        let working_dir = set.plan().working_dir.clone();
         // Read before the barrier runs, which resets it. Two numbers, because
         // the interesting one is the second: the barrier's 256 MiB trigger is
         // checked per routed batch, so anything above it is the overshoot the
@@ -3336,15 +3368,13 @@ impl Pipeline {
         // starts tracking set size instead is the shape that regression looks
         // like.
         let dirty_bytes = set.dirty_bytes();
-        let touched: Vec<String> = set
-            .touched_paths()
-            .into_iter()
-            .filter_map(|path| {
-                path.strip_prefix(&working_dir)
-                    .ok()
-                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-            })
-            .collect();
+        // Relative name and absolute path together, straight from the set. An
+        // earlier shape recovered the relative name by stripping the working
+        // directory off the absolute path; with member payload under the
+        // staging root and envelopes under the working directory there is no
+        // single prefix to strip, and a silent `strip_prefix` failure would
+        // have dropped exactly the payload destinations from the sync set.
+        let touched = set.touched_paths();
 
         // Every sync is queued to its owner thread before any of them is
         // awaited. Envelope v2 made this set `members + volumes` rather than
@@ -3352,15 +3382,12 @@ impl Pipeline {
         // fsyncs on the pipeline task; the barrier's contract only asks that
         // they have all completed before it persists, not that they happened
         // one after another.
-        let paths: Vec<PathBuf> = touched
-            .iter()
-            .map(|relative| working_dir.join(relative))
-            .collect();
+        let paths: Vec<PathBuf> = touched.iter().map(|(_, path)| path.clone()).collect();
         let outcomes = crate::pipeline::orchestrator::sync_direct_destinations(paths).await;
         let results: HashMap<String, Result<(), String>> = touched
             .into_iter()
             .zip(outcomes)
-            .map(|(relative, outcome)| (relative, outcome.map_err(|error| error.to_string())))
+            .map(|((relative, _), outcome)| (relative, outcome.map_err(|error| error.to_string())))
             .collect();
 
         let mut drain = InlineDrain;
@@ -3428,7 +3455,6 @@ impl Pipeline {
             return;
         };
         let set_name = set.set_name().to_string();
-        let working_dir = set.plan().working_dir.clone();
         // Both are the set's own working files and both are meaningless once the
         // members are committed, but they part company under retention: the
         // envelopes *are* the virtual volume image and can be asked to outlive
@@ -3450,10 +3476,14 @@ impl Pipeline {
             .into_iter()
             .filter_map(|(_, name, partial)| {
                 let destination = set.plan().member_output_path(name).ok()?;
+                // Both under the staging root, so the commit below is a
+                // same-directory rename — never the cross-device rename the
+                // working-dir-relative shape produced on a split-volume
+                // install.
                 Some((
                     name.to_string(),
                     unpacked_sizes.get(name).copied().unwrap_or(0),
-                    working_dir.join(partial),
+                    set.plan().destination_path(partial),
                     destination,
                 ))
             })
@@ -4290,12 +4320,11 @@ impl Pipeline {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
         };
-        let working_dir = set.plan().working_dir.clone();
         let mut doomed: Vec<PathBuf> = set
             .router
             .member_partials()
             .into_iter()
-            .map(|(_, _, partial)| working_dir.join(partial))
+            .map(|(_, _, partial)| set.plan().destination_path(partial))
             .collect();
         doomed.extend(set.plan().envelope_paths());
         // Repair scratch. Normally deleted the moment its spans are routed, so
@@ -4592,8 +4621,11 @@ impl Pipeline {
 /// CRC32 composes over a rolling buffer, so the resident cost is one
 /// [`REARM_CHUNK_BYTES`] buffer for the whole plan rather than the largest part
 /// in it.
+///
+/// `destination_dir` is the job's staging root, because every run names a member
+/// `.direct.partial` and those are payload.
 fn read_restart_seeded_runs(
-    working_dir: &std::path::Path,
+    destination_dir: &std::path::Path,
     runs: &[super::router::RestartReadRun],
 ) -> std::io::Result<Vec<u32>> {
     use std::io::{Read, Seek, SeekFrom};
@@ -4605,7 +4637,7 @@ fn read_restart_seeded_runs(
         let file = match &mut open {
             Some((path, file)) if path == &run.relative_partial => file,
             _ => {
-                let file = std::fs::File::open(working_dir.join(&run.relative_partial))?;
+                let file = std::fs::File::open(destination_dir.join(&run.relative_partial))?;
                 open = Some((run.relative_partial.clone(), file));
                 &mut open.as_mut().expect("just assigned").1
             }

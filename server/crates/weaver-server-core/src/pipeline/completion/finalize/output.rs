@@ -168,9 +168,14 @@ async fn run_move_to_complete(
     dest: PathBuf,
     phase_counters: Arc<PhaseCounters>,
 ) -> Result<MoveToCompleteResult, String> {
-    // Every cached disk write handle under the working dir must be closed
-    // before its files are renamed or moved.
+    // Every cached disk write handle under either of the job's roots must be
+    // closed before its files are renamed or moved. The staging root is not
+    // only extraction output any more: direct-store writes member payload
+    // straight into it, through the same owner pool.
     crate::pipeline::close_cached_write_handles_under(&working_dir).await;
+    if let Some(staging) = staging_dir.as_deref() {
+        crate::pipeline::close_cached_write_handles_under(staging).await;
+    }
 
     // Verify at least one source directory exists before creating
     // the destination, so a missing source doesn't leave behind an

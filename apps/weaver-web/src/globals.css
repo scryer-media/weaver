@@ -225,6 +225,12 @@
   font-family: var(--font-sans);
 }
 
+[data-code-font],
+[data-code-font] * {
+  font-family: var(--font-mono), ui-monospace, "SFMono-Regular", "Cascadia Code",
+    "Source Code Pro", Menlo, Consolas, monospace;
+}
+
 * {
   border-color: var(--color-border);
 }

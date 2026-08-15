@@ -29,7 +29,7 @@ pub(crate) enum AdmissionRefusal {
 /// suffix by the restart sweep, exactly as `.envelope` is.
 pub(crate) const REPAIR_SUFFIX: &str = ".repair";
 
-/// Appends `suffix` to the final component of a working-directory-relative
+/// Appends `suffix` to the final component of a root-relative
 /// path, shortening the component's stem so the result stays inside
 /// [`weaver_model::files::DOWNLOAD_FILENAME_MAX_BYTES`].
 fn with_suffix(relative: &str, suffix: &str) -> String {
@@ -52,8 +52,34 @@ impl AdmissionRefusal {
     }
 }
 
-/// One admitted archive set: its identity, its volume-to-file mapping and the
-/// working directory its destinations are relative to.
+/// One admitted archive set: its identity, its volume-to-file mapping, and the
+/// **two** roots its derived paths hang off.
+///
+/// # Why two roots
+///
+/// A direct set writes two populations of file and they belong on two different
+/// volumes:
+///
+/// - **working data** — the per-volume envelopes, the holds scratch, the repair
+///   scratch — which exists only while the set is downloading, is read only by
+///   this subsystem, and is deleted at finalization or demotion. It belongs in
+///   the job's working directory, beside the PAR2 files and the volumes a
+///   demotion would materialize, which is where every other intermediate lives;
+/// - **member payload** — the `.direct.partial`s and, after the commit rename,
+///   the members themselves. That is the job's *output*, and weaver publishes
+///   output by renaming it out of `complete_dir/.weaver-staging/<job_id>` into
+///   the final directory.
+///
+/// The first shape resolved both against the working directory. On the ordinary
+/// deployment — intermediate on fast local disk, complete on a NAS — that put
+/// the payload on the wrong filesystem, so the publish rename returned `EXDEV`
+/// and `move_path_with_copy_fallback` copied every byte a second time. Writing
+/// the payload straight into the staging root makes the publish a same-volume
+/// rename, exactly as it already is for a member the incremental extractor
+/// produced, and the stream lands on the destination volume exactly once.
+///
+/// The split is the *only* thing [`Self::destination_dir`] is for. Everything
+/// that is genuinely working data still derives from [`Self::working_dir`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirectSetPlan {
     pub(crate) set_name: String,
@@ -61,7 +87,15 @@ pub(crate) struct DirectSetPlan {
     pub(crate) volumes: BTreeMap<u32, u32>,
     /// NZB file index to volume index — the direction the decode seam asks in.
     pub(crate) files: HashMap<u32, u32>,
+    /// The job's intermediate directory: envelopes, holds scratch, repair
+    /// scratch, and the volume files a demotion reconstructs.
     pub(crate) working_dir: PathBuf,
+    /// The job's extraction staging root, `complete_dir/.weaver-staging/<job_id>`
+    /// — where the member payload is written and from where completion
+    /// publishes it by rename. Deterministic per job id
+    /// ([`crate::pipeline::Pipeline::deterministic_extraction_staging_dir`]), so
+    /// it re-derives identically across a restart.
+    pub(crate) destination_dir: PathBuf,
 }
 
 impl DirectSetPlan {
@@ -69,6 +103,7 @@ impl DirectSetPlan {
     pub(crate) fn discover(
         spec: &JobSpec,
         working_dir: &Path,
+        destination_dir: &Path,
     ) -> (Vec<Self>, Vec<(String, AdmissionRefusal)>) {
         let mut candidates: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
         for (file_index, file) in spec.files.iter().enumerate() {
@@ -126,6 +161,7 @@ impl DirectSetPlan {
                 volumes,
                 files,
                 working_dir: working_dir.to_path_buf(),
+                destination_dir: destination_dir.to_path_buf(),
             });
         }
         (admitted, refused)
@@ -294,11 +330,15 @@ impl DirectSetPlan {
     /// have refused now resolve identically. With several members per set that
     /// difference is reachable, where a single-member set could only ever have
     /// demoted on it.
-    /// The member name as it exists *relative to the job's working directory*
-    /// once written — the same sanitization the destination path is derived
-    /// through, so a caller recording what direct finalization produced records
-    /// a name completion can resolve back to a file. `Err` for a name that
-    /// sanitizes away entirely, which never reaches a destination either.
+    /// The member name as it exists *relative to the job's staging root* once
+    /// written — the same sanitization the destination path is derived through,
+    /// so a caller recording what direct finalization produced records a name
+    /// completion can resolve back to a file. `Err` for a name that sanitizes
+    /// away entirely, which never reaches a destination either.
+    ///
+    /// This is exactly the name the incremental extractor records for a member
+    /// it wrote into the same root, which is what lets completion treat the two
+    /// populations identically.
     pub(crate) fn destination_relative_name(member_name: &str) -> Result<String, ()> {
         Self::resolve_member_path(member_name)
     }
@@ -323,7 +363,12 @@ impl DirectSetPlan {
         Self::resolve_member_path(member_name).map(|safe| safe.to_ascii_lowercase())
     }
 
-    /// Working-directory-relative `.direct.partial` for one member.
+    /// **Staging-root**-relative `.direct.partial` for one member.
+    ///
+    /// Relative to [`Self::destination_dir`], not to the working directory:
+    /// the partial *is* the payload file, and the commit that turns it into the
+    /// member is a rename, which has to stay on one filesystem. Resolve it with
+    /// [`Self::destination_path`].
     ///
     /// Only the **last** component is clamped, and only the stem inside it: a
     /// member stored inside a directory keeps its directory, and the
@@ -342,10 +387,46 @@ impl DirectSetPlan {
         Self::resolve_member_path(member_name).map(|safe| with_suffix(&safe, &suffix))
     }
 
-    /// Final destination for a member.
+    /// Absolute path of a member payload file from its
+    /// **destination-root-relative** name — a `.direct.partial` from
+    /// [`Self::member_partial_path`], or a committed member's own relative name.
+    ///
+    /// The one rule this type exists to state: member payload never resolves
+    /// against the working directory. A `.direct.partial` that landed there
+    /// would have to cross a filesystem at the commit rename, which is the
+    /// `EXDEV`-then-copy this split removes — and a temp file for a destination
+    /// must be created on the destination's own volume for the same reason.
+    pub(crate) fn destination_path(&self, relative: &str) -> PathBuf {
+        self.destination_dir.join(relative)
+    }
+
+    /// Absolute path for a **barrier/checkpoint destination**, which is either a
+    /// member payload file or a source volume's envelope.
+    ///
+    /// The two share one registration, sync and claim mechanism keyed by
+    /// destination index (see [`super::set::envelope_destination_key`]), so this
+    /// is where the mechanism's single stream of relative paths is split back
+    /// onto the two roots. The key band decides it, not the path text: envelope
+    /// keys count down from `u32::MAX` and are derived from the volume index,
+    /// which is a layout coordinate and therefore the same on every run.
+    pub(crate) fn barrier_destination_path(&self, destination_key: u32, relative: &str) -> PathBuf {
+        if self.is_envelope_destination(destination_key) {
+            self.working_dir.join(relative)
+        } else {
+            self.destination_dir.join(relative)
+        }
+    }
+
+    /// Whether a barrier destination key names one of this plan's envelopes.
+    pub(crate) fn is_envelope_destination(&self, destination_key: u32) -> bool {
+        self.volumes
+            .contains_key(&super::set::envelope_volume_for_key(destination_key))
+    }
+
+    /// Final destination for a member, under the staging root.
     pub(crate) fn member_output_path(&self, member_name: &str) -> Result<PathBuf, ()> {
         let safe = Self::resolve_member_path(member_name)?;
-        Ok(crate::pipeline::Pipeline::member_output_paths(&self.working_dir, &safe).0)
+        Ok(crate::pipeline::Pipeline::member_output_paths(&self.destination_dir, &safe).0)
     }
 
     /// Digest of the layout plan the coverage is produced against.

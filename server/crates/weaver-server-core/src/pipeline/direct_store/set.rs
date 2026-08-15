@@ -34,6 +34,24 @@ pub(crate) const fn envelope_destination_key(volume_index: u32) -> u32 {
     u32::MAX - volume_index
 }
 
+/// The inverse of [`envelope_destination_key`]: the volume a destination key
+/// would name *if* it is an envelope key.
+///
+/// Meaningless on its own — every `u32` maps to some volume index — so the
+/// answer is only a classification when the caller checks the result against the
+/// volumes it actually plans
+/// ([`super::plan::DirectSetPlan::is_envelope_destination`]). A member id `m`
+/// would have to satisfy `u32::MAX - m < volumes` to be mistaken for one, which
+/// is the same gap [`DirectSet::ensure_registered`] already asserts.
+///
+/// It exists because the two bands now resolve against **different roots**:
+/// envelopes are working data and members are payload, and the destination key
+/// is the one discriminator that is stable across runs (a volume index is a
+/// layout coordinate; the relative path text is not something to sniff).
+pub(crate) const fn envelope_volume_for_key(destination_key: u32) -> u32 {
+    u32::MAX - destination_key
+}
+
 /// Whether a set is still routing, and if not, why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectSetStatus {
@@ -831,17 +849,28 @@ impl DirectSet {
             .unwrap_or(0)
     }
 
-    /// Destination paths touched since the last successful barrier, resolved to
-    /// absolute paths for the sync step.
-    pub(crate) fn touched_paths(&self) -> Vec<std::path::PathBuf> {
-        let working_dir = &self.router.plan().working_dir;
+    /// Destination paths touched since the last successful barrier, each paired
+    /// with the relative path the barrier knows it by.
+    ///
+    /// Both halves are returned because the caller needs both and cannot derive
+    /// one from the other any more: the sync step is keyed by the relative path
+    /// the barrier will ask for, while the fsync itself needs the absolute path
+    /// — and the two roots mean stripping a single prefix off the absolute path
+    /// no longer recovers the relative one.
+    pub(crate) fn touched_paths(&self) -> Vec<(String, std::path::PathBuf)> {
+        let plan = self.router.plan();
         self.barrier
             .as_ref()
             .map(|barrier| {
                 barrier
                     .touched_destinations()
                     .into_iter()
-                    .map(|relative| working_dir.join(relative))
+                    .map(|(destination_key, relative)| {
+                        (
+                            relative.to_string(),
+                            plan.barrier_destination_path(destination_key, relative),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -997,13 +1026,13 @@ impl DirectSet {
         // `v` volumes and `m` members would otherwise pay `v * m` path clones
         // every time a provider is assembled — which is once per authoritative
         // PAR2 pass, per demotion sweep and per tolerated extraction (nit).
-        let working_dir = &self.router.plan().working_dir;
+        let plan = self.router.plan();
         let partials: std::sync::Arc<std::collections::HashMap<u32, std::path::PathBuf>> =
             std::sync::Arc::new(
                 self.router
                     .member_partials()
                     .into_iter()
-                    .map(|(member_id, _, partial)| (member_id, working_dir.join(partial)))
+                    .map(|(member_id, _, partial)| (member_id, plan.destination_path(partial)))
                     .collect(),
             );
         // Shared for the same reason the paths are, and empty for every set

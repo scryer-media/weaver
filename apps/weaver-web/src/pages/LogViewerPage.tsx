@@ -5,6 +5,7 @@ import { SERVICE_LOGS_QUERY } from "@/graphql/queries";
 import { Button } from "@/components/ui/button";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { useTranslate } from "@/lib/context/translate-context";
+import { CODE_FONT } from "@/lib/fonts";
 import { useIsMobile } from "@/lib/hooks/use-mobile";
 import { cn } from "@/lib/utils";
 
@@ -488,14 +489,12 @@ export function LogViewerPage() {
       <div
         ref={scrollRef}
         onScroll={handleScroll}
+        data-code-font
         className={cn(
           "overflow-y-auto rounded-inner border border-border bg-background/40 text-xs leading-5",
           isMobile ? "h-[50vh] min-h-[260px]" : "h-[28rem] min-h-[320px]",
         )}
-        style={{
-          fontFamily:
-            "'Fira Code', 'Fira Mono', 'JetBrains Mono', 'Source Code Pro', 'Cascadia Code', 'Consolas', monospace",
-        }}
+        style={{ fontFamily: CODE_FONT }}
       >
         {snapshot.lines.length === 0 ? (
           <p className="p-4 text-muted-foreground">No logs available yet.</p>
