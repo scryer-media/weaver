@@ -9,12 +9,13 @@ import {
 
 interface JobStatusBadgeProps {
   status: string;
+  label?: string;
   compact?: boolean;
   className?: string;
 }
 
 /** A single pipeline-status chip: colored text on a soft tint of the same token. */
-export function JobStatusBadge({ status, compact = false, className }: JobStatusBadgeProps) {
+export function JobStatusBadge({ status, label, compact = false, className }: JobStatusBadgeProps) {
   const t = useTranslate();
   const token = statusToken(status);
   return (
@@ -27,7 +28,7 @@ export function JobStatusBadge({ status, compact = false, className }: JobStatus
         className,
       )}
     >
-      {t(statusI18nKey(status))}
+      {label ?? t(statusI18nKey(status))}
     </span>
   );
 }

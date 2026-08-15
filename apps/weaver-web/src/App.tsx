@@ -7,6 +7,7 @@ import { router } from "./router";
 import { useLanguage } from "@/lib/hooks/use-language";
 import { TranslateContext, type TranslateContextValue } from "@/lib/context/translate-context";
 import { PwaProvider } from "@/lib/context/pwa-context";
+import { Toaster } from "@/components/ui/sonner";
 
 function AppProviders() {
   const { isReady, t, uiLanguage, setLanguagePreference, selectedLanguage } = useLanguage();
@@ -62,6 +63,7 @@ function AppProviders() {
     <TranslateContext.Provider value={contextValue}>
       <Provider value={client}>
         <RouterProvider router={router} />
+        <Toaster />
       </Provider>
     </TranslateContext.Provider>
   );

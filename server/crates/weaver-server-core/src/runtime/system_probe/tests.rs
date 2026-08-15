@@ -17,6 +17,19 @@ fn parse_filesystem_types() {
 }
 
 #[test]
+fn parse_startup_iops_override() {
+    assert_eq!(parse_startup_iops(Some("50000")), Some(50000.0));
+    assert_eq!(parse_startup_iops(Some(" 12500.5 ")), Some(12500.5));
+    assert_eq!(parse_startup_iops(None), None);
+    assert_eq!(parse_startup_iops(Some("")), None);
+    assert_eq!(parse_startup_iops(Some("off")), None);
+    assert_eq!(parse_startup_iops(Some("0")), None);
+    assert_eq!(parse_startup_iops(Some("-100")), None);
+    assert_eq!(parse_startup_iops(Some("inf")), None);
+    assert_eq!(parse_startup_iops(Some("NaN")), None);
+}
+
+#[test]
 fn detect_returns_valid_profile() {
     let profile = detect(Path::new("/tmp"));
     assert!(profile.cpu.logical_cores > 0);

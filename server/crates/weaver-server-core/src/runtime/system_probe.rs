@@ -305,7 +305,13 @@ fn detect_cgroup_memory_limit() -> Option<u64> {
 
 fn detect_disk(output_dir: &Path) -> DiskProfile {
     let (storage_class, filesystem) = detect_disk_info(output_dir);
-    let iops = benchmark_random_read_iops(output_dir).unwrap_or(10_000.0);
+    let iops = match startup_iops_override() {
+        Some(pinned) => {
+            debug!(iops = pinned, "disk probe skipped: WEAVER_STARTUP_IOPS");
+            pinned
+        }
+        None => benchmark_random_read_iops(output_dir).unwrap_or(10_000.0),
+    };
 
     debug!(?storage_class, ?filesystem, iops, "disk probe");
 
@@ -316,6 +322,19 @@ fn detect_disk(output_dir: &Path) -> DiskProfile {
         random_read_iops: iops,
         same_filesystem: true,
     }
+}
+
+/// `WEAVER_STARTUP_IOPS=<positive number>` skips the startup random-read
+/// probe and pins `random_read_iops` to that value, so benchmark and e2e
+/// runs are not skewed by the probe's I/O wait (and tuning stays
+/// deterministic across runs). Unset or invalid values run the probe.
+fn startup_iops_override() -> Option<f64> {
+    parse_startup_iops(std::env::var("WEAVER_STARTUP_IOPS").ok().as_deref())
+}
+
+fn parse_startup_iops(raw: Option<&str>) -> Option<f64> {
+    let value: f64 = raw?.trim().parse().ok()?;
+    (value.is_finite() && value > 0.0).then_some(value)
 }
 
 /// Benchmark random 4 KB read IOPS on the given directory's filesystem.

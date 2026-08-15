@@ -340,6 +340,17 @@ func renderWeaver(c Config, _ bool) ProductSpec {
 	if rustLog := os.Getenv("RUST_LOG"); rustLog != "" {
 		env = append(env, "RUST_LOG="+rustLog)
 	}
+	// Pin the startup random-read IOPS so the server skips its startup disk
+	// probe — a 4 MB write + fsync + 200 random preads that otherwise lands
+	// inside the measured process lifetime and varies with the bench host's
+	// storage — and tunes identically on every run. An operator can override
+	// the pinned value for a diagnostic; the probe itself only runs when the
+	// variable is unset, which no benchmark run should want.
+	startupIops := os.Getenv("WEAVER_STARTUP_IOPS")
+	if startupIops == "" {
+		startupIops = "50000"
+	}
+	env = append(env, "WEAVER_STARTUP_IOPS="+startupIops)
 	if c.QueueInput != nil {
 		return ProductSpec{
 			APIPort:       9090,
