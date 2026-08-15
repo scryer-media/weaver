@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::history::types::history_delete_row_state_from_core;
+use crate::history::types::{history_delete_row_state_from_core, history_table_item_from_row};
 use crate::jobs::types::load_duplicate_summaries_chunked;
 
 enum HistoryQueryPlan {
@@ -484,7 +484,7 @@ fn build_history_page_sql(
     let rows = db.list_job_history(&items_filter)?;
     let items = rows
         .into_iter()
-        .map(|row| history_item_from_row(&row, None))
+        .map(|row| history_table_item_from_row(&row, None))
         .collect();
 
     Ok(HistoryPage {
@@ -569,13 +569,20 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
     let status = input.status.unwrap_or(HistoryStatusFilter::All);
     let sort_field = input.sort_field.unwrap_or(HistorySortField::CompletedAt);
     let sort_direction = input.sort_direction.unwrap_or(HistorySortDirection::Desc);
+    let requires_full_display_projection = search.is_some() || sort_field == HistorySortField::Name;
 
     // Delete-operation badges are attached by the caller for the final page only
     // (see `load_history_page`); they do not affect search, sort, status, or
     // counts, so they are omitted here.
     let filtered_by_search: Vec<HistoryItem> = rows
         .into_iter()
-        .map(|row| history_item_from_row(&row, None))
+        .map(|row| {
+            if requires_full_display_projection {
+                history_item_from_row(&row, None)
+            } else {
+                history_table_item_from_row(&row, None)
+            }
+        })
         .filter(|item| history_matches_search(item, search.as_deref()))
         .collect();
 

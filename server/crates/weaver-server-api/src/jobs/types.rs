@@ -306,6 +306,73 @@ pub struct QueueSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+pub enum QueuePriority {
+    Low,
+    Normal,
+    High,
+}
+
+impl QueuePriority {
+    pub(crate) fn from_metadata(metadata: &[(String, String)]) -> Self {
+        metadata
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY))
+            .and_then(|(_, value)| normalize_priority_value(value).ok())
+            .as_deref()
+            .map_or(Self::Normal, |value| match value {
+                "HIGH" => Self::High,
+                "LOW" => Self::Low,
+                _ => Self::Normal,
+            })
+    }
+
+    pub(crate) const fn rank(self) -> u8 {
+        match self {
+            Self::Low => 1,
+            Self::Normal => 2,
+            Self::High => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+pub enum QueueSortField {
+    Name,
+    State,
+    Priority,
+    Category,
+    Progress,
+    Size,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+pub enum QueueSortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, InputObject)]
+pub struct QueuePageInput {
+    pub page_index: u32,
+    pub page_size: u32,
+    pub search: Option<String>,
+    pub states: Option<Vec<QueueItemState>>,
+    pub priorities: Option<Vec<QueuePriority>>,
+    pub categories: Option<Vec<String>>,
+    pub sort_field: QueueSortField,
+    pub sort_direction: QueueSortDirection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+pub struct QueuePage {
+    pub items: Vec<QueueItem>,
+    pub total_count: u32,
+    pub summary: QueueSummary,
+    pub categories: Vec<String>,
+    pub latest_cursor: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
 pub enum QueueEventKind {
     ItemCreated,
     ItemStateChanged,
@@ -1059,13 +1126,61 @@ pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
         metadata: &info.metadata,
         category: info.category.as_deref(),
     });
+    queue_item_from_display(
+        info,
+        client_request_id,
+        attributes,
+        state,
+        display.original_title,
+        display.display_title,
+        display.parsed_release,
+    )
+}
+
+/// Projects just the display data needed by queue tables. Full release parsing
+/// stays on detail/snapshot paths, where callers actually render it.
+pub(crate) fn queue_table_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
+    let (client_request_id, attributes) = split_attributes(&info.metadata);
+    let state = queue_item_state_from_job_info(info);
+    let (original_title, display_title) = queue_display_titles_from_job(info);
+    queue_item_from_display(
+        info,
+        client_request_id,
+        attributes,
+        state,
+        original_title,
+        display_title,
+        ParsedRelease::default(),
+    )
+}
+
+pub(crate) fn queue_display_titles_from_job(
+    info: &weaver_server_core::JobInfo,
+) -> (String, String) {
+    let original_title =
+        weaver_server_core::ingest::original_release_title(&info.name, &info.metadata);
+    let display_title =
+        weaver_server_core::ingest::derive_release_name(Some(&original_title), Some(&info.name));
+    (original_title, display_title)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_item_from_display(
+    info: &weaver_server_core::JobInfo,
+    client_request_id: Option<String>,
+    attributes: Vec<Attribute>,
+    state: QueueItemState,
+    original_title: String,
+    display_title: String,
+    parsed_release: ParsedRelease,
+) -> QueueItem {
     QueueItem {
         id: info.job_id.0,
         job_hash: info.job_hash.as_ref().map(hex::encode),
         name: info.name.clone(),
-        display_title: display.display_title,
-        original_title: display.original_title,
-        parsed_release: display.parsed_release,
+        display_title,
+        original_title,
+        parsed_release,
         state,
         download_state: QueueDownloadState::from(info.download_state),
         post_state: QueuePostState::from(info.post_state),

@@ -1,8 +1,5 @@
 import {
   getCoreRowModel,
-  getFilteredRowModel,
-  getPaginationRowModel,
-  getSortedRowModel,
   useReactTable,
   type ColumnDef,
   type RowSelectionState,
@@ -29,7 +26,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import { Link } from "react-router";
-import { useClient, useMutation, useQuery } from "urql";
+import { useClient, useMutation, useQuery, useSubscription } from "urql";
 import { BulkEditModal } from "@/components/BulkEditModal";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { DataTable } from "@/components/data-table/DataTable";
@@ -74,13 +71,14 @@ import {
   PAUSE_JOB_MUTATION,
   RESUME_ALL_MUTATION,
   RESUME_JOB_MUTATION,
+  QUEUE_EVENTS_SUBSCRIPTION,
+  QUEUE_PAGE_QUERY,
   SET_SPEED_LIMIT_MUTATION,
   UPDATE_JOBS_MUTATION,
 } from "@/graphql/queries";
 import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";
 import {
   useLiveDownloadBlock,
-  useLiveJobs,
   useLivePaused,
   useLiveSpeed,
 } from "@/lib/context/live-data-context";
@@ -90,7 +88,12 @@ import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { getJobStages } from "@/lib/job-stages";
 import { isActiveStatus, STATUS_BG_CLASS, statusToken } from "@/lib/status-tokens";
 import { useStableQueueEta } from "@/lib/hooks/use-stable-queue-eta";
-import { formatJobReleaseName, type JobData } from "@/lib/job-types";
+import {
+  formatJobReleaseName,
+  normalizeJobData,
+  type GraphqlJobData,
+  type JobData,
+} from "@/lib/job-types";
 import { cn } from "@/lib/utils";
 
 type QueueStatusFilter =
@@ -111,12 +114,6 @@ type QueueSelectOption = {
   value: string;
   label: string;
 };
-type OpenQueueCellSelect = {
-  field: "priority" | "category";
-  jobId: number;
-} | null;
-type QueueCellSelectField = NonNullable<OpenQueueCellSelect>["field"];
-
 type QueueTablePreferences = {
   pageSize: number;
   search: string;
@@ -139,7 +136,33 @@ type QueueRowData = JobData & {
   etaDisplay: string;
 };
 
+type QueuePageSummary = {
+  totalItems: number;
+  queuedItems: number;
+  activeItems: number;
+  pausedItems: number;
+};
+
+type QueuePageResponse = {
+  queuePage: {
+    items: GraphqlJobData[];
+    totalCount: number;
+    summary: QueuePageSummary;
+    categories: string[];
+    latestCursor: string;
+  };
+};
+
+type QueueEventPayload = {
+  cursor: string;
+  kind: "ITEM_CREATED" | "ITEM_STATE_CHANGED" | "ITEM_PROGRESS" | "ITEM_ATTENTION" | "ITEM_COMPLETED" | "ITEM_REMOVED" | "GLOBAL_STATE_CHANGED";
+  itemId: number | null;
+  item: GraphqlJobData | null;
+};
+
 const QUEUE_PAGE_SIZE_OPTIONS = [25, 50, 100, 500] as const;
+const EMPTY_QUEUE_PAGE_ITEMS: GraphqlJobData[] = [];
+const EMPTY_QUEUE_CATEGORIES: string[] = [];
 const DEFAULT_QUEUE_PREFERENCES: QueueTablePreferences = {
   pageSize: 50,
   search: "",
@@ -169,6 +192,52 @@ const QUEUE_ACTIVE_STATUSES: QueueStatusFilter[] = [
 const NO_CATEGORY_SELECT_VALUE = "__no_category__";
 
 type QueueLayout = "table" | "compact";
+
+function queueStatusToGraphql(status: QueueStatusFilter): string {
+  return status === "MOVING" ? "FINALIZING" : status;
+}
+
+function queueSortingToGraphql(sorting: SortingState) {
+  const current = sorting[0];
+  const sortField = (() => {
+    switch (current?.id) {
+      case "name":
+        return "NAME";
+      case "status":
+        return "STATE";
+      case "priority":
+        return "PRIORITY";
+      case "category":
+        return "CATEGORY";
+      case "size":
+        return "SIZE";
+      default:
+        return "PROGRESS";
+    }
+  })();
+  return {
+    sortField,
+    sortDirection: current?.desc === false ? "ASC" : "DESC",
+  };
+}
+
+function buildQueuePageInput(
+  preferences: QueueTablePreferences,
+  search: string,
+  pageIndex: number,
+) {
+  return {
+    pageIndex,
+    pageSize: preferences.pageSize,
+    search: search.length > 0 ? search : undefined,
+    states: preferences.statuses.length > 0
+      ? preferences.statuses.map(queueStatusToGraphql)
+      : undefined,
+    priorities: preferences.priorities.length > 0 ? preferences.priorities : undefined,
+    categories: preferences.categories.length > 0 ? preferences.categories : undefined,
+    ...queueSortingToGraphql(preferences.sorting),
+  };
+}
 
 function sameStatusSet(current: readonly string[], preset: readonly string[]): boolean {
   return current.length === preset.length && preset.every((value) => current.includes(value));
@@ -239,31 +308,21 @@ const QueueActionButtons = memo(function QueueActionButtons({
 
 const QueueCellSelect = memo(function QueueCellSelect({
   jobId,
-  field,
   value,
   options,
   ariaLabel,
   disabled,
-  open,
-  onOpenChange,
   onValueChange,
   className,
 }: {
   jobId: number;
-  field: QueueCellSelectField;
   value: string;
   options: QueueSelectOption[];
   ariaLabel: string;
   disabled?: boolean;
-  open?: boolean;
-  onOpenChange?: (jobId: number, field: QueueCellSelectField, open: boolean) => void;
   onValueChange: (jobId: number, value: string) => void;
   className?: string;
 }) {
-  const handleOpenChange = useCallback((nextOpen: boolean) => {
-    onOpenChange?.(jobId, field, nextOpen);
-  }, [field, jobId, onOpenChange]);
-
   const handleValueChange = useCallback((nextValue: string) => {
     onValueChange(jobId, nextValue);
   }, [jobId, onValueChange]);
@@ -272,8 +331,6 @@ const QueueCellSelect = memo(function QueueCellSelect({
     <div className="flex justify-center" data-row-click-ignore="true">
       <Select
         value={value}
-        open={open}
-        onOpenChange={handleOpenChange}
         onValueChange={handleValueChange}
         disabled={disabled}
       >
@@ -449,34 +506,6 @@ function formatResetAt(epochMs?: number | null) {
   });
 }
 
-function pruneBooleanRecord<T extends Record<string, boolean>>(
-  current: T,
-  validIds: Set<string>,
-): T {
-  const entries = Object.entries(current);
-  if (entries.length === 0) {
-    return current;
-  }
-
-  let changed = false;
-  const nextEntries: Array<[string, boolean]> = [];
-
-  for (const [id, enabled] of entries) {
-    if (enabled && validIds.has(id)) {
-      nextEntries.push([id, enabled]);
-      continue;
-    }
-
-    changed = true;
-  }
-
-  if (!changed && nextEntries.length === entries.length) {
-    return current;
-  }
-
-  return Object.fromEntries(nextEntries) as T;
-}
-
 function queueStatusLabel(status: QueueStatusFilter, t: ReturnType<typeof useTranslate>) {
   switch (status) {
     case "QUEUED":
@@ -498,24 +527,6 @@ function queueStatusLabel(status: QueueStatusFilter, t: ReturnType<typeof useTra
   }
 }
 
-function queueDisplayRank(status: string): number {
-  switch (status) {
-    case "VERIFYING":
-    case "REPAIRING":
-    case "EXTRACTING":
-    case "MOVING":
-      return 0;
-    case "DOWNLOADING":
-      return 1;
-    default:
-      return 2;
-  }
-}
-
-function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-
 export function JobList() {
   const client = useClient();
   const [serversResult] = useQuery({ query: HAS_CONFIGURED_SERVERS_QUERY });
@@ -530,16 +541,90 @@ export function JobList() {
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [pendingJobUpdates, setPendingJobUpdates] = useState<Record<number, PendingQueueJobUpdate>>({});
   const [savingQueueFields, setSavingQueueFields] = useState<Record<string, boolean>>({});
-  const [openQueueCellSelect, setOpenQueueCellSelect] = useState<OpenQueueCellSelect>(null);
   const [queueLayout, setQueueLayout] = useState<QueueLayout>("table");
 
-  const allJobs = useLiveJobs();
   const speed = useLiveSpeed();
   const isPaused = useLivePaused();
   const downloadBlock = useLiveDownloadBlock();
-  const jobs = allJobs.filter((job) => job.status !== "COMPLETE" && job.status !== "FAILED");
+  const deferredSearch = useDeferredValue(queuePreferences.search.trim());
+  const queuePageInput = useMemo(
+    () => buildQueuePageInput(queuePreferences, deferredSearch, pageIndex),
+    [deferredSearch, pageIndex, queuePreferences],
+  );
+  const queueQueryKey = useMemo(() => JSON.stringify(queuePageInput), [queuePageInput]);
+  const queueTableVirtualization = useMemo(
+    () => ({
+      estimatedRowHeight: 56,
+      overscan: 8,
+      resetKey: queueQueryKey,
+    }),
+    [queueQueryKey],
+  );
+  const queueRowClassName = useCallback(() => "text-xs", []);
+  const [{ data: queuePageData, fetching: fetchingQueuePage }, reexecuteQueuePage] = useQuery<QueuePageResponse>({
+    query: QUEUE_PAGE_QUERY,
+    variables: { input: queuePageInput },
+  });
+  const [{ data: queueEventData, error: queueEventError }] = useSubscription<{
+    queueEvents: QueueEventPayload;
+  }>({
+    query: QUEUE_EVENTS_SUBSCRIPTION,
+    variables: { after: queuePageData?.queuePage.latestCursor },
+    pause: !queuePageData?.queuePage.latestCursor,
+  });
+  const [eventItems, setEventItems] = useState<Record<number, GraphqlJobData>>({});
+  const queueRefreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const queuePageItems = queuePageData?.queuePage.items ?? EMPTY_QUEUE_PAGE_ITEMS;
+  const jobs = useMemo(
+    () => queuePageItems.map((job) => normalizeJobData(eventItems[job.id] ?? job)),
+    [eventItems, queuePageItems],
+  );
   const policyBlockedJobs = jobs.filter((job) => isBlockedByDownloadPolicy(job, downloadBlock)).length;
   const capResetAt = formatResetAt(downloadBlock.windowEndsAtEpochMs);
+
+  useEffect(() => {
+    setRowSelection({});
+  }, [queueQueryKey]);
+
+  useEffect(() => {
+    setEventItems({});
+  }, [queuePageItems]);
+
+  useEffect(() => {
+    if (queueEventError) {
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
+      return;
+    }
+    const event = queueEventData?.queueEvents;
+    if (!event) {
+      return;
+    }
+    if (event.kind === "ITEM_PROGRESS") {
+      if (!event.item) {
+        void reexecuteQueuePage({ requestPolicy: "network-only" });
+        return;
+      }
+      if (queuePageItems.some((item) => item.id === event.item?.id)) {
+        setEventItems((current) => ({ ...current, [event.item!.id]: event.item! }));
+      }
+      if (queuePreferences.sorting[0]?.id !== "progress") {
+        return;
+      }
+    }
+    if (queueRefreshTimeoutRef.current) {
+      clearTimeout(queueRefreshTimeoutRef.current);
+    }
+    queueRefreshTimeoutRef.current = setTimeout(() => {
+      queueRefreshTimeoutRef.current = null;
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
+    }, 250);
+  }, [queueEventData, queueEventError, queuePageItems, queuePreferences.sorting, reexecuteQueuePage]);
+
+  useEffect(() => () => {
+    if (queueRefreshTimeoutRef.current) {
+      clearTimeout(queueRefreshTimeoutRef.current);
+    }
+  }, []);
 
   const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
   const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
@@ -603,28 +688,7 @@ export function JobList() {
     [rowSelection],
   );
 
-  const queueCategoriesRef = useRef<string[]>([]);
-  const queueCategories = useMemo(
-    () => {
-      const next = Array.from(
-        new Set(
-          jobs
-            .map((job) => resolveJobCategory(job, pendingJobUpdates[job.id]))
-            .filter((category): category is string => Boolean(category)),
-        ),
-      ).sort((left, right) => left.localeCompare(right));
-
-      if (sameStringArray(queueCategoriesRef.current, next)) {
-        return queueCategoriesRef.current;
-      }
-
-      queueCategoriesRef.current = next;
-      return next;
-    },
-    [jobs, pendingJobUpdates],
-  );
-
-  const editableCategoryOptionsRef = useRef<string[]>([]);
+  const queueCategories = queuePageData?.queuePage.categories ?? EMPTY_QUEUE_CATEGORIES;
   const editableCategoryOptions = useMemo(
     () => {
       const next = Array.from(
@@ -635,12 +699,6 @@ export function JobList() {
           ...queueCategories,
         ]),
       ).sort((left, right) => left.localeCompare(right));
-
-      if (sameStringArray(editableCategoryOptionsRef.current, next)) {
-        return editableCategoryOptionsRef.current;
-      }
-
-      editableCategoryOptionsRef.current = next;
       return next;
     },
     [categoryData?.categories, queueCategories],
@@ -662,24 +720,6 @@ export function JobList() {
     ],
     [editableCategoryOptions, t],
   );
-
-  useEffect(() => {
-    const nextCategories = queuePreferences.categories
-      .filter((category) => queueCategories.includes(category));
-    if (nextCategories.length === queuePreferences.categories.length) {
-      return;
-    }
-
-    setQueuePreferences((current) => ({
-      ...current,
-      categories: current.categories.filter((category) => queueCategories.includes(category)),
-    }));
-  }, [queueCategories, queuePreferences.categories, setQueuePreferences]);
-
-  useEffect(() => {
-    const validIds = new Set(jobs.map((job) => String(job.id)));
-    setRowSelection((current) => pruneBooleanRecord(current, validIds));
-  }, [jobs]);
 
   useEffect(() => {
     setPendingJobUpdates((current) => {
@@ -727,33 +767,10 @@ export function JobList() {
     });
   }, [jobs]);
 
-  const queueRows = useMemo(
-    () =>
-      jobs
-        .filter((job) => {
-          const pending = pendingJobUpdates[job.id];
-          const matchesStatus =
-            queuePreferences.statuses.length === 0
-            || queuePreferences.statuses.includes(job.status as QueueStatusFilter);
-          const priority = resolveJobPriority(job, pending);
-          const matchesPriority =
-            queuePreferences.priorities.length === 0
-            || queuePreferences.priorities.includes(priority);
-          const category = resolveJobCategory(job, pending);
-          const matchesCategory =
-            queuePreferences.categories.length === 0
-            || (category != null && queuePreferences.categories.includes(category));
-          return matchesStatus && matchesPriority && matchesCategory;
-        })
-        .sort((left, right) => queueDisplayRank(left.status) - queueDisplayRank(right.status)),
-    [jobs, pendingJobUpdates, queuePreferences.categories, queuePreferences.priorities, queuePreferences.statuses],
-  );
-
-  const deferredSearch = useDeferredValue(queuePreferences.search.trim().toLowerCase());
   const queueEtaById = useStableQueueEta(jobs, speed);
   const queueTableRows = useMemo<QueueRowData[]>(
     () =>
-      queueRows.map((job) => {
+      jobs.map((job) => {
         const pending = pendingJobUpdates[job.id];
         const priorityValue = resolveJobPriority(job, pending);
         const categoryValue = resolveJobCategory(job, pending);
@@ -779,19 +796,10 @@ export function JobList() {
               : (queueEtaById.get(job.id) ?? "\u2014"),
         };
       }),
-    [capResetAt, downloadBlock, isPaused, pendingJobUpdates, queueEtaById, queueRows, t],
+    [capResetAt, downloadBlock, isPaused, jobs, pendingJobUpdates, queueEtaById, t],
   );
-  const queueSearchIndex = useMemo(
-    () =>
-      new Map(
-        queueTableRows.map((job) => [
-          String(job.id),
-          job.displayName.toLowerCase(),
-        ]),
-      ),
-    [queueTableRows],
-  );
-  const pageCount = Math.max(1, Math.ceil(queueTableRows.length / queuePreferences.pageSize));
+  const totalCount = queuePageData?.queuePage.totalCount ?? 0;
+  const pageCount = Math.max(1, Math.ceil(totalCount / queuePreferences.pageSize));
 
   useEffect(() => {
     if (pageIndex >= pageCount && pageIndex > 0) {
@@ -850,8 +858,10 @@ export function JobList() {
           [jobId]: previousUpdate,
         };
       });
+    } else {
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
     }
-  }, [setQueueFieldSaving, updateJobs]);
+  }, [reexecuteQueuePage, setQueueFieldSaving, updateJobs]);
 
   const handleInlineCategoryChange = useCallback(async (jobId: number, value: string) => {
     const nextCategory = value === NO_CATEGORY_SELECT_VALUE ? null : value;
@@ -888,23 +898,10 @@ export function JobList() {
           [jobId]: previousUpdate,
         };
       });
+    } else {
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
     }
-  }, [setQueueFieldSaving, updateJobs]);
-
-  const handleQueueCellSelectOpenChange = useCallback(
-    (jobId: number, field: NonNullable<OpenQueueCellSelect>["field"], open: boolean) => {
-      setOpenQueueCellSelect((current) => {
-        if (!open) {
-          return current?.jobId === jobId && current.field === field ? null : current;
-        }
-        if (current?.jobId === jobId && current.field === field) {
-          return current;
-        }
-        return { jobId, field };
-      });
-    },
-    [],
-  );
+  }, [reexecuteQueuePage, setQueueFieldSaving, updateJobs]);
 
   const handlePrioritySelectValueChange = useCallback((jobId: number, value: string) => {
     void handleInlinePriorityChange(jobId, value as QueuePriorityFilter);
@@ -997,13 +994,10 @@ export function JobList() {
         cell: ({ row }) => (
           <QueueCellSelect
             jobId={row.original.id}
-            field="priority"
             value={row.original.priorityValue}
             options={prioritySelectOptions}
             ariaLabel={`${t("upload.priorityLabel")} ${row.original.displayName}`}
             disabled={Boolean(savingQueueFields[`${row.original.id}:priority`])}
-            open={openQueueCellSelect?.jobId === row.original.id && openQueueCellSelect.field === "priority"}
-            onOpenChange={handleQueueCellSelectOpenChange}
             onValueChange={handlePrioritySelectValueChange}
             className="w-[108px]"
           />
@@ -1025,13 +1019,10 @@ export function JobList() {
         cell: ({ row }) => (
           <QueueCellSelect
             jobId={row.original.id}
-            field="category"
             value={row.original.categoryValue ?? NO_CATEGORY_SELECT_VALUE}
             options={categorySelectOptions}
             ariaLabel={`${t("table.category")} ${row.original.displayName}`}
             disabled={Boolean(savingQueueFields[`${row.original.id}:category`])}
-            open={openQueueCellSelect?.jobId === row.original.id && openQueueCellSelect.field === "category"}
-            onOpenChange={handleQueueCellSelectOpenChange}
             onValueChange={handleCategorySelectValueChange}
             className="w-[136px]"
           />
@@ -1108,11 +1099,9 @@ export function JobList() {
       categorySelectOptions,
       handleCancelJob,
       handleCategorySelectValueChange,
-      handleQueueCellSelectOpenChange,
       handlePauseJob,
       handlePrioritySelectValueChange,
       handleResumeJob,
-      openQueueCellSelect,
       prioritySelectOptions,
       savingQueueFields,
       t,
@@ -1124,18 +1113,11 @@ export function JobList() {
     columns,
     getRowId: (row) => String(row.id),
     enableRowSelection: true,
+    manualPagination: true,
+    manualSorting: true,
+    pageCount,
     getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-    globalFilterFn: (row, _columnId, filterValue) => {
-      if (typeof filterValue !== "string" || filterValue.length === 0) {
-        return true;
-      }
-      return queueSearchIndex.get(row.id)?.includes(filterValue) ?? false;
-    },
     state: {
-      globalFilter: deferredSearch,
       pagination: {
         pageIndex,
         pageSize: queuePreferences.pageSize,
@@ -1198,6 +1180,7 @@ export function JobList() {
     if (!result.error) {
       setRowSelection({});
       setBulkEditOpen(false);
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
     }
   };
 
@@ -1215,6 +1198,7 @@ export function JobList() {
     });
     if (!result.error) {
       setRowSelection({});
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
     }
   };
 
@@ -1232,6 +1216,7 @@ export function JobList() {
     });
     if (!result.error) {
       setRowSelection({});
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
     }
   };
 
@@ -1249,6 +1234,7 @@ export function JobList() {
     });
     if (!result.error) {
       setRowSelection({});
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
     }
     setCancelSelectedConfirm(false);
   };
@@ -1268,23 +1254,23 @@ export function JobList() {
     count: number;
     statuses: QueueStatusFilter[];
   }[] = [
-    { key: "all", label: t("history.filterAll"), count: jobs.length, statuses: [] },
+    { key: "all", label: t("history.filterAll"), count: queuePageData?.queuePage.summary.totalItems ?? 0, statuses: [] },
     {
       key: "active",
       label: t("queue.filterActive"),
-      count: jobs.filter((job) => QUEUE_ACTIVE_STATUSES.includes(job.status as QueueStatusFilter)).length,
+      count: queuePageData?.queuePage.summary.activeItems ?? 0,
       statuses: QUEUE_ACTIVE_STATUSES,
     },
     {
       key: "queued",
       label: t("status.queued"),
-      count: jobs.filter((job) => job.status === "QUEUED").length,
+      count: queuePageData?.queuePage.summary.queuedItems ?? 0,
       statuses: ["QUEUED"],
     },
     {
       key: "stalled",
       label: t("queue.filterStalled"),
-      count: jobs.filter((job) => job.status === "PAUSED").length,
+      count: queuePageData?.queuePage.summary.pausedItems ?? 0,
       statuses: ["PAUSED"],
     },
   ];
@@ -1415,7 +1401,7 @@ export function JobList() {
         </Card>
       ) : null}
 
-      {jobs.length === 0 ? (
+      {!fetchingQueuePage && totalCount === 0 ? (
         <EmptyState
           title={t("jobs.empty")}
           description={t("jobs.emptyHint")}
@@ -1772,7 +1758,8 @@ export function JobList() {
               <DataTable
                 table={queueTable}
                 wrapperClassName="max-h-[70vh]"
-                rowClassName={() => "text-xs"}
+                rowClassName={queueRowClassName}
+                virtualization={queueTableVirtualization}
                 emptyState={
                   <div className="space-y-3 py-12 text-center">
                     <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
@@ -1886,7 +1873,7 @@ export function JobList() {
             )}
             <DataTablePagination
               table={queueTable}
-              totalCount={queueTable.getFilteredRowModel().rows.length}
+              totalCount={totalCount}
               pageSizeOptions={[...QUEUE_PAGE_SIZE_OPTIONS]}
               rowsPerPageLabel={t("table.rowsPerPage")}
               previousLabel={t("action.previous")}

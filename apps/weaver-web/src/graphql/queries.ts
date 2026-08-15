@@ -36,6 +36,39 @@ const FACADE_QUEUE_ITEM_FIELDS = `
   }
 `;
 
+const QUEUE_TABLE_ITEM_FIELDS = `
+  fragment QueueTableItemFields on QueueItem {
+    id
+    name
+    displayTitle
+    originalTitle
+    status: state
+    progressPercent
+    totalBytes
+    downloadedBytes
+    optionalRecoveryBytes
+    optionalRecoveryDownloadedBytes
+    phaseProgress {
+      phase
+      completedBytes
+      totalBytes
+      progressPercent
+      rateBps
+      estimatedRemainingMs
+      startedAtEpochMs
+      updatedAtEpochMs
+    }
+    failedBytes
+    health
+    hasPassword
+    category
+    metadata: attributes {
+      key
+      value
+    }
+  }
+`;
+
 export const FACADE_HISTORY_ITEM_FIELDS = `
   fragment FacadeHistoryItemFields on HistoryItem {
     id
@@ -477,6 +510,26 @@ export const JOBS_PAGE_QUERY = gql`
   ${PARSED_RELEASE_FIELDS}
   ${FACADE_QUEUE_ITEM_FIELDS}
   ${DOWNLOAD_BLOCK_FIELDS}
+`;
+
+export const QUEUE_PAGE_QUERY = gql`
+  query QueuePage($input: QueuePageInput!) {
+    queuePage(input: $input) {
+      items {
+        ...QueueTableItemFields
+      }
+      totalCount
+      summary {
+        totalItems
+        queuedItems
+        activeItems
+        pausedItems
+      }
+      categories
+      latestCursor
+    }
+  }
+  ${QUEUE_TABLE_ITEM_FIELDS}
 `;
 
 export const JOB_QUERY = gql`

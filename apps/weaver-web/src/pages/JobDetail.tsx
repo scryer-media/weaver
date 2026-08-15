@@ -45,7 +45,6 @@ import {
 import { authHeaders, requestGraphqlClientRestart } from "@/graphql/client";
 import {
   useLiveConnection,
-  useLiveJob,
   useLiveSpeed,
 } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -53,7 +52,7 @@ import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-
 import { cn } from "@/lib/utils";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
-import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
+import { normalizeJobData, type GraphqlJobData } from "@/lib/job-types";
 import {
   readDownloadErrorMessage,
   saveResponseAsDownload,
@@ -88,7 +87,6 @@ export function JobDetail() {
   const { id } = useParams();
   const jobId = Number(id);
   const navigate = useNavigate();
-  const liveJob = useLiveJob(jobId);
   const speed = useLiveSpeed();
   const connection = useLiveConnection();
   const queryVariables = useMemo(() => ({ id: jobId }), [jobId]);
@@ -125,7 +123,6 @@ export function JobDetail() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [deleteAcceptError, setDeleteAcceptError] = useState<string | null>(null);
-  const [lastLiveJob, setLastLiveJob] = useState<JobData | null>(null);
   const [polledData, setPolledData] = useState<JobDetailQueryData | undefined>();
   const [isDownloadingNzb, setIsDownloadingNzb] = useState(false);
   const [nzbDownloadError, setNzbDownloadError] = useState<string | null>(null);
@@ -155,7 +152,6 @@ export function JobDetail() {
   );
 
   useEffect(() => {
-    setLastLiveJob(null);
     setPolledData(undefined);
     setNzbDownloadError(null);
   }, [jobId]);
@@ -172,12 +168,6 @@ export function JobDetail() {
     }
   }, [connection.status, subscriptionData]);
 
-  useEffect(() => {
-    if (liveJob) {
-      setLastLiveJob(liveJob);
-    }
-  }, [liveJob]);
-
   useReconnectPolling<JobDetailQueryData>({
     enabled: connection.isDisconnected && Number.isFinite(jobId),
     query: JOB_QUERY,
@@ -188,8 +178,7 @@ export function JobDetail() {
     },
   });
 
-  const queryJobIsTerminal = queryJob?.status === "COMPLETE" || queryJob?.status === "FAILED";
-  const job = liveJob ?? (queryJobIsTerminal ? queryJob : lastLiveJob ?? queryJob);
+  const job = queryJob;
   const timeline = jobQueryData?.jobTimeline ?? null;
   const etaSpeed = useStableEtaSpeed(job ? [job] : [], speed);
   const eta = job

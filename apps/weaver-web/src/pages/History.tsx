@@ -323,6 +323,20 @@ export function History() {
     () => buildHistoryPageInput(historyPreferences, deferredSearch, pageIndex),
     [deferredSearch, historyPreferences, pageIndex],
   );
+  const historyQueryKey = useMemo(() => JSON.stringify(historyPageInput), [historyPageInput]);
+  const historyTableVirtualization = useMemo(
+    () => ({
+      estimatedRowHeight: 64,
+      overscan: 8,
+      resetKey: historyQueryKey,
+    }),
+    [historyQueryKey],
+  );
+  const historyRowClassName = useCallback((row: { getIsSelected: () => boolean; original: HistoryJob }) => cn(
+    "text-[13px]",
+    row.getIsSelected() && "bg-primary/[0.06]",
+    row.original.deleteOperation?.locked && "bg-status-paused/5 opacity-75",
+  ), []);
 
   const [{ data, fetching }, reexecuteHistoryPage] = useQuery<HistoryPageResponse>({
     query: HISTORY_PAGE_QUERY,
@@ -1196,11 +1210,8 @@ export function History() {
               table={historyTable}
               tableClassName="table-fixed"
               wrapperClassName="max-h-[70vh]"
-              rowClassName={(row) => cn(
-                "text-[13px]",
-                row.getIsSelected() && "bg-primary/[0.06]",
-                row.original.deleteOperation?.locked && "bg-status-paused/5 opacity-75",
-              )}
+              rowClassName={historyRowClassName}
+              virtualization={historyTableVirtualization}
               emptyState={
                 <div className="space-y-3 py-12 text-center">
                   <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>

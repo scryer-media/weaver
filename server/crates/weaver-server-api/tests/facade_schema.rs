@@ -44,6 +44,10 @@ async fn public_facade_schema_exposes_core_surface() {
         "queueSnapshot query should be present"
     );
     assert!(
+        sdl.contains("queuePage(input: QueuePageInput!): QueuePage!"),
+        "queuePage query should be present"
+    );
+    assert!(
         sdl.contains("latestQueueCursor: String!"),
         "latestQueueCursor query should be present"
     );
