@@ -308,6 +308,23 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
     let mut out = out_base;
     let mut i: isize = -(span as isize);
 
+    // r11: on Neoverse-N1 the SEARCH_END = false span runs the frozen-roll
+    // kernel (see `n1_span` at the end of this file); it consumes the whole
+    // span (`i` -> 0), so the Rust loop below no-ops at runtime and the shared
+    // exit glue takes over unchanged. Every other core — Apple silicon in
+    // particular — keeps the Rust loop.
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    if !SEARCH_END && i != 0 && n1_span::engaged() {
+        n1_span::span(
+            sp,
+            &mut i,
+            &mut out,
+            &mut esc_first,
+            entry_next_mask,
+            table.as_ptr() as *const u8,
+        );
+    }
+
     {
         while i != 0 {
             // Straddle resolution for the previous window's tail classification.
@@ -1767,4 +1784,336 @@ pub(super) unsafe fn decode_normal_run_neon(
 
     let (extra_src, extra_dst) = decode_normal_run_scalar(input, src, output, dst);
     (src - start + extra_src, dst - dst_start + extra_dst)
+}
+
+// ---------------------------------------------------------------------------
+// r11: the Neoverse-N1 frozen span kernel (SEARCH_END = false).
+//
+// MAINTENANCE CONTRACT — mirror of the AVX2 raw kernels' contract:
+// `decode_kernel_neon64_raw` above remains the SOURCE OF TRUTH and the escape
+// hatch (WEAVER_YENC_N1_ASM=0, or any non-N1 core — Apple silicon never enters
+// here). This block freezes the emission for issue-width-bound Neoverse-N1,
+// where the Rust loop's LLVM allocation pays +20% instructions and +44-86%
+// branches vs the same algorithm hand-scheduled (perf-counter localized,
+// JOURNAL r11). Tune the Rust loop, measure via the escape hatch, then
+// re-derive this block if the Rust loop wins.
+//
+// The body is an instruction-for-instruction transliteration of rapidyenc
+// 27f435a's compiled do_decode_simd<isRaw=1, searchEnd=0, 64, do_decode_neon>
+// aarch64 emission (spec archived: yenc-program/results/r11/n1-oracle-se0.txt,
+// 0x39030; loop body 0x39120-0x392b4 + dot-arm 0x393d8-0x394ac + collision
+// block 0x3954c-0x395e4), register-for-register, with these deviations:
+//   1. the dot-arm's stp/ldp d12/d13 stack spills -> spare v14/v15 (nostack);
+//   2. the collision block's bit-lane + 0x2a/0x6a reloads -> the already-
+//      resident v17/v18/v25 (the reloads exist in the oracle only because gcc
+//      spilled them around the cold block);
+//   3. rodata pools -> pointer operands on Rust statics; the compact-store
+//      LUT is weaver's own `compact_table_16` (identical 32768x16 layout,
+//      mask<<4 indexing);
+//   4. entry-state vectors v19/v26 are built by the Rust prologue from the
+//      carried scalars instead of the oracle's per-state rodata forms.
+// ---------------------------------------------------------------------------
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub(super) mod n1_span {
+    #[repr(C, align(16))]
+    pub struct A16(pub [u8; 16]);
+    // tbx class table: CR (13) and LF (10) -> 0xff; every byte >= 16 keeps the
+    // `=` compare result (tbx semantics). `.` deliberately absent (raw-mode
+    // dots enter via the carried v26 / the dot-arm only).
+    pub static N1_TBX_CRLF: A16 = A16([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0, 0, 0xff, 0, 0]);
+    pub static N1_BIT_LANES: A16 = A16([1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128]);
+    // Byte-broadcast for the collision expansion: mask bytes 0/1 to lanes;
+    // bytes 2..7 reached by ext-shifted copies of the mask register.
+    pub static N1_BCAST01: A16 = A16([0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1]);
+
+    /// Engage on Neoverse-N1 (MIDR implementer 0x41 part 0xd0c) only, with a
+    /// runtime escape hatch. Apple silicon compiles this module out entirely
+    /// (target_os gate), so the M5-winning Rust path is untouched there.
+    pub fn engaged() -> bool {
+        static ENGAGED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENGAGED.get_or_init(|| {
+            if std::env::var_os("WEAVER_YENC_N1_ASM").is_some_and(|v| v == "0") {
+                return false;
+            }
+            std::fs::read_to_string("/sys/devices/system/cpu/cpu0/regs/identification/midr_el1")
+                .ok()
+                .and_then(|s| {
+                    u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+                })
+                .is_some_and(|midr| {
+                    ((midr >> 24) & 0xff) == 0x41 && ((midr >> 4) & 0xfff) == 0xd0c
+                })
+        })
+    }
+
+    /// Decode the whole SIMD span (`*i` negative, steps of 64 to 0). On exit
+    /// `*i == 0`, `*out` is the advanced output cursor and `*esc_first` the
+    /// carried trailing-`=` flag. The caller's tail reserve covers every
+    /// lookahead this block performs (deepest read: window + 67).
+    #[allow(unused_assignments)]
+    pub unsafe fn span(
+        sp: *const u8,
+        i: &mut isize,
+        out: &mut *mut u8,
+        esc_first: &mut u64,
+        entry_next_mask: u16,
+        table: *const u8,
+    ) {
+        use std::arch::aarch64::*;
+        let mut cur = unsafe { sp.offset(*i) };
+        let mut i_v = *i;
+        let mut out_v = *out;
+        let mut ef = *esc_first;
+        // v19: lane-A subtrahend vector, byte 0 = 42 | carry<<6 (oracle's
+        // yencOffset trick); v26: carried line-start dot marker.
+        let mut v19_init = [0x2au8; 16];
+        v19_init[0] = 0x2a | ((ef as u8) << 6);
+        let v19_q = unsafe { vld1q_u8(v19_init.as_ptr()) };
+        let zero = unsafe { vdupq_n_u8(0) };
+        let v26_q = match entry_next_mask {
+            1 => unsafe { vsetq_lane_u8::<0>(1, zero) },
+            2 => unsafe { vsetq_lane_u8::<1>(2, zero) },
+            _ => zero,
+        };
+        unsafe {
+            core::arch::asm!(
+                // ---- prologue: pin the constant file (oracle 390ec-39118) --
+                "ldr q3, [{tbx}]",
+                "ldr q17, [{bits}]",
+                "movi v16.16b, #0x3d",
+                "movi v18.16b, #0x2a",
+                "movi v24.16b, #0xd6",
+                "movi v25.16b, #0x6a",
+                "mov w15, #0x2a",
+                "b 2f",
+                // ---- clean window (oracle 39120-39144) ---------------------
+                "1:",
+                "sub v20.16b, v4.16b, v19.16b",
+                "add {cur}, {cur}, #0x40",
+                "add v21.16b, v24.16b, v5.16b",
+                "adds {i}, {i}, #0x40",
+                "add v22.16b, v24.16b, v6.16b",
+                "mov {ef}, #0x0",
+                "add v23.16b, v24.16b, v7.16b",
+                "movi v19.16b, #0x2a",
+                "st1 {{v20.16b-v23.16b}}, [{out}], #64",
+                "b.eq 9f",
+                // ---- loop top (oracle 39148) -------------------------------
+                "2:",
+                "ld1 {{v4.16b-v7.16b}}, [{cur}]",
+                "cmeq v2.16b, v5.16b, v16.16b",
+                "cmeq v1.16b, v6.16b, v16.16b",
+                "cmeq v28.16b, v7.16b, v16.16b",
+                "cmeq v27.16b, v4.16b, v16.16b",
+                "mov v8.16b, v2.16b",
+                "mov v30.16b, v1.16b",
+                "mov v31.16b, v28.16b",
+                "mov v29.16b, v27.16b",
+                "tbx v8.16b, {{v3.16b}}, v5.16b",
+                "tbx v30.16b, {{v3.16b}}, v6.16b",
+                "tbx v31.16b, {{v3.16b}}, v7.16b",
+                "tbx v29.16b, {{v3.16b}}, v4.16b",
+                "orr v0.16b, v8.16b, v30.16b",
+                "orr v29.16b, v26.16b, v29.16b",
+                "orr v0.16b, v0.16b, v31.16b",
+                "orr v0.16b, v0.16b, v29.16b",
+                "uqxtn v0.2s, v0.2d",
+                "fmov x0, d0",
+                "cbz x0, 1b",
+                // ---- specials: bit-weight reduce (oracle 39198-391d8) ------
+                "and v0.16b, v8.16b, v17.16b",
+                "and v29.16b, v29.16b, v17.16b",
+                "and v8.16b, v31.16b, v17.16b",
+                "and v30.16b, v30.16b, v17.16b",
+                "and v31.16b, v27.16b, v17.16b",
+                "and v11.16b, v2.16b, v17.16b",
+                "and v9.16b, v1.16b, v17.16b",
+                "and v10.16b, v28.16b, v17.16b",
+                "addp v30.16b, v30.16b, v8.16b",
+                "addp v29.16b, v29.16b, v0.16b",
+                "addp v31.16b, v31.16b, v11.16b",
+                "addp v8.16b, v9.16b, v10.16b",
+                "addp v0.16b, v29.16b, v30.16b",
+                "addp v30.16b, v31.16b, v8.16b",
+                "addp v0.16b, v0.16b, v30.16b",
+                "mov x5, v0.d[1]",
+                "fmov x4, d0",
+                "cmp x4, x5",
+                "b.ne 5f",
+                // ---- all specials are '=' (oracle 391e4-39224) -------------
+                "3:",
+                "orr x0, {ef}, x5, lsl #1",
+                "tst x0, x4",
+                "b.ne 7f",
+                "ext v28.16b, v1.16b, v28.16b, #15",
+                "lsr x5, x5, #63",
+                "ext v1.16b, v2.16b, v1.16b, #15",
+                "and {ef}, x5, #0xff",
+                "ext v2.16b, v27.16b, v2.16b, #15",
+                "ext v27.16b, v18.16b, v27.16b, #15",
+                "bsl v28.16b, v25.16b, v18.16b",
+                "bsl v1.16b, v25.16b, v18.16b",
+                "bsl v2.16b, v25.16b, v18.16b",
+                "bsl v27.16b, v25.16b, v19.16b",
+                "sub v28.16b, v7.16b, v28.16b",
+                "sub v1.16b, v6.16b, v1.16b",
+                "sub v2.16b, v5.16b, v2.16b",
+                "sub v4.16b, v4.16b, v27.16b",
+                // ---- compaction store (oracle 39228-392b4) -----------------
+                "4:",
+                "ubfiz x1, x4, #4, #15",
+                "cnt v0.8b, v0.8b",
+                "ubfx x3, x4, #16, #15",
+                "ubfx x0, x4, #32, #15",
+                "ubfx x5, x4, #48, #15",
+                "orr w10, w15, {ef:w}, lsl #6",
+                "ldr q5, [{lut}, x1]",
+                "lsl x3, x3, #4",
+                "fmov x1, d0",
+                "lsl x0, x0, #4",
+                "lsl x5, x5, #4",
+                "mov v19.b[0], w10",
+                "tbl v4.16b, {{v4.16b}}, v5.16b",
+                "add {cur}, {cur}, #0x40",
+                "adds {i}, {i}, #0x40",
+                "sub x4, {k8}, x1",
+                "str q4, [{out}]",
+                "add x4, x4, x4, lsr #8",
+                "and x17, x4, #0xff",
+                "ldr q0, [{lut}, x3]",
+                "add x16, {out}, w4, uxtb",
+                "ubfx x11, x4, #16, #8",
+                "ubfx x1, x4, #32, #8",
+                "add x10, x16, x11",
+                "ubfx x4, x4, #48, #8",
+                "tbl v2.16b, {{v2.16b}}, v0.16b",
+                "add x3, x10, x1",
+                "str q2, [{out}, x17]",
+                "add {out}, x3, x4",
+                "ldr q0, [{lut}, x0]",
+                "tbl v1.16b, {{v1.16b}}, v0.16b",
+                "str q1, [x16, x11]",
+                "ldr q0, [{lut}, x5]",
+                "tbl v28.16b, {{v28.16b}}, v0.16b",
+                "str q28, [x10, x1]",
+                "b.ne 2b",
+                "b 9f",
+                // ---- dot-arm: `\r` (+2 `.`) probe (oracle 393d8-394ac) -----
+                "5:",
+                "movi v26.16b, #0x2e",
+                "movi v9.16b, #0xd",
+                "ext v11.16b, v4.16b, v5.16b, #2",
+                "ext v10.16b, v5.16b, v6.16b, #2",
+                "ext v29.16b, v6.16b, v7.16b, #2",
+                "cmeq v8.16b, v4.16b, v9.16b",
+                "cmeq v30.16b, v5.16b, v9.16b",
+                "cmeq v11.16b, v11.16b, v26.16b",
+                "cmeq v10.16b, v10.16b, v26.16b",
+                "cmeq v29.16b, v29.16b, v26.16b",
+                "and v11.16b, v11.16b, v8.16b",
+                "and v10.16b, v10.16b, v30.16b",
+                "ldur q30, [{cur}, #50]",
+                "cmeq v8.16b, v6.16b, v9.16b",
+                "cmeq v9.16b, v7.16b, v9.16b",
+                "cmeq v30.16b, v30.16b, v26.16b",
+                "movi v26.4s, #0x0",
+                "and v29.16b, v29.16b, v8.16b",
+                "orr v8.16b, v11.16b, v10.16b",
+                "and v9.16b, v30.16b, v9.16b",
+                "orr v8.16b, v8.16b, v29.16b",
+                "orr v8.16b, v8.16b, v9.16b",
+                "uqxtn v8.2s, v8.2d",
+                "fmov x0, d8",
+                "cbz x0, 3b",
+                // stuffed dots present: build m2nldot, kill + carry (39440+)
+                "ext v30.16b, v6.16b, v7.16b, #1",
+                "ldur q14, [{cur}, #49]",
+                "movi v15.16b, #0xa",
+                "ext v8.16b, v4.16b, v5.16b, #1",
+                "ext v31.16b, v5.16b, v6.16b, #1",
+                "cmeq v30.16b, v30.16b, v15.16b",
+                "cmeq v8.16b, v8.16b, v15.16b",
+                "cmeq v31.16b, v31.16b, v15.16b",
+                "cmeq v14.16b, v14.16b, v15.16b",
+                "and v8.16b, v8.16b, v17.16b",
+                "and v14.16b, v14.16b, v9.16b",
+                "and v9.16b, v30.16b, v17.16b",
+                "and v30.16b, v31.16b, v17.16b",
+                "and v8.16b, v8.16b, v11.16b",
+                "ext v26.16b, v14.16b, v26.16b, #14",
+                "and v9.16b, v9.16b, v29.16b",
+                "and v14.16b, v14.16b, v17.16b",
+                "and v10.16b, v30.16b, v10.16b",
+                "addp v9.16b, v9.16b, v14.16b",
+                "addp v8.16b, v8.16b, v10.16b",
+                "addp v8.16b, v8.16b, v9.16b",
+                "addp v8.16b, v8.16b, v8.16b",
+                "shl v8.2d, v8.2d, #2",
+                "fmov x0, d8",
+                "orr v0.16b, v0.16b, v8.16b",
+                "orr x4, x4, x0",
+                "b 3b",
+                // ---- consecutive-'=' collision (oracle 3954c-395e4) --------
+                "7:",
+                "bic x0, x5, x0",
+                "and x0, x0, #0x5555555555555555",
+                "add x0, x0, x5",
+                "eor x0, x0, #0x5555555555555555",
+                "and x0, x0, x5",
+                "ldr q14, [{bcast}]",
+                "orr {ef}, {ef}, x0, lsl #1",
+                "lsr x0, x0, #63",
+                "fmov d8, {ef}",
+                "bic x4, x4, {ef}",
+                "and {ef}, x0, #0xff",
+                "ext v2.16b, v8.16b, v8.16b, #2",
+                "ext v1.16b, v8.16b, v8.16b, #4",
+                "ext v28.16b, v8.16b, v8.16b, #6",
+                "tbl v27.16b, {{v8.16b}}, v14.16b",
+                "tbl v2.16b, {{v2.16b}}, v14.16b",
+                "tbl v1.16b, {{v1.16b}}, v14.16b",
+                "tbl v28.16b, {{v28.16b}}, v14.16b",
+                "cmtst v27.16b, v27.16b, v17.16b",
+                "cmtst v2.16b, v2.16b, v17.16b",
+                "cmtst v1.16b, v1.16b, v17.16b",
+                "cmtst v28.16b, v28.16b, v17.16b",
+                "bsl v27.16b, v25.16b, v18.16b",
+                "bsl v2.16b, v25.16b, v18.16b",
+                "bsl v1.16b, v25.16b, v18.16b",
+                "bsl v28.16b, v25.16b, v18.16b",
+                "bic v0.16b, v0.16b, v8.16b",
+                "sub v2.16b, v5.16b, v2.16b",
+                "sub v1.16b, v6.16b, v1.16b",
+                "sub v28.16b, v7.16b, v28.16b",
+                "sub v4.16b, v4.16b, v27.16b",
+                "b 4b",
+                "9:",
+                cur = inout(reg) cur,
+                i = inout(reg) i_v,
+                out = inout(reg) out_v,
+                ef = inout(reg) ef,
+                lut = in(reg) table,
+                k8 = in(reg) 0x0808080808080808u64,
+                tbx = in(reg) N1_TBX_CRLF.0.as_ptr(),
+                bits = in(reg) N1_BIT_LANES.0.as_ptr(),
+                bcast = in(reg) N1_BCAST01.0.as_ptr(),
+                inout("v19") v19_q => _,
+                inout("v26") v26_q => _,
+                out("x0") _, out("x1") _, out("x3") _, out("x4") _, out("x5") _,
+                out("x10") _, out("x11") _, out("x12") _, out("x15") _,
+                out("x16") _, out("x17") _,
+                out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _,
+                out("v5") _, out("v6") _, out("v7") _, out("v8") _, out("v9") _,
+                out("v10") _, out("v11") _, out("v14") _, out("v15") _,
+                out("v16") _, out("v17") _, out("v18") _, out("v20") _,
+                out("v21") _, out("v22") _, out("v23") _, out("v24") _,
+                out("v25") _, out("v27") _, out("v28") _, out("v29") _,
+                out("v30") _, out("v31") _,
+                options(nostack),
+            );
+        }
+        *i = i_v;
+        *out = out_v;
+        *esc_first = ef;
+    }
 }
