@@ -1368,6 +1368,105 @@ fn dispatch_zero_window_preserves_crlf_entry_state() {
     }
 }
 
+#[test]
+fn raw_kernel_span_bound_matches_scalar_at_every_length() {
+    // Covers the SIMD span bound. The raw x86 kernels drive their window loop
+    // off a precomputed span (`(simd_limit / WIDTH) * WIDTH`) plus a negative
+    // induction variable, rather than re-testing `src + WIDTH <= simd_limit`
+    // each window. That rewrite is only correct if the span consumes EXACTLY the
+    // windows the bound test admitted — one window too many reads past the tail
+    // reserve, one too few silently shifts work into the scalar epilogue and
+    // changes nothing observable, so only a dense length sweep pins it.
+    //
+    // Sweeps every length across four window boundaries with a body that keeps
+    // specials (and therefore the compaction path) live right up to the tail.
+    for len in 120usize..=460 {
+        let mut input = Vec::with_capacity(len);
+        let mut col = 0usize;
+        while input.len() < len {
+            // '=' escapes and CRLF breaks interleaved so the final admitted
+            // window is a specials window, not a clean one.
+            if col == 40 {
+                // Line break, then a stuffed dot at the new line start on every
+                // other line: the `\r\n.` merge is the most span-sensitive
+                // shape in the kernel (it feeds `min_mask` into the NEXT
+                // window), so it must be live across the sweep.
+                input.extend_from_slice(b"\r\n");
+                if input.len() % 3 == 0 {
+                    input.push(b'.');
+                    col = 1;
+                } else {
+                    col = 0;
+                }
+            } else if col % 7 == 3 {
+                input.push(b'=');
+                input.push(b'J');
+                col += 2;
+            } else {
+                input.push(b'M');
+                col += 1;
+            }
+        }
+        input.truncate(len);
+        // `truncate` can cut an escape pair in half; a dangling trailing '=' is
+        // a malformed escape by contract (both tiers agree, but the reference
+        // call would return Err before the comparison). Keep the tail valid.
+        if input[len - 1] == b'=' || input[len - 1] == b'\r' {
+            input[len - 1] = b'M';
+        }
+        for &(dot, preserve, search) in &[
+            (true, false, false),
+            (true, false, true),
+            (true, true, true),
+            (false, false, false),
+        ] {
+            let simd = run_kernel_whole(&input, dot, preserve, search, false, None).unwrap();
+            let reference = run_kernel_whole(&input, dot, preserve, search, true, None).unwrap();
+            assert_eq!(
+                simd, reference,
+                "span bound diverged at len={len} dot={dot} preserve={preserve} search={search}"
+            );
+        }
+    }
+}
+
+#[test]
+fn compaction_cursor_matches_scalar_at_every_lane_position() {
+    // Covers the 4-lane LUT compaction cursor. Each 64-byte window compacts as
+    // four 16-byte lanes whose table offset and store-cursor advance come from a
+    // different slice of the skip mask; the x86 tiers compute those slices with
+    // shared shifts and position-invariant popcounts (rapidyenc's scheme), so a
+    // wrong shift or a popcount taken over the wrong 16-bit field corrupts only
+    // the lanes downstream of it. Walking a single escape through all 64 lane
+    // positions of a window exercises every slice boundary, and the second and
+    // third windows make a cursor drift visible rather than self-cancelling.
+    for pos in 0..64usize {
+        for extra in [0usize, 1] {
+            let mut input = vec![b'M'; 192];
+            // Escape pair at `pos` (and optionally a second one a lane apart, so
+            // masks with two set bits in different 16-bit fields are covered).
+            input[pos] = b'=';
+            input[pos + 1] = b'J';
+            if extra == 1 && pos + 20 < 190 {
+                input[pos + 18] = b'=';
+                input[pos + 19] = b'J';
+            }
+            // A CRLF break in the third window keeps a non-escape special in the
+            // skip mask too.
+            input[150] = b'\r';
+            input[151] = b'\n';
+            for &(dot, search) in &[(true, false), (true, true), (false, false)] {
+                let simd = run_kernel_whole(&input, dot, false, search, false, None).unwrap();
+                let reference = run_kernel_whole(&input, dot, false, search, true, None).unwrap();
+                assert_eq!(
+                    simd, reference,
+                    "compaction diverged at escape pos={pos} extra={extra} dot={dot} search={search}"
+                );
+            }
+        }
+    }
+}
+
 // Deterministic windows that pin the block-boundary carries: escapes,
 // line-start escapes and dots, and escaped CRs at the 64-byte edge, plus
 // control lines and terminators mid-window. Shared by the differential

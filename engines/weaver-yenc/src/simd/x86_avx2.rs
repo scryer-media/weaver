@@ -23,7 +23,12 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
     const WIDTH: usize = 64;
 
     let mut src = 0usize;
-    let mut dst = 0usize;
+    // Output cursor is a running pointer, exactly the oracle's `p`. Keeping a
+    // `(base, offset)` pair instead cost a reload of the spilled base on every
+    // window plus a separate offset register; `dst` is materialised once, after
+    // the SIMD span, for the scalar epilogue.
+    let out_base = output.as_mut_ptr();
+    let mut out = out_base;
     // Oracle `lenBuffer` for `isRaw && searchEnd` is `width-1 + 3 + 1`
     // (decoder_common.h:44-46) == this 67; the widest lookahead is the lane-B
     // `+4` view, ending at `src + WIDTH + 3`, and the loop bound
@@ -39,7 +44,7 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
     let y_needle = _mm256_set1_epi8(b'y' as i8);
     let eq_y = _mm256_set1_epi16(0x793d); // "=y", u16-aligned
     let esc_off = _mm256_set1_epi8(-106);
-    let table = compact_table_16();
+    let table = compact_table_16().as_ptr() as *const u8;
     let special_lut = _mm256_set_epi8(
         -1,
         b'=' as i8,
@@ -136,9 +141,22 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
     let mut broke = false;
 
     if input.len() > WIDTH * 2 {
-        while src + WIDTH <= simd_limit {
-            let a = _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i);
-            let b = _mm256_loadu_si256(input.as_ptr().add(src + 32) as *const __m256i);
+        // Oracle loop shape (`for(i = -len; i; i += 64)`, decoder_avx2_base.h:84):
+        // one negative induction variable counting up to zero, so the back edge
+        // is `add`+`jne` with no separate bound compare and no second cursor.
+        // The previous `while src + WIDTH <= simd_limit` form compiled to
+        // lea/sub/cmp/mov/ja — three extra µops on every window. `src` is only
+        // read at the SEARCH_END break and after the loop, so it is derived from
+        // `i` there instead of maintained per window.
+        //
+        // `span` is the number of bytes the old bound admitted: iteration `k`
+        // ran when `64k + 64 <= simd_limit`, i.e. `k < simd_limit / 64`.
+        let span = (simd_limit / WIDTH) * WIDTH;
+        let sp = input.as_ptr().add(span);
+        let mut i: isize = -(span as isize);
+        while i != 0 {
+            let a = _mm256_loadu_si256(sp.offset(i) as *const __m256i);
+            let b = _mm256_loadu_si256(sp.offset(i + 32) as *const __m256i);
 
             let cmp_a = _mm256_cmpeq_epi8(
                 a,
@@ -156,8 +174,8 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
                     | (_mm256_movemask_epi8(eq_va) as u32 as u64);
 
                 if mask != mask_eq {
-                    let tmp2a = _mm256_loadu_si256(input.as_ptr().add(src + 2) as *const __m256i);
-                    let tmp2b = _mm256_loadu_si256(input.as_ptr().add(src + 34) as *const __m256i);
+                    let tmp2a = _mm256_loadu_si256(sp.offset(i + 2) as *const __m256i);
+                    let tmp2b = _mm256_loadu_si256(sp.offset(i + 34) as *const __m256i);
                     // `=` at lane+2 (oracle decoder_avx2_base.h:153-156). The
                     // oracle's alignr alternative for this view is its `#if 0`
                     // experiment; the plain loadu view is the live arm.
@@ -177,11 +195,11 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
                     if partial != 0 {
                         let m1lf_a = _mm256_cmpeq_epi8(
                             lf,
-                            _mm256_loadu_si256(input.as_ptr().add(src + 1) as *const __m256i),
+                            _mm256_loadu_si256(sp.offset(i + 1) as *const __m256i),
                         );
                         let m1lf_b = _mm256_cmpeq_epi8(
                             lf,
-                            _mm256_loadu_si256(input.as_ptr().add(src + 33) as *const __m256i),
+                            _mm256_loadu_si256(sp.offset(i + 33) as *const __m256i),
                         );
                         let m1nl_a = _mm256_and_si256(m1lf_a, _mm256_cmpeq_epi8(a, cr));
                         let m1nl_b = _mm256_and_si256(m1lf_b, _mm256_cmpeq_epi8(b, cr));
@@ -194,14 +212,10 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
                         // the `mask` merge, so an aborted window reports the
                         // pre-merge mask to the no-backtrack exit rule.
                         if SEARCH_END {
-                            let tmp3a =
-                                _mm256_loadu_si256(input.as_ptr().add(src + 3) as *const __m256i);
-                            let tmp3b =
-                                _mm256_loadu_si256(input.as_ptr().add(src + 35) as *const __m256i);
-                            let tmp4a =
-                                _mm256_loadu_si256(input.as_ptr().add(src + 4) as *const __m256i);
-                            let tmp4b =
-                                _mm256_loadu_si256(input.as_ptr().add(src + 36) as *const __m256i);
+                            let tmp3a = _mm256_loadu_si256(sp.offset(i + 3) as *const __m256i);
+                            let tmp3b = _mm256_loadu_si256(sp.offset(i + 35) as *const __m256i);
+                            let tmp4a = _mm256_loadu_si256(sp.offset(i + 4) as *const __m256i);
+                            let tmp4b = _mm256_loadu_si256(sp.offset(i + 36) as *const __m256i);
 
                             let m3cr_a = _mm256_cmpeq_epi8(cr, tmp3a);
                             let m3cr_b = _mm256_cmpeq_epi8(cr, tmp3b);
@@ -243,7 +257,12 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
                                 _mm256_or_si256(m4end_b, m3end_b),
                             ));
                             if any_end != 0 {
-                                state.state = x86_break_state(input, src, mask, esc_first);
+                                state.state = x86_break_state(
+                                    input,
+                                    (span as isize + i) as usize,
+                                    mask,
+                                    esc_first,
+                                );
                                 broke = true;
                                 break;
                             }
@@ -289,10 +308,8 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
                         // boxes, no beyond-spread win on realshape. Neither was
                         // adopted.
                         if SEARCH_END {
-                            let tmp3a =
-                                _mm256_loadu_si256(input.as_ptr().add(src + 3) as *const __m256i);
-                            let tmp3b =
-                                _mm256_loadu_si256(input.as_ptr().add(src + 35) as *const __m256i);
+                            let tmp3a = _mm256_loadu_si256(sp.offset(i + 3) as *const __m256i);
+                            let tmp3b = _mm256_loadu_si256(sp.offset(i + 35) as *const __m256i);
                             let m3eqy_a =
                                 _mm256_and_si256(match2_eq_a, _mm256_cmpeq_epi8(y_needle, tmp3a));
                             let m3eqy_b =
@@ -300,15 +317,11 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
                             if _mm256_movemask_epi8(_mm256_or_si256(m3eqy_a, m3eqy_b)) != 0 {
                                 let m1lf_a = _mm256_cmpeq_epi8(
                                     lf,
-                                    _mm256_loadu_si256(
-                                        input.as_ptr().add(src + 1) as *const __m256i
-                                    ),
+                                    _mm256_loadu_si256(sp.offset(i + 1) as *const __m256i),
                                 );
                                 let m1lf_b = _mm256_cmpeq_epi8(
                                     lf,
-                                    _mm256_loadu_si256(
-                                        input.as_ptr().add(src + 33) as *const __m256i
-                                    ),
+                                    _mm256_loadu_si256(sp.offset(i + 33) as *const __m256i),
                                 );
                                 let end_found = _mm256_movemask_epi8(_mm256_or_si256(
                                     _mm256_and_si256(
@@ -321,7 +334,12 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
                                     ),
                                 ));
                                 if end_found != 0 {
-                                    state.state = x86_break_state(input, src, mask, esc_first);
+                                    state.state = x86_break_state(
+                                        input,
+                                        (span as isize + i) as usize,
+                                        mask,
+                                        esc_first,
+                                    );
                                     broke = true;
                                     break;
                                 }
@@ -334,14 +352,19 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
                 }
 
                 let esc_first_in = esc_first;
-                let eq_shift1 = (mask_eq << 1) | esc_first_in;
+                // `+` not `|`: `x << 1` always has bit 0 clear and
+                // `esc_first_in` is 0 or 1, so the two are identical, but the
+                // add folds the shift and the merge into one 3-operand
+                // `lea r, [esc + 2*mask_eq]` — the oracle's
+                // `(maskEq << 1) + escFirst` (decoder_avx2_base.h:434).
+                let eq_shift1 = (mask_eq << 1).wrapping_add(esc_first_in);
                 let collision = (mask_eq & eq_shift1) != 0;
                 let fixed_eq = if collision {
                     fix_eq_mask(mask_eq, eq_shift1)
                 } else {
                     mask_eq
                 };
-                let escaped = (fixed_eq << 1) | esc_first_in;
+                let escaped = (fixed_eq << 1).wrapping_add(esc_first_in);
                 esc_first = fixed_eq >> 63;
                 let (decoded_a, decoded_b) = if escaped == 0 {
                     (_mm256_add_epi8(a, yenc_offset), _mm256_add_epi8(b, sub42))
@@ -353,7 +376,7 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
                         _mm256_inserti128_si256(eq_needle, _mm256_castsi256_si128(eq_va), 1),
                     );
                     let sel_b = _mm256_cmpeq_epi8(
-                        _mm256_loadu_si256(input.as_ptr().add(src + 31) as *const __m256i),
+                        _mm256_loadu_si256(sp.offset(i + 31) as *const __m256i),
                         eq_needle,
                     );
                     (
@@ -370,62 +393,22 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
                     ))),
                 );
 
-                let shuf_a = _mm256_inserti128_si256(
-                    _mm256_castsi128_si256(_mm_loadu_si128(
-                        table[(skip & 0x7fff) as usize].as_ptr() as *const __m128i,
-                    )),
-                    _mm_loadu_si128(
-                        table[((skip >> 16) & 0x7fff) as usize].as_ptr() as *const __m128i
-                    ),
-                    1,
-                );
-                let packed_a = _mm256_shuffle_epi8(decoded_a, shuf_a);
-                _mm_storeu_si128(
-                    output.as_mut_ptr().add(dst) as *mut __m128i,
-                    _mm256_castsi256_si128(packed_a),
-                );
-                dst += 16 - (skip & 0xffff).count_ones() as usize;
-                _mm_storeu_si128(
-                    output.as_mut_ptr().add(dst) as *mut __m128i,
-                    _mm256_extracti128_si256::<1>(packed_a),
-                );
-                dst += 16 - ((skip >> 16) & 0xffff).count_ones() as usize;
-                let shuf_b = _mm256_inserti128_si256(
-                    _mm256_castsi128_si256(_mm_loadu_si128(
-                        table[((skip >> 32) & 0x7fff) as usize].as_ptr() as *const __m128i,
-                    )),
-                    _mm_loadu_si128(
-                        table[((skip >> 48) & 0x7fff) as usize].as_ptr() as *const __m128i
-                    ),
-                    1,
-                );
-                let packed_b = _mm256_shuffle_epi8(decoded_b, shuf_b);
-                _mm_storeu_si128(
-                    output.as_mut_ptr().add(dst) as *mut __m128i,
-                    _mm256_castsi256_si128(packed_b),
-                );
-                dst += 16 - ((skip >> 32) & 0xffff).count_ones() as usize;
-                _mm_storeu_si128(
-                    output.as_mut_ptr().add(dst) as *mut __m128i,
-                    _mm256_extracti128_si256::<1>(packed_b),
-                );
-                dst += 16 - ((skip >> 48) & 0xffff).count_ones() as usize;
+                out = avx2_compact_store64(decoded_a, decoded_b, skip, table, out);
             } else {
-                _mm256_storeu_si256(
-                    output.as_mut_ptr().add(dst) as *mut __m256i,
-                    _mm256_add_epi8(a, yenc_offset),
-                );
-                _mm256_storeu_si256(
-                    output.as_mut_ptr().add(dst + 32) as *mut __m256i,
-                    _mm256_add_epi8(b, sub42),
-                );
-                dst += WIDTH;
+                _mm256_storeu_si256(out as *mut __m256i, _mm256_add_epi8(a, yenc_offset));
+                _mm256_storeu_si256(out.add(32) as *mut __m256i, _mm256_add_epi8(b, sub42));
+                out = out.add(WIDTH);
                 esc_first = 0;
                 yenc_offset = sub42;
             }
-            src += WIDTH;
+            i += WIDTH as isize;
         }
+        src = (span as isize + i) as usize;
     }
+
+    // `out` advanced by the SIMD span (or not at all); hand the scalar epilogue
+    // the equivalent byte offset.
+    let mut dst = out.offset_from(out_base) as usize;
 
     // Only re-derive the carried state when the SIMD loop actually consumed at
     // least one window. With no window consumed (len in {129,130} => simd_limit
@@ -553,7 +536,7 @@ pub(super) unsafe fn decode_kernel_avx2(
     if input.len() > WIDTH * 2 {
         let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
         let eq_needle = _mm256_set1_epi8(b'=' as i8);
-        let table = compact_table_16();
+        let table = compact_table_16().as_ptr() as *const u8;
 
         // Carry the decoder state in registers for the length of the span. The
         // hot windows (bulk data, plain line breaks) only ever touch these
@@ -746,48 +729,16 @@ pub(super) unsafe fn decode_kernel_avx2(
             } else {
                 // 2-lane compaction: one 256-bit shuffle folds the
                 // low/high 16-byte compaction tables, then each 16-byte lane
-                // stores with a popcount-advanced cursor.
-                let shuf_a = _mm256_inserti128_si256(
-                    _mm256_castsi128_si256(_mm_loadu_si128(
-                        table[(skip & 0x7fff) as usize].as_ptr() as *const __m128i,
-                    )),
-                    _mm_loadu_si128(
-                        table[((skip >> 16) & 0x7fff) as usize].as_ptr() as *const __m128i
-                    ),
-                    1,
+                // stores with a popcount-advanced cursor. Shared with the raw
+                // kernel so the two can't drift apart.
+                let out = avx2_compact_store64(
+                    decoded_a,
+                    decoded_b,
+                    skip,
+                    table,
+                    output.as_mut_ptr().add(dst),
                 );
-                let packed_a = _mm256_shuffle_epi8(decoded_a, shuf_a);
-                _mm_storeu_si128(
-                    output.as_mut_ptr().add(dst) as *mut __m128i,
-                    _mm256_castsi256_si128(packed_a),
-                );
-                dst += 16 - (skip & 0xffff).count_ones() as usize;
-                _mm_storeu_si128(
-                    output.as_mut_ptr().add(dst) as *mut __m128i,
-                    _mm256_extracti128_si256(packed_a, 1),
-                );
-                dst += 16 - ((skip >> 16) & 0xffff).count_ones() as usize;
-
-                let shuf_b = _mm256_inserti128_si256(
-                    _mm256_castsi128_si256(_mm_loadu_si128(
-                        table[((skip >> 32) & 0x7fff) as usize].as_ptr() as *const __m128i,
-                    )),
-                    _mm_loadu_si128(
-                        table[((skip >> 48) & 0x7fff) as usize].as_ptr() as *const __m128i
-                    ),
-                    1,
-                );
-                let packed_b = _mm256_shuffle_epi8(decoded_b, shuf_b);
-                _mm_storeu_si128(
-                    output.as_mut_ptr().add(dst) as *mut __m128i,
-                    _mm256_castsi256_si128(packed_b),
-                );
-                dst += 16 - ((skip >> 32) & 0xffff).count_ones() as usize;
-                _mm_storeu_si128(
-                    output.as_mut_ptr().add(dst) as *mut __m128i,
-                    _mm256_extracti128_si256(packed_b, 1),
-                );
-                dst += 16 - ((skip >> 48) & 0xffff).count_ones() as usize;
+                dst = out.offset_from(output.as_mut_ptr()) as usize;
             }
 
             src += WIDTH;
@@ -812,6 +763,87 @@ pub(super) unsafe fn decode_kernel_avx2(
         written: dst,
         end: state.end.into(),
     })
+}
+
+/// 2×2-lane LUT compaction + store for one 64-byte window, in the oracle's
+/// exact addressing shape (rapidyenc `decoder_avx2_base.h:556-600`, the
+/// `PLATFORM_AMD64` arm). Byte-for-byte identical output to the previous
+/// open-coded form; only the index/cursor arithmetic changed:
+///
+///   * table offsets are computed as **byte** offsets, not element indices, so
+///     each lane costs one shift + one AND instead of shift + AND + scale
+///     (`(skip >> 12) & 0x7fff0` is `((skip >> 16) & 0x7fff) * 16`);
+///   * a single `skip >> 28` is shared between lane 2's table offset AND lane
+///     2's popcount, replacing two independent extractions;
+///   * popcounts use position-invariant masks (`skip & 0xffff_0000` rather than
+///     `(skip >> 16) & 0xffff`) — popcount ignores bit position, so the shift
+///     is pure waste;
+///   * the four `+16` lane advances fold into one `+64` at the end, and the
+///     cursor is a running pointer instead of a `(base, offset)` pair, which
+///     also stops the output base from being spilled and reloaded per window.
+///
+/// Measured on Haswell (E5-2666 v3) the old form cost 29 scalar µops here
+/// against the oracle's 27; combined with the loop-induction fix this closes
+/// the specials-path µop gap (see `yenc-avx2-lever` notes).
+///
+/// `out` must have 64 writable bytes; the returned pointer is
+/// `out + 64 - popcount(skip)`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
+#[inline]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub(super) unsafe fn avx2_compact_store64(
+    decoded_a: std::arch::x86_64::__m256i,
+    decoded_b: std::arch::x86_64::__m256i,
+    skip: u64,
+    table: *const u8,
+    out: *mut u8,
+) -> *mut u8 {
+    use std::arch::x86_64::*;
+
+    // `wrapping_*`: the cursor legitimately steps backwards past `out` between
+    // lane stores (the oracle's `p -= popcnt(...)` then `store [p + 16]`); every
+    // dereference below is still at or above `out`.
+    let mut p = out;
+
+    let shuf_a = _mm256_inserti128_si256(
+        _mm256_castsi128_si256(_mm_loadu_si128(
+            table.add(((skip << 4) & 0x7_fff0) as usize) as *const __m128i,
+        )),
+        _mm_loadu_si128(table.add(((skip >> 12) & 0x7_fff0) as usize) as *const __m128i),
+        1,
+    );
+    let packed_a = _mm256_shuffle_epi8(decoded_a, shuf_a);
+    _mm_storeu_si128(p as *mut __m128i, _mm256_castsi256_si128(packed_a));
+    p = p.wrapping_sub((skip as u32 & 0xffff).count_ones() as usize);
+    _mm_storeu_si128(
+        p.wrapping_add(16) as *mut __m128i,
+        _mm256_extracti128_si256::<1>(packed_a),
+    );
+    p = p.wrapping_sub((skip as u32 & 0xffff_0000).count_ones() as usize);
+
+    // `hi` carries bits 28.. of `skip`; `hi & 0x7fff0` is lane 2's byte offset
+    // and `hi & 0xffff0` is lane 2's popcount window — both off the one shift.
+    let hi = skip >> 28;
+    let shuf_b = _mm256_inserti128_si256(
+        _mm256_castsi128_si256(_mm_loadu_si128(
+            table.add((hi & 0x7_fff0) as usize) as *const __m128i
+        )),
+        _mm_loadu_si128(table.add(((hi >> 16) & 0x7_fff0) as usize) as *const __m128i),
+        1,
+    );
+    let packed_b = _mm256_shuffle_epi8(decoded_b, shuf_b);
+    _mm_storeu_si128(
+        p.wrapping_add(32) as *mut __m128i,
+        _mm256_castsi256_si128(packed_b),
+    );
+    p = p.wrapping_sub((hi as u32 & 0xf_fff0).count_ones() as usize);
+    _mm_storeu_si128(
+        p.wrapping_add(48) as *mut __m128i,
+        _mm256_extracti128_si256::<1>(packed_b),
+    );
+    p = p.wrapping_sub(((hi >> 20) as u32).count_ones() as usize);
+    p.wrapping_add(64)
 }
 
 #[cfg(target_arch = "x86_64")]
