@@ -13,8 +13,82 @@ use super::model::{
 };
 use super::runner::ControlEffects;
 use crate::persistence::encryption::{decrypt_value, encrypt_value};
-use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRow, SqlRuntime};
+use crate::persistence::sql_runtime::{
+    SqlArg, SqlEngine, SqlRow, SqlRuntime, SqlTx, max_rows_for_tx,
+};
 use crate::persistence::{Database, StateError};
+
+/// Insert a run of captured output lines as multi-row `INSERT ... VALUES` batches.
+///
+/// One `execute` per line is one round trip to the SQLite connection's worker
+/// thread per line, and a chatty extension emits thousands. Batching collapses
+/// that to `ceil(lines / chunk)` statements. `chunk` comes from the shared
+/// bind-count budget, matching how `bulk_insert_job_events_tx` batches — the
+/// established pattern in this crate.
+///
+/// Sequences stay dense and ascending from `first_sequence`, so the retention
+/// pass and the `(attempt_id, sequence)` primary key see exactly what the
+/// per-row loop produced.
+async fn bulk_insert_log_chunks_tx(
+    tx: &mut SqlTx<'_>,
+    attempt_id: &str,
+    first_sequence: i64,
+    lines: &[(LogStream, Vec<u8>)],
+    created_at_epoch_ms: i64,
+) -> Result<(), StateError> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    const COLUMNS: &str = "INSERT INTO post_processing_log_chunks (
+        attempt_id, sequence, stream, payload, byte_count, created_at_epoch_ms
+     ) ";
+    let chunk_size = max_rows_for_tx(tx, 6);
+    match tx {
+        SqlTx::Sqlite(tx) => {
+            for (index, chunk) in lines.chunks(chunk_size).enumerate() {
+                let base = first_sequence + (index * chunk_size) as i64;
+                let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(COLUMNS);
+                let mut offset = 0_i64;
+                builder.push_values(chunk, |mut row, (stream, payload)| {
+                    row.push_bind(attempt_id)
+                        .push_bind(base + offset)
+                        .push_bind(log_stream_name(*stream))
+                        .push_bind(payload.as_slice())
+                        .push_bind(payload.len() as i64)
+                        .push_bind(created_at_epoch_ms);
+                    offset += 1;
+                });
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
+        SqlTx::Postgres(tx) => {
+            for (index, chunk) in lines.chunks(chunk_size).enumerate() {
+                let base = first_sequence + (index * chunk_size) as i64;
+                let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(COLUMNS);
+                let mut offset = 0_i64;
+                builder.push_values(chunk, |mut row, (stream, payload)| {
+                    row.push_bind(attempt_id)
+                        .push_bind(base + offset)
+                        .push_bind(log_stream_name(*stream))
+                        .push_bind(payload.as_slice())
+                        .push_bind(payload.len() as i64)
+                        .push_bind(created_at_epoch_ms);
+                    offset += 1;
+                });
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
+    }
+    Ok(())
+}
 
 const GLOBAL_ASSIGNMENT_KEY: &str = "*";
 const POST_PROCESSING_SETTINGS_KEY: &str = "post_processing.settings.v1";
@@ -1582,7 +1656,7 @@ impl Database {
                 let id = id.clone();
                 let lines = lines.clone();
                 Box::pin(async move {
-                    let mut next = tx
+                    let next = tx
                         .fetch_optional(
                             "SELECT COALESCE(MAX(sequence), -1) + 1 AS next_sequence
                                FROM post_processing_log_chunks WHERE attempt_id = {}",
@@ -1593,23 +1667,7 @@ impl Database {
                             StateError::Database("failed to allocate log sequence".into())
                         })?
                         .i64("next_sequence")?;
-                    for (stream, payload) in &lines {
-                        tx.execute(
-                            "INSERT INTO post_processing_log_chunks (
-                                attempt_id, sequence, stream, payload, byte_count, created_at_epoch_ms
-                             ) VALUES ({}, {}, {}, {}, {}, {})",
-                            &[
-                                SqlArg::Text(id.clone()),
-                                SqlArg::I64(next),
-                                SqlArg::Text(log_stream_name(*stream).to_string()),
-                                SqlArg::Bytes(payload.clone()),
-                                SqlArg::I64(payload.len() as i64),
-                                SqlArg::I64(created_at_epoch_ms),
-                            ],
-                        )
-                        .await?;
-                        next += 1;
-                    }
+                    bulk_insert_log_chunks_tx(tx, &id, next, &lines, created_at_epoch_ms).await?;
                     let rows = tx
                         .fetch_all(
                             "SELECT sequence, byte_count FROM post_processing_log_chunks
