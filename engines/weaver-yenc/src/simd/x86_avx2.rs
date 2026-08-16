@@ -1154,19 +1154,49 @@ unsafe fn avx2_raw_kernel_oracle(
             "shl {meq}, 32",
             "or {mask}, {meq}",
             "jnz 21b",
-            // clean window: the head's fallthrough (oracle 6c2f2)
+            // clean window: the head's fallthrough. First iteration decodes
+            // with the carried `yov` (straddled-escape byte 0) and resets the
+            // carry, then falls into the pipelined clean streak.
             "vpaddb {s1}, {yov}, {lo}",
             "vpaddb {s0}, {hi}, {s42}",
-            "add {c}, 64",
-            "vmovdqu ymmword ptr [{out}], {s1}",
-            "xor {ef:e}, {ef:e}",
-            "add {out}, 64",
             "vmovdqa {yov}, {s42}",
-            "vmovdqu ymmword ptr [{out} - 32], {s0}",
+            "xor {ef:e}, {ef:e}",
+            "jmp 42f",
+            // ---- pipelined clean streak: decode N, then load N+1 BEFORE
+            // storing N (the July 2-window result: breaking the serial
+            // load->store->load chain is worth ~+15% on pure-clean content;
+            // here it costs the heavy path nothing — specials exit to 21).
+            // In-streak invariants: ef == 0, yov == sub42, mmv == dot (a
+            // pending dot forces the specials path, so a clean window can
+            // never carry one).
+            ".p2align 4",
+            "41:",
+            "vpaddb {s1}, {lo}, {s42}",
+            "vpaddb {s0}, {hi}, {s42}",
+            "42:",
+            // speculative next-window loads: the span keeps a 67-byte tail
+            // reserve, so reading one window past the last is in bounds.
+            "vmovdqa {hi}, ymmword ptr [{c} + 64]",
+            "vmovdqa {lo}, ymmword ptr [{c} + 32]",
+            "vmovdqu ymmword ptr [{out}], {s1}",
+            "vmovdqu ymmword ptr [{out} + 32], {s0}",
+            "add {c}, 64",
+            "add {out}, 64",
             "mov {mask}, {ne}",
             "add {mask}, {c}",
-            "jnz 20b",
-            "jmp 30f",
+            "jz 30f",
+            "vpminub {s1}, {hi}, {dot}",
+            "vpminub {s0}, {mmv}, {lo}",
+            "vpshufb {s1}, {lut}, {s1}",
+            "vpshufb {s0}, {lut}, {s0}",
+            "vpcmpeqb {s1}, {s1}, {hi}",
+            "vpcmpeqb {s0}, {s0}, {lo}",
+            "vpmovmskb {meq:e}, {s1}",
+            "vpmovmskb {mask:e}, {s0}",
+            "shl {meq}, 32",
+            "or {mask}, {meq}",
+            "jz 41b",
+            "jmp 21b",
             // ---- CR/LF present: remat CR, `.`-at-+2 probe (oracle 6c358) -
             ".p2align 4",
             "23:",
