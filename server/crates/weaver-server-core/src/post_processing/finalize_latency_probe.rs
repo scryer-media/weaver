@@ -426,3 +426,260 @@ fn finalize_latency_breakdown() {
         true,
     ));
 }
+
+/// End-to-end reproduction of a supervised post-processing attempt, using a real
+/// child process.
+///
+/// The finalize DB work measures at a few milliseconds, so the seconds seen in
+/// the field are somewhere else in the run. This drives the genuine
+/// `execute_extension` path — real supervisor process, real pipes, real capture
+/// tasks — against a script that emits a controlled number of output lines, and
+/// reports the phases the runner probes now emit:
+///
+/// - `pp.runner.spawn_supervisor` — forking the weaver binary as supervisor
+/// - `pp.runner.wait_for_exit` + `pp.runner.exit_poll_ticks` — the 50 ms poll loop
+/// - `pp.runner.drain_output` — joining the capture tasks after exit
+///
+/// The supervisor is the weaver binary itself (`std::env::current_exe`), and a
+/// libtest binary does not carry the supervisor entrypoint, so this needs a real
+/// weaver build passed explicitly:
+///
+/// ```text
+/// PROBE_WEAVER_BIN=/path/to/target/release/weaver \
+///   cargo test --release -p weaver-server-core --lib supervised_attempt -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "measurement harness; needs PROBE_WEAVER_BIN, run with --ignored --nocapture"]
+fn supervised_attempt_phase_breakdown() {
+    use super::model::TimeoutPolicy;
+    use super::runner::{ExtensionExecutionRequest, InterpreterConfig, JobExecutionContext};
+    use std::path::PathBuf;
+
+    let Ok(weaver_bin) = std::env::var("PROBE_WEAVER_BIN") else {
+        println!("\nPROBE_WEAVER_BIN not set — skipping supervised reproduction.");
+        println!("Build weaver and re-run with PROBE_WEAVER_BIN=<path to weaver binary>.\n");
+        return;
+    };
+    let weaver_bin = PathBuf::from(weaver_bin);
+    assert!(
+        weaver_bin.is_file(),
+        "PROBE_WEAVER_BIN does not point at a file: {}",
+        weaver_bin.display()
+    );
+
+    let repeats = env_usize("PROBE_REPEATS", 10);
+    println!("\n=== supervised attempt phases (real child process) ===");
+    println!("supervisor: {}", weaver_bin.display());
+    println!(
+        "  {:<10} {:>12} {:>12} {:>12}",
+        "lines", "attempt_ms", "per_line_us", "output_lines"
+    );
+
+    for line_count in [0_usize, 100, 1_000, 4_000] {
+        // Build a real discoverable package so the manifest carries the genuine
+        // package digest; the runner verifies it and rejects anything else as
+        // UntrustedPackage.
+        let data = tempfile::tempdir().unwrap();
+        // discover_extensions scans `<data_dir>/scripts/*`, not the data dir itself.
+        let package = data.path().join("scripts").join("probe-extension");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("weaver-extension.json"),
+            r#"{
+                "schema_version": 1,
+                "kind": "native",
+                "id": "probe.supervised",
+                "name": "Probe",
+                "version": "1",
+                "entrypoint": "run.sh",
+                "commands": [],
+                "options": []
+            }"#,
+        )
+        .unwrap();
+        let script = package.join("run.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ni=0\nwhile [ $i -lt {line_count} ]; do\n  echo \"[$i] extension progress line padded to a realistic width ------------------------------\"\n  i=$((i+1))\ndone\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let manifest = super::discovery::discover_extensions(
+            data.path(),
+            super::discovery::DiscoveryOptions {
+                enabled: true,
+                bare_script_adapter: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            !manifest.is_empty(),
+            "probe package was not discovered under {}/scripts",
+            data.path().display()
+        );
+        let manifest = manifest.into_iter().next().unwrap().manifest;
+        let work = tempfile::tempdir().unwrap();
+
+        let mut totals = Samples::new("attempt");
+        let mut produced = 0_usize;
+        for index in 0..repeats {
+            let request = ExtensionExecutionRequest {
+                attempt_id: format!("probe-attempt-{line_count}-{index}"),
+                manifest: manifest.clone(),
+                managed_path: package.clone(),
+                options: vec![],
+                approved_roots: vec![],
+                context: JobExecutionContext {
+                    job_id: 42,
+                    name: "Probe Job".into(),
+                    nzb_filename: "probe.nzb".into(),
+                    category: Some("movies".into()),
+                    group: None,
+                    source_url: None,
+                    working_directory: work.path().to_path_buf(),
+                    final_directory: work.path().to_path_buf(),
+                    pipeline_outcome: PipelineOutcome::Succeeded,
+                    par_status: 0,
+                    unpack_status: 0,
+                    compatibility: Default::default(),
+                },
+                timeout_policy: TimeoutPolicy::Default24Hours,
+                termination_grace: Duration::from_secs(10),
+                interpreters: InterpreterConfig::default(),
+                control_token: None,
+                diagnostic_command: None,
+                supervisor_executable: Some(weaver_bin.clone()),
+            };
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let started = Instant::now();
+            let result = runtime
+                .block_on(super::runner::execute_extension(request, None))
+                .unwrap();
+            totals.push(started.elapsed());
+            produced = result.output.len();
+        }
+        let mean_ms = totals.values.iter().sum::<Duration>().as_secs_f64() * 1000.0
+            / totals.values.len() as f64;
+        let per_line_us = if line_count == 0 {
+            0.0
+        } else {
+            mean_ms * 1000.0 / line_count as f64
+        };
+        println!("  {line_count:<10} {mean_ms:>12.2} {per_line_us:>12.2} {produced:>12}");
+        println!("    {}", totals.report().trim());
+    }
+    println!(
+        "\n(the runner's own phase buckets — pp.runner.spawn_supervisor / wait_for_exit /\n \
+         exit_poll_ticks / drain_output — are emitted by the perf probe when\n \
+         WEAVER_PROFILE_HOT_PATHS=1 is set)\n"
+    );
+}
+
+/// Cost of the recursive artifact walk `execute_steps` runs on entry and again
+/// after any step that moves the working directory.
+#[test]
+#[ignore = "measurement harness; run explicitly with --ignored --nocapture"]
+fn artifact_walk_scaling() {
+    println!("\n=== collect_artifact_paths scaling ===");
+    println!("  {:<10} {:>10} {:>12}", "files", "walk_ms", "found");
+    for file_count in [100_usize, 1_000, 10_000, 30_000] {
+        let root = tempfile::tempdir().unwrap();
+        // A realistic extracted layout: nested directories, not one flat dir.
+        for index in 0..file_count {
+            let dir = root.path().join(format!("d{}", index / 100));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("f{index}.bin")), b"x").unwrap();
+        }
+        let started = Instant::now();
+        let found = super::service::collect_artifact_paths_for_test(root.path(), 10_000);
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        println!("  {file_count:<10} {elapsed:>10.2} {found:>12}");
+    }
+    println!("(MAX_DISCOVERED_ARTIFACTS caps the result at 10000)\n");
+}
+
+/// Read latency on the writer lane vs the read lane, under pipeline-style write
+/// load.
+///
+/// This is the workload the split was made for: GraphQL/queue reads while the
+/// download pipeline is writing. Both arms submit the *identical* query future;
+/// the only difference is which executor it lands on, so the delta is the lane
+/// and nothing else.
+#[test]
+#[ignore = "measurement harness; run explicitly with --ignored --nocapture"]
+fn read_lane_under_write_load() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+
+    let repeats = env_usize("PROBE_REPEATS", 60);
+    let history_rows = env_usize("PROBE_HISTORY_ROWS", 5000);
+
+    let mut harness = Harness::new();
+    harness.seed_history(history_rows);
+    println!("\n=== read latency: writer lane vs read lane ===");
+    println!("history_rows={history_rows} repeats={repeats} per cell");
+
+    // A representative UI read: a filtered, ordered page over job_history.
+    let query = |db: &Database, on_read_lane: bool| {
+        let datastore = db.datastore();
+        let future = async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, name, status, completed_at FROM job_history
+                  WHERE status = {} ORDER BY completed_at DESC LIMIT 50",
+                &[SqlArg::Text("complete".to_string())],
+            )
+            .await?;
+            Ok::<_, crate::StateError>(rows.len())
+        };
+        if on_read_lane {
+            db.run_sql_blocking_read(future)
+        } else {
+            db.run_sql_blocking(future)
+        }
+    };
+
+    for contended in [false, true] {
+        let stop = Arc::new(AtomicBool::new(false));
+        let load = contended.then(|| spawn_writer_load(&harness.db, stop.clone()));
+        // Let the writer queue actually fill before sampling.
+        if contended {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+
+        let mut writer_lane = Samples::new("  writer lane");
+        let mut read_lane = Samples::new("  read lane");
+        for _ in 0..repeats {
+            let started = Instant::now();
+            query(&harness.db, false).unwrap();
+            writer_lane.push(started.elapsed());
+
+            let started = Instant::now();
+            query(&harness.db, true).unwrap();
+            read_lane.push(started.elapsed());
+        }
+
+        if let Some(load) = load {
+            stop.store(true, Ordering::Relaxed);
+            let queued = load.join().unwrap();
+            println!("\ncontended (background writes queued: {queued})");
+        } else {
+            println!("\nidle");
+        }
+        println!("{}", writer_lane.report());
+        println!("{}", read_lane.report());
+        let w: Duration = writer_lane.values.iter().sum();
+        let r: Duration = read_lane.values.iter().sum();
+        println!(
+            "  ratio (>1 = read lane faster): {:.2}x",
+            w.as_secs_f64() / r.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+    }
+    println!();
+}

@@ -63,12 +63,10 @@ impl DatabaseRuntimeWorker {
                 PostgresDatabaseRuntimeWorker::start(postgres_db_concurrency_from_env())
                     .map(Self::Postgres)
             }
-            DatabaseTarget::SqlitePath(_) | DatabaseTarget::SqliteUrl(_) => {
-                Ok(Self::Sqlite {
-                    writer: SqliteDatabaseRuntimeWorker::start()?,
-                    reads: SqliteReadRuntimeWorker::start(sqlite_read_concurrency_from_env())?,
-                })
-            }
+            DatabaseTarget::SqlitePath(_) | DatabaseTarget::SqliteUrl(_) => Ok(Self::Sqlite {
+                writer: SqliteDatabaseRuntimeWorker::start()?,
+                reads: SqliteReadRuntimeWorker::start(sqlite_read_concurrency_from_env())?,
+            }),
         }
     }
 
