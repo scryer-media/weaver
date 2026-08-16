@@ -103,12 +103,13 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
-# `unrar-rs` and `par2-rs` are ordinary registry dependencies as of their
-# 2026-08-05 publish under the renamed crates. During local development against
-# an unpublished rarpar change, add a `[patch.crates-io]` block pointing at the
-# sibling checkout — and remember the crate *directories* there still carry the
-# old `weaver-*` names; the rename deliberately left them in place. Patch all
-# three (`par2-rs`, `unrar-rs`, `reedsolomon-rs`) together: types cross those
-# crate boundaries, and a half-patched pair does not unify. Remove the block
-# before merging — while it exists, any build without the sibling checkout
-# (the docker image build included) cannot compile this workspace.
+[profile.test]
+debug = 0
+split-debuginfo = "off"
+incremental = false
+
+# `par2-rs`, `unrar-rs` and `reedsolomon-rs` are ordinary crates.io
+# dependencies. Do not add a `[patch.crates-io]` block that points outside this
+# repository: the e2e harness's Weaver image build refuses such a manifest, and
+# any build without that exact checkout cannot compile the workspace. When a
+# rarpar change is needed, publish it and bump the requirement here instead.
