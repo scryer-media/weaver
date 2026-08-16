@@ -1,5 +1,16 @@
 use super::*;
 
+/// MAINTENANCE CONTRACT (operator-set): this Rust kernel — and the whole
+/// intrinsic path selected by `WEAVER_YENC_RAW_ASM=0` — is preserved
+/// permanently as the tunable source of truth behind the frozen `asm!`
+/// kernels. The workflow for any future tuning or bugfix is: change the
+/// Rust here, validate + measure through the `=0` escape hatch, and only
+/// then re-transliterate the winning emission into the asm blocks (see
+/// `avx2_raw_kernel_oracle` / `avx2_raw_span_setrue_asm` and the
+/// yenc-program JOURNAL for the transliteration method). Never let the asm
+/// and this Rust drift semantically: the oracle differential suite is the
+/// drift detector.
+///
 /// Faithful port of rapidyenc `do_decode_avx2` (decoder_avx2_base.h), the
 /// `isRaw=true, searchEnd=false` instantiation — the realshape decode path.
 /// 1:1 translation of the oracle's HOT LOOP: decoder state lives entirely in
@@ -164,7 +175,37 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
         let span = (simd_limit / WIDTH) * WIDTH;
         let sp = input.as_ptr().add(span);
         let mut i: isize = -(span as isize);
-        while i != 0 {
+        // r10: the SEARCH_END=true span runs the frozen-roll asm kernel; on a
+        // terminator hit it exits with the window unconsumed (i != 0) and the
+        // pre-merge mask, feeding the same no-backtrack break glue the Rust
+        // loop used. The Rust loop below remains the =0 escape hatch and the
+        // tunable source of truth (see the maintenance contract above).
+        #[cfg(weaver_yenc_raw_asm)]
+        let mut asm_ran = false;
+        #[cfg(weaver_yenc_raw_asm)]
+        if SEARCH_END && i != 0 {
+            let mut break_mask = 0u64;
+            avx2_raw_span_setrue_asm(
+                input.as_ptr(),
+                &mut i,
+                &mut out,
+                &mut esc_first,
+                &mut break_mask,
+                min_mask,
+                yenc_offset,
+            );
+            if i != 0 {
+                state.state =
+                    x86_break_state(input, (span as isize + i) as usize, break_mask, esc_first);
+                broke = true;
+            }
+            asm_ran = true;
+        }
+        #[cfg(weaver_yenc_raw_asm)]
+        let run_rust_span = !asm_ran;
+        #[cfg(not(weaver_yenc_raw_asm))]
+        let run_rust_span = true;
+        while run_rust_span && i != 0 {
             let a = _mm256_loadu_si256(sp.offset(i) as *const __m256i);
             let b = _mm256_loadu_si256(sp.offset(i + 32) as *const __m256i);
 
@@ -877,6 +918,36 @@ static AVX2_ESC_IDX_B: Align32 = Align32([
 #[cfg(target_arch = "x86_64")]
 static AVX2_ESC_BIT_LANES: u64 = 0x8040_2010_0804_0201;
 
+/// Single-byte broadcast sources for the SE=true asm kernel's in-block
+/// constant rematerialization (mirroring its source emission's rodata
+/// broadcasts) plus the 32-byte specials LUT for restoring the table
+/// register after the dot-arm uses it as scratch.
+#[cfg(target_arch = "x86_64")]
+static YB_DOT: u8 = 0x2e;
+#[cfg(target_arch = "x86_64")]
+static YB_EQ: u8 = 0x3d;
+#[cfg(target_arch = "x86_64")]
+static YB_CR: u8 = 0x0d;
+#[cfg(target_arch = "x86_64")]
+static YB_LF: u8 = 0x0a;
+#[cfg(target_arch = "x86_64")]
+static YB_SUB42: u8 = 0xd6;
+#[cfg(target_arch = "x86_64")]
+static YB_ESC: u8 = 0x96;
+#[cfg(target_arch = "x86_64")]
+static YB_Y: u8 = 0x79;
+#[cfg(target_arch = "x86_64")]
+static YW_EQY: u16 = 0x793d;
+/// The specials LUT rows as bytes (index by min(byte, '.')): '.'->'.',
+/// '\n'->'\n', '\r'->'\r', '='->'=' — everything else maps to 0xff (no
+/// match). Identical per 16-byte lane; matches `special_lut` in the
+/// kernels.
+#[cfg(target_arch = "x86_64")]
+static AVX2_SPECIAL_LUT: Align32 = Align32([
+    0x2e, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0a, 0xff, 0xff, 0x0d, 0x3d, 0xff,
+    0x2e, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0a, 0xff, 0xff, 0x0d, 0x3d, 0xff,
+]);
+
 /// Rung 3 r9g: the whole `SEARCH_END = false` kernel in the ORACLE'S OWN
 /// shape — a transliteration of rapidyenc's compiled `do_decode_avx2`
 /// (`isRaw=true, searchEnd=false`) as emitted by the measurement host's gcc
@@ -1053,7 +1124,7 @@ unsafe fn avx2_raw_kernel_oracle(
         // window's end).
         let c0 = input.as_ptr().add(src + 32);
         let negend = -((input.as_ptr() as usize + src + span + 32) as isize);
-        let mut c_v = c0;
+        let c_v = c0;
         let mut out_v = output.as_mut_ptr().add(dst);
         let mut ef_v = esc_first;
 
@@ -1277,7 +1348,7 @@ unsafe fn avx2_raw_kernel_oracle(
             "vpaddb {s0}, {hi}, {s0}",
             "jmp 24b",
             "30:",
-            c = inout(reg) c_v,
+            c = inout(reg) c_v => _,
             ne = in(reg) negend,
             out = inout(reg) out_v,
             ef = inout(reg) ef_v,
@@ -1346,6 +1417,394 @@ unsafe fn avx2_raw_kernel_oracle(
         written: dst,
         end: state.end.into(),
     })
+}
+
+/// r10: the `SEARCH_END = true` span loop as one `asm!` block — a
+/// transliteration of WEAVER'S OWN emission of this loop from the build
+/// whose fused-lane timing measured well on BOTH Alder Lake and Zen2
+/// (archived as `yenc-program/setrue-adl.txt`). Unlike the SE=false kernel
+/// (which copies the oracle, since the oracle was faster there), weaver's
+/// fused searchEnd path BEATS the oracle's — the problem was only that its
+/// register allocation re-rolled every build (±15% swings on the fused
+/// clean/dots lanes). Freezing the good roll ends that permanently.
+///
+/// Deviations from the source emission, each strictly smaller:
+/// - its two ymm stack spills around the dot arm (`yenc_offset`, `eq_va`)
+///   become rematerializations (3 ops from `esc_first` / 1 compare from
+///   the lane) — `options(nostack)` requires it and remat is cheaper;
+/// - its two loop-invariant stack reloads (the `sub42` xor-base and the
+///   alignr fill) come from the pinned `{s42}`/`{eqn}` registers;
+/// - its rodata constant-restore storms are mirrored via this module's
+///   `sym` statics (byte-broadcast sources + the 32-byte specials LUT).
+///
+/// Break protocol (the terminator probe hit an end candidate): the block
+/// exits with `i != 0` (the window UNCONSUMED), `{mask}` holding the
+/// pre-merge specials mask and `{ef}` the pre-window carry — exactly the
+/// values the existing Rust `x86_break_state` glue consumes. `i == 0`
+/// means the span ran to completion.
+///
+/// Safety: same contract as the Rust span loop it replaces (the caller's
+/// span keeps the 67-byte tail reserve; the deepest view reads
+/// `c24 + 0`, i.e. `window + 68 - 32`… all views are the Rust loop's own
+/// offsets). Flags clobbered; reads input + LUT, writes output; no stack.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(weaver_yenc_raw_asm), allow(dead_code))]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn avx2_raw_span_setrue_asm(
+    input_base: *const u8,
+    i: &mut isize,
+    out: &mut *mut u8,
+    esc_first: &mut u64,
+    break_mask: &mut u64,
+    min_mask: std::arch::x86_64::__m256i,
+    yenc_offset: std::arch::x86_64::__m256i,
+) {
+    use std::arch::x86_64::*;
+
+    let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
+    let dot = _mm256_set1_epi8(b'.' as i8);
+    let eq_needle = _mm256_set1_epi8(b'=' as i8);
+    let cr = _mm256_set1_epi8(b'\r' as i8);
+    let special_lut = _mm256_load_si256(AVX2_SPECIAL_LUT.0.as_ptr() as *const __m256i);
+    let table = compact_table_16().as_ptr() as *const u8;
+
+    let c24 = input_base.add(0x24);
+    let mut i_v = *i;
+    let mut out_v = *out;
+    let mut ef_v = *esc_first;
+    let mut mask_v: u64;
+
+    core::arch::asm!(
+        "jmp 20f",
+        // ---- escaped == 0: plain adds (falls into the store) ------------
+        ".p2align 4",
+        "18:",
+        "vpaddb {s6}, {yov}, {la}",
+        "vpaddb {la}, {s42}, {lb}",
+        "xor {esc:e}, {esc:e}",
+        // ---- store: skip via andn into the ef reg, yov rebuild ----------
+        "19:",
+        "andn {ef}, {esc}, {mask}",
+        "vmovd {s0:x}, {efn:e}",
+        "vpsllw {s0:x}, {s0:x}, 6",
+        "vpxor {yov}, {s0}, {s42}",
+        "mov {mask:e}, {ef:e}",
+        "shl {mask:e}, 4",
+        "and {mask:e}, 0x7fff0",
+        "vmovdqu {s0:x}, xmmword ptr [{tab} + {mask}]",
+        "mov {mask:e}, {ef:e}",
+        "shr {mask:e}, 12",
+        "and {mask:e}, 0x7fff0",
+        "vinserti128 {s0}, {s0}, xmmword ptr [{tab} + {mask}], 1",
+        "vpshufb {s0}, {s6}, {s0}",
+        "vmovdqu xmmword ptr [{out}], {s0:x}",
+        "movzx {mask:e}, {ef:x}",
+        "popcnt {mask:e}, {mask:e}",
+        "sub {out}, {mask}",
+        "vextracti128 xmmword ptr [{out} + 16], {s0}, 1",
+        "mov {mask:e}, {ef:e}",
+        "and {mask:e}, 0xffff0000",
+        "popcnt {mask:e}, {mask:e}",
+        "sub {out}, {mask}",
+        "mov {mask}, {ef}",
+        "shr {mask}, 28",
+        "mov {esc:e}, {mask:e}",
+        "and {esc:e}, 0x7fff0",
+        "vmovdqu {s0:x}, xmmword ptr [{tab} + {esc}]",
+        "mov {esc}, {ef}",
+        "shr {esc}, 44",
+        "and {esc:e}, 0x7fff0",
+        "vinserti128 {s0}, {s0}, xmmword ptr [{tab} + {esc}], 1",
+        "vpshufb {s0}, {la}, {s0}",
+        "vmovdqu xmmword ptr [{out} + 32], {s0:x}",
+        "and {mask:e}, 0xffff0",
+        "popcnt {mask:e}, {mask:e}",
+        "sub {out}, {mask}",
+        "vextracti128 xmmword ptr [{out} + 48], {s0}, 1",
+        "shr {ef}, 48",
+        "popcnt {ef:e}, {ef:e}",
+        "sub {out}, {ef}",
+        "mov {ef}, {efn}",
+        "add {out}, 64",
+        "add {c}, 64",
+        "add {i}, 64",
+        "jz 30f",
+        // ---- loop head --------------------------------------------------
+        "20:",
+        "vmovdqu {la}, ymmword ptr [{c} - 36]",
+        "vmovdqu {lb}, ymmword ptr [{c} - 4]",
+        "vpminub {s6}, {mmv}, {la}",
+        "vpshufb {s6}, {lut}, {s6}",
+        "vpminub {s7}, {dot}, {lb}",
+        "vpshufb {s7}, {lut}, {s7}",
+        "vpcmpeqb {s7}, {s7}, {lb}",
+        "vpmovmskb {mask:e}, {s7}",
+        "shl {mask}, 32",
+        "vpcmpeqb {s6}, {s6}, {la}",
+        "vpmovmskb {esc:e}, {s6}",
+        "or {mask}, {esc}",
+        "jz 29f",
+        // ---- specials: eq masks ----------------------------------------
+        "vpcmpeqb {eqa}, {eqn}, {la}",
+        "vpcmpeqb {s6}, {eqn}, {lb}",
+        "vpmovmskb {efn:e}, {s6}",
+        "mov {t}, {efn}",
+        "shl {t}, 32",
+        "vpmovmskb {meq:e}, {eqa}",
+        "or {meq}, {t}",
+        "cmp {mask}, {meq}",
+        "jne 23f",
+        // eq-only: reset min_mask, collision test, fall into the join
+        "vmovdqa {mmv}, {dot}",
+        "lea {esc}, [{ef} + {meq}*2]",
+        "test {meq}, {esc}",
+        "jnz 27f",
+        // ---- join -------------------------------------------------------
+        "22:",
+        "shr {efn:e}, 31",
+        "test {esc}, {esc}",
+        "jz 18b",
+        // isolated escapes
+        "vinserti128 {s0}, {eqn}, {eqa:x}, 1",
+        "vpalignr {s0}, {eqa}, {s0}, 15",
+        "vpcmpeqb {s1}, {eqn}, ymmword ptr [{c} - 5]",
+        "vpbroadcastb {s7}, byte ptr [rip + {esc_b}]",
+        "vpblendvb {s0}, {yov}, {s7}, {s0}",
+        "vpaddb {s6}, {s0}, {la}",
+        "vpblendvb {s0}, {s42}, {s7}, {s1}",
+        "vpaddb {la}, {s0}, {lb}",
+        "jmp 19b",
+        // ---- clean window ----------------------------------------------
+        ".p2align 4",
+        "29:",
+        "vpaddb {s0}, {yov}, {la}",
+        "vmovdqu ymmword ptr [{out}], {s0}",
+        "vpaddb {s0}, {s42}, {lb}",
+        "vmovdqu ymmword ptr [{out} + 32], {s0}",
+        "vmovdqa {yov}, {s42}",
+        "xor {ef:e}, {ef:e}",
+        "add {out}, 64",
+        "add {c}, 64",
+        "add {i}, 64",
+        "jnz 20b",
+        "jmp 30f",
+        // ---- CR/LF present ---------------------------------------------
+        "23:",
+        "vmovdqu {s12}, ymmword ptr [{c} - 34]",
+        "vmovdqu {s7}, ymmword ptr [{c} - 2]",
+        "vmovdqa {s0}, {eqn}",
+        "vpcmpeqb {eqn}, {crv}, {la}",
+        "vpcmpeqb {s6}, {dot}, {s12}",
+        "vpand {s6}, {s6}, {eqn}",
+        "vpcmpeqb {mmv}, {crv}, {lb}",
+        "vmovdqa {s2}, {crv}",
+        "vpcmpeqb {crv}, {dot}, {s7}",
+        "vpand {crv}, {crv}, {mmv}",
+        "vpor {s42}, {s6}, {crv}",
+        "vpmovmskb {t:e}, {s42}",
+        "vpcmpeqb {s7}, {s0}, {s7}",
+        "vpcmpeqb {s12}, {s0}, {s12}",
+        "test {t:e}, {t:e}",
+        "je 28f",
+        // ---- stuffed dot + full terminator probe ------------------------
+        "25:",
+        "vmovdqu {s42}, ymmword ptr [{c} - 33]",
+        "vmovdqu {dot}, ymmword ptr [{c} - 32]",
+        "vmovdqu {s1}, ymmword ptr [{c} - 1]",
+        "vmovdqu {yov}, ymmword ptr [{c}]",
+        "vpcmpeqb {lut}, {s2}, {s42}",
+        "vpcmpeqb {s2}, {s2}, {s1}",
+        "vpbroadcastb {eqa}, byte ptr [rip + {lf_b}]",
+        "vpcmpeqb {s0}, {dot}, {eqa}",
+        "vpand {s0}, {s0}, {lut}",
+        "vpcmpeqb {lut}, {yov}, {eqa}",
+        "vpand {s2}, {s2}, {lut}",
+        "vpbroadcastb {eqa}, byte ptr [rip + {y_b}]",
+        "vpcmpeqb {lut}, {s42}, {eqa}",
+        "vpand {lut}, {lut}, {s12}",
+        "vpcmpeqb {s1}, {s1}, {eqa}",
+        "vpand {s1}, {s1}, {s7}",
+        "vpbroadcastb {s7}, byte ptr [rip + {lf_b}]",
+        "vpcmpeqb {s7}, {s7}, ymmword ptr [{c} - 35]",
+        "vpand {s42}, {s7}, {eqn}",
+        "vpbroadcastw {eqa}, word ptr [rip + {eqy_w}]",
+        "vpcmpeqw {dot}, {dot}, {eqa}",
+        "vpsllw {dot}, {dot}, 8",
+        "vpor {s0}, {s0}, {dot}",
+        "vpsrlw {dot}, {lut}, 8",
+        "vpor {s0}, {s0}, {dot}",
+        "vpand {dot}, {s42}, {s6}",
+        "vpand {s0}, {s0}, {dot}",
+        "vpcmpeqw {dot}, {yov}, {eqa}",
+        "vpsllw {dot}, {dot}, 8",
+        "vpor {s2}, {s2}, {dot}",
+        "vpsrlw {dot}, {s1}, 8",
+        "vpor {s2}, {s2}, {dot}",
+        "vpand {lut}, {lut}, {s42}",
+        "vpbroadcastb {dot}, byte ptr [rip + {lf_b}]",
+        "vpcmpeqb {s12}, {dot}, ymmword ptr [{c} - 3]",
+        "vpand {dot}, {s12}, {mmv}",
+        "vpand {s1}, {s1}, {dot}",
+        "vpor {s1}, {s1}, {lut}",
+        "vpor {s0}, {s0}, {s1}",
+        "vpand {eqn}, {dot}, {crv}",
+        "vpand {s1}, {s2}, {eqn}",
+        "vpor {s0}, {s0}, {s1}",
+        "vpmovmskb {t:e}, {s0}",
+        "test {t:e}, {t:e}",
+        "jnz 60f",
+        "vpand {s0}, {s7}, {s6}",
+        "vpmovmskb {esc:e}, {s0}",
+        "vpand {s0}, {s12}, {crv}",
+        "vpmovmskb {t:e}, {s0}",
+        "shl {t}, 34",
+        "lea {esc}, [{t} + {esc}*4]",
+        "or {mask}, {esc}",
+        "vextracti128 {s0:x}, {eqn}, 1",
+        "vpsrldq {s0:x}, {s0:x}, 14",
+        "vpbroadcastb {dot}, byte ptr [rip + {dot_b}]",
+        "vpsubusb {mmv}, {dot}, {s0}",
+        // constant restore (the roll's storm, via statics) + remats
+        "vmovdqa {lut}, ymmword ptr [rip + {lut_s}]",
+        "vpbroadcastb {s42}, byte ptr [rip + {sub_b}]",
+        "vpbroadcastb {eqn}, byte ptr [rip + {eq_b}]",
+        "vpbroadcastb {crv}, byte ptr [rip + {cr_b}]",
+        "vmovd {yov:x}, {ef:e}",
+        "vpsllw {yov:x}, {yov:x}, 6",
+        "vpxor {yov}, {yov}, {s42}",
+        "vpcmpeqb {eqa}, {eqn}, {la}",
+        "lea {esc}, [{ef} + {meq}*2]",
+        "test {meq}, {esc}",
+        "jnz 27f",
+        "jmp 22b",
+        // ---- CRLF but no stuffed dot: bare =y probe ---------------------
+        "28:",
+        "vpbroadcastb {s1}, byte ptr [rip + {y_b}]",
+        "vpcmpeqb {s0}, {s1}, ymmword ptr [{c} - 33]",
+        "vpand {s6}, {s0}, {s12}",
+        "vpcmpeqb {s0}, {s1}, ymmword ptr [{c} - 1]",
+        "vpand {s7}, {s0}, {s7}",
+        "vpor {s0}, {s7}, {s6}",
+        "vpmovmskb {t:e}, {s0}",
+        "test {t:e}, {t:e}",
+        "je 41f",
+        "vpbroadcastb {s1}, byte ptr [rip + {lf_b}]",
+        "vpcmpeqb {s0}, {s1}, ymmword ptr [{c} - 35]",
+        "vpand {s0}, {s0}, {eqn}",
+        "vpand {s0}, {s0}, {s6}",
+        "vpcmpeqb {s1}, {s1}, ymmword ptr [{c} - 3]",
+        "vpand {s1}, {s1}, {mmv}",
+        "vpand {s1}, {s1}, {s7}",
+        "vpor {s0}, {s0}, {s1}",
+        "vpmovmskb {t:e}, {s0}",
+        "vmovdqa {mmv}, {dot}",
+        "vpbroadcastb {s42}, byte ptr [rip + {sub_b}]",
+        "vpbroadcastb {eqn}, byte ptr [rip + {eq_b}]",
+        "vpbroadcastb {crv}, byte ptr [rip + {cr_b}]",
+        "vmovdqa {lut}, ymmword ptr [rip + {lut_s}]",
+        "vmovd {yov:x}, {ef:e}",
+        "vpsllw {yov:x}, {yov:x}, 6",
+        "vpxor {yov}, {yov}, {s42}",
+        "vpcmpeqb {eqa}, {eqn}, {la}",
+        "test {t:e}, {t:e}",
+        "jnz 60f",
+        "lea {esc}, [{ef} + {meq}*2]",
+        "test {meq}, {esc}",
+        "je 22b",
+        "jmp 27f",
+        "41:",
+        "vmovdqa {mmv}, {dot}",
+        "vpbroadcastb {s42}, byte ptr [rip + {sub_b}]",
+        "vpbroadcastb {eqn}, byte ptr [rip + {eq_b}]",
+        "vpbroadcastb {crv}, byte ptr [rip + {cr_b}]",
+        "vmovdqa {lut}, ymmword ptr [rip + {lut_s}]",
+        "vmovd {yov:x}, {ef:e}",
+        "vpsllw {yov:x}, {yov:x}, 6",
+        "vpxor {yov}, {yov}, {s42}",
+        "vpcmpeqb {eqa}, {eqn}, {la}",
+        "lea {esc}, [{ef} + {meq}*2]",
+        "test {meq}, {esc}",
+        "jnz 27f",
+        "jmp 22b",
+        // ---- consecutive-`=` collision ---------------------------------
+        "27:",
+        "mov {efn}, {meq}",
+        "and {efn}, {fives}",
+        "andn {efn}, {esc}, {efn}",
+        "add {efn}, {meq}",
+        "xor {efn}, {fives}",
+        "and {meq}, {efn}",
+        "lea {esc}, [{meq} + {meq}]",
+        "mov {efn}, {meq}",
+        "shr {efn}, 63",
+        "add {esc}, {ef}",
+        "jz 18b",
+        "vmovq {s0:x}, {esc}",
+        "vpermq {s0}, {s0}, 0x44",
+        "vpshufb {s1}, {s0}, ymmword ptr [rip + {ia}]",
+        "vpbroadcastq {s2}, qword ptr [rip + {bl}]",
+        "vpshufb {s0}, {s0}, ymmword ptr [rip + {ib}]",
+        "vpand {s1}, {s1}, {s2}",
+        "vpand {s0}, {s0}, {s2}",
+        "vpcmpeqb {s1}, {s1}, {s2}",
+        "vpbroadcastb {s7}, byte ptr [rip + {esc_b}]",
+        "vpblendvb {s1}, {s42}, {s7}, {s1}",
+        "vpaddb {s6}, {s1}, {la}",
+        "vpcmpeqb {s0}, {s0}, {s2}",
+        "vpblendvb {s0}, {s42}, {s7}, {s0}",
+        "vpaddb {la}, {s0}, {lb}",
+        "jmp 19b",
+        // ---- terminator hit: break with the window unconsumed ----------
+        "60:",
+        "30:",
+        c = inout(reg) c24 => _,
+        i = inout(reg) i_v,
+        out = inout(reg) out_v,
+        ef = inout(reg) ef_v,
+        efn = out(reg) _,
+        tab = in(reg) table,
+        fives = in(reg) 0x5555_5555_5555_5555u64,
+        mask = out(reg) mask_v,
+        meq = out(reg) _,
+        esc = out(reg) _,
+        t = out(reg) _,
+        lut = inout(ymm_reg) special_lut => _,
+        dot = inout(ymm_reg) dot => _,
+        s42 = inout(ymm_reg) sub42 => _,
+        eqn = inout(ymm_reg) eq_needle => _,
+        crv = inout(ymm_reg) cr => _,
+        mmv = inout(ymm_reg) min_mask => _,
+        yov = inout(ymm_reg) yenc_offset => _,
+        eqa = out(ymm_reg) _,
+        la = out(ymm_reg) _,
+        lb = out(ymm_reg) _,
+        s0 = out(ymm_reg) _,
+        s1 = out(ymm_reg) _,
+        s2 = out(ymm_reg) _,
+        s6 = out(ymm_reg) _,
+        s7 = out(ymm_reg) _,
+        s12 = out(ymm_reg) _,
+        ia = sym AVX2_ESC_IDX_A,
+        ib = sym AVX2_ESC_IDX_B,
+        bl = sym AVX2_ESC_BIT_LANES,
+        lut_s = sym AVX2_SPECIAL_LUT,
+        dot_b = sym YB_DOT,
+        eq_b = sym YB_EQ,
+        cr_b = sym YB_CR,
+        lf_b = sym YB_LF,
+        sub_b = sym YB_SUB42,
+        esc_b = sym YB_ESC,
+        y_b = sym YB_Y,
+        eqy_w = sym YW_EQY,
+        options(nostack),
+    );
+
+    *i = i_v;
+    *out = out_v;
+    *esc_first = ef_v;
+    *break_mask = mask_v;
 }
 
 #[cfg(target_arch = "x86_64")]
