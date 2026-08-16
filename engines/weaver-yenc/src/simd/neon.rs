@@ -196,8 +196,10 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
     use std::arch::aarch64::*;
     const WIDTH: usize = 64;
 
-    let mut src = 0usize;
-    let mut dst = 0usize;
+    // Both are materialised from `i` / the running output pointer once the SIMD
+    // loop has run; the loop itself never touches them.
+    let mut src: usize;
+    let mut dst: usize;
     // +2 dot lookahead loads read up to src+65 on the last window; the tail
     // budget (identical to AVX2/VBMI2 raw) keeps them in bounds.
     let tail = WIDTH - 1 + 4;
@@ -271,8 +273,33 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
     const PEND_CR: u64 = 1 << 63; // `\r` seen; needs `\n=y`
     let mut pending_tail: u64 = 0;
 
-    if input.len() > WIDTH * 2 {
-        while src + WIDTH <= simd_limit {
+    // Negative induction + running pointers — the oracle's loop shape
+    // (`for(i = -len; i; i += 64)`, decoder_neon64.cc:62), and the NEON twin of
+    // the AVX2 raw kernel's `span`/`sp`/`i` rewrite.
+    //
+    // The index form (`src`/`dst` counters plus `base + index` per access) costs
+    // seven extra instructions on EVERY window — two address adds, `dst += 64`,
+    // `src + 64`, `src + 128`, the cursor copy, and a `cmp` the counter form
+    // folds into its `subs`. That is the whole clean-path deficit; measured on
+    // three microarchitectures it tracks 7 instructions divided by the core's
+    // decode width.
+    //
+    // `span` is the exact byte count covered by whole windows, so the last
+    // window still has the full 67-byte tail reserve behind it. DO NOT round
+    // `span` up: one window over happens to be benign because the reserve is
+    // exactly one window of slack, two windows over decodes wrong.
+    let span = if input.len() > WIDTH * 2 {
+        (simd_limit / WIDTH) * WIDTH
+    } else {
+        0
+    };
+    let sp = input.as_ptr().add(span);
+    let out_base = output.as_mut_ptr();
+    let mut out = out_base;
+    let mut i: isize = -(span as isize);
+
+    {
+        while i != 0 {
             // Straddle resolution for the previous window's tail classification.
             // `src + 2 < input.len()` holds by the loop bound (src + 131 <=
             // input.len()). Everything before `src` is already consumed and
@@ -285,15 +312,15 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                 // tags: equality lets LLVM hoist the compares above the
                 // zero test and pay them on every window.
                 let resumed = if pending_tail & PEND_CR != 0 {
-                    (*input.get_unchecked(src) == b'\n'
-                        && *input.get_unchecked(src + 1) == b'='
-                        && *input.get_unchecked(src + 2) == b'y')
+                    (*sp.offset(i) == b'\n'
+                        && *sp.offset(i + 1) == b'='
+                        && *sp.offset(i + 2) == b'y')
                         .then_some(DecoderState::Cr)
                 } else if pending_tail & PEND_CRLF != 0 {
-                    (*input.get_unchecked(src) == b'=' && *input.get_unchecked(src + 1) == b'y')
+                    (*sp.offset(i) == b'=' && *sp.offset(i + 1) == b'y')
                         .then_some(DecoderState::CrLf)
                 } else {
-                    (*input.get_unchecked(src) == b'y').then_some(DecoderState::CrLfEq)
+                    (*sp.offset(i) == b'y').then_some(DecoderState::CrLfEq)
                 };
                 if let Some(resumed) = resumed {
                     state.state = resumed;
@@ -303,10 +330,15 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                 pending_tail = 0;
             }
 
-            let a = vld1q_u8(input.as_ptr().add(src));
-            let b = vld1q_u8(input.as_ptr().add(src + 16));
-            let c = vld1q_u8(input.as_ptr().add(src + 32));
-            let d = vld1q_u8(input.as_ptr().add(src + 48));
+            // Anchor every in-window address on the window base. Deriving the
+            // +49..+52 lookaheads straight off `sp.offset(i)` lets LLVM's
+            // induction-variable rewrite pick the *lookahead* as the loop's
+            // base register, which leaves the four window loads at offsets
+            // -0x32/-0x22/-0x12/-0x2 — not multiples of 16, so `ldp` cannot
+            // form and the window costs four `ldur` instead of two `ldp`.
+            let win = sp.offset(i);
+            let data = vld1q_u8_x4(win);
+            let (a, b, c, d) = (data.0, data.1, data.2, data.3);
 
             let eq_a = vceqq_u8(a, constants.eq);
             let eq_b = vceqq_u8(b, constants.eq);
@@ -371,7 +403,7 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                     // instruction instead of a load plus an `ext`.
                     // In bounds: the loop bound gives `src + 131 <= len`, and
                     // the deepest such view below reads `src + 67`.
-                    let tmp2 = vld1q_u8(input.as_ptr().add(src + 50));
+                    let tmp2 = vld1q_u8(win.add(50));
                     let cr_a = vceqq_u8(a, constants.cr);
                     let cr_b = vceqq_u8(b, constants.cr);
                     let cr_c = vceqq_u8(c, constants.cr);
@@ -385,7 +417,7 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                         let lf_a = vceqq_u8(vextq_u8::<1>(a, b), constants.lf);
                         let lf_b = vceqq_u8(vextq_u8::<1>(b, c), constants.lf);
                         let lf_c = vceqq_u8(vextq_u8::<1>(c, d), constants.lf);
-                        let lf_d = vceqq_u8(vld1q_u8(input.as_ptr().add(src + 49)), constants.lf);
+                        let lf_d = vceqq_u8(vld1q_u8(win.add(49)), constants.lf);
                         let m2nldot_a = vandq_u8(m2cr_a, lf_a);
                         let m2nldot_b = vandq_u8(m2cr_b, lf_b);
                         let m2nldot_c = vandq_u8(m2cr_c, lf_c);
@@ -407,8 +439,8 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                             // `vext::<3|4>(d, next_data)` written as the
                             // equivalent overlapping loads (bytes 51..66 /
                             // 52..67), so no next-window register is needed.
-                            let tmp3 = vld1q_u8(input.as_ptr().add(src + 51));
-                            let tmp4 = vld1q_u8(input.as_ptr().add(src + 52));
+                            let tmp3 = vld1q_u8(win.add(51));
+                            let tmp4 = vld1q_u8(win.add(52));
 
                             // `\r\n` at lane i+3 (closing an article terminator).
                             let m4nl_a = vextq_u8::<3>(m1nl_a, m1nl_b);
@@ -476,7 +508,12 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                                 vorrq_u8(vorrq_u8(end3_a, end3_b), vorrq_u8(end3_c, end3_d)),
                             );
                             if neon64_any(any_end) {
-                                state.state = neon64_break_state(input, src, mask, esc_first);
+                                state.state = neon64_break_state(
+                                    input,
+                                    (span as isize + i) as usize,
+                                    mask,
+                                    esc_first,
+                                );
                                 broke = true;
                                 break;
                             }
@@ -548,10 +585,7 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                                 let m3eqy_a = vandq_u8(m2eq_a, vceqq_u8(vextq_u8::<3>(a, b), y));
                                 let m3eqy_b = vandq_u8(m2eq_b, vceqq_u8(vextq_u8::<3>(b, c), y));
                                 let m3eqy_c = vandq_u8(m2eq_c, vceqq_u8(vextq_u8::<3>(c, d), y));
-                                let m3eqy_d = vandq_u8(
-                                    m2eq_d,
-                                    vceqq_u8(vld1q_u8(input.as_ptr().add(src + 51)), y),
-                                );
+                                let m3eqy_d = vandq_u8(m2eq_d, vceqq_u8(vld1q_u8(win.add(51)), y));
                                 let any_eqy = vorrq_u8(
                                     vorrq_u8(m3eqy_a, m3eqy_b),
                                     vorrq_u8(m3eqy_c, m3eqy_d),
@@ -560,10 +594,7 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                                     let lf_a = vceqq_u8(vextq_u8::<1>(a, b), constants.lf);
                                     let lf_b = vceqq_u8(vextq_u8::<1>(b, c), constants.lf);
                                     let lf_c = vceqq_u8(vextq_u8::<1>(c, d), constants.lf);
-                                    let lf_d = vceqq_u8(
-                                        vld1q_u8(input.as_ptr().add(src + 49)),
-                                        constants.lf,
-                                    );
+                                    let lf_d = vceqq_u8(vld1q_u8(win.add(49)), constants.lf);
                                     let match_end = vorrq_u8(
                                         vorrq_u8(
                                             vandq_u8(m3eqy_a, vandq_u8(lf_a, cr_a)),
@@ -575,8 +606,12 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                                         ),
                                     );
                                     if neon64_any(match_end) {
-                                        state.state =
-                                            neon64_break_state(input, src, mask, esc_first);
+                                        state.state = neon64_break_state(
+                                            input,
+                                            (span as isize + i) as usize,
+                                            mask,
+                                            esc_first,
+                                        );
                                         broke = true;
                                         break;
                                     }
@@ -590,9 +625,9 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                             // the `escaped` bit that would falsify it; the veto
                             // itself happens once `escaped` is resolved, below.
                             if cand >> 61 != 0 {
-                                let b61 = *input.get_unchecked(src + 61);
-                                let b62 = *input.get_unchecked(src + 62);
-                                let b63 = *input.get_unchecked(src + 63);
+                                let b61 = *win.add(61);
+                                let b62 = *win.add(62);
+                                let b63 = *win.add(63);
                                 pending_tail = if b61 == b'\r' && b62 == b'\n' && b63 == b'=' {
                                     PEND_EQ
                                 } else if b62 == b'\r' && b63 == b'\n' {
@@ -664,73 +699,73 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                 yenc_offset = vsetq_lane_u8::<0>(((esc_first as u8) << 6) | 42, normal_offset);
 
                 if skip == 0 {
-                    vst1q_u8(output.as_mut_ptr().add(dst), decoded[0]);
-                    vst1q_u8(output.as_mut_ptr().add(dst + 16), decoded[1]);
-                    vst1q_u8(output.as_mut_ptr().add(dst + 32), decoded[2]);
-                    vst1q_u8(output.as_mut_ptr().add(dst + 48), decoded[3]);
-                    dst += WIDTH;
+                    vst1q_u8_x4(
+                        out,
+                        uint8x16x4_t(decoded[0], decoded[1], decoded[2], decoded[3]),
+                    );
+                    out = out.add(WIDTH);
                 } else {
                     // Four independent LUT-compaction stores; the entry gate +
                     // tail guarantee ≥64 spare output bytes so each 16-byte
                     // store can overwrite ahead.
                     let keeps = per_group_keeps(skip);
-                    compact_store_16(
+                    out = compact_store_16_at(
                         decoded[0],
                         (skip & 0xffff) as u16,
                         keeps.0,
                         table,
-                        output,
-                        &mut dst,
+                        out,
                     );
-                    compact_store_16(
+                    out = compact_store_16_at(
                         decoded[1],
                         ((skip >> 16) & 0xffff) as u16,
                         keeps.1,
                         table,
-                        output,
-                        &mut dst,
+                        out,
                     );
-                    compact_store_16(
+                    out = compact_store_16_at(
                         decoded[2],
                         ((skip >> 32) & 0xffff) as u16,
                         keeps.2,
                         table,
-                        output,
-                        &mut dst,
+                        out,
                     );
-                    compact_store_16(
+                    out = compact_store_16_at(
                         decoded[3],
                         ((skip >> 48) & 0xffff) as u16,
                         keeps.3,
                         table,
-                        output,
-                        &mut dst,
+                        out,
                     );
                 }
             } else {
                 // No specials (and no carried dot): bulk decode, subtract the
-                // carried offset on lane A and 42 on the rest (oracle lines
-                // 423-431).
-                vst1q_u8(output.as_mut_ptr().add(dst), vsubq_u8(a, yenc_offset));
-                vst1q_u8(
-                    output.as_mut_ptr().add(dst + 16),
-                    vsubq_u8(b, normal_offset),
+                // carried offset on lane A and 42 on the rest, and retire the
+                // window with a single `st1 {v.16b - v.16b}, [x], #64` — the
+                // oracle's `_vst1q_u8_x4` (decoder_neon64.cc:424-427). With the
+                // running `out` pointer this assembles to the post-incrementing
+                // form, so the store carries its own cursor update.
+                vst1q_u8_x4(
+                    out,
+                    uint8x16x4_t(
+                        vsubq_u8(a, yenc_offset),
+                        vsubq_u8(b, normal_offset),
+                        vsubq_u8(c, normal_offset),
+                        vsubq_u8(d, normal_offset),
+                    ),
                 );
-                vst1q_u8(
-                    output.as_mut_ptr().add(dst + 32),
-                    vsubq_u8(c, normal_offset),
-                );
-                vst1q_u8(
-                    output.as_mut_ptr().add(dst + 48),
-                    vsubq_u8(d, normal_offset),
-                );
-                dst += WIDTH;
+                out = out.add(WIDTH);
                 esc_first = 0;
                 yenc_offset = normal_offset;
             }
-            src += WIDTH;
+            i += WIDTH as isize;
         }
     }
+
+    // Materialise the index pair the (cold) epilogue below works in. `i` is in
+    // `-span..=0`, so both are in range and the cast cannot wrap.
+    src = (span as isize + i) as usize;
+    dst = out.offset_from(out_base) as usize;
 
     // The loop ran out of windows with a tail classification still pending, so
     // the straddle test above never got its next iteration. Resolve it here,
@@ -1601,6 +1636,32 @@ pub(super) unsafe fn compact_store_16(
     let packed = unsafe { vqtbl1q_u8(decoded, shuffle) };
     unsafe { vst1q_u8(output.as_mut_ptr().add(*dst), packed) };
     *dst += keep;
+}
+
+/// [`compact_store_16`] against a running output pointer instead of a
+/// `(&mut [u8], &mut usize)` pair, returning the advanced cursor.
+///
+/// Same store, same LUT row, same overwrite-ahead contract — the caller still
+/// guarantees 64 spare output bytes per window. The pair form makes LLVM
+/// re-derive `base + index` for every one of the four lane stores; the pointer
+/// form carries one register through, which is the shape the oracle uses
+/// (`p += counts & 0xff`, decoder_neon64.cc:396-419).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(super) unsafe fn compact_store_16_at(
+    decoded: std::arch::aarch64::uint8x16_t,
+    skip_mask: u16,
+    keep: usize,
+    table: &[[u8; 16]; 32768],
+    out: *mut u8,
+) -> *mut u8 {
+    use std::arch::aarch64::*;
+
+    debug_assert_eq!(keep, 16 - skip_mask.count_ones() as usize);
+    let shuffle = unsafe { vld1q_u8(table[(skip_mask & 0x7fff) as usize].as_ptr()) };
+    let packed = unsafe { vqtbl1q_u8(decoded, shuffle) };
+    unsafe { vst1q_u8(out, packed) };
+    unsafe { out.add(keep) }
 }
 
 /// NEON implementation for aarch64: process 16 bytes at a time.
