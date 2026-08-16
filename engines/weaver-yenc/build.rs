@@ -14,15 +14,16 @@ fn main() {
     println!("cargo:rerun-if-env-changed=WEAVER_YENC_RAW_ASM");
     println!("cargo:rerun-if-changed=rapidyenc_shim.cc");
 
-    // A/B switch for the hand-written AVX2 raw span loop (Rung 3): build with
-    // `WEAVER_YENC_RAW_ASM=1` to route `decode_kernel_avx2_raw::<false>`'s SIMD
-    // span through the `asm!` loop, leave unset (or "0") for the intrinsic
-    // loop. Both forms stay compiled on x86_64 so the differential tests can
-    // compare them on real hardware regardless of the cfg.
-    if matches!(
-        env::var("WEAVER_YENC_RAW_ASM").as_deref(),
-        Ok(v) if !v.is_empty() && v != "0"
-    ) {
+    // The oracle-model `asm!` decode kernel (`avx2_raw_kernel_oracle`) is the
+    // DEFAULT `SEARCH_END=false` path on x86_64: measured on Alder Lake and
+    // Zen2/Windows it matches or beats rapidyenc on every decode fixture
+    // (realshape 1.013/1.127, crlf 1.111/1.048; >1 = weaver faster), where
+    // the intrinsic loop trailed on realshape. `WEAVER_YENC_RAW_ASM=0` is the
+    // escape hatch back to the intrinsic loop (A/B runs, or triage on a
+    // microarchitecture that disagrees with the measured set). Both forms
+    // stay compiled on x86_64 so the differential tests can compare them on
+    // real hardware regardless of the cfg.
+    if !matches!(env::var("WEAVER_YENC_RAW_ASM").as_deref(), Ok("0")) {
         println!("cargo:rustc-cfg=weaver_yenc_raw_asm");
     }
 
