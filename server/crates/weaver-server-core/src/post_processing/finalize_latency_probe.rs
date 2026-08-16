@@ -471,11 +471,22 @@ fn supervised_attempt_phase_breakdown() {
     println!("\n=== supervised attempt phases (real child process) ===");
     println!("supervisor: {}", weaver_bin.display());
     println!(
-        "  {:<10} {:>12} {:>12} {:>12}",
-        "lines", "attempt_ms", "per_line_us", "output_lines"
+        "  {:<7} {:>8} {:>9} {:>11} {:>11} {:>8}",
+        "lines", "payload", "emitted", "attempt_ms", "per_line_us", "retained"
     );
 
-    for line_count in [0_usize, 100, 1_000, 4_000] {
+    // The last row is the REAL e2e fixture shape, copied from
+    // e2e/playwright-weaver/tests/support/setup/post-processing-package.ts:
+    // 5000 iterations of `printf 'e2e-log-%s context=%s payload=%s\n'` with a
+    // 1024-byte payload — about 5.4 MB, which overruns the 4 MiB retention cap
+    // and is what sets `output_truncated=true` on the slow field case.
+    for (line_count, payload_bytes) in [
+        (0_usize, 0_usize),
+        (100, 60),
+        (1_000, 60),
+        (4_000, 60),
+        (5_000, 1024),
+    ] {
         // Build a real discoverable package so the manifest carries the genuine
         // package digest; the runner verifies it and rejects anything else as
         // UntrustedPackage.
@@ -498,10 +509,13 @@ fn supervised_attempt_phase_breakdown() {
         )
         .unwrap();
         let script = package.join("run.sh");
+        // Same construction as the e2e fixture: a /bin/sh loop doing one printf
+        // per line. The shell loop is part of what is being measured, on purpose.
+        let payload = "x".repeat(payload_bytes);
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\ni=0\nwhile [ $i -lt {line_count} ]; do\n  echo \"[$i] extension progress line padded to a realistic width ------------------------------\"\n  i=$((i+1))\ndone\nexit 0\n"
+                "#!/bin/sh\ni=0\npayload='{payload}'\nwhile [ \"$i\" -lt {line_count} ]; do\n  printf 'e2e-log-%s payload=%s\\n' \"$i\" \"$payload\"\n  i=$((i + 1))\ndone\nexit 0\n"
             ),
         )
         .unwrap();
@@ -572,7 +586,10 @@ fn supervised_attempt_phase_breakdown() {
         } else {
             mean_ms * 1000.0 / line_count as f64
         };
-        println!("  {line_count:<10} {mean_ms:>12.2} {per_line_us:>12.2} {produced:>12}");
+        let mb = (line_count * (payload_bytes + 20)) as f64 / (1024.0 * 1024.0);
+        println!(
+            "  {line_count:<7} {payload_bytes:>7}B {mb:>7.2}MB {mean_ms:>11.2} {per_line_us:>11.2} {produced:>8}"
+        );
         println!("    {}", totals.report().trim());
     }
     println!(

@@ -9,7 +9,7 @@ impl Database {
         end_bucket_epoch_minute: i64,
     ) -> Result<u64, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let sql = match datastore.engine() {
                 SqlEngine::Sqlite => {
                     "SELECT SUM(payload_bytes) AS total

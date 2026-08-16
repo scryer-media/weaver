@@ -100,7 +100,7 @@ impl Database {
             }
             StoreDatastore::Postgres { pool } => {
                 let tables_dir = tables_dir.clone();
-                self.run_sql_blocking(async move { export_postgres(pool, &tables_dir).await })?
+                self.run_sql_blocking_read(async move { export_postgres(pool, &tables_dir).await })?
             }
         };
         Ok(LogicalBackupExport {
@@ -130,7 +130,7 @@ impl Database {
             StoreDatastore::Postgres { pool } => {
                 let tables_dir = tables_dir.to_path_buf();
                 let expected = expected.clone();
-                self.run_sql_blocking(async move {
+                self.run_sql_blocking_read(async move {
                     import_postgres(pool, &tables_dir, &expected, allow_older_catalog).await
                 })
             }
@@ -146,7 +146,7 @@ impl Database {
                     validate_sqlite_catalog(&mut conn).await.map(|_| ())
                 })
             }
-            StoreDatastore::Postgres { pool } => self.run_sql_blocking(async move {
+            StoreDatastore::Postgres { pool } => self.run_sql_blocking_read(async move {
                 let mut conn = pool.acquire().await.map_err(db_err)?;
                 validate_postgres_catalog(&mut conn).await.map(|_| ())
             }),
@@ -180,7 +180,7 @@ impl Database {
             }
             StoreDatastore::Postgres { pool } => {
                 let expected = expected.clone();
-                self.run_sql_blocking(async move {
+                self.run_sql_blocking_read(async move {
                     let mut conn = pool.acquire().await.map_err(db_err)?;
                     let mut tx = conn.begin().await.map_err(db_err)?;
                     validate_postgres_counts(&mut tx, &expected).await?;

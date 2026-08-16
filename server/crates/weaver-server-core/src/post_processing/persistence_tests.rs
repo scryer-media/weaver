@@ -196,7 +196,7 @@ fn revisions_profiles_and_frozen_plans_are_durable_and_secret_safe() {
 
     let datastore = db.datastore();
     let secret_json = db
-        .run_sql_blocking(async move { stored_secret_json(datastore).await })
+        .run_sql_blocking_read(async move { stored_secret_json(datastore).await })
         .unwrap();
     assert!(!secret_json.contains("top-secret"));
     assert!(secret_json.contains("enc:v1:"));

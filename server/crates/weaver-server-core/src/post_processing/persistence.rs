@@ -495,7 +495,7 @@ impl Database {
             SqlArg::Text(extension_id.as_str().to_string()),
             SqlArg::Text(revision_id.as_str().to_string()),
         ];
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT manifest_json, trust_state, managed_path, discovered_source_path,
@@ -512,7 +512,7 @@ impl Database {
 
     pub fn list_extension_revisions(&self) -> Result<Vec<ExtensionRevisionRecord>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT manifest_json, trust_state, managed_path, discovered_source_path,
@@ -602,7 +602,7 @@ impl Database {
         let datastore = self.datastore();
         let profile_id = profile_id.as_str().to_string();
         let key = self.encryption_key().cloned();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let Some(row) = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT profile_id, name, enabled, created_at_epoch_ms, updated_at_epoch_ms
@@ -638,7 +638,7 @@ impl Database {
 
     pub fn list_post_processing_profiles(&self) -> Result<Vec<ProfileRecord>, StateError> {
         let datastore = self.datastore();
-        let ids = self.run_sql_blocking(async move {
+        let ids = self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT profile_id FROM post_processing_profiles ORDER BY name, profile_id",
@@ -800,7 +800,7 @@ impl Database {
     ) -> Result<Option<ProfileId>, StateError> {
         let datastore = self.datastore();
         let key = scope_key.to_string();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT profile_id FROM post_processing_profile_assignments
@@ -935,7 +935,7 @@ impl Database {
     ) -> Result<Option<ExtensionRevisionRecord>, StateError> {
         let datastore = self.datastore();
         let id = extension_id.as_str().to_string();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT manifest_json, trust_state, managed_path, discovered_source_path,
@@ -1036,7 +1036,7 @@ impl Database {
     ) -> Result<Option<FrozenPlan>, StateError> {
         let datastore = self.datastore();
         let key = self.encryption_key().cloned();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT plan_json, secret_options_json FROM post_processing_job_plans
@@ -1723,7 +1723,7 @@ impl Database {
         let after = after.map(i64::try_from).transpose().map_err(|_| {
             StateError::Database("post-processing log cursor exceeds SQL range".into())
         })?;
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let mut rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT sequence, stream, payload, created_at_epoch_ms
@@ -1769,7 +1769,7 @@ impl Database {
         let datastore = self.datastore();
         let id = run_id.as_str().to_string();
         let key = self.encryption_key().cloned();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT run_id, job_id, status, pipeline_outcome_json, summary, terminal_intent,
@@ -1791,7 +1791,7 @@ impl Database {
     ) -> Result<Option<PostProcessingRunRecord>, StateError> {
         let datastore = self.datastore();
         let key = self.encryption_key().cloned();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT r.run_id, r.job_id, r.status, r.pipeline_outcome_json, r.summary,
@@ -1818,7 +1818,7 @@ impl Database {
         let datastore = self.datastore();
         let key = self.encryption_key().cloned();
         let limit = i64::from(limit.clamp(1, 500));
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let columns = "run_id, job_id, status, pipeline_outcome_json, summary, terminal_intent,
                            plan_json, secret_options_json, rerun_of_run_id, queued_at_epoch_ms,
                            queue_position,
@@ -1916,7 +1916,7 @@ impl Database {
     ) -> Result<Vec<PostProcessingAttemptRecord>, StateError> {
         let datastore = self.datastore();
         let id = run_id.as_str().to_string();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT attempt_id, run_id, step_index, status, extension_id, revision_id,
@@ -1970,7 +1970,7 @@ impl Database {
         &self,
     ) -> Result<PostProcessingMetricsSnapshot, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let queue_row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT COUNT(*) AS queue_depth FROM post_processing_runs WHERE status = 'queued'",

@@ -1022,7 +1022,7 @@ impl Database {
     /// Check if the database has no settings (i.e. fresh / needs migration).
     pub fn is_empty(&self) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let count = crate::persistence::sql_runtime::SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT COUNT(*) AS count FROM settings",
@@ -1344,7 +1344,7 @@ impl Database {
         use crate::persistence::sql_runtime::SqlRuntime;
 
         let datastore = self.datastore();
-        let encrypted_credentials_exist = self.run_sql_blocking(async move {
+        let encrypted_credentials_exist = self.run_sql_blocking_read(async move {
             for query in [
                 "SELECT password FROM servers WHERE password IS NOT NULL",
                 "SELECT password FROM rss_feeds WHERE password IS NOT NULL",
@@ -1389,7 +1389,7 @@ impl Database {
 
         let datastore = self.datastore();
         let credential_key = key.clone();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             for (kind, query) in [
                 (
                     "server",

@@ -11,7 +11,7 @@ impl Database {
         server_id: u32,
     ) -> Result<Option<ServerDownloadUsage>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT server_id, lifetime_bytes, quota_baseline_bytes,
@@ -29,7 +29,7 @@ impl Database {
 
     pub fn list_server_download_usage(&self) -> Result<Vec<ServerDownloadUsage>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT server_id, lifetime_bytes, quota_baseline_bytes,

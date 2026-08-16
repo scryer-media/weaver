@@ -431,7 +431,7 @@ mod tests {
     fn count_rows(db: &Database, table: &str, job_id: u64) -> i64 {
         let datastore = db.datastore();
         let sql = format!("SELECT COUNT(*) FROM {table} WHERE job_id = {{}}");
-        db.run_sql_blocking(async move {
+        db.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 &sql,

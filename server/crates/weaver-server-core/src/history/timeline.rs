@@ -145,7 +145,7 @@ impl Database {
     /// Load all events for a specific job, ordered by insertion order.
     pub fn get_job_events(&self, job_id: u64) -> Result<Vec<JobEvent>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT job_id, timestamp, kind, message, file_id
@@ -186,7 +186,7 @@ impl Database {
         cap: u32,
     ) -> Result<Vec<JobEvent>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let mut rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT job_id, timestamp, kind, message, file_id
@@ -221,7 +221,7 @@ impl Database {
         cap: u32,
     ) -> Result<Vec<JobEventRecord>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let mut rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT id, job_id, timestamp, kind, message, file_id
@@ -280,7 +280,7 @@ impl Database {
               GROUP BY job_id, kind"
         );
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[]).await?;
             let mut bounds: std::collections::HashMap<u64, Vec<(String, i64, i64)>> =
                 std::collections::HashMap::new();
@@ -326,7 +326,7 @@ impl Database {
               LIMIT {limit}"
         );
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[]).await?;
             rows.into_iter()
                 .map(|row| {
