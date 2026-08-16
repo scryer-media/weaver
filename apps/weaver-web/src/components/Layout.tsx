@@ -1,6 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Link, Outlet, useLocation } from "react-router";
 import { useTheme } from "next-themes";
+import { toast } from "sonner";
 import {
   Activity,
   Clock3,
@@ -40,7 +41,6 @@ import { Button } from "@/components/ui/button";
 import {
   Sheet,
   SheetContent,
-  SheetDescription,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
@@ -84,6 +84,7 @@ const DEFAULT_GLOBAL_STATE: GlobalQueueState["globalState"] = {
   isPaused: false,
   downloadBlock: DEFAULT_DOWNLOAD_BLOCK,
 };
+const RECONNECT_TOAST_ID = "graphql-connection";
 
 const RoutedOutlet = memo(function RoutedOutlet() {
   return <Outlet />;
@@ -135,28 +136,6 @@ function SponsorLink({ label }: { label: string }) {
       <Heart className="size-3.5 text-status-failed/70" aria-hidden="true" />
       <span>{label}</span>
     </a>
-  );
-}
-
-function DisconnectBanner({
-  title,
-  message,
-}: {
-  title: string;
-  message: string;
-}) {
-  return (
-    <div className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-3 text-amber-950 dark:text-amber-100">
-      <div className="flex items-center gap-3">
-        <div className="flex size-8 items-center justify-center rounded-full bg-amber-500/20">
-          <Unplug className="size-4" />
-        </div>
-        <div className="min-w-0">
-          <div className="text-sm font-semibold">{title}</div>
-          <div className="text-sm text-amber-900/80 dark:text-amber-100/80">{message}</div>
-        </div>
-      </div>
-    </div>
   );
 }
 
@@ -253,6 +232,25 @@ export function Layout() {
     : t("connection.retryingBody");
   const speedHistory = useSpeedHistory(liveData.speed);
 
+  useEffect(() => {
+    if (!liveData.connection.isDisconnected) {
+      toast.dismiss(RECONNECT_TOAST_ID);
+      return;
+    }
+
+    toast.loading(t("connection.disconnectedTitle"), {
+      id: RECONNECT_TOAST_ID,
+      description: disconnectBannerMessage,
+      duration: Infinity,
+      dismissible: true,
+      icon: <Unplug className="size-4 text-amber-500" />,
+    });
+  }, [disconnectBannerMessage, liveData.connection.isDisconnected, t]);
+
+  useEffect(() => () => {
+    toast.dismiss(RECONNECT_TOAST_ID);
+  }, []);
+
   const lastTitleUpdate = useRef(0);
   useEffect(() => {
     const now = Date.now();
@@ -295,9 +293,6 @@ export function Layout() {
             <Link to="/" className="min-w-0">
               <div className="font-space-grotesk text-[22px] font-bold leading-none tracking-tight text-foreground">
                 Weaver
-              </div>
-              <div className="mt-1.5 text-[10.5px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">
-                Queue Control
               </div>
             </Link>
             <ThemeToggle />
@@ -402,15 +397,6 @@ export function Layout() {
             </span>
           </header>
 
-          {liveData.connection.isDisconnected ? (
-            <div className="flex-none">
-              <DisconnectBanner
-                title={t("connection.disconnectedTitle")}
-                message={disconnectBannerMessage}
-              />
-            </div>
-          ) : null}
-
           <div className="flex-1 overflow-y-auto">
             <div className="mx-auto w-full max-w-[1600px] px-4 py-5 sm:px-6 lg:px-8 lg:py-8">
               <RoutedOutlet />
@@ -425,9 +411,6 @@ export function Layout() {
             <SheetTitle className="font-space-grotesk text-xl font-bold text-foreground">
               Weaver
             </SheetTitle>
-            <SheetDescription className="text-[10.5px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">
-              Queue Control
-            </SheetDescription>
           </SheetHeader>
           <div className="flex min-h-0 flex-1 flex-col">
             <nav className="flex-1 overflow-y-auto px-3 py-4">

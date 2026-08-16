@@ -4,6 +4,31 @@
     <meta charset="UTF-8" />
     <base href="/" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (() => {
+        const root = document.documentElement;
+        try {
+          const storedTheme = window.localStorage.getItem("theme");
+          const theme = storedTheme === "system"
+            ? window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"
+            : storedTheme === "light" ? "light" : "dark";
+          root.classList.toggle("dark", theme === "dark");
+          root.dataset.initialTheme = theme;
+          root.style.colorScheme = theme;
+        } catch {
+          root.classList.add("dark");
+          root.dataset.initialTheme = "dark";
+          root.style.colorScheme = "dark";
+        }
+      })();
+    </script>
+    <style>
+      html, body { background-color: #050914; color-scheme: dark; }
+      html[data-initial-theme="light"], html[data-initial-theme="light"] body {
+        background-color: #f8f9fc;
+        color-scheme: light;
+      }
+    </style>
     <meta name="theme-color" content="#d9d9d9" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#081224" media="(prefers-color-scheme: dark)" />
     <meta name="mobile-web-app-capable" content="yes" />

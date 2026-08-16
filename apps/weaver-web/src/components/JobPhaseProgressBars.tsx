@@ -1,12 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import { Progress } from "@/components/ui/progress";
 import { formatSpeed } from "@/components/SpeedDisplay";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { JobPhase, JobPhaseProgressData } from "@/lib/job-types";
 import { cn } from "@/lib/utils";
-
-const REVEAL_AFTER_MS = 5_000;
-const MIN_REMAINING_MS = 5_000;
 
 const PHASE_PRIORITY: Record<JobPhase, number> = {
   MOVING: 0,
@@ -51,48 +48,15 @@ export function JobPhaseProgressBars({
 }) {
   const t = useTranslate();
   const phases = useMemo(() => phaseProgress ?? [], [phaseProgress]);
-  const [now, setNow] = useState(() => Date.now());
-  const [revealed, setRevealed] = useState<Set<JobPhase>>(() => new Set());
-  const phaseKey = phases.map((phase) => phase.phase).sort().join("|");
-
-  useEffect(() => {
-    if (phases.length === 0) {
-      return;
-    }
-    const id = window.setInterval(() => setNow(Date.now()), 1_000);
-    return () => window.clearInterval(id);
-  }, [phases.length]);
-
-  useEffect(() => {
-    const live = new Set(phases.map((phase) => phase.phase));
-    setRevealed((previous) => {
-      const next = new Set<JobPhase>();
-      for (const phase of previous) {
-        if (live.has(phase)) {
-          next.add(phase);
-        }
-      }
-      for (const phase of phases) {
-        const remaining = phase.estimatedRemainingMs ?? 0;
-        if (
-          phase.totalBytes > 0 &&
-          now - phase.startedAtEpochMs >= REVEAL_AFTER_MS &&
-          remaining >= MIN_REMAINING_MS
-        ) {
-          next.add(phase.phase);
-        }
-      }
-      return next;
-    });
-  }, [now, phaseKey, phases]);
 
   const visible = phases
-    .filter((phase) => revealed.has(phase.phase) && phase.totalBytes > 0)
+    .filter((phase) => phase.totalBytes > 0)
     .sort((left, right) => PHASE_PRIORITY[left.phase] - PHASE_PRIORITY[right.phase])
     .slice(0, 2);
+  const progressClassName = cn("rounded-pill bg-secondary", compact ? "h-1.5" : "h-2");
 
   if (visible.length === 0) {
-    return null;
+    return <Progress value={0} className={progressClassName} />;
   }
 
   return (
@@ -109,7 +73,7 @@ export function JobPhaseProgressBars({
             </div>
             <Progress
               value={pct}
-              className={cn("rounded-pill bg-secondary", compact ? "h-1.5" : "h-2")}
+              className={progressClassName}
               indicatorClassName={cn("rounded-pill", PHASE_COLOR[phase.phase])}
             />
           </div>

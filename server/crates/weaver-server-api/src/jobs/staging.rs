@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use async_graphql::UploadValue;
 
 use crate::auth::CallerIdentity;
+use weaver_nzb::Nzb;
 use weaver_server_core::auth::generate_api_key;
 use weaver_server_core::ingest::{
     SubmitNzbError, nzb_to_submission_spec, persist_decoded_nzb_reader_to_zstd,
@@ -21,6 +22,7 @@ pub(crate) struct StagedUploadEntry {
     pub(crate) owner: CallerIdentity,
     pub(crate) filename: String,
     pub(crate) nzb_zstd: Vec<u8>,
+    pub(crate) nzb: Nzb,
     created_at: Instant,
     last_touched_at: Instant,
 }
@@ -110,6 +112,7 @@ impl StagedUploadManager {
             owner,
             filename: filename.clone(),
             nzb_zstd,
+            nzb,
             created_at: now,
             last_touched_at: now,
         };

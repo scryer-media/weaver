@@ -6,9 +6,10 @@ import { useTranslate } from "@/lib/context/translate-context";
 interface UploadModalProps {
   open: boolean;
   onClose: () => void;
+  onSubmitted?: () => void;
 }
 
-export function UploadModal({ open, onClose }: UploadModalProps) {
+export function UploadModal({ open, onClose, onSubmitted }: UploadModalProps) {
   const t = useTranslate();
   const formRef = useRef<HTMLFormElement | null>(null);
   const wasOpenRef = useRef(false);
@@ -90,7 +91,10 @@ export function UploadModal({ open, onClose }: UploadModalProps) {
             key={openCycle}
             layout="dialog"
             open={open}
-            onSubmitted={onClose}
+            onSubmitted={() => {
+              onSubmitted?.();
+              onClose();
+            }}
             formRef={formRef}
           />
         ) : null}

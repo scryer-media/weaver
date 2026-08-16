@@ -264,7 +264,7 @@ async fn submit_prepared_nzb(
     db: &Database,
     handle: &SchedulerHandle,
     config: &SharedConfig,
-    nzb: Nzb,
+    nzb: &Nzb,
     prepared: PreparedSubmission,
     mut options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
@@ -825,7 +825,7 @@ pub async fn submit_nzb_bytes_with_options(
         db,
         handle,
         config,
-        nzb,
+        &nzb,
         PreparedSubmission {
             nzb_zstd,
             filename,
@@ -1016,7 +1016,7 @@ where
         db,
         handle,
         config,
-        nzb,
+        &nzb,
         PreparedSubmission {
             nzb_zstd,
             filename,
@@ -1067,7 +1067,6 @@ pub async fn submit_staged_nzb_zstd_with_options(
     metadata: Vec<(String, String)>,
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
-    let submit_started = Instant::now();
     let nzb = match persisted_nzb::parse_persisted_nzb_bytes(&nzb_zstd) {
         Ok(nzb) => nzb,
         Err(persisted_nzb::PersistedNzbError::Io(error)) => {
@@ -1077,6 +1076,25 @@ pub async fn submit_staged_nzb_zstd_with_options(
             return Err(SubmitNzbError::Parse(error));
         }
     };
+    submit_staged_parsed_nzb_with_options(
+        db, handle, config, &nzb, nzb_zstd, filename, password, category, metadata, options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_staged_parsed_nzb_with_options(
+    db: &Database,
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+    nzb: &Nzb,
+    nzb_zstd: Vec<u8>,
+    filename: Option<String>,
+    password: Option<String>,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+    options: SubmissionOptions,
+) -> Result<SubmittedJob, SubmitNzbError> {
     submit_prepared_nzb(
         db,
         handle,
@@ -1088,7 +1106,7 @@ pub async fn submit_staged_nzb_zstd_with_options(
             password,
             category,
             metadata,
-            submit_started,
+            submit_started: Instant::now(),
         },
         options,
     )

@@ -77,6 +77,7 @@ import {
   UPDATE_JOBS_MUTATION,
 } from "@/graphql/queries";
 import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";
+import { useGraphqlConnectionState } from "@/graphql/client";
 import {
   useLiveDownloadBlock,
   useLivePaused,
@@ -529,6 +530,7 @@ function queueStatusLabel(status: QueueStatusFilter, t: ReturnType<typeof useTra
 
 export function JobList() {
   const client = useClient();
+  const graphqlConnection = useGraphqlConnectionState();
   const [serversResult] = useQuery({ query: HAS_CONFIGURED_SERVERS_QUERY });
   const [{ data: categoryData }] = useQuery({ query: CATEGORIES_QUERY });
   const hasNoServers = serversResult.data?.hasConfiguredServers === false;
@@ -561,10 +563,11 @@ export function JobList() {
     [queueQueryKey],
   );
   const queueRowClassName = useCallback(() => "text-xs", []);
-  const [{ data: queuePageData, fetching: fetchingQueuePage }, reexecuteQueuePage] = useQuery<QueuePageResponse>({
-    query: QUEUE_PAGE_QUERY,
-    variables: { input: queuePageInput },
-  });
+  const [{ data: queuePageData, error: queuePageError }, reexecuteQueuePage] =
+    useQuery<QueuePageResponse>({
+      query: QUEUE_PAGE_QUERY,
+      variables: { input: queuePageInput },
+    });
   const [{ data: queueEventData, error: queueEventError }] = useSubscription<{
     queueEvents: QueueEventPayload;
   }>({
@@ -574,7 +577,15 @@ export function JobList() {
   });
   const [eventItems, setEventItems] = useState<Record<number, GraphqlJobData>>({});
   const queueRefreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastQueueEventCursorRef = useRef<string | null>(null);
+  const lastQueueEventErrorRef = useRef<string | null>(null);
+  const lastQueueConnectionAtRef = useRef<number | null | undefined>(undefined);
   const queuePageItems = queuePageData?.queuePage.items ?? EMPTY_QUEUE_PAGE_ITEMS;
+  const [hasBootstrappedQueue, setHasBootstrappedQueue] = useState(false);
+  const queueInitialFetchPending = queuePageData === undefined && !queuePageError;
+  const serverConfigurationPending = serversResult.data === undefined && !serversResult.error;
+  const isQueueBootstrapPending =
+    !hasBootstrappedQueue && (queueInitialFetchPending || serverConfigurationPending);
   const jobs = useMemo(
     () => queuePageItems.map((job) => normalizeJobData(eventItems[job.id] ?? job)),
     [eventItems, queuePageItems],
@@ -591,14 +602,42 @@ export function JobList() {
   }, [queuePageItems]);
 
   useEffect(() => {
-    if (queueEventError) {
-      void reexecuteQueuePage({ requestPolicy: "network-only" });
+    if (!isQueueBootstrapPending) {
+      setHasBootstrappedQueue(true);
+    }
+  }, [isQueueBootstrapPending]);
+
+  useEffect(() => {
+    if (graphqlConnection.status !== "connected" || graphqlConnection.lastConnectedAt === null) {
+      lastQueueConnectionAtRef.current = null;
       return;
+    }
+    if (lastQueueConnectionAtRef.current === undefined) {
+      lastQueueConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+      return;
+    }
+    if (lastQueueConnectionAtRef.current === graphqlConnection.lastConnectedAt) {
+      return;
+    }
+    lastQueueConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+    void reexecuteQueuePage({ requestPolicy: "network-only" });
+  }, [graphqlConnection.lastConnectedAt, graphqlConnection.status, reexecuteQueuePage]);
+
+  useEffect(() => {
+    if (queueEventError) {
+      const errorKey = queueEventError.message;
+      if (lastQueueEventErrorRef.current !== errorKey) {
+        lastQueueEventErrorRef.current = errorKey;
+        void reexecuteQueuePage({ requestPolicy: "network-only" });
+      }
+    } else {
+      lastQueueEventErrorRef.current = null;
     }
     const event = queueEventData?.queueEvents;
-    if (!event) {
+    if (!event || lastQueueEventCursorRef.current === event.cursor) {
       return;
     }
+    lastQueueEventCursorRef.current = event.cursor;
     if (event.kind === "ITEM_PROGRESS") {
       if (!event.item) {
         void reexecuteQueuePage({ requestPolicy: "network-only" });
@@ -1293,6 +1332,18 @@ export function JobList() {
         title={t("jobs.title")}
         actions={
           <>
+            {hasNoServers ? (
+              <Card className="flex h-[66px] shrink-0 items-center rounded-inner border-destructive/40 bg-destructive/8 shadow-none">
+                <div className="flex h-full w-full items-center gap-2 px-4">
+                  <Badge variant="destructive" className="px-2 py-0.5 text-[10px] uppercase tracking-[0.12em]">
+                    {t("jobs.noServersBadge")}
+                  </Badge>
+                  <Button asChild variant="outline" size="sm" className="h-7 px-2 text-xs">
+                    <Link to="/settings/servers">{t("jobs.noServersAction")}</Link>
+                  </Button>
+                </div>
+              </Card>
+            ) : null}
             <div className="flex overflow-hidden rounded-inner border border-border bg-card">
               <div className="border-r border-border px-4 py-2.5">
                 <div className="text-[9.5px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
@@ -1378,30 +1429,11 @@ export function JobList() {
         </Card>
       ) : null}
 
-      {hasNoServers ? (
-        <Card className="border-destructive/40 bg-destructive/8">
-          <CardContent className="flex flex-col gap-4 py-5 sm:flex-row sm:items-center sm:justify-between">
-            <div className="space-y-2">
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge variant="destructive">{t("jobs.noServersBadge")}</Badge>
-                <span className="text-sm font-medium text-foreground">
-                  {t("jobs.noServersTitle")}
-                </span>
-              </div>
-              <div className="text-sm text-muted-foreground">
-                {t("jobs.noServersBody")}
-              </div>
-            </div>
-            <div className="flex shrink-0 items-center gap-2">
-              <Button asChild variant="outline">
-                <Link to="/settings/servers">{t("jobs.noServersAction")}</Link>
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      ) : null}
-
-      {!fetchingQueuePage && totalCount === 0 ? (
+      {isQueueBootstrapPending ? (
+        <div role="status" className="py-8 text-center text-sm text-muted-foreground">
+          {t("label.loading")}
+        </div>
+      ) : totalCount === 0 ? (
         <EmptyState
           title={t("jobs.empty")}
           description={t("jobs.emptyHint")}
@@ -1423,8 +1455,6 @@ export function JobList() {
                   setPageIndex(0);
                 }}
                 searchPlaceholder={t("jobs.searchPlaceholder")}
-                searchContainerClassName="max-w-[280px]"
-                searchInputClassName="h-10"
                 centerContainerClassName="min-h-10"
                 centerContent={selectedIds.length > 0 ? (
                   <div className="inline-flex h-10 min-w-0 items-center justify-center gap-1.5 rounded-md border border-border/70 bg-muted/20 px-2">
@@ -1900,8 +1930,8 @@ export function JobList() {
 
       <ConfirmDialog
         open={cancelSelectedConfirm}
-        title={t("confirm.cancelJobBatch")}
-        message={t("confirm.cancelJobBatchMessage", { count: selectedIds.length })}
+        title={t("confirm.cancelSelected", { count: selectedIds.length })}
+        message={t("confirm.cancelSelectedMessage")}
         confirmLabel={t("confirm.cancelJobConfirm")}
         cancelLabel={t("confirm.cancelJobDismiss")}
         onConfirm={() => void handleBulkCancel()}
@@ -1915,7 +1945,11 @@ export function JobList() {
         onApply={handleBulkEdit}
       />
 
-      <UploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />
+      <UploadModal
+        open={uploadOpen}
+        onClose={() => setUploadOpen(false)}
+        onSubmitted={() => void reexecuteQueuePage({ requestPolicy: "network-only" })}
+      />
 
       <Dialog open={speedLimitOpen} onOpenChange={setSpeedLimitOpen}>
         <DialogContent>

@@ -23,6 +23,7 @@ pub use submission::{
     next_submission_job_id, nzb_to_submission_spec, reconcile_duplicate_fingerprint_backfill,
     reconcile_semantic_promotions, resolve_submission_category,
     run_duplicate_fingerprint_backfill_batch, submit_nzb_bytes, submit_nzb_bytes_with_options,
-    submit_staged_nzb_zstd, submit_staged_nzb_zstd_with_options, submit_uploaded_nzb_reader,
+    submit_staged_nzb_zstd, submit_staged_nzb_zstd_with_options,
+    submit_staged_parsed_nzb_with_options, submit_uploaded_nzb_reader,
     submit_uploaded_nzb_reader_with_options,
 };

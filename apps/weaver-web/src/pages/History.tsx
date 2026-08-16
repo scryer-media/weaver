@@ -29,6 +29,7 @@ import { formatBytes } from "@/components/SpeedDisplay";
 import { cn } from "@/lib/utils";
 import { STATUS_BG_CLASS, STATUS_TEXT_CLASS } from "@/lib/status-tokens";
 import { useTranslate } from "@/lib/context/translate-context";
+import { useGraphqlConnectionState } from "@/graphql/client";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
 import {
   formatJobReleaseName,
@@ -294,10 +295,13 @@ function reconcileDeleteOperations(
 
 export function History() {
   const t = useTranslate();
+  const graphqlConnection = useGraphqlConnectionState();
   const previousDeleteOperationsRef = useRef<HistoryDeleteOperationSummary[]>([]);
   const previousRawJobsRef = useRef<HistoryJob[]>([]);
   const previousVisibleJobsRef = useRef<HistoryJob[]>([]);
   const deleteOperationsFetchingRef = useRef(false);
+  const lastHistoryConnectionAtRef = useRef<number | null | undefined>(undefined);
+  const lastHistoryEventErrorRef = useRef<string | null>(null);
   const [historyPreferences, setHistoryPreferences] = useTablePreferences(
     "weaver.history.table.preferences",
     DEFAULT_HISTORY_PREFERENCES,
@@ -601,7 +605,46 @@ export function History() {
     },
     [hasActiveDeleteOperations, refetchHistoryPage, reexecuteHistoryDeleteOperations],
   );
-  useSubscription({ query: HISTORY_FACADE_EVENTS_SUBSCRIPTION }, handleSubscription);
+  const [{ error: historyEventError }] = useSubscription(
+    { query: HISTORY_FACADE_EVENTS_SUBSCRIPTION },
+    handleSubscription,
+  );
+
+  useEffect(() => {
+    if (graphqlConnection.status !== "connected" || graphqlConnection.lastConnectedAt === null) {
+      lastHistoryConnectionAtRef.current = null;
+      return;
+    }
+    if (lastHistoryConnectionAtRef.current === undefined) {
+      lastHistoryConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+      return;
+    }
+    if (lastHistoryConnectionAtRef.current === graphqlConnection.lastConnectedAt) {
+      return;
+    }
+    lastHistoryConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+    void refetchHistoryPage();
+    void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
+  }, [
+    graphqlConnection.lastConnectedAt,
+    graphqlConnection.status,
+    refetchHistoryPage,
+    reexecuteHistoryDeleteOperations,
+  ]);
+
+  useEffect(() => {
+    if (!historyEventError) {
+      lastHistoryEventErrorRef.current = null;
+      return;
+    }
+    const errorKey = historyEventError.message;
+    if (lastHistoryEventErrorRef.current === errorKey) {
+      return;
+    }
+    lastHistoryEventErrorRef.current = errorKey;
+    void refetchHistoryPage();
+    void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
+  }, [historyEventError, refetchHistoryPage, reexecuteHistoryDeleteOperations]);
 
   const timestampFormatter = useMemo(
     () =>

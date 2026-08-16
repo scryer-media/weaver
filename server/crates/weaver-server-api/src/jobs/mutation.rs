@@ -21,7 +21,7 @@ use crate::{ScheduledResumeCoordinator, ScheduledResumeError};
 use weaver_server_core::ingest::{
     SubmissionDuplicateOutcome, SubmissionOptions, SubmitNzbError, SubmittedJob,
     fetch_nzb_from_url, materialize_semantic_promotion, submit_nzb_bytes_with_options,
-    submit_staged_nzb_zstd_with_options, submit_uploaded_nzb_reader_with_options,
+    submit_staged_parsed_nzb_with_options, submit_uploaded_nzb_reader_with_options,
 };
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::jobs::{
@@ -190,10 +190,11 @@ impl JobsMutation {
             );
             options.frozen_post_processing_plan = frozen_post_processing_plan.clone();
 
-            match submit_staged_nzb_zstd_with_options(
+            match submit_staged_parsed_nzb_with_options(
                 db,
                 handle,
                 config,
+                &entry.nzb,
                 entry.nzb_zstd.clone(),
                 Some(entry.filename.clone()),
                 password.clone(),
