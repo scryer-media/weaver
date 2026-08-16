@@ -820,6 +820,7 @@ export function ApiKeysSection() {
           <div className="min-w-52 flex-1">
             <Label className="mb-2">{t("settings.apiKeyName")}</Label>
             <Input
+              data-testid="api-key-name"
               value={newKeyName}
               onChange={(e) => setNewKeyName(e.target.value)}
               placeholder={t("settings.apiKeyNamePlaceholder")}
