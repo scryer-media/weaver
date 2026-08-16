@@ -6,7 +6,7 @@ use crate::persistence::sql_runtime::SqlRuntime;
 impl Database {
     pub fn list_categories(&self) -> Result<Vec<CategoryConfig>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT id, name, dest_dir, aliases FROM categories ORDER BY name",
@@ -30,7 +30,7 @@ impl Database {
 
     pub fn next_category_id(&self) -> Result<u32, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT MAX(id) AS id FROM categories",

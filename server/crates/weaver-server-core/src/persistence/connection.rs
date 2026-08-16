@@ -37,7 +37,22 @@ enum PostgresDatabaseRuntimeJob {
 
 #[derive(Clone)]
 enum DatabaseRuntimeWorker {
-    Sqlite(SqliteDatabaseRuntimeWorker),
+    /// SQLite carries two executors on purpose. `writer` is a single thread —
+    /// SQLite is at its best with one writer, and serialising there is what keeps
+    /// same-key state transitions ordered. `reads` is a small multi-threaded
+    /// executor, because in WAL mode readers take a snapshot and neither block
+    /// the writer nor are blocked by it, so there is no reason for a query to
+    /// queue behind the download pipeline's writes. The pool already has 16
+    /// connections, each on its own sqlx worker thread; before this split, 15 of
+    /// them could never be in flight.
+    Sqlite {
+        writer: SqliteDatabaseRuntimeWorker,
+        reads: SqliteReadRuntimeWorker,
+    },
+    /// PostgreSQL needs none of this: its executor is already multi-threaded with
+    /// a permit per pooled connection, so reads and writes are concurrent
+    /// whichever entry point they use. `run_sql_blocking_read` forwards to the
+    /// same executor rather than adding a second one.
     Postgres(PostgresDatabaseRuntimeWorker),
 }
 
@@ -49,7 +64,10 @@ impl DatabaseRuntimeWorker {
                     .map(Self::Postgres)
             }
             DatabaseTarget::SqlitePath(_) | DatabaseTarget::SqliteUrl(_) => {
-                SqliteDatabaseRuntimeWorker::start().map(Self::Sqlite)
+                Ok(Self::Sqlite {
+                    writer: SqliteDatabaseRuntimeWorker::start()?,
+                    reads: SqliteReadRuntimeWorker::start(sqlite_read_concurrency_from_env())?,
+                })
             }
         }
     }
@@ -64,7 +82,7 @@ impl DatabaseRuntimeWorker {
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
         match self {
-            Self::Sqlite(worker) => worker.block_on(caller, future),
+            Self::Sqlite { writer, .. } => writer.block_on(caller, future),
             Self::Postgres(worker) => worker.block_on(future),
         }
     }
@@ -80,10 +98,26 @@ impl DatabaseRuntimeWorker {
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
         match self {
-            Self::Sqlite(worker) => worker.block_on_local(caller, build),
+            Self::Sqlite { writer, .. } => writer.block_on_local(caller, build),
             Self::Postgres(_) => Err(StateError::Database(
                 "run_sql_blocking_local requires sqlite datastore".to_string(),
             )),
+        }
+    }
+
+    /// Dispatch a **pure read** — no writes, and not part of a write transaction.
+    fn block_on_read<T, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        future: Fut,
+    ) -> Result<T, StateError>
+    where
+        T: Send + 'static,
+        Fut: Future<Output = Result<T, StateError>> + Send + 'static,
+    {
+        match self {
+            Self::Sqlite { reads, .. } => reads.block_on(caller, future),
+            Self::Postgres(worker) => worker.block_on(future),
         }
     }
 
@@ -98,7 +132,7 @@ impl DatabaseRuntimeWorker {
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
         match self {
-            Self::Sqlite(worker) => worker.block_on_local(caller, build),
+            Self::Sqlite { writer, .. } => writer.block_on_local(caller, build),
             Self::Postgres(worker) => worker.block_on_local(build),
         }
     }
@@ -474,6 +508,140 @@ impl PostgresDatabaseRuntimeWorker {
     }
 }
 
+/// Multi-threaded executor for pure SQLite reads.
+///
+/// WAL gives every reader a consistent snapshot taken at its own BEGIN, and a
+/// reader neither blocks nor is blocked by the single writer. So reads only need
+/// an executor that can drive several of them at once; the concurrency limit is
+/// the pool size, since each in-flight read holds one pooled connection.
+///
+/// Ordering note, deliberately unchanged: a read submitted *after* a synchronous
+/// write call has returned still observes that write, because the caller blocked
+/// until the writer committed and the reader's snapshot is taken afterwards.
+/// Writes queued through `writer_tx` (`try_queue_write` / `try_queue_archive_job`)
+/// were already asynchronous with respect to readers before this split — that is
+/// why `flush_write_queue` and the archive `committed` oneshot exist — so callers
+/// that need read-your-write on those paths must keep using them.
+#[derive(Clone)]
+struct SqliteReadRuntimeWorker {
+    tx: std_mpsc::Sender<SqliteReadJob>,
+    queue_depth: Arc<AtomicUsize>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+type SqliteReadJob = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>;
+
+impl SqliteReadRuntimeWorker {
+    fn start(concurrency: usize) -> Result<Self, StateError> {
+        let concurrency = concurrency.max(1);
+        let (tx, rx) = std_mpsc::channel::<SqliteReadJob>();
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+
+        std::thread::Builder::new()
+            .name("weaver-sqlite-read-dispatch".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(concurrency)
+                    .thread_name("weaver-sqlite-read")
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string());
+                let runtime = match runtime {
+                    Ok(runtime) => {
+                        let _ = ready_tx.send(Ok(()));
+                        runtime
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                // Dispatch only: each job spawns onto the multi-threaded runtime
+                // and this loop moves straight to the next, so reads overlap
+                // instead of queueing behind each other.
+                while let Ok(job) = rx.recv() {
+                    job(&runtime);
+                }
+            })
+            .map_err(|error| StateError::Database(error.to_string()))?;
+
+        ready_rx
+            .recv()
+            .map_err(|_| StateError::Database("database read worker stopped".to_string()))?
+            .map_err(StateError::Database)?;
+
+        Ok(Self {
+            tx,
+            queue_depth: Arc::new(AtomicUsize::new(0)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    fn block_on<T, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        future: Fut,
+    ) -> Result<T, StateError>
+    where
+        T: Send + 'static,
+        Fut: Future<Output = Result<T, StateError>> + Send + 'static,
+    {
+        let started = Instant::now();
+        let queued_at = Instant::now();
+        let depth = self.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
+        crate::runtime::perf_probe::record_value("db.sqlite.read.depth_at_submit", depth as u64);
+        let queue_depth = self.queue_depth.clone();
+        let in_flight = self.in_flight.clone();
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        self.tx
+            .send(Box::new(move |runtime| {
+                runtime.spawn(async move {
+                    let waited = queued_at.elapsed();
+                    queue_depth.fetch_sub(1, Ordering::AcqRel);
+                    let active = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                    if crate::runtime::perf_probe::enabled() {
+                        crate::runtime::perf_probe::record("db.sqlite.read.wait", waited);
+                        crate::runtime::perf_probe::record_value(
+                            "db.sqlite.read.in_flight",
+                            active as u64,
+                        );
+                    }
+                    let exec_started = Instant::now();
+                    let result = future.await;
+                    in_flight.fetch_sub(1, Ordering::AcqRel);
+                    if crate::runtime::perf_probe::enabled() {
+                        let elapsed = exec_started.elapsed();
+                        crate::runtime::perf_probe::record("db.sqlite.read.exec", elapsed);
+                        crate::runtime::perf_probe::record_owned(
+                            format!("db.sqlite.read.caller.{}.exec", caller_label(caller)),
+                            elapsed,
+                        );
+                    }
+                    let _ = reply_tx.send(result);
+                });
+            }))
+            .map_err(|_| StateError::Database("database read worker stopped".to_string()))?;
+        let result = reply_rx
+            .recv()
+            .map_err(|_| StateError::Database("database read worker panicked".to_string()))?;
+        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on_read", started.elapsed());
+        result
+    }
+}
+
+/// Read concurrency defaults to the SQLite pool size: every in-flight read holds
+/// one pooled connection, so more workers than connections only queues inside
+/// sqlx instead of here.
+fn sqlite_read_concurrency_from_env() -> usize {
+    let pool_max = crate::persistence::sql_services::sqlite_max_connections_from_env() as usize;
+    std::env::var("WEAVER_SQLITE_READ_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(pool_max)
+        .clamp(1, pool_max.max(1))
+}
+
 fn postgres_db_concurrency_from_env() -> usize {
     let pool_max = crate::persistence::sql_services::postgres_max_connections_from_env() as usize;
     std::env::var("WEAVER_POSTGRES_DB_CONCURRENCY")
@@ -810,6 +978,23 @@ impl Database {
     {
         self.sql_worker
             .block_on(std::panic::Location::caller(), future)
+    }
+
+    /// Run a **pure read**: no writes, and not inside a write transaction.
+    ///
+    /// Reads dispatched here run on the multi-threaded read executor instead of
+    /// queueing behind the single writer. Use [`Self::run_sql_blocking`] for
+    /// anything that writes, and for reads that must sit inside a write
+    /// transaction (read-modify-write), where the ordering the single writer
+    /// provides is the point.
+    #[track_caller]
+    pub(crate) fn run_sql_blocking_read<T, Fut>(&self, future: Fut) -> Result<T, StateError>
+    where
+        T: Send + 'static,
+        Fut: std::future::Future<Output = Result<T, StateError>> + Send + 'static,
+    {
+        self.sql_worker
+            .block_on_read(std::panic::Location::caller(), future)
     }
 
     #[track_caller]

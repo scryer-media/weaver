@@ -7,7 +7,7 @@ use crate::settings::record::SettingRecord;
 impl Database {
     pub(crate) fn list_setting_records(&self) -> Result<Vec<SettingRecord>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT key, value FROM settings ORDER BY key",
@@ -29,7 +29,7 @@ impl Database {
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, StateError> {
         let datastore = self.datastore();
         let key = key.to_string();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT value FROM settings WHERE key = {}",
