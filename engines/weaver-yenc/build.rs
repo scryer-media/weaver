@@ -9,8 +9,22 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(rapidyenc_linked)");
+    println!("cargo:rustc-check-cfg=cfg(weaver_yenc_raw_asm)");
     println!("cargo:rerun-if-env-changed=WEAVER_RAPIDYENC_SRC");
+    println!("cargo:rerun-if-env-changed=WEAVER_YENC_RAW_ASM");
     println!("cargo:rerun-if-changed=rapidyenc_shim.cc");
+
+    // A/B switch for the hand-written AVX2 raw span loop (Rung 3): build with
+    // `WEAVER_YENC_RAW_ASM=1` to route `decode_kernel_avx2_raw::<false>`'s SIMD
+    // span through the `asm!` loop, leave unset (or "0") for the intrinsic
+    // loop. Both forms stay compiled on x86_64 so the differential tests can
+    // compare them on real hardware regardless of the cfg.
+    if matches!(
+        env::var("WEAVER_YENC_RAW_ASM").as_deref(),
+        Ok(v) if !v.is_empty() && v != "0"
+    ) {
+        println!("cargo:rustc-cfg=weaver_yenc_raw_asm");
+    }
 
     let Some(root) = env::var_os("WEAVER_RAPIDYENC_SRC") else {
         return;
