@@ -1,0 +1,8 @@
+{
+  "slug": "rar5-hp-encrypted",
+  "title": "E2E.Test.RAR5.HPEncrypted.2024.1080p-TESTGRP",
+  "description": "RAR5 with header-level encryption (-hp). Tests encrypted header parsing + data decryption.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "password": "e2e-test-password"
+}

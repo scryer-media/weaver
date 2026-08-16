@@ -1,0 +1,7 @@
+{
+  "slug": "zip-unencrypted",
+  "title": "E2E.Test.ZIP.Unencrypted.2024.1080p-TESTGRP",
+  "description": "Plain ZIP archive with no encryption",
+  "category": "2000",
+  "expected_outcome": "success"
+}

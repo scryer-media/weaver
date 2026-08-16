@@ -1,0 +1,7 @@
+{
+  "slug": "bzip2-single",
+  "title": "E2E.Test.BZ2.2024.1080p-TESTGRP",
+  "description": "BZip2-compressed single MKV file",
+  "category": "2000",
+  "expected_outcome": "success"
+}

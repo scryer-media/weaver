@@ -1,0 +1,309 @@
+services:
+  # NNTP server (Go) — accepts article POSTs, serves BODY/STAT requests
+  # Articles stored on disk in DATA_DIR, only index kept in memory.
+  nntp:
+    image: ${E2E_NNTP_IMAGE:-weaver-e2e-nntp:local}
+    pull_policy: never
+    ports:
+      - "${E2E_NNTP_PORT:-1119}:119"
+      - "${E2E_NNTP_TLS_PORT:-1563}:563"
+    environment:
+      NNTP_LISTEN_ADDR: "0.0.0.0:119"
+      NNTP_TLS_LISTEN_ADDR: "0.0.0.0:563"
+      NNTP_GENERATE_TEST_TLS: "1"
+      NNTP_TLS_DIR: /certs
+      NNTP_TLS_DNS_NAMES: "nntp,localhost"
+      NNTP_DATA_DIR: /data/articles
+      NNTP_USERNAME: "${E2E_NNTP_USERNAME:-e2e-user}"
+      NNTP_PASSWORD_FILE: /run/secrets/nntp-password
+      NNTP_PIPELINING: "${E2E_NNTP_PIPELINING:-0}"
+      NNTP_ENABLE_TEST_CONTROL: "1"
+    secrets:
+      - nntp-password
+    volumes:
+      - nntp-certs:/certs
+      - nntp-data:/data
+    healthcheck:
+      test: ["CMD", "/e2e-nntp", "health", "--addr", "127.0.0.1:119"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Second NNTP server — backup/failover target for multi-server testing.
+  # Independent data volume; chaos can be enabled per-server.
+  nntp2:
+    image: ${E2E_NNTP_IMAGE:-weaver-e2e-nntp:local}
+    pull_policy: never
+    ports:
+      - "${E2E_NNTP2_PORT:-2119}:119"
+    environment:
+      NNTP_LISTEN_ADDR: "0.0.0.0:119"
+      NNTP_DATA_DIR: /data/articles
+      NNTP_USERNAME: "${E2E_NNTP_USERNAME:-e2e-user}"
+      NNTP_PASSWORD_FILE: /run/secrets/nntp-password
+      NNTP_PIPELINING: "${E2E_NNTP2_PIPELINING:-0}"
+      NNTP_ENABLE_TEST_CONTROL: "1"
+    secrets:
+      - nntp-password
+    volumes:
+      - nntp2-data:/data
+    healthcheck:
+      test: ["CMD", "/e2e-nntp", "health", "--addr", "127.0.0.1:119"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  # Toxiproxy — TCP-level chaos proxy between weaver and NNTP servers.
+  # Injects real network failures: latency, packet loss, connection resets,
+  # bandwidth limits, timeouts at the TCP stack level.
+  # API on port 8474 for runtime toxic management.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+    ports:
+      - "${E2E_TOXIPROXY_API_PORT:-8474}:8474"   # toxiproxy API
+      - "${E2E_TOXIPROXY_NNTP1_PORT:-3119}:3119" # proxied NNTP server 1
+      - "${E2E_TOXIPROXY_NNTP2_PORT:-4119}:4119" # proxied NNTP server 2
+    volumes:
+      - ./services/toxiproxy/config.json:/config/toxiproxy.json:ro
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    depends_on:
+      nntp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Lightweight Newznab-compatible indexer (Go)
+  newznab:
+    image: ${E2E_NEWZNAB_IMAGE:-weaver-e2e-newznab:local}
+    pull_policy: never
+    build: ./services/newznab
+    ports:
+      - "${E2E_NEWZNAB_PORT:-8088}:8088"
+    environment:
+      API_KEY: test-e2e-key
+      LISTEN_ADDR: "0.0.0.0:8088"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8088/admin/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
+  # Published Weaver image under test against fake NNTP.
+  weaver:
+    image: ${E2E_WEAVER_IMAGE:-ghcr.io/scryer-media/weaver:latest}
+    depends_on:
+      nntp:
+        condition: service_healthy
+      nntp2:
+        condition: service_healthy
+    ports:
+      - "${E2E_WEAVER_PORT:-19091}:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - weaver-config:/config
+      - weaver-data:/data
+      - weaver-downloads:/data/complete
+      - weaver-e2e-clock:/e2e-clock
+      - weaver-watch-folder:/watch-folder
+      - nntp-certs:/certs:ro
+      - ./services/weaver/weaver.toml:/config-src/weaver.toml:ro
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: "${E2E_WEAVER_TIMEZONE:-UTC}"
+      RUST_LOG: info,weaver::pipeline=debug
+      WEAVER_ENCRYPTION_KEY: ${E2E_WEAVER_ENCRYPTION_KEY-d2VhdmVyLWUyZS13ZWF2ZXItc2VjcmV0LWtleS0wMDE=}
+      WEAVER_NNTP_HOST: ${E2E_NNTP_CLIENT_HOST:-nntp}
+      WEAVER_NNTP_PORT: ${E2E_NNTP_CLIENT_PORT:-119}
+      WEAVER_NNTP_BACKUP_HOST: ${E2E_NNTP_BACKUP_CLIENT_HOST:-nntp2}
+      WEAVER_NNTP_BACKUP_PORT: ${E2E_NNTP_BACKUP_CLIENT_PORT:-119}
+      WEAVER_DATABASE_URL: "${E2E_WEAVER_DATABASE_URL:-}"
+      WEAVER_E2E_MODE: "${E2E_WEAVER_MODE:-0}"
+      WEAVER_E2E_CLOCK_FILE: "${E2E_WEAVER_CLOCK_FILE:-}"
+      WEAVER_RSS_ALLOW_PRIVATE_NETWORK: "${WEAVER_RSS_ALLOW_PRIVATE_NETWORK:-false}"
+      WEAVER_BASE_URL: "${E2E_WEAVER_BASE_URL:-/}"
+      # weaver a8faf19d (2026-08-03) added an HTTP Host allowlist: a request whose
+      # Host is neither an IP literal nor "localhost" is answered with 421 unless
+      # the host appears here. Playwright reaches this service by its compose
+      # name ("http://weaver:9090"), so the *deployment* has to declare that
+      # hostname -- exactly what a real operator does when Weaver sits
+      # behind a proxy or on a container network. Declaring it here rather than
+      # baking an ENV into the image keeps the image identical to what ships and
+      # keeps this working when E2E_WEAVER_IMAGE points at the published image.
+      # An entry with no port matches any port, so "weaver" covers "weaver:9090".
+      WEAVER_HTTP_ALLOWED_HOSTS: "${E2E_WEAVER_ALLOWED_HOSTS:-weaver}"
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      - mkdir -p /config /data /data/complete /watch-folder && chown -R "${PUID:-1000}:${PGID:-1000}" /config /data /watch-folder && cp /config-src/weaver.toml /config/weaver.toml && sed -i -e "s/host = \"nntp\"/host = \"$${WEAVER_NNTP_HOST:-nntp}\"/g" -e "s/host = \"nntp2\"/host = \"$${WEAVER_NNTP_BACKUP_HOST:-nntp2}\"/g" -e "0,/port = 119/s/port = 119/port = $${WEAVER_NNTP_PORT:-119}/" -e "0,/port = 119/s/port = 119/port = $${WEAVER_NNTP_BACKUP_PORT:-119}/" /config/weaver.toml && exec /entrypoint.sh -c /config/weaver.toml serve --port 9090 --base-url "$${WEAVER_BASE_URL:-/}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider \"http://127.0.0.1:9090$${WEAVER_BASE_URL:-/}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  nzbget:
+    image: lscr.io/linuxserver/nzbget:latest
+    depends_on:
+      nntp:
+        condition: service_healthy
+    ports:
+      - "${E2E_NZBGET_PORT:-16789}:6789"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./services/nzbget/nzbget.conf:/config-src/nzbget.conf:ro
+      - ./services/nzbget/copy-config.sh:/custom-cont-init.d/10-copy-config.sh:ro
+      - nzbget-downloads:/nzbget-downloads
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: Etc/UTC
+      NZBGET_CONFIG_VARIANT: ${E2E_NZBGET_CONFIG_VARIANT:-default}
+      NZBGET_NNTP_HOST: ${E2E_NNTP_CLIENT_HOST:-nntp}
+      NZBGET_NNTP_PORT: ${E2E_NNTP_CLIENT_PORT:-119}
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z localhost 6789"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  sabnzbd:
+    image: lscr.io/linuxserver/sabnzbd:4.5.5-ls244
+    depends_on:
+      nntp:
+        condition: service_healthy
+    ports:
+      - "${E2E_SABNZBD_PORT:-18085}:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./services/sabnzbd/sabnzbd.ini:/config-src/sabnzbd.ini:ro
+      - ./services/sabnzbd/copy-config.sh:/custom-cont-init.d/10-copy-config.sh:ro
+      - sabnzbd-downloads:/sabnzbd-downloads
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: Etc/UTC
+      HOST_WHITELIST: localhost,127.0.0.1,sabnzbd,playwright
+      SABNZBD_NNTP_HOST: ${E2E_NNTP_CLIENT_HOST:-nntp}
+      SABNZBD_NNTP_PORT: ${E2E_NNTP_CLIENT_PORT:-119}
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z localhost 8080"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  # PostgreSQL under test as a Weaver datastore. Every release flow runs against
+  # both SQLite and this service, so its environment and volume are named apart
+  # from the rest of the stack and are torn down with the run.
+  weaver-postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: "${E2E_WEAVER_POSTGRES_DB:-weaver}"
+      POSTGRES_USER: "${E2E_WEAVER_POSTGRES_USER:-weaver}"
+      POSTGRES_PASSWORD: "${E2E_WEAVER_POSTGRES_PASSWORD:-weaver-pass}"
+    ports:
+      - "${E2E_WEAVER_POSTGRES_PORT:-0}:5432"
+    volumes:
+      - weaver-postgres-data:/var/lib/postgresql
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        mkdir -p /var/lib/postgresql/server-certs
+        if [ ! -s /var/lib/postgresql/server-certs/server.key ] || [ ! -s /var/lib/postgresql/server-certs/server.crt ]; then
+          openssl req -new -x509 -days 3650 -nodes -text \
+            -subj "/CN=weaver-postgres" \
+            -keyout /var/lib/postgresql/server-certs/server.key \
+            -out /var/lib/postgresql/server-certs/server.crt
+          chown postgres:postgres /var/lib/postgresql/server-certs/server.key /var/lib/postgresql/server-certs/server.crt
+          chmod 600 /var/lib/postgresql/server-certs/server.key
+        fi
+        exec docker-entrypoint.sh postgres \
+          -c ssl=on \
+          -c ssl_cert_file=/var/lib/postgresql/server-certs/server.crt \
+          -c ssl_key_file=/var/lib/postgresql/server-certs/server.key
+    healthcheck:
+      test: ["CMD-SHELL", "PGPASSWORD=\"$${POSTGRES_PASSWORD}\" psql \"postgresql://$${POSTGRES_USER}@127.0.0.1/$${POSTGRES_DB}?sslmode=require\" -c 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Browser and runtime acceptance runner. It builds from the Playwright project
+  # in this repository and mounts only paths under this directory, so a run is
+  # reproducible from a clean checkout.
+  weaver-playwright:
+    image: ${E2E_WEAVER_PLAYWRIGHT_IMAGE:-weaver-e2e-playwright:local}
+    pull_policy: never
+    build:
+      context: ./playwright-weaver
+      dockerfile: Dockerfile
+      labels:
+        org.weaver-e2e.playwright-source-fingerprint: "${E2E_WEAVER_PLAYWRIGHT_SOURCE_FINGERPRINT:-unversioned}"
+    depends_on:
+      weaver:
+        condition: service_healthy
+    volumes:
+      - weaver-data:/weaver-data
+      - weaver-downloads:/weaver-downloads:ro
+      - weaver-e2e-clock:/e2e-clock
+      - weaver-watch-folder:/watch-folder
+      # Live-mount the spec sources over the image's baked copy so editing a
+      # flow takes effect on the next `compose run` without rebuilding the
+      # playwright image. node_modules, config, and reporters stay from the
+      # image; the Dockerfile `COPY . .` remains the hermetic CI fallback.
+      - ./playwright-weaver/tests:/work/tests:ro
+      - ${FIXTURES_DIR:-./fixtures}:/work/fixtures:ro
+      - ${E2E_WEAVER_PLAYWRIGHT_ARTIFACTS_DIR:-./artifacts/weaver}:/artifacts
+    environment:
+      PLAYWRIGHT_BASE_URL: "${E2E_WEAVER_PLAYWRIGHT_BASE_URL:-http://weaver:9090}"
+      PLAYWRIGHT_ARTIFACTS_DIR: "/artifacts"
+      WEAVER_URL: "http://weaver:9090"
+      E2E_WEAVER_RELEASE_FLOW: "${E2E_WEAVER_RELEASE_FLOW:-}"
+      E2E_WEAVER_RELEASE_FLOW_DATASTORE: "${E2E_WEAVER_RELEASE_FLOW_DATASTORE:-sqlite}"
+      E2E_WEAVER_ARTIFACT_STAGE: "${E2E_WEAVER_ARTIFACT_STAGE:-}"
+      E2E_WEAVER_BACKUP_SOURCE_DATASTORE: "${E2E_WEAVER_BACKUP_SOURCE_DATASTORE:-}"
+      E2E_WEAVER_BACKUP_TARGET_DATASTORE: "${E2E_WEAVER_BACKUP_TARGET_DATASTORE:-}"
+      E2E_WEAVER_BACKUP_STAGE: "${E2E_WEAVER_BACKUP_STAGE:-}"
+      E2E_WEAVER_ENCRYPTION_LIFECYCLE_STAGE: "${E2E_WEAVER_ENCRYPTION_LIFECYCLE_STAGE:-}"
+      E2E_WEAVER_ENCRYPTION_LIFECYCLE_STATE_FILE: "${E2E_WEAVER_ENCRYPTION_LIFECYCLE_STATE_FILE:-}"
+      E2E_WEAVER_ENCRYPTION_LIFECYCLE_STATE_SECRET: "${E2E_WEAVER_ENCRYPTION_LIFECYCLE_STATE_SECRET:-}"
+      E2E_WEAVER_PROVIDER_CAP_STAGE: "${E2E_WEAVER_PROVIDER_CAP_STAGE:-}"
+      E2E_WEAVER_QUOTA_STAGE: "${E2E_WEAVER_QUOTA_STAGE:-initial}"
+      E2E_WEAVER_RATE_LIMIT_STAGE: "${E2E_WEAVER_RATE_LIMIT_STAGE:-initial}"
+      E2E_WEAVER_UI_STAGE: "${E2E_WEAVER_UI_STAGE:-initial}"
+      E2E_WEAVER_CLOCK_FILE: "/e2e-clock/now"
+
+  # Nyuu — real usenet binary poster (yEnc encoding + NNTP posting + NZB generation)
+  nyuu:
+    image: ${NYUU_IMAGE:-e2e-nyuu}
+    pull_policy: never
+    build: ./services/nyuu
+    network_mode: "service:nntp"
+    volumes:
+      - ${FIXTURES_DIR:-./fixtures}:/work/fixtures
+      - ./testdata:/data:ro
+    entrypoint: ["sh", "-lc"]
+    command: ["trap : TERM INT; sleep infinity & wait"]
+    profiles: ["cli"]
+
+volumes:
+  nntp-certs:
+  nntp-data:
+  nntp2-data:
+  weaver-config:
+  weaver-data:
+  weaver-downloads:
+  weaver-e2e-clock:
+  weaver-watch-folder:
+  weaver-postgres-data:
+  nzbget-downloads:
+  sabnzbd-downloads:
+
+secrets:
+  nntp-password:
+    environment: E2E_NNTP_PASSWORD

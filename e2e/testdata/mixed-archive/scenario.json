@@ -1,0 +1,7 @@
+{
+  "slug": "mixed-archive",
+  "title": "E2E.Test.Mixed.Archive.2024.1080p-TESTGRP",
+  "description": "RAR5 archive + standalone NFO + sample MKV in same download. Tests mixed file type handling",
+  "category": "2000",
+  "expected_outcome": "success"
+}

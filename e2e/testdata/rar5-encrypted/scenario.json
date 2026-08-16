@@ -1,0 +1,8 @@
+{
+  "slug": "rar5-encrypted",
+  "title": "E2E.Test.RAR5.Encrypted.2024.1080p-TESTGRP",
+  "description": "Password-protected RAR5",
+  "category": "2000",
+  "expected_outcome": "success",
+  "password": "e2e-test-password"
+}

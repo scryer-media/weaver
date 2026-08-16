@@ -1,0 +1,21 @@
+{
+  "slug": "rar5-filename-dedupe",
+  "title": "E2E.Test.RAR5.Filename.Dedupe.Encrypted.1080p-TESTGRP",
+  "description": "Two encrypted RAR5 payloads whose posted archive filenames collide after sanitization. Exercises NZBGet-style .duplicateN disambiguation without dropping either file.",
+  "category": "5000",
+  "expected_outcome": "success",
+  "password": "e2e-rar-filename-password",
+  "segment_size": 65536,
+  "runtimeAssertions": {
+    "fileIdentityRewrite": {
+      "requiredCurrentFilenames": [
+        "dedupe_archive.rar",
+        "dedupe_archive.duplicate1.rar"
+      ],
+      "forbiddenCurrentFilenames": [
+        "dedupe?archive.rar"
+      ],
+      "requiredClassificationSource": "declared"
+    }
+  }
+}

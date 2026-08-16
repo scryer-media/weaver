@@ -1,0 +1,20 @@
+{
+  "slug": "rar5-filename-normalization",
+  "title": "E2E.Test.RAR5.Filename.Normalization.Encrypted.1080p-TESTGRP",
+  "description": "Encrypted RAR5 payload posted with an NZBGet-reserved character in the archive filename. Exercises Weaver download filename sanitization before RAR extraction.",
+  "category": "5000",
+  "expected_outcome": "success",
+  "password": "e2e-rar-filename-password",
+  "segment_size": 65536,
+  "runtimeAssertions": {
+    "fileIdentityRewrite": {
+      "requiredCurrentFilenames": [
+        "normalize_encrypted.rar"
+      ],
+      "forbiddenCurrentFilenames": [
+        "normalize?encrypted.rar"
+      ],
+      "requiredClassificationSource": "declared"
+    }
+  }
+}

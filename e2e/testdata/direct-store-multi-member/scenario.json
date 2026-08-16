@@ -1,0 +1,10 @@
+{
+  "slug": "direct-store-multi-member",
+  "title": "Neon.Meridian.S01E04E05.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "RAR5 store-method set carrying two members, each mapped independently; the set finalises only once both have been placed.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "neon.meridian.s01e04.mkv": "f57523e4feeb7b3ca97928a19a0d9d846affcd886f80c031a0c4149582dc2c03"
+  }
+}

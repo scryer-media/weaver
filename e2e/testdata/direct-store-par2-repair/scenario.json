@@ -1,0 +1,17 @@
+{
+  "slug": "direct-store-par2-repair",
+  "title": "Violet.Cascade.S01E07.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "RAR5 store-method set across four volumes with PAR2 recovery, damaged by deleting the last few articles of an interior volume. The holes are repaired while the set keeps routing direct: only the damaged volume materialises, the clean volumes stay virtual.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "violet.cascade.s01e07.mkv": "69d3cd3c6a7bd0118985796437c52a761f0f718df90da0582de74a097276bca8"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "deleteSubjectContains": [
+    "archive.part2.rar"
+  ],
+  "deleteSubjectTailArticles": 3
+}

@@ -1,0 +1,7 @@
+{
+  "slug": "nested-5deep",
+  "title": "E2E.Test.Nested.5Deep.2024.1080p-TESTGRP",
+  "description": "5 levels of nested RAR (exceeds 3-level limit). Tests graceful stop at max depth, leaving inner archive as output",
+  "category": "2000",
+  "expected_outcome": "nested_depth_exceeded"
+}

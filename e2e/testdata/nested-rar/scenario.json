@@ -1,0 +1,7 @@
+{
+  "slug": "nested-rar",
+  "title": "E2E.Test.Nested.RAR.2024.1080p-TESTGRP",
+  "description": "RAR5 containing a RAR5 containing an MKV. Tests 2-level nested extraction",
+  "category": "2000",
+  "expected_outcome": "success"
+}

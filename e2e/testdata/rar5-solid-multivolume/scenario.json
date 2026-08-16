@@ -1,0 +1,7 @@
+{
+  "slug": "rar5-solid-multivolume",
+  "title": "E2E.Test.RAR5.Solid.MultiVol.2024.1080p-TESTGRP",
+  "description": "Solid RAR5 split across 4 volumes. Tests solid + multivolume combined path",
+  "category": "2000",
+  "expected_outcome": "success"
+}

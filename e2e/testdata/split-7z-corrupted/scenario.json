@@ -1,0 +1,7 @@
+{
+  "slug": "split-7z-corrupted",
+  "title": "E2E.Test.Split.7z.Corrupted.2024.1080p-TESTGRP",
+  "description": "Split .7z archive with the final volume truncated so it parses initially but fails during extraction. No PAR2.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure"
+}

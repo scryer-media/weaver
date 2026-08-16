@@ -1,0 +1,28 @@
+{
+  "slug": "par2-obfuscated-rar-rewrite",
+  "title": "E2E.Test.PAR2.Obfuscated.RAR.Rewrite.2024.1080p-TESTGRP",
+  "description": "Clean 3-volume RAR5 set staged under obfuscated numeric filenames plus canonical PAR2 sidecars. Tests that PAR2 authoritative rewrite/rebind is observed in active_file_identities before extraction completes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 65536,
+  "fixtureAssets": [
+    "rar5-multivolume/archive.part1.rar::51273aad56a8b904e96928935278a627.101",
+    "rar5-multivolume/archive.part2.rar::51273aad56a8b904e96928935278a627.102",
+    "rar5-multivolume/archive.part3.rar::51273aad56a8b904e96928935278a627.103"
+  ],
+  "runtimeAssertions": {
+    "fileIdentityRewrite": {
+      "requiredCurrentFilenames": [
+        "archive.part1.rar",
+        "archive.part2.rar",
+        "archive.part3.rar"
+      ],
+      "forbiddenCurrentFilenames": [
+        "51273aad56a8b904e96928935278a627.101",
+        "51273aad56a8b904e96928935278a627.102",
+        "51273aad56a8b904e96928935278a627.103"
+      ],
+      "requiredClassificationSource": "par2"
+    }
+  }
+}

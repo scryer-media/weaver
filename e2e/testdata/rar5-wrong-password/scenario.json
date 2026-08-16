@@ -1,0 +1,8 @@
+{
+  "slug": "rar5-wrong-password",
+  "title": "E2E.Test.RAR5.WrongPass.2024.1080p-TESTGRP",
+  "description": "Encrypted RAR5 with wrong password in NZB metadata. Tests graceful decryption failure",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "password": "wrong-password-here"
+}

@@ -1,0 +1,19 @@
+{
+  "slug": "multiserver-backup-par2-repair",
+  "title": "E2E.Test.MultiServer.Backup.PAR2.Repair.2024.1080p-TESTGRP",
+  "description": "Small RAR payload with PAR2 sidecars where both servers lose the first archive article, but only the primary loses recovery volumes after backup sync. Verifies repair still succeeds by fetching recovery data from the backup server.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "fixtureAssets": [
+    "par2-small-repair/archive.rar",
+    "par2-small-repair/archive_repair.par2",
+    "par2-small-repair/archive_repair.vol00+24.par2"
+  ],
+  "deleteFirstMessageIDs": 1,
+  "primaryDeleteSubjectContains": [
+    ".vol"
+  ],
+  "requiredJobEvents": [
+    "RepairComplete"
+  ]
+}

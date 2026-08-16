@@ -1,0 +1,7 @@
+{
+  "slug": "par2-rar4",
+  "title": "E2E.Test.PAR2.RAR4.2024.1080p-TESTGRP",
+  "description": "Corrupted RAR4 with PAR2 recovery. Tests PAR2 repair on RAR4 format",
+  "category": "2000",
+  "expected_outcome": "repair_then_success"
+}

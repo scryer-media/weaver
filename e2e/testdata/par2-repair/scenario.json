@@ -1,0 +1,7 @@
+{
+  "slug": "par2-repair",
+  "title": "E2E.Test.PAR2.Repair.2024.1080p-TESTGRP",
+  "description": "Corrupted RAR5 + PAR2 recovery data. Tests repair",
+  "category": "2000",
+  "expected_outcome": "repair_then_success"
+}

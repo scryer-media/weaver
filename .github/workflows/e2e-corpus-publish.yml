@@ -1,0 +1,289 @@
+name: e2e-corpus-publish
+
+# Publishes one revision of the e2e harness's signed, content-addressed
+# fixture corpus to R2. Manual, main-only, protected: this is the only
+# workflow that holds R2 write credentials for the corpus bucket, and running
+# it is an operator decision.
+#
+# It never creates a branch, commit or pull request. Pinning the published
+# manifest in e2e/test-corpus/lock.json is a reviewed PR, and so is the ledger
+# update this run uploads as an artifact.
+#
+# Three things are deliberately different from the corpus tooling this was
+# ported from:
+#   * every digest is BLAKE3 — these fixtures are media-shaped and run to
+#     hundreds of megabytes each, so hashing throughput is the cost that
+#     matters;
+#   * fixtures are either `generated` (e2e/cmd/fixturegen rebuilds them from a
+#     declarative recipe, running every oracle on a toolchain pinned by
+#     e2e/test-corpus/toolchains.json) or `blocked` (no such recipe yet).
+#     Nothing is imported from another repository, so there is no upstream
+#     re-fetch stage;
+#   * there is no Git-LFS transport. Hydration is R2-only.
+#
+# A `blocked` entry refuses publication. That is the point: the corpus becomes
+# publishable exactly when it becomes reconstructible from pinned toolchains.
+# Until every entry is `generated`, a real (non-dry) run is expected to stop at
+# the publish step with the list of generators still to port — which is the
+# backlog, printed by the job that would consume it.
+#
+# See e2e/docs/test-corpus.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Reconstruct, verify and build without uploading anything'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: e2e-corpus-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Pinned: signature bundles are only comparable if every publication used the
+  # same signer. Bump deliberately.
+  COSIGN_VERSION: v3.1.3
+  BUILD_DIR: target/test-corpus/build
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-24.04
+    # The GitHub-hosted maximum. Reconstructing this corpus means building the
+    # pinned RARLAB images, compiling par2cmdline-turbo from source, and
+    # writing several gigabytes of archives; it is slow by design.
+    timeout-minutes: 360
+    # The protected environment holds the R2 secrets and gates the run on its
+    # reviewers; the corpus variables live beside it.
+    environment: test-corpus-publish
+    permissions:
+      contents: read
+      # Keyless cosign: the workflow's own OIDC identity signs the manifest and
+      # its provenance, and e2e/test-corpus/lock.json pins that identity.
+      id-token: write
+    defaults:
+      run:
+        working-directory: e2e
+    env:
+      # Public-read side (also recorded in lock.json) and the bucket name:
+      # plain variables. The S3 endpoint and the credential pair: secrets,
+      # exported straight into the environment the publisher reads. The names
+      # are the same ones the rarpar corpus workflow uses, on purpose.
+      R2_CORPUS_BUCKET: ${{ vars.R2_CORPUS_BUCKET }}
+      R2_CORPUS_PUBLIC_URL: ${{ vars.R2_CORPUS_PUBLIC_URL }}
+      R2_CORPUS_S3_ENDPOINT: ${{ secrets.R2_CORPUS_ENDPOINT }}
+      R2_CORPUS_ACCESS_KEY_ID: ${{ secrets.R2_CORPUS_S3_ACCESS_KEY }}
+      R2_CORPUS_SECRET_ACCESS_KEY: ${{ secrets.R2_CORPUS_S3_SECRET }}
+      DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+    steps:
+      - name: Refuse anything but a run from main
+        working-directory: .
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::the corpus is published from refs/heads/main only (got $REF)"
+            exit 1
+          fi
+          if [ "$DRY_RUN" != "true" ]; then
+            for name in R2_CORPUS_BUCKET R2_CORPUS_PUBLIC_URL; do
+              if [ -z "${!name:-}" ]; then
+                echo "::error::repository/environment variable $name is not set"
+                exit 1
+              fi
+            done
+            for name in R2_CORPUS_S3_ENDPOINT R2_CORPUS_ACCESS_KEY_ID R2_CORPUS_SECRET_ACCESS_KEY; do
+              if [ -z "${!name:-}" ]; then
+                echo "::error::secret for $name (R2_CORPUS_ENDPOINT / R2_CORPUS_S3_ACCESS_KEY / R2_CORPUS_S3_SECRET) is not available to this run"
+                exit 1
+              fi
+            done
+            case "$R2_CORPUS_PUBLIC_URL" in
+              https://*) ;;
+              *) echo "::error::R2_CORPUS_PUBLIC_URL must be an https URL"; exit 1 ;;
+            esac
+            case "$R2_CORPUS_S3_ENDPOINT" in
+              https://*) ;;
+              *) echo "::error::R2_CORPUS_ENDPOINT must be the https S3 endpoint (https://<account>.r2.cloudflarestorage.com)"; exit 1 ;;
+            esac
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: e2e/go.mod
+          cache-dependency-path: e2e/go.sum
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      # The fixture binaries are not in git. A checkout carries the ledger, the
+      # profiles, the lock and every scenario.json; the bytes come from the
+      # published corpus. While nothing is pinned there is nothing to hydrate,
+      # and the generation stage below is the only source of fixtures — which
+      # is why the first publication can only happen once every entry is
+      # `generated`.
+      - name: Hydrate the fixture tree
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          if [ -z "$(jq -r '.manifest.blake3' test-corpus/lock.json)" ]; then
+            echo "::notice::test-corpus/lock.json pins no manifest — this is a bootstrap run, nothing to hydrate"
+          else
+            go run ./cmd/corpus hydrate --profile all
+          fi
+
+      # Every oracle image the lock pins, built from the Dockerfiles the lock
+      # itself names (e2e/internal/fixturegen/docker/*). Each verifies the
+      # reviewed SHA-256 of its download before installing anything, and the
+      # generator re-verifies the same digest in Go before it calls docker at
+      # all.
+      #
+      # This runner is amd64, which is what every image pins, so nothing is
+      # emulated here: the RARLAB 3.93/4.20/5.00 releases are 32-bit x86
+      # binaries and the kernel's IA-32 support runs them directly. A developer
+      # regenerating on an arm64 host needs QEMU binfmt handlers for amd64 and
+      # 386 instead — see e2e/docs/generators.md. Installing them requires a
+      # privileged container, which this job, holding the corpus write
+      # credentials, deliberately does not run.
+      - name: Build the pinned generator toolchain images
+        timeout-minutes: 150
+        run: |
+          set -euo pipefail
+          lock=test-corpus/toolchains.json
+          jq -c '[.rar_writers[], .archivers[], .par2_generator] | .[] | select(.dockerfile != null)' "$lock" \
+          | while read -r pin; do
+              id=$(echo "$pin" | jq -r .id)
+              dockerfile=$(echo "$pin" | jq -r .dockerfile)
+              case "$dockerfile" in
+                */rarlab/*)
+                  args=(--build-arg "RAR_URL=$(echo "$pin" | jq -r .url)"
+                        --build-arg "RAR_SHA256=$(echo "$pin" | jq -r .sha256)"
+                        --build-arg "RAR_BINARY=$(echo "$pin" | jq -r .binary)") ;;
+                */par2/*)
+                  args=(--build-arg "PAR2_URL=$(echo "$pin" | jq -r .url)"
+                        --build-arg "PAR2_SHA256=$(echo "$pin" | jq -r .sha256)") ;;
+                */sevenzip/*)
+                  args=(--build-arg "SEVENZIP_URL=$(echo "$pin" | jq -r .url)"
+                        --build-arg "SEVENZIP_SHA256=$(echo "$pin" | jq -r .sha256)") ;;
+                *)
+                  echo "::error::toolchain $id names an unknown Dockerfile $dockerfile"
+                  exit 1 ;;
+              esac
+              echo "::group::$id"
+              docker buildx build \
+                --platform "$(echo "$pin" | jq -r .platform)" \
+                --tag "$(echo "$pin" | jq -r .image)" \
+                --file "$dockerfile" \
+                "${args[@]}" \
+                --cache-from "type=gha,scope=corpus-$id" \
+                --cache-to "type=gha,mode=max,scope=corpus-$id" \
+                --load "$(dirname "$dockerfile")"
+              echo "::endgroup::"
+            done
+          docker pull --platform "$(jq -r .video_encoder.platform "$lock")" "$(jq -r .video_encoder.image "$lock")"
+
+      # One Go program rebuilds the whole corpus from its declarative recipes.
+      # A recipe that fails fails the job: a fixture nobody can regenerate is a
+      # fixture nobody can publish. Video encoding dominates the wall time, so
+      # the clips are generated first and everything else derives from them.
+      - name: Regenerate the fixtures
+        timeout-minutes: 180
+        run: |
+          set -euo pipefail
+          go run ./cmd/fixturegen --list
+          go run ./cmd/fixturegen --all --workers 4
+
+      # Generated fixtures are shape-reproducible, not byte-reproducible: RAR
+      # stamps times into headers and encryption draws a random salt. A
+      # regeneration therefore legitimately changes digests, so the ledger is
+      # refreshed here and uploaded for the operator's follow-up PR. The
+      # workflow never commits it.
+      - name: Build the manifest and provenance
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          go run ./cmd/corpus build --update-ledger --out "$BUILD_DIR"
+          cat "$BUILD_DIR/manifest.blake3"
+
+      - name: Verify the corpus against its ledger
+        timeout-minutes: 60
+        run: go run ./cmd/corpus verify --all-present --offline
+
+      - name: Sign the manifest and provenance
+        if: env.DRY_RUN != 'true'
+        timeout-minutes: 15
+        run: go run ./cmd/corpus sign --dir "$BUILD_DIR"
+
+      # Refuses while any ledger entry is blocked; uploads objects, manifest,
+      # provenance and both bundles otherwise, then reads the manifest back
+      # from the public side before printing the lock entry.
+      - name: Publish the corpus revision
+        timeout-minutes: 180
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            go run ./cmd/corpus publish --dir "$BUILD_DIR" --dry-run
+          else
+            go run ./cmd/corpus publish \
+              --dir "$BUILD_DIR" \
+              --base-url "$R2_CORPUS_PUBLIC_URL" \
+              --s3-endpoint "$R2_CORPUS_S3_ENDPOINT" \
+              --bucket "$R2_CORPUS_BUCKET"
+          fi
+
+      - name: Record the publication
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "### e2e test-corpus publish"
+            echo
+            echo "- ref: \`$GITHUB_REF\` @ \`$GITHUB_SHA\`"
+            echo "- dry run: \`$DRY_RUN\`"
+            if [ -f "$BUILD_DIR/manifest.blake3" ]; then
+              echo "- manifest: \`$(cat "$BUILD_DIR/manifest.blake3")\`"
+            fi
+            if [ -f "$BUILD_DIR/lock.json" ]; then
+              echo
+              echo "Pin this in \`e2e/test-corpus/lock.json\`:"
+              echo
+              echo '```json'
+              cat "$BUILD_DIR/lock.json"
+              echo '```'
+            fi
+            echo
+            echo "**This workflow never commits.** Pinning is a reviewed PR that carries both the"
+            echo "updated \`e2e/test-corpus/sources.json\` (attached to this run) and the lock entry"
+            echo "above, and it must pass CI from a clean checkout."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the build directory and the updated ledger as run artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-test-corpus-${{ github.run_id }}
+          path: |
+            e2e/target/test-corpus/build/manifest.json
+            e2e/target/test-corpus/build/manifest.blake3
+            e2e/target/test-corpus/build/manifest.json.sigstore.json
+            e2e/target/test-corpus/build/provenance.json
+            e2e/target/test-corpus/build/provenance.json.sigstore.json
+            e2e/target/test-corpus/build/lock.json
+            e2e/test-corpus/sources.json
+          if-no-files-found: warn
+          retention-days: 90

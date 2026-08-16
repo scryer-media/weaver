@@ -1,0 +1,8 @@
+{
+  "slug": "health-failure",
+  "title": "E2E.Test.HealthFail.2024.1080p-TESTGRP",
+  "description": "Missing articles. Tests health check failure",
+  "category": "2000",
+  "expected_outcome": "health_failure",
+  "skip_articles_pct": 50
+}

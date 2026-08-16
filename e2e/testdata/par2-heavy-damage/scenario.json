@@ -1,0 +1,7 @@
+{
+  "slug": "par2-heavy-damage",
+  "title": "E2E.Test.PAR2.HeavyDamage.2024.1080p-TESTGRP",
+  "description": "RAR5 with 5 corrupted regions (20KB total). 3 damaged slices, 30 recovery blocks available. Tests multi-slice repair.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success"
+}

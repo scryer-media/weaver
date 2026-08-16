@@ -1,0 +1,8 @@
+{
+  "slug": "rar4-multi-member-encrypted",
+  "title": "E2E.Test.RAR4.MultiMember.Encrypted.S01E01.E03.1080p-TESTGRP",
+  "description": "Encrypted RAR4 with 3 episode members. Tests RAR4 multi-member + password decryption",
+  "category": "5000",
+  "expected_outcome": "success",
+  "password": "e2e-test-password"
+}

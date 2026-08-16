@@ -1,0 +1,8 @@
+{
+  "slug": "rar4-encrypted",
+  "title": "E2E.Test.RAR4.Encrypted.2024.720p-TESTGRP",
+  "description": "Password-protected RAR4 archive with header-level encryption (-hp)",
+  "category": "2000",
+  "expected_outcome": "success",
+  "password": "e2e-test-password"
+}

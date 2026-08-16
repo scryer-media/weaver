@@ -1,0 +1,7 @@
+{
+  "slug": "rar5-recovery-volume-insufficient",
+  "title": "E2E.Test.RAR5.RecoveryVolume.Insufficient.2026.1080p-TESTGRP",
+  "description": "Four RAR5 volumes posted with a single RARLAB recovery volume but two data volumes absent. One .rev cannot rebuild two volumes; the job must fail cleanly instead of extracting a truncated member.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure"
+}

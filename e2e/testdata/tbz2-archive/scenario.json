@@ -1,0 +1,7 @@
+{
+  "slug": "tbz2-archive",
+  "title": "E2E.Test.TBZ2.2024.1080p-TESTGRP",
+  "description": "Small tar+bzip2 archive using the .tbz2 alias",
+  "category": "2000",
+  "expected_outcome": "success"
+}

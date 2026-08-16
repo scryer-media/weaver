@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "base_url": "",
+  "manifest": {
+    "blake3": "",
+    "url": ""
+  },
+  "signature": {
+    "bundle_url": "",
+    "certificate_identity": "https://github.com/scryer-media/weaver/.github/workflows/e2e-corpus-publish.yml@refs/heads/main",
+    "certificate_oidc_issuer": "https://token.actions.githubusercontent.com"
+  },
+  "provenance": {
+    "blake3": "",
+    "url": ""
+  },
+  "published_from": {
+    "commit": "",
+    "run": ""
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "slug": "nested-3deep",
+  "title": "E2E.Test.Nested.3Deep.2024.1080p-TESTGRP",
+  "description": "RAR5 containing RAR5 containing 7z containing MKV. Tests 3-level nested extraction",
+  "category": "2000",
+  "expected_outcome": "success"
+}

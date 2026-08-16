@@ -1,0 +1,7 @@
+{
+  "slug": "single-7z-corrupted",
+  "title": "E2E.Test.7z.Corrupted.2024.1080p.WEB-DL.H264-TESTGRP",
+  "description": "Single .7z archive truncated near the end so it parses initially but fails during extraction. No PAR2.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure"
+}

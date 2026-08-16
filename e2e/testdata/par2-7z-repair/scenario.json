@@ -1,0 +1,10 @@
+{
+  "slug": "par2-7z-repair",
+  "title": "E2E.Test.PAR2.7z.Repair.2024.1080p.WEB-DL.H264-TESTGRP",
+  "description": "Single 7z archive with PAR2 sidecars and deterministic mid-file corruption. Tests generic PAR2 repair before archive extraction.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "requiredJobEvents": [
+    "RepairComplete"
+  ]
+}
