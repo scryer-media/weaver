@@ -1016,6 +1016,20 @@ impl Pipeline {
         })
     }
 
+    /// Whether the job carries any standalone RAR recovery volume (`.rev`),
+    /// the only input that makes a recovery-volume restore worth attempting.
+    /// Cheap on purpose: it runs from the completion checkpoint, which fires
+    /// far more often than a restore is possible.
+    pub(in crate::pipeline) fn job_has_rar_recovery_volume_files(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|state| {
+            state.assembly.files().any(|file| {
+                std::path::Path::new(file.filename())
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("rev"))
+            })
+        })
+    }
+
     /// Restore missing RAR data volumes from sibling standalone `.rev` files.
     ///
     /// The recovery crate discovers and validates matching recovery volumes from

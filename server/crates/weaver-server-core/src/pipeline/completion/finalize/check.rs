@@ -2878,10 +2878,17 @@ impl Pipeline {
             return;
         }
 
+        // Standalone `.rev` files can rebuild a volume that never posted just as
+        // well as one that failed CRC. Gating this on `has_crc_failures` alone
+        // meant a set whose hole was known *before* any extraction was tried
+        // — the common case, since the topology usually knows the missing
+        // index from the neighbouring volumes' headers — went straight to "no
+        // retryable work remains" without the recovery volumes ever being read.
         if download_pipeline_exhausted
             && only_rar_archives
-            && has_crc_failures
+            && (has_crc_failures || rar_waiting_for_missing_volumes)
             && !self.job_has_active_extraction_tasks(job_id)
+            && self.job_has_rar_recovery_volume_files(job_id)
         {
             match self.try_restore_rar_recovery_volumes(job_id).await {
                 Ok(true) => return,

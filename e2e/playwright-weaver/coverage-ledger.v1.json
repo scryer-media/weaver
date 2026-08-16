@@ -7,6 +7,7 @@
     { "path": "/monitoring", "owner": "ui-runtime-observability", "oracle": "browser" },
     { "path": "/history", "owner": "ui-runtime-observability", "oracle": "browser" },
     { "path": "/logs", "owner": "ui-runtime-observability", "oracle": "browser" },
+    { "path": "/system-info", "owner": "ui-runtime-observability", "oracle": "browser" },
     { "path": "/servers", "owner": "ui-settings-crud", "oracle": "browser" },
     { "path": "/categories", "owner": "ui-settings-crud", "oracle": "browser" },
     { "path": "/settings", "owner": "ui-settings-crud", "oracle": "browser" },
