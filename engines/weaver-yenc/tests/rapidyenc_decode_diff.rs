@@ -1,9 +1,11 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use weaver_yenc::{
     RapidyencDecodeEnd, RapidyencDecodeState, decode_rapidyenc_ex, decode_rapidyenc_incremental,
@@ -120,11 +122,157 @@ struct Observation {
     end: RapidyencDecodeEnd,
 }
 
+/// The compiled oracle image, shared by every test in this process.
+///
+/// Each test drives its own oracle *process* -- they run concurrently and each
+/// owns a private stdin/stdout stream -- but they all exec one image, compiled
+/// once.
+///
+/// Building once is what makes this harness deterministic. Each test used to
+/// build privately into `<tmp>/weaver-yenc-rapidyenc-oracle-<pid>-<nanos>`, and
+/// because the tests all start together, two of them could read the same value
+/// from the clock and derive the *same* directory. `create_dir_all` succeeds on
+/// an existing directory, so the collision was silent, and the colliding tests
+/// then compiled to one `oracle` path and exec'd it while another was still
+/// writing it. Whichever test lost that race failed before checking a single
+/// case, in one of three ways:
+///
+/// * `ETXTBSY` ("Text file busy") -- exec'ing an image a linker still holds
+///   open for writing. This is the ~1-run-in-100 flake seen on Linux.
+/// * `ENOENT` -- a colliding test finished first and its cleanup removed the
+///   shared directory out from under a test that had not spawned yet.
+/// * "rapidyenc oracle exited before responding" -- a half-linked image ran.
+///
+/// The clock's granularity sets the rate: 25ns under Linux, but 1000ns under
+/// macOS, where collisions are correspondingly commoner. Nothing about the
+/// failure is specific to the test that reports it -- it is whichever one loses.
+struct OracleBinary {
+    binary: PathBuf,
+    temp_dir: PathBuf,
+}
+
+impl Drop for OracleBinary {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
+/// Weak, so the build is dropped -- and its temp dir removed -- as soon as the
+/// last [`Oracle`] using it goes away, exactly as the per-test cleanup did.
+static ORACLE_BINARY: LazyLock<Mutex<Weak<OracleBinary>>> =
+    LazyLock::new(|| Mutex::new(Weak::new()));
+
+/// Compile the oracle once per process, and hand every caller the same image.
+fn shared_oracle_binary(root: &Path) -> Result<Arc<OracleBinary>, Box<dyn Error>> {
+    // Deliberately held across the compile: the tests that lose this race wait
+    // for the winner's binary rather than linking one of their own, so no exec
+    // can overlap a link.
+    let mut slot = ORACLE_BINARY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = slot.upgrade() {
+        return Ok(existing);
+    }
+    let built = Arc::new(build_oracle_binary(root)?);
+    *slot = Arc::downgrade(&built);
+    Ok(built)
+}
+
+fn build_oracle_binary(root: &Path) -> Result<OracleBinary, Box<dyn Error>> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "weaver-yenc-rapidyenc-oracle-{}-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    // The counter above is what actually guarantees uniqueness: the clock alone
+    // did not, and `create_dir_all` accepts an existing directory, which is what
+    // kept the old collision silent. `create_dir` fails on one instead, so if a
+    // name is ever reused again this reports it rather than sharing the path.
+    std::fs::create_dir(&temp_dir)?;
+
+    let source = temp_dir.join("oracle.cc");
+    let binary = temp_dir.join("oracle");
+    // Link under a scratch name and rename into place, so the path we exec is
+    // only ever published whole and is never itself the file being written.
+    let linked = temp_dir.join("oracle.linked");
+    std::fs::write(&source, ORACLE_SOURCE)?;
+
+    let cxx = std::env::var_os("CXX").unwrap_or_else(|| OsString::from("c++"));
+    let output = Command::new(cxx)
+        .arg("-std=c++17")
+        .arg("-O2")
+        .arg("-DRAPIDYENC_DISABLE_ENCODE")
+        .arg("-DRAPIDYENC_DISABLE_CRC")
+        .arg("-I")
+        .arg(root)
+        .arg(&source)
+        .arg(root.join("rapidyenc.cc"))
+        .arg(root.join("src/decoder.cc"))
+        .arg("-o")
+        .arg(&linked)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "failed to build rapidyenc oracle\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::rename(&linked, &binary)?;
+
+    Ok(OracleBinary { binary, temp_dir })
+}
+
+/// Start an oracle process, waiting out any writer still holding the image.
+///
+/// `execve` reports `ETXTBSY` ("Text file busy") while any process holds the
+/// binary open for writing. [`OracleBinary`] describes how a shared output path
+/// used to produce that here, and building once removes it: no linker is alive
+/// by the time any test reaches this function.
+///
+/// The retry stays as a backstop, because `execve` can also see a writer this
+/// process does not control -- `fork` copies every descriptor and `O_CLOEXEC`
+/// only clears them at `exec`, so an unrelated child can briefly hold a
+/// writable duplicate. That window is transient by construction, which is what
+/// makes waiting the right response rather than failing the run.
+fn spawn_oracle(binary: &Path) -> Result<Child, Box<dyn Error>> {
+    const ATTEMPTS: usize = 100;
+    const BACKOFF: Duration = Duration::from_millis(10);
+
+    for attempt in 1..=ATTEMPTS {
+        match Command::new(binary)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < ATTEMPTS =>
+            {
+                std::thread::sleep(BACKOFF);
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to spawn rapidyenc oracle {} after {attempt} attempt(s): {err}",
+                    binary.display()
+                )
+                .into());
+            }
+        }
+    }
+    unreachable!("the final attempt returns rather than retrying")
+}
+
 struct Oracle {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    temp_dir: PathBuf,
+    /// Keeps the shared image alive; its temp dir is removed once the last
+    /// oracle in the process lets go.
+    _binary: Arc<OracleBinary>,
 }
 
 impl Oracle {
@@ -133,42 +281,8 @@ impl Oracle {
             return Ok(None);
         };
 
-        let temp_dir = std::env::temp_dir().join(format!(
-            "weaver-yenc-rapidyenc-oracle-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
-        std::fs::create_dir_all(&temp_dir)?;
-        let source = temp_dir.join("oracle.cc");
-        let binary = temp_dir.join("oracle");
-        std::fs::write(&source, ORACLE_SOURCE)?;
-
-        let cxx = std::env::var_os("CXX").unwrap_or_else(|| OsString::from("c++"));
-        let output = Command::new(cxx)
-            .arg("-std=c++17")
-            .arg("-O2")
-            .arg("-DRAPIDYENC_DISABLE_ENCODE")
-            .arg("-DRAPIDYENC_DISABLE_CRC")
-            .arg("-I")
-            .arg(&root)
-            .arg(&source)
-            .arg(root.join("rapidyenc.cc"))
-            .arg(root.join("src/decoder.cc"))
-            .arg("-o")
-            .arg(&binary)
-            .output()?;
-        assert!(
-            output.status.success(),
-            "failed to build rapidyenc oracle\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let mut child = Command::new(&binary)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
+        let binary = shared_oracle_binary(&root)?;
+        let mut child = spawn_oracle(&binary.binary)?;
         let stdin = child.stdin.take().expect("oracle stdin");
         let stdout = BufReader::new(child.stdout.take().expect("oracle stdout"));
 
@@ -176,7 +290,7 @@ impl Oracle {
             child,
             stdin,
             stdout,
-            temp_dir,
+            _binary: binary,
         }))
     }
 
@@ -225,9 +339,10 @@ impl Oracle {
 
 impl Drop for Oracle {
     fn drop(&mut self) {
+        // Reap the child first; the shared image's temp dir is then removed by
+        // `OracleBinary::drop` when this is the last oracle holding it.
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.temp_dir);
     }
 }
 
