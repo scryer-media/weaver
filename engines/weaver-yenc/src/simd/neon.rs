@@ -171,8 +171,11 @@ pub(super) unsafe fn decode_kernel_neon(
 ///
 /// Register-carried state (oracle → here):
 /// - `escFirst` → `esc_first: u64`
-/// - `yencOffset` → `yenc_offset: uint8x16_t` (byte0 = 106 on a carried escape,
-///   else 42; lanes 1..15 = 42)
+/// - `yencOffset` (byte0 = 106 on a carried escape, else 42; lanes 1..15 = 42)
+///   → NOT carried. It is a pure function of `esc_first`, so the two arms that
+///   need it derive it at the point of use and the clean window touches only
+///   the `dup(42)` constant (see the note in the body — the carried form is a
+///   measured +56% cliff in the `SEARCH_END = true` instantiation).
 /// - `nextMask`/`minMask` → `next_mask_mix: uint8x16_t`. Unlike AVX2/VBMI2
 ///   (which clamp via `min_epu8` + a `min_mask`), NEON keeps `.` OUT of the
 ///   specials LUT and injects a line-start dot by OR-ing `next_mask_mix` into
@@ -219,13 +222,20 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
         _ => 0,
     };
 
-    // yenc_offset: byte0 = 106 (=42+64) if a `=` straddled in from the previous
-    // window, else 42; lanes 1..15 always 42 (oracle line 58).
-    let mut yenc_offset = if esc_first != 0 {
-        vsetq_lane_u8::<0>(42 + 64, normal_offset)
-    } else {
-        normal_offset
-    };
+    // The oracle's `yencOffset` (byte0 = 106 = 42+64 while a `=` straddled in
+    // from the previous window, else 42; lanes 1..15 always 42, oracle line 58)
+    // is deliberately NOT a loop-carried vector here. It is a pure function of
+    // the carried scalar `esc_first`, so the windows that need it — an escape
+    // carried into a specials-free window, or an isolated escape resolved this
+    // window — derive it where they use it, and the common clean window touches
+    // only the `normal_offset` constant. Measured reason (round 3): the carried
+    // vector sits exactly at the `SEARCH_END = true` instantiation's register
+    // budget; any change that adds one live vector evicts it into a
+    // `str q`/`ldr q` pair on the clean window's dependency path (+56% on
+    // `clean until_end`). A value that is never carried cannot be evicted; the
+    // per-window always-derive form was also measured (+5.3% on clean, from
+    // rebuilding it on every window) and is what the gate below avoids.
+    //
     // next_mask_mix: a carried line-start dot. Values 1/2 survive the
     // `& bit_weights` reduction at lanes 0/1 (oracle lines 53-57).
     let mut next_mask_mix = match entry_next_mask {
@@ -358,7 +368,24 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
             cmp_a = vorrq_u8(cmp_a, next_mask_mix);
 
             let any = vorrq_u8(vorrq_u8(cmp_a, cmp_b), vorrq_u8(cmp_c, cmp_d));
-            if neon64_any(any) {
+            let any_bits = neon64_any_bits(any);
+            // Common window: no specials AND no escape carried in. Only the
+            // `normal_offset` constant is touched, so no vector value is
+            // loop-carried through this path (see the `yencOffset` note above).
+            // The `| esc_first` is one scalar `orr` off the vector dependency
+            // chain; `esc_first` is already 0 here, so it needs no reset.
+            if (any_bits | esc_first) == 0 {
+                vst1q_u8_x4(
+                    out,
+                    uint8x16x4_t(
+                        vsubq_u8(a, normal_offset),
+                        vsubq_u8(b, normal_offset),
+                        vsubq_u8(c, normal_offset),
+                        vsubq_u8(d, normal_offset),
+                    ),
+                );
+                out = out.add(WIDTH);
+            } else if any_bits != 0 {
                 // Fused bit-weight reduction: lane 0 → specials mask, lane 1 →
                 // `=` mask (oracle lines 102-125).
                 let merged = neon64_addp(
@@ -662,10 +689,12 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
 
                 let decoded = if escaped == 0 {
                     // No escaped bytes in this window: plain offset subtract.
-                    // Lane A uses `yenc_offset` (identical to `normal_offset`
-                    // here, since escaped==0 ⇒ esc_first_in==0).
+                    // `escaped == 0` implies `esc_first_in == 0` (bit 0 of
+                    // `escaped` IS `esc_first_in`), so lane A takes the plain
+                    // constant too — no derived vector on this arm, which is
+                    // every CRLF-only specials window.
                     [
-                        vsubq_u8(a, yenc_offset),
+                        vsubq_u8(a, normal_offset),
                         vsubq_u8(b, normal_offset),
                         vsubq_u8(c, normal_offset),
                         vsubq_u8(d, normal_offset),
@@ -678,9 +707,15 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                 } else {
                     // Isolated escapes: the escaped lanes are exactly the `=`
                     // compares shifted one byte. Lane A uses the oracle's
-                    // `vext(dup42, cmpEqA, 15)` + `yenc_offset` 42-bit-trick so a
+                    // `vext(dup42, cmpEqA, 15)` + `yencOffset` 42-bit-trick so a
                     // carried escape at byte 0 is applied via `yenc_offset`
-                    // (oracle lines 360-391).
+                    // (oracle lines 360-391) — derived here from the carried-in
+                    // scalar (byte 0 = 106 when an escape carried in, else 42)
+                    // instead of rebuilt at window exit and carried: the same
+                    // `lsl`/`orr`/`ins` the exit rebuild spent, now off the
+                    // loop-carried set and only on the arm that needs it.
+                    let yenc_offset =
+                        vsetq_lane_u8::<0>(((esc_first_in as u8) << 6) | 42, normal_offset);
                     let sel_a = vextq_u8::<15>(normal_offset, eq_a);
                     let sel_b = vextq_u8::<15>(eq_a, eq_b);
                     let sel_c = vextq_u8::<15>(eq_b, eq_c);
@@ -694,9 +729,6 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                 };
 
                 let skip = mask & !escaped;
-                // Rebuild yenc_offset byte0 for the next window's carried escape
-                // (oracle line 393).
-                yenc_offset = vsetq_lane_u8::<0>(((esc_first as u8) << 6) | 42, normal_offset);
 
                 if skip == 0 {
                     vst1q_u8_x4(
@@ -739,16 +771,20 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                     );
                 }
             } else {
-                // No specials (and no carried dot): bulk decode, subtract the
-                // carried offset on lane A and 42 on the rest, and retire the
-                // window with a single `st1 {v.16b - v.16b}, [x], #64` — the
-                // oracle's `_vst1q_u8_x4` (decoder_neon64.cc:424-427). With the
-                // running `out` pointer this assembles to the post-incrementing
-                // form, so the store carries its own cursor update.
+                // No specials (and no carried dot) but an escape carried in from
+                // the previous window's trailing `=` (`esc_first == 1`): byte 0
+                // alone decodes with 106, the rest is bulk data, retired with the
+                // same single `st1 {v.16b - v.16b}, [x], #64` as the clean window
+                // (the oracle's `_vst1q_u8_x4`, decoder_neon64.cc:424-427; with
+                // the running `out` pointer this assembles to the
+                // post-incrementing form). Rare — a `=`-terminated window
+                // followed by a specials-free one — so the byte-0 offset is
+                // built here rather than taxing the common clean window with it.
+                let first_off = vsetq_lane_u8::<0>(42 + 64, normal_offset);
                 vst1q_u8_x4(
                     out,
                     uint8x16x4_t(
-                        vsubq_u8(a, yenc_offset),
+                        vsubq_u8(a, first_off),
                         vsubq_u8(b, normal_offset),
                         vsubq_u8(c, normal_offset),
                         vsubq_u8(d, normal_offset),
@@ -756,7 +792,6 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                 );
                 out = out.add(WIDTH);
                 esc_first = 0;
-                yenc_offset = normal_offset;
             }
             i += WIDTH as isize;
         }
@@ -848,9 +883,19 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn neon64_any(v: std::arch::aarch64::uint8x16_t) -> bool {
+    unsafe { neon64_any_bits(v) != 0 }
+}
+
+/// The scalar behind [`neon64_any`]: the `uqxtn`-narrowed 64-bit view of `v`,
+/// nonzero iff some lane of `v` is. Exposed so a caller can fold another
+/// scalar predicate into the same zero test (`(bits | x) == 0`) with one `orr`
+/// instead of a second compare-and-branch.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neon64_any_bits(v: std::arch::aarch64::uint8x16_t) -> u64 {
     use std::arch::aarch64::*;
 
-    unsafe { vget_lane_u64::<0>(vreinterpret_u64_u32(vqmovn_u64(vreinterpretq_u64_u8(v)))) != 0 }
+    unsafe { vget_lane_u64::<0>(vreinterpret_u64_u32(vqmovn_u64(vreinterpretq_u64_u8(v)))) }
 }
 
 /// The oracle's `vpaddq_u8` (decoder_neon64.cc:102-125, 240-250), which clang
