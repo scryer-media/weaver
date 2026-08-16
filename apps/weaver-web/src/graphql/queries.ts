@@ -870,28 +870,6 @@ export const EVENTS_SUBSCRIPTION = gql`
   }
 `;
 
-export const JOB_UPDATES_SUBSCRIPTION = gql`
-  subscription JobUpdates {
-    queueSnapshots {
-      items {
-        ...FacadeQueueItemFields
-      }
-      summary {
-        currentDownloadSpeed
-      }
-      globalState {
-        isPaused
-        downloadBlock {
-          ...DownloadBlockFields
-        }
-      }
-    }
-  }
-  ${PARSED_RELEASE_FIELDS}
-  ${FACADE_QUEUE_ITEM_FIELDS}
-  ${DOWNLOAD_BLOCK_FIELDS}
-`;
-
 export const QUEUE_EVENTS_SUBSCRIPTION = gql`
   subscription QueueEvents($after: String) {
     queueEvents(after: $after) {

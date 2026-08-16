@@ -4,27 +4,70 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use async_graphql::UploadValue;
+use weaver_nzb::Nzb;
 
 use crate::auth::CallerIdentity;
-use weaver_nzb::Nzb;
 use weaver_server_core::auth::generate_api_key;
 use weaver_server_core::ingest::{
-    SubmitNzbError, nzb_to_submission_spec, persist_decoded_nzb_reader_to_zstd,
+    StagedSubmissionPreparation, SubmitNzbError, hash_persisted_nzb_bytes, nzb_to_submission_spec,
+    parse_persisted_nzb_bytes, persist_decoded_nzb_reader_to_zstd,
 };
+use weaver_server_core::jobs::FingerprintEvidence;
 use weaver_server_core::security::RuntimeSecurityConfig;
 
 const DEFAULT_STAGED_UPLOAD_TTL: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct StagedUploadEntry {
     pub(crate) id: String,
     pub(crate) owner: CallerIdentity,
     pub(crate) filename: String,
     pub(crate) nzb_zstd: Vec<u8>,
-    pub(crate) nzb: Nzb,
+    pub(crate) preparation: Option<StagedSubmissionPreparation>,
     created_at: Instant,
     last_touched_at: Instant,
+}
+
+fn staged_preparation_from_nzb(
+    nzb: &Nzb,
+    filename: &str,
+    job_hash: [u8; 32],
+) -> StagedSubmissionPreparation {
+    let spec = nzb_to_submission_spec(nzb, Some(filename), None, None, Vec::new());
+    let evidence = FingerprintEvidence::from_validated_spec(&spec, job_hash);
+    StagedSubmissionPreparation { spec, evidence }
+}
+
+impl StagedUploadEntry {
+    pub(crate) async fn rehydrate_preparation(&mut self) -> Result<(), SubmitNzbError> {
+        let filename = self.filename.clone();
+        let nzb_zstd = self.nzb_zstd.clone();
+        let preparation = tokio::task::spawn_blocking(move || {
+            let nzb = match parse_persisted_nzb_bytes(&nzb_zstd) {
+                Ok(nzb) => nzb,
+                Err(weaver_server_core::ingest::PersistedNzbError::Io(error)) => {
+                    return Err(SubmitNzbError::Save(error));
+                }
+                Err(weaver_server_core::ingest::PersistedNzbError::Parse(error)) => {
+                    return Err(SubmitNzbError::Parse(error));
+                }
+            };
+            if nzb.files.is_empty() {
+                return Err(SubmitNzbError::Empty);
+            }
+            let job_hash = hash_persisted_nzb_bytes(&nzb_zstd);
+            Ok(staged_preparation_from_nzb(&nzb, &filename, job_hash))
+        })
+        .await
+        .map_err(|error| {
+            SubmitNzbError::State(weaver_server_core::StateError::Database(format!(
+                "staged submission preparation worker panicked: {error}"
+            )))
+        })??;
+        self.preparation = Some(preparation);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,7 +147,20 @@ impl StagedUploadManager {
             return Err(SubmitNzbError::Empty);
         }
 
-        let spec = nzb_to_submission_spec(&nzb, Some(filename.as_str()), None, None, Vec::new());
+        let filename_for_preparation = filename.clone();
+        let job_hash = hash_persisted_nzb_bytes(&nzb_zstd);
+        let preparation = tokio::task::spawn_blocking(move || {
+            staged_preparation_from_nzb(&nzb, &filename_for_preparation, job_hash)
+        })
+        .await
+        .map_err(|error| {
+            SubmitNzbError::State(weaver_server_core::StateError::Database(format!(
+                "staged submission preparation worker panicked: {error}"
+            )))
+        })?;
+        let display_name = preparation.spec.name.clone();
+        let total_files = preparation.spec.files.len() as u32;
+        let total_bytes = preparation.spec.total_bytes;
         let staged_upload_id = generate_api_key();
         let now = Instant::now();
         let entry = StagedUploadEntry {
@@ -112,7 +168,7 @@ impl StagedUploadManager {
             owner,
             filename: filename.clone(),
             nzb_zstd,
-            nzb,
+            preparation: Some(preparation),
             created_at: now,
             last_touched_at: now,
         };
@@ -127,9 +183,9 @@ impl StagedUploadManager {
         Ok(StagedUploadSummary {
             staged_upload_id,
             filename,
-            display_name: spec.name,
-            total_files: spec.files.len() as u32,
-            total_bytes: spec.total_bytes,
+            display_name,
+            total_files,
+            total_bytes,
         })
     }
 

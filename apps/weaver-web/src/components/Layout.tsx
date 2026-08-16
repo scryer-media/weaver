@@ -175,15 +175,18 @@ export function Layout() {
   const [uploadOpen, setUploadOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [polledMetrics, setPolledMetrics] = useState<LiveMetricsSnapshot | undefined>();
+  const [subscriptionMetrics, setSubscriptionMetrics] = useState<LiveMetricsSnapshot>();
+  const lastMetricsSubscriptionErrorRef = useRef<string | null>(null);
+  const lastMetricsConnectionAtRef = useRef<number | null | undefined>(undefined);
   const connectionState = useGraphqlConnectionState();
 
-  const [{ data: metricsQueryData }] = useQuery<LiveMetricsSnapshot>({
+  const [{ data: metricsQueryData }, reexecuteMetricsQuery] = useQuery<LiveMetricsSnapshot>({
     query: LIVE_METRICS_QUERY,
   });
   const [{ data: versionData }] = useQuery<{ version: string }>({
     query: VERSION_QUERY,
   });
-  const [{ data: metricsSubscriptionData }] = useSubscription<{
+  const [{ data: metricsSubscriptionData, error: metricsSubscriptionError }] = useSubscription<{
     systemMetricsUpdates: LiveMetricsSnapshot;
   }>({
     query: LIVE_METRICS_SUBSCRIPTION,
@@ -199,12 +202,51 @@ export function Layout() {
 
   useEffect(() => {
     if (connectionState.status === "connected" && metricsSubscriptionData?.systemMetricsUpdates) {
+      setSubscriptionMetrics(metricsSubscriptionData.systemMetricsUpdates);
       setPolledMetrics(undefined);
     }
   }, [connectionState.status, metricsSubscriptionData]);
 
+  useEffect(() => {
+    if (connectionState.status !== "connected") {
+      setSubscriptionMetrics(undefined);
+      return;
+    }
+    if (connectionState.lastConnectedAt === null) {
+      return;
+    }
+    if (lastMetricsConnectionAtRef.current === undefined) {
+      lastMetricsConnectionAtRef.current = connectionState.lastConnectedAt;
+      return;
+    }
+    if (lastMetricsConnectionAtRef.current === connectionState.lastConnectedAt) {
+      return;
+    }
+    lastMetricsConnectionAtRef.current = connectionState.lastConnectedAt;
+    setSubscriptionMetrics(undefined);
+    void reexecuteMetricsQuery({ requestPolicy: "network-only" });
+  }, [
+    connectionState.lastConnectedAt,
+    connectionState.status,
+    reexecuteMetricsQuery,
+  ]);
+
+  useEffect(() => {
+    if (!metricsSubscriptionError) {
+      lastMetricsSubscriptionErrorRef.current = null;
+      return;
+    }
+    const errorKey = metricsSubscriptionError.message;
+    if (lastMetricsSubscriptionErrorRef.current === errorKey) {
+      return;
+    }
+    lastMetricsSubscriptionErrorRef.current = errorKey;
+    setSubscriptionMetrics(undefined);
+    void reexecuteMetricsQuery({ requestPolicy: "network-only" });
+  }, [metricsSubscriptionError, reexecuteMetricsQuery]);
+
   const metricsSnapshot =
-    polledMetrics ?? metricsSubscriptionData?.systemMetricsUpdates ?? metricsQueryData;
+    polledMetrics ?? subscriptionMetrics ?? metricsQueryData;
   const currentGlobalState = metricsSnapshot?.globalState ?? DEFAULT_GLOBAL_STATE;
   const isPolling = reconnectMetricsPolling.isPolling;
   const liveData = useMemo(

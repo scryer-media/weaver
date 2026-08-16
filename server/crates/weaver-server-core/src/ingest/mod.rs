@@ -18,12 +18,13 @@ pub use persisted_nzb::{
     persist_decoded_nzb_reader_to_zstd,
 };
 pub use submission::{
-    DuplicateBackfillReport, SubmissionDuplicateOutcome, SubmissionOptions, SubmitNzbError,
-    SubmittedJob, fetch_nzb_from_url, init_job_counter, materialize_semantic_promotion,
-    next_submission_job_id, nzb_to_submission_spec, reconcile_duplicate_fingerprint_backfill,
+    DuplicateBackfillReport, StagedSubmissionPreparation, SubmissionDuplicateOutcome,
+    SubmissionOptions, SubmitNzbError, SubmittedJob, SubmittedJobSummary, fetch_nzb_from_url,
+    init_job_counter, materialize_semantic_promotion, next_submission_job_id,
+    nzb_to_submission_spec, reconcile_duplicate_fingerprint_backfill,
     reconcile_semantic_promotions, resolve_submission_category,
     run_duplicate_fingerprint_backfill_batch, submit_nzb_bytes, submit_nzb_bytes_with_options,
     submit_staged_nzb_zstd, submit_staged_nzb_zstd_with_options,
-    submit_staged_parsed_nzb_with_options, submit_uploaded_nzb_reader,
-    submit_uploaded_nzb_reader_with_options,
+    submit_staged_parsed_nzb_with_options, submit_staged_prepared_nzb_with_options,
+    submit_uploaded_nzb_reader, submit_uploaded_nzb_reader_with_options,
 };

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import { ChevronRight, Download } from "lucide-react";
 import { useMutation, useQuery, useSubscription } from "urql";
@@ -42,7 +42,11 @@ import {
   REPROCESS_JOB_MUTATION,
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
-import { authHeaders, requestGraphqlClientRestart } from "@/graphql/client";
+import {
+  authHeaders,
+  requestGraphqlClientRestart,
+  useGraphqlConnectionState,
+} from "@/graphql/client";
 import {
   useLiveConnection,
   useLiveSpeed,
@@ -89,6 +93,7 @@ export function JobDetail() {
   const navigate = useNavigate();
   const speed = useLiveSpeed();
   const connection = useLiveConnection();
+  const graphqlConnection = useGraphqlConnectionState();
   const queryVariables = useMemo(() => ({ id: jobId }), [jobId]);
 
   const [{ data, fetching }, reexecuteJobQuery] = useQuery<JobDetailQueryData>({
@@ -100,7 +105,7 @@ export function JobDetail() {
     variables: queryVariables,
     pause: !Number.isFinite(jobId),
   });
-  const [{ data: subscriptionData }] = useSubscription<{
+  const [{ data: subscriptionData, error: subscriptionError }] = useSubscription<{
     jobDetailUpdates: JobDetailSnapshotData;
   }>({
     query: JOB_DETAIL_UPDATES_SUBSCRIPTION,
@@ -124,13 +129,16 @@ export function JobDetail() {
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [deleteAcceptError, setDeleteAcceptError] = useState<string | null>(null);
   const [polledData, setPolledData] = useState<JobDetailQueryData | undefined>();
+  const [subscriptionSnapshot, setSubscriptionSnapshot] = useState<JobDetailSnapshotData>();
   const [isDownloadingNzb, setIsDownloadingNzb] = useState(false);
   const [nzbDownloadError, setNzbDownloadError] = useState<string | null>(null);
   const [duplicateAction, setDuplicateAction] = useState<DuplicateAction | null>(null);
   const [duplicateActionError, setDuplicateActionError] = useState<string | null>(null);
+  const lastSubscriptionErrorRef = useRef<string | null>(null);
+  const lastConnectionAtRef = useRef<number | null | undefined>(undefined);
   const jobQueryData =
     polledData?.jobDetailSnapshot
-    ?? subscriptionData?.jobDetailUpdates
+    ?? subscriptionSnapshot
     ?? data?.jobDetailSnapshot
     ?? null;
   const queryJob = useMemo(() => {
@@ -153,20 +161,61 @@ export function JobDetail() {
 
   useEffect(() => {
     setPolledData(undefined);
+    setSubscriptionSnapshot(undefined);
     setNzbDownloadError(null);
   }, [jobId]);
 
   useEffect(() => {
-    if (!connection.isDisconnected) {
+    if (connection.isDisconnected) {
+      setSubscriptionSnapshot(undefined);
+    } else {
       setPolledData(undefined);
     }
   }, [connection.isDisconnected]);
 
   useEffect(() => {
     if (connection.status === "connected" && subscriptionData?.jobDetailUpdates) {
+      setSubscriptionSnapshot(subscriptionData.jobDetailUpdates);
       setPolledData(undefined);
     }
   }, [connection.status, subscriptionData]);
+
+  useEffect(() => {
+    if (graphqlConnection.status !== "connected" || graphqlConnection.lastConnectedAt === null) {
+      return;
+    }
+    if (lastConnectionAtRef.current === undefined) {
+      lastConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+      return;
+    }
+    if (lastConnectionAtRef.current === graphqlConnection.lastConnectedAt) {
+      return;
+    }
+    lastConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+    setSubscriptionSnapshot(undefined);
+    void reexecuteJobQuery({ requestPolicy: "network-only" });
+    void reexecuteDuplicateSnapshot({ requestPolicy: "network-only" });
+  }, [
+    graphqlConnection.lastConnectedAt,
+    graphqlConnection.status,
+    reexecuteDuplicateSnapshot,
+    reexecuteJobQuery,
+  ]);
+
+  useEffect(() => {
+    if (!subscriptionError) {
+      lastSubscriptionErrorRef.current = null;
+      return;
+    }
+    const errorKey = subscriptionError.message;
+    if (lastSubscriptionErrorRef.current === errorKey) {
+      return;
+    }
+    lastSubscriptionErrorRef.current = errorKey;
+    setSubscriptionSnapshot(undefined);
+    void reexecuteJobQuery({ requestPolicy: "network-only" });
+    void reexecuteDuplicateSnapshot({ requestPolicy: "network-only" });
+  }, [reexecuteDuplicateSnapshot, reexecuteJobQuery, subscriptionError]);
 
   useReconnectPolling<JobDetailQueryData>({
     enabled: connection.isDisconnected && Number.isFinite(jobId),

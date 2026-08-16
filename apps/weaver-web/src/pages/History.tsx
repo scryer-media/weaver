@@ -612,7 +612,6 @@ export function History() {
 
   useEffect(() => {
     if (graphqlConnection.status !== "connected" || graphqlConnection.lastConnectedAt === null) {
-      lastHistoryConnectionAtRef.current = null;
       return;
     }
     if (lastHistoryConnectionAtRef.current === undefined) {

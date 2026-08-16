@@ -1218,16 +1218,16 @@ fn queue_item_from_display(
 pub fn queue_item_from_submission(
     submitted: &weaver_server_core::ingest::SubmittedJob,
 ) -> QueueItem {
-    let (client_request_id, attributes) = split_attributes(&submitted.spec.metadata);
+    let (client_request_id, attributes) = split_attributes(&submitted.summary.metadata);
     let display = release_display_info(ReleaseDisplayInput {
-        job_name: &submitted.spec.name,
-        metadata: &submitted.spec.metadata,
-        category: submitted.spec.category.as_deref(),
+        job_name: &submitted.summary.name,
+        metadata: &submitted.summary.metadata,
+        category: submitted.summary.category.as_deref(),
     });
     QueueItem {
         id: submitted.job_id.0,
         job_hash: Some(hex::encode(submitted.job_hash)),
-        name: submitted.spec.name.clone(),
+        name: submitted.summary.name.clone(),
         display_title: display.display_title,
         original_title: display.original_title,
         parsed_release: display.parsed_release,
@@ -1239,18 +1239,18 @@ pub fn queue_item_from_submission(
         download_retry_at_epoch_ms: None,
         error: None,
         progress_percent: 0.0,
-        total_bytes: submitted.spec.total_bytes,
+        total_bytes: submitted.summary.total_bytes,
         downloaded_bytes: 0,
         optional_recovery_bytes: 0,
         optional_recovery_downloaded_bytes: 0,
         phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
-        file_count: submitted.spec.files.len() as u32,
-        remaining_file_count: submitted.spec.files.len() as u32,
-        remaining_par_count: submitted.spec.par2_volume_count() as u32,
-        has_password: submitted.spec.password.is_some(),
-        category: submitted.spec.category.clone(),
+        file_count: submitted.summary.file_count,
+        remaining_file_count: submitted.summary.file_count,
+        remaining_par_count: submitted.summary.remaining_par_count,
+        has_password: submitted.summary.password.is_some(),
+        category: submitted.summary.category.clone(),
         attributes,
         client_request_id,
         output_dir: None,

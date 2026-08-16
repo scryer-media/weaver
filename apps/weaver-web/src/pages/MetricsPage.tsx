@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useSubscription } from "urql";
 import { Loader2 } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
@@ -8,7 +8,7 @@ import { StatTile } from "@/components/StatTile";
 import { TimeSeriesChart } from "@/components/TimeSeriesChart";
 import { Progress } from "@/components/ui/progress";
 import { SegmentedControl } from "@/components/ui/segmented-control";
-import { requestGraphqlClientRestart } from "@/graphql/client";
+import { requestGraphqlClientRestart, useGraphqlConnectionState } from "@/graphql/client";
 import {
   METRICS_PAGE_QUERY,
   METRICS_PAGE_SUBSCRIPTION,
@@ -65,16 +65,20 @@ export function MetricsPage() {
   const liveJobs = useLiveJobs();
   const livePaused = useLivePaused();
   const liveSpeed = useLiveSpeed();
+  const graphqlConnection = useGraphqlConnectionState();
   const [historyRange, setHistoryRange] = useState<MetricsHistoryRange>("ONE_HOUR");
   const [polledSnapshot, setPolledSnapshot] = useState<MetricsPageData | undefined>();
-  const [{ data: queryData, fetching, error }] = useQuery<MetricsPageData>({
+  const [subscriptionSnapshot, setSubscriptionSnapshot] = useState<MetricsPageData>();
+  const lastSubscriptionErrorRef = useRef<string | null>(null);
+  const lastConnectionAtRef = useRef<number | null | undefined>(undefined);
+  const [{ data: queryData, fetching, error }, reexecuteMetricsPage] = useQuery<MetricsPageData>({
     query: METRICS_PAGE_QUERY,
   });
   const handleSubscription = (
     _prev: MetricsPageData | undefined,
     response: { systemMetricsUpdates: MetricsPageData },
   ) => response.systemMetricsUpdates;
-  const [{ data: subscriptionData }] = useSubscription(
+  const [{ data: subscriptionData, error: subscriptionError }] = useSubscription(
     { query: METRICS_PAGE_SUBSCRIPTION },
     handleSubscription,
   );
@@ -88,14 +92,59 @@ export function MetricsPage() {
   });
 
   useEffect(() => {
-    if (!liveConnection.isDisconnected) {
+    if (liveConnection.isDisconnected) {
+      setSubscriptionSnapshot(undefined);
+    } else {
       setPolledSnapshot(undefined);
     }
   }, [liveConnection.isDisconnected]);
 
+  useEffect(() => {
+    if (graphqlConnection.status === "connected" && subscriptionData) {
+      setSubscriptionSnapshot(subscriptionData);
+    }
+  }, [graphqlConnection.status, subscriptionData]);
+
   const [{ data: serverHealthData }, reexecuteServerHealth] = useQuery<{
     serverHealth: ServerHealthEntry[];
   }>({ query: SERVER_HEALTH_QUERY });
+
+  useEffect(() => {
+    if (graphqlConnection.status !== "connected" || graphqlConnection.lastConnectedAt === null) {
+      return;
+    }
+    if (lastConnectionAtRef.current === undefined) {
+      lastConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+      return;
+    }
+    if (lastConnectionAtRef.current === graphqlConnection.lastConnectedAt) {
+      return;
+    }
+    lastConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+    setSubscriptionSnapshot(undefined);
+    void reexecuteMetricsPage({ requestPolicy: "network-only" });
+    void reexecuteServerHealth({ requestPolicy: "network-only" });
+  }, [
+    graphqlConnection.lastConnectedAt,
+    graphqlConnection.status,
+    reexecuteMetricsPage,
+    reexecuteServerHealth,
+  ]);
+
+  useEffect(() => {
+    if (!subscriptionError) {
+      lastSubscriptionErrorRef.current = null;
+      return;
+    }
+    const errorKey = subscriptionError.message;
+    if (lastSubscriptionErrorRef.current === errorKey) {
+      return;
+    }
+    lastSubscriptionErrorRef.current = errorKey;
+    setSubscriptionSnapshot(undefined);
+    void reexecuteMetricsPage({ requestPolicy: "network-only" });
+    void reexecuteServerHealth({ requestPolicy: "network-only" });
+  }, [reexecuteMetricsPage, reexecuteServerHealth, subscriptionError]);
 
   useEffect(() => {
     if (liveConnection.isDisconnected) {
@@ -122,7 +171,7 @@ export function MetricsPage() {
     return { total, active, downloading, queued, paused, failed };
   }, [liveJobs]);
 
-  const snapshot = subscriptionData ?? polledSnapshot ?? queryData;
+  const snapshot = polledSnapshot ?? subscriptionSnapshot ?? queryData;
   const metrics = snapshot?.metrics;
   const isPaused = snapshot?.globalState?.isPaused ?? livePaused;
   const downloadBlock = snapshot?.globalState?.downloadBlock ?? liveDownloadBlock;

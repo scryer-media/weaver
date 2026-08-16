@@ -19,9 +19,10 @@ use crate::jobs::types::{
 };
 use crate::{ScheduledResumeCoordinator, ScheduledResumeError};
 use weaver_server_core::ingest::{
-    SubmissionDuplicateOutcome, SubmissionOptions, SubmitNzbError, SubmittedJob,
-    fetch_nzb_from_url, materialize_semantic_promotion, submit_nzb_bytes_with_options,
-    submit_staged_parsed_nzb_with_options, submit_uploaded_nzb_reader_with_options,
+    ORIGINAL_TITLE_METADATA_KEY, SubmissionDuplicateOutcome, SubmissionOptions, SubmitNzbError,
+    SubmittedJob, fetch_nzb_from_url, materialize_semantic_promotion,
+    normalize_archive_password_candidate, submit_nzb_bytes_with_options,
+    submit_staged_prepared_nzb_with_options, submit_uploaded_nzb_reader_with_options,
 };
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::jobs::{
@@ -157,7 +158,7 @@ impl JobsMutation {
         let mut results = Vec::with_capacity(input.staged_upload_ids.len());
 
         for staged_upload_id in input.staged_upload_ids {
-            let Some(entry) = found_by_id.remove(&staged_upload_id) else {
+            let Some(mut entry) = found_by_id.remove(&staged_upload_id) else {
                 let error = if missing_ids.contains(&staged_upload_id) {
                     "staged upload expired; re-add file".to_string()
                 } else {
@@ -190,16 +191,50 @@ impl JobsMutation {
             );
             options.frozen_post_processing_plan = frozen_post_processing_plan.clone();
 
-            match submit_staged_parsed_nzb_with_options(
+            let original_title = entry.preparation.as_ref().and_then(|preparation| {
+                preparation
+                    .spec
+                    .metadata
+                    .iter()
+                    .find(|(key, _)| key == ORIGINAL_TITLE_METADATA_KEY)
+                    .cloned()
+            });
+            let Some(mut preparation) = entry.preparation.take() else {
+                manager.restore_entry(entry);
+                results.push(StagedNzbSubmissionResult {
+                    staged_upload_id,
+                    accepted: false,
+                    retained: false,
+                    status: None,
+                    item: None,
+                    semantic_duplicate: None,
+                    error: Some("staged upload is unavailable; re-add file".to_string()),
+                });
+                continue;
+            };
+            preparation.spec.password = normalize_archive_password_candidate(password.as_deref())
+                .or(preparation.spec.password);
+            preparation.spec.category = category.clone();
+            preparation.spec.metadata = metadata.clone();
+            if !preparation
+                .spec
+                .metadata
+                .iter()
+                .any(|(key, _)| key == ORIGINAL_TITLE_METADATA_KEY)
+                && let Some(original_title) = original_title
+            {
+                preparation.spec.metadata.push(original_title);
+            }
+            let nzb_zstd = std::mem::take(&mut entry.nzb_zstd);
+            let restore_nzb_zstd = nzb_zstd.clone();
+
+            match submit_staged_prepared_nzb_with_options(
                 db,
                 handle,
                 config,
-                &entry.nzb,
-                entry.nzb_zstd.clone(),
+                preparation,
+                nzb_zstd,
                 Some(entry.filename.clone()),
-                password.clone(),
-                category.clone(),
-                metadata.clone(),
                 options,
             )
             .await
@@ -226,8 +261,13 @@ impl JobsMutation {
                 }
                 Err(error) => {
                     let structured = submission_result_from_error(client_request_id.clone(), error);
-                    manager.restore_entry(entry);
-                    let (status, semantic_duplicate, error) = match structured {
+                    entry.nzb_zstd = restore_nzb_zstd;
+                    let retention = entry.rehydrate_preparation().await;
+                    let retained = retention.is_ok();
+                    if retained {
+                        manager.restore_entry(entry);
+                    }
+                    let (status, semantic_duplicate, mut error) = match structured {
                         Ok(result) => (
                             Some(result.status),
                             result.semantic_duplicate,
@@ -239,10 +279,15 @@ impl JobsMutation {
                         ),
                         Err(error) => (None, None, error.to_string()),
                     };
+                    if let Err(retention_error) = retention {
+                        error = format!(
+                            "{error}; staged upload could not be retained: {retention_error}"
+                        );
+                    }
                     results.push(StagedNzbSubmissionResult {
                         staged_upload_id,
                         accepted: false,
-                        retained: true,
+                        retained,
                         status,
                         item: None,
                         semantic_duplicate,

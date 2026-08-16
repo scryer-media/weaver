@@ -85,6 +85,7 @@ import {
 } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
+import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { getJobStages } from "@/lib/job-stages";
 import { isActiveStatus, STATUS_BG_CLASS, statusToken } from "@/lib/status-tokens";
@@ -154,6 +155,8 @@ type QueuePageResponse = {
   };
 };
 
+type QueuePageData = QueuePageResponse["queuePage"];
+
 type QueueEventPayload = {
   cursor: string;
   kind: "ITEM_CREATED" | "ITEM_STATE_CHANGED" | "ITEM_PROGRESS" | "ITEM_ATTENTION" | "ITEM_COMPLETED" | "ITEM_REMOVED" | "GLOBAL_STATE_CHANGED";
@@ -161,7 +164,18 @@ type QueueEventPayload = {
   item: GraphqlJobData | null;
 };
 
+type QueueItemEventOverlay = {
+  item: GraphqlJobData;
+  cursor: bigint;
+};
+
+type PolledQueuePage = {
+  queryKey: string;
+  page: QueuePageData;
+};
+
 const QUEUE_PAGE_SIZE_OPTIONS = [25, 50, 100, 500] as const;
+const QUEUE_EVENT_REFRESH_INTERVAL_MS = 2_000;
 const EMPTY_QUEUE_PAGE_ITEMS: GraphqlJobData[] = [];
 const EMPTY_QUEUE_CATEGORIES: string[] = [];
 const DEFAULT_QUEUE_PREFERENCES: QueueTablePreferences = {
@@ -238,6 +252,20 @@ function buildQueuePageInput(
     categories: preferences.categories.length > 0 ? preferences.categories : undefined,
     ...queueSortingToGraphql(preferences.sorting),
   };
+}
+
+function decodeQueueEventCursor(cursor: string): bigint | null {
+  try {
+    const base64 = cursor.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = `${base64}${"=".repeat((4 - (base64.length % 4)) % 4)}`;
+    const decoded = atob(padded);
+    if (!decoded.startsWith("evt:")) {
+      return null;
+    }
+    return BigInt(decoded.slice(4));
+  } catch {
+    return null;
+  }
 }
 
 function sameStatusSet(current: readonly string[], preset: readonly string[]): boolean {
@@ -553,6 +581,7 @@ export function JobList() {
     () => buildQueuePageInput(queuePreferences, deferredSearch, pageIndex),
     [deferredSearch, pageIndex, queuePreferences],
   );
+  const queuePageVariables = useMemo(() => ({ input: queuePageInput }), [queuePageInput]);
   const queueQueryKey = useMemo(() => JSON.stringify(queuePageInput), [queuePageInput]);
   const queueTableVirtualization = useMemo(
     () => ({
@@ -566,28 +595,111 @@ export function JobList() {
   const [{ data: queuePageData, error: queuePageError }, reexecuteQueuePage] =
     useQuery<QueuePageResponse>({
       query: QUEUE_PAGE_QUERY,
-      variables: { input: queuePageInput },
+      variables: queuePageVariables,
     });
+  const [polledQueuePage, setPolledQueuePage] = useState<PolledQueuePage>();
+  useReconnectPolling<QueuePageResponse>({
+    enabled: graphqlConnection.status === "disconnected",
+    query: QUEUE_PAGE_QUERY,
+    variables: queuePageVariables,
+    onData: (data) => setPolledQueuePage({ queryKey: queueQueryKey, page: data.queuePage }),
+  });
+  const queuePage = useMemo(
+    () => {
+      const currentPolledPage =
+        polledQueuePage?.queryKey === queueQueryKey ? polledQueuePage.page : undefined;
+      if (graphqlConnection.status === "disconnected" && currentPolledPage) {
+        return currentPolledPage;
+      }
+      return queuePageData?.queuePage;
+    },
+    [graphqlConnection.status, polledQueuePage, queuePageData?.queuePage, queueQueryKey],
+  );
   const [{ data: queueEventData, error: queueEventError }] = useSubscription<{
     queueEvents: QueueEventPayload;
   }>({
     query: QUEUE_EVENTS_SUBSCRIPTION,
-    variables: { after: queuePageData?.queuePage.latestCursor },
-    pause: !queuePageData?.queuePage.latestCursor,
+    variables: { after: queuePage?.latestCursor },
+    pause: !queuePage?.latestCursor,
   });
-  const [eventItems, setEventItems] = useState<Record<number, GraphqlJobData>>({});
+  const [eventItems, setEventItems] = useState<Record<number, QueueItemEventOverlay>>({});
+  const [optimisticallyRemovedJobIds, setOptimisticallyRemovedJobIds] = useState<Set<number>>(
+    () => new Set(),
+  );
   const queueRefreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastQueueEventCursorRef = useRef<string | null>(null);
+  const lastQueueRefreshAtRef = useRef(0);
+  const lastQueueEventSequenceRef = useRef<bigint | null>(null);
   const lastQueueEventErrorRef = useRef<string | null>(null);
   const lastQueueConnectionAtRef = useRef<number | null | undefined>(undefined);
-  const queuePageItems = queuePageData?.queuePage.items ?? EMPTY_QUEUE_PAGE_ITEMS;
+  const rawQueuePageItems = queuePage?.items ?? EMPTY_QUEUE_PAGE_ITEMS;
+  const queuePageItems = useMemo(
+    () =>
+      optimisticallyRemovedJobIds.size === 0
+        ? rawQueuePageItems
+        : rawQueuePageItems.filter((job) => !optimisticallyRemovedJobIds.has(job.id)),
+    [optimisticallyRemovedJobIds, rawQueuePageItems],
+  );
+  const hideQueueJobs = useCallback((ids: readonly number[]) => {
+    if (ids.length === 0) {
+      return;
+    }
+    const idsToHide = new Set(ids);
+    setOptimisticallyRemovedJobIds((current) => {
+      const next = new Set(current);
+      let changed = false;
+      for (const id of idsToHide) {
+        if (!next.has(id)) {
+          next.add(id);
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+    setEventItems((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const id of idsToHide) {
+        if (id in next) {
+          delete next[id];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+    setRowSelection((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const id of idsToHide) {
+        if (next[id]) {
+          delete next[id];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, []);
+  const restoreQueueJobs = useCallback((ids: readonly number[]) => {
+    if (ids.length === 0) {
+      return;
+    }
+    setOptimisticallyRemovedJobIds((current) => {
+      let changed = false;
+      const next = new Set(current);
+      for (const id of ids) {
+        if (next.delete(id)) {
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, []);
   const [hasBootstrappedQueue, setHasBootstrappedQueue] = useState(false);
-  const queueInitialFetchPending = queuePageData === undefined && !queuePageError;
+  const queueInitialFetchPending = queuePage === undefined && !queuePageError;
   const serverConfigurationPending = serversResult.data === undefined && !serversResult.error;
   const isQueueBootstrapPending =
     !hasBootstrappedQueue && (queueInitialFetchPending || serverConfigurationPending);
   const jobs = useMemo(
-    () => queuePageItems.map((job) => normalizeJobData(eventItems[job.id] ?? job)),
+    () => queuePageItems.map((job) => normalizeJobData(eventItems[job.id]?.item ?? job)),
     [eventItems, queuePageItems],
   );
   const policyBlockedJobs = jobs.filter((job) => isBlockedByDownloadPolicy(job, downloadBlock)).length;
@@ -599,7 +711,48 @@ export function JobList() {
 
   useEffect(() => {
     setEventItems({});
-  }, [queuePageItems]);
+    setPolledQueuePage(undefined);
+    if (queueRefreshTimeoutRef.current) {
+      clearTimeout(queueRefreshTimeoutRef.current);
+      queueRefreshTimeoutRef.current = null;
+    }
+  }, [queueQueryKey]);
+
+  useEffect(() => {
+    const pageCursor = queuePage && decodeQueueEventCursor(queuePage.latestCursor);
+    if (pageCursor === null || pageCursor === undefined) {
+      return;
+    }
+    setEventItems((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const [jobId, overlay] of Object.entries(current)) {
+        if (overlay.cursor <= pageCursor) {
+          delete next[Number(jobId)];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [queuePage]);
+
+  useEffect(() => {
+    setOptimisticallyRemovedJobIds((current) => {
+      if (current.size === 0) {
+        return current;
+      }
+      const visibleJobIds = new Set(rawQueuePageItems.map((job) => job.id));
+      const next = new Set(current);
+      let changed = false;
+      for (const id of current) {
+        if (!visibleJobIds.has(id)) {
+          next.delete(id);
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [rawQueuePageItems]);
 
   useEffect(() => {
     if (!isQueueBootstrapPending) {
@@ -608,8 +761,35 @@ export function JobList() {
   }, [isQueueBootstrapPending]);
 
   useEffect(() => {
+    if (graphqlConnection.status === "disconnected") {
+      setEventItems({});
+    }
+  }, [graphqlConnection.status]);
+
+  const refreshQueuePageNow = useCallback(() => {
+    if (queueRefreshTimeoutRef.current) {
+      clearTimeout(queueRefreshTimeoutRef.current);
+      queueRefreshTimeoutRef.current = null;
+    }
+    lastQueueRefreshAtRef.current = Date.now();
+    void reexecuteQueuePage({ requestPolicy: "network-only" });
+  }, [reexecuteQueuePage]);
+
+  const scheduleQueuePageRefresh = useCallback(() => {
+    if (queueRefreshTimeoutRef.current) {
+      return;
+    }
+    const elapsed = Date.now() - lastQueueRefreshAtRef.current;
+    const delay = Math.max(0, QUEUE_EVENT_REFRESH_INTERVAL_MS - elapsed);
+    queueRefreshTimeoutRef.current = setTimeout(() => {
+      queueRefreshTimeoutRef.current = null;
+      lastQueueRefreshAtRef.current = Date.now();
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
+    }, delay);
+  }, [reexecuteQueuePage]);
+
+  useEffect(() => {
     if (graphqlConnection.status !== "connected" || graphqlConnection.lastConnectedAt === null) {
-      lastQueueConnectionAtRef.current = null;
       return;
     }
     if (lastQueueConnectionAtRef.current === undefined) {
@@ -620,44 +800,66 @@ export function JobList() {
       return;
     }
     lastQueueConnectionAtRef.current = graphqlConnection.lastConnectedAt;
-    void reexecuteQueuePage({ requestPolicy: "network-only" });
-  }, [graphqlConnection.lastConnectedAt, graphqlConnection.status, reexecuteQueuePage]);
+    lastQueueEventSequenceRef.current = null;
+    setEventItems({});
+    setPolledQueuePage(undefined);
+    refreshQueuePageNow();
+  }, [graphqlConnection.lastConnectedAt, graphqlConnection.status, refreshQueuePageNow]);
 
   useEffect(() => {
     if (queueEventError) {
       const errorKey = queueEventError.message;
       if (lastQueueEventErrorRef.current !== errorKey) {
         lastQueueEventErrorRef.current = errorKey;
-        void reexecuteQueuePage({ requestPolicy: "network-only" });
+        refreshQueuePageNow();
       }
     } else {
       lastQueueEventErrorRef.current = null;
     }
     const event = queueEventData?.queueEvents;
-    if (!event || lastQueueEventCursorRef.current === event.cursor) {
+    if (!event) {
       return;
     }
-    lastQueueEventCursorRef.current = event.cursor;
+    const eventCursor = decodeQueueEventCursor(event.cursor);
+    if (eventCursor === null) {
+      refreshQueuePageNow();
+      return;
+    }
+    if (lastQueueEventSequenceRef.current !== null && eventCursor <= lastQueueEventSequenceRef.current) {
+      return;
+    }
+    lastQueueEventSequenceRef.current = eventCursor;
+    if (event.kind === "ITEM_REMOVED" && event.itemId != null) {
+      hideQueueJobs([event.itemId]);
+    }
+    if (event.item && queuePageItems.some((item) => item.id === event.item?.id)) {
+      setEventItems((current) => {
+        const currentOverlay = current[event.item!.id];
+        if (currentOverlay && currentOverlay.cursor >= eventCursor) {
+          return current;
+        }
+        return { ...current, [event.item!.id]: { item: event.item!, cursor: eventCursor } };
+      });
+    }
     if (event.kind === "ITEM_PROGRESS") {
       if (!event.item) {
-        void reexecuteQueuePage({ requestPolicy: "network-only" });
+        scheduleQueuePageRefresh();
         return;
-      }
-      if (queuePageItems.some((item) => item.id === event.item?.id)) {
-        setEventItems((current) => ({ ...current, [event.item!.id]: event.item! }));
       }
       if (queuePreferences.sorting[0]?.id !== "progress") {
         return;
       }
     }
-    if (queueRefreshTimeoutRef.current) {
-      clearTimeout(queueRefreshTimeoutRef.current);
-    }
-    queueRefreshTimeoutRef.current = setTimeout(() => {
-      queueRefreshTimeoutRef.current = null;
-      void reexecuteQueuePage({ requestPolicy: "network-only" });
-    }, 250);
-  }, [queueEventData, queueEventError, queuePageItems, queuePreferences.sorting, reexecuteQueuePage]);
+    scheduleQueuePageRefresh();
+  }, [
+    hideQueueJobs,
+    queueEventData,
+    queueEventError,
+    queuePageItems,
+    queuePreferences.sorting,
+    refreshQueuePageNow,
+    scheduleQueuePageRefresh,
+  ]);
 
   useEffect(() => () => {
     if (queueRefreshTimeoutRef.current) {
@@ -669,7 +871,7 @@ export function JobList() {
   const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
-  const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
+  const [, cancelJob] = useMutation<{ cancelJob: boolean }>(CANCEL_JOB_MUTATION);
   const [, setSpeedLimit] = useMutation(SET_SPEED_LIMIT_MUTATION);
   const [, updateJobs] = useMutation(UPDATE_JOBS_MUTATION);
 
@@ -720,6 +922,21 @@ export function JobList() {
     setCancelConfirmId(id);
   }, []);
 
+  const handleConfirmCancelJob = useCallback(async () => {
+    const id = cancelConfirmId;
+    setCancelConfirmId(null);
+    if (id == null) {
+      return;
+    }
+
+    hideQueueJobs([id]);
+    const result = await cancelJob({ id });
+    if (result.error || result.data?.cancelJob !== true) {
+      restoreQueueJobs([id]);
+    }
+    void reexecuteQueuePage({ requestPolicy: "network-only" });
+  }, [cancelConfirmId, cancelJob, hideQueueJobs, reexecuteQueuePage, restoreQueueJobs]);
+
   const selectedIds = useMemo(
     () => Object.entries(rowSelection)
       .filter(([, selected]) => selected)
@@ -727,7 +944,7 @@ export function JobList() {
     [rowSelection],
   );
 
-  const queueCategories = queuePageData?.queuePage.categories ?? EMPTY_QUEUE_CATEGORIES;
+  const queueCategories = queuePage?.categories ?? EMPTY_QUEUE_CATEGORIES;
   const editableCategoryOptions = useMemo(
     () => {
       const next = Array.from(
@@ -837,7 +1054,11 @@ export function JobList() {
       }),
     [capResetAt, downloadBlock, isPaused, jobs, pendingJobUpdates, queueEtaById, t],
   );
-  const totalCount = queuePageData?.queuePage.totalCount ?? 0;
+  const totalCount = Math.max(
+    0,
+    (queuePage?.totalCount ?? 0)
+      - rawQueuePageItems.filter((job) => optimisticallyRemovedJobIds.has(job.id)).length,
+  );
   const pageCount = Math.max(1, Math.ceil(totalCount / queuePreferences.pageSize));
 
   useEffect(() => {
@@ -1264,6 +1485,7 @@ export function JobList() {
       return;
     }
 
+    hideQueueJobs(selectedIds);
     const result = await executeAliasedIdMutation<boolean>({
       client,
       ids: selectedIds,
@@ -1271,10 +1493,14 @@ export function JobList() {
       aliasPrefix: "cancelJob",
       fieldName: "cancelJob",
     });
-    if (!result.error) {
-      setRowSelection({});
-      void reexecuteQueuePage({ requestPolicy: "network-only" });
+    const cancelledIds = selectedIds.filter(
+      (_id, index) => result.data?.[`cancelJob${index}`] === true,
+    );
+    const failedIds = selectedIds.filter((id) => !cancelledIds.includes(id));
+    if (failedIds.length > 0) {
+      restoreQueueJobs(failedIds);
     }
+    void reexecuteQueuePage({ requestPolicy: "network-only" });
     setCancelSelectedConfirm(false);
   };
 
@@ -1293,23 +1519,23 @@ export function JobList() {
     count: number;
     statuses: QueueStatusFilter[];
   }[] = [
-    { key: "all", label: t("history.filterAll"), count: queuePageData?.queuePage.summary.totalItems ?? 0, statuses: [] },
+    { key: "all", label: t("history.filterAll"), count: queuePage?.summary.totalItems ?? 0, statuses: [] },
     {
       key: "active",
       label: t("queue.filterActive"),
-      count: queuePageData?.queuePage.summary.activeItems ?? 0,
+      count: queuePage?.summary.activeItems ?? 0,
       statuses: QUEUE_ACTIVE_STATUSES,
     },
     {
       key: "queued",
       label: t("status.queued"),
-      count: queuePageData?.queuePage.summary.queuedItems ?? 0,
+      count: queuePage?.summary.queuedItems ?? 0,
       statuses: ["QUEUED"],
     },
     {
       key: "stalled",
       label: t("queue.filterStalled"),
-      count: queuePageData?.queuePage.summary.pausedItems ?? 0,
+      count: queuePage?.summary.pausedItems ?? 0,
       statuses: ["PAUSED"],
     },
   ];
@@ -1919,12 +2145,7 @@ export function JobList() {
         message={t("confirm.cancelJobMessage")}
         confirmLabel={t("confirm.cancelJobConfirm")}
         cancelLabel={t("confirm.cancelJobDismiss")}
-        onConfirm={() => {
-          if (cancelConfirmId != null) {
-            void cancelJob({ id: cancelConfirmId });
-          }
-          setCancelConfirmId(null);
-        }}
+        onConfirm={() => void handleConfirmCancelJob()}
         onCancel={() => setCancelConfirmId(null)}
       />
 
