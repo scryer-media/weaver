@@ -13,6 +13,16 @@ use crate::jobs::{ActiveJob, JobId};
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlRuntime, StoreDatastore};
 
+/// Re-exported for the finalize-latency probe so both build the same row shape.
+pub(super) fn probe_history_row(job_id: u64) -> JobHistoryRow {
+    history_row(job_id)
+}
+
+/// Re-exported for the finalize-latency probe.
+pub(super) fn probe_manifest() -> super::model::ExtensionManifest {
+    manifest()
+}
+
 fn history_row(job_id: u64) -> JobHistoryRow {
     JobHistoryRow {
         job_id,

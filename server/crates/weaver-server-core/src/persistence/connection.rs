@@ -54,47 +54,148 @@ impl DatabaseRuntimeWorker {
         }
     }
 
-    fn block_on<T, Fut>(&self, future: Fut) -> Result<T, StateError>
+    fn block_on<T, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        future: Fut,
+    ) -> Result<T, StateError>
     where
         T: Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
         match self {
-            Self::Sqlite(worker) => worker.block_on(future),
+            Self::Sqlite(worker) => worker.block_on(caller, future),
             Self::Postgres(worker) => worker.block_on(future),
         }
     }
 
-    fn block_on_local<T, Build, Fut>(&self, build: Build) -> Result<T, StateError>
+    fn block_on_local<T, Build, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        build: Build,
+    ) -> Result<T, StateError>
     where
         T: Send + 'static,
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
         match self {
-            Self::Sqlite(worker) => worker.block_on_local(build),
+            Self::Sqlite(worker) => worker.block_on_local(caller, build),
             Self::Postgres(_) => Err(StateError::Database(
                 "run_sql_blocking_local requires sqlite datastore".to_string(),
             )),
         }
     }
 
-    fn block_on_startup_local<T, Build, Fut>(&self, build: Build) -> Result<T, StateError>
+    fn block_on_startup_local<T, Build, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        build: Build,
+    ) -> Result<T, StateError>
     where
         T: Send + 'static,
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
         match self {
-            Self::Sqlite(worker) => worker.block_on_local(build),
+            Self::Sqlite(worker) => worker.block_on_local(caller, build),
             Self::Postgres(worker) => worker.block_on_local(build),
         }
     }
 }
 
+/// The SQLite executor is a single thread, so *every* database call in the
+/// process — reads included — is serialized behind whatever is already running
+/// or queued on it. A caller's wall time is therefore `wait + exec`, and only
+/// `exec` is that caller's own cost; `wait` is somebody else's work. Reporting
+/// only the sum (as `db.runtime.sqlite.block_on` did) makes a victim of queueing
+/// look identical to a slow query, which is what made post-processing finalize
+/// latency unattributable.
+///
+/// These probes split the two and attribute both to the `#[track_caller]` call
+/// site, and sample the queue depth seen at submit. All of it is behind
+/// `WEAVER_PROFILE_HOT_PATHS`; when that is off `record*` returns immediately
+/// and the only residual cost is the depth counter.
 #[derive(Clone)]
 struct SqliteDatabaseRuntimeWorker {
     tx: std_mpsc::Sender<SqliteDatabaseRuntimeJob>,
+    /// Jobs submitted but not yet picked up by the executor thread. The channel
+    /// itself is unbounded and exposes no depth, so this is the only queueing
+    /// signal available.
+    queue_depth: Arc<AtomicUsize>,
+}
+
+/// Bookkeeping shared by both submit paths: count the job in, and hand back the
+/// enqueue instant so the executor side can split wait from exec.
+struct SqliteSubmission {
+    queued_at: Instant,
+    queue_depth: Arc<AtomicUsize>,
+    caller: &'static std::panic::Location<'static>,
+}
+
+impl SqliteSubmission {
+    fn open(
+        worker: &SqliteDatabaseRuntimeWorker,
+        caller: &'static std::panic::Location<'static>,
+    ) -> Self {
+        let depth = worker.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
+        crate::runtime::perf_probe::record_value("db.sqlite.queue.depth_at_submit", depth as u64);
+        Self {
+            queued_at: Instant::now(),
+            queue_depth: worker.queue_depth.clone(),
+            caller,
+        }
+    }
+
+    /// Called on the executor thread the moment the job is picked up.
+    fn start(self) -> SqliteExecution {
+        let waited = self.queued_at.elapsed();
+        self.queue_depth.fetch_sub(1, Ordering::AcqRel);
+        // Guarded: building the per-caller label allocates, and this runs on
+        // every database call in the process. Nothing here may cost anything
+        // when profiling is off.
+        if crate::runtime::perf_probe::enabled() {
+            crate::runtime::perf_probe::record("db.sqlite.queue.wait", waited);
+            crate::runtime::perf_probe::record_owned(
+                format!("db.sqlite.caller.{}.wait", caller_label(self.caller)),
+                waited,
+            );
+        }
+        SqliteExecution {
+            started: Instant::now(),
+            caller: self.caller,
+        }
+    }
+}
+
+struct SqliteExecution {
+    started: Instant,
+    caller: &'static std::panic::Location<'static>,
+}
+
+impl Drop for SqliteExecution {
+    fn drop(&mut self) {
+        if !crate::runtime::perf_probe::enabled() {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        crate::runtime::perf_probe::record("db.sqlite.queue.exec", elapsed);
+        crate::runtime::perf_probe::record_owned(
+            format!("db.sqlite.caller.{}.exec", caller_label(self.caller)),
+            elapsed,
+        );
+    }
+}
+
+/// `file:line` of the call site, with the workspace-relative tail only so the
+/// bucket labels stay stable across checkouts.
+fn caller_label(location: &std::panic::Location<'static>) -> String {
+    let file = location.file();
+    let short = file
+        .rfind("/src/")
+        .map(|index| &file[index + 5..])
+        .unwrap_or(file);
+    format!("{short}:{}", location.line())
 }
 
 impl SqliteDatabaseRuntimeWorker {
@@ -131,18 +232,27 @@ impl SqliteDatabaseRuntimeWorker {
             .map_err(|_| StateError::Database("database runtime worker stopped".to_string()))?
             .map_err(StateError::Database)?;
 
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            queue_depth: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
-    fn block_on<T, Fut>(&self, future: Fut) -> Result<T, StateError>
+    fn block_on<T, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        future: Fut,
+    ) -> Result<T, StateError>
     where
         T: Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
         let started = Instant::now();
+        let submission = SqliteSubmission::open(self, caller);
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         self.tx
             .send(Box::new(move |runtime| {
+                let _execution = submission.start();
                 let _ = reply_tx.send(runtime.block_on(future));
             }))
             .map_err(|_| StateError::Database("database runtime worker stopped".to_string()))?;
@@ -153,16 +263,22 @@ impl SqliteDatabaseRuntimeWorker {
         result
     }
 
-    fn block_on_local<T, Build, Fut>(&self, build: Build) -> Result<T, StateError>
+    fn block_on_local<T, Build, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        build: Build,
+    ) -> Result<T, StateError>
     where
         T: Send + 'static,
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
         let started = Instant::now();
+        let submission = SqliteSubmission::open(self, caller);
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         self.tx
             .send(Box::new(move |runtime| {
+                let _execution = submission.start();
                 let _ = reply_tx.send(runtime.block_on(build()));
             }))
             .map_err(|_| StateError::Database("database runtime worker stopped".to_string()))?;
@@ -368,11 +484,12 @@ fn postgres_db_concurrency_from_env() -> usize {
         .clamp(1, pool_max.max(1))
 }
 
+#[track_caller]
 fn open_sql_services_blocking(
     sql_worker: &DatabaseRuntimeWorker,
     target: DatabaseTarget,
 ) -> Result<DatabaseServices, StateError> {
-    sql_worker.block_on_startup_local(move || {
+    sql_worker.block_on_startup_local(std::panic::Location::caller(), move || {
         DatabaseServices::open(target, crate::schema_migrations::MigrationMode::Apply)
     })
 }
@@ -397,12 +514,14 @@ impl DatabaseWriterExecutor {
         self.sql_services.datastore()
     }
 
+    #[track_caller]
     pub(crate) fn run_sql_blocking<T, Fut>(&self, future: Fut) -> Result<T, StateError>
     where
         T: Send + 'static,
         Fut: std::future::Future<Output = Result<T, StateError>> + Send + 'static,
     {
-        self.sql_worker.block_on(future)
+        self.sql_worker
+            .block_on(std::panic::Location::caller(), future)
     }
 
     pub(crate) fn job_history_cache_generation(&self) -> u64 {
@@ -421,6 +540,17 @@ impl DatabaseWriterExecutor {
 }
 
 type WriteOp = Box<dyn FnOnce(&Database) -> Result<(), StateError> + Send + 'static>;
+
+/// A writer-queue command plus the instant it was enqueued.
+///
+/// The ordered writer consumes one command at a time and awaits each before
+/// taking the next, so a command's latency is `queue wait + execution` exactly
+/// as on the SQLite executor below it. Carrying the enqueue instant is what lets
+/// the consumer report those two separately per command kind.
+struct QueuedWrite {
+    queued_at: Instant,
+    command: DbWriteCommand,
+}
 
 enum DbWriteCommand {
     ArchiveJob {
@@ -448,6 +578,19 @@ enum DbWriteCommand {
     Flush {
         reply: oneshot::Sender<()>,
     },
+}
+
+impl DbWriteCommand {
+    /// Stable bucket label. `Write` carries a caller-supplied `&'static str`, so
+    /// generic ordered writes stay distinguishable from each other.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::ArchiveJob { .. } => "archive_job",
+            Self::InsertJobEvents { .. } => "insert_job_events",
+            Self::Write { label, .. } => label,
+            Self::Flush { .. } => "flush",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -513,7 +656,7 @@ pub struct Database {
     target: DatabaseTarget,
     sql_services: DatabaseServices,
     sql_worker: DatabaseRuntimeWorker,
-    writer_tx: mpsc::Sender<DbWriteCommand>,
+    writer_tx: mpsc::Sender<QueuedWrite>,
     /// Count of in-flight background re-sends into the bounded writer queue
     /// (archive jobs and generic ordered writes) spawned when `try_send` hit a
     /// full queue. `flush_write_queue` waits for this to reach zero before its
@@ -608,7 +751,7 @@ impl Database {
         let datastore = self.datastore();
         let worker = self.sql_worker.clone();
         drop(self);
-        worker.block_on(async move {
+        worker.block_on(std::panic::Location::caller(), async move {
             match datastore {
                 StoreDatastore::Sqlite { pool, .. } => pool.close().await,
                 StoreDatastore::Postgres { pool } => pool.close().await,
@@ -659,14 +802,17 @@ impl Database {
             .clear();
     }
 
+    #[track_caller]
     pub(crate) fn run_sql_blocking<T, Fut>(&self, future: Fut) -> Result<T, StateError>
     where
         T: Send + 'static,
         Fut: std::future::Future<Output = Result<T, StateError>> + Send + 'static,
     {
-        self.sql_worker.block_on(future)
+        self.sql_worker
+            .block_on(std::panic::Location::caller(), future)
     }
 
+    #[track_caller]
     pub(crate) fn run_sql_blocking_local<T, Build, Fut>(
         &self,
         build: Build,
@@ -676,7 +822,8 @@ impl Database {
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<T, StateError>> + 'static,
     {
-        self.sql_worker.block_on_local(build)
+        self.sql_worker
+            .block_on_local(std::panic::Location::caller(), build)
     }
 
     /// Set the encryption key used to protect sensitive fields (passwords).
@@ -730,13 +877,25 @@ impl Database {
         }
     }
 
-    fn spawn_writer_task(&self, mut rx: mpsc::Receiver<DbWriteCommand>) {
+    fn spawn_writer_task(&self, mut rx: mpsc::Receiver<QueuedWrite>) {
         let writer = DatabaseWriterExecutor::from_database(self);
         // Handle used only to execute generic `Write` ops; carries a detached
         // sender so it never keeps the real writer channel open (see above).
         let writer_db = self.writer_task_handle();
         let worker = async move {
-            while let Some(command) = rx.recv().await {
+            while let Some(QueuedWrite { queued_at, command }) = rx.recv().await {
+                // Same guard as the SQLite executor: the per-command labels
+                // allocate, so nothing may be built unless profiling is on.
+                let _executed = crate::runtime::perf_probe::enabled().then(|| {
+                    let label = command.label();
+                    let waited = queued_at.elapsed();
+                    crate::runtime::perf_probe::record("db.writer_queue.wait", waited);
+                    crate::runtime::perf_probe::record_owned(
+                        format!("db.writer_queue.{label}.wait"),
+                        waited,
+                    );
+                    crate::runtime::perf_probe::owned_scope(format!("db.writer_queue.{label}.exec"))
+                });
                 match command {
                     DbWriteCommand::ArchiveJob {
                         job_id,
@@ -889,6 +1048,7 @@ impl Database {
         command: DbWriteCommand,
         context: &'static str,
     ) -> Result<(), StateError> {
+        let command = self.enqueue_write(command);
         match self.writer_tx.try_send(command) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
@@ -922,18 +1082,34 @@ impl Database {
         }
     }
 
+    /// Stamp a command with its enqueue instant and sample how full the ordered
+    /// writer queue already is. Depth is derived from the channel rather than a
+    /// separate counter so it cannot drift from reality.
+    fn enqueue_write(&self, command: DbWriteCommand) -> QueuedWrite {
+        let depth = self
+            .writer_tx
+            .max_capacity()
+            .saturating_sub(self.writer_tx.capacity());
+        crate::runtime::perf_probe::record_value("db.writer_queue.depth_at_submit", depth as u64);
+        QueuedWrite {
+            queued_at: Instant::now(),
+            command,
+        }
+    }
+
     pub async fn queue_archive_job(
         &self,
         job_id: crate::jobs::ids::JobId,
         history: crate::history::JobHistoryRow,
     ) -> Result<(), StateError> {
+        let command = self.enqueue_write(DbWriteCommand::ArchiveJob {
+            job_id,
+            history: Box::new(history),
+            typed_terminal_cause: None,
+            committed: None,
+        });
         self.writer_tx
-            .send(DbWriteCommand::ArchiveJob {
-                job_id,
-                history: Box::new(history),
-                typed_terminal_cause: None,
-                committed: None,
-            })
+            .send(command)
             .await
             .map_err(|_| StateError::Database("database writer queue closed".to_string()))
     }
@@ -942,8 +1118,9 @@ impl Database {
         &self,
         events: Vec<crate::history::JobEvent>,
     ) -> Result<(), StateError> {
+        let command = self.enqueue_write(DbWriteCommand::InsertJobEvents { events });
         self.writer_tx
-            .send(DbWriteCommand::InsertJobEvents { events })
+            .send(command)
             .await
             .map_err(|_| StateError::Database("database writer queue closed".to_string()))
     }
@@ -954,8 +1131,9 @@ impl Database {
         // behind every write that had already been accepted for the queue.
         self.wait_for_pending_write_retries().await;
         let (reply, rx) = oneshot::channel();
+        let command = self.enqueue_write(DbWriteCommand::Flush { reply });
         self.writer_tx
-            .send(DbWriteCommand::Flush { reply })
+            .send(command)
             .await
             .map_err(|_| StateError::Database("database writer queue closed".to_string()))?;
         rx.await

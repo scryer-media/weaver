@@ -78,6 +78,18 @@ pub(crate) fn scope(label: &'static str) -> Scope {
     }
 }
 
+/// [`scope`] for a label only known at runtime (per-command / per-caller
+/// buckets). The `String` is built by the caller either way, so this stays out
+/// of the disabled fast path by never being reached when profiling is off —
+/// callers guard with [`enabled`] or accept one allocation.
+pub(crate) fn owned_scope(label: String) -> OwnedScope {
+    OwnedScope {
+        label,
+        started: Instant::now(),
+        enabled: enabled(),
+    }
+}
+
 pub(crate) fn cpu_scope(label: &'static str) -> CpuScope {
     let enabled = enabled();
     CpuScope {
@@ -117,6 +129,20 @@ impl Drop for Scope {
     fn drop(&mut self) {
         if self.enabled {
             profiler().record(self.label.to_string(), self.started.elapsed());
+        }
+    }
+}
+
+pub(crate) struct OwnedScope {
+    label: String,
+    started: Instant,
+    enabled: bool,
+}
+
+impl Drop for OwnedScope {
+    fn drop(&mut self) {
+        if self.enabled {
+            profiler().record(std::mem::take(&mut self.label), self.started.elapsed());
         }
     }
 }
