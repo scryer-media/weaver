@@ -167,9 +167,9 @@ pub(crate) async fn run(
         Ok(submitted) => {
             info!(
                 job_id = submitted.job_id.0,
-                job = %submitted.spec.name,
-                files = submitted.spec.files.len(),
-                bytes = submitted.spec.total_bytes,
+                job = %submitted.summary.name,
+                files = submitted.summary.file_count,
+                bytes = submitted.summary.total_bytes,
                 "submitted standalone NZB job"
             );
             submitted

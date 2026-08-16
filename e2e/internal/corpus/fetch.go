@@ -26,6 +26,11 @@ type FetchOptions struct {
 	// fetched). It is called from several goroutines; it must be safe for
 	// concurrent use.
 	Progress func(string)
+	// Only, when non-empty, restricts the hydration to these ledger paths.
+	// A path the published manifest does not carry is simply not fetched;
+	// the caller sees it still missing and decides what that means. With
+	// Only set, the profile list may be empty, which means "any profile".
+	Only []string
 }
 
 // DefaultConcurrency is the in-flight download and upload bound.
@@ -46,7 +51,7 @@ func Fetch(ctx context.Context, root string, lock *Lock, profileNames []string, 
 	if !lock.Pinned() {
 		return ErrNotPinned
 	}
-	if len(profileNames) == 0 {
+	if len(profileNames) == 0 && len(opts.Only) == 0 {
 		return errors.New("fetch needs at least one profile")
 	}
 	client := opts.Client
@@ -66,11 +71,33 @@ func Fetch(ctx context.Context, root string, lock *Lock, profileNames []string, 
 	if err != nil {
 		return err
 	}
-	wanted, err := resolveFrozenProfiles(manifest, profileNames)
-	if err != nil {
-		return err
+	var wanted []ManifestFile
+	if len(profileNames) == 0 {
+		wanted = append(wanted, manifest.Files...)
+	} else {
+		wanted, err = resolveFrozenProfiles(manifest, profileNames)
+		if err != nil {
+			return err
+		}
 	}
-	progress(fmt.Sprintf("manifest %s: %d files across %v", lock.Manifest.BLAKE3, len(wanted), profileNames))
+	if len(opts.Only) > 0 {
+		only := make(map[string]struct{}, len(opts.Only))
+		for _, path := range opts.Only {
+			only[path] = struct{}{}
+		}
+		filtered := wanted[:0]
+		for _, file := range wanted {
+			if _, ok := only[file.Path]; ok {
+				filtered = append(filtered, file)
+			}
+		}
+		wanted = filtered
+	}
+	if len(profileNames) == 0 {
+		progress(fmt.Sprintf("manifest %s: %d of the requested files are published", lock.Manifest.BLAKE3, len(wanted)))
+	} else {
+		progress(fmt.Sprintf("manifest %s: %d files across %v", lock.Manifest.BLAKE3, len(wanted), profileNames))
+	}
 
 	work := make(chan ManifestFile)
 	var waitGroup sync.WaitGroup

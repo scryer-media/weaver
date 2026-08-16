@@ -3,6 +3,7 @@
 // published bucket, and (in the publish workflow) signs and uploads a corpus
 // revision.
 //
+//	go run ./cmd/corpus ensure --profile functional
 //	go run ./cmd/corpus verify --all-present --offline
 //	go run ./cmd/corpus hydrate --profile functional
 //	go run ./cmd/corpus build --out target/test-corpus/build
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/scryer-media/weaver/e2e/internal/corpus"
+	"github.com/scryer-media/weaver/e2e/internal/fixturegen"
 )
 
 const (
@@ -56,6 +58,8 @@ func run(ctx context.Context, args []string) int {
 		return dispatch(verifyCommand(ctx, rest))
 	case "fetch", "hydrate":
 		return dispatch(fetchCommand(ctx, command, rest))
+	case "ensure":
+		return dispatch(ensureCommand(ctx, rest))
 	case "sign":
 		return dispatch(signCommand(ctx, rest))
 	case "publish":
@@ -78,6 +82,10 @@ func usage() {
   build     --out <dir> [--update-ledger]      build the manifest and provenance from the tree
   verify    [--all-present] [--require-signature] [--offline]
                                                check ledger, tree, lock and signature
+  ensure    --profile <name> | --slug <slug> [--no-fetch] [--no-generate] [--quick]
+                                               make the fixtures present: reuse what matches the
+                                               ledger, fetch the rest from the published corpus,
+                                               generate only what is still missing
   hydrate   --profile <name> [--profile …]     fetch the named profiles from the published corpus
   fetch     --profile <name> [--profile …]     the same thing, under its transport name
   sign      --dir <build-dir>                  cosign the manifest and provenance (keyless)
@@ -429,6 +437,64 @@ func fetchCommand(ctx context.Context, name string, args []string) error {
 		return fmt.Errorf(
 			"%w\n  Until then the fixtures come from a generator run: dispatch the e2e-corpus-publish workflow from main to publish the first revision, then pin it in %s through a reviewed PR",
 			err, corpus.LockFile)
+	}
+	return err
+}
+
+// --------------------------------------------------------------- ensure ----
+
+func ensureCommand(ctx context.Context, args []string) error {
+	flags, root := newFlagSet("ensure")
+	var profiles, slugs repeatedFlag
+	flags.Var(&profiles, "profile", "corpus profile to make present; repeat for more than one")
+	flags.Var(&slugs, "slug", "scenario directory to make present; repeat for more than one")
+	noFetch := flags.Bool("no-fetch", false, "do not consult the published corpus; generate straight away")
+	noGenerate := flags.Bool("no-generate", false, "stop after the fetch; anything still missing is an error")
+	quick := flags.Bool("quick", false, "trust a present file by size alone instead of re-hashing it")
+	workers := flags.Int("workers", 4, "concurrent scenario generation")
+	concurrency := flags.Int("concurrency", corpus.DefaultConcurrency, "in-flight downloads")
+	verbose := flags.Bool("verbose", false, "echo oracle output during generation")
+	if err := parse(flags, args); err != nil {
+		return err
+	}
+	if len(profiles) == 0 && len(slugs) == 0 {
+		return badUsage("ensure needs at least one --profile or --slug (run `corpus profiles` to list the profiles)")
+	}
+	state, err := load(*root)
+	if err != nil {
+		return err
+	}
+	var paths []string
+	for _, slug := range slugs {
+		owned := fixturegen.ScenarioPaths(state.ledger, slug)
+		if len(owned) == 0 {
+			if reason, only := fixturegen.ScenarioOnly[slug]; only {
+				return fmt.Errorf("%s owns no fixture bytes: it %s", slug, reason)
+			}
+			return fmt.Errorf("no ledger path is under testdata/%s/", slug)
+		}
+		paths = append(paths, owned...)
+	}
+	report, err := fixturegen.Ensure(ctx, fixturegen.EnsureConfig{
+		Root:        state.root,
+		Profiles:    profiles,
+		Paths:       paths,
+		NoFetch:     *noFetch,
+		NoGenerate:  *noGenerate,
+		Digest:      !*quick,
+		Workers:     *workers,
+		Concurrency: *concurrency,
+		Verbose:     *verbose,
+		Log:         os.Stdout,
+	})
+	fmt.Printf("ensure: %d wanted, %d present, %d fetched, %d generated",
+		len(report.Wanted), len(report.Present), len(report.Fetched), len(report.Generated))
+	if len(report.GeneratedSlugs) > 0 {
+		fmt.Printf(" (%s)", strings.Join(report.GeneratedSlugs, ", "))
+	}
+	fmt.Println()
+	if report.LedgerChanged {
+		fmt.Printf("the tree is now a local corpus revision: %s carries the regenerated digests; publish and pin before committing that change\n", corpus.LedgerFile)
 	}
 	return err
 }

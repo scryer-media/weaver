@@ -23,7 +23,13 @@ tasks:
       - go build -o {{.E2E_BIN}} ./cmd/weaver-e2e
 
   hydrate:
-    desc: Fetch one fixture-corpus profile from the published corpus
+    desc: "Make one fixture-corpus profile present: reuse, then fetch from the published corpus, then generate what is still missing"
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - go run ./cmd/corpus ensure --profile {{.PROFILE | default "functional"}} {{.CLI_ARGS}}
+
+  fetch:
+    desc: Fetch one fixture-corpus profile from the published corpus only (no local generation)
     dir: "{{.TASKFILE_DIR}}"
     cmds:
       - go run ./cmd/corpus hydrate --profile {{.PROFILE | default "functional"}}

@@ -82,6 +82,25 @@ func functionalFullPhase(def fullPhaseDefinition) bool {
 	return def.seedProfile == "functional"
 }
 
+// fullPhaseFixtureProfiles is what the selected phases will seed: each seeding
+// phase's profile, plus the release gate's own corpus profile when that phase
+// runs, since its flows seed probe fixtures of their own.
+func fullPhaseFixtureProfiles(phases []*fullPhaseContext) []string {
+	var profiles []string
+	for _, phase := range phases {
+		if phase == nil {
+			continue
+		}
+		if !phase.SkipSeed && strings.TrimSpace(phase.SeedProfile) != "" {
+			profiles = append(profiles, phase.SeedProfile)
+		}
+		if phase.Command == "release-gate" {
+			profiles = append(profiles, "release-gate")
+		}
+	}
+	return uniqueSorted(profiles)
+}
+
 func fullPhaseNeedsLocalWeaverImage(phase *fullPhaseContext) bool {
 	return phase != nil && (phase.Command == "container-restart" || phase.Command == "release-gate")
 }
@@ -768,6 +787,11 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	if err := writeFullRunManifest(manifestPath, tempRoot, phases); err != nil {
 		log.Fatalf("write full-run manifest: %v", err)
 	}
+
+	// Fixtures first, before the dashboard takes the terminal: a fetch or a
+	// generation is minutes to an hour of plain log lines, and every phase
+	// below seeds from the tree it produces.
+	ensureFixtureProfiles(fullPhaseFixtureProfiles(phases)...)
 
 	seedableCount, err := countSeedableFixtures(phases)
 	if err != nil {

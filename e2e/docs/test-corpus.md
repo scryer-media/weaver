@@ -3,8 +3,10 @@
 Everything under `testdata/` except `scenario.json` is the **fixture corpus**:
 237 archives, parity sets, split volumes, recovery volumes and source clips — about 6.2 GiB — that
 the seeder posts to the fake NNTP servers before any scenario runs. The bytes
-are not in git. They are published as a signed, content-addressed object set
-and hydrated by `go run ./cmd/corpus hydrate`.
+are not in git. They are published as a signed, content-addressed object set;
+`go run ./cmd/corpus ensure` — which the harness runs itself before seeding —
+reuses what a checkout already has, hydrates the rest from that object set,
+and generates only what is still missing.
 
 What *is* in git is the description: one ledger entry per fixture path with its
 size, its BLAKE3 digest and where it came from; the named subsets a lane
@@ -38,9 +40,16 @@ cost that actually shows up. A full pass over the tree takes a few seconds.
 ## Commands
 
 ```sh
-# What CI and developers run before anything else.
-go run ./cmd/corpus hydrate --profile functional
+# What developers run before anything else — and what every suite runs itself:
+# reuse what matches the ledger, fetch the rest from the published corpus,
+# generate only what is still missing (--no-generate for a fetch-only lane).
+go run ./cmd/corpus ensure --profile functional
+go run ./cmd/corpus ensure --slug rar5-multivolume --quick
 task hydrate PROFILE=chaos
+
+# The published corpus only; refuses while nothing is pinned.
+go run ./cmd/corpus hydrate --profile functional
+task fetch PROFILE=functional
 
 # Ledger vs tree vs lock, offline; --all-present requires the whole corpus.
 go run ./cmd/corpus verify --all-present --offline
@@ -95,7 +104,7 @@ git commit ──► test-corpus/lock.json ──► manifest BLAKE3 ──► m
                                          --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-- `hydrate` verifies the manifest against the locked digest and every object
+- `hydrate` (and the fetch step of `ensure`) verifies the manifest against the locked digest and every object
   against its manifest digest **before writing anything**. Files land through a
   temporary file and a rename, so a fixture path is either whole or absent. A
   file already present with the right size and digest is left alone.
@@ -114,8 +123,12 @@ git commit ──► test-corpus/lock.json ──► manifest BLAKE3 ──► m
 ## Bootstrap
 
 Nothing is published yet: `test-corpus/lock.json` carries an empty manifest
-digest, so `hydrate` refuses and says so. The corpus files currently live only
-in developer checkouts and in what the generator rebuilds.
+digest, so `hydrate` refuses and says so, and `ensure` — the harness's own
+pre-flight — skips the fetch and generates whatever a checkout is missing.
+Once a manifest is pinned the same `ensure` fetches first and generates only
+what the published corpus does not carry (a scenario added after the last
+publication, say). The corpus files currently live only in developer checkouts
+and in what the generator rebuilds.
 
 Getting from here to a hydrating harness is a sequence, not a switch:
 
@@ -127,7 +140,8 @@ Getting from here to a hydrating harness is a sequence, not a switch:
    uploads the revision, then prints the lock entry.
 3. **Pin it in a reviewed PR** carrying the workflow's updated `sources.json`
    and the lock entry. The workflow never commits; pinning is always a review.
-4. From that commit on, `hydrate` fetches from the bucket in every lane.
+4. From that commit on, `ensure` (and `hydrate`) fetch from the bucket in
+   every lane; generation becomes the fallback for what is not published.
 
 The `.gitignore` rules make this concrete today: of everything under
 `testdata/`, git sees only the 100 `scenario.json` files. No fixture byte is

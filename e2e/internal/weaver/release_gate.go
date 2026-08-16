@@ -291,6 +291,7 @@ func runWeaverReleaseGate(parent context.Context, mode string) error {
 	if err != nil {
 		return err
 	}
+	ensureFixtureProfiles("release-gate")
 	runDir, err := newWeaverReleaseGateRunDir()
 	if err != nil {
 		return err

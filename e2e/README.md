@@ -50,8 +50,10 @@ cd e2e
 # 1. Build the CLI (writes ./.bin/weaver-e2e).
 task build
 
-# 2. Hydrate the fixture payloads for the suite you are about to run.
-task hydrate PROFILE=functional          # or: go run ./cmd/corpus hydrate --profile functional
+# 2. Optional: make the fixture payloads present up front. Every suite does this
+#    itself before seeding — reuse what is on disk, fetch the rest from the
+#    published corpus, generate only what is still missing.
+task hydrate PROFILE=functional          # or: go run ./cmd/corpus ensure --profile functional
 
 # 3. The canonical release command: every pipeline phase plus the product-behavior gate.
 task full
@@ -80,7 +82,7 @@ subcommands.
 | `playwright-weaver/` | The Playwright project (image `weaver-e2e-playwright:local`); `tests/` is live-mounted into the container |
 | `testdata/<slug>/` | One directory per scenario: `scenario.json` is tracked, the payload bytes are hydrated; `testdata/shared/` holds the source clips the generators encode from |
 | `test-corpus/` | The corpus ledger, profiles, toolchain lock and published-manifest lock |
-| `cmd/corpus`, `internal/corpus` | The corpus tool: `hydrate`, `verify`, `build`, `sign`, `publish` |
+| `cmd/corpus`, `internal/corpus` | The corpus tool: `ensure`, `hydrate`, `verify`, `build`, `sign`, `publish` |
 | `cmd/fixturegen`, `internal/fixturegen` | The fixture generator: one declarative recipe per scenario, run on pinned oracle images |
 | `fixtures/` | Seeded NZB output written by `weaver-e2e seed`; not tracked |
 | `docs/` | [`test-corpus.md`](docs/test-corpus.md) and [`generators.md`](docs/generators.md) |
@@ -89,17 +91,35 @@ subcommands.
 
 The payload bytes under `testdata/` — 237 archives, parity sets, split volumes,
 recovery volumes and source clips — are **not in git**. They are a signed,
-content-addressed object set described by `test-corpus/sources.json`, published
-by a manual workflow, and hydrated on demand:
+content-addressed object set described by `test-corpus/sources.json` and
+published by a manual workflow. Before anything is seeded the harness makes
+the fixtures it needs present, always in the same order:
+
+1. **reuse** what is on disk and matches the ledger;
+2. **fetch** what is missing from the published corpus, when
+   `test-corpus/lock.json` pins one;
+3. **generate** locally only what is still missing after that.
+
+`full`, `functional`, `release-gate` and `seed-all` run that as a digest-checked
+pre-flight over their whole profile; every fixture is size-checked again as it
+is seeded, so a scenario seeded on its own is covered too. The same thing by
+hand:
 
 ```bash
 task hydrate PROFILE=functional          # chaos | tcp-chaos | restart | release-gate | shared | all
+go run ./cmd/corpus ensure --slug rar5-multivolume
+task fetch PROFILE=functional            # published corpus only, never generates
 task corpus:verify -- --all-present --offline
 ```
 
-Every digest is BLAKE3; hydration verifies the manifest against the pinned
-lock and every object against the manifest before writing a byte; `verify`
-fails closed if the ledger, the tree and the lock disagree in either direction.
+`E2E_FIXTURES=fetch` forbids local generation (what a CI lane wants);
+`E2E_FIXTURES=off` skips the check entirely. Every digest is BLAKE3; a fetch
+verifies the manifest against the pinned lock and every object against the
+manifest before writing a byte; `verify` fails closed if the ledger, the tree
+and the lock disagree in either direction. A locally generated fixture is a
+*local corpus revision*: the ledger's digests for that scenario are refreshed
+(byte-reproducible families come back identical and change nothing), so do
+not commit that ledger change unless you are publishing it.
 
 Every fixture is generated. `go run ./cmd/fixturegen` rebuilds any scenario
 from its recipe on the oracle images pinned in `test-corpus/toolchains.json` —
@@ -199,6 +219,7 @@ Docker path.
 | `E2E_NNTP_MODULE_VERSION` | `v0.1.0` | Published `e2e-nntp` module version the fake NNTP image is built from |
 | `E2E_NNTP_SOURCE_DIR` | unset | Developer override: build the fake NNTP image from this local module root instead. Never guessed; a missing directory is an error |
 | `E2E_NNTP_PIPELINING` / `E2E_NNTP2_PIPELINING` | `0` | Advertise RFC 4644 `PIPELINING` per fake server |
+| `E2E_FIXTURES` | `auto` | How missing fixtures are obtained before seeding: `auto` fetches from the published corpus then generates what is still missing; `fetch` never generates; `off` does nothing |
 | `E2E_WEAVER_POSTGRES_DB` / `_USER` / `_PASSWORD` | `weaver` / `weaver` / `weaver-pass` | PostgreSQL settings for the PostgreSQL phases |
 | `FIXTURES_DIR` / `TESTDATA_DIR` | `<e2e>/fixtures` / `<e2e>/testdata` | Seeded output and scenario sources |
 | `E2E_RUN_DIR` | temp dir | State directory for managed-local runs (`tcp-chaos`, `tls-test`, restart, local `download-bench`) |

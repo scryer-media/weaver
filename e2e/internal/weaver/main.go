@@ -1590,8 +1590,11 @@ func ensureStandardDockerInfrastructure() {
 // --- seed ---
 
 func cmdSeed(dir string) {
-	ensureSeedingInfrastructure()
 	absDir := resolveRepoPath(dir)
+	// Fixtures before infrastructure: a missing payload should fail (or be
+	// fetched or generated) before any container is started for it.
+	ensureFixtureDir(absDir)
+	ensureSeedingInfrastructure()
 	scenario, err := loadScenario(absDir)
 	if err != nil {
 		log.Fatal(err)
@@ -1620,6 +1623,7 @@ func seedFixture(dir string) error {
 
 func seedFixtureWithRetry(dir string, attempts int) error {
 	absDir := resolveRepoPath(dir)
+	ensureFixtureDir(absDir)
 
 	scenario, err := loadScenario(absDir)
 	if err != nil {
@@ -2082,6 +2086,7 @@ func seedAllForProfile(profile string) {
 		log.Fatalf("no fixtures configured for seed profile %q", profile)
 	}
 
+	ensureFixtureProfiles(profile)
 	ensureSeedingInfrastructure()
 	emitProgressEvent(progressEvent{Kind: "seed_total", Total: len(dirs), Detail: "fixtures"})
 
