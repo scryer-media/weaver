@@ -62,7 +62,7 @@ func Run(ctx context.Context, cfg Config) error {
 			return err
 		}
 		startupCtx, cancelStartup := context.WithTimeout(ctx, cfg.StartupTimeout)
-		readyVersion, err := waitUntilReady(startupCtx, cfg.PollInterval, api)
+		readyVersion, err := waitUntilContainerReady(startupCtx, cfg.PollInterval, api, container)
 		cancelStartup()
 		if err != nil {
 			return fmt.Errorf("wait for %s readiness: %w", cfg.Client, err)
@@ -275,29 +275,6 @@ func writeNewFileMode(path string, contents []byte, mode os.FileMode) error {
 		return err
 	}
 	return nil
-}
-
-func waitUntilReady(ctx context.Context, interval time.Duration, api productAPI) (string, error) {
-	var lastErr error
-	for {
-		version, err := api.waitReady(ctx)
-		if err == nil {
-			return version, nil
-		}
-		lastErr = err
-		timer := time.NewTimer(interval)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			return "", fmt.Errorf("%w (last readiness error: %v)", ctx.Err(), lastErr)
-		case <-timer.C:
-		}
-	}
 }
 
 func waitUntilContainerReady(ctx context.Context, interval time.Duration, api productAPI, container *runningContainer) (string, error) {

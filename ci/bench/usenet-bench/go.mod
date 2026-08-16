@@ -1,6 +1,6 @@
 module github.com/scryer-media/weaver/ci/bench/usenet-bench
 
-go 1.22
+go 1.26.2
 
 require github.com/zeebo/blake3 v0.2.4
 

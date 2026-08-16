@@ -418,12 +418,13 @@ func (api *nzbgetAPI) waitComplete(ctx context.Context, nzbID string, interval t
 				continue
 			}
 			status := strings.ToUpper(fieldString(record, "Status"))
-			if nzbgetHistoryFailed(record, status) {
-				return false, fmt.Errorf("NZBGet history status %q", fieldString(record, "Status"))
-			}
-			if nzbgetHistoryComplete(status) {
+			if nzbgetHistoryComplete(status) && !nzbgetHistoryFailed(record, status) {
 				return true, nil
 			}
+			// A history record is terminal in NZBGet. Anything that is not an
+			// unqualified success (FAILURE/*, DELETED/*, WARNING/*, or a failed
+			// granular stage) ends the run instead of polling until timeout.
+			return false, fmt.Errorf("NZBGet history status %q", fieldString(record, "Status"))
 		}
 		return false, nil
 	})
@@ -466,7 +467,9 @@ func (api *nzbgetAPI) observe(ctx context.Context, jobIDs []string) (map[string]
 		case nzbgetHistoryComplete(status):
 			observations[id] = jobObservation{state: jobComplete, status: fieldString(record, "Status")}
 		default:
-			observations[id] = jobObservation{state: jobActive, status: fieldString(record, "Status")}
+			// History entries are terminal; a WARNING/* record with clean
+			// granular stages is still not a benchmark success.
+			observations[id] = jobObservation{state: jobFailed, status: fieldString(record, "Status")}
 		}
 	}
 	return observations, nil
@@ -544,16 +547,19 @@ func (api *weaverAPI) waitReady(ctx context.Context) (string, error) {
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return "", fmt.Errorf("Weaver session endpoint returned HTTP %d", response.StatusCode)
 	}
+	// `version` is the running binary's Cargo package version. Returning it
+	// lets the launchers reconcile the declared client version for Weaver
+	// exactly as they already do for SABnzbd and NZBGet.
 	var data struct {
-		Typename string `json:"__typename"`
+		Version string `json:"version"`
 	}
-	if err := api.graphQL(ctx, "query { __typename }", nil, &data); err != nil {
+	if err := api.graphQL(ctx, "query { version }", nil, &data); err != nil {
 		return "", err
 	}
-	if data.Typename == "" {
-		return "", fmt.Errorf("Weaver GraphQL readiness query returned no typename")
+	if strings.TrimSpace(data.Version) == "" {
+		return "", fmt.Errorf("Weaver GraphQL readiness query returned no version")
 	}
-	return "", nil
+	return strings.TrimSpace(data.Version), nil
 }
 
 func (api *weaverAPI) queue(ctx context.Context, nzbPath, archivePassword string, options queueOptions) (string, error) {
@@ -573,20 +579,32 @@ func (api *weaverAPI) queue(ctx context.Context, nzbPath, archivePassword string
 	}
 	var data struct {
 		SubmitNZB struct {
-			Accepted bool `json:"accepted"`
-			Item     struct {
+			Accepted  bool            `json:"accepted"`
+			Status    string          `json:"status"`
+			JobID     json.RawMessage `json:"jobId"`
+			ErrorCode string          `json:"errorCode"`
+			Message   string          `json:"message"`
+			Item      *struct {
 				ID json.RawMessage `json:"id"`
 			} `json:"item"`
 		} `json:"submitNzb"`
 	}
-	query := "mutation Submit($input: SubmitNzbInput!) { submitNzb(input: $input) { accepted item { id } } }"
+	query := "mutation Submit($input: SubmitNzbInput!) { submitNzb(input: $input) { accepted status jobId errorCode message item { id } } }"
 	if err := api.graphQL(ctx, query, map[string]any{"input": input}, &data); err != nil {
 		return "", fmt.Errorf("queue NZB in Weaver: %w", err)
 	}
 	if !data.SubmitNZB.Accepted {
-		return "", fmt.Errorf("Weaver did not accept queued NZB")
+		reason := strings.TrimSpace(strings.Join([]string{data.SubmitNZB.Status, data.SubmitNZB.ErrorCode, data.SubmitNZB.Message}, " "))
+		if reason == "" {
+			reason = "no reason reported"
+		}
+		return "", fmt.Errorf("Weaver did not accept queued NZB: %s", reason)
 	}
-	id, err := numericID(data.SubmitNZB.Item.ID)
+	rawID := data.SubmitNZB.JobID
+	if data.SubmitNZB.Item != nil && len(data.SubmitNZB.Item.ID) > 0 {
+		rawID = data.SubmitNZB.Item.ID
+	}
+	id, err := numericID(rawID)
 	if err != nil {
 		return "", fmt.Errorf("Weaver submission id: %w", err)
 	}

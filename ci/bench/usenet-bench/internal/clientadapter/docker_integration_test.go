@@ -71,8 +71,8 @@ func TestProductImagesReachAPI(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := waitUntilReady(ctx, cfg.PollInterval, api); err != nil {
-				logPath := filepath.Join(cfg.ConfigDir, "client-container.log")
+			if _, err := waitUntilContainerReady(ctx, cfg.PollInterval, api, container); err != nil {
+				logPath := filepath.Join(filepath.Dir(cfg.ConfigDir), "client-container.log")
 				t.Fatalf("client did not become ready: %v (container log will be saved at %s)", err, logPath)
 			}
 		})

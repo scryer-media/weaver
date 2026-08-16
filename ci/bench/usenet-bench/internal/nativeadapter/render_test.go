@@ -29,6 +29,37 @@ func TestWeaverRenderUsesServiceLaunchAndStockExtractionDefault(t *testing.T) {
 	if strings.Contains(string(spec.Content), "WEAVER_MAX_CONCURRENT_EXTRACTIONS=") {
 		t.Fatalf("native stock configuration must not override Weaver extraction concurrency:\n%s", spec.Content)
 	}
+	if !strings.Contains(string(spec.Content), "WEAVER_STARTUP_IOPS=50000\n") {
+		t.Fatalf("native Weaver environment lacks the Docker-parity startup IOPS pin (probe skip):\n%s", spec.Content)
+	}
+}
+
+func TestWeaverRenderMirrorsDockerOperatorOverridesIntoTheAuditRecord(t *testing.T) {
+	t.Setenv("WEAVER_NNTP_TLS_BACKEND", "s2n")
+	t.Setenv("RUST_LOG", "weaver_nntp=debug")
+	t.Setenv("WEAVER_STARTUP_IOPS", "12345")
+	cfg := testConfig(benchmark.Weaver)
+	cfg.LaunchCommand = []string{"weaver", "--config", "{{config_dir}}", "serve", "--port", "{{api_port}}"}
+	spec, err := renderProduct(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment := strings.Join(spec.Environment, "\n")
+	for _, expected := range []string{
+		"WEAVER_NNTP_TLS_BACKEND=s2n",
+		"RUST_LOG=weaver_nntp=debug",
+		"WEAVER_STARTUP_IOPS=12345",
+	} {
+		if !strings.Contains(environment, expected) {
+			t.Fatalf("native Weaver environment lacks operator override %q:\n%s", expected, environment)
+		}
+	}
+	if strings.Contains(environment, "WEAVER_STARTUP_IOPS=50000") {
+		t.Fatalf("operator IOPS override must replace the default pin:\n%s", environment)
+	}
+	if !strings.Contains(string(spec.Rendered), "WEAVER_STARTUP_IOPS=12345") {
+		t.Fatalf("rendered audit record must list the effective startup IOPS pin:\n%s", spec.Rendered)
+	}
 }
 
 func TestNativeSABAndNZBGetRenderEquivalentThroughputSettings(t *testing.T) {

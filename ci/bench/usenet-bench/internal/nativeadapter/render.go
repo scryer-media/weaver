@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -17,8 +18,6 @@ type productSpec struct {
 	Content      []byte
 	Environment  []string
 	Command      []string
-	ReportPath   string
-	AckPath      string
 	Rendered     []byte
 	ConfigSHA256 string
 }
@@ -60,11 +59,29 @@ func renderWeaver(cfg Config) productSpec {
 	if cfg.Transport == benchmark.TLS && cfg.TLSValidation == benchmark.TLSCAVerified {
 		env = append(env, "WEAVER_SERVER_1_TLS_CA_CERT="+cfg.NNTPCAFile)
 	}
+	// The native launcher inherits the controller environment, so these would
+	// reach Weaver anyway; rendering them explicitly keeps the audit record
+	// identical to the Docker lane, which lists every effective product setting.
+	if tlsBackend := os.Getenv("WEAVER_NNTP_TLS_BACKEND"); tlsBackend != "" {
+		env = append(env, "WEAVER_NNTP_TLS_BACKEND="+tlsBackend)
+	}
+	if rustLog := os.Getenv("RUST_LOG"); rustLog != "" {
+		env = append(env, "RUST_LOG="+rustLog)
+	}
+	// Match the Docker lane: pin the startup random-read IOPS so Weaver skips
+	// its startup disk probe (a write + fsync + random-read burst that would
+	// otherwise run inside the measured native process lifetime and vary with
+	// the host's storage). An operator override is honoured for diagnostics.
+	startupIops := os.Getenv("WEAVER_STARTUP_IOPS")
+	if startupIops == "" {
+		startupIops = "50000"
+	}
+	env = append(env, "WEAVER_STARTUP_IOPS="+startupIops)
 	return productSpec{
 		ConfigName:  "weaver.env",
 		Content:     []byte(strings.Join(env, "\n") + "\n"),
 		Environment: env,
-		Command:     expandCommand(cfg.LaunchCommand, cfg, "", ""),
+		Command:     expandCommand(cfg.LaunchCommand, cfg),
 	}
 }
 
@@ -106,7 +123,7 @@ func renderSABnzbd(cfg Config, directUnpack bool) productSpec {
 	return productSpec{
 		ConfigName: "sabnzbd.ini",
 		Content:    []byte(content),
-		Command:    expandCommand(cfg.LaunchCommand, cfg, "", ""),
+		Command:    expandCommand(cfg.LaunchCommand, cfg),
 	}
 }
 
@@ -169,19 +186,17 @@ func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 	return productSpec{
 		ConfigName: "nzbget.conf",
 		Content:    []byte(content),
-		Command:    expandCommand(cfg.LaunchCommand, cfg, "", ""),
+		Command:    expandCommand(cfg.LaunchCommand, cfg),
 	}
 }
 
-func expandCommand(command []string, cfg Config, reportPath, ackPath string) []string {
+func expandCommand(command []string, cfg Config) []string {
 	_, apiPort, _ := nativeAPIAddress(cfg.APIEndpoint)
 	replacements := map[string]string{
 		"{{config_dir}}":  cfg.ConfigDir,
 		"{{fixture_dir}}": cfg.FixtureDir,
 		"{{nzb_path}}":    cfg.NZBPath,
 		"{{output_dir}}":  cfg.OutputDir,
-		"{{report_path}}": reportPath,
-		"{{report_ack}}":  ackPath,
 		"{{api_port}}":    strconv.Itoa(apiPort),
 	}
 	expanded := make([]string, len(command))

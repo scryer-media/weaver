@@ -37,6 +37,11 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 {
+		// The proxy is configured entirely through its environment; refusing
+		// stray arguments keeps a typo from silently starting an unshaped server.
+		log.Fatalf("nntpshaper takes no arguments (got %q); use `nntpshaper health --addr host:port` for the probe and NNTP_EGRESS_* / *_ADDR environment variables for the proxy", os.Args[1:])
+	}
 	bitsPerSecond, err := uintEnv("NNTP_EGRESS_BITS_PER_SECOND", 0)
 	if err != nil {
 		log.Fatal(err)

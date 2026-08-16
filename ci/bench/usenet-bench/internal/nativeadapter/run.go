@@ -351,61 +351,6 @@ func nativeInstructionMeasurement() benchmark.CounterMeasurement {
 	)
 }
 
-type weaverReport struct {
-	SchemaVersion int       `json:"schema_version"`
-	QueuedAt      time.Time `json:"queued_at"`
-	CompletionAt  time.Time `json:"completion_at"`
-	Status        string    `json:"status"`
-}
-
-func waitForWeaverReport(ctx context.Context, interval time.Duration, reportPath string, process *nativeProcess) (time.Time, time.Time, error) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	var lastReportError error
-	for {
-		contents, err := os.ReadFile(reportPath)
-		switch {
-		case err == nil:
-			var report weaverReport
-			if decodeErr := json.Unmarshal(contents, &report); decodeErr != nil {
-				lastReportError = fmt.Errorf("decode Weaver CLI report: %w", decodeErr)
-			} else if validationErr := validateWeaverReport(report); validationErr != nil {
-				lastReportError = validationErr
-			} else {
-				return report.QueuedAt, report.CompletionAt, nil
-			}
-		case os.IsNotExist(err):
-			lastReportError = nil
-		default:
-			return time.Time{}, time.Time{}, fmt.Errorf("read Weaver CLI report: %w", err)
-		}
-		if process.exited() {
-			if lastReportError != nil {
-				return time.Time{}, time.Time{}, fmt.Errorf("Weaver CLI exited before writing a valid terminal report: %w", lastReportError)
-			}
-			return time.Time{}, time.Time{}, fmt.Errorf("Weaver CLI exited without a terminal report: %w", process.err)
-		}
-		select {
-		case <-ctx.Done():
-			return time.Time{}, time.Time{}, ctx.Err()
-		case <-ticker.C:
-		}
-	}
-}
-
-func validateWeaverReport(report weaverReport) error {
-	if report.SchemaVersion != 1 {
-		return fmt.Errorf("unsupported Weaver CLI report schema %d", report.SchemaVersion)
-	}
-	if report.Status != "complete" {
-		return fmt.Errorf("Weaver CLI reported unexpected terminal status %q", report.Status)
-	}
-	if report.QueuedAt.IsZero() || report.CompletionAt.IsZero() || report.CompletionAt.Before(report.QueuedAt) {
-		return fmt.Errorf("Weaver CLI report has invalid timestamps")
-	}
-	return nil
-}
-
 func waitUntilReady(ctx context.Context, interval time.Duration, api *clientadapter.API, process *nativeProcess) (string, error) {
 	var lastErr error
 	for {
