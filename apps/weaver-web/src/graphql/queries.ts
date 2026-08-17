@@ -244,6 +244,38 @@ export const VERSION_QUERY = gql`
   }
 `;
 
+export const UPDATE_STATUS_QUERY = gql`
+  query UpdateStatus {
+    updateStatus {
+      currentVersion
+      latestVersion
+      updateAvailable
+      releaseUrl
+      publishedAtEpochMs
+      checking
+      lastCheckedAtEpochMs
+      lastSuccessfulCheckAtEpochMs
+      lastError
+    }
+  }
+`;
+
+export const UPDATE_STATUS_SUBSCRIPTION = gql`
+  subscription UpdateStatusUpdates {
+    updateStatusUpdates {
+      currentVersion
+      latestVersion
+      updateAvailable
+      releaseUrl
+      publishedAtEpochMs
+      checking
+      lastCheckedAtEpochMs
+      lastSuccessfulCheckAtEpochMs
+      lastError
+    }
+  }
+`;
+
 export const BROWSE_DIRECTORIES_QUERY = gql`
   query BrowseDirectories($path: String) {
     browseDirectories(path: $path) {

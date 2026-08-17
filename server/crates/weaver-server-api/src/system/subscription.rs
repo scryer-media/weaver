@@ -15,6 +15,25 @@ impl SystemSubscription {
         Ok(tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|result| result.ok()))
     }
 
+    /// Subscribe to release-check state changes, including the initial snapshot.
+    #[graphql(guard = "ReadGuard")]
+    async fn update_status_updates(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<impl Stream<Item = UpdateStatus>> {
+        let mut receiver = ctx
+            .data::<weaver_server_core::update_check::UpdateCheckService>()?
+            .subscribe();
+        Ok(async_stream::stream! {
+            let initial = receiver.borrow().clone();
+            yield initial.into();
+            while receiver.changed().await.is_ok() {
+                let status = receiver.borrow().clone();
+                yield status.into();
+            }
+        })
+    }
+
     /// Subscribe to cadence-driven system metrics and global queue state.
     #[graphql(guard = "ReadGuard")]
     async fn system_metrics_updates(

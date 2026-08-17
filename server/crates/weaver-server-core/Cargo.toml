@@ -40,6 +40,8 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true, default-features = false }
 reqwest = { workspace = true }
+semver = { workspace = true }
+httpdate = { workspace = true }
 regex = { workspace = true }
 ipnet = { workspace = true }
 quick-xml = { workspace = true }
@@ -75,7 +77,9 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 serde_json = { workspace = true }
-tokio = { workspace = true }
+# `test-util` powers the paused-clock update-check tests. Kept dev-only so the
+# release binary never links tokio's clock-control machinery.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 sevenz-rust2 = { workspace = true }
 axum = { workspace = true }

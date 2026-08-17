@@ -1364,6 +1364,10 @@ type QueryRoot {
 	"""
 	queueItems(filter: QueueFilterInput, first: Int, after: String): [QueueItem!]!
 	"""
+	Server-paginated queue rows for the interactive queue table.
+	"""
+	queuePage(input: QueuePageInput!): QueuePage!
+	"""
 	Public queue facade for one active item.
 	"""
 	queueItem(id: Int!): QueueItem
@@ -1448,6 +1452,10 @@ type QueryRoot {
 	The running weaver binary version.
 	"""
 	version: String!
+	"""
+	Latest stable Weaver release information observed by the background checker.
+	"""
+	updateStatus: UpdateStatus!
 	"""
 	Safe runtime and storage facts for the built-in troubleshooting UI.
 	"""
@@ -1618,6 +1626,25 @@ enum QueueMoveKind {
 	OFFSET
 }
 
+type QueuePage {
+	items: [QueueItem!]!
+	totalCount: Int!
+	summary: QueueSummary!
+	categories: [String!]!
+	latestCursor: String!
+}
+
+input QueuePageInput {
+	pageIndex: Int!
+	pageSize: Int!
+	search: String
+	states: [QueueItemState!]
+	priorities: [QueuePriority!]
+	categories: [String!]
+	sortField: QueueSortField!
+	sortDirection: QueueSortDirection!
+}
+
 enum QueuePhase {
 	DOWNLOADING
 	REPAIRING
@@ -1652,6 +1679,12 @@ enum QueuePostState {
 	FAILED
 }
 
+enum QueuePriority {
+	LOW
+	NORMAL
+	HIGH
+}
+
 type QueueSnapshot {
 	items: [QueueItem!]!
 	summary: QueueSummary!
@@ -1659,6 +1692,20 @@ type QueueSnapshot {
 	globalState: GlobalQueueState!
 	latestCursor: String!
 	generatedAt: DateTime!
+}
+
+enum QueueSortDirection {
+	ASC
+	DESC
+}
+
+enum QueueSortField {
+	NAME
+	STATE
+	PRIORITY
+	CATEGORY
+	PROGRESS
+	SIZE
 }
 
 type QueueSummary {
@@ -2132,6 +2179,10 @@ type SubscriptionRoot {
 	"""
 	serviceLogLines: String!
 	"""
+	Subscribe to release-check state changes, including the initial snapshot.
+	"""
+	updateStatusUpdates: UpdateStatus!
+	"""
 	Subscribe to cadence-driven system metrics and global queue state.
 	"""
 	systemMetricsUpdates: SystemMetricsSnapshot!
@@ -2205,6 +2256,21 @@ enum TimelineStage {
 	EXTRACTING
 	INTERRUPTED
 	FINAL_MOVE
+}
+
+"""
+Latest stable release observed by the background release checker.
+"""
+type UpdateStatus {
+	currentVersion: String!
+	latestVersion: String
+	updateAvailable: Boolean!
+	releaseUrl: String
+	publishedAtEpochMs: Int
+	checking: Boolean!
+	lastCheckedAtEpochMs: Int
+	lastSuccessfulCheckAtEpochMs: Int
+	lastError: String
 }
 
 """

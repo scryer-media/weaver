@@ -35,7 +35,7 @@ use crate::servers::types::Server;
 use crate::settings::types::GeneralSettings;
 use crate::system::types::{
     DirectoryBrowseResult, DiskUsage, MetricsHistoryResult, ServerHealth, ServiceLogsPayload,
-    SystemMetricsSnapshot, SystemStatus,
+    SystemMetricsSnapshot, SystemStatus, UpdateStatus,
 };
 use crate::system::types::{DownloadBlock, Metrics, PipelineEventGql};
 

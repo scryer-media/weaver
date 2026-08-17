@@ -140,6 +140,7 @@ pub struct TestHarness {
     pub server_transfer_policy:
         Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
     pub auth_cache: LoginAuthCache,
+    pub update_check: weaver_server_core::update_check::UpdateCheckService,
     _scheduler_task: JoinHandle<()>,
     _tempdir: tempfile::TempDir,
 }
@@ -212,6 +213,8 @@ impl TestHarness {
 
         let scheduled_resume =
             weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
+        let update_check = weaver_server_core::update_check::UpdateCheckService::new(db.clone())
+            .expect("failed to create update checker");
         let schema = build_schema(SchemaContext {
             handle: handle.clone(),
             scheduled_resume: scheduled_resume.clone(),
@@ -222,6 +225,7 @@ impl TestHarness {
             api_key_cache,
             rss,
             watch_folder,
+            update_check: update_check.clone(),
             schedules: shared_schedules,
             log_buffer:
                 weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
@@ -267,6 +271,7 @@ impl TestHarness {
             shared_state,
             server_transfer_policy,
             auth_cache,
+            update_check,
             _scheduler_task: scheduler_task,
             _tempdir: tempdir,
         }

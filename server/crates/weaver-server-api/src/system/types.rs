@@ -830,6 +830,36 @@ pub struct SystemStatus {
     pub summary: QueueSummary,
 }
 
+/// Latest stable release observed by the background release checker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+pub struct UpdateStatus {
+    pub current_version: String,
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+    pub release_url: Option<String>,
+    pub published_at_epoch_ms: Option<i64>,
+    pub checking: bool,
+    pub last_checked_at_epoch_ms: Option<i64>,
+    pub last_successful_check_at_epoch_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+impl From<weaver_server_core::update_check::UpdateStatus> for UpdateStatus {
+    fn from(value: weaver_server_core::update_check::UpdateStatus) -> Self {
+        Self {
+            current_version: value.current_version,
+            latest_version: value.latest_version,
+            update_available: value.update_available,
+            release_url: value.release_url,
+            published_at_epoch_ms: value.published_at_epoch_ms,
+            checking: value.checking,
+            last_checked_at_epoch_ms: value.last_checked_at_epoch_ms,
+            last_successful_check_at_epoch_ms: value.last_successful_check_at_epoch_ms,
+            last_error: value.last_error,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
 pub enum DeploymentEnvironmentGql {
     Native,

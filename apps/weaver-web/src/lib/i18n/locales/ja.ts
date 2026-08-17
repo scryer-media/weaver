@@ -11,6 +11,8 @@ const ja: LocaleDictionary = {
   "nav.upload": "アップロード",
   "nav.settings": "設定",
   "nav.sponsor": "スポンサー",
+  "update.newVersion": "新しいバージョン v{{version}}",
+  "update.newVersionAria": "GitHub で Weaver v{{version}} を新しいタブで開く",
 
   // Status labels
   "status.queued": "待機中",

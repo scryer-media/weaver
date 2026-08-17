@@ -13,6 +13,8 @@ const en: LocaleDictionary = {
   "nav.upload": "Upload",
   "nav.settings": "Settings",
   "nav.sponsor": "Sponsor",
+  "update.newVersion": "New version v{{version}}",
+  "update.newVersionAria": "Open Weaver v{{version}} on GitHub in a new tab",
   "nav.logs": "Logs",
 
   // System information

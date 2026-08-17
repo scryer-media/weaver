@@ -20,6 +20,7 @@ pub mod schema_migrations;
 pub mod security;
 pub mod servers;
 pub mod settings;
+pub mod update_check;
 pub mod watch_folder;
 
 pub use auth::{ApiKeyRow, AuthCredentials};
