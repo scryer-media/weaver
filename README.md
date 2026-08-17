@@ -62,6 +62,8 @@ services:
       - PGID=1000
       - TZ=Etc/UTC
       - UMASK=022 # optional
+      # Docker and reverse-proxy deployments must explicitly bind beyond loopback.
+      - WEAVER_HTTP_BIND_ADDRESS=0.0.0.0
       - WEAVER_HTTP_ALLOWED_HOSTS=weaver,weaver.example.me # permit the Compose service name and any reverse proxy names
     volumes:
       - /path/to/weaver/config:/config # this is the critical volume with all your config data and encryption key
@@ -70,9 +72,38 @@ services:
     restart: unless-stopped
 ```
 
+Weaver binds to `127.0.0.1` by default. Set `WEAVER_HTTP_BIND_ADDRESS=0.0.0.0`
+for Docker, LAN, or reverse-proxy deployments, or use a specific non-loopback
+address. Binding and browser trust are separate: binding to a LAN interface
+does not trust its clients. To deliberately allow loginless browser access,
+configure `WEAVER_TRUSTED_CIDRS` with explicit client networks, for example
+`127.0.0.0/8,::1/128` for local access only. Matching clients receive full
+administrative browser access; agents and integrations must use persistent,
+scoped API keys instead.
+
+For an unattended first start, configure `WEAVER_BOOTSTRAP_LOGIN_USERNAME` and
+exactly one of `WEAVER_BOOTSTRAP_LOGIN_PASSWORD` or
+`WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE`. Bootstrap credentials are used only
+when no login is already stored; they never overwrite an existing login.
+
 ## API
 
 Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and subscription support. The same API powers the web UI, so anything you can do in the interface is available programmatically.
+
+`/metrics` remains authenticated by default. Give Prometheus a persistent
+Read-scoped Weaver API key using its standard bearer authorization support:
+
+```yaml
+scrape_configs:
+  - job_name: weaver
+    static_configs:
+      - targets: ["weaver:9090"]
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/weaver-metrics-api-key
+```
+
+This sends `Authorization: Bearer <key>` without reusing browser credentials.
 
 ## License
 

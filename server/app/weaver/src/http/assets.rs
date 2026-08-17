@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use axum::extract::Extension;
+use axum::extract::{ConnectInfo, Extension};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::Embed;
+use std::net::SocketAddr;
 
 use weaver_server_core::auth as jwt;
 use weaver_server_core::auth::LoginAuthCache;
@@ -55,11 +56,17 @@ pub(super) async fn static_handler(
     Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
     Extension(auth_cache): Extension<LoginAuthCache>,
     Extension(security): Extension<RuntimeSecurityConfig>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
 ) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
 
-    // Try the exact path first, then fall back to index.html for SPA routing.
-    if let Some(file) = FrontendAssets::get(path) {
+    // Static assets remain public so that both login and setup-required pages
+    // can load. The SPA entry itself is always handled below, including the
+    // exact /index.html path.
+    if !path.is_empty()
+        && path != "index.html"
+        && let Some(file) = FrontendAssets::get(path)
+    {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
 
         // Hashed assets (Vite output in assets/) are immutable - cache for 1 year.
@@ -87,7 +94,7 @@ pub(super) async fn static_handler(
             }
         }
 
-        (
+        return (
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, mime.as_ref().to_string()),
@@ -95,38 +102,42 @@ pub(super) async fn static_handler(
             ],
             file.data,
         )
-            .into_response()
-    } else {
-        // SPA fallback: serve index.html (or login page if auth is enabled).
-        // When auth is enabled and the user doesn't have a valid JWT cookie,
-        // serve the standalone login page instead of the React app.
-        if let Some(secret) = super::auth::jwt_secret_if_auth_enabled(&auth_cache) {
-            let has_valid_jwt = super::auth::extract_jwt_cookie(&headers)
-                .is_some_and(|token| jwt::verify_jwt(&token, &secret).is_ok());
-            if !has_valid_jwt {
-                return login_page_response();
-            }
-        }
+            .into_response();
+    }
 
-        if let Some(index) = FrontendAssets::get("index.html") {
-            let mime = mime_guess::from_path("index.html").first_or_octet_stream();
-            let body = rewrite_index_html(&index.data, &base_url);
-            let mut response = (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, mime.as_ref().to_string())],
-                body,
-            )
-                .into_response();
-            if auth_cache.snapshot().is_none() {
-                let cookie = super::auth::session_cookie_value(&session_token, &security);
-                if let Ok(value) = HeaderValue::from_str(&cookie) {
-                    response.headers_mut().append(header::SET_COOKIE, value);
-                }
-            }
-            response
+    let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
+    let trusted_peer = security.is_trusted_peer(peer);
+    let has_valid_jwt =
+        super::auth::jwt_secret_if_auth_enabled(&auth_cache).is_some_and(|secret| {
+            super::auth::extract_jwt_cookie(&headers)
+                .is_some_and(|token| jwt::verify_jwt(&token, &secret).is_ok())
+        });
+    if !trusted_peer && !has_valid_jwt {
+        return if auth_cache.snapshot().is_some() {
+            login_page_response()
         } else {
-            StatusCode::NOT_FOUND.into_response()
+            setup_required_response()
+        };
+    }
+
+    if let Some(index) = FrontendAssets::get("index.html") {
+        let mime = mime_guess::from_path("index.html").first_or_octet_stream();
+        let body = rewrite_index_html(&index.data, &base_url);
+        let mut response = (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, mime.as_ref().to_string())],
+            body,
+        )
+            .into_response();
+        if trusted_peer {
+            let cookie = super::auth::session_cookie_value(&session_token, &security);
+            if let Ok(value) = HeaderValue::from_str(&cookie) {
+                response.headers_mut().append(header::SET_COOKIE, value);
+            }
         }
+        response
+    } else {
+        StatusCode::NOT_FOUND.into_response()
     }
 }
 
@@ -183,14 +194,12 @@ const LOGIN_PAGE_HTML: &str = r#"<!DOCTYPE html>
   <div class="forgot">
     <a id="forgot-link">Forgot password?</a>
     <div class="reset-help" id="reset-help">
-      Stop weaver, then restart with:<br/><br/>
-      <code>WEAVER_RESET_LOGIN=1</code><br/><br/>
-      This disables login protection on startup. You can then set a new password in Settings &rarr; Security.
-      <br/><br/>
+      Stop Weaver, then restart with reset plus bootstrap credentials. Prefer a password file.<br/><br/>
       <strong>Docker:</strong><br/>
-      <code>docker run -e WEAVER_RESET_LOGIN=1 ...</code><br/><br/>
+      <code>docker run -e WEAVER_RESET_LOGIN=1 -e WEAVER_BOOTSTRAP_LOGIN_USERNAME=admin -e WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE=/run/secrets/weaver-login -v /host/password:/run/secrets/weaver-login:ro ...</code><br/><br/>
       <strong>Bare metal:</strong><br/>
-      <code>WEAVER_RESET_LOGIN=1 weaver serve</code>
+      <code>WEAVER_RESET_LOGIN=1 WEAVER_BOOTSTRAP_LOGIN_USERNAME=admin WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE=/path/to/password weaver serve</code><br/><br/>
+      Alternatively, configure explicit <code>WEAVER_TRUSTED_CIDRS</code> for loginless full-administrator browser access.
     </div>
   </div>
 </div>
@@ -238,4 +247,68 @@ fn login_page_response() -> Response {
         LOGIN_PAGE_HTML,
     )
         .into_response()
+}
+
+fn setup_required_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string())],
+        "<!doctype html><title>Weaver setup required</title><h1>Weaver setup required</h1><p>Configure WEAVER_BOOTSTRAP_LOGIN_USERNAME with exactly one of WEAVER_BOOTSTRAP_LOGIN_PASSWORD or WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE, configure explicit WEAVER_TRUSTED_CIDRS for loginless browser administration, or use the supported login-management command.</p>",
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn entry_response(
+        path: &'static str,
+        security: RuntimeSecurityConfig,
+        peer: Option<SocketAddr>,
+    ) -> Response {
+        static_handler(
+            Uri::from_static(path),
+            HeaderMap::new(),
+            Extension(BaseUrl(Arc::new(String::new()))),
+            Extension(super::super::SessionToken(Arc::new(
+                "browser-token".to_string(),
+            ))),
+            Extension(LoginAuthCache::default()),
+            Extension(security),
+            peer.map(|peer| Extension(ConnectInfo(peer))),
+        )
+        .await
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn untrusted_entry_without_login_requires_setup() {
+        let response = entry_response("/", RuntimeSecurityConfig::default(), None).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn trusted_root_and_index_issue_peer_bound_browser_cookie() {
+        let security = RuntimeSecurityConfig {
+            trusted_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
+            ..Default::default()
+        };
+        let peer = "127.0.0.1:49152".parse().unwrap();
+
+        for path in ["/", "/index.html"] {
+            let response = entry_response(path, security.clone(), Some(peer)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let cookie = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap();
+            assert!(cookie.starts_with("weaver_session=browser-token;"));
+            assert!(cookie.contains("HttpOnly"));
+            assert!(cookie.contains("SameSite=Strict"));
+        }
+    }
 }

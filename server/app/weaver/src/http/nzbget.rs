@@ -18,6 +18,7 @@ use weaver_server_api::{
     submit_nzb_bytes_with_options,
 };
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
+use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::SharedConfig;
 use weaver_server_core::{
     Database, FieldUpdate, HistoryFilter, JobId, JobStatus, JobUpdate, SchedulerError,
@@ -32,6 +33,7 @@ pub(super) struct NzbgetFacadeContext {
     auth_cache: LoginAuthCache,
     api_key_cache: ApiKeyCache,
     session_token: super::SessionToken,
+    security: RuntimeSecurityConfig,
     http_client: reqwest::Client,
     started_at: Instant,
     scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
@@ -64,6 +66,7 @@ impl NzbgetFacadeContext {
         auth_cache: LoginAuthCache,
         api_key_cache: ApiKeyCache,
         session_token: super::SessionToken,
+        security: RuntimeSecurityConfig,
         rss: weaver_server_api::RssService,
         watch_folder: weaver_server_core::watch_folder::WatchFolderService,
         scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
@@ -81,6 +84,7 @@ impl NzbgetFacadeContext {
             auth_cache,
             api_key_cache,
             session_token,
+            security,
             http_client,
             started_at: Instant::now(),
             scheduled_resume,
@@ -286,12 +290,17 @@ pub(super) async fn resolve_scope_for_facade(
     ctx: &NzbgetFacadeContext,
     headers: &HeaderMap,
 ) -> Result<CallerScope, StatusCode> {
-    let headers = normalize_nzbget_auth_headers(headers)?;
+    let mut headers = normalize_nzbget_auth_headers(headers)?;
+    // The compatibility facade is machine-only: it deliberately accepts only
+    // persistent API keys, never either browser cookie.
+    headers.remove(header::COOKIE);
     super::auth::resolve_caller(
         &ctx.db,
         &ctx.auth_cache,
         &ctx.api_key_cache,
         &ctx.session_token.0,
+        &ctx.security,
+        super::auth::BrowserSessionPolicy::Denied,
         &headers,
     )
     .await

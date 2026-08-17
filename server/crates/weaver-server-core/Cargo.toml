@@ -41,6 +41,7 @@ sha2 = { workspace = true }
 hmac = { workspace = true, default-features = false }
 reqwest = { workspace = true }
 regex = { workspace = true }
+ipnet = { workspace = true }
 quick-xml = { workspace = true }
 notify = { workspace = true }
 zstd = { workspace = true }

@@ -43,12 +43,18 @@ fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
 fn job_nzb_test_router(db: Database, handle: SchedulerHandle) -> Router {
     let auth_cache = LoginAuthCache::default();
     let api_key_cache = ApiKeyCache::default();
-    let session_token = SessionToken(Arc::new("session-token".to_string()));
+    api_key_cache.upsert(ApiKeyAuthRow {
+        key_hash: hash_api_key("session-token"),
+        id: 9_998,
+        scope: "admin".to_string(),
+    });
+    let session_token = SessionToken(Arc::new("browser-session-token".to_string()));
     let request_auth = RequestAuthContext {
         db: db.clone(),
         auth_cache: auth_cache.clone(),
         api_key_cache: api_key_cache.clone(),
         session_token: session_token.clone(),
+        security: Arc::new(weaver_server_core::security::RuntimeSecurityConfig::default()),
     };
 
     Router::new()
@@ -66,6 +72,9 @@ fn job_nzb_test_router(db: Database, handle: SchedulerHandle) -> Router {
         .layer(Extension(auth_cache))
         .layer(Extension(api_key_cache))
         .layer(Extension(request_auth))
+        .layer(Extension(
+            weaver_server_core::security::RuntimeSecurityConfig::default(),
+        ))
         .layer(Extension(session_token))
 }
 
@@ -151,7 +160,14 @@ fn nzbget_test_router(
     api_key_cache: ApiKeyCache,
 ) -> Router {
     let auth_cache = LoginAuthCache::default();
-    let session_token = SessionToken(Arc::new("session-token".to_string()));
+    let session_token = SessionToken(Arc::new("browser-session-token".to_string()));
+    // Historical facade fixtures used the process token as a stand-in. Keep
+    // their request data stable while making it a persistent test API key.
+    api_key_cache.upsert(ApiKeyAuthRow {
+        key_hash: hash_api_key("session-token"),
+        id: 9_999,
+        scope: "admin".to_string(),
+    });
     let rss = weaver_server_api::RssService::new(handle.clone(), config.clone(), db.clone());
     let watch_folder = weaver_server_core::watch_folder::WatchFolderService::new(
         db.clone(),
@@ -171,6 +187,7 @@ fn nzbget_test_router(
         auth_cache,
         api_key_cache,
         session_token,
+        weaver_server_core::security::RuntimeSecurityConfig::default(),
         rss,
         watch_folder,
         scheduled_resume,
@@ -629,7 +646,7 @@ async fn nzbget_rbac_allows_read_keys_and_rejects_read_key_mutations() {
 }
 
 #[tokio::test]
-async fn nzbget_auth_accepts_basic_password_as_weaver_token() {
+async fn nzbget_auth_accepts_basic_password_as_persistent_api_key() {
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         test_scheduler_handle(),
@@ -3120,13 +3137,22 @@ async fn resolve_scope_requires_explicit_auth_when_login_is_disabled() {
     let auth_cache = LoginAuthCache::default();
     let api_key_cache = ApiKeyCache::default();
     let headers = HeaderMap::new();
-    let result =
-        auth::resolve_scope(&db, &auth_cache, &api_key_cache, "session-token", &headers).await;
+    let security = weaver_server_core::security::RuntimeSecurityConfig::default();
+    let result = auth::resolve_scope(
+        &db,
+        &auth_cache,
+        &api_key_cache,
+        "session-token",
+        &security,
+        auth::BrowserSessionPolicy::Denied,
+        &headers,
+    )
+    .await;
     assert_eq!(result, Err(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
-async fn resolve_scope_accepts_session_bearer_without_login() {
+async fn resolve_scope_rejects_process_token_bearer_without_login() {
     let db = Database::open_in_memory().unwrap();
     let auth_cache = LoginAuthCache::default();
     let api_key_cache = ApiKeyCache::default();
@@ -3135,13 +3161,22 @@ async fn resolve_scope_accepts_session_bearer_without_login() {
         header::AUTHORIZATION,
         HeaderValue::from_static("Bearer session-token"),
     );
-    let result =
-        auth::resolve_scope(&db, &auth_cache, &api_key_cache, "session-token", &headers).await;
-    assert_eq!(result, Ok(CallerScope::Local));
+    let security = weaver_server_core::security::RuntimeSecurityConfig::default();
+    let result = auth::resolve_scope(
+        &db,
+        &auth_cache,
+        &api_key_cache,
+        "session-token",
+        &security,
+        auth::BrowserSessionPolicy::Denied,
+        &headers,
+    )
+    .await;
+    assert_eq!(result, Err(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
-async fn resolve_scope_accepts_session_cookie_without_login() {
+async fn resolve_scope_accepts_session_cookie_only_from_trusted_peer() {
     let db = Database::open_in_memory().unwrap();
     let auth_cache = LoginAuthCache::default();
     let api_key_cache = ApiKeyCache::default();
@@ -3151,10 +3186,137 @@ async fn resolve_scope_accepts_session_cookie_without_login() {
         HeaderValue::from_static("weaver_session=session-token"),
     );
 
-    let result =
-        auth::resolve_scope(&db, &auth_cache, &api_key_cache, "session-token", &headers).await;
+    let security = weaver_server_core::security::RuntimeSecurityConfig {
+        trusted_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
+        ..Default::default()
+    };
+    let peer = "127.0.0.1:49152".parse().unwrap();
+    let result = auth::resolve_scope(
+        &db,
+        &auth_cache,
+        &api_key_cache,
+        "session-token",
+        &security,
+        auth::BrowserSessionPolicy::TrustedPeer(Some(peer)),
+        &headers,
+    )
+    .await;
 
     assert_eq!(result, Ok(CallerScope::Local));
+}
+
+#[tokio::test]
+async fn resolve_scope_rejects_session_cookie_from_untrusted_peer() {
+    let db = Database::open_in_memory().unwrap();
+    let auth_cache = LoginAuthCache::default();
+    let api_key_cache = ApiKeyCache::default();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        HeaderValue::from_static("weaver_session=session-token"),
+    );
+    let security = weaver_server_core::security::RuntimeSecurityConfig {
+        trusted_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
+        ..Default::default()
+    };
+    let peer = "192.0.2.1:49152".parse().unwrap();
+
+    let result = auth::resolve_scope(
+        &db,
+        &auth_cache,
+        &api_key_cache,
+        "session-token",
+        &security,
+        auth::BrowserSessionPolicy::TrustedPeer(Some(peer)),
+        &headers,
+    )
+    .await;
+
+    assert_eq!(result, Err(StatusCode::UNAUTHORIZED));
+}
+
+#[tokio::test]
+async fn explicit_invalid_api_key_does_not_fall_back_to_trusted_browser_cookie() {
+    let db = Database::open_in_memory().unwrap();
+    let auth_cache = LoginAuthCache::default();
+    let api_key_cache = ApiKeyCache::default();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer invalid"),
+    );
+    headers.insert(
+        header::COOKIE,
+        HeaderValue::from_static("weaver_session=session-token"),
+    );
+    let security = weaver_server_core::security::RuntimeSecurityConfig {
+        trusted_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
+        ..Default::default()
+    };
+    let peer = "127.0.0.1:49152".parse().unwrap();
+
+    let result = auth::resolve_scope(
+        &db,
+        &auth_cache,
+        &api_key_cache,
+        "session-token",
+        &security,
+        auth::BrowserSessionPolicy::TrustedPeer(Some(peer)),
+        &headers,
+    )
+    .await;
+
+    assert_eq!(result, Err(StatusCode::UNAUTHORIZED));
+}
+
+#[tokio::test]
+async fn conflicting_api_key_headers_are_rejected() {
+    let db = Database::open_in_memory().unwrap();
+    let auth_cache = LoginAuthCache::default();
+    let api_key_cache = ApiKeyCache::default();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer first"),
+    );
+    headers.insert("x-api-key", HeaderValue::from_static("second"));
+    let security = weaver_server_core::security::RuntimeSecurityConfig::default();
+
+    let result = auth::resolve_scope(
+        &db,
+        &auth_cache,
+        &api_key_cache,
+        "session-token",
+        &security,
+        auth::BrowserSessionPolicy::Denied,
+        &headers,
+    )
+    .await;
+
+    assert_eq!(result, Err(StatusCode::UNAUTHORIZED));
+}
+
+#[tokio::test]
+async fn resolve_scope_rejects_process_token_in_x_api_key() {
+    let db = Database::open_in_memory().unwrap();
+    let auth_cache = LoginAuthCache::default();
+    let api_key_cache = ApiKeyCache::default();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-api-key", HeaderValue::from_static("session-token"));
+    let security = weaver_server_core::security::RuntimeSecurityConfig::default();
+
+    let result = auth::resolve_scope(
+        &db,
+        &auth_cache,
+        &api_key_cache,
+        "session-token",
+        &security,
+        auth::BrowserSessionPolicy::Denied,
+        &headers,
+    )
+    .await;
+
+    assert_eq!(result, Err(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -3173,8 +3335,17 @@ async fn resolve_scope_accepts_cached_jwt_without_db_lookup() {
         HeaderValue::from_str(&format!("weaver_jwt={token}")).unwrap(),
     );
 
-    let result =
-        auth::resolve_scope(&db, &auth_cache, &api_key_cache, "session-token", &headers).await;
+    let security = weaver_server_core::security::RuntimeSecurityConfig::default();
+    let result = auth::resolve_scope(
+        &db,
+        &auth_cache,
+        &api_key_cache,
+        "session-token",
+        &security,
+        auth::BrowserSessionPolicy::Denied,
+        &headers,
+    )
+    .await;
     assert_eq!(result, Ok(CallerScope::Admin));
 }
 
@@ -3196,8 +3367,17 @@ async fn resolve_scope_accepts_cached_api_key_without_db_lookup() {
         HeaderValue::from_str(&format!("Bearer {raw_key}")).unwrap(),
     );
 
-    let result =
-        auth::resolve_scope(&db, &auth_cache, &api_key_cache, "session-token", &headers).await;
+    let security = weaver_server_core::security::RuntimeSecurityConfig::default();
+    let result = auth::resolve_scope(
+        &db,
+        &auth_cache,
+        &api_key_cache,
+        "session-token",
+        &security,
+        auth::BrowserSessionPolicy::Denied,
+        &headers,
+    )
+    .await;
     assert_eq!(result, Ok(CallerScope::Read));
 }
 
@@ -3541,10 +3721,8 @@ async fn job_output_file_download_handler_streams_history_file() {
                 .uri("/api/jobs/10001/output-file")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header(header::ACCEPT_ENCODING, "gzip")
-                .body(Body::from(format!(
-                    "path={}&token=session-token",
-                    file_path.display()
-                )))
+                .header(header::AUTHORIZATION, "Bearer session-token")
+                .body(Body::from(format!("path={}", file_path.display())))
                 .unwrap(),
         )
         .await

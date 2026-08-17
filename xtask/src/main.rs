@@ -11,7 +11,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::{
+    fs::{OpenOptionsExt, PermissionsExt},
+    process::CommandExt,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Output, Stdio};
 #[cfg(unix)]
@@ -36,6 +39,9 @@ const TCP_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_millis(200);
 const RELEASE_DRY_RUN_CACHE_FILE: &str = "tmp/xtask-release-dry-run.json";
 const RELEASE_DRY_RUN_CACHE_DIR: &str = "tmp/xtask-release-dry-run-cache";
 const BACKEND_SHUTDOWN_GRACE_PERIOD: StdDuration = StdDuration::from_secs(5);
+const LOCAL_AGENT_API_KEY_NAME: &str = "xtask-local-agent";
+const LOCAL_AGENT_API_KEY_SCOPE: &str = "admin";
+const LOCAL_AGENT_API_KEY_FILENAME: &str = "local-agent-api-key";
 const RELEASE_ALLOWED_CARGO_AUDIT_IDS: &[ReleaseAuditAllow] = &[
     ReleaseAuditAllow {
         id: "RUSTSEC-2023-0071",
@@ -2503,6 +2509,141 @@ fn ensure_state_encryption_key(key_path: &Path, db_path: &Path) -> Result<String
     Ok(key)
 }
 
+fn local_agent_api_key_path(state_dir: &Path) -> PathBuf {
+    std::env::var_os("WEAVER_DEV_AGENT_API_KEY_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join(LOCAL_AGENT_API_KEY_FILENAME))
+}
+
+fn strip_trailing_line_endings(value: String) -> String {
+    value.trim_end_matches(['\r', '\n']).to_string()
+}
+
+fn load_local_agent_api_key(path: &Path) -> Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect local agent API key file {}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "local agent API key path {} must be a regular file",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "failed to restrict local agent API key file permissions for {}",
+            path.display()
+        )
+    })?;
+
+    let key =
+        strip_trailing_line_endings(fs::read_to_string(path).with_context(|| {
+            format!("failed to read local agent API key file {}", path.display())
+        })?);
+    if key.is_empty() {
+        bail!("local agent API key file {} is empty", path.display());
+    }
+
+    Ok(Some(key))
+}
+
+fn generate_local_agent_api_key() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).context("failed to generate local agent API key")?;
+    Ok(format!("wvr_{}", hex::encode(bytes)))
+}
+
+fn write_local_agent_api_key(path: &Path, key: &str) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create local agent API key directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).with_context(|| {
+        format!(
+            "failed to create local agent API key file {}",
+            path.display()
+        )
+    })?;
+    writeln!(file, "{key}").with_context(|| {
+        format!(
+            "failed to write local agent API key file {}",
+            path.display()
+        )
+    })?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync local agent API key file {}", path.display()))?;
+    Ok(())
+}
+
+fn ensure_local_agent_api_key(path: &Path) -> Result<String> {
+    if let Some(key) = load_local_agent_api_key(path)? {
+        return Ok(key);
+    }
+
+    let key = generate_local_agent_api_key()?;
+    write_local_agent_api_key(path, &key)?;
+    Ok(key)
+}
+
+fn hash_local_agent_api_key(key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn provision_local_agent_api_key(db_path: &Path, key: &str) -> Result<()> {
+    let key_hash = hash_local_agent_api_key(key);
+    let mut existing = Command::new("sqlite3");
+    existing.args([
+        "-noheader",
+        db_path
+            .to_str()
+            .ok_or_else(|| anyhow!("database path is not UTF-8"))?,
+        &format!("SELECT name FROM api_keys WHERE key_hash = X'{key_hash}';"),
+    ]);
+    let existing_name = run_capture(&mut existing)?.trim().to_string();
+    if !existing_name.is_empty() && existing_name != LOCAL_AGENT_API_KEY_NAME {
+        bail!(
+            "local agent API key file maps to an existing non-local API key; \
+             choose a different WEAVER_DEV_AGENT_API_KEY_FILE or replace the file"
+        );
+    }
+
+    let now = Utc::now().timestamp_millis();
+    let sql = format!(
+        "BEGIN IMMEDIATE; \
+         DELETE FROM api_keys WHERE name = '{LOCAL_AGENT_API_KEY_NAME}' AND key_hash != X'{key_hash}'; \
+         INSERT INTO api_keys (name, key_hash, scope, created_at) \
+         VALUES ('{LOCAL_AGENT_API_KEY_NAME}', X'{key_hash}', '{LOCAL_AGENT_API_KEY_SCOPE}', {now}) \
+         ON CONFLICT(key_hash) DO UPDATE SET scope = excluded.scope; \
+         COMMIT;"
+    );
+    let mut provision = Command::new("sqlite3");
+    provision.arg(db_path).arg(sql);
+    run_checked(&mut provision)
+}
+
 fn reset_serve_database(db_path: &Path) -> Result<()> {
     let cleanup_targets = [
         db_path.to_path_buf(),
@@ -2628,6 +2769,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
             .unwrap_or_else(|_| ctx.path("tmp/dev-instance").display().to_string()),
     );
     let state_key_file = state_dir.join("encryption.key");
+    let local_agent_key_file = local_agent_api_key_path(&state_dir);
     let rust_log = build_rust_log(args.target.as_deref());
     let backend_binary = if args.release {
         ctx.path("target/release/weaver")
@@ -2705,6 +2847,8 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         &backend_log,
         Some(encryption_key.as_str()),
     )?;
+    let local_agent_api_key = ensure_local_agent_api_key(&local_agent_key_file)?;
+    provision_local_agent_api_key(&db_path, &local_agent_api_key)?;
     seed_runtime_dirs(&db_path, &data_dir)?;
 
     step(format!(
@@ -2753,6 +2897,14 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     println!("    State:    {}", state_dir.display());
     println!("    Data:     {}", data_dir.display());
     println!("    Log:      tail -f {}", backend_log.display());
+    println!(
+        "    Local agent API key (Admin): {}",
+        local_agent_key_file.display()
+    );
+    println!(
+        "    Agent setup: export WEAVER_API_KEY_FILE={}",
+        local_agent_key_file.display()
+    );
     println!();
     println!("==> Starting Vite dev server with live updates...");
 
@@ -2956,6 +3108,53 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_agent_key_strips_only_trailing_line_endings() {
+        assert_eq!(
+            strip_trailing_line_endings("  key with spaces  \r\n".to_string()),
+            "  key with spaces  "
+        );
+        assert_eq!(strip_trailing_line_endings("\r\n".to_string()), "");
+    }
+
+    #[test]
+    fn local_agent_key_generation_uses_weaver_key_shape() {
+        let key = generate_local_agent_api_key().unwrap();
+        assert!(key.starts_with("wvr_"));
+        assert_eq!(key.len(), 36);
+    }
+
+    #[test]
+    fn local_agent_key_provisioning_is_admin_and_rotates_the_previous_dev_key() {
+        let state = tempfile::tempdir().unwrap();
+        let db_path = state.path().join("weaver.db");
+        let mut schema = Command::new("sqlite3");
+        schema.arg(&db_path).arg(
+            "CREATE TABLE api_keys (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                name TEXT NOT NULL, \
+                key_hash BLOB NOT NULL UNIQUE, \
+                scope TEXT NOT NULL, \
+                created_at INTEGER NOT NULL, \
+                last_used_at INTEGER\
+            );",
+        );
+        run_checked(&mut schema).unwrap();
+
+        provision_local_agent_api_key(&db_path, "wvr_local-agent-one").unwrap();
+        provision_local_agent_api_key(&db_path, "wvr_local-agent-two").unwrap();
+
+        let mut query = Command::new("sqlite3");
+        query
+            .arg("-noheader")
+            .arg(&db_path)
+            .arg("SELECT name || '|' || scope || '|' || length(key_hash) FROM api_keys;");
+        assert_eq!(
+            run_capture(&mut query).unwrap().trim(),
+            "xtask-local-agent|admin|32"
+        );
+    }
 
     #[test]
     fn graphql_baseline_bootstrap_applies_only_before_the_baseline_release() {

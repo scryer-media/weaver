@@ -2,10 +2,11 @@ use std::path::{Path as FsPath, PathBuf};
 
 use axum::Form;
 use axum::body::Body;
-use axum::extract::{Extension, Path};
+use axum::extract::{ConnectInfo, Extension, Path};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
+use std::net::SocketAddr;
 use tokio_util::io::ReaderStream;
 
 use weaver_server_core::Database;
@@ -13,6 +14,7 @@ use weaver_server_core::SchedulerHandle;
 use weaver_server_core::auth::{ApiKeyCache, LoginAuthCache};
 use weaver_server_core::ingest::{decode_persisted_nzb_bytes, original_release_title};
 use weaver_server_core::jobs::ids::JobId;
+use weaver_server_core::security::RuntimeSecurityConfig;
 
 const INTERNAL_OUTPUT_MARKER_NAME: &str = ".weaver-job-dir";
 
@@ -21,10 +23,20 @@ async fn require_read(
     auth_cache: &LoginAuthCache,
     api_key_cache: &ApiKeyCache,
     session_token: &str,
+    security: &RuntimeSecurityConfig,
+    peer: Option<SocketAddr>,
     headers: &HeaderMap,
 ) -> Result<(), StatusCode> {
-    let scope =
-        super::auth::resolve_scope(db, auth_cache, api_key_cache, session_token, headers).await?;
+    let scope = super::auth::resolve_scope(
+        db,
+        auth_cache,
+        api_key_cache,
+        session_token,
+        security,
+        super::auth::BrowserSessionPolicy::TrustedPeer(peer),
+        headers,
+    )
+    .await?;
     if scope.can_read() {
         Ok(())
     } else {
@@ -40,25 +52,30 @@ struct JobNzbDownload {
 #[derive(Debug, Deserialize)]
 pub(super) struct JobOutputFileDownloadRequest {
     path: String,
-    token: Option<String>,
 }
 
 pub(super) async fn job_nzb_download_handler(
     Path(job_id): Path<u64>,
-    Extension(db): Extension<Database>,
     Extension(handle): Extension<SchedulerHandle>,
-    Extension(auth_cache): Extension<LoginAuthCache>,
-    Extension(api_key_cache): Extension<ApiKeyCache>,
-    Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
+    Extension(request_auth): Extension<super::RequestAuthContext>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(status) =
-        require_read(&db, &auth_cache, &api_key_cache, &session_token, &headers).await
+    if let Err(status) = require_read(
+        &request_auth.db,
+        &request_auth.auth_cache,
+        &request_auth.api_key_cache,
+        request_auth.session_token.0.as_str(),
+        &request_auth.security,
+        peer.map(|Extension(ConnectInfo(peer))| peer),
+        &headers,
+    )
+    .await
     {
         return status.into_response();
     }
 
-    let job = match load_job_nzb_download(&db, &handle, job_id).await {
+    let job = match load_job_nzb_download(&request_auth.db, &handle, job_id).await {
         Ok(Some(job)) => job,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(status) => return status.into_response(),
@@ -88,16 +105,18 @@ pub(super) async fn job_output_file_download_handler(
     Path(job_id): Path<u64>,
     Extension(handle): Extension<SchedulerHandle>,
     Extension(request_auth): Extension<super::RequestAuthContext>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Form(request): Form<JobOutputFileDownloadRequest>,
 ) -> Response {
-    if let Err(status) = require_read_with_optional_token(
+    if let Err(status) = require_read(
         &request_auth.db,
         &request_auth.auth_cache,
         &request_auth.api_key_cache,
         request_auth.session_token.0.as_str(),
+        &request_auth.security,
+        peer.map(|Extension(ConnectInfo(peer))| peer),
         &headers,
-        request.token.as_deref(),
     )
     .await
     {
@@ -119,34 +138,6 @@ pub(super) async fn job_output_file_download_handler(
         Ok(response) => response,
         Err(status) => status.into_response(),
     }
-}
-
-async fn require_read_with_optional_token(
-    db: &Database,
-    auth_cache: &LoginAuthCache,
-    api_key_cache: &ApiKeyCache,
-    session_token: &str,
-    headers: &HeaderMap,
-    token: Option<&str>,
-) -> Result<(), StatusCode> {
-    let mut effective_headers = headers.clone();
-    if effective_headers.get(header::AUTHORIZATION).is_none()
-        && let Some(token) = token.filter(|value| !value.trim().is_empty())
-    {
-        let value = format!("Bearer {}", token.trim());
-        let header_value =
-            axum::http::HeaderValue::from_str(&value).map_err(|_| StatusCode::BAD_REQUEST)?;
-        effective_headers.insert(header::AUTHORIZATION, header_value);
-    }
-
-    require_read(
-        db,
-        auth_cache,
-        api_key_cache,
-        session_token,
-        &effective_headers,
-    )
-    .await
 }
 
 async fn load_job_nzb_download(

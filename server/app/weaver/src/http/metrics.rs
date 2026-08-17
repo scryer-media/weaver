@@ -154,6 +154,8 @@ pub(super) async fn metrics_handler(
             &request_auth.auth_cache,
             &request_auth.api_key_cache,
             request_auth.session_token.0.as_str(),
+            &request_auth.security,
+            super::auth::BrowserSessionPolicy::Denied,
             &headers,
         )
         .await?;

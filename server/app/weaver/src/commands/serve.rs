@@ -21,6 +21,13 @@ pub(crate) async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let started_at = std::time::Instant::now();
     let security = RuntimeSecurityConfig::from_env()?;
+    crate::bootstrap::bootstrap_login_if_needed(&db).await?;
+    if !security.trusted_cidrs.is_empty() {
+        warn!(
+            trusted_cidrs = ?security.trusted_cidrs,
+            "matching WEAVER_TRUSTED_CIDRS clients receive loginless full administrative browser access"
+        );
+    }
     let data_dir = PathBuf::from(&config.data_dir);
     let intermediate_dir = PathBuf::from(config.intermediate_dir());
     let complete_dir = PathBuf::from(config.complete_dir());

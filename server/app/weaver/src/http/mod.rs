@@ -39,6 +39,7 @@ struct RequestAuthContext {
     auth_cache: LoginAuthCache,
     api_key_cache: ApiKeyCache,
     session_token: SessionToken,
+    security: Arc<RuntimeSecurityConfig>,
 }
 
 pub struct ServerRuntime {

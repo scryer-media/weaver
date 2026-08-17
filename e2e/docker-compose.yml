@@ -126,6 +126,11 @@ services:
       WEAVER_E2E_CLOCK_FILE: "${E2E_WEAVER_CLOCK_FILE:-}"
       WEAVER_RSS_ALLOW_PRIVATE_NETWORK: "${WEAVER_RSS_ALLOW_PRIVATE_NETWORK:-false}"
       WEAVER_BASE_URL: "${E2E_WEAVER_BASE_URL:-/}"
+      # This grants loginless administration to every isolated test-network
+      # client solely to preserve E2E browser behavior. Never copy it into
+      # production configuration.
+      WEAVER_HTTP_BIND_ADDRESS: "0.0.0.0"
+      WEAVER_TRUSTED_CIDRS: "0.0.0.0/0,::/0"
       # weaver a8faf19d (2026-08-03) added an HTTP Host allowlist: a request whose
       # Host is neither an IP literal nor "localhost" is answered with 421 unless
       # the host appears here. Playwright reaches this service by its compose

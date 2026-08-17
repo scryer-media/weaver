@@ -3,6 +3,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use http::uri::Authority;
+use ipnet::IpNet;
 use reqwest::Url;
 
 pub const ENV_HTTP_BIND_ADDRESS: &str = "WEAVER_HTTP_BIND_ADDRESS";
@@ -15,10 +16,9 @@ pub const ENV_NZB_UPLOAD_LIMIT_BYTES: &str = "WEAVER_NZB_UPLOAD_LIMIT_BYTES";
 pub const ENV_NZB_DECOMPRESSED_LIMIT_BYTES: &str = "WEAVER_NZB_DECOMPRESSED_LIMIT_BYTES";
 pub const ENV_RSS_ALLOW_PRIVATE_NETWORK: &str = "WEAVER_RSS_ALLOW_PRIVATE_NETWORK";
 pub const ENV_STRICT_SECURITY: &str = "WEAVER_STRICT_SECURITY";
+pub const ENV_TRUSTED_CIDRS: &str = "WEAVER_TRUSTED_CIDRS";
 
-// Keep the default bind broad for Docker and homelab deployments. Production-style
-// guardrails live in WEAVER_STRICT_SECURITY rather than silently narrowing this.
-pub const DEFAULT_HTTP_BIND_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+pub const DEFAULT_HTTP_BIND_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 pub const DEFAULT_BACKUP_UPLOAD_LIMIT_BYTES: u64 = 2_147_483_648;
 pub const DEFAULT_NZB_UPLOAD_LIMIT_BYTES: u64 = 268_435_456;
 pub const DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES: u64 = 536_870_912;
@@ -131,10 +131,19 @@ pub struct RuntimeSecurityConfig {
     pub nzb_decompressed_limit_bytes: u64,
     pub rss_allow_private_network: bool,
     pub strict_security: bool,
+    pub trusted_cidrs: Vec<IpNet>,
 }
 
 impl RuntimeSecurityConfig {
     pub fn from_env() -> Result<Self, SecurityConfigError> {
+        let strict_security = parse_bool_env(ENV_STRICT_SECURITY, false)?;
+        let trusted_cidrs = parse_trusted_cidrs_env()?;
+        if strict_security && !trusted_cidrs.is_empty() {
+            return Err(SecurityConfigError::new(format!(
+                "{ENV_STRICT_SECURITY}=1 refuses non-empty {ENV_TRUSTED_CIDRS}"
+            )));
+        }
+
         Ok(Self {
             http_bind_address: parse_ip_env(ENV_HTTP_BIND_ADDRESS, DEFAULT_HTTP_BIND_ADDRESS)?,
             http_allowed_hosts: parse_http_allowed_hosts_env()?,
@@ -154,7 +163,8 @@ impl RuntimeSecurityConfig {
                 DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES,
             )?,
             rss_allow_private_network: parse_bool_env(ENV_RSS_ALLOW_PRIVATE_NETWORK, false)?,
-            strict_security: parse_bool_env(ENV_STRICT_SECURITY, false)?,
+            strict_security,
+            trusted_cidrs,
         })
     }
 
@@ -178,6 +188,11 @@ impl RuntimeSecurityConfig {
     }
 
     pub fn strict_security_violation(&self, login_enabled: bool) -> Option<String> {
+        if self.strict_security && !self.trusted_cidrs.is_empty() {
+            return Some(format!(
+                "{ENV_STRICT_SECURITY}=1 refuses non-empty {ENV_TRUSTED_CIDRS}"
+            ));
+        }
         if self.strict_security && self.exposes_admin_without_login(login_enabled) {
             return Some(format!(
                 "{ENV_STRICT_SECURITY}=1 refuses {ENV_HTTP_BIND_ADDRESS}={} without login auth enabled",
@@ -185,6 +200,24 @@ impl RuntimeSecurityConfig {
             ));
         }
         None
+    }
+
+    /// Returns whether the immediate socket peer is inside an explicitly trusted network.
+    /// Proxy forwarding headers are intentionally not considered here.
+    pub fn is_trusted_peer(&self, peer: Option<SocketAddr>) -> bool {
+        let Some(peer) = peer else {
+            return false;
+        };
+        let ip = match peer.ip() {
+            IpAddr::V6(ip) => ip
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(ip)),
+            ip => ip,
+        };
+        self.trusted_cidrs
+            .iter()
+            .any(|network| network.contains(&ip))
     }
 }
 
@@ -201,6 +234,7 @@ impl Default for RuntimeSecurityConfig {
             nzb_decompressed_limit_bytes: DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES,
             rss_allow_private_network: false,
             strict_security: false,
+            trusted_cidrs: Vec::new(),
         }
     }
 }
@@ -273,6 +307,32 @@ fn parse_http_allowed_hosts_env() -> Result<Vec<HttpAuthority>, SecurityConfigEr
             HttpAuthority::parse(entry).map_err(|_| {
                 SecurityConfigError::new(format!(
                     "{ENV_HTTP_ALLOWED_HOSTS} contains invalid authority {entry:?}; use exact hostnames or host:port entries"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn parse_trusted_cidrs_env() -> Result<Vec<IpNet>, SecurityConfigError> {
+    let Ok(value) = env::var(ENV_TRUSTED_CIDRS) else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    value
+        .split(',')
+        .map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return Err(SecurityConfigError::new(format!(
+                    "{ENV_TRUSTED_CIDRS} must not contain empty entries"
+                )));
+            }
+            entry.parse::<IpNet>().map_err(|_| {
+                SecurityConfigError::new(format!(
+                    "{ENV_TRUSTED_CIDRS} contains invalid CIDR {entry:?}"
                 ))
             })
         })
@@ -439,6 +499,7 @@ mod tests {
             ENV_NZB_DECOMPRESSED_LIMIT_BYTES,
             ENV_RSS_ALLOW_PRIVATE_NETWORK,
             ENV_STRICT_SECURITY,
+            ENV_TRUSTED_CIDRS,
         ] {
             unsafe { env::remove_var(name) };
         }
@@ -452,8 +513,9 @@ mod tests {
         let config = RuntimeSecurityConfig::from_env().unwrap();
 
         assert_eq!(config.http_bind_address, DEFAULT_HTTP_BIND_ADDRESS);
-        assert_eq!(config.http_bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(config.http_bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(config.http_allowed_hosts.is_empty());
+        assert!(config.trusted_cidrs.is_empty());
         assert!(config.metrics_auth_required);
         assert!(config.cors_allowed_origins.is_empty());
         assert!(!config.secure_cookies);
@@ -539,14 +601,14 @@ mod tests {
     #[test]
     fn open_admin_warning_predicate_tracks_bind_and_login() {
         let default = RuntimeSecurityConfig::default();
-        assert!(default.exposes_admin_without_login(false));
+        assert!(!default.exposes_admin_without_login(false));
         assert!(!default.exposes_admin_without_login(true));
 
-        let loopback = RuntimeSecurityConfig {
-            http_bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        let exposed = RuntimeSecurityConfig {
+            http_bind_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             ..RuntimeSecurityConfig::default()
         };
-        assert!(!loopback.exposes_admin_without_login(false));
+        assert!(exposed.exposes_admin_without_login(false));
     }
 
     #[test]
@@ -566,6 +628,55 @@ mod tests {
             ..RuntimeSecurityConfig::default()
         };
         assert!(loopback.strict_security_violation(false).is_none());
+    }
+
+    #[test]
+    fn trusted_cidrs_parse_and_match_immediate_peer_only() {
+        let _guard = env_lock();
+        clear_env();
+        unsafe {
+            env::set_var(
+                ENV_TRUSTED_CIDRS,
+                " 10.0.0.0/8 , 2001:db8::/32 , 192.168.0.0/16 ",
+            );
+        }
+
+        let config = RuntimeSecurityConfig::from_env().unwrap();
+        assert_eq!(config.trusted_cidrs.len(), 3);
+        assert!(config.is_trusted_peer(Some("10.42.0.1:1234".parse().unwrap())));
+        assert!(config.is_trusted_peer(Some("[2001:db8::42]:1234".parse().unwrap())));
+        assert!(config.is_trusted_peer(Some("[::ffff:192.168.3.4]:1234".parse().unwrap())));
+        assert!(!config.is_trusted_peer(Some("172.16.0.1:1234".parse().unwrap())));
+        assert!(!config.is_trusted_peer(None));
+
+        clear_env();
+    }
+
+    #[test]
+    fn trusted_cidrs_reject_empty_invalid_and_non_cidr_entries() {
+        let _guard = env_lock();
+        clear_env();
+
+        for value in ["10.0.0.0/8,,192.168.0.0/16", "not-a-cidr", "10.0.0.1"] {
+            unsafe { env::set_var(ENV_TRUSTED_CIDRS, value) };
+            assert!(
+                RuntimeSecurityConfig::from_env().is_err(),
+                "accepted {value}"
+            );
+            clear_env();
+        }
+    }
+
+    #[test]
+    fn strict_security_rejects_trusted_cidrs() {
+        let _guard = env_lock();
+        clear_env();
+        unsafe {
+            env::set_var(ENV_STRICT_SECURITY, "1");
+            env::set_var(ENV_TRUSTED_CIDRS, "127.0.0.0/8");
+        }
+        assert!(RuntimeSecurityConfig::from_env().is_err());
+        clear_env();
     }
 
     #[test]

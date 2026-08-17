@@ -122,13 +122,35 @@ fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         .find_map(|cookie| cookie.strip_prefix(&prefix).map(|value| value.to_string()))
 }
 
-fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+fn explicit_api_key(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
+    let bearer = match headers.get(header::AUTHORIZATION) {
+        Some(value) => {
+            let value = value.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+            let value = value
+                .strip_prefix("Bearer ")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or(StatusCode::UNAUTHORIZED)?;
+            Some(value.to_owned())
+        }
+        None => None,
+    };
+    let api_key = match headers.get("x-api-key") {
+        Some(value) => {
+            let value = value.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+            (!value.is_empty())
+                .then(|| value.to_owned())
+                .ok_or(StatusCode::UNAUTHORIZED)
+                .map(Some)?
+        }
+        None => None,
+    };
+
+    match (bearer, api_key) {
+        (Some(bearer), Some(api_key)) if bearer != api_key => Err(StatusCode::UNAUTHORIZED),
+        (Some(key), _) | (_, Some(key)) => Ok(Some(key)),
+        (None, None) => Ok(None),
+    }
 }
 
 /// Check if login auth is enabled and return the cached JWT secret if so.
@@ -218,29 +240,29 @@ pub(super) struct ResolvedCaller {
     pub(super) identity: CallerIdentity,
 }
 
-/// Resolve the caller scope and stable request identity from API key header, JWT cookie, or session token.
+/// Browser session cookies are accepted only on browser-facing routes whose
+/// immediate socket peer has been explicitly trusted by the operator.
+#[derive(Clone, Copy)]
+pub(super) enum BrowserSessionPolicy {
+    TrustedPeer(Option<SocketAddr>),
+    Denied,
+}
+
+/// Resolve the caller scope and stable request identity from persistent API
+/// key headers, a login JWT cookie, or a trusted-peer browser session cookie.
 pub(super) async fn resolve_caller(
     db: &Database,
     auth_cache: &LoginAuthCache,
     api_key_cache: &ApiKeyCache,
     session_token: &str,
+    security: &RuntimeSecurityConfig,
+    browser_session: BrowserSessionPolicy,
     headers: &HeaderMap,
 ) -> Result<ResolvedCaller, StatusCode> {
-    let api_key_header = headers.get("x-api-key");
-    let bearer_token = extract_bearer_token(headers);
-    let presented_token = bearer_token
-        .as_deref()
-        .or_else(|| api_key_header.and_then(|value| value.to_str().ok()));
-
-    // 1. Bearer token or API key header (session token or stored key).
-    if let Some(raw_key) = presented_token {
-        if raw_key == session_token {
-            return Ok(ResolvedCaller {
-                scope: CallerScope::Local,
-                identity: CallerIdentity::Local(hash_api_key(raw_key)),
-            });
-        }
-        let key_hash = hash_api_key(raw_key);
+    // An explicit machine credential must be a persistent API key. In
+    // particular, never fall back to browser cookies after an invalid header.
+    if let Some(raw_key) = explicit_api_key(headers)? {
+        let key_hash = hash_api_key(&raw_key);
         if let Some(row) = lookup_api_key_auth(db, api_key_cache, key_hash).await? {
             queue_touch_api_key_last_used(db, row.id);
             return Ok(ResolvedCaller {
@@ -248,6 +270,7 @@ pub(super) async fn resolve_caller(
                 identity: CallerIdentity::ApiKey(row.key_hash),
             });
         }
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     // 2. JWT cookie (when login auth is enabled).
@@ -262,9 +285,10 @@ pub(super) async fn resolve_caller(
         });
     }
 
-    // 3. No login auth enabled: accept the browser-only session cookie issued
-    // by the SPA index response.
-    if cached_auth.is_none()
+    // A browser cookie is process-bound *and* peer-bound. Possession alone is
+    // deliberately insufficient, even if login credentials are not configured.
+    if let BrowserSessionPolicy::TrustedPeer(peer) = browser_session
+        && security.is_trusted_peer(peer)
         && let Some(cookie) = extract_session_cookie(headers)
         && cookie == session_token
     {
@@ -277,19 +301,27 @@ pub(super) async fn resolve_caller(
     Err(StatusCode::UNAUTHORIZED)
 }
 
-/// Resolve the caller scope from API key header, JWT cookie, or session token.
+/// Resolve the caller scope with an explicit browser-session policy.
 pub(super) async fn resolve_scope(
     db: &Database,
     auth_cache: &LoginAuthCache,
     api_key_cache: &ApiKeyCache,
     session_token: &str,
+    security: &RuntimeSecurityConfig,
+    browser_session: BrowserSessionPolicy,
     headers: &HeaderMap,
 ) -> Result<CallerScope, StatusCode> {
-    Ok(
-        resolve_caller(db, auth_cache, api_key_cache, session_token, headers)
-            .await?
-            .scope,
+    Ok(resolve_caller(
+        db,
+        auth_cache,
+        api_key_cache,
+        session_token,
+        security,
+        browser_session,
+        headers,
     )
+    .await?
+    .scope)
 }
 
 #[derive(Deserialize)]
@@ -475,21 +507,25 @@ mod tests {
 
 pub(super) async fn auth_status_handler(
     Extension(auth_cache): Extension<LoginAuthCache>,
+    Extension(security): Extension<RuntimeSecurityConfig>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> Json<serde_json::Value> {
     let creds = auth_cache.snapshot();
-    let authenticated = if let Some(creds) = creds.as_ref() {
+    let login_authenticated = if let Some(creds) = creds.as_ref() {
         if let Some(token) = extract_jwt_cookie(&headers) {
             jwt::verify_jwt(&token, &creds.jwt_secret).is_ok()
         } else {
             false
         }
     } else {
-        true // auth not enabled -> everyone is "authenticated"
+        false
     };
+    let trusted_peer = security.is_trusted_peer(peer.map(|Extension(ConnectInfo(peer))| peer));
 
     Json(serde_json::json!({
         "enabled": creds.is_some(),
-        "authenticated": authenticated,
+        "authenticated": login_authenticated || trusted_peer,
+        "setupRequired": creds.is_none() && !trusted_peer,
     }))
 }

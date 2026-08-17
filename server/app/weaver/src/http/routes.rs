@@ -81,6 +81,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     } = runtime;
     let base_url_ext = super::assets::BaseUrl(Arc::new(base_url.clone()));
     let session_token = super::SessionToken(Arc::new(generate_api_key()));
+    let request_security = Arc::new(security.clone());
     let login_limiter = super::auth::LoginRateLimiter::default();
     let backup_upload_limit =
         usize::try_from(security.backup_upload_limit_bytes).unwrap_or(usize::MAX);
@@ -91,6 +92,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         auth_cache: auth_cache.clone(),
         api_key_cache: api_key_cache.clone(),
         session_token: session_token.clone(),
+        security: Arc::clone(&request_security),
     };
     let nzbget_context = super::nzbget::NzbgetFacadeContext::new(
         db.clone(),
@@ -99,6 +101,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         auth_cache.clone(),
         api_key_cache.clone(),
         session_token.clone(),
+        security.clone(),
         rss,
         watch_folder,
         scheduled_resume,

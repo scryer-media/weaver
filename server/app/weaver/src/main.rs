@@ -38,6 +38,19 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Rayon's global pool runs the archive engines' data-parallel loops. Give
+    // its workers the same 8 MiB the tokio threads get below: under this
+    // binary's fat-LTO profile the optimizer inlines a `par_iter` closure into
+    // rayon's recursive splitting helper, so a closure with a few tens of KiB
+    // of locals is multiplied by the recursion depth — a RAR3 recovery-volume
+    // restore aborted the whole server that way on a default 2 MiB worker.
+    // The stack is reserved, not committed, so this costs nothing at rest.
+    // Ignoring the error is deliberate: it only says a pool already exists.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .stack_size(8 * 1024 * 1024)
+        .thread_name(|index| format!("weaver-rayon-{index}"))
+        .build_global();
+
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all().thread_stack_size(8 * 1024 * 1024); // 8 MB - pipeline futures are large
     weaver_server_core::runtime::affinity::install_tokio_worker_affinity(&mut builder);

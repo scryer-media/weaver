@@ -524,6 +524,21 @@ func TestWeaverComposeKeepsPrivateRSSDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestWeaverComposeDeclaresIsolatedBrowserTrust(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(weaverE2ETestRoot(t), "docker-compose.yml"))
+	if err != nil {
+		t.Fatalf("read docker compose file: %v", err)
+	}
+	for _, mapping := range []string{
+		`WEAVER_HTTP_BIND_ADDRESS: "0.0.0.0"`,
+		`WEAVER_TRUSTED_CIDRS: "0.0.0.0/0,::/0"`,
+	} {
+		if !strings.Contains(string(body), mapping) {
+			t.Fatalf("Weaver Compose isolated browser-trust mapping is missing %q", mapping)
+		}
+	}
+}
+
 func TestWeaverPlaywrightComposeServiceIsSelfContained(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(weaverE2ETestRoot(t), "docker-compose.yml"))
 	if err != nil {
