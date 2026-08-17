@@ -1569,6 +1569,26 @@ fn boundary_special_cases() -> Vec<Vec<u8>> {
     case.extend_from_slice(b"\r\n.tail");
     cases.push(case);
 
+    // Terminator "\r\n=y" with "\r\n" at window bytes 62/63: the candidate
+    // is straddle-only (cand<<2 == 0), so ONLY the pending-tail carry can see
+    // it (classify PEND_CRLF, resume-hit next window).
+    let mut case = vec![b'A'; 62];
+    case.extend_from_slice(b"\r\n=yignored-after-terminator");
+    case.extend_from_slice(&[b'W'; 96]);
+    cases.push(case);
+
+    // Terminator with only "\r" at window byte 63 (PEND_CR classify + hit).
+    let mut case = vec![b'A'; 63];
+    case.extend_from_slice(b"\r\n=yignored-after-terminator");
+    case.extend_from_slice(&[b'X'; 96]);
+    cases.push(case);
+
+    // Same straddle shape, non-terminator continuation (classify + miss).
+    let mut case = vec![b'A'; 62];
+    case.extend_from_slice(b"\r\nnormal-line-continues");
+    case.extend_from_slice(&[b'Y'; 96]);
+    cases.push(case);
+
     cases
 }
 
