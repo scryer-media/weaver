@@ -705,6 +705,7 @@ impl Pipeline {
         file_offset: u64,
         decoded_len: u64,
         part_crc: u32,
+        part_crc_verified: bool,
         segments: &[weaver_yenc::Segment],
     ) {
         let Some(block_size) = self.par2_block_size(file_id.job_id) else {
@@ -716,6 +717,7 @@ impl Pipeline {
             file_offset,
             decoded_len,
             part_crc,
+            part_crc_verified,
             segments,
         );
     }
@@ -858,7 +860,16 @@ impl Pipeline {
                 continue;
             };
             for (block_index, verdict) in verdicts {
-                if verdict == crate::pipeline::integrity::BlockVerdict::Intact {
+                // Mirror the evidence split exactly: a block that cannot mint
+                // an `InStreamCrc32Proof` (no independent article-grid
+                // coverage) is NOT claimed, so settle-time verification reads
+                // it back like any other unclaimed block.
+                if matches!(
+                    verdict,
+                    crate::pipeline::integrity::BlockVerdict::Intact {
+                        independently_covered: true,
+                    }
+                ) {
                     claimed.insert((file_id, block_index));
                 }
             }

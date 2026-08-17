@@ -103,17 +103,50 @@ fn extraction_chunk_from_row(row: SqlRow) -> Result<ExtractionChunk, StateError>
 }
 
 impl Database {
+    /// Completed-file digests that are safe to treat as *calculated from the
+    /// downloaded bytes*: rows whose `md5_provenance` records how the value
+    /// was obtained ('streamed' or 'verified'). Legacy rows — written before
+    /// provenance existed — are excluded here, because they may hold a PAR2
+    /// description's EXPECTED hash copied verbatim, and quick verification
+    /// must never treat an expectation as an observation. Use
+    /// [`Self::load_complete_file_hashes_any`] where a hash is only an
+    /// identity hint.
     pub fn load_complete_file_hashes(
         &self,
         job_id: JobId,
     ) -> Result<HashMap<u32, [u8; 16]>, StateError> {
+        self.load_complete_file_hashes_inner(job_id, true)
+    }
+
+    /// Every persisted completed-file digest regardless of provenance,
+    /// including legacy rows of unknown origin. Identity hints only — never
+    /// verification evidence.
+    pub fn load_complete_file_hashes_any(
+        &self,
+        job_id: JobId,
+    ) -> Result<HashMap<u32, [u8; 16]>, StateError> {
+        self.load_complete_file_hashes_inner(job_id, false)
+    }
+
+    fn load_complete_file_hashes_inner(
+        &self,
+        job_id: JobId,
+        trusted_only: bool,
+    ) -> Result<HashMap<u32, [u8; 16]>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
+            let sql = if trusted_only {
                 "SELECT file_index, md5
                  FROM active_files
-                 WHERE job_id = {}",
+                 WHERE job_id = {} AND md5_provenance IS NOT NULL"
+            } else {
+                "SELECT file_index, md5
+                 FROM active_files
+                 WHERE job_id = {}"
+            };
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                sql,
                 &[SqlArg::I64(job_id.0 as i64)],
             )
             .await?;

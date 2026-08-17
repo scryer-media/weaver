@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -701,23 +701,17 @@ impl Pipeline {
                             all_parts_crc_verified: streamed.all_parts_crc_verified,
                         });
                     }
-                    if let Some(md5) = self.expected_par2_hash_for_fast_verified_rar_file(
-                        file_id,
-                        filename,
-                        total_bytes,
-                        expected_file_crc,
-                        &streamed,
-                    ) {
-                        crate::runtime::perf_probe::record(
-                            "download.file_hash.md5.par2_expected_fast_path",
-                            std::time::Duration::from_nanos(1),
-                        );
-                        return Ok(CompletedFileChecksum {
-                            md5: Some(md5),
-                            crc32: streamed.crc32,
-                            all_parts_crc_verified: streamed.all_parts_crc_verified,
-                        });
-                    }
+                    // The PAR2 expected-MD5 substitution that used to live here is
+                    // deliberately gone: a PAR2 description's hash is an
+                    // EXPECTATION, and storing it as though it had been
+                    // calculated from the downloaded bytes let quick
+                    // verification certify a file the in-stream IFSC verdicts
+                    // had already proven Damaged (the yEnc aggregate CRC it was
+                    // gated on is the poster's own declaration, not independent
+                    // evidence). Files land in the deferral paths below instead
+                    // and are adjudicated by the dual-CRC slice verdicts, like
+                    // SABnzbd's quick-check and NZBGet's ParQuick, which only
+                    // ever compare observed values against expectations.
                     let file_crc_matched = expected_file_crc
                         .is_some_and(|expected_file_crc| streamed.crc32 == expected_file_crc);
                     if file_crc_matched && self.can_defer_completed_file_md5(file_id) {
@@ -775,106 +769,6 @@ impl Pipeline {
             .await
             .map_err(|error| format!("file checksum task panicked: {error}"))?
             .map_err(|error| format!("failed to checksum completed file: {error}"))
-    }
-
-    fn expected_par2_hash_for_fast_verified_rar_file(
-        &self,
-        file_id: NzbFileId,
-        filename: &str,
-        total_bytes: u64,
-        expected_file_crc: Option<u32>,
-        streamed: &StreamedCompletedFileChecksum,
-    ) -> Option<[u8; 16]> {
-        if let Some(expected_file_crc) = expected_file_crc {
-            if streamed.crc32 != expected_file_crc {
-                crate::runtime::perf_probe::record(
-                    "download.file_hash.md5.fast_path_reject.file_crc_mismatch",
-                    std::time::Duration::from_nanos(1),
-                );
-                return None;
-            }
-        } else {
-            crate::runtime::perf_probe::record(
-                "download.file_hash.md5.fast_path_without_file_crc",
-                std::time::Duration::from_nanos(1),
-            );
-        }
-        if !streamed.all_parts_crc_verified {
-            crate::runtime::perf_probe::record(
-                "download.file_hash.md5.fast_path_reject.unverified_part_crc",
-                std::time::Duration::from_nanos(1),
-            );
-            return None;
-        }
-
-        let job_id = file_id.job_id;
-        let state = self.jobs.get(&job_id)?;
-        let file = state.assembly.file(file_id)?;
-        if !matches!(
-            self.classified_role_for_file(job_id, file),
-            weaver_model::files::FileRole::RarVolume { .. }
-        ) {
-            crate::runtime::perf_probe::record(
-                "download.file_hash.md5.fast_path_reject.not_rar",
-                std::time::Duration::from_nanos(1),
-            );
-            return None;
-        }
-        let Some(par2_set) = self.par2_set(job_id) else {
-            crate::runtime::perf_probe::record(
-                "download.file_hash.md5.fast_path_reject.no_par2_metadata",
-                std::time::Duration::from_nanos(1),
-            );
-            return None;
-        };
-
-        let mut candidate_names = BTreeSet::new();
-        candidate_names.insert(weaver_model::files::sanitize_download_filename(filename));
-        candidate_names.insert(weaver_model::files::sanitize_download_filename(
-            file.filename(),
-        ));
-        if let Some(identity) = self.effective_file_identity(job_id, file_id) {
-            candidate_names.insert(weaver_model::files::sanitize_download_filename(
-                &identity.source_filename,
-            ));
-            candidate_names.insert(weaver_model::files::sanitize_download_filename(
-                &identity.current_filename,
-            ));
-            if let Some(canonical) = identity.canonical_filename.as_ref() {
-                candidate_names.insert(weaver_model::files::sanitize_download_filename(canonical));
-            }
-        }
-
-        let mut hashes = par2_set
-            .files
-            .values()
-            .filter(|desc| desc.length == total_bytes)
-            .filter(|desc| {
-                candidate_names.contains(&weaver_model::files::sanitize_download_filename(
-                    &desc.filename,
-                ))
-            })
-            .map(|desc| desc.hash_full)
-            .collect::<Vec<_>>();
-        hashes.sort_unstable();
-        hashes.dedup();
-        match hashes.as_slice() {
-            [hash] => Some(*hash),
-            [] => {
-                crate::runtime::perf_probe::record(
-                    "download.file_hash.md5.fast_path_reject.no_par2_match",
-                    std::time::Duration::from_nanos(1),
-                );
-                None
-            }
-            _ => {
-                crate::runtime::perf_probe::record(
-                    "download.file_hash.md5.fast_path_reject.ambiguous_par2_match",
-                    std::time::Duration::from_nanos(1),
-                );
-                None
-            }
-        }
     }
 
     pub(crate) fn note_decode_started(&mut self, segment_id: SegmentId) {
@@ -2026,6 +1920,7 @@ impl Pipeline {
                     file_offset,
                     data.len_bytes() as u64,
                     part_crc,
+                    part_crc_verified,
                     &segments,
                 );
 

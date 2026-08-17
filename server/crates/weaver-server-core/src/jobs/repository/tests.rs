@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use crate::jobs::persistence::CompletedHashProvenance;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -1374,7 +1375,7 @@ fn complete_files_bulk_upserts_hashes_and_is_idempotent() {
         (0u32, "data.rar".to_string(), Some([0x11; 16])),
         (1u32, "data.r00".to_string(), None),
     ];
-    db.complete_files(JobId(1), &entries).unwrap();
+    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed).unwrap();
 
     let jobs = db.load_active_jobs().unwrap();
     assert_eq!(jobs[&JobId(1)].complete_files.len(), 2);
@@ -1385,7 +1386,7 @@ fn complete_files_bulk_upserts_hashes_and_is_idempotent() {
 
     // Re-run upserts the filename/hash in place.
     let entries = vec![(0u32, "data-renamed.rar".to_string(), Some([0x22; 16]))];
-    db.complete_files(JobId(1), &entries).unwrap();
+    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed).unwrap();
     assert_eq!(
         fetch_text(
             &db,
@@ -1405,6 +1406,7 @@ fn complete_files_guards_absent_job() {
     db.complete_files(
         JobId(7),
         &[(0u32, "ghost.rar".to_string(), Some([0x01; 16]))],
+        CompletedHashProvenance::Streamed,
     )
     .unwrap();
     let count = fetch_i64(&db, "SELECT COUNT(*) FROM active_files", vec![]);
@@ -1419,7 +1421,7 @@ fn complete_files_chunks_beyond_sqlite_bind_limit() {
     let entries: Vec<(u32, String, Option<[u8; 16]>)> = (0..1500)
         .map(|i| (i, format!("file-{i}.rar"), Some([(i % 256) as u8; 16])))
         .collect();
-    db.complete_files(JobId(1), &entries).unwrap();
+    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed).unwrap();
 
     let count = fetch_i64(
         &db,

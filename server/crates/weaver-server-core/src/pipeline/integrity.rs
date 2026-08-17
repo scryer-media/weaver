@@ -56,7 +56,15 @@ const MAX_PENDING_SEGMENTS_PER_FILE: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockVerdict {
     /// The derived block CRC32 matched the recovery set's IFSC entry.
-    Intact,
+    ///
+    /// `independently_covered` is true only when every article that
+    /// contributed bytes to this block also verified its declared yEnc
+    /// `pcrc32` — the second, article-aligned grid. A block assembled from
+    /// articles without declared (or with unverified) part CRCs still has a
+    /// correct derived CRC32, but it was seen intact by one grid, not two,
+    /// and must not mint an [`par2_rs::InStreamCrc32Proof`] claiming
+    /// independent coverage.
+    Intact { independently_covered: bool },
     /// The derived block CRC32 contradicted the IFSC entry: these bytes are
     /// damaged, and no read-back is needed to know it.
     Damaged,
@@ -130,15 +138,39 @@ fn fold_tiling(segments: &[Segment], start: u64, end: u64) -> Option<u32> {
     (cursor == end).then_some(crc).flatten()
 }
 
+/// One pending segment plus the attestation of the article that carried it.
+#[derive(Debug, Clone, Copy)]
+struct PendingSegment {
+    segment: Segment,
+    /// The carrying article verified its declared yEnc `pcrc32`.
+    pcrc_verified: bool,
+}
+
+/// One closed block: the derived CRC32 plus whether every contributing
+/// article carried a verified `pcrc32` (see [`BlockVerdict::Intact`]).
+#[derive(Debug, Clone, Copy)]
+struct DerivedBlock {
+    crc32: u32,
+    independently_covered: bool,
+}
+
 /// Per-file assembly of block CRC32s from decoded-article segments.
 #[derive(Debug)]
 struct FileBlockCrcs {
     block_size: NonZeroU64,
     /// Segments belonging to blocks that are not closed yet, keyed by file
     /// offset so a duplicate arrival replaces rather than duplicates.
-    pending: BTreeMap<u64, Segment>,
-    /// Derived CRC32 per zero-based block index.
-    derived: BTreeMap<u32, u32>,
+    pending: BTreeMap<u64, PendingSegment>,
+    /// Derived CRC32 (+ attestation) per zero-based block index.
+    derived: BTreeMap<u32, DerivedBlock>,
+    /// Placement and part CRC of every article accepted so far, keyed by file
+    /// offset. This is what detects a replay that carries *different* bytes:
+    /// a re-arrival with the same `(offset, len, part_crc)` is an identical
+    /// duplicate and a no-op; anything else rewrote the range on disk, so
+    /// every verdict derived over that range is invalidated (the rewritten
+    /// bytes are re-claimable only from segments observed at or after the
+    /// rewrite). Bounded by the number of articles in the file.
+    articles: BTreeMap<u64, (u64, u32)>,
     /// Set once the file's length is known, which is what makes the short final
     /// block closable.
     file_len: Option<u64>,
@@ -152,6 +184,7 @@ impl FileBlockCrcs {
             block_size,
             pending: BTreeMap::new(),
             derived: BTreeMap::new(),
+            articles: BTreeMap::new(),
             file_len: None,
             overflowed: false,
         }
@@ -184,17 +217,25 @@ impl FileBlockCrcs {
             if self.file_len.is_none() && end - start < size {
                 continue;
             }
-            let tiling: Vec<Segment> = self
+            let tiling: Vec<PendingSegment> = self
                 .pending
                 .range(start..end)
-                .map(|(_, segment)| *segment)
+                .map(|(_, pending)| *pending)
                 .collect();
-            let Some(crc32) = fold_tiling(&tiling, start, end) else {
+            let segments: Vec<Segment> = tiling.iter().map(|pending| pending.segment).collect();
+            let Some(crc32) = fold_tiling(&segments, start, end) else {
                 continue;
             };
-            self.derived.insert(block_index, crc32);
-            for segment in tiling {
-                self.pending.remove(&segment.file_offset);
+            let independently_covered = tiling.iter().all(|pending| pending.pcrc_verified);
+            self.derived.insert(
+                block_index,
+                DerivedBlock {
+                    crc32,
+                    independently_covered,
+                },
+            );
+            for pending in tiling {
+                self.pending.remove(&pending.segment.file_offset);
             }
         }
     }
@@ -228,14 +269,25 @@ pub(crate) fn slice_evidence_from_verdicts(
     }
     verdicts
         .iter()
-        .filter(|(_, verdict)| **verdict == BlockVerdict::Intact)
-        .filter_map(|(&block_index, _)| {
+        .filter_map(|(&block_index, verdict)| {
+            let BlockVerdict::Intact {
+                independently_covered,
+            } = *verdict
+            else {
+                return None;
+            };
             // Real bytes the block covers: a whole block, or the short
             // remainder for the final one. PAR2's zero padding is not part of
             // the file, so it is not part of the covered length.
             let start = u64::from(block_index).checked_mul(block_size)?;
             let covered = file_length.checked_sub(start)?.min(block_size);
-            let proof = par2_rs::InStreamCrc32Proof::try_new(covered, true, true, true).ok()?;
+            // `try_new` rejects a proof without independent coverage, so a
+            // block assembled from articles that never verified a declared
+            // `pcrc32` mints no evidence and stays with settle-time
+            // verification — exactly like an unclaimed block.
+            let proof =
+                par2_rs::InStreamCrc32Proof::try_new(covered, true, true, independently_covered)
+                    .ok()?;
             Some(par2_rs::SliceEvidence::from_in_stream_crc32(
                 recovery_set_id,
                 par2_file_id,
@@ -279,6 +331,7 @@ impl BlockCrcCollector {
         file_offset: u64,
         len: u64,
         part_crc: u32,
+        part_crc_verified: bool,
         segments: &[Segment],
     ) {
         if len == 0 {
@@ -298,6 +351,48 @@ impl BlockCrcCollector {
             return;
         }
 
+        // Replay adjudication. An arrival at an offset we have accepted before
+        // either carries the same bytes — same length, same part CRC — and is
+        // a no-op, or it rewrote the range on disk. A rewrite invalidates
+        // every closed verdict over the touched blocks *and* every pending
+        // segment inside the rewritten range: those describe bytes that are no
+        // longer there. Contributions outside the rewritten range but inside a
+        // touched block survive — their bytes were not rewritten — so the
+        // block may close again once segments observed at or after the rewrite
+        // tile the rest. If they never do, the block stays unclaimed and
+        // settle-time verification owns it, which reads the disk as it is now.
+        match entry.articles.get(&file_offset) {
+            Some(&(prev_len, prev_crc)) if prev_len == len && prev_crc == part_crc => {
+                // Byte-identical duplicate. No invalidation — the rewrite put
+                // the same bytes back — and no early return either: the
+                // pipeline re-feeds duplicates through this seam on purpose,
+                // and letting the segments re-enter `pending` is what lets a
+                // block invalidated by a *different* article's rewrite close
+                // again once its unchanged articles replay. For blocks that
+                // are still derived this is a no-op: `close_blocks` skips
+                // them and keyed inserts replace their own earlier records.
+            }
+            Some(_) => {
+                let size = entry.block_size.get();
+                let first_block = u32::try_from(file_offset / size).unwrap_or(u32::MAX);
+                let last_block = u32::try_from((end - 1) / size).unwrap_or(u32::MAX);
+                for block_index in first_block..=last_block {
+                    entry.derived.remove(&block_index);
+                }
+                let stale: Vec<u64> = entry
+                    .pending
+                    .range(..end)
+                    .filter(|(_, pending)| pending.segment.end_offset() > file_offset)
+                    .map(|(&offset, _)| offset)
+                    .collect();
+                for offset in stale {
+                    entry.pending.remove(&offset);
+                }
+            }
+            None => {}
+        }
+        entry.articles.insert(file_offset, (len, part_crc));
+
         let article_matches_placement = fold_tiling(segments, file_offset, end) == Some(part_crc);
         let whole_article = [Segment {
             file_offset,
@@ -312,7 +407,13 @@ impl BlockCrcCollector {
         };
 
         for segment in accepted {
-            entry.pending.insert(segment.file_offset, *segment);
+            entry.pending.insert(
+                segment.file_offset,
+                PendingSegment {
+                    segment: *segment,
+                    pcrc_verified: part_crc_verified,
+                },
+            );
         }
         if entry.pending.len() > MAX_PENDING_SEGMENTS_PER_FILE {
             entry.overflowed = true;
@@ -355,7 +456,11 @@ impl BlockCrcCollector {
     /// pin a derived value against a direct hash of the block's bytes.
     #[cfg(test)]
     pub(crate) fn derived_block_crc(&self, file_id: NzbFileId, block_index: u32) -> Option<u32> {
-        self.files.get(&file_id)?.derived.get(&block_index).copied()
+        self.files
+            .get(&file_id)?
+            .derived
+            .get(&block_index)
+            .map(|block| block.crc32)
     }
 
     /// Every block this file has an in-stream CRC for, ascending.
@@ -364,7 +469,12 @@ impl BlockCrcCollector {
         self.files
             .get(&file_id)
             .into_iter()
-            .flat_map(|entry| entry.derived.iter().map(|(index, crc)| (*index, *crc)))
+            .flat_map(|entry| {
+                entry
+                    .derived
+                    .iter()
+                    .map(|(index, block)| (*index, block.crc32))
+            })
     }
 
     /// Compare this file's derived block CRC32s against a recovery set's IFSC
@@ -390,7 +500,7 @@ impl BlockCrcCollector {
         }
         let checksums = par2_set.file_checksums(&par2_file_id);
         let block_size = entry.block_size.get();
-        for (&block_index, &derived) in &entry.derived {
+        for (&block_index, derived) in &entry.derived {
             let Some((start, end)) = entry.block_bounds(block_index) else {
                 continue;
             };
@@ -403,15 +513,17 @@ impl BlockCrcCollector {
             };
             let padding = block_size - (end - start);
             let padded = if padding == 0 {
-                derived
+                derived.crc32
             } else {
                 par2_rs::checksum::Crc32CombineOp::new(padding)
-                    .combine(derived, crc32_of_zeros(padding))
+                    .combine(derived.crc32, crc32_of_zeros(padding))
             };
             verdicts.insert(
                 block_index,
                 if padded == expected {
-                    BlockVerdict::Intact
+                    BlockVerdict::Intact {
+                        independently_covered: derived.independently_covered,
+                    }
                 } else {
                     BlockVerdict::Damaged
                 },

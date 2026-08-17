@@ -2383,8 +2383,15 @@ async fn list_jobs_keeps_legacy_idle_post_state_for_waiting_rar_phase() {
     assert_eq!(info.post_state, crate::jobs::model::PostState::Idle);
 }
 
+/// Regression for the removed PAR2 expected-hash substitution: a completed
+/// RAR volume whose yEnc aggregate CRC matches must NOT have the recovery
+/// set's EXPECTED MD5 persisted as though it had been calculated. The yEnc
+/// header is the poster's own declaration; a same-length different byte
+/// sequence with internally consistent yEnc CRCs used to sail through here
+/// and later self-certify quick verification against the very hash it was
+/// copied from, overriding a `Damaged` IFSC verdict.
 #[tokio::test]
-async fn completed_rar_with_par2_metadata_and_verified_yenc_crc_uses_expected_hash() {
+async fn completed_rar_with_par2_metadata_never_persists_the_expected_hash() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20020);
@@ -2429,12 +2436,24 @@ async fn completed_rar_with_par2_metadata_and_verified_yenc_crc_uses_expected_ha
     )
     .await;
 
-    let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
-    assert_eq!(hashes.get(&0).copied(), Some(expected_hash));
+    // Neither loader may hold the PAR2 expectation. A digest, when one is
+    // persisted at all, must be the one calculated from the downloaded
+    // bytes — never the recovery set's declared value.
+    let actual_hash = par2_rs::checksum::md5(payload);
+    let trusted = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_ne!(trusted.get(&0).copied(), Some(expected_hash));
+    if let Some(stored) = trusted.get(&0) {
+        assert_eq!(*stored, actual_hash);
+    }
+    let any = pipeline.db.load_complete_file_hashes_any(job_id).unwrap();
+    assert_ne!(any.get(&0).copied(), Some(expected_hash));
 }
 
+/// Twin of the test above for the no-whole-file-CRC arm the substitution also
+/// served: with only part CRCs verified, completion must still not mint the
+/// PAR2 expectation as a persisted digest.
 #[tokio::test]
-async fn completed_rar_without_whole_file_crc_uses_expected_hash_when_parts_verified() {
+async fn completed_rar_without_whole_file_crc_never_persists_the_expected_hash() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20021);
@@ -2470,8 +2489,14 @@ async fn completed_rar_without_whole_file_crc_uses_expected_hash_when_parts_veri
 
     submit_decoded_segment(&mut pipeline, file_id, 0, 0, payload, filename, None).await;
 
-    let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
-    assert_eq!(hashes.get(&0).copied(), Some(expected_hash));
+    let actual_hash = par2_rs::checksum::md5(payload);
+    let trusted = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_ne!(trusted.get(&0).copied(), Some(expected_hash));
+    if let Some(stored) = trusted.get(&0) {
+        assert_eq!(*stored, actual_hash);
+    }
+    let any = pipeline.db.load_complete_file_hashes_any(job_id).unwrap();
+    assert_ne!(any.get(&0).copied(), Some(expected_hash));
 }
 
 #[tokio::test]

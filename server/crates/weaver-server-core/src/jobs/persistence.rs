@@ -480,6 +480,26 @@ fn build_extracted_members_pg_sql(row_count: usize) -> String {
     )
 }
 
+/// How a persisted completed-file MD5 was obtained. Legacy rows predate this
+/// distinction (NULL in `active_files.md5_provenance`) and are never trusted
+/// for quick verification — they can identify a file, not certify it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletedHashProvenance {
+    /// Folded from the decode pass over the downloaded bytes themselves.
+    Streamed,
+    /// Confirmed by an actual PAR2 verification pass over the file.
+    Verified,
+}
+
+impl CompletedHashProvenance {
+    pub(crate) fn as_sql(self) -> &'static str {
+        match self {
+            Self::Streamed => "streamed",
+            Self::Verified => "verified",
+        }
+    }
+}
+
 /// Build the Postgres autocommit statement that upserts `row_count` completed
 /// files guarded by a `FOR KEY SHARE` lock on the owning job, mirroring the
 /// single-row [`Database::complete_file_with_optional_hash`] shape. `$1` is the
@@ -491,22 +511,23 @@ fn build_complete_files_pg_sql(row_count: usize) -> String {
             values.push_str(", ");
         }
         if row == 0 {
-            values.push_str("({}::bigint, {}::bigint, {}::text, {}::bytea)");
+            values.push_str("({}::bigint, {}::bigint, {}::text, {}::bytea, {}::text)");
         } else {
-            values.push_str("({}, {}, {}, {})");
+            values.push_str("({}, {}, {}, {}, {})");
         }
     }
     format!(
         "WITH active_complete_files_active AS (
              SELECT 1 FROM active_jobs WHERE job_id = {{}} FOR KEY SHARE
          )
-         INSERT INTO active_files (job_id, file_index, filename, md5)
-         SELECT d.job_id, d.file_index, d.filename, d.md5
-         FROM (VALUES {values}) AS d(job_id, file_index, filename, md5),
+         INSERT INTO active_files (job_id, file_index, filename, md5, md5_provenance)
+         SELECT d.job_id, d.file_index, d.filename, d.md5, d.md5_provenance
+         FROM (VALUES {values}) AS d(job_id, file_index, filename, md5, md5_provenance),
               active_complete_files_active
          ON CONFLICT(job_id, file_index) DO UPDATE SET
             filename = excluded.filename,
-            md5 = excluded.md5"
+            md5 = excluded.md5,
+            md5_provenance = excluded.md5_provenance"
     )
 }
 
@@ -1118,28 +1139,49 @@ impl Database {
         filename: &str,
         md5: Option<&[u8; 16]>,
     ) -> Result<(), StateError> {
+        self.complete_file_with_provenance(
+            job_id,
+            file_index,
+            filename,
+            md5,
+            CompletedHashProvenance::Streamed,
+        )
+    }
+
+    pub fn complete_file_with_provenance(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        filename: &str,
+        md5: Option<&[u8; 16]>,
+        provenance: CompletedHashProvenance,
+    ) -> Result<(), StateError> {
         let datastore = self.datastore();
         let filename = filename.to_string();
         let md5 = md5.map(|md5| md5.to_vec());
+        let provenance = md5.is_some().then(|| provenance.as_sql().to_string());
         self.run_sql_blocking(async move {
             match datastore.engine() {
                 SqlEngine::Sqlite => {
                     SqlRuntime::run_in_transaction(&datastore, "complete_file", |tx| {
                         let filename = filename.clone();
                         let md5 = md5.clone();
+                        let provenance = provenance.clone();
                         Box::pin(async move {
                             if active_job_exists_tx(tx, job_id).await? {
                                 tx.execute(
-                                    "INSERT INTO active_files (job_id, file_index, filename, md5)
-                                     VALUES ({}, {}, {}, {})
+                                    "INSERT INTO active_files (job_id, file_index, filename, md5, md5_provenance)
+                                     VALUES ({}, {}, {}, {}, {})
                                      ON CONFLICT(job_id, file_index) DO UPDATE SET
                                         filename = excluded.filename,
-                                        md5 = excluded.md5",
+                                        md5 = excluded.md5,
+                                        md5_provenance = excluded.md5_provenance",
                                     &[
                                         SqlArg::I64(job_id.0 as i64),
                                         SqlArg::I64(file_index as i64),
                                         SqlArg::Text(filename),
                                         SqlArg::OptBytes(md5),
+                                        SqlArg::OptText(provenance),
                                     ],
                                 )
                                 .await?;
@@ -1159,18 +1201,20 @@ impl Database {
                              WHERE job_id = {}
                              FOR KEY SHARE
                          )
-                             INSERT INTO active_files (job_id, file_index, filename, md5)
-                             SELECT {}, {}, {}, {}
+                             INSERT INTO active_files (job_id, file_index, filename, md5, md5_provenance)
+                             SELECT {}, {}, {}, {}, {}
                              FROM active_file_complete_active
                              ON CONFLICT(job_id, file_index) DO UPDATE SET
                                 filename = excluded.filename,
-                                md5 = excluded.md5",
+                                md5 = excluded.md5,
+                                md5_provenance = excluded.md5_provenance",
                         &[
                             SqlArg::I64(job_id.0 as i64),
                             SqlArg::I64(job_id.0 as i64),
                             SqlArg::I64(file_index as i64),
                             SqlArg::Text(filename),
                             SqlArg::OptBytes(md5),
+                            SqlArg::OptText(provenance),
                         ],
                     )
                     .await
@@ -1196,10 +1240,13 @@ impl Database {
         &self,
         job_id: JobId,
         entries: &[(u32, String, Option<[u8; 16]>)],
+        provenance: CompletedHashProvenance,
     ) -> Result<(), StateError> {
-        // 4 value binds per row (job_id, file_index, filename, md5) plus the
-        // single guard bind reused across the chunk.
-        const BINDS_PER_ROW: usize = 4;
+        // 5 value binds per row (job_id, file_index, filename, md5,
+        // md5_provenance) plus the single guard bind reused across the chunk.
+        // Batched completions carry decode-streamed digests, so a present md5
+        // records 'streamed' provenance.
+        const BINDS_PER_ROW: usize = 5;
 
         if entries.is_empty() {
             return Ok(());
@@ -1222,7 +1269,7 @@ impl Database {
                             };
                             for chunk in entries.chunks(chunk_size) {
                                 let mut builder = QueryBuilder::<Sqlite>::new(
-                                    "INSERT INTO active_files (job_id, file_index, filename, md5) ",
+                                    "INSERT INTO active_files (job_id, file_index, filename, md5, md5_provenance) ",
                                 );
                                 builder.push_values(
                                     chunk,
@@ -1230,13 +1277,15 @@ impl Database {
                                         row.push_bind(job_id.0 as i64)
                                             .push_bind(*file_index as i64)
                                             .push_bind(filename.clone())
-                                            .push_bind(md5.map(|md5| md5.to_vec()));
+                                            .push_bind(md5.map(|md5| md5.to_vec()))
+                                            .push_bind(md5.map(|_| provenance.as_sql()));
                                     },
                                 );
                                 builder.push(
                                     " ON CONFLICT(job_id, file_index) DO UPDATE SET
                                         filename = excluded.filename,
-                                        md5 = excluded.md5",
+                                        md5 = excluded.md5,
+                                        md5_provenance = excluded.md5_provenance",
                                 );
                                 builder.build().execute(&mut **tx).await.map_err(db_err)?;
                             }
@@ -1257,6 +1306,9 @@ impl Database {
                             args.push(SqlArg::I64(*file_index as i64));
                             args.push(SqlArg::Text(filename.clone()));
                             args.push(SqlArg::OptBytes(md5.map(|md5| md5.to_vec())));
+                            args.push(SqlArg::OptText(
+                                md5.map(|_| provenance.as_sql().to_string()),
+                            ));
                         }
                         SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
                     }

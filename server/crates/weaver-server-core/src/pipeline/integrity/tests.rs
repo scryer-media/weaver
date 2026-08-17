@@ -165,6 +165,7 @@ fn derived_block_crcs_match_direct_over_random_article_tilings() {
                 start as u64,
                 (end - start) as u64,
                 part_crc,
+                true,
                 &segments,
             );
         }
@@ -230,6 +231,7 @@ fn a_missing_article_leaves_its_blocks_unclaimed() {
             start as u64,
             (end - start) as u64,
             part_crc,
+            true,
             &segments,
         );
     }
@@ -252,7 +254,7 @@ fn segments_contradicting_the_pipeline_placement_are_reduced_to_one_record() {
     // The poster's `=ypart begin` claimed offset 0 while the pipeline placed the
     // article at 1024: the segments were cut on a grid that does not exist.
     let (part_crc, segments) = decode_article_segments(&payload[1024..], 0, Some(block_size), 64);
-    collector.note_article(file_id, block_size, 1024, 1024, part_crc, &segments);
+    collector.note_article(file_id, block_size, 1024, 1024, part_crc, true, &segments);
     collector.note_file_len(file_id, 2048);
 
     assert_eq!(collector.rebased_articles(), 1);
@@ -262,7 +264,7 @@ fn segments_contradicting_the_pipeline_placement_are_reduced_to_one_record() {
 
     // The same article placed where its own segments say it is composes fully.
     let mut honest = BlockCrcCollector::new();
-    honest.note_article(file_id, block_size, 0, 1024, part_crc, &segments);
+    honest.note_article(file_id, block_size, 0, 1024, part_crc, true, &segments);
     honest.note_file_len(file_id, 1024);
     assert_eq!(honest.rebased_articles(), 0);
     assert_eq!(honest.derived_blocks(file_id).count(), 2);
@@ -279,7 +281,7 @@ fn pending_segments_are_retired_as_blocks_close() {
         let end = start + 512;
         let (part_crc, segments) =
             decode_article_segments(&payload[start..end], start as u64, Some(block_size), 128);
-        collector.note_article(file_id, block_size, start as u64, 512, part_crc, &segments);
+        collector.note_article(file_id, block_size, start as u64, 512, part_crc, true, &segments);
     }
     collector.note_file_len(file_id, 8192);
 
@@ -392,6 +394,7 @@ fn decode_articles_into(
             begin,
             decoded.result.bytes_written as u64,
             decoded.result.part_crc,
+            true,
             &decoded.result.segments,
         );
     }
@@ -436,7 +439,7 @@ fn a_damaged_article_is_localised_to_exactly_its_blocks_with_no_read_back() {
         .collect();
     let intact: Vec<u32> = verdicts
         .iter()
-        .filter(|(_, verdict)| **verdict == BlockVerdict::Intact)
+        .filter(|(_, verdict)| matches!(verdict, BlockVerdict::Intact { .. }))
         .map(|(index, _)| *index)
         .collect();
 
@@ -498,7 +501,7 @@ fn an_undamaged_download_claims_every_block_intact() {
     assert!(
         verdicts
             .values()
-            .all(|verdict| *verdict == BlockVerdict::Intact),
+            .all(|verdict| matches!(verdict, BlockVerdict::Intact { .. })),
         "verdicts {verdicts:?}"
     );
 }
@@ -521,10 +524,10 @@ fn pre_block_size_articles_claim_only_what_they_tile() {
         let (part_crc, segments) =
             decode_article_segments(&payload[start..start + 1024], start as u64, None, 100);
         assert_eq!(segments.len(), 1);
-        collector.note_article(file_id, block_size, start as u64, 1024, part_crc, &segments);
+        collector.note_article(file_id, block_size, start as u64, 1024, part_crc, true, &segments);
     }
     let (part_crc, segments) = decode_article_segments(&payload[2048..], 2048, None, 100);
-    collector.note_article(file_id, block_size, 2048, 2048, part_crc, &segments);
+    collector.note_article(file_id, block_size, 2048, 2048, part_crc, true, &segments);
     collector.note_file_len(file_id, 4096);
 
     let claimed: Vec<u32> = collector
@@ -635,7 +638,7 @@ fn a_damaged_article_flows_from_evidence_through_a_session_to_repair() {
         .collect();
     let unclaimed: Vec<u32> = verdicts
         .iter()
-        .filter(|(_, verdict)| **verdict != BlockVerdict::Intact)
+        .filter(|(_, verdict)| !matches!(verdict, BlockVerdict::Intact { .. }))
         .map(|(index, _)| *index)
         .collect();
     assert_eq!(unclaimed, vec![2, 5], "verdicts {verdicts:?}");
@@ -703,5 +706,198 @@ fn a_damaged_article_flows_from_evidence_through_a_session_to_repair() {
         std::fs::read(working.path().join("payload.bin")).expect("repaired file"),
         payload,
         "repair must reproduce the true payload"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Evidence-correctness battery for the quick-verification consistency fix:
+// pCRC-gated independent coverage + duplicate/replay invalidation.
+// ---------------------------------------------------------------------------
+
+/// A recovery set whose IFSC entries are computed from the given bytes, so
+/// verdicts against it are `Intact` exactly when the collector derived the
+/// true CRC of those bytes.
+fn set_for_bytes(bytes: &[u8], block_size: u64) -> (par2_rs::Par2FileSet, par2_rs::FileId) {
+    let set = fixture_set("payload", bytes, block_size);
+    let par2_file_id = par2_file_id("payload", bytes);
+    (set, par2_file_id)
+}
+
+#[test]
+fn unverified_pcrc_blocks_close_but_mint_no_independent_evidence() {
+    let block_size = block(1024);
+    let file_id = file(90);
+    let data = random_bytes(0x9e_1, 2048);
+    let mut collector = BlockCrcCollector::new();
+
+    let (crc_a, segs_a) = decode_article_segments(&data[..1024], 0, Some(block_size), 333);
+    let (crc_b, segs_b) = decode_article_segments(&data[1024..], 1024, Some(block_size), 333);
+    // Article A never verified its declared pcrc32; article B did.
+    collector.note_article(file_id, block_size, 0, 1024, crc_a, false, &segs_a);
+    collector.note_article(file_id, block_size, 1024, 1024, crc_b, true, &segs_b);
+    collector.note_file_len(file_id, 2048);
+
+    // Both blocks closed with correct CRCs...
+    assert_eq!(
+        collector.derived_block_crc(file_id, 0),
+        Some(direct_crc(&data[..1024]))
+    );
+    assert_eq!(
+        collector.derived_block_crc(file_id, 1),
+        Some(direct_crc(&data[1024..]))
+    );
+
+    let (set, par2_file_id) = set_for_bytes(&data, 1024);
+    let verdicts = collector.verdicts_against(file_id, &set, par2_file_id);
+    assert_eq!(
+        verdicts.get(&0),
+        Some(&BlockVerdict::Intact {
+            independently_covered: false
+        })
+    );
+    assert_eq!(
+        verdicts.get(&1),
+        Some(&BlockVerdict::Intact {
+            independently_covered: true
+        })
+    );
+
+    // ...but only the independently covered block mints slice evidence.
+    let evidence = slice_evidence_from_verdicts(
+        set.recovery_set_id,
+        par2_file_id,
+        2048,
+        1024,
+        &verdicts,
+    );
+    assert_eq!(evidence.len(), 1);
+}
+
+#[test]
+fn mixed_pcrc_contributions_to_one_block_deny_independent_coverage() {
+    let block_size = block(1024);
+    let file_id = file(91);
+    let data = random_bytes(0x9e_2, 1024);
+    let mut collector = BlockCrcCollector::new();
+
+    // Two articles tile one block; only one verified its pcrc32.
+    let (crc_a, segs_a) = decode_article_segments(&data[..512], 0, Some(block_size), 100);
+    let (crc_b, segs_b) = decode_article_segments(&data[512..], 512, Some(block_size), 100);
+    collector.note_article(file_id, block_size, 0, 512, crc_a, true, &segs_a);
+    collector.note_article(file_id, block_size, 512, 512, crc_b, false, &segs_b);
+    collector.note_file_len(file_id, 1024);
+
+    let (set, par2_file_id) = set_for_bytes(&data, 1024);
+    let verdicts = collector.verdicts_against(file_id, &set, par2_file_id);
+    assert_eq!(
+        verdicts.get(&0),
+        Some(&BlockVerdict::Intact {
+            independently_covered: false
+        })
+    );
+    assert!(
+        slice_evidence_from_verdicts(set.recovery_set_id, par2_file_id, 1024, 1024, &verdicts)
+            .is_empty()
+    );
+}
+
+#[test]
+fn identical_duplicate_does_not_disturb_derived_blocks() {
+    let block_size = block(1024);
+    let file_id = file(92);
+    let data = random_bytes(0x9e_3, 1024);
+    let mut collector = BlockCrcCollector::new();
+
+    let (crc, segs) = decode_article_segments(&data, 0, Some(block_size), 256);
+    collector.note_article(file_id, block_size, 0, 1024, crc, true, &segs);
+    collector.note_file_len(file_id, 1024);
+    let derived_before = collector.derived_block_crc(file_id, 0);
+    assert!(derived_before.is_some());
+    let blocks_before = collector.blocks_derived();
+
+    // Byte-identical replay: same placement, same part CRC.
+    collector.note_article(file_id, block_size, 0, 1024, crc, true, &segs);
+    assert_eq!(collector.derived_block_crc(file_id, 0), derived_before);
+    assert_eq!(collector.blocks_derived(), blocks_before);
+}
+
+#[test]
+fn conflicting_replay_invalidates_and_rederives_from_the_rewrite() {
+    let block_size = block(1024);
+    let file_id = file(93);
+    let original = random_bytes(0x1a2b_3c4d, 1024);
+    let rewritten = random_bytes(0x5f6e_7d8c, 1024);
+    let mut collector = BlockCrcCollector::new();
+
+    let (crc_orig, segs_orig) = decode_article_segments(&original, 0, Some(block_size), 256);
+    collector.note_article(file_id, block_size, 0, 1024, crc_orig, true, &segs_orig);
+    collector.note_file_len(file_id, 1024);
+    assert_eq!(
+        collector.derived_block_crc(file_id, 0),
+        Some(direct_crc(&original))
+    );
+
+    // The replay carries different bytes: the earlier verdict must die and
+    // the block must re-derive from the rewrite, never keep describing the
+    // pre-rewrite content.
+    let (crc_new, segs_new) = decode_article_segments(&rewritten, 0, Some(block_size), 256);
+    assert_ne!(crc_orig, crc_new, "fixture must actually differ");
+    collector.note_article(file_id, block_size, 0, 1024, crc_new, true, &segs_new);
+    assert_eq!(
+        collector.derived_block_crc(file_id, 0),
+        Some(direct_crc(&rewritten))
+    );
+
+    // And the verdict grid agrees with the rewritten content, not the original.
+    let (set_new, id_new) = set_for_bytes(&rewritten, 1024);
+    let verdicts = collector.verdicts_against(file_id, &set_new, id_new);
+    assert!(matches!(
+        verdicts.get(&0),
+        Some(BlockVerdict::Intact { .. })
+    ));
+    let (set_old, id_old) = set_for_bytes(&original, 1024);
+    let verdicts_old = collector.verdicts_against(file_id, &set_old, id_old);
+    assert_eq!(verdicts_old.get(&0), Some(&BlockVerdict::Damaged));
+}
+
+#[test]
+fn partial_block_replay_keeps_unrewritten_contributions() {
+    let block_size = block(1024);
+    let file_id = file(94);
+    let first_half = random_bytes(0x1357_9bdf, 512);
+    let second_half = random_bytes(0x2468_ace0, 512);
+    let replacement_first_half = random_bytes(0xfdb9_7531, 512);
+    let mut collector = BlockCrcCollector::new();
+
+    let (crc_a, segs_a) = decode_article_segments(&first_half, 0, Some(block_size), 128);
+    let (crc_b, segs_b) = decode_article_segments(&second_half, 512, Some(block_size), 128);
+    collector.note_article(file_id, block_size, 0, 512, crc_a, true, &segs_a);
+    collector.note_article(file_id, block_size, 512, 512, crc_b, true, &segs_b);
+    collector.note_file_len(file_id, 1024);
+    let mut whole: Vec<u8> = first_half.clone();
+    whole.extend_from_slice(&second_half);
+    assert_eq!(collector.derived_block_crc(file_id, 0), Some(direct_crc(&whole)));
+
+    // Rewrite only the first article's range. The earlier verdict dies, and —
+    // because the second half's segments were retired when the block first
+    // closed — the block is UNCLAIMED, not re-derived: current segments alone
+    // cannot reconstruct the rewritten slice, so settle-time verification
+    // owns it (the handoff's rule, verbatim).
+    let (crc_a2, segs_a2) =
+        decode_article_segments(&replacement_first_half, 0, Some(block_size), 128);
+    assert_ne!(crc_a, crc_a2, "fixture must actually differ");
+    collector.note_article(file_id, block_size, 0, 512, crc_a2, true, &segs_a2);
+    assert_eq!(collector.derived_block_crc(file_id, 0), None);
+
+    // The pipeline re-feeds duplicates through this seam deliberately. When
+    // the unchanged second half replays (byte-identical duplicate), its
+    // segments re-enter pending and the block re-closes over the bytes that
+    // are actually on disk now: replacement + surviving second half.
+    collector.note_article(file_id, block_size, 512, 512, crc_b, true, &segs_b);
+    let mut rewritten: Vec<u8> = replacement_first_half.clone();
+    rewritten.extend_from_slice(&second_half);
+    assert_eq!(
+        collector.derived_block_crc(file_id, 0),
+        Some(direct_crc(&rewritten))
     );
 }

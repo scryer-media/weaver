@@ -1,0 +1,12 @@
+-- Provenance for completed-file MD5 rows.
+--
+-- Before the PAR2 expected-hash substitution was removed, `active_files.md5`
+-- could hold either a digest calculated from the downloaded bytes or a value
+-- copied verbatim from the recovery set's file description — and nothing in
+-- the row said which. Quick verification must only trust the former, so from
+-- here on every write records how the value was obtained:
+--   'streamed'  — folded from the decode pass over the bytes themselves
+--   'verified'  — confirmed by an actual PAR2 verification pass
+-- Legacy rows keep NULL and are treated as identity hints only: they can name
+-- a file, but they cannot authorize quick completion.
+ALTER TABLE active_files ADD COLUMN md5_provenance TEXT;

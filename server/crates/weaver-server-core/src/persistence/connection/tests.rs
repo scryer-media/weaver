@@ -1454,6 +1454,7 @@ async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
             (0, "vol0-old.rar".to_string(), Some([0x11; 16])),
             (1, "vol1-old.rar".to_string(), None),
         ],
+        crate::jobs::persistence::CompletedHashProvenance::Streamed,
     )
     .unwrap();
     assert_eq!(

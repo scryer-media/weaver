@@ -36,6 +36,19 @@ type RetainedPar2SessionResult = Result<RetainedPar2SessionOutcome, String>;
 fn committed_evidence_from_candidate(
     candidate: &Par2SessionEvidenceCandidate,
 ) -> Result<Option<par2_rs::CommittedFileEvidence>, String> {
+    // Both evidence shapes assert the file's content; neither is meaningful
+    // if the bytes on disk are not the length the PAR2 set describes (the
+    // decoded length was already required to match when the candidate was
+    // bound). One metadata stat per completed file, never a content read.
+    // A stat-able file whose length disagrees with the PAR2 description can
+    // never satisfy either evidence shape. A path that does not stat is NOT
+    // rejected: direct sets deliberately keep no conventional file at this
+    // path (the envelope + partials are the bytes), and a genuinely missing
+    // conventional file fails downstream verification on its own.
+    match std::fs::metadata(&candidate.path) {
+        Ok(metadata) if metadata.len() != candidate.expected_length => return Ok(None),
+        Ok(_) | Err(_) => {}
+    }
     if let Some(md5) = candidate.full_md5 {
         return par2_rs::CommittedFileEvidence::from_full_md5_path(
             &candidate.path,
@@ -923,9 +936,35 @@ impl Pipeline {
                 .unwrap_or_else(|| file.filename().to_string());
             let expected_length = file.total_bytes();
             let checksum = completed_checksums.get(&file_id).copied();
+            // Full-MD5 evidence comes from a same-session streamed digest or
+            // a persisted row whose provenance says the value was calculated
+            // ('streamed'/'verified' — `load_complete_file_hashes` filters).
+            // Legacy rows of unknown origin never reach this: before the
+            // expected-hash substitution was removed they could hold a PAR2
+            // EXPECTATION copied verbatim, and an expectation must never be
+            // replayed as an observation.
             let full_md5 = checksum
                 .and_then(|checksum| checksum.md5)
                 .or_else(|| completed_hashes.get(&file_id.file_index).copied());
+            // A file any in-stream IFSC verdict already proved Damaged must
+            // not seed the session with completion evidence of any kind: the
+            // authoritative pass owns it. Unclaimed or NoReference blocks are
+            // not damage — they simply leave this file to the settle/read
+            // paths that always covered them.
+            if self
+                .block_crc_verdicts(file_id)
+                .is_some_and(|verdicts| {
+                    verdicts.values().any(|verdict| {
+                        matches!(verdict, crate::pipeline::integrity::BlockVerdict::Damaged)
+                    })
+                })
+            {
+                crate::runtime::perf_probe::record(
+                    "completion.par2_evidence.rejected.damaged_in_stream_verdict",
+                    std::time::Duration::from_nanos(1),
+                );
+                continue;
+            }
             let bound_candidates = par2_set
                 .recovery_file_ids
                 .iter()
@@ -963,14 +1002,16 @@ impl Pipeline {
         Ok(candidates)
     }
 
+    /// The digest to persist for a file an actual PAR2 verification pass just
+    /// ruled intact: the trusted digest we already hold, if any. `None` — not
+    /// a zero sentinel — when there is none: a row completed without a digest
+    /// is honest, while a fabricated all-zero digest stamped with trusted
+    /// provenance would be one more expectation dressed as an observation.
     fn expected_hash_for_verified_file(
         file_id: NzbFileId,
         existing_hashes: &HashMap<u32, [u8; 16]>,
-    ) -> [u8; 16] {
-        existing_hashes
-            .get(&file_id.file_index)
-            .copied()
-            .unwrap_or([0u8; 16])
+    ) -> Option<[u8; 16]> {
+        existing_hashes.get(&file_id.file_index).copied()
     }
 
     async fn try_deobfuscate_files_with_par2(&mut self, job_id: JobId) -> usize {
@@ -1761,7 +1802,16 @@ impl Pipeline {
                 // file. This is an auxiliary NZB file, not a PAR2 source.
                 continue;
             }
+            // Persisted digests may stand in here only because the loader is
+            // provenance-filtered: a row without `md5_provenance` (legacy —
+            // possibly a PAR2 expectation recorded by the removed
+            // substitution) never loads, so a job whose rows are all legacy
+            // gets no quick verification and runs the authoritative pass.
             let Some(file_hash) = completed_hashes.get(&file_id.file_index).copied() else {
+                crate::runtime::perf_probe::record(
+                    "completion.quick_verify.rejected.persisted_hash_untrusted",
+                    std::time::Duration::from_nanos(1),
+                );
                 return Ok(None);
             };
             current_hashes_by_name.insert(current_filename.to_string(), file_hash);
@@ -2122,14 +2172,17 @@ impl Pipeline {
                 (
                     file_id.file_index,
                     filename.clone(),
-                    Some(Self::expected_hash_for_verified_file(
-                        *file_id,
-                        &existing_hashes,
-                    )),
+                    Self::expected_hash_for_verified_file(*file_id, &existing_hashes),
                 )
             })
             .collect();
-        self.db_blocking(move |db| db.complete_files(job_id, &complete_entries))
+        self.db_blocking(move |db| {
+            db.complete_files(
+                job_id,
+                &complete_entries,
+                crate::jobs::persistence::CompletedHashProvenance::Verified,
+            )
+        })
             .await
             .map_err(|error| format!("failed to persist PAR2-reconciled files: {error}"))?;
 
