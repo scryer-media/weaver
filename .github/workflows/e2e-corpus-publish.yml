@@ -3,29 +3,35 @@ name: e2e-corpus-publish
 # Publishes one revision of the e2e harness's signed, content-addressed
 # fixture corpus to R2. Manual, main-only, protected: this is the only
 # workflow that holds R2 write credentials for the corpus bucket, and running
-# it is an operator decision.
+# it is an operator decision. It never creates a branch, commit or pull
+# request — pinning the published manifest in e2e/test-corpus/lock.json is a
+# reviewed PR, and so is the refreshed ledger this run uploads as an artifact.
 #
-# It never creates a branch, commit or pull request. Pinning the published
-# manifest in e2e/test-corpus/lock.json is a reviewed PR, and so is the ledger
-# update this run uploads as an artifact.
+# The corpus is **generated**, never carried forward: the run builds the
+# pinned oracle images and runs every checked-in recipe against them. Nothing
+# is hydrated from the published corpus and nothing is imported from another
+# repository.
 #
-# Three things are deliberately different from the corpus tooling this was
-# ported from:
-#   * every digest is BLAKE3 — these fixtures are media-shaped and run to
-#     hundreds of megabytes each, so hashing throughput is the cost that
-#     matters;
-#   * fixtures are either `generated` (e2e/cmd/fixturegen rebuilds them from a
-#     declarative recipe, running every oracle on a toolchain pinned by
-#     e2e/test-corpus/toolchains.json) or `blocked` (no such recipe yet).
-#     Nothing is imported from another repository, so there is no upstream
-#     re-fetch stage;
-#   * there is no Git-LFS transport. Hydration is R2-only.
+# Generation fans out, the way the rarpar corpus workflow's does. Stage 0 is
+# one runner that builds the artifact cache — the encoded clips and the
+# intermediate archives every family derives from; the encoder is not
+# byte-reproducible, and scenario.json pins extracted bytes, so every archive
+# of a clip has to be an archive of the clip that gets published — plus the
+# shared-clips fixtures cut from that same cache. One runner per stage-1
+# family then restores the cache, generates its own fixtures, and hands them
+# on as an artifact; `assemble` gathers the artifacts, holds the result to the
+# ledger's exact path set and refreshes its digests. The job graph is:
 #
-# A `blocked` entry refuses publication. That is the point: the corpus becomes
-# publishable exactly when it becomes reconstructible from pinned toolchains.
-# Until every entry is `generated`, a real (non-dry) run is expected to stop at
-# the publish step with the list of generators still to port — which is the
-# backlog, printed by the job that would consume it.
+#   guard ─► plan ─► generate (shared clips + artifact cache)
+#                        └─► generate (one job per family) ─► assemble ─► publish
+#
+# The matrix is not written down here: `plan` asks the recipe table for it
+# with `fixturegen --list-json`, so a recipe family added in Go gets a runner
+# without anyone editing this file. There is no separate validation fan-out —
+# the suites that consume this corpus need a product build and a Docker
+# stack, the generator already runs its oracle checks on every fixture it
+# writes, and `assemble` holds the whole tree to the ledger in both
+# directions.
 #
 # See e2e/docs/test-corpus.md.
 
@@ -52,13 +58,308 @@ env:
   BUILD_DIR: target/test-corpus/build
 
 jobs:
+  # A bad dispatch fails in seconds, before any runner starts an image build.
+  # This job deliberately does not join the protected environment: an
+  # environment with required reviewers would make it wait for an approval
+  # instead of failing, which is the opposite of what it is for. The
+  # configuration checks that need the environment's secrets are the publish
+  # job's first step.
+  guard:
+    name: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Refuse anything but a run from main
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::the corpus is published from refs/heads/main only (got $REF)"
+            exit 1
+          fi
+
+  # The Go side is what generates the corpus, so it is checked once here
+  # rather than on every runner — and the generation matrix is read out of the
+  # same recipe table the generators run from.
+  plan:
+    name: plan
+    needs: [guard]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: e2e
+    outputs:
+      families: ${{ steps.units.outputs.families }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: e2e/go.mod
+          cache-dependency-path: e2e/go.sum
+
+      - name: Validate the recipes, the ledger and the corpus tooling
+        run: go test ./...
+
+      - id: units
+        name: Derive the generation matrix from the recipe table
+        run: |
+          set -euo pipefail
+          go run ./cmd/fixturegen --list-json > "$RUNNER_TEMP/units.json"
+          families="$(jq -c '[.units[] | select(.stage == 1) | .key]' "$RUNNER_TEMP/units.json")"
+          count="$(printf '%s' "$families" | jq 'length')"
+          if [ "$count" -lt 1 ]; then
+            echo "::error::the recipe table lists no stage-1 family; there would be nothing to generate"
+            exit 1
+          fi
+          echo "families=$families" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Generation matrix"
+            echo
+            echo "$count family job(s) plus the stage-0 shared clips:"
+            echo
+            jq -r '.units[] | "- `\(.key)` (stage \(.stage), \(.slugs | length) scenario(s)) — toolchains: \(.toolchains | join(", "))"' "$RUNNER_TEMP/units.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Stage 0: the artifact cache plus the shared clips. It is one job rather
+  # than a step of each family job because the encoder is not
+  # byte-reproducible — two encodes of the same clip differ — and 139 ledger
+  # entries record a clip (or an archive of one) as their input, with
+  # scenario.json pinning the extracted bytes. Every family job restores this
+  # cache and rebuilds nothing in it.
+  generate-shared:
+    name: generate (shared clips)
+    needs: [plan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: e2e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: e2e/go.mod
+          cache-dependency-path: e2e/go.sum
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Build the oracle images the artifact cache needs
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          only="$(go run ./cmd/fixturegen --list-json \
+            | jq -r '(.artifact_toolchains + (.units[] | select(.stage == 0) | .toolchains)) | unique | join(" ")')"
+          ONLY="$only" ../.github/scripts/e2e-corpus-images.sh
+
+      # The whole cache, then the stage-0 fixtures from the same cached bytes.
+      # The ledger is refreshed once, in `assemble`, never here.
+      - name: Build the artifact cache and the shared clips
+        run: |
+          set -euo pipefail
+          go run ./cmd/fixturegen --build-artifacts --workers 2
+          go run ./cmd/fixturegen --paths --family shared-clips --out "$RUNNER_TEMP/group-paths.txt"
+          tr '\n' '\0' < "$RUNNER_TEMP/group-paths.txt" | xargs -0 -r rm -f
+          go run ./cmd/fixturegen --family shared-clips --skip-ledger
+
+      - name: Check and pack this group's output
+        run: |
+          set -euo pipefail
+          go run ./cmd/fixturegen --paths --family shared-clips --with-scenarios --verify \
+            --out "$RUNNER_TEMP/group-paths.txt"
+          tar -cf "$RUNNER_TEMP/corpus-shared-clips.tar" -T "$RUNNER_TEMP/group-paths.txt"
+          tar -cf "$RUNNER_TEMP/artifact-cache.tar" target/fixturegen/artifacts
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: corpus-group-shared-clips
+          path: ${{ runner.temp }}/corpus-shared-clips.tar
+          if-no-files-found: error
+          # Fixture bytes are already compressed; the zip layer would only cost
+          # CPU on both ends.
+          compression-level: 0
+          retention-days: 1
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: corpus-artifact-cache
+          path: ${{ runner.temp }}/artifact-cache.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  # One runner per stage-1 family. Each restores the shared cache, builds only
+  # the images its own recipes drive, and uploads only the fixtures the ledger
+  # says it owns — so every ledger path is carried by exactly one artifact —
+  # plus its scenario.json files, whose pinned output digests generation
+  # rewrites from the cached clip bytes.
+  generate:
+    name: generate (${{ matrix.family }})
+    needs: [plan, generate-shared]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      # One broken recipe should not hide the state of the other twelve.
+      fail-fast: false
+      matrix:
+        family: ${{ fromJSON(needs.plan.outputs.families) }}
+    defaults:
+      run:
+        working-directory: e2e
+    env:
+      FAMILY: ${{ matrix.family }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: e2e/go.mod
+          cache-dependency-path: e2e/go.sum
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Download the shared artifact cache
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: corpus-artifact-cache
+          path: ${{ runner.temp }}/cache
+
+      # The stage-0 bytes this family's recipes read, exactly as the run will
+      # publish them. Rebuilding them here would give this runner different
+      # clips from the ones the corpus ships.
+      - name: Restore the shared artifact cache
+        run: tar -xf "$RUNNER_TEMP/cache/artifact-cache.tar"
+
+      - name: Build the oracle images this family needs
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          only="$(go run ./cmd/fixturegen --list-json \
+            | jq -r --arg key "$FAMILY" '.units[] | select(.key == $key) | .toolchains | join(" ")')"
+          if [ -z "$only" ]; then
+            echo "::error::no unit with key $FAMILY in the generation matrix"
+            exit 1
+          fi
+          ONLY="$only" ../.github/scripts/e2e-corpus-images.sh
+
+      - name: Generate this family's fixtures
+        run: |
+          set -euo pipefail
+          go run ./cmd/fixturegen --paths --family "$FAMILY" --out "$RUNNER_TEMP/group-paths.txt"
+          tr '\n' '\0' < "$RUNNER_TEMP/group-paths.txt" | xargs -0 -r rm -f
+          go run ./cmd/fixturegen --family "$FAMILY" --skip-ledger --workers 4
+
+      # Every path this family owns, produced, and nothing outside the ledger.
+      - name: Check and pack this group's output
+        run: |
+          set -euo pipefail
+          go run ./cmd/fixturegen --paths --family "$FAMILY" --with-scenarios --verify \
+            --out "$RUNNER_TEMP/group-paths.txt"
+          tar -cf "$RUNNER_TEMP/corpus-$FAMILY.tar" -T "$RUNNER_TEMP/group-paths.txt"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: corpus-group-${{ matrix.family }}
+          path: ${{ runner.temp }}/corpus-${{ matrix.family }}.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  # Where the shares become a corpus revision: the tree is rebuilt from the
+  # artifacts alone, required to be exactly the ledger's path set, and the
+  # ledger's sizes and digests are refreshed from the bytes that arrived.
+  assemble:
+    name: assemble
+    needs: [generate, generate-shared]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: e2e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: e2e/go.mod
+          cache-dependency-path: e2e/go.sum
+
+      - name: Download every generation artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: corpus-group-*
+          path: ${{ runner.temp }}/groups
+
+      - name: Rebuild the fixture tree from the generation artifacts
+        run: |
+          set -euo pipefail
+          # Nothing is carried forward: every ledger path is removed first, so
+          # a fixture no job produced cannot survive from the checkout (the
+          # checkout carries none, but a local reproduction of this flow does).
+          go run ./cmd/fixturegen --paths --all --out "$RUNNER_TEMP/all-paths.txt"
+          tr '\n' '\0' < "$RUNNER_TEMP/all-paths.txt" | xargs -0 -r rm -f
+          for archive in "$RUNNER_TEMP"/groups/*/corpus-*.tar; do
+            echo "unpacking $(basename "$archive")"
+            tar -xf "$archive"
+          done
+
+      # No generator runs here. `build --update-ledger` refuses a listed path
+      # that is absent, and `verify --all-present` holds the tree to the
+      # ledger in both directions — a path no artifact carried, or a fixture
+      # nobody ledgered, fails.
+      - name: Assemble the corpus revision
+        run: |
+          set -euo pipefail
+          go run ./cmd/corpus build --update-ledger --out "$BUILD_DIR"
+          cat "$BUILD_DIR/manifest.blake3"
+
+      - name: Verify the corpus against its ledger
+        run: go run ./cmd/corpus verify --all-present --offline
+
+      - name: Pack the assembled tree
+        run: |
+          set -euo pipefail
+          go run ./cmd/fixturegen --paths --all --with-scenarios --out "$RUNNER_TEMP/all-paths.txt"
+          tar -cf "$RUNNER_TEMP/corpus-tree.tar" -T "$RUNNER_TEMP/all-paths.txt"
+
+      # The one tree the publish job uploads. Nothing regenerates it.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: corpus-tree
+          path: ${{ runner.temp }}/corpus-tree.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      # The manifest, its provenance, and the refreshed ledger the tree was
+      # held to. The publish job uploads these exact bytes.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: corpus-build
+          path: |
+            e2e/target/test-corpus/build/manifest.json
+            e2e/target/test-corpus/build/manifest.blake3
+            e2e/target/test-corpus/build/provenance.json
+            e2e/test-corpus/sources.json
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
     name: publish
+    needs: [assemble]
     runs-on: ubuntu-24.04
-    # The GitHub-hosted maximum. Reconstructing this corpus means building the
-    # pinned RARLAB images, compiling par2cmdline-turbo from source, and
-    # writing several gigabytes of archives; it is slow by design.
-    timeout-minutes: 360
+    timeout-minutes: 120
     # The protected environment holds the R2 secrets and gates the run on its
     # reviewers; the corpus variables live beside it.
     environment: test-corpus-publish
@@ -82,16 +383,13 @@ jobs:
       R2_CORPUS_SECRET_ACCESS_KEY: ${{ secrets.R2_CORPUS_S3_SECRET }}
       DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
     steps:
-      - name: Refuse anything but a run from main
+      # The secrets and variables live in this environment, so this is the
+      # first place they can be checked at all; the ref was settled by `guard`
+      # before any of the work started.
+      - name: Refuse an incomplete publishing configuration
         working-directory: .
-        env:
-          REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          if [ "$REF" != "refs/heads/main" ]; then
-            echo "::error::the corpus is published from refs/heads/main only (got $REF)"
-            exit 1
-          fi
           if [ "$DRY_RUN" != "true" ]; then
             for name in R2_CORPUS_BUCKET R2_CORPUS_PUBLIC_URL; do
               if [ -z "${!name:-}" ]; then
@@ -129,100 +427,30 @@ jobs:
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Download the assembled corpus
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: corpus-tree
+          path: ${{ runner.temp }}/tree
 
-      # The fixture binaries are not in git. A checkout carries the ledger, the
-      # profiles, the lock and every scenario.json; the bytes come from the
-      # published corpus. While nothing is pinned there is nothing to hydrate,
-      # and the generation stage below is the only source of fixtures — which
-      # is why the first publication can only happen once every entry is
-      # `generated`.
-      - name: Hydrate the fixture tree
-        timeout-minutes: 90
+      - name: Download the manifest, provenance and refreshed ledger
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: corpus-build
+          path: ${{ runner.temp }}/build
+
+      # The bytes to publish are the ones `assemble` verified: the tree, the
+      # manifest built from it, and the ledger that describes both. Nothing is
+      # rebuilt here, so nothing can differ from what was verified.
+      - name: Restore the assembled corpus and its manifest
         run: |
           set -euo pipefail
-          if [ -z "$(jq -r '.manifest.blake3' test-corpus/lock.json)" ]; then
-            echo "::notice::test-corpus/lock.json pins no manifest — this is a bootstrap run, nothing to hydrate"
-          else
-            go run ./cmd/corpus hydrate --profile all
-          fi
-
-      # Every oracle image the lock pins, built from the Dockerfiles the lock
-      # itself names (e2e/internal/fixturegen/docker/*). Each verifies the
-      # reviewed SHA-256 of its download before installing anything, and the
-      # generator re-verifies the same digest in Go before it calls docker at
-      # all.
-      #
-      # This runner is amd64, which is what every image pins, so nothing is
-      # emulated here: the RARLAB 3.93/4.20/5.00 releases are 32-bit x86
-      # binaries and the kernel's IA-32 support runs them directly. A developer
-      # regenerating on an arm64 host needs QEMU binfmt handlers for amd64 and
-      # 386 instead — see e2e/docs/generators.md. Installing them requires a
-      # privileged container, which this job, holding the corpus write
-      # credentials, deliberately does not run.
-      - name: Build the pinned generator toolchain images
-        timeout-minutes: 150
-        run: |
-          set -euo pipefail
-          lock=test-corpus/toolchains.json
-          jq -c '[.rar_writers[], .archivers[], .par2_generator] | .[] | select(.dockerfile != null)' "$lock" \
-          | while read -r pin; do
-              id=$(echo "$pin" | jq -r .id)
-              dockerfile=$(echo "$pin" | jq -r .dockerfile)
-              case "$dockerfile" in
-                */rarlab/*)
-                  args=(--build-arg "RAR_URL=$(echo "$pin" | jq -r .url)"
-                        --build-arg "RAR_SHA256=$(echo "$pin" | jq -r .sha256)"
-                        --build-arg "RAR_BINARY=$(echo "$pin" | jq -r .binary)") ;;
-                */par2/*)
-                  args=(--build-arg "PAR2_URL=$(echo "$pin" | jq -r .url)"
-                        --build-arg "PAR2_SHA256=$(echo "$pin" | jq -r .sha256)") ;;
-                */sevenzip/*)
-                  args=(--build-arg "SEVENZIP_URL=$(echo "$pin" | jq -r .url)"
-                        --build-arg "SEVENZIP_SHA256=$(echo "$pin" | jq -r .sha256)") ;;
-                *)
-                  echo "::error::toolchain $id names an unknown Dockerfile $dockerfile"
-                  exit 1 ;;
-              esac
-              echo "::group::$id"
-              docker buildx build \
-                --platform "$(echo "$pin" | jq -r .platform)" \
-                --tag "$(echo "$pin" | jq -r .image)" \
-                --file "$dockerfile" \
-                "${args[@]}" \
-                --cache-from "type=gha,scope=corpus-$id" \
-                --cache-to "type=gha,mode=max,scope=corpus-$id" \
-                --load "$(dirname "$dockerfile")"
-              echo "::endgroup::"
-            done
-          docker pull --platform "$(jq -r .video_encoder.platform "$lock")" "$(jq -r .video_encoder.image "$lock")"
-
-      # One Go program rebuilds the whole corpus from its declarative recipes.
-      # A recipe that fails fails the job: a fixture nobody can regenerate is a
-      # fixture nobody can publish. Video encoding dominates the wall time, so
-      # the clips are generated first and everything else derives from them.
-      - name: Regenerate the fixtures
-        timeout-minutes: 180
-        run: |
-          set -euo pipefail
-          go run ./cmd/fixturegen --list
-          go run ./cmd/fixturegen --all --workers 4
-
-      # Generated fixtures are shape-reproducible, not byte-reproducible: RAR
-      # stamps times into headers and encryption draws a random salt. A
-      # regeneration therefore legitimately changes digests, so the ledger is
-      # refreshed here and uploaded for the operator's follow-up PR. The
-      # workflow never commits it.
-      - name: Build the manifest and provenance
-        timeout-minutes: 60
-        run: |
-          set -euo pipefail
-          go run ./cmd/corpus build --update-ledger --out "$BUILD_DIR"
+          tar -xf "$RUNNER_TEMP/tree/corpus-tree.tar"
+          mkdir -p "$BUILD_DIR"
+          cp "$RUNNER_TEMP"/build/e2e/target/test-corpus/build/* "$BUILD_DIR"/
+          cp "$RUNNER_TEMP/build/e2e/test-corpus/sources.json" test-corpus/sources.json
           cat "$BUILD_DIR/manifest.blake3"
-
-      - name: Verify the corpus against its ledger
-        timeout-minutes: 60
-        run: go run ./cmd/corpus verify --all-present --offline
+          go run ./cmd/corpus verify --all-present --offline
 
       - name: Sign the manifest and provenance
         if: env.DRY_RUN != 'true'
@@ -233,7 +461,7 @@ jobs:
       # provenance and both bundles otherwise, then reads the manifest back
       # from the public side before printing the lock entry.
       - name: Publish the corpus revision
-        timeout-minutes: 180
+        timeout-minutes: 90
         run: |
           set -euo pipefail
           if [ "$DRY_RUN" = "true" ]; then
@@ -267,12 +495,23 @@ jobs:
               echo '```'
             fi
             echo
-            echo "**This workflow never commits.** Pinning is a reviewed PR that carries both the"
-            echo "updated \`e2e/test-corpus/sources.json\` (attached to this run) and the lock entry"
-            echo "above, and it must pass CI from a clean checkout."
+            echo "**This workflow never commits.** Pinning is a reviewed PR that carries the"
+            echo "updated \`e2e/test-corpus/sources.json\`, the rewritten \`scenario.json\` files"
+            echo "(both in this run's artifacts) and the lock entry above, and it must pass CI"
+            echo "from a clean checkout."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Keep the build directory and the updated ledger as run artifacts
+      # Generation rewrites the pinned output digests in scenario.json, so the
+      # lock-pin PR needs those files alongside the ledger. Pack the whole set
+      # out of the assembled tree rather than making the operator collect them.
+      - name: Collect the rewritten scenario.json files
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$BUILD_DIR"
+          find testdata -maxdepth 2 -name scenario.json | sort | tar -cf "$BUILD_DIR/scenarios.tar" -T -
+
+      - name: Keep the build directory and the refreshed ledger as run artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -284,6 +523,7 @@ jobs:
             e2e/target/test-corpus/build/provenance.json
             e2e/target/test-corpus/build/provenance.json.sigstore.json
             e2e/target/test-corpus/build/lock.json
+            e2e/target/test-corpus/build/scenarios.tar
             e2e/test-corpus/sources.json
           if-no-files-found: warn
           retention-days: 90

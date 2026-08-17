@@ -25,6 +25,14 @@ go run ./cmd/fixturegen --all --only-missing
 # Build somewhere else and look before replacing anything. `--out` never
 # touches testdata/, the ledger, or any scenario.json.
 go run ./cmd/fixturegen --all --out target/fixturegen/preview
+
+# The publish workflow's fan-out surface: the generation matrix as JSON, one
+# family's scenarios, the whole artifact cache, and the ledger paths a family
+# owns (--verify holds them present and refuses anything unledgered on disk).
+go run ./cmd/fixturegen --list-json
+go run ./cmd/fixturegen --family rar-recovery-volumes --skip-ledger
+go run ./cmd/fixturegen --build-artifacts
+go run ./cmd/fixturegen --paths --family zip --with-scenarios --verify
 ```
 
 Other flags: `--workers` (default 4) bounds how many scenarios build at once,

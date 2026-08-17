@@ -31,7 +31,7 @@ which byte, and how to add a scenario are in [generators.md](generators.md).
 | `test-corpus/toolchains.json` | The generator-toolchain lock: five RARLAB writers, the official 7-Zip console binary, par2cmdline-turbo, the digest-pinned FFmpeg encoder image, and the Go writers, each pinned by URL and SHA-256 or by image digest. A toolchain change is a deliberate corpus revision. |
 | `test-corpus/lock.json` | The published manifest this checkout hydrates from: its BLAKE3, its URL, the Sigstore identity that must have signed it, and the commit it was published from. Empty digest means nothing is published yet. |
 | `cmd/fixturegen`, `internal/fixturegen` | The generator: one declarative recipe per scenario directory, plus the Dockerfiles for the oracle images the lock pins. See [generators.md](generators.md). |
-| `.github/workflows/e2e-corpus-publish.yml` | The manual, main-only, protected workflow that reconstructs, verifies, signs and uploads a corpus revision. (Repository root, not `e2e/`.) |
+| `.github/workflows/e2e-corpus-publish.yml` | The manual, main-only, protected workflow that reconstructs, verifies, signs and uploads a corpus revision, one runner per recipe family. (Repository root, not `e2e/`.) |
 
 Every digest in this corpus is **BLAKE3**, not SHA-256: these files are
 media-shaped and run to hundreds of megabytes, so hashing throughput is the
@@ -135,11 +135,21 @@ Getting from here to a hydrating harness is a sequence, not a switch:
 1. **Write the generators.** Publication is refused while any ledger entry is
    `blocked`. **This step is done**: `cmd/fixturegen` reproduces all 237
    fixtures from pinned oracles, and no entry is blocked.
-2. **Dispatch the publish workflow from `main`.** It rebuilds the pinned
-   toolchain images, runs the generator, builds the manifest, signs it and
-   uploads the revision, then prints the lock entry.
-3. **Pin it in a reviewed PR** carrying the workflow's updated `sources.json`
-   and the lock entry. The workflow never commits; pinning is always a review.
+2. **Dispatch the publish workflow from `main`.** Generation fans out the
+   way the rarpar corpus workflow's does: one stage-0 runner builds the
+   artifact cache — the encoded clips and intermediate archives every family
+   derives from, built once because the encoder is not byte-reproducible and
+   scenario.json pins extracted bytes — plus the shared clips; one runner per
+   recipe family then restores that cache, builds only the oracle images its
+   own recipes drive (`fixturegen --list-json` is the matrix), generates its
+   fixtures and hands them on as an artifact. `assemble` rebuilds the tree
+   from the artifacts alone, holds it to the ledger's exact path set,
+   refreshes the ledger's sizes and digests, and builds the manifest; the
+   publish job signs and uploads exactly what `assemble` verified, then
+   prints the lock entry.
+3. **Pin it in a reviewed PR** carrying the workflow's updated `sources.json`,
+   the rewritten `scenario.json` files (both in the run's artifacts) and the
+   lock entry. The workflow never commits; pinning is always a review.
 4. From that commit on, `ensure` (and `hydrate`) fetch from the bucket in
    every lane; generation becomes the fallback for what is not published.
 

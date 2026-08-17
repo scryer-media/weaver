@@ -4,14 +4,23 @@
 //	go run ./cmd/fixturegen --list
 //	go run ./cmd/fixturegen --all
 //	go run ./cmd/fixturegen --scenario rar5-single --scenario par2-repair
+//	go run ./cmd/fixturegen --family rar-recovery-volumes
 //	go run ./cmd/fixturegen --all --only-missing
 //	go run ./cmd/fixturegen --all --out target/fixturegen/preview
+//
+// The publish workflow's fan-out surface (see .github/workflows/e2e-corpus-publish.yml):
+//
+//	go run ./cmd/fixturegen --list-json
+//	go run ./cmd/fixturegen --build-artifacts
+//	go run ./cmd/fixturegen --paths --family zip --with-scenarios --out group.txt
+//	go run ./cmd/fixturegen --paths --family zip --verify
 //
 // Exit codes: 0 success, 1 failure, 2 usage.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -54,16 +63,22 @@ func main() {
 type usageError struct{ error }
 
 func run() error {
-	var scenarios slugList
+	var scenarios, families slugList
 	list := flag.Bool("list", false, "print every recipe, its family and its declared oracles, then exit")
+	listJSON := flag.Bool("list-json", false, "print the generation matrix (stage-0 and stage-1 units) as JSON, then exit")
+	buildArtifacts := flag.Bool("build-artifacts", false, "build the whole artifact cache under target/fixturegen/artifacts, then exit")
+	paths := flag.Bool("paths", false, "print the ledger paths the selection owns instead of generating")
+	verify := flag.Bool("verify", false, "with --paths: require every path present and non-empty, and nothing unledgered on disk")
+	withScenarios := flag.Bool("with-scenarios", false, "with --paths: include each slug's scenario.json")
 	all := flag.Bool("all", false, "generate every recipe")
-	out := flag.String("out", "", "write fixtures here instead of testdata/ (the ledger is then left alone)")
+	out := flag.String("out", "", "write fixtures here instead of testdata/ (the ledger is then left alone); with --paths, write the list here")
 	onlyMissing := flag.Bool("only-missing", false, "skip a scenario whose ledger files are all present")
 	workers := flag.Int("workers", 4, "how many scenarios to build at once")
 	root := flag.String("root", "", "harness root (defaults to the directory holding go.mod)")
 	verbose := flag.Bool("verbose", false, "echo oracle output")
 	skipLedger := flag.Bool("skip-ledger", false, "do not refresh sizes, digests and provenance in test-corpus/sources.json")
 	flag.Var(&scenarios, "scenario", "scenario slug to generate; repeatable, or comma-separated")
+	flag.Var(&families, "family", "recipe family (name or key from --list-json) to select; repeatable, or comma-separated")
 	flag.Parse()
 
 	harnessRoot, err := resolveRoot(*root)
@@ -73,12 +88,31 @@ func run() error {
 	if *list {
 		return printRecipes(harnessRoot)
 	}
+	if *listJSON {
+		return printListing(harnessRoot)
+	}
+	if *buildArtifacts {
+		return buildArtifactCache(harnessRoot, *workers, *verbose)
+	}
+	if len(families) > 0 {
+		familySlugs, err := fixturegen.FamilySelector(families)
+		if err != nil {
+			return usageError{err}
+		}
+		scenarios = append(scenarios, familySlugs...)
+	}
+	if *paths {
+		return printPaths(harnessRoot, *all, scenarios, *withScenarios, *verify, *out)
+	}
+	if *verify || *withScenarios {
+		return usageError{errors.New("--verify and --with-scenarios only make sense with --paths")}
+	}
 	if !*all && len(scenarios) == 0 {
 		flag.Usage()
-		return usageError{errors.New("choose --list, --all, or one or more --scenario values")}
+		return usageError{errors.New("choose --list, --all, or one or more --scenario/--family values")}
 	}
 	if *all && len(scenarios) > 0 {
-		return usageError{errors.New("--all and --scenario are mutually exclusive")}
+		return usageError{errors.New("--all and --scenario/--family are mutually exclusive")}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -179,6 +213,59 @@ func printRecipes(root string) error {
 		fmt.Printf("  %s\n", id)
 	}
 	return nil
+}
+
+func printListing(root string) error {
+	listing, err := fixturegen.Units(root)
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(listing)
+}
+
+func buildArtifactCache(root string, workers int, verbose bool) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	started := time.Now()
+	fmt.Println("fixturegen: building the artifact cache")
+	err := fixturegen.BuildArtifacts(ctx, fixturegen.Config{
+		Root: root, Workers: workers, Verbose: verbose, Log: os.Stdout,
+	})
+	fmt.Printf("fixturegen: artifact cache ready in %s\n", time.Since(started).Round(time.Second))
+	return err
+}
+
+func printPaths(root string, all bool, scenarios slugList, withScenarios, verify bool, out string) error {
+	slugs := []string(scenarios)
+	if all {
+		if len(slugs) > 0 {
+			return usageError{errors.New("--all and --scenario/--family are mutually exclusive")}
+		}
+		for _, recipe := range fixturegen.Recipes() {
+			slugs = append(slugs, recipe.Slug)
+		}
+	}
+	if len(slugs) == 0 {
+		return usageError{errors.New("--paths needs --all or one or more --scenario/--family values")}
+	}
+	paths, err := fixturegen.LedgerPathsForSlugs(root, slugs, withScenarios)
+	if err != nil {
+		return err
+	}
+	if verify {
+		if err := fixturegen.VerifyProduced(root, paths); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "fixturegen: all %d selected path(s) were produced, and nothing outside the ledger was\n", len(paths))
+	}
+	rendered := strings.Join(paths, "\n") + "\n"
+	if out == "" {
+		fmt.Print(rendered)
+		return nil
+	}
+	return os.WriteFile(out, []byte(rendered), 0o644)
 }
 
 func resolveRoot(override string) (string, error) {
