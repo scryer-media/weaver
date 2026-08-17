@@ -10,6 +10,7 @@ use std::time::Instant;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::StateError;
+use crate::operations::instrumentation::{DbRuntimeMetrics, DbRuntimeMetricsSnapshot};
 use crate::persistence::database_target::DatabaseTarget;
 use crate::persistence::sql_runtime::{StoreDatastore, db_err};
 use crate::persistence::sql_services::DatabaseServices;
@@ -90,11 +91,24 @@ impl DatabaseRuntimeWorker {
             Self::Postgres(worker) => worker.block_on_local(build),
         }
     }
+
+    /// Saturation and latency counters for whichever executor is in use.
+    fn runtime_metrics(&self) -> &Arc<DbRuntimeMetrics> {
+        match self {
+            Self::Sqlite(worker) => &worker.metrics,
+            Self::Postgres(worker) => &worker.metrics,
+        }
+    }
 }
 
 #[derive(Clone)]
 struct SqliteDatabaseRuntimeWorker {
     tx: std_mpsc::Sender<SqliteDatabaseRuntimeJob>,
+    /// Executor saturation and operation latency. Not hot-path state: every
+    /// site that touches it is already blocking on a channel round-trip to the
+    /// database thread and already reads the clock for the `perf_probe` record
+    /// alongside it.
+    metrics: Arc<DbRuntimeMetrics>,
 }
 
 impl SqliteDatabaseRuntimeWorker {
@@ -131,7 +145,11 @@ impl SqliteDatabaseRuntimeWorker {
             .map_err(|_| StateError::Database("database runtime worker stopped".to_string()))?
             .map_err(StateError::Database)?;
 
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            // The sqlite runtime is a single serialized worker thread.
+            metrics: Arc::new(DbRuntimeMetrics::new("sqlite", 1)),
+        })
     }
 
     fn block_on<T, Fut>(&self, future: Fut) -> Result<T, StateError>
@@ -140,6 +158,7 @@ impl SqliteDatabaseRuntimeWorker {
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
         let started = Instant::now();
+        let _in_flight = self.metrics.note_submission_started();
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         self.tx
             .send(Box::new(move |runtime| {
@@ -149,7 +168,9 @@ impl SqliteDatabaseRuntimeWorker {
         let result = reply_rx
             .recv()
             .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
-        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on", started.elapsed());
+        let elapsed = started.elapsed();
+        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on", elapsed);
+        self.metrics.note_submission_finished(elapsed);
         result
     }
 
@@ -160,6 +181,7 @@ impl SqliteDatabaseRuntimeWorker {
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
         let started = Instant::now();
+        let _in_flight = self.metrics.note_submission_started();
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         self.tx
             .send(Box::new(move |runtime| {
@@ -169,7 +191,9 @@ impl SqliteDatabaseRuntimeWorker {
         let result = reply_rx
             .recv()
             .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
-        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on_local", started.elapsed());
+        let elapsed = started.elapsed();
+        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on_local", elapsed);
+        self.metrics.note_submission_finished(elapsed);
         result
     }
 }
@@ -180,6 +204,9 @@ struct PostgresDatabaseRuntimeWorker {
     in_flight: Arc<AtomicUsize>,
     blocked_submissions: Arc<AtomicUsize>,
     concurrency: usize,
+    /// Executor saturation and operation latency. See the sqlite worker for
+    /// why this is not hot-path state.
+    metrics: Arc<DbRuntimeMetrics>,
 }
 
 impl PostgresDatabaseRuntimeWorker {
@@ -255,6 +282,7 @@ impl PostgresDatabaseRuntimeWorker {
             in_flight,
             blocked_submissions,
             concurrency,
+            metrics: Arc::new(DbRuntimeMetrics::new("postgres", concurrency as u64)),
         })
     }
 
@@ -264,6 +292,7 @@ impl PostgresDatabaseRuntimeWorker {
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
         let started = Instant::now();
+        let _in_flight = self.metrics.note_submission_started();
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         let job = PostgresDatabaseRuntimeJob::Send(Box::new(move || {
             Box::pin(async move {
@@ -275,6 +304,7 @@ impl PostgresDatabaseRuntimeWorker {
             Ok(()) => {}
             Err(std_mpsc::TrySendError::Full(job)) => {
                 let blocked_started = Instant::now();
+                self.metrics.note_submission_blocked();
                 let blocked = self.blocked_submissions.fetch_add(1, Ordering::AcqRel) + 1;
                 tracing::debug!(
                     db_executor = "postgres",
@@ -307,7 +337,9 @@ impl PostgresDatabaseRuntimeWorker {
         let result = reply_rx
             .recv()
             .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
-        crate::runtime::perf_probe::record("db.runtime.postgres.block_on", started.elapsed());
+        let elapsed = started.elapsed();
+        crate::runtime::perf_probe::record("db.runtime.postgres.block_on", elapsed);
+        self.metrics.note_submission_finished(elapsed);
         result
     }
 
@@ -318,6 +350,7 @@ impl PostgresDatabaseRuntimeWorker {
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
         let started = Instant::now();
+        let _in_flight = self.metrics.note_submission_started();
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         let job = PostgresDatabaseRuntimeJob::Local(Box::new(move |runtime| {
             let _ = reply_tx.send(runtime.block_on(build()));
@@ -327,6 +360,7 @@ impl PostgresDatabaseRuntimeWorker {
             Ok(()) => {}
             Err(std_mpsc::TrySendError::Full(job)) => {
                 let blocked_started = Instant::now();
+                self.metrics.note_submission_blocked();
                 let blocked = self.blocked_submissions.fetch_add(1, Ordering::AcqRel) + 1;
                 tracing::debug!(
                     db_executor = "postgres",
@@ -353,7 +387,9 @@ impl PostgresDatabaseRuntimeWorker {
         let result = reply_rx
             .recv()
             .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
-        crate::runtime::perf_probe::record("db.runtime.postgres.block_on_local", started.elapsed());
+        let elapsed = started.elapsed();
+        crate::runtime::perf_probe::record("db.runtime.postgres.block_on_local", elapsed);
+        self.metrics.note_submission_finished(elapsed);
         result
     }
 }
@@ -526,6 +562,15 @@ pub struct Database {
 }
 
 impl Database {
+    /// Executor engine, saturation and operation-latency histogram for the
+    /// database runtime backing this handle.
+    ///
+    /// Read at scrape time. Cheap: a handful of `Relaxed` atomic loads plus one
+    /// `Vec` for the histogram buckets.
+    pub fn runtime_metrics_snapshot(&self) -> DbRuntimeMetricsSnapshot {
+        self.sql_worker.runtime_metrics().snapshot()
+    }
+
     /// Open (or create) the database at `path`.
     /// Runs schema migrations and configures SQLite pragmas.
     pub fn open(path: &Path) -> Result<Self, StateError> {
@@ -687,6 +732,25 @@ impl Database {
     /// Get a reference to the encryption key, if set.
     pub(crate) fn encryption_key(&self) -> Option<&crate::persistence::encryption::EncryptionKey> {
         self.encryption_key.as_ref()
+    }
+
+    /// Answer a trivial query, to prove the datastore is reachable.
+    ///
+    /// Deliberately touches no table: a readiness probe must report on the
+    /// connection, not on whether some particular schema object exists. This is
+    /// a blocking call — callers on an async runtime must wrap it in
+    /// `spawn_blocking`.
+    pub fn probe_liveness(&self) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            crate::persistence::sql_runtime::SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT 1 AS alive",
+                &[],
+            )
+            .await?;
+            Ok(())
+        })
     }
 
     /// Check if the database has no settings (i.e. fresh / needs migration).

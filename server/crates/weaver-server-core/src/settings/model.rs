@@ -55,6 +55,9 @@ pub struct Config {
     /// RAR direct-store routing. Absent means "every default".
     #[serde(default)]
     pub direct_store: Option<DirectStoreOverrides>,
+    /// Prometheus exposition knobs.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     /// Path to the config file on disk. Not serialized to TOML.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
@@ -195,6 +198,53 @@ pub struct DirectStoreOverrides {
     pub holds_scratch_ceiling_bytes: Option<u64>,
 }
 
+/// Prometheus exposition knobs (`[metrics]`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// How much per-job detail `/metrics` carries. Per-job series are the
+    /// exporter's only unbounded label dimension: the runtime keeps up to a
+    /// thousand finished jobs, and each one would otherwise mint a full set of
+    /// value series that never goes away.
+    #[serde(default)]
+    pub per_job_series: PerJobSeries,
+}
+
+/// Which jobs get their own `weaver_job_*` series.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerJobSeries {
+    /// Only jobs that are still moving (everything but complete and failed).
+    #[default]
+    Active,
+    /// Every job the runtime still remembers, finished ones included.
+    All,
+    /// No per-job series at all; `weaver_pipeline_jobs{status}` still reports
+    /// the aggregate queue mix.
+    Off,
+}
+
+impl PerJobSeries {
+    pub const ALL: [Self; 3] = [Self::Active, Self::All, Self::Off];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::All => "all",
+            Self::Off => "off",
+        }
+    }
+
+    /// Parse a persisted setting value; unknown text falls back to the default
+    /// so a typo degrades to the safe cardinality rather than failing startup.
+    pub fn from_str_or_default(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "all" => Self::All,
+            "off" => Self::Off,
+            _ => Self::Active,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BufferPoolOverrides {
     pub small_count: Option<usize>,
@@ -256,8 +306,36 @@ mod tests {
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: DuplicatePolicy::default(),
             direct_store: None,
+            metrics: Default::default(),
             config_path: None,
         }
+    }
+
+    #[test]
+    fn per_job_series_parses_persisted_values_and_defaults_safely() {
+        assert_eq!(PerJobSeries::from_str_or_default("all"), PerJobSeries::All);
+        assert_eq!(
+            PerJobSeries::from_str_or_default(" OFF "),
+            PerJobSeries::Off
+        );
+        assert_eq!(
+            PerJobSeries::from_str_or_default("active"),
+            PerJobSeries::Active
+        );
+        // A typo must not fail startup or silently pick the highest-cardinality
+        // setting; it falls back to the default.
+        assert_eq!(
+            PerJobSeries::from_str_or_default("evrything"),
+            PerJobSeries::Active
+        );
+        assert_eq!(PerJobSeries::default(), PerJobSeries::Active);
+        for mode in PerJobSeries::ALL {
+            assert_eq!(PerJobSeries::from_str_or_default(mode.as_str()), mode);
+        }
+        assert_eq!(
+            config_with_server().metrics.per_job_series,
+            PerJobSeries::Active
+        );
     }
 
     #[test]

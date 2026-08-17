@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -531,6 +533,13 @@ pub struct JobState {
     /// Extraction writes chunks and assembled files here instead of
     /// working_dir, keeping local storage usage low for NFS setups.
     pub staging_dir: Option<PathBuf>,
+    /// Shared decoded-byte counter for this job's category.
+    ///
+    /// Resolved once, when the job enters the pipeline, so the per-segment byte
+    /// accounting site never looks a category up: it does a single `Relaxed`
+    /// `fetch_add` through this already-resolved pointer. `None` only while a
+    /// test builds a bare state; the accounting site simply skips then.
+    pub category_bytes: Option<Arc<AtomicU64>>,
 }
 
 impl JobState {

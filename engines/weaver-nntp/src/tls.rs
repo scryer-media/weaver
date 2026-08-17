@@ -695,6 +695,33 @@ pub(crate) enum NntpTlsBackend {
     S2n,
 }
 
+impl NntpTlsBackend {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ManualRustls => "rustls",
+            #[cfg(not(windows))]
+            Self::S2n => "s2n",
+        }
+    }
+}
+
+/// Name of the TLS backend that carries article bodies, for `weaver_build_info`.
+///
+/// Reports the **owned blocking BODY lane's** choice, because that is the lane
+/// the bulk of the traffic goes through and the only one whose default differs
+/// by platform: unix defaults to s2n, Windows is always the rustls engine.
+/// `WEAVER_NNTP_TLS_BACKEND` overrides both lanes at once, so whenever an
+/// operator has made a choice this reports exactly that choice.
+///
+/// An unparseable override falls back to the rustls engine rather than
+/// failing: this exists to label a build, and a label must not be able to take
+/// the exporter down. The connection path still rejects the bad value loudly.
+pub fn selected_tls_backend_name() -> &'static str {
+    selected_blocking_tls_backend()
+        .unwrap_or(NntpTlsBackend::ManualRustls)
+        .as_str()
+}
+
 /// Parse an explicit `WEAVER_NNTP_TLS_BACKEND` value.
 fn parse_tls_backend(value: &str) -> Result<NntpTlsBackend, NntpError> {
     if value.eq_ignore_ascii_case("s2n") {

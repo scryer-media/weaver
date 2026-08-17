@@ -954,6 +954,12 @@ impl Pipeline {
             NestedExtractionDecision::PreserveOutputsAtDepthLimit => {}
         }
 
+        // Low-frequency: one observation per job-level extraction, never on a
+        // per-segment path. Records the metric next to the event that already
+        // announces the same fact.
+        self.metrics
+            .job_lifecycle
+            .note_extraction(crate::operations::instrumentation::StageOutcomeKind::Complete);
         let _ = self
             .event_tx
             .send(PipelineEvent::ExtractionComplete { job_id });

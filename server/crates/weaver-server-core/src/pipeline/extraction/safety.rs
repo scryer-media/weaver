@@ -465,6 +465,13 @@ impl JobExtractionBudget {
         )
     }
 
+    /// The job's metrics handle. Extraction resolves the budget once per
+    /// member, so this is how the per-member timer reaches the histograms
+    /// without threading a second handle through `RarExtractionContext`.
+    pub(crate) fn metrics(&self) -> &Arc<PipelineMetrics> {
+        &self.metrics
+    }
+
     fn reject(&self, reason: ExtractionRejectionReason, detail: String) -> ExtractionFailure {
         let failure = ExtractionFailure { reason, detail };
         let first = !self.cancelled.swap(true, Ordering::AcqRel);

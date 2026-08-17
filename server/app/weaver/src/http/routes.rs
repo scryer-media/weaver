@@ -78,6 +78,8 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         config,
         base_url,
         security,
+        disk_space,
+        http_metrics,
     } = runtime;
     let base_url_ext = super::assets::BaseUrl(Arc::new(base_url.clone()));
     let session_token = super::SessionToken(Arc::new(generate_api_key()));
@@ -112,6 +114,10 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
 
     let inner = Router::new()
         .route("/metrics", get(super::metrics::metrics_handler))
+        // Probes live on the same router as everything else, so they inherit
+        // the Host allowlist rather than opening an unguarded side door.
+        .route("/healthz", get(super::health::healthz_handler))
+        .route("/readyz", get(super::health::readyz_handler))
         .merge(nzbget_rpc_routes)
         .route("/graphql", post(super::graphql::graphql_handler))
         .route("/graphql/ws", get(super::graphql::ws_handler))
@@ -146,9 +152,20 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .layer(Extension(api_key_cache))
         .layer(Extension(request_auth))
         .layer(Extension(metrics_exporter))
+        // `build_router` consumes the `ServerRuntime`, so the two scrape-time
+        // collectors are re-published as extensions; that is how the metrics
+        // handler reaches them.
+        .layer(Extension(disk_space))
+        .layer(Extension(http_metrics.clone()))
         .layer(Extension(base_url_ext))
         .layer(Extension(security))
-        .layer(Extension(session_token));
+        .layer(Extension(session_token))
+        // Outermost of the inner router's layers, so the recorded duration
+        // covers the handler and everything wrapped around it.
+        .layer(middleware::from_fn(move |req, next| {
+            let http_metrics = http_metrics.clone();
+            async move { super::request_metrics::track_requests(http_metrics, req, next).await }
+        }));
 
     if base_url.is_empty() {
         inner

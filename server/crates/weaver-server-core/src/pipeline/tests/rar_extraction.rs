@@ -88,6 +88,96 @@ async fn extraction_reserves_member_totals_at_open() {
     );
 }
 
+/// `weaver_pipeline_extract_member_duration_seconds` stays absent until a
+/// member has actually been extracted, then reports one observation per
+/// member. Extraction is rare next to an article, so the wall clock this needs
+/// is nowhere near a per-segment path.
+#[tokio::test]
+async fn extracting_members_records_one_wall_duration_each() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20021);
+
+    let files = build_multifile_multivolume_rar_set();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Silver Horizon Archive", &files),
+    )
+    .await;
+
+    let volume_paths = files
+        .iter()
+        .enumerate()
+        .map(|(volume, (filename, bytes))| {
+            let path = temp_dir.path().join(filename);
+            std::fs::write(&path, bytes).unwrap();
+            (volume as u32, path)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut archive = unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+    for (volume, (_, bytes)) in files.iter().enumerate().skip(1) {
+        archive
+            .add_volume(volume, Box::new(std::io::Cursor::new(bytes.clone())))
+            .unwrap();
+    }
+    let options = unrar_rs::ExtractOptions {
+        verify: true,
+        password: None,
+        restore_owners: false,
+    };
+    let output_dir = temp_dir.path().join("out");
+    std::fs::create_dir_all(&output_dir).unwrap();
+
+    // The budget is what carries the job's metrics handle into the extractor,
+    // so build it exactly as the extraction task does.
+    let budget = pipeline.extraction_budget(job_id, &output_dir).unwrap();
+    let root = std::sync::Arc::new(
+        crate::pipeline::extraction::ExtractionRoot::open(&output_dir).unwrap(),
+    );
+
+    assert!(
+        pipeline
+            .metrics
+            .pipeline_histograms
+            .snapshot()
+            .extract_member_duration
+            .is_none(),
+        "the histogram must be absent, not an all-zero series, before the first member"
+    );
+
+    for (member, expected_count) in [("E01.mkv", 1u64), ("E02.mkv", 2u64)] {
+        let idx = archive.find_member_sanitized(member).unwrap();
+        Pipeline::extract_rar_member_to_output(
+            &mut archive,
+            crate::pipeline::extraction::RarExtractionContext::new(
+                &volume_paths,
+                &pipeline.event_tx,
+                job_id,
+                "show",
+                &output_dir,
+                &options,
+            )
+            .with_security(std::sync::Arc::clone(&root), std::sync::Arc::clone(&budget)),
+            idx,
+        )
+        .unwrap();
+
+        let histogram = pipeline
+            .metrics
+            .pipeline_histograms
+            .snapshot()
+            .extract_member_duration
+            .expect("an extracted member turns the histogram on");
+        assert_eq!(histogram.count, expected_count);
+        assert_eq!(
+            histogram.cumulative_counts().last().copied(),
+            Some(expected_count),
+            "every observation must land in a bucket"
+        );
+    }
+}
+
 #[tokio::test]
 async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
     let temp_dir = tempfile::tempdir().unwrap();

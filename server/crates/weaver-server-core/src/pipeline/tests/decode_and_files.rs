@@ -51,6 +51,70 @@ async fn pump_decode_queue_releases_bytes_for_inactive_job() {
     );
 }
 
+/// `weaver_pipeline_decode_task_duration_seconds` is absent until the decode
+/// path has timed something, then reports exactly one observation per decode
+/// task — the single clock read the task is allowed, taken once at its end
+/// whichever way the task exits.
+#[tokio::test]
+async fn decode_tasks_record_one_wall_duration_each() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20033);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Silver Horizon Decode Timing",
+            &[("silver-horizon.bin".to_string(), 512u32)],
+        ),
+    )
+    .await;
+
+    assert!(
+        pipeline
+            .metrics
+            .pipeline_histograms
+            .snapshot()
+            .decode_task_duration
+            .is_none(),
+        "the histogram must be absent, not an all-zero series, before the first task"
+    );
+
+    // The payload is not valid yEnc, so both tasks take the decode-failure
+    // exit. That is deliberate: the measurement has to close on every path out
+    // of the task, not only the happy one.
+    for segment_number in 0..2u32 {
+        let raw = Bytes::from_static(b"not a yenc article");
+        pipeline.metrics.note_decode_work_queued(raw.len() as u64);
+        pipeline.pending_decode.push_back(PendingDecodeWork {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                segment_number,
+            },
+            raw,
+            source_server_idx: None,
+            exclude_servers: Vec::new(),
+        });
+    }
+
+    pipeline.pump_decode_queue();
+    assert!(pipeline.pending_decode.is_empty());
+
+    let metrics = Arc::clone(&pipeline.metrics);
+    wait_until(Duration::from_secs(10), || {
+        metrics
+            .pipeline_histograms
+            .snapshot()
+            .decode_task_duration
+            .is_some_and(|histogram| histogram.count == 2)
+    })
+    .await
+    .expect("both decode tasks should record a duration");
+}
+
 #[tokio::test]
 async fn pump_decode_queue_respects_decode_thread_limit() {
     let temp_dir = tempfile::tempdir().unwrap();

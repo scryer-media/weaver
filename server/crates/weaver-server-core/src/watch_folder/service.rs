@@ -383,6 +383,7 @@ mod tests {
             watch_folder,
             duplicate_policy: Default::default(),
             direct_store: None,
+            metrics: Default::default(),
             config_path: None,
         }))
     }

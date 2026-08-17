@@ -702,6 +702,70 @@ impl HotBestModeBlockReason {
     }
 }
 
+/// Labels for the `hot_dispatch_best_mode_block_reason` snapshot code, in code
+/// order. The metrics snapshot carries the raw integer; exposing the mapping
+/// lets the Prometheus exporter render a state-set rather than an opaque gauge.
+pub const HOT_BEST_MODE_BLOCK_REASON_LABELS: [&str; 5] = [
+    "none",
+    "hot_has_queued_primary",
+    "lane_capacity_available",
+    "pipeline_promotion_pending",
+    "recent_expansion_helped",
+];
+
+/// Labels for the `hot_dispatch_last_expansion_kind` snapshot code, in code
+/// order. Code 0 means "no expansion has been recorded yet".
+pub const HOT_EXPANSION_KIND_LABELS: [&str; 3] = ["none", "lane_start", "pipeline_promotion"];
+
+/// Resolve a `hot_dispatch_best_mode_block_reason` code to its label, falling
+/// back to `unknown` so an unmapped code stays visible instead of panicking a
+/// scrape.
+pub fn hot_best_mode_block_reason_label(code: usize) -> &'static str {
+    HOT_BEST_MODE_BLOCK_REASON_LABELS
+        .get(code)
+        .copied()
+        .unwrap_or("unknown")
+}
+
+/// Resolve a `hot_dispatch_last_expansion_kind` code to its label.
+pub fn hot_expansion_kind_label(code: usize) -> &'static str {
+    HOT_EXPANSION_KIND_LABELS
+        .get(code)
+        .copied()
+        .unwrap_or("unknown")
+}
+
+#[cfg(test)]
+mod hot_dispatch_label_tests {
+    use super::*;
+
+    #[test]
+    fn labels_line_up_with_snapshot_codes() {
+        for reason in [
+            HotBestModeBlockReason::None,
+            HotBestModeBlockReason::HotHasQueuedPrimary,
+            HotBestModeBlockReason::LaneCapacityAvailable,
+            HotBestModeBlockReason::PipelinePromotionPending,
+            HotBestModeBlockReason::RecentExpansionHelped,
+        ] {
+            assert_ne!(
+                hot_best_mode_block_reason_label(reason.as_code()),
+                "unknown"
+            );
+        }
+        assert_eq!(hot_best_mode_block_reason_label(99), "unknown");
+
+        for kind in [
+            HotExpansionKind::LaneStart,
+            HotExpansionKind::PipelinePromotion,
+        ] {
+            assert_ne!(hot_expansion_kind_label(kind.as_code()), "unknown");
+        }
+        assert_eq!(hot_expansion_kind_label(0), "none");
+        assert_eq!(hot_expansion_kind_label(99), "unknown");
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct IpReplacementCandidate {
     pub(super) old_key: ServerIpKey,
@@ -1738,6 +1802,11 @@ pub struct Pipeline {
     pub(super) download_wait_by_job: HashMap<JobId, DownloadWaitStatus>,
     /// Idempotent terminal segment accounting.
     pub(in crate::pipeline) terminal_segment_failures: HashSet<SegmentId>,
+    /// Files already counted into `weaver_files_missing_total`. A completion
+    /// check re-enters many times per job; this keeps the counter per-file
+    /// rather than per-check. Per-file, so the set is bounded by the job's
+    /// file count and never touched from a per-segment path.
+    pub(in crate::pipeline) files_counted_missing: HashSet<NzbFileId>,
     /// Work parked specifically on per-server quota capacity or policy changes.
     pub(super) server_quota_parked: HashSet<SegmentId>,
     /// Directory for active downloads (per-job subdirectories).
@@ -1820,6 +1889,24 @@ pub struct Pipeline {
     /// generation they were scheduled under so stale indices can be dropped
     /// when they re-enter after a rebuild.
     pub(super) pool_generation: u64,
+    /// Per-server article attempt counters for the active NNTP generation,
+    /// indexed by runtime `server_idx`.
+    ///
+    /// Held as a plain `Vec` with no lock: the completion path indexes it
+    /// directly and only ever does `Relaxed` `fetch_add`s through the `Arc`s.
+    /// It is rebuilt exactly when a new NNTP generation is activated, from
+    /// `metrics.server_metrics`, which re-uses the counters of any stable
+    /// server id it has already seen so lifetime totals survive a config
+    /// reload. A stale generation may hand us an out-of-range index; the
+    /// completion path bounds-checks and skips.
+    pub(super) server_counters: Vec<Arc<crate::operations::instrumentation::ServerCounters>>,
+    /// Wall-clock start of each in-flight job stage, keyed by `(job, stage)`.
+    ///
+    /// Per-job, not per-segment: a job passes through each stage at most a
+    /// handful of times, so a `HashMap` here costs nothing measurable and never
+    /// appears on an article path.
+    pub(super) job_stage_started_at:
+        HashMap<(JobId, crate::operations::instrumentation::JobStageKind), Instant>,
     /// Bounded completion path for dedicated adaptive-capacity probes.
     pub(super) capacity_probe_result_tx: mpsc::Sender<CapacityProbeCompletion>,
     pub(super) capacity_probe_result_rx: mpsc::Receiver<CapacityProbeCompletion>,
@@ -1972,6 +2059,11 @@ pub struct Pipeline {
     pub(super) par2_bypassed: HashSet<JobId>,
     /// Jobs whose PAR2 set has already validated the current payload bytes.
     pub(super) par2_verified: HashSet<JobId>,
+    /// Jobs that have already contributed a row to `weaver_verifications_total`.
+    /// Claimed by the first verdict a job produces, so the `unverifiable`
+    /// fallback recorded when a job ends with no PAR2 set can never
+    /// double-count a job an actual pass already ruled on.
+    pub(in crate::pipeline) jobs_with_verification_outcome: HashSet<JobId>,
     /// Jobs that have consumed NZBGet's one permitted post-processing PAR re-entry.
     pub(super) post_processing_repair_reentered: HashSet<JobId>,
     /// Jobs returning from that PAR pass to terminal extension processing in place.

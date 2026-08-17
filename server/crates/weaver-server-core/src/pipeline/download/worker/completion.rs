@@ -488,7 +488,53 @@ impl Pipeline {
                 self.observe_ip_rtt_attempts(&result.attempts);
             }
 
+            let is_recovery = result.origin.is_recovery();
+            // Per-server counters are indexed by the runtime `server_idx` of
+            // the generation the result was dispatched under. After a rebuild
+            // the same index may name a different server, so results from a
+            // superseded generation are not attributed at all (an out-of-range
+            // index is caught by the bounds check below either way). One
+            // integer compare; the stale case only exists around a config
+            // reload.
+            let attribute_to_servers = result.runtime_generation == self.pool_generation;
             for (attempt_index, attempt) in result.attempts.iter().enumerate() {
+                // Per-server metric accounting. Hot-path safe: a bounds-checked
+                // index into a lock-free `Vec<Arc<ServerCounters>>` followed by
+                // `Relaxed` `fetch_add`s and a histogram observation over the
+                // `elapsed` this attempt already carries. No allocation, no
+                // lock, no clock read, no map lookup.
+                let metric_outcome = match attempt.outcome {
+                    FetchAttemptOutcome::Success => {
+                        crate::operations::instrumentation::ServerAttemptOutcomeKind::Success
+                    }
+                    FetchAttemptOutcome::NotFound => {
+                        crate::operations::instrumentation::ServerAttemptOutcomeKind::NotFound
+                    }
+                    FetchAttemptOutcome::AuthenticationFailure => {
+                        crate::operations::instrumentation::ServerAttemptOutcomeKind::AuthFailure
+                    }
+                    FetchAttemptOutcome::TransientFailure => {
+                        crate::operations::instrumentation::ServerAttemptOutcomeKind::TransientFailure
+                    }
+                    FetchAttemptOutcome::PermanentFailure => {
+                        crate::operations::instrumentation::ServerAttemptOutcomeKind::PermanentFailure
+                    }
+                    FetchAttemptOutcome::QuotaBlocked | FetchAttemptOutcome::QuotaUnrequested => {
+                        crate::operations::instrumentation::ServerAttemptOutcomeKind::QuotaBlocked
+                    }
+                };
+                if let Some(counters) = attribute_to_servers
+                    .then(|| self.server_counters.get(attempt.server_idx))
+                    .flatten()
+                {
+                    counters.note_attempt(metric_outcome, is_recovery);
+                    // A quota block never reached the wire, so its `elapsed` is
+                    // not a round-trip and would poison the latency histogram.
+                    if metric_outcome.has_round_trip() {
+                        counters.observe_latency(attempt.elapsed);
+                    }
+                }
+
                 let outcome = match attempt.outcome {
                     FetchAttemptOutcome::QuotaBlocked | FetchAttemptOutcome::QuotaUnrequested => {
                         continue;
@@ -517,7 +563,7 @@ impl Pipeline {
                     latency_ms: attempt.elapsed.as_millis().min(u64::MAX as u128) as u64,
                     outcome,
                     error: attempt.error.clone(),
-                    is_recovery: result.origin.is_recovery(),
+                    is_recovery,
                 });
             }
 

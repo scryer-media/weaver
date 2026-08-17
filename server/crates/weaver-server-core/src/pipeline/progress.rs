@@ -13,6 +13,19 @@ pub(crate) struct JobPhaseRuntime {
     pub(super) last_sample: Option<(Instant, u64)>,
 }
 
+/// The metric stage label for a user-visible job phase. Verification and
+/// post-processing are not phases, so they arm their timers from their own
+/// start/finish points.
+const fn stage_kind_for_phase(phase: JobPhase) -> crate::operations::instrumentation::JobStageKind {
+    use crate::operations::instrumentation::JobStageKind;
+    match phase {
+        JobPhase::Downloading => JobStageKind::Download,
+        JobPhase::Repairing => JobStageKind::Repair,
+        JobPhase::Extracting => JobStageKind::Extract,
+        JobPhase::Moving => JobStageKind::Move,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PhasePublishSignature(Vec<(JobPhase, u8, bool)>);
 
@@ -47,10 +60,16 @@ impl Pipeline {
         };
         self.phase_progress.insert(key, runtime);
         self.phase_publish_state.remove(&job_id);
+        // Stage timing rides the phase lifecycle, which is per job per phase —
+        // a handful of events over a job's whole life, never a per-segment
+        // path. One `Instant::now()` here is the cheapest honest measurement
+        // available and costs nothing that matters at this frequency.
+        self.note_stage_started(job_id, stage_kind_for_phase(phase));
         counters
     }
 
     pub(crate) fn phase_end(&mut self, job_id: JobId, phase: JobPhase) {
+        self.note_stage_finished(job_id, stage_kind_for_phase(phase));
         if self.phase_progress.remove(&(job_id, phase)).is_some()
             && let Some(phases) = self.phase_progress_snapshots.get_mut(&job_id)
         {
@@ -59,6 +78,43 @@ impl Pipeline {
                 self.phase_progress_snapshots.remove(&job_id);
             }
         }
+    }
+
+    /// Arm the wall-clock timer for one job stage.
+    ///
+    /// Low-frequency by construction: a job enters each stage a handful of
+    /// times. Re-arming an already-armed stage is ignored so a stage that is
+    /// re-entered (a repair pass returning to extraction, say) reports the span
+    /// of its first entry rather than restarting the clock mid-stage.
+    pub(crate) fn note_stage_started(
+        &mut self,
+        job_id: JobId,
+        stage: crate::operations::instrumentation::JobStageKind,
+    ) {
+        self.job_stage_started_at
+            .entry((job_id, stage))
+            .or_insert_with(Instant::now);
+    }
+
+    /// Observe one job stage's wall duration, if it was armed.
+    ///
+    /// Low-frequency: see [`Self::note_stage_started`].
+    pub(crate) fn note_stage_finished(
+        &mut self,
+        job_id: JobId,
+        stage: crate::operations::instrumentation::JobStageKind,
+    ) {
+        if let Some(started) = self.job_stage_started_at.remove(&(job_id, stage)) {
+            self.metrics
+                .job_lifecycle
+                .note_stage_duration(stage, started.elapsed());
+        }
+    }
+
+    /// Drop any stage timers still armed for a job that is going away, so the
+    /// map cannot outlive the jobs it describes.
+    pub(crate) fn discard_stage_timers(&mut self, job_id: JobId) {
+        self.job_stage_started_at.retain(|(id, _), _| *id != job_id);
     }
 
     pub(crate) fn phase_subtract_completed_bytes(

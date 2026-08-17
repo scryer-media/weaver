@@ -527,6 +527,12 @@ impl Pipeline {
             return Ok(());
         }
 
+        // Terminal transition: the job is leaving the verification question
+        // behind. With no recovery set there was never a verdict to be had, so
+        // attribute it rather than leaving the job out of
+        // `weaver_verifications_total` entirely. No-op when a pass ruled.
+        self.note_job_unverifiable_if_no_par2_set(job_id);
+
         if self
             .post_processing_repair_return_to_terminal
             .remove(&job_id)
@@ -714,6 +720,11 @@ impl Pipeline {
         if !self.inflight_terminal_post_processing.insert(job_id) {
             return;
         }
+        // Low-frequency: at most one terminal post-processing run per job.
+        self.note_stage_started(
+            job_id,
+            crate::operations::instrumentation::JobStageKind::PostProcess,
+        );
         let run_id = match self.db.create_post_processing_run(
             job_id.0,
             &plan,
@@ -1039,6 +1050,11 @@ impl Pipeline {
         done: TerminalPostProcessingDone,
     ) {
         self.inflight_terminal_post_processing.remove(&done.job_id);
+        // Low-frequency: closes the timer armed when the run was launched.
+        self.note_stage_finished(
+            done.job_id,
+            crate::operations::instrumentation::JobStageKind::PostProcess,
+        );
         self.terminal_post_processing_cancellations
             .remove(&done.job_id);
         if let Some(primary_failure) = done.primary_failure {

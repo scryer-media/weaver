@@ -218,6 +218,7 @@ impl Pipeline {
         self.clear_job_write_backlog(job_id);
         self.clear_job_progress_floor_runtime(job_id);
         self.clear_job_phase_progress_runtime(job_id);
+        self.discard_stage_timers(job_id);
         self.clear_job_retention_excludes(job_id);
         self.decode_retries
             .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
@@ -257,6 +258,20 @@ impl Pipeline {
             }
         };
         let completed = matches!(state.status, JobStatus::Complete);
+
+        // Low-frequency: one observation per job reaching a terminal status.
+        // `created_at` is an `Instant` the job state already carries, so the
+        // duration costs one clock read at the end of a whole job — no
+        // `SystemTime::now()` and nothing on an article path.
+        self.metrics.job_lifecycle.note_finished(
+            if completed {
+                crate::operations::instrumentation::JobResultKind::Complete
+            } else {
+                crate::operations::instrumentation::JobResultKind::Failed
+            },
+            state.spec.category.as_deref().unwrap_or(""),
+            Some(state.created_at.elapsed()),
+        );
 
         let now = timestamp_secs() as i64;
         let elapsed_secs = state.created_at.elapsed().as_secs() as i64;

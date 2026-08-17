@@ -788,6 +788,13 @@ impl Pipeline {
             total_bytes: spec.total_bytes,
         });
 
+        // Resolve the category's shared decoded-byte counter once, here, so the
+        // per-segment accounting site does a single `Relaxed` `fetch_add`
+        // through an already-resolved pointer instead of a map lookup.
+        let category_bytes = self
+            .metrics
+            .job_lifecycle
+            .category_bytes_counter(spec.category.as_deref());
         let par2_bytes = spec.par2_bytes();
         let mut state = JobState {
             job_id,
@@ -826,6 +833,7 @@ impl Pipeline {
             download_queue,
             recovery_queue,
             staging_dir: None,
+            category_bytes: Some(category_bytes),
         };
         state.refresh_runtime_lanes_from_status();
         self.jobs.insert(job_id, state);
@@ -1053,6 +1061,13 @@ impl Pipeline {
                 Self::build_job_assembly(job_id, &spec, &all_segments);
             let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
 
+            // Resolve the category's shared decoded-byte counter once, here, so the
+            // per-segment accounting site does a single `Relaxed` `fetch_add`
+            // through an already-resolved pointer instead of a map lookup.
+            let category_bytes = self
+                .metrics
+                .job_lifecycle
+                .category_bytes_counter(spec.category.as_deref());
             let par2_bytes = spec.par2_bytes();
             let mut state = JobState {
                 job_id,
@@ -1087,6 +1102,7 @@ impl Pipeline {
                 download_queue,
                 recovery_queue,
                 staging_dir: None,
+                category_bytes: Some(category_bytes),
             };
             state.refresh_runtime_lanes_from_status();
             self.jobs.insert(job_id, state);
@@ -1519,6 +1535,13 @@ impl Pipeline {
             total_bytes: spec.total_bytes,
         });
 
+        // Resolve the category's shared decoded-byte counter once, here, so the
+        // per-segment accounting site does a single `Relaxed` `fetch_add`
+        // through an already-resolved pointer instead of a map lookup.
+        let category_bytes = self
+            .metrics
+            .job_lifecycle
+            .category_bytes_counter(spec.category.as_deref());
         let par2_bytes = spec.par2_bytes();
         let mut state = JobState {
             job_id,
@@ -1608,6 +1631,7 @@ impl Pipeline {
             download_queue,
             recovery_queue,
             staging_dir: restored_staging_dir,
+            category_bytes: Some(category_bytes),
         };
         state.refresh_runtime_lanes_from_status();
         self.jobs.insert(job_id, state);

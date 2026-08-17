@@ -1684,6 +1684,12 @@ impl Pipeline {
                         self.check_job_completion(job_id).await;
                         return;
                     }
+                    // Low-frequency: one observation per job-level extraction, never on a
+                    // per-segment path. Records the metric next to the event that already
+                    // announces the same fact.
+                    self.metrics.job_lifecycle.note_extraction(
+                        crate::operations::instrumentation::StageOutcomeKind::Failed,
+                    );
                     let _ = self.event_tx.send(PipelineEvent::ExtractionFailed {
                         job_id,
                         error: e.clone(),

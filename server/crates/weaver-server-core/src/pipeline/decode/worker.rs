@@ -1570,6 +1570,14 @@ impl Pipeline {
             // Track decoded (not raw/yEnc-encoded) bytes so progress never exceeds 100%.
             if let Some(state) = self.jobs.get_mut(&job_id) {
                 state.downloaded_bytes += decoded_size as u64;
+                // Hot-path safe: the category's counter was resolved once when
+                // the job was added, so this is a single `Relaxed` `fetch_add`
+                // through an already-held `Arc` — no map lookup, no allocation,
+                // no lock, and it rides the job-state lookup this path already
+                // performs.
+                if let Some(category_bytes) = state.category_bytes.as_ref() {
+                    category_bytes.fetch_add(decoded_size as u64, Ordering::Relaxed);
+                }
             }
 
             // A direct set's source volume never becomes a file, so its bytes
@@ -1739,10 +1747,18 @@ impl Pipeline {
             return Err(SegmentWriteError::new(file_id, source));
         }
         self.note_file_progress_floor(file_id, contiguous_end_after_ready, false);
-        let write_us = write_start.elapsed().as_micros() as u64;
+        // Hot-path safe: `write_start.elapsed()` is the single clock read this
+        // path already performs for the `disk_write_latency_us` gauge, and the
+        // histogram observes exactly that same span so the two agree. The
+        // observation itself is three `Relaxed` `fetch_add`s.
+        let write_elapsed = write_start.elapsed();
+        let write_us = write_elapsed.as_micros() as u64;
         self.metrics
             .disk_write_latency_us
             .store(write_us, Ordering::Relaxed);
+        self.metrics
+            .pipeline_histograms
+            .observe_disk_write(write_elapsed);
 
         self.remove_empty_write_buffer(file_id);
         Ok(())
@@ -1852,10 +1868,18 @@ impl Pipeline {
 
         let write_start = Instant::now();
         let write_result = write_segments_to_disk(&file_path, segments).await;
-        let write_us = write_start.elapsed().as_micros() as u64;
+        // Hot-path safe: reuses the `write_start` this path already keeps for
+        // the `disk_write_latency_us` gauge, so the histogram costs no extra
+        // clock read — only the three `Relaxed` `fetch_add`s inside `observe`.
+        // The last-write gauge is left untouched for compatibility.
+        let write_elapsed = write_start.elapsed();
+        let write_us = write_elapsed.as_micros() as u64;
         self.metrics
             .disk_write_latency_us
             .store(write_us, Ordering::Relaxed);
+        self.metrics
+            .pipeline_histograms
+            .observe_disk_write(write_elapsed);
         self.release_write_buffered(segment_bytes, segment_count);
         let (written, write_error) = match write_result {
             Ok(written) => (written, None),
