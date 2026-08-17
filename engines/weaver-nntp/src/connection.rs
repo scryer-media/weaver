@@ -1693,7 +1693,7 @@ mod tests {
     use crate::test_support::{
         ScriptedStep, spawn_scripted_server as spawn_shared_scripted_server,
     };
-    use crate::tls::ManualTlsStream;
+    use crate::tls::{ManualTlsStream, TLS_READ_TURN_LIMIT};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
@@ -2362,6 +2362,73 @@ mod tests {
 
         assert_eq!(read.bytes, TLS_DRAIN_PAYLOAD_BYTES);
         assert_eq!(read_buf.len(), TLS_DRAIN_PAYLOAD_BYTES);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_tls_transport_bounds_each_turn_and_preserves_stream() {
+        let (client_config, server_config) = test_tls_configs();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload_len = TLS_READ_TURN_LIMIT * 3 + 12_345;
+        let payload: Arc<[u8]> = (0..payload_len)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>()
+            .into();
+        let server_payload = Arc::clone(&payload);
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let acceptor = TlsAcceptor::from(server_config);
+            let mut tls = acceptor.accept(socket).await.unwrap();
+            tls.write_all(&server_payload).await.unwrap();
+            tls.flush().await.unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let remote_addr = tcp.peer_addr().unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let inner = ManualTlsStream::connect(tcp, client_config, server_name)
+            .await
+            .unwrap();
+        let mut transport = NntpTransport::ManualTls { inner, remote_addr };
+        let mut received = Vec::with_capacity(payload_len);
+        let mut read_buf = BytesMut::with_capacity(TLS_READ_TURN_LIMIT);
+        let mut read_calls = 0usize;
+
+        while received.len() < payload_len {
+            let read = tokio::time::timeout(
+                Duration::from_secs(5),
+                transport.read_into_buf_with_stats(&mut read_buf, usize::MAX),
+            )
+            .await
+            .expect("manual TLS read timed out")
+            .expect("manual TLS read failed");
+            assert_ne!(read.bytes, 0, "stream closed before the complete payload");
+            assert_eq!(read.bytes, read_buf.len());
+            assert!(
+                read.bytes <= TLS_READ_TURN_LIMIT,
+                "one read appended {} bytes, above the {}-byte turn limit",
+                read.bytes,
+                TLS_READ_TURN_LIMIT
+            );
+            received.extend_from_slice(&read_buf);
+            read_buf.clear();
+            read_calls += 1;
+        }
+
+        server.await.unwrap();
+        let eof = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport.read_into_buf(&mut read_buf, usize::MAX),
+        )
+        .await
+        .expect("manual TLS EOF read timed out")
+        .expect("manual TLS EOF read failed");
+
+        assert_eq!(eof, 0);
+        assert!(read_buf.is_empty());
+        assert!(read_calls >= 4);
+        assert_eq!(received.as_slice(), payload.as_ref());
     }
 
     async fn spawn_scripted_server(steps: Vec<ScriptStep>, hold_open_after_last: Duration) -> u16 {

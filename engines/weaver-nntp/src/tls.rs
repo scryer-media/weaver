@@ -88,8 +88,14 @@ pin_project_lite::pin_project! {
 }
 
 pub(crate) const TLS_READ_BUFFER: usize = 256 * 1024;
+pub(crate) const TLS_READ_TURN_LIMIT: usize = 1024 * 1024;
 const TLS_PLAINTEXT_DRAIN_CHUNK: usize = 16 * 1024;
 const TLS_BACKEND_ENV: &str = "WEAVER_NNTP_TLS_BACKEND";
+
+#[inline]
+fn read_turn_exhausted_without_plaintext(ciphertext: usize, plaintext: usize) -> bool {
+    ciphertext >= TLS_READ_TURN_LIMIT && plaintext == 0
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransportReadStats {
@@ -148,7 +154,13 @@ async fn read_s2n_available_into(
     target_read_size: usize,
 ) -> io::Result<TransportRead> {
     let started_len = dst.len();
-    let target_read_size = target_read_size.max(1);
+    // The ceiling mirrors the manual-rustls lane's turn budget. Production
+    // targets are built as `per_connection.min(256 KiB)` (or the 64 KiB
+    // default), so the clamp is the identity on the whole tuned range — it
+    // exists because `dst.reserve(target_read_size - total)` below reserves
+    // the full remaining target, and an unbounded caller-supplied target
+    // would turn that into a capacity-overflow abort.
+    let target_read_size = target_read_size.clamp(1, TLS_READ_TURN_LIMIT);
     let mut stats = TransportReadStats::default();
     let bytes = std::future::poll_fn(|cx| {
         loop {
@@ -408,8 +420,9 @@ impl ManualTlsStream {
         target_read_size: usize,
         mut stats: Option<&mut TransportReadStats>,
     ) -> io::Result<usize> {
-        let started_len = dst.len();
-        let drained = self.session.drain_plaintext(dst, stats.as_deref_mut())?;
+        let drained =
+            self.session
+                .drain_plaintext_up_to(dst, TLS_READ_TURN_LIMIT, stats.as_deref_mut())?;
         if drained > 0 {
             if let Some(stats) = stats.as_deref_mut() {
                 stats.cached_plaintext_returns += 1;
@@ -417,10 +430,12 @@ impl ManualTlsStream {
             return Ok(drained);
         }
 
-        let read_size = target_read_size.max(TLS_READ_BUFFER);
+        let read_size = target_read_size.clamp(TLS_READ_BUFFER, TLS_READ_TURN_LIMIT);
         if self.read_buffer.len() < read_size {
             self.read_buffer.resize(read_size, 0);
         }
+        let mut ciphertext_read_this_turn = 0usize;
+        let mut plaintext_read_this_turn = 0usize;
 
         loop {
             if let Some(stats) = stats.as_deref_mut() {
@@ -428,22 +443,37 @@ impl ManualTlsStream {
             }
             self.tcp.readable().await?;
             let mut saw_eof = false;
-            let len_before_ready = dst.len();
+            let plaintext_before_ready = plaintext_read_this_turn;
 
             loop {
+                let remaining_ciphertext = TLS_READ_TURN_LIMIT - ciphertext_read_this_turn;
+                if remaining_ciphertext == 0 {
+                    if let Some(stats) = stats.as_deref_mut() {
+                        stats.backend_target_full_returns += 1;
+                    }
+                    break;
+                }
                 if let Some(stats) = stats.as_deref_mut() {
                     stats.try_read_calls += 1;
                 }
-                match self.tcp.try_read(&mut self.read_buffer[..read_size]) {
+                let attempt_size = read_size.min(remaining_ciphertext);
+                match self.tcp.try_read(&mut self.read_buffer[..attempt_size]) {
                     Ok(0) => {
                         saw_eof = true;
                         break;
                     }
                     Ok(n) => {
+                        ciphertext_read_this_turn += n;
                         if let Some(stats) = stats.as_deref_mut() {
                             stats.try_read_bytes += n as u64;
                         }
-                        self.feed_ciphertext(n, dst, stats.as_deref_mut())?;
+                        let remaining_plaintext = TLS_READ_TURN_LIMIT - plaintext_read_this_turn;
+                        plaintext_read_this_turn += self.feed_ciphertext_up_to(
+                            n,
+                            dst,
+                            remaining_plaintext,
+                            stats.as_deref_mut(),
+                        )?;
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         if let Some(stats) = stats.as_deref_mut() {
@@ -455,13 +485,22 @@ impl ManualTlsStream {
                 }
             }
 
-            if dst.len() > started_len {
-                return Ok(dst.len() - started_len);
+            if plaintext_read_this_turn > 0 {
+                return Ok(plaintext_read_this_turn);
             }
             if saw_eof {
                 return Ok(0);
             }
-            if dst.len() == len_before_ready
+            if read_turn_exhausted_without_plaintext(
+                ciphertext_read_this_turn,
+                plaintext_read_this_turn,
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "TLS read turn reached its limit without application plaintext",
+                ));
+            }
+            if plaintext_read_this_turn == plaintext_before_ready
                 && let Some(stats) = stats.as_deref_mut()
             {
                 stats.empty_readiness_wakes += 1;
@@ -494,6 +533,21 @@ impl ManualTlsStream {
         self.session
             .feed_ciphertext_slice(&self.read_buffer[..bytes], dst, stats)
     }
+
+    fn feed_ciphertext_up_to(
+        &mut self,
+        bytes: usize,
+        dst: &mut BytesMut,
+        max_plaintext: usize,
+        stats: Option<&mut TransportReadStats>,
+    ) -> io::Result<usize> {
+        self.session.feed_ciphertext_slice_up_to(
+            &self.read_buffer[..bytes],
+            dst,
+            max_plaintext,
+            stats,
+        )
+    }
 }
 
 impl RustlsSession {
@@ -501,10 +555,21 @@ impl RustlsSession {
         &mut self,
         ciphertext: &[u8],
         dst: &mut BytesMut,
+        stats: Option<&mut TransportReadStats>,
+    ) -> io::Result<usize> {
+        self.feed_ciphertext_slice_up_to(ciphertext, dst, usize::MAX, stats)
+    }
+
+    fn feed_ciphertext_slice_up_to(
+        &mut self,
+        ciphertext: &[u8],
+        dst: &mut BytesMut,
+        max_plaintext: usize,
         mut stats: Option<&mut TransportReadStats>,
     ) -> io::Result<usize> {
         let mut cursor = Cursor::new(ciphertext);
         let mut plaintext_bytes = 0usize;
+        let mut remaining_plaintext = max_plaintext;
 
         while (cursor.position() as usize) < ciphertext.len() {
             if let Some(stats) = stats.as_deref_mut() {
@@ -519,14 +584,19 @@ impl RustlsSession {
                     self.tls
                         .process_new_packets()
                         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-                    plaintext_bytes += self.drain_plaintext(dst, stats.as_deref_mut())?;
+                    let drained =
+                        self.drain_plaintext_up_to(dst, remaining_plaintext, stats.as_deref_mut())?;
+                    plaintext_bytes += drained;
+                    remaining_plaintext -= drained;
                 }
                 Err(err) if err.kind() == io::ErrorKind::Other => {
-                    let drained = self.drain_plaintext(dst, stats.as_deref_mut())?;
+                    let drained =
+                        self.drain_plaintext_up_to(dst, remaining_plaintext, stats.as_deref_mut())?;
                     if drained == 0 {
                         return Err(err);
                     }
                     plaintext_bytes += drained;
+                    remaining_plaintext -= drained;
                 }
                 Err(err) => return Err(err),
             }
@@ -538,18 +608,32 @@ impl RustlsSession {
     pub(crate) fn drain_plaintext(
         &mut self,
         dst: &mut BytesMut,
+        stats: Option<&mut TransportReadStats>,
+    ) -> io::Result<usize> {
+        self.drain_plaintext_up_to(dst, usize::MAX, stats)
+    }
+
+    fn drain_plaintext_up_to(
+        &mut self,
+        dst: &mut BytesMut,
+        max_plaintext: usize,
         mut stats: Option<&mut TransportReadStats>,
     ) -> io::Result<usize> {
         if let Some(stats) = stats.as_deref_mut() {
             stats.plaintext_drain_calls += 1;
         }
-        let started_len = dst.len();
+        let mut plaintext_bytes = 0usize;
+        let mut remaining_plaintext = max_plaintext;
 
         loop {
-            dst.reserve(TLS_PLAINTEXT_DRAIN_CHUNK);
+            if remaining_plaintext == 0 {
+                break;
+            }
+            let requested = TLS_PLAINTEXT_DRAIN_CHUNK.min(remaining_plaintext);
+            dst.reserve(requested);
             let old_len = dst.len();
             let spare = dst.spare_capacity_mut();
-            let writable = spare.len().min(TLS_PLAINTEXT_DRAIN_CHUNK);
+            let writable = spare.len().min(requested);
             if writable == 0 {
                 break;
             }
@@ -570,6 +654,8 @@ impl RustlsSession {
                         stats.plaintext_bytes += n as u64;
                     }
                     dst.set_len(old_len + n);
+                    plaintext_bytes += n;
+                    remaining_plaintext -= n;
                 },
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     if let Some(stats) = stats.as_deref_mut() {
@@ -581,7 +667,7 @@ impl RustlsSession {
             }
         }
 
-        Ok(dst.len() - started_len)
+        Ok(plaintext_bytes)
     }
 }
 
@@ -1029,7 +1115,6 @@ pub async fn upgrade_starttls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(windows))]
     use std::sync::Arc;
     #[cfg(not(windows))]
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1041,10 +1126,8 @@ mod tests {
     use tokio::sync::oneshot;
     #[cfg(not(windows))]
     use tokio_rustls::TlsAcceptor;
-    #[cfg(not(windows))]
-    use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
-    #[cfg(not(windows))]
     use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio_rustls::rustls::{ServerConfig as RustlsServerConfig, ServerConnection};
 
     #[cfg(not(windows))]
     const TLS_DRAIN_RECORD_BYTES: usize = 16 * 1024;
@@ -1054,6 +1137,179 @@ mod tests {
     const TLS_DRAIN_PAYLOAD_BYTES: usize = TLS_DRAIN_RECORD_BYTES * TLS_DRAIN_RECORDS;
     #[cfg(not(windows))]
     const TLS_TEST_BUFFER_BYTES: usize = 256 * 1024;
+
+    fn rustls_test_configs() -> (Arc<ClientConfig>, Arc<RustlsServerConfig>) {
+        let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate test certificate");
+        let cert_der = certified_key.cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            certified_key.signing_key.serialize_der(),
+        ));
+
+        let server_provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+        let server_config = RustlsServerConfig::builder_with_provider(Arc::new(server_provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).expect("client root store");
+        let client_provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+        let client_config = ClientConfig::builder_with_provider(Arc::new(client_provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        (Arc::new(client_config), Arc::new(server_config))
+    }
+
+    fn transfer_client_to_server(client: &mut ClientConnection, server: &mut ServerConnection) {
+        let mut wire = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut wire).expect("client TLS write");
+        }
+        if wire.is_empty() {
+            return;
+        }
+        let mut cursor = Cursor::new(wire.as_slice());
+        while (cursor.position() as usize) < wire.len() {
+            let read = server.read_tls(&mut cursor).expect("server TLS read");
+            assert_ne!(read, 0, "server stopped before consuming TLS bytes");
+            server
+                .process_new_packets()
+                .expect("server process packets");
+        }
+    }
+
+    fn transfer_server_to_client(
+        server: &mut ServerConnection,
+        client: &mut ClientConnection,
+    ) -> usize {
+        let mut wire = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut wire).expect("server TLS write");
+        }
+        if wire.is_empty() {
+            return 0;
+        }
+        let wire_len = wire.len();
+        let mut cursor = Cursor::new(wire.as_slice());
+        while (cursor.position() as usize) < wire.len() {
+            let read = client.read_tls(&mut cursor).expect("client TLS read");
+            assert_ne!(read, 0, "client stopped before consuming TLS bytes");
+            client
+                .process_new_packets()
+                .expect("client process packets");
+        }
+        wire_len
+    }
+
+    fn handshake_rustls_pair(client: &mut ClientConnection, server: &mut ServerConnection) {
+        for _ in 0..16 {
+            transfer_client_to_server(client, server);
+            let _ = transfer_server_to_client(server, client);
+            if !client.is_handshaking() && !server.is_handshaking() {
+                transfer_client_to_server(client, server);
+                let _ = transfer_server_to_client(server, client);
+                return;
+            }
+        }
+        panic!("in-memory TLS handshake did not complete");
+    }
+
+    #[test]
+    fn cached_plaintext_drain_respects_read_turn_limit() {
+        let (client_config, server_config) = rustls_test_configs();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut client = ClientConnection::new(client_config, server_name).unwrap();
+        let mut server = ServerConnection::new(server_config).unwrap();
+        client.set_buffer_limit(None);
+        server.set_buffer_limit(None);
+        handshake_rustls_pair(&mut client, &mut server);
+
+        let drain_limit = TLS_PLAINTEXT_DRAIN_CHUNK / 2;
+        let payload_len = TLS_PLAINTEXT_DRAIN_CHUNK;
+        let record = vec![0x5Au8; TLS_PLAINTEXT_DRAIN_CHUNK];
+        server
+            .writer()
+            .write_all(&record)
+            .expect("queue server plaintext");
+        let wire_len = transfer_server_to_client(&mut server, &mut client);
+        assert!(
+            wire_len > payload_len,
+            "server emitted no application record"
+        );
+
+        let mut session = RustlsSession { tls: client };
+        let mut dst = BytesMut::new();
+        let first = session
+            .drain_plaintext_up_to(&mut dst, drain_limit, None)
+            .unwrap();
+        assert_eq!(first, drain_limit);
+        assert_eq!(dst.len(), drain_limit);
+
+        let second = session
+            .drain_plaintext_up_to(&mut dst, drain_limit, None)
+            .unwrap();
+        assert_eq!(second, drain_limit);
+        assert_eq!(dst.len(), payload_len);
+        assert_eq!(session.drain_plaintext(&mut dst, None).unwrap(), 0);
+        assert!(dst.iter().all(|byte| *byte == 0x5A));
+    }
+
+    #[test]
+    fn partial_tls_record_is_preserved_across_feeds() {
+        let (client_config, server_config) = rustls_test_configs();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut client = ClientConnection::new(client_config, server_name).unwrap();
+        let mut server = ServerConnection::new(server_config).unwrap();
+        handshake_rustls_pair(&mut client, &mut server);
+
+        let payload = vec![0xA5; TLS_PLAINTEXT_DRAIN_CHUNK / 2];
+        server
+            .writer()
+            .write_all(&payload)
+            .expect("queue server plaintext");
+        let mut wire = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut wire).expect("server TLS write");
+        }
+        assert!(wire.len() > payload.len());
+
+        let split = wire.len() - 1;
+        let mut session = RustlsSession { tls: client };
+        let mut dst = BytesMut::new();
+        let first = session
+            .feed_ciphertext_slice_up_to(&wire[..split], &mut dst, TLS_READ_TURN_LIMIT, None)
+            .unwrap();
+        assert_eq!(first, 0);
+        assert!(dst.is_empty());
+
+        let second = session
+            .feed_ciphertext_slice_up_to(&wire[split..], &mut dst, TLS_READ_TURN_LIMIT, None)
+            .unwrap();
+        assert_eq!(second, payload.len());
+        assert_eq!(dst.as_ref(), payload.as_slice());
+    }
+
+    #[test]
+    fn full_read_turn_without_plaintext_is_rejected() {
+        assert!(!read_turn_exhausted_without_plaintext(
+            TLS_READ_TURN_LIMIT - 1,
+            0
+        ));
+        assert!(!read_turn_exhausted_without_plaintext(
+            TLS_READ_TURN_LIMIT,
+            1
+        ));
+        assert!(read_turn_exhausted_without_plaintext(
+            TLS_READ_TURN_LIMIT,
+            0
+        ));
+    }
 
     #[test]
     fn parse_tls_backend_accepts_rustls_aliases() {
