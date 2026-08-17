@@ -9,8 +9,23 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(rapidyenc_linked)");
+    println!("cargo:rustc-check-cfg=cfg(weaver_yenc_raw_asm)");
     println!("cargo:rerun-if-env-changed=WEAVER_RAPIDYENC_SRC");
+    println!("cargo:rerun-if-env-changed=WEAVER_YENC_RAW_ASM");
     println!("cargo:rerun-if-changed=rapidyenc_shim.cc");
+
+    // The oracle-model `asm!` decode kernel (`avx2_raw_kernel_oracle`) is the
+    // DEFAULT `SEARCH_END=false` path on x86_64: measured on Alder Lake and
+    // Zen2/Windows it matches or beats rapidyenc on every decode fixture
+    // (realshape 1.013/1.127, crlf 1.111/1.048; >1 = weaver faster), where
+    // the intrinsic loop trailed on realshape. `WEAVER_YENC_RAW_ASM=0` is the
+    // escape hatch back to the intrinsic loop (A/B runs, or triage on a
+    // microarchitecture that disagrees with the measured set). Both forms
+    // stay compiled on x86_64 so the differential tests can compare them on
+    // real hardware regardless of the cfg.
+    if !matches!(env::var("WEAVER_YENC_RAW_ASM").as_deref(), Ok("0")) {
+        println!("cargo:rustc-cfg=weaver_yenc_raw_asm");
+    }
 
     let Some(root) = env::var_os("WEAVER_RAPIDYENC_SRC") else {
         return;
