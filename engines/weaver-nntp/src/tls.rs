@@ -7,6 +7,7 @@ use std::time::Duration;
 #[cfg(not(windows))]
 use bytes::BufMut;
 use bytes::BytesMut;
+use rustls_pki_types::{CertificateDer, pem::PemObject};
 #[cfg(not(windows))]
 use s2n_tls::{config::Config as S2nConfig, security};
 #[cfg(not(windows))]
@@ -661,8 +662,7 @@ pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>
         let pem_data = std::fs::read(path).map_err(|e| {
             NntpError::MalformedResponse(format!("failed to read CA cert {}: {e}", path.display()))
         })?;
-        let mut cursor = std::io::Cursor::new(&pem_data);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(&pem_data)
             .filter_map(|r| r.ok())
             .collect();
         if certs.is_empty() {

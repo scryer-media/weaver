@@ -183,7 +183,7 @@ export function metricValue(
     );
     if (!match || match[1] !== metric) continue;
     const sampleLabels = Object.fromEntries(
-      [...(match[2] ?? "").matchAll(/(\w+)="((?:\\.|[^"])*)"/g)].map((entry) => [
+      [...(match[2] ?? "").matchAll(/(\w+)="((?:[^"\\]|\\.)*)"/g)].map((entry) => [
         entry[1],
         entry[2].replaceAll('\\"', '"').replaceAll("\\\\", "\\"),
       ]),

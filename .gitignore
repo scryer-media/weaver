@@ -1,6 +1,9 @@
 # Build artifacts
 /target
 **/target
+# Sanitizer builds use a separate target dir so instrumented artifacts never
+# mix with (or invalidate) the release/bench caches.
+/target-asan
 **/*.rs.bk
 *.so
 *.dylib

@@ -3962,15 +3962,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5540,7 +5531,7 @@ dependencies = [
  "pin-project-lite",
  "rand 0.10.2",
  "rcgen",
- "rustls-pemfile",
+ "rustls-pki-types",
  "s2n-tls",
  "s2n-tls-sys",
  "s2n-tls-tokio",
