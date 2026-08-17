@@ -201,6 +201,29 @@ pub enum DownloadBlockKind {
     ServerQuota,
 }
 
+impl DownloadBlockKind {
+    /// Every variant, in gate-reason label order. The Prometheus exporter
+    /// renders one series per variant; deriving the label set from `ALL` keeps
+    /// a new gate reason from silently vanishing off `/metrics`.
+    pub const ALL: [Self; 5] = [
+        Self::None,
+        Self::ManualPause,
+        Self::Scheduled,
+        Self::IspCap,
+        Self::ServerQuota,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ManualPause => "manual_pause",
+            Self::Scheduled => "scheduled",
+            Self::IspCap => "isp_cap",
+            Self::ServerQuota => "server_quota",
+        }
+    }
+}
+
 /// Where a manual queue reorder should land a job. The order only breaks ties
 /// within a dispatch priority band: a LOW job moved to the top still yields to
 /// HIGH/NORMAL work.
@@ -777,6 +800,63 @@ impl SchedulerHandle {
 
     pub fn get_extraction_rejections(&self) -> [u64; 9] {
         self.state.metrics().extraction_rejections()
+    }
+
+    /// Whether the pipeline task is gone.
+    ///
+    /// Reads the command channel's liveness without sending anything through
+    /// it, so a readiness probe can tell "the scheduler died" from "the
+    /// scheduler is busy" — a probe that queued a command behind the pipeline
+    /// loop would fail exactly when the box is most loaded.
+    pub fn is_closed(&self) -> bool {
+        self.cmd_tx.is_closed()
+    }
+
+    /// Count one job accepted into the pipeline, labelled by where it came
+    /// from and which category it landed in.
+    ///
+    /// Called from the submission path, which is the only place that knows the
+    /// origin. Low-frequency by construction (one call per submitted job), so
+    /// the label map behind it is never contended.
+    pub fn note_job_submitted(
+        &self,
+        origin: crate::jobs::SubmissionOrigin,
+        category: Option<&str>,
+    ) {
+        self.state
+            .metrics()
+            .job_lifecycle
+            .note_submitted(origin.as_str(), category.unwrap_or(""));
+    }
+
+    /// Per-server article attempt counters and latency for the servers of the
+    /// currently active NNTP generation.
+    ///
+    /// Read on demand rather than folded into [`MetricsSnapshot`]: the 100 ms
+    /// snapshot tick must stay a fixed-size struct copy with no `Vec` in it.
+    /// This reads through a `RwLock` that is only ever write-locked when a new
+    /// NNTP runtime generation is activated, so it never contends with the
+    /// per-article path that increments the counters.
+    pub fn server_metrics_snapshot(
+        &self,
+    ) -> Vec<crate::operations::instrumentation::ServerMetricsSnapshot> {
+        self.state.metrics().server_metrics.snapshot()
+    }
+
+    /// Job lifecycle counters and duration histograms. Read on demand; see
+    /// [`Self::server_metrics_snapshot`] for why this is not in the tick.
+    pub fn job_lifecycle_metrics_snapshot(
+        &self,
+    ) -> crate::operations::instrumentation::JobLifecycleMetricsSnapshot {
+        self.state.metrics().job_lifecycle.snapshot()
+    }
+
+    /// Pipeline stage duration histograms. Read on demand; see
+    /// [`Self::server_metrics_snapshot`] for why this is not in the tick.
+    pub fn pipeline_histograms_snapshot(
+        &self,
+    ) -> crate::operations::instrumentation::PipelineHistogramsSnapshot {
+        self.state.metrics().pipeline_histograms.snapshot()
     }
 
     /// Get a fresh atomics-based metrics snapshot without advancing the shared

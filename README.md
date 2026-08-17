@@ -90,8 +90,12 @@ when no login is already stored; they never overwrite an existing login.
 
 Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and subscription support. The same API powers the web UI, so anything you can do in the interface is available programmatically.
 
-`/metrics` remains authenticated by default. Give Prometheus a persistent
-Read-scoped Weaver API key using its standard bearer authorization support:
+## Metrics & dashboards
+
+Weaver serves Prometheus metrics at `/metrics` on the same port as the web UI. They cover download throughput, pipeline backpressure, per-server health and quotas, and post-processing — enough to answer "why is this slow right now?" without opening the UI.
+
+`/metrics` is authenticated by default; to disable, set `WEAVER_METRICS_AUTH_REQUIRED=0`.
+Otherwise give Prometheus a persistent Read-scoped Weaver API key using its standard bearer authorization support:
 
 ```yaml
 scrape_configs:
@@ -104,6 +108,8 @@ scrape_configs:
 ```
 
 This sends `Authorization: Bearer <key>` without reusing browser credentials.
+
+See [docs/metrics.md](docs/metrics.md) for the full metric catalogue, label conventions, and useful PromQL. Ready-made [Grafana dashboard](contrib/grafana/weaver-overview.json) and [Prometheus alert rules](contrib/prometheus/weaver-alerts.yml) live under `contrib/`.
 
 ## License
 

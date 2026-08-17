@@ -14,6 +14,40 @@ pub(in crate::pipeline) fn lane_acquire_failure_for_work(
     }
 }
 
+/// Closes one decode task's wall-clock measurement, on whichever path the task
+/// leaves by.
+///
+/// This is the single, deliberate exception to "no clock reads on a
+/// per-segment path". `perf_probe::scope` already pays an unconditional
+/// `Instant::now()` when the task starts; this guard adds the matching read at
+/// the end and feeds the *same* `Duration` to both the profile bucket and the
+/// histogram, so profiling on or off the cost is one extra clock read per
+/// decode task — one per decoded article, roughly one per 750 KB of work, not
+/// one per byte. Everything else on this path stays `Relaxed`-atomic only.
+struct DecodeTaskTimer {
+    scope: Option<crate::runtime::perf_probe::Scope>,
+    metrics: Arc<crate::operations::metrics::PipelineMetrics>,
+}
+
+impl DecodeTaskTimer {
+    fn start(metrics: Arc<crate::operations::metrics::PipelineMetrics>) -> Self {
+        Self {
+            scope: Some(crate::runtime::perf_probe::scope("download.decode.task")),
+            metrics,
+        }
+    }
+}
+
+impl Drop for DecodeTaskTimer {
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope.take() {
+            self.metrics
+                .pipeline_histograms
+                .observe_decode_task(scope.finish());
+        }
+    }
+}
+
 fn send_blocking_decode_failure(
     tx: &mpsc::Sender<DecodeDone>,
     segment_id: SegmentId,
@@ -71,7 +105,7 @@ impl Pipeline {
                 "download.decode.task.enter",
                 Duration::from_nanos(1),
             );
-            let _profile_scope = crate::runtime::perf_probe::scope("download.decode.task");
+            let _decode_task_timer = DecodeTaskTimer::start(Arc::clone(&metrics));
             let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.task");
             crate::runtime::affinity::pin_current_thread_for_hot_download_path();
 

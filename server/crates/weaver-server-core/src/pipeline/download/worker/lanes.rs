@@ -184,6 +184,58 @@ impl Pipeline {
     pub(crate) fn clear_terminal_segment_failures(&mut self, job_id: JobId) {
         self.terminal_segment_failures
             .retain(|segment_id| segment_id.file_id.job_id != job_id);
+        self.files_counted_missing
+            .retain(|file_id| file_id.job_id != job_id);
+    }
+
+    /// Count the files this job could not assemble from articles.
+    ///
+    /// Called once the download pipeline has drained with data files still
+    /// incomplete: that is the moment the remaining segments are known to be
+    /// unavailable across every configured server rather than merely late.
+    /// A file is counted **once**, with the number of segments still missing
+    /// at that moment — not once per failed segment — and the per-job guard
+    /// set keeps the many re-entries of the completion check from counting it
+    /// again. PAR2 may still rebuild the file afterwards; that is a repair,
+    /// and `weaver_repairs_total` is where it is accounted for. What this
+    /// counter answers is how much of the payload Usenet itself could not
+    /// supply.
+    ///
+    /// Per-file, per-job: a `HashMap` lookup and a `HashSet` insert here are
+    /// the same class of work `check_job_completion` around it already does,
+    /// and nothing on a per-segment path reaches this.
+    pub(in crate::pipeline) fn note_incomplete_files_after_download_drain(
+        &mut self,
+        job_id: JobId,
+    ) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let incomplete: Vec<(NzbFileId, u64)> = state
+            .assembly
+            .files()
+            .filter(|file| !file.is_complete())
+            // Recovery volumes are optional by design: an absent PAR2 block is
+            // not a file the job failed to assemble, it is recovery capacity
+            // that was never needed or never fetched.
+            .filter(|file| {
+                !matches!(
+                    file.role(),
+                    weaver_model::files::FileRole::Par2 {
+                        is_index: false,
+                        ..
+                    }
+                )
+            })
+            .map(|file| (file.file_id(), u64::from(file.missing_count())))
+            .collect();
+        for (file_id, missing_segments) in incomplete {
+            if self.files_counted_missing.insert(file_id) {
+                self.metrics
+                    .job_lifecycle
+                    .note_file_missing(missing_segments);
+            }
+        }
     }
 
     fn health_counted_segment_bytes(&self, segment_id: SegmentId) -> u64 {

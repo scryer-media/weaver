@@ -158,7 +158,18 @@ impl Pipeline {
                         self.clear_job_write_backlog(job_id);
                         self.clear_job_progress_floor_runtime(job_id);
                         self.clear_job_phase_progress_runtime(job_id);
+                        self.discard_stage_timers(job_id);
                         self.clear_job_retention_excludes(job_id);
+
+                        // Low-frequency: one observation per cancellation. The
+                        // elapsed span comes from the `Instant` the job state
+                        // already carries, so no extra wall-clock source is
+                        // introduced.
+                        self.metrics.job_lifecycle.note_finished(
+                            crate::operations::instrumentation::JobResultKind::Cancelled,
+                            state.spec.category.as_deref().unwrap_or(""),
+                            Some(state.created_at.elapsed()),
+                        );
 
                         let working_dir = state.working_dir.clone();
                         let staging_dir = state.staging_dir.clone();
@@ -485,6 +496,13 @@ impl Pipeline {
                     // generation also invalidates the failure indices carried by
                     // in-flight delayed retries when they re-enter the queue.
                     self.pool_generation = self.pool_generation.wrapping_add(1);
+                    // Re-point the per-server metric counters at the new pool
+                    // layout. This is the only place the counter vector is
+                    // rebuilt, so the completion path can index it without a
+                    // lock; counters are keyed by stable server id, so lifetime
+                    // totals carry across the rebuild.
+                    self.server_counters =
+                        Self::activate_server_counters(&self.metrics, &self.nntp);
                     let recovery_requeues = self.wake_all_infrastructure_retries();
                     self.clear_retention_exclude_cache();
                     for state in self.jobs.values_mut() {

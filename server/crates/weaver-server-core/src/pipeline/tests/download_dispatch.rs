@@ -996,6 +996,175 @@ async fn terminal_accounting_is_idempotent() {
     assert!(!pipeline.terminal_segment_failures.contains(&segment_id));
 }
 
+/// `weaver_files_missing_total` counts **files**, not failed segments, and it
+/// counts them where the download pass gives up rather than at each permanent
+/// segment failure: two dead segments in one file are one missing file.
+#[tokio::test]
+async fn exhausted_download_counts_one_missing_file_with_its_missing_segments() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20017);
+    let segment_sizes = [4_000u32; 20];
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Silver Horizon", "silver-horizon.mkv", &segment_sizes),
+    )
+    .await;
+
+    // Two of the twenty segments exhaust their retries. Health probes are not
+    // what is under test, so hold them off; the surviving 90% health is above
+    // the no-PAR2 critical threshold either way, so the job stays alive to
+    // reach the completion check below.
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.next_health_probe_failed_bytes = u64::MAX;
+    }
+    for segment_number in 0..2 {
+        pipeline.book_failed_segment(SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number,
+        });
+    }
+    assert!(
+        pipeline.jobs.contains_key(&job_id),
+        "two permanent failures must not be enough to abort the job"
+    );
+
+    // The queues drain with the file still short: nothing else is coming.
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+    }
+
+    let before = pipeline.metrics.job_lifecycle.snapshot();
+    assert_eq!(before.files_missing_total, 0);
+    assert_eq!(before.missing_segments_total, 0);
+
+    pipeline.check_job_completion(job_id).await;
+
+    let snapshot = pipeline.metrics.job_lifecycle.snapshot();
+    // One file, counted once, carrying every segment it never received — not
+    // one row per booked segment failure.
+    assert_eq!(snapshot.files_missing_total, 1);
+    assert_eq!(
+        snapshot.missing_segments_total,
+        u64::from(segment_sizes.len() as u32)
+    );
+}
+
+/// The completion check re-enters many times per job, so the per-file guard is
+/// what keeps `weaver_files_missing_total` from climbing on every pass.
+#[tokio::test]
+async fn missing_files_are_counted_once_across_repeated_completion_checks() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20019);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec(
+            "Silver Horizon Encore",
+            "encore.mkv",
+            &[4_000, 4_000, 4_000],
+        ),
+    )
+    .await;
+
+    for _ in 0..5 {
+        pipeline.note_incomplete_files_after_download_drain(job_id);
+    }
+
+    let snapshot = pipeline.metrics.job_lifecycle.snapshot();
+    assert_eq!(snapshot.files_missing_total, 1);
+    assert_eq!(snapshot.missing_segments_total, 3);
+}
+
+/// A job with no PAR2 set can never produce an `intact`/`damaged`/`missing`
+/// verdict, so it is accounted for as `unverifiable` at its terminal
+/// transition instead of being left out of `weaver_verifications_total`.
+#[tokio::test]
+async fn job_without_par2_records_one_unverifiable_verification() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20018);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Silver Horizon Reprise", "reprise.mkv", &[4_000, 4_000]),
+    )
+    .await;
+    assert!(pipeline.par2_set(job_id).is_none());
+
+    fn unverifiable(pipeline: &Pipeline) -> u64 {
+        pipeline
+            .metrics
+            .job_lifecycle
+            .snapshot()
+            .verifications
+            .iter()
+            .find(|(result, _)| *result == "unverifiable")
+            .map(|(_, count)| *count)
+            .expect("unverifiable is one of the pre-declared verification results")
+    }
+
+    assert_eq!(unverifiable(&pipeline), 0);
+
+    // A live job reaching the decision twice contributes one row: the guard
+    // set is claimed by the first, and a real verdict would have claimed it
+    // first of all.
+    pipeline.note_job_unverifiable_if_no_par2_set(job_id);
+    pipeline.note_job_unverifiable_if_no_par2_set(job_id);
+    assert_eq!(unverifiable(&pipeline), 1);
+
+    // The terminal transition itself is one of those decisions, so a failure
+    // after the fact adds nothing.
+    pipeline.fail_job(job_id, "no article ever landed".to_string());
+    assert_eq!(unverifiable(&pipeline), 1);
+}
+
+/// The same terminal transition on a job that *does* carry a recovery set
+/// records nothing: that job's verdict is the verification pass's to report.
+#[tokio::test]
+async fn job_with_par2_set_records_no_unverifiable_verification() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20020);
+    let payload_filename = "payload.mkv";
+    let payload: Vec<u8> = (0..32u32).map(|value| (value % 251) as u8).collect();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Silver Horizon Recovered",
+            &[(payload_filename.to_string(), payload.len() as u32)],
+        ),
+    )
+    .await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        placement_par2_file_set(&[(payload_filename.to_string(), payload)]),
+        &[],
+    );
+    assert!(pipeline.par2_set(job_id).is_some());
+
+    pipeline.note_job_unverifiable_if_no_par2_set(job_id);
+    pipeline.fail_job(job_id, "disk went away".to_string());
+
+    let verifications = pipeline.metrics.job_lifecycle.snapshot().verifications;
+    assert!(
+        verifications.iter().all(|(_, count)| *count == 0),
+        "a job with a recovery set must not be attributed to any verdict here: {verifications:?}"
+    );
+}
+
 #[tokio::test]
 async fn server_quota_lane_failure_parks_until_retry_at_without_lane_spin() {
     let temp_dir = tempfile::tempdir().unwrap();

@@ -1411,10 +1411,15 @@ impl Pipeline {
         outcome.missing_blocks = outcome.verification.total_missing_blocks;
         self.recompute_volume_safety_from_verification(job_id, &outcome.verification);
 
-        let _ = self.event_tx.send(PipelineEvent::JobVerificationComplete {
+        let passed = !par2_verification_needs_repair(&outcome.verification);
+        self.note_job_verification_result(
             job_id,
-            passed: !par2_verification_needs_repair(&outcome.verification),
-        });
+            passed,
+            outcome.verification.total_missing_blocks,
+        );
+        let _ = self
+            .event_tx
+            .send(PipelineEvent::JobVerificationComplete { job_id, passed });
 
         Ok(outcome)
     }
@@ -1586,10 +1591,11 @@ impl Pipeline {
         self.recompute_volume_safety_from_verification(job_id, &verification);
 
         if emit_events {
-            let _ = self.event_tx.send(PipelineEvent::JobVerificationComplete {
-                job_id,
-                passed: !par2_verification_needs_repair(&verification),
-            });
+            let passed = !par2_verification_needs_repair(&verification);
+            self.note_job_verification_result(job_id, passed, verification.total_missing_blocks);
+            let _ = self
+                .event_tx
+                .send(PipelineEvent::JobVerificationComplete { job_id, passed });
         }
 
         Ok((verification, placement_plan))
@@ -1639,10 +1645,72 @@ impl Pipeline {
         self.finalize_ready_direct_sets(job_id).await;
     }
 
-    fn emit_job_verification_started(&self, job_id: JobId) {
+    fn emit_job_verification_started(&mut self, job_id: JobId) {
+        // Low-frequency: a job enters PAR2 verification a handful of times, so
+        // arming the stage timer here costs one clock read per pass and never
+        // touches an article path.
+        self.note_stage_started(
+            job_id,
+            crate::operations::instrumentation::JobStageKind::Verify,
+        );
         let _ = self
             .event_tx
             .send(PipelineEvent::JobVerificationStarted { job_id });
+    }
+
+    /// Fold one job-level PAR2 verification verdict into the lifecycle metrics
+    /// and close the verify stage timer.
+    ///
+    /// Low-frequency: one call per verification pass, never per segment. The
+    /// four-way label is derived from what the pass actually produced — a pass
+    /// that needs repair and found nothing at all on disk is `missing`, one
+    /// that needs repair with blocks present is `damaged`.
+    fn note_job_verification_result(&mut self, job_id: JobId, passed: bool, missing_blocks: u32) {
+        use crate::operations::instrumentation::{JobStageKind, VerificationOutcomeKind};
+        let outcome = if passed {
+            VerificationOutcomeKind::Intact
+        } else if missing_blocks > 0 {
+            VerificationOutcomeKind::Missing
+        } else {
+            VerificationOutcomeKind::Damaged
+        };
+        // Claim the job before recording, so a later `unverifiable` fallback
+        // cannot add a second row for a job an actual pass already ruled on.
+        // Re-verification of the same job (verify, repair, verify again) is a
+        // real second outcome and still counts, which is why the claim gates
+        // only the fallback and not this.
+        self.jobs_with_verification_outcome.insert(job_id);
+        self.metrics.job_lifecycle.note_verification(outcome);
+        self.note_stage_finished(job_id, JobStageKind::Verify);
+    }
+
+    /// Record that this job ended with no PAR2 verdict to be had.
+    ///
+    /// A job with no recovery set can never produce `intact`, `damaged` or
+    /// `missing`: there is nothing to verify the payload against. Without
+    /// this, such jobs contribute nothing at all to
+    /// `weaver_verifications_total`, and the ratio of verified to unverified
+    /// downloads — the thing an operator actually wants from that series — is
+    /// unanswerable.
+    ///
+    /// Low-frequency: at most one call per job, at the terminal transition.
+    /// The guard set is the same per-job set a real verdict claims, so the two
+    /// can never both fire for one job.
+    pub(in crate::pipeline) fn note_job_verification_unavailable(&mut self, job_id: JobId) {
+        use crate::operations::instrumentation::VerificationOutcomeKind;
+        if self.jobs_with_verification_outcome.insert(job_id) {
+            self.metrics
+                .job_lifecycle
+                .note_verification(VerificationOutcomeKind::Unverifiable);
+        }
+    }
+
+    /// Called at the two terminal transitions — the final move and job failure
+    /// — to attribute a job that never had a recovery set.
+    pub(in crate::pipeline) fn note_job_unverifiable_if_no_par2_set(&mut self, job_id: JobId) {
+        if self.par2_set(job_id).is_none() {
+            self.note_job_verification_unavailable(job_id);
+        }
     }
 
     async fn quick_verify_par2_with_placement(
@@ -2639,6 +2707,12 @@ impl Pipeline {
         let download_pipeline_exhausted = !self.job_has_pending_download_pipeline_work(job_id);
         if download_pipeline_exhausted {
             self.emit_download_pipeline_drained_if_pending(job_id);
+            if has_incomplete_data_files {
+                // The download pass is over and files are still short of
+                // segments: this is where "cannot be assembled from articles"
+                // becomes a fact rather than a race with work still in flight.
+                self.note_incomplete_files_after_download_drain(job_id);
+            }
         }
         let only_rar_archives = self.job_has_only_rar_archives(job_id);
 
@@ -3496,6 +3570,13 @@ impl Pipeline {
                                     outcome.files_missing
                                 );
                                 warn!(job_id = job_id.0, error = %msg);
+                                // Low-frequency: one observation per job-level repair, never on a
+                                // per-segment path. Records the metric next to the event that already
+                                // announces the same fact.
+                                self.metrics.job_lifecycle.note_repair(
+                                    crate::operations::instrumentation::StageOutcomeKind::Failed,
+                                    0,
+                                );
                                 let _ = self.event_tx.send(PipelineEvent::RepairFailed {
                                     job_id,
                                     error: msg.clone(),
@@ -3516,6 +3597,13 @@ impl Pipeline {
                                 files_damaged = outcome.files_damaged,
                                 files_missing = outcome.files_missing,
                                 "PAR2 repair complete"
+                            );
+                            // Low-frequency: one observation per job-level repair, never on a
+                            // per-segment path. Records the metric next to the event that already
+                            // announces the same fact.
+                            self.metrics.job_lifecycle.note_repair(
+                                crate::operations::instrumentation::StageOutcomeKind::Complete,
+                                u64::from(slices_repaired),
                             );
                             let _ = self.event_tx.send(PipelineEvent::RepairComplete {
                                 job_id,
@@ -3590,6 +3678,13 @@ impl Pipeline {
                         }
                         Err(error_msg) => {
                             warn!(job_id = job_id.0, error = %error_msg, "PAR2 repair failed");
+                            // Low-frequency: one observation per job-level repair, never on a
+                            // per-segment path. Records the metric next to the event that already
+                            // announces the same fact.
+                            self.metrics.job_lifecycle.note_repair(
+                                crate::operations::instrumentation::StageOutcomeKind::Failed,
+                                0,
+                            );
                             let _ = self.event_tx.send(PipelineEvent::RepairFailed {
                                 job_id,
                                 error: error_msg.clone(),
@@ -3902,6 +3997,13 @@ impl Pipeline {
                                 files_missing = outcome.files_missing,
                                 "PAR2 repair complete"
                             );
+                            // Low-frequency: one observation per job-level repair, never on a
+                            // per-segment path. Records the metric next to the event that already
+                            // announces the same fact.
+                            self.metrics.job_lifecycle.note_repair(
+                                crate::operations::instrumentation::StageOutcomeKind::Complete,
+                                u64::from(slices_repaired),
+                            );
                             let _ = self.event_tx.send(PipelineEvent::RepairComplete {
                                 job_id,
                                 slices_repaired,
@@ -4021,6 +4123,13 @@ impl Pipeline {
                         }
                         Err(error_msg) => {
                             warn!(job_id = job_id.0, error = %error_msg, "PAR2 repair failed");
+                            // Low-frequency: one observation per job-level repair, never on a
+                            // per-segment path. Records the metric next to the event that already
+                            // announces the same fact.
+                            self.metrics.job_lifecycle.note_repair(
+                                crate::operations::instrumentation::StageOutcomeKind::Failed,
+                                0,
+                            );
                             let _ = self.event_tx.send(PipelineEvent::RepairFailed {
                                 job_id,
                                 error: error_msg.clone(),
@@ -4282,6 +4391,12 @@ impl Pipeline {
                 }
 
                 info!(job_id = job_id.0, "extraction complete");
+                // Low-frequency: one observation per job-level extraction, never on a
+                // per-segment path. Records the metric next to the event that already
+                // announces the same fact.
+                self.metrics.job_lifecycle.note_extraction(
+                    crate::operations::instrumentation::StageOutcomeKind::Complete,
+                );
                 let _ = self
                     .event_tx
                     .send(PipelineEvent::ExtractionComplete { job_id });

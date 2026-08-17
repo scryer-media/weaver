@@ -4,7 +4,8 @@ use crate::jobs::{DuplicateAction, DuplicatePolicy};
 use crate::persistence::Database;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
-    BufferPoolOverrides, Config, DirectStoreOverrides, RetryOverrides, TunerOverrides,
+    BufferPoolOverrides, Config, DirectStoreOverrides, MetricsConfig, PerJobSeries, RetryOverrides,
+    TunerOverrides,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
@@ -217,6 +218,13 @@ impl Database {
             .unwrap_or(default_duplicate_policy.normalized_name),
         };
 
+        let metrics = MetricsConfig {
+            per_job_series: settings
+                .get("metrics.per_job_series")
+                .map(|value| PerJobSeries::from_str_or_default(value))
+                .unwrap_or_default(),
+        };
+
         Ok(Config {
             data_dir,
             intermediate_dir,
@@ -233,6 +241,7 @@ impl Database {
             watch_folder,
             duplicate_policy,
             direct_store,
+            metrics,
             config_path: None,
         })
     }
@@ -368,6 +377,11 @@ impl Database {
                 self.set_setting("retry.multiplier", &v.to_string())?;
             }
         }
+
+        self.set_setting(
+            "metrics.per_job_series",
+            config.metrics.per_job_series.as_str(),
+        )?;
 
         self.replace_servers(&config.servers)?;
         self.replace_categories(&config.categories)?;

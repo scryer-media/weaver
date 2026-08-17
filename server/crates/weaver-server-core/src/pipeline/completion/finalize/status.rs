@@ -838,6 +838,9 @@ impl Pipeline {
         self.live_par2.remove_job(job_id);
         self.block_crcs.forget_job(job_id);
         self.par2_verified.remove(&job_id);
+        // A reprocessed job runs its verification again, so it must be able to
+        // record a fresh outcome.
+        self.jobs_with_verification_outcome.remove(&job_id);
         self.unavailable_promoted_recovery_segments
             .retain(|segment_id| segment_id.file_id.job_id != job_id);
     }

@@ -19,6 +19,36 @@ pub(crate) struct RarExtractionContext<'a> {
     pub(crate) phase_attempt: Option<Arc<PhaseAttemptCounters>>,
 }
 
+/// Times one archive-member extraction end to end, closing on whichever path
+/// the extraction leaves by — including the early guardrail rejections.
+///
+/// A member is thousands of articles' worth of work, so unlike the decode task
+/// this wall clock is nowhere near a per-segment path: it is the same class of
+/// low-frequency event as a verification or a repair. `cpu_scope` above still
+/// reports thread CPU time for the profiler; this reports the wall time the
+/// operator's `weaver_pipeline_extract_member_duration_seconds` needs.
+struct MemberExtractionTimer {
+    metrics: Arc<PipelineMetrics>,
+    started: std::time::Instant,
+}
+
+impl MemberExtractionTimer {
+    fn start(metrics: Arc<PipelineMetrics>) -> Self {
+        Self {
+            metrics,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for MemberExtractionTimer {
+    fn drop(&mut self) {
+        self.metrics
+            .pipeline_histograms
+            .observe_extract_member(self.started.elapsed());
+    }
+}
+
 struct PhaseAttemptRollbackGuard {
     attempt: Option<Arc<PhaseAttemptCounters>>,
 }
@@ -428,6 +458,7 @@ impl Pipeline {
                 )?
             }
         };
+        let _member_timer = MemberExtractionTimer::start(Arc::clone(budget.metrics()));
         let phase_guard = PhaseAttemptRollbackGuard::new(phase_attempt);
         let member = archive
             .member_info(idx)

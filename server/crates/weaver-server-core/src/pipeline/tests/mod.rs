@@ -98,6 +98,7 @@ impl TestHarness {
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
+            metrics: Default::default(),
             config_path: None,
         }));
 
@@ -241,6 +242,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         download_queue: DownloadQueue::new(),
         recovery_queue: DownloadQueue::new(),
         staging_dir: None,
+        category_bytes: None,
     }
 }
 
@@ -385,6 +387,7 @@ async fn new_direct_pipeline_at_roots(
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store,
+        metrics: Default::default(),
         config_path: None,
     }));
 
@@ -1479,6 +1482,7 @@ async fn insert_active_job_with_persisted_nzb_named(
             download_queue,
             recovery_queue,
             staging_dir: None,
+            category_bytes: None,
         },
     );
     pipeline.job_order.push(job_id);

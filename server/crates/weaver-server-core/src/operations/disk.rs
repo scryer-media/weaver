@@ -1,4 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use crate::operations::instrumentation::DiskSpaceSnapshot;
 
 /// Capacity for the filesystem backing a path.
 #[derive(Debug, Clone, Copy)]
@@ -79,5 +83,97 @@ pub fn disk_space(path: &Path) -> Option<DiskSpace> {
     {
         let _ = path;
         None
+    }
+}
+
+/// TTL-cached capacity sampler for the configured directory roles.
+///
+/// `statvfs`/`GetDiskFreeSpaceExW` are cheap but not free, and a metrics scrape
+/// can arrive far more often than free space meaningfully changes. The cache
+/// keeps a scrape storm from turning into a syscall storm. Nothing here runs on
+/// a pipeline path — it is called only from the exporter.
+#[derive(Debug)]
+pub struct DiskSpaceCollector {
+    roles: Vec<(&'static str, PathBuf)>,
+    cache: Mutex<Option<(Instant, Vec<DiskSpaceSnapshot>)>>,
+}
+
+impl DiskSpaceCollector {
+    /// `roles` pairs a stable role label (`data`, `intermediate`, `complete`)
+    /// with the directory configured for it.
+    pub fn new(roles: Vec<(&'static str, PathBuf)>) -> Self {
+        Self {
+            roles,
+            cache: Mutex::new(None),
+        }
+    }
+
+    /// Sample every role, re-using the previous result while it is younger than
+    /// `ttl`. Roles whose path cannot be stat'd (not created yet, unmounted)
+    /// are omitted rather than reported as zero-capacity.
+    pub fn sample(&self, ttl: Duration) -> Vec<DiskSpaceSnapshot> {
+        let now = Instant::now();
+        {
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some((sampled_at, snapshots)) = cache.as_ref()
+                && now.duration_since(*sampled_at) < ttl
+            {
+                return snapshots.clone();
+            }
+        }
+
+        let snapshots = self
+            .roles
+            .iter()
+            .filter_map(|(role, path)| {
+                disk_space(path).map(|space| DiskSpaceSnapshot {
+                    role,
+                    path: path.display().to_string(),
+                    total_bytes: space.total_bytes,
+                    available_bytes: space.available_bytes,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        *self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((now, snapshots.clone()));
+        snapshots
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collector_reports_a_row_per_stattable_role() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let collector = DiskSpaceCollector::new(vec![
+            ("data", dir.path().to_path_buf()),
+            ("intermediate", dir.path().join("does-not-exist")),
+        ]);
+        let snapshots = collector.sample(Duration::from_secs(30));
+        assert_eq!(snapshots.len(), 1, "unstattable roles are omitted");
+        assert_eq!(snapshots[0].role, "data");
+        assert!(snapshots[0].total_bytes > 0);
+    }
+
+    #[test]
+    fn collector_serves_the_cache_within_the_ttl() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let collector = DiskSpaceCollector::new(vec![("data", dir.path().to_path_buf())]);
+        let first = collector.sample(Duration::from_secs(3600));
+        let second = collector.sample(Duration::from_secs(3600));
+        assert_eq!(first, second);
+
+        // A zero TTL always re-samples; the shape must stay stable.
+        let third = collector.sample(Duration::ZERO);
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].role, "data");
     }
 }

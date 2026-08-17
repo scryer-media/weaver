@@ -352,6 +352,14 @@ impl ServerHealth {
         &self.state
     }
 
+    /// How many times this server has been disabled since process start. Drives
+    /// the exponential re-enable backoff and is exported as a monitoring
+    /// counter — a server that keeps flapping shows a climbing value even when
+    /// each individual outage is short enough to miss a scrape.
+    pub fn disable_count(&self) -> u32 {
+        self.disable_count
+    }
+
     /// If the server is disabled and the backoff period has elapsed, transition
     /// back to Degraded for a probationary period. The consecutive failure count
     /// is set to one below the disable threshold so that a single additional
@@ -858,6 +866,15 @@ mod tests {
         assert!(!health.is_available());
         assert_eq!(health.failure_count, 1);
         assert_eq!(health.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn disable_count_is_observable() {
+        let mut health = ServerHealth::new(test_config());
+        assert_eq!(health.disable_count(), 0);
+
+        health.record_failure(true);
+        assert_eq!(health.disable_count(), 1);
     }
 
     #[test]

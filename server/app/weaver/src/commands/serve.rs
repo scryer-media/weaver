@@ -149,6 +149,16 @@ pub(crate) async fn run(
 
     // Create and start the pipeline.
     let maintenance_complete_dir = complete_dir.clone();
+    // Captured before the directories move into the pipeline. The collector
+    // stats these paths at scrape time, TTL-cached, so it never runs on a
+    // pipeline path.
+    let disk_space_collector = Arc::new(
+        weaver_server_core::operations::disk::DiskSpaceCollector::new(vec![
+            ("data", data_dir.clone()),
+            ("intermediate", intermediate_dir.clone()),
+            ("complete", complete_dir.clone()),
+        ]),
+    );
     let mut pipeline = Pipeline::new(
         cmd_rx,
         event_tx,
@@ -200,6 +210,7 @@ pub(crate) async fn run(
         db.clone(),
         nntp_pool,
         Arc::clone(&server_transfer_policy),
+        shared_config.clone(),
     );
 
     let mut pipeline_task = tokio::spawn(async move {
@@ -229,8 +240,10 @@ pub(crate) async fn run(
         watch_folder: watch_folder.clone(),
         metrics_exporter,
         config: shared_config.clone(),
+        http_metrics: http::HttpMetricsHandle::new(base_url.clone()),
         base_url,
         security,
+        disk_space: disk_space_collector,
     };
     let mut server_task = tokio::spawn(http::run_server(server_runtime, addr));
 

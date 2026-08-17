@@ -1,0 +1,199 @@
+# Prometheus alerting rules for Weaver.
+#
+# Load with:
+#   rule_files:
+#     - /etc/prometheus/weaver-alerts.yml
+#
+# Every rule keys on `server_id` where a server is involved, because that label
+# survives a hostname change; `server` is carried along for the annotation text.
+groups:
+  - name: weaver
+    rules:
+      - alert: WeaverDown
+        expr: up{job="weaver"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Weaver is not being scraped"
+          description: >-
+            Prometheus has not scraped Weaver at {{ $labels.instance }} for 5
+            minutes. Check that the process is running and that /metrics is
+            still reachable with the configured credentials.
+
+      - alert: WeaverServerDisabled
+        expr: weaver_server_state{state="disabled"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Usenet server {{ $labels.server }} is disabled"
+          description: >-
+            Weaver has taken {{ $labels.server }} (server_id
+            {{ $labels.server_id }}) out of rotation for over 5 minutes.
+            weaver_server_state_reason gives the cause; auth_failure means bad
+            credentials, failure_ratio means the provider is failing a steady
+            fraction of requests.
+
+      - alert: WeaverServerFlapping
+        expr: increase(weaver_server_disabled_total[1h]) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "Usenet server {{ $labels.server }} keeps being disabled"
+          description: >-
+            {{ $labels.server }} has been disabled
+            {{ $value | printf "%.0f" }} times in the last hour. Short outages
+            can hide between scrapes, so treat this as a provider problem even
+            if the server currently looks healthy.
+
+      - alert: WeaverAllServersUnavailable
+        expr: >-
+          sum by (instance) (weaver_server_state{state="healthy"})
+            + sum by (instance) (weaver_server_state{state="degraded"})
+            == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No usable Usenet server on {{ $labels.instance }}"
+          description: >-
+            Every configured server is cooling down or disabled, so nothing can
+            download.
+
+      - alert: WeaverDownloadsGatedByIspCap
+        expr: weaver_pipeline_download_gate{reason="isp_cap"} == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Downloads blocked by the ISP bandwidth cap"
+          description: >-
+            The configured ISP cap has been holding downloads for 15 minutes.
+            weaver_bandwidth_cap_remaining_bytes shows what is left, and
+            weaver_bandwidth_cap_window_end_seconds when the window rolls over.
+
+      - alert: WeaverDownloadsGatedByServerQuota
+        expr: weaver_pipeline_download_gate{reason="server_quota"} == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Downloads blocked by a per-server quota"
+          description: >-
+            Every server with work available has exhausted its quota window.
+            Check weaver_server_download_quota_blocked to see which.
+
+      - alert: WeaverHardPressureStall
+        expr: weaver_pipeline_download_pressure_current_stall_seconds > 600
+        labels:
+          severity: critical
+        annotations:
+          summary: "Download pipeline stalled on backpressure for 10m"
+          description: >-
+            Hard backpressure has been holding dispatch for
+            {{ $value | printf "%.0f" }}s.
+            weaver_pipeline_download_pressure_reason says whether decode, write,
+            or both are behind; a write-side stall usually means the disk or the
+            destination filesystem, not Weaver.
+
+      - alert: WeaverPostProcessingFailures
+        expr: >-
+          rate(weaver_post_processing_attempts_total{result="failed"}[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Post-processing scripts are failing"
+          description: >-
+            Post-processing has been failing continuously for 15 minutes at
+            {{ $value | printf "%.3f" }} failures/s. Check the script exit codes
+            in the job history.
+
+      - alert: WeaverServerQuotaNearlyExhausted
+        expr: >-
+          weaver_server_download_quota_enabled == 1
+          and
+          (
+            weaver_server_download_quota_used_bytes
+              / clamp_min(weaver_server_download_quota_limit_bytes, 1)
+          ) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.server }} has used over 90% of its quota"
+          description: >-
+            {{ $labels.server }} (server_id {{ $labels.server_id }}) is at
+            {{ $value | humanizePercentage }} of its download quota for the
+            current window. Downloads will start spilling to lower-priority
+            servers, or stop, when it runs out.
+
+      - alert: WeaverIspCapNearlyExhausted
+        expr: >-
+          weaver_bandwidth_cap_enabled == 1
+          and
+          (
+            weaver_bandwidth_cap_used_bytes
+              / clamp_min(weaver_bandwidth_cap_limit_bytes, 1)
+          ) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ISP bandwidth cap over 90% consumed"
+          description: >-
+            {{ $value | humanizePercentage }} of the configured ISP cap has been
+            used in the current window.
+
+      - alert: WeaverServerArticleMissRatioHigh
+        # The `and` clause is a volume floor: on a quiet server two misses out
+        # of five attempts is a 40% ratio and means nothing. 100 attempts over
+        # the window is enough for the ratio to carry signal.
+        expr: >-
+          (
+            sum by (server_id, server) (rate(weaver_server_article_attempts_total{outcome="not_found"}[15m]))
+              / clamp_min(sum by (server_id, server) (rate(weaver_server_article_attempts_total[15m])), 0.001)
+          ) > 0.05
+          and
+          sum by (server_id, server) (increase(weaver_server_article_attempts_total[15m])) >= 100
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.server }} is missing over 5% of articles"
+          description: >-
+            {{ $labels.server }} (server_id {{ $labels.server_id }}) answered
+            {{ $value | humanizePercentage }} of article requests with "not
+            found" over the last 15 minutes. That is a retention problem on the
+            provider's side: jobs will increasingly need PAR2 repair or fail
+            outright, and a backup server will be carrying the difference.
+
+      - alert: WeaverCompleteDiskAlmostFull
+        expr: >-
+          weaver_disk_available_bytes{role="complete"}
+            / clamp_min(weaver_disk_total_bytes{role="complete"}, 1)
+          < 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Completed-downloads filesystem is nearly full"
+          description: >-
+            Only {{ $value | humanizePercentage }} of {{ $labels.path }} is
+            free. Weaver moves finished jobs here, so extraction and the final
+            move will start failing before the disk is completely full.
+
+      - alert: WeaverSegmentsFailingPermanently
+        expr: >-
+          rate(weaver_pipeline_segments_failed_permanent_total[30m]) > 0.5
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Segments are failing permanently"
+          description: >-
+            {{ $value | printf "%.2f" }} segments/s are exhausting their retries.
+            Sustained loss at this rate usually means retention or a provider
+            problem rather than transient errors, and jobs will start needing
+            PAR2 repair or failing outright.

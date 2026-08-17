@@ -113,6 +113,7 @@ impl Pipeline {
             configured_connections: total_connections,
             effective_connections: nntp.pool().effective_connection_capacity(),
         });
+        let server_counters = Self::activate_server_counters(&metrics, &nntp);
         let owned_download_lane_pool =
             download::owned_lane::OwnedDownloadLanePool::new(total_connections.max(1));
         shared_state.set_paused(initial_global_paused);
@@ -170,6 +171,7 @@ impl Pipeline {
             pending_retries_by_segment: HashMap::new(),
             download_wait_by_job: HashMap::new(),
             terminal_segment_failures: HashSet::new(),
+            files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),
             intermediate_dir,
             complete_dir,
@@ -217,6 +219,8 @@ impl Pipeline {
             retry_rx,
             infrastructure_retries: infrastructure_retry::InfrastructureRetryQueue::default(),
             pool_generation: 0,
+            server_counters,
+            job_stage_started_at: HashMap::new(),
             capacity_probe_result_tx,
             capacity_probe_result_rx,
             probe_result_tx,
@@ -292,6 +296,7 @@ impl Pipeline {
             pending_concat: HashMap::new(),
             par2_bypassed: HashSet::new(),
             par2_verified: HashSet::new(),
+            jobs_with_verification_outcome: HashSet::new(),
             post_processing_repair_reentered: HashSet::new(),
             post_processing_repair_return_to_terminal: HashSet::new(),
             unavailable_promoted_recovery_segments: HashSet::new(),
@@ -383,6 +388,31 @@ impl Pipeline {
 
     pub fn nntp_pool(&self) -> Arc<weaver_nntp::pool::NntpPool> {
         self.nntp.pool().clone()
+    }
+
+    /// Point the per-server metric counters at the servers of `nntp`.
+    ///
+    /// Called only when an NNTP runtime generation is activated (startup and
+    /// every `RebuildNntp`), never on an article path. The registry re-uses the
+    /// counters of any stable server id it has already seen, so a server that
+    /// survives a config reload keeps its lifetime totals even though its
+    /// runtime index may have moved.
+    pub(in crate::pipeline) fn activate_server_counters(
+        metrics: &PipelineMetrics,
+        nntp: &NntpClient,
+    ) -> Vec<Arc<crate::operations::instrumentation::ServerCounters>> {
+        let pool = nntp.pool();
+        let stable_ids = (0..pool.server_count())
+            .map(|index| {
+                pool.stable_server_id(weaver_nntp::pool::ServerId(index))
+                    .map(|stable| stable.0)
+                    // A pool entry with no durable identity can only come from a
+                    // synthetic config; index it by position so its counters are
+                    // still addressable rather than dropping the server.
+                    .unwrap_or(index as u32)
+            })
+            .collect::<Vec<_>>();
+        metrics.server_metrics.activate(&stable_ids)
     }
 
     pub(in crate::pipeline) fn drive_capacity_probes_at(&self, now: tokio::time::Instant) {

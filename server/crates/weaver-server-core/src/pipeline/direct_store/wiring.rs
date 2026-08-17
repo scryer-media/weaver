@@ -2103,6 +2103,13 @@ impl Pipeline {
         self.metrics
             .direct_sets_repaired_while_direct
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Low-frequency: one observation per job-level repair, never on a
+        // per-segment path. Records the metric next to the event that already
+        // announces the same fact.
+        self.metrics.job_lifecycle.note_repair(
+            crate::operations::instrumentation::StageOutcomeKind::Complete,
+            outcome.recovery_blocks_used as u64,
+        );
         let _ = self.event_tx.send(PipelineEvent::RepairComplete {
             job_id,
             slices_repaired: u32::try_from(outcome.recovery_blocks_used).unwrap_or(u32::MAX),

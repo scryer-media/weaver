@@ -6,6 +6,7 @@ pub(crate) mod fs;
 pub mod log_buffer;
 pub(crate) mod perf_probe;
 pub mod postprocess_pool;
+pub mod process_metrics;
 pub mod reload;
 pub mod system_probe;
 pub mod system_profile;

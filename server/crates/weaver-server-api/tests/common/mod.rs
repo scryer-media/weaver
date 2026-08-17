@@ -184,6 +184,7 @@ impl TestHarness {
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             direct_store: None,
+            metrics: Default::default(),
             config_path: None,
         };
         let shared_config: SharedConfig = Arc::new(RwLock::new(config));
@@ -568,6 +569,7 @@ fn spawn_test_scheduler(
                         download_queue: DownloadQueue::new(),
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
+                        category_bytes: None,
                         restored_download_floor_bytes: 0,
                     };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
@@ -716,6 +718,7 @@ fn spawn_test_scheduler(
                         download_queue: DownloadQueue::new(),
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
+                        category_bytes: None,
                         restored_download_floor_bytes: 0,
                     };
                     jobs.insert(job_id, state);

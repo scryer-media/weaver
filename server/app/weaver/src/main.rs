@@ -2,18 +2,22 @@ mod args;
 mod bootstrap;
 mod commands;
 mod http;
+mod logging;
 mod shutdown;
 mod wiring;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use tracing::error;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 use crate::args::{Cli, Command};
+use crate::logging::{LogColor, LogFormat};
 
 const LOG_FILE_ENV: &str = "WEAVER_LOG_FILE";
 const DOTENV_FILE: &str = ".env";
@@ -65,9 +69,19 @@ async fn async_main() {
     let config_path = cli.resolved_config_path();
     let Cli {
         log_file: log_file_override,
+        log_format: log_format_override,
         command,
         ..
     } = cli;
+    let log_format = LogFormat::resolve(
+        log_format_override.as_deref(),
+        std::env::var_os(logging::LOG_FORMAT_ENV).as_ref(),
+    );
+    let log_color = LogColor::resolve(std::env::var_os(logging::LOG_COLOR_ENV).as_ref());
+    let stdout_ansi = log_color.should_colour(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").is_some(),
+    );
     let command = command.unwrap_or_else(Command::default_serve);
 
     let log_ring_buffer =
@@ -75,7 +89,6 @@ async fn async_main() {
     let buffer_layer = tracing_subscriber::fmt::layer()
         .with_writer(LogBufferWriter(log_ring_buffer.clone()))
         .with_ansi(false);
-    let stdout_layer = tracing_subscriber::fmt::layer();
     let env_log_file = std::env::var_os(LOG_FILE_ENV).map(PathBuf::from);
     let log_file_config = resolve_log_file_config(
         log_file_override.as_deref(),
@@ -104,16 +117,37 @@ async fn async_main() {
         }
         None => None,
     };
-    let log_file_layer = log_file_writer.map(|writer| {
-        tracing_subscriber::fmt::layer()
-            .with_writer(LogFileMakeWriter(writer))
-            .with_ansi(false)
+    // The in-memory ring buffer always keeps the human-readable line format:
+    // the web log viewer parses it, so a JSON stdout must not reformat it.
+    let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![Box::new(buffer_layer)];
+    layers.push(match log_format {
+        LogFormat::Json => Box::new(tracing_subscriber::fmt::layer().json()),
+        LogFormat::Text => Box::new(tracing_subscriber::fmt::layer().with_ansi(stdout_ansi)),
     });
+    if let Some(writer) = log_file_writer {
+        layers.push(match log_format {
+            LogFormat::Json => Box::new(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(LogFileMakeWriter(writer)),
+            ),
+            LogFormat::Text => Box::new(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(LogFileMakeWriter(writer))
+                    .with_ansi(false),
+            ),
+        });
+    }
     tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
-        .with(stdout_layer)
-        .with(buffer_layer)
-        .with(log_file_layer)
+        .with(layers)
+        // `from_default_env()` alone resolves to ERROR-only when RUST_LOG is
+        // unset, which left a default install with effectively no operational
+        // logging. INFO is the floor now; RUST_LOG still overrides it wholesale.
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
         .init();
     install_panic_hook();
 

@@ -130,6 +130,7 @@ fn config_roundtrip() {
             enabled: Some(true),
             holds_scratch_ceiling_bytes: Some(128 * 1024 * 1024),
         }),
+        metrics: Default::default(),
         config_path: None,
     };
 

@@ -503,6 +503,9 @@ async fn submit_prepared_nzb(
             .clone()
             .unwrap_or_else(|| format!("job-{}.nzb", job_id.0)),
     );
+    // Captured before `spec` moves into the scheduler; the submission origin is
+    // only knowable here, so this is where the submitted counter is recorded.
+    let submitted_category = spec.category.clone();
 
     if let Err(error) = handle
         .add_job_with_options(
@@ -540,6 +543,8 @@ async fn submit_prepared_nzb(
         rollback_accepted_submission(db, job_id, superseded_job_id, true).await;
         return Err(error.into());
     }
+
+    handle.note_job_submitted(options.origin, submitted_category.as_deref());
 
     info!(
         job_id = job_id.0,
@@ -630,6 +635,9 @@ pub async fn materialize_semantic_promotion(
         return Err(SubmitNzbError::Empty);
     }
 
+    // Captured before the source's fields move into the spec; the promoted job
+    // needs the same `(origin, category)` labels an ordinary submission gets.
+    let promoted_category = source.category.clone();
     let spec = nzb_to_submission_spec(
         &nzb,
         source.filename.as_deref(),
@@ -665,6 +673,21 @@ pub async fn materialize_semantic_promotion(
         .await;
         return Err(error.into());
     }
+
+    // A promotion puts a job in the queue that `submit_nzb` never counted: the
+    // candidate was parked at admission time, before it had a queue entry. The
+    // claim carries no intake origin of its own — the durable snapshot's
+    // `origin` column is free-form text that also holds non-submission values
+    // like the fingerprint backfill marker, so it cannot be read back as a
+    // `SubmissionOrigin` — and this *is* an internal requeue of content whose
+    // first attempt did not finish, which is what `internal-redownload` names.
+    // Recorded after the scheduler accepted the job, exactly as the ordinary
+    // submission path does.
+    handle.note_job_submitted(
+        crate::jobs::SubmissionOrigin::InternalRedownload,
+        promoted_category.as_deref(),
+    );
+
     let db = db.clone();
     let completed = tokio::task::spawn_blocking(move || {
         db.complete_semantic_promotion_claim(job_id, generation)

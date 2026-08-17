@@ -412,6 +412,7 @@ fn build_service(
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
+        metrics: Default::default(),
         config_path: None,
     }));
     let handle = test_scheduler_handle(submissions);
