@@ -83,9 +83,6 @@ pub struct FileAssembly {
     /// A repeated article leaves no reliable proof that all writes had a
     /// single, unambiguous source. Keep fast PAR2 evidence conservative.
     has_duplicate_segments: bool,
-    /// A decoded article whose length differs from the NZB-declared segment
-    /// length cannot prove gap-free, overlap-free file assembly.
-    has_length_mismatch: bool,
 }
 
 /// Result of committing a segment to assembly.
@@ -128,7 +125,6 @@ impl FileAssembly {
             received_bytes: 0,
             placements: BTreeMap::new(),
             has_duplicate_segments: false,
-            has_length_mismatch: false,
         }
     }
 
@@ -186,12 +182,12 @@ impl FileAssembly {
             });
         }
 
-        // Mark as received.
-        let expected_size = self.cumulative_offsets[segment_number as usize + 1]
-            - self.cumulative_offsets[segment_number as usize];
-        if u64::from(decoded_size) != expected_size {
-            self.has_length_mismatch = true;
-        }
+        // NOTE: decoded_size is never compared against the NZB-declared
+        // segment size on purpose — declared sizes are yEnc-ENCODED (~3%
+        // larger than decoded on every real post), so such a comparison is
+        // not a corruption signal. Gap-free, overlap-free assembly is proven
+        // from the recorded placements instead; see
+        // `contiguous_placements_proven`.
         self.received.set(segment_number as usize, true);
         self.received_bytes += decoded_size as u64;
 
@@ -206,7 +202,6 @@ impl FileAssembly {
         self.received_bytes = 0;
         self.placements.clear();
         self.has_duplicate_segments = false;
-        self.has_length_mismatch = false;
     }
 
     pub fn mark_complete(&mut self) {
@@ -305,9 +300,29 @@ impl FileAssembly {
         self.has_duplicate_segments
     }
 
-    /// Whether any committed article differed from its declared segment size.
-    pub fn has_length_mismatch(&self) -> bool {
-        self.has_length_mismatch
+    /// Whether the recorded placements prove a gap-free, overlap-free
+    /// decoded tiling of `[0, received_bytes())`.
+    ///
+    /// Placements are recorded from each accepted article's own bounded
+    /// header before its write, and `placement_conflict` refuses overlaps on
+    /// the way in, so a complete file whose placements start at zero, abut
+    /// exactly in ordinal order, and sum to the decoded total was assembled
+    /// with no gap and no overlap. Files completed by verification or repair
+    /// rather than by decode have no such observations and prove nothing
+    /// here — deliberately: this proof licenses whole-file CRC evidence, and
+    /// only the decode path measured what it wrote.
+    pub fn contiguous_placements_proven(&self) -> bool {
+        if !self.is_complete() || self.placements.len() != self.total_segments as usize {
+            return false;
+        }
+        let mut cursor = 0u64;
+        for (offset, len) in self.placements.values() {
+            if *offset != cursor {
+                return false;
+            }
+            cursor = cursor.saturating_add(u64::from(*len));
+        }
+        cursor == self.received_bytes
     }
 }
 

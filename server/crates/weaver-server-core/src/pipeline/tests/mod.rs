@@ -1708,12 +1708,12 @@ async fn write_and_complete_file(
     let file_id = NzbFileId { job_id, file_index };
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state
-            .assembly
-            .file_mut(file_id)
-            .unwrap()
-            .commit_segment(0, bytes.len() as u32)
-            .unwrap();
+        let file = state.assembly.file_mut(file_id).unwrap();
+        // Mirror the decode worker: every accepted arrival records its
+        // placement before the commit, which is what the contiguity proof
+        // reads.
+        file.record_placement(0, 0, bytes.len() as u32);
+        file.commit_segment(0, bytes.len() as u32).unwrap();
     }
 
     pipeline

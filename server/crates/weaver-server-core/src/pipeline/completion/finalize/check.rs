@@ -934,31 +934,36 @@ impl Pipeline {
                 .effective_file_identity(job_id, file_id)
                 .map(|identity| identity.current_filename)
                 .unwrap_or_else(|| file.filename().to_string());
-            let expected_length = file.total_bytes();
+            // Decoded length: what the commits accumulated and what PAR2 and
+            // the on-disk file measure. The NZB-declared `total_bytes()` is
+            // yEnc-encoded and must never reach a description or metadata
+            // comparison.
+            let expected_length = file.received_bytes();
             let checksum = completed_checksums.get(&file_id).copied();
-            // Full-MD5 evidence comes from a same-session streamed digest or
-            // a persisted row whose provenance says the value was calculated
-            // ('streamed'/'verified' — `load_complete_file_hashes` filters).
-            // Legacy rows of unknown origin never reach this: before the
-            // expected-hash substitution was removed they could hold a PAR2
-            // EXPECTATION copied verbatim, and an expectation must never be
-            // replayed as an observation.
-            let full_md5 = checksum
-                .and_then(|checksum| checksum.md5)
-                .or_else(|| completed_hashes.get(&file_id.file_index).copied());
+            // Full-MD5 evidence comes from the CURRENT file generation. A
+            // runtime checksum entry, when one exists, always speaks for the
+            // file: `Some(md5)` is the current digest, and `None` means the
+            // current generation has none (a CRC-metadata completion, or the
+            // md5-less sentinel a failed finalize records after a duplicate
+            // rewrite) — the persisted row may then be a generation behind
+            // and must NOT be revived to stand in for it. The database is
+            // consulted only when the runtime has no entry at all: the
+            // restart shape, where the provenance-filtered row
+            // (`load_complete_file_hashes`) is the only generation there is.
+            let full_md5 = match checksum {
+                Some(current) => current.md5,
+                None => completed_hashes.get(&file_id.file_index).copied(),
+            };
             // A file any in-stream IFSC verdict already proved Damaged must
             // not seed the session with completion evidence of any kind: the
             // authoritative pass owns it. Unclaimed or NoReference blocks are
             // not damage — they simply leave this file to the settle/read
             // paths that always covered them.
-            if self
-                .block_crc_verdicts(file_id)
-                .is_some_and(|verdicts| {
-                    verdicts.values().any(|verdict| {
-                        matches!(verdict, crate::pipeline::integrity::BlockVerdict::Damaged)
-                    })
+            if self.block_crc_verdicts(file_id).is_some_and(|verdicts| {
+                verdicts.values().any(|verdict| {
+                    matches!(verdict, crate::pipeline::integrity::BlockVerdict::Damaged)
                 })
-            {
+            }) {
                 crate::runtime::perf_probe::record(
                     "completion.par2_evidence.rejected.damaged_in_stream_verdict",
                     std::time::Duration::from_nanos(1),
@@ -992,9 +997,8 @@ impl Pipeline {
                 crc32: checksum.map_or(0, |checksum| checksum.crc32),
                 contiguous_assembly_proven: checksum.is_some_and(|checksum| {
                     checksum.all_parts_crc_verified
-                        && file.received_bytes() == expected_length
                         && !file.has_duplicate_segments()
-                        && !file.has_length_mismatch()
+                        && file.contiguous_placements_proven()
                 }),
                 bound_file_id,
             });
@@ -1761,6 +1765,10 @@ impl Pipeline {
         _working_dir: std::path::PathBuf,
     ) -> Result<Option<(par2_rs::VerificationResult, par2_rs::PlacementPlan)>, String> {
         let completed_hashes = self.load_existing_complete_file_hashes(job_id).await?;
+        let runtime_checksums = self
+            .par2_runtime(job_id)
+            .map(|runtime| runtime.completed_checksums.clone())
+            .unwrap_or_default();
         let Some(state) = self.jobs.get(&job_id) else {
             return Ok(None);
         };
@@ -1778,6 +1786,35 @@ impl Pipeline {
             }
 
             let file_id = file.file_id();
+            // The file's measured digest, by generation: a runtime checksum
+            // entry always speaks for the CURRENT generation (`Some` = its
+            // digest, `None` = it has none — a CRC-metadata completion or
+            // the sentinel a failed finalize records after a duplicate
+            // rewrite), and the persisted row stands in only when the
+            // runtime holds no entry at all (the restart shape). An older
+            // row must never outrank or revive over the current generation.
+            let measured_md5 = match runtime_checksums.get(&file_id) {
+                Some(current) => current.md5,
+                None => completed_hashes.get(&file_id.file_index).copied(),
+            };
+            // In-stream IFSC verdicts veto every quick arm below, the live
+            // one included. A Damaged block means the dual-CRC grid saw bytes
+            // that contradict the recovery set, so any hash that still
+            // matches — a stale trusted row, or a genuine conflict with the
+            // live per-slice proof — is exactly what must not conclude
+            // verification here. Conflicted files go to the authoritative
+            // pass, which reads the real bytes.
+            if self.block_crc_verdicts(file_id).is_some_and(|verdicts| {
+                verdicts.values().any(|verdict| {
+                    matches!(verdict, crate::pipeline::integrity::BlockVerdict::Damaged)
+                })
+            }) {
+                crate::runtime::perf_probe::record(
+                    "completion.quick_verify.rejected.damaged_in_stream_verdict",
+                    std::time::Duration::from_nanos(1),
+                );
+                return Ok(None);
+            }
             let identity = self.effective_file_identity(job_id, file_id);
             let current_filename = identity
                 .as_ref()
@@ -1802,14 +1839,48 @@ impl Pipeline {
                 // file. This is an auxiliary NZB file, not a PAR2 source.
                 continue;
             }
-            // Persisted digests may stand in here only because the loader is
-            // provenance-filtered: a row without `md5_provenance` (legacy —
-            // possibly a PAR2 expectation recorded by the removed
-            // substitution) never loads, so a job whose rows are all legacy
-            // gets no quick verification and runs the authoritative pass.
-            let Some(file_hash) = completed_hashes.get(&file_id.file_index).copied() else {
+            // Clean dual-CRC arm. Metadata-early downloads deliberately
+            // stream no MD5 — the article/IFSC grids carry verification — so
+            // a clean file has no digest anywhere and would otherwise fall to
+            // the authoritative pass and re-read every byte it just wrote.
+            // The grid match demands every described slice Intact with
+            // independent coverage at exact length; the Damaged veto above
+            // already refused conflicted files before any arm ran.
+            if let Some(grid_match) = self.in_stream_verified_par2_match(file_id, &par2_set) {
+                // A measured digest outranks the grid. When a trusted MD5
+                // exists for this file — streamed, re-read after a duplicate,
+                // or verified — and it disagrees with the description the
+                // grid selected, the CRC evidence has been contradicted by a
+                // stronger instrument and only the authoritative pass may
+                // adjudicate. No digest is ever computed for this check; it
+                // compares bytes already in hand.
+                if let Some(measured) = measured_md5
+                    && par2_set
+                        .file_description(&grid_match.0)
+                        .is_some_and(|description| description.hash_full != measured)
+                {
+                    crate::runtime::perf_probe::record(
+                        "completion.quick_verify.rejected.grid_contradicts_measured_md5",
+                        std::time::Duration::from_nanos(1),
+                    );
+                    return Ok(None);
+                }
                 crate::runtime::perf_probe::record(
-                    "completion.quick_verify.rejected.persisted_hash_untrusted",
+                    "completion.quick_verify.par2_match.in_stream_grid",
+                    std::time::Duration::from_nanos(1),
+                );
+                live_matches_by_name.insert(current_filename.to_string(), grid_match);
+                continue;
+            }
+            // `measured_md5` is generation-ordered (runtime first) and the
+            // persisted side is provenance-filtered: a row without trusted
+            // `md5_provenance` (legacy — possibly a PAR2 expectation
+            // recorded by the removed substitution) never loads. A file
+            // with no current-generation digest gets no quick verification
+            // and runs the authoritative pass.
+            let Some(file_hash) = measured_md5 else {
+                crate::runtime::perf_probe::record(
+                    "completion.quick_verify.rejected.no_current_generation_digest",
                     std::time::Duration::from_nanos(1),
                 );
                 return Ok(None);
@@ -2183,8 +2254,8 @@ impl Pipeline {
                 crate::jobs::persistence::CompletedHashProvenance::Verified,
             )
         })
-            .await
-            .map_err(|error| format!("failed to persist PAR2-reconciled files: {error}"))?;
+        .await
+        .map_err(|error| format!("failed to persist PAR2-reconciled files: {error}"))?;
 
         for (file_id, _filename, _total_bytes) in &files_to_complete {
             self.pending_file_progress.remove(file_id);
@@ -2197,6 +2268,207 @@ impl Pipeline {
         }
 
         Ok(files_to_complete.len())
+    }
+
+    /// After an *authoritative* post-repair verification, re-persist every
+    /// confirmed file's digest from the recovery set with `Verified`
+    /// provenance.
+    ///
+    /// Repair rewrites bytes in place, so a digest streamed before the
+    /// rewrite describes content that is gone; left standing, a restart
+    /// would load it as trusted and compare stale bytes' MD5 against the
+    /// recovery set forever. Persisting the description's digest is sound
+    /// here — and only here — because the caller just ran a placement
+    /// verification that read the bytes off disk and proved them Complete;
+    /// the quick paths' synthetic all-valid results must never reach this
+    /// function.
+    ///
+    /// A `Verified` digest is attached only through an UNAMBIGUOUS identity:
+    /// every alias a name resolves to is kept (never first-wins), a
+    /// `Renamed` result prefers the actual verified path over the expected
+    /// description name, each verification entry must resolve to exactly one
+    /// assembly file, no two entries may claim the same file, and the file
+    /// on disk must measure exactly the described length. Anything short of
+    /// that keeps whatever digest state already exists.
+    pub(crate) async fn refresh_authoritative_verified_hashes(
+        &mut self,
+        job_id: JobId,
+        par2_set: &par2_rs::Par2FileSet,
+        verification: &par2_rs::VerificationResult,
+    ) -> Result<(), String> {
+        struct ResolvedRefresh {
+            file_index: u32,
+            filename: String,
+            path: std::path::PathBuf,
+            described_length: u64,
+            hash: [u8; 16],
+        }
+
+        let resolved: Vec<ResolvedRefresh> = {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return Ok(());
+            };
+            let working_dir = state.working_dir.clone();
+
+            // Every alias each name could mean — never collapsed first-wins.
+            // Current filenames are also kept separately: a `Renamed` result
+            // names a physical path, and physical paths may only resolve
+            // against where files live NOW. The path the pre-plan
+            // verification saw a file at can, by refresh time, be nothing
+            // but some other file's immutable source alias — resolving a
+            // renamed result through source/canonical aliases is how a
+            // digest lands on the wrong file.
+            let mut by_name = HashMap::<String, Vec<NzbFileId>>::new();
+            let mut by_current = HashMap::<String, Vec<NzbFileId>>::new();
+            for file in state.assembly.files() {
+                if !file.is_complete() {
+                    continue;
+                }
+                let file_id = file.file_id();
+                let mut aliases: Vec<String> = Vec::new();
+                let current_name;
+                if let Some(identity) = self.effective_file_identity(job_id, file_id) {
+                    current_name = identity.current_filename.clone();
+                    aliases.push(identity.current_filename);
+                    aliases.push(identity.source_filename);
+                    if let Some(canonical) = identity.canonical_filename {
+                        aliases.push(canonical);
+                    }
+                } else {
+                    current_name = file.filename().to_string();
+                    aliases.push(current_name.clone());
+                }
+                aliases.sort();
+                aliases.dedup();
+                for alias in aliases {
+                    let ids = by_name.entry(alias).or_default();
+                    if !ids.contains(&file_id) {
+                        ids.push(file_id);
+                    }
+                }
+                let ids = by_current.entry(current_name).or_default();
+                if !ids.contains(&file_id) {
+                    ids.push(file_id);
+                }
+            }
+
+            let mut matched = HashMap::<NzbFileId, (String, u64, [u8; 16])>::new();
+            let mut contested: HashSet<NzbFileId> = HashSet::new();
+            for file_verification in &verification.files {
+                if !matches!(
+                    file_verification.status,
+                    par2_rs::verify::FileStatus::Complete | par2_rs::verify::FileStatus::Renamed(_)
+                ) {
+                    continue;
+                }
+                let Some(description) = par2_set.file_description(&file_verification.file_id)
+                else {
+                    continue;
+                };
+
+                // The name the verified bytes actually live under outranks
+                // the name the description expected: for `Renamed`, that is
+                // the renamed path. Renamed results are physical-path
+                // claims, so they resolve against CURRENT names only —
+                // never through source or canonical aliases.
+                let mut candidate_names: Vec<String> = Vec::new();
+                let name_map = match &file_verification.status {
+                    par2_rs::verify::FileStatus::Renamed(path) => {
+                        if let Some(filename) = path.file_name() {
+                            candidate_names.push(filename.to_string_lossy().to_string());
+                        }
+                        &by_current
+                    }
+                    _ => &by_name,
+                };
+                candidate_names.push(file_verification.filename.clone());
+
+                // The first name that resolves at all decides — and it must
+                // resolve to exactly one file, or this entry is ambiguous
+                // and attaches nothing.
+                let resolved_id = candidate_names.iter().find_map(|name| {
+                    let ids = name_map.get(name)?;
+                    Some(if ids.len() == 1 { Some(ids[0]) } else { None })
+                });
+                let Some(Some(file_id)) = resolved_id else {
+                    if resolved_id.is_some() {
+                        crate::runtime::perf_probe::record(
+                            "completion.post_repair.refresh_skipped.ambiguous_alias",
+                            std::time::Duration::from_nanos(1),
+                        );
+                    }
+                    continue;
+                };
+                // Two verification entries claiming one assembly file prove
+                // the mapping is not one-to-one; neither may attach.
+                if matched.remove(&file_id).is_some() || contested.contains(&file_id) {
+                    contested.insert(file_id);
+                    crate::runtime::perf_probe::record(
+                        "completion.post_repair.refresh_skipped.contested_file",
+                        std::time::Duration::from_nanos(1),
+                    );
+                    continue;
+                }
+                let current_filename = self
+                    .current_filename_for_file_id(job_id, file_id)
+                    .unwrap_or_else(|| file_verification.filename.clone());
+                matched.insert(
+                    file_id,
+                    (current_filename, description.length, description.hash_full),
+                );
+            }
+
+            matched
+                .into_iter()
+                .map(
+                    |(file_id, (filename, described_length, hash))| ResolvedRefresh {
+                        file_index: file_id.file_index,
+                        path: working_dir.join(&filename),
+                        filename,
+                        described_length,
+                        hash,
+                    },
+                )
+                .collect()
+        };
+
+        // The digest may only attach to a file whose bytes measure exactly
+        // the described length. `received_bytes` is unusable here — repair
+        // reconciliation marks files complete with the encoded NZB total —
+        // so ask the filesystem; the authoritative pass just read these
+        // files, and this is one bounded stat per confirmed file on the
+        // exceptional post-repair path.
+        let mut entries: Vec<(u32, String, Option<[u8; 16]>)> = Vec::new();
+        for refresh in resolved {
+            match tokio::fs::metadata(&refresh.path).await {
+                Ok(metadata) if metadata.len() == refresh.described_length => {
+                    entries.push((refresh.file_index, refresh.filename, Some(refresh.hash)));
+                }
+                Ok(_) | Err(_) => {
+                    crate::runtime::perf_probe::record(
+                        "completion.post_repair.refresh_skipped.length_mismatch",
+                        std::time::Duration::from_nanos(1),
+                    );
+                }
+            }
+        }
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+        crate::runtime::perf_probe::record(
+            "completion.post_repair.verified_hashes_refreshed",
+            std::time::Duration::from_nanos(1),
+        );
+        self.db_blocking(move |db| {
+            db.complete_files(
+                job_id,
+                &entries,
+                crate::jobs::persistence::CompletedHashProvenance::Verified,
+            )
+        })
+        .await
+        .map_err(|error| format!("failed to refresh post-repair verified hashes: {error}"))
     }
 
     async fn refresh_verified_complete_archive_topologies(
@@ -4123,6 +4395,22 @@ impl Pipeline {
                             .await;
                             if let Err(error) = self
                                 .reconcile_verified_par2_files(job_id, &post_repair_verification)
+                                .await
+                            {
+                                self.fail_job(job_id, error);
+                                return;
+                            }
+                            // Repair rewrote bytes; digests streamed before it
+                            // describe content that is gone. The verification
+                            // above was authoritative (it read the disk), so
+                            // the described digests are proven observations
+                            // for every file it confirmed.
+                            if let Err(error) = self
+                                .refresh_authoritative_verified_hashes(
+                                    job_id,
+                                    &par2_set,
+                                    &post_repair_verification,
+                                )
                                 .await
                             {
                                 self.fail_job(job_id, error);

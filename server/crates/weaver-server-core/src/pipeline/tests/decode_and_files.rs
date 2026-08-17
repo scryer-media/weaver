@@ -931,7 +931,7 @@ fn streaming_hash_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) ->
 }
 
 #[tokio::test]
-async fn replayed_article_mid_download_does_not_force_a_whole_file_reread() {
+async fn replayed_article_mid_download_condemns_the_streamed_hash_but_completes_cleanly() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20007);
@@ -964,9 +964,13 @@ async fn replayed_article_mid_download_does_not_force_a_whole_file_reread() {
         Some(4)
     );
 
-    // The same article again, landing behind the file's write cursor. Its bytes
-    // are already in the running file hash, so re-feeding them is what used to
-    // trip the hash's offset check and condemn a healthy file to a re-read.
+    // The same article again, landing behind the file's write cursor. The
+    // arrival rewrote the range on disk, and nothing at the commit seam can
+    // prove it wrote the same bytes the stream already digested — CRC
+    // equality is not byte identity — so the streamed state is condemned to
+    // the completion-time re-read, which digests the disk as the rewrite
+    // left it. The duplicate's bytes are still not fed to the running hash:
+    // the poison replaces the stream, it does not double-feed it.
     submit_decoded_segment(
         &mut pipeline,
         file_id,
@@ -978,16 +982,16 @@ async fn replayed_article_mid_download_does_not_force_a_whole_file_reread() {
     )
     .await;
     assert!(
-        !pipeline.file_hash_reread_required.contains(&file_id),
-        "a duplicate article must not force a whole-file re-read of a healthy file"
+        pipeline.file_hash_reread_required.contains(&file_id),
+        "a duplicate rewrite must condemn the streamed hash state to a re-read"
     );
     assert_eq!(
         pipeline
             .file_hash_states
             .get(&file_id)
             .map(|state| state.bytes_fed()),
-        Some(4),
-        "the duplicate's bytes must not be fed to the running hash a second time"
+        None,
+        "the condemned streaming state must be dropped, not fed further"
     );
 
     for (segment_number, offset, chunk) in [(1u32, 4u64, &payload[4..8]), (2, 8, &payload[8..12])] {
@@ -1003,9 +1007,9 @@ async fn replayed_article_mid_download_does_not_force_a_whole_file_reread() {
         .await;
     }
 
-    // `expected_file_crc` is supplied, so a wrong streamed CRC32 fails the job
-    // rather than completing it: FileComplete here is the whole-file gate
-    // passing on a hash that never left the streaming path.
+    // `expected_file_crc` is supplied, so a wrong CRC32 fails the job rather
+    // than completing it: FileComplete here is the whole-file gate passing on
+    // the completion-time re-read of the bytes the rewrite left on disk.
     let drained_events = drain_job_events(&mut events, job_id);
     assert!(
         drained_events.iter().any(|event| matches!(
@@ -1021,6 +1025,111 @@ async fn replayed_article_mid_download_does_not_force_a_whole_file_reread() {
             .any(|event| matches!(event, PipelineEvent::JobFailed { .. })),
         "{drained_events:?}"
     );
+}
+
+#[tokio::test]
+async fn late_metadata_conflicting_duplicate_cannot_quick_verify_against_stale_bytes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20017);
+    let filename = "late-metadata-dup.bin";
+    // The original first article and its same-length rewrite.
+    let original: &[u8] = b"aaaabbbbcccc";
+    let disk_final: &[u8] = b"zzzzbbbbcccc";
+    let whole_file_crc = par2_rs::checksum::crc32(disk_final);
+    let spec = segmented_job_spec("Late Metadata Conflicting Duplicate", filename, &[4, 4, 4]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    // No PAR2 metadata exists yet: nothing records block verdicts, so if the
+    // streamed digest survived the rewrite below, no verdict could veto it.
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        &original[0..4],
+        filename,
+        Some(whole_file_crc),
+    )
+    .await;
+    // The duplicate rewrites the range with DIFFERENT same-length bytes.
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        &disk_final[0..4],
+        filename,
+        Some(whole_file_crc),
+    )
+    .await;
+    assert!(pipeline.file_hash_reread_required.contains(&file_id));
+    for (segment_number, offset, chunk) in
+        [(1u32, 4u64, &disk_final[4..8]), (2, 8, &disk_final[8..12])]
+    {
+        submit_decoded_segment(
+            &mut pipeline,
+            file_id,
+            segment_number,
+            offset,
+            chunk,
+            filename,
+            Some(whole_file_crc),
+        )
+        .await;
+    }
+    let drained = drain_job_events(&mut events, job_id);
+    assert!(
+        drained.iter().any(|event| matches!(
+            event,
+            PipelineEvent::FileComplete { total_bytes, .. }
+                if *total_bytes == disk_final.len() as u64
+        )),
+        "{drained:?}"
+    );
+
+    // Whatever completion persisted must describe the disk as the rewrite
+    // left it, never the pre-rewrite stream.
+    let trusted = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_ne!(
+        trusted.get(&0).copied(),
+        Some(par2_rs::checksum::md5(original)),
+        "the pre-rewrite digest must not be persisted as trusted"
+    );
+
+    // PAR2 metadata arrives only now, describing the ORIGINAL bytes.
+    let mut par2_set = placement_par2_file_set(&[(filename.to_string(), original.to_vec())]);
+    let par2_file_id = par2_set.recovery_file_ids[0];
+    let slice_checksum = {
+        let mut state = par2_rs::SliceChecksumState::new();
+        state.update(original);
+        let (crc32, md5) = state.finalize(Some(original.len() as u64));
+        par2_rs::SliceChecksum { crc32, md5 }
+    };
+    par2_set
+        .slice_checksums
+        .insert(par2_file_id, vec![slice_checksum]);
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+    }
+    pipeline.check_job_completion(job_id).await;
+
+    // Quick verification refuses — the honest digest mismatches the
+    // description, the grid never observed these articles, and no stale
+    // trusted hash exists to lie with — so the authoritative pass runs.
+    assert!(drain_job_verification_started(&mut events, job_id) >= 1);
+    assert!(!pipeline.par2_verified.contains(&job_id));
 }
 
 #[tokio::test]

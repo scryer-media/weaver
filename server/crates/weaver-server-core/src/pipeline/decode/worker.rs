@@ -1921,6 +1921,7 @@ impl Pipeline {
                     data.len_bytes() as u64,
                     part_crc,
                     part_crc_verified,
+                    was_duplicate,
                     &segments,
                 );
 
@@ -1933,7 +1934,20 @@ impl Pipeline {
                 // 815f1a12 (they are handed back and rewritten idempotently
                 // rather than wedging the reorder buffer), so the feed — both
                 // the immediate and the deferred arm — is skipped for them.
+                //
+                // Skipping the feed is not enough on its own: this arrival
+                // REWROTE the range on disk, and nothing at this seam can
+                // prove it wrote the same bytes the stream already digested.
+                // A hash state left standing here could complete into a
+                // persisted digest of the pre-rewrite bytes and quick-verify
+                // a file whose content it no longer describes — with no block
+                // verdict to veto it when PAR2 metadata arrives only later.
+                // So the whole streamed state (MD5 and CRC-metadata arms
+                // alike) is condemned to the completion-time re-read, which
+                // digests the disk as the rewrite left it. Duplicates are the
+                // exceptional path; clean downloads never pay this.
                 if was_duplicate {
+                    self.mark_file_hash_reread_required_for(file_id, "duplicate_rewrite");
                     drop(data);
                 } else {
                     let use_crc_metadata = self.should_use_completed_file_crc_metadata(file_id);

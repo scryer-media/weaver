@@ -476,6 +476,827 @@ async fn clean_par2_quick_verification_exits_verifying_for_split_join() {
 }
 
 #[tokio::test]
+async fn damaged_in_stream_verdict_blocks_quick_verification_even_with_matching_hash() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30177);
+    let payload_filename = "payload.mkv";
+    let expected: Vec<u8> = (0..32u32).map(|value| (value % 251) as u8).collect();
+    let mut actual = expected.clone();
+    actual[7] ^= 0xFF; // same length, different bytes on the wire
+    let spec = standalone_job_spec(
+        "Damaged Verdict Blocks Quick Verify",
+        &[(payload_filename.to_string(), expected.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // The recovery set describes `expected`, IFSC reference included: one
+    // slice covering the whole file.
+    let mut par2_set = placement_par2_file_set(&[(payload_filename.to_string(), expected.clone())]);
+    let par2_file_id = par2_set.recovery_file_ids[0];
+    par2_set.slice_checksums.insert(
+        par2_file_id,
+        vec![par2_rs::SliceChecksum {
+            crc32: par2_rs::checksum::crc32(&expected),
+            md5: par2_rs::checksum::md5(&expected),
+        }],
+    );
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+
+    // What actually arrived is `actual` ...
+    write_and_complete_file(&mut pipeline, job_id, 0, payload_filename, &actual).await;
+    // ... while the trusted store claims a digest equal to the PAR2
+    // expectation — the poisoned shape the removed expected-hash substitution
+    // used to produce, indistinguishable from a stale trusted row whose bytes
+    // were rewritten after it was recorded. On hash comparison alone, quick
+    // verification would pass tautologically.
+    persist_completed_file_hash(&pipeline, job_id, 0, payload_filename, &expected).await;
+
+    // The dual-CRC grid saw the real bytes: one pCRC-verified article covers
+    // the whole file and its derived slice CRC contradicts the IFSC reference.
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let wire_crc = par2_rs::checksum::crc32(&actual);
+    pipeline.note_block_crc_segments(
+        file_id,
+        0,
+        actual.len() as u64,
+        wire_crc,
+        true,
+        false,
+        &[weaver_yenc::Segment {
+            file_offset: 0,
+            len: actual.len() as u64,
+            crc32: wire_crc,
+        }],
+    );
+    assert!(
+        pipeline
+            .block_crc_verdicts(file_id)
+            .is_some_and(|verdicts| {
+                verdicts.values().any(|verdict| {
+                    matches!(verdict, crate::pipeline::integrity::BlockVerdict::Damaged)
+                })
+            }),
+        "precondition: the grid must call this file Damaged"
+    );
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+    }
+
+    pipeline.check_job_completion(job_id).await;
+
+    // The matching digest must not override the in-stream verdict: quick
+    // verification refuses and the authoritative pass owns the file.
+    assert!(drain_job_verification_started(&mut events, job_id) >= 1);
+    assert!(!pipeline.par2_verified.contains(&job_id));
+}
+
+#[tokio::test]
+async fn metadata_early_clean_download_quick_completes_from_the_dual_crc_grid_alone() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30178);
+    let payload_filename = "payload.mkv";
+    let payload: Vec<u8> = (0..64u32).map(|value| (value % 251) as u8).collect();
+    let spec = standalone_job_spec(
+        "Metadata Early Clean Grid Quick Verify",
+        &[(payload_filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Metadata-early: the recovery set (two 32-byte slices, IFSC included) is
+    // installed before any article lands, which is exactly the shape that
+    // streams no MD5 at all.
+    let mut par2_set = placement_par2_file_set(&[(payload_filename.to_string(), payload.clone())]);
+    par2_set.slice_size = 32;
+    let par2_file_id = par2_set.recovery_file_ids[0];
+    let slice_checksums: Vec<par2_rs::SliceChecksum> = payload
+        .chunks(32)
+        .map(|slice| {
+            let mut state = par2_rs::SliceChecksumState::new();
+            state.update(slice);
+            let (crc32, md5) = state.finalize(Some(32));
+            par2_rs::SliceChecksum { crc32, md5 }
+        })
+        .collect();
+    par2_set
+        .slice_checksums
+        .insert(par2_file_id, slice_checksums);
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+
+    write_and_complete_file(&mut pipeline, job_id, 0, payload_filename, &payload).await;
+    // Deliberately NO persisted digest: the grid is the only evidence.
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    for (index, slice) in payload.chunks(32).enumerate() {
+        let offset = (index as u64) * 32;
+        let crc = par2_rs::checksum::crc32(slice);
+        pipeline.note_block_crc_segments(
+            file_id,
+            offset,
+            slice.len() as u64,
+            crc,
+            true,
+            false,
+            &[weaver_yenc::Segment {
+                file_offset: offset,
+                len: slice.len() as u64,
+                crc32: crc,
+            }],
+        );
+    }
+    assert!(
+        pipeline
+            .block_crc_verdicts(file_id)
+            .is_some_and(|verdicts| {
+                verdicts.len() == 2
+                    && verdicts.values().all(|verdict| {
+                        matches!(
+                            verdict,
+                            crate::pipeline::integrity::BlockVerdict::Intact {
+                                independently_covered: true
+                            }
+                        )
+                    })
+            }),
+        "precondition: both slices must close Intact with independent coverage"
+    );
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+    }
+
+    pipeline.check_job_completion(job_id).await;
+
+    // No digest was ever computed or persisted, and nothing may re-read the
+    // payload: the grid alone quick-verifies the file.
+    assert_eq!(drain_job_verification_started(&mut events, job_id), 0);
+    assert!(pipeline.par2_verified.contains(&job_id));
+
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+}
+
+async fn grid_verified_direct_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    payload_filename: &str,
+    payload: &[u8],
+    declared_size: u32,
+) -> NzbFileId {
+    let spec = standalone_job_spec(
+        "Grid Verified Direct Job",
+        &[(payload_filename.to_string(), declared_size)],
+    );
+    insert_active_job(pipeline, job_id, spec).await;
+
+    let mut par2_set = placement_par2_file_set(&[(payload_filename.to_string(), payload.to_vec())]);
+    par2_set.slice_size = 32;
+    let par2_file_id = par2_set.recovery_file_ids[0];
+    let slice_checksums: Vec<par2_rs::SliceChecksum> = payload
+        .chunks(32)
+        .map(|slice| {
+            let mut state = par2_rs::SliceChecksumState::new();
+            state.update(slice);
+            let (crc32, md5) = state.finalize(Some(32));
+            par2_rs::SliceChecksum { crc32, md5 }
+        })
+        .collect();
+    par2_set
+        .slice_checksums
+        .insert(par2_file_id, slice_checksums);
+    install_test_par2_runtime(pipeline, job_id, par2_set, &[]);
+
+    write_and_complete_file(pipeline, job_id, 0, payload_filename, payload).await;
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    for (index, slice) in payload.chunks(32).enumerate() {
+        let offset = (index as u64) * 32;
+        let crc = par2_rs::checksum::crc32(slice);
+        pipeline.note_block_crc_segments(
+            file_id,
+            offset,
+            slice.len() as u64,
+            crc,
+            true,
+            false,
+            &[weaver_yenc::Segment {
+                file_offset: offset,
+                len: slice.len() as u64,
+                crc32: crc,
+            }],
+        );
+    }
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+    }
+    file_id
+}
+
+#[tokio::test]
+async fn grid_quick_completion_survives_encoded_nzb_declared_sizes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30181);
+    let payload: Vec<u8> = (0..64u32).map(|value| (value % 251) as u8).collect();
+    // Production shape: the NZB declares the yEnc-ENCODED article size, ~3%
+    // larger than the decoded payload PAR2 describes. The grid arm must
+    // compare decoded lengths, never the declared total.
+    let declared = payload.len() as u32 + 37;
+    let file_id =
+        grid_verified_direct_job(&mut pipeline, job_id, "payload.mkv", &payload, declared).await;
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        let file = state.assembly.file(file_id).unwrap();
+        assert_ne!(
+            file.total_bytes(),
+            payload.len() as u64,
+            "fixture must actually be encoded-shaped"
+        );
+        assert_eq!(file.received_bytes(), payload.len() as u64);
+    }
+
+    pipeline.check_job_completion(job_id).await;
+
+    assert_eq!(drain_job_verification_started(&mut events, job_id), 0);
+    assert!(pipeline.par2_verified.contains(&job_id));
+}
+
+#[tokio::test]
+async fn grid_quick_match_with_agreeing_measured_md5_still_quick_verifies() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30182);
+    let payload: Vec<u8> = (0..64u32).map(|value| (value % 251) as u8).collect();
+    grid_verified_direct_job(
+        &mut pipeline,
+        job_id,
+        "payload.mkv",
+        &payload,
+        payload.len() as u32,
+    )
+    .await;
+    persist_completed_file_hash(&pipeline, job_id, 0, "payload.mkv", &payload).await;
+
+    pipeline.check_job_completion(job_id).await;
+
+    assert_eq!(drain_job_verification_started(&mut events, job_id), 0);
+    assert!(pipeline.par2_verified.contains(&job_id));
+}
+
+#[tokio::test]
+async fn grid_quick_match_contradicted_by_measured_md5_goes_authoritative() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30183);
+    let payload: Vec<u8> = (0..64u32).map(|value| (value % 251) as u8).collect();
+    grid_verified_direct_job(
+        &mut pipeline,
+        job_id,
+        "payload.mkv",
+        &payload,
+        payload.len() as u32,
+    )
+    .await;
+    // A trusted measured digest — the shape a duplicate-triggered re-read
+    // leaves behind — that contradicts the description the grid selected.
+    // CRC evidence must not override the stronger instrument.
+    persist_completed_file_hash(
+        &pipeline,
+        job_id,
+        0,
+        "payload.mkv",
+        b"other content entirely",
+    )
+    .await;
+
+    pipeline.check_job_completion(job_id).await;
+
+    assert!(drain_job_verification_started(&mut events, job_id) >= 1);
+}
+
+#[tokio::test]
+async fn grid_quick_path_refuses_when_a_slice_lacks_independent_coverage() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30179);
+    let payload_filename = "payload.mkv";
+    let payload: Vec<u8> = (0..64u32).map(|value| (value % 251) as u8).collect();
+    let spec = standalone_job_spec(
+        "Grid Quick Verify Unverified Slice",
+        &[(payload_filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let mut par2_set = placement_par2_file_set(&[(payload_filename.to_string(), payload.clone())]);
+    par2_set.slice_size = 32;
+    let par2_file_id = par2_set.recovery_file_ids[0];
+    let slice_checksums: Vec<par2_rs::SliceChecksum> = payload
+        .chunks(32)
+        .map(|slice| {
+            let mut state = par2_rs::SliceChecksumState::new();
+            state.update(slice);
+            let (crc32, md5) = state.finalize(Some(32));
+            par2_rs::SliceChecksum { crc32, md5 }
+        })
+        .collect();
+    par2_set
+        .slice_checksums
+        .insert(par2_file_id, slice_checksums);
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+
+    write_and_complete_file(&mut pipeline, job_id, 0, payload_filename, &payload).await;
+
+    // The second article's pCRC never verified: its slice closes Intact but
+    // without independent coverage, so the grid cannot vouch for the file.
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    for (index, slice) in payload.chunks(32).enumerate() {
+        let offset = (index as u64) * 32;
+        let crc = par2_rs::checksum::crc32(slice);
+        pipeline.note_block_crc_segments(
+            file_id,
+            offset,
+            slice.len() as u64,
+            crc,
+            index == 0,
+            false,
+            &[weaver_yenc::Segment {
+                file_offset: offset,
+                len: slice.len() as u64,
+                crc32: crc,
+            }],
+        );
+    }
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+    }
+
+    pipeline.check_job_completion(job_id).await;
+
+    // With no digest anywhere and the grid short of the bar, the file is not
+    // quick-verified: the authoritative pass runs — and, reading genuinely
+    // clean bytes, is entitled to verify the job the slow way.
+    assert!(drain_job_verification_started(&mut events, job_id) >= 1);
+}
+
+#[tokio::test]
+async fn post_repair_refresh_replaces_stale_streamed_digests_with_verified_ones() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30180);
+    let payload_filename = "payload.mkv";
+    let payload: Vec<u8> = (0..48u32).map(|value| (value % 249) as u8).collect();
+    let spec = standalone_job_spec(
+        "Post Repair Hash Refresh",
+        &[(payload_filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let par2_set = placement_par2_file_set(&[(payload_filename.to_string(), payload.clone())]);
+    let par2_file_id = par2_set.recovery_file_ids[0];
+
+    write_and_complete_file(&mut pipeline, job_id, 0, payload_filename, &payload).await;
+    // The digest streamed BEFORE repair rewrote the file: it describes bytes
+    // that are gone.
+    let pre_rewrite_bytes = b"content the repair replaced";
+    persist_completed_file_hash(&pipeline, job_id, 0, payload_filename, pre_rewrite_bytes).await;
+
+    let verification = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: par2_file_id,
+            filename: payload_filename.to_string(),
+            status: par2_rs::verify::FileStatus::Complete,
+            valid_slices: vec![true],
+            missing_slice_count: 0,
+        }],
+        recovery_blocks_available: 0,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+    pipeline
+        .refresh_authoritative_verified_hashes(job_id, &par2_set, &verification)
+        .await
+        .unwrap();
+
+    let trusted = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_eq!(
+        trusted.get(&0).copied(),
+        Some(par2_rs::checksum::md5(&payload)),
+        "the authoritative post-repair digest must replace the stale streamed one"
+    );
+    assert_ne!(
+        trusted.get(&0).copied(),
+        Some(par2_rs::checksum::md5(pre_rewrite_bytes))
+    );
+}
+
+#[tokio::test]
+async fn post_repair_refresh_prefers_the_renamed_path_identity() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30184);
+    let disk_filename = "obfuscated.bin";
+    let payload: Vec<u8> = (0..48u32).map(|value| (value % 249) as u8).collect();
+    let spec = standalone_job_spec(
+        "Post Repair Renamed Mapping",
+        &[(disk_filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // The description knows the file by its correct name; verification found
+    // the content living under the obfuscated on-disk name.
+    let par2_set = placement_par2_file_set(&[("correct.mkv".to_string(), payload.clone())]);
+    let par2_file_id = par2_set.recovery_file_ids[0];
+    write_and_complete_file(&mut pipeline, job_id, 0, disk_filename, &payload).await;
+    persist_completed_file_hash(&pipeline, job_id, 0, disk_filename, b"stale pre-repair").await;
+
+    let verification = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: par2_file_id,
+            filename: "correct.mkv".to_string(),
+            status: par2_rs::verify::FileStatus::Renamed(std::path::PathBuf::from(disk_filename)),
+            valid_slices: vec![true],
+            missing_slice_count: 0,
+        }],
+        recovery_blocks_available: 0,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+    pipeline
+        .refresh_authoritative_verified_hashes(job_id, &par2_set, &verification)
+        .await
+        .unwrap();
+
+    let trusted = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_eq!(
+        trusted.get(&0).copied(),
+        Some(par2_rs::checksum::md5(&payload)),
+        "the renamed-path identity must resolve and attach the verified digest"
+    );
+}
+
+#[tokio::test]
+async fn post_repair_refresh_skips_contested_and_ambiguous_identities() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30185);
+    let payload: Vec<u8> = (0..48u32).map(|value| (value % 249) as u8).collect();
+    // Two assembly files share one filename: any name-based resolution of
+    // that alias is ambiguous by construction.
+    let spec = standalone_job_spec(
+        "Post Repair Ambiguous Aliases",
+        &[
+            ("same.bin".to_string(), payload.len() as u32),
+            ("same.bin".to_string(), payload.len() as u32),
+            ("unique.bin".to_string(), payload.len() as u32),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let par2_set = placement_par2_file_set(&[
+        ("same.bin".to_string(), payload.clone()),
+        ("unique.bin".to_string(), payload.clone()),
+    ]);
+    for (index, name) in [(0u32, "same.bin"), (1, "same.bin"), (2, "unique.bin")] {
+        write_and_complete_file(&mut pipeline, job_id, index, name, &payload).await;
+        persist_completed_file_hash(&pipeline, job_id, index, name, b"stale pre-repair").await;
+    }
+
+    let complete = |file_id, filename: &str| par2_rs::verify::FileVerification {
+        file_id,
+        filename: filename.to_string(),
+        status: par2_rs::verify::FileStatus::Complete,
+        valid_slices: vec![true],
+        missing_slice_count: 0,
+    };
+    // Entry 1 resolves an ambiguous alias; entries 2 and 3 both claim the
+    // one unambiguous file. Nothing may attach anywhere.
+    let verification = par2_rs::VerificationResult {
+        files: vec![
+            complete(par2_set.recovery_file_ids[0], "same.bin"),
+            complete(par2_set.recovery_file_ids[1], "unique.bin"),
+            complete(par2_set.recovery_file_ids[0], "unique.bin"),
+        ],
+        recovery_blocks_available: 0,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+    pipeline
+        .refresh_authoritative_verified_hashes(job_id, &par2_set, &verification)
+        .await
+        .unwrap();
+
+    let stale = par2_rs::checksum::md5(b"stale pre-repair");
+    let trusted = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    for index in 0..3u32 {
+        assert_eq!(
+            trusted.get(&index).copied(),
+            Some(stale),
+            "file {index}: ambiguity must leave existing digests untouched"
+        );
+    }
+}
+
+#[tokio::test]
+async fn post_repair_refresh_requires_the_described_length_on_disk() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30186);
+    let payload_filename = "payload.mkv";
+    let payload: Vec<u8> = (0..48u32).map(|value| (value % 249) as u8).collect();
+    let mut described = payload.clone();
+    described.extend_from_slice(b"tail the disk file does not have");
+    let spec = standalone_job_spec(
+        "Post Repair Length Gate",
+        &[(payload_filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let par2_set = placement_par2_file_set(&[(payload_filename.to_string(), described.clone())]);
+    let par2_file_id = par2_set.recovery_file_ids[0];
+    write_and_complete_file(&mut pipeline, job_id, 0, payload_filename, &payload).await;
+    persist_completed_file_hash(&pipeline, job_id, 0, payload_filename, b"stale pre-repair").await;
+
+    let verification = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: par2_file_id,
+            filename: payload_filename.to_string(),
+            status: par2_rs::verify::FileStatus::Complete,
+            valid_slices: vec![true, true],
+            missing_slice_count: 0,
+        }],
+        recovery_blocks_available: 0,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+    pipeline
+        .refresh_authoritative_verified_hashes(job_id, &par2_set, &verification)
+        .await
+        .unwrap();
+
+    let trusted = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_eq!(
+        trusted.get(&0).copied(),
+        Some(par2_rs::checksum::md5(b"stale pre-repair")),
+        "a length disagreement must not attach the described digest"
+    );
+}
+
+#[tokio::test]
+async fn stale_persisted_digest_must_not_outrank_the_current_runtime_generation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30187);
+    let payload_filename = "payload.mkv";
+    let payload: Vec<u8> = (0..64u32).map(|value| (value % 251) as u8).collect();
+    let spec = standalone_job_spec(
+        "Runtime Generation Outranks Persisted",
+        &[(payload_filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        placement_par2_file_set(&[(payload_filename.to_string(), payload.clone())]),
+        &[],
+    );
+    write_and_complete_file(&mut pipeline, job_id, 0, payload_filename, &payload).await;
+
+    // Generation 1: the file completed clean once; its digest — which equals
+    // the description — was persisted as trusted.
+    persist_completed_file_hash(&pipeline, job_id, 0, payload_filename, &payload).await;
+
+    // A duplicate then physically rewrote AND extended the file. Completion
+    // re-read the new generation into the runtime, but persisting the
+    // replacement row failed (the worker logs and carries on), so the
+    // database still holds the stale generation.
+    let mut rewritten = payload.clone();
+    rewritten[7] ^= 0xFF;
+    rewritten.extend_from_slice(b"duplicate tail growth");
+    tokio::fs::write(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .working_dir
+            .join(payload_filename),
+        &rewritten,
+    )
+    .await
+    .unwrap();
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .completed_checksums
+        .insert(
+            file_id,
+            crate::pipeline::CompletedFileChecksum {
+                md5: Some(par2_rs::checksum::md5(&rewritten)),
+                crc32: par2_rs::checksum::crc32(&rewritten),
+                all_parts_crc_verified: false,
+            },
+        );
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+    }
+    pipeline.check_job_completion(job_id).await;
+
+    // The current generation disagrees with the description; the stale
+    // matching row must not quick-verify over it.
+    assert!(drain_job_verification_started(&mut events, job_id) >= 1);
+    assert!(!pipeline.par2_verified.contains(&job_id));
+}
+
+#[tokio::test]
+async fn an_unavailable_current_generation_must_not_revive_the_persisted_digest() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30188);
+    let payload_filename = "payload.mkv";
+    let payload: Vec<u8> = (0..64u32).map(|value| (value % 251) as u8).collect();
+    let spec = standalone_job_spec(
+        "Unavailable Generation No Revival",
+        &[(payload_filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        placement_par2_file_set(&[(payload_filename.to_string(), payload.clone())]),
+        &[],
+    );
+    write_and_complete_file(&mut pipeline, job_id, 0, payload_filename, &payload).await;
+    persist_completed_file_hash(&pipeline, job_id, 0, payload_filename, &payload).await;
+
+    // The current generation's finalize failed: the worker records exactly
+    // this sentinel. The older persisted row describes bytes that may be
+    // gone and must not be revived to quick-verify.
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .completed_checksums
+        .insert(
+            file_id,
+            crate::pipeline::CompletedFileChecksum {
+                md5: None,
+                crc32: 0,
+                all_parts_crc_verified: false,
+            },
+        );
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+    }
+    pipeline.check_job_completion(job_id).await;
+
+    // The stale row must not produce a hash-only quick pass; the
+    // authoritative pass runs instead — and, reading genuinely clean bytes,
+    // is entitled to verify the job the slow way.
+    assert!(drain_job_verification_started(&mut events, job_id) >= 1);
+}
+
+#[tokio::test]
+async fn post_repair_refresh_resolves_renamed_results_against_current_names_only() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30189);
+    let payload: Vec<u8> = (0..48u32).map(|value| (value % 249) as u8).collect();
+    let mut other_content = payload.clone();
+    other_content[3] ^= 0x55; // same length, different bytes
+    let spec = standalone_job_spec(
+        "Renamed Resolution Current Names Only",
+        &[
+            ("x.bin".to_string(), payload.len() as u32),
+            ("c-file.bin".to_string(), other_content.len() as u32),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Post-placement reality: the verified file now lives at its correct
+    // name "b.mkv"; the path the pre-plan verification saw it at — "a.mkv" —
+    // is no longer any of its aliases. A second, unrelated file happens to
+    // have been POSTED as "a.mkv" (immutable source alias) and has the same
+    // length as the description.
+    pipeline
+        .set_file_identity(
+            job_id,
+            crate::jobs::record::ActiveFileIdentity {
+                file_index: 0,
+                source_filename: "x.bin".to_string(),
+                current_filename: "b.mkv".to_string(),
+                canonical_filename: Some("b.mkv".to_string()),
+                classification: None,
+                classification_source: crate::jobs::record::FileIdentitySource::Par2,
+            },
+        )
+        .unwrap();
+    pipeline
+        .set_file_identity(
+            job_id,
+            crate::jobs::record::ActiveFileIdentity {
+                file_index: 1,
+                source_filename: "a.mkv".to_string(),
+                current_filename: "c-file.bin".to_string(),
+                canonical_filename: None,
+                classification: None,
+                classification_source: crate::jobs::record::FileIdentitySource::Par2,
+            },
+        )
+        .unwrap();
+    write_and_complete_file(&mut pipeline, job_id, 0, "b.mkv", &payload).await;
+    write_and_complete_file(&mut pipeline, job_id, 1, "c-file.bin", &other_content).await;
+    persist_completed_file_hash(&pipeline, job_id, 0, "b.mkv", b"stale pre-repair").await;
+    persist_completed_file_hash(&pipeline, job_id, 1, "c-file.bin", b"stale pre-repair").await;
+
+    let par2_set = placement_par2_file_set(&[("b.mkv".to_string(), payload.clone())]);
+    let par2_file_id = par2_set.recovery_file_ids[0];
+    let verification = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: par2_file_id,
+            filename: "b.mkv".to_string(),
+            status: par2_rs::verify::FileStatus::Renamed(std::path::PathBuf::from("a.mkv")),
+            valid_slices: vec![true],
+            missing_slice_count: 0,
+        }],
+        recovery_blocks_available: 0,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+    pipeline
+        .refresh_authoritative_verified_hashes(job_id, &par2_set, &verification)
+        .await
+        .unwrap();
+
+    let stale = par2_rs::checksum::md5(b"stale pre-repair");
+    let trusted = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_eq!(
+        trusted.get(&1).copied(),
+        Some(stale),
+        "a stale pre-plan path must never attach the digest to an unrelated file via its source alias"
+    );
+    assert_eq!(
+        trusted.get(&0).copied(),
+        Some(par2_rs::checksum::md5(&payload)),
+        "the digest belongs to the file whose CURRENT name carries the verified content"
+    );
+}
+
+#[tokio::test]
 async fn corrupt_single_sevenz_enters_authoritative_par2_verification() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

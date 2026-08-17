@@ -48,13 +48,40 @@ fn duplicate_segment() {
 }
 
 #[test]
-fn segment_length_mismatch_disqualifies_contiguous_assembly_proof() {
-    let mut asm = make_assembly(vec![500]);
-    asm.commit_segment(0, 499).unwrap();
-    assert!(asm.has_length_mismatch());
+fn contiguous_placements_prove_a_gap_free_decoded_tiling() {
+    // Production shape: declared (encoded) sizes are LARGER than decoded.
+    let mut asm = make_assembly(vec![516, 516]);
+    asm.record_placement(0, 0, 500);
+    asm.commit_segment(0, 500).unwrap();
+    asm.record_placement(1, 500, 500);
+    asm.commit_segment(1, 500).unwrap();
+    assert!(asm.contiguous_placements_proven());
 
     asm.reset();
-    assert!(!asm.has_length_mismatch());
+    assert!(!asm.contiguous_placements_proven());
+}
+
+#[test]
+fn a_placement_gap_or_missing_record_disproves_contiguity() {
+    // A gap between placements: the decoded tiling is not airtight.
+    let mut asm = make_assembly(vec![516, 516]);
+    asm.record_placement(0, 0, 500);
+    asm.commit_segment(0, 500).unwrap();
+    asm.record_placement(1, 512, 500);
+    asm.commit_segment(1, 500).unwrap();
+    assert!(!asm.contiguous_placements_proven());
+
+    // Complete but with no placement observations at all (the shape
+    // verification/repair completion leaves): nothing is proven.
+    let mut unobserved = make_assembly(vec![516]);
+    unobserved.commit_segment(0, 500).unwrap();
+    assert!(!unobserved.contiguous_placements_proven());
+
+    // Incomplete files prove nothing either.
+    let mut incomplete = make_assembly(vec![516, 516]);
+    incomplete.record_placement(0, 0, 500);
+    incomplete.commit_segment(0, 500).unwrap();
+    assert!(!incomplete.contiguous_placements_proven());
 }
 
 #[test]

@@ -699,6 +699,7 @@ impl Pipeline {
     /// is authoritative over the poster's `=ypart begin`. Called after the bytes
     /// are durable, on the same seam as live PAR2 verification, so a block
     /// claimed here describes content that is actually on disk.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn note_block_crc_segments(
         &mut self,
         file_id: NzbFileId,
@@ -706,6 +707,7 @@ impl Pipeline {
         decoded_len: u64,
         part_crc: u32,
         part_crc_verified: bool,
+        was_duplicate: bool,
         segments: &[weaver_yenc::Segment],
     ) {
         let Some(block_size) = self.par2_block_size(file_id.job_id) else {
@@ -718,6 +720,7 @@ impl Pipeline {
             decoded_len,
             part_crc,
             part_crc_verified,
+            was_duplicate,
             segments,
         );
     }
@@ -735,6 +738,57 @@ impl Pipeline {
         let (par2_file_id, ..) = self.resolve_live_par2_binding(file_id)?;
         let verdicts = self.block_crcs.verdicts_against(file_id, set, par2_file_id);
         (!verdicts.is_empty()).then_some(verdicts)
+    }
+
+    /// A completed file's PAR2 identity, provable from the in-stream dual-CRC
+    /// grid alone.
+    ///
+    /// `Some` means: the file binds uniquely by name/identity to one PAR2
+    /// description, its assembled length equals the described length exactly,
+    /// and every described slice closed `Intact` with independent (pCRC
+    /// verified) article coverage — the same bar `InStreamCrc32Proof`
+    /// enforces per slice, demanded here for all of them. Anything less —
+    /// a missing slice, an unclaimed block, `NoReference`, `Damaged`, a
+    /// length disagreement, an unverified contribution — returns `None`, and
+    /// the caller falls back to digests or the authoritative read.
+    pub(crate) fn in_stream_verified_par2_match(
+        &self,
+        file_id: NzbFileId,
+        par2_set: &par2_rs::Par2FileSet,
+    ) -> Option<(par2_rs::FileId, String)> {
+        let (par2_file_id, ..) = self.resolve_live_par2_binding(file_id)?;
+        let description = par2_set.file_description(&par2_file_id)?;
+        if description.length == 0 {
+            // A zero-length description has no slices; "every slice intact"
+            // would be vacuously true on no evidence at all.
+            return None;
+        }
+        let state = self.jobs.get(&file_id.job_id)?;
+        let file = state.assembly.file(file_id)?;
+        // `received_bytes` is the decoded length the commits accumulated —
+        // what PAR2 describes. `total_bytes()` is the NZB's declared segment
+        // sum, which is yEnc-ENCODED (~3% larger on real posts) and must
+        // never be compared against a description.
+        if !file.is_complete() || file.received_bytes() != description.length {
+            return None;
+        }
+        let verdicts = self.block_crc_verdicts(file_id)?;
+        let slice_count = par2_set.slice_count_for_file(description.length);
+        let all_slices_independently_intact = (0..slice_count).all(|slice_index| {
+            matches!(
+                verdicts.get(&slice_index),
+                Some(crate::pipeline::integrity::BlockVerdict::Intact {
+                    independently_covered: true
+                })
+            )
+        });
+        if !all_slices_independently_intact {
+            return None;
+        }
+        Some((
+            par2_file_id,
+            sanitize_download_filename(&description.filename),
+        ))
     }
 
     pub(crate) fn note_live_par2_file_complete(&mut self, file_id: NzbFileId, received_bytes: u64) {

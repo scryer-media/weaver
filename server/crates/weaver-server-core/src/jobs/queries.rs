@@ -135,21 +135,21 @@ impl Database {
     ) -> Result<HashMap<u32, [u8; 16]>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
+            // Explicit allowlist rather than IS NOT NULL: a future provenance
+            // label is untrusted until the code that writes it also teaches
+            // this filter what it means.
             let sql = if trusted_only {
                 "SELECT file_index, md5
                  FROM active_files
-                 WHERE job_id = {} AND md5_provenance IS NOT NULL"
+                 WHERE job_id = {} AND md5_provenance IN ('streamed', 'verified')"
             } else {
                 "SELECT file_index, md5
                  FROM active_files
                  WHERE job_id = {}"
             };
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                sql,
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
+            let rows =
+                SqlRuntime::fetch_all(datastore.read_exec(), sql, &[SqlArg::I64(job_id.0 as i64)])
+                    .await?;
 
             let mut hashes = HashMap::new();
             for row in rows {

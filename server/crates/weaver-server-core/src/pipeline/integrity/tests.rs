@@ -166,6 +166,7 @@ fn derived_block_crcs_match_direct_over_random_article_tilings() {
                 (end - start) as u64,
                 part_crc,
                 true,
+                false,
                 &segments,
             );
         }
@@ -232,6 +233,7 @@ fn a_missing_article_leaves_its_blocks_unclaimed() {
             (end - start) as u64,
             part_crc,
             true,
+            false,
             &segments,
         );
     }
@@ -254,7 +256,9 @@ fn segments_contradicting_the_pipeline_placement_are_reduced_to_one_record() {
     // The poster's `=ypart begin` claimed offset 0 while the pipeline placed the
     // article at 1024: the segments were cut on a grid that does not exist.
     let (part_crc, segments) = decode_article_segments(&payload[1024..], 0, Some(block_size), 64);
-    collector.note_article(file_id, block_size, 1024, 1024, part_crc, true, &segments);
+    collector.note_article(
+        file_id, block_size, 1024, 1024, part_crc, true, false, &segments,
+    );
     collector.note_file_len(file_id, 2048);
 
     assert_eq!(collector.rebased_articles(), 1);
@@ -264,7 +268,9 @@ fn segments_contradicting_the_pipeline_placement_are_reduced_to_one_record() {
 
     // The same article placed where its own segments say it is composes fully.
     let mut honest = BlockCrcCollector::new();
-    honest.note_article(file_id, block_size, 0, 1024, part_crc, true, &segments);
+    honest.note_article(
+        file_id, block_size, 0, 1024, part_crc, true, false, &segments,
+    );
     honest.note_file_len(file_id, 1024);
     assert_eq!(honest.rebased_articles(), 0);
     assert_eq!(honest.derived_blocks(file_id).count(), 2);
@@ -281,7 +287,16 @@ fn pending_segments_are_retired_as_blocks_close() {
         let end = start + 512;
         let (part_crc, segments) =
             decode_article_segments(&payload[start..end], start as u64, Some(block_size), 128);
-        collector.note_article(file_id, block_size, start as u64, 512, part_crc, true, &segments);
+        collector.note_article(
+            file_id,
+            block_size,
+            start as u64,
+            512,
+            part_crc,
+            true,
+            false,
+            &segments,
+        );
     }
     collector.note_file_len(file_id, 8192);
 
@@ -395,6 +410,7 @@ fn decode_articles_into(
             decoded.result.bytes_written as u64,
             decoded.result.part_crc,
             true,
+            false,
             &decoded.result.segments,
         );
     }
@@ -524,10 +540,21 @@ fn pre_block_size_articles_claim_only_what_they_tile() {
         let (part_crc, segments) =
             decode_article_segments(&payload[start..start + 1024], start as u64, None, 100);
         assert_eq!(segments.len(), 1);
-        collector.note_article(file_id, block_size, start as u64, 1024, part_crc, true, &segments);
+        collector.note_article(
+            file_id,
+            block_size,
+            start as u64,
+            1024,
+            part_crc,
+            true,
+            false,
+            &segments,
+        );
     }
     let (part_crc, segments) = decode_article_segments(&payload[2048..], 2048, None, 100);
-    collector.note_article(file_id, block_size, 2048, 2048, part_crc, true, &segments);
+    collector.note_article(
+        file_id, block_size, 2048, 2048, part_crc, true, false, &segments,
+    );
     collector.note_file_len(file_id, 4096);
 
     let claimed: Vec<u32> = collector
@@ -727,14 +754,14 @@ fn set_for_bytes(bytes: &[u8], block_size: u64) -> (par2_rs::Par2FileSet, par2_r
 fn unverified_pcrc_blocks_close_but_mint_no_independent_evidence() {
     let block_size = block(1024);
     let file_id = file(90);
-    let data = random_bytes(0x9e_1, 2048);
+    let data = random_bytes(0x9e1, 2048);
     let mut collector = BlockCrcCollector::new();
 
     let (crc_a, segs_a) = decode_article_segments(&data[..1024], 0, Some(block_size), 333);
     let (crc_b, segs_b) = decode_article_segments(&data[1024..], 1024, Some(block_size), 333);
     // Article A never verified its declared pcrc32; article B did.
-    collector.note_article(file_id, block_size, 0, 1024, crc_a, false, &segs_a);
-    collector.note_article(file_id, block_size, 1024, 1024, crc_b, true, &segs_b);
+    collector.note_article(file_id, block_size, 0, 1024, crc_a, false, false, &segs_a);
+    collector.note_article(file_id, block_size, 1024, 1024, crc_b, true, false, &segs_b);
     collector.note_file_len(file_id, 2048);
 
     // Both blocks closed with correct CRCs...
@@ -763,13 +790,8 @@ fn unverified_pcrc_blocks_close_but_mint_no_independent_evidence() {
     );
 
     // ...but only the independently covered block mints slice evidence.
-    let evidence = slice_evidence_from_verdicts(
-        set.recovery_set_id,
-        par2_file_id,
-        2048,
-        1024,
-        &verdicts,
-    );
+    let evidence =
+        slice_evidence_from_verdicts(set.recovery_set_id, par2_file_id, 2048, 1024, &verdicts);
     assert_eq!(evidence.len(), 1);
 }
 
@@ -777,14 +799,14 @@ fn unverified_pcrc_blocks_close_but_mint_no_independent_evidence() {
 fn mixed_pcrc_contributions_to_one_block_deny_independent_coverage() {
     let block_size = block(1024);
     let file_id = file(91);
-    let data = random_bytes(0x9e_2, 1024);
+    let data = random_bytes(0x9e2, 1024);
     let mut collector = BlockCrcCollector::new();
 
     // Two articles tile one block; only one verified its pcrc32.
     let (crc_a, segs_a) = decode_article_segments(&data[..512], 0, Some(block_size), 100);
     let (crc_b, segs_b) = decode_article_segments(&data[512..], 512, Some(block_size), 100);
-    collector.note_article(file_id, block_size, 0, 512, crc_a, true, &segs_a);
-    collector.note_article(file_id, block_size, 512, 512, crc_b, false, &segs_b);
+    collector.note_article(file_id, block_size, 0, 512, crc_a, true, false, &segs_a);
+    collector.note_article(file_id, block_size, 512, 512, crc_b, false, false, &segs_b);
     collector.note_file_len(file_id, 1024);
 
     let (set, par2_file_id) = set_for_bytes(&data, 1024);
@@ -802,23 +824,314 @@ fn mixed_pcrc_contributions_to_one_block_deny_independent_coverage() {
 }
 
 #[test]
-fn identical_duplicate_does_not_disturb_derived_blocks() {
+fn identical_replay_readjudicates_instead_of_trusting_crc_equality() {
     let block_size = block(1024);
     let file_id = file(92);
-    let data = random_bytes(0x9e_3, 1024);
+    let data = random_bytes(0x9e3, 1024);
     let mut collector = BlockCrcCollector::new();
 
     let (crc, segs) = decode_article_segments(&data, 0, Some(block_size), 256);
-    collector.note_article(file_id, block_size, 0, 1024, crc, true, &segs);
+    collector.note_article(file_id, block_size, 0, 1024, crc, true, false, &segs);
     collector.note_file_len(file_id, 1024);
     let derived_before = collector.derived_block_crc(file_id, 0);
     assert!(derived_before.is_some());
     let blocks_before = collector.blocks_derived();
 
-    // Byte-identical replay: same placement, same part CRC.
-    collector.note_article(file_id, block_size, 0, 1024, crc, true, &segs);
+    // A replay with the same placement and part CRC still rewrote the range,
+    // and CRC32 equality cannot prove it wrote the same bytes. The earlier
+    // verdict dies and the block re-derives from the replay's own segments —
+    // which tile it completely here, so it closes right back to the same
+    // value, through a fresh adjudication rather than a trusted shortcut.
+    collector.note_article(file_id, block_size, 0, 1024, crc, true, true, &segs);
     assert_eq!(collector.derived_block_crc(file_id, 0), derived_before);
-    assert_eq!(collector.blocks_derived(), blocks_before);
+    assert_eq!(collector.blocks_derived(), blocks_before + 1);
+}
+
+#[test]
+fn identical_replay_of_a_partial_contribution_leaves_the_block_unclaimed() {
+    let block_size = block(1024);
+    let file_id = file(94);
+    let data = random_bytes(0x9e4, 1024);
+    let mut collector = BlockCrcCollector::new();
+
+    // Two articles tile one block; closing it retires both contributions.
+    let (crc_a, segs_a) = decode_article_segments(&data[..512], 0, Some(block_size), 256);
+    let (crc_b, segs_b) = decode_article_segments(&data[512..], 512, Some(block_size), 256);
+    collector.note_article(file_id, block_size, 0, 512, crc_a, true, false, &segs_a);
+    collector.note_article(file_id, block_size, 512, 512, crc_b, true, false, &segs_b);
+    collector.note_file_len(file_id, 1024);
+    assert_eq!(
+        collector.derived_block_crc(file_id, 0),
+        Some(direct_crc(&data))
+    );
+
+    // An identical replay of just the first article invalidates the block —
+    // the rewrite spans only half of it, and the other half's retired
+    // contribution cannot vouch for a range it did not re-observe — so the
+    // block stays unclaimed for the read paths until the neighbor replays.
+    collector.note_article(file_id, block_size, 0, 512, crc_a, true, true, &segs_a);
+    assert_eq!(collector.derived_block_crc(file_id, 0), None);
+
+    // The unchanged neighbor replaying is what re-tiles and re-closes it.
+    collector.note_article(file_id, block_size, 512, 512, crc_b, true, true, &segs_b);
+    assert_eq!(
+        collector.derived_block_crc(file_id, 0),
+        Some(direct_crc(&data))
+    );
+}
+
+/// Not a correctness gate: measures `verdicts_against` at a large-file
+/// shape so the completion-time cost of building the verdict map twice
+/// (damage veto + grid match) is a number rather than a guess. Run with
+/// `--release -- --nocapture` for meaningful output.
+#[test]
+fn verdict_map_construction_cost_at_large_file_shape() {
+    let block_size = block(1024);
+    let file_id = file(120);
+    let blocks = 16_384usize;
+    let data = random_bytes(0xbe9c, blocks * 1024);
+    let (set, par2_id) = set_for_bytes(&data, 1024);
+    let mut collector = BlockCrcCollector::new();
+    for index in 0..blocks {
+        let start = index * 1024;
+        let (crc, segs) = decode_article_segments(
+            &data[start..start + 1024],
+            start as u64,
+            Some(block_size),
+            512,
+        );
+        collector.note_article(
+            file_id,
+            block_size,
+            start as u64,
+            1024,
+            crc,
+            true,
+            false,
+            &segs,
+        );
+    }
+    collector.note_file_len(file_id, (blocks * 1024) as u64);
+
+    let iterations = 100u32;
+    let started = std::time::Instant::now();
+    let mut verdict_count = 0usize;
+    for _ in 0..iterations {
+        verdict_count += collector.verdicts_against(file_id, &set, par2_id).len();
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(verdict_count, blocks * iterations as usize);
+    eprintln!(
+        "verdicts_against: {blocks} blocks, {:?}/build ({:.1} ns/block); double-build cost/file = {:?}",
+        elapsed / iterations,
+        elapsed.as_nanos() as f64 / f64::from(iterations) / blocks as f64,
+        elapsed / iterations
+    );
+}
+
+#[test]
+fn duplicate_at_a_different_offset_invalidates_what_it_overlaps() {
+    let block_size = block(1024);
+    let file_id = file(99);
+    let data = random_bytes(0x9e8, 2048);
+    let mut collector = BlockCrcCollector::new();
+
+    // Two articles close both blocks.
+    let (crc_a, segs_a) = decode_article_segments(&data[..1024], 0, Some(block_size), 256);
+    let (crc_b, segs_b) = decode_article_segments(&data[1024..], 1024, Some(block_size), 256);
+    collector.note_article(file_id, block_size, 0, 1024, crc_a, true, false, &segs_a);
+    collector.note_article(file_id, block_size, 1024, 1024, crc_b, true, false, &segs_b);
+    collector.note_file_len(file_id, 2048);
+    assert!(collector.derived_block_crc(file_id, 0).is_some());
+    assert!(collector.derived_block_crc(file_id, 1).is_some());
+
+    // The same ordinal re-delivered with a different bounded placement: it
+    // rewrote [512, 1536), straddling both blocks, at an offset no earlier
+    // evidence was keyed by. Both verdicts must die; the replay's own
+    // segments cannot tile either block alone, so both stay unclaimed.
+    let rewrite = random_bytes(0x9e9, 1024);
+    let (crc_r, segs_r) = decode_article_segments(&rewrite, 512, Some(block_size), 256);
+    collector.note_article(file_id, block_size, 512, 1024, crc_r, true, true, &segs_r);
+    assert_eq!(collector.derived_block_crc(file_id, 0), None);
+    assert_eq!(collector.derived_block_crc(file_id, 1), None);
+
+    // Fresh observations of the un-rewritten flanks provide complete
+    // coverage again; both blocks re-derive over the disk as it is NOW.
+    let (crc_l, segs_l) = decode_article_segments(&data[..512], 0, Some(block_size), 256);
+    let (crc_t, segs_t) = decode_article_segments(&data[1536..], 1536, Some(block_size), 256);
+    collector.note_article(file_id, block_size, 0, 512, crc_l, true, true, &segs_l);
+    collector.note_article(file_id, block_size, 1536, 512, crc_t, true, true, &segs_t);
+    let mut expected_block0 = data[..512].to_vec();
+    expected_block0.extend_from_slice(&rewrite[..512]);
+    let mut expected_block1 = rewrite[512..].to_vec();
+    expected_block1.extend_from_slice(&data[1536..]);
+    assert_eq!(
+        collector.derived_block_crc(file_id, 0),
+        Some(direct_crc(&expected_block0))
+    );
+    assert_eq!(
+        collector.derived_block_crc(file_id, 1),
+        Some(direct_crc(&expected_block1))
+    );
+}
+
+#[test]
+fn shorter_duplicate_invalidates_only_the_bytes_it_rewrote() {
+    let block_size = block(1024);
+    let file_id = file(100);
+    let data = random_bytes(0x9ea, 2048);
+    let mut collector = BlockCrcCollector::new();
+
+    let (crc_a, segs_a) = decode_article_segments(&data[..1024], 0, Some(block_size), 256);
+    let (crc_b, segs_b) = decode_article_segments(&data[1024..], 1024, Some(block_size), 256);
+    collector.note_article(file_id, block_size, 0, 1024, crc_a, true, false, &segs_a);
+    collector.note_article(file_id, block_size, 1024, 1024, crc_b, true, false, &segs_b);
+    collector.note_file_len(file_id, 2048);
+
+    // The ordinal returns with a shorter valid extent: only [0, 512) was
+    // rewritten. Block 0 dies and stays unclaimed — its other half's retired
+    // contribution cannot vouch again — while block 1's bytes were never
+    // touched and its verdict survives.
+    let (crc_s, segs_s) = decode_article_segments(&data[..512], 0, Some(block_size), 256);
+    collector.note_article(file_id, block_size, 0, 512, crc_s, true, true, &segs_s);
+    assert_eq!(collector.derived_block_crc(file_id, 0), None);
+    assert!(collector.derived_block_crc(file_id, 1).is_some());
+
+    // Re-observing the other half completes coverage and re-derives.
+    let (crc_h, segs_h) = decode_article_segments(&data[512..1024], 512, Some(block_size), 256);
+    collector.note_article(file_id, block_size, 512, 512, crc_h, true, true, &segs_h);
+    assert_eq!(
+        collector.derived_block_crc(file_id, 0),
+        Some(direct_crc(&data[..1024]))
+    );
+}
+
+#[test]
+fn overflow_fails_closed_and_clears_prior_claims() {
+    let block_size = block(1024);
+    let file_id = file(95);
+    let data = random_bytes(0x9e5, 1024);
+    let (set, par2_id) = set_for_bytes(&data, 1024);
+    let mut collector = BlockCrcCollector::new();
+
+    // A block derives Intact before anything goes wrong.
+    let (crc, segs) = decode_article_segments(&data, 0, Some(block_size), 256);
+    collector.note_article(file_id, block_size, 0, 1024, crc, true, false, &segs);
+    collector.note_file_len(file_id, 1024);
+    assert!(collector.derived_block_crc(file_id, 0).is_some());
+
+    // Non-tiling one-byte articles pile up in a far block until pending
+    // overflows. Every earlier claim must die with the overflow: this file
+    // has stopped observing arrivals, so a later rewrite would go unnoticed
+    // and nothing previously derived can be trusted to describe the disk.
+    let mut offset = 10 * 1024;
+    while collector.derived_block_crc(file_id, 0).is_some() {
+        let segment = Segment {
+            file_offset: offset,
+            len: 1,
+            crc32: 0xdead_beef,
+        };
+        collector.note_article(
+            file_id,
+            block_size,
+            offset,
+            1,
+            0xdead_beef,
+            true,
+            false,
+            &[segment],
+        );
+        offset += 2; // gapped: nothing ever tiles, pending only grows
+    }
+    assert_eq!(collector.derived_block_crc(file_id, 0), None);
+    assert!(
+        collector
+            .verdicts_against(file_id, &set, par2_id)
+            .is_empty()
+    );
+
+    // A conflicting rewrite of the once-claimed range arrives after the
+    // overflow; the file stays claim-free rather than resurrecting anything.
+    collector.note_article(file_id, block_size, 0, 1024, !crc, true, true, &[]);
+    assert_eq!(collector.derived_block_crc(file_id, 0), None);
+    assert!(
+        collector
+            .verdicts_against(file_id, &set, par2_id)
+            .is_empty()
+    );
+}
+
+#[test]
+fn short_final_block_verdict_requires_length_congruence() {
+    let block_size = block(1024);
+    let data = random_bytes(0x9e6, 1536); // block 0 full, block 1 short
+
+    // Congruent lengths: both blocks get verdicts.
+    let file_id = file(96);
+    let (set, par2_id) = set_for_bytes(&data, 1024);
+    let mut collector = BlockCrcCollector::new();
+    for (start, end) in [(0usize, 1024usize), (1024, 1536)] {
+        let (crc, segs) =
+            decode_article_segments(&data[start..end], start as u64, Some(block_size), 256);
+        collector.note_article(
+            file_id,
+            block_size,
+            start as u64,
+            (end - start) as u64,
+            crc,
+            true,
+            false,
+            &segs,
+        );
+    }
+    collector.note_file_len(file_id, 1536);
+    let verdicts = collector.verdicts_against(file_id, &set, par2_id);
+    assert_eq!(verdicts.len(), 2);
+
+    // The collector believes a different final extent than the description:
+    // the full interior block still compares 1:1, but the short final block
+    // was closed — and would be zero-padded — on the wrong basis, so it gets
+    // no verdict at all rather than a wrong one.
+    let file_id = file(97);
+    let mut longer = data.clone();
+    longer.extend_from_slice(&random_bytes(0x9e7, 64));
+    let (set_longer, par2_id_longer) = set_for_bytes(&longer, 1024);
+    let mut collector = BlockCrcCollector::new();
+    for (start, end) in [(0usize, 1024usize), (1024, 1536)] {
+        let (crc, segs) =
+            decode_article_segments(&data[start..end], start as u64, Some(block_size), 256);
+        collector.note_article(
+            file_id,
+            block_size,
+            start as u64,
+            (end - start) as u64,
+            crc,
+            true,
+            false,
+            &segs,
+        );
+    }
+    collector.note_file_len(file_id, 1536); // description says 1600
+    let verdicts = collector.verdicts_against(file_id, &set_longer, par2_id_longer);
+    assert_eq!(verdicts.len(), 1, "only the full interior block may speak");
+    assert!(verdicts.contains_key(&0));
+
+    // Description shorter than the collector's interior extent: a full block
+    // that reaches past the described end is not a slice of this description
+    // and must stay silent too.
+    let file_id = file(98);
+    let short_desc = &data[..900];
+    let (set_short, par2_id_short) = set_for_bytes(short_desc, 1024);
+    let mut collector = BlockCrcCollector::new();
+    let (crc, segs) = decode_article_segments(&data[..1024], 0, Some(block_size), 256);
+    collector.note_article(file_id, block_size, 0, 1024, crc, true, false, &segs);
+    collector.note_file_len(file_id, 1536);
+    assert!(collector.derived_block_crc(file_id, 0).is_some());
+    assert!(
+        collector
+            .verdicts_against(file_id, &set_short, par2_id_short)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -830,7 +1143,9 @@ fn conflicting_replay_invalidates_and_rederives_from_the_rewrite() {
     let mut collector = BlockCrcCollector::new();
 
     let (crc_orig, segs_orig) = decode_article_segments(&original, 0, Some(block_size), 256);
-    collector.note_article(file_id, block_size, 0, 1024, crc_orig, true, &segs_orig);
+    collector.note_article(
+        file_id, block_size, 0, 1024, crc_orig, true, false, &segs_orig,
+    );
     collector.note_file_len(file_id, 1024);
     assert_eq!(
         collector.derived_block_crc(file_id, 0),
@@ -842,7 +1157,7 @@ fn conflicting_replay_invalidates_and_rederives_from_the_rewrite() {
     // pre-rewrite content.
     let (crc_new, segs_new) = decode_article_segments(&rewritten, 0, Some(block_size), 256);
     assert_ne!(crc_orig, crc_new, "fixture must actually differ");
-    collector.note_article(file_id, block_size, 0, 1024, crc_new, true, &segs_new);
+    collector.note_article(file_id, block_size, 0, 1024, crc_new, true, true, &segs_new);
     assert_eq!(
         collector.derived_block_crc(file_id, 0),
         Some(direct_crc(&rewritten))
@@ -871,12 +1186,15 @@ fn partial_block_replay_keeps_unrewritten_contributions() {
 
     let (crc_a, segs_a) = decode_article_segments(&first_half, 0, Some(block_size), 128);
     let (crc_b, segs_b) = decode_article_segments(&second_half, 512, Some(block_size), 128);
-    collector.note_article(file_id, block_size, 0, 512, crc_a, true, &segs_a);
-    collector.note_article(file_id, block_size, 512, 512, crc_b, true, &segs_b);
+    collector.note_article(file_id, block_size, 0, 512, crc_a, true, false, &segs_a);
+    collector.note_article(file_id, block_size, 512, 512, crc_b, true, false, &segs_b);
     collector.note_file_len(file_id, 1024);
     let mut whole: Vec<u8> = first_half.clone();
     whole.extend_from_slice(&second_half);
-    assert_eq!(collector.derived_block_crc(file_id, 0), Some(direct_crc(&whole)));
+    assert_eq!(
+        collector.derived_block_crc(file_id, 0),
+        Some(direct_crc(&whole))
+    );
 
     // Rewrite only the first article's range. The earlier verdict dies, and —
     // because the second half's segments were retired when the block first
@@ -886,14 +1204,14 @@ fn partial_block_replay_keeps_unrewritten_contributions() {
     let (crc_a2, segs_a2) =
         decode_article_segments(&replacement_first_half, 0, Some(block_size), 128);
     assert_ne!(crc_a, crc_a2, "fixture must actually differ");
-    collector.note_article(file_id, block_size, 0, 512, crc_a2, true, &segs_a2);
+    collector.note_article(file_id, block_size, 0, 512, crc_a2, true, true, &segs_a2);
     assert_eq!(collector.derived_block_crc(file_id, 0), None);
 
     // The pipeline re-feeds duplicates through this seam deliberately. When
     // the unchanged second half replays (byte-identical duplicate), its
     // segments re-enter pending and the block re-closes over the bytes that
     // are actually on disk now: replacement + surviving second half.
-    collector.note_article(file_id, block_size, 512, 512, crc_b, true, &segs_b);
+    collector.note_article(file_id, block_size, 512, 512, crc_b, true, true, &segs_b);
     let mut rewritten: Vec<u8> = replacement_first_half.clone();
     rewritten.extend_from_slice(&second_half);
     assert_eq!(

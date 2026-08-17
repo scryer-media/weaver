@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
 use crate::jobs::persistence::CompletedHashProvenance;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -1367,6 +1367,37 @@ fn save_file_identities_chunks_beyond_sqlite_bind_limit() {
 }
 
 #[test]
+fn trusted_hash_loader_admits_only_allowlisted_provenance() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    let entries = vec![(0u32, "data.rar".to_string(), Some([0x11; 16]))];
+    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed)
+        .unwrap();
+    assert_eq!(
+        db.load_complete_file_hashes(JobId(1)).unwrap().get(&0),
+        Some(&[0x11; 16])
+    );
+
+    // A provenance label this code has never written is untrusted until the
+    // writer that mints it also teaches the filter what it means — even
+    // though it is not NULL.
+    execute_sql(
+        &db,
+        "UPDATE active_files SET md5_provenance = 'imported' WHERE job_id = {} AND file_index = {}",
+        vec![SqlArg::I64(1), SqlArg::I64(0)],
+    );
+    assert_eq!(
+        db.load_complete_file_hashes(JobId(1)).unwrap().get(&0),
+        None
+    );
+    assert_eq!(
+        db.load_complete_file_hashes_any(JobId(1)).unwrap().get(&0),
+        Some(&[0x11; 16]),
+        "identity hints still see the row"
+    );
+}
+
+#[test]
 fn complete_files_bulk_upserts_hashes_and_is_idempotent() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
@@ -1375,7 +1406,8 @@ fn complete_files_bulk_upserts_hashes_and_is_idempotent() {
         (0u32, "data.rar".to_string(), Some([0x11; 16])),
         (1u32, "data.r00".to_string(), None),
     ];
-    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed).unwrap();
+    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed)
+        .unwrap();
 
     let jobs = db.load_active_jobs().unwrap();
     assert_eq!(jobs[&JobId(1)].complete_files.len(), 2);
@@ -1386,7 +1418,8 @@ fn complete_files_bulk_upserts_hashes_and_is_idempotent() {
 
     // Re-run upserts the filename/hash in place.
     let entries = vec![(0u32, "data-renamed.rar".to_string(), Some([0x22; 16]))];
-    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed).unwrap();
+    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed)
+        .unwrap();
     assert_eq!(
         fetch_text(
             &db,
@@ -1421,7 +1454,8 @@ fn complete_files_chunks_beyond_sqlite_bind_limit() {
     let entries: Vec<(u32, String, Option<[u8; 16]>)> = (0..1500)
         .map(|i| (i, format!("file-{i}.rar"), Some([(i % 256) as u8; 16])))
         .collect();
-    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed).unwrap();
+    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed)
+        .unwrap();
 
     let count = fetch_i64(
         &db,

@@ -163,14 +163,6 @@ struct FileBlockCrcs {
     pending: BTreeMap<u64, PendingSegment>,
     /// Derived CRC32 (+ attestation) per zero-based block index.
     derived: BTreeMap<u32, DerivedBlock>,
-    /// Placement and part CRC of every article accepted so far, keyed by file
-    /// offset. This is what detects a replay that carries *different* bytes:
-    /// a re-arrival with the same `(offset, len, part_crc)` is an identical
-    /// duplicate and a no-op; anything else rewrote the range on disk, so
-    /// every verdict derived over that range is invalidated (the rewritten
-    /// bytes are re-claimable only from segments observed at or after the
-    /// rewrite). Bounded by the number of articles in the file.
-    articles: BTreeMap<u64, (u64, u32)>,
     /// Set once the file's length is known, which is what makes the short final
     /// block closable.
     file_len: Option<u64>,
@@ -184,7 +176,6 @@ impl FileBlockCrcs {
             block_size,
             pending: BTreeMap::new(),
             derived: BTreeMap::new(),
-            articles: BTreeMap::new(),
             file_len: None,
             overflowed: false,
         }
@@ -217,16 +208,15 @@ impl FileBlockCrcs {
             if self.file_len.is_none() && end - start < size {
                 continue;
             }
-            let tiling: Vec<PendingSegment> = self
-                .pending
-                .range(start..end)
-                .map(|(_, pending)| *pending)
-                .collect();
-            let segments: Vec<Segment> = tiling.iter().map(|pending| pending.segment).collect();
+            let mut independently_covered = true;
+            let mut segments: Vec<Segment> = Vec::new();
+            for pending in self.pending.range(start..end).map(|(_, pending)| pending) {
+                independently_covered &= pending.pcrc_verified;
+                segments.push(pending.segment);
+            }
             let Some(crc32) = fold_tiling(&segments, start, end) else {
                 continue;
             };
-            let independently_covered = tiling.iter().all(|pending| pending.pcrc_verified);
             self.derived.insert(
                 block_index,
                 DerivedBlock {
@@ -234,8 +224,8 @@ impl FileBlockCrcs {
                     independently_covered,
                 },
             );
-            for pending in tiling {
-                self.pending.remove(&pending.segment.file_offset);
+            for segment in &segments {
+                self.pending.remove(&segment.file_offset);
             }
         }
     }
@@ -324,6 +314,11 @@ impl BlockCrcCollector {
     /// which is always true even when the poster's offsets are not — the article
     /// then composes only where its own boundaries tile a block, which is the
     /// same position an article decoded before the block size was known is in.
+    // One argument per fact of the wire observation (placement, length, pCRC
+    // value + whether it was verified, whether the assembly already held this
+    // ordinal, checkpoint segments); bundling them into a struct would only
+    // rename the tuple.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn note_article(
         &mut self,
         file_id: NzbFileId,
@@ -332,6 +327,7 @@ impl BlockCrcCollector {
         len: u64,
         part_crc: u32,
         part_crc_verified: bool,
+        was_duplicate: bool,
         segments: &[Segment],
     ) {
         if len == 0 {
@@ -351,47 +347,46 @@ impl BlockCrcCollector {
             return;
         }
 
-        // Replay adjudication. An arrival at an offset we have accepted before
-        // either carries the same bytes — same length, same part CRC — and is
-        // a no-op, or it rewrote the range on disk. A rewrite invalidates
-        // every closed verdict over the touched blocks *and* every pending
-        // segment inside the rewritten range: those describe bytes that are no
-        // longer there. Contributions outside the rewritten range but inside a
-        // touched block survive — their bytes were not rewritten — so the
-        // block may close again once segments observed at or after the rewrite
-        // tile the rest. If they never do, the block stays unclaimed and
-        // settle-time verification owns it, which reads the disk as it is now.
-        match entry.articles.get(&file_offset) {
-            Some(&(prev_len, prev_crc)) if prev_len == len && prev_crc == part_crc => {
-                // Byte-identical duplicate. No invalidation — the rewrite put
-                // the same bytes back — and no early return either: the
-                // pipeline re-feeds duplicates through this seam on purpose,
-                // and letting the segments re-enter `pending` is what lets a
-                // block invalidated by a *different* article's rewrite close
-                // again once its unchanged articles replay. For blocks that
-                // are still derived this is a no-op: `close_blocks` skips
-                // them and keyed inserts replace their own earlier records.
+        // Replay adjudication. Duplicate identity is the NZB segment ordinal
+        // — the assembly's `was_duplicate` — not this arrival's offset: a
+        // re-delivered article may legally carry a different bounded `=ypart
+        // begin` or a shorter extent, so it can rewrite bytes that earlier
+        // evidence was derived over WITHOUT landing at the offset that
+        // evidence was keyed by. Every duplicate therefore invalidates by
+        // RANGE: every derived block and every pending segment overlapping
+        // the bytes this arrival just rewrote describes content that may no
+        // longer be there — even when CRCs match, because CRC32 equality
+        // cannot establish byte identity. The segments fed below then
+        // re-enter `pending`, so a block the rewrite fully tiles closes
+        // right back from the new observation; contributions outside the
+        // rewritten range but inside a touched block survive, and the block
+        // may close again once segments observed at or after the rewrite
+        // tile the rest. If they never do, it stays unclaimed and the read
+        // paths own it. First deliveries never rewrote anything — placement
+        // conflicts are refused upstream before the write — so the clean
+        // path skips all of this.
+        if was_duplicate {
+            let size = entry.block_size.get();
+            let first_block = u32::try_from(file_offset / size).unwrap_or(u32::MAX);
+            let last_block = u32::try_from((end - 1) / size).unwrap_or(u32::MAX);
+            for block_index in first_block..=last_block {
+                entry.derived.remove(&block_index);
             }
-            Some(_) => {
-                let size = entry.block_size.get();
-                let first_block = u32::try_from(file_offset / size).unwrap_or(u32::MAX);
-                let last_block = u32::try_from((end - 1) / size).unwrap_or(u32::MAX);
-                for block_index in first_block..=last_block {
-                    entry.derived.remove(&block_index);
-                }
-                let stale: Vec<u64> = entry
-                    .pending
-                    .range(..end)
-                    .filter(|(_, pending)| pending.segment.end_offset() > file_offset)
-                    .map(|(&offset, _)| offset)
-                    .collect();
-                for offset in stale {
-                    entry.pending.remove(&offset);
-                }
+            // Pending entries are mutually disjoint (placement discipline on
+            // the way in, this purge on rewrites), so walking backwards from
+            // `end` and stopping at the first segment that ends at or before
+            // `file_offset` visits only the overlap plus one neighbour.
+            let stale: Vec<u64> = entry
+                .pending
+                .range(..end)
+                .rev()
+                .take_while(|(_, pending)| pending.segment.end_offset() > file_offset)
+                .map(|(&offset, _)| offset)
+                .collect();
+            for offset in stale {
+                entry.pending.remove(&offset);
             }
-            None => {}
         }
-        entry.articles.insert(file_offset, (len, part_crc));
 
         let article_matches_placement = fold_tiling(segments, file_offset, end) == Some(part_crc);
         let whole_article = [Segment {
@@ -416,8 +411,12 @@ impl BlockCrcCollector {
             );
         }
         if entry.pending.len() > MAX_PENDING_SEGMENTS_PER_FILE {
+            // Fail closed: once this file stops observing arrivals, a later
+            // rewrite would go unnoticed, so no previously derived claim may
+            // survive either — settle-time verification owns the whole file.
             entry.overflowed = true;
             entry.pending.clear();
+            entry.derived.clear();
             return;
         }
 
@@ -466,15 +465,12 @@ impl BlockCrcCollector {
     /// Every block this file has an in-stream CRC for, ascending.
     #[cfg(test)]
     pub(crate) fn derived_blocks(&self, file_id: NzbFileId) -> impl Iterator<Item = (u32, u32)> {
-        self.files
-            .get(&file_id)
-            .into_iter()
-            .flat_map(|entry| {
-                entry
-                    .derived
-                    .iter()
-                    .map(|(index, block)| (*index, block.crc32))
-            })
+        self.files.get(&file_id).into_iter().flat_map(|entry| {
+            entry
+                .derived
+                .iter()
+                .map(|(index, block)| (*index, block.crc32))
+        })
     }
 
     /// Compare this file's derived block CRC32s against a recovery set's IFSC
@@ -494,16 +490,47 @@ impl BlockCrcCollector {
         let Some(entry) = self.files.get(&file_id) else {
             return verdicts;
         };
+        if entry.overflowed {
+            // Fail closed: an overflowed file stopped observing arrivals, so
+            // nothing it once derived can be trusted to describe the disk.
+            return verdicts;
+        }
         if par2_set.slice_size != entry.block_size.get() {
             // A verdict derived on one grid says nothing about another.
             return verdicts;
         }
+        let Some(description) = par2_set.file_description(&par2_file_id) else {
+            // Length congruence below is what licenses the final short
+            // block's zero-padded comparison; without the description there
+            // is no length to be congruent with.
+            return verdicts;
+        };
         let checksums = par2_set.file_checksums(&par2_file_id);
         let block_size = entry.block_size.get();
         for (&block_index, derived) in &entry.derived {
             let Some((start, end)) = entry.block_bounds(block_index) else {
                 continue;
             };
+            // Length congruence, per block. A full-size block within the
+            // described extent compares 1:1 with its IFSC entry no matter
+            // what length the collector believes. The short final block is
+            // different: its verdict zero-pads from the extent the collector
+            // closed it at, which is a statement about the described file
+            // only when that extent IS the described length. A collector
+            // whose length disagrees with the description must not have its
+            // final block compared on the wrong padding basis — that block
+            // stays unclaimed and the read paths own it.
+            if end - start == block_size {
+                if end > description.length {
+                    // Beyond the described extent entirely: not a slice of
+                    // this description. NoReference (below) covers the case
+                    // where the checksum table simply ends; skipping here
+                    // avoids ever comparing bytes the description disclaims.
+                    continue;
+                }
+            } else if entry.file_len != Some(description.length) || end != description.length {
+                continue;
+            }
             let Some(expected) = checksums
                 .and_then(|checksums| checksums.get(block_index as usize))
                 .map(|checksum| checksum.crc32)
