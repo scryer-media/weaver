@@ -13,8 +13,82 @@ use super::model::{
 };
 use super::runner::ControlEffects;
 use crate::persistence::encryption::{decrypt_value, encrypt_value};
-use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRow, SqlRuntime};
+use crate::persistence::sql_runtime::{
+    SqlArg, SqlEngine, SqlRow, SqlRuntime, SqlTx, max_rows_for_tx,
+};
 use crate::persistence::{Database, StateError};
+
+/// Insert a run of captured output lines as multi-row `INSERT ... VALUES` batches.
+///
+/// One `execute` per line is one round trip to the SQLite connection's worker
+/// thread per line, and a chatty extension emits thousands. Batching collapses
+/// that to `ceil(lines / chunk)` statements. `chunk` comes from the shared
+/// bind-count budget, matching how `bulk_insert_job_events_tx` batches — the
+/// established pattern in this crate.
+///
+/// Sequences stay dense and ascending from `first_sequence`, so the retention
+/// pass and the `(attempt_id, sequence)` primary key see exactly what the
+/// per-row loop produced.
+async fn bulk_insert_log_chunks_tx(
+    tx: &mut SqlTx<'_>,
+    attempt_id: &str,
+    first_sequence: i64,
+    lines: &[(LogStream, Vec<u8>)],
+    created_at_epoch_ms: i64,
+) -> Result<(), StateError> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    const COLUMNS: &str = "INSERT INTO post_processing_log_chunks (
+        attempt_id, sequence, stream, payload, byte_count, created_at_epoch_ms
+     ) ";
+    let chunk_size = max_rows_for_tx(tx, 6);
+    match tx {
+        SqlTx::Sqlite(tx) => {
+            for (index, chunk) in lines.chunks(chunk_size).enumerate() {
+                let base = first_sequence + (index * chunk_size) as i64;
+                let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(COLUMNS);
+                let mut offset = 0_i64;
+                builder.push_values(chunk, |mut row, (stream, payload)| {
+                    row.push_bind(attempt_id)
+                        .push_bind(base + offset)
+                        .push_bind(log_stream_name(*stream))
+                        .push_bind(payload.as_slice())
+                        .push_bind(payload.len() as i64)
+                        .push_bind(created_at_epoch_ms);
+                    offset += 1;
+                });
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
+        SqlTx::Postgres(tx) => {
+            for (index, chunk) in lines.chunks(chunk_size).enumerate() {
+                let base = first_sequence + (index * chunk_size) as i64;
+                let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(COLUMNS);
+                let mut offset = 0_i64;
+                builder.push_values(chunk, |mut row, (stream, payload)| {
+                    row.push_bind(attempt_id)
+                        .push_bind(base + offset)
+                        .push_bind(log_stream_name(*stream))
+                        .push_bind(payload.as_slice())
+                        .push_bind(payload.len() as i64)
+                        .push_bind(created_at_epoch_ms);
+                    offset += 1;
+                });
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
+    }
+    Ok(())
+}
 
 const GLOBAL_ASSIGNMENT_KEY: &str = "*";
 const POST_PROCESSING_SETTINGS_KEY: &str = "post_processing.settings.v1";
@@ -421,7 +495,7 @@ impl Database {
             SqlArg::Text(extension_id.as_str().to_string()),
             SqlArg::Text(revision_id.as_str().to_string()),
         ];
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT manifest_json, trust_state, managed_path, discovered_source_path,
@@ -438,7 +512,7 @@ impl Database {
 
     pub fn list_extension_revisions(&self) -> Result<Vec<ExtensionRevisionRecord>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT manifest_json, trust_state, managed_path, discovered_source_path,
@@ -528,7 +602,7 @@ impl Database {
         let datastore = self.datastore();
         let profile_id = profile_id.as_str().to_string();
         let key = self.encryption_key().cloned();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let Some(row) = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT profile_id, name, enabled, created_at_epoch_ms, updated_at_epoch_ms
@@ -564,7 +638,7 @@ impl Database {
 
     pub fn list_post_processing_profiles(&self) -> Result<Vec<ProfileRecord>, StateError> {
         let datastore = self.datastore();
-        let ids = self.run_sql_blocking(async move {
+        let ids = self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT profile_id FROM post_processing_profiles ORDER BY name, profile_id",
@@ -726,7 +800,7 @@ impl Database {
     ) -> Result<Option<ProfileId>, StateError> {
         let datastore = self.datastore();
         let key = scope_key.to_string();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT profile_id FROM post_processing_profile_assignments
@@ -861,7 +935,7 @@ impl Database {
     ) -> Result<Option<ExtensionRevisionRecord>, StateError> {
         let datastore = self.datastore();
         let id = extension_id.as_str().to_string();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT manifest_json, trust_state, managed_path, discovered_source_path,
@@ -962,7 +1036,7 @@ impl Database {
     ) -> Result<Option<FrozenPlan>, StateError> {
         let datastore = self.datastore();
         let key = self.encryption_key().cloned();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT plan_json, secret_options_json FROM post_processing_job_plans
@@ -1582,7 +1656,7 @@ impl Database {
                 let id = id.clone();
                 let lines = lines.clone();
                 Box::pin(async move {
-                    let mut next = tx
+                    let next = tx
                         .fetch_optional(
                             "SELECT COALESCE(MAX(sequence), -1) + 1 AS next_sequence
                                FROM post_processing_log_chunks WHERE attempt_id = {}",
@@ -1593,23 +1667,7 @@ impl Database {
                             StateError::Database("failed to allocate log sequence".into())
                         })?
                         .i64("next_sequence")?;
-                    for (stream, payload) in &lines {
-                        tx.execute(
-                            "INSERT INTO post_processing_log_chunks (
-                                attempt_id, sequence, stream, payload, byte_count, created_at_epoch_ms
-                             ) VALUES ({}, {}, {}, {}, {}, {})",
-                            &[
-                                SqlArg::Text(id.clone()),
-                                SqlArg::I64(next),
-                                SqlArg::Text(log_stream_name(*stream).to_string()),
-                                SqlArg::Bytes(payload.clone()),
-                                SqlArg::I64(payload.len() as i64),
-                                SqlArg::I64(created_at_epoch_ms),
-                            ],
-                        )
-                        .await?;
-                        next += 1;
-                    }
+                    bulk_insert_log_chunks_tx(tx, &id, next, &lines, created_at_epoch_ms).await?;
                     let rows = tx
                         .fetch_all(
                             "SELECT sequence, byte_count FROM post_processing_log_chunks
@@ -1665,7 +1723,7 @@ impl Database {
         let after = after.map(i64::try_from).transpose().map_err(|_| {
             StateError::Database("post-processing log cursor exceeds SQL range".into())
         })?;
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let mut rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT sequence, stream, payload, created_at_epoch_ms
@@ -1711,7 +1769,7 @@ impl Database {
         let datastore = self.datastore();
         let id = run_id.as_str().to_string();
         let key = self.encryption_key().cloned();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT run_id, job_id, status, pipeline_outcome_json, summary, terminal_intent,
@@ -1733,7 +1791,7 @@ impl Database {
     ) -> Result<Option<PostProcessingRunRecord>, StateError> {
         let datastore = self.datastore();
         let key = self.encryption_key().cloned();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT r.run_id, r.job_id, r.status, r.pipeline_outcome_json, r.summary,
@@ -1760,7 +1818,7 @@ impl Database {
         let datastore = self.datastore();
         let key = self.encryption_key().cloned();
         let limit = i64::from(limit.clamp(1, 500));
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let columns = "run_id, job_id, status, pipeline_outcome_json, summary, terminal_intent,
                            plan_json, secret_options_json, rerun_of_run_id, queued_at_epoch_ms,
                            queue_position,
@@ -1858,7 +1916,7 @@ impl Database {
     ) -> Result<Vec<PostProcessingAttemptRecord>, StateError> {
         let datastore = self.datastore();
         let id = run_id.as_str().to_string();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT attempt_id, run_id, step_index, status, extension_id, revision_id,
@@ -1912,7 +1970,7 @@ impl Database {
         &self,
     ) -> Result<PostProcessingMetricsSnapshot, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let queue_row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT COUNT(*) AS queue_depth FROM post_processing_runs WHERE status = 'queued'",

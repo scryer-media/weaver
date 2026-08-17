@@ -10,6 +10,8 @@ pub mod service;
 #[cfg(test)]
 mod discovery_tests;
 #[cfg(test)]
+mod finalize_latency_probe;
+#[cfg(test)]
 mod manifest_tests;
 #[cfg(test)]
 mod model_tests;

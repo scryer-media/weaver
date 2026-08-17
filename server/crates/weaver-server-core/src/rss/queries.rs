@@ -24,7 +24,7 @@ const RSS_SEEN_SELECT: &str =
 impl Database {
     pub fn next_rss_feed_id(&self) -> Result<u32, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT MAX(id) AS id FROM rss_feeds",
@@ -42,7 +42,7 @@ impl Database {
 
     pub fn next_rss_rule_id(&self) -> Result<u32, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT MAX(id) AS id FROM rss_rules",
@@ -63,7 +63,7 @@ impl Database {
 
         let datastore = self.datastore();
         let encryption_key = self.encryption_key().cloned();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 &format!("{RSS_FEED_SELECT} ORDER BY id"),
@@ -86,7 +86,7 @@ impl Database {
 
         let datastore = self.datastore();
         let encryption_key = self.encryption_key().cloned();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 &format!("{RSS_FEED_SELECT} WHERE id = {{}}"),
@@ -104,7 +104,7 @@ impl Database {
 
     pub fn list_rss_rules(&self, feed_id: u32) -> Result<Vec<RssRuleRow>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 &format!("{RSS_RULE_SELECT} WHERE feed_id = {{}} ORDER BY sort_order, id"),
@@ -117,7 +117,7 @@ impl Database {
 
     pub fn get_rss_rule(&self, id: u32) -> Result<Option<RssRuleRow>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 &format!("{RSS_RULE_SELECT} WHERE id = {{}}"),
@@ -132,7 +132,7 @@ impl Database {
     pub fn rss_seen_item_exists(&self, feed_id: u32, item_id: &str) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let item_id = item_id.to_string();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let exists = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT 1 AS exists_value FROM rss_seen_items WHERE feed_id = {} AND item_id = {}",
@@ -149,7 +149,7 @@ impl Database {
         limit: Option<u32>,
     ) -> Result<Vec<RssSeenItemRow>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let mut sql = String::from(RSS_SEEN_SELECT);
             let mut args = Vec::new();
             if let Some(feed_id) = feed_id {

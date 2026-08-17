@@ -14,7 +14,7 @@ use crate::settings::{BufferPoolOverrides, Config, RetryOverrides, TunerOverride
 
 fn fetch_i64(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> i64 {
     let datastore = db.datastore();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         let row = SqlRuntime::fetch_optional(datastore.read_exec(), sql, &args)
             .await?
             .ok_or_else(|| StateError::Database(format!("query returned no rows: {sql}")))?;
@@ -25,7 +25,7 @@ fn fetch_i64(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> i64 {
 
 fn fetch_text(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> String {
     let datastore = db.datastore();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         let row = SqlRuntime::fetch_optional(datastore.read_exec(), sql, &args)
             .await?
             .ok_or_else(|| StateError::Database(format!("query returned no rows: {sql}")))?;
@@ -36,7 +36,7 @@ fn fetch_text(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> String {
 
 fn execute(db: &Database, sql: &'static str, args: Vec<SqlArg>) {
     let datastore = db.datastore();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         SqlRuntime::execute(datastore.read_exec(), sql, &args).await?;
         Ok(())
     })
@@ -136,7 +136,7 @@ type ForeignKeyGroup = (String, String, Vec<(i64, String, String)>);
 
 fn extract_canonical_schema(db: &Database) -> CanonicalSchema {
     let datastore = db.datastore();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         match datastore.engine() {
             SqlEngine::Sqlite => extract_sqlite_schema(&datastore).await,
             SqlEngine::Postgres => extract_postgres_schema(&datastore).await,

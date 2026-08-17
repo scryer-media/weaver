@@ -60,7 +60,7 @@ impl Database {
     /// Get the stored login credentials, if any.
     pub fn get_auth_credentials(&self) -> Result<Option<AuthCredentials>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT username, password_hash, created_at, updated_at FROM auth_credentials WHERE id = 1",

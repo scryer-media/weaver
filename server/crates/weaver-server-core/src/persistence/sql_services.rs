@@ -314,7 +314,7 @@ pub(crate) fn sqlite_url_with_create(path: &str) -> String {
     format!("sqlite://{path}?mode=rwc")
 }
 
-fn sqlite_max_connections_from_env() -> u32 {
+pub(crate) fn sqlite_max_connections_from_env() -> u32 {
     std::env::var("WEAVER_SQLITE_MAX_CONNECTIONS")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())

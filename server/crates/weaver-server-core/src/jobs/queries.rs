@@ -134,7 +134,7 @@ impl Database {
         trusted_only: bool,
     ) -> Result<HashMap<u32, [u8; 16]>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             // Explicit allowlist rather than IS NOT NULL: a future provenance
             // label is untrusted until the code that writes it also teaches
             // this filter what it means.
@@ -167,7 +167,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<HashMap<u32, ActivePar2File>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT file_index, filename, recovery_block_count, promoted
@@ -192,7 +192,7 @@ impl Database {
 
     pub fn load_failed_extractions(&self, job_id: JobId) -> Result<HashSet<String>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT member_name FROM active_failed_extractions
@@ -208,7 +208,7 @@ impl Database {
 
     pub fn load_active_job_normalization_retried(&self, job_id: JobId) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT normalization_retried FROM active_jobs WHERE job_id = {}",
@@ -226,7 +226,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<HashMap<String, HashSet<u32>>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT set_name, volume_index
@@ -248,7 +248,7 @@ impl Database {
 
     pub fn load_active_jobs(&self) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let mut jobs = HashMap::new();
 
             let rows = SqlRuntime::fetch_all(
@@ -443,7 +443,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<Option<PersistedNzbRecord>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT nzb_path, nzb_zstd
@@ -472,7 +472,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<(HashMap<u32, u64>, HashSet<u32>), StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT file_index, contiguous_bytes_written
@@ -509,7 +509,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<HashMap<u32, DetectedArchiveIdentity>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT file_index, kind, set_name, volume_index
@@ -535,7 +535,7 @@ impl Database {
 
     pub fn max_job_id_all(&self) -> Result<u64, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT MAX(id) AS id FROM (
@@ -565,7 +565,7 @@ impl Database {
     ) -> Result<Vec<ExtractionChunk>, StateError> {
         let datastore = self.datastore();
         let set_name = set_name.to_string();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT member_name, volume_index, bytes_written, temp_path,
@@ -587,7 +587,7 @@ impl Database {
     ) -> Result<Option<Vec<u8>>, StateError> {
         let datastore = self.datastore();
         let set_name = set_name.to_string();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT headers FROM active_archive_headers
@@ -605,7 +605,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<HashMap<String, Vec<u8>>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT set_name, headers FROM active_archive_headers
@@ -626,7 +626,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<RarVolumeFactsBySet, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT set_name, volume_index, facts_blob
@@ -655,7 +655,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<HashMap<String, Vec<u8>>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT set_name, snapshot FROM active_direct_coverage
@@ -677,7 +677,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<Vec<(String, u32)>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT set_name, volume_index

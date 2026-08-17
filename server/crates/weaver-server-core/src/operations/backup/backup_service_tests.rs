@@ -71,7 +71,7 @@ fn query_count(db: &Database, table: &'static str) -> i64 {
 fn history_post_processing_state(db: &Database, job_id: u64) -> (String, Option<String>) {
     let job_id = i64::try_from(job_id).expect("test job ID fits in i64");
     let datastore = db.datastore();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         let row = SqlRuntime::fetch_optional(
             datastore.read_exec(),
             "SELECT post_processing_summary, post_processing_run_id

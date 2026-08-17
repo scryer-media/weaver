@@ -700,7 +700,7 @@ async fn rebuild_job_history_attributes_tx(
 impl Database {
     pub fn schema_version(&self) -> Result<i64, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT version FROM schema_version LIMIT 1",
@@ -714,7 +714,7 @@ impl Database {
 
     pub fn restore_target_is_pristine(&self) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             for entry in catalog::BACKUP_TABLE_CATALOG {
                 let query = match entry.restore_target_policy {
                     catalog::RestoreTargetPolicy::Replace => continue,
@@ -780,7 +780,7 @@ impl Database {
             }
             StoreDatastore::Postgres { pool } => {
                 let dest = dest.to_path_buf();
-                self.run_sql_blocking(copy_postgres_stable_tables_to_backup(pool, dest))?;
+                self.run_sql_blocking_read(copy_postgres_stable_tables_to_backup(pool, dest))?;
             }
         }
 
@@ -807,7 +807,7 @@ impl Database {
         let datastore = self.datastore();
         if let StoreDatastore::Postgres { pool } = datastore {
             let src = src.to_path_buf();
-            return self.run_sql_blocking(import_stable_state_to_postgres(
+            return self.run_sql_blocking_read(import_stable_state_to_postgres(
                 pool,
                 src,
                 include_post_processing,

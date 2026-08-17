@@ -15,7 +15,7 @@ use crate::{
 fn fetch_i64(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) -> i64 {
     let datastore = db.datastore();
     let sql = sql.into();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         let row = SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args)
             .await?
             .ok_or_else(|| StateError::Database(format!("query returned no rows: {sql}")))?;
@@ -27,7 +27,7 @@ fn fetch_i64(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) -> i64 {
 fn fetch_i64_pair(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) -> (i64, i64) {
     let datastore = db.datastore();
     let sql = sql.into();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         let row = SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args)
             .await?
             .ok_or_else(|| StateError::Database(format!("query returned no rows: {sql}")))?;
@@ -52,7 +52,7 @@ fn fetch_text(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>, column: 
 fn execute_sql(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) {
     let datastore = db.datastore();
     let sql = sql.into();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
         Ok(())
     })

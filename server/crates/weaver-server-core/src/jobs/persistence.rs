@@ -628,7 +628,7 @@ impl Database {
         generation: i64,
     ) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             Ok(SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT 1 FROM semantic_duplicate_candidates
@@ -938,7 +938,7 @@ impl Database {
               WHERE job_id IN ({ids})"
         );
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::execute(datastore.read_exec(), &sql, &[]).await?;
             Ok(())
         })

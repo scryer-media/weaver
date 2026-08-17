@@ -94,7 +94,22 @@ security-framework-sys = { version = "2", default-features = false }
 keyring = { version = "4", default-features = false, features = ["v1"] }
 keyring-core = { version = "1", default-features = false }
 windows-sys = { version = "0.61", default-features = false }
-par2-rs = { version = "0.4", default-features = false, features = ["metal", "native-crypto"] }
+# `metal` is deliberately NOT enabled, and must not be re-added without an
+# explicit decision. This one feature is the ONLY path by which GPU code reaches
+# a weaver build: `par2-rs/metal` -> `reedsolomon-rs/metal` -> `objc2` +
+# `objc2-foundation` + `objc2-metal`, all target-gated to macOS aarch64, so the
+# Apple-silicon build was the only one that ever compiled it.
+#
+# In par2-rs 0.4.x it gates the GPU arm of both PAR2 creation (which weaver
+# never calls) and PAR2 *repair* (which weaver does call). With the feature off
+# the GPU arm is compiled out entirely — `GpuSession` does not exist, every hook
+# is a no-op, and the CPU streaming path is the only path — and creation's
+# `CreationBackend::{Auto, Metal}` both resolve to the CPU backend. Nothing in
+# weaver needs to change to take the CPU path; it is the only one built.
+#
+# Re-enabling means shipping a GPU repair lane again: decide it deliberately,
+# and re-verify with `cargo tree -e features --workspace | grep metal`.
+par2-rs = { version = "0.4", default-features = false, features = ["native-crypto"] }
 unrar-rs = { version = "0.5", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.12.0", default-features = false }
 

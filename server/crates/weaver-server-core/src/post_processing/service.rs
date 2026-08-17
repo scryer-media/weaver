@@ -516,9 +516,14 @@ impl PostProcessingService {
         let mut explicit_final_directory = false;
         let pipeline_succeeded = matches!(run.pipeline_outcome, PipelineOutcome::Succeeded);
         let mut cancellation = cancellation;
-        let mut available_artifacts =
-            collect_artifact_paths(&context.working_directory, MAX_DISCOVERED_ARTIFACTS);
-        let settings = self.db.post_processing_settings()?;
+        let mut available_artifacts = {
+            let _probe = crate::runtime::perf_probe::scope("pp.run.collect_artifacts");
+            collect_artifact_paths(&context.working_directory, MAX_DISCOVERED_ARTIFACTS)
+        };
+        let settings = {
+            let _probe = crate::runtime::perf_probe::scope("pp.run.load_settings");
+            self.db.post_processing_settings()?
+        };
 
         for step in run.plan.steps() {
             if selected_step_indexes.is_some_and(|selected| !selected.contains(&step.index())) {
@@ -540,13 +545,15 @@ impl PostProcessingService {
                 summary = PostProcessingSummary::Cancelled;
                 break;
             }
-            let record = self
-                .db
-                .extension_revision(
-                    step.revision().extension_id(),
-                    step.revision().revision_id(),
-                )?
-                .ok_or(PostProcessingServiceError::RevisionUnavailable)?;
+            let record = {
+                let _probe = crate::runtime::perf_probe::scope("pp.step.lookup_revision");
+                self.db
+                    .extension_revision(
+                        step.revision().extension_id(),
+                        step.revision().revision_id(),
+                    )?
+                    .ok_or(PostProcessingServiceError::RevisionUnavailable)?
+            };
             if record.trust_state != TrustState::Approved {
                 return Err(PostProcessingServiceError::RevisionUnavailable);
             }
@@ -559,6 +566,7 @@ impl PostProcessingService {
                 .map(PathBuf::from)
                 .ok_or(PostProcessingServiceError::RevisionUnavailable)?;
             let (control_token, control_token_hash) = issue_control_token()?;
+            let _attempt_setup = crate::runtime::perf_probe::scope("pp.step.attempt_setup");
             let attempt_id = self.db.enqueue_post_processing_attempt(
                 &run.run_id,
                 step,
@@ -593,6 +601,8 @@ impl PostProcessingService {
             };
             let db = self.db.clone();
             let spawned_attempt_id = attempt_id.clone();
+            drop(_attempt_setup);
+            let _probe = crate::runtime::perf_probe::scope("pp.step.execute_extension");
             let result =
                 execute_extension_with_spawn_callback(request, cancellation.clone(), move || {
                     if db
@@ -607,6 +617,7 @@ impl PostProcessingService {
                     }
                 })
                 .await;
+            drop(_probe);
             match result {
                 Ok(result) => {
                     let timestamp = now_epoch_ms();
@@ -615,8 +626,14 @@ impl PostProcessingService {
                         .iter()
                         .map(|line| (line.stream, line.bytes.clone()))
                         .collect::<Vec<_>>();
-                    self.db
-                        .append_post_processing_logs(&attempt_id, &captured_lines, timestamp)?;
+                    {
+                        let _probe = crate::runtime::perf_probe::scope("pp.step.append_logs");
+                        self.db.append_post_processing_logs(
+                            &attempt_id,
+                            &captured_lines,
+                            timestamp,
+                        )?;
+                    }
                     let (attempt_status, failed) = match result.disposition {
                         ExecutionDisposition::Succeeded => (AttemptStatus::Succeeded, false),
                         ExecutionDisposition::Skipped => (AttemptStatus::Skipped, false),
@@ -628,6 +645,7 @@ impl PostProcessingService {
                         ExecutionDisposition::TimedOut => (AttemptStatus::TimedOut, true),
                         ExecutionDisposition::Failed => (AttemptStatus::Failed, true),
                     };
+                    let _probe = crate::runtime::perf_probe::scope("pp.step.finish_attempt");
                     self.db.finish_post_processing_attempt(
                         &attempt_id,
                         attempt_status,
@@ -639,6 +657,11 @@ impl PostProcessingService {
                     )?;
                     if let Some(directory) = result.effects.directory.as_ref() {
                         context.working_directory = directory.clone();
+                        // Re-walked in full whenever a step moves the working
+                        // directory, so a plan with several such steps pays the
+                        // walk several times.
+                        let _probe =
+                            crate::runtime::perf_probe::scope("pp.step.collect_artifacts_rewalk");
                         available_artifacts = collect_artifact_paths(
                             &context.working_directory,
                             MAX_DISCOVERED_ARTIFACTS,
@@ -722,12 +745,15 @@ impl PostProcessingService {
             PostProcessingSummary::NotRun => RunStatus::Skipped,
             PostProcessingSummary::Failed => RunStatus::Failed,
         };
-        self.db.finish_post_processing_run(
-            &run.run_id,
-            run_status,
-            summary.clone(),
-            now_epoch_ms(),
-        )?;
+        {
+            let _probe = crate::runtime::perf_probe::scope("pp.run.finish_run");
+            self.db.finish_post_processing_run(
+                &run.run_id,
+                run_status,
+                summary.clone(),
+                now_epoch_ms(),
+            )?;
+        }
         Ok(RunExecutionReport {
             run_id: Some(run.run_id),
             summary,
@@ -800,6 +826,11 @@ fn collect_artifact_paths(root: &Path, limit: usize) -> Vec<PathBuf> {
         }
     }
     artifacts
+}
+
+#[cfg(test)]
+pub(crate) fn collect_artifact_paths_for_test(root: &Path, limit: usize) -> usize {
+    collect_artifact_paths(root, limit).len()
 }
 
 fn issue_control_token() -> Result<(String, Vec<u8>), StateError> {

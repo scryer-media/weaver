@@ -1306,8 +1306,10 @@ async fn execute_supervised(
         use std::os::unix::process::CommandExt;
         command.as_std_mut().process_group(0);
     }
+    let spawn_started = Instant::now();
     let mut child = command.spawn()?;
     let supervisor_pid = child.id();
+    crate::runtime::perf_probe::record("pp.runner.spawn_supervisor", spawn_started.elapsed());
     if let Some(on_spawn) = on_spawn
         && let Err(error) = on_spawn()
     {
@@ -1360,26 +1362,50 @@ async fn execute_supervised(
         })
         .transpose()?;
     let mut cancellation = cancellation;
-    let (status, forced) = loop {
-        if let Some(status) = child.try_wait()? {
-            break (Some(status), None);
+    let wait_started = Instant::now();
+    // Exit, cancellation and the timeout are all awaited together. This used to
+    // poll `try_wait` on a 50 ms sleep, which quantised every attempt to a
+    // multiple of that period: measured, an extension producing NO output still
+    // cost ~55 ms, and 1000 lines cost no more than 0 lines, because the time was
+    // spent asleep rather than working. Waiting on the child reports the exit as
+    // soon as it happens.
+    let (status, forced) = {
+        let cancelled = async {
+            match cancellation.as_mut() {
+                Some(receiver) => loop {
+                    if *receiver.borrow() {
+                        return;
+                    }
+                    if receiver.changed().await.is_err() {
+                        // Sender gone: nothing can cancel us any more.
+                        std::future::pending::<()>().await;
+                    }
+                },
+                // No cancellation channel: never fires.
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let timed_out = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            status = child.wait() => (Some(status?), None),
+            () = cancelled => {
+                terminate_supervisor(&mut child, supervisor_pid, grace).await?;
+                (None, Some(ExecutionDisposition::Cancelled))
+            }
+            () = timed_out => {
+                terminate_supervisor(&mut child, supervisor_pid, grace).await?;
+                (None, Some(ExecutionDisposition::TimedOut))
+            }
         }
-        if cancellation
-            .as_ref()
-            .is_some_and(|receiver| *receiver.borrow())
-        {
-            terminate_supervisor(&mut child, supervisor_pid, grace).await?;
-            break (None, Some(ExecutionDisposition::Cancelled));
-        }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            terminate_supervisor(&mut child, supervisor_pid, grace).await?;
-            break (None, Some(ExecutionDisposition::TimedOut));
-        }
-        if let Some(receiver) = cancellation.as_mut() {
-            let _ = receiver.has_changed();
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     };
+    crate::runtime::perf_probe::record("pp.runner.wait_for_exit", wait_started.elapsed());
+    let drain_started = Instant::now();
     drop(stdin);
     stdout_task
         .await
@@ -1387,6 +1413,7 @@ async fn execute_supervised(
     stderr_task
         .await
         .map_err(|error| RunnerError::SupervisorProtocol(error.to_string()))??;
+    crate::runtime::perf_probe::record("pp.runner.drain_output", drain_started.elapsed());
     let captured = Arc::try_unwrap(output)
         .map_err(|_| RunnerError::SupervisorProtocol("output collector remained shared".into()))?
         .into_inner()

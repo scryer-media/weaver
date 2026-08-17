@@ -180,7 +180,7 @@ impl Database {
         options: DbMaintenanceOptions,
     ) -> Result<DbMaintenanceReport, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             if datastore.engine() != SqlEngine::Sqlite {
                 return Err(StateError::Database(
                     "sqlite maintenance requires a sqlite datastore".to_string(),
@@ -198,7 +198,7 @@ impl Database {
         &self,
     ) -> Result<PostgresMaintenanceReport, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             if datastore.engine() != SqlEngine::Postgres {
                 return Err(StateError::Database(
                     "postgres maintenance requires a postgres datastore".to_string(),

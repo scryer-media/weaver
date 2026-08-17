@@ -61,7 +61,7 @@ impl Database {
     pub fn lookup_api_key(&self, key_hash: &[u8; 32]) -> Result<Option<ApiKeyRow>, StateError> {
         let datastore = self.datastore();
         let key_hash = key_hash.to_vec();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT id, name, scope, created_at, last_used_at
@@ -77,7 +77,7 @@ impl Database {
     /// List all API keys (without hashes).
     pub fn list_api_keys(&self) -> Result<Vec<ApiKeyRow>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT id, name, scope, created_at, last_used_at
@@ -91,7 +91,7 @@ impl Database {
 
     pub fn list_api_key_auth_rows(&self) -> Result<Vec<ApiKeyAuthRow>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT key_hash, id, scope FROM api_keys",

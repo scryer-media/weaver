@@ -344,7 +344,7 @@ impl Database {
     ) -> Result<MetricsHistoryQueryResult, StateError> {
         let datastore = self.datastore();
         match tier {
-            MetricsHistoryTier::Raw10s => self.run_sql_blocking(async move {
+            MetricsHistoryTier::Raw10s => self.run_sql_blocking_read(async move {
                 Ok(MetricsHistoryQueryResult {
                     resolution_sec: tier.resolution_sec(),
                     data: MetricsHistoryQueryData::Raw(
@@ -353,8 +353,8 @@ impl Database {
                     ),
                 })
             }),
-            MetricsHistoryTier::Rollup5m | MetricsHistoryTier::Rollup1h => {
-                self.run_sql_blocking(async move {
+            MetricsHistoryTier::Rollup5m | MetricsHistoryTier::Rollup1h => self
+                .run_sql_blocking_read(async move {
                     Ok(MetricsHistoryQueryResult {
                         resolution_sec: tier.resolution_sec(),
                         data: MetricsHistoryQueryData::Rollup(
@@ -367,8 +367,7 @@ impl Database {
                             .await?,
                         ),
                     })
-                })
-            }
+                }),
         }
     }
 
@@ -377,7 +376,7 @@ impl Database {
         tier: MetricsHistoryTier,
     ) -> Result<Vec<MetricsHistoryChunkRow>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT resolution_sec, chunk_start_epoch_sec, body_zstd
