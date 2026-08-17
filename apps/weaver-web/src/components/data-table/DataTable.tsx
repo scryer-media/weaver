@@ -3,9 +3,9 @@ import {
   memo,
   useEffect,
   useRef,
+  useState,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
-  type RefObject,
 } from "react";
 import { flexRender, type Row, type Table as TanstackTable } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -97,7 +97,7 @@ type VirtualizedDataTableBodyProps<TData> = {
   rows: Row<TData>[];
   columnCount: number;
   emptyState: ReactNode;
-  scrollRef: RefObject<HTMLDivElement | null>;
+  scrollElement: HTMLDivElement | null;
   rowClassName?: (row: Row<TData>) => string | undefined;
   onRowClick?: (row: Row<TData>, event: ReactMouseEvent<HTMLTableRowElement>) => void;
   virtualization: DataTableVirtualization;
@@ -107,14 +107,14 @@ function VirtualizedDataTableBody<TData>({
   rows,
   columnCount,
   emptyState,
-  scrollRef,
+  scrollElement,
   rowClassName,
   onRowClick,
   virtualization,
 }: VirtualizedDataTableBodyProps<TData>) {
   const rowVirtualizer = useVirtualizer({
     count: rows.length,
-    getScrollElement: () => scrollRef.current,
+    getScrollElement: () => scrollElement,
     getItemKey: (index) => rows[index]?.id ?? index,
     estimateSize: () => virtualization.estimatedRowHeight,
     overscan: virtualization.overscan ?? 8,
@@ -190,11 +190,14 @@ export function DataTable<TData>({
 }: DataTableProps<TData>) {
   const rows = table.getRowModel().rows;
   const columnCount = table.getVisibleLeafColumns().length;
-  const tableScrollRef = useRef<HTMLDivElement>(null);
+  // A callback ref makes the scroll container a piece of React state. Passing
+  // only `ref.current` lets TanStack Virtual initialize before the wrapper is
+  // mounted; when the first page then arrives, its range can remain empty.
+  const [tableScrollElement, setTableScrollElement] = useState<HTMLDivElement | null>(null);
 
   return (
     <Table
-      ref={virtualization ? tableScrollRef : undefined}
+      ref={virtualization ? setTableScrollElement : undefined}
       className={tableClassName}
       wrapperClassName={wrapperClassName}
     >
@@ -222,7 +225,7 @@ export function DataTable<TData>({
           rows={rows}
           columnCount={columnCount}
           emptyState={emptyState}
-          scrollRef={tableScrollRef}
+          scrollElement={tableScrollElement}
           rowClassName={rowClassName}
           onRowClick={onRowClick}
           virtualization={virtualization}
