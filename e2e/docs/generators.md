@@ -130,6 +130,7 @@ payload almost every archive wraps), `clip-preview` (5 MiB exactly),
 | `rarlab-7.23` | `rarlinux-x64-723.tar.gz`, SHA-256 `759b4b6a…cab588` | every general-corpus RAR5 archive (`-ma5`) |
 | `sevenzip-26.02` | `https://www.7-zip.org/a/7z2602-linux-x64.tar.xz`, SHA-256 `41aaba7b…c28c03e` | every 7z container |
 | `par2cmdline-turbo-1.4.0` | `v1.4.0.tar.gz`, SHA-256 `6f2cb042…d1b972` | every PAR2 recovery set |
+| `uudeview-0.5.20` | `uudeview_0.5.20.orig.tar.gz`, SHA-256 `a2a44fa5…70a414` | every uuencoded article, and the decoder each one is proved against |
 | `ffmpeg-7.1-ubuntu2404` | image digest `sha256:292a972c…71931d` | every video clip |
 | `go-fixture-bytes` | Go 1.26.2, stdlib | payload streams and every byte edit |
 | `go-archive-zip` | Go 1.26.2, `archive/zip` | zip containers, including ZipCrypto |
@@ -193,6 +194,7 @@ zip/tar/gzip/DEFLATE/zstd/bzip2/brotli by Go.
 | stream codec | `gzip-single`, `gzip-corrupted`, `deflate-single`, `bzip2-single`, `zstd-single`, `brotli-single` | bare streams, no container |
 | direct store | 6 slugs | stored, non-solid RAR sets the direct-store router must carry |
 | mixed | `mixed-archive` | a RAR beside a loose clip and an NFO |
+| uuencode | `uu-release`, `uu-mixed-yenc`, `uu-preamble-tail`, `uu-missing-middle` | the only fixtures nyuu cannot post — it is a yEnc poster with no encoding selector — so their article bodies ship pre-encoded and the seeder posts them itself. uuenview writes the encoding and splits it at line boundaries; uudeview decodes every one back before it is published. `uu-preamble-tail` carries the corpus's one deliberate deviation from oracle output: an unpadded final group, the broken-encoder probe |
 
 Nine scenario directories own no bytes at all — they stage another scenario's
 assets through `fixtureAssets`, or the harness injects their fault. They are

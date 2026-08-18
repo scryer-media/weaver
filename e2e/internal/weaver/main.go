@@ -58,6 +58,7 @@ type Scenario struct {
 	BackupFixtureAssets          []string                   `json:"backupFixtureAssets,omitempty"`
 	DeleteSubjectContains        []string                   `json:"deleteSubjectContains,omitempty"`
 	DeleteSubjectTailArticles    int                        `json:"deleteSubjectTailArticles,omitempty"`
+	DeleteSegmentNumbers         []int                      `json:"deleteSegmentNumbers,omitempty"`
 	PrimaryDeleteSubjectContains []string                   `json:"primaryDeleteSubjectContains,omitempty"`
 	PrimaryChaosConfig           string                     `json:"primaryChaosConfig,omitempty"`
 	RequiredJobEvents            []string                   `json:"requiredJobEvents,omitempty"`
@@ -1086,6 +1087,13 @@ var canonicalFixtureSlugs = []string{
 	"tbz2-archive",
 	"tgz-archive",
 	"unicode-filenames",
+	// uuencode. Nyuu cannot post these — see internal/weaver/uu_seed.go — so
+	// their articles come from the corpus pre-encoded and the seeder posts
+	// them itself.
+	"uu-release",
+	"uu-mixed-yenc",
+	"uu-preamble-tail",
+	"uu-missing-middle",
 	"zip-corrupted",
 	"zip-encrypted",
 	"zip-unencrypted",
@@ -1680,13 +1688,41 @@ func seedScenarioRelease(absDir string, scenario *Scenario) error {
 		log.Printf("[%s] %s", scenario.Slug, fmt.Sprintf(format, args...))
 	}
 
-	stageDir, files, totalBytes, cleanupStage, err := prepareFixtureStaging(absDir, scenario)
+	// A uu scenario's articles are already encoded; they are posted from the
+	// corpus rather than handed to nyuu, which only speaks yEnc. A scenario
+	// may have both kinds, one kind, or — for a pure uu release — nothing at
+	// all for nyuu to stage.
+	uuPlan, err := loadUUPlan(absDir)
 	if err != nil {
-		return fmt.Errorf("prepare staged files in %s: %w", absDir, err)
+		return fmt.Errorf("load uu posting plan for %s: %w", scenario.Slug, err)
+	}
+	stagesForNyuu, err := scenarioStagesPostableFiles(absDir, scenario)
+	if err != nil {
+		return fmt.Errorf("inspect staged files in %s: %w", absDir, err)
+	}
+	if !stagesForNyuu && uuPlan == nil {
+		return fmt.Errorf("fixture %s has no staged files and no uu posting plan", absDir)
+	}
+
+	var (
+		stageDir     string
+		files        []string
+		totalBytes   int64
+		cleanupStage = func() {}
+	)
+	if stagesForNyuu {
+		stageDir, files, totalBytes, cleanupStage, err = prepareFixtureStaging(absDir, scenario)
+		if err != nil {
+			return fmt.Errorf("prepare staged files in %s: %w", absDir, err)
+		}
 	}
 	defer cleanupStage()
 
-	logSeed("seeding %d file(s), title=%s", len(files), scenario.Title)
+	uuFileCount := 0
+	if uuPlan != nil {
+		uuFileCount = len(uuPlan.Files)
+	}
+	logSeed("seeding %d yEnc file(s) and %d uuencoded file(s), title=%s", len(files), uuFileCount, scenario.Title)
 
 	if err := purgeSeededArticles(scenario.Slug); err != nil {
 		return fmt.Errorf("purge existing articles for %s: %w", scenario.Slug, err)
@@ -1704,18 +1740,37 @@ func seedScenarioRelease(absDir string, scenario *Scenario) error {
 	if err := os.Remove(nzbPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("reset generated NZB for %s: %w", scenario.Slug, err)
 	}
-	stageDirInNyuu, err := nyuuContainerPathForHost(stageDir)
-	if err != nil {
-		return fmt.Errorf("resolve nyuu stage path for %s: %w", scenario.Slug, err)
-	}
-	nzbPathInNyuu, err := nyuuContainerPathForHost(nzbPath)
-	if err != nil {
-		return fmt.Errorf("resolve nyuu nzb path for %s: %w", scenario.Slug, err)
+	if stagesForNyuu {
+		stageDirInNyuu, err := nyuuContainerPathForHost(stageDir)
+		if err != nil {
+			return fmt.Errorf("resolve nyuu stage path for %s: %w", scenario.Slug, err)
+		}
+		nzbPathInNyuu, err := nyuuContainerPathForHost(nzbPath)
+		if err != nil {
+			return fmt.Errorf("resolve nyuu nzb path for %s: %w", scenario.Slug, err)
+		}
+
+		if err := runNyuuPost(stageDirInNyuu, files, scenario, "127.0.0.1", "119", nzbPathInNyuu); err != nil {
+			return fmt.Errorf("nyuu failed for %s: %w", scenario.Slug, err)
+		}
 	}
 
-	if err := runNyuuPost(stageDirInNyuu, files, scenario, "127.0.0.1", "119", nzbPathInNyuu); err != nil {
-		return fmt.Errorf("nyuu failed for %s: %w", scenario.Slug, err)
+	if uuPlan != nil {
+		elements, uuBytes, err := seedUUArticles(nntpHost(), nntpPort(), scenario, absDir, uuPlan)
+		if err != nil {
+			return fmt.Errorf("post uu articles for %s: %w", scenario.Slug, err)
+		}
+		totalBytes += uuBytes
+		if stagesForNyuu {
+			err = spliceUUFilesIntoNZB(nzbPath, elements)
+		} else {
+			err = writeUUNZB(nzbPath, scenario, elements)
+		}
+		if err != nil {
+			return fmt.Errorf("write uu NZB entries for %s: %w", scenario.Slug, err)
+		}
 	}
+
 	if err := normalizeNZBDateAttributes(nzbPath, existingDates); err != nil {
 		return fmt.Errorf("normalize NZB dates for %s: %w", scenario.Slug, err)
 	}
@@ -1757,6 +1812,24 @@ func seedScenarioRelease(absDir string, scenario *Scenario) error {
 		)
 		if err := deleteArticlesByMessageID(messageIDs); err != nil {
 			return fmt.Errorf("delete targeted articles for %s: %w", scenario.Slug, err)
+		}
+	}
+
+	if len(scenario.DeleteSegmentNumbers) > 0 {
+		messageIDs, err := extractMessageIDsBySegmentNumbers(nzbData, scenario.DeleteSubjectContains, scenario.DeleteSegmentNumbers)
+		if err != nil {
+			return fmt.Errorf("extract segment-number delete ids for %s: %w", scenario.Slug, err)
+		}
+		if len(messageIDs) == 0 {
+			return fmt.Errorf(
+				"no NZB segments matched deleteSegmentNumbers=%v for %s",
+				scenario.DeleteSegmentNumbers,
+				scenario.Slug,
+			)
+		}
+		logSeed("deleting %d article(s) at segment number(s) %v...", len(messageIDs), scenario.DeleteSegmentNumbers)
+		if err := deleteArticlesByMessageID(messageIDs); err != nil {
+			return fmt.Errorf("delete segment-number articles for %s: %w", scenario.Slug, err)
 		}
 	}
 
@@ -2448,6 +2521,75 @@ func extractMessageIDsBySubjectContains(nzbData []byte, needles []string, tailAr
 			segments = segments[len(segments)-tailArticles:]
 		}
 		for _, segment := range segments {
+			msgID := strings.TrimSpace(segment.MessageID)
+			msgID = strings.TrimPrefix(msgID, "<")
+			msgID = strings.TrimSuffix(msgID, ">")
+			if msgID != "" {
+				ids = append(ids, msgID)
+			}
+		}
+	}
+
+	return ids, nil
+}
+
+// extractMessageIDsBySegmentNumbers selects articles by their position within
+// a file, which is what an interior-hole scenario needs: deleteSubjectContains
+// picks whole files and deleteSubjectTailArticles only reaches the tail, so
+// neither can name a segment in the middle. The subject needles stay optional
+// and narrow which files are considered; with none, every file is.
+func extractMessageIDsBySegmentNumbers(nzbData []byte, needles []string, numbers []int) ([]string, error) {
+	type nzbSegment struct {
+		Number    int    `xml:"number,attr"`
+		MessageID string `xml:",chardata"`
+	}
+	type nzbFile struct {
+		Subject  string       `xml:"subject,attr"`
+		Segments []nzbSegment `xml:"segments>segment"`
+	}
+	type nzbDoc struct {
+		Files []nzbFile `xml:"file"`
+	}
+
+	var doc nzbDoc
+	if err := xml.Unmarshal(nzbData, &doc); err != nil {
+		return nil, err
+	}
+
+	wanted := make(map[int]struct{}, len(numbers))
+	for _, number := range numbers {
+		wanted[number] = struct{}{}
+	}
+	if len(wanted) == 0 {
+		return nil, nil
+	}
+
+	lowerNeedles := make([]string, 0, len(needles))
+	for _, needle := range needles {
+		if needle = strings.ToLower(strings.TrimSpace(needle)); needle != "" {
+			lowerNeedles = append(lowerNeedles, needle)
+		}
+	}
+
+	var ids []string
+	for _, file := range doc.Files {
+		if len(lowerNeedles) > 0 {
+			subject := strings.ToLower(file.Subject)
+			matched := false
+			for _, needle := range lowerNeedles {
+				if strings.Contains(subject, needle) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		for _, segment := range file.Segments {
+			if _, ok := wanted[segment.Number]; !ok {
+				continue
+			}
 			msgID := strings.TrimSpace(segment.MessageID)
 			msgID = strings.TrimPrefix(msgID, "<")
 			msgID = strings.TrimSuffix(msgID, ">")

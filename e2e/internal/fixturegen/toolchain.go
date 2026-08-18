@@ -15,6 +15,10 @@
 //   - PAR2 recovery material comes from par2cmdline-turbo.
 //   - 7z containers come from the official 7-Zip console binary.
 //   - Video comes from the digest-pinned FFmpeg image.
+//   - uuencoding, and the split across multi-part postings, come from
+//     UUDeview's uuenview — and every encoding is decoded back by uudeview
+//     before it is published, so no fixture can ship a shape a real decoder
+//     rejects.
 //
 // Every one of those is pinned by URL and SHA-256, or by image digest, in
 // test-corpus/toolchains.json.
@@ -74,6 +78,7 @@ type Lock struct {
 	RARWriters    []Toolchain `json:"rar_writers"`
 	VideoEncoder  Toolchain   `json:"video_encoder"`
 	PAR2Generator Toolchain   `json:"par2_generator"`
+	UUCodec       Toolchain   `json:"uu_codec"`
 	Archivers     []Toolchain `json:"archivers"`
 	GoWriters     []GoWriter  `json:"go_writers"`
 }
@@ -111,10 +116,10 @@ func LoadLock(root string) (Lock, error) {
 }
 
 func (lock Lock) all() []Toolchain {
-	toolchains := make([]Toolchain, 0, len(lock.RARWriters)+len(lock.Archivers)+2)
+	toolchains := make([]Toolchain, 0, len(lock.RARWriters)+len(lock.Archivers)+3)
 	toolchains = append(toolchains, lock.RARWriters...)
 	toolchains = append(toolchains, lock.Archivers...)
-	toolchains = append(toolchains, lock.VideoEncoder, lock.PAR2Generator)
+	toolchains = append(toolchains, lock.VideoEncoder, lock.PAR2Generator, lock.UUCodec)
 	return toolchains
 }
 
@@ -176,6 +181,8 @@ func (toolchain Toolchain) buildArgs() []string {
 		return []string{"PAR2_URL=" + toolchain.URL, "PAR2_SHA256=" + toolchain.SHA256}
 	case strings.Contains(toolchain.Dockerfile, "/sevenzip/"):
 		return []string{"SEVENZIP_URL=" + toolchain.URL, "SEVENZIP_SHA256=" + toolchain.SHA256}
+	case strings.Contains(toolchain.Dockerfile, "/uudeview/"):
+		return []string{"UUDEVIEW_URL=" + toolchain.URL, "UUDEVIEW_SHA256=" + toolchain.SHA256}
 	default:
 		return nil
 	}

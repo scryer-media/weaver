@@ -1,0 +1,11 @@
+{
+  "slug": "uu-release",
+  "title": "Silver.Horizon.S01E04.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A pure uuencoded release with no archive and no PAR2: an eight-article payload and a single-article sidecar, canonical shape throughout. Tests uudecode and multi-article assembly, and that a single-article file is not a special case.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "silver.horizon.s01e04.mkv": "13085bd3004f2c6e4c466ccfce951e2790ea939b47fe254d7e5d623d66d4c510",
+    "silver.horizon.s01e04.nfo": "4330d944b474d639a05efb3267089de0cf4d8dfbaeb393c12a16e56496503373"
+  }
+}

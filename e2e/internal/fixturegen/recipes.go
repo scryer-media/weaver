@@ -879,10 +879,150 @@ func Recipes() []Recipe {
 		})
 	}
 
+	// ----------------------------------------------------------- uuencode
+	//
+	// These are the only fixtures the harness cannot post with nyuu: it is a
+	// yEnc poster and has no encoding selector, so a uu release ships its
+	// article bodies pre-encoded and the seeder posts those bytes verbatim.
+	// The encoding and the split across articles are UUDeview's, not this
+	// package's — see uuencode.go — and every one of them is decoded back by a
+	// real decoder before it is allowed into the corpus.
+	add(Recipe{
+		Slug: "uu-release", Family: "uuencode", ByteReproducible: true,
+		Notes: "A plain uuencoded release: one multi-article payload and one single-article sidecar, canonical shape throughout, no archive and no PAR2. This is the baseline the other uu fixtures deviate from.",
+		Build: func(ctx context.Context, env *Env) error {
+			media, notes := env.StagePath(uuReleaseMedia), env.StagePath(uuReleaseNFO)
+			if err := WritePRNG(media, "silver-horizon", uuMediaBytes); err != nil {
+				return err
+			}
+			if err := WriteText(notes, uuReleaseNotesText, uuShortSidecarBytes); err != nil {
+				return err
+			}
+			return EncodeUU(ctx, env, []UUSpec{
+				{Source: media, Name: uuReleaseMedia, LinesPerPart: 200},
+				{Source: notes, Name: uuReleaseNFO},
+			})
+		},
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			return map[string]string{
+				uuReleaseMedia: env.StagePath(uuReleaseMedia),
+				uuReleaseNFO:   env.StagePath(uuReleaseNFO),
+			}, nil
+		},
+	})
+
+	add(Recipe{
+		Slug: "uu-mixed-yenc", Family: "uuencode", ByteReproducible: true,
+		Notes: "One NZB carrying both encodings: the media file is posted as yEnc by nyuu the way every other fixture is, and the sidecar beside it is uuencoded across three articles. A reader has to decide per file, not per job.",
+		Build: func(ctx context.Context, env *Env) error {
+			// The media file is a plain output: it stays a top-level file in
+			// the scenario directory, which is what makes the seeder stage it
+			// and hand it to nyuu.
+			if err := WritePRNG(env.OutputPath(uuMixedMedia), "amber-trail", uuMediaBytes); err != nil {
+				return err
+			}
+			notes := env.StagePath(uuMixedNFO)
+			if err := WriteText(notes, uuMixedNotesText, uuLongSidecarBytes); err != nil {
+				return err
+			}
+			return EncodeUU(ctx, env, []UUSpec{
+				{Source: notes, Name: uuMixedNFO, LinesPerPart: 200},
+			})
+		},
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			return map[string]string{
+				uuMixedMedia: env.OutputPath(uuMixedMedia),
+				uuMixedNFO:   env.StagePath(uuMixedNFO),
+			}, nil
+		},
+	})
+
+	add(Recipe{
+		Slug: "uu-preamble-tail", Family: "uuencode", ByteReproducible: true,
+		Notes: "Two tolerance probes in one release. The media file keeps uuenview's own `_=_ Part n of m` block, so every article — continuations included — opens with prose a decoder has to skip. The sidecar's last group is left unpadded, the way a class of broken encoder really did post it; the pinned decoder recovers both byte for byte, which is what the scenario's digests pin.",
+		Build: func(ctx context.Context, env *Env) error {
+			media, notes := env.StagePath(uuPreambleMedia), env.StagePath(uuPreambleNFO)
+			if err := WritePRNG(media, "violet-cascade", uuMediaBytes); err != nil {
+				return err
+			}
+			// uuLongSidecarBytes is not a multiple of three, so the encoding
+			// ends on a partial group and there is padding for the probe to
+			// strip.
+			if err := WriteText(notes, uuPreambleNotesText, uuLongSidecarBytes); err != nil {
+				return err
+			}
+			return EncodeUU(ctx, env, []UUSpec{
+				{Source: media, Name: uuPreambleMedia, LinesPerPart: 200, KeepEncoderPreamble: true},
+				{Source: notes, Name: uuPreambleNFO, LinesPerPart: 200, UnpadFinalGroup: true},
+			})
+		},
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			return map[string]string{
+				uuPreambleMedia: env.StagePath(uuPreambleMedia),
+				uuPreambleNFO:   env.StagePath(uuPreambleNFO),
+			}, nil
+		},
+	})
+
+	add(Recipe{
+		Slug: "uu-missing-middle", Family: "uuencode", ByteReproducible: true,
+		Notes: "A canonical uu multipart with one interior article deleted after posting and no PAR2 to rebuild it. The scenario asserts that the job reaches a terminal state and is labelled there — not which damage verdict it lands on.",
+		Build: func(ctx context.Context, env *Env) error {
+			media := env.StagePath(uuMissingMedia)
+			if err := WritePRNG(media, "crimson-vale", uuMediaBytes); err != nil {
+				return err
+			}
+			return EncodeUU(ctx, env, []UUSpec{
+				{Source: media, Name: uuMissingMedia, LinesPerPart: 200},
+			})
+		},
+	})
+
 	// ------------------------------------------------------- direct store
 	recipes = append(recipes, DirectStoreRecipes()...)
 	return recipes
 }
+
+// The uu fixtures' member names. They are invented titles, and they are also
+// the names the `begin` lines carry, which makes them the names a decoder
+// writes and therefore the keys the scenarios' output digests are held under.
+const (
+	uuReleaseMedia  = "silver.horizon.s01e04.mkv"
+	uuReleaseNFO    = "silver.horizon.s01e04.nfo"
+	uuMixedMedia    = "amber.trail.s01e02.mkv"
+	uuMixedNFO      = "amber.trail.s01e02.nfo"
+	uuPreambleMedia = "violet.cascade.s01e05.mkv"
+	uuPreambleNFO   = "violet.cascade.s01e05.nfo"
+	uuMissingMedia  = "crimson.vale.s01e06.mkv"
+)
+
+// The uu payload sizes. Unlike the rest of the corpus these are exact rather
+// than encoder-determined, and deliberately so: the number of articles a file
+// is split across is a function of its size, and every one of those articles
+// is its own ledger path. A payload that changed size by a byte could change
+// the file list, which is a corpus revision by hand rather than a digest
+// refresh. Fixing the sizes here fixes the shapes:
+//
+//	uuMediaBytes        1,457 lines -> 8 articles at 200 lines
+//	uuShortSidecarBytes    23 lines -> 1 article
+//	uuLongSidecarBytes    445 lines -> 3 articles at 200 lines
+//
+// uuLongSidecarBytes is additionally not a multiple of three, which is what
+// leaves the tail-tolerance probe a partial final group to strip.
+const (
+	uuMediaBytes        = 65536
+	uuShortSidecarBytes = 1024
+	uuLongSidecarBytes  = 20003
+)
+
+// The sidecar payloads. They are padded out to a fixed size by WriteText, so
+// what matters here is only that each is a distinct, deterministic run of
+// bytes; the titles are invented.
+const (
+	uuReleaseNotesText  = "Silver Horizon - season one, episode four. Encoded for the e2e corpus; every name here is invented.\n"
+	uuMixedNotesText    = "Amber Trail - season one, episode two. The sidecar beside a yEnc-posted media file, uuencoded across three articles.\n"
+	uuPreambleNotesText = "Violet Cascade - season one, episode five. The tail-tolerance probe: this file's encoding ends on an unpadded final group.\n"
+)
 
 // ---------------------------------------------------------------- helpers
 

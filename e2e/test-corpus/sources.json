@@ -19,7 +19,8 @@
         "rarlab-5.00",
         "rarlab-6.24",
         "rarlab-7.23",
-        "sevenzip-26.02"
+        "sevenzip-26.02",
+        "uudeview-0.5.20"
       ],
       "byte_reproducible": false,
       "notes": "The Go fixture generator. Payload synthesis, every byte edit, and the zip, tar, gzip, DEFLATE, zstd, bzip2 and brotli containers are Go; RAR comes only from RARLAB's own writer, PAR2 from par2cmdline-turbo, 7z from the official 7-Zip console binary and video from the pinned FFmpeg image. Not byte-reproducible as a whole: RAR and 7z stamp creation times and draw encryption salts, and the video encoders are not bit-exact across builds. The zip, tar and stream-codec families are byte-reproducible from their recipe alone."
@@ -4172,6 +4173,510 @@
         ],
         "inputs": [
           "testdata/single-mkv/test-media.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-missing-middle/uu/crimson.vale.s01e06.mkv.001",
+      "size": 12434,
+      "blake3": "70ed81c22c75be707a416e1f94202d5d06d3417fdcdbf5c73ef3952f2445bdc6",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-missing-middle/uu/crimson.vale.s01e06.mkv.002",
+      "size": 12400,
+      "blake3": "eec7ab498635cc75274ac02a1cd41212622717d3fd3891891db4563e0a0e2bf7",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-missing-middle/uu/crimson.vale.s01e06.mkv.003",
+      "size": 12400,
+      "blake3": "a8d9bca297dc5317395ac8d0c80fdca8ffac18af13d358930c0597ad74438098",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-missing-middle/uu/crimson.vale.s01e06.mkv.004",
+      "size": 12400,
+      "blake3": "42cae0b20bcddd8c505da9c229f503bbfaaba4099edc00aeb27a29e77ed97e20",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-missing-middle/uu/crimson.vale.s01e06.mkv.005",
+      "size": 12400,
+      "blake3": "181196e83d5f7155c2802804e7ae0b01c4539963ebdbba9afd25c35802bb601e",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-missing-middle/uu/crimson.vale.s01e06.mkv.006",
+      "size": 12400,
+      "blake3": "efd149e1c403b627d8d710df1d3b0c5cc76198d4ea3c0e7f98e048ca04954005",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-missing-middle/uu/crimson.vale.s01e06.mkv.007",
+      "size": 12400,
+      "blake3": "042b8ca1c054c2df1a6edfcd1ec479bc179843ba322c1d16ff0dbbd25f8e8ada",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-missing-middle/uu/crimson.vale.s01e06.mkv.008",
+      "size": 3504,
+      "blake3": "1def22d72822c235f1d25b2ad3b41c9718ebff71993715b428067108a1179f6a",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-missing-middle/uu/plan.json",
+      "size": 1109,
+      "blake3": "9fb735cc3b9773d6e73936151cc196c3c276d94f38134c5a8f67a095831e2778",
+      "format": "uu-plan",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-mixed-yenc/amber.trail.s01e02.mkv",
+      "size": 65536,
+      "blake3": "aee3051225ba68a062d4c6d2fe018cbcbd6b1ead4017ca1b415c68cf4cce0706",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-mixed-yenc/uu/amber.trail.s01e02.nfo.001",
+      "size": 12433,
+      "blake3": "982e0f9e0850fb6777ebef702fb80f6abe16ca7bb9d284cf67ad0254b132d169",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-mixed-yenc/uu/amber.trail.s01e02.nfo.002",
+      "size": 12400,
+      "blake3": "9e7f6b3876be316a8b5c92d3a065ee73d20835d81301fea7e49f92a4bc0834c5",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-mixed-yenc/uu/amber.trail.s01e02.nfo.003",
+      "size": 2768,
+      "blake3": "156c297d6afa2e5dc85b9b97a79fd08b9ae57d754ecd6e054efd06eeab36879a",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-mixed-yenc/uu/plan.json",
+      "size": 500,
+      "blake3": "eb6928860f99c320d061f054d994383cfaea68b230e30922c4e03874d2cb007e",
+      "format": "uu-plan",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-preamble-tail/uu/plan.json",
+      "size": 1596,
+      "blake3": "756ce3d18608008b7553ceab6d1f78e73ed0a6b590e368b1bce8025657cf90c8",
+      "format": "uu-plan",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-preamble-tail/uu/violet.cascade.s01e05.mkv.001",
+      "size": 12502,
+      "blake3": "5c32c978ee7eb3bfef6189609ab13e174104f898e2b5267711dd9a4b304be88c",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-preamble-tail/uu/violet.cascade.s01e05.mkv.002",
+      "size": 12466,
+      "blake3": "7cd57d9f4607f73547ced84b1ed4f44149cb098277b81947852a44d09eed9337",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-preamble-tail/uu/violet.cascade.s01e05.mkv.003",
+      "size": 12466,
+      "blake3": "8c5d1b4a6da46f8cbb52855b1b302c3bf0c5bb9e33478c708059d862f0bc5565",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-preamble-tail/uu/violet.cascade.s01e05.mkv.004",
+      "size": 12466,
+      "blake3": "15b74601446d41c6219699abd616f87fa9756d689a854cd5c53ebe7ac38eda61",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-preamble-tail/uu/violet.cascade.s01e05.mkv.005",
+      "size": 12466,
+      "blake3": "ba3bce6cbbca6d3c47be1c20d90e70d695fb33a12ead8ff5631c89e2c5f2aa6a",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-preamble-tail/uu/violet.cascade.s01e05.mkv.006",
+      "size": 12466,
+      "blake3": "6284f9032d9e89c6172b7032aba7f8ba940599f36303ae23357db00c0d7b60da",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-preamble-tail/uu/violet.cascade.s01e05.mkv.007",
+      "size": 12466,
+      "blake3": "b7058660c14e90a660f4ac5cbe0738922e41c24592209c77d59dbc2d19bea4eb",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-preamble-tail/uu/violet.cascade.s01e05.mkv.008",
+      "size": 3570,
+      "blake3": "c4c7f5737caf39e577c74cfd65e059b99e696a2dd58876114451f505f8c42aee",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-preamble-tail/uu/violet.cascade.s01e05.nfo.001",
+      "size": 12436,
+      "blake3": "cce4a1022517b4217c385955a24c4d94fb9e1a877ba607fb381134757c586c18",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-preamble-tail/uu/violet.cascade.s01e05.nfo.002",
+      "size": 12400,
+      "blake3": "9e7f6b3876be316a8b5c92d3a065ee73d20835d81301fea7e49f92a4bc0834c5",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-preamble-tail/uu/violet.cascade.s01e05.nfo.003",
+      "size": 2767,
+      "blake3": "4e848262bdab0888b87cd988ec6b077306e7c494a15dc42caa88ba8c04111c3f",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-release/uu/plan.json",
+      "size": 1349,
+      "blake3": "c088ffedda5b3a43a86aa1a8fd60fd592cf60e5e4d24042df37b4ec354347cd5",
+      "format": "uu-plan",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-release/uu/silver.horizon.s01e04.mkv.001",
+      "size": 12436,
+      "blake3": "79079617e6b2f6d3f14b146c4c8d0e327888739abd6053412d62c0c15ae1eb3c",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-release/uu/silver.horizon.s01e04.mkv.002",
+      "size": 12400,
+      "blake3": "4df3c188b5faeb810c0e8c33e2404dcce9b2d5886350df90aedd4eb00357b9cb",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-release/uu/silver.horizon.s01e04.mkv.003",
+      "size": 12400,
+      "blake3": "361cb8ce88aa0ce26b2ab7994c7960321f578480c0308d8b6fceb45699f4846c",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-release/uu/silver.horizon.s01e04.mkv.004",
+      "size": 12400,
+      "blake3": "f6ca230e78bb69b8198e5e5b45059be5a88936f44cde84894728246b877aa149",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-release/uu/silver.horizon.s01e04.mkv.005",
+      "size": 12400,
+      "blake3": "e62facbfd52a1a123545c0dcafed18a026506288eb6b6dde09308c9bfc01f906",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-release/uu/silver.horizon.s01e04.mkv.006",
+      "size": 12400,
+      "blake3": "e32bd21c6b04a2abc6a4818b0576e47fe5c3a084ba8fbda13e7e219ffdb61cc2",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-release/uu/silver.horizon.s01e04.mkv.007",
+      "size": 12400,
+      "blake3": "b6a73b9da9331d79a0fbc7f395b64dce8eb8dfeb43a1768f8e2419853964d2c5",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-release/uu/silver.horizon.s01e04.mkv.008",
+      "size": 3504,
+      "blake3": "ed0a34177fa0ddd0be8e214285c0d4e5288c9d474452c4934d5b572ab3ba9fd6",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/uu-release/uu/silver.horizon.s01e04.nfo.001",
+      "size": 1456,
+      "blake3": "69bca4cfb800b635f4c52340b17281f972690c662f8965988fb736a7bdf91415",
+      "format": "uu",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "uudeview-0.5.20"
         ]
       }
     },

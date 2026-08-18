@@ -28,7 +28,7 @@ which byte, and how to add a scenario are in [generators.md](generators.md).
 | --- | --- |
 | `test-corpus/sources.json` | The ledger. One entry per fixture: path, size, BLAKE3, container format, and its source (`generated` with generator/toolchains/inputs, or `blocked` with a reason). Also the generator table. |
 | `test-corpus/profiles.json` | Named subsets as path globs — what one suite hydrates. Derived from the harness's own slug lists. |
-| `test-corpus/toolchains.json` | The generator-toolchain lock: five RARLAB writers, the official 7-Zip console binary, par2cmdline-turbo, the digest-pinned FFmpeg encoder image, and the Go writers, each pinned by URL and SHA-256 or by image digest. A toolchain change is a deliberate corpus revision. |
+| `test-corpus/toolchains.json` | The generator-toolchain lock: five RARLAB writers, the official 7-Zip console binary, par2cmdline-turbo, UUDeview, the digest-pinned FFmpeg encoder image, and the Go writers, each pinned by URL and SHA-256 or by image digest. A toolchain change is a deliberate corpus revision. |
 | `test-corpus/lock.json` | The published manifest this checkout hydrates from: its BLAKE3, its URL, the Sigstore identity that must have signed it, and the commit it was published from. Empty digest means nothing is published yet. |
 | `cmd/fixturegen`, `internal/fixturegen` | The generator: one declarative recipe per scenario directory, plus the Dockerfiles for the oracle images the lock pins. See [generators.md](generators.md). |
 | `.github/workflows/e2e-corpus-publish.yml` | The manual, main-only, protected workflow that reconstructs, verifies, signs and uploads a corpus revision, one runner per recipe family. (Repository root, not `e2e/`.) |
