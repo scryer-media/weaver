@@ -10,11 +10,11 @@ use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, trace, warn};
-use weaver_yenc::{DecodeResult as YencDecodeResult, YencError};
+use weaver_yenc::YencError;
 
 use crate::connection::ServerConfig;
 use crate::error::{NntpError, Result};
-use crate::fused_yenc::{FusedYencArticleStats, FusedYencError};
+use crate::fused_yenc::{FusedArticleBody, FusedYencArticleStats, FusedYencError};
 use crate::health::{CooldownReason, ServerState};
 use crate::pool::{
     BodyServerAvailability, NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig,
@@ -113,7 +113,9 @@ impl std::error::Error for BlockingBodyLaneAcquireError {}
 pub struct DecodedBody {
     pub raw_size: u32,
     pub decoded: Vec<Box<[u8]>>,
-    pub result: YencDecodeResult,
+    /// What the body decoded to. yEnc and uuencode carry different evidence, so
+    /// this is a sum type rather than a yEnc result with absent fields.
+    pub body: FusedArticleBody,
     pub cpu: DecodedBodyCpu,
     pub io: DecodedBodyIo,
 }
@@ -761,7 +763,7 @@ impl BodyLaneLease {
                 cpu: decoded_cpu_from_fused_stats(&article.stats),
                 io: decoded_io_from_fused_stats(&article.stats),
                 decoded: article.chunks,
-                result: article.result,
+                body: article.body,
             }),
             Err(FusedYencError::Yenc(error)) => {
                 Err(DecodedBodyError::Decode { raw_size: 0, error })
@@ -2813,7 +2815,7 @@ impl NntpClient {
                         cpu: decoded_cpu_from_fused_stats(&article.stats),
                         io: decoded_io_from_fused_stats(&article.stats),
                         decoded: article.chunks,
-                        result: article.result,
+                        body: article.body,
                     });
                 }
                 Err(FusedYencError::Yenc(error)) => {
@@ -2866,7 +2868,7 @@ impl NntpClient {
                 cpu: decoded_cpu_from_fused_stats(&article.stats),
                 io: decoded_io_from_fused_stats(&article.stats),
                 decoded: article.chunks,
-                result: article.result,
+                body: article.body,
             }),
             Err(FusedYencError::Yenc(error)) => {
                 Err(DecodedBodyError::Decode { raw_size: 0, error })

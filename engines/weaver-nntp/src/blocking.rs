@@ -1903,7 +1903,7 @@ fn decoded_body_from_article(article: FusedYencArticle) -> DecodedBody {
         cpu: decoded_cpu_from_fused_stats(&article.stats),
         io: decoded_io_from_fused_stats(&article.stats),
         decoded: article.chunks,
-        result: article.result,
+        body: article.body,
     }
 }
 

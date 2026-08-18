@@ -12,6 +12,7 @@ use crate::error::NntpError;
 use crate::response::parse_response;
 use crate::tls::TransportReadStats;
 use crate::types::Response;
+use crate::uu::{self, UuDecoder, UuOutcome};
 
 const MAX_CONTROL_LINE: usize = 16 * 1024;
 const MAX_ARTICLE_RESERVE: usize = 16 * 1024 * 1024;
@@ -97,15 +98,61 @@ impl From<FusedYencError> for NntpError {
 
 pub type Result<T> = std::result::Result<T, FusedYencError>;
 
+/// What an article's body decoded to, and therefore what evidence it carries.
+///
+/// The two encodings are not interchangeable products. A yEnc article states
+/// where its bytes belong in the file and what they check to; a uuencode article
+/// states neither. Keeping them apart in the type means no downstream stage can
+/// read a placement or a checksum off a uuencode article by accident.
+#[derive(Debug)]
+pub enum FusedArticleBody {
+    /// yEnc: offsets, per-part CRC, and the block-aligned CRC segments the
+    /// dual-CRC grid is fed from.
+    Yenc(Box<DecodeResult>),
+    /// uuencode: decoded bytes, and a name only if this part carried a header.
+    Uu(UuOutcome),
+}
+
+impl FusedArticleBody {
+    /// The yEnc decode result, or `None` for a uuencode article.
+    pub fn yenc(&self) -> Option<&DecodeResult> {
+        match self {
+            Self::Yenc(result) => Some(result),
+            Self::Uu(_) => None,
+        }
+    }
+
+    /// The uuencode outcome, or `None` for a yEnc article.
+    pub fn uu(&self) -> Option<&UuOutcome> {
+        match self {
+            Self::Uu(outcome) => Some(outcome),
+            Self::Yenc(_) => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FusedYencArticle {
     pub response: Response,
     pub chunks: Vec<Box<[u8]>>,
-    pub result: DecodeResult,
+    pub body: FusedArticleBody,
     pub stats: FusedYencArticleStats,
 }
 
 impl FusedYencArticle {
+    /// The yEnc decode result, for callers that already know this article is
+    /// yEnc — the decoder's own tests, which post yEnc bodies by construction.
+    ///
+    /// Panics on a uuencode article. Production paths match on
+    /// [`Self::body`] instead, so that the two encodings' differing evidence
+    /// has to be handled rather than assumed.
+    #[cfg(test)]
+    pub(crate) fn yenc_result(&self) -> &DecodeResult {
+        self.body
+            .yenc()
+            .expect("article under test decodes as yEnc")
+    }
+
     pub fn to_data(&self) -> Vec<u8> {
         let len = self.chunks.iter().map(|chunk| chunk.len()).sum();
         let mut data = Vec::with_capacity(len);
@@ -166,6 +213,9 @@ enum FusedArticleState {
     Body,
     YEndLine,
     NntpTerminator,
+    /// A uuencode article claimed the header scan; the rest of the body is fed
+    /// line-by-line to the uuencode decoder instead of the yEnc kernels.
+    UuBody,
     Done,
 }
 
@@ -182,6 +232,8 @@ pub struct FusedYencArticleDecoder {
     metadata: Option<YencMetadata>,
     /// Bytes of non-`=ybegin` lines skipped while scanning for the yEnc header.
     junk_before_ybegin_bytes: usize,
+    /// Present once the header scan handed the article to uuencode.
+    uu: Option<UuDecoder>,
     yend_line: Option<Vec<u8>>,
     decode_state: DecodeState,
     output: Vec<u8>,
@@ -200,6 +252,7 @@ impl FusedYencArticleDecoder {
             line_buf: Vec::with_capacity(256),
             metadata: None,
             junk_before_ybegin_bytes: 0,
+            uu: None,
             yend_line: None,
             decode_state: DecodeState::new(),
             output: Vec::new(),
@@ -261,6 +314,16 @@ impl FusedYencArticleDecoder {
                     let cpu_started = self.phase_cpu_started();
                     let result = self.process_nntp_terminator(src);
                     add_cpu_delta(&mut self.stats.nntp_terminator_cpu, cpu_started);
+                    if !result? {
+                        return Ok(None);
+                    }
+                    self.stats.leftover_bytes_after_terminator = src.len() as u64;
+                    return self.finish_article().map(Some);
+                }
+                FusedArticleState::UuBody => {
+                    let cpu_started = self.phase_cpu_started();
+                    let result = self.process_uu_body(src);
+                    add_cpu_delta(&mut self.stats.body_decode_cpu, cpu_started);
                     if !result? {
                         return Ok(None);
                     }
@@ -369,6 +432,25 @@ impl FusedYencArticleDecoder {
             if self.line_buf == b".\r\n" || self.line_buf == b".\n" {
                 return Err(YencError::MissingHeader.into());
             }
+
+            // A line that is not `=ybegin` may still be the start of a
+            // uuencode article — including on the very first line, because a
+            // continuation part of a multi-part uuencode post carries no header
+            // at all and opens straight into data. Offering the line to the
+            // uuencode sniffer *before* it counts as junk is what lets such an
+            // article be claimed rather than scanned past.
+            //
+            // yEnc precedence is unaffected: `=ybegin` is matched above, so a
+            // yEnc article never reaches this branch and its cost is unchanged.
+            if uu::looks_like_uu(&self.line_buf) {
+                let mut decoder = UuDecoder::new();
+                decoder.push_line(&self.line_buf);
+                self.line_buf.clear();
+                self.uu = Some(decoder);
+                self.state = FusedArticleState::UuBody;
+                return Ok(true);
+            }
+
             self.junk_before_ybegin_bytes = self
                 .junk_before_ybegin_bytes
                 .saturating_add(self.line_buf.len());
@@ -483,7 +565,40 @@ impl FusedYencArticleDecoder {
         }
     }
 
+    /// Feed the rest of the article to the uuencode decoder, a line at a time.
+    ///
+    /// Returns `true` once the NNTP multiline terminator has been consumed.
+    /// Lines after the uuencode `end` are still drained here rather than
+    /// rejected: trailers are routine, and the decoder ignores them.
+    fn process_uu_body(&mut self, src: &mut BytesMut) -> Result<bool> {
+        loop {
+            if !self.consume_line_into_buffer(src)? {
+                return Ok(false);
+            }
+
+            if self.line_buf == b".\r\n" || self.line_buf == b".\n" {
+                self.stats.nntp_terminator_hits += 1;
+                self.stats.nntp_terminator_bytes += self.line_buf.len() as u64;
+                self.line_buf.clear();
+                return Ok(true);
+            }
+
+            if let Some(decoder) = self.uu.as_mut() {
+                decoder.push_line(&self.line_buf);
+                if !decoder.output().is_empty() {
+                    self.output.extend_from_slice(&decoder.take_output());
+                }
+            }
+            self.line_buf.clear();
+            self.flush_ready_output();
+        }
+    }
+
     fn finish_article(&mut self) -> Result<FusedYencArticle> {
+        if self.uu.is_some() {
+            return self.finish_uu_article();
+        }
+
         let cpu_started = self.phase_cpu_started();
         let response = self.response.take().ok_or_else(|| {
             NntpError::MalformedResponse("missing BODY response line".to_string())
@@ -520,7 +635,52 @@ impl FusedYencArticleDecoder {
         Ok(FusedYencArticle {
             response,
             chunks,
-            result,
+            body: FusedArticleBody::Yenc(Box::new(result)),
+            stats,
+        })
+    }
+
+    /// Close out an article the uuencode decoder claimed.
+    ///
+    /// An article that engaged the sniffer but decoded nothing is not a
+    /// uuencode article after all — treating it as one would hand the pipeline
+    /// an empty segment for a file that never existed. It fails as a missing
+    /// header instead, which is exactly what the article would have done before
+    /// uuencode support existed.
+    fn finish_uu_article(&mut self) -> Result<FusedYencArticle> {
+        let cpu_started = self.phase_cpu_started();
+        let response = self.response.take().ok_or_else(|| {
+            NntpError::MalformedResponse("missing BODY response line".to_string())
+        })?;
+        let decoder = self.uu.take().ok_or(YencError::MissingHeader)?;
+        let outcome = decoder.outcome();
+
+        if outcome.decoded_len == 0 && !outcome.ended {
+            return Err(YencError::MissingHeader.into());
+        }
+
+        self.flush_output();
+        let chunks = std::mem::take(&mut self.output_chunks);
+
+        let mut stats = self.stats.clone();
+        stats.decoded_bytes_written = outcome.decoded_len;
+        // uuencode carries no checksum and no declared size, so every field
+        // that would report one stays at its "nothing to say" value rather than
+        // reporting a zero that could be read as a verified result.
+        stats.crc_actual = 0;
+        stats.crc_expected = None;
+        stats.yenc_size_expected = None;
+        stats.yenc_size_actual = outcome.decoded_len;
+        stats.output_batches = chunks.len() as u64;
+        stats.input_bytes_consumed = stats.encoded_bytes_consumed;
+        add_cpu_delta(&mut stats.article_finish_cpu, cpu_started);
+
+        self.state = FusedArticleState::Done;
+
+        Ok(FusedYencArticle {
+            response,
+            chunks,
+            body: FusedArticleBody::Uu(outcome),
             stats,
         })
     }
@@ -774,32 +934,38 @@ mod tests {
             .flat_map(|chunk| chunk.iter().copied())
             .collect();
         assert_eq!(expected.data, actual_data);
-        assert_eq!(expected.result.bytes_written, actual.result.bytes_written);
-        assert_eq!(expected.result.part_crc, actual.result.part_crc);
+        assert_eq!(
+            expected.result.bytes_written,
+            actual.yenc_result().bytes_written
+        );
+        assert_eq!(expected.result.part_crc, actual.yenc_result().part_crc);
         assert_eq!(
             expected.result.expected_part_crc,
-            actual.result.expected_part_crc
+            actual.yenc_result().expected_part_crc
         );
         assert_eq!(
             expected.result.expected_file_crc,
-            actual.result.expected_file_crc
+            actual.yenc_result().expected_file_crc
         );
-        assert_eq!(expected.result.has_trailer, actual.result.has_trailer);
-        assert_eq!(expected.result.crc_status, actual.result.crc_status);
-        assert_eq!(expected.result.defects, actual.result.defects);
+        assert_eq!(
+            expected.result.has_trailer,
+            actual.yenc_result().has_trailer
+        );
+        assert_eq!(expected.result.crc_status, actual.yenc_result().crc_status);
+        assert_eq!(expected.result.defects, actual.yenc_result().defects);
         // Gate 3: checkpoint placement is a function of file offsets, so the
         // two decoders must emit byte-identical segment records however the
         // wire bytes were split -- not merely agree on the article CRC.
-        assert_eq!(expected.result.segments, actual.result.segments);
+        assert_eq!(expected.result.segments, actual.yenc_result().segments);
         assert_eq!(
-            weaver_yenc::combine_contiguous(&actual.result.segments)
+            weaver_yenc::combine_contiguous(&actual.yenc_result().segments)
                 .map_or(0, |folded| folded.crc32),
-            actual.result.part_crc,
+            actual.yenc_result().part_crc,
             "article pcrc32 must be the fold of its own segments"
         );
 
         let expected_meta = &expected.result.metadata;
-        let actual_meta = &actual.result.metadata;
+        let actual_meta = &actual.yenc_result().metadata;
         assert_eq!(expected_meta.name, actual_meta.name);
         assert_eq!(expected_meta.size, actual_meta.size);
         assert_eq!(expected_meta.line_length, actual_meta.line_length);
@@ -1080,8 +1246,8 @@ mod tests {
             &[usize::MAX],
         );
         assert_eq!(decoded.to_data(), BROKEN_POSTER_BODY);
-        assert!(decoded.result.defects.junk_before_ybegin);
-        assert_eq!(decoded.result.crc_status, CrcVerification::Verified);
+        assert!(decoded.yenc_result().defects.junk_before_ybegin);
+        assert_eq!(decoded.yenc_result().crc_status, CrcVerification::Verified);
     }
 
     /// D7: `line=`/`size=`/`name=` are all optional -- reference decoders do
@@ -1136,7 +1302,7 @@ mod tests {
 
         let (decoded, _) =
             decode_fused_with_chunks(&transcript(&article, b"221 head\r\n"), &[usize::MAX]);
-        assert!(decoded.result.defects.ypart_end_exceeds_size);
+        assert!(decoded.yenc_result().defects.ypart_end_exceeds_size);
         assert_eq!(decoded.to_data(), BROKEN_POSTER_BODY);
     }
 
@@ -1157,8 +1323,8 @@ mod tests {
 
         let (decoded, _) =
             decode_fused_with_chunks(&transcript(&article, b"221 head\r\n"), &[usize::MAX]);
-        assert!(!decoded.result.defects.any());
-        assert_eq!(decoded.result.crc_status, CrcVerification::Verified);
+        assert!(!decoded.yenc_result().defects.any());
+        assert_eq!(decoded.yenc_result().crc_status, CrcVerification::Verified);
     }
 
     /// D9: a mangled `crc32=` is treated as absent, leaving the article decoded
@@ -1177,13 +1343,16 @@ mod tests {
             let (decoded, _) =
                 decode_fused_with_chunks(&transcript(&article, b"223 next\r\n"), &[usize::MAX]);
             assert_eq!(decoded.to_data(), BROKEN_POSTER_BODY, "crc32={garbage:?}");
-            assert!(decoded.result.defects.invalid_crc32, "crc32={garbage:?}");
+            assert!(
+                decoded.yenc_result().defects.invalid_crc32,
+                "crc32={garbage:?}"
+            );
             assert_eq!(
-                decoded.result.crc_status,
+                decoded.yenc_result().crc_status,
                 CrcVerification::Unverified,
                 "crc32={garbage:?} must not read as verified"
             );
-            assert_eq!(decoded.result.expected_file_crc, None);
+            assert_eq!(decoded.yenc_result().expected_file_crc, None);
         }
     }
 
@@ -1201,8 +1370,8 @@ mod tests {
 
         let (decoded, _) =
             decode_fused_with_chunks(&transcript(&article, b"223 next\r\n"), &[usize::MAX]);
-        assert_eq!(decoded.result.crc_status, CrcVerification::Verified);
-        assert!(!decoded.result.defects.invalid_crc32);
+        assert_eq!(decoded.yenc_result().crc_status, CrcVerification::Verified);
+        assert!(!decoded.yenc_result().defects.invalid_crc32);
     }
 
     /// D10: one byte-wise parser behind every entry point, so tab separators
@@ -1324,8 +1493,8 @@ mod tests {
         let (decoded, _) =
             decode_fused_with_chunks(&transcript(&article, b"223 next\r\n"), &[usize::MAX]);
         assert_eq!(decoded.to_data(), BROKEN_POSTER_BODY);
-        assert!(decoded.result.has_trailer);
-        assert_eq!(decoded.result.crc_status, CrcVerification::Verified);
+        assert!(decoded.yenc_result().has_trailer);
+        assert_eq!(decoded.yenc_result().crc_status, CrcVerification::Verified);
     }
 
     // ── E19: pre-reservation for oversized articles ──────────────────────
@@ -1505,5 +1674,229 @@ mod tests {
             .flat_map(|chunk| chunk.iter().copied())
             .collect::<Vec<_>>();
         assert_eq!(payload, original);
+    }
+
+    // ---- uuencode sniffing and routing ----
+
+    /// Encode `data` as a uuencode body, optionally with a `begin` header.
+    fn uu_body(data: &[u8], name: Option<&str>) -> Vec<u8> {
+        let mut body = Vec::new();
+        if let Some(name) = name {
+            body.extend_from_slice(format!("begin 644 {name}\r\n").as_bytes());
+        }
+        for line in data.chunks(45) {
+            body.push((line.len() as u8) + b' ');
+            for group in line.chunks(3) {
+                let b0 = group[0];
+                let b1 = group.get(1).copied().unwrap_or(0);
+                let b2 = group.get(2).copied().unwrap_or(0);
+                for sextet in [
+                    b0 >> 2,
+                    ((b0 << 4) | (b1 >> 4)) & 0x3F,
+                    ((b1 << 2) | (b2 >> 6)) & 0x3F,
+                    b2 & 0x3F,
+                ] {
+                    body.push(if sextet == 0 { b'`' } else { sextet + b' ' });
+                }
+            }
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(b"`\r\nend\r\n");
+        body
+    }
+
+    fn article_payload(article: &FusedYencArticle) -> Vec<u8> {
+        article
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect()
+    }
+
+    #[test]
+    fn uu_article_decodes_and_reports_a_uu_body() {
+        let original: Vec<u8> = (0..5_000u32).map(|i| (i * 31 + 7) as u8).collect();
+        let transcript = transcript(&uu_body(&original, Some("silver-horizon.bin")), b"");
+
+        // Split across awkward chunk boundaries: uuencode is line-oriented, so
+        // the streaming line assembly has to hold partial lines correctly.
+        let (article, leftover) = decode_fused_with_chunks(&transcript, &[7, 1, 3, 500, 64, 4096]);
+
+        assert!(leftover.is_empty());
+        assert_eq!(article_payload(&article), original);
+
+        let outcome = article.body.uu().expect("uuencode body");
+        assert_eq!(outcome.decoded_len, original.len() as u64);
+        assert_eq!(outcome.filename.as_deref(), Some("silver-horizon.bin"));
+        assert!(outcome.ended);
+        assert!(!outcome.damaged);
+        assert!(article.body.yenc().is_none());
+    }
+
+    #[test]
+    fn uu_continuation_article_engages_on_its_very_first_line() {
+        // A continuation part carries no `begin` line at all: the article opens
+        // with data, so the sniffer has to claim it on line one.
+        let original: Vec<u8> = (0..2_000u32).map(|i| (i * 17 + 3) as u8).collect();
+        let mut body = uu_body(&original, None);
+        // A continuation part does not end the file either; drop the terminator
+        // so this is purely bare data lines.
+        body.truncate(body.len() - b"`\r\nend\r\n".len());
+        let transcript = transcript(&body, b"");
+
+        let (article, _) = decode_fused_with_chunks(&transcript, &[13, 4096]);
+
+        assert_eq!(article_payload(&article), original);
+        let outcome = article.body.uu().expect("uuencode body");
+        assert_eq!(outcome.decoded_len, original.len() as u64);
+        assert_eq!(outcome.filename, None);
+        assert!(outcome.saw_body);
+        assert!(!outcome.ended);
+    }
+
+    #[test]
+    fn uu_article_survives_a_large_preamble_before_begin() {
+        // Leading junk is offered to the sniffer line by line; a `begin` that
+        // arrives after a chatty preamble still decodes.
+        let original: Vec<u8> = (0..900u32).map(|i| (i * 13 + 5) as u8).collect();
+        let mut body = Vec::new();
+        for index in 0..200 {
+            body.extend_from_slice(
+                format!("Preamble line {index} from the poster.\r\n").as_bytes(),
+            );
+        }
+        body.extend_from_slice(&uu_body(&original, Some("silver-horizon.bin")));
+        let transcript = transcript(&body, b"");
+
+        let (article, _) = decode_fused_with_chunks(&transcript, &[4096, 4096, 4096]);
+
+        assert_eq!(article_payload(&article), original);
+        assert_eq!(
+            article.body.uu().expect("uuencode body").decoded_len,
+            original.len() as u64
+        );
+    }
+
+    #[test]
+    fn junk_without_any_uu_line_still_fails_as_a_missing_header() {
+        // The junk cap is unchanged for articles the sniffer does not claim:
+        // prose that is neither yEnc nor uuencode must still fail exactly as it
+        // did before, rather than being scanned forever.
+        let mut body = Vec::new();
+        while body.len() <= MAX_HEADER_SCAN_BYTES {
+            body.extend_from_slice(b"this line is ordinary prose and encodes nothing at all\r\n");
+        }
+        let transcript = transcript(&body, b"");
+
+        let mut decoder = FusedYencArticleDecoder::new();
+        let mut src = BytesMut::from(&transcript[..]);
+        let error = decoder
+            .decode_available(&mut src)
+            .expect_err("junk beyond the scan cap must fail");
+        assert!(
+            matches!(error, FusedYencError::Yenc(YencError::MissingHeader)),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn article_with_no_binary_data_fails_like_a_missing_header() {
+        // A single line can look uuencode-ish and then produce nothing. That is
+        // not a uuencode article, and admitting it would hand the pipeline an
+        // empty segment for a file that never existed.
+        let transcript = transcript(b"begin 644 empty.bin\r\n", b"");
+
+        let mut decoder = FusedYencArticleDecoder::new();
+        let mut src = BytesMut::from(&transcript[..]);
+        let error = decoder
+            .decode_available(&mut src)
+            .expect_err("a body-less uuencode article must fail");
+        assert!(
+            matches!(error, FusedYencError::Yenc(YencError::MissingHeader)),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn uu_article_surfaces_damage_without_losing_bytes() {
+        let original: Vec<u8> = (0..135u32).map(|i| (i * 7 + 1) as u8).collect();
+        let good = uu_body(&original, Some("silver-horizon.bin"));
+
+        // Splice a line that claims 45 bytes but carries two characters.
+        let insert_at = good
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .expect("header line ending")
+            + 2;
+        let mut body = good[..insert_at].to_vec();
+        body.extend_from_slice(b"M!!\r\n");
+        body.extend_from_slice(&good[insert_at..]);
+        let transcript = transcript(&body, b"");
+
+        let (article, _) = decode_fused_with_chunks(&transcript, &[4096]);
+
+        let outcome = article.body.uu().expect("uuencode body");
+        assert!(outcome.damaged, "the bad line must be reported");
+        // Every good line's bytes are still here — PAR2 judges, not the decoder.
+        assert_eq!(article_payload(&article), original);
+        assert_eq!(outcome.decoded_len, original.len() as u64);
+    }
+
+    #[test]
+    fn the_captured_real_world_uu_article_decodes_to_its_published_values() {
+        // The only genuine field-captured uuencode article in either reference
+        // decoder's suite: a complete NNTP BODY response, dot-stuffed body and
+        // all, carrying an SVG. Every other uuencode fixture in this repository
+        // was synthesised by an encoder written against the format, so this is
+        // the one test that checks the decoder against a real posting nobody
+        // designed to make it pass.
+        //
+        // The three expected values are the ones the reference suite asserts,
+        // so a failure here is a real disagreement between the two decoders
+        // rather than a disagreement about the fixture. See
+        // `testdata/README.md` for provenance and licensing.
+        let transcript = include_bytes!("../testdata/uu_logo_full.nntp");
+
+        let mut src = BytesMut::from(&transcript[..]);
+        let mut decoder = FusedYencArticleDecoder::new();
+        let article = decoder
+            .decode_available(&mut src)
+            .unwrap()
+            .expect("the captured article decodes in one pass");
+
+        let decoded = article_payload(&article);
+        let outcome = article.body.uu().expect("uuencode body");
+
+        assert_eq!(outcome.filename.as_deref(), Some("logo-full.svg"));
+        assert_eq!(decoded.len(), 2184);
+        assert_eq!(outcome.decoded_len, 2184);
+
+        let mut crc = weaver_yenc::crc::Crc32::new();
+        crc.update(&decoded);
+        assert_eq!(crc.finalize(), 0x6BC2_917D);
+
+        assert!(outcome.ended, "the article carries its terminator");
+        assert!(!outcome.damaged, "a real posting must decode cleanly");
+        // It really is the SVG the `begin` line named, which is what makes the
+        // CRC meaningful rather than a hash of whatever happened to come out.
+        assert!(decoded.starts_with(b"<svg "), "decoded an SVG document");
+        assert!(decoded.ends_with(b"</svg>"), "and all of it");
+    }
+
+    #[test]
+    fn yenc_article_is_unaffected_by_the_uu_sniffer() {
+        // The sniffer sits on the `=ybegin`-miss branch, so a yEnc article
+        // never reaches it and still produces a yEnc body.
+        let original: Vec<u8> = (0..4_096u32).map(|i| (i * 11 + 2) as u8).collect();
+        let mut article = Vec::new();
+        encode(&original, &mut article, 128, "silver-horizon.bin").unwrap();
+        let transcript = transcript(&article, b"");
+
+        let (expected, _) = decode_current(&transcript);
+        let (actual, leftover) = decode_fused_with_chunks(&transcript, &[64, 4096]);
+
+        assert!(leftover.is_empty());
+        assert!(actual.body.uu().is_none(), "yEnc must not report a uu body");
+        assert_same_article(&expected, &actual);
     }
 }

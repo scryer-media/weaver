@@ -3370,7 +3370,7 @@ mod tests {
 
         assert_eq!(chunks, vec![original.to_vec()]);
         assert_eq!(article.to_data(), original);
-        assert_eq!(article.result.bytes_written, original.len());
+        assert_eq!(article.yenc_result().bytes_written, original.len());
     }
 
     #[tokio::test]
