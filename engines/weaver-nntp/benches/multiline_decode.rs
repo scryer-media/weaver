@@ -2,7 +2,7 @@ use bytes::BytesMut;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use tokio_util::codec::Decoder;
 use weaver_nntp::codec::{NntpCodec, NntpFrame, StreamChunk};
-use weaver_nntp::fused_yenc::FusedYencArticleDecoder;
+use weaver_nntp::fused_yenc::{FusedYencArticle, FusedYencArticleDecoder};
 use weaver_nntp::response::parse_response;
 use weaver_yenc::{StreamingArticleDecoder, encode};
 
@@ -113,15 +113,30 @@ fn decode_current_yenc(payload: &BytesMut) -> usize {
     decoder.finish(output).unwrap().data.len()
 }
 
+/// Decoded byte count of a benchmark article, which is yEnc by construction.
+///
+/// The fused decoder now returns a sum type, because an article can also come
+/// back as uuencode. Every payload these benchmarks build carries a `=ybegin`,
+/// so the yEnc arm is the only reachable one — and asserting that keeps the
+/// uuencode sniffer honest: if it ever claimed one of these articles, the
+/// benchmark would fail rather than quietly measure a different decoder.
+fn fused_yenc_bytes_written(article: &FusedYencArticle) -> usize {
+    article
+        .body
+        .yenc()
+        .expect("benchmark article decodes as yEnc")
+        .bytes_written
+}
+
 fn decode_fused_yenc(payload: &BytesMut) -> usize {
     let mut decoder = FusedYencArticleDecoder::new();
     let mut buf = payload.clone();
-    decoder
-        .decode_available(&mut buf)
-        .unwrap()
-        .expect("complete benchmark article")
-        .result
-        .bytes_written
+    fused_yenc_bytes_written(
+        &decoder
+            .decode_available(&mut buf)
+            .unwrap()
+            .expect("complete benchmark article"),
+    )
 }
 
 fn decode_fused_yenc_three_chunks(payload: &BytesMut) -> usize {
@@ -138,10 +153,7 @@ fn decode_fused_yenc_three_chunks(payload: &BytesMut) -> usize {
             article = decoder.decode_available(&mut buf).unwrap();
         }
     }
-    article
-        .expect("complete benchmark article")
-        .result
-        .bytes_written
+    fused_yenc_bytes_written(&article.expect("complete benchmark article"))
 }
 
 fn bench_multiline_decode(c: &mut Criterion) {
