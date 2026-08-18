@@ -181,6 +181,16 @@ func TestWeaverImagePlanDockerfilePublishedShape(t *testing.T) {
 	if !strings.Contains(dockerfile, "rustup toolchain install 1.97.1") {
 		t.Fatalf("published dockerfile must still honour the repo toolchain pin:\n%s", dockerfile)
 	}
+	for _, fragment := range []string{
+		"# syntax=docker/dockerfile:1.7",
+		"COPY apps/weaver-web/package.json apps/weaver-web/package-lock.json",
+		"--mount=type=cache,target=/root/.npm",
+		"--mount=type=cache,target=/app/target",
+	} {
+		if !strings.Contains(dockerfile, fragment) {
+			t.Fatalf("published dockerfile is missing cache optimization %q:\n%s", fragment, dockerfile)
+		}
+	}
 }
 
 func TestWeaverImagePlanBuildArgs(t *testing.T) {
@@ -225,9 +235,10 @@ func TestWeaverImageFingerprintTracksBuildInputs(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "weaver")
 	writeFile(t, filepath.Join(root, "Cargo.toml"), publishedCargoToml)
 	writeFile(t, filepath.Join(root, "rust-toolchain.toml"), "[toolchain]\nchannel = \"1.97.1\"\n")
-	writeFile(t, filepath.Join(root, ".dockerignore"), "target\n")
+	writeFile(t, filepath.Join(root, ".dockerignore"), "target\ne2e\n")
 	writeFile(t, filepath.Join(root, "server/src/main.rs"), "fn main() {}\n")
 	writeFile(t, filepath.Join(root, "target/release/weaver"), "ignored build output")
+	writeFile(t, filepath.Join(root, "e2e/internal/weaver/main.go"), "package weaver\n")
 
 	plan := weaverImagePlan{Toolchain: "1.97.1"}
 	initial := fingerprintForTest(t, root, plan)
@@ -238,6 +249,11 @@ func TestWeaverImageFingerprintTracksBuildInputs(t *testing.T) {
 	writeFile(t, filepath.Join(root, "target/release/weaver"), "new ignored build output")
 	if ignored := fingerprintForTest(t, root, plan); ignored != initial {
 		t.Fatalf("ignored target output changed fingerprint: %s != %s", initial, ignored)
+	}
+
+	writeFile(t, filepath.Join(root, "e2e/internal/weaver/main.go"), "package weaver\n// changed\n")
+	if ignored := fingerprintForTest(t, root, plan); ignored != initial {
+		t.Fatalf("ignored E2E source changed fingerprint: %s != %s", ignored, initial)
 	}
 
 	writeFile(t, filepath.Join(root, "server/src/main.rs"), "fn main() { println!(\"changed\"); }\n")

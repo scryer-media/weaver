@@ -2201,7 +2201,7 @@ func cmdSeedAll() {
 	seedAllForProfile(env("E2E_SEED_PROFILE", "functional"))
 }
 
-// syncArticlesToBackup copies all articles from nntp to nntp2 using Docker's archive-copy API.
+// syncArticlesToBackup streams all articles from nntp to nntp2 through Docker.
 // It is a no-op when nntp2 is not running.
 func syncArticlesToBackup() error {
 	if !dockerContainerRunning("nntp2") {
@@ -2218,23 +2218,7 @@ func syncArticlesToBackup() error {
 	}
 
 	log.Printf("syncing articles to backup NNTP server (nntp2)...")
-	stagingDir, err := os.MkdirTemp("", "e2e-nntp-sync-")
-	if err != nil {
-		return fmt.Errorf("create NNTP sync staging directory: %w", err)
-	}
-	defer os.RemoveAll(stagingDir)
-
-	if err := runExternalCommand(
-		exec.Command("docker", "cp", sourceID+":/data/articles", stagingDir),
-		"copy primary NNTP articles",
-	); err != nil {
-		return err
-	}
-	articlesDir := filepath.Join(stagingDir, "articles")
-	if err := runExternalCommand(
-		exec.Command("docker", "cp", articlesDir+string(os.PathSeparator)+".", backupID+":/data/articles"),
-		"copy articles to backup NNTP",
-	); err != nil {
+	if err := streamArticlesToBackup(sourceID, backupID); err != nil {
 		return err
 	}
 	// Tell nntp2 to reload its index
@@ -2243,6 +2227,40 @@ func syncArticlesToBackup() error {
 		log.Printf("  nntp2 reload: %s", resp)
 	}
 	log.Printf("  backup NNTP server synced")
+	return nil
+}
+
+// streamArticlesToBackup avoids materializing the complete fixture corpus on
+// the host. The previous docker cp -> temporary directory -> docker cp path
+// doubled disk I/O and left both functional datastores contending for it.
+func streamArticlesToBackup(sourceID, backupID string) error {
+	source := exec.Command("docker", "exec", sourceID, "tar", "-C", "/data/articles", "-cf", "-", ".")
+	destination := exec.Command("docker", "exec", "-i", backupID, "tar", "-C", "/data/articles", "-xf", "-")
+
+	var sourceStderr, destinationStderr bytes.Buffer
+	source.Stderr = &sourceStderr
+	destination.Stderr = &destinationStderr
+	archive, err := source.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("open primary NNTP article stream: %w", err)
+	}
+	destination.Stdin = archive
+	if err := destination.Start(); err != nil {
+		return fmt.Errorf("start backup NNTP article stream: %w", err)
+	}
+	if err := source.Start(); err != nil {
+		_ = destination.Process.Kill()
+		_ = destination.Wait()
+		return fmt.Errorf("start primary NNTP article stream: %w", err)
+	}
+
+	if err := source.Wait(); err != nil {
+		_ = destination.Wait()
+		return fmt.Errorf("stream primary NNTP articles: %w: %s", err, strings.TrimSpace(sourceStderr.String()))
+	}
+	if err := destination.Wait(); err != nil {
+		return fmt.Errorf("extract backup NNTP articles: %w: %s", err, strings.TrimSpace(destinationStderr.String()))
+	}
 	return nil
 }
 
@@ -4138,6 +4156,10 @@ func managedWeaverEnv(base []string, runRoot, rustLog string) []string {
 		"XDG_CONFIG_HOME="+configDir,
 		"XDG_DATA_HOME="+dataDir,
 		"WEAVER_FORCE_KEY_FILE=1",
+		// The managed server is reached only through its loopback port by the
+		// E2E client. Trusting loopback keeps it loginless for those tests
+		// without weakening non-local browser administration.
+		"WEAVER_TRUSTED_CIDRS=127.0.0.1/32,::1/128",
 	)
 	if weaverUsesPostgresDatastore() {
 		env = appendOrReplaceEnv(env, "WEAVER_DATABASE_URL", weaverPostgresURL())
