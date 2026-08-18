@@ -583,7 +583,17 @@ impl Pipeline {
                     .then_some(*par2_file_id)
             })
             .collect::<Vec<_>>();
-        let par2_file_id = unique_par2_binding_candidate(&candidates)?;
+        let par2_file_id = match candidates.len() {
+            // Name binding, unchanged, and it always wins.
+            1 => candidates[0],
+            // No name matched anything. An obfuscated post lies in its subject,
+            // not in its bytes, so ask the bytes.
+            0 => self.content_bound_par2_file_id(file_id, set)?,
+            // Two descriptions answer to this file's name. That is an ambiguity
+            // in the naming, and content cannot resolve it into a *name*
+            // binding — it stays refused, exactly as before.
+            _ => return None,
+        };
         // The binding length is what PAR2 *describes*, never the NZB's
         // declared total: `<segment bytes=…>` is yEnc-**encoded** size, around
         // 1.03x the decoded bytes, so a declared total can never equal
@@ -598,6 +608,70 @@ impl Pipeline {
             state.working_dir.join(current_filename),
             file.is_complete(),
         ))
+    }
+
+    /// The one description whose `hash_16k` the file's captured prefix
+    /// reproduces, if exactly one does.
+    ///
+    /// # Why this exists
+    ///
+    /// Obfuscated posts lie about names and tell the truth about bytes. A set
+    /// posted as `a7f3e91c.part01.rar` binds to nothing by name, and a file that
+    /// binds to nothing has no description to measure its in-stream block
+    /// verdicts against — so the whole dual-CRC grid lapses for it and every
+    /// volume is read back from disk at completion. The recovery set already
+    /// carries the answer: `hash_16k` is content, and content is the thing the
+    /// obfuscation did not touch.
+    ///
+    /// # The window is the description's, not ours
+    ///
+    /// A description shorter than [`crate::pipeline::PAR2_HASH_16K_BYTES`]
+    /// hashes its whole file with no padding, so each candidate is matched over
+    /// `min(desc.length, 16 KiB)` of the prefix — its own window, not a fixed
+    /// one. A description whose window the capture does not cover is skipped
+    /// rather than guessed at.
+    ///
+    /// Lengths come from the descriptions only. The NZB's `<segment bytes>` are
+    /// yEnc-encoded and would put the window in the wrong place for yEnc and
+    /// wildly wrong for uuencode.
+    ///
+    /// # Fail-closed, on the same terms as the name path
+    ///
+    /// Zero matches and two matches both return `None`. Two descriptions
+    /// sharing a 16 KiB prefix is a real shape — think a set of volumes with
+    /// identical headers — and it is exactly the case where binding by content
+    /// would be a guess. The file is then unbound, which costs it in-stream
+    /// verification and nothing else: it is read at completion like every file
+    /// was before the grid existed.
+    fn content_bound_par2_file_id(
+        &self,
+        file_id: NzbFileId,
+        set: &Par2FileSet,
+    ) -> Option<par2_rs::FileId> {
+        let prefix = self.file_prefix_16k.get(&file_id)?;
+        if prefix.is_empty() {
+            return None;
+        }
+        let matches = set
+            .files
+            .iter()
+            .filter(|(_, desc)| {
+                let window = (desc.length as usize).min(crate::pipeline::PAR2_HASH_16K_BYTES);
+                // A zero-length description has no content to be identified by.
+                // A window the capture does not reach cannot be tested without
+                // inventing the bytes it is missing.
+                window > 0
+                    && prefix.len() >= window
+                    && par2_rs::checksum::md5(&prefix[..window]) == desc.hash_16k
+            })
+            .map(|(par2_file_id, _)| *par2_file_id)
+            .collect::<Vec<_>>();
+        let bound = unique_par2_binding_candidate(&matches)?;
+        crate::runtime::perf_probe::record(
+            "par2.binding.resolved_by_content",
+            std::time::Duration::from_nanos(1),
+        );
+        Some(bound)
     }
 
     /// The recovery set's block size for a job, once its PAR2 packets have been
