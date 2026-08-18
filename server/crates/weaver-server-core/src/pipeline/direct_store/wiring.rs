@@ -1357,11 +1357,47 @@ impl Pipeline {
     /// for damage that belongs to files the job legitimately finished without,
     /// which is precisely the case repair exists for.
     ///
-    /// Deliberately a **full** `verify_all`, never `WEAVER_PAR2_FAST_VERIFY`'s
-    /// sampled form: fast-verify's per-slice accounting is what repair narrowed
-    /// a repair's size away from, and a sampled span would re-inflate it.
-    /// Weaver sets the flag on no path that can reach here; the pin is in
-    /// [`super::repair`]'s module docs.
+    /// # Before a repair, and after one
+    ///
+    /// The same pass runs on both sides of a repair-while-direct, and the two
+    /// are not asking the same question.
+    ///
+    /// *Before*, it is asking whether the set is damaged, and a file the
+    /// dual-CRC grid adjudicated in stream is answered from that evidence
+    /// rather than read. That is the clean path and it is unchanged.
+    ///
+    /// *After*, it is asking whether the repair landed — and that question has
+    /// to be answered by reading the bytes. Every claim source this pass has is
+    /// a statement about what the **wire** delivered: the grid folds per-article
+    /// CRCs recorded at the durability seam, and the session is seeded from the
+    /// same verdicts. None of them can see a `pwrite` that silently short-wrote,
+    /// a bad sector under the envelope, or a repaired span that never reached
+    /// the platter. A direct set's source volumes are exactly the files nothing
+    /// else ever re-reads, so if this pass stands on wire evidence, a disk fault
+    /// under a repaired set ships in a `Completed` job.
+    ///
+    /// So a post-repair pass takes no claims and reads every described file,
+    /// unconditionally and with no knob to turn it off. See
+    /// [`Self::direct_sets_repaired_in_place`] for how the two are told apart.
+    ///
+    /// The reads themselves go to real files — [`super::provider::VirtualVolumeReader`]
+    /// holds an open handle on the envelope and on each member `.direct.partial`
+    /// — so "read the bytes" here means the same thing it means for a
+    /// conventional file, even though the volume it reconstructs is virtual.
+    ///
+    /// # Why the post-repair pass may still verify from slice proof
+    ///
+    /// `fast_verify` is not a sampled read: par2-rs proves an intact candidate
+    /// from its per-slice IFSC checksums scanned at read speed and skips only
+    /// the inherently serial whole-file MD5, and a file it cannot prove that way
+    /// falls through to the strict pipeline with its per-slice accounting fully
+    /// intact (par2-rs `verify.rs`, the `fast_verify && let Some(..)` arms). So
+    /// every byte is still read and a damaged volume — the only kind whose
+    /// accounting a follow-up repair would be sized from — is still measured
+    /// slice by slice.
+    ///
+    /// The pre-repair pass keeps the strict default. Its verdict is what sizes
+    /// the repair, and it is not the pass this optimisation was measured for.
     pub(crate) async fn verify_direct_sets_quietly(
         &mut self,
         job_id: JobId,
@@ -1386,10 +1422,20 @@ impl Pipeline {
             inner, provider, &volumes,
         ));
 
-        let mut verification = match self
-            .verify_direct_sets_through_session(job_id, &par2_set, &working_dir, &access)
-            .await
-        {
+        // A repair already ran for one of this job's live sets, so this pass is
+        // the read-back that decides whether it landed. Every claim below is
+        // wire evidence; see this function's docs for why none of it may stand
+        // in on this pass.
+        let post_repair = self.direct_sets_repaired_in_place(job_id);
+
+        let session_verification = if post_repair {
+            None
+        } else {
+            self.verify_direct_sets_through_session(job_id, &par2_set, &working_dir, &access)
+                .await
+        };
+
+        let mut verification = match session_verification {
             Some(verification) => verification,
             None => {
                 // Read and verify through the access adapter. A direct set's
@@ -1409,7 +1455,21 @@ impl Pipeline {
                 // (pCRC-verified) article coverage at exactly the described
                 // length, over bytes that were durable before the claim was
                 // made. Anything less is not adjudicated and is read.
-                let claimed = self.grid_claimed_file_verifications(job_id, &par2_set);
+                //
+                // Post-repair, no file is stood in for. The grid is in fact
+                // already empty here — `repair_damaged_volumes`' caller retires
+                // it for the whole job before the rewrite, because a repair
+                // moves bytes the grid claimed — so this is belt to that
+                // braces. It is worth having as its own statement: the emptiness
+                // is a consequence of a decision made for a different reason
+                // several hundred lines away, and the requirement that a
+                // post-repair pass reads everything should not be one refactor
+                // of that decision away from silently lapsing.
+                let claimed = if post_repair {
+                    Vec::new()
+                } else {
+                    self.grid_claimed_file_verifications(job_id, &par2_set)
+                };
                 let claimed_ids: HashSet<par2_rs::FileId> =
                     claimed.iter().map(|file| file.file_id).collect();
                 let to_read: Vec<par2_rs::FileId> = par2_set
@@ -1435,6 +1495,10 @@ impl Pipeline {
                 {
                     self.direct_verify_read_splits
                         .push((claimed.len(), to_read.len()));
+                    if post_repair {
+                        self.direct_post_repair_read_splits
+                            .push((claimed.len(), to_read.len()));
+                    }
                 }
                 if to_read.is_empty() {
                     // Nothing left to read: every described file carries an
@@ -1453,7 +1517,20 @@ impl Pipeline {
                     let access = std::sync::Arc::clone(&access);
                     let mut verification = tokio::task::spawn_blocking(move || {
                         pp_pool.install(move || {
-                            par2_rs::verify_selected_file_ids(&read_set, access.as_ref(), &to_read)
+                            if post_repair {
+                                par2_rs::verify_selected_file_ids_with_options(
+                                    &read_set,
+                                    access.as_ref(),
+                                    &to_read,
+                                    &crate::pipeline::completion::finalize::check::selective_pass_verify_options(),
+                                )
+                            } else {
+                                par2_rs::verify_selected_file_ids(
+                                    &read_set,
+                                    access.as_ref(),
+                                    &to_read,
+                                )
+                            }
                         })
                     })
                     .await
@@ -1495,6 +1572,44 @@ impl Pipeline {
             self.last_direct_verdict = Some(verification.clone());
         }
         Some(verification)
+    }
+
+    /// Has a repair-while-direct already run for one of this job's live sets?
+    ///
+    /// The discriminator between the two passes
+    /// [`Self::verify_direct_sets_quietly`] serves. The latch it reads is burned
+    /// at a repair's first irreversible step, so it is true from the moment any
+    /// byte of a set could have moved — which is exactly when a claim about what
+    /// the wire delivered stops being a claim about what is on disk.
+    ///
+    /// Per job rather than per set. The pass verifies the job's whole recovery
+    /// set in one go and its claim sources are job-scoped, so there is no
+    /// coherent way to read half of it from evidence and half from disk; one
+    /// repaired set makes the whole pass a read-back.
+    ///
+    /// Demoted sets are skipped: their volumes are real files that the
+    /// conventional repairer and its own post-repair pass now own.
+    ///
+    /// # This is defence in depth, and it is worth having anyway
+    ///
+    /// The grid is already empty on a post-repair pass without this: the repair
+    /// retires the whole job's grid state before it rewrites a byte
+    /// (`block_crcs.forget_job`, in the repair path above), and the session arm
+    /// is gated on the same evidence. A counterfactual run with both guards
+    /// removed still reads every volume back.
+    ///
+    /// It stays because the emptiness is a *consequence* of a decision made
+    /// several hundred lines away, for a different reason — retiring claims over
+    /// bytes that moved — and the requirement here is a different statement: a
+    /// post-repair pass must read the disk. Deriving a safety property from
+    /// another decision's side effect is how it lapses silently when that
+    /// decision is refactored. One bool is a cheap price for saying it where it
+    /// is meant.
+    pub(in crate::pipeline) fn direct_sets_repaired_in_place(&self, job_id: JobId) -> bool {
+        self.direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| !set.is_demoted() && set.repair_attempted())
     }
 
     /// The `FileVerification` entries the dual-CRC grid can stand in for, in

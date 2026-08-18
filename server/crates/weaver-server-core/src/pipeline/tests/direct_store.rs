@@ -14358,3 +14358,404 @@ mod cross_device {
         );
     }
 }
+
+#[tokio::test]
+async fn a_uuencoded_article_demotes_the_direct_set_that_claims_its_volume() {
+    // Sets are admitted from the NZB's filenames, before a single article has
+    // been decoded, so an archive posted in uuencode is admitted exactly like a
+    // yEnc one — and can never be routed, because a uuencode article declares
+    // no offset to route on. Excluding those articles quietly is not enough: a
+    // starved set neither finalizes nor demotes, its volumes keep answering
+    // `is_direct_source_file`, and that suppresses the archive probe which
+    // dispatches extraction. The job would complete with its archive sitting
+    // unextracted on disk.
+    let member_name = "Silver.Horizon.S01E17.mkv";
+    let payload: Vec<u8> = (0..1600u32).map(|index| (index % 251) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 2);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let job_id = JobId(41099);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Admission is lazy, so the very first article of the job is uuencode and
+    // the set has not been built yet — which is exactly the shape that must
+    // still end with a demoted set rather than one admitted moments later.
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    super::decode_and_files::submit_uu_segment_named(
+        &mut pipeline,
+        file_id,
+        0,
+        &volumes[0].1[..64],
+        false,
+        false,
+        member_name,
+    )
+    .await;
+
+    assert!(
+        !pipeline.direct_store.sets_for(job_id).is_empty(),
+        "the set was admitted"
+    );
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .all(|set| set.is_demoted()),
+        "a uuencode article must take the set off the direct path"
+    );
+    assert!(
+        !pipeline.is_direct_source_file(file_id),
+        "the volume is back on the conventional path, so extraction can be dispatched for it"
+    );
+}
+
+/// Absolute path of one source volume's sparse envelope, found by suffix.
+///
+/// The name is built from the set's plan, so a test that hard-coded it would
+/// pin a private naming scheme rather than the behaviour under test.
+fn envelope_path_for_volume(pipeline: &Pipeline, job_id: JobId, volume_index: u32) -> PathBuf {
+    pipeline
+        .direct_store
+        .sets_for(job_id)
+        .iter()
+        .find_map(|set| {
+            set.plan()
+                .volumes
+                .contains_key(&volume_index)
+                .then(|| set.plan().envelope_path(volume_index))
+        })
+        .expect("the set owns this volume")
+}
+
+#[tokio::test]
+async fn the_post_direct_repair_pass_stands_in_for_nothing_and_reads_every_volume() {
+    // Before a repair, the quiet direct pass stands in for every volume the
+    // dual-CRC grid adjudicated and reads only the rest — that is the whole
+    // point of the grid and it is measured by the sibling test.
+    //
+    // After a repair it may stand in for nothing. Every claim the pass has is a
+    // statement about what the WIRE delivered, and the question a post-repair
+    // pass is asking is whether the bytes reached the DISK. Those are different
+    // questions and only one of them can be answered by re-reading evidence.
+    const RR_BYTES: usize = 512;
+    let member_name = "Silver.Horizon.S03E09.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 211) as u8).collect();
+    let clean = recovery_record_store_set(member_name, &payload, 3, RR_BYTES);
+    let par2_bytes = repairable_par2_index(&clean, 4);
+    let mut volumes = clean.clone();
+    damage_recovery_record(&mut volumes, 1, RR_BYTES);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41410);
+    let (mut pipeline, _, _) = grid_fed_direct_job(
+        &temp_dir,
+        job_id,
+        &volumes,
+        &par2_bytes,
+        GridFeed::default(),
+    )
+    .await;
+
+    assert_eq!(
+        pipeline.direct_verify_read_splits.first().copied(),
+        Some((2, 1)),
+        "non-vacuity: the PRE-repair pass must have claimed the two clean \
+         volumes, or there is no standing-in for the post-repair pass to have \
+         given up; splits = {:?}",
+        pipeline.direct_verify_read_splits
+    );
+    assert!(
+        pipeline.direct_post_repair_read_splits.is_empty(),
+        "and nothing may be recorded as post-repair before a repair has run"
+    );
+
+    drive_grid_fed_job_to_terminal(&mut pipeline, job_id).await;
+
+    assert!(
+        !pipeline.direct_post_repair_read_splits.is_empty(),
+        "a repair ran, so at least one pass must have been a read-back; all \
+         splits = {:?}",
+        pipeline.direct_verify_read_splits
+    );
+    for (claimed, read) in &pipeline.direct_post_repair_read_splits {
+        assert_eq!(
+            *claimed, 0,
+            "a post-repair pass may stand in for nothing; splits = {:?}",
+            pipeline.direct_post_repair_read_splits
+        );
+        assert_eq!(
+            *read, 3,
+            "and it must read every described volume; splits = {:?}",
+            pipeline.direct_post_repair_read_splits
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_disk_fault_under_a_grid_claimed_volume_is_caught_after_a_repair() {
+    // The fault this whole seam exists for. A direct set's source volumes are
+    // the files nothing else re-reads: the grid adjudicated them from per-article
+    // CRCs at the durability seam, and on the strength of that the verification
+    // pass never opens them. A `pwrite` that silently short-wrote, or a sector
+    // that went bad under the envelope, is invisible to every one of those
+    // claims — they describe what the wire delivered, not what the platter kept.
+    //
+    // So: corrupt a claimed volume's bytes ON DISK after they commit, and watch
+    // the two passes disagree. The pre-repair pass stands in for it and calls it
+    // clean, which is the window. The post-repair pass reads it and does not.
+    const RR_BYTES: usize = 512;
+    let member_name = "Silver.Horizon.S03E10.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 211) as u8).collect();
+    let clean = recovery_record_store_set(member_name, &payload, 3, RR_BYTES);
+    let par2_bytes = repairable_par2_index(&clean, 4);
+    // Volume 1's recovery record is damaged on the WIRE, which is what gives the
+    // job a repair to run at all. Volume 0 is perfect on the wire.
+    let mut volumes = clean.clone();
+    damage_recovery_record(&mut volumes, 1, RR_BYTES);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41411);
+    let (mut pipeline, _, _) = grid_fed_direct_job(
+        &temp_dir,
+        job_id,
+        &volumes,
+        &par2_bytes,
+        GridFeed::default(),
+    )
+    .await;
+
+    let pre_repair_splits = pipeline.direct_verify_read_splits.clone();
+    assert_eq!(
+        pre_repair_splits.first().copied(),
+        Some((2, 1)),
+        "non-vacuity: volume 0 has to have been CLAIMED by the grid rather than \
+         read, or the disk fault below would have been caught by the ordinary \
+         pass and this test proves nothing; splits = {pre_repair_splits:?}"
+    );
+
+    // The fault. Volume 0's envelope is rewritten on disk with bytes the wire
+    // never carried — a bad sector, a short write, a neighbour scribbling. The
+    // grid's claim for volume 0 still stands: it was made from article CRCs
+    // recorded when those bytes were durable, and nothing has re-read them since.
+    let envelope = envelope_path_for_volume(&pipeline, job_id, 0);
+    let mut faulted = std::fs::read(&envelope).expect("volume 0's envelope exists on disk");
+    assert!(
+        faulted.len() > 64,
+        "non-vacuity: the envelope must actually hold bytes to corrupt; len = {}",
+        faulted.len()
+    );
+    for byte in faulted.iter_mut().take(64) {
+        *byte ^= 0xFF;
+    }
+    std::fs::write(&envelope, &faulted).expect("the fault lands on disk");
+
+    drive_grid_fed_job_to_terminal(&mut pipeline, job_id).await;
+
+    let post_repair = pipeline.direct_post_repair_read_splits.clone();
+    assert!(
+        !post_repair.is_empty(),
+        "a repair ran, so a read-back pass must have followed it; splits = {:?}",
+        pipeline.direct_verify_read_splits
+    );
+    assert!(
+        post_repair.iter().all(|(claimed, _)| *claimed == 0),
+        "and it stood in for nothing, which is the only reason it could see the \
+         fault at all; splits = {post_repair:?}"
+    );
+
+    // The verdict the last quiet pass reached. Volume 0 is the file whose bytes
+    // were corrupted, and it must not come back Complete.
+    let verdict = pipeline
+        .last_direct_verdict
+        .clone()
+        .expect("a quiet pass recorded its verdict");
+    let volume_zero = &clean[0].0;
+    let entry = verdict
+        .files
+        .iter()
+        .find(|file| file.filename == *volume_zero)
+        .unwrap_or_else(|| panic!("volume 0 is described; verdict = {verdict:?}"));
+    assert!(
+        !matches!(entry.status, par2_rs::verify::FileStatus::Complete),
+        "the post-repair pass read volume 0 off disk and must have reported the \
+         fault; a Complete verdict here is a corrupt member shipping in a \
+         finished job. status = {:?}",
+        entry.status
+    );
+}
+
+#[tokio::test]
+async fn the_post_repair_discriminator_follows_the_repair_latch() {
+    // The read-back rule is only as good as the question "has a repair run?",
+    // and the two tests above cannot pin that question on their own: the grid is
+    // independently empty after a repair, so they pass either way (verified by
+    // re-running them with the guard removed). This pins the discriminator.
+    const RR_BYTES: usize = 512;
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 211) as u8).collect();
+
+    // A set nothing damaged. It verifies clean and never repairs, so every pass
+    // it sees may stand in for what the grid adjudicated.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let clean_job = JobId(41412);
+    let undamaged = single_member_store_set("Silver.Horizon.S03E11.mkv", &payload, 3);
+    let clean_par2 = par2_index_over_volumes(&undamaged);
+    let (clean_pipeline, _, _) = grid_fed_direct_job(
+        &temp_dir,
+        clean_job,
+        &undamaged,
+        &clean_par2,
+        GridFeed::default(),
+    )
+    .await;
+    assert!(
+        !clean_pipeline.direct_sets_repaired_in_place(clean_job),
+        "a set that was never repaired must not be read back as if it had been;          sets = {:?}",
+        clean_pipeline.direct_store.sets_for(clean_job)
+    );
+
+    // And one whose recovery record arrived damaged, which repairs in place.
+    let damaged_temp = tempfile::tempdir().unwrap();
+    let damaged_job = JobId(41413);
+    let clean_set = recovery_record_store_set("Amber.Trail.S03E11.mkv", &payload, 3, RR_BYTES);
+    let damaged_par2 = repairable_par2_index(&clean_set, 4);
+    let mut damaged = clean_set.clone();
+    damage_recovery_record(&mut damaged, 1, RR_BYTES);
+    let (mut pipeline, _, _) = grid_fed_direct_job(
+        &damaged_temp,
+        damaged_job,
+        &damaged,
+        &damaged_par2,
+        GridFeed::default(),
+    )
+    .await;
+    assert!(
+        pipeline.direct_store.repair_attempts > 0,
+        "non-vacuity: the fixture must actually repair in place, or the latch \
+         never burns and this asserts nothing"
+    );
+    assert!(
+        pipeline.direct_sets_repaired_in_place(damaged_job),
+        "the latch burns at a repair's first irreversible step, so from that \
+         moment on every quiet pass is a read-back"
+    );
+
+    // A demoted set is not this pass's business: its volumes became real files
+    // and the conventional repairer brings its own post-repair verification.
+    for index in 0..pipeline.direct_store.sets_for(damaged_job).len() {
+        if let Some(set) = pipeline.direct_store.set_mut(damaged_job, index) {
+            set.demote(crate::pipeline::direct_store::router::DemotionReason::UnparsableVolume);
+        }
+    }
+    assert!(
+        !pipeline.direct_sets_repaired_in_place(damaged_job),
+        "a demoted set hands its volumes to the conventional path"
+    );
+}
+
+#[tokio::test]
+async fn an_obfuscated_direct_set_still_reaches_zero_io_grid_adjudication() {
+    // An obfuscated post names its volumes after a hash while the recovery set
+    // describes their real names. A volume that binds to no description
+    // forfeits the dual-CRC grid entirely — nothing to measure a verdict
+    // against — so every volume would be read back at completion.
+    //
+    // MEASURED, and it is not what the content binder was written for: this
+    // shape already binds by NAME. PAR2-driven identity classification assigns
+    // each volume a `canonical_filename` of "silver.horizon.partNN.rar" with
+    // `classification_source: Par2`, and `resolve_par2_file_binding` searches
+    // the canonical name along with the posted one. Verified by running this
+    // test with the content fallback removed: it still passes.
+    //
+    // It stays as the regression pin for that path — the claim "an obfuscated
+    // direct set gets zero-I/O adjudication" is worth holding however it is
+    // achieved, and if the classifier ever stops inferring the name, the
+    // content binder is what keeps this green.
+    let member_name = "Silver.Horizon.S04E01.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
+    let described = single_member_store_set(member_name, &payload, 3);
+    // The recovery set describes the volumes under their real names...
+    let par2_bytes = par2_index_over_volumes(&described);
+    // ...while the post carries them under an obfuscated stem.
+    let posted: Vec<(String, Vec<u8>)> = described
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            (
+                format!("a7f3e91c8b2d4f60.part{:02}.rar", index + 1),
+                bytes.clone(),
+            )
+        })
+        .collect();
+    assert!(
+        posted
+            .iter()
+            .zip(described.iter())
+            .all(|((posted, _), (real, _))| posted != real),
+        "non-vacuity: the posted names must differ from the described ones"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41420);
+    let (pipeline, _, _) = grid_fed_direct_job(
+        &temp_dir,
+        job_id,
+        &posted,
+        &par2_bytes,
+        GridFeed {
+            retained_session: true,
+            ..GridFeed::default()
+        },
+    )
+    .await;
+
+    let par2_set = pipeline
+        .par2_set(job_id)
+        .cloned()
+        .expect("the index parsed");
+    for ordinal in 0..posted.len() as u32 {
+        let file_id = NzbFileId {
+            job_id,
+            file_index: IndexPosition::First.volume_file_index(ordinal),
+        };
+        let bound = pipeline
+            .resolve_par2_file_binding(file_id)
+            .unwrap_or_else(|| panic!("volume {ordinal} must bind to a description"));
+        let described_name = &par2_set
+            .file_description(&bound.0)
+            .expect("the bound description")
+            .filename;
+        assert_eq!(
+            described_name, &described[ordinal as usize].0,
+            "volume {ordinal} must bind to the description holding its own bytes, \
+             not merely to some description"
+        );
+    }
+
+    // And the binding reached the grid while it mattered. The observables have
+    // to be records of what the pass DID rather than state inspected
+    // afterwards: finalization retires a finalized set's grid entries on
+    // purpose, so a post-hoc look at the collector finds nothing whether the
+    // adjudication happened or not.
+    assert!(
+        pipeline.direct_session_pass_calls > 0,
+        "the zero-I/O session arm answered, which it can only do when every \
+         described volume is adjudicated in stream"
+    );
+    assert!(
+        pipeline.direct_verify_read_splits.is_empty(),
+        "so no volume was read back at all; splits = {:?}",
+        pipeline.direct_verify_read_splits
+    );
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        sets.contains("Finalized"),
+        "and the verdict cleared the set; got {sets}"
+    );
+}
