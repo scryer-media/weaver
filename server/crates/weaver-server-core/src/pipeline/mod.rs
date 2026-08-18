@@ -80,6 +80,46 @@ fn download_restart_checkpoint_bytes() -> u64 {
     })
 }
 
+/// How long after a post's own date its articles are left alone before weaver
+/// will fetch them.
+///
+/// # Why there is a delay at all
+///
+/// A binary post does not appear on a server the instant it is made: it
+/// propagates, article by article, and a reader that starts pulling immediately
+/// meets articles that simply have not arrived yet. Every one of those reads is
+/// a not-found that looks exactly like a missing article — it burns a retry, it
+/// spends the article's server budget, it marks servers unhealthy, and on a
+/// par2-less job it can fail a download that would have succeeded ten minutes
+/// later. Waiting costs a few minutes; not waiting costs accuracy in the one
+/// signal weaver uses to decide an article is gone.
+///
+/// # Why it is not a setting
+///
+/// Deliberately not user-facing: no settings row, no schema column, no UI, no
+/// API surface. Both major clients expose this knob and the community guidance
+/// that has grown up around it is a range — roughly five to fifteen minutes —
+/// rather than a value anyone tunes per job. A knob whose right answer is "the
+/// conservative end, always" is not a choice worth asking a user to make; it is
+/// a default worth getting right. The environment variable exists so an
+/// operator can disable the behaviour or shorten it for a test, not as a
+/// supported configuration surface.
+///
+/// `WEAVER_PROPAGATION_DELAY_SECS`: unset takes the conservative end of that
+/// range, `0` disables deferral entirely, and any other value is a delay in
+/// seconds. Read once, like every other environment gate here.
+fn propagation_delay() -> Duration {
+    const DEFAULT_PROPAGATION_DELAY_SECS: u64 = 300;
+    static DELAY: OnceLock<Duration> = OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let secs = std::env::var("WEAVER_PROPAGATION_DELAY_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_PROPAGATION_DELAY_SECS);
+        Duration::from_secs(secs)
+    })
+}
+
 fn health_milli(total: u64, failed_bytes: u64) -> u32 {
     total
         .saturating_sub(failed_bytes)
@@ -2112,6 +2152,20 @@ pub struct Pipeline {
     pub(super) download_pressure_soft_dispatch_after: Option<Instant>,
     /// Per-job delay after restart-durable-lead throttling parks primary work.
     pub(super) download_restart_durable_lead_retry_after: HashMap<JobId, Instant>,
+    /// When each deferred job's articles become old enough to fetch.
+    ///
+    /// Absent means the question has not been asked yet or was answered
+    /// "eligible" — see [`Pipeline::propagation_hold_until`], which is where the
+    /// answer is computed and cached. Same shape and same role as
+    /// `download_restart_durable_lead_retry_after` above: a per-job "not
+    /// before", read at the dispatch gate and surfaced to the run loop's sleep
+    /// so the wake happens at eligibility rather than by polling.
+    pub(super) propagation_ready_at: HashMap<JobId, Instant>,
+    /// Test-only override of [`propagation_delay`], mirroring
+    /// `stateful_par2_session_forced`. The env gate is read once per process,
+    /// so a test that needs a different delay cannot get one by setting the
+    /// variable.
+    pub(super) propagation_delay_forced: Option<Duration>,
     /// Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
     /// Current in-memory decoded backlog retained for sequential write ordering.

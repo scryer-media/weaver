@@ -664,6 +664,7 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
+        self.propagation_ready_at.remove(&job_id);
         // The direct-store runtime is per-job state like every map
         // above it. Left behind, its sets keep a removed job "active" and the
         // barrier poll keeps demanding checkpoints for a working directory that
@@ -840,6 +841,12 @@ impl Pipeline {
             let durable_lead_retry_sleep = tokio::time::sleep(
                 durable_lead_retry_delay.unwrap_or_else(|| std::time::Duration::from_secs(3600)),
             );
+            // A deferred job wakes the loop exactly when its post is old
+            // enough, rather than being rediscovered by polling.
+            let propagation_delay = self.next_propagation_delay();
+            let propagation_sleep = tokio::time::sleep(
+                propagation_delay.unwrap_or_else(|| std::time::Duration::from_secs(3600)),
+            );
             let infrastructure_retry_deadline = self.infrastructure_retries.next_deadline();
             let infrastructure_retry_sleep =
                 tokio::time::sleep_until(infrastructure_retry_deadline.unwrap_or_else(|| {
@@ -963,6 +970,7 @@ impl Pipeline {
                     }
                     _ = rate_sleep, if !rate_delay.is_zero() => {}
                     _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {}
+                    _ = propagation_sleep, if propagation_delay.is_some() => {}
                     _ = infrastructure_retry_sleep, if infrastructure_retry_deadline.is_some() => {
                         self.requeue_due_infrastructure_retries();
                     }

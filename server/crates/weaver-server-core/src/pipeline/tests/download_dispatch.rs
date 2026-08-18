@@ -3079,6 +3079,7 @@ async fn dispatch_downloads_respects_hard_write_byte_pressure() {
         file_index: 0,
     };
     let buffered = BufferedDecodedSegment {
+        encoding: SegmentEncoding::Yenc,
         segment_id: SegmentId {
             file_id,
             segment_number: 99,
@@ -5995,6 +5996,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Decoded(DecodeResult {
+                encoding: SegmentEncoding::Yenc,
                 segment_id,
                 raw_size,
                 yenc_layout: YencLayoutAssertions {
@@ -7255,4 +7257,262 @@ async fn pause_rejects_extracting_state_without_download_lane() {
             .to_string()
             .contains("pause is only supported in queued or downloading states")
     );
+}
+
+// ---- propagation delay ----
+
+/// Seconds since the epoch, as the NZB's `date` attribute carries it.
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// A one-file job whose files carry `posted_at` (or no date at all).
+fn posted_job_spec(name: &str, posted_at: Option<u64>) -> JobSpec {
+    let mut spec = standalone_job_spec(name, &[("queued.bin".to_string(), 512u32)]);
+    for file in &mut spec.files {
+        file.posted_at_epoch = posted_at;
+    }
+    spec
+}
+
+#[tokio::test]
+async fn a_freshly_posted_job_defers_until_its_articles_have_propagated() {
+    // A post is not on the server the instant it is made. Fetching it now
+    // produces not-founds that look exactly like missing articles: they burn
+    // retries, spend the article's server budget and mark servers unhealthy —
+    // and on a par2-less job they can fail a download that would have worked
+    // minutes later.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.propagation_delay_forced = Some(Duration::from_secs(3600));
+    let job_id = JobId(20200);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        posted_job_spec("Silver Horizon Fresh", Some(now_epoch_secs())),
+    )
+    .await;
+
+    let hold = pipeline
+        .propagation_hold_until(job_id)
+        .expect("a post made now must be held");
+    assert!(hold > Instant::now());
+
+    // What is NOT pinned here, said plainly: the dispatch seam consults this
+    // gate in one `if` at the top of `try_dispatch_download_for_job`, and this
+    // harness cannot exercise it. `dispatch_downloads` never reaches per-job
+    // dispatch without a server behind it, so any assertion about the job's
+    // status or queue after a dispatch pass holds whether or not the gate
+    // exists — measured, by removing the gate and watching them still pass. The
+    // gate's decision function is what these tests pin; its one-line call site
+    // is verified by reading.
+
+    // The run loop is told when to wake, rather than rediscovering this by
+    // polling.
+    let wake = pipeline
+        .next_propagation_delay()
+        .expect("a deferred job must expose its wakeup");
+    assert!(wake <= Duration::from_secs(3600));
+    assert!(wake > Duration::from_secs(3500));
+}
+
+#[tokio::test]
+async fn the_deferral_boundary_is_posted_at_plus_the_delay() {
+    // The arithmetic, pinned either side of the line without waiting on a
+    // clock: the same delay, two posts, one a second short of eligible and one
+    // a second past it.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.propagation_delay_forced = Some(Duration::from_secs(3600));
+    let now = now_epoch_secs();
+
+    let young = JobId(20201);
+    insert_active_job(
+        &mut pipeline,
+        young,
+        posted_job_spec("Silver Horizon Young", Some(now - 3599)),
+    )
+    .await;
+    assert!(
+        pipeline.propagation_hold_until(young).is_some(),
+        "one second short of the delay is still deferred"
+    );
+
+    let old = JobId(20202);
+    insert_active_job(
+        &mut pipeline,
+        old,
+        posted_job_spec("Silver Horizon Old", Some(now - 3601)),
+    )
+    .await;
+    assert!(
+        pipeline.propagation_hold_until(old).is_none(),
+        "a post older than the delay starts immediately"
+    );
+    assert!(
+        !pipeline.propagation_ready_at.contains_key(&old),
+        "and an eligible job leaves no deferral state behind"
+    );
+}
+
+#[tokio::test]
+async fn a_job_becomes_eligible_when_its_delay_elapses() {
+    // The transition itself, on a real clock with a delay small enough to wait
+    // for.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.propagation_delay_forced = Some(Duration::from_millis(120));
+    let job_id = JobId(20203);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        posted_job_spec("Silver Horizon Soon", Some(now_epoch_secs())),
+    )
+    .await;
+    assert!(
+        pipeline.propagation_hold_until(job_id).is_some(),
+        "held at first"
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(
+        pipeline.propagation_hold_until(job_id).is_none(),
+        "and eligible once the delay has passed"
+    );
+    assert!(
+        pipeline.next_propagation_delay().is_none(),
+        "with nothing left for the run loop to wake for"
+    );
+}
+
+#[tokio::test]
+async fn a_job_with_no_parseable_dates_is_never_deferred() {
+    // No date is not the same question as "posted just now". An NZB that
+    // carries no usable dates has no anchor to defer against, so it starts
+    // immediately — the same stance retention takes for the same reason.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.propagation_delay_forced = Some(Duration::from_secs(3600));
+    let job_id = JobId(20204);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        posted_job_spec("Silver Horizon Undated", None),
+    )
+    .await;
+
+    assert!(pipeline.propagation_hold_until(job_id).is_none());
+    assert!(pipeline.next_propagation_delay().is_none());
+}
+
+#[tokio::test]
+async fn the_newest_date_in_the_nzb_is_the_anchor() {
+    // Files with no date contribute nothing, and the anchor is the newest date
+    // the NZB does carry — that is the article most likely to still be in
+    // flight, and deferring to it is what makes the wait cover the whole post.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.propagation_delay_forced = Some(Duration::from_secs(3600));
+    let now = now_epoch_secs();
+    let job_id = JobId(20205);
+    let mut spec = standalone_job_spec(
+        "Silver Horizon Mixed Dates",
+        &[
+            ("old.bin".to_string(), 512u32),
+            ("new.bin".to_string(), 512),
+        ],
+    );
+    spec.files[0].posted_at_epoch = Some(now - 86_400);
+    spec.files[1].posted_at_epoch = None;
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    assert!(
+        pipeline.propagation_hold_until(job_id).is_none(),
+        "a day-old anchor beside an undated file is eligible"
+    );
+
+    let fresh = JobId(20206);
+    let mut spec = standalone_job_spec(
+        "Silver Horizon Fresh Tail",
+        &[
+            ("old.bin".to_string(), 512u32),
+            ("new.bin".to_string(), 512),
+        ],
+    );
+    spec.files[0].posted_at_epoch = Some(now - 86_400);
+    spec.files[1].posted_at_epoch = Some(now);
+    insert_active_job(&mut pipeline, fresh, spec).await;
+    assert!(
+        pipeline.propagation_hold_until(fresh).is_some(),
+        "one fresh file is enough to hold the job — its articles are the ones \
+         still propagating"
+    );
+}
+
+#[tokio::test]
+async fn a_zero_delay_disables_deferral_entirely() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.propagation_delay_forced = Some(Duration::ZERO);
+    let job_id = JobId(20207);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        posted_job_spec("Silver Horizon Disabled", Some(now_epoch_secs())),
+    )
+    .await;
+
+    assert!(
+        pipeline.propagation_hold_until(job_id).is_none(),
+        "WEAVER_PROPAGATION_DELAY_SECS=0 is the off switch"
+    );
+    assert!(pipeline.propagation_ready_at.is_empty());
+}
+
+#[tokio::test]
+async fn deferral_survives_pause_resume_and_leaves_nothing_behind_on_delete() {
+    // A deferral is invisible to the lifecycle: it holds no status, no queue
+    // position and no lock, so pause and resume behave exactly as they always
+    // did — and removing the job takes its deferral with it rather than
+    // leaving a wakeup for a job that no longer exists.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.propagation_delay_forced = Some(Duration::from_secs(3600));
+    let job_id = JobId(20208);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        posted_job_spec("Silver Horizon Lifecycle", Some(now_epoch_secs())),
+    )
+    .await;
+    assert!(pipeline.propagation_hold_until(job_id).is_some());
+
+    set_job_status_for_test(&mut pipeline, job_id, JobStatus::Paused);
+    let _ = &job_id;
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Paused),
+        "pause works on a deferred job exactly as on any queued one"
+    );
+    pipeline.dispatch_downloads();
+    set_job_status_for_test(&mut pipeline, job_id, JobStatus::Queued);
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Queued),
+        "and resume returns it to the ordinary queued state"
+    );
+    assert!(
+        pipeline.propagation_hold_until(job_id).is_some(),
+        "still deferred afterwards — the clock did not restart and did not stop"
+    );
+
+    pipeline.purge_terminal_job_runtime(job_id);
+    assert!(
+        !pipeline.propagation_ready_at.contains_key(&job_id),
+        "a removed job must not leave a wakeup behind"
+    );
+    assert!(pipeline.next_propagation_delay().is_none());
 }

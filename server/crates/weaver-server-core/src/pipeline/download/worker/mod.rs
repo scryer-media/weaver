@@ -96,6 +96,13 @@ impl Pipeline {
         pressure: DownloadPressure,
         spillover_loan_kind: Option<SpilloverLoanKind>,
     ) -> DispatchAttempt {
+        // Too young to fetch: its articles are still propagating, and asking for
+        // them now produces not-founds that are indistinguishable from missing
+        // articles. Ahead of every other gate because it is a statement about
+        // the post rather than about the pipeline's own capacity.
+        if self.propagation_hold_until(job_id).is_some() {
+            return DispatchAttempt::NoWork;
+        }
         if let Some(ready_at) = self
             .download_restart_durable_lead_retry_after
             .get(&job_id)
