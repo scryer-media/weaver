@@ -795,6 +795,52 @@ impl Pipeline {
             })
     }
 
+    /// Take any set claiming this file off the direct path, because its
+    /// articles arrived uuencoded.
+    ///
+    /// Sets are admitted from the NZB's filenames, before a single article has
+    /// been decoded, so an archive posted in uuencode is admitted exactly like a
+    /// yEnc one. It can never be routed: routing writes an article's bytes into
+    /// a volume at the offset the article declares, and a uuencode article
+    /// declares no offset — its position is the decoded length of its whole
+    /// prefix, which only sequential assembly can supply.
+    ///
+    /// Excluding those articles from the routing seam is not enough on its own.
+    /// A set that is merely starved never finalizes and never demotes, so every
+    /// suppression keyed on [`Self::is_direct_source_file`] keeps holding for
+    /// its volumes — including the archive probe that dispatches extraction,
+    /// which would leave the job completing with its archive unextracted on
+    /// disk. Demoting puts the volumes back on the conventional path, where the
+    /// sequential cursor is already writing them.
+    ///
+    /// `ensure_direct_sets` runs first for the same reason
+    /// [`Self::direct_route_target`] runs it: admission is lazy, so a job whose
+    /// very first article is uuencoded would otherwise find no set to demote
+    /// and admit one moments later.
+    pub(crate) async fn demote_direct_sets_for_uu_article(&mut self, file_id: NzbFileId) {
+        let job_id = file_id.job_id;
+        self.ensure_direct_sets(job_id);
+        let set_indices: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, set)| {
+                (!set.is_demoted() && set.plan().volume_for_file(file_id.file_index).is_some())
+                    .then_some(index)
+            })
+            .collect();
+        for set_index in set_indices {
+            self.demote_direct_set(
+                job_id,
+                set_index,
+                DemotionReason::UuencodedSourceVolume,
+                None,
+            )
+            .await;
+        }
+    }
+
     /// Whether this file's bytes are a direct set's source volume, so no legacy
     /// floor, completed-file row or archive re-probe may be written for it.
     /// `&self`, because the suppression checks sit inside paths that already

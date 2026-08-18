@@ -1975,6 +1975,7 @@ async fn submit_decoded_segment_with_segments(
     pipeline
         .handle_decode_success(
             DecodeResult {
+                encoding: SegmentEncoding::Yenc,
                 segment_id: SegmentId {
                     file_id,
                     segment_number,
@@ -2025,6 +2026,7 @@ async fn submit_decoded_segment_from_server(
     pipeline
         .handle_decode_success(
             DecodeResult {
+                encoding: SegmentEncoding::Yenc,
                 segment_id: SegmentId {
                     file_id,
                     segment_number,

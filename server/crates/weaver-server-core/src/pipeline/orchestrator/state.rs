@@ -116,9 +116,14 @@ impl Pipeline {
     }
 
     pub(crate) fn clear_job_write_backlog(&mut self, job_id: JobId) {
-        let file_ids: Vec<NzbFileId> = self
+        // Both maps, not just the write buffers: a completed uuencode file
+        // keeps a tombstone entry in `uu_files` after its write buffer is gone
+        // (it is what suppresses the restart checkpoint), and teardown is where
+        // that entry is finally dropped.
+        let file_ids: std::collections::HashSet<NzbFileId> = self
             .write_buffers
             .keys()
+            .chain(self.uu_files.keys())
             .copied()
             .filter(|file_id| file_id.job_id == job_id)
             .collect();
@@ -130,6 +135,16 @@ impl Pipeline {
                 released_bytes += buf.buffered_bytes();
                 released_segments += buf.buffered_len();
             }
+            // Parked uuencode parts are held in memory for want of an offset,
+            // so they have to be released on the same teardown the write buffer
+            // is, or a torn-down job keeps its bytes alive.
+            if let Some(uu) = self.uu_files.remove(&file_id) {
+                released_bytes += uu.parked_bytes();
+                released_segments += uu.parked.len();
+            }
+            self.uu_park_requeues
+                .retain(|segment_id, _| segment_id.file_id != file_id);
+            self.file_prefix_16k.remove(&file_id);
         }
 
         if released_bytes > 0 || released_segments > 0 {

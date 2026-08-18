@@ -1324,10 +1324,116 @@ pub(super) fn crc_not_mismatched(status: weaver_yenc::CrcVerification) -> bool {
     status != weaver_yenc::CrcVerification::Mismatch
 }
 
+/// How a segment was encoded on the wire, and therefore what evidence it
+/// carries into the pipeline.
+///
+/// This is not cosmetic. A yEnc article declares where its bytes belong and
+/// what they check to, and the whole zero-I/O verification story is built on
+/// that. A uuencode article declares neither, so several stages that are
+/// correct for yEnc are unsound for uuencode and gate on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SegmentEncoding {
+    /// yEnc: per-part offsets and CRC, block-aligned CRC segments.
+    Yenc,
+    /// uuencode: decoded bytes and a segment index, nothing more.
+    Uu(UuSegmentFacts),
+}
+
+/// The only things a uuencode article establishes beyond its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct UuSegmentFacts {
+    /// A line in this part failed to decode. Its bytes are kept regardless —
+    /// PAR2 adjudicates, not the decoder — but the file is no longer clean.
+    pub(super) damaged: bool,
+    /// This part carried the uuencode `end` marker, so it ends the file.
+    pub(super) ended: bool,
+}
+
+impl SegmentEncoding {
+    /// uuencode segments cannot be placed from the article itself, so they are
+    /// assembled sequentially rather than by declared offset.
+    pub(super) fn is_uu(self) -> bool {
+        matches!(self, Self::Uu(_))
+    }
+
+    pub(super) fn uu_facts(self) -> Option<UuSegmentFacts> {
+        match self {
+            Self::Uu(facts) => Some(facts),
+            Self::Yenc => None,
+        }
+    }
+}
+
+/// Sequential-assembly state for one uuencode file.
+///
+/// A uuencode part's position is the cumulative *decoded* length of every part
+/// before it, which is only knowable once that whole prefix has arrived. So
+/// assembly is strictly sequential: a part that arrives early has to wait, and
+/// it has to wait in memory, because there is no offset to write it to yet.
+/// That is the structural difference from yEnc, whose out-of-order parts can be
+/// persisted immediately at the offset their own header declares.
+#[derive(Default)]
+pub(super) struct UuFileAssembly {
+    /// The next segment ordinal the cursor will place.
+    pub(super) next_index: u32,
+    /// The decoded byte offset that ordinal will be placed at.
+    pub(super) next_offset: u64,
+    /// Parts that arrived ahead of the cursor, keyed by ordinal.
+    ///
+    /// Bounded by the same per-file limit the write reorder buffer uses; see
+    /// the admission check at the placement seam for what happens on overflow.
+    pub(super) parked: BTreeMap<u32, DecodedChunk>,
+    /// A part decoded with damage, or a gap was closed by shifting later parts
+    /// down over a part that never arrived.
+    pub(super) damaged: bool,
+    /// The uuencode `end` marker was seen on some part.
+    pub(super) saw_end: bool,
+    /// The name from the uuencode `begin` header, from whichever part carried
+    /// it. First non-empty wins.
+    ///
+    /// yEnc repeats `name=` on every article, so the article that completes a
+    /// file always carries the name to the identity seam. uuencode states it
+    /// once, on the part that opens the body — which is normally the first
+    /// part, and is emphatically not the last. Both reference decoders apply
+    /// the name whichever part it arrives on, so it is retained here rather
+    /// than read off the completing article.
+    pub(super) filename: Option<String>,
+    /// The file completed and this entry is a tombstone: `parked` has been
+    /// released and the completion warning has already been issued.
+    ///
+    /// The entry outlives completion on purpose. It is what
+    /// [`Pipeline::note_file_progress_floor`] reads to keep a restart
+    /// checkpoint from ever being written for a uuencode file, and that
+    /// suppression has to hold for the final write of the file as much as for
+    /// every write before it.
+    pub(super) finished: bool,
+}
+
+impl UuFileAssembly {
+    /// Bytes currently held for parts waiting on their prefix.
+    pub(super) fn parked_bytes(&self) -> usize {
+        self.parked.values().map(|chunk| chunk.len_bytes()).sum()
+    }
+}
+
+/// The window a PAR2 file description's `hash_16k` covers.
+///
+/// SPEC TRAP, and it is the whole reason this constant is a `min` rather than a
+/// length: a description shorter than this hashes its **whole file**, with no
+/// zero padding to 16 KiB. par2-rs writes it that way
+/// (`&file_data[..file_data.len().min(16384)]`), so a matcher that padded — or
+/// that skipped short descriptions — would silently refuse to bind exactly the
+/// small files an obfuscated set is most likely to open with.
+pub(super) const PAR2_HASH_16K_BYTES: usize = 16 * 1024;
+
 /// Result of a decode task.
 pub(super) struct DecodeResult {
     pub(super) segment_id: SegmentId,
     pub(super) raw_size: u64,
+    /// How the article was encoded. Everything below that reads like a
+    /// declared placement or a checksum is meaningful only for
+    /// [`SegmentEncoding::Yenc`].
+    pub(super) encoding: SegmentEncoding,
     pub(super) yenc_layout: YencLayoutAssertions,
     pub(super) crc_valid: bool,
     pub(super) part_crc_verified: bool,
@@ -1590,6 +1696,9 @@ impl From<Vec<Box<[u8]>>> for DecodedChunk {
 pub(super) struct BufferedDecodedSegment {
     pub(super) segment_id: SegmentId,
     pub(super) decoded_size: u32,
+    /// Carried from the decoder so the durability seam can tell whether this
+    /// segment is allowed to feed the dual-CRC grid.
+    pub(super) encoding: SegmentEncoding,
     pub(super) data: DecodedChunk,
     pub(super) part_crc: u32,
     pub(super) part_crc_verified: bool,
@@ -2011,6 +2120,22 @@ pub struct Pipeline {
     pub(super) write_buffered_segments: usize,
     /// Per-file write reorder buffers for decoded segments waiting on write order.
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
+    /// The first [`PAR2_HASH_16K_BYTES`] decoded bytes of each file, anchored at
+    /// offset 0, for binding an **obfuscated** file to its PAR2 description by
+    /// content when its name matches nothing.
+    ///
+    /// Bounded twice over: 16 KiB per file, and only files whose first article
+    /// has landed have an entry at all. Dropped with the rest of the job's
+    /// per-file runtime.
+    pub(super) file_prefix_16k: HashMap<NzbFileId, Vec<u8>>,
+    /// Sequential-assembly state for uuencode files, created on the first
+    /// uuencode part of a file and dropped with that file's write buffer.
+    pub(super) uu_files: HashMap<NzbFileId, UuFileAssembly>,
+    /// How often each uuencode segment has been displaced by park pressure and
+    /// requeued. Purely a livelock bound — deliberately NOT the decode-failure
+    /// counter, because park pressure is an ordering condition and must never
+    /// spend a segment's retry budget.
+    pub(super) uu_park_requeues: HashMap<SegmentId, u32>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
     /// Direct-store routing state: admitted archive sets, their routers and

@@ -265,10 +265,15 @@ impl Pipeline {
             download_pressure_hard_stall_started_at: None,
             download_pressure_soft_dispatch_after: None,
             download_restart_durable_lead_retry_after: HashMap::new(),
+            propagation_ready_at: HashMap::new(),
+            propagation_delay_forced: None,
             last_download_dispatch_stall_log_at: None,
             write_buffered_bytes: 0,
             write_buffered_segments: 0,
             write_buffers: HashMap::new(),
+            file_prefix_16k: HashMap::new(),
+            uu_files: HashMap::new(),
+            uu_park_requeues: HashMap::new(),
             par2_runtime: HashMap::new(),
             block_crcs: crate::pipeline::integrity::BlockCrcCollector::new(),
             direct_store: crate::pipeline::direct_store::wiring::DirectStoreRuntime::with_settings(
@@ -543,6 +548,29 @@ impl Pipeline {
         // The routing seam already returns before this is reached; the guard is
         // here so any *other* caller inherits the same rule.
         if self.is_direct_source_file(file_id) {
+            return;
+        }
+        // A uuencode file has no resumable checkpoint, so it must never write
+        // one. The floor is a count of DECODED bytes, and the restart path that
+        // reads it back (`segments_covered_by_floor`) walks the NZB's DECLARED
+        // segment sizes to decide which ordinals those bytes cover. Declared
+        // sizes are ENCODED: yEnc runs ~1.03x its decoded bytes, so the walk
+        // stops a little early and a yEnc file merely re-fetches a segment or
+        // two. uuencode runs ~1.38x, so the walk marks a prefix of ordinals
+        // received whose decoded end nobody can compute — and a uuencode part's
+        // offset is precisely the decoded length of its whole prefix. The
+        // resumed cursor would start at ordinal 0 with every arriving part
+        // parked forever behind ordinals that were never queued.
+        //
+        // Suppressing the checkpoint costs a partial uuencode file its resume
+        // and nothing else: with no floor recorded, the restart finds nothing to
+        // skip and the file downloads from ordinal 0 with a cursor that agrees.
+        // That is the honest price of sequential assembly — an offset is only
+        // knowable from the whole prefix, so a prefix nobody measured cannot be
+        // resumed from. The tombstone left by `finish_uu_file` keeps this
+        // holding for the file's final write too, which lands after the
+        // completion branch has run.
+        if self.uu_files.contains_key(&file_id) {
             return;
         }
         let current = self
@@ -2019,6 +2047,7 @@ mod disk_write_handle_cache_tests {
 
     fn segment(bytes: &[u8]) -> BufferedDecodedSegment {
         BufferedDecodedSegment {
+            encoding: SegmentEncoding::Yenc,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id: JobId(1),

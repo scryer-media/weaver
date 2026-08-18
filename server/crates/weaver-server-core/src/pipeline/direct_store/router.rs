@@ -296,6 +296,21 @@ pub(crate) enum DemotionReason {
     /// describes different bytes. Unreadable means unverifiable, and
     /// unverifiable demotes.
     RepairGapUnreadable,
+    /// A source volume arrived uuencoded.
+    ///
+    /// Sets are admitted from the NZB's filenames, before a single article has
+    /// been decoded, so an archive posted in uuencode is admitted exactly like
+    /// a yEnc one. It can never be routed: routing writes an article's bytes
+    /// into a volume at the offset the article declares, and a uuencode article
+    /// declares no offset — its position is the decoded length of its whole
+    /// prefix, which only sequential assembly can supply.
+    ///
+    /// A demotion rather than a quiet exclusion, because a set that is merely
+    /// starved never finalizes and never demotes, and its volumes keep
+    /// answering `is_direct_source_file` — which suppresses the archive probe
+    /// that dispatches extraction. The job would then complete with its archive
+    /// sitting unextracted on disk.
+    UuencodedSourceVolume,
     /// The volume's headers could not be parsed from the staged image.
     UnparsableVolume,
     /// A non-final part's packed CRC32 did not match the bytes routed for it.
@@ -396,6 +411,7 @@ impl DemotionReason {
             Self::RestartRereadFailed => "restart_reread_failed",
             Self::RepairRerouteFailed => "repair_reroute_failed",
             Self::RepairGapUnreadable => "repair_gap_unreadable",
+            Self::UuencodedSourceVolume => "uuencoded_source_volume",
             Self::UnparsableVolume => "unparsable_volume",
             Self::PartChecksumMismatch => "part_checksum_mismatch",
             Self::MemberChecksumMismatch => "member_checksum_mismatch",

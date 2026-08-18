@@ -33,6 +33,21 @@ impl OutOfOrderPersistReason {
     }
 }
 
+/// Where a uuencode part can go right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UuPlacement {
+    /// Its prefix is complete; place it at this decoded offset.
+    Place(u64),
+    /// Its prefix has not arrived; hold it.
+    Park,
+    /// The park is full and this part is the furthest from the cursor. Its
+    /// bytes are dropped and its ordinal goes back to the download queue.
+    Displaced,
+    /// The cursor already shifted past this ordinal after it was booked failed,
+    /// so its bytes have no home and never will. Dropped terminally.
+    Stale,
+}
+
 #[derive(Debug)]
 struct SegmentWriteError {
     file_id: NzbFileId,
@@ -1231,15 +1246,79 @@ impl Pipeline {
         }
     }
 
+    /// Commit a decoded segment, then release any uuencode parts its arrival
+    /// unblocked.
+    ///
+    /// Sequential assembly means one part's placement can make the next one
+    /// placeable, and that one the next again. Released parts re-enter through
+    /// the same path rather than through a second copy of the commit logic, so
+    /// there is exactly one place where a segment is placed, written and
+    /// accounted for.
     pub(crate) async fn handle_decode_success(
         &mut self,
         result: DecodeResult,
         source: SegmentSource,
     ) {
+        let file_id = result.segment_id.file_id;
+        let is_uu = result.encoding.is_uu();
+        if is_uu {
+            // Ahead of the commit, because the routing seam inside is what a
+            // live set would otherwise capture these bytes with, and because
+            // the archive-probe suppression a live set carries has to be gone
+            // before this file can complete.
+            self.demote_direct_sets_for_uu_article(file_id).await;
+        }
+        self.handle_decode_success_inner(result, source).await;
+
+        if !is_uu {
+            return;
+        }
+        while let Some((segment_number, data)) = self.take_next_ready_uu_segment(file_id) {
+            let released = DecodeResult {
+                segment_id: SegmentId {
+                    file_id,
+                    segment_number,
+                },
+                raw_size: data.len_bytes() as u64,
+                // Damage and the end marker were folded into the file's state
+                // when this part first arrived; replaying them here would be
+                // harmless but redundant.
+                encoding: SegmentEncoding::Uu(crate::pipeline::UuSegmentFacts {
+                    damaged: false,
+                    ended: false,
+                }),
+                yenc_layout: YencLayoutAssertions {
+                    file_size: 0,
+                    part: None,
+                    total: None,
+                    begin: None,
+                    end: None,
+                },
+                crc_valid: true,
+                part_crc_verified: false,
+                part_crc: 0,
+                expected_file_crc: None,
+                data,
+                yenc_name: String::new(),
+                segments: Vec::new(),
+            };
+            self.handle_decode_success_inner(
+                released,
+                SegmentSource {
+                    source_server_idx: None,
+                    exclude_servers: Vec::new(),
+                },
+            )
+            .await;
+        }
+    }
+
+    async fn handle_decode_success_inner(&mut self, result: DecodeResult, source: SegmentSource) {
         let _profile_scope = crate::runtime::perf_probe::scope("download.handle_decode_success");
         let DecodeResult {
             segment_id,
             raw_size: _,
+            encoding,
             yenc_layout,
             crc_valid,
             part_crc_verified,
@@ -1286,29 +1365,112 @@ impl Pipeline {
                 }
             };
             let decoded_len = data.len_bytes();
-            let file_offset = match validate_yenc_layout(expected_layout, yenc_layout, decoded_len)
-            {
-                Ok(file_offset) => file_offset,
-                Err(mismatch) => {
-                    let error = format_yenc_layout_mismatch(
-                        mismatch,
-                        expected_layout,
-                        yenc_layout,
-                        decoded_len,
-                    );
-                    self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-                    self.handle_decode_failure(
-                        segment_id,
-                        &error,
-                        &source.exclude_servers,
-                        source.source_server_idx,
-                    );
-                    return;
+
+            // uuencode cannot be placed by the yEnc layout rules. An article
+            // declares no range, so the validator's no-range arm falls back to
+            // the NZB's declared prefix — and NZB segment byte counts are
+            // *encoded* sizes. yEnc encodes at roughly 1.03x, so that fallback
+            // is nearly right for yEnc; uuencode encodes at roughly 1.38x, so
+            // the same number would place every part far past where its bytes
+            // belong and scatter the file. The only correct offset is the
+            // cumulative DECODED length of the preceding parts, which the
+            // sequential cursor below owns. No declared byte count enters that
+            // computation anywhere.
+            let file_offset = if let Some(facts) = encoding.uu_facts() {
+                // Before any placement decision, because a part can be parked,
+                // displaced or dropped below and every one of those returns
+                // early — and the part that carries the `begin` header is a
+                // part like any other. Both facts it establishes about identity
+                // are recorded here so they survive whatever happens to its
+                // bytes: the retained name for the completion seam, and the
+                // PAR2 recovery-count registration the yEnc path performs for
+                // every article.
+                if !yenc_name.is_empty() {
+                    self.note_uu_filename(file_id, &yenc_name);
+                    self.note_recovery_count_from_yenc_name(job_id, file_id.file_index, &yenc_name);
+                }
+                match self.place_uu_segment(
+                    file_id,
+                    segment_id.segment_number,
+                    facts,
+                    decoded_len,
+                    &data,
+                ) {
+                    UuPlacement::Place(offset) => offset,
+                    UuPlacement::Park => {
+                        // Held until its prefix arrives. `data` moves into the
+                        // park; the cursor releases it later through this same
+                        // path, so nothing downstream sees a half-placed part.
+                        //
+                        // Anything the park had to displace to stay inside its
+                        // bound must be re-fetched: its bytes are gone, and the
+                        // download layer already counts it as delivered.
+                        drop(_cpu_scope);
+                        let displaced =
+                            self.park_uu_segment(file_id, segment_id.segment_number, data);
+                        for ordinal in displaced {
+                            self.requeue_displaced_uu_segment(SegmentId {
+                                file_id,
+                                segment_number: ordinal,
+                            });
+                        }
+                        return;
+                    }
+                    UuPlacement::Displaced => {
+                        // The park is full and this part sits furthest from the
+                        // cursor, so it is dropped rather than held — but it
+                        // still has to come back, on the same zero-burn terms
+                        // as anything the park displaces.
+                        drop(_cpu_scope);
+                        self.requeue_displaced_uu_segment(segment_id);
+                        return;
+                    }
+                    UuPlacement::Stale => {
+                        // The cursor shifted past this ordinal when it was
+                        // booked failed, so these bytes have nowhere to go and
+                        // a re-fetch would only produce the same homeless
+                        // article again. Drop it terminally.
+                        drop(_cpu_scope);
+                        crate::runtime::perf_probe::record(
+                            "download.uu.stale_arrival_dropped",
+                            std::time::Duration::from_nanos(1),
+                        );
+                        debug!(
+                            segment = %segment_id,
+                            "uuencode part arrived after its ordinal was shifted away; dropping"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                match validate_yenc_layout(expected_layout, yenc_layout, decoded_len) {
+                    Ok(file_offset) => file_offset,
+                    Err(mismatch) => {
+                        let error = format_yenc_layout_mismatch(
+                            mismatch,
+                            expected_layout,
+                            yenc_layout,
+                            decoded_len,
+                        );
+                        self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                        self.handle_decode_failure(
+                            segment_id,
+                            &error,
+                            &source.exclude_servers,
+                            source.source_server_idx,
+                        );
+                        return;
+                    }
                 }
             };
             // The bytes that actually decoded, not what the NZB declared: its
             // sizes are yEnc-encoded and run ~3% large.
             let decoded_size = decoded_len as u32;
+
+            // One bounded memcpy for the obfuscation binder, and for the
+            // overwhelming majority of articles not even that — the first thing
+            // it does is compare `file_offset` against 16 KiB and return.
+            self.note_par2_binding_prefix(file_id, file_offset, &data);
 
             // The per-segment bounds above cannot see across segments, so they
             // would still let an article claim a range an earlier ordinal
@@ -1446,6 +1608,7 @@ impl Pipeline {
             let buffered_segment = BufferedDecodedSegment {
                 segment_id,
                 decoded_size,
+                encoding,
                 data,
                 part_crc,
                 part_crc_verified,
@@ -1473,11 +1636,37 @@ impl Pipeline {
                 }
             }
 
+            // uuencode is excluded from direct store. Direct routing places an
+            // article's bytes straight into a recovery volume at the offset the
+            // article declares, and a uuencode article declares no offset at
+            // all — its position is only known once every earlier part of the
+            // file has been decoded and measured. There is nothing to route on,
+            // so these bytes take the conventional assembly path, where the
+            // sequential cursor can place them.
+            //
+            // Skipping the routing seam is not enough on its own. Direct sets
+            // are admitted from the NZB's filenames alone, before a single
+            // article has been decoded, so a uuencoded archive set is admitted
+            // exactly like a yEnc one and then never fed. A starved set never
+            // finalizes and never demotes, and `is_direct_source_file` keeps
+            // answering yes for its volumes — which suppresses the archive
+            // probe that dispatches extraction, so the job would complete with
+            // its archive sitting unextracted on disk. The set is therefore
+            // demoted at the first uuencode article, which happens in
+            // [`Self::handle_decode_success`] before this seam is reached, so
+            // by the time control arrives here the set is already demoted and
+            // its volumes are back on the conventional path.
+            let direct_target = if encoding.is_uu() {
+                None
+            } else {
+                self.direct_route_target(file_id)
+            };
+
             // A direct set's source volume never becomes a file, so its bytes
             // leave the conventional path here — before the write reorder
             // buffer, before `write_segments_to_disk`, and therefore before any
             // legacy progress floor or completed-file row.
-            match self.direct_route_target(file_id) {
+            match direct_target {
                 Some(DirectFileTarget::Route {
                     set_index,
                     volume_index,
@@ -1551,6 +1740,324 @@ impl Pipeline {
         if let Err(error) = self.relieve_global_write_backlog().await {
             self.fail_job_for_disk_write(error, "failed to relieve global write backlog");
         }
+    }
+
+    /// Retain the file's first [`crate::pipeline::PAR2_HASH_16K_BYTES`] decoded
+    /// bytes, so an obfuscated file can be bound to its PAR2 description by
+    /// content when its name matches nothing.
+    ///
+    /// # Placement, not durability
+    ///
+    /// This runs at the placement seam rather than at either commit seam, and
+    /// that is deliberate. It is the one point both encodings and both routes
+    /// pass through — conventional assembly, direct-store routing (whose commit
+    /// seam is handed a length, not bytes) and uuencode alike — so one call site
+    /// covers what would otherwise be three, and the direct case is the one the
+    /// binder exists for.
+    ///
+    /// It costs nothing in soundness, because a binding is an **identity**
+    /// question and not a durability claim: it decides which description a
+    /// file's verdicts are measured against, and every claim that asserts
+    /// anything about bytes on disk is gated at its own seam, after its own
+    /// write returned. A prefix captured here and a prefix read back later can
+    /// only disagree if the disk lied, which is the window workstream C's
+    /// post-repair read-back closes and which no binding could have caught.
+    ///
+    /// # Only an offset-0-anchored, contiguous prefix
+    ///
+    /// The buffer grows only from its own end. An article that starts past what
+    /// has been captured is skipped rather than stitched in at its offset —
+    /// a hash over bytes with a hole in them is not the hash of anything, and a
+    /// file whose first article never arrives simply never content-binds, which
+    /// is the correct answer rather than a special case.
+    fn note_par2_binding_prefix(
+        &mut self,
+        file_id: NzbFileId,
+        file_offset: u64,
+        data: &DecodedChunk,
+    ) {
+        // The hot-path guard: one comparison, before any map touch. Every
+        // article of every file past the first 16 KiB stops here.
+        if file_offset >= crate::pipeline::PAR2_HASH_16K_BYTES as u64 {
+            return;
+        }
+        let prefix = self.file_prefix_16k.entry(file_id).or_default();
+        let captured = prefix.len() as u64;
+        // A gap the buffer cannot close, or a range already wholly captured.
+        if file_offset > captured {
+            return;
+        }
+        let mut skip = (captured - file_offset) as usize;
+        if skip >= data.len_bytes() {
+            return;
+        }
+        data.for_each_slice(|slice| {
+            if skip >= slice.len() {
+                skip -= slice.len();
+                return;
+            }
+            let slice = &slice[skip..];
+            skip = 0;
+            let room = crate::pipeline::PAR2_HASH_16K_BYTES.saturating_sub(prefix.len());
+            if room == 0 {
+                return;
+            }
+            prefix.extend_from_slice(&slice[..slice.len().min(room)]);
+        });
+    }
+
+    /// Retain the name a uuencode `begin` header stated for this file.
+    ///
+    /// First non-empty wins. A well-formed post states it once, and a
+    /// duplicate of that part restates the same thing; if two parts of one file
+    /// somehow disagree, the earlier claim is the one the assembly has already
+    /// been reasoning about, so changing identity mid-file would be the more
+    /// surprising answer.
+    fn note_uu_filename(&mut self, file_id: NzbFileId, name: &str) {
+        let uu = self.uu_files.entry(file_id).or_default();
+        if uu.filename.is_none() {
+            uu.filename = Some(name.to_string());
+        }
+    }
+
+    /// Decide where a uuencode part goes, or that it cannot go anywhere yet.
+    ///
+    /// Every offset here is a sum of DECODED lengths. No NZB-declared byte
+    /// count participates: those are encoded sizes, and mixing the two units is
+    /// exactly how a uuencode file gets scattered.
+    fn place_uu_segment(
+        &mut self,
+        file_id: NzbFileId,
+        segment_number: u32,
+        facts: crate::pipeline::UuSegmentFacts,
+        decoded_len: usize,
+        _data: &DecodedChunk,
+    ) -> UuPlacement {
+        let max_pending = self.write_buf_max_pending;
+        let already_placed = self
+            .jobs
+            .get(&file_id.job_id)
+            .and_then(|state| state.assembly.file(file_id))
+            .and_then(|file| file.placement_of(segment_number));
+
+        let uu = self.uu_files.entry(file_id).or_default();
+        uu.damaged |= facts.damaged;
+        uu.saw_end |= facts.ended;
+
+        // A part that already has a placement is a duplicate: the same article
+        // decoded twice. Re-place it exactly where its first copy went, so the
+        // rewrite lands on its own bytes. Deriving a fresh offset from the
+        // cursor would be wrong — the cursor has already moved past it.
+        if let Some((offset, _)) = already_placed {
+            return UuPlacement::Place(offset);
+        }
+
+        if segment_number == uu.next_index {
+            let offset = uu.next_offset;
+            uu.next_index = uu.next_index.saturating_add(1);
+            uu.next_offset = uu.next_offset.saturating_add(decoded_len as u64);
+            return UuPlacement::Place(offset);
+        }
+
+        if segment_number < uu.next_index {
+            // Behind the cursor with no recorded placement: the cursor was
+            // advanced past this ordinal because it failed permanently, and the
+            // file was shifted to close the gap. Its bytes no longer have a
+            // home — re-placing them would overwrite a later part, and
+            // re-fetching them would fetch bytes that can never be placed.
+            return UuPlacement::Stale;
+        }
+
+        if uu.parked.len() >= max_pending
+            && uu
+                .parked
+                .last_key_value()
+                .is_some_and(|(highest, _)| segment_number >= *highest)
+        {
+            return UuPlacement::Displaced;
+        }
+
+        UuPlacement::Park
+    }
+
+    /// Hold a part that arrived ahead of its prefix, returning any part the
+    /// park had to displace to stay inside its bound.
+    ///
+    /// The displaced part's bytes are dropped here, so the caller **must**
+    /// return its ordinal to the download queue. The download layer already
+    /// considers that segment finished; without a fresh fetch its data exists
+    /// nowhere, and the cursor would wedge permanently the moment it reached
+    /// that ordinal.
+    #[must_use]
+    fn park_uu_segment(
+        &mut self,
+        file_id: NzbFileId,
+        segment_number: u32,
+        data: DecodedChunk,
+    ) -> Vec<u32> {
+        let max_pending = self.write_buf_max_pending;
+        let Some(uu) = self.uu_files.get_mut(&file_id) else {
+            return Vec::new();
+        };
+        uu.parked.insert(segment_number, data);
+
+        let mut displaced = Vec::new();
+        while uu.parked.len() > max_pending {
+            // Displace from the far end: those parts are the furthest from the
+            // cursor, so re-fetching them is the least urgent work.
+            let Some(highest) = uu.parked.keys().next_back().copied() else {
+                break;
+            };
+            uu.parked.remove(&highest);
+            displaced.push(highest);
+        }
+        displaced
+    }
+
+    /// Return a uuencode segment to the download queue because of park
+    /// pressure, without charging it any retry budget.
+    ///
+    /// Park pressure is an ORDERING condition, not a data condition: the
+    /// segment downloaded and decoded perfectly, it simply arrived too far
+    /// ahead of the cursor to be held. Charging it against
+    /// `MAX_SEGMENT_RETRIES` would let a pathological arrival order manufacture
+    /// permanent file damage out of articles that were never actually bad, so
+    /// this mirrors the zero-burn requeue the 430-exclusion path uses.
+    ///
+    /// The per-segment counter here exists only to bound livelock, and is
+    /// deliberately not the decode-failure counter. It should be unreachable in
+    /// practice: the park holds `write_buf_max_pending` segments, so a segment
+    /// can only be displaced repeatedly if that many *lower* ordinals keep
+    /// overtaking it, and each pass moves the cursor closer to it. Outside a
+    /// test that shrinks the park to a handful of slots, exhausting this is not
+    /// an ordering the download scheduler can produce.
+    /// Return a park-displaced segment to the download queue, falling back to
+    /// the counted failure path only if it has been displaced implausibly often.
+    fn requeue_displaced_uu_segment(&mut self, segment_id: SegmentId) {
+        if self.requeue_uu_segment_for_ordering(segment_id) {
+            return;
+        }
+        // Livelock guard reached: treat it as a real failure so the segment
+        // cannot cycle forever. See the note on the requeue budget for why this
+        // is not expected outside a test with an artificially tiny park.
+        self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+        self.handle_decode_failure(
+            segment_id,
+            "uuencode reorder park displaced this segment repeatedly",
+            &[],
+            None,
+        );
+    }
+
+    fn requeue_uu_segment_for_ordering(&mut self, segment_id: SegmentId) -> bool {
+        const MAX_UU_PARK_REQUEUES: u32 = 8;
+
+        let attempts = self.uu_park_requeues.entry(segment_id).or_insert(0);
+        *attempts += 1;
+        if *attempts > MAX_UU_PARK_REQUEUES {
+            return false;
+        }
+
+        let job_id = segment_id.file_id.job_id;
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return false;
+        };
+        let file_idx = segment_id.file_id.file_index as usize;
+        let Some(file_spec) = state.spec.files.get(file_idx) else {
+            return false;
+        };
+        let Some(seg_spec) = file_spec
+            .segments
+            .iter()
+            .find(|segment| segment.ordinal == segment_id.segment_number)
+        else {
+            return false;
+        };
+
+        let work = DownloadWork {
+            segment_id,
+            message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+            groups: file_spec.groups.clone(),
+            priority: file_spec.role.download_priority(),
+            byte_estimate: seg_spec.bytes,
+            retry_count: 0,
+            is_recovery: file_spec.role.is_recovery(),
+            exclude_servers: Vec::new(),
+            avoid_server: None,
+        };
+        state.download_queue.push(work);
+        self.update_queue_metrics();
+        crate::runtime::perf_probe::record(
+            "download.uu.park_requeue",
+            std::time::Duration::from_nanos(1),
+        );
+        debug!(
+            segment = %segment_id,
+            "uuencode part displaced by park pressure; requeued without retry budget"
+        );
+        true
+    }
+
+    /// The next parked part the cursor can release, if any.
+    ///
+    /// Called after a placement advances the cursor. Exactly one part is
+    /// released per call: it goes back through the ordinary placement path,
+    /// which advances the cursor again and so makes the call after it the one
+    /// that finds the next part. That keeps a single place where a segment is
+    /// placed, written and accounted for, however long the released run is.
+    fn take_next_ready_uu_segment(&mut self, file_id: NzbFileId) -> Option<(u32, DecodedChunk)> {
+        let uu = self.uu_files.get_mut(&file_id)?;
+        let index = uu.next_index;
+        uu.parked.remove(&index).map(|data| (index, data))
+    }
+
+    /// Close out a uuencode file's sequential state and report its condition.
+    ///
+    /// Three things can make a completed uuencode file untrustworthy, and none
+    /// of them is visible to any later stage on its own:
+    ///
+    /// - a part decoded with a bad line,
+    /// - a part never arrived and the file was shifted to close the gap, so
+    ///   everything past the hole is misaligned rather than merely missing,
+    /// - the `end` marker never appeared, meaning the post itself was truncated
+    ///   even though every ordinal the NZB listed did arrive.
+    ///
+    /// None of these can be caught downstream the way a yEnc CRC mismatch is,
+    /// because uuencode ships no checksum. Every uuencode segment is already
+    /// committed with `part_crc_verified: false`, so the file can never claim a
+    /// fast-path verification and always faces a real read; this records *why*
+    /// so the reason survives into the log rather than being inferred.
+    ///
+    /// Returns the name the file's `begin` header stated, for the identity seam
+    /// that runs just after this — a uuencode file's name arrives on the part
+    /// that opened the body, which is not the part that finishes it.
+    ///
+    /// The entry is left in place as a tombstone rather than removed: parked
+    /// bytes are released, but the fact that this file is uuencode has to
+    /// outlive completion so the restart-checkpoint suppression in
+    /// [`Self::note_file_progress_floor`] still holds for the file's final
+    /// write. Teardown drops it with the rest of the job's per-file state.
+    fn finish_uu_file(&mut self, file_id: NzbFileId) -> Option<String> {
+        self.uu_park_requeues
+            .retain(|segment_id, _| segment_id.file_id != file_id);
+        let uu = self.uu_files.get_mut(&file_id)?;
+        uu.parked.clear();
+        let filename = uu.filename.clone();
+        if uu.finished {
+            // A duplicate arrival re-runs the completion branch; the condition
+            // was reported the first time through.
+            return filename;
+        }
+        uu.finished = true;
+        if uu.damaged || !uu.saw_end {
+            warn!(
+                file_id = %file_id,
+                decode_damage = uu.damaged,
+                missing_end_marker = !uu.saw_end,
+                "uuencode file completed in a damaged state; PAR2 is the authority on recovery"
+            );
+        }
+        filename
     }
 
     fn fail_job_for_disk_write(&mut self, error: SegmentWriteError, context: &'static str) {
@@ -1847,6 +2354,7 @@ impl Pipeline {
         let BufferedDecodedSegment {
             segment_id,
             decoded_size,
+            encoding,
             data,
             part_crc,
             part_crc_verified,
@@ -1905,15 +2413,26 @@ impl Pipeline {
                 // arrival rewrote the range, so if the replay carried different
                 // bytes than the first copy did, skipping the feed would leave
                 // a verdict describing content that is no longer on disk.
-                self.note_block_crc_segments(
-                    file_id,
-                    file_offset,
-                    data.len_bytes() as u64,
-                    part_crc,
-                    part_crc_verified,
-                    was_duplicate,
-                    &segments,
-                );
+                //
+                // uuencode is excluded outright. The grid closes a PAR2 block
+                // by folding the block-aligned CRC32 segments of the articles
+                // that tile it, and a uuencode article supplies neither: no
+                // per-part CRC to fold, and no declared offset to tile against.
+                // Feeding it would mean claiming a block from bytes whose
+                // position was inferred rather than declared, which is exactly
+                // the substitution the grid exists to avoid. These files are
+                // verified by reading them, like every unclaimed block.
+                if !encoding.is_uu() {
+                    self.note_block_crc_segments(
+                        file_id,
+                        file_offset,
+                        data.len_bytes() as u64,
+                        part_crc,
+                        part_crc_verified,
+                        was_duplicate,
+                        &segments,
+                    );
+                }
 
                 // The file hash is a *running* stream: every chunk must be fed
                 // once, in offset order. A duplicate's bytes were already fed
@@ -2005,6 +2524,7 @@ impl Pipeline {
                         "download.file_progress.complete_file_row_covers_restart",
                         std::time::Duration::ZERO,
                     );
+                    let uu_filename = self.finish_uu_file(file_id);
                     self.unavailable_promoted_recovery_segments
                         .retain(|segment_id| segment_id.file_id != file_id);
                     if let Some(mut write_buf) = self.write_buffers.remove(&file_id) {
@@ -2113,31 +2633,49 @@ impl Pipeline {
                         .insert(file_id, file_checksum);
                     let file_hash = file_checksum.md5;
 
-                    if !yenc_name.is_empty() && yenc_name != filename {
+                    // The name the article stream stated for this file. yEnc
+                    // repeats `name=` on every article, so the completing one
+                    // carries it; uuencode states it once, on the part that
+                    // opened the body, and that part is normally the first.
+                    // The retained `begin` name is therefore substituted here
+                    // so a uuencode file reaches exactly the same identity and
+                    // rebind reasoning a yEnc file does, rather than silently
+                    // presenting an empty name and skipping it.
+                    let posted_name: &str = if yenc_name.is_empty() {
+                        uu_filename.as_deref().unwrap_or_default()
+                    } else {
+                        yenc_name.as_str()
+                    };
+                    if !posted_name.is_empty() && posted_name != filename {
                         if self.yenc_name_matches_rewritten_source(
-                            job_id, file_id, &yenc_name, filename,
+                            job_id,
+                            file_id,
+                            posted_name,
+                            filename,
                         ) {
                             debug!(
                                 job_id = job_id.0,
                                 current = %filename,
-                                yenc = %yenc_name,
-                                "yEnc name differs from current filename after file identity rewrite"
+                                posted = %posted_name,
+                                "posted article name differs from current filename after file identity rewrite"
                             );
-                        } else if self
-                            .yenc_name_expected_from_par2_identity(job_id, file_id, &yenc_name)
-                        {
+                        } else if self.yenc_name_expected_from_par2_identity(
+                            job_id,
+                            file_id,
+                            posted_name,
+                        ) {
                             debug!(
                                 job_id = job_id.0,
                                 assembly = %filename,
-                                yenc = %yenc_name,
-                                "yEnc name deferred to PAR2 canonical identity"
+                                posted = %posted_name,
+                                "posted article name deferred to PAR2 canonical identity"
                             );
                         } else {
                             warn!(
                                 job_id = job_id.0,
                                 assembly = %filename,
-                                yenc = %yenc_name,
-                                "yEnc name disagrees with assembly filename"
+                                posted = %posted_name,
+                                "posted article name disagrees with assembly filename"
                             );
                         }
                     }

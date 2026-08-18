@@ -178,7 +178,35 @@ impl Pipeline {
             state.failed_bytes = state.failed_bytes.saturating_add(failed_bytes);
         }
         self.mark_promoted_recovery_segment_unavailable(seg_id);
+        self.skip_failed_uu_segment(seg_id);
         self.check_health(job_id);
+    }
+
+    /// Unwedge a uuencode file whose cursor is waiting on a part that will
+    /// never arrive.
+    ///
+    /// Sequential assembly has no way past a permanently missing part on its
+    /// own: every later part's offset is defined by that part's decoded length,
+    /// which is now unknowable. The choice is to wedge the file forever or to
+    /// close the gap, and closing it is what both reference downloaders do.
+    ///
+    /// The consequence is stated plainly: every part after the hole is written
+    /// one hole-width early, so the file's bytes past that point are
+    /// **misaligned**, not merely incomplete. The file is marked damaged and
+    /// PAR2 is the authority on whether it can be recovered. Without PAR2 the
+    /// file is simply wrong, which is still better than a job that never
+    /// finishes — and the damage flag is what tells the truth about it.
+    pub(in crate::pipeline) fn skip_failed_uu_segment(&mut self, seg_id: SegmentId) {
+        let Some(uu) = self.uu_files.get_mut(&seg_id.file_id) else {
+            return;
+        };
+        if seg_id.segment_number != uu.next_index {
+            // Only the ordinal the cursor is actually waiting on can wedge it.
+            // A later failure is handled when the cursor reaches it.
+            return;
+        }
+        uu.damaged = true;
+        uu.next_index = uu.next_index.saturating_add(1);
     }
 
     pub(crate) fn clear_terminal_segment_failures(&mut self, job_id: JobId) {

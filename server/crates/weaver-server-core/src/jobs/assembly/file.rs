@@ -160,6 +160,15 @@ impl FileAssembly {
         self.placements.insert(segment_number, (offset, len));
     }
 
+    /// Where an ordinal was placed, if it has arrived.
+    ///
+    /// Sequential assembly needs this to re-place a duplicate at the offset its
+    /// first copy already occupies, rather than deriving an offset the cursor
+    /// has since moved past.
+    pub fn placement_of(&self, segment_number: u32) -> Option<(u64, u32)> {
+        self.placements.get(&segment_number).copied()
+    }
+
     /// Record that a segment has been received and decoded.
     pub fn commit_segment(
         &mut self,
@@ -204,6 +213,23 @@ impl FileAssembly {
         self.has_duplicate_segments = false;
     }
 
+    /// Declare the file fully received.
+    ///
+    /// UNITS: `received_bytes` normally accumulates DECODED bytes, one segment
+    /// at a time, while `total_bytes` is the sum of the NZB's DECLARED segment
+    /// sizes — which are encoded. The two are deliberately made equal here, so
+    /// that a file completed by verification or repair reports 100% rather than
+    /// the ~97% a yEnc file's decoded total would otherwise show against its
+    /// declared total.
+    ///
+    /// That gap is far wider for uuencode: it encodes at roughly 1.38x, so a
+    /// uuencode file's decoded total is about 72% of its declared total. The
+    /// decision is to keep this behaviour unchanged for both encodings —
+    /// completion is a statement about *segments*, and every ordinal has been
+    /// accounted for. `received_bytes` after this call is a progress figure in
+    /// declared units, not a measurement of the bytes on disk, and nothing may
+    /// use it as one. The bytes actually written are the sum of the recorded
+    /// placements; `contiguous_placements_proven` is what reasons about those.
     pub fn mark_complete(&mut self) {
         self.received.fill(true);
         self.received_bytes = self.total_bytes;

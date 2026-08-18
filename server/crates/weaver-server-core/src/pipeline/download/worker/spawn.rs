@@ -73,6 +73,18 @@ fn send_blocking_decode_failure(
 }
 
 impl Pipeline {
+    /// Decode an article that arrived as an undecoded buffer.
+    ///
+    /// This is the buffer-decode path, reached only from
+    /// [`DownloadPayload::Raw`]. Production never takes it: the download lanes
+    /// decode inline and hand back [`DownloadPayload::Decoded`], so `Raw` is
+    /// constructed only by tests.
+    ///
+    /// It is therefore yEnc-only. The uuencode sniffer lives in the fused
+    /// streaming decoder, which this path does not use, so a uuencode article
+    /// routed through here would fail its decode exactly as it did before
+    /// uuencode support existed. If `Raw` is ever made production-reachable
+    /// again, this path needs the same sniffer the fused decoder has.
     pub(in crate::pipeline::download::worker) fn spawn_decode_task(
         &self,
         work: PendingDecodeWork,
@@ -160,6 +172,9 @@ impl Pipeline {
                             result: DecodeResult {
                                 segment_id,
                                 raw_size,
+                                // This buffer-decode path is yEnc-only; see the note at
+                                // its call site.
+                                encoding: SegmentEncoding::Yenc,
                                 yenc_layout,
                                 crc_valid,
                                 part_crc_verified,
@@ -229,6 +244,9 @@ impl Pipeline {
                             result: DecodeResult {
                                 segment_id,
                                 raw_size,
+                                // This buffer-decode path is yEnc-only; see the note at
+                                // its call site.
+                                encoding: SegmentEncoding::Yenc,
                                 yenc_layout,
                                 crc_valid,
                                 part_crc_verified,
