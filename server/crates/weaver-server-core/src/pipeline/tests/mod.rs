@@ -52,6 +52,7 @@ mod health_probe;
 mod par2_completion;
 mod rar_extraction;
 mod restore_history;
+mod sfv_completion;
 
 struct TestHarness {
     _temp_dir: TempDir,

@@ -160,6 +160,7 @@ impl Pipeline {
         self.pending_concat.remove(&job_id);
         self.par2_bypassed.remove(&job_id);
         self.par2_verified.remove(&job_id);
+        self.sfv_checked.remove(&job_id);
     }
 
     pub(crate) fn clear_job_rar_runtime(&mut self, job_id: JobId) {

@@ -67,4 +67,5 @@ mod extract;
 mod nested;
 mod output;
 mod rar;
+mod sfv;
 mod status;

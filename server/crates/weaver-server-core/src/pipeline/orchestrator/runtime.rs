@@ -308,6 +308,7 @@ impl Pipeline {
             pending_concat: HashMap::new(),
             par2_bypassed: HashSet::new(),
             par2_verified: HashSet::new(),
+            sfv_checked: HashSet::new(),
             jobs_with_verification_outcome: HashSet::new(),
             post_processing_repair_reentered: HashSet::new(),
             post_processing_repair_return_to_terminal: HashSet::new(),

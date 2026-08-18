@@ -1957,7 +1957,7 @@ impl Pipeline {
         self.finalize_ready_direct_sets(job_id).await;
     }
 
-    fn emit_job_verification_started(&mut self, job_id: JobId) {
+    pub(super) fn emit_job_verification_started(&mut self, job_id: JobId) {
         // Low-frequency: a job enters PAR2 verification a handful of times, so
         // arming the stage timer here costs one clock read per pass and never
         // touches an article path.
@@ -1977,7 +1977,12 @@ impl Pipeline {
     /// four-way label is derived from what the pass actually produced — a pass
     /// that needs repair and found nothing at all on disk is `missing`, one
     /// that needs repair with blocks present is `damaged`.
-    fn note_job_verification_result(&mut self, job_id: JobId, passed: bool, missing_blocks: u32) {
+    pub(super) fn note_job_verification_result(
+        &mut self,
+        job_id: JobId,
+        passed: bool,
+        missing_blocks: u32,
+    ) {
         use crate::operations::instrumentation::{JobStageKind, VerificationOutcomeKind};
         let outcome = if passed {
             VerificationOutcomeKind::Intact
@@ -4815,6 +4820,31 @@ impl Pipeline {
             );
             warn!(job_id = job_id.0, error = %msg);
             self.fail_job(job_id, msg);
+            return;
+        }
+
+        // Every branch above this line either returns or leaves the job with
+        // all of its data files complete and its PAR2 question settled, and
+        // every branch below dispatches the job onward — to extraction, or
+        // straight to the final move. So this is the one point a job with no
+        // recovery set passes through on its way to completion, and it is
+        // where a `.sfv` listing is both readable and still meaningful:
+        //
+        //  - after the PAR2 block, so a job with a set is adjudicated by it and
+        //    the fallback's own scope guard sees a settled answer rather than
+        //    racing one;
+        //  - after deobfuscation, which only ever runs off PAR2 metadata, so
+        //    the names a listing is matched against are the job's final ones;
+        //  - before extraction, which is what consumes the posted files — the
+        //    RAR volumes and split parts a listing actually names — and whose
+        //    cleanup deletes them;
+        //  - before the move to complete, so the working directory paths still
+        //    resolve;
+        //  - before the terminal transition records history, so a verdict
+        //    reaches history and the UI through the same family PAR2 verdicts
+        //    use rather than arriving after the job is already filed.
+        if let Some(error) = self.verify_par2_less_job_with_sfv(job_id).await {
+            self.fail_job(job_id, error);
             return;
         }
 

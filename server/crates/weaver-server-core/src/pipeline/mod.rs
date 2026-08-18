@@ -2266,6 +2266,10 @@ pub struct Pipeline {
     pub(super) par2_bypassed: HashSet<JobId>,
     /// Jobs whose PAR2 set has already validated the current payload bytes.
     pub(super) par2_verified: HashSet<JobId>,
+    /// Jobs the SFV fallback has already ruled on (one-shot guard). The
+    /// completion gate is re-entered many times per job and the fallback's
+    /// disk arm reads the whole payload, so it runs once.
+    pub(super) sfv_checked: HashSet<JobId>,
     /// Jobs that have already contributed a row to `weaver_verifications_total`.
     /// Claimed by the first verdict a job produces, so the `unverifiable`
     /// fallback recorded when a job ends with no PAR2 set can never
