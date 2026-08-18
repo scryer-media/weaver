@@ -1,5 +1,6 @@
 use bytes::BytesMut;
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use tokio_util::codec::Decoder;
 use weaver_nntp::codec::{NntpCodec, NntpFrame, StreamChunk};
 use weaver_nntp::fused_yenc::{FusedYencArticle, FusedYencArticleDecoder};

@@ -1271,7 +1271,7 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
     );
     let linux_linker_env = format!("{}=musl-gcc", cargo_target_env_key(&linux_target, "LINKER"));
     let linux_clippy_script = format!(
-        "set -euo pipefail; export PATH=\"/usr/local/cargo/bin:$PATH\"; apt-get update >/dev/null; apt-get install -y --no-install-recommends musl-tools >/dev/null; /usr/local/cargo/bin/rustup component add clippy; /usr/local/cargo/bin/rustup target add {linux_target}; cargo clippy --workspace --lib --bins --tests --examples --target {linux_target} -- -D warnings"
+        "set -euo pipefail; export PATH=\"/usr/local/cargo/bin:$PATH\"; apt-get update >/dev/null; apt-get install -y --no-install-recommends musl-tools >/dev/null; /usr/local/cargo/bin/rustup component add clippy; /usr/local/cargo/bin/rustup target add {linux_target}; cargo clippy --workspace --lib --bins --tests --examples --benches --target {linux_target} -- -D warnings"
     );
 
     if !args.linux_only {
@@ -1284,6 +1284,7 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
             "--bins",
             "--tests",
             "--examples",
+            "--benches",
             "--",
             "-D",
             "warnings",
@@ -1338,6 +1339,7 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
                 "--bins",
                 "--tests",
                 "--examples",
+                "--benches",
                 "--target",
                 &linux_target,
                 "--",

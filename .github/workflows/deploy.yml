@@ -208,7 +208,7 @@ jobs:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
       - name: Run clippy
-        run: cargo clippy --workspace --locked --lib --bins --tests --examples -- -D warnings
+        run: cargo clippy --workspace --locked --lib --bins --tests --examples --benches -- -D warnings
       - name: Show trusted tag sccache stats
         if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         run: sccache --show-stats || true
