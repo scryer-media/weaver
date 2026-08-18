@@ -1133,7 +1133,7 @@ pub(super) fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size
     build_test_par2_index_for_files(&[(filename, file_data)], slice_size)
 }
 
-fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_size: u64) -> Vec<u8> {
+pub(super) fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_size: u64) -> Vec<u8> {
     struct IndexedFile {
         id: [u8; 16],
         desc_body: Vec<u8>,
@@ -1218,6 +1218,139 @@ fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_size: u64) -> 
         ));
     }
     stream
+}
+
+/// A recovery set over several described files, with real recovery slices
+/// computed over the set's whole input-slice sequence (files in recovery-set
+/// order, each slice zero-padded to `slice_size`) — which is what makes a
+/// multi-file repair actually repairable in a test.
+pub(super) fn build_repairable_par2_set_for_files(
+    files: &[(&str, &[u8])],
+    slice_size: u64,
+    recovery_block_count: usize,
+) -> Par2FileSet {
+    struct Described {
+        file_id: par2_rs::FileId,
+        description: par2_rs::FileDescription,
+        slice_checksums: Vec<par2_rs::SliceChecksum>,
+        slice_count: usize,
+    }
+
+    let described: Vec<Described> = files
+        .iter()
+        .map(|(filename, file_data)| {
+            let file_length = file_data.len() as u64;
+            let hash_full = checksum::md5(file_data);
+            let hash_16k = checksum::md5(&file_data[..file_data.len().min(16 * 1024)]);
+
+            let mut file_id_input = Vec::new();
+            file_id_input.extend_from_slice(&hash_16k);
+            file_id_input.extend_from_slice(&file_length.to_le_bytes());
+            file_id_input.extend_from_slice(filename.as_bytes());
+            let file_id = par2_rs::FileId::from_bytes(checksum::md5(&file_id_input));
+
+            let slice_count = if file_length == 0 {
+                0usize
+            } else {
+                file_length.div_ceil(slice_size) as usize
+            };
+            let slice_checksums = (0..slice_count)
+                .map(|slice_index| {
+                    let start = slice_index as u64 * slice_size;
+                    let end = ((start + slice_size) as usize).min(file_data.len());
+                    let slice_data = &file_data[start as usize..end];
+                    let mut checksum_state = par2_rs::SliceChecksumState::new();
+                    checksum_state.update(slice_data);
+                    let pad_to = ((slice_data.len() as u64) < slice_size).then_some(slice_size);
+                    let (crc32, md5) = checksum_state.finalize(pad_to);
+                    par2_rs::SliceChecksum { crc32, md5 }
+                })
+                .collect();
+
+            Described {
+                file_id,
+                description: par2_rs::FileDescription {
+                    file_id,
+                    hash_full,
+                    hash_16k,
+                    length: file_length,
+                    par2_name: (*filename).to_string(),
+                    filename: (*filename).to_string(),
+                },
+                slice_checksums,
+                slice_count,
+            }
+        })
+        .collect();
+
+    let mut main_body = Vec::new();
+    main_body.extend_from_slice(&slice_size.to_le_bytes());
+    main_body.extend_from_slice(&(described.len() as u32).to_le_bytes());
+    for file in &described {
+        main_body.extend_from_slice(file.file_id.as_bytes());
+    }
+
+    let mut par2_set = Par2FileSet {
+        recovery_set_id: par2_rs::RecoverySetId::from_bytes(checksum::md5(&main_body)),
+        slice_size,
+        recovery_file_ids: described.iter().map(|file| file.file_id).collect(),
+        non_recovery_file_ids: Vec::new(),
+        files: described
+            .iter()
+            .map(|file| (file.file_id, file.description.clone()))
+            .collect(),
+        slice_checksums: described
+            .iter()
+            .map(|file| (file.file_id, file.slice_checksums.clone()))
+            .collect(),
+        recovery_slices: std::collections::BTreeMap::new(),
+        creator: None,
+    };
+
+    let slice_size_bytes = slice_size as usize;
+    let word_count = (slice_size_bytes / 2).max(1);
+    let total_slices: usize = described.iter().map(|file| file.slice_count).sum();
+    let constants = par2_rs::input_slice_constants(total_slices);
+
+    // The set's input-slice sequence: every file's slices in recovery-set
+    // order, each padded out to a full slice.
+    let mut padded = Vec::with_capacity(total_slices * slice_size_bytes);
+    for ((_, file_data), file) in files.iter().zip(described.iter()) {
+        let mut file_padded = file_data.to_vec();
+        file_padded.resize(file.slice_count * slice_size_bytes, 0);
+        padded.extend_from_slice(&file_padded);
+    }
+
+    for exponent in 0..recovery_block_count {
+        let exponent = exponent as u32;
+        let mut recovery = vec![0u8; slice_size_bytes];
+
+        for (input_index, &constant) in constants.iter().enumerate() {
+            let factor = par2_rs::gf_pow(constant, exponent);
+            for word_index in 0..word_count {
+                let input_word = u16::from_le_bytes([
+                    padded[input_index * slice_size_bytes + word_index * 2],
+                    padded[input_index * slice_size_bytes + word_index * 2 + 1],
+                ]);
+                let contribution = par2_rs::gf_mul(input_word, factor);
+                let current =
+                    u16::from_le_bytes([recovery[word_index * 2], recovery[word_index * 2 + 1]]);
+                let updated = par2_rs::gf_add(current, contribution).to_le_bytes();
+                recovery[word_index * 2] = updated[0];
+                recovery[word_index * 2 + 1] = updated[1];
+            }
+        }
+
+        par2_set.recovery_slices.insert(
+            exponent,
+            par2_rs::RecoverySlice {
+                exponent,
+                data: bytes::Bytes::from(recovery).into(),
+            },
+        );
+    }
+
+    par2_set
 }
 
 fn build_repairable_par2_set(

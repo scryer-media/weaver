@@ -1861,6 +1861,29 @@ pub struct Pipeline {
     /// two volumes with a later one that could stand in for none.
     #[cfg(test)]
     pub(super) direct_verify_read_splits: Vec<(usize, usize)>,
+    /// `(files carried, files read)` for every post-repair PAR2 pass, in the
+    /// order they ran. Same shape and same purpose as
+    /// `direct_verify_read_splits`: the selective post-repair pass exists so the
+    /// second number is only what the repair rewrote, and only a per-pass record
+    /// can show that — a job can repair more than once.
+    #[cfg(test)]
+    pub(super) par2_post_repair_read_splits: Vec<(usize, usize)>,
+    /// `(files composed from wire CRCs, files read from disk)` for every SFV
+    /// verification pass, in the order they ran. Same shape and same purpose as
+    /// the two above: the zero-I/O arm exists so the second number is only the
+    /// files the wire could not vouch for, and only a per-pass record can show
+    /// which arm actually answered.
+    #[cfg(test)]
+    pub(super) sfv_verify_read_splits: Vec<(usize, usize)>,
+    /// `(files claimed, files read)` for every quiet direct pass that ran
+    /// **after** a repair-while-direct, in order.
+    ///
+    /// Separate from `direct_verify_read_splits`, which records every quiet
+    /// pass: the post-repair pass has a rule of its own — it may claim nothing
+    /// and must read everything — and only a record that says which passes were
+    /// post-repair can pin it.
+    #[cfg(test)]
+    pub(super) direct_post_repair_read_splits: Vec<(usize, usize)>,
     /// The verdict of the most recent quiet direct pass. The pipeline runs
     /// that pass itself, mid-assembly, while live state is still intact — a
     /// test that calls the pass afterwards observes a different situation

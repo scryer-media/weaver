@@ -201,6 +201,12 @@ impl Pipeline {
             #[cfg(test)]
             direct_verify_read_splits: Vec::new(),
             #[cfg(test)]
+            par2_post_repair_read_splits: Vec::new(),
+            #[cfg(test)]
+            sfv_verify_read_splits: Vec::new(),
+            #[cfg(test)]
+            direct_post_repair_read_splits: Vec::new(),
+            #[cfg(test)]
             last_direct_verdict: None,
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),

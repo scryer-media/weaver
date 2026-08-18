@@ -302,6 +302,174 @@ fn par2_verification_needs_repair(verification: &par2_rs::VerificationResult) ->
     verification.needs_repair()
 }
 
+/// What an authoritative PAR2 pass is asked to read.
+enum Par2PassScope {
+    /// Every recovery file, over a plan observed by a fresh directory scan.
+    /// The conventional pass, unchanged.
+    WholeSet,
+    /// Only these file IDs, read at their canonical names. The caller owns the
+    /// merge with whatever it is standing in for, and the placement plan it
+    /// returns is derived from that merged result rather than scanned.
+    Selected(Vec<par2_rs::FileId>),
+}
+
+/// Run the read the scope asks for. `verify_all` is `verify_selected_file_ids`
+/// over the whole recovery set, so the two arms are one pipeline reached with
+/// different file lists — the same per-slice and whole-file rules, the same
+/// verdicts, over fewer files. The selective arm alone opts into the crate's
+/// fast-verify mode; the conventional arm stays strict.
+///
+/// # Why the selective arm verifies from slice proof
+///
+/// par2-rs hashes at two tiers: a whole-file MD5, which is one message and
+/// therefore one inherently serial chain, and per-slice MD5s, which are
+/// independent messages fed several at a time through the crate's multi-buffer
+/// SIMD engine. The strict pipeline reaches its `Complete` verdict from the
+/// **whole-file** digest, so a strict pass over one large intact file is a
+/// single serial MD5 chain. Measured on the crate's `single_file_verify_shape`
+/// bench over one intact 128 MiB file: 149 ms strict, against 12 ms for the
+/// same bytes proved from their per-slice IFSC checksums and a 7.8 ms
+/// read-only floor — the serial digest is roughly 95% of the strict pass.
+///
+/// The whole-file rule exists to establish the *identity* of files the
+/// library scans: a found file's full digest is what says it is the described
+/// file at all. The selective arm reads nothing whose identity is open —
+/// identity here is fixed by name, not discovered by digest. Each file in its
+/// list is read at the canonical name its description gives it, where the
+/// repairer just installed it after verifying the staged bytes against their
+/// IFSC checksums (or, in the placement corners, confirmed it complete with
+/// its own scan). Proving those bytes again from the same per-slice checksums
+/// answers the question this pass is asking — did the rewrite land intact — at
+/// read speed, and it is the same proof class the repairer's install readback
+/// and the in-stream grid already stand a verdict on. The mode self-guards:
+/// it engages only when the on-disk length matches the description (always
+/// true for a fresh install) and falls back to the strict pipeline otherwise,
+/// so the verdicts are byte-identical either way. The conventional whole-set
+/// arm keeps the strict default because it *is* the scan that establishes
+/// identity.
+fn verify_in_scope(
+    scope: &Par2PassScope,
+    par2_set: &par2_rs::Par2FileSet,
+    access: &dyn par2_rs::FileAccess,
+) -> par2_rs::VerificationResult {
+    match scope {
+        Par2PassScope::WholeSet => par2_rs::verify_all(par2_set, access),
+        Par2PassScope::Selected(file_ids) => par2_rs::verify_selected_file_ids_with_options(
+            par2_set,
+            access,
+            file_ids,
+            &selective_pass_verify_options(),
+        ),
+    }
+}
+
+/// The options the selective post-repair arm verifies with: fast-verify on,
+/// nothing else. Factored out of [`verify_in_scope`] so a test can pin that
+/// the selective pass asks for slice proof — the verdicts are identical in
+/// both modes by design, so no downstream observation could.
+///
+/// Shared with the direct-store side, whose post-repair read-back is the same
+/// pass over virtual volumes and wants the same terms; see
+/// [`crate::pipeline::Pipeline::verify_direct_sets_quietly`].
+pub(in crate::pipeline) fn selective_pass_verify_options() -> par2_rs::VerifyOptions {
+    par2_rs::VerifyOptions {
+        fast_verify: true,
+        ..par2_rs::VerifyOptions::default()
+    }
+}
+
+/// The files a PAR2 repair rewrote, taken from the verification that decided
+/// the repair was needed.
+///
+/// A repair writes a file when that file is not already complete at its
+/// canonical path: par2-rs stages exactly the recoverable files that fail
+/// `is_canonical_complete`, reconstructs or copies them into a staging
+/// directory, reads them back against their IFSC slice checksums, and installs
+/// them over their canonical targets. `Complete` therefore means untouched —
+/// the repair had nothing to write — while `Damaged` and `Missing` are the two
+/// verdicts that put a file in the write set.
+///
+/// Untouchedness is the ordinary case, not the guarantee. A set holding two
+/// files with identical content can have the placement scan's first-match-wins
+/// rename move an exactly-placed file away, after which the repairer's own
+/// scanner finds that content under the other name and copies it back. What
+/// licenses carrying a `Complete` verdict is not that the bytes were left alone
+/// but that they are *content-invariant*: the verdict and the digest it vouches
+/// are statements about content matching the description, every install the
+/// repair makes is read back against the set's IFSC checksums before it lands,
+/// and content that matches the description matches it whichever file wrote it.
+/// A `Complete` entry therefore stays true across a repair that did touch it.
+///
+/// `Renamed` is carried, not read: it names content that already exists intact
+/// somewhere else, which the placement normalization moves rather than
+/// rewrites. It is also unreachable from this producer — only the repairer's
+/// own scanner emits `Renamed`, never `verify_all`/`verify_selected_file_ids`
+/// — and is matched here so the rule is stated where the classification lives
+/// instead of relying on that.
+fn par2_repair_write_set(verification: &par2_rs::VerificationResult) -> Vec<par2_rs::FileId> {
+    verification
+        .files
+        .iter()
+        .filter(|file| {
+            matches!(
+                file.status,
+                par2_rs::verify::FileStatus::Damaged(_) | par2_rs::verify::FileStatus::Missing
+            )
+        })
+        .map(|file| file.file_id)
+        .collect()
+}
+
+/// The placement plan a fresh directory scan would produce for `verification`,
+/// derived from the verdicts instead of re-read from disk.
+///
+/// A file that verified `Complete` was read at the name its description gives
+/// it, so it is exactly placed; one that is still `Damaged` or `Missing` has no
+/// disk file standing for it, which is what `unresolved` means. `Renamed`
+/// carries its physical path and becomes the rename that moves it home.
+///
+/// `swaps` is necessarily empty: a swap is two files each sitting on the
+/// other's name, and neither can then be `Complete` at its own name nor
+/// `Renamed` to a name the plan is also moving something onto. Whatever
+/// pairwise displacement existed was already normalized by the plan the
+/// pre-repair pass produced and this job applied before repairing. `conflicts`
+/// is empty for the same reason it is fatal elsewhere — the verification has
+/// one entry per file ID, so no two disk files can be claiming one description
+/// here.
+fn placement_plan_from_verification(
+    verification: &par2_rs::VerificationResult,
+) -> par2_rs::PlacementPlan {
+    let mut exact = Vec::new();
+    let mut renames = Vec::new();
+    let mut unresolved = Vec::new();
+    for file in &verification.files {
+        match &file.status {
+            par2_rs::verify::FileStatus::Complete => exact.push(file.file_id),
+            par2_rs::verify::FileStatus::Renamed(path) => {
+                let Some(current_name) = path.file_name().map(|name| name.to_string_lossy()) else {
+                    unresolved.push(file.file_id);
+                    continue;
+                };
+                renames.push(par2_rs::PlacementEntry {
+                    file_id: file.file_id,
+                    current_name: current_name.into_owned(),
+                    correct_name: file.filename.clone(),
+                });
+            }
+            par2_rs::verify::FileStatus::Damaged(_) | par2_rs::verify::FileStatus::Missing => {
+                unresolved.push(file.file_id);
+            }
+        }
+    }
+    par2_rs::PlacementPlan {
+        exact,
+        swaps: Vec::new(),
+        renames,
+        unresolved,
+        conflicts: Vec::new(),
+    }
+}
+
 fn summarize_rar_set_phase(
     set_name: &str,
     set_state: &crate::pipeline::archive::rar_state::RarSetState,
@@ -1484,6 +1652,132 @@ impl Pipeline {
             });
         }
 
+        let (mut verification, placement_plan) = self
+            .run_par2_placement_pass(job_id, par2_set, working_dir, Par2PassScope::WholeSet)
+            .await?;
+        Self::log_placement_plan(job_id, &placement_plan);
+        self.settle_par2_pass_result(job_id, &mut verification, emit_events);
+        Ok((verification, placement_plan))
+    }
+
+    /// The post-repair authoritative pass, reading only the files the repair
+    /// rewrote and standing in for the rest with the pre-repair pass's own
+    /// entries.
+    ///
+    /// The pre-repair pass read every file in this set minutes ago, in this
+    /// same flow, and the repair only ever writes the files that pass could not
+    /// call complete ([`par2_repair_write_set`]). Re-reading and re-hashing the
+    /// files it left alone answers a question that was already answered by
+    /// reading the same bytes.
+    pub(in crate::pipeline) async fn verify_repaired_par2_files_with_placement(
+        &mut self,
+        job_id: JobId,
+        par2_set: Arc<par2_rs::Par2FileSet>,
+        working_dir: std::path::PathBuf,
+        pre_repair: &par2_rs::VerificationResult,
+    ) -> Result<(par2_rs::VerificationResult, par2_rs::PlacementPlan), String> {
+        let write_set = par2_repair_write_set(pre_repair);
+        #[cfg(test)]
+        {
+            self.par2_post_repair_read_splits.push((
+                pre_repair.files.len().saturating_sub(write_set.len()),
+                write_set.len(),
+            ));
+        }
+        info!(
+            job_id = job_id.0,
+            carried = pre_repair.files.len().saturating_sub(write_set.len()),
+            rewritten = write_set.len(),
+            "post-repair PAR2 verification reads only what the repair rewrote"
+        );
+
+        let (fresh, _) = self
+            .run_par2_placement_pass(
+                job_id,
+                Arc::clone(&par2_set),
+                working_dir,
+                Par2PassScope::Selected(write_set),
+            )
+            .await?;
+
+        // The carried entries are the pre-repair pass's, verbatim: same status,
+        // same filename, same `valid_slices`. Everything downstream —
+        // reconciliation, the authoritative digest refresh, placement — has to
+        // see exactly what a full pass over unchanged bytes would have
+        // reported, and the cheapest way to guarantee that is to hand it the
+        // report that pass already made.
+        //
+        // The residual this accepts, stated rather than hidden: a file the
+        // repair did not touch could be corrupted by something outside this job
+        // in the minutes between the two passes, and this merge would not catch
+        // it. That is the same window, and the same trust class, as the
+        // in-stream claims the quick paths already stand a whole verification on
+        // — evidence proven by reading the bytes, then relied on after the read.
+        // It is unconditional for that reason: a knob would only offer the
+        // choice of paying for a re-read that answers a different question than
+        // the one this pass is asked.
+        let mut verification =
+            par2_rs::verify::merge_verification_results(&par2_set, pre_repair, fresh);
+        self.settle_par2_pass_result(job_id, &mut verification, false);
+        let placement_plan = placement_plan_from_verification(&verification);
+        Self::log_placement_plan(job_id, &placement_plan);
+        Ok((verification, placement_plan))
+    }
+
+    /// Everything an authoritative pass does with its raw result before a
+    /// caller may read it: the direct-set damage adjustments, the volume-safety
+    /// recomputation and, when the caller is emitting them, the verdict events.
+    fn settle_par2_pass_result(
+        &mut self,
+        job_id: JobId,
+        verification: &mut par2_rs::VerificationResult,
+        emit_events: bool,
+    ) {
+        let adjustments = self.apply_direct_damage_adjustments(job_id, verification);
+        if adjustments.skipped_blocks > 0 {
+            info!(
+                job_id = job_id.0,
+                skipped_blocks = adjustments.skipped_blocks,
+                "excluded eagerly-deleted CRC-verified volumes from damage count"
+            );
+        }
+        if adjustments.retained_suspect_blocks > 0 {
+            info!(
+                job_id = job_id.0,
+                retained_suspect_blocks = adjustments.retained_suspect_blocks,
+                "retained suspect eagerly-deleted volumes in damage count"
+            );
+        }
+        if adjustments.forgiven_direct_blocks > 0 {
+            info!(
+                job_id = job_id.0,
+                forgiven_direct_blocks = adjustments.forgiven_direct_blocks,
+                "excluded finalized direct-store volumes from damage count"
+            );
+        }
+
+        self.recompute_volume_safety_from_verification(job_id, verification);
+
+        if emit_events {
+            let passed = !par2_verification_needs_repair(verification);
+            self.note_job_verification_result(job_id, passed, verification.total_missing_blocks);
+            let _ = self
+                .event_tx
+                .send(PipelineEvent::JobVerificationComplete { job_id, passed });
+        }
+    }
+
+    /// The authoritative PAR2 read, in whichever of its two shapes
+    /// [`Par2PassScope`] asks for. Returns the raw result and the plan the pass
+    /// read through; settling it is the caller's, so the selective shape can
+    /// merge first and settle once over the combined set.
+    async fn run_par2_placement_pass(
+        &mut self,
+        job_id: JobId,
+        par2_set: Arc<par2_rs::Par2FileSet>,
+        working_dir: std::path::PathBuf,
+        scope: Par2PassScope,
+    ) -> Result<(par2_rs::VerificationResult, par2_rs::PlacementPlan), String> {
         #[cfg(test)]
         {
             self.par2_authoritative_verify_calls += 1;
@@ -1502,19 +1796,43 @@ impl Pipeline {
         let direct = self.direct_par2_overlay(job_id);
         let verify_result = tokio::task::spawn_blocking(move || {
             pp_pool.install(move || {
-                let mut plan = par2_rs::scan_placement(&verify_dir, &par2_set)
-                    .map_err(|error| format!("placement scan failed: {error}"))?;
-                if !plan.conflicts.is_empty() {
-                    return Err(format!(
-                        "placement scan found {} conflicting file matches",
-                        plan.conflicts.len()
-                    ));
-                }
+                // The whole-set shape observes placement; the selective shape
+                // asserts it. `scan_placement` is not the cheap half of this
+                // pass — it computes the FULL-file MD5 of every disk file whose
+                // 16k hash matches a description — so a post-repair pass that
+                // scanned would re-read the whole set to build a plan that can
+                // only come back the identity: this job applied the pre-repair
+                // plan before repairing, and par2-rs installs every file it
+                // rewrote at that file's canonical name. An empty plan *is* the
+                // identity placement for reading, because
+                // `PlacementFileAccess::from_plan` takes its overrides from
+                // `swaps` and `renames` alone and otherwise resolves a file at
+                // the name its description gives it.
+                let mut plan = match &scope {
+                    Par2PassScope::WholeSet => {
+                        let plan = par2_rs::scan_placement(&verify_dir, &par2_set)
+                            .map_err(|error| format!("placement scan failed: {error}"))?;
+                        if !plan.conflicts.is_empty() {
+                            return Err(format!(
+                                "placement scan found {} conflicting file matches",
+                                plan.conflicts.len()
+                            ));
+                        }
+                        plan
+                    }
+                    Par2PassScope::Selected(_) => par2_rs::PlacementPlan {
+                        exact: Vec::new(),
+                        swaps: Vec::new(),
+                        renames: Vec::new(),
+                        unresolved: Vec::new(),
+                        conflicts: Vec::new(),
+                    },
+                };
 
                 let Some(direct) = direct else {
                     let file_access =
                         par2_rs::PlacementFileAccess::from_plan(verify_dir, &par2_set, &plan);
-                    return Ok((par2_rs::verify_all(&par2_set, &file_access), plan));
+                    return Ok((verify_in_scope(&scope, &par2_set, &file_access), plan));
                 };
 
                 // The scan walked a directory the direct volumes are absent
@@ -1555,7 +1873,7 @@ impl Pipeline {
                         &direct.volumes,
                     );
                 let counters = file_access.counters();
-                let verification = par2_rs::verify_all(&par2_set, &file_access);
+                let verification = verify_in_scope(&scope, &par2_set, &file_access);
                 debug!(
                     virtual_volumes = direct.volumes.len(),
                     sequential_opens = counters.sequential_opens(),
@@ -1588,47 +1906,11 @@ impl Pipeline {
 
         self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
 
-        let (mut verification, placement_plan) = match verify_result {
-            Ok(Ok(result)) => result,
-            Ok(Err(message)) => return Err(message),
-            Err(error) => return Err(format!("verification task panicked: {error}")),
-        };
-        Self::log_placement_plan(job_id, &placement_plan);
-
-        let adjustments = self.apply_direct_damage_adjustments(job_id, &mut verification);
-        if adjustments.skipped_blocks > 0 {
-            info!(
-                job_id = job_id.0,
-                skipped_blocks = adjustments.skipped_blocks,
-                "excluded eagerly-deleted CRC-verified volumes from damage count"
-            );
+        match verify_result {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(message)) => Err(message),
+            Err(error) => Err(format!("verification task panicked: {error}")),
         }
-        if adjustments.retained_suspect_blocks > 0 {
-            info!(
-                job_id = job_id.0,
-                retained_suspect_blocks = adjustments.retained_suspect_blocks,
-                "retained suspect eagerly-deleted volumes in damage count"
-            );
-        }
-        if adjustments.forgiven_direct_blocks > 0 {
-            info!(
-                job_id = job_id.0,
-                forgiven_direct_blocks = adjustments.forgiven_direct_blocks,
-                "excluded finalized direct-store volumes from damage count"
-            );
-        }
-
-        self.recompute_volume_safety_from_verification(job_id, &verification);
-
-        if emit_events {
-            let passed = !par2_verification_needs_repair(&verification);
-            self.note_job_verification_result(job_id, passed, verification.total_missing_blocks);
-            let _ = self
-                .event_tx
-                .send(PipelineEvent::JobVerificationComplete { job_id, passed });
-        }
-
-        Ok((verification, placement_plan))
     }
 
     /// What [`Pipeline::apply_direct_damage_adjustments`] moved, so each caller
@@ -2268,10 +2550,30 @@ impl Pipeline {
     /// rewrite describes content that is gone; left standing, a restart
     /// would load it as trusted and compare stale bytes' MD5 against the
     /// recovery set forever. Persisting the description's digest is sound
-    /// here — and only here — because the caller just ran a placement
-    /// verification that read the bytes off disk and proved them Complete;
-    /// the quick paths' synthetic all-valid results must never reach this
+    /// here — and only here — because every `Complete` entry the caller hands
+    /// over is vouched by a pass that read the bytes off disk. The quick paths'
+    /// synthetic all-valid results, which read nothing, must never reach this
     /// function.
+    ///
+    /// # The vouching is two passes, not one
+    ///
+    /// The post-repair result is a merge, and each half is proven by its own
+    /// read:
+    ///
+    /// - the files the repair **rewrote** are proven by the post-repair pass,
+    ///   which read them back after the repair installed them;
+    /// - the files it **did not touch** are proven by the pre-repair pass,
+    ///   which read them in this same flow — that pass is what decided they
+    ///   were complete, and being complete is exactly why the repair left them
+    ///   alone.
+    ///
+    /// Both halves are measured bytes; neither is a description standing in for
+    /// a read. What the merge accepts is a *window* rather than a gap in
+    /// evidence: an untouched file that some other writer corrupts between the
+    /// two passes still carries its earlier verdict. That is the same trust
+    /// class as an in-stream claim relied on across the same interval, and it
+    /// is stated at the merge site in
+    /// [`Pipeline::verify_repaired_par2_files_with_placement`].
     ///
     /// A `Verified` digest is attached only through an UNAMBIGUOUS identity:
     /// every alias a name resolves to is kept (never first-wins), a
@@ -4269,12 +4571,11 @@ impl Pipeline {
 
                             self.emit_job_verification_started(job_id);
                             let (post_repair_verification, post_repair_placement_plan) = match self
-                                .verify_par2_with_placement(
+                                .verify_repaired_par2_files_with_placement(
                                     job_id,
                                     Arc::clone(&par2_set),
                                     working_dir.clone(),
-                                    true,
-                                    false,
+                                    &verification,
                                 )
                                 .await
                             {
@@ -4334,10 +4635,13 @@ impl Pipeline {
                                 return;
                             }
                             // Repair rewrote bytes; digests streamed before it
-                            // describe content that is gone. The verification
-                            // above was authoritative (it read the disk), so
-                            // the described digests are proven observations
-                            // for every file it confirmed.
+                            // describe content that is gone. Every `Complete`
+                            // entry in the merged result is vouched by a pass
+                            // that read the disk — the files the repair rewrote
+                            // by the selective pass just above, the ones it left
+                            // alone by the pre-repair pass that decided they
+                            // were complete — so the described digests are
+                            // proven observations, not expectations.
                             if let Err(error) = self
                                 .refresh_authoritative_verified_hashes(
                                     job_id,
@@ -4747,6 +5051,328 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_id_from(seed: u8) -> par2_rs::FileId {
+        par2_rs::FileId::from_bytes([seed; 16])
+    }
+
+    fn file_verification(
+        seed: u8,
+        filename: &str,
+        status: par2_rs::verify::FileStatus,
+        valid_slices: Vec<bool>,
+    ) -> par2_rs::verify::FileVerification {
+        let missing_slice_count = valid_slices.iter().filter(|valid| !**valid).count() as u32;
+        par2_rs::verify::FileVerification {
+            file_id: file_id_from(seed),
+            filename: filename.to_string(),
+            status,
+            valid_slices,
+            missing_slice_count,
+        }
+    }
+
+    /// A four-file pre-repair verdict with one of each status.
+    fn mixed_pre_repair_verification() -> par2_rs::VerificationResult {
+        let files = vec![
+            file_verification(
+                1,
+                "intact.bin",
+                par2_rs::verify::FileStatus::Complete,
+                vec![true, true],
+            ),
+            file_verification(
+                2,
+                "damaged.bin",
+                par2_rs::verify::FileStatus::Damaged(1),
+                vec![true, false],
+            ),
+            file_verification(
+                3,
+                "missing.bin",
+                par2_rs::verify::FileStatus::Missing,
+                vec![false, false],
+            ),
+            file_verification(
+                4,
+                "moved.bin",
+                par2_rs::verify::FileStatus::Renamed(std::path::PathBuf::from(
+                    "/work/elsewhere.bin",
+                )),
+                vec![true, true],
+            ),
+        ];
+        let total_missing_blocks = files
+            .iter()
+            .map(|file| file.missing_slice_count)
+            .sum::<u32>();
+        par2_rs::VerificationResult {
+            files,
+            recovery_blocks_available: 8,
+            total_missing_blocks,
+            repairable: par2_rs::verify::Repairability::Repairable {
+                blocks_needed: total_missing_blocks,
+                blocks_available: 8,
+            },
+        }
+    }
+
+    #[test]
+    fn par2_repair_write_set_is_the_damaged_and_missing_files() {
+        let write_set = par2_repair_write_set(&mixed_pre_repair_verification());
+
+        assert_eq!(
+            write_set,
+            vec![file_id_from(2), file_id_from(3)],
+            "a repair writes exactly the files that were not already complete at \
+             their canonical name — Damaged and Missing. Complete is untouched by \
+             construction, and Renamed is content that already exists intact \
+             somewhere else and is moved by placement, never rewritten."
+        );
+    }
+
+    #[test]
+    fn selective_pass_opts_into_slice_proof_verification() {
+        let options = selective_pass_verify_options();
+
+        assert!(
+            options.fast_verify,
+            "the selective post-repair arm proves a rewritten file from its \
+             per-slice IFSC checksums (multi-buffer engine, ~12ms/128MiB) \
+             instead of the inherently serial whole-file MD5 (~149ms/128MiB). \
+             The identity the strict digest exists to establish is already \
+             fixed here: the file was read at the canonical name the repairer \
+             just installed it to, IFSC-verified before install."
+        );
+        assert!(
+            options.cancel.is_none() && options.progress.is_none(),
+            "fast-verify is the only option the selective arm sets"
+        );
+    }
+
+    #[test]
+    fn placement_plan_from_verification_places_by_verdict() {
+        let plan = placement_plan_from_verification(&mixed_pre_repair_verification());
+
+        assert_eq!(plan.exact, vec![file_id_from(1)]);
+        assert_eq!(plan.unresolved, vec![file_id_from(2), file_id_from(3)]);
+        assert_eq!(plan.renames.len(), 1);
+        assert_eq!(plan.renames[0].file_id, file_id_from(4));
+        assert_eq!(plan.renames[0].current_name, "elsewhere.bin");
+        assert_eq!(plan.renames[0].correct_name, "moved.bin");
+        assert!(
+            plan.swaps.is_empty() && plan.conflicts.is_empty(),
+            "a verdict-derived plan can express neither: the result holds one \
+             entry per file ID, so nothing can be contested, and a pairwise \
+             displacement was already normalized before the repair ran"
+        );
+    }
+
+    /// A recovery set carrying nothing but the two numbers the merge reads:
+    /// the recovery-block count and the file order.
+    fn merge_test_par2_set(recovery_blocks: u32) -> par2_rs::Par2FileSet {
+        let recovery_slices = (0..recovery_blocks)
+            .map(|exponent| {
+                (
+                    exponent,
+                    par2_rs::RecoverySlice {
+                        exponent,
+                        data: bytes::Bytes::from_static(&[0u8; 4]).into(),
+                    },
+                )
+            })
+            .collect();
+        par2_rs::Par2FileSet {
+            recovery_set_id: par2_rs::RecoverySetId::from_bytes([9u8; 16]),
+            slice_size: 4,
+            recovery_file_ids: (1..=4).map(file_id_from).collect(),
+            non_recovery_file_ids: Vec::new(),
+            files: HashMap::new(),
+            slice_checksums: HashMap::new(),
+            recovery_slices,
+            creator: None,
+        }
+    }
+
+    /// The shape the merge actually sees. `verify_all` and
+    /// `verify_selected_file_ids` only ever report `Complete`, `Damaged` or
+    /// `Missing` — `Renamed` comes from the repairer's own scanner, never from
+    /// the pass that produces the pre-repair result this merges onto.
+    fn production_pre_repair_verification() -> par2_rs::VerificationResult {
+        let mut verification = mixed_pre_repair_verification();
+        verification
+            .files
+            .retain(|file| !matches!(file.status, par2_rs::verify::FileStatus::Renamed(_)));
+        verification
+    }
+
+    #[test]
+    fn post_repair_merge_carries_untouched_entries_verbatim() {
+        let par2_set = merge_test_par2_set(8);
+        let base = production_pre_repair_verification();
+        // What a selective pass over the write set comes back with once the
+        // repair has installed both files. Deliberately out of recovery-set
+        // order, so the reorder is doing work.
+        let fresh = par2_rs::VerificationResult {
+            files: vec![
+                file_verification(
+                    3,
+                    "missing.bin",
+                    par2_rs::verify::FileStatus::Complete,
+                    vec![true, true],
+                ),
+                file_verification(
+                    2,
+                    "damaged.bin",
+                    par2_rs::verify::FileStatus::Complete,
+                    vec![true, true],
+                ),
+            ],
+            recovery_blocks_available: 8,
+            total_missing_blocks: 0,
+            repairable: par2_rs::verify::Repairability::NotNeeded,
+        };
+
+        let merged = par2_rs::verify::merge_verification_results(&par2_set, &base, fresh);
+
+        // Recovery-set order, whatever order the selective read came back in.
+        let order: Vec<par2_rs::FileId> = merged.files.iter().map(|file| file.file_id).collect();
+        assert_eq!(
+            order,
+            vec![file_id_from(1), file_id_from(2), file_id_from(3)]
+        );
+
+        // The carried entry is the pre-repair pass's, untouched.
+        let before = &base.files[0];
+        let after = merged
+            .files
+            .iter()
+            .find(|file| file.file_id == file_id_from(1))
+            .expect("carried file must survive the merge");
+        assert_eq!(after.filename, before.filename);
+        assert_eq!(after.valid_slices, before.valid_slices);
+        assert_eq!(after.missing_slice_count, before.missing_slice_count);
+        assert_eq!(
+            format!("{:?}", after.status),
+            format!("{:?}", before.status),
+            "downstream has to see exactly what a full pass over unchanged bytes \
+             would have reported"
+        );
+
+        // The rewritten files carry the fresh verdict, and the set-level
+        // numbers were recomputed rather than inherited.
+        assert!(!par2_verification_needs_repair(&merged));
+        assert_eq!(merged.total_missing_blocks, 0);
+        assert!(matches!(
+            merged.repairable,
+            par2_rs::verify::Repairability::NotNeeded
+        ));
+    }
+
+    #[test]
+    fn a_carried_renamed_entry_would_keep_the_post_repair_gate_red() {
+        // Not a production shape — the pre-repair pass cannot report `Renamed`
+        // — but the carry rule is stated over all four statuses, so what it
+        // would mean is pinned rather than assumed. `needs_repair` is any
+        // status that is not `Complete`, so carrying a `Renamed` entry into the
+        // post-repair gate would fail the job on "file placements remain". The
+        // classification is still right: `Renamed` content is not rewritten by
+        // a repair, so re-reading it would not change the verdict either.
+        let par2_set = merge_test_par2_set(8);
+        let base = mixed_pre_repair_verification();
+        let fresh = par2_rs::VerificationResult {
+            files: vec![
+                file_verification(
+                    2,
+                    "damaged.bin",
+                    par2_rs::verify::FileStatus::Complete,
+                    vec![true, true],
+                ),
+                file_verification(
+                    3,
+                    "missing.bin",
+                    par2_rs::verify::FileStatus::Complete,
+                    vec![true, true],
+                ),
+            ],
+            recovery_blocks_available: 8,
+            total_missing_blocks: 0,
+            repairable: par2_rs::verify::Repairability::NotNeeded,
+        };
+
+        let merged = par2_rs::verify::merge_verification_results(&par2_set, &base, fresh);
+
+        let carried = merged
+            .files
+            .iter()
+            .find(|file| file.file_id == file_id_from(4))
+            .expect("carried file must survive the merge");
+        assert!(matches!(
+            carried.status,
+            par2_rs::verify::FileStatus::Renamed(_)
+        ));
+        assert_eq!(merged.total_missing_blocks, 0);
+        assert!(par2_verification_needs_repair(&merged));
+    }
+
+    #[test]
+    fn post_repair_merge_still_fails_a_file_the_repair_left_damaged() {
+        let par2_set = merge_test_par2_set(8);
+        let base = production_pre_repair_verification();
+        let fresh = par2_rs::VerificationResult {
+            files: vec![
+                file_verification(
+                    2,
+                    "damaged.bin",
+                    par2_rs::verify::FileStatus::Damaged(1),
+                    vec![true, false],
+                ),
+                file_verification(
+                    3,
+                    "missing.bin",
+                    par2_rs::verify::FileStatus::Complete,
+                    vec![true, true],
+                ),
+            ],
+            recovery_blocks_available: 8,
+            total_missing_blocks: 1,
+            repairable: par2_rs::verify::Repairability::Repairable {
+                blocks_needed: 1,
+                blocks_available: 8,
+            },
+        };
+
+        let merged = par2_rs::verify::merge_verification_results(&par2_set, &base, fresh);
+
+        assert!(
+            par2_verification_needs_repair(&merged),
+            "the gate that fails the job after a repair reads the merged result, \
+             so a rewritten file that is still damaged has to survive the merge \
+             as damage"
+        );
+        assert_eq!(merged.total_missing_blocks, 1);
+    }
+
+    #[test]
+    fn placement_plan_from_a_clean_post_repair_result_is_a_no_op() {
+        let mut verification = mixed_pre_repair_verification();
+        for file in &mut verification.files {
+            file.status = par2_rs::verify::FileStatus::Complete;
+            file.valid_slices.fill(true);
+            file.missing_slice_count = 0;
+        }
+        verification.total_missing_blocks = 0;
+
+        let plan = placement_plan_from_verification(&verification);
+
+        assert_eq!(plan.exact.len(), 4);
+        assert!(
+            plan.swaps.is_empty() && plan.renames.is_empty(),
+            "which is what makes `apply_placement_plan_for_retry_or_repair` a \
+             no-op for the post-repair pass: every file is already at the name \
+             its description gives it"
+        );
+    }
 
     #[test]
     fn par2_repair_memory_limit_defaults_when_unset() {

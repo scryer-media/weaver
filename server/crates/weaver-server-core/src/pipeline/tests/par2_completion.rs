@@ -1889,6 +1889,317 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
     assert_eq!(completed_payload, original_payload);
 }
 
+/// A two-payload job whose first file is damaged and whose second is intact,
+/// wired the same way as the single-payload repair test above.
+///
+/// The damaged payload carries a `Zip` archive topology so the job's clean-PAR2
+/// integrity gate reads `StrongDecode`. That is what routes it through the
+/// verify-then-repair branch — the one whose post-repair pass this exercises —
+/// rather than the repairer-analysis branch a bare payload takes.
+///
+/// Returns the working directory plus the two payloads' original bytes.
+async fn two_payload_repair_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    job_name: &str,
+) -> (PathBuf, Vec<u8>, Vec<u8>) {
+    let damaged_filename = "damaged.zip";
+    let intact_filename = "intact.mkv";
+    let index_filename = "repair.par2";
+    let recovery_filename = "repair.vol00+01.par2";
+    let damaged_original: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let intact_original: Vec<u8> = (0..128u32)
+        .map(|value| (value % 241) as u8 ^ 0x5A)
+        .collect();
+    let mut damaged_on_disk = damaged_original.clone();
+    for byte in &mut damaged_on_disk[64..128] {
+        *byte = 0;
+    }
+
+    let par2_bytes = build_test_par2_index_for_files(
+        &[
+            (damaged_filename, &damaged_original),
+            (intact_filename, &intact_original),
+        ],
+        64,
+    );
+    let recovery_bytes = vec![0xAA; 64];
+    let payload_segments = |prefix: &str| {
+        vec![
+            segment_spec! {
+                number: 0,
+                bytes: 64,
+                message_id: format!("{prefix}-0@example.com"),
+            },
+            segment_spec! {
+                number: 1,
+                bytes: 64,
+                message_id: format!("{prefix}-1@example.com"),
+            },
+        ]
+    };
+    let spec = JobSpec {
+        name: job_name.to_string(),
+        password: None,
+        total_bytes: (damaged_original.len()
+            + intact_original.len()
+            + par2_bytes.len()
+            + recovery_bytes.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: damaged_filename.to_string(),
+                role: FileRole::from_filename(damaged_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: payload_segments("selective-damaged"),
+            },
+            FileSpec {
+                filename: intact_filename.to_string(),
+                role: FileRole::from_filename(intact_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: payload_segments("selective-intact"),
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "selective-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: recovery_filename.to_string(),
+                role: FileRole::from_filename(recovery_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: recovery_bytes.len() as u32,
+                    message_id: "selective-recovery@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(pipeline, job_id, spec).await;
+
+    tokio::fs::write(working_dir.join(damaged_filename), &damaged_on_disk)
+        .await
+        .unwrap();
+    tokio::fs::write(working_dir.join(intact_filename), &intact_original)
+        .await
+        .unwrap();
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        for file_index in 0..2u32 {
+            let file_id = NzbFileId { job_id, file_index };
+            let file = state.assembly.file_mut(file_id).unwrap();
+            file.commit_segment(0, 64).unwrap();
+            file.commit_segment(1, 64).unwrap();
+        }
+        state.assembly.set_archive_topology(
+            damaged_filename.to_string(),
+            crate::jobs::assembly::ArchiveTopology {
+                archive_type: crate::jobs::assembly::ArchiveType::Zip,
+                volume_map: HashMap::from([(damaged_filename.to_string(), 0)]),
+                complete_volumes: [0u32].into_iter().collect(),
+                expected_volume_count: Some(1),
+                members: vec![crate::jobs::assembly::ArchiveMember {
+                    name: "sample.mkv".to_string(),
+                    first_volume: 0,
+                    last_volume: 0,
+                    unpacked_size: 0,
+                }],
+                unresolved_spans: Vec::new(),
+            },
+        );
+    }
+    write_and_complete_file(pipeline, job_id, 2, index_filename, &par2_bytes).await;
+    write_and_complete_file(pipeline, job_id, 3, recovery_filename, &recovery_bytes).await;
+    install_test_par2_runtime(
+        pipeline,
+        job_id,
+        build_repairable_par2_set_for_files(
+            &[
+                (damaged_filename, &damaged_original),
+                (intact_filename, &intact_original),
+            ],
+            64,
+            1,
+        ),
+        &[
+            (2, index_filename, 0, false),
+            (3, recovery_filename, 1, true),
+        ],
+    );
+
+    (working_dir, damaged_original, intact_original)
+}
+
+/// The post-repair pass reads the file the repair rewrote and nothing else.
+#[tokio::test]
+async fn post_repair_verification_reads_only_the_files_the_repair_rewrote() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut repair_events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30288);
+    let job_name = "Selective Post Repair Verification";
+    let (working_dir, damaged_original, intact_original) =
+        two_payload_repair_job(&mut pipeline, job_id, job_name).await;
+    // The re-entry that routes a job through verify-then-repair: PAR2 already
+    // ruled the job clean once, extraction then failed on the archive, and the
+    // job comes back through the gate with its verdict closed.
+    pipeline.par2_verified.insert(job_id);
+    pipeline
+        .failed_extractions
+        .insert(job_id, ["sample.mkv".to_string()].into_iter().collect());
+
+    pipeline.check_job_completion(job_id).await;
+
+    assert_eq!(
+        pipeline.par2_post_repair_read_splits,
+        vec![(1usize, 1usize)],
+        "one file carried from the pre-repair pass, one file read back — the \
+         intact payload must not be re-hashed just because its neighbour was \
+         repaired. splits = {:?}",
+        pipeline.par2_post_repair_read_splits
+    );
+    assert_eq!(drain_job_repair_complete(&mut repair_events, job_id), 1);
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "and the merged verdict has to clear the post-repair gate — a carried \
+         entry that lost its Complete status would fail the job here; status = {:?}",
+        job_status_for_assert(&pipeline, job_id)
+    );
+    assert!(
+        !pipeline.failed_extractions.contains_key(&job_id),
+        "the post-repair arm's downstream work ran over the merged result"
+    );
+    assert_eq!(
+        tokio::fs::read(working_dir.join("damaged.zip"))
+            .await
+            .unwrap(),
+        damaged_original,
+        "the repair really did rewrite the damaged payload"
+    );
+    assert_eq!(
+        tokio::fs::read(working_dir.join("intact.mkv"))
+            .await
+            .unwrap(),
+        intact_original
+    );
+}
+
+/// The trade this seam accepts, pinned honestly rather than left implicit.
+///
+/// A file the repair did not touch is vouched by the pre-repair pass, which
+/// read its bytes. If something outside this job rewrites that file in the
+/// minutes between the two passes, the post-repair pass will not notice — it
+/// is not asked to. This is the documented residual, not a bug: it is the same
+/// window, and the same trust class, as an in-stream claim relied on across the
+/// same interval. The test exists so the day someone changes it, they change it
+/// deliberately.
+#[tokio::test]
+async fn post_repair_verification_accepts_a_file_corrupted_after_the_pre_repair_read() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30289);
+    let (working_dir, _damaged_original, intact_original) = two_payload_repair_job(
+        &mut pipeline,
+        job_id,
+        "Post Repair Verification Accepted Window",
+    )
+    .await;
+    let par2_set = pipeline.par2_set(job_id).cloned().unwrap();
+    let intact_file_id = par2_set.recovery_file_ids[1];
+    let damaged_file_id = par2_set.recovery_file_ids[0];
+
+    // Stand in for the pre-repair pass: the damaged payload was the write set,
+    // the intact one was read and proved complete.
+    let pre_repair = par2_rs::VerificationResult {
+        files: vec![
+            par2_rs::verify::FileVerification {
+                file_id: damaged_file_id,
+                filename: "damaged.zip".to_string(),
+                status: par2_rs::verify::FileStatus::Damaged(1),
+                valid_slices: vec![true, false],
+                missing_slice_count: 1,
+            },
+            par2_rs::verify::FileVerification {
+                file_id: intact_file_id,
+                filename: "intact.mkv".to_string(),
+                status: par2_rs::verify::FileStatus::Complete,
+                valid_slices: vec![true, true],
+                missing_slice_count: 0,
+            },
+        ],
+        recovery_blocks_available: par2_set.recovery_block_count(),
+        total_missing_blocks: 1,
+        repairable: par2_rs::verify::Repairability::Repairable {
+            blocks_needed: 1,
+            blocks_available: par2_set.recovery_block_count(),
+        },
+    };
+
+    // The repair installs the file it rewrote...
+    tokio::fs::write(working_dir.join("damaged.zip"), &_damaged_original)
+        .await
+        .unwrap();
+    // ...and, in the same window, something outside this job destroys the file
+    // the repair never touched.
+    let mut corrupted = intact_original.clone();
+    corrupted[..64].fill(0);
+    tokio::fs::write(working_dir.join("intact.mkv"), &corrupted)
+        .await
+        .unwrap();
+
+    let (merged, plan) = pipeline
+        .verify_repaired_par2_files_with_placement(
+            job_id,
+            Arc::clone(&par2_set),
+            working_dir.clone(),
+            &pre_repair,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pipeline.par2_post_repair_read_splits,
+        vec![(1usize, 1usize)]
+    );
+    let intact_entry = merged
+        .files
+        .iter()
+        .find(|file| file.file_id == intact_file_id)
+        .unwrap();
+    assert!(
+        matches!(intact_entry.status, par2_rs::verify::FileStatus::Complete),
+        "the corruption is NOT caught, by design: the entry carried is the one \
+         the pre-repair pass made, and that pass read bytes which were sound at \
+         the time"
+    );
+    let damaged_entry = merged
+        .files
+        .iter()
+        .find(|file| file.file_id == damaged_file_id)
+        .unwrap();
+    assert!(
+        matches!(damaged_entry.status, par2_rs::verify::FileStatus::Complete),
+        "while the rewritten file WAS read back, and reports what is on disk now"
+    );
+    assert!(plan.swaps.is_empty() && plan.renames.is_empty());
+}
+
 #[tokio::test]
 async fn restored_repairing_payload_uses_single_repairer_analyze_and_execute_pass() {
     let temp_dir = tempfile::tempdir().unwrap();
