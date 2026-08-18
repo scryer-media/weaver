@@ -285,9 +285,10 @@ pub(super) async fn resolve_caller(
         });
     }
 
-    // A browser cookie is process-bound *and* peer-bound. Possession alone is
-    // deliberately insufficient, even if login credentials are not configured.
+    // A browser cookie is process-bound *and* peer-bound. Once login is
+    // enabled, credentials always take precedence over trusted-network access.
     if let BrowserSessionPolicy::TrustedPeer(peer) = browser_session
+        && cached_auth.is_none()
         && security.is_trusted_peer(peer)
         && let Some(cookie) = extract_session_cookie(headers)
         && cookie == session_token

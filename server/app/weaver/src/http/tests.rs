@@ -3207,6 +3207,42 @@ async fn resolve_scope_accepts_session_cookie_only_from_trusted_peer() {
 }
 
 #[tokio::test]
+async fn resolve_scope_rejects_trusted_session_cookie_when_login_is_enabled() {
+    let db = Database::open_in_memory().unwrap();
+    let password_hash = hash_password("hunter2").unwrap();
+    let auth_cache = LoginAuthCache::default();
+    auth_cache.replace(Some(CachedLoginAuth::new(
+        "admin",
+        password_hash,
+        jwt::generate_jwt_secret(),
+    )));
+    let api_key_cache = ApiKeyCache::default();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        HeaderValue::from_static("weaver_session=session-token"),
+    );
+    let security = weaver_server_core::security::RuntimeSecurityConfig {
+        trusted_cidrs: vec!["0.0.0.0/0".parse().unwrap()],
+        ..Default::default()
+    };
+    let peer = "192.0.2.1:49152".parse().unwrap();
+
+    let result = auth::resolve_scope(
+        &db,
+        &auth_cache,
+        &api_key_cache,
+        "session-token",
+        &security,
+        auth::BrowserSessionPolicy::TrustedPeer(Some(peer)),
+        &headers,
+    )
+    .await;
+
+    assert_eq!(result, Err(StatusCode::UNAUTHORIZED));
+}
+
+#[tokio::test]
 async fn resolve_scope_rejects_session_cookie_from_untrusted_peer() {
     let db = Database::open_in_memory().unwrap();
     let auth_cache = LoginAuthCache::default();

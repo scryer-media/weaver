@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::Extension;
+use axum::extract::{ConnectInfo, Extension};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 
@@ -275,6 +275,7 @@ impl PrometheusMetricsExporter {
 }
 
 pub(super) async fn metrics_handler(
+    ConnectInfo(peer_addr): ConnectInfo<std::net::SocketAddr>,
     Extension(exporter): Extension<PrometheusMetricsExporter>,
     Extension(request_auth): Extension<super::RequestAuthContext>,
     Extension(security): Extension<RuntimeSecurityConfig>,
@@ -292,10 +293,10 @@ pub(super) async fn metrics_handler(
             &request_auth.api_key_cache,
             request_auth.session_token.0.as_str(),
             &security,
-            // A scrape is not a browser: Prometheus presents a Read-scoped API
-            // key, never the SPA's session cookie, so the browser-session path
-            // stays closed here.
-            super::auth::BrowserSessionPolicy::Denied,
+            // Prometheus normally presents a Read-scoped API key, while the
+            // browser must be able to render the real metrics surface from a
+            // trusted peer or authenticated login session.
+            super::auth::BrowserSessionPolicy::TrustedPeer(Some(peer_addr)),
             &headers,
         )
         .await?;
