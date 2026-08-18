@@ -3985,9 +3985,6 @@
         "toolchains": [
           "ffmpeg-7.1-ubuntu2404",
           "go-fixture-bytes"
-        ],
-        "inputs": [
-          "testdata/single-mkv/test-media.mkv"
         ]
       }
     },
@@ -4002,9 +3999,6 @@
         "toolchains": [
           "ffmpeg-7.1-ubuntu2404",
           "go-fixture-bytes"
-        ],
-        "inputs": [
-          "testdata/single-mkv/test-media.mkv"
         ]
       }
     },

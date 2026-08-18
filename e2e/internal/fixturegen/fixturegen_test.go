@@ -527,6 +527,33 @@ func TestEveryLedgeredFixtureIsOwnedByARecipe(t *testing.T) {
 	}
 }
 
+// The ledger's `inputs` are written from the owning recipe's Inputs, so a
+// recipe whose declaration is corrected without the ledger being rewritten
+// leaves the published provenance naming bytes the fixture was never built
+// from. Nothing else notices: the digests still match, and the stale path is
+// still a valid ledger path.
+func TestLedgerInputsMatchTheOwningRecipe(t *testing.T) {
+	ledger, _, err := corpus.LoadLedger(repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declared := map[string][]string{}
+	for _, recipe := range Recipes() {
+		declared[recipe.Slug] = recipe.Inputs
+	}
+	for _, file := range ledger.Files {
+		slug := strings.SplitN(strings.TrimPrefix(file.Path, "testdata/"), "/", 2)[0]
+		want, ok := declared[slug]
+		if !ok {
+			continue
+		}
+		if strings.Join(file.Source.Inputs, "\n") != strings.Join(want, "\n") {
+			t.Errorf("%s records inputs %v, but recipe %s declares %v",
+				file.Path, file.Source.Inputs, slug, want)
+		}
+	}
+}
+
 func TestRecipesAreWellFormed(t *testing.T) {
 	for _, recipe := range Recipes() {
 		if strings.TrimSpace(recipe.Family) == "" {

@@ -107,8 +107,9 @@ func Recipes() []Recipe {
 
 	add(Recipe{
 		Slug: "split-plain-mkv", Family: "direct media",
-		Notes:  "A short clip cut into two plain parts at 256 KiB. The split is a byte split: nothing in it understands Matroska.",
-		Inputs: []string{samplePayloadPath},
+		Notes: "A short clip cut into two plain parts at 256 KiB. The split is a byte split: nothing in it understands Matroska. " +
+			"The payload is the clip-small artifact, not the 1080p clip the archive families wrap, and no other scenario carries those bytes: " +
+			"the two parts are the only ledger paths that hold them, so the recipe declares no inputs.",
 		Build: func(ctx context.Context, env *Env) error {
 			source, err := env.ArtifactPath(ctx, "clip-small")
 			if err != nil {
