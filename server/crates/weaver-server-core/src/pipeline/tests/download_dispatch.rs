@@ -7301,14 +7301,12 @@ async fn a_freshly_posted_job_defers_until_its_articles_have_propagated() {
         .expect("a post made now must be held");
     assert!(hold > Instant::now());
 
-    // What is NOT pinned here, said plainly: the dispatch seam consults this
-    // gate in one `if` at the top of `try_dispatch_download_for_job`, and this
-    // harness cannot exercise it. `dispatch_downloads` never reaches per-job
-    // dispatch without a server behind it, so any assertion about the job's
-    // status or queue after a dispatch pass holds whether or not the gate
-    // exists — measured, by removing the gate and watching them still pass. The
-    // gate's decision function is what these tests pin; its one-line call site
-    // is verified by reading.
+    // The call site itself is pinned by
+    // `a_deferred_job_issues_nothing_until_it_is_eligible`, which drives
+    // `dispatch_downloads` on a pipeline built with a connection to spend. This
+    // test pins the decision function alone: at zero connections
+    // `dispatch_downloads` never reaches per-job dispatch, so a status or queue
+    // assertion here would hold whether or not the gate exists.
 
     // The run loop is told when to wake, rather than rediscovering this by
     // polling.
@@ -7317,6 +7315,89 @@ async fn a_freshly_posted_job_defers_until_its_articles_have_propagated() {
         .expect("a deferred job must expose its wakeup");
     assert!(wake <= Duration::from_secs(3600));
     assert!(wake > Duration::from_secs(3500));
+}
+
+#[tokio::test]
+async fn a_deferred_job_issues_nothing_until_it_is_eligible() {
+    // The gate's *call site*, driven end to end: `dispatch_downloads` picks the
+    // job, reaches `try_dispatch_download_for_job`, and the first thing that
+    // function does is ask whether the post has propagated.
+    //
+    // The fixture that makes this observable is one connection instead of zero.
+    // Every other propagation test uses `new_direct_pipeline`, which is built
+    // with `total_connections: 0`; the hot-dispatch loop is gated on
+    // `active_download_connections < max`, so with no capacity it exits before
+    // the per-job call and any assertion after it is vacuous. One connection and
+    // a matching `connection_ramp` is the whole fixture — no fake pool and no
+    // production seam. The empty server list is fine: leasing, activation and
+    // the queue drain are synchronous, and only the spawned fetch needs a
+    // server, exactly as the surrounding hot-dispatch tests rely on.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        1,
+    )
+    .await;
+    pipeline.connection_ramp = 1;
+    pipeline.propagation_delay_forced = Some(Duration::from_millis(150));
+
+    let job_id = JobId(20209);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        posted_job_spec("Silver Horizon Deferred Dispatch", Some(now_epoch_secs())),
+    )
+    .await;
+    // `insert_active_job` admits at `Downloading`. A deferred job has never
+    // dispatched a segment, so `Queued` is its real state — and staying there is
+    // half of what the gate promises.
+    set_job_status_for_test(&mut pipeline, job_id, JobStatus::Queued);
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        1,
+        "one file, one segment, waiting to be issued"
+    );
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(
+        pipeline.active_downloads, 0,
+        "a deferred job must not put an article on the wire"
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        1,
+        "and its segment must still be queued, not leased"
+    );
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Queued),
+        "with the job still queued: a deferral is not a status"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(
+        pipeline.active_downloads, 1,
+        "once the post has propagated the same pass dispatches it"
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        0,
+        "and the segment leaves the queue"
+    );
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Downloading),
+        "the first dispatched segment is what moves the job to Downloading"
+    );
 }
 
 #[tokio::test]
