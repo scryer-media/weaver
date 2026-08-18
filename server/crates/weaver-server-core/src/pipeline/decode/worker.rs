@@ -1889,10 +1889,6 @@ impl Pipeline {
                     let _ = self
                         .event_tx
                         .send(PipelineEvent::SegmentCommitted { segment_id });
-                    // The normal write completed before this commit path is
-                    // entered. Feed the durable bytes to advisory live PAR2
-                    // verification before hash-mode ownership can move them.
-                    self.note_live_par2_segment(file_id, file_offset, &data);
                 }
 
                 // Ordering contract: this seam runs only after
@@ -2053,15 +2049,13 @@ impl Pipeline {
 
                     // Queued behind the file's final write on its owner
                     // thread, so the fd is released before verification,
-                    // repair, or the final move touch this path.
+                    // repair, or the final move touch this path. The
+                    // completion note is in-memory only: the settle
+                    // read-backs that claim whatever in-stream feeding did
+                    // not (including the leftover flush above, which writes
+                    // directly without re-entering this seam) belong to the
+                    // completion-gate sweep, not to the download path.
                     crate::pipeline::release_cached_write_handle(file_path);
-                    self.note_live_par2_file_complete(file_id, total_bytes);
-
-                    // In-memory only: the settle read-backs that claim whatever
-                    // in-stream feeding did not (including the leftover flush
-                    // above, which writes directly without re-entering this
-                    // seam) belong to the completion-gate sweep, not to the
-                    // download path.
                     self.note_live_par2_file_complete(file_id, total_bytes);
 
                     // The file's length is what makes its short final block

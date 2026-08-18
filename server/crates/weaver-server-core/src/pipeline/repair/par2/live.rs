@@ -23,20 +23,22 @@ pub(crate) const PARTIAL_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const DISK_READ_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PRE_METADATA_RANGES: usize = 4096;
 
-/// 0.7.9 is deliberately opt-in.  0.8 enables this by default, so keep the
-/// parser explicit rather than overloading presence/absence semantics.
+/// 0.7.9 was deliberately opt-in. 0.8 enables live verification by default:
+/// an unset (or empty) variable means ON, and only an explicit
+/// "0" / "false" / "no" / "off" turns it off. Positive spellings stay
+/// accepted so existing opt-in configurations keep meaning what they said.
 pub(crate) fn env_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| parse_enabled(std::env::var(LIVE_PAR2_ENV).ok().as_deref()))
 }
 
 fn parse_enabled(raw: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         raw.map(str::trim)
             .unwrap_or_default()
             .to_ascii_lowercase()
             .as_str(),
-        "1" | "true" | "yes" | "on"
+        "0" | "false" | "no" | "off"
     )
 }
 
@@ -125,6 +127,12 @@ struct LiveJob {
     pre_metadata_overflowed: HashSet<NzbFileId>,
     queued_reads: Vec<LiveRead>,
     queued_read_keys: HashSet<LiveRead>,
+    /// Slices the stream has since strongly verified. A queued read whose
+    /// whole range lies inside resolved slices is a proven no-op (feeding a
+    /// verified slice from disk yields `Duplicate`), so the sweep drops it
+    /// instead of paying the I/O. Conflicts un-resolve their slice, which
+    /// revives its reads.
+    resolved_slices: HashSet<(FileId, u32)>,
     disk_read_budget: u64,
 }
 
@@ -137,6 +145,7 @@ impl Default for LiveJob {
             pre_metadata_overflowed: HashSet::new(),
             queued_reads: Vec::new(),
             queued_read_keys: HashSet::new(),
+            resolved_slices: HashSet::new(),
             disk_read_budget: DISK_READ_BUDGET_BYTES,
         }
     }
@@ -247,6 +256,7 @@ impl LivePar2Registry {
         job.bindings.clear();
         job.queued_reads.clear();
         job.queued_read_keys.clear();
+        job.resolved_slices.clear();
         job.disk_read_budget = DISK_READ_BUDGET_BYTES;
     }
 
@@ -414,10 +424,48 @@ impl LivePar2Registry {
     }
 
     pub(crate) fn take_reads(&mut self, job_id: JobId) -> Vec<LiveRead> {
-        self.jobs
-            .get_mut(&job_id)
-            .map(|job| std::mem::take(&mut job.queued_reads))
-            .unwrap_or_default()
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return Vec::new();
+        };
+        let queued = std::mem::take(&mut job.queued_reads);
+        let slice_size = job
+            .session
+            .as_ref()
+            .and_then(|session| session.par2_set())
+            .map(|set| set.slice_size)
+            .unwrap_or(0);
+        if slice_size == 0 || job.resolved_slices.is_empty() {
+            return queued;
+        }
+        // A read queued for a slice the stream later strongly verified is a
+        // proven no-op: feeding a verified slice back from disk can only
+        // return `Duplicate`. Dropping it here is what makes a fully
+        // in-stream-verified job settle with zero disk reads. The key stays
+        // in `queued_read_keys`, so nothing requeues it, and the budget the
+        // read reserved goes back to the pool.
+        queued
+            .into_iter()
+            .filter(|read| {
+                let Some(binding) = job.bindings.get(&read.file_id) else {
+                    return true;
+                };
+                let end = read.offset.saturating_add(read.len).saturating_sub(1);
+                let (Ok(first), Ok(last)) = (
+                    u32::try_from(read.offset / slice_size),
+                    u32::try_from(end / slice_size),
+                ) else {
+                    return true;
+                };
+                let resolved = (first..=last).all(|slice_index| {
+                    job.resolved_slices
+                        .contains(&(binding.par2_file_id, slice_index))
+                });
+                if resolved {
+                    job.disk_read_budget = job.disk_read_budget.saturating_add(read.len);
+                }
+                !resolved
+            })
+            .collect()
     }
 
     pub(crate) fn path_for_read(&self, read: LiveRead) -> Option<PathBuf> {
@@ -631,12 +679,29 @@ impl LivePar2Registry {
         outcome: FeedOutcome,
         from_disk: bool,
     ) {
+        let slice_size = job
+            .session
+            .as_ref()
+            .and_then(|session| session.par2_set())
+            .map(|set| set.slice_size)
+            .unwrap_or(0);
         match outcome.disposition() {
             FeedDisposition::BudgetExhausted | FeedDisposition::NeedsSettleRead => {
                 metrics.partial_fallbacks = metrics.partial_fallbacks.saturating_add(1);
             }
             FeedDisposition::ConflictingOverlap => {
                 metrics.overlap_fallbacks = metrics.overlap_fallbacks.saturating_add(1);
+                // The conflicted slice's verification state was discarded;
+                // its reads must run again, so it stops being resolved.
+                for read in outcome.settle_reads() {
+                    let slice_index = read
+                        .offset()
+                        .checked_div(slice_size)
+                        .and_then(|index| u32::try_from(index).ok());
+                    if let Some(slice_index) = slice_index {
+                        job.resolved_slices.remove(&(read.file_id(), slice_index));
+                    }
+                }
             }
             _ => {}
         }
@@ -644,6 +709,8 @@ impl LivePar2Registry {
             if evidence.is_valid() && evidence.strength() == SliceEvidenceStrength::Crc32AndMd5 {
                 metrics.strongly_verified_slices =
                     metrics.strongly_verified_slices.saturating_add(1);
+                job.resolved_slices
+                    .insert((evidence.file_id(), evidence.slice_index()));
             } else if !evidence.is_valid() {
                 metrics.invalid_slices = metrics.invalid_slices.saturating_add(1);
             }
@@ -780,18 +847,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stable_parser_is_opt_in() {
+    fn parser_is_default_on_with_explicit_opt_out() {
         for raw in [
-            None,
-            Some(""),
             Some("0"),
             Some("false"),
             Some("off"),
+            Some(" OFF "),
             Some("no"),
         ] {
             assert!(!parse_enabled(raw));
         }
-        for raw in [Some("1"), Some("true"), Some("YES"), Some(" on ")] {
+        // Default-on: absence and empty mean enabled, positive spellings are
+        // still honored, and an unrecognized value must not silently disable
+        // live verification.
+        for raw in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("true"),
+            Some("YES"),
+            Some(" on "),
+            Some("bogus"),
+        ] {
             assert!(parse_enabled(raw));
         }
     }
