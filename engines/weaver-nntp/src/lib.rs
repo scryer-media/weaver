@@ -51,6 +51,7 @@ pub mod response;
 pub mod tls;
 pub mod transfer;
 pub mod types;
+pub mod uu;
 
 #[cfg(test)]
 mod test_support;
