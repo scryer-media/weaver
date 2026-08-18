@@ -9,8 +9,6 @@ use weaver_model::files::{
     reserve_download_filename, sanitize_download_filename,
 };
 
-pub(crate) mod live;
-
 pub(crate) const PROMOTED_RECOVERY_PRIORITY: u32 = 2;
 const PAR2_PACKET_ALIGNMENT: u64 = 4;
 const PAR2_RECOVERY_PACKET_OVERHEAD: u64 = 68; // 64-byte header + 4-byte exponent
@@ -58,36 +56,6 @@ where
     oldest_unprotected
         .map(|(job_id, _)| job_id)
         .or_else(|| protected_available.then_some(protected_job_id))
-}
-
-/// Where one live-PAR2 read-back gets its bytes.
-///
-/// A conventional file is re-read from disk; a direct set's source volume has
-/// no file, so it is read through the hybrid virtual-volume provider. Both are
-/// owned values so the read can move onto the blocking pool.
-enum LiveReadSource {
-    OnDisk(std::path::PathBuf),
-    Virtual(
-        u32,
-        crate::pipeline::direct_store::provider::HybridVolumeProvider,
-    ),
-}
-
-/// One file's length check for the live short-circuit.
-///
-/// `scan_placement` rejects a file whose length disagrees with its description,
-/// and the short-circuit has to reach the same verdict without running it. For
-/// a direct volume the length is the provider's, not a `stat`'s.
-enum LiveLengthCheck {
-    OnDisk {
-        path: std::path::PathBuf,
-        expected: u64,
-    },
-    Virtual {
-        volume_index: u32,
-        actual: u64,
-        expected: u64,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,7 +209,7 @@ fn select_recovery_file_indices(
         })
 }
 
-fn unique_live_par2_candidate(candidates: &[par2_rs::FileId]) -> Option<par2_rs::FileId> {
+fn unique_par2_binding_candidate(candidates: &[par2_rs::FileId]) -> Option<par2_rs::FileId> {
     let [candidate] = candidates else {
         return None;
     };
@@ -577,7 +545,14 @@ impl Pipeline {
         })
     }
 
-    pub(crate) fn resolve_live_par2_binding(
+    /// Bind one pipeline file to the single PAR2 description that names it.
+    ///
+    /// This is the dual-CRC grid's name-to-description resolver: it is what
+    /// [`Self::block_crc_verdicts`] and [`Self::in_stream_verified_par2_match`]
+    /// use to decide which description a file's in-stream block verdicts are
+    /// measured against. Ambiguity is refused outright — a name matching two
+    /// descriptions yields no binding at all.
+    pub(crate) fn resolve_par2_file_binding(
         &self,
         file_id: NzbFileId,
     ) -> Option<(par2_rs::FileId, u64, std::path::PathBuf, bool)> {
@@ -587,8 +562,8 @@ impl Pipeline {
         let current_filename = self.current_filename_for_file(file_id.job_id, file);
         // Sanitized on the way in, because they are matched against sanitized
         // descriptions below. Comparing a raw posted name to a sanitized one
-        // silently loses the binding — and with it live verification for that
-        // file — for every name that needed sanitizing at all.
+        // silently loses the binding — and with it in-stream verification for
+        // that file — for every name that needed sanitizing at all.
         let mut names = HashSet::from([
             sanitize_download_filename(&current_filename),
             sanitize_download_filename(file.filename()),
@@ -608,15 +583,13 @@ impl Pipeline {
                     .then_some(*par2_file_id)
             })
             .collect::<Vec<_>>();
-        let par2_file_id = unique_live_par2_candidate(&candidates)?;
-        // The binding length is what PAR2 *describes*, never the
-        // NZB's declared total: `<segment bytes=…>` is yEnc-**encoded** size,
-        // around 1.03x the decoded bytes, so a declared total can never equal
-        // `desc.length` for a real post. `bind` refuses on that inequality, so
-        // passing the declared total silently refused every binding — pending
-        // spans then never drained and nothing was ever verified in stream.
-        // The meaningful length check is decoded-vs-described and lives in
-        // `live_par2_clean_verification_shape`, which compares
+        let par2_file_id = unique_par2_binding_candidate(&candidates)?;
+        // The binding length is what PAR2 *describes*, never the NZB's
+        // declared total: `<segment bytes=…>` is yEnc-**encoded** size, around
+        // 1.03x the decoded bytes, so a declared total can never equal
+        // `desc.length` for a real post. The meaningful length check is
+        // decoded-vs-described and lives in
+        // [`Self::in_stream_verified_par2_match`], which compares
         // `file.received_bytes()` against this same `desc.length`.
         let described_length = set.file_description(&par2_file_id)?.length;
         Some((
@@ -625,65 +598,6 @@ impl Pipeline {
             state.working_dir.join(current_filename),
             file.is_complete(),
         ))
-    }
-
-    fn bind_live_par2_file(&mut self, file_id: NzbFileId) {
-        let Some((par2_file_id, length, path, complete)) = self.resolve_live_par2_binding(file_id)
-        else {
-            return;
-        };
-        if self.live_par2.bind(file_id, par2_file_id, length, path) && complete {
-            // The *received* length, never the described one. This is the
-            // fail-safe for a file whose decoded bytes disagree with what PAR2
-            // describes, and since `bind` was handed `desc.length` as the
-            // binding length, passing it again here would compare a value to
-            // itself: `rejected` could never fire and `completed_bytes` would
-            // always look right.
-            let received_bytes = self
-                .jobs
-                .get(&file_id.job_id)
-                .and_then(|state| state.assembly.file(file_id))
-                .map(|file| file.received_bytes());
-            if let Some(received_bytes) = received_bytes {
-                self.live_par2.note_file_complete(file_id, received_bytes);
-            }
-        }
-    }
-
-    pub(crate) fn activate_live_par2(&mut self, job_id: JobId, packets: &[par2_rs::Packet]) {
-        self.live_par2.activate(job_id, packets);
-        let file_ids = self
-            .jobs
-            .get(&job_id)
-            .map(|state| {
-                state
-                    .assembly
-                    .files()
-                    .map(|file| file.file_id())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for file_id in file_ids {
-            self.bind_live_par2_file(file_id);
-        }
-    }
-
-    /// Feed bytes after normal assembly made them durable.  We only retain
-    /// lightweight range shape until metadata and identity are both known.
-    pub(crate) fn note_live_par2_segment(
-        &mut self,
-        file_id: NzbFileId,
-        file_offset: u64,
-        data: &crate::pipeline::DecodedChunk,
-    ) {
-        if !self.live_par2.enabled()
-            || (!self.job_spec_has_par2_file(file_id.job_id)
-                && self.par2_set(file_id.job_id).is_none())
-        {
-            return;
-        }
-        self.bind_live_par2_file(file_id);
-        self.live_par2.note_segment(file_id, file_offset, data);
     }
 
     /// The recovery set's block size for a job, once its PAR2 packets have been
@@ -696,8 +610,8 @@ impl Pipeline {
     /// was placed in.
     ///
     /// `file_offset` and `decoded_len` are the pipeline's own placement, which
-    /// is authoritative over the poster's `=ypart begin`. Called after the bytes
-    /// are durable, on the same seam as live PAR2 verification, so a block
+    /// is authoritative over the poster's `=ypart begin`. Called on the
+    /// durability seam — after the write for this segment returned — so a block
     /// claimed here describes content that is actually on disk.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn note_block_crc_segments(
@@ -735,7 +649,7 @@ impl Pipeline {
         file_id: NzbFileId,
     ) -> Option<std::collections::BTreeMap<u32, crate::pipeline::integrity::BlockVerdict>> {
         let set = self.par2_set(file_id.job_id)?;
-        let (par2_file_id, ..) = self.resolve_live_par2_binding(file_id)?;
+        let (par2_file_id, ..) = self.resolve_par2_file_binding(file_id)?;
         let verdicts = self.block_crcs.verdicts_against(file_id, set, par2_file_id);
         (!verdicts.is_empty()).then_some(verdicts)
     }
@@ -756,7 +670,7 @@ impl Pipeline {
         file_id: NzbFileId,
         par2_set: &par2_rs::Par2FileSet,
     ) -> Option<(par2_rs::FileId, String)> {
-        let (par2_file_id, ..) = self.resolve_live_par2_binding(file_id)?;
+        let (par2_file_id, ..) = self.resolve_par2_file_binding(file_id)?;
         let description = par2_set.file_description(&par2_file_id)?;
         if description.length == 0 {
             // A zero-length description has no slices; "every slice intact"
@@ -791,144 +705,75 @@ impl Pipeline {
         ))
     }
 
-    pub(crate) fn note_live_par2_file_complete(&mut self, file_id: NzbFileId, received_bytes: u64) {
-        self.bind_live_par2_file(file_id);
-        self.live_par2.note_file_complete(file_id, received_bytes);
-    }
-
-    /// Complete the bounded disk backfill/settle phase.  Any I/O error or
-    /// short read simply leaves live verification incomplete and the existing
-    /// authoritative pass remains responsible for the job.
-    pub(crate) async fn run_live_par2_reads(&mut self, job_id: JobId) {
-        let reads = self.live_par2.take_reads(job_id);
-        if reads.is_empty() {
-            return;
-        }
-        // The adopted engine settles a read by opening the binding's path,
-        // which is right for every conventional file and impossible for a
-        // direct set: suppression leaves its source volumes with no file at
-        // all, so a path read is dropped and every span stays `Pending`
-        // forever. Ask direct-store first — the hybrid provider serves the same
-        // bytes in the same source-volume coordinate space, assembled from the
-        // envelope plus the routed member partials, and for an encrypted set
-        // the overlay re-derives the posted cipher on the way out. A range
-        // landing on a hole comes back short, exactly as a truncated file
-        // would, and those blocks correctly stay `Pending` for the
-        // authoritative pass.
-        let reads = reads
-            .into_iter()
-            .filter_map(|read| {
-                let source = match self.direct_virtual_volume(read.file_id) {
-                    Some((volume_index, _, provider)) => {
-                        LiveReadSource::Virtual(volume_index, provider)
-                    }
-                    None => LiveReadSource::OnDisk(self.live_par2.path_for_read(read)?),
-                };
-                Some((read, source))
-            })
-            .collect::<Vec<_>>();
-        let started = Instant::now();
-        let results = match tokio::task::spawn_blocking(move || {
-            reads
-                .into_iter()
-                .map(|(read, source)| {
-                    let result = match source {
-                        LiveReadSource::OnDisk(path) => {
-                            live::read_range_best_effort(&path, read.offset, read.len)
-                        }
-                        LiveReadSource::Virtual(volume_index, provider) => {
-                            live::read_virtual_range_best_effort(
-                                &provider,
-                                volume_index,
-                                read.offset,
-                                read.len,
-                            )
-                        }
-                    };
-                    (read, result)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        {
-            Ok(results) => results,
-            Err(error) => {
-                warn!(job_id = job_id.0, error = %error, "live PAR2 disk-read task panicked");
-                return;
-            }
-        };
-        crate::runtime::perf_probe::record("verify.live_par2.disk_reads", started.elapsed());
-        for (read, result) in results {
-            match result {
-                Ok(bytes) => self.live_par2.apply_read(read, &bytes),
-                Err(error) => debug!(
-                    job_id = job_id.0,
-                    file_id = %read.file_id,
-                    offset = read.offset,
-                    len = read.len,
-                    error = %error,
-                    "live PAR2 read unavailable; falling back to authoritative verification"
-                ),
-            }
-        }
-    }
-
-    pub(crate) async fn settle_live_par2_job(&mut self, job_id: JobId) {
-        let claimed = self.in_stream_claimed_slices(job_id);
-        self.live_par2.schedule_settle_reads(job_id, &claimed);
-        self.run_live_par2_reads(job_id).await;
-        let metrics = self.live_par2.metrics();
-        debug!(
-            job_id = job_id.0,
-            partial_bytes = self.live_par2.partial_bytes(),
-            strong_slices = metrics.strongly_verified_slices,
-            metadata_range_overflows = metrics.metadata_range_overflows,
-            backfill_reads = metrics.backfill_reads,
-            settle_reads = metrics.settle_reads,
-            disk_read_bytes = metrics.disk_read_bytes,
-            disk_read_budget_exhausted = metrics.disk_read_budget_exhausted,
-            blocks_claimed_in_stream = self.block_crcs.blocks_derived(),
-            articles_without_usable_segments = self.block_crcs.rebased_articles(),
-            "live PAR2 settle diagnostics"
-        );
-    }
-
-    /// `(file, slice)` pairs whose bytes in-stream block verification found
-    /// intact against the recovery set's IFSC CRC32.
+    /// Whether the dual-CRC grid adjudicated **every** described slice of
+    /// **every** described file in a job's recovery set.
     ///
-    /// A block found *damaged* is deliberately not listed: settle-time
-    /// verification still reads it, so the authoritative pass sees the same
-    /// evidence it always did about bytes that are actually wrong. Only the
-    /// intact case is a read the download path already paid for.
-    pub(crate) fn in_stream_claimed_slices(
+    /// This is the bar an access-backed repair session has to clear before it
+    /// may stand in for the read-and-verify pass. That session reads no source
+    /// bytes — `analyze()` skips the scan, because the direct volumes are
+    /// absent from the directory by construction — so it reports only what its
+    /// evidence established. One unclaimed slice and it would call an unread
+    /// volume missing, so anything short of total coverage refuses and the
+    /// caller falls back to the pass, which can actually read a virtual volume.
+    ///
+    /// Total coverage here means *clean*:
+    /// [`Self::in_stream_verified_par2_match`] demands every slice `Intact`
+    /// with independent (pCRC-verified) article coverage at exactly the
+    /// described length. A set carrying a `Damaged` block is deliberately not
+    /// adjudicated — the grid withholds damaged slices from evidence, so a
+    /// session seeded from it would have nothing to say about the very blocks
+    /// that matter, and those need the real bytes read.
+    pub(crate) fn grid_adjudicated_par2_bindings(
         &self,
         job_id: JobId,
-    ) -> std::collections::HashSet<(NzbFileId, u32)> {
-        let mut claimed = std::collections::HashSet::new();
-        let Some(state) = self.jobs.get(&job_id) else {
-            return claimed;
+        par2_set: &par2_rs::Par2FileSet,
+    ) -> bool {
+        if par2_set.files.is_empty() {
+            // No descriptions is not proof of anything; "every slice intact"
+            // would be vacuously true on no evidence at all.
+            return false;
+        }
+        let Some(adjudicated) = self.grid_adjudicated_par2_file_ids(job_id, par2_set) else {
+            return false;
         };
+        par2_set
+            .files
+            .iter()
+            .all(|(par2_file_id, _)| adjudicated.contains(par2_file_id))
+    }
+
+    /// The per-description half of [`Self::grid_adjudicated_par2_bindings`]:
+    /// which of a job's PAR2 descriptions the dual-CRC grid proved clean in
+    /// stream, at exactly the described length, with independent article
+    /// coverage on every slice.
+    ///
+    /// `None` is ambiguity — two pipeline files claiming one description — and
+    /// is not a smaller answer than the empty set: it means the name-to-
+    /// description resolution itself cannot be trusted, so no claim derived
+    /// from it may be acted on.
+    ///
+    /// Split out because the two callers want different shapes of the same
+    /// question. The access-backed session needs the all-or-nothing answer,
+    /// because it reads nothing and one unclaimed slice would have it call an
+    /// unread volume missing. The read-and-verify pass needs the per-file
+    /// answer: a file this proves clean is one it does not have to read, and
+    /// every other file is read exactly as before.
+    pub(crate) fn grid_adjudicated_par2_file_ids(
+        &self,
+        job_id: JobId,
+        par2_set: &par2_rs::Par2FileSet,
+    ) -> Option<HashSet<par2_rs::FileId>> {
+        let state = self.jobs.get(&job_id)?;
         let file_ids: Vec<NzbFileId> = state.assembly.files().map(|file| file.file_id()).collect();
+        let mut adjudicated = HashSet::new();
         for file_id in file_ids {
-            let Some(verdicts) = self.block_crc_verdicts(file_id) else {
-                continue;
-            };
-            for (block_index, verdict) in verdicts {
-                // Mirror the evidence split exactly: a block that cannot mint
-                // an `InStreamCrc32Proof` (no independent article-grid
-                // coverage) is NOT claimed, so settle-time verification reads
-                // it back like any other unclaimed block.
-                if matches!(
-                    verdict,
-                    crate::pipeline::integrity::BlockVerdict::Intact {
-                        independently_covered: true,
-                    }
-                ) {
-                    claimed.insert((file_id, block_index));
-                }
+            if let Some((par2_file_id, _)) = self.in_stream_verified_par2_match(file_id, par2_set)
+                && !adjudicated.insert(par2_file_id)
+            {
+                return None;
             }
         }
-        claimed
+        Some(adjudicated)
     }
 
     /// Every file's in-stream block verdicts for a job, shaped as PAR2 slice
@@ -936,10 +781,9 @@ impl Pipeline {
     ///
     /// Only *intact* verdicts become evidence — see
     /// [`crate::pipeline::integrity::slice_evidence_from_verdicts`] for why the
-    /// damaged ones are deliberately withheld. That is the same split
-    /// [`Self::in_stream_claimed_slices`] makes for settle-time reads, so the
-    /// two stay consistent: a block is either claimed in stream and seeded
-    /// here, or unclaimed and read back.
+    /// damaged ones are deliberately withheld. A block is therefore either
+    /// claimed in stream and seeded here, or unclaimed and left for the
+    /// authoritative pass to read back.
     pub(crate) fn in_stream_slice_evidence(&self, job_id: JobId) -> Vec<par2_rs::SliceEvidence> {
         let Some(set) = self.par2_set(job_id) else {
             return Vec::new();
@@ -956,7 +800,7 @@ impl Pipeline {
             let Some(verdicts) = self.block_crc_verdicts(file_id) else {
                 continue;
             };
-            let Some((par2_file_id, ..)) = self.resolve_live_par2_binding(file_id) else {
+            let Some((par2_file_id, ..)) = self.resolve_par2_file_binding(file_id) else {
                 continue;
             };
             let Some(length) = set.file_description(&par2_file_id).map(|desc| desc.length) else {
@@ -971,20 +815,6 @@ impl Pipeline {
             ));
         }
         evidence
-    }
-
-    pub(crate) fn live_par2_strong_evidence(
-        &mut self,
-        job_id: JobId,
-    ) -> Vec<(std::path::PathBuf, par2_rs::SliceEvidence)> {
-        self.live_par2.strong_evidence(job_id)
-    }
-
-    pub(crate) fn live_par2_complete_bindings(
-        &self,
-        job_id: JobId,
-    ) -> Option<HashMap<NzbFileId, par2_rs::FileId>> {
-        self.live_par2.complete_bindings_if_strong(job_id)
     }
 
     /// Whether the retained session is in play. Reads the environment in a
@@ -1142,7 +972,6 @@ impl Pipeline {
     /// downloaded bytes. A retained location must nevertheless be discarded:
     /// repair always derives a fresh location from the current identity.
     pub(crate) fn invalidate_par2_session_for_identity_rebind(&mut self, job_id: JobId) {
-        self.live_par2.invalidate_job(job_id);
         if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
             runtime.session_evidence_file_ids.clear();
             if let Some(session) = runtime.session.as_mut() {
@@ -1150,158 +979,7 @@ impl Pipeline {
             }
         }
     }
-    /// performed while reading the files.
-    pub(crate) async fn live_par2_clean_verification(
-        &self,
-        job_id: JobId,
-    ) -> Option<(par2_rs::VerificationResult, par2_rs::PlacementPlan)> {
-        let (verification, placement_plan, length_checks) =
-            self.live_par2_clean_verification_shape(job_id)?;
-        if !Self::live_par2_lengths_match(job_id, length_checks).await {
-            return None;
-        }
-        Some((verification, placement_plan))
-    }
-    async fn live_par2_lengths_match(job_id: JobId, checks: Vec<LiveLengthCheck>) -> bool {
-        let mut on_disk = Vec::with_capacity(checks.len());
-        for check in checks {
-            match check {
-                LiveLengthCheck::OnDisk { path, expected } => on_disk.push((path, expected)),
-                LiveLengthCheck::Virtual {
-                    volume_index,
-                    actual,
-                    expected,
-                } => {
-                    if actual != expected {
-                        debug!(
-                            job_id = job_id.0,
-                            volume_index,
-                            actual,
-                            expected,
-                            "live PAR2 short-circuit refused — a direct volume's virtual length \
-                             disagrees with the PAR2 description"
-                        );
-                        return false;
-                    }
-                }
-            }
-        }
-        if on_disk.is_empty() {
-            return true;
-        }
-        let mismatch = tokio::task::spawn_blocking(move || {
-            on_disk.into_iter().find(|(path, expected)| {
-                !std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == *expected)
-            })
-        })
-        .await;
-        match mismatch {
-            Ok(None) => true,
-            Ok(Some((path, expected))) => {
-                debug!(
-                    job_id = job_id.0,
-                    path = %path.display(),
-                    expected,
-                    "live PAR2 short-circuit refused — on-disk length disagrees with the PAR2 description"
-                );
-                false
-            }
-            Err(error) => {
-                warn!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "live PAR2 length-check task panicked; falling through to the full pass"
-                );
-                false
-            }
-        }
-    }
-    fn live_par2_clean_verification_shape(
-        &self,
-        job_id: JobId,
-    ) -> Option<(
-        par2_rs::VerificationResult,
-        par2_rs::PlacementPlan,
-        Vec<LiveLengthCheck>,
-    )> {
-        let par2_set = self.par2_set(job_id)?;
-        if par2_set.recovery_file_ids.is_empty() {
-            return None;
-        }
-        // The adopted engine states this as NzbFileId -> par2 FileId, keyed
-        // the other way round, and gates on `Crc32AndMd5` slice strength
-        // rather than a bare "ok" — strictly stronger than the map this
-        // short-circuit used to read. Inverted here so the rest of the shape
-        // check is unchanged.
-        let verified: HashMap<par2_rs::FileId, NzbFileId> = self
-            .live_par2
-            .complete_bindings_if_strong(job_id)?
-            .into_iter()
-            .map(|(nzb_file_id, par2_file_id)| (par2_file_id, nzb_file_id))
-            .collect();
-        let state = self.jobs.get(&job_id)?;
 
-        let mut files = Vec::with_capacity(par2_set.recovery_file_ids.len());
-        let mut length_checks = Vec::with_capacity(par2_set.recovery_file_ids.len());
-        let mut claimed_files = HashSet::new();
-        for par2_file_id in &par2_set.recovery_file_ids {
-            let file_id = verified.get(par2_file_id).copied()?;
-            if !claimed_files.insert(file_id) {
-                return None;
-            }
-            let file = state.assembly.file(file_id)?;
-            let desc = par2_set.file_description(par2_file_id)?;
-            // `received_bytes` is the decoded length — the space PAR2
-            // describes. The NZB's declared total is yEnc-encoded size and
-            // never equals it.
-            if !file.is_complete() || file.received_bytes() != desc.length {
-                return None;
-            }
-            let correct_filename = sanitize_download_filename(&desc.filename);
-            let current_filename =
-                sanitize_download_filename(&self.current_filename_for_file(job_id, file));
-            if current_filename != correct_filename {
-                return None;
-            }
-            length_checks.push(match self.direct_virtual_volume(file_id) {
-                Some((volume_index, len, _)) => LiveLengthCheck::Virtual {
-                    volume_index,
-                    actual: len,
-                    expected: desc.length,
-                },
-                None => LiveLengthCheck::OnDisk {
-                    path: state.working_dir.join(&current_filename),
-                    expected: desc.length,
-                },
-            });
-
-            let slice_count = par2_set.slice_count_for_file(desc.length) as usize;
-            files.push(par2_rs::verify::FileVerification {
-                file_id: *par2_file_id,
-                filename: correct_filename,
-                status: par2_rs::verify::FileStatus::Complete,
-                valid_slices: vec![true; slice_count],
-                missing_slice_count: 0,
-            });
-        }
-
-        Some((
-            par2_rs::VerificationResult {
-                files,
-                recovery_blocks_available: par2_set.recovery_block_count(),
-                total_missing_blocks: 0,
-                repairable: par2_rs::verify::Repairability::NotNeeded,
-            },
-            par2_rs::PlacementPlan {
-                exact: par2_set.recovery_file_ids.clone(),
-                swaps: Vec::new(),
-                renames: Vec::new(),
-                unresolved: Vec::new(),
-                conflicts: Vec::new(),
-            },
-            length_checks,
-        ))
-    }
     pub(crate) fn note_recovery_count_from_yenc_name(
         &mut self,
         job_id: JobId,
@@ -1463,13 +1141,12 @@ impl Pipeline {
         }
 
         let parse_path = file_path.clone();
-        let (par2_set, packets) = match tokio::task::spawn_blocking(move || {
+        let par2_set = match tokio::task::spawn_blocking(move || {
             let packets = par2_rs::scan_packets_from_path(&parse_path)?
                 .into_iter()
                 .map(|(packet, _)| packet)
                 .collect::<Vec<_>>();
-            let set = par2_rs::Par2FileSet::from_packets(packets.clone())?;
-            Ok::<_, par2_rs::Par2Error>((set, packets))
+            par2_rs::Par2FileSet::from_packets(packets)
         })
         .await
         {
@@ -1518,8 +1195,6 @@ impl Pipeline {
             runtime.primary_path = Some(file_path);
             runtime.set = Some(Arc::new(par2_set));
         }
-        self.activate_live_par2(job_id, &packets);
-        self.run_live_par2_reads(job_id).await;
 
         let _ = self
             .event_tx
@@ -1583,7 +1258,6 @@ impl Pipeline {
         self.ensure_par2_runtime(job_id)
             .merged_recovery_paths
             .insert(file_path.clone());
-        self.live_par2.merge_packets(job_id, &packet_list);
         if let Some(mut session) = self
             .par2_runtime
             .get_mut(&job_id)

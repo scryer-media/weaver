@@ -199,6 +199,8 @@ impl Pipeline {
             #[cfg(test)]
             direct_session_pass_calls: 0,
             #[cfg(test)]
+            direct_verify_read_splits: Vec::new(),
+            #[cfg(test)]
             last_direct_verdict: None,
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
@@ -262,7 +264,6 @@ impl Pipeline {
             write_buffered_segments: 0,
             write_buffers: HashMap::new(),
             par2_runtime: HashMap::new(),
-            live_par2: crate::pipeline::repair::live::LivePar2Registry::new(),
             block_crcs: crate::pipeline::integrity::BlockCrcCollector::new(),
             direct_store: crate::pipeline::direct_store::wiring::DirectStoreRuntime::with_settings(
                 direct_store_settings,

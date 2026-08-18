@@ -533,7 +533,6 @@ async fn run_gate_with_password(
     if let Some(bytes) = scratch_ceiling {
         pipeline.direct_store.set_holds_scratch_ceiling(bytes);
     }
-    pipeline.live_par2.set_enabled(false);
 
     let mut spec = direct_store_job_spec("Silver Horizon", volumes);
     spec.password = password.map(str::to_owned);
@@ -586,7 +585,6 @@ async fn run_direct_store_routing_only(
 ) -> (String, PathBuf) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
 
     let spec = direct_store_job_spec("Silver Horizon", volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -837,7 +835,6 @@ async fn a_member_hiding_past_the_first_is_adopted_and_routes_direct() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41010);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -957,7 +954,6 @@ struct Par2GateOutcome {
     status: Option<JobStatus>,
     volume_file_seen: bool,
     admitted: bool,
-    full_verify_skips: u64,
     authoritative_verify_calls: usize,
     demotions: String,
 }
@@ -970,12 +966,11 @@ struct Par2GateOutcome {
 /// gates would have deleted the volume image the verifier is about to need.
 async fn run_par2_direct_gate(
     gate: DirectStoreGate,
-    live_par2: bool,
     job_id: JobId,
     member_name: &str,
     volumes: &[(String, Vec<u8>)],
 ) -> Par2GateOutcome {
-    run_par2_direct_gate_with_password(gate, live_par2, job_id, member_name, volumes, None).await
+    run_par2_direct_gate_with_password(gate, job_id, member_name, volumes, None).await
 }
 
 /// [`run_par2_direct_gate`] with one extra input, so an encrypted
@@ -983,7 +978,6 @@ async fn run_par2_direct_gate(
 /// plaintext one does.
 async fn run_par2_direct_gate_with_password(
     gate: DirectStoreGate,
-    live_par2: bool,
     job_id: JobId,
     member_name: &str,
     volumes: &[(String, Vec<u8>)],
@@ -993,7 +987,6 @@ async fn run_par2_direct_gate_with_password(
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
-    pipeline.live_par2.set_enabled(live_par2);
 
     let (mut spec, index_file_index) =
         par2_bearing_job_spec("Silver Horizon", volumes, &par2_bytes);
@@ -1060,7 +1053,6 @@ async fn run_par2_direct_gate_with_password(
         status: job_status_for_assert(&pipeline, job_id),
         volume_file_seen,
         admitted,
-        full_verify_skips: pipeline.live_par2.metrics().full_verify_skips,
         authoritative_verify_calls: pipeline.par2_authoritative_verify_calls,
         demotions: sets_after_verification,
     }
@@ -1081,7 +1073,6 @@ async fn a_par2_bearing_direct_job_completes_byte_identically_and_never_writes_a
 
     let conventional = run_par2_direct_gate(
         DirectStoreGate::Disabled,
-        true,
         JobId(41011),
         member_name,
         &volumes,
@@ -1089,7 +1080,6 @@ async fn a_par2_bearing_direct_job_completes_byte_identically_and_never_writes_a
     .await;
     let direct = run_par2_direct_gate(
         DirectStoreGate::Enabled,
-        true,
         JobId(41012),
         member_name,
         &volumes,
@@ -1145,9 +1135,8 @@ async fn a_par2_bearing_direct_job_completes_byte_identically_and_never_writes_a
     // against virtual volumes — both are wave-2 behaviour, and a job that did
     // neither would have failed the byte comparison above against zero files.
     assert!(
-        direct.full_verify_skips > 0 || direct.authoritative_verify_calls > 0,
-        "the job must have reached a PAR2 verdict; skips={} authoritative={}",
-        direct.full_verify_skips,
+        direct.authoritative_verify_calls > 0,
+        "the job must have reached a PAR2 verdict; authoritative={}",
         direct.authoritative_verify_calls
     );
 }
@@ -1198,7 +1187,6 @@ async fn run_damaged_par2_gate(
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
-    pipeline.live_par2.set_enabled(true);
 
     let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", volumes, par2_bytes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -1417,7 +1405,6 @@ async fn a_duplicate_article_after_finalization_leaves_the_finished_output_alone
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41014);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -1512,7 +1499,6 @@ async fn demote_mid_download(
 ) -> (Pipeline, std::path::PathBuf, u64) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let spec = direct_store_job_spec("Silver Horizon", volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
@@ -1700,7 +1686,6 @@ async fn direct_store_pages_held_bytes_to_scratch_instead_of_demoting() {
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline.direct_store.set_holds_budget(64);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41018);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -1820,7 +1805,6 @@ async fn a_scratch_ceiling_breach_demotes_the_set() {
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline.direct_store.set_holds_budget(64);
     pipeline.direct_store.set_holds_scratch_ceiling(16);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41054);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -2024,7 +2008,6 @@ async fn direct_store_demotes_a_volume_whose_yenc_whole_file_crc_disagrees() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41022);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -2091,7 +2074,6 @@ async fn a_complete_direct_volume_never_refreshes_archive_state() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41023);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -2149,7 +2131,6 @@ async fn removing_a_job_prunes_the_direct_store_runtime() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41024);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     insert_active_job(&mut pipeline, job_id, spec).await;
@@ -2254,7 +2235,6 @@ async fn a_rar4_set_routes_directly_because_the_format_is_read_not_assumed() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41025);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -2403,7 +2383,6 @@ async fn run_multi_member_gate(
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
-    pipeline.live_par2.set_enabled(false);
 
     let spec = direct_store_job_spec("Silver Horizon", volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -2682,7 +2661,6 @@ async fn a_recovery_record_set_routes_direct_and_its_envelopes_carry_the_recover
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41045);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -2790,7 +2768,6 @@ async fn a_virtual_volume_reads_back_the_volume_the_conventional_gate_would_have
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41046);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     insert_active_job(&mut pipeline, job_id, spec).await;
@@ -2953,7 +2930,6 @@ async fn payload_past_the_last_known_header_is_held_until_the_walk_proves_what_i
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41047);
     let spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, 3);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -3295,7 +3271,6 @@ async fn retained_envelope_bytes_count_against_the_staged_budget() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41053);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -3324,7 +3299,6 @@ async fn retained_envelope_bytes_count_against_the_staged_budget() {
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline.direct_store.set_holds_budget(BUDGET);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41055);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let paged_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -3797,7 +3771,6 @@ async fn a_migration_that_cannot_read_its_partial_demotes_cleanly() {
     let job_id = JobId(41094);
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
@@ -4010,7 +3983,6 @@ async fn direct_job_after_verification(
 ) -> (Pipeline, PathBuf) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(true);
 
     let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", volumes, par2_bytes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -4119,7 +4091,6 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
     let job_id = JobId(41052);
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
 
     let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -4142,7 +4113,7 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
     .await;
     // Volume 0's identity now carries a canonical name that is *another*
     // volume's PAR2 name, so its candidate set spans two descriptions of the
-    // same recovery set and `resolve_live_par2_binding` refuses to pick one.
+    // same recovery set and `resolve_par2_file_binding` refuses to pick one.
     // This is the shape a rewritten identity produces in the wild; the recovery
     // set itself stays completely honest, which is what lets the job finish
     // conventionally below.
@@ -4164,7 +4135,7 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
         );
     assert!(
         pipeline
-            .resolve_live_par2_binding(NzbFileId {
+            .resolve_par2_file_binding(NzbFileId {
                 job_id,
                 file_index: 0
             })
@@ -4174,7 +4145,7 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
     );
     assert!(
         pipeline
-            .resolve_live_par2_binding(NzbFileId {
+            .resolve_par2_file_binding(NzbFileId {
                 job_id,
                 file_index: 1
             })
@@ -4250,7 +4221,6 @@ async fn a_mid_download_direct_set_is_neither_verified_against_nor_demoted_for_i
     // On, as in production: it is the live short-circuit that reaches a clean
     // verdict for a par2-bearing direct set (a direct set never enters the
     // archive topology, so the clean-integrity gate reads `None` for it).
-    pipeline.live_par2.set_enabled(true);
 
     let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -4329,9 +4299,7 @@ async fn a_mid_download_direct_set_is_neither_verified_against_nor_demoted_for_i
     );
     let settled = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
-        pipeline.par2_authoritative_verify_calls > verifies_before
-            || pipeline.live_par2.metrics().full_verify_skips > 0
-            || settled.contains("Finalized"),
+        pipeline.par2_authoritative_verify_calls > verifies_before || settled.contains("Finalized"),
         "and verification must have proceeded normally rather than being deferred \
          forever; sets={settled}"
     );
@@ -4448,7 +4416,6 @@ async fn direct_store_before_restart_with_password(
 ) -> PathBuf {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let mut spec = direct_store_job_spec_with_articles("Silver Horizon", volumes, articles);
     spec.password = password.map(str::to_owned);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -4564,7 +4531,6 @@ async fn direct_store_after_restart_with_password(
 ) -> Pipeline {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(gate);
-    pipeline.live_par2.set_enabled(false);
     let mut spec = direct_store_job_spec_with_articles("Silver Horizon", volumes, articles);
     spec.password = password.map(str::to_owned);
     pipeline
@@ -4878,7 +4844,6 @@ async fn a_direct_set_writes_payload_to_the_staging_root_and_scratch_to_the_work
     // Small enough that the first held payload pages out, so the scratch file
     // this test is half about actually exists.
     pipeline.direct_store.set_holds_budget(64);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41120);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -5606,7 +5571,6 @@ async fn a_restart_during_the_par2_wait_refetches_nothing_of_the_set() {
     let working_dir = {
         let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-        pipeline.live_par2.set_enabled(true);
         let working_dir = insert_active_job(&mut pipeline, job_id, spec.clone()).await;
         for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
             submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number)
@@ -5631,7 +5595,6 @@ async fn a_restart_during_the_par2_wait_refetches_nothing_of_the_set() {
 
     let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(true);
     pipeline
         .restore_job(RestoreJobRequest {
             job_id,
@@ -5777,7 +5740,6 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
     let working_dir = {
         let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-        pipeline.live_par2.set_enabled(false);
         let working_dir = insert_active_job(&mut pipeline, job_id, spec.clone()).await;
         for (file_index, segment_number) in in_order_arrivals(all_files.len()) {
             submit_volume_article(
@@ -5797,7 +5759,6 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
 
     let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     pipeline
         .restore_job(RestoreJobRequest {
             job_id,
@@ -5876,7 +5837,6 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
     let rar_working_dir = {
         let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-        pipeline.live_par2.set_enabled(false);
         let working_dir = insert_active_job(&mut pipeline, rar_only_job, rar_spec.clone()).await;
         for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
             submit_volume_article(
@@ -5895,7 +5855,6 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
     };
     let (mut rar_pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     rar_pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    rar_pipeline.live_par2.set_enabled(false);
     rar_pipeline
         .restore_job(RestoreJobRequest {
             job_id: rar_only_job,
@@ -5955,7 +5914,6 @@ async fn a_scratch_io_failure_demotes_the_set() {
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline.direct_store.set_holds_budget(64);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41072);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -5983,7 +5941,6 @@ async fn pausing_a_job_with_dirty_direct_coverage_demands_a_barrier() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41073);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     insert_active_job(&mut pipeline, job_id, spec).await;
@@ -6595,7 +6552,6 @@ async fn run_repairable_par2_gate_with_articles(
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
-    pipeline.live_par2.set_enabled(true);
 
     let (mut spec, index_file_index) =
         par2_bearing_job_spec_positioned("Silver Horizon", volumes, par2_bytes, position, articles);
@@ -6914,7 +6870,6 @@ async fn live_damaged_direct_job(
 ) -> (Pipeline, PathBuf) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(true);
     if let Some(bytes) = holds_budget {
         pipeline.direct_store.set_holds_budget(bytes);
     }
@@ -7187,7 +7142,6 @@ async fn direct_job_with_undownloaded_recovery(
 ) -> (Pipeline, PathBuf, u32, u32) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(true);
 
     let (mut spec, index_file_index) =
         par2_bearing_job_spec("Silver Horizon", volumes, index_bytes);
@@ -7692,7 +7646,6 @@ async fn a_direct_set_still_receiving_articles_neither_repairs_nor_waits_nor_dem
     let job_id = JobId(41116);
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(true);
 
     let (mut spec, index_file_index) =
         par2_bearing_job_spec("Silver Horizon", &volumes, &index_bytes);
@@ -7831,7 +7784,6 @@ async fn two_sets_sharing_a_clamped_partial_keep_their_bytes_apart() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
@@ -7939,7 +7891,6 @@ async fn direct_job_with_one_finalized_neighbour(
     lost: (u32, u32),
 ) -> PathBuf {
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(true);
 
     let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", volumes, par2_bytes);
     let working_dir = insert_active_job(pipeline, job_id, spec).await;
@@ -8227,7 +8178,6 @@ async fn a_job_that_dies_inside_the_retention_window_sweeps_its_envelopes_on_res
     // what a killed process leaves behind.
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let (spec, _) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
     pipeline
         .restore_job(RestoreJobRequest {
@@ -8310,7 +8260,6 @@ async fn an_encrypted_finalized_set_keeps_a_retained_image_that_reads_back_as_po
     let job_id = JobId(41093);
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(true);
     let (mut spec, _index_file_index) =
         par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
     spec.password = Some("moonlit-harbour".to_string());
@@ -8434,7 +8383,6 @@ async fn run_lost_article_gate(
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
-    pipeline.live_par2.set_enabled(true);
 
     let (mut spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", volumes, par2_bytes);
     spec.password = password.map(str::to_owned);
@@ -8753,7 +8701,6 @@ async fn an_interior_hole_sizes_the_repair_by_the_slices_it_actually_touches() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(true);
     let job_id = JobId(41081);
     let (spec, index_file_index) =
         par2_bearing_job_spec_with_articles("Silver Horizon", &volumes, &par2_bytes, ARTICLES);
@@ -8883,7 +8830,6 @@ async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads(
             },
         )
         .await;
-        pipeline.live_par2.set_enabled(false);
         let spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, ARTICLES);
         let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
         for (file_index, segment_number) in &arrivals {
@@ -8926,7 +8872,6 @@ async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads(
         },
     )
     .await;
-    pipeline.live_par2.set_enabled(false);
     let rows_before = pipeline.db.load_direct_coverage(job_id).unwrap();
     assert!(!rows_before.is_empty(), "phase 1 must have checkpointed");
     let spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, ARTICLES);
@@ -8994,7 +8939,6 @@ async fn a_destination_that_cannot_be_marked_sparse_demotes_before_it_holds_a_ho
     pipeline
         .direct_store
         .set_sparse_marking(SparseMarking::AlwaysFail);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41091);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -9035,7 +8979,6 @@ async fn a_holds_scratch_that_cannot_be_marked_sparse_demotes_the_set() {
     pipeline
         .direct_store
         .set_sparse_marking(SparseMarking::AlwaysFail);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41092);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -9287,7 +9230,6 @@ async fn encrypted_routing_outcome(
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let mut spec = direct_store_job_spec("Silver Horizon", volumes);
     spec.password = password.map(str::to_owned);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -9549,7 +9491,6 @@ async fn an_encrypted_span_that_arrives_before_its_predecessor_block_is_held_the
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(43042);
     let mut spec = direct_store_job_spec("Silver Horizon", &volumes);
     spec.password = Some("moonlit-harbour".to_string());
@@ -9757,7 +9698,6 @@ async fn a_password_that_arrives_before_the_first_article_still_admits_the_set()
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(43071);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
@@ -9832,7 +9772,6 @@ async fn a_password_corrected_before_the_first_article_admits_with_the_correctio
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(43141);
     let mut spec = direct_store_job_spec("Silver Horizon", &volumes);
     // Added with a typo.
@@ -10080,7 +10019,6 @@ async fn encrypted_routing_leaves_the_plan_135_guarantees_untouched() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(43101);
     let mut spec = direct_store_job_spec("Silver Horizon", &volumes);
     spec.password = Some("moonlit-harbour".to_string());
@@ -10185,7 +10123,6 @@ async fn a_par2_bearing_encrypted_job_routes_direct_and_completes_byte_identical
 
     let conventional = run_par2_direct_gate_with_password(
         DirectStoreGate::Disabled,
-        true,
         JobId(43110),
         member_name,
         &volumes,
@@ -10194,7 +10131,6 @@ async fn a_par2_bearing_encrypted_job_routes_direct_and_completes_byte_identical
     .await;
     let direct = run_par2_direct_gate_with_password(
         DirectStoreGate::Enabled,
-        true,
         JobId(43111),
         member_name,
         &volumes,
@@ -10248,137 +10184,13 @@ async fn a_par2_bearing_encrypted_job_routes_direct_and_completes_byte_identical
         direct.demotions
     );
     // The point, unchanged by encryption: verification finishes with the
-    // download. The live short-circuit is what settles a clean set, and it can
-    // only settle one whose straddling blocks come back from a read that
-    // answers in posted space — which is the overlay.
+    // download, and it does so entirely against virtual volumes — the pass
+    // reads the set through the overlay, which answers in posted space.
     assert!(
-        direct.full_verify_skips > 0,
-        "the clean encrypted set must take the live short-circuit; skips={} \
+        direct.authoritative_verify_calls > 0,
+        "the clean encrypted set must have reached a PAR2 verdict; \
          authoritative={}",
-        direct.full_verify_skips,
         direct.authoritative_verify_calls
-    );
-}
-
-#[tokio::test]
-async fn live_par2_settles_an_encrypted_direct_volume_through_the_overlay() {
-    // The in-stream-feed finding, inverted by the overlay. Live verification's
-    // in-stream feed was always honest — those are the posted cipher bytes,
-    // taken before the write transform — but a block straddling an article
-    // boundary is only ever settled by a *read-back*, and that read-back once
-    // resolved through the virtual volume to the member's plaintext
-    // `.direct.partial`. Every boundary block would have come back `Bad`, so
-    // both halves refused.
-    //
-    // The overlay makes the read-back answer in posted space, so both halves are
-    // live again. The assertion is the strong one: coverage is recorded, blocks
-    // really do settle, and **not one of them is `Bad`** — which is precisely
-    // what would have happened had the read-back returned plaintext.
-    let member_name = "Silver.Horizon.S02E17.mkv";
-    // Not a multiple of 16: the member carries tail padding, so its last cipher
-    // block is one the overlay can only re-encrypt from the retained padding.
-    let payload: Vec<u8> = (0..2405u32).map(|index| (index % 193) as u8).collect();
-    let volumes = encrypted_store_set(
-        member_name,
-        &payload,
-        3,
-        "moonlit-harbour",
-        Some("moonlit-harbour"),
-        true,
-    );
-    let par2_bytes = par2_index_over_volumes(&volumes);
-
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
-    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(true);
-    let job_id = JobId(43151);
-    let (mut spec, index_file_index) =
-        par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
-    spec.password = Some("moonlit-harbour".to_string());
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
-        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
-    }
-    assert!(
-        pipeline
-            .direct_store
-            .set(job_id, 0)
-            .is_some_and(|set| !set.is_demoted() && set.router.routes_encrypted()),
-        "non-vacuity: the set under test must really be decrypting at write time"
-    );
-
-    // The feed half: posted cipher, recorded against every volume.
-    for file_index in 0..volumes.len() as u32 {
-        assert!(
-            pipeline
-                .live_par2
-                .recorded_ranges(NzbFileId { job_id, file_index })
-                .is_some_and(|ranges| !ranges.is_empty()),
-            "live verification must record posted coverage for encrypted direct \
-             volume {file_index}"
-        );
-    }
-
-    // The read-back half: the virtual volume answers, and it answers in posted
-    // space — the bytes a settle read would consume are the volume's own.
-    for (file_index, (_, posted)) in volumes.iter().enumerate().take(volumes.len() - 1) {
-        let file_index = file_index as u32;
-        let (volume_index, len, provider) = pipeline
-            .direct_virtual_volume(NzbFileId { job_id, file_index })
-            .unwrap_or_else(|| panic!("volume {file_index} must answer through the overlay"));
-        assert_eq!(len, posted.len() as u64);
-        let mut reader = provider.open(volume_index).expect("registered");
-        let mut read_back = Vec::new();
-        std::io::Read::read_to_end(&mut reader, &mut read_back).unwrap();
-        assert_eq!(
-            &read_back, posted,
-            "a settle read of encrypted direct volume {file_index} must see the \
-             bytes that were posted"
-        );
-    }
-
-    submit_decoded_segment(
-        &mut pipeline,
-        NzbFileId {
-            job_id,
-            file_index: index_file_index,
-        },
-        0,
-        0,
-        &par2_bytes,
-        "silver.horizon.par2",
-        None,
-    )
-    .await;
-    pipeline.settle_live_par2_job(job_id).await;
-
-    assert!(
-        pipeline.live_par2.is_active(job_id),
-        "non-vacuity: live verification must really be switched on for this job"
-    );
-    assert_eq!(
-        pipeline.live_par2.metrics().invalid_slices,
-        0,
-        "not one live block may come back Bad — a read-back that returned \
-         plaintext would have failed every block straddling an article boundary"
-    );
-    let metrics = pipeline.live_par2.metrics();
-    assert!(
-        metrics.backfill_reads + metrics.settle_reads > 0,
-        "non-vacuity for that: blocks must really have been settled by a
-         **read-back** through the virtual volume, which is the half E1 could not
-         do at all; got {metrics:?}"
-    );
-    assert!(
-        metrics.full_verify_skips > 0,
-        "and every one of them must have come back Ok, or the short-circuit could
-         not have fired; got {metrics:?}"
-    );
-    assert!(
-        pipeline.par2_set(job_id).is_some(),
-        "the recovery set must have parsed, or nothing above verified anything"
     );
 }
 
@@ -10417,7 +10229,6 @@ async fn a_recovery_set_the_spec_never_declared_no_longer_demotes_an_encrypted_s
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(43112);
     let (mut spec, index_file_index) =
         par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
@@ -10750,7 +10561,6 @@ async fn an_encrypted_set_that_demotes_rebuilds_byte_exact_posted_volumes() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let job_id = JobId(43131);
     let (mut spec, _index_file_index) =
         par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
@@ -10848,7 +10658,6 @@ async fn a_par2_bearing_encrypted_set_restarted_mid_download_verifies_and_comple
     let (working_dir, index_file_index) = {
         let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-        pipeline.live_par2.set_enabled(false);
         let mut spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, ARTICLES);
         let index_file_index = append_par2_index(&mut spec, &par2_bytes);
         spec.password = Some("moonlit-harbour".to_string());
@@ -10872,7 +10681,6 @@ async fn a_par2_bearing_encrypted_set_restarted_mid_download_verifies_and_comple
 
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(true);
     let mut spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, ARTICLES);
     append_par2_index(&mut spec, &par2_bytes);
     spec.password = Some("moonlit-harbour".to_string());
@@ -11354,7 +11162,6 @@ async fn a_par2_bearing_encrypted_rar4_job_routes_direct_and_completes_byte_iden
 
     let conventional = run_par2_direct_gate_with_password(
         DirectStoreGate::Disabled,
-        true,
         JobId(44041),
         member_name,
         &volumes,
@@ -11363,7 +11170,6 @@ async fn a_par2_bearing_encrypted_rar4_job_routes_direct_and_completes_byte_iden
     .await;
     let direct = run_par2_direct_gate_with_password(
         DirectStoreGate::Enabled,
-        true,
         JobId(44042),
         member_name,
         &volumes,
@@ -11909,7 +11715,6 @@ async fn run_hp_gate(
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
-    pipeline.live_par2.set_enabled(false);
 
     let mut spec = direct_store_job_spec("Silver Horizon", volumes);
     spec.password = spec_password.map(str::to_owned);
@@ -11971,7 +11776,6 @@ async fn hp_routing_outcome_named(
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let mut spec = direct_store_job_spec("Silver Horizon", volumes);
     spec.password = spec_password.map(str::to_owned);
     let working_dir = insert_active_job_with_persisted_nzb_named(
@@ -12052,7 +11856,6 @@ async fn hp_fallback_outcome(
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let mut spec = direct_store_job_spec("Silver Horizon", volumes);
     spec.password = spec_password.map(str::to_owned);
     let working_dir =
@@ -12927,7 +12730,6 @@ async fn a_password_harvest_that_failed_does_not_arm_the_once_per_job_memo() {
         let job_id = JobId(45121);
         let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-        pipeline.live_par2.set_enabled(false);
         let spec = direct_store_job_spec("Silver Horizon", &volumes);
         insert_active_job_with_persisted_nzb(&mut pipeline, job_id, spec, nzb_zstd).await;
 
@@ -12981,7 +12783,6 @@ async fn a_par2_bearing_header_encrypted_job_verifies_and_completes_byte_identic
 
     let conventional = run_par2_direct_gate_with_password(
         DirectStoreGate::Disabled,
-        true,
         JobId(45111),
         member_name,
         &volumes,
@@ -12990,7 +12791,6 @@ async fn a_par2_bearing_header_encrypted_job_verifies_and_completes_byte_identic
     .await;
     let direct = run_par2_direct_gate_with_password(
         DirectStoreGate::Enabled,
-        true,
         JobId(45112),
         member_name,
         &volumes,
@@ -13025,10 +12825,9 @@ async fn a_par2_bearing_header_encrypted_job_verifies_and_completes_byte_identic
         direct.demotions
     );
     assert!(
-        direct.full_verify_skips > 0 || direct.authoritative_verify_calls > 0,
+        direct.authoritative_verify_calls > 0,
         "the job must have reached a PAR2 verdict rather than skipping the question; \
-         skips={} authoritative={}",
-        direct.full_verify_skips,
+         authoritative={}",
         direct.authoritative_verify_calls
     );
     assert_eq!(
@@ -13097,7 +12896,6 @@ async fn a_header_encrypted_set_keys_from_a_password_supplied_after_its_harvest_
     let job_id = JobId(45101);
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     // No password in the spec, none in the NZB body, and the NZB's name is the
     // job id — so `archive_password_candidates_for_job` has nothing to return.
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
@@ -13340,7 +13138,6 @@ async fn a_header_encrypted_set_prefers_the_proved_candidate_over_the_spec_passw
     let job_id = JobId(45091);
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
     let mut spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, ARTICLES);
     // The operator's guess, which is wrong and which the spec prefers.
     spec.password = Some("not-the-password".to_string());
@@ -13425,214 +13222,6 @@ async fn a_header_encrypted_set_prefers_the_proved_candidate_over_the_spec_passw
     ));
 }
 
-/// The refusal is the safety property, so it is asserted rather than assumed:
-/// with live verification off there is no evidence to report from, and the
-/// session must hand the pass back rather than report an unread volume as
-/// missing.
-#[tokio::test]
-async fn the_direct_session_refuses_without_live_evidence() {
-    let member_name = "Silver.Horizon.S04E03.mkv";
-    let payload: Vec<u8> = (0..3072u32).map(|index| (index % 251) as u8).collect();
-    let pristine = single_member_store_set(member_name, &payload, 3);
-    let par2_bytes = par2_index_over_volumes(&pristine);
-    let mut posted = pristine.clone();
-    posted[1].1[9] ^= 0xFF;
-
-    let temp_dir = tempfile::tempdir().unwrap();
-    let job_id = JobId(45205);
-    let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
-    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    // The one difference from the differential above.
-    pipeline.live_par2.set_enabled(false);
-    pipeline.stateful_par2_session_forced = Some(true);
-
-    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &pristine, &par2_bytes);
-    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-    for (file_index, segment_number) in in_order_arrivals(posted.len()) {
-        submit_volume_article(&mut pipeline, job_id, &posted, file_index, segment_number).await;
-    }
-    submit_decoded_segment(
-        &mut pipeline,
-        NzbFileId {
-            job_id,
-            file_index: index_file_index,
-        },
-        0,
-        0,
-        &par2_bytes,
-        "silver.horizon.par2",
-        None,
-    )
-    .await;
-
-    let par2_set = pipeline
-        .par2_set(job_id)
-        .cloned()
-        .expect("the index parsed");
-    let resolution = pipeline
-        .resolve_direct_sets_before_par2_repairer(job_id, par2_set, working_dir)
-        .await;
-
-    assert_eq!(
-        pipeline.direct_session_pass_calls, 0,
-        "with no live evidence the session must refuse; reporting from an \
-         empty session would call every unread volume missing"
-    );
-    let _ = resolution;
-}
-
-/// The quiet direct pass's actual verdict, flattened into something two runs
-/// can be compared on. `VerificationResult` carries no `PartialEq`, and
-/// comparing `DirectPar2Resolution` instead would compare a three-variant enum
-/// — where `Unresolved` is also what "no live set" and "the pass refused"
-/// return, so agreement there means nothing.
-type DirectVerdictSummary = (Vec<(String, String, Vec<bool>, u32)>, u32, String);
-
-fn direct_verdict_summary(verification: &par2_rs::VerificationResult) -> DirectVerdictSummary {
-    let mut files = verification
-        .files
-        .iter()
-        .map(|file| {
-            (
-                file.filename.clone(),
-                format!("{:?}", file.status),
-                file.valid_slices.clone(),
-                file.missing_slice_count,
-            )
-        })
-        .collect::<Vec<_>>();
-    files.sort();
-    (
-        files,
-        verification.total_missing_blocks,
-        format!("{:?}", verification.repairable),
-    )
-}
-
-/// Runs a whole damaged-direct job with the retained-session gate forced, and
-/// reports the verdict the pipeline's *own* quiet direct pass reached.
-///
-/// The damage is **posted**, not written afterwards, and that is load-bearing:
-/// a set whose articles all arrive intact extracts, finalizes, and stops
-/// answering through the overlay, so it never reaches this pass at all. Damaged
-/// posted bytes keep the set live *and* fully adjudicated — every slice carries
-/// a verdict, one of them bad — which is the window the session arm serves, and
-/// the case repair exists for.
-///
-/// The pass is observed where the pipeline runs it, mid-assembly, rather than
-/// invoked afterwards: by the time a job settles, its live state has been
-/// retired and the session arm correctly refuses, so a pass called at that
-/// point measures a different situation than the one under test.
-async fn damaged_direct_verdict_with_session_gate(
-    job_id: JobId,
-    session_gate: bool,
-) -> (Option<DirectVerdictSummary>, bool, usize) {
-    let member_name = "Silver.Horizon.S04E02.mkv";
-    let payload: Vec<u8> = (0..3072u32).map(|index| (index % 251) as u8).collect();
-    let pristine = single_member_store_set(member_name, &payload, 3);
-    // PAR2 describes the volumes as posted correctly; the bytes that arrive do
-    // not match it.
-    let par2_bytes = par2_index_over_volumes(&pristine);
-    let mut posted = pristine.clone();
-    posted[1].1[9] ^= 0xFF;
-
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
-    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(true);
-    pipeline.stateful_par2_session_forced = Some(session_gate);
-
-    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &pristine, &par2_bytes);
-    insert_active_job(&mut pipeline, job_id, spec).await;
-    for (file_index, segment_number) in in_order_arrivals(posted.len()) {
-        submit_volume_article(&mut pipeline, job_id, &posted, file_index, segment_number).await;
-    }
-    submit_decoded_segment(
-        &mut pipeline,
-        NzbFileId {
-            job_id,
-            file_index: index_file_index,
-        },
-        0,
-        0,
-        &par2_bytes,
-        "silver.horizon.par2",
-        None,
-    )
-    .await;
-    pipeline.settle_live_par2_job(job_id).await;
-
-    let metrics = pipeline.live_par2.metrics();
-    (
-        pipeline
-            .last_direct_verdict
-            .as_ref()
-            .map(direct_verdict_summary),
-        metrics.strongly_verified_slices > 0 && metrics.invalid_slices > 0,
-        pipeline.direct_session_pass_calls,
-    )
-}
-
-/// The retained session drives the authoritative pass for direct
-/// sets, and reaches the verdict the read-and-verify pass would have reached —
-/// the same files, the same per-slice validity, the same missing-block count,
-/// the same repairability.
-///
-/// This is the substitution that matters. An access-backed session reads **no**
-/// source bytes — `analyze()` skips the scan entirely — so it can only stand in
-/// where the live engine adjudicated every described slice in stream. A slice
-/// proven *bad* counts: it is resolved, and resolving it is what the pass was
-/// for. If the two arms could disagree, a direct job's verdict would depend on
-/// a gate, which is precisely what the gate has to be able to flip without
-/// changing behaviour.
-#[tokio::test]
-async fn the_retained_session_finds_the_same_direct_damage_as_the_pass() {
-    let (gate_off, adjudicated_off, session_calls_off) =
-        damaged_direct_verdict_with_session_gate(JobId(45203), false).await;
-    let (gate_on, adjudicated_on, session_calls_on) =
-        damaged_direct_verdict_with_session_gate(JobId(45204), true).await;
-
-    assert!(
-        adjudicated_off && adjudicated_on,
-        "non-vacuity: live verification must really have adjudicated this set \
-         in stream, damage included, or there is no evidence to substitute for"
-    );
-    assert_eq!(
-        session_calls_off, 0,
-        "with the gate off every direct verdict must come from the \
-         read-and-verify pass"
-    );
-    assert!(
-        session_calls_on > 0,
-        "non-vacuity: with the gate on the session must really have produced a \
-         verdict, not silently fallen back to the pass"
-    );
-
-    let (files_off, missing_off, repairable_off) =
-        gate_off.expect("the read-and-verify pass must produce a verdict");
-    let (files_on, missing_on, repairable_on) =
-        gate_on.expect("the session must produce a verdict");
-
-    // Non-vacuity for the damage itself: a verdict that found nothing wrong
-    // would make the comparison below meaningless.
-    assert!(
-        missing_off > 0
-            && files_off
-                .iter()
-                .any(|(_, _, valid, _)| valid.contains(&false)),
-        "the damaged set must really verify as damaged: {files_off:?}"
-    );
-    assert_eq!(
-        files_on, files_off,
-        "every file's status and per-slice validity must match"
-    );
-    assert_eq!(missing_on, missing_off, "and the missing-block count");
-    assert_eq!(
-        repairable_on, repairable_off,
-        "and the repairability verdict"
-    );
-}
-
 /// A volume's articles arrive in whatever order twelve connections finish
 /// them, so several mid-file articles routinely land before the one carrying
 /// offset zero. The unparsable ceiling must judge the prefix the header walk
@@ -13657,7 +13246,6 @@ async fn out_of_order_arrival_does_not_trip_the_header_prefix_ceiling() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
 
     let spec = direct_store_job_spec_with_articles("Out-of-order store set", &volumes, articles);
     insert_active_job(&mut pipeline, job_id, spec).await;
@@ -13686,6 +13274,670 @@ async fn out_of_order_arrival_does_not_trip_the_header_prefix_ceiling() {
             "the set must never demote on arrival order alone; after segment \
              {segment}: {state}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The dual-CRC grid, fed from the direct seam
+//
+// A direct set's source volumes leave the conventional decode path before its
+// commit seam, so until the routing seam fed the grid itself a direct volume
+// carried no block verdict at all — and every PAR2 pass over a direct set read
+// every byte back through the virtual-volume adapter to learn what the decode
+// pass already knew.
+//
+// Two preconditions run through all of these, and both are production shapes:
+// the recovery set has to be **parsed before the volumes decode**, because that
+// is where the block size a decoder cuts on comes from; and the articles have to
+// carry block-grid CRC segments, because a whole-article record tiles no block
+// it does not exactly coincide with.
+// ---------------------------------------------------------------------------
+
+/// Articles per volume in the grid fixtures.
+const GRID_ARTICLES: usize = 2;
+
+/// The CRC segments a decoder emits once the recovery set's block size is
+/// known: one per block boundary the article crosses, based at the article's
+/// placement in the file.
+fn block_cut_segments(file_offset: u64, data: &[u8], block_size: u64) -> Vec<weaver_yenc::Segment> {
+    let mut segments = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < data.len() {
+        let absolute = file_offset + cursor as u64;
+        let to_boundary = (block_size - (absolute % block_size)) as usize;
+        let end = (cursor + to_boundary).min(data.len());
+        segments.push(weaver_yenc::Segment {
+            file_offset: absolute,
+            len: (end - cursor) as u64,
+            crc32: checksum::crc32(&data[cursor..end]),
+        });
+        cursor = end;
+    }
+    segments
+}
+
+/// One volume article, carrying the decoder's block-grid segmentation.
+///
+/// `data` is what the wire delivered, which is the volume's own bytes for an
+/// honest arrival and something else for a replay.
+#[allow(clippy::too_many_arguments)]
+async fn submit_grid_cut_article(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    file_index: u32,
+    segment_number: u32,
+    file_offset: u64,
+    data: &[u8],
+    filename: &str,
+) {
+    let segments = block_cut_segments(file_offset, data, PAR2_SLICE_BYTES);
+    submit_decoded_segment_with_segments(
+        pipeline,
+        NzbFileId { job_id, file_index },
+        segment_number,
+        file_offset,
+        data,
+        filename,
+        None,
+        true,
+        Some(segments),
+    )
+    .await;
+}
+
+/// The article extent one volume ordinal's segment covers, in the fixtures'
+/// two-articles-per-volume shape.
+fn grid_article_extent(
+    volumes: &[(String, Vec<u8>)],
+    ordinal: u32,
+    segment_number: u32,
+) -> (usize, usize) {
+    article_extent(
+        volumes[ordinal as usize].1.len(),
+        segment_number,
+        GRID_ARTICLES,
+    )
+}
+
+/// A par2-bearing direct job whose recovery set parses **before** its volumes
+/// arrive, with every volume article carrying block-grid CRC segments.
+///
+/// The index leads the NZB as well as the wire, so a volume's set-relative
+/// index and its NZB file index never coincide — the coordinate confusion that
+/// would otherwise pass unnoticed here, where evidence is keyed by one and the
+/// grid by the other.
+async fn grid_fed_direct_job(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    par2_bytes: &[u8],
+    feed: GridFeed,
+) -> (Pipeline, PathBuf, PathBuf) {
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    if feed.retained_session {
+        // The retained session is off unless the environment turns it on, and a
+        // test about that arm must not depend on the ambient default.
+        pipeline.stateful_par2_session_forced = Some(true);
+    }
+
+    let (spec, index_file_index) = par2_bearing_job_spec_positioned(
+        "Silver Horizon",
+        volumes,
+        par2_bytes,
+        IndexPosition::First,
+        GRID_ARTICLES,
+    );
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    deliver_par2_index(&mut pipeline, job_id, index_file_index, par2_bytes).await;
+    assert!(
+        pipeline.par2_block_size(job_id).is_some(),
+        "non-vacuity: the index has to be parsed before the volumes decode, or the \
+         decoder has no grid to cut on and the whole fixture claims nothing"
+    );
+
+    let last_volume = volumes.len() as u32 - 1;
+    for ordinal in 0..volumes.len() as u32 {
+        for segment_number in 0..GRID_ARTICLES as u32 {
+            if feed.withhold_last_article
+                && ordinal == last_volume
+                && segment_number + 1 == GRID_ARTICLES as u32
+            {
+                continue;
+            }
+            let (start, end) = grid_article_extent(volumes, ordinal, segment_number);
+            let (filename, bytes) = &volumes[ordinal as usize];
+            submit_grid_cut_article(
+                &mut pipeline,
+                job_id,
+                IndexPosition::First.volume_file_index(ordinal),
+                segment_number,
+                start as u64,
+                &bytes[start..end],
+                filename,
+            )
+            .await;
+        }
+    }
+    (pipeline, working_dir, complete_dir)
+}
+
+/// How [`grid_fed_direct_job`] delivers the job.
+#[derive(Debug, Clone, Copy, Default)]
+struct GridFeed {
+    /// Force the retained PAR2 session on, so the zero-I/O arm is reachable.
+    retained_session: bool,
+    /// Hold back the last volume's last article, which keeps the set **live**:
+    /// a set whose volumes all completed reaches its verdict inside the feed
+    /// and has finalized (or repaired) by the time the test looks at it.
+    withhold_last_article: bool,
+}
+
+/// Every block verdict one volume carries, or an empty map when it carries
+/// none at all.
+fn verdicts_for(
+    pipeline: &Pipeline,
+    job_id: JobId,
+    ordinal: u32,
+) -> std::collections::BTreeMap<u32, crate::pipeline::integrity::BlockVerdict> {
+    pipeline
+        .block_crc_verdicts(NzbFileId {
+            job_id,
+            file_index: IndexPosition::First.volume_file_index(ordinal),
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn direct_routed_articles_claim_their_blocks_in_the_dual_crc_grid() {
+    // The wiring itself. A direct volume's bytes never become a file, but they
+    // are durable — in member partials and envelopes — before this seam records
+    // anything, which is the same contract the conventional seam states. So the
+    // grid may claim them, and every described slice of every volume has to come
+    // back Intact with independent (pCRC-verified) coverage.
+    //
+    // The last volume's last article is withheld so the set is still **live**
+    // when the verdicts are read: a set whose volumes all complete reaches its
+    // PAR2 verdict inside the feed and finalizes, and finalization takes the
+    // virtual volume image apart and retires the claims with it.
+    let member_name = "Silver.Horizon.S03E01.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 197) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let par2_bytes = par2_index_over_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41401);
+    let (pipeline, _, _) = grid_fed_direct_job(
+        &temp_dir,
+        job_id,
+        &volumes,
+        &par2_bytes,
+        GridFeed {
+            withhold_last_article: true,
+            ..GridFeed::default()
+        },
+    )
+    .await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        !sets.contains("Demoted"),
+        "non-vacuity: the set has to have stayed direct, or these verdicts came \
+         off the conventional path; got {sets}"
+    );
+    let par2_set = pipeline
+        .par2_set(job_id)
+        .cloned()
+        .expect("the index parsed");
+
+    let complete_volumes = volumes.len() as u32 - 1;
+    assert!(
+        complete_volumes > 1,
+        "non-vacuity: more than one volume has to have completed, or this proves \
+         nothing about a set"
+    );
+    for ordinal in 0..complete_volumes {
+        let verdicts = verdicts_for(&pipeline, job_id, ordinal);
+        assert!(
+            !verdicts.is_empty(),
+            "volume {ordinal} produced no block verdict at all — the direct seam \
+             never reached the grid; sets = {sets}"
+        );
+        assert!(
+            verdicts.values().all(|verdict| matches!(
+                verdict,
+                crate::pipeline::integrity::BlockVerdict::Intact {
+                    independently_covered: true
+                }
+            )),
+            "volume {ordinal} claimed a block without independent coverage or with \
+             damage: {verdicts:?}"
+        );
+
+        let file_id = NzbFileId {
+            job_id,
+            file_index: IndexPosition::First.volume_file_index(ordinal),
+        };
+        let grid_match = pipeline.in_stream_verified_par2_match(file_id, &par2_set);
+        assert!(
+            grid_match.is_some(),
+            "and the volume must bind to its description on the grid alone — every \
+             described slice Intact at exactly the described length; verdicts = \
+             {verdicts:?}"
+        );
+        let described = par2_set
+            .file_description(&grid_match.expect("bound above").0)
+            .expect("the description the binding named")
+            .length;
+        assert_eq!(
+            verdicts.len() as u32,
+            par2_set.slice_count_for_file(described),
+            "every described slice must be claimed, not merely some of them"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_direct_volumes_final_short_block_closes_on_its_decoded_length() {
+    // The trap this exists for: the NZB's declared segment sizes are yEnc-
+    // *encoded*, around 3% larger than the bytes that land, and closing the
+    // short final block on that number puts its boundary past the described
+    // extent — where `verdicts_against` refuses the comparison and the last
+    // slice of every volume silently falls back to a read. The fixtures declare
+    // inflated sizes precisely so this cannot pass by accident.
+    let member_name = "Silver.Horizon.S03E02.mkv";
+    let payload: Vec<u8> = (0..2350u32).map(|index| (index % 181) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let par2_bytes = par2_index_over_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41402);
+    // The last volume is held back for the same reason as above: finalization
+    // retires the claims, and this test is about how they were made.
+    let (pipeline, _, _) = grid_fed_direct_job(
+        &temp_dir,
+        job_id,
+        &volumes,
+        &par2_bytes,
+        GridFeed {
+            withhold_last_article: true,
+            ..GridFeed::default()
+        },
+    )
+    .await;
+    let par2_set = pipeline
+        .par2_set(job_id)
+        .cloned()
+        .expect("the index parsed");
+
+    for ordinal in 0..volumes.len() as u32 - 1 {
+        let decoded_len = volumes[ordinal as usize].1.len() as u64;
+        assert_ne!(
+            decoded_len % PAR2_SLICE_BYTES,
+            0,
+            "non-vacuity: volume {ordinal} has to end mid-block, or there is no \
+             short final block to close"
+        );
+        let file_id = NzbFileId {
+            job_id,
+            file_index: IndexPosition::First.volume_file_index(ordinal),
+        };
+        let declared = pipeline
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.assembly.file(file_id))
+            .expect("the volume's assembly")
+            .total_bytes();
+        assert!(
+            declared > decoded_len,
+            "non-vacuity: the fixture must declare yEnc-encoded sizes, or the two \
+             lengths agree and the trap cannot fire; declared={declared} \
+             decoded={decoded_len}"
+        );
+
+        let last_block = u32::try_from((decoded_len - 1) / PAR2_SLICE_BYTES).unwrap();
+        let verdicts = verdicts_for(&pipeline, job_id, ordinal);
+        assert_eq!(
+            verdicts.get(&last_block),
+            Some(&crate::pipeline::integrity::BlockVerdict::Intact {
+                independently_covered: true
+            }),
+            "volume {ordinal}'s final short block must close against the DECODED \
+             length; verdicts = {verdicts:?}"
+        );
+        assert_eq!(
+            verdicts.len() as u32,
+            par2_set.slice_count_for_file(decoded_len),
+            "and it must be the last of a complete claim, not an isolated one"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_grid_verified_direct_set_takes_the_zero_io_session_pass() {
+    // The prize. Every described slice of every volume was adjudicated in
+    // stream, so the retained session — which reads no source bytes at all, its
+    // `analyze()` skipping the scan because the volumes are absent from the
+    // directory by construction — reports the verdict from evidence alone.
+    // Before the seam fed the grid this arm was unreachable by construction.
+    let member_name = "Silver.Horizon.S03E03.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let par2_bytes = par2_index_over_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41403);
+    let (pipeline, _, _) = grid_fed_direct_job(
+        &temp_dir,
+        job_id,
+        &volumes,
+        &par2_bytes,
+        GridFeed {
+            retained_session: true,
+            ..GridFeed::default()
+        },
+    )
+    .await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        pipeline.direct_session_pass_calls > 0,
+        "the session arm must have answered for this set; sets = {sets}"
+    );
+    assert!(
+        pipeline.direct_verify_read_splits.is_empty(),
+        "and no read-and-verify pass may have run at all — that pass reads every \
+         volume back through the virtual-volume adapter, which is the I/O this \
+         whole seam exists to avoid; splits = {:?}",
+        pipeline.direct_verify_read_splits
+    );
+    assert!(
+        sets.contains("Finalized"),
+        "and the verdict has to have cleared the set, or the zero-I/O pass \
+         concluded something the job could not act on; got {sets}"
+    );
+}
+
+#[tokio::test]
+async fn a_damaged_direct_set_reads_only_the_volume_the_grid_could_not_claim() {
+    // The damaged-set prize. One volume's envelope is corrupt, so the
+    // all-or-nothing session gate refuses and the read-and-verify pass runs —
+    // but re-reading the two volumes the decode pass already proved clean is
+    // pure cost. They are stood in for on the same bar the session demands, and
+    // only the damaged one is read.
+    const RR_BYTES: usize = 512;
+    let member_name = "Silver.Horizon.S03E04.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 211) as u8).collect();
+    let clean = recovery_record_store_set(member_name, &payload, 3, RR_BYTES);
+    let par2_bytes = repairable_par2_index(&clean, 4);
+    let mut volumes = clean.clone();
+    damage_recovery_record(&mut volumes, 1, RR_BYTES);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41404);
+    let (mut pipeline, _, complete_dir) = grid_fed_direct_job(
+        &temp_dir,
+        job_id,
+        &volumes,
+        &par2_bytes,
+        GridFeed::default(),
+    )
+    .await;
+
+    assert_eq!(
+        pipeline.direct_verify_read_splits.first().copied(),
+        Some((2, 1)),
+        "the pass that reached the damage verdict had to stand in for the two \
+         clean volumes and read only the damaged one. (3, 0) would mean the grid \
+         claimed damage it cannot see; (0, 3) would mean the direct seam never \
+         reached the grid at all. splits = {:?}",
+        pipeline.direct_verify_read_splits
+    );
+    assert!(
+        pipeline.direct_session_pass_calls == 0,
+        "and the zero-I/O session arm must refuse a set it can only half claim"
+    );
+
+    // The job still ends where it always did: repaired in place, member
+    // extracted, no volume file ever written.
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        !sets.contains("Demoted"),
+        "the set must repair in place rather than hand its volumes back; got {sets}"
+    );
+    drive_grid_fed_job_to_terminal(&mut pipeline, job_id).await;
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    let member = std::fs::read(output_root.join(member_name))
+        .ok()
+        .or_else(|| staging_member(&complete_dir, member_name));
+    assert_eq!(
+        member.as_deref(),
+        Some(payload.as_slice()),
+        "and it must still reach the member the conventional gate produces; \
+         sets = {sets}"
+    );
+}
+
+/// Drives a job that has already been fed to whatever terminal state it
+/// reaches, in the shape the repairable gate uses.
+async fn drive_grid_fed_job_to_terminal(pipeline: &mut Pipeline, job_id: JobId) {
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+        state.recovery_queue = crate::DownloadQueue::new();
+    }
+    for _ in 0..48 {
+        if matches!(
+            job_status_for_assert(pipeline, job_id),
+            Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
+        ) {
+            break;
+        }
+        drain_rar_refreshes(pipeline).await;
+        pipeline.check_job_completion(job_id).await;
+        pump_pipeline_runtime_queues(pipeline).await;
+        settle_inflight_moves(pipeline).await;
+        if let Ok(Some(done)) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            pipeline.extract_done_rx.recv(),
+        )
+        .await
+        {
+            pipeline.handle_extraction_done(done).await;
+            pump_pipeline_runtime_queues(pipeline).await;
+            settle_inflight_moves(pipeline).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn demoting_a_direct_set_forgets_the_grid_state_its_volumes_carried() {
+    // A demotion hands the volumes back to the conventional path, which is
+    // about to fill real files with them — reconstructed from the routed bytes
+    // or refetched off the wire. The direct phase's claims describe a different
+    // image of the same coordinates, and merging the two would let a block
+    // closed over one adjudicate bytes of the other.
+    let member_name = "Silver.Horizon.S03E05.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 149) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let par2_bytes = par2_index_over_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41405);
+    let (mut pipeline, _, _) = grid_fed_direct_job(
+        &temp_dir,
+        job_id,
+        &volumes,
+        &par2_bytes,
+        GridFeed {
+            withhold_last_article: true,
+            ..GridFeed::default()
+        },
+    )
+    .await;
+
+    let volume_file = NzbFileId {
+        job_id,
+        file_index: IndexPosition::First.volume_file_index(0),
+    };
+    let claimed_before = verdicts_for(&pipeline, job_id, 0);
+    assert!(
+        claimed_before.len() > 1,
+        "non-vacuity: the volume has to carry claims across more than one \
+         article, or 'the untouched half kept nothing' proves nothing; got \
+         {claimed_before:?}"
+    );
+
+    pipeline
+        .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded, None)
+        .await;
+
+    assert!(
+        verdicts_for(&pipeline, job_id, 0).is_empty(),
+        "the demotion must retire every claim the direct phase made about this \
+         volume"
+    );
+
+    // One article comes back conventionally, carrying bytes that are NOT what
+    // the recovery set describes. Only the blocks it tiles may have a verdict at
+    // all, and they must read Damaged: anything the direct phase claimed about
+    // the rest would be a verdict about an image that no longer exists.
+    let (start, end) = grid_article_extent(&volumes, 0, 0);
+    let (filename, bytes) = &volumes[0];
+    let rewritten: Vec<u8> = bytes[start..end].iter().map(|byte| !byte).collect();
+    submit_grid_cut_article(
+        &mut pipeline,
+        job_id,
+        volume_file.file_index,
+        0,
+        start as u64,
+        &rewritten,
+        filename,
+    )
+    .await;
+
+    let after = verdicts_for(&pipeline, job_id, 0);
+    assert!(
+        !after.is_empty(),
+        "non-vacuity: the conventional re-feed has to reach the grid, or the \
+         assertion below is satisfied by an empty map"
+    );
+    assert!(
+        after
+            .values()
+            .all(|verdict| matches!(verdict, crate::pipeline::integrity::BlockVerdict::Damaged)),
+        "every verdict must come from the bytes the conventional path just \
+         wrote: {after:?}"
+    );
+    assert!(
+        after.len() < claimed_before.len(),
+        "and the articles that did not come back must carry no verdict at all — \
+         a surviving direct-phase claim is exactly what the forget prevents; \
+         before={claimed_before:?} after={after:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_direct_article_re_adjudicates_the_range_it_rewrote() {
+    // The grid is positional, not sequential, so a duplicate is fed through the
+    // direct seam on purpose — exactly as the conventional seam feeds one. The
+    // replay rewrote its range on disk, and a verdict derived before it can only
+    // stand if it is derived again from the arrival that did the rewriting.
+    let member_name = "Silver.Horizon.S03E06.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 167) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let par2_bytes = par2_index_over_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41406);
+    let (mut pipeline, _, _) = grid_fed_direct_job(
+        &temp_dir,
+        job_id,
+        &volumes,
+        &par2_bytes,
+        GridFeed {
+            withhold_last_article: true,
+            ..GridFeed::default()
+        },
+    )
+    .await;
+
+    let before = verdicts_for(&pipeline, job_id, 0);
+    let derived_before = pipeline.block_crcs.blocks_derived();
+    let (start, end) = grid_article_extent(&volumes, 0, 0);
+    let first_block = u32::try_from(start as u64 / PAR2_SLICE_BYTES).unwrap();
+    let straddling_block = u32::try_from((end as u64 - 1) / PAR2_SLICE_BYTES).unwrap();
+    assert!(
+        first_block < straddling_block,
+        "non-vacuity: the replayed article has to tile at least one whole block \
+         AND end inside another, or 'by range' has no range to be about"
+    );
+    assert_ne!(
+        end as u64 % PAR2_SLICE_BYTES,
+        0,
+        "non-vacuity: the article must end mid-block, or nothing straddles the \
+         boundary"
+    );
+    assert!(
+        before.len() as u32 > straddling_block + 1,
+        "non-vacuity: there have to be blocks beyond the replayed range to \
+         survive it; got {before:?}"
+    );
+
+    let (filename, bytes) = &volumes[0];
+    submit_grid_cut_article(
+        &mut pipeline,
+        job_id,
+        IndexPosition::First.volume_file_index(0),
+        0,
+        start as u64,
+        &bytes[start..end],
+        filename,
+    )
+    .await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        !sets.contains("Demoted"),
+        "non-vacuity: a byte-identical replay must not demote the set, or this \
+         measures the demotion rather than the feed; got {sets}"
+    );
+    assert!(
+        pipeline.block_crcs.blocks_derived() > derived_before,
+        "the duplicate must have reached the grid and closed its blocks again: a \
+         seam that skipped the feed would leave the counter where it was, and \
+         with it a claim nothing re-derived"
+    );
+
+    let after = verdicts_for(&pipeline, job_id, 0);
+    for block in first_block..straddling_block {
+        assert_eq!(
+            after.get(&block),
+            Some(&crate::pipeline::integrity::BlockVerdict::Intact {
+                independently_covered: true
+            }),
+            "a block the replay tiles on its own re-derives from the arrival that \
+             rewrote it; after = {after:?}"
+        );
+    }
+    assert!(
+        !after.contains_key(&straddling_block),
+        "the block straddling the replay's end must go unclaimed: the other \
+         half's contribution was retired when that block first closed, and a \
+         retired observation cannot vouch for bytes a rewrite has since \
+         touched; after = {after:?}"
+    );
+    for (block, verdict) in &before {
+        if *block > straddling_block {
+            assert_eq!(
+                after.get(block),
+                Some(verdict),
+                "and a block outside the rewritten range must keep the claim it \
+                 already had — the invalidation is by RANGE, not by file; \
+                 after = {after:?}"
+            );
+        }
     }
 }
 
@@ -13851,7 +14103,6 @@ mod cross_device {
         // Small enough that held payload pages out to the scratch file, so the
         // working-data half of the split is observable too.
         pipeline.direct_store.set_holds_budget(64);
-        pipeline.live_par2.set_enabled(false);
 
         let job_id = JobId(49001);
         let spec = direct_store_job_spec("Silver Horizon", &volumes);
@@ -14048,7 +14299,6 @@ mod cross_device {
         )
         .await;
         pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-        pipeline.live_par2.set_enabled(false);
 
         let job_id = JobId(49002);
         let spec = direct_store_job_spec("Silver Horizon", &volumes);

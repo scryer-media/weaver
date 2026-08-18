@@ -1,19 +1,19 @@
 use super::{
     RecoveryCandidate, RecoveryCountSource, is_terminal_status, par2_recovery_packet_size,
     parse_stateful_par2_session_enabled, select_par2_session_eviction,
-    select_recovery_file_indices, unique_live_par2_candidate,
+    select_recovery_file_indices, unique_par2_binding_candidate,
 };
 use crate::{JobId, JobStatus};
 use std::time::{Duration, Instant};
 
 #[test]
-fn live_par2_binding_requires_one_matching_description() {
+fn par2_file_binding_requires_one_matching_description() {
     let first = par2_rs::FileId::from_bytes([1; 16]);
     let second = par2_rs::FileId::from_bytes([2; 16]);
 
-    assert_eq!(unique_live_par2_candidate(&[]), None);
-    assert_eq!(unique_live_par2_candidate(&[first]), Some(first));
-    assert_eq!(unique_live_par2_candidate(&[first, second]), None);
+    assert_eq!(unique_par2_binding_candidate(&[]), None);
+    assert_eq!(unique_par2_binding_candidate(&[first]), Some(first));
+    assert_eq!(unique_par2_binding_candidate(&[first, second]), None);
 }
 
 #[test]

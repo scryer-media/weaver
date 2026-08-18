@@ -153,11 +153,6 @@ fn explicit_api_key(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
     }
 }
 
-/// Check if login auth is enabled and return the cached JWT secret if so.
-pub(super) fn jwt_secret_if_auth_enabled(auth_cache: &LoginAuthCache) -> Option<[u8; 32]> {
-    auth_cache.snapshot().map(|auth| auth.jwt_secret)
-}
-
 pub(super) fn caller_scope_from_api_key_scope(scope: &str) -> CallerScope {
     match scope {
         "admin" => CallerScope::Admin,

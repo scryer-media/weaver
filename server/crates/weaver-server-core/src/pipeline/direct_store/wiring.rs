@@ -817,21 +817,23 @@ impl Pipeline {
     /// The virtual volume behind one direct source file, as a **one-volume**
     /// provider plus its logical length.
     ///
-    /// Live PAR2's settle and backfill reads are defined in source-volume space,
-    /// which is exactly the space a virtual volume answers in — but they arrive
-    /// one file at a time, so building the whole set's provider per read would
-    /// be O(volumes) work for a one-volume question. The length is the decoded
-    /// total the download layer tracks, never a file's `metadata().len()`: for a
-    /// direct volume there is no file to ask.
+    /// A test-only accessor: production reads a direct set through
+    /// [`super::par2_access::DirectVolumeFileAccess`], which builds the whole
+    /// set's provider once for the pass. This answers the one-volume question a
+    /// test asks when it wants to inspect what a single volume reads back as,
+    /// without rebuilding the set's plan lookup in test code.
     ///
+    /// The length is the decoded total the download layer tracks, never a
+    /// file's `metadata().len()`: for a direct volume there is no file to ask.
     /// `None` for anything that is not a live direct set's source volume,
     /// including a demoted set's — whose volumes are materializing or being
     /// refetched, and are read from disk like any other file.
     ///
-    /// An **encrypted** set answers here like any other since the overlay
-    /// landed: the provider re-encrypts the member ranges it reads out of the
-    /// partials, so what comes back is the posted bytes the caller asked for
-    /// rather than the plaintext sitting on disk.
+    /// An **encrypted** set answers here like any other: the provider
+    /// re-encrypts the member ranges it reads out of the partials, so what comes
+    /// back is the posted bytes the caller asked for rather than the plaintext
+    /// sitting on disk.
+    #[cfg(test)]
     pub(crate) fn direct_virtual_volume(
         &self,
         file_id: NzbFileId,
@@ -864,7 +866,7 @@ impl Pipeline {
     /// is the whole answer.
     ///
     /// A volume is included only when its PAR2 identity resolves unambiguously
-    /// through the same name candidates live verification binds on. An
+    /// through the same name candidates the grid's binding resolver uses. An
     /// unresolved one is skipped **here**, but that skip is not the safety net:
     /// a half-bound set would have the pass read its remaining volumes off a
     /// disk they are not on and report them missing, and
@@ -910,7 +912,7 @@ impl Pipeline {
                     job_id,
                     file_index: *file_index,
                 };
-                let Some((par2_file_id, _, _, _)) = self.resolve_live_par2_binding(file_id) else {
+                let Some((par2_file_id, _, _, _)) = self.resolve_par2_file_binding(file_id) else {
                     continue;
                 };
                 // A retained image carries the lengths it was captured with, so
@@ -1061,7 +1063,7 @@ impl Pipeline {
                     .volumes
                     .iter()
                     .find(|(_, file_index)| {
-                        self.resolve_live_par2_binding(NzbFileId {
+                        self.resolve_par2_file_binding(NzbFileId {
                             job_id,
                             file_index: **file_index,
                         })
@@ -1151,7 +1153,7 @@ impl Pipeline {
                 if !self.is_direct_source_file(file_id) {
                     return None;
                 }
-                self.resolve_live_par2_binding(file_id)
+                self.resolve_par2_file_binding(file_id)
                     .map(|(par2_file_id, _, _, _)| par2_file_id)
             })
             .collect();
@@ -1344,14 +1346,92 @@ impl Pipeline {
         {
             Some(verification) => verification,
             None => {
-                let pp_pool = self.pp_pool.clone();
-                let par2_set = std::sync::Arc::clone(&par2_set);
-                let access = std::sync::Arc::clone(&access);
-                tokio::task::spawn_blocking(move || {
-                    pp_pool.install(move || par2_rs::verify_all(&par2_set, access.as_ref()))
-                })
-                .await
-                .ok()?
+                // Read and verify through the access adapter. A direct set's
+                // source volumes have no files, so the adapter answers every
+                // read out of the envelope plus the routed member partials —
+                // and for an encrypted set the overlay re-derives the posted
+                // cipher on the way out — which is what lets the ordinary pass
+                // reach a verdict without materializing a single volume.
+                //
+                // The grid's claims are honoured **here** too, per file. The
+                // session above is all-or-nothing by necessity, and a set with
+                // one damaged volume therefore always lands in this arm — where
+                // re-reading the volumes the decode pass already proved clean is
+                // pure cost. So the files the grid adjudicated are stood in for,
+                // and only the rest are read. The bar is the session's own,
+                // unchanged: every described slice `Intact` with independent
+                // (pCRC-verified) article coverage at exactly the described
+                // length, over bytes that were durable before the claim was
+                // made. Anything less is not adjudicated and is read.
+                let claimed = self.grid_claimed_file_verifications(job_id, &par2_set);
+                let claimed_ids: HashSet<par2_rs::FileId> =
+                    claimed.iter().map(|file| file.file_id).collect();
+                let to_read: Vec<par2_rs::FileId> = par2_set
+                    .recovery_file_ids
+                    .iter()
+                    .copied()
+                    .filter(|file_id| !claimed_ids.contains(file_id))
+                    .collect();
+                if !claimed.is_empty() {
+                    debug!(
+                        job_id = job_id.0,
+                        claimed_in_stream = claimed.len(),
+                        read = to_read.len(),
+                        "the direct read-and-verify pass is standing in for volumes the \
+                         dual-CRC grid already adjudicated"
+                    );
+                    crate::runtime::perf_probe::record_value(
+                        "direct_store.verify.files_claimed_in_stream",
+                        claimed.len() as u64,
+                    );
+                }
+                #[cfg(test)]
+                {
+                    self.direct_verify_read_splits
+                        .push((claimed.len(), to_read.len()));
+                }
+                if to_read.is_empty() {
+                    // Nothing left to read: every described file carries an
+                    // in-stream proof. Synthesised in exactly the shape the
+                    // completion gate's quick pass synthesises for the same
+                    // evidence on the conventional side.
+                    par2_rs::VerificationResult {
+                        files: claimed,
+                        recovery_blocks_available: par2_set.recovery_block_count(),
+                        total_missing_blocks: 0,
+                        repairable: par2_rs::verify::Repairability::NotNeeded,
+                    }
+                } else {
+                    let pp_pool = self.pp_pool.clone();
+                    let read_set = std::sync::Arc::clone(&par2_set);
+                    let access = std::sync::Arc::clone(&access);
+                    let mut verification = tokio::task::spawn_blocking(move || {
+                        pp_pool.install(move || {
+                            par2_rs::verify_selected_file_ids(&read_set, access.as_ref(), &to_read)
+                        })
+                    })
+                    .await
+                    .ok()?;
+                    // Appended, then re-ordered to the recovery set's own file
+                    // order so the result is shaped exactly as `verify_all`'s
+                    // would have been. `total_missing_blocks` is untouched — a
+                    // claimed file contributes no missing block — and
+                    // `refresh_repairability` re-reads the assessment over the
+                    // combined files, preserving a resource-limited verdict the
+                    // read half may have reached.
+                    verification.files.extend(claimed);
+                    let order: HashMap<par2_rs::FileId, usize> = par2_set
+                        .recovery_file_ids
+                        .iter()
+                        .enumerate()
+                        .map(|(position, file_id)| (*file_id, position))
+                        .collect();
+                    verification.files.sort_by_key(|file| {
+                        order.get(&file.file_id).copied().unwrap_or(usize::MAX)
+                    });
+                    verification.refresh_repairability();
+                    verification
+                }
             }
         };
         let adjustments = self.apply_direct_damage_adjustments(job_id, &mut verification);
@@ -1371,6 +1451,53 @@ impl Pipeline {
         Some(verification)
     }
 
+    /// The `FileVerification` entries the dual-CRC grid can stand in for, in
+    /// the shape `par2_rs::verify_all` would have produced by reading them.
+    ///
+    /// The claim is per description and it is the same claim
+    /// [`Pipeline::grid_adjudicated_par2_bindings`] makes for the whole set:
+    /// this file bound uniquely to this description, its assembled decoded
+    /// length equals the described length, and every described slice closed
+    /// `Intact` with independent article coverage. Nothing here is derived from
+    /// the *pass*; it is derived from evidence the download seam recorded once
+    /// the bytes were durable.
+    ///
+    /// Empty on ambiguity — two pipeline files claiming one description — so an
+    /// unresolvable binding costs the reads it always did rather than producing
+    /// a claim from a resolution that cannot be trusted.
+    pub(crate) fn grid_claimed_file_verifications(
+        &self,
+        job_id: JobId,
+        par2_set: &par2_rs::Par2FileSet,
+    ) -> Vec<par2_rs::verify::FileVerification> {
+        let Some(adjudicated) = self.grid_adjudicated_par2_file_ids(job_id, par2_set) else {
+            return Vec::new();
+        };
+        if adjudicated.is_empty() {
+            return Vec::new();
+        }
+        par2_set
+            .recovery_file_ids
+            .iter()
+            .filter(|file_id| adjudicated.contains(file_id))
+            .filter_map(|file_id| {
+                let description = par2_set.file_description(file_id)?;
+                let slice_count = par2_set.slice_count_for_file(description.length) as usize;
+                Some(par2_rs::verify::FileVerification {
+                    file_id: *file_id,
+                    // The description's own name, not a sanitized one: that is
+                    // what the read pass puts here, and a consumer that
+                    // compares the two must not be able to tell which produced
+                    // the entry.
+                    filename: description.filename.clone(),
+                    status: par2_rs::verify::FileStatus::Complete,
+                    valid_slices: vec![true; slice_count],
+                    missing_slice_count: 0,
+                })
+            })
+            .collect()
+    }
+
     /// The retained session's verdict for a job's direct sets, or `None` to
     /// fall back to the read-and-verify pass.
     ///
@@ -1379,15 +1506,24 @@ impl Pipeline {
     /// An access-backed session reads **no** source bytes: `analyze()` skips
     /// the scan entirely, because `base_dir` holds no sources to find. It
     /// reports what its evidence established and nothing more. So it can stand
-    /// in for the pass only when every described slice already carries a strong
-    /// verdict — which is what the live engine produces in stream, and what
-    /// `fully_adjudicated_bindings` checks. A slice proven *bad* counts: it is
-    /// resolved, and resolving it is what the pass was for. A slice with no
-    /// verdict does not, and one of those is enough to send the whole job back
-    /// to `verify_all`, which can actually read a virtual volume.
+    /// in for the pass only when the dual-CRC grid already adjudicated every
+    /// described slice in stream, which is what
+    /// [`Pipeline::grid_adjudicated_par2_bindings`] checks. A slice with no
+    /// verdict does not qualify, and one of those is enough to send the whole
+    /// job back to `verify_all`, which can actually read a virtual volume.
     ///
-    /// Refusing is therefore ordinary, not exceptional — a job with live
-    /// verification off never takes this path at all.
+    /// Refusing is therefore ordinary, not exceptional — any set the grid could
+    /// not fully claim in stream takes the pass, as does every damaged one.
+    ///
+    /// # What feeds the gate
+    ///
+    /// The grid is fed for a direct volume by `commit_direct_segment`, in
+    /// source-volume coordinates, on the same durability contract the
+    /// conventional seam states: the article's destination writes returned
+    /// before the claim was recorded. So a clean direct set can satisfy the gate
+    /// and take this arm, and a set the grid could only partly claim falls to
+    /// the pass below — which stands in for the files it *did* claim and reads
+    /// only the rest.
     async fn verify_direct_sets_through_session(
         &mut self,
         job_id: JobId,
@@ -1395,19 +1531,14 @@ impl Pipeline {
         working_dir: &std::path::Path,
         access: &std::sync::Arc<super::par2_access::DirectVolumeFileAccess>,
     ) -> Option<par2_rs::VerificationResult> {
-        // Blocks the decode pass already adjudicated count as resolved here:
-        // the settle pass deliberately did not read them back, so requiring a
-        // read-derived verdict for them would reject every job that in-stream
-        // verification actually helped.
+        if !self.grid_adjudicated_par2_bindings(job_id, par2_set) {
+            return None;
+        }
+        // Blocks the decode pass already adjudicated are what this session
+        // reports from: they cost no I/O, and the gate above proved they cover
+        // every described slice.
         let in_stream = self.in_stream_slice_evidence(job_id);
-        let in_stream_claimed = in_stream
-            .iter()
-            .map(|evidence| (evidence.file_id(), evidence.slice_index()))
-            .collect::<std::collections::HashSet<_>>();
-        self.live_par2
-            .fully_adjudicated_bindings(job_id, &in_stream_claimed)?;
-        let evidence = self.live_par2_strong_evidence(job_id);
-        if evidence.is_empty() && in_stream.is_empty() {
+        if in_stream.is_empty() {
             return None;
         }
 
@@ -1438,20 +1569,11 @@ impl Pipeline {
         let par2_set = std::sync::Arc::clone(par2_set);
         let joined = tokio::task::spawn_blocking(move || {
             let outcome = pp_pool.install(|| {
-                // In-stream verdicts first: they cost no I/O, and where the
-                // live engine also settled a slice the two agree, so the
-                // second seed is a no-op rather than a contradiction.
+                // Keyed by FileId, not by path: a direct volume has no path to
+                // key on.
                 for slice in in_stream {
                     if let Err(error) = session.add_slice_evidence_for_file(slice) {
                         return Err(format!("failed to seed in-stream slice evidence: {error}"));
-                    }
-                }
-                for (_, slice) in evidence {
-                    // Keyed by FileId, not by path: a direct volume has no
-                    // path to key on, and the path the live engine captured
-                    // belongs to a file that was never written.
-                    if let Err(error) = session.add_slice_evidence_for_file(slice) {
-                        return Err(format!("failed to seed live slice evidence: {error}"));
                     }
                 }
                 session
@@ -1927,10 +2049,9 @@ impl Pipeline {
                 "checkpoint delete failed: {error}"
             )));
         }
-        // A repair rewrites bytes the live verifier already claimed as good
+        // A repair rewrites bytes the dual-CRC grid already claimed as intact
         // blocks, so its state for this job is retired rather than trusted —
         // the same stance `run_par2_repairer` takes for a conventional repair.
-        self.live_par2.remove_job(job_id);
         self.block_crcs.forget_job(job_id);
         // Announced from here rather than from a status transition: the set
         // never enters `JobStatus::Repairing` — that status carries the repair
@@ -2491,6 +2612,12 @@ impl Pipeline {
         let job_id = file_id.job_id;
         let decoded_size = segment.decoded_size;
         let part_crc = segment.part_crc;
+        // The dual-CRC grid's half of the article, carried past the routing to
+        // the commit seam below. `contiguous_bytes` copies, so the decoded
+        // payload can be dropped the moment the spans are written while these
+        // two facts about it travel on.
+        let part_crc_verified = segment.part_crc_verified;
+        let segments = segment.segments;
         let bytes = contiguous_bytes(&segment.data);
         // The article the seam is holding: if the set demotes here it is
         // dropped without ever reaching the assembly, so nothing else would
@@ -2535,31 +2662,19 @@ impl Pipeline {
             return DirectRouteOutcome::Demoted;
         }
 
-        // Ordering contract: every routed destination write for this span has
-        // returned, so a later settle read of the same range sees exactly these
-        // bytes. Live PAR2 is defined in *source volume* space, which is what
-        // `file_offset` already is.
-        //
-        // With par2-bearing jobs refused at admission, this only ever runs for
-        // a job whose spec declares no PAR2 file, where the registry's first
-        // call answers `skip_job` and every later one is a set lookup. The call
-        // stays because the refusal belonged to an earlier shape, not to the
-        // seam: those jobs are admitted now and this is where their coverage
-        // comes from.
-        //
-        // An **encrypted** set is fed here too. The feed half was always
-        // correct — `segment.data` is the posted cipher, taken before the write
-        // transform — and the write side suppressed it only because the other
-        // half could not settle a straddling block: the read-back went through
-        // `direct_virtual_volume` to the member's plaintext partial, so every
-        // boundary block came back `Bad`. The re-encrypting overlay is what
-        // makes that read-back answer in posted space, so both halves are live
-        // again.
-        self.note_live_par2_segment(file_id, file_offset, &segment.data);
         drop(bytes);
 
-        self.commit_direct_segment(segment_id, decoded_size, set_index, volume_index)
-            .await;
+        self.commit_direct_segment(
+            segment_id,
+            decoded_size,
+            set_index,
+            volume_index,
+            file_offset,
+            part_crc,
+            part_crc_verified,
+            &segments,
+        )
+        .await;
         DirectRouteOutcome::Routed
     }
 
@@ -3058,12 +3173,21 @@ impl Pipeline {
     }
 
     /// The suppressed twin of `commit_persisted_segment`.
+    // The extra four arguments are the conventional seam's own dual-CRC
+    // contract, carried here rather than re-derived: placement, the article's
+    // pCRC and whether it was independently verified, and the block-aligned
+    // segments the decoder cut. Bundling them would only rename the tuple.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_direct_segment(
         &mut self,
         segment_id: SegmentId,
         decoded_size: u32,
         set_index: usize,
         volume_index: u32,
+        file_offset: u64,
+        part_crc: u32,
+        part_crc_verified: bool,
+        segments: &[weaver_yenc::Segment],
     ) {
         let file_id = segment_id.file_id;
         let job_id = file_id.job_id;
@@ -3105,6 +3229,33 @@ impl Pipeline {
                 .event_tx
                 .send(PipelineEvent::SegmentCommitted { segment_id });
         }
+
+        // The dual-CRC grid, fed in **source-volume space** — the same
+        // coordinates the conventional seam uses for the same file, because
+        // `file_offset` is an offset into the volume either way. The only
+        // difference is where those bytes are durable: a routed article is on
+        // disk in member partials and envelopes rather than in a volume file,
+        // and `place_direct_spans` awaited every one of those writes before this
+        // seam was reached. That is the same ordering contract
+        // `commit_persisted_segment` states — a block claimed here describes
+        // content a later read (through the virtual-volume access adapter, which
+        // reads exactly those partials) would find.
+        //
+        // Duplicates are fed on purpose, exactly as the conventional seam feeds
+        // them: the grid is positional, and a replay that rewrote a range must
+        // invalidate the verdicts derived over it whether or not its bytes
+        // agreed. Withholding the feed would leave a claim describing content
+        // that may no longer be there.
+        self.note_block_crc_segments(
+            file_id,
+            file_offset,
+            u64::from(decoded_size),
+            part_crc,
+            part_crc_verified,
+            was_duplicate,
+            segments,
+        );
+
         if !file_complete {
             return;
         }
@@ -3128,14 +3279,17 @@ impl Pipeline {
             total_bytes,
         });
 
-        // The live verifier's fail-safe length verdict, which the conventional
-        // file-complete path feeds at exactly this point. A direct volume has
-        // no file to `stat`, but `received_bytes` is the decoded length — the
-        // space PAR2 describes — so the check is the same one, from the same
-        // number, and a volume whose decoded length disagrees with its
-        // description retires its live state instead of short-circuiting on
-        // blocks that hashed clean against the wrong file.
-        self.note_live_par2_file_complete(file_id, total_bytes);
+        // The volume's length is what makes its short final block closable:
+        // until now that block's extent was undecided, so no tiling of it could
+        // be trusted to be the whole block.
+        //
+        // `total_bytes` is the assembly's **decoded** `received_bytes`, never
+        // `total_bytes()` — the NZB's declared segment sum is yEnc-*encoded*,
+        // around 3% larger on a real post, and a length that overstates the file
+        // pushes the final block's boundary past the described extent, where
+        // `verdicts_against` refuses to compare it at all. Same value, same
+        // reason, as the conventional seam's `note_file_len`.
+        self.block_crcs.note_file_len(file_id, total_bytes);
 
         // The file-complete state a physical volume drops here. Every one of
         // these is keyed by a file that will never exist, so leaving them
@@ -3633,6 +3787,31 @@ impl Pipeline {
         {
             warn!(job_id = job_id.0, error = %error, "failed to retire a direct-store checkpoint");
         }
+        // The other end of the direct phase, and the same rule the demotion
+        // applies: the commit above renamed the member partials to their
+        // destinations and (unless a live neighbour still needs to read them)
+        // deleted the envelopes, so the virtual volume image the grid's claims
+        // describe has been taken apart. A claim that outlived it would say a
+        // *file* is intact when nothing can be read to check, and a later pass
+        // would offer its slices to `plan_repair` as input it cannot open.
+        // Retiring it costs at most the read a finalized volume always cost.
+        let finalized_volume_files: Vec<NzbFileId> = self
+            .direct_store
+            .set(job_id, set_index)
+            .map(|set| {
+                set.plan()
+                    .volumes
+                    .values()
+                    .map(|file_index| NzbFileId {
+                        job_id,
+                        file_index: *file_index,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for file_id in finalized_volume_files {
+            self.block_crcs.forget_file(file_id);
+        }
         if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
             set.mark_finalized();
         }
@@ -4051,6 +4230,33 @@ impl Pipeline {
             return;
         }
         let set_name = set.set_name().to_string();
+        // Every volume of this set is about to become a real file: either
+        // reconstruction writes it from the routed bytes, or the refetch pulls
+        // it back off the wire article by article — and in both cases the
+        // conventional seam owns the feeds from here.
+        //
+        // The direct phase's grid state has to go *before* that can happen. It
+        // describes a virtual volume assembled out of member partials and
+        // envelopes, and the file the conventional path is about to fill is a
+        // different image of the same coordinates: reconstruction may write a
+        // shorter prefix than the direct phase claimed, and a refetch rewrites
+        // ranges wholesale. Leaving it would let a block closed in one image
+        // adjudicate bytes of the other — and worse, survive into
+        // `in_stream_verified_par2_match`, whose whole job is to say a file need
+        // not be read. Per file rather than per job: a job's other sets, and its
+        // conventional files, are untouched by this demotion.
+        let demoted_volume_files: Vec<NzbFileId> = set
+            .plan()
+            .volumes
+            .values()
+            .map(|file_index| NzbFileId {
+                job_id,
+                file_index: *file_index,
+            })
+            .collect();
+        for file_id in demoted_volume_files {
+            self.block_crcs.forget_file(file_id);
+        }
 
         crate::runtime::perf_probe::record_owned(
             format!("direct_store.demoted.{}", reason.metric()),

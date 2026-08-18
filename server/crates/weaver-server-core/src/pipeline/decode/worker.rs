@@ -886,11 +886,10 @@ impl Pipeline {
         self.persisted_file_progress.remove(&file_id);
         self.mark_file_hash_reread_required_for(file_id, "whole_file_crc_recovery");
         // CRC recovery rewrites this file's bytes through `write_segment_to_disk`
-        // directly — its early returns never reach the live seam — so blocks
-        // live already claimed would sit `Ok` over changed disk content. The
-        // job's live state is retired here for the same reason the yEnc hash
-        // state is invalidated above.
-        self.live_par2.remove_job(file_id.job_id);
+        // directly — its early returns never reach the dual-CRC seam — so
+        // blocks the grid already claimed would sit `Intact` over changed disk
+        // content. The job's block state is retired here for the same reason
+        // the yEnc hash state is invalidated above.
         self.block_crcs.forget_job(file_id.job_id);
 
         self.file_crc_recoveries.insert(
@@ -1893,24 +1892,19 @@ impl Pipeline {
 
                 // Ordering contract: this seam runs only after
                 // `write_segments_to_disk` returned for this segment, so these
-                // bytes are already on disk and a later live-PAR2 settle read
-                // of the same range sees exactly them.
+                // bytes are already on disk and any later read of the same
+                // range — a settle-time verification read, the authoritative
+                // pass — sees exactly them. That is what lets an in-stream
+                // block verdict stand in for a read: it describes bytes that
+                // are durable, not bytes still in a buffer.
                 //
                 // A duplicate is fed here on purpose, unlike the file hash
-                // below. Live PAR2 is positional, not sequential: a whole-block
-                // re-feed recomputes the same verdict from the same bytes, and
-                // a partial re-feed of a block that already has a verdict
-                // retires it to the settle read (`stage_partial` names this
-                // case). It is also required rather than merely harmless — this
+                // below. The dual-CRC grid is positional, not sequential: a
+                // whole-block re-feed recomputes the same verdict from the same
+                // bytes. It is also required rather than merely harmless — this
                 // arrival rewrote the range, so if the replay carried different
                 // bytes than the first copy did, skipping the feed would leave
                 // a verdict describing content that is no longer on disk.
-                self.note_live_par2_segment(file_id, file_offset, &data);
-
-                // In-stream block verification, on the same durability seam and
-                // for the same reason: a verdict must describe the bytes that
-                // are on disk. Positional like live PAR2, so a duplicate replays
-                // to the same records rather than double-counting a stream.
                 self.note_block_crc_segments(
                     file_id,
                     file_offset,
@@ -2049,17 +2043,15 @@ impl Pipeline {
 
                     // Queued behind the file's final write on its owner
                     // thread, so the fd is released before verification,
-                    // repair, or the final move touch this path. The
-                    // completion note is in-memory only: the settle
-                    // read-backs that claim whatever in-stream feeding did
-                    // not (including the leftover flush above, which writes
-                    // directly without re-entering this seam) belong to the
-                    // completion-gate sweep, not to the download path.
+                    // repair, or the final move touch this path.
                     crate::pipeline::release_cached_write_handle(file_path);
-                    self.note_live_par2_file_complete(file_id, total_bytes);
 
                     // The file's length is what makes its short final block
                     // closable: until now that block's extent was undecided.
+                    // Blocks the grid could not claim in stream (including the
+                    // leftover flush above, which writes directly without
+                    // re-entering this seam) are left unclaimed for the
+                    // completion gate's verification pass to read back.
                     self.block_crcs.note_file_len(file_id, total_bytes);
 
                     let expected_file_crc = self.expected_file_crcs.get(&file_id).copied();

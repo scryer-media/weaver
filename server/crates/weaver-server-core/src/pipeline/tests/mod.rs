@@ -1787,6 +1787,39 @@ async fn submit_decoded_segment_with_part_crc_verified(
     expected_file_crc: Option<u32>,
     part_crc_verified: bool,
 ) {
+    submit_decoded_segment_with_segments(
+        pipeline,
+        file_id,
+        segment_number,
+        file_offset,
+        data,
+        filename,
+        expected_file_crc,
+        part_crc_verified,
+        None,
+    )
+    .await;
+}
+
+/// [`submit_decoded_segment_with_part_crc_verified`] with the decoder's CRC
+/// segmentation chosen by the caller.
+///
+/// `None` is what a decoder emits with no PAR2 block size declared: one segment
+/// covering the whole article. `Some` is what it emits once the recovery set has
+/// parsed and the lease carries its block size — segments cut on the block grid,
+/// which is the only shape the dual-CRC grid can close a block from.
+#[allow(clippy::too_many_arguments)]
+async fn submit_decoded_segment_with_segments(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    segment_number: u32,
+    file_offset: u64,
+    data: &[u8],
+    filename: &str,
+    expected_file_crc: Option<u32>,
+    part_crc_verified: bool,
+    segments: Option<Vec<weaver_yenc::Segment>>,
+) {
     let file = pipeline
         .jobs
         .get(&file_id.job_id)
@@ -1799,6 +1832,13 @@ async fn submit_decoded_segment_with_part_crc_verified(
         begin: Some(file_offset + 1),
         end: Some(file_offset + data.len() as u64),
     };
+    let segments = segments.unwrap_or_else(|| {
+        vec![weaver_yenc::Segment {
+            file_offset: yenc_layout.begin.map_or(0, |begin| begin.saturating_sub(1)),
+            len: data.len() as u64,
+            crc32: par2_rs::checksum::crc32(data),
+        }]
+    });
     pipeline
         .handle_decode_success(
             DecodeResult {
@@ -1814,14 +1854,7 @@ async fn submit_decoded_segment_with_part_crc_verified(
                 expected_file_crc,
                 data: DecodedChunk::from(data.to_vec()),
                 yenc_name: filename.to_string(),
-                // What a decoder with no PAR2 block size declared emits: one
-                // segment covering the whole article, based where `=ypart`
-                // places it.
-                segments: vec![weaver_yenc::Segment {
-                    file_offset: yenc_layout.begin.map_or(0, |begin| begin.saturating_sub(1)),
-                    len: data.len() as u64,
-                    crc32: par2_rs::checksum::crc32(data),
-                }],
+                segments,
             },
             SegmentSource {
                 source_server_idx: None,

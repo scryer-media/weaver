@@ -496,9 +496,8 @@ impl Pipeline {
         .await
         .map_err(|e| format!("placement normalization task panicked: {e}"))??;
 
-        // Placement moved bytes out from under the names live verification
-        // bound, so the job's live state is retired rather than re-resolved.
-        self.live_par2.remove_job(job_id);
+        // Placement moved bytes out from under the names the grid bound, so the
+        // job's block state is retired rather than re-resolved.
         self.block_crcs.forget_job(job_id);
 
         info!(

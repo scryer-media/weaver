@@ -564,6 +564,20 @@ impl BlockCrcCollector {
         self.files.retain(|file_id, _| file_id.job_id != job_id);
     }
 
+    /// Drop everything retained for **one** file.
+    ///
+    /// The narrow twin of [`Self::forget_job`], for the transitions that retire
+    /// a single file's evidence while the rest of the job's stands: a direct
+    /// set's source volumes handed back to the conventional download path, whose
+    /// bytes are about to be written again from scratch. Whatever the direct
+    /// phase derived described a virtual volume assembled from member partials
+    /// and envelopes; the conventional feeds that follow describe a real file,
+    /// and merging the two would let evidence from one image adjudicate blocks
+    /// of another.
+    pub(crate) fn forget_file(&mut self, file_id: NzbFileId) {
+        self.files.remove(&file_id);
+    }
+
     pub(crate) fn blocks_derived(&self) -> u64 {
         self.blocks_derived
     }

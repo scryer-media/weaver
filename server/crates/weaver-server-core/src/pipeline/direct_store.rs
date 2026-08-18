@@ -183,8 +183,7 @@ mod tests;
 /// setting it to an on word forces it on. Leaving it unset defers to config.
 ///
 /// Config *and* env — config as the durable operator surface and env as the
-/// override — is the settled answer. `WEAVER_LIVE_PAR2` remains env-only; it
-/// guards a different feature and moving it is out of scope here.
+/// override — is the settled answer.
 pub(crate) const DIRECT_STORE_ENV: &str = "WEAVER_RAR_DIRECT_STORE";
 
 /// Env override for the per-set holds-scratch ceiling, in **bytes**.

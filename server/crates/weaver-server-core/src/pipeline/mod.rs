@@ -1853,6 +1853,14 @@ pub struct Pipeline {
     /// "the session agreed" from "the session refused and fell back".
     #[cfg(test)]
     pub(super) direct_session_pass_calls: usize,
+    /// `(files stood in for, files read)` for every direct read-and-verify
+    /// pass, in the order they ran. The whole point of feeding the grid from
+    /// the direct seam is that the second number shrinks, and only a per-pass
+    /// record can show it: a repair retires the job's block state and
+    /// re-verifies, so a cumulative count would blend a pass that stood in for
+    /// two volumes with a later one that could stand in for none.
+    #[cfg(test)]
+    pub(super) direct_verify_read_splits: Vec<(usize, usize)>,
     /// The verdict of the most recent quiet direct pass. The pipeline runs
     /// that pass itself, mid-assembly, while live state is still intact — a
     /// test that calls the pass afterwards observes a different situation
@@ -1982,9 +1990,6 @@ pub struct Pipeline {
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
-    /// Advisory in-stream PAR2 evidence. It owns a single partial-boundary
-    /// budget shared by every job and never replaces authoritative repair.
-    pub(super) live_par2: repair::LivePar2Registry,
     /// Direct-store routing state: admitted archive sets, their routers and
     /// their coverage barriers. Inert while the gate is off.
     pub(super) direct_store: direct_store::wiring::DirectStoreRuntime,

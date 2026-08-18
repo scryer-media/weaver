@@ -106,14 +106,17 @@ pub(super) async fn static_handler(
     }
 
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
-    let trusted_peer = security.is_trusted_peer(peer);
-    let has_valid_jwt =
-        super::auth::jwt_secret_if_auth_enabled(&auth_cache).is_some_and(|secret| {
-            super::auth::extract_jwt_cookie(&headers)
-                .is_some_and(|token| jwt::verify_jwt(&token, &secret).is_ok())
-        });
+    let cached_auth = auth_cache.snapshot();
+    // Trusted-network sessions only apply while login protection is disabled.
+    // When login is enabled, returning the SPA shell would make it repeatedly
+    // receive GraphQL 401s instead of serving the sign-in page.
+    let trusted_peer = cached_auth.is_none() && security.is_trusted_peer(peer);
+    let has_valid_jwt = cached_auth.as_ref().is_some_and(|auth| {
+        super::auth::extract_jwt_cookie(&headers)
+            .is_some_and(|token| jwt::verify_jwt(&token, &auth.jwt_secret).is_ok())
+    });
     if !trusted_peer && !has_valid_jwt {
-        return if auth_cache.snapshot().is_some() {
+        return if cached_auth.is_some() {
             login_page_response()
         } else {
             setup_required_response()

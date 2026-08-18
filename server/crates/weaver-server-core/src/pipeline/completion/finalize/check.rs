@@ -99,20 +99,8 @@ fn committed_evidence_from_candidate(
 fn run_retained_par2_session(
     mut session: par2_rs::Par2RepairSession,
     candidates: Vec<Par2SessionEvidenceCandidate>,
-    live_evidence: Vec<(std::path::PathBuf, par2_rs::SliceEvidence)>,
     repair: bool,
 ) -> (par2_rs::Par2RepairSession, RetainedPar2SessionResult) {
-    for (path, evidence) in live_evidence {
-        match session.add_slice_evidence(path, evidence) {
-            Ok(()) | Err(par2_rs::Par2SessionError::EvidenceDoesNotMatch { .. }) => {}
-            Err(error) => {
-                return (
-                    session,
-                    Err(format!("failed to add live PAR2 slice evidence: {error}")),
-                );
-            }
-        }
-    }
     let mut admitted_file_ids = Vec::new();
     for candidate in candidates {
         let evidence = match committed_evidence_from_candidate(&candidate) {
@@ -826,11 +814,11 @@ impl Pipeline {
     /// loop above cannot see it and a job made entirely of direct sets reads
     /// `None` — which forces the authoritative pass, whose repair branch
     /// materializes every still-routing set before handing the repairer files it
-    /// can write into. While the job is live that costs nothing, because live
-    /// PAR2 verifies from the decode buffer and short-circuits the pass. **After
-    /// a restart there is no decode buffer**: no article of a byte-complete set
-    /// arrives, live PAR2 has nothing to hash, and a set that is byte-perfect on
-    /// disk is materialized and redownloaded anyway.
+    /// can write into. While the job is downloading that costs little, because
+    /// the dual-CRC grid claims blocks off the articles as they arrive. **After
+    /// a restart no article arrives at all**: a byte-complete set feeds the grid
+    /// nothing, so it can claim nothing, and a set that is byte-perfect on disk
+    /// is materialized and redownloaded anyway.
     ///
     /// A **restored** RAR set has the same claim to `StrongDecode` a
     /// conventionally extracted one does, and for a stronger reason than
@@ -845,12 +833,13 @@ impl Pipeline {
     ///   for the *split archive* — an archive whose integrity nothing in this job
     ///   has checked. A mixed job contributes nothing here.
     /// - **Every set was restored, and none is demoted.** A set this run
-    ///   downloaded live is deliberately left alone: live PAR2 hashes its
-    ///   articles out of the decode buffer, which catches damage in the *volume*
-    ///   space that no member checksum can see — a corrupted recovery record, say
-    ///   — and that detection must not be traded away. Live sets keep reaching the
-    ///   authoritative pass exactly as before; this is only about the sets live
-    ///   PAR2 could never have seen, because not one article of them arrived.
+    ///   downloaded is deliberately left alone: its articles fed the dual-CRC
+    ///   grid, which adjudicates blocks in the *volume* space that no member
+    ///   checksum can see — a corrupted recovery record, say — and that
+    ///   detection must not be traded away. Freshly downloaded sets keep
+    ///   reaching the authoritative pass exactly as before; this is only about
+    ///   the sets the grid could never have seen, because not one article of
+    ///   them arrived.
     /// - **No set is carrying restart-seeded coverage.** Bytes restored from a
     ///   checkpoint are covered and *unverified* until the re-arm re-reads
     ///   them; a set still holding them has decoded nothing and may not claim
@@ -1196,9 +1185,8 @@ impl Pipeline {
         }
 
         if renamed > 0 {
-            // Renames move the bytes live verification bound to a name, so the
-            // job's live state is retired rather than re-resolved.
-            self.live_par2.remove_job(job_id);
+            // Renames move the bytes the grid bound to a name, so the job's
+            // block state is retired rather than re-resolved.
             self.block_crcs.forget_job(job_id);
             info!(job_id = job_id.0, renamed, "PAR2 deobfuscation complete");
         }
@@ -1223,9 +1211,8 @@ impl Pipeline {
         }
 
         if repair {
-            // A repair rewrites bytes the live verifier never saw, so its
-            // block state is retired rather than trusted afterwards.
-            self.live_par2.remove_job(job_id);
+            // A repair rewrites bytes the grid never saw, so its block state is
+            // retired rather than trusted afterwards.
             self.block_crcs.forget_job(job_id);
         }
 
@@ -1288,13 +1275,11 @@ impl Pipeline {
                     return Err(error);
                 }
             };
-            self.settle_live_par2_job(job_id).await;
-            let live_evidence = self.live_par2_strong_evidence(job_id);
             let mut repair_task = tokio::task::spawn_blocking(move || {
                 if repair {
                     crate::e2e_failpoint::maybe_delay("repair.task_start");
                 }
-                run_retained_par2_session(session, candidates, live_evidence, repair)
+                run_retained_par2_session(session, candidates, repair)
             });
             let repair_result = if repair {
                 loop {
@@ -1764,6 +1749,32 @@ impl Pipeline {
         par2_set: Arc<par2_rs::Par2FileSet>,
         _working_dir: std::path::PathBuf,
     ) -> Result<Option<(par2_rs::VerificationResult, par2_rs::PlacementPlan)>, String> {
+        // A live direct set's source volumes are not files. This pass answers in
+        // *placement* terms — it hands back a plan whose swaps and renames move
+        // real paths, and a clean verdict from it skips the direct-aware pass
+        // entirely — so a volume that exists only as routed member partials and
+        // envelopes has no business being decided here. The direct pass
+        // (`verify_direct_sets_quietly`) is the one that knows how to stand in
+        // for a grid-adjudicated virtual volume and how to read the rest, and it
+        // reaches the same zero-I/O conclusion from the same evidence.
+        //
+        // Before the grid was fed from the direct seam this refusal happened by
+        // accident: a direct volume carried neither a block verdict nor a
+        // completed-file digest, so the loop below fell through its
+        // `no_current_generation_digest` arm. It is stated rather than inherited
+        // now that the first of those two is no longer true.
+        if self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| !set.is_demoted() && !set.is_finalized())
+        {
+            crate::runtime::perf_probe::record(
+                "completion.quick_verify.rejected.live_direct_set",
+                std::time::Duration::from_nanos(1),
+            );
+            return Ok(None);
+        }
         let completed_hashes = self.load_existing_complete_file_hashes(job_id).await?;
         let runtime_checksums = self
             .par2_runtime(job_id)
@@ -1774,12 +1785,11 @@ impl Pipeline {
         };
 
         let mut current_hashes_by_name = HashMap::<String, [u8; 16]>::new();
-        // Live evidence may stand in for persisted whole-file hashes only
-        // when it proves every described slice with CRC32+MD5 and a stable,
-        // complete assembly identity. Any incomplete/ambiguous live state is
-        // ignored and the existing persisted-MD5 quick path remains intact.
-        let live_bindings = self.live_par2_complete_bindings(job_id);
-        let mut live_matches_by_name = HashMap::<String, (par2_rs::FileId, String)>::new();
+        // Two arms decide a file: the dual-CRC grid's per-slice proof, and the
+        // persisted/runtime whole-file MD5. Neither computes a digest here —
+        // both read evidence already in hand — and an in-stream `Damaged`
+        // verdict vetoes both before either runs.
+        let mut grid_matches_by_name = HashMap::<String, (par2_rs::FileId, String)>::new();
         for file in state.assembly.files() {
             if !file.is_complete() {
                 continue;
@@ -1797,13 +1807,12 @@ impl Pipeline {
                 Some(current) => current.md5,
                 None => completed_hashes.get(&file_id.file_index).copied(),
             };
-            // In-stream IFSC verdicts veto every quick arm below, the live
-            // one included. A Damaged block means the dual-CRC grid saw bytes
-            // that contradict the recovery set, so any hash that still
-            // matches — a stale trusted row, or a genuine conflict with the
-            // live per-slice proof — is exactly what must not conclude
-            // verification here. Conflicted files go to the authoritative
-            // pass, which reads the real bytes.
+            // In-stream IFSC verdicts veto every quick arm below. A Damaged
+            // block means the dual-CRC grid saw bytes that contradict the
+            // recovery set, so any hash that still matches — a stale trusted
+            // row, say — is exactly what must not conclude verification here.
+            // Conflicted files go to the authoritative pass, which reads the
+            // real bytes.
             if self.block_crc_verdicts(file_id).is_some_and(|verdicts| {
                 verdicts.values().any(|verdict| {
                     matches!(verdict, crate::pipeline::integrity::BlockVerdict::Damaged)
@@ -1820,25 +1829,6 @@ impl Pipeline {
                 .as_ref()
                 .map(|value| value.current_filename.as_str())
                 .unwrap_or_else(|| file.filename());
-            if let Some(par2_file_id) = live_bindings
-                .as_ref()
-                .and_then(|bindings| bindings.get(&file_id))
-                .copied()
-            {
-                let Some(desc) = par2_set.file_description(&par2_file_id) else {
-                    return Ok(None);
-                };
-                live_matches_by_name.insert(
-                    current_filename.to_string(),
-                    (par2_file_id, sanitize_download_filename(&desc.filename)),
-                );
-                continue;
-            }
-            if live_bindings.is_some() {
-                // The live eligibility proof already covered every described
-                // file. This is an auxiliary NZB file, not a PAR2 source.
-                continue;
-            }
             // Clean dual-CRC arm. Metadata-early downloads deliberately
             // stream no MD5 — the article/IFSC grids carry verification — so
             // a clean file has no digest anywhere and would otherwise fall to
@@ -1869,7 +1859,7 @@ impl Pipeline {
                     "completion.quick_verify.par2_match.in_stream_grid",
                     std::time::Duration::from_nanos(1),
                 );
-                live_matches_by_name.insert(current_filename.to_string(), grid_match);
+                grid_matches_by_name.insert(current_filename.to_string(), grid_match);
                 continue;
             }
             // `measured_md5` is generation-ordered (runtime first) and the
@@ -1908,7 +1898,7 @@ impl Pipeline {
                 .push((*file_id, sanitize_download_filename(&desc.filename)));
         }
 
-        let mut matches = live_matches_by_name;
+        let mut matches = grid_matches_by_name;
         let mut match_counts = HashMap::<par2_rs::FileId, u32>::new();
         for (file_id, _) in matches.values() {
             *match_counts.entry(*file_id).or_default() += 1;
@@ -3442,79 +3432,25 @@ impl Pipeline {
 
             let par2_set = self.par2_set(job_id).cloned();
 
-            // A suspect volume is damage the full pass deliberately keeps:
-            // `apply_eager_delete_exclusions` retains its missing blocks
-            // instead of forgiving them. Live block state says nothing about
-            // that, so any suspect volume refuses every live short-circuit —
-            // both the whole-pass skip below and the quick path's, which the
-            // stateful session also lets stand in for the full
-            // pass.
-            let no_suspect_volumes = self.suspect_rar_volumes_for_job(job_id).is_empty();
-
-            // Live in-stream block verification. Deliberately
-            // conservative: it only applies to a clean, fully downloaded job
-            // that is not mid-repair, and only when every recovery-set file is
-            // matched with every one of its blocks proven Ok. Every other case
-            // — a single Pending or Bad block, an unmatched file, an inactive
-            // verifier — falls through to the passes below unchanged.
-            let live_par2_short_circuit_allowed = self.live_par2.enabled()
-                && par2_validation_needed
-                && !has_crc_failures
-                && !has_incomplete_data_files
-                && !rar_waiting_for_missing_volumes
-                && !extension_repair_requested
-                && !matches!(current_status, JobStatus::Repairing)
-                && clean_par2_integrity_gate_allows_fast_path
-                && no_suspect_volumes;
-            if live_par2_short_circuit_allowed && par2_set.is_some() {
-                self.settle_live_par2_job(job_id).await;
-                if let Some((verification, placement_plan)) =
-                    self.live_par2_clean_verification(job_id).await
-                {
-                    let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
-                    Self::trip_par2_verification_started_failpoint();
-                    self.live_par2.note_full_verify_skip();
-                    let live_metrics = self.live_par2.metrics();
-                    info!(
-                        job_id = job_id.0,
-                        files = verification.files.len(),
-                        blocks_in_stream = live_metrics.strongly_verified_slices,
-                        blocks_backfilled = live_metrics.backfill_reads,
-                        blocks_settled = live_metrics.settle_reads,
-                        partials_abandoned = live_metrics.partial_fallbacks,
-                        partial_bytes_peak = live_metrics.disk_read_bytes,
-                        "live PAR2 block verification proved the set clean — skipping the full verify pass"
-                    );
-                    self.finish_clean_par2_verification(
-                        job_id,
-                        working_dir,
-                        CleanPar2Verification {
-                            verification,
-                            placement_plan,
-                            incomplete_message:
-                                "clean live PAR2 verification but job still has incomplete data files after reconciliation",
-                            retry_message:
-                                "cleared failed extractions after live verify — retrying",
-                        },
-                        has_crc_failures,
-                        archive_extraction_applicable,
-                    )
-                    .await;
-                    return;
-                }
+            if par2_set.is_some() {
+                // What the dual-CRC grid managed to claim off the download for
+                // this job, recorded once at the verification gate — the point
+                // where its work is finished and every arm below is about to
+                // read it. `blocks_claimed` is the read the download path
+                // already paid for; `articles_without_usable_segments` is the
+                // shortfall, articles whose yEnc segmentation could not be
+                // rebased onto the block grid and which therefore claim
+                // nothing.
+                debug!(
+                    job_id = job_id.0,
+                    blocks_claimed_in_stream = self.block_crcs.blocks_derived(),
+                    articles_without_usable_segments = self.block_crcs.rebased_articles(),
+                    "in-stream block verification diagnostics"
+                );
             }
 
             if quick_par2_verification_allowed && let Some(par2_set) = par2_set.as_ref() {
                 let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
-                self.settle_live_par2_job(job_id).await;
-                // What this records is "live evidence stood in for the full
-                // pass", so it takes the same evidence the full short-circuit
-                // above demands — complete bindings alone say nothing about
-                // the length the file actually has on disk. When that check
-                // fails, the quick pass still succeeds on its own persisted
-                // checksums; the credit simply does not belong to live.
-                let live_short_circuit =
-                    no_suspect_volumes && self.live_par2_clean_verification(job_id).await.is_some();
                 Self::trip_par2_verification_started_failpoint();
                 match self
                     .quick_verify_par2_with_placement(
@@ -3525,9 +3461,6 @@ impl Pipeline {
                     .await
                 {
                     Ok(Some((verification, placement_plan))) => {
-                        if live_short_circuit {
-                            self.live_par2.note_full_verify_skip();
-                        }
                         info!(
                             job_id = job_id.0,
                             "quick PAR2 verification passed for clean exhausted job"
