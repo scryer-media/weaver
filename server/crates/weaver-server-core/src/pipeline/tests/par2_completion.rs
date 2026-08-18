@@ -1297,6 +1297,59 @@ async fn post_repair_refresh_resolves_renamed_results_against_current_names_only
 }
 
 #[tokio::test]
+async fn unparseable_par2_index_is_skipped_and_the_job_keeps_serving() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30500);
+    let payload_filename = "payload.mkv";
+    let index_filename = "broken.par2";
+    let payload: Vec<u8> = (0..64u32).map(|value| (value % 251) as u8).collect();
+    // Structurally invalid PAR2 bytes: the same warn-and-continue arm that a
+    // packet-scan `ResourceLimitExceeded` from a hostile index now lands in
+    // (par2-rs 0.5 proves limit errors at the crate level; this pins what
+    // weaver does with ANY parse-side error from that seam).
+    let garbage = vec![0x5Au8; 4096];
+    let spec = standalone_job_spec(
+        "Unparseable PAR2 Keeps Serving",
+        &[
+            (payload_filename.to_string(), payload.len() as u32),
+            (index_filename.to_string(), garbage.len() as u32),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    write_and_complete_file_like_decode_worker(&mut pipeline, job_id, 1, index_filename, &garbage)
+        .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    pipeline.try_load_par2_metadata(job_id, file_id).await;
+
+    // The broken index installs nothing and poisons nothing: no recovery set,
+    // and the data file still downloads and completes normally.
+    assert!(pipeline.par2_set(job_id).is_none());
+    write_and_complete_file_like_decode_worker(
+        &mut pipeline,
+        job_id,
+        0,
+        payload_filename,
+        &payload,
+    )
+    .await;
+    // Retirement from the active map is fine — that is a completed job. What
+    // the broken index must never cause is a failure.
+    let drained = drain_job_events(&mut events, job_id);
+    assert!(
+        !drained
+            .iter()
+            .any(|event| matches!(event, PipelineEvent::JobFailed { .. })),
+        "{drained:?}"
+    );
+}
+
+#[tokio::test]
 async fn corrupt_single_sevenz_enters_authoritative_par2_verification() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -4329,6 +4382,7 @@ async fn stage_clean_live_par2_verdict(
     // PAR2 packets, so activation takes them and is synchronous. Production
     // scans them off disk; the test scans the same bytes it just wrote.
     let live_packets: Vec<par2_rs::Packet> = par2_rs::scan_packets(par2_bytes, 0)
+        .expect("test PAR2 bytes stay within the default packet-scan limits")
         .into_iter()
         .map(|(packet, _)| packet)
         .collect();
@@ -4492,6 +4546,7 @@ async fn par2_repair_execution_retires_live_par2_state() {
     // PAR2 packets, so activation takes them and is synchronous. Production
     // scans them off disk; the test scans the same bytes it just wrote.
     let live_packets: Vec<par2_rs::Packet> = par2_rs::scan_packets(&par2_bytes, 0)
+        .expect("test PAR2 bytes stay within the default packet-scan limits")
         .into_iter()
         .map(|(packet, _)| packet)
         .collect();

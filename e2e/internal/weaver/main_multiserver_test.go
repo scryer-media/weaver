@@ -1,6 +1,9 @@
 package weaver
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestExtractFirstMessageIDsReturnsLeadingIDsInNZBOrder(t *testing.T) {
 	input := []byte(`<?xml version="1.0" encoding="UTF-8"?>
@@ -56,5 +59,15 @@ func TestScenarioUsesExclusiveNntpState(t *testing.T) {
 	}
 	if scenarioUsesExclusiveNntpState(&Scenario{}) {
 		t.Fatal("plain scenario should not force exclusive NNTP state")
+	}
+}
+
+func TestArticleSyncCommandsUseDockerArchiveStreaming(t *testing.T) {
+	source, destination := articleSyncCommands("primary", "backup")
+	if want := []string{"docker", "cp", "primary:/data/articles/.", "-"}; !reflect.DeepEqual(source.Args, want) {
+		t.Fatalf("source command = %q, want %q", source.Args, want)
+	}
+	if want := []string{"docker", "cp", "-", "backup:/data/articles"}; !reflect.DeepEqual(destination.Args, want) {
+		t.Fatalf("destination command = %q, want %q", destination.Args, want)
 	}
 }

@@ -1742,8 +1742,21 @@ impl RawS2nConfig {
         check_s2n_status("load CA PEM", unsafe {
             s2n::s2n_config_add_pem_to_trust_store(config.as_ptr(), pem.as_ptr())
         })?;
+        // Pinned OFF, deliberately and permanently: the read loop
+        // (`read_buffered_pull_direct`) already IS the multi-record
+        // optimization — it drains one record per `s2n_recv` into advancing
+        // offsets of the destination until the target fills or s2n is dry,
+        // so every record is copied exactly once and the per-call cost being
+        // amortized is a bare FFI call. s2n's internal multi-record mode
+        // reaches the same call shape by assembling through its own buffered
+        // plaintext first — extra copy work per byte to economize calls that
+        // cost nothing here. It measured worse for exactly that reason. An
+        // env switch used to offer this as a "try it" knob; it was a trap —
+        // the name promises batching wins the loop above already delivers.
+        // Pinned rather than left to the library default so an upstream
+        // default change cannot silently reintroduce the copies.
         check_s2n_status("configure multi-record receive", unsafe {
-            s2n::s2n_config_set_recv_multi_record(config.as_ptr(), multi_record_receive_enabled())
+            s2n::s2n_config_set_recv_multi_record(config.as_ptr(), false)
         })?;
         Ok(config)
     }
@@ -1751,20 +1764,6 @@ impl RawS2nConfig {
     fn as_ptr(&self) -> *mut s2n::s2n_config {
         self.ptr.as_ptr()
     }
-}
-
-/// Multi-record receive decrypts every full record already buffered before
-/// returning, trading larger reads for extra buffered-copy work. Off by
-/// default (single-record reads measured better under the previous allocator
-/// economics); env-gated so the trade can be re-measured without a rebuild.
-#[cfg(not(windows))]
-fn multi_record_receive_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("WEAVER_NNTP_S2N_MULTI_RECORD")
-            .map(|value| matches!(value.trim(), "1" | "true" | "on"))
-            .unwrap_or(false)
-    })
 }
 
 #[cfg(not(windows))]

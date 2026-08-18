@@ -2234,8 +2234,7 @@ func syncArticlesToBackup() error {
 // the host. The previous docker cp -> temporary directory -> docker cp path
 // doubled disk I/O and left both functional datastores contending for it.
 func streamArticlesToBackup(sourceID, backupID string) error {
-	source := exec.Command("docker", "exec", sourceID, "tar", "-C", "/data/articles", "-cf", "-", ".")
-	destination := exec.Command("docker", "exec", "-i", backupID, "tar", "-C", "/data/articles", "-xf", "-")
+	source, destination := articleSyncCommands(sourceID, backupID)
 
 	var sourceStderr, destinationStderr bytes.Buffer
 	source.Stderr = &sourceStderr
@@ -2262,6 +2261,15 @@ func streamArticlesToBackup(sourceID, backupID string) error {
 		return fmt.Errorf("extract backup NNTP articles: %w: %s", err, strings.TrimSpace(destinationStderr.String()))
 	}
 	return nil
+}
+
+// articleSyncCommands streams Docker's archive protocol directly between
+// containers. Unlike `docker exec ... tar`, this does not require tar inside
+// the intentionally minimal e2e-nntp image.
+func articleSyncCommands(sourceID, backupID string) (*exec.Cmd, *exec.Cmd) {
+	source := exec.Command("docker", "cp", sourceID+":/data/articles/.", "-")
+	destination := exec.Command("docker", "cp", "-", backupID+":/data/articles")
+	return source, destination
 }
 
 // --- verify ---

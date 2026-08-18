@@ -275,18 +275,19 @@ RUN arch="${TARGETARCH:-$(uname -m)}" && \
     rustup default %s && \
     echo "$target" > /tmp/weaver-target
 COPY apps/weaver-web/package.json apps/weaver-web/package-lock.json ./apps/weaver-web/
-RUN --mount=type=cache,target=/root/.npm \
+RUN --mount=type=cache,id=weaver-e2e-npm,target=/root/.npm,sharing=locked \
     cd apps/weaver-web && npm ci --legacy-peer-deps
 COPY . .
 # Belt and braces: if rust-toolchain.toml resolves to something other than the
 # channel the harness parsed, rustup installs it here and the musl target is
 # added to whichever toolchain actually ends up active.
 RUN rustup show active-toolchain && rustup target add "$(cat /tmp/weaver-target)"
-RUN --mount=type=cache,target=/root/.npm \
+RUN --mount=type=cache,id=weaver-e2e-npm,target=/root/.npm,sharing=locked \
     cd apps/weaver-web && npm run build
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
+RUN --mount=type=cache,id=weaver-e2e-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=weaver-e2e-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=weaver-e2e-cargo-target,target=/app/target,sharing=locked \
+    CARGO_INCREMENTAL=1 CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
     cargo build --release --locked -p weaver --target "$(cat /tmp/weaver-target)" && \
     cp "target/$(cat /tmp/weaver-target)/release/weaver" /tmp/weaver-portable
 

@@ -184,8 +184,9 @@ func TestWeaverImagePlanDockerfilePublishedShape(t *testing.T) {
 	for _, fragment := range []string{
 		"# syntax=docker/dockerfile:1.7",
 		"COPY apps/weaver-web/package.json apps/weaver-web/package-lock.json",
-		"--mount=type=cache,target=/root/.npm",
-		"--mount=type=cache,target=/app/target",
+		"--mount=type=cache,id=weaver-e2e-npm,target=/root/.npm,sharing=locked",
+		"--mount=type=cache,id=weaver-e2e-cargo-target,target=/app/target,sharing=locked",
+		"CARGO_INCREMENTAL=1 CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16",
 	} {
 		if !strings.Contains(dockerfile, fragment) {
 			t.Fatalf("published dockerfile is missing cache optimization %q:\n%s", fragment, dockerfile)

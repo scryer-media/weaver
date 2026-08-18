@@ -109,7 +109,7 @@ windows-sys = { version = "0.61", default-features = false }
 #
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
-par2-rs = { version = "0.4", default-features = false, features = ["native-crypto"] }
+par2-rs = { version = "0.5", default-features = false, features = ["native-crypto"] }
 unrar-rs = { version = "0.5", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.12.0", default-features = false }
 
