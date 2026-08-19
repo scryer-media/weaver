@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{error, info, warn};
 
-use crate::{http, shutdown, wiring};
+use crate::{http, restart, shutdown, wiring};
 use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::{Config, SharedConfig};
@@ -294,6 +294,10 @@ pub(crate) async fn run(
         maintenance_complete_dir,
     );
 
+    // The UI's restart button reaches the serve loop through this handle; the
+    // loop owns when the process is actually safe to replace.
+    let restart_controller = weaver_server_core::runtime::restart::RestartController::new();
+
     // Run HTTP server on the listener bound above.
     let server_runtime = http::ServerRuntime {
         schema,
@@ -311,6 +315,7 @@ pub(crate) async fn run(
         base_url,
         security,
         disk_space: disk_space_collector,
+        restart: restart_controller.clone(),
     };
     let mut server_task = tokio::spawn(http::run_server(server_runtime, listener));
 
@@ -358,28 +363,12 @@ pub(crate) async fn run(
         })
     };
 
-    tokio::select! {
-        _ = shutdown::wait_for_shutdown() => {
-            info!("received shutdown signal, shutting down");
-            handle.shutdown().await.ok();
-            if let Err(join_error) = pipeline_task.await {
-                error!(error = %join_error, "pipeline task failed during shutdown");
-            }
-            finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
-            server_task.abort();
-            rss_task.abort();
-            watch_folder.stop().await;
-            metrics_history_task.abort();
-            maintenance_task.abort();
-            semantic_promotion_task.abort();
-            server_transfer_maintenance.abort();
-            wiring::flush_server_transfer_usage(
-                Arc::clone(&server_transfer_policy),
-                "serve shutdown",
-            )
-            .await;
-            Ok(())
-        }
+    // Both ways out of a healthy process run the same teardown; only what
+    // happens after it differs, so the arms settle an intent instead of each
+    // spelling the sequence out.
+    let stop = tokio::select! {
+        _ = shutdown::wait_for_shutdown() => ServeStop::Signal,
+        _ = restart_controller.requested() => ServeStop::Restart,
         result = &mut pipeline_task => {
             let error = shutdown::pipeline_exit_error(result);
             finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
@@ -395,7 +384,7 @@ pub(crate) async fn run(
                 "serve pipeline exit",
             )
             .await;
-            Err(error.into())
+            return Err(error.into());
         }
         result = &mut server_task => {
             handle.shutdown().await.ok();
@@ -414,11 +403,57 @@ pub(crate) async fn run(
                 "serve HTTP exit",
             )
             .await;
-            match result {
+            return match result {
                 Ok(Ok(())) => Err("HTTP server exited unexpectedly".into()),
                 Ok(Err(error)) => Err(error),
                 Err(join_error) => Err(format!("HTTP server task failed: {join_error}").into()),
-            }
+            };
+        }
+    };
+
+    match stop {
+        ServeStop::Signal => info!("received shutdown signal, shutting down"),
+        ServeStop::Restart => info!("restart requested, shutting down before starting again"),
+    }
+    handle.shutdown().await.ok();
+    if let Err(join_error) = pipeline_task.await {
+        error!(error = %join_error, "pipeline task failed during shutdown");
+    }
+    finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
+    server_task.abort();
+    // Awaited, not just aborted: a restart rebinds this port immediately, and
+    // on Windows a listening socket that outlives this process by a moment is
+    // enough to fail that bind.
+    let _ = server_task.await;
+    rss_task.abort();
+    watch_folder.stop().await;
+    metrics_history_task.abort();
+    maintenance_task.abort();
+    semantic_promotion_task.abort();
+    server_transfer_maintenance.abort();
+    wiring::flush_server_transfer_usage(Arc::clone(&server_transfer_policy), stop.flush_context())
+        .await;
+
+    match stop {
+        ServeStop::Signal => Ok(()),
+        // Unix re-execs in place, so on success this never returns.
+        ServeStop::Restart => restart::restart_now().map_err(Into::into),
+    }
+}
+
+/// Why the serve loop is leaving a healthy process: a signal, or a restart the
+/// operator asked for. The teardown is identical; only the last step differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeStop {
+    Signal,
+    Restart,
+}
+
+impl ServeStop {
+    fn flush_context(self) -> &'static str {
+        match self {
+            Self::Signal => "serve shutdown",
+            Self::Restart => "serve restart",
         }
     }
 }

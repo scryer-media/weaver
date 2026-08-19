@@ -252,6 +252,10 @@ impl AuthMutation {
         .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
         security.set_trusted_cidrs(parsed_networks);
+        // The stored mode is now a decision, not a default: an operator who
+        // picks no-login here must not have the first-run wizard served back to
+        // every browser outside the machine on the next page load.
+        security.mark_security_configured();
         info!(
             mode = parsed_mode.as_setting_value(),
             networks = ?networks,

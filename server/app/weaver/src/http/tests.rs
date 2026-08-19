@@ -3644,6 +3644,219 @@ async fn auth_status_handler_uses_cached_auth_state() {
     assert_eq!(payload["authenticated"], true);
 }
 
+/// `/api/auth/status` is unauthenticated, so it describes the deployment only
+/// to a browser that is about to run the first-run wizard.
+fn auth_status_test_router(
+    db: Database,
+    auth_cache: LoginAuthCache,
+    security: weaver_server_core::security::RuntimeSecurityConfig,
+) -> Router {
+    auth_status_test_router_from_peer(db, auth_cache, security, "127.0.0.1:49152")
+}
+
+fn auth_status_test_router_from_peer(
+    db: Database,
+    auth_cache: LoginAuthCache,
+    security: weaver_server_core::security::RuntimeSecurityConfig,
+    peer: &str,
+) -> Router {
+    let peer_addr: SocketAddr = peer.parse().unwrap();
+    Router::new()
+        .route("/api/auth/status", get(auth::auth_status_handler))
+        // `MockConnectInfo` is only read by the `ConnectInfo` extractor; the
+        // peer-aware handlers take `Extension<ConnectInfo<_>>`, which is what
+        // `into_make_service_with_connect_info` inserts in production.
+        .layer(Extension(axum::extract::ConnectInfo(peer_addr)))
+        .layer(Extension(db))
+        .layer(Extension(security))
+        .layer(Extension(auth_cache))
+}
+
+async fn auth_status_payload(app: Router) -> serde_json::Value {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/auth/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn auth_status_describes_the_deployment_only_while_setup_is_pending() {
+    let payload = auth_status_payload(auth_status_test_router(
+        Database::open_in_memory().unwrap(),
+        LoginAuthCache::default(),
+        weaver_server_core::security::RuntimeSecurityConfig::default(),
+    ))
+    .await;
+
+    assert_eq!(payload["setupRequired"], true);
+    assert_eq!(payload["setup"]["bindEditable"], true);
+    let deployment = payload["setup"]["deployment"].as_str().unwrap();
+    assert!(
+        ["native", "docker", "container"].contains(&deployment),
+        "{deployment}"
+    );
+
+    // An environment-pinned address is reported as unaskable rather than asked
+    // and then ignored.
+    let security = {
+        let mut security = weaver_server_core::security::RuntimeSecurityConfig::default();
+        security.bind_address_source = weaver_server_core::security::BindAddressSource::Environment;
+        security
+    };
+    let payload = auth_status_payload(auth_status_test_router(
+        Database::open_in_memory().unwrap(),
+        LoginAuthCache::default(),
+        security,
+    ))
+    .await;
+    assert_eq!(payload["setup"]["bindEditable"], false);
+}
+
+#[tokio::test]
+async fn auth_status_omits_the_setup_facts_once_setup_cannot_run() {
+    let db = Database::open_in_memory().unwrap();
+    let auth_cache = LoginAuthCache::default();
+    auth_cache.replace(Some(CachedLoginAuth::new(
+        "admin",
+        hash_password(&test_password()).unwrap(),
+        jwt::generate_jwt_secret(),
+    )));
+    let payload = auth_status_payload(auth_status_test_router(
+        db,
+        auth_cache,
+        weaver_server_core::security::RuntimeSecurityConfig::default(),
+    ))
+    .await;
+
+    assert_eq!(payload["setupRequired"], false);
+    assert!(payload.get("setup").is_none());
+
+    // No credentials, but a peer the operator already trusts: the app renders,
+    // so there is no wizard to inform either.
+    let security = {
+        let security = weaver_server_core::security::RuntimeSecurityConfig::default();
+        security.set_trusted_cidrs(vec!["127.0.0.0/8".parse().unwrap()]);
+        security
+    };
+    let payload = auth_status_payload(auth_status_test_router(
+        Database::open_in_memory().unwrap(),
+        LoginAuthCache::default(),
+        security,
+    ))
+    .await;
+
+    assert_eq!(payload["setupRequired"], false);
+    assert!(payload.get("setup").is_none());
+}
+
+#[tokio::test]
+async fn a_configured_no_login_instance_never_asks_an_outside_browser_to_set_up() {
+    // The Loop-1 pin. A no-login install with a widened bind has no
+    // credentials and trusts nothing but loopback, so every other browser sees
+    // exactly what a fresh install looks like — and used to be handed a wizard
+    // whose endpoint refuses it, on every visit, forever. Setup is offered to
+    // exactly the peers that could complete it: loopback. An outside browser
+    // never gets it, configured or not — the entry page tells it where setup
+    // runs instead.
+    let lan_browser = "192.168.1.20:49152";
+
+    let fresh_loopback = auth_status_payload(auth_status_test_router_from_peer(
+        Database::open_in_memory().unwrap(),
+        LoginAuthCache::default(),
+        weaver_server_core::security::RuntimeSecurityConfig::default(),
+        "127.0.0.1:49152",
+    ))
+    .await;
+    assert_eq!(fresh_loopback["setupRequired"], true);
+    assert!(fresh_loopback.get("setup").is_some());
+
+    let fresh_lan = auth_status_payload(auth_status_test_router_from_peer(
+        Database::open_in_memory().unwrap(),
+        LoginAuthCache::default(),
+        weaver_server_core::security::RuntimeSecurityConfig::default(),
+        lan_browser,
+    ))
+    .await;
+    assert_eq!(
+        fresh_lan["setupRequired"], false,
+        "a peer the wizard endpoint would refuse must not be told to run it"
+    );
+    assert!(fresh_lan.get("setup").is_none());
+
+    let configured = {
+        let security = weaver_server_core::security::RuntimeSecurityConfig::default();
+        security.apply_stored_trust(Some("no_login"), None);
+        security
+    };
+    let payload = auth_status_payload(auth_status_test_router_from_peer(
+        Database::open_in_memory().unwrap(),
+        LoginAuthCache::default(),
+        configured,
+        lan_browser,
+    ))
+    .await;
+
+    assert_eq!(payload["setupRequired"], false);
+    assert_eq!(payload["authenticated"], false);
+    // And the deployment facts stay unspoken: this endpoint is
+    // unauthenticated, and there is no wizard left to inform.
+    assert!(payload.get("setup").is_none());
+}
+
+#[tokio::test]
+async fn a_credential_reset_reopens_setup_for_the_machines_own_browser() {
+    // WEAVER_RESET_LOGIN clears credentials but leaves the stored access mode:
+    // configured, credential-less, trusting nothing. The machine's own browser
+    // is the one thing that can repair that from the UI, so the configured
+    // state must not suppress setup for it.
+    let security = weaver_server_core::security::RuntimeSecurityConfig::default();
+    security.apply_stored_trust(Some("login_required"), None);
+    assert!(security.security_configured());
+
+    let payload = auth_status_payload(auth_status_test_router_from_peer(
+        Database::open_in_memory().unwrap(),
+        LoginAuthCache::default(),
+        security,
+        "127.0.0.1:49152",
+    ))
+    .await;
+
+    assert_eq!(payload["setupRequired"], true);
+    assert!(payload.get("setup").is_some());
+}
+
+#[tokio::test]
+async fn an_env_pinned_deployment_never_asks_an_outside_browser_to_set_up() {
+    // Loop 2's other half: `WEAVER_TRUSTED_CIDRS` declares the policy in the
+    // deployment, so a browser outside those networks has nothing to complete.
+    let security = {
+        let mut security = weaver_server_core::security::RuntimeSecurityConfig::default();
+        security.trust_env_pinned = true;
+        security.set_trusted_cidrs(vec!["10.0.0.0/8".parse().unwrap()]);
+        security.apply_stored_trust(None, None);
+        security
+    };
+    let payload = auth_status_payload(auth_status_test_router_from_peer(
+        Database::open_in_memory().unwrap(),
+        LoginAuthCache::default(),
+        security,
+        "192.168.1.20:49152",
+    ))
+    .await;
+
+    assert_eq!(payload["setupRequired"], false);
+    assert!(payload.get("setup").is_none());
+}
+
 #[tokio::test]
 async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
     let db = Database::open_in_memory().unwrap();
@@ -5897,6 +6110,9 @@ mod setup_handler_tests {
             .layer(Extension(db))
             .layer(Extension(security))
             .layer(Extension(auth_cache))
+            .layer(Extension(SessionToken(Arc::new(
+                "browser-session-token".to_string(),
+            ))))
     }
 
     fn peer(value: &str) -> SocketAddr {
@@ -6147,6 +6363,30 @@ mod setup_handler_tests {
     }
 
     #[tokio::test]
+    async fn finishing_setup_marks_the_install_configured_in_every_clone() {
+        // Without this the wizard is its own trap: a no-login install stores
+        // no credentials and trusts only loopback, so from the router clone
+        // serving the LAN browser the instance still looks fresh and the
+        // wizard comes back on the next page load — with an endpoint that
+        // refuses that browser every time.
+        let db = Database::open_in_memory().unwrap();
+        let security = RuntimeSecurityConfig::default();
+        let already_cloned = security.clone();
+        assert!(!already_cloned.security_configured());
+
+        let app = setup_test_router(
+            db.clone(),
+            LoginAuthCache::default(),
+            security,
+            loopback_peer(),
+        );
+        let outcome = post_setup(app, serde_json::json!({ "mode": "no_login" })).await;
+
+        assert_eq!(outcome.status, StatusCode::OK);
+        assert!(already_cloned.security_configured());
+    }
+
+    #[tokio::test]
     async fn the_bind_address_is_validated_before_it_is_stored() {
         let db = Database::open_in_memory().unwrap();
         let app = setup_test_router(
@@ -6246,5 +6486,256 @@ mod setup_handler_tests {
         // All-or-nothing: one bad entry must not admit a partial trust list.
         assert_eq!(outcome.status, StatusCode::BAD_REQUEST);
         assert_nothing_written(&db);
+    }
+
+    #[tokio::test]
+    async fn an_env_pinned_trust_list_is_never_overridden_by_the_wizard() {
+        // WEAVER_TRUSTED_CIDRS pins the browser-access policy exactly as the
+        // bind variable pins the address: the wizard may still create the
+        // credentials — the half the environment did not answer — but its
+        // policy answer is neither stored nor applied live, and no-login
+        // (which would be a total no-op) is refused outright.
+        let pinned = || {
+            let mut security = RuntimeSecurityConfig::default();
+            security.trust_env_pinned = true;
+            security.set_trusted_cidrs(vec!["10.0.0.0/8".parse().unwrap()]);
+            security
+        };
+
+        let db = Database::open_in_memory().unwrap();
+        let security = pinned();
+        let live_clone = security.clone();
+        let app = setup_test_router(
+            db.clone(),
+            LoginAuthCache::default(),
+            security,
+            loopback_peer(),
+        );
+        let outcome = post_setup(
+            app,
+            serde_json::json!({
+                "mode": "login_except_local",
+                "username": "admin",
+                "password": test_password(),
+                "trustedNetworks": ["192.168.0.0/16"],
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.status, StatusCode::OK);
+        assert_eq!(outcome.payload["accessPolicyIgnoredBecauseEnvPinned"], true);
+        // Credentials landed; the policy did not.
+        assert!(db.get_auth_credentials().unwrap().is_some());
+        assert_eq!(setting(&db, SETTING_ACCESS_MODE), None);
+        assert_eq!(setting(&db, SETTING_TRUSTED_NETWORKS), None);
+        // The live list is still the environment's, not the wizard's.
+        assert!(live_clone.is_trusted_peer(Some(peer("10.1.2.3:49152"))));
+        assert!(!live_clone.is_trusted_peer(Some(peer("192.168.1.20:49152"))));
+
+        let db = Database::open_in_memory().unwrap();
+        let app = setup_test_router(
+            db.clone(),
+            LoginAuthCache::default(),
+            pinned(),
+            loopback_peer(),
+        );
+        let outcome = post_setup(app, serde_json::json!({ "mode": "no_login" })).await;
+        assert_eq!(outcome.status, StatusCode::BAD_REQUEST);
+        assert_nothing_written(&db);
+    }
+
+    #[tokio::test]
+    async fn a_no_login_setup_hands_its_own_browser_the_trusted_session_cookie() {
+        let db = Database::open_in_memory().unwrap();
+        let app = setup_test_router(
+            db.clone(),
+            LoginAuthCache::default(),
+            RuntimeSecurityConfig::default(),
+            loopback_peer(),
+        );
+
+        let outcome = post_setup(app, serde_json::json!({ "mode": "no_login" })).await;
+
+        assert_eq!(outcome.status, StatusCode::OK);
+        // This page does not reload when the operator restarts from it, so the
+        // cookie the next page load would set has to arrive here.
+        assert!(
+            outcome
+                .cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("weaver_session=")),
+            "{:?}",
+            outcome.cookies
+        );
+        assert!(
+            !outcome
+                .cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("weaver_jwt=")),
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_reports_whether_the_wizard_may_offer_a_restart() {
+        let db = Database::open_in_memory().unwrap();
+        let app = setup_test_router(
+            db.clone(),
+            LoginAuthCache::default(),
+            RuntimeSecurityConfig::default(),
+            loopback_peer(),
+        );
+
+        let outcome = post_setup(
+            app,
+            serde_json::json!({ "mode": "no_login", "bindAddress": "0.0.0.0" }),
+        )
+        .await;
+
+        assert_eq!(outcome.status, StatusCode::OK);
+        assert_eq!(outcome.payload["restartRequiredForBind"], true);
+        // The rule is the deployment's, so the answer depends on where the
+        // test runs; the contract is that the wizard is told either way.
+        assert!(outcome.payload["restartSupported"].is_boolean());
+        if outcome.payload["restartSupported"] == false {
+            assert!(outcome.payload["restartUnsupportedReason"].is_string());
+        }
+    }
+}
+
+/// `POST /api/system/restart` takes the server away from everyone using it, so
+/// what is fixed here is who may ask and where it is refused outright.
+mod restart_handler_tests {
+    use super::*;
+    use weaver_server_core::runtime::restart::{RestartCapability, RestartController};
+
+    /// Long enough to cover the handler's response grace, so "nothing was
+    /// requested" is a settled fact rather than a race.
+    const NOT_REQUESTED_WINDOW: std::time::Duration = std::time::Duration::from_millis(750);
+
+    fn restart_test_router(controller: RestartController, api_key_cache: ApiKeyCache) -> Router {
+        let db = Database::open_in_memory().unwrap();
+        let auth_cache = LoginAuthCache::default();
+        let session_token = SessionToken(Arc::new("browser-session-token".to_string()));
+        let security = weaver_server_core::security::RuntimeSecurityConfig::default();
+        security.set_trusted_cidrs(vec!["127.0.0.0/8".parse().unwrap()]);
+        let request_auth = RequestAuthContext {
+            db: db.clone(),
+            auth_cache: auth_cache.clone(),
+            api_key_cache: api_key_cache.clone(),
+            session_token: session_token.clone(),
+            security: Arc::new(security.clone()),
+        };
+        let peer_addr: SocketAddr = "127.0.0.1:49152".parse().unwrap();
+
+        Router::new()
+            .route("/api/system/restart", post(system::restart_handler))
+            // The peer the trusted-browser rule is judged on, in the shape
+            // `into_make_service_with_connect_info` produces.
+            .layer(Extension(axum::extract::ConnectInfo(peer_addr)))
+            .layer(Extension(controller))
+            .layer(Extension(request_auth))
+            .layer(Extension(db))
+            .layer(Extension(auth_cache))
+            .layer(Extension(api_key_cache))
+            .layer(Extension(security))
+            .layer(Extension(session_token))
+    }
+
+    async fn post_restart(app: Router, header: (&str, &str)) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/restart")
+                    .header(header.0, header.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_admin_key_and_a_trusted_browser_may_restart() {
+        let controller = RestartController::with_capability_source(RestartCapability::supported);
+        let app = restart_test_router(controller.clone(), api_key_cache("admin-key", "admin"));
+
+        let (status, payload) = post_restart(app.clone(), ("x-api-key", "admin-key")).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["ok"], true);
+
+        // The response has to reach the browser before the process goes away,
+        // so the request is made after a short grace period.
+        tokio::time::timeout(std::time::Duration::from_secs(5), controller.requested())
+            .await
+            .expect("an accepted restart reaches the serve loop");
+
+        let (status, _) = post_restart(
+            app,
+            (
+                header::COOKIE.as_str(),
+                "weaver_session=browser-session-token",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn read_and_control_keys_and_anonymous_callers_may_not() {
+        let controller = RestartController::with_capability_source(RestartCapability::supported);
+
+        for (raw_key, scope, expected) in [
+            ("read-key", "read", StatusCode::FORBIDDEN),
+            ("control-key", "control", StatusCode::FORBIDDEN),
+        ] {
+            let app = restart_test_router(controller.clone(), api_key_cache(raw_key, scope));
+            let (status, _) = post_restart(app, ("x-api-key", raw_key)).await;
+            assert_eq!(status, expected, "{scope}");
+        }
+
+        let app = restart_test_router(controller.clone(), ApiKeyCache::default());
+        let (status, _) = post_restart(app, ("x-api-key", "unknown-key")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        assert!(
+            tokio::time::timeout(NOT_REQUESTED_WINDOW, controller.requested())
+                .await
+                .is_err(),
+            "a refused caller must not reach the serve loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deployment_that_must_not_exit_is_refused_before_anything_happens() {
+        let controller = RestartController::with_capability_source(|| {
+            RestartCapability::unsupported(
+                "Weaver is running in a Docker container, where the container runtime decides \
+                 restarts. Restart the container instead.",
+            )
+        });
+        let app = restart_test_router(controller.clone(), api_key_cache("admin-key", "admin"));
+
+        let (status, payload) = post_restart(app, ("x-api-key", "admin-key")).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            payload["error"]
+                .as_str()
+                .expect("the refusal explains itself")
+                .contains("container")
+        );
+        assert!(
+            tokio::time::timeout(NOT_REQUESTED_WINDOW, controller.requested())
+                .await
+                .is_err(),
+            "a container must never be asked to exit"
+        );
     }
 }

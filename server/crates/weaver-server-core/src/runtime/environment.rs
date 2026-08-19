@@ -76,6 +76,10 @@ fn detect_deployment(
     {
         Some("docker") => return DeploymentEnvironment::Docker,
         Some("container") => return DeploymentEnvironment::Container,
+        // The heuristics below read cgroup strings; "native" is the operator's
+        // override when they misfire, because everything a container may not
+        // do (self-restart, the wizard's bind question) hangs off this answer.
+        Some("native") => return DeploymentEnvironment::Native,
         _ => {}
     }
     if docker_env_present {
@@ -120,6 +124,12 @@ mod tests {
         assert_eq!(
             detect_deployment(Some("container"), false, None),
             DeploymentEnvironment::Container
+        );
+        // The escape hatch for misfiring heuristics: "native" overrides even
+        // hard container evidence.
+        assert_eq!(
+            detect_deployment(Some("native"), true, Some("0::/docker/abc")),
+            DeploymentEnvironment::Native
         );
     }
 

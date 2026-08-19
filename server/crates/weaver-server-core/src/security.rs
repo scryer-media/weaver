@@ -1,6 +1,7 @@
 use std::env;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use http::uri::Authority;
@@ -327,6 +328,16 @@ pub struct RuntimeSecurityConfig {
     /// wizard that picks "no login" must be able to admit the very next
     /// request, not the next restart.
     trusted_cidrs: Arc<RwLock<Vec<IpNet>>>,
+    /// True once the operator's browser-access policy is settled, shared across
+    /// clones for the same reason the trust list is: the answer decides whether
+    /// a credential-less visitor is shown the first-run wizard, and a wizard
+    /// that just finished must stop being offered on the very next request.
+    ///
+    /// It is deliberately NOT "has trust" or "has credentials": a configured
+    /// no-login instance has neither from an outside browser's point of view,
+    /// and that is exactly the install that would otherwise be handed an
+    /// uncompletable wizard forever.
+    security_configured: Arc<AtomicBool>,
     /// True when `WEAVER_TRUSTED_CIDRS` supplied the list, which pins it: the
     /// stored access mode is ignored and the UI shows the policy read-only.
     pub trust_env_pinned: bool,
@@ -374,6 +385,10 @@ impl RuntimeSecurityConfig {
             rss_allow_private_network: parse_bool_env(ENV_RSS_ALLOW_PRIVATE_NETWORK, false)?,
             strict_security,
             trusted_cidrs: Arc::new(RwLock::new(trusted_cidrs)),
+            // An env-pinned deployment has already declared its policy, so it
+            // is configured before the database is even open. Everything else
+            // waits for `apply_stored_trust` to read the stored mode.
+            security_configured: Arc::new(AtomicBool::new(trust_env_pinned)),
             trust_env_pinned,
             bind_fallback: None,
         })
@@ -428,9 +443,19 @@ impl RuntimeSecurityConfig {
     /// reachability while a bad trust value would cost authentication.
     pub fn apply_stored_trust(&self, mode: Option<&str>, stored_networks: Option<&str>) {
         if self.trust_env_pinned {
+            // An environment-managed deployment declared its policy in the
+            // deployment itself; its outside visitors must never be offered a
+            // wizard they could not submit anyway.
+            self.mark_security_configured();
             return;
         }
         let mode = mode.and_then(AccessMode::parse_setting_value);
+        // An unparsable stored mode leaves the install unconfigured on purpose:
+        // trust already failed closed above, and re-asking is the only way the
+        // operator gets to answer again.
+        if mode.is_some() {
+            self.mark_security_configured();
+        }
         let networks: Vec<IpNet> = match mode {
             None | Some(AccessMode::LoginRequired) => Vec::new(),
             Some(AccessMode::NoLogin) => parse_cidr_list(&LOOPBACK_NETWORKS),
@@ -465,6 +490,25 @@ impl RuntimeSecurityConfig {
             .read()
             .expect("trusted-network lock poisoned")
             .clone()
+    }
+
+    /// Whether the operator's browser-access policy has been settled — by a
+    /// stored access mode, or by an environment that pins the trust list.
+    ///
+    /// The gate that keeps a configured install from re-offering the first-run
+    /// wizard to browsers it does not trust. Without it, "no credentials and
+    /// not a trusted peer" reads identically for a never-configured instance
+    /// and for a configured no-login one, and the second is then stuck: the
+    /// wizard renders on every visit and its endpoint refuses every submit.
+    pub fn security_configured(&self) -> bool {
+        self.security_configured.load(Ordering::Relaxed)
+    }
+
+    /// Record that the browser-access policy is settled, visible to every clone
+    /// of this config immediately. Called by the two writers that can settle it
+    /// at runtime: the first-run wizard and the access-policy mutation.
+    pub fn mark_security_configured(&self) {
+        self.security_configured.store(true, Ordering::Relaxed);
     }
 
     pub fn has_trusted_cidrs(&self) -> bool {
@@ -555,6 +599,7 @@ impl Default for RuntimeSecurityConfig {
             rss_allow_private_network: false,
             strict_security: false,
             trusted_cidrs: Arc::new(RwLock::new(Vec::new())),
+            security_configured: Arc::new(AtomicBool::new(false)),
             trust_env_pinned: false,
             bind_fallback: None,
         }
@@ -932,6 +977,61 @@ mod tests {
     }
 
     #[test]
+    fn a_parsed_stored_mode_marks_the_install_configured() {
+        // The Loop-1 signal: "configured" must be answerable without asking
+        // whether credentials exist or whether THIS peer is trusted, because a
+        // no-login instance answers no to both from every outside browser.
+        let config = RuntimeSecurityConfig::default();
+        assert!(!config.security_configured());
+
+        config.apply_stored_trust(None, None);
+        assert!(
+            !config.security_configured(),
+            "a fresh install with no stored mode is not configured"
+        );
+
+        config.apply_stored_trust(Some("no_login"), None);
+        assert!(config.security_configured());
+
+        // An unparsable mode stays unconfigured, so the operator gets to
+        // answer again instead of being locked out of the question.
+        let config = RuntimeSecurityConfig::default();
+        config.apply_stored_trust(Some("everyone"), None);
+        assert!(!config.security_configured());
+        assert!(config.trusted_cidrs().is_empty());
+    }
+
+    #[test]
+    fn env_pinned_trust_counts_as_configured() {
+        // `apply_stored_trust` early-returns for an env pin, and that path must
+        // still settle the question: an environment-managed deployment declared
+        // its policy in the deployment, so its visitors must never be offered a
+        // wizard the endpoint would refuse.
+        let config = RuntimeSecurityConfig {
+            trust_env_pinned: true,
+            ..RuntimeSecurityConfig::default()
+        };
+        assert!(!config.security_configured(), "premise: not yet settled");
+
+        config.apply_stored_trust(None, None);
+
+        assert!(config.security_configured());
+    }
+
+    #[test]
+    fn configured_state_is_live_across_clones() {
+        // Same requirement as the trust list: the wizard writes through one
+        // clone and the next request arrives through another.
+        let config = RuntimeSecurityConfig::default();
+        let clone = config.clone();
+        assert!(!clone.security_configured());
+
+        config.mark_security_configured();
+
+        assert!(clone.security_configured());
+    }
+
+    #[test]
     fn trust_changes_are_live_across_clones() {
         // The wizard's whole mechanism: a policy write in one clone must admit
         // the very next request arriving through another clone.
@@ -1021,6 +1121,7 @@ mod tests {
         );
         assert!(!config.rss_allow_private_network);
         assert!(!config.strict_security);
+        assert!(!config.security_configured());
     }
 
     #[test]
@@ -1170,6 +1271,9 @@ mod tests {
 
         let config = RuntimeSecurityConfig::from_env().unwrap();
         assert_eq!(config.trusted_cidrs().len(), 3);
+        // An env pin is a declared policy from the first instant, before the
+        // database is even open.
+        assert!(config.trust_env_pinned && config.security_configured());
         assert!(config.is_trusted_peer(Some("10.42.0.1:1234".parse().unwrap())));
         assert!(config.is_trusted_peer(Some("[2001:db8::42]:1234".parse().unwrap())));
         assert!(config.is_trusted_peer(Some("[::ffff:192.168.3.4]:1234".parse().unwrap())));

@@ -1,5 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { SecurityUpgradeWizard, SetupWizardPage } from "@/pages/SetupWizardPage";
+import {
+  SecurityUpgradeWizard,
+  SetupWizardPage,
+  type SetupEnvironment,
+} from "@/pages/SetupWizardPage";
 import { Provider, useQuery } from "urql";
 import { RouterProvider } from "react-router/dom";
 import { ThemeProvider } from "next-themes";
@@ -76,10 +80,7 @@ function AppProviders() {
 interface SecuritySetupState {
   adminLoginStatus: { enabled: boolean };
   accessPolicy: {
-    mode: string;
-    trustedNetworks: string[];
     editable: boolean;
-    envPinned: boolean;
     configured: boolean;
     strictSecurity: boolean;
   };
@@ -88,6 +89,7 @@ interface SecuritySetupState {
     storedAddress: string | null;
     editable: boolean;
   };
+  serverRestart: { supported: boolean; reason: string | null; deployment: string };
 }
 
 /// Offer the security wizard once to an install that predates these settings.
@@ -138,6 +140,11 @@ function SecurityUpgradeGate({ children }: { children: React.ReactNode }) {
           strictSecurity: data.accessPolicy.strictSecurity,
           bindEditable: data.httpBindAddress.editable,
           bindEffective: data.httpBindAddress.storedAddress ?? data.httpBindAddress.address,
+          restartSupported: Boolean(data.serverRestart?.supported),
+          restartUnsupportedReason: data.serverRestart?.reason ?? null,
+          // The GraphQL enum arrives upper-cased; the wizard compares against
+          // the same lower-case spellings the REST status surface uses.
+          deployment: (data.serverRestart?.deployment ?? "").toLowerCase(),
         }}
         onDone={() => setDecision("app")}
       />
@@ -152,15 +159,20 @@ function SecurityUpgradeGate({ children }: { children: React.ReactNode }) {
 /// can usefully see.
 function SetupGate({ children }: { children: React.ReactNode }) {
   const [setupRequired, setSetupRequired] = useState<boolean | null>(null);
+  // Only sent to a browser that is about to run the wizard, so it is absent
+  // whenever `setupRequired` is false — and absent entirely on a server that
+  // predates it, which the wizard reads as "ask the bind question normally".
+  const [setupEnvironment, setSetupEnvironment] = useState<SetupEnvironment | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const statusUrl = new URL("api/auth/status", document.baseURI).href;
     fetch(statusUrl, { credentials: "include" })
       .then((response) => (response.ok ? response.json() : { setupRequired: false }))
-      .then((payload: { setupRequired?: boolean }) => {
+      .then((payload: { setupRequired?: boolean; setup?: SetupEnvironment }) => {
         if (!cancelled) {
           setSetupRequired(Boolean(payload.setupRequired));
+          setSetupEnvironment(payload.setup ?? null);
         }
       })
       .catch(() => {
@@ -179,7 +191,7 @@ function SetupGate({ children }: { children: React.ReactNode }) {
     return <div className="min-h-screen bg-background" aria-hidden="true" />;
   }
   if (setupRequired) {
-    return <SetupWizardPage />;
+    return <SetupWizardPage environment={setupEnvironment} />;
   }
   return <>{children}</>;
 }

@@ -3,8 +3,8 @@ use crate::observability::with_timed_config_read;
 use crate::system::metrics_history::{build_metrics_history, tier_for_range};
 use crate::system::types::{
     ConfiguredStorage, DatabaseEngineGql, DecoderTierGql, DeploymentEnvironmentGql, DiskCapacity,
-    MetricsHistoryRangeGql, OperatingSystemGql, SystemComputeInfo, SystemInfo, SystemMemoryInfo,
-    SystemStorageProfile,
+    MetricsHistoryRangeGql, OperatingSystemGql, ServerRestartCapability, SystemComputeInfo,
+    SystemInfo, SystemMemoryInfo, SystemStorageProfile,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -92,6 +92,32 @@ impl SystemQuery {
             },
             configured_storage,
         })
+    }
+    /// Whether Weaver can restart itself here, and the deployment that decided
+    /// it — everything the security wizard needs in one field.
+    ///
+    /// Deliberately its own small field rather than part of `systemInfo`,
+    /// whose resolver probes storage: the wizard asks this on every app load,
+    /// so the answer has to stay cheap.
+    #[graphql(guard = "AdminGuard")]
+    async fn server_restart(&self) -> ServerRestartCapability {
+        use weaver_server_core::runtime::restart::{
+            resolvable_executable, restart_capability, ui_restart_enabled,
+        };
+
+        // One detection answers both the restart rule and the deployment the
+        // wizard's bind question branches on.
+        let environment = weaver_server_core::runtime::environment::detect_runtime_environment();
+        let capability = restart_capability(
+            &environment,
+            resolvable_executable().as_deref(),
+            ui_restart_enabled(),
+        );
+        ServerRestartCapability {
+            supported: capability.supported,
+            reason: capability.reason,
+            deployment: deployment_environment_gql(environment.deployment),
+        }
     }
     /// System status facade for integrations.
     #[graphql(guard = "ReadGuard")]

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation } from "urql";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,7 +14,168 @@ interface SetupResponse {
   ok?: boolean;
   restartRequiredForBind?: boolean;
   bindIgnoredBecauseEnvPinned?: boolean;
+  restartSupported?: boolean;
+  restartUnsupportedReason?: string | null;
   error?: string;
+}
+
+/// How this deployment answers the bind question, from `/api/auth/status`.
+/// Absent on a server that predates it, which reads as "ask normally".
+export interface SetupEnvironment {
+  bindEditable: boolean;
+  deployment: string;
+}
+
+/// True for a deployment whose network exposure its runtime decides, not
+/// Weaver: the bind address is namespace-local and published ports are what
+/// the operator actually controls.
+function isContainerDeployment(deployment: string | undefined): boolean {
+  return deployment === "docker" || deployment === "container";
+}
+
+const CONTAINER_BIND_NOTE =
+  "Network access is decided by the ports your container publishes.";
+const ENV_PINNED_BIND_NOTE =
+  "This deployment pins Weaver's network address with WEAVER_HTTP_BIND_ADDRESS.";
+
+// The accepted response is followed by a short grace period on the server, and
+// the listener only stops once teardown finishes, so an immediate probe would
+// answer from the process that is on its way out.
+const RESTART_PROBE_DELAY_MS = 3_000;
+const RESTART_PROBE_INTERVAL_MS = 1_500;
+const RESTART_PROBE_TIMEOUT_MS = 45_000;
+
+function restartUrl(): string {
+  return new URL("api/system/restart", document.baseURI).href;
+}
+
+function statusUrl(): string {
+  return new URL("api/auth/status", document.baseURI).href;
+}
+
+/// The two buttons on a restart-required screen.
+///
+/// The restart button only exists where restarting is genuinely safe — a
+/// container that exits without a restart policy leaves the operator with
+/// nothing — so an unsupported deployment gets exactly the screen it had
+/// before: the manual instruction and a way back into the app.
+function RestartNoteActions({
+  restartSupported,
+  restartUnsupportedReason,
+  onContinue,
+}: {
+  restartSupported: boolean;
+  /** The server's refusal, shown so the manual instruction says which kind of
+   *  restart this deployment actually needs. */
+  restartUnsupportedReason?: string | null;
+  onContinue: () => void;
+}) {
+  const [phase, setPhase] = useState<"idle" | "restarting" | "unreachable">("idle");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (phase !== "restarting") {
+      return;
+    }
+    let cancelled = false;
+    let timer: number | undefined;
+    const deadline = Date.now() + RESTART_PROBE_TIMEOUT_MS;
+
+    const probe = async () => {
+      if (cancelled) {
+        return;
+      }
+      try {
+        const response = await fetch(statusUrl(), {
+          credentials: "include",
+          cache: "no-store",
+        });
+        if (!cancelled && response.ok) {
+          window.location.reload();
+          return;
+        }
+      } catch {
+        // Expected for as long as Weaver is down.
+      }
+      if (cancelled) {
+        return;
+      }
+      if (Date.now() >= deadline) {
+        setPhase("unreachable");
+        return;
+      }
+      timer = window.setTimeout(probe, RESTART_PROBE_INTERVAL_MS);
+    };
+
+    timer = window.setTimeout(probe, RESTART_PROBE_DELAY_MS);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [phase]);
+
+  const restart = async () => {
+    setError(null);
+    try {
+      const response = await fetch(restartUrl(), {
+        method: "POST",
+        credentials: "include",
+      });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => ({}))) as { error?: string };
+        setError(payload.error ?? `restart failed (${response.status})`);
+        return;
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      return;
+    }
+    setPhase("restarting");
+  };
+
+  if (!restartSupported) {
+    return (
+      <div className="space-y-3">
+        {restartUnsupportedReason ? (
+          <p className="text-sm text-muted-foreground">{restartUnsupportedReason}</p>
+        ) : null}
+        <Button onClick={onContinue}>Continue on this machine</Button>
+      </div>
+    );
+  }
+
+  if (phase === "restarting") {
+    return (
+      <p className="text-sm text-muted-foreground">
+        Restarting Weaver. This page reloads by itself as soon as Weaver answers
+        again.
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {phase === "unreachable" ? (
+        <p className="text-sm text-muted-foreground">
+          Weaver has not answered this page for 45 seconds. If the address
+          change moved Weaver off the address this browser is using, this page
+          cannot reach it — open Weaver at its new address. If it is not back at
+          all, start it the way you normally start it.
+        </p>
+      ) : null}
+      {error ? <p className="text-sm text-destructive">{error}</p> : null}
+      {phase === "idle" ? (
+        <Button variant="destructive" onClick={restart} className="w-full">
+          Restart Weaver
+        </Button>
+      ) : null}
+      <Button onClick={onContinue} className="w-full">
+        Continue on this machine
+      </Button>
+    </div>
+  );
 }
 
 // Deliberately neutral: three equal choices, none preselected. The wizard's
@@ -94,7 +255,7 @@ function ModeCard({
   );
 }
 
-export function SetupWizardPage() {
+export function SetupWizardPage({ environment }: { environment?: SetupEnvironment | null }) {
   const [mode, setMode] = useState<AccessMode | null>(null);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -103,6 +264,16 @@ export function SetupWizardPage() {
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [restartNote, setRestartNote] = useState(false);
+  const [restartSupported, setRestartSupported] = useState(false);
+  const [restartUnsupportedReason, setRestartUnsupportedReason] = useState<string | null>(null);
+
+  // The bind question is only a question where this deployment leaves the
+  // answer to Weaver. A container publishes ports, and an environment-pinned
+  // address makes any answer here inert — asking either would collect a
+  // decision the server then ignores.
+  const containerized = isContainerDeployment(environment?.deployment);
+  const bindPinned = environment ? !environment.bindEditable : false;
+  const bindQuestionApplies = !containerized && !bindPinned;
 
   const needsCredentials = mode === "login_required" || mode === "login_except_local";
   const credentialsValid =
@@ -122,7 +293,7 @@ export function SetupWizardPage() {
         body.username = username.trim();
         body.password = password;
       }
-      if (bindWide) {
+      if (bindWide && bindQuestionApplies) {
         body.bindAddress = "0.0.0.0";
       }
       const response = await fetch(setupUrl(), {
@@ -138,6 +309,8 @@ export function SetupWizardPage() {
         return;
       }
       if (payload.restartRequiredForBind) {
+        setRestartSupported(Boolean(payload.restartSupported));
+        setRestartUnsupportedReason(payload.restartUnsupportedReason ?? null);
         setRestartNote(true);
         return;
       }
@@ -158,7 +331,11 @@ export function SetupWizardPage() {
             machine until it restarts — restart it now, then open it at its
             network address.
           </p>
-          <Button onClick={() => window.location.reload()}>Continue on this machine</Button>
+          <RestartNoteActions
+            restartSupported={restartSupported}
+            restartUnsupportedReason={restartUnsupportedReason}
+            onContinue={() => window.location.reload()}
+          />
         </div>
       </div>
     );
@@ -224,47 +401,55 @@ export function SetupWizardPage() {
           </div>
         ) : null}
 
-        <fieldset className="space-y-3">
-          <legend className="text-sm font-medium">Where should Weaver answer?</legend>
-          <label className="flex cursor-pointer items-start gap-3">
-            <input
-              type="radio"
-              name="bind"
-              className="mt-1"
-              checked={!bindWide}
-              onChange={() => setBindWide(false)}
-            />
-            <span>
-              <span className="font-medium">This machine only</span>
-              <span className="block text-sm text-muted-foreground">
-                Reachable at localhost. The safe default.
+        {bindQuestionApplies ? (
+          <fieldset className="space-y-3">
+            <legend className="text-sm font-medium">How can I access Weaver?</legend>
+            <label className="flex cursor-pointer items-start gap-3">
+              <input
+                type="radio"
+                name="bind"
+                className="mt-1"
+                checked={!bindWide}
+                onChange={() => setBindWide(false)}
+              />
+              <span>
+                <span className="font-medium">This machine only</span>
+                <span className="block text-sm text-muted-foreground">
+                  Reachable at localhost.
+                </span>
               </span>
-            </span>
-          </label>
-          <label className="flex cursor-pointer items-start gap-3">
-            <input
-              type="radio"
-              name="bind"
-              className="mt-1"
-              checked={bindWide}
-              onChange={() => setBindWide(true)}
-            />
-            <span>
-              <span className="font-medium">My network</span>
-              <span className="block text-sm text-muted-foreground">
-                Other machines on your network can reach Weaver. Takes effect
-                after a restart.
+            </label>
+            <label className="flex cursor-pointer items-start gap-3">
+              <input
+                type="radio"
+                name="bind"
+                className="mt-1"
+                checked={bindWide}
+                onChange={() => setBindWide(true)}
+              />
+              <span>
+                <span className="font-medium">My network</span>
+                <span className="block text-sm text-muted-foreground">
+                  Other machines on your network can reach Weaver. Takes effect
+                  after a restart.
+                </span>
               </span>
-            </span>
-          </label>
-          {bindWide && mode === "no_login" ? (
-            <p className="text-sm text-amber-500">
-              With no login, anyone who can reach this machine's network
-              address gets full control of Weaver. Only choose this on a
-              network where you trust every device.
-            </p>
-          ) : null}
-        </fieldset>
+            </label>
+            {bindWide && mode === "no_login" ? (
+              <p className="text-sm text-amber-500">
+                No login limits browsers to this machine even when Weaver
+                answers network-wide: other devices' browsers are turned away,
+                only API clients with keys get in. If other machines should
+                browse Weaver, choose &quot;Require login, except my local
+                network&quot; instead.
+              </p>
+            ) : null}
+          </fieldset>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            {containerized ? CONTAINER_BIND_NOTE : ENV_PINNED_BIND_NOTE}
+          </p>
+        )}
 
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
 
@@ -282,6 +467,12 @@ export interface SecurityUpgradeState {
   bindEditable: boolean;
   /** The address the next restart uses: the stored setting, or what is running. */
   bindEffective: string;
+  /** Whether this deployment can restart Weaver from the browser. */
+  restartSupported: boolean;
+  /** The server's refusal when it cannot, for the manual instruction. */
+  restartUnsupportedReason: string | null;
+  /** `native`, `docker`, or `container` — who decides network exposure. */
+  deployment: string;
 }
 
 /// Loopback judged on the spelling the server reports, including the
@@ -327,9 +518,12 @@ export function SecurityUpgradeWizard({
     return null;
   };
 
+  // A container's exposure is its published ports, so the question is never
+  // asked there — not even when nothing pins the address.
+  const containerized = isContainerDeployment(state.deployment);
   // Only when the answer differs from what the next restart already does —
   // an unchanged choice must not produce a write or a restart notice.
-  const bindChanges = state.bindEditable && bindWide !== wideNow;
+  const bindChanges = state.bindEditable && !containerized && bindWide !== wideNow;
 
   const applyPolicy = async (chosen: AccessMode): Promise<boolean> => {
     const result = await setPolicy({ mode: chosen });
@@ -390,7 +584,11 @@ export function SecurityUpgradeWizard({
             waits for a restart — restart Weaver, then open it at its new
             address.
           </p>
-          <Button onClick={onDone}>Continue on this machine</Button>
+          <RestartNoteActions
+            restartSupported={state.restartSupported}
+            restartUnsupportedReason={state.restartUnsupportedReason}
+            onContinue={onDone}
+          />
         </div>
       </div>
     );
@@ -421,9 +619,11 @@ export function SecurityUpgradeWizard({
           ))}
         </fieldset>
 
-        {state.bindEditable ? (
+        {containerized ? (
+          <p className="text-sm text-muted-foreground">{CONTAINER_BIND_NOTE}</p>
+        ) : state.bindEditable ? (
           <fieldset className="space-y-3">
-            <legend className="text-sm font-medium">Where should Weaver answer?</legend>
+            <legend className="text-sm font-medium">How can I access Weaver?</legend>
             <label className="flex cursor-pointer items-start gap-3">
               <input
                 type="radio"
@@ -435,7 +635,7 @@ export function SecurityUpgradeWizard({
               <span>
                 <span className="font-medium">This machine only</span>
                 <span className="block text-sm text-muted-foreground">
-                  Reachable at localhost. The safe default.
+                  Reachable at localhost.
                 </span>
               </span>
             </label>
@@ -457,9 +657,11 @@ export function SecurityUpgradeWizard({
             </label>
             {bindWide && mode === "no_login" ? (
               <p className="text-sm text-amber-500">
-                With no login, anyone who can reach this machine's network
-                address gets full control of Weaver. Only choose this on a
-                network where you trust every device.
+                No login limits browsers to this machine even when Weaver
+                answers network-wide: other devices' browsers are turned away,
+                only API clients with keys get in. If other machines should
+                browse Weaver, choose &quot;Require login, except my local
+                network&quot; instead.
               </p>
             ) : null}
           </fieldset>

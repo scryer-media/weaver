@@ -408,6 +408,7 @@ pub(super) async fn setup_handler(
     Extension(db): Extension<Database>,
     Extension(auth_cache): Extension<LoginAuthCache>,
     Extension(security): Extension<RuntimeSecurityConfig>,
+    Extension(session_token): Extension<super::SessionToken>,
     Json(body): Json<SetupRequest>,
 ) -> Response {
     use weaver_server_core::security::{
@@ -430,6 +431,17 @@ pub(super) async fn setup_handler(
     let Some(mode) = AccessMode::parse_setting_value(&body.mode) else {
         return super::error_response(StatusCode::BAD_REQUEST, "unknown access mode");
     };
+    // With the trust list pinned by the environment, the wizard's only real
+    // effect is creating credentials. No-login creates none and stores
+    // nothing, which would complete setup as a total no-op and leave this
+    // browser exactly where it started — refuse it instead of pretending.
+    if security.trust_env_pinned && matches!(mode, AccessMode::NoLogin) {
+        return super::error_response(
+            StatusCode::BAD_REQUEST,
+            "WEAVER_TRUSTED_CIDRS pins the browser-access policy in this deployment's \
+             environment; choose a login mode",
+        );
+    }
 
     // Credentials: required for the two login modes, refused for no-login so a
     // password can never be silently collected and ignored.
@@ -531,14 +543,22 @@ pub(super) async fn setup_handler(
         None => None,
     };
 
+    // The environment pins the browser-access policy exactly as it pins the
+    // bind address: the wizard's answer is neither stored nor applied live,
+    // so a running env-managed instance can never have its trust list swapped
+    // out from under the deployment by a loopback browser. Credentials are
+    // still created — they are the half the environment did not answer.
+    let trust_pinned_by_env = security.trust_env_pinned;
     let db_for_write = db.clone();
     let mode_value = mode.as_setting_value().to_string();
     let networks_json = networks_json.clone();
     let bind_for_write = bind_to_store.clone();
     let hashed_for_write = hashed.clone();
-    let store_trusted = matches!(mode, AccessMode::LoginExceptLocal);
+    let store_trusted = matches!(mode, AccessMode::LoginExceptLocal) && !trust_pinned_by_env;
     let write_result = tokio::task::spawn_blocking(move || {
-        db_for_write.set_setting(SETTING_ACCESS_MODE, &mode_value)?;
+        if !trust_pinned_by_env {
+            db_for_write.set_setting(SETTING_ACCESS_MODE, &mode_value)?;
+        }
         if store_trusted {
             db_for_write.set_setting(SETTING_TRUSTED_NETWORKS, &networks_json)?;
         }
@@ -569,9 +589,25 @@ pub(super) async fn setup_handler(
     // reads), credentials swap into the cache, and the wizard's own browser is
     // signed in so completing setup lands in the app rather than at a login
     // form. Only the bind address waits for a restart.
-    security.set_trusted_cidrs(parsed_networks);
+    if !trust_pinned_by_env {
+        security.set_trusted_cidrs(parsed_networks);
+        // The policy is settled from this instant, which is what stops a
+        // no-login install re-offering this wizard to every browser it does
+        // not trust. (An env-pinned deployment was settled at startup.)
+        security.mark_security_configured();
+    }
 
     let mut response_headers: Vec<(header::HeaderName, String)> = Vec::new();
+    // A no-login install that now trusts this browser's own machine gets the
+    // browser session cookie the next page load would hand it anyway. The
+    // wizard's remaining calls are made from THIS page, which never reloads
+    // when the operator restarts Weaver from it.
+    if credentials.is_none() && security.is_trusted_peer(Some(peer_addr)) {
+        response_headers.push((
+            header::SET_COOKIE,
+            session_cookie_value(session_token.0.as_str(), &security),
+        ));
+    }
     if let (Some((username, hash)), Some(secret)) = (hashed, jwt_secret) {
         let cached = weaver_server_core::auth::CachedLoginAuth::new(username, hash, secret);
         let token = jwt::create_jwt(&cached.username, &cached.jwt_secret, JWT_TTL_SECS);
@@ -598,6 +634,9 @@ pub(super) async fn setup_handler(
         "first-run setup completed from the wizard"
     );
 
+    // Whether the browser may offer to do the restart itself, answered from the
+    // same rule the restart endpoint enforces.
+    let restart_capability = weaver_server_core::runtime::restart::current_restart_capability();
     let mut response = (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -605,6 +644,9 @@ pub(super) async fn setup_handler(
             "restartRequiredForBind": restart_required_for_bind,
             "bindIgnoredBecauseEnvPinned": bind_pinned_by_env
                 && body.bind_address.as_deref().is_some_and(|v| !v.trim().is_empty()),
+            "accessPolicyIgnoredBecauseEnvPinned": trust_pinned_by_env,
+            "restartSupported": restart_capability.supported,
+            "restartUnsupportedReason": restart_capability.reason,
         })),
     )
         .into_response();
@@ -753,11 +795,35 @@ pub(super) async fn auth_status_handler(
     } else {
         false
     };
-    let trusted_peer = security.is_trusted_peer(peer.map(|Extension(ConnectInfo(peer))| peer));
+    let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
+    let trusted_peer = security.is_trusted_peer(peer);
+    // Setup is offered to exactly the browsers that could complete it:
+    // `setup_handler` admits loopback-or-trusted, and a trusted peer skips
+    // the wizard entirely (it is already admitted), which leaves loopback.
+    // The loopback term is what stops the two permanent loops — a CONFIGURED
+    // no-login instance looks like "no credentials, not trusted" to every
+    // outside browser, and inside a container NO outside browser is ever
+    // loopback — while still reopening the wizard for the machine's own
+    // browser after WEAVER_RESET_LOGIN clears the credentials on an
+    // already-configured install.
+    let setup_required = creds.is_none()
+        && !trusted_peer
+        && peer.is_some_and(|peer| weaver_server_core::security::ip_is_loopback(peer.ip()));
 
-    Json(serde_json::json!({
+    let mut status = serde_json::json!({
         "enabled": creds.is_some(),
         "authenticated": login_authenticated || trusted_peer,
-        "setupRequired": creds.is_none() && !trusted_peer,
-    }))
+        "setupRequired": setup_required,
+    });
+    // Only a browser about to run the first-run wizard is told how this
+    // deployment is packaged. This endpoint is unauthenticated, so a
+    // configured install must not describe itself to anyone who asks.
+    if setup_required {
+        let environment = weaver_server_core::runtime::environment::detect_runtime_environment();
+        status["setup"] = serde_json::json!({
+            "bindEditable": security.bind_address_source.is_editable(),
+            "deployment": environment.deployment.as_str(),
+        });
+    }
+    Json(status)
 }

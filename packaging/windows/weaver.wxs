@@ -7,6 +7,7 @@
       Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Weaver is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Icon Id="WeaverIcon" SourceFile="$(var.StageDir)\weaver.ico" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="ScryerMediaFolder" Name="Scryer Media">
@@ -29,6 +30,8 @@
               Name="Weaver"
               Description="Open Weaver"
               Target="[#WeaverTrayExe]"
+              Icon="WeaverIcon"
+              IconIndex="0"
               WorkingDirectory="INSTALLFOLDER" />
           <RemoveFolder Id="RemoveWeaverStartMenuFolder" On="uninstall" />
           <RegistryValue

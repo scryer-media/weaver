@@ -80,6 +80,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         security,
         disk_space,
         http_metrics,
+        restart,
     } = runtime;
     let base_url_ext = super::assets::BaseUrl(Arc::new(base_url.clone()));
     let session_token = super::SessionToken(Arc::new(generate_api_key()));
@@ -141,6 +142,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             post(super::backup::backup_export_handler),
         )
         .nest("/api/backup", backup_upload_routes)
+        .route("/api/system/restart", post(super::system::restart_handler))
         .route("/api/auth/setup", post(super::auth::setup_handler))
         .route("/api/login", post(super::auth::login_handler))
         .route("/api/logout", post(super::auth::logout_handler))
@@ -164,6 +166,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .layer(Extension(base_url_ext))
         .layer(Extension(security))
         .layer(Extension(session_token))
+        .layer(Extension(restart))
         // Outermost of the inner router's layers, so the recorded duration
         // covers the handler and everything wrapped around it.
         .layer(middleware::from_fn(move |req, next| {

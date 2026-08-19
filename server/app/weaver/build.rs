@@ -79,6 +79,7 @@ fn watch_head(git_dir: &Path) {
 
 fn compile_windows_resources() {
     println!("cargo:rerun-if-changed=resources/windows/weaver.rc");
+    println!("cargo:rerun-if-changed=resources/windows/weaver.ico");
     println!("cargo:rerun-if-changed=resources/windows/weaver.exe.manifest");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {

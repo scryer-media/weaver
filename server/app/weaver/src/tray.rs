@@ -15,6 +15,10 @@ fn main() {
 }
 
 #[cfg(windows)]
+#[path = "tray_ipc.rs"]
+mod tray_ipc;
+
+#[cfg(windows)]
 mod windows {
     use std::ffi::c_void;
     use std::io::{Read, Write};
@@ -31,6 +35,7 @@ mod windows {
         CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT,
         WPARAM,
     };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Registry::{
         HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ, RegCloseKey,
         RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
@@ -43,21 +48,26 @@ mod windows {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
         DispatchMessageW, FindWindowW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-        HMENU, IDI_APPLICATION, LoadIconW, MB_ICONERROR, MB_OK, MF_CHECKED, MF_SEPARATOR,
-        MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
-        SW_SHOWNORMAL, SetForegroundWindow, SetWindowLongPtrW, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-        TrackPopupMenu, TranslateMessage, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP,
-        WNDCLASSW,
+        HMENU, LoadIconW, MB_ICONERROR, MB_OK, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
+        MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL,
+        SetForegroundWindow, SetWindowLongPtrW, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+        TranslateMessage, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+    };
+
+    // The window class and message ids are shared with weaver.exe, which posts
+    // the restart message to this window.
+    use super::tray_ipc::{
+        CLASS_NAME, OPEN_WINDOW_MESSAGE, RESTART_MESSAGE, SHUTDOWN_MESSAGE, TRAY_CALLBACK_MESSAGE,
     };
 
     const DEFAULT_PORT: u16 = 9090;
-    const CLASS_NAME: &str = "ScryerMedia.Weaver.Desktop.v1.Tray";
     const MUTEX_NAMESPACE: &str = "Global\\ScryerMedia.Weaver.Desktop.v1.Tray.";
     const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     const RUN_VALUE: &str = "ScryerMedia.Weaver";
-    const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
-    const OPEN_WINDOW_MESSAGE: u32 = WM_APP + 2;
-    const SHUTDOWN_MESSAGE: u32 = WM_APP + 3;
+    const WEAVER_ICON_RESOURCE_ID: usize = 1;
+    /// How long the tray waits for a server that asked to be restarted to
+    /// actually exit before it stops waiting and kills the child.
+    const SERVER_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
     const MENU_OPEN: u32 = 1;
     const MENU_START: u32 = 2;
@@ -333,14 +343,26 @@ mod windows {
         }
 
         unsafe fn add_icon(&mut self, window: HWND) -> Result<(), String> {
+            // SAFETY: Resource ID 1 is the application-owned multi-resolution Weaver icon.
+            let icon = unsafe {
+                LoadIconW(
+                    GetModuleHandleW(ptr::null()),
+                    WEAVER_ICON_RESOURCE_ID as *const u16,
+                )
+            };
+            if icon.is_null() {
+                return Err(format!(
+                    "failed to load Weaver tray icon: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
             let mut data = NOTIFYICONDATAW {
                 cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
                 hWnd: window,
                 uID: 1,
                 uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
                 uCallbackMessage: TRAY_CALLBACK_MESSAGE,
-                // SAFETY: Loading the system application icon requires no owned resource.
-                hIcon: unsafe { LoadIconW(ptr::null_mut(), IDI_APPLICATION) },
+                hIcon: icon,
                 ..Default::default()
             };
             write_wide_buffer(&mut data.szTip, "Weaver");
@@ -451,6 +473,50 @@ mod windows {
             }
         }
 
+        /// Restart a server that asked to be restarted from its own UI.
+        ///
+        /// Unlike the menu path, the server is already tearing itself down, so
+        /// the old process must be gone before the replacement starts:
+        /// `start_server` returns early while the port still answers, so
+        /// starting without waiting would silently leave the user with no
+        /// server at all.
+        fn restart_requested_by_server(&mut self) -> Result<(), String> {
+            self.wait_for_server_exit(SERVER_EXIT_TIMEOUT);
+            self.start_server()?;
+            if wait_for_server(DEFAULT_PORT, Duration::from_secs(30)) {
+                Ok(())
+            } else {
+                Err("timed out waiting for Weaver after restart".to_string())
+            }
+        }
+
+        /// Wait for the running server to disappear, bounded so a process that
+        /// never exits cannot strand the tray. The owned child is the reliable
+        /// signal; when the tray does not own one, the port answering is the
+        /// only evidence left. Falls back to the kill path on timeout.
+        fn wait_for_server_exit(&mut self, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                match self.server.as_mut() {
+                    Some(child) => match child.try_wait() {
+                        Ok(Some(_)) => {
+                            self.server = None;
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(_) => break,
+                    },
+                    None => {
+                        if !server_ready(DEFAULT_PORT) {
+                            return;
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+            let _ = self.stop_server();
+        }
+
         fn show_menu(&mut self, window: HWND) -> Result<(), String> {
             // SAFETY: CreatePopupMenu creates a menu owned by this function until DestroyMenu.
             let menu = unsafe { CreatePopupMenu() };
@@ -555,6 +621,7 @@ mod windows {
                 TRAY_CALLBACK_MESSAGE if lparam as u32 == WM_LBUTTONUP => state.open_weaver(),
                 TRAY_CALLBACK_MESSAGE if lparam as u32 == WM_RBUTTONUP => state.show_menu(window),
                 OPEN_WINDOW_MESSAGE => state.open_weaver(),
+                RESTART_MESSAGE => state.restart_requested_by_server(),
                 SHUTDOWN_MESSAGE => {
                     // SAFETY: This is the live window associated with the tray state.
                     unsafe { DestroyWindow(window) };

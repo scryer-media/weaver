@@ -1337,6 +1337,7 @@ jobs:
           Copy-Item target\x86_64-pc-windows-msvc\release\weaver.exe, target\x86_64-pc-windows-msvc\release\weaver-tray.exe, LICENSE -Destination $stage -Force
           Compress-Archive -Path "$stage\*" -DestinationPath weaver-windows-x86_64.zip
           if (-not (Test-Path weaver-windows-x86_64.zip)) { throw "missing weaver-windows-x86_64.zip" }
+          Copy-Item server\app\weaver\resources\windows\weaver.ico -Destination $stage -Force
           $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
           $version = ($metadata.packages | Where-Object { $_.name -eq "weaver" } | Select-Object -First 1).version
           .\packaging\windows\build-msi.ps1 `
@@ -1635,6 +1636,7 @@ jobs:
           Copy-Item target\aarch64-pc-windows-msvc\release\weaver.exe, target\aarch64-pc-windows-msvc\release\weaver-tray.exe, LICENSE -Destination $stage -Force
           Compress-Archive -Path "$stage\*" -DestinationPath weaver-windows-arm64.zip
           if (-not (Test-Path weaver-windows-arm64.zip)) { throw "missing weaver-windows-arm64.zip" }
+          Copy-Item server\app\weaver\resources\windows\weaver.ico -Destination $stage -Force
           $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
           $version = ($metadata.packages | Where-Object { $_.name -eq "weaver" } | Select-Object -First 1).version
           .\packaging\windows\build-msi.ps1 `

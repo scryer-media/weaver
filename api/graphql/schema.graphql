@@ -1579,6 +1579,15 @@ type QueryRoot {
 	"""
 	systemInfo: SystemInfo!
 	"""
+	Whether Weaver can restart itself here, and the deployment that decided
+	it — everything the security wizard needs in one field.
+	
+	Deliberately its own small field rather than part of `systemInfo`,
+	whose resolver probes storage: the wizard asks this on every app load,
+	so the answer has to stay cheap.
+	"""
+	serverRestart: ServerRestartCapability!
+	"""
 	System status facade for integrations.
 	"""
 	systemStatus: SystemStatus!
@@ -2168,6 +2177,27 @@ input ServerInput {
 	"""
 	downloadQuota: ServerDownloadQuotaInput
 	tlsCaCert: String
+}
+
+"""
+Whether this deployment can restart Weaver from the browser.
+
+A container must not be exited from the UI — without a restart policy the
+operator would be left with nothing — so the deployment, not the operator,
+answers this.
+"""
+type ServerRestartCapability {
+	supported: Boolean!
+	"""
+	Set only when unsupported: what to do instead.
+	"""
+	reason: String
+	"""
+	The packaging that decided this answer. The security wizard reads it
+	here rather than from `systemInfo`, whose resolver probes storage —
+	this field must stay cheap enough to ask on every app load.
+	"""
+	deployment: DeploymentEnvironmentGql!
 }
 
 type ServiceLogsPayload {

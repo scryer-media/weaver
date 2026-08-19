@@ -916,6 +916,22 @@ pub struct SystemInfo {
     pub configured_storage: Vec<ConfiguredStorage>,
 }
 
+/// Whether this deployment can restart Weaver from the browser.
+///
+/// A container must not be exited from the UI — without a restart policy the
+/// operator would be left with nothing — so the deployment, not the operator,
+/// answers this.
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct ServerRestartCapability {
+    pub supported: bool,
+    /// Set only when unsupported: what to do instead.
+    pub reason: Option<String>,
+    /// The packaging that decided this answer. The security wizard reads it
+    /// here rather than from `systemInfo`, whose resolver probes storage —
+    /// this field must stay cheap enough to ask on every app load.
+    pub deployment: DeploymentEnvironmentGql,
+}
+
 /// Filesystem capacity for a configured storage directory (data / intermediate / complete).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct DiskUsage {

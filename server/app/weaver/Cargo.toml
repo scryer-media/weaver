@@ -71,6 +71,7 @@ mimalloc = { version = "0.1.52", default-features = false }
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
   "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Shell",

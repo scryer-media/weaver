@@ -8,6 +8,7 @@ mod metrics;
 mod nzbget;
 mod request_metrics;
 mod routes;
+mod system;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +62,9 @@ pub struct ServerRuntime {
     pub config: SharedConfig,
     pub base_url: String,
     pub security: RuntimeSecurityConfig,
+    /// Handle the restart endpoint pulls to ask the serve loop to tear down
+    /// and start again.
+    pub restart: weaver_server_core::runtime::restart::RestartController,
     /// TTL-cached free-space sampler for the configured directory roles.
     /// Constructed at wiring time from the resolved data/intermediate/complete
     /// directories; read by the exporter at scrape time.

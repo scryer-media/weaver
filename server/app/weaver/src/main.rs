@@ -3,7 +3,10 @@ mod bootstrap;
 mod commands;
 mod http;
 mod logging;
+mod restart;
 mod shutdown;
+#[cfg(windows)]
+mod tray_ipc;
 mod wiring;
 
 use std::io::IsTerminal;

@@ -1234,10 +1234,7 @@ export const SECURITY_SETUP_STATE_QUERY = gql`
       enabled
     }
     accessPolicy {
-      mode
-      trustedNetworks
       editable
-      envPinned
       configured
       strictSecurity
     }
@@ -1245,6 +1242,11 @@ export const SECURITY_SETUP_STATE_QUERY = gql`
       address
       storedAddress
       editable
+    }
+    serverRestart {
+      supported
+      reason
+      deployment
     }
   }
 `;

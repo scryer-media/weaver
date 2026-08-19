@@ -39,7 +39,7 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
 }
 
 $stageDir = (Resolve-Path -LiteralPath $StageDir).Path
-foreach ($required in @("weaver.exe", "weaver-tray.exe", "LICENSE")) {
+foreach ($required in @("weaver.exe", "weaver-tray.exe", "weaver.ico", "LICENSE")) {
   if (-not (Test-Path (Join-Path $stageDir $required))) {
     throw "MSI staging directory is missing ${required}: $stageDir"
   }

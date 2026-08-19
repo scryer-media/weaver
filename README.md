@@ -63,12 +63,22 @@ services:
       - TZ=Etc/UTC
       - UMASK=022 # optional
       - WEAVER_HTTP_ALLOWED_HOSTS=weaver,weaver.example.me # permit the Compose service name and any reverse proxy names
+      # First-run setup: pick one of the two blocks below.
+      # - WEAVER_TRUSTED_CIDRS=192.168.0.0/16 # browsers in these networks get full access without a login
+      # - WEAVER_BOOTSTRAP_LOGIN_USERNAME=admin # creates the login on first start, then sign in normally
+      # - WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE=/run/secrets/weaver-login # the password, read from a mounted file
     volumes:
       - /path/to/weaver/config:/config # this is the critical volume with all your config data and encryption key
     ports:
       - 9090:9090
     restart: unless-stopped
 ```
+
+First-run setup for a container happens through the variables commented out
+above, because no browser reaches a container as "the machine itself" — a
+native install runs the setup wizard in the browser instead. Until one of them
+is set, the container's web page explains this rather than showing a wizard it
+could not accept.
 
 Weaver binds to `127.0.0.1` by default, so a native install is never exposed by
 accident; the container image ships `WEAVER_HTTP_BIND_ADDRESS=0.0.0.0`, since a

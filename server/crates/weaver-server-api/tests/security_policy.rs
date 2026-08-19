@@ -226,3 +226,20 @@ async fn keeping_the_current_setup_is_what_stops_the_wizard_returning() {
     // Login-required trusts nothing, which is the pre-upgrade behaviour.
     assert!(harness.security.trusted_cidrs().is_empty());
 }
+
+#[tokio::test]
+async fn a_policy_change_settles_the_live_configured_flag_too() {
+    // The stored answer is what the next START reads; this flag is what the
+    // RUNNING process reads to decide whether a credential-less browser is
+    // shown the first-run wizard. An operator who picks no-login here must not
+    // have that wizard served back to every browser outside the machine.
+    let harness = TestHarness::new().await;
+    assert!(!harness.security.security_configured());
+
+    let response = harness
+        .execute(r#"mutation { setAccessPolicy(mode: "no_login") }"#)
+        .await;
+    assert_no_errors(&response);
+
+    assert!(harness.security.security_configured());
+}
