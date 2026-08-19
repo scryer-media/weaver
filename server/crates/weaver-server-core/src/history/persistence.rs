@@ -294,38 +294,6 @@ async fn delete_job_history_bundle_tx(
     {
         return Ok(false);
     }
-    if tx
-        .fetch_optional(
-            "SELECT run_id FROM post_processing_runs
-              WHERE job_id = {} AND status IN ('queued', 'starting', 'running')
-              LIMIT 1",
-            &[SqlArg::I64(job_id)],
-        )
-        .await?
-        .is_some()
-    {
-        return Err(StateError::Conflict(
-            "cannot delete history while post-processing is active".into(),
-        ));
-    }
-    tx.execute(
-        "UPDATE post_processing_runs SET rerun_of_run_id = NULL
-          WHERE job_id <> {} AND rerun_of_run_id IN (
-              SELECT run_id FROM post_processing_runs WHERE job_id = {}
-          )",
-        &[SqlArg::I64(job_id), SqlArg::I64(job_id)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM post_processing_runs WHERE job_id = {}",
-        &[SqlArg::I64(job_id)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM post_processing_job_plans WHERE job_id = {}",
-        &[SqlArg::I64(job_id)],
-    )
-    .await?;
     tx.execute(
         "DELETE FROM job_events WHERE job_id = {}",
         &[SqlArg::I64(job_id)],
@@ -365,54 +333,6 @@ async fn delete_all_job_history_bundles_tx(tx: &mut SqlTx<'_>) -> Result<Vec<Job
                 .map(JobId)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if tx
-        .fetch_optional(
-            "SELECT r.run_id FROM post_processing_runs r
-              WHERE r.status IN ('queued', 'starting', 'running')
-                AND EXISTS (
-                    SELECT 1 FROM job_history h WHERE h.job_id = r.job_id
-                )
-              LIMIT 1",
-            &[],
-        )
-        .await?
-        .is_some()
-    {
-        return Err(StateError::Conflict(
-            "cannot delete history while post-processing is active".into(),
-        ));
-    }
-    tx.execute(
-        "UPDATE post_processing_runs SET rerun_of_run_id = NULL
-          WHERE NOT EXISTS (
-              SELECT 1 FROM job_history h WHERE h.job_id = post_processing_runs.job_id
-          ) AND rerun_of_run_id IN (
-              SELECT source.run_id FROM post_processing_runs source
-              WHERE EXISTS (
-                  SELECT 1 FROM job_history h WHERE h.job_id = source.job_id
-              )
-          )",
-        &[],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM post_processing_runs
-          WHERE EXISTS (
-              SELECT 1 FROM job_history h
-               WHERE h.job_id = post_processing_runs.job_id
-          )",
-        &[],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM post_processing_job_plans
-          WHERE EXISTS (
-              SELECT 1 FROM job_history h
-               WHERE h.job_id = post_processing_job_plans.job_id
-          )",
-        &[],
-    )
-    .await?;
     tx.execute(
         "DELETE FROM job_events
           WHERE EXISTS (

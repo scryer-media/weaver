@@ -81,7 +81,6 @@ type BackupManifest = {
     complete_dir: string;
   };
   encrypted: boolean;
-  managed_packages?: Array<{ digest: string }>;
   notes: string[];
 };
 
@@ -517,9 +516,6 @@ export function BackupRestoreSection({
                     (total, table) => total + table.rows,
                     0,
                   )}
-                </div>
-                <div>
-                  Managed packages: {inspectResult.manifest.managed_packages?.length ?? 0}
                 </div>
                 <div>
                   {t("settings.restoreEncrypted")}:{" "}

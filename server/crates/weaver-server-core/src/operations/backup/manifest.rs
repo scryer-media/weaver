@@ -63,18 +63,32 @@ pub struct BackupManifest {
     pub part_checksums: BTreeMap<String, String>,
     pub source_paths: BackupSourcePaths,
     pub encrypted: bool,
-    #[serde(default)]
-    pub managed_packages: Vec<ManagedPackageInventory>,
+    /// Extension packages a pre-0.9 bundle carried, parsed only so a restore can
+    /// say how many it ignored.
+    ///
+    /// Post-processing scripts are files in the scripts directory with no
+    /// digest and no managed install location, so there is nothing left to
+    /// restore these into. Never written: new bundles omit the field entirely,
+    /// and an older Weaver reading one defaults it back to empty.
+    #[serde(default, rename = "managed_packages", skip_serializing)]
+    pub legacy_managed_packages: Vec<serde_json::Value>,
     #[serde(default)]
     pub notes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ManagedPackageInventory {
-    pub digest: String,
-    pub archive_prefix: String,
-    pub file_count: usize,
-    pub uncompressed_bytes: u64,
+impl BackupManifest {
+    /// The warning a restore surfaces when the bundle carried extension
+    /// packages, or `None` when it did not.
+    pub(crate) fn legacy_package_warning(&self) -> Option<String> {
+        let count = self.legacy_managed_packages.len();
+        (count > 0).then(|| {
+            format!(
+                "This backup carries {count} post-processing extension package(s) from an older \
+                 Weaver. They were not restored — post-processing scripts are now plain files in \
+                 the scripts directory, so copy any you still want into it."
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,7 +128,6 @@ pub struct RestoreReport {
     pub pending_restore_id: Option<String>,
     pub history_jobs: usize,
     pub category_remaps_applied: usize,
-    pub managed_packages_restored: usize,
     pub warnings: Vec<String>,
 }
 
@@ -176,7 +189,6 @@ pub enum BackupServiceError {
 pub(crate) fn build_bundle_manifest(
     source_paths: BackupSourcePaths,
     export: &LogicalBackupExport,
-    managed_packages: Vec<ManagedPackageInventory>,
     instance_secrets_checksum: String,
 ) -> BackupManifest {
     let mut part_checksums = export
@@ -197,7 +209,7 @@ pub(crate) fn build_bundle_manifest(
         part_checksums,
         source_paths,
         encrypted: true,
-        managed_packages,
+        legacy_managed_packages: Vec::new(),
         notes: vec![
             "Logical stable-state bundle; active work and media payloads are excluded.".into(),
             "The encrypted bundle contains the source instance encryption master key.".into(),
@@ -233,7 +245,10 @@ pub(crate) fn validate_manifest_structure(
     if manifest.scope != BACKUP_SCOPE {
         return Err(BackupServiceError::UnsupportedScope(manifest.scope.clone()));
     }
-    if manifest.format_version.is_legacy() && !manifest.managed_packages.is_empty() {
+    // The legacy format never carried packages, and its unpacker refuses every
+    // entry outside manifest.json and backup.db, so a declaration here means
+    // the manifest and the archive disagree.
+    if manifest.format_version.is_legacy() && !manifest.legacy_managed_packages.is_empty() {
         return Err(BackupServiceError::Validation(
             "legacy backup unexpectedly declares managed packages".into(),
         ));
@@ -275,41 +290,6 @@ pub(crate) fn validate_manifest_structure(
         {
             return Err(BackupServiceError::Validation(
                 "logical bundle manifest is incomplete".into(),
-            ));
-        }
-        validate_package_inventory(&manifest.managed_packages)?;
-    }
-    Ok(())
-}
-
-fn validate_package_inventory(
-    packages: &[ManagedPackageInventory],
-) -> Result<(), BackupServiceError> {
-    let mut digests = std::collections::HashSet::new();
-    let mut prefixes = std::collections::HashSet::new();
-    for package in packages {
-        let Some(hex) = package.digest.strip_prefix("blake3:") else {
-            return Err(BackupServiceError::Validation(
-                "managed package digest must use blake3".into(),
-            ));
-        };
-        if hex.len() != 64
-            || !hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
-            return Err(BackupServiceError::Validation(
-                "managed package digest is invalid".into(),
-            ));
-        }
-        let expected_prefix = format!("managed-extensions/blake3/{hex}");
-        if package.archive_prefix != expected_prefix
-            || package.file_count == 0
-            || !digests.insert(package.digest.as_str())
-            || !prefixes.insert(package.archive_prefix.as_str())
-        {
-            return Err(BackupServiceError::Validation(
-                "managed package inventory is invalid".into(),
             ));
         }
     }

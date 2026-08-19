@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::logical::{verify_table_parts, visit_table_objects};
+use super::logical::verify_table_parts;
 use super::manifest::{
     BackupInstanceSecrets, BackupManifest, BackupServiceError, RestoreOptions, io_err,
     validate_manifest,
@@ -12,7 +12,6 @@ use super::permissions;
 use crate::Database;
 use crate::persistence::encryption::promote_restore_encryption_key;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-use crate::post_processing::discovery::{copy_package, hash_package, package_files};
 
 pub(crate) const PENDING_RESTORE_DIR: &str = "restore-pending";
 const READY_MARKER: &str = "restore-ready";
@@ -20,7 +19,6 @@ const LOCATION_POINTER: &str = "restore-pending-location";
 const PENDING_METADATA: &str = "pending.json";
 const PROMOTION_JOURNAL: &str = "promotion.json";
 const FAILURE_REPORT: &str = "restore-error.json";
-const PACKAGE_INSTALLS: &str = "package-installs.json";
 const DATABASE_RESTORE_MARKER_KEY: &str = "backup_restore_generation";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,7 +37,6 @@ pub(crate) struct PendingRestoreMetadata {
 #[derive(Clone, Debug)]
 pub struct PendingRestoreOutcome {
     pub restore_id: String,
-    pub managed_packages_restored: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -67,12 +64,6 @@ struct PromotionJournal {
 struct RestoreFailure {
     restore_id: String,
     error: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PackageInstallJournal {
-    restore_id: String,
-    digests: BTreeSet<String>,
 }
 
 #[cfg(test)]
@@ -252,7 +243,7 @@ pub fn apply_pending_restore(
             .flatten()
             .is_none_or(|journal| journal.phase <= PromotionPhase::Validated)
         {
-            cleanup_pending_package_installs(&root);
+            // Nothing to undo outside the pending directory itself.
         }
         if let Ok(metadata) = read_pending_metadata(&root) {
             let _ = write_atomic_owner_only_json(
@@ -380,7 +371,7 @@ fn apply_pending_restore_inner(
     }
     let _ = std::fs::remove_file(root.join(FAILURE_REPORT));
 
-    let (manifest, restored_key, installed_packages) = if metadata.legacy {
+    let (manifest, restored_key) = if metadata.legacy {
         let expected_checksum = metadata.legacy_backup_checksum.as_deref().ok_or_else(|| {
             BackupServiceError::Validation("staged legacy restore has no database checksum".into())
         })?;
@@ -405,7 +396,7 @@ fn apply_pending_restore_inner(
                 "the active target key changed after the legacy restore was staged".into(),
             ));
         }
-        (None, key, Vec::new())
+        (None, key)
     } else {
         let manifest: BackupManifest =
             serde_json::from_slice(&std::fs::read(root.join("manifest.json")).map_err(io_err)?)
@@ -419,13 +410,7 @@ fn apply_pending_restore_inner(
             &secrets.encryption_master_key,
         )
         .map_err(BackupServiceError::Validation)?;
-        let installed = install_managed_packages(
-            root,
-            &manifest,
-            Path::new(&metadata.options.data_dir),
-            &metadata.restore_id,
-        )?;
-        (Some((manifest, secrets)), key, installed)
+        (Some((manifest, secrets)), key)
     };
 
     let sqlite_path = db
@@ -441,7 +426,6 @@ fn apply_pending_restore_inner(
             &restored_key,
             &mut journal,
             &live_path,
-            &installed_packages,
         )?
     } else {
         apply_postgres_restore(
@@ -451,7 +435,6 @@ fn apply_pending_restore_inner(
             manifest.as_ref().map(|(manifest, _)| manifest),
             &restored_key,
             &mut journal,
-            &installed_packages,
         )?
     };
 
@@ -465,7 +448,6 @@ fn apply_pending_restore_inner(
         db,
         Some(PendingRestoreOutcome {
             restore_id: metadata.restore_id,
-            managed_packages_restored: installed_packages.len(),
         }),
     ))
 }
@@ -479,7 +461,6 @@ fn apply_sqlite_restore(
     restored_key: &crate::persistence::encryption::EncryptionKey,
     journal: &mut Option<PromotionJournal>,
     live_path: &Path,
-    installed_packages: &[PathBuf],
 ) -> Result<Database, BackupServiceError> {
     let database_parent = live_path.parent().unwrap_or_else(|| Path::new("."));
     let preparing_dir =
@@ -504,7 +485,6 @@ fn apply_sqlite_restore(
         if let Err(error) = import_restore_payload(&prepared_db, root, metadata, manifest) {
             let _ = prepared_db.close();
             let _ = std::fs::remove_dir_all(&preparing_dir);
-            remove_installed_packages(installed_packages);
             return Err(error);
         }
         validate_restored_database(&prepared_db, manifest)?;
@@ -609,13 +589,9 @@ fn apply_postgres_restore(
     manifest: Option<&BackupManifest>,
     restored_key: &crate::persistence::encryption::EncryptionKey,
     journal: &mut Option<PromotionJournal>,
-    installed_packages: &[PathBuf],
 ) -> Result<Database, BackupServiceError> {
     if journal_phase(journal) < PromotionPhase::DatabaseInstalled {
-        if let Err(error) = import_restore_payload(&db, root, metadata, manifest) {
-            remove_installed_packages(installed_packages);
-            return Err(error);
-        }
+        import_restore_payload(&db, root, metadata, manifest)?;
         *journal = Some(write_promotion_phase(
             root,
             &metadata.restore_id,
@@ -643,7 +619,7 @@ fn import_restore_payload(
 ) -> Result<(), BackupServiceError> {
     fail_database_import_if_requested()?;
     if metadata.legacy {
-        db.import_stable_state_with_post_processing(&root.join("backup.db"), false)
+        db.import_stable_state(&root.join("backup.db"))
             .map_err(|error| BackupServiceError::Validation(error.to_string()))
     } else {
         let manifest = manifest.ok_or_else(|| {
@@ -837,35 +813,6 @@ fn write_promotion_phase(
     Ok(journal)
 }
 
-fn remove_installed_packages(paths: &[PathBuf]) {
-    for path in paths {
-        let _ = std::fs::remove_dir_all(path);
-    }
-}
-
-fn cleanup_pending_package_installs(root: &Path) {
-    let Ok(metadata) = read_pending_metadata(root) else {
-        return;
-    };
-    let Ok(bytes) = std::fs::read(root.join(PACKAGE_INSTALLS)) else {
-        return;
-    };
-    let Ok(journal) = serde_json::from_slice::<PackageInstallJournal>(&bytes) else {
-        return;
-    };
-    if journal.restore_id != metadata.restore_id {
-        return;
-    }
-    let data_dir = Path::new(&metadata.options.data_dir);
-    let paths = journal
-        .digests
-        .iter()
-        .filter_map(|digest| digest.strip_prefix("blake3:"))
-        .map(|digest| data_dir.join("managed-extensions/blake3").join(digest))
-        .collect::<Vec<_>>();
-    remove_installed_packages(&paths);
-}
-
 fn sync_file(path: &Path) -> Result<(), BackupServiceError> {
     std::fs::File::open(path)
         .and_then(|file| file.sync_all())
@@ -962,54 +909,6 @@ fn revalidate_logical_pending(
         ));
     }
 
-    for package in &manifest.managed_packages {
-        let path = root.join(&package.archive_prefix);
-        let files = package_files(&path)
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        let bytes = files.iter().try_fold(0_u64, |total, (_, file)| {
-            total
-                .checked_add(std::fs::metadata(file).map_err(io_err)?.len())
-                .ok_or_else(|| BackupServiceError::Validation("package is too large".into()))
-        })?;
-        let digest = hash_package(&path)
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        if files.len() != package.file_count
-            || bytes != package.uncompressed_bytes
-            || digest.as_str() != package.digest
-        {
-            return Err(BackupServiceError::Validation(format!(
-                "staged managed package {} failed inventory validation",
-                package.digest
-            )));
-        }
-    }
-
-    let mut referenced = BTreeSet::new();
-    visit_table_objects(root, "post_processing_extension_revisions", |row| {
-        if row
-            .get("managed_path")
-            .is_none_or(serde_json::Value::is_null)
-        {
-            return Ok(());
-        }
-        let digest = row
-            .get("digest")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| crate::StateError::Database("managed revision has no digest".into()))?;
-        referenced.insert(digest.to_string());
-        Ok(())
-    })
-    .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-    let declared = manifest
-        .managed_packages
-        .iter()
-        .map(|package| package.digest.clone())
-        .collect::<BTreeSet<_>>();
-    if referenced != declared {
-        return Err(BackupServiceError::Validation(
-            "managed package inventory no longer matches revision references".into(),
-        ));
-    }
     Ok(())
 }
 
@@ -1018,157 +917,6 @@ pub(crate) fn file_checksum(path: &Path) -> Result<String, BackupServiceError> {
     let mut hasher = blake3::Hasher::new();
     std::io::copy(&mut file, &mut hasher).map_err(io_err)?;
     Ok(hasher.finalize().to_hex().to_string())
-}
-
-fn install_managed_packages(
-    root: &Path,
-    manifest: &BackupManifest,
-    data_dir: &Path,
-    restore_id: &str,
-) -> Result<Vec<PathBuf>, BackupServiceError> {
-    let path = root.join(PACKAGE_INSTALLS);
-    let mut journal = if path.exists() {
-        let journal: PackageInstallJournal =
-            serde_json::from_slice(&std::fs::read(&path).map_err(io_err)?)
-                .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        if journal.restore_id != restore_id {
-            return Err(BackupServiceError::Validation(
-                "managed package install journal belongs to another restore".into(),
-            ));
-        }
-        journal
-    } else {
-        PackageInstallJournal {
-            restore_id: restore_id.to_string(),
-            digests: BTreeSet::new(),
-        }
-    };
-    let declared = manifest
-        .managed_packages
-        .iter()
-        .map(|package| package.digest.clone())
-        .collect::<BTreeSet<_>>();
-    if !journal.digests.is_subset(&declared) {
-        return Err(BackupServiceError::Validation(
-            "managed package install journal contains an undeclared digest".into(),
-        ));
-    }
-
-    let result = (|| {
-        let mut installed = Vec::new();
-        for package in &manifest.managed_packages {
-            let source = root.join(&package.archive_prefix);
-            let target = data_dir.join(&package.archive_prefix);
-            if target.exists() {
-                let actual = hash_package(&target)
-                    .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-                if actual.as_str() != package.digest {
-                    return Err(BackupServiceError::Validation(format!(
-                        "managed package {} already exists with different content",
-                        package.digest
-                    )));
-                }
-                if journal.digests.contains(&package.digest) {
-                    installed.push(target);
-                }
-                continue;
-            }
-
-            if journal.digests.insert(package.digest.clone()) {
-                write_atomic_owner_only_json(&path, &journal)?;
-            }
-            let parent = target.parent().ok_or_else(|| {
-                BackupServiceError::Validation("managed package target has no parent".into())
-            })?;
-            create_dir_all_durable(parent)?;
-            let temporary = parent.join(format!(
-                ".restore-{}-{}",
-                std::process::id(),
-                package.digest.trim_start_matches("blake3:")
-            ));
-            if temporary.exists() {
-                std::fs::remove_dir_all(&temporary).map_err(io_err)?;
-            }
-            std::fs::create_dir(&temporary).map_err(io_err)?;
-            if let Err(error) = copy_package(&source, &temporary) {
-                let _ = std::fs::remove_dir_all(&temporary);
-                return Err(BackupServiceError::Validation(error.to_string()));
-            }
-            if let Err(error) = secure_package_tree(&temporary) {
-                let _ = std::fs::remove_dir_all(&temporary);
-                return Err(error);
-            }
-            let actual = match hash_package(&temporary) {
-                Ok(actual) => actual,
-                Err(error) => {
-                    let _ = std::fs::remove_dir_all(&temporary);
-                    return Err(BackupServiceError::Validation(error.to_string()));
-                }
-            };
-            if actual.as_str() != package.digest {
-                let _ = std::fs::remove_dir_all(&temporary);
-                return Err(BackupServiceError::Validation(format!(
-                    "managed package {} failed staged verification",
-                    package.digest
-                )));
-            }
-            match std::fs::rename(&temporary, &target) {
-                Ok(()) => {
-                    sync_directory(parent)?;
-                    installed.push(target);
-                }
-                Err(error) if target.exists() => {
-                    let _ = std::fs::remove_dir_all(&temporary);
-                    let actual = hash_package(&target).map_err(|hash_error| {
-                        BackupServiceError::Validation(hash_error.to_string())
-                    })?;
-                    if actual.as_str() != package.digest {
-                        return Err(io_err(error));
-                    }
-                    installed.push(target);
-                }
-                Err(error) => {
-                    let _ = std::fs::remove_dir_all(&temporary);
-                    return Err(io_err(error));
-                }
-            }
-        }
-        Ok(installed)
-    })();
-    if result.is_err() {
-        let paths = journal
-            .digests
-            .iter()
-            .filter_map(|digest| digest.strip_prefix("blake3:"))
-            .map(|digest| data_dir.join("managed-extensions/blake3").join(digest))
-            .collect::<Vec<_>>();
-        remove_installed_packages(&paths);
-    }
-    result
-}
-
-fn secure_package_tree(root: &Path) -> Result<(), BackupServiceError> {
-    set_directory_owner_only(root)?;
-    let files =
-        package_files(root).map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-    let mut directories = BTreeSet::new();
-    for (_, file) in files {
-        set_file_owner_only(&file)?;
-        sync_file(&file)?;
-        let mut parent = file.parent();
-        while let Some(directory) = parent {
-            if directory == root {
-                break;
-            }
-            directories.insert(directory.to_path_buf());
-            parent = directory.parent();
-        }
-    }
-    for directory in directories {
-        set_directory_owner_only(&directory)?;
-        sync_directory(&directory)?;
-    }
-    sync_directory(root)
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), BackupServiceError> {

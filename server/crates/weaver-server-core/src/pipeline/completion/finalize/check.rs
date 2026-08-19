@@ -3438,16 +3438,12 @@ impl Pipeline {
         let archive_extraction_applicable = self.extraction_readiness_for_job(job_id)
             != ExtractionReadiness::NotApplicable
             || only_rar_archives;
-        let extension_repair_requested = self
-            .post_processing_repair_return_to_terminal
-            .contains(&job_id);
         let authoritative_par2_verification_needed = par2_validation_needed
             && (rar_par2_repair_ready
                 || has_crc_failures
                 || (has_incomplete_data_files && download_pipeline_exhausted)
                 || rar_waiting_for_missing_volumes
                 || matches!(current_status, JobStatus::Repairing)
-                || extension_repair_requested
                 || matches!(
                     clean_par2_integrity_gate,
                     CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None
@@ -3463,7 +3459,6 @@ impl Pipeline {
         };
         let quick_par2_verification_allowed = par2_validation_needed
             && !matches!(current_status, JobStatus::Repairing)
-            && !extension_repair_requested
             // A set waiting on a volume that never posted needs the
             // *authoritative* analyzer: only that names the exact missing
             // blocks a recovery promotion has to target, and the quick pass has

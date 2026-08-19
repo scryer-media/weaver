@@ -1,29 +1,24 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
 use super::archive::{
-    ManagedPackageSource, is_bundle_encrypted, maybe_decrypt_archive, unpack_bundle_archive,
-    unpack_plain_archive, write_bundle_archive,
+    is_bundle_encrypted, maybe_decrypt_archive, unpack_bundle_archive, unpack_plain_archive,
+    write_bundle_archive,
 };
-use super::logical::{
-    read_table_objects, validate_legacy_encryption_key, verify_table_parts, visit_table_objects,
-};
+use super::logical::{read_table_objects, validate_legacy_encryption_key, verify_table_parts};
 use super::manifest::{
     BackupArtifact, BackupInspectResult, BackupInstanceSecrets, BackupManifest, BackupServiceError,
-    BackupSourcePaths, BackupStatus, CategoryRemapRequirement, ManagedPackageInventory,
-    RestoreOptions, RestoreReport, build_bundle_manifest, io_err, required_category_remaps,
-    validate_manifest,
+    BackupSourcePaths, BackupStatus, CategoryRemapRequirement, RestoreOptions, RestoreReport,
+    build_bundle_manifest, io_err, required_category_remaps, validate_manifest,
 };
 use super::pending::{PendingRestoreMetadata, pending_restore_status, stage_pending_restore};
 use super::restore::{
     normalize_restore_options, rewrite_backup_db_for_restore, rewrite_logical_bundle_for_restore,
 };
-use crate::post_processing::discovery::{copy_package, hash_package, package_files};
 use crate::rss::RssService;
 use crate::settings::{Config, SharedConfig};
 use crate::{Database, SchedulerHandle};
@@ -143,11 +138,8 @@ impl BackupService {
             .map_err(|error| BackupServiceError::Io(error.to_string()))?;
         let fallback_config = self.inner.config.read().await.clone();
         let export_root = export.staging.path().to_path_buf();
-        let (source_paths, managed_packages) = tokio::task::spawn_blocking(move || {
-            Ok::<_, BackupServiceError>((
-                source_paths_from_export(&export_root, &fallback_config)?,
-                managed_package_sources_from_export(&export_root)?,
-            ))
+        let source_paths = tokio::task::spawn_blocking(move || {
+            source_paths_from_export(&export_root, &fallback_config)
         })
         .await
         .map_err(|error| BackupServiceError::Io(error.to_string()))??;
@@ -172,15 +164,7 @@ impl BackupService {
         let secrets_path = export.staging.path().join("instance-secrets.json");
         write_json(&secrets_path, &secrets)?;
         let secrets_checksum = checksum_hex(&secrets_path)?;
-        let manifest = build_bundle_manifest(
-            source_paths,
-            &export,
-            managed_packages
-                .iter()
-                .map(|package| package.inventory.clone())
-                .collect(),
-            secrets_checksum,
-        );
+        let manifest = build_bundle_manifest(source_paths, &export, secrets_checksum);
         write_json(&export.staging.path().join("manifest.json"), &manifest)?;
 
         let artifact_dir = super::create_backup_temp_dir().map_err(io_err)?;
@@ -189,12 +173,10 @@ impl BackupService {
         let path = artifact_dir.path().join(&filename);
         let staging = export.staging.path().to_path_buf();
         let output = path.clone();
-        tokio::task::spawn_blocking(move || {
-            write_bundle_archive(&output, &password, &staging, &managed_packages)
-        })
-        .await
-        .map_err(|error| BackupServiceError::Io(error.to_string()))?
-        .map_err(io_err)?;
+        tokio::task::spawn_blocking(move || write_bundle_archive(&output, &password, &staging))
+            .await
+            .map_err(|error| BackupServiceError::Io(error.to_string()))?
+            .map_err(io_err)?;
 
         Ok(BackupArtifact {
             filename,
@@ -358,7 +340,6 @@ impl BackupService {
             pending_restore_id: Some(restore_id),
             history_jobs,
             category_remaps_applied: options.category_remaps.len(),
-            managed_packages_restored: loaded.manifest.managed_packages.len(),
             warnings: loaded.warnings,
         })
     }
@@ -418,8 +399,6 @@ impl BackupService {
                     &secrets.encryption_master_key,
                 )
                 .map_err(BackupServiceError::Validation)?;
-                validate_extracted_packages(&validation_root, &validation_manifest)?;
-                validate_managed_references(&validation_root, &validation_manifest)?;
                 let remaps = category_remaps_from_logical(
                     &validation_root,
                     &validation_manifest.source_paths,
@@ -429,13 +408,14 @@ impl BackupService {
             .await
             .map_err(|error| BackupServiceError::Io(error.to_string()))??;
         validate_logical_database(&root, &manifest, restored_key).await?;
+        let warnings = manifest.legacy_package_warning().into_iter().collect();
         Ok(LoadedBackup {
             _temp_dir: temp_dir,
             root,
             manifest,
             kind: LoadedBackupKind::Logical { secrets },
             required_category_remaps,
-            warnings: Vec::new(),
+            warnings,
         })
     }
 
@@ -582,139 +562,6 @@ fn source_paths_from_export(
         intermediate_dir,
         complete_dir,
     })
-}
-
-fn managed_package_sources_from_export(
-    root: &Path,
-) -> Result<Vec<ManagedPackageSource>, BackupServiceError> {
-    let mut packages = BTreeMap::<String, PathBuf>::new();
-    visit_table_objects(root, "post_processing_extension_revisions", |row| {
-        let Some(path) = row.get("managed_path").and_then(JsonValue::as_str) else {
-            return Ok(());
-        };
-        let digest = row
-            .get("digest")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| crate::StateError::Database("managed revision has no digest".into()))?
-            .to_string();
-        if let Some(existing) = packages.insert(digest.clone(), PathBuf::from(path))
-            && existing != Path::new(path)
-        {
-            return Err(crate::StateError::Database(format!(
-                "managed package {digest} has conflicting paths"
-            )));
-        }
-        Ok(())
-    })
-    .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-    packages
-        .into_iter()
-        .map(|(digest, path)| {
-            let hex = digest
-                .strip_prefix("blake3:")
-                .ok_or_else(|| {
-                    BackupServiceError::Validation("managed package digest must use blake3".into())
-                })?
-                .to_owned();
-            let staged = root.join("managed-extensions/blake3").join(&hex);
-            if let Some(parent) = staged.parent() {
-                std::fs::create_dir_all(parent).map_err(io_err)?;
-            }
-            copy_package(&path, &staged)
-                .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-            let actual = hash_package(&staged)
-                .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-            if actual.as_str() != digest {
-                let _ = std::fs::remove_dir_all(&staged);
-                return Err(BackupServiceError::Validation(format!(
-                    "managed package {digest} changed while the backup snapshot was prepared"
-                )));
-            }
-            let files = package_files(&staged)
-                .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-            let uncompressed_bytes = files.iter().try_fold(0_u64, |total, (_, file)| {
-                total
-                    .checked_add(std::fs::metadata(file).map_err(io_err)?.len())
-                    .ok_or_else(|| {
-                        BackupServiceError::Validation("managed package is too large".into())
-                    })
-            })?;
-            Ok(ManagedPackageSource {
-                inventory: ManagedPackageInventory {
-                    digest,
-                    archive_prefix: format!("managed-extensions/blake3/{hex}"),
-                    file_count: files.len(),
-                    uncompressed_bytes,
-                },
-                path: staged,
-            })
-        })
-        .collect()
-}
-
-fn validate_extracted_packages(
-    root: &Path,
-    manifest: &BackupManifest,
-) -> Result<(), BackupServiceError> {
-    for package in &manifest.managed_packages {
-        let path = root.join(&package.archive_prefix);
-        let files = package_files(&path)
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        let bytes = files.iter().try_fold(0_u64, |total, (_, path)| {
-            total
-                .checked_add(std::fs::metadata(path).map_err(io_err)?.len())
-                .ok_or_else(|| BackupServiceError::Validation("package is too large".into()))
-        })?;
-        if files.len() != package.file_count || bytes != package.uncompressed_bytes {
-            return Err(BackupServiceError::Validation(format!(
-                "managed package {} does not match its inventory",
-                package.digest
-            )));
-        }
-        let actual = hash_package(&path)
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        if actual.as_str() != package.digest {
-            return Err(BackupServiceError::Validation(format!(
-                "managed package {} failed digest verification",
-                package.digest
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_managed_references(
-    root: &Path,
-    manifest: &BackupManifest,
-) -> Result<(), BackupServiceError> {
-    let mut referenced = BTreeSet::new();
-    visit_table_objects(root, "post_processing_extension_revisions", |row| {
-        if row
-            .get("managed_path")
-            .is_none_or(serde_json::Value::is_null)
-        {
-            return Ok(());
-        }
-        let digest = row
-            .get("digest")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| crate::StateError::Database("managed revision has no digest".into()))?;
-        referenced.insert(digest.to_string());
-        Ok(())
-    })
-    .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-    let declared = manifest
-        .managed_packages
-        .iter()
-        .map(|package| package.digest.clone())
-        .collect::<BTreeSet<_>>();
-    if referenced == declared {
-        Ok(())
-    } else {
-        Err(BackupServiceError::Validation(
-            "managed package inventory does not match revision references".into(),
-        ))
-    }
 }
 
 fn category_remaps_from_logical(

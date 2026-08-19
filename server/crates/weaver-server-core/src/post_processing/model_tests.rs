@@ -1,315 +1,275 @@
-use std::collections::HashSet;
+use super::model::{
+    OptionName, OptionValue, PostProcessingSettings, PostProcessingSummary, ResolvedOption,
+    ScriptAdapter, ScriptList, ScriptListEntry, ScriptLists, ScriptManifest, ScriptName,
+    ScriptOption, ScriptOptionType, ScriptStatus, SecretOptionValue, merge_post_processing_summary,
+};
 
-use super::model::*;
-
-fn verified_digest(seed: char) -> VerifiedExtensionDigest {
-    VerifiedExtensionDigest::from_verified_package_digest(
-        ExtensionDigest::new(format!("sha256:{}", seed.to_string().repeat(64))).unwrap(),
-    )
+fn script(name: &str) -> ScriptName {
+    ScriptName::new(name).unwrap()
 }
 
-fn revision(seed: char) -> ExtensionRevision {
-    ExtensionRevision::from_verified(
-        ExtensionId::new("example.extension").unwrap(),
-        DeclaredExtensionVersion::new("1.0.0").unwrap(),
-        verified_digest(seed),
-    )
-}
-
-fn roots() -> ApprovedFilesystemRoots {
-    ApprovedFilesystemRoots::new(vec![
-        ApprovedFilesystemRoot::new("/srv/weaver/output").unwrap(),
-    ])
-}
-
-fn selection(seed: char) -> ExtensionSelection {
-    ExtensionSelection::pinned(
-        ExtensionId::new("example.extension").unwrap(),
-        revision(seed).revision_id().clone(),
-    )
-}
-
-fn ordered_step(
-    index: u32,
-    timeout_policy: TimeoutPolicy,
-    options: Vec<ResolvedOption>,
-) -> OrderedStep {
-    OrderedStep::new(
-        index,
-        selection('a'),
-        RunWhen::Always,
-        OnFailure::Continue,
-        OutcomeImpact::Warning,
-        timeout_policy,
-        roots(),
+fn manifest(options: Vec<ScriptOption>) -> ScriptManifest {
+    ScriptManifest::new(
+        ScriptAdapter::Sabnzbd,
+        None,
+        "Example".into(),
+        None,
+        "run.sh".into(),
+        vec![],
         options,
     )
     .unwrap()
 }
 
-#[test]
-fn nzbget_identity_preserves_compatibility_name_without_collisions() {
-    let names = [
-        "My Script",
-        "My-Script",
-        "My_Script",
-        "my script",
-        "My.Script!",
-        "Mý Script",
-    ];
-    let ids = names
-        .into_iter()
-        .map(|name| NzbgetCompatibilityName::new(name).unwrap())
-        .map(|name| {
-            assert!(!name.as_str().is_empty());
-            name.weaver_extension_id().unwrap()
-        })
-        .collect::<HashSet<_>>();
-    assert_eq!(ids.len(), names.len());
-}
-
-#[test]
-fn revisions_are_digest_bound_even_when_manifest_versions_match() {
-    let first = revision('a');
-    let second = revision('b');
-    assert_eq!(first.declared_version().as_str(), "1.0.0");
-    assert_eq!(second.declared_version().as_str(), "1.0.0");
-    assert_ne!(first.revision_id(), second.revision_id());
-    assert_ne!(
-        ExtensionSelection::pinned(first.extension_id().clone(), first.revision_id().clone())
-            .revision_id(),
-        ExtensionSelection::pinned(second.extension_id().clone(), second.revision_id().clone())
-            .revision_id()
-    );
-
-    let mut wire = serde_json::to_value(&first).unwrap();
-    wire["revision_id"] = serde_json::Value::String("sha256-deadbeef".to_string());
-    assert!(serde_json::from_value::<ExtensionRevision>(wire).is_err());
-}
-
-#[test]
-fn generic_secret_serde_fails_closed_for_resolved_options_profiles_and_plans() {
-    let secret = ResolvedOption::new(
-        OptionName::new("api_key").unwrap(),
-        ResolvedOptionValue::Secret(SecretOptionValue::for_execution("do-not-log")),
-    );
-    let profile = Profile::new(
-        ProfileId::new("default-profile").unwrap(),
-        "Default".to_string(),
-        vec![ordered_step(
-            0,
-            TimeoutPolicy::Default24Hours,
-            vec![secret.clone()],
-        )],
-    )
-    .unwrap();
-    let profile_json = serde_json::to_string(&profile).unwrap();
-    assert!(!format!("{profile:?}").contains("do-not-log"));
-    assert!(!profile_json.contains("do-not-log"));
-    assert!(serde_json::from_str::<Profile>(&profile_json).is_err());
-
-    let frozen = FrozenPlan::new(
-        FrozenPlanProvenance::Explicit,
-        vec![
-            FrozenPlanStep::new(
-                0,
-                revision('a'),
-                RunWhen::Always,
-                OnFailure::Continue,
-                OutcomeImpact::Warning,
-                TimeoutPolicy::Default24Hours,
-                roots(),
-                vec![secret],
-            )
-            .unwrap(),
-        ],
-    )
-    .unwrap();
-    let frozen_json = serde_json::to_string(&frozen).unwrap();
-    assert!(!frozen_json.contains("do-not-log"));
-    assert!(serde_json::from_str::<FrozenPlan>(&frozen_json).is_err());
-    assert!(
-        serde_json::from_str::<ResolvedOptionValue>(r#"{"type":"secret","value":"[REDACTED]"}"#)
-            .is_err()
-    );
-}
-
-#[test]
-fn submission_and_revision_selection_stay_separate_and_validated() {
-    let selected = selection('a');
-    let submission = SubmissionPlanSelection::extensions(vec![selected.clone()]).unwrap();
-    assert_eq!(submission.mode(), SubmissionPlanSelectionMode::Extensions);
-    assert_eq!(submission.selected_extensions().unwrap(), [selected]);
-    assert_eq!(
-        SubmissionPlanSelection::inherit().mode(),
-        SubmissionPlanSelectionMode::Inherit
-    );
-    assert_eq!(
-        SubmissionPlanSelection::disabled().mode(),
-        SubmissionPlanSelectionMode::Disabled
-    );
-    assert_eq!(
-        SubmissionPlanSelection::profile(ProfileId::new("default-profile").unwrap()).mode(),
-        SubmissionPlanSelectionMode::Profile
-    );
-    assert!(SubmissionPlanSelection::extensions(vec![]).is_err());
-    assert!(serde_json::from_str::<ExtensionSelection>(
-        r#"{"extension_id":"example.extension","mode":"latest_approved","revision_id":"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#
-    )
-    .is_err());
-}
-
-#[test]
-fn profiles_freeze_roots_timeouts_and_canonical_ordering() {
-    let finite = TimeoutPolicy::Finite(NonZeroTimeoutSeconds::new(90).unwrap());
-    let profile = Profile::new(
-        ProfileId::new("default-profile").unwrap(),
-        "Default".to_string(),
-        vec![
-            ordered_step(1, finite, vec![]),
-            ordered_step(0, finite, vec![]),
-        ],
-    )
-    .unwrap();
-    assert_eq!(profile.steps()[0].index(), 0);
-    assert_eq!(profile.steps()[0].approved_roots().as_slice().len(), 1);
-    assert_eq!(profile.steps()[0].timeout_policy(), finite);
-    assert!(NonZeroTimeoutSeconds::new(0).is_err());
-    assert!(serde_json::from_str::<NonZeroTimeoutSeconds>("0").is_err());
-    assert!(
-        Profile::new(
-            ProfileId::new("default-profile").unwrap(),
-            "Default".to_string(),
-            vec![ordered_step(2, TimeoutPolicy::Unlimited, vec![])]
-        )
-        .is_err()
-    );
-    assert!(
-        OrderedStep::new(
-            0,
-            selection('a'),
-            RunWhen::Always,
-            OnFailure::Continue,
-            OutcomeImpact::Warning,
-            TimeoutPolicy::Default24Hours,
-            roots(),
-            vec![
-                ResolvedOption::new(
-                    OptionName::new("Api.Key").unwrap(),
-                    ResolvedOptionValue::String("a".into())
-                ),
-                ResolvedOption::new(
-                    OptionName::new("api.key").unwrap(),
-                    ResolvedOptionValue::String("b".into())
-                ),
-            ],
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn approved_roots_reject_portable_unsafe_components() {
-    for root in [
-        r"C:\CON",
-        r"C:\CON .txt",
-        r"C:\safe\trailing. ",
-        r"C:\safe\file.txt:alternate-stream",
-        r"\\?\C:\safe",
-        r"\\?\UNC\server\share",
-        r"\\.\PhysicalDrive0",
-        r"\??\C:\safe",
-        "/srv/../weaver",
-        "/srv/control\ncharacter",
-    ] {
-        assert!(ApprovedFilesystemRoot::new(root).is_err());
-    }
-    assert!(ApprovedFilesystemRoot::new("/").is_ok());
-    assert!(ApprovedFilesystemRoot::new(r"C:\").is_ok());
-    assert!(ApprovedFilesystemRoot::new(r"\\server\share").is_ok());
-}
-
-#[test]
-fn settings_validate_allowed_roots_and_duplicates() {
-    let mut settings = PostProcessingSettings {
-        allowed_roots: vec!["/srv/weaver".into()],
-        ..PostProcessingSettings::default()
-    };
-    assert!(settings.validate().is_ok());
-
-    settings.allowed_roots.push("/srv/weaver".into());
-    assert!(settings.validate().is_err());
-    settings.allowed_roots = vec![r"\\?\C:\unsafe".into()];
-    assert!(settings.validate().is_err());
-}
-
-#[test]
-fn frozen_plans_preserve_provenance_and_policy() {
-    let frozen_step = FrozenPlanStep::new(
-        0,
-        revision('a'),
-        RunWhen::PipelineSuccess,
-        OnFailure::Stop,
-        OutcomeImpact::FailJob,
-        TimeoutPolicy::Unlimited,
-        roots(),
+fn option(name: &str, option_type: ScriptOptionType, default: Option<OptionValue>) -> ScriptOption {
+    ScriptOption::new(
+        None,
+        OptionName::new(name).unwrap(),
+        option_type,
+        default,
+        None,
         vec![],
+        vec![],
+        false,
     )
-    .unwrap();
-    let plan = FrozenPlan::new(
-        FrozenPlanProvenance::CategoryProfile {
-            profile_id: ProfileId::new("default-profile").unwrap(),
-        },
-        vec![frozen_step],
-    )
-    .unwrap();
-    assert_eq!(plan.steps()[0].approved_roots().as_slice().len(), 1);
-    assert_eq!(plan.steps()[0].timeout_policy(), TimeoutPolicy::Unlimited);
-    assert!(FrozenPlan::new(FrozenPlanProvenance::Disabled, vec![]).is_ok());
-    assert!(FrozenPlan::new(FrozenPlanProvenance::Empty, vec![]).is_ok());
-    assert!(FrozenPlan::new(FrozenPlanProvenance::Disabled, plan.steps().to_vec()).is_err());
+    .unwrap()
 }
 
 #[test]
-fn pipeline_and_post_processing_outcomes_remain_separate() {
-    let pipeline = PipelineOutcome::Failed {
-        stage: PipelineFailureStage::Repair,
-        code: "par2_unrecoverable".to_string(),
-        message: "repair data is insufficient".to_string(),
+fn script_names_stay_inside_the_scripts_directory() {
+    assert!(ScriptName::new("cleanup.sh").is_ok());
+    assert!(ScriptName::new("Video Sort").is_ok());
+    for rejected in [
+        "",
+        " leading",
+        "trailing ",
+        "../escape",
+        "nested/name",
+        r"nested\name",
+        "stream:name",
+        ".hidden",
+        "trailing.",
+        "CON",
+        "com1.txt",
+        "null\0byte",
+    ] {
+        assert!(
+            ScriptName::new(rejected).is_err(),
+            "accepted {rejected:?} as a script name"
+        );
+    }
+}
+
+#[test]
+fn script_lists_reject_duplicates_and_zero_timeouts() {
+    assert!(ScriptList::new(vec![ScriptListEntry::new(script("a.sh"))]).is_ok());
+    assert!(
+        ScriptList::new(vec![
+            ScriptListEntry::new(script("a.sh")),
+            ScriptListEntry::new(script("a.sh")),
+        ])
+        .is_err()
+    );
+    let zero = ScriptListEntry {
+        script: script("a.sh"),
+        enabled: true,
+        timeout_seconds: Some(0),
     };
-    assert!(matches!(
-        pipeline,
-        PipelineOutcome::Failed {
-            stage: PipelineFailureStage::Repair,
-            ..
-        }
-    ));
-    assert_eq!(PostProcessingSummary::NotRun, PostProcessingSummary::NotRun);
+    assert!(ScriptList::new(vec![zero]).is_err());
+}
+
+#[test]
+fn category_overrides_beat_the_global_default_case_insensitively() {
+    let mut lists = ScriptLists {
+        global: ScriptList::new(vec![ScriptListEntry::new(script("global.sh"))]).unwrap(),
+        ..ScriptLists::default()
+    };
+    lists.categories.insert(
+        "Movies".into(),
+        ScriptList::new(vec![ScriptListEntry::new(script("movies.sh"))]).unwrap(),
+    );
+
     assert_eq!(
-        PostProcessingSummary::Interrupted,
-        PostProcessingSummary::Interrupted
+        lists.resolve(None).entries()[0].script.as_str(),
+        "global.sh"
+    );
+    assert_eq!(
+        lists.resolve(Some("tv")).entries()[0].script.as_str(),
+        "global.sh"
+    );
+    // Download clients echo their own casing back, so the lookup cannot be exact.
+    for category in ["Movies", "movies", " MOVIES "] {
+        assert_eq!(
+            lists.resolve(Some(category)).entries()[0].script.as_str(),
+            "movies.sh",
+            "category {category:?} did not resolve its override"
+        );
+    }
+}
+
+#[test]
+fn disabled_entries_are_kept_in_order_but_never_run() {
+    let list = ScriptList::new(vec![
+        ScriptListEntry::new(script("first.sh")),
+        ScriptListEntry {
+            script: script("second.sh"),
+            enabled: false,
+            timeout_seconds: None,
+        },
+        ScriptListEntry::new(script("third.sh")),
+    ])
+    .unwrap();
+    assert_eq!(list.entries().len(), 3);
+    let enabled = list
+        .enabled_entries()
+        .map(|entry| entry.script.as_str().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(enabled, ["first.sh", "third.sh"]);
+}
+
+#[test]
+fn the_job_rollup_reports_the_worst_script_outcome() {
+    use PostProcessingSummary::{Cancelled, Failed, Interrupted, NotRun, Succeeded, Warning};
+    assert_eq!(merge_post_processing_summary(NotRun, NotRun), NotRun);
+    assert_eq!(merge_post_processing_summary(Succeeded, NotRun), Succeeded);
+    assert_eq!(merge_post_processing_summary(Succeeded, Warning), Warning);
+    assert_eq!(merge_post_processing_summary(Warning, Failed), Failed);
+    assert_eq!(
+        merge_post_processing_summary(Failed, Interrupted),
+        Interrupted
+    );
+    assert_eq!(
+        merge_post_processing_summary(Interrupted, Cancelled),
+        Cancelled
+    );
+    assert_eq!(
+        merge_post_processing_summary(Cancelled, Succeeded),
+        Cancelled
     );
 }
 
 #[test]
-fn artifact_conditions_are_safe_content_prerequisites_and_remain_backward_compatible() {
-    let condition = ArtifactCondition::new(vec![".mkv".into(), ".srt".into()], 2).unwrap();
-    let matching = [
-        std::path::Path::new("/output/movie.mkv"),
-        std::path::Path::new("/output/movie.srt"),
+fn script_status_maps_onto_the_job_summary() {
+    assert_eq!(
+        ScriptStatus::Succeeded.summary(),
+        PostProcessingSummary::Succeeded
+    );
+    // NZBGet's "NONE" is a decision, not a problem.
+    assert_eq!(
+        ScriptStatus::Skipped.summary(),
+        PostProcessingSummary::Succeeded
+    );
+    assert_eq!(
+        ScriptStatus::Warning.summary(),
+        PostProcessingSummary::Warning
+    );
+    assert_eq!(
+        ScriptStatus::Failed.summary(),
+        PostProcessingSummary::Failed
+    );
+    assert_eq!(
+        ScriptStatus::TimedOut.summary(),
+        PostProcessingSummary::Failed
+    );
+    assert_eq!(
+        ScriptStatus::Cancelled.summary(),
+        PostProcessingSummary::Cancelled
+    );
+}
+
+#[test]
+fn options_merge_over_manifest_defaults_and_reject_undeclared_or_mistyped_keys() {
+    let manifest = manifest(vec![
+        option(
+            "mode",
+            ScriptOptionType::String,
+            Some(OptionValue::String("safe".into())),
+        ),
+        option("token", ScriptOptionType::Secret, None),
+    ]);
+
+    let resolved = manifest.resolve_options(&[]).unwrap();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].name().as_str(), "mode");
+
+    let supplied = vec![
+        ResolvedOption::new(
+            OptionName::new("mode").unwrap(),
+            OptionValue::String("fast".into()),
+        ),
+        ResolvedOption::new(
+            OptionName::new("token").unwrap(),
+            OptionValue::Secret(SecretOptionValue::from_admin_input("hunter2")),
+        ),
     ];
-    assert!(condition.matches(matching));
-    assert!(!condition.matches([std::path::Path::new("/output/movie.mkv")]));
-    assert!(ArtifactCondition::new(vec!["../movie.mkv".into()], 0).is_err());
+    let resolved = manifest.resolve_options(&supplied).unwrap();
+    assert_eq!(resolved.len(), 2);
+    assert!(resolved[1].value().is_secret());
 
-    let step = ordered_step(0, TimeoutPolicy::Default24Hours, vec![])
-        .with_artifact_condition(condition.clone());
-    let round_trip: OrderedStep =
-        serde_json::from_value(serde_json::to_value(&step).unwrap()).unwrap();
-    assert_eq!(round_trip.artifact_condition(), &condition);
+    let undeclared = vec![ResolvedOption::new(
+        OptionName::new("nope").unwrap(),
+        OptionValue::String("x".into()),
+    )];
+    assert!(manifest.resolve_options(&undeclared).is_err());
 
-    let mut legacy = serde_json::to_value(&step).unwrap();
-    legacy.as_object_mut().unwrap().remove("artifact_condition");
-    let legacy: OrderedStep = serde_json::from_value(legacy).unwrap();
-    assert_eq!(legacy.artifact_condition(), &ArtifactCondition::default());
+    let mistyped = vec![ResolvedOption::new(
+        OptionName::new("mode").unwrap(),
+        OptionValue::Integer(1),
+    )];
+    assert!(manifest.resolve_options(&mistyped).is_err());
+}
+
+#[test]
+fn a_required_option_without_a_value_is_refused() {
+    let required = ScriptOption::new(
+        None,
+        OptionName::new("token").unwrap(),
+        ScriptOptionType::String,
+        None,
+        None,
+        vec![],
+        vec![],
+        true,
+    )
+    .unwrap();
+    assert!(manifest(vec![required]).resolve_options(&[]).is_err());
+}
+
+#[test]
+fn secret_options_never_carry_a_manifest_default_and_never_serialize() {
+    assert!(
+        ScriptOption::new(
+            None,
+            OptionName::new("token").unwrap(),
+            ScriptOptionType::Secret,
+            Some(OptionValue::String("plaintext".into())),
+            None,
+            vec![],
+            vec![],
+            false,
+        )
+        .is_err()
+    );
+    let secret = OptionValue::Secret(SecretOptionValue::from_admin_input("hunter2"));
+    let json = serde_json::to_string(&secret).unwrap();
+    assert!(json.contains("[REDACTED]"));
+    assert!(!json.contains("hunter2"));
+    assert!(serde_json::from_str::<OptionValue>(&json).is_err());
+}
+
+#[test]
+fn settings_bound_concurrency_and_require_a_grace_period() {
+    let mut settings = PostProcessingSettings::default();
+    assert!(
+        !settings.execution_enabled,
+        "execution stays off by default"
+    );
+    assert!(settings.validate().is_ok());
+    settings.concurrency = 0;
+    assert!(settings.validate().is_err());
+    settings.concurrency = 9;
+    assert!(settings.validate().is_err());
+    settings.concurrency = 8;
+    settings.termination_grace_seconds = 0;
+    assert!(settings.validate().is_err());
 }

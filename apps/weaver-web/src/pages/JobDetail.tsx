@@ -40,6 +40,7 @@ import {
   PROMOTE_DUPLICATE_CANDIDATE_MUTATION,
   REDOWNLOAD_JOB_MUTATION,
   REPROCESS_JOB_MUTATION,
+  RERUN_POST_PROCESSING_MUTATION,
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
 import {
@@ -116,6 +117,7 @@ export function JobDetail() {
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
+  const [rerunScriptsState, rerunPostProcessing] = useMutation(RERUN_POST_PROCESSING_MUTATION);
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
   const [acceptDeleteState, acceptHistoryDelete] = useMutation(ACCEPT_HISTORY_DELETE_MUTATION);
   const [markDuplicateGoodState, markDuplicateGood] = useMutation(MARK_DUPLICATE_GOOD_MUTATION);
@@ -425,6 +427,19 @@ export function JobDetail() {
                 </Button>
                 <Button variant="outline" onClick={() => setShowRedownloadConfirm(true)}>
                   {t("action.redownload")}
+                </Button>
+                {/* Scripts only: the download is untouched, so this is safe to
+                    offer beside the heavier reprocess and redownload actions. */}
+                <Button
+                  variant="outline"
+                  disabled={rerunScriptsState.fetching}
+                  onClick={() => {
+                    void rerunPostProcessing({ jobId: job.id }).then(() => {
+                      void reexecuteJobQuery({ requestPolicy: "network-only" });
+                    });
+                  }}
+                >
+                  {t("action.rerunPostProcessing")}
                 </Button>
               </>
             ) : null}

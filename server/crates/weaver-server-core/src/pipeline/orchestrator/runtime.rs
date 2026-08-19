@@ -98,14 +98,14 @@ impl Pipeline {
             warn!(error = %error, "failed to load post-processing settings; using disabled defaults");
             crate::post_processing::model::PostProcessingSettings::default()
         });
-        let terminal_post_processing_service =
-            crate::post_processing::service::PostProcessingService::new_with_termination_grace(
+        let terminal_post_processing_executor =
+            crate::post_processing::executor::PostProcessingExecutor::new(
                 db.clone(),
+                std::path::PathBuf::from(&data_dir),
                 usize::from(post_processing_settings.concurrency),
-                Duration::from_secs(post_processing_settings.termination_grace_seconds),
             );
-        if let Err(error) = terminal_post_processing_service.recover_interrupted() {
-            warn!(error = %error, "failed to recover interrupted post-processing attempts");
+        if let Err(error) = terminal_post_processing_executor.recover_interrupted() {
+            warn!(error = %error, "failed to mark interrupted post-processing jobs");
         }
         let nntp = Arc::new(nntp);
         shared_state.set_nntp_runtime_activation(NntpRuntimeActivation {
@@ -245,7 +245,7 @@ impl Pipeline {
             move_done_rx,
             terminal_post_processing_done_tx,
             terminal_post_processing_done_rx,
-            terminal_post_processing_service,
+            terminal_post_processing_executor,
             inflight_terminal_post_processing: HashSet::new(),
             terminal_post_processing_cancellations: HashMap::new(),
             global_paused: initial_global_paused,
@@ -310,8 +310,6 @@ impl Pipeline {
             par2_verified: HashSet::new(),
             sfv_checked: HashSet::new(),
             jobs_with_verification_outcome: HashSet::new(),
-            post_processing_repair_reentered: HashSet::new(),
-            post_processing_repair_return_to_terminal: HashSet::new(),
             unavailable_promoted_recovery_segments: HashSet::new(),
             finished_jobs: initial_history,
             shared_state,
@@ -515,10 +513,10 @@ impl Pipeline {
         }
     }
 
-    pub fn post_processing_service(
+    pub fn post_processing_executor(
         &self,
-    ) -> crate::post_processing::service::PostProcessingService {
-        self.terminal_post_processing_service.clone()
+    ) -> crate::post_processing::executor::PostProcessingExecutor {
+        self.terminal_post_processing_executor.clone()
     }
 
     pub(crate) fn effective_downloaded_bytes(state: &JobState) -> u64 {

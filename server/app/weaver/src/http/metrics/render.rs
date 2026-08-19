@@ -15,7 +15,7 @@ use weaver_server_core::operations::instrumentation::{
 };
 use weaver_server_core::operations::metrics_store::JOB_STATUS_KEYS;
 use weaver_server_core::pipeline::{HOT_BEST_MODE_BLOCK_REASON_LABELS, HOT_EXPANSION_KIND_LABELS};
-use weaver_server_core::post_processing::persistence::PostProcessingMetricsSnapshot;
+use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot;
 use weaver_server_core::settings::PerJobSeries;
 use weaver_server_core::{
     DispatchShareMode, DownloadPressureReason, DownloadPressureState, JobInfo, JobStatus,

@@ -795,7 +795,6 @@ pub struct SubmitNzbInput {
     pub dupe_key: Option<String>,
     pub dupe_score: Option<i64>,
     pub dupe_mode: Option<DuplicateModeGql>,
-    pub post_processing: Option<crate::post_processing::types::PostProcessingSelectionInput>,
 }
 
 #[derive(Debug, InputObject)]
@@ -827,7 +826,6 @@ pub struct SubmitStagedNzbsInput {
     pub dupe_key: Option<String>,
     pub dupe_score: Option<i64>,
     pub dupe_mode: Option<DuplicateModeGql>,
-    pub post_processing: Option<crate::post_processing::types::PostProcessingSelectionInput>,
 }
 
 #[derive(Debug, Clone, SimpleObject)]

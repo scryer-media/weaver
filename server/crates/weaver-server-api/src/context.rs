@@ -63,10 +63,10 @@ pub struct SchemaContext {
     /// the assertion. The `HistoryDeleteManager` is still wired into the schema
     /// so on-demand delete mutations work regardless.
     pub spawn_history_delete_worker: bool,
-    /// Production passes the pipeline-owned service so automatic runs and API
-    /// reruns share concurrency, pause, and cancellation state.
-    pub post_processing_service:
-        Option<weaver_server_core::post_processing::service::PostProcessingService>,
+    /// Production passes the pipeline-owned executor so automatic runs and API
+    /// reruns share concurrency and cancellation state.
+    pub post_processing_executor:
+        Option<weaver_server_core::post_processing::executor::PostProcessingExecutor>,
 }
 
 /// Render the GraphQL SDL for the public API without constructing any runtime
@@ -109,12 +109,18 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
         .expect("http client build should succeed");
     let staged_upload_manager = StagedUploadManager::new();
     staged_upload_manager.spawn_cleanup_worker();
-    let post_processing_service = context.post_processing_service.clone().unwrap_or_else(|| {
+    let post_processing_executor = context.post_processing_executor.clone().unwrap_or_else(|| {
         let settings = context.db.post_processing_settings().unwrap_or_default();
-        weaver_server_core::post_processing::service::PostProcessingService::new_with_termination_grace(
+        // Only reached in tests: production hands over the pipeline's executor.
+        let data_dir = context
+            .config
+            .try_read()
+            .map(|config| std::path::PathBuf::from(&config.data_dir))
+            .unwrap_or_default();
+        weaver_server_core::post_processing::executor::PostProcessingExecutor::new(
             context.db.clone(),
+            data_dir,
             usize::from(settings.concurrency),
-            Duration::from_secs(settings.termination_grace_seconds),
         )
     });
 
@@ -141,6 +147,6 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     .data(replay)
     .data(history_delete_manager)
     .data(staged_upload_manager);
-    let schema = schema.data(post_processing_service);
+    let schema = schema.data(post_processing_executor);
     schema.finish()
 }

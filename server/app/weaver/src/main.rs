@@ -190,7 +190,6 @@ async fn async_main() {
     let (mut db, mut config) = if let Some(outcome) = restore_outcome {
         tracing::info!(
             restore_id = %outcome.restore_id,
-            managed_packages = outcome.managed_packages_restored,
             "applied staged backup restore"
         );
         let config = match db.load_config() {

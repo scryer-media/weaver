@@ -31,7 +31,7 @@ scrape_configs:
 
 **30 seconds is the recommended interval**, and 15s is the floor. Each scrape
 takes a snapshot of the scheduler, briefly locks the NNTP health map to read
-counters, and makes one database call for post-processing counters. None of
+counters, and samples free disk space. None of
 that is on the download hot path, but it is not free either — scraping every
 second buys nothing, because the rate gauges are already smoothed over a
 multi-second window.
@@ -502,13 +502,13 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_server_download_quota_remaining_bytes` | gauge | `server_id`, `server` | Remaining admissible BODY bytes in the current server quota window. |
 | `weaver_server_download_quota_blocked` | gauge | `server_id`, `server` | Whether the server currently rejects new BODY requests because of its quota. |
 | `weaver_extraction_rejections_total` | counter | `reason` | Archive entries refused by extraction guardrails, by reason. |
-| `weaver_post_processing_queue_depth` | gauge | — | Post-processing scripts waiting to run. |
-| `weaver_post_processing_active_attempts` | gauge | — | Post-processing script attempts currently running. |
-| `weaver_post_processing_attempt_duration_seconds` | summary | — | Wall-clock duration of completed post-processing script attempts. |
-| `weaver_post_processing_attempt_results` | counter | `result` | Completed post-processing script attempts by outcome. **Deprecated — use `weaver_post_processing_attempts_total`.** |
-| `weaver_post_processing_attempts_total` | counter | `result` | Completed post-processing script attempts by outcome. |
-| `weaver_post_processing_output_truncations` | counter | — | Post-processing script attempts whose captured output was truncated. **Deprecated — use `weaver_post_processing_output_truncations_total`.** |
-| `weaver_post_processing_output_truncations_total` | counter | — | Post-processing script attempts whose captured output was truncated. |
+| `weaver_post_processing_queue_depth` | gauge | — | Jobs waiting for a post-processing slot. |
+| `weaver_post_processing_active_attempts` | gauge | — | Post-processing scripts currently running. |
+| `weaver_post_processing_attempt_duration_seconds` | summary | — | Wall-clock duration of completed post-processing script executions. |
+| `weaver_post_processing_attempt_results` | counter | `result` | Completed post-processing script executions by outcome. **Deprecated — use `weaver_post_processing_attempts_total`.** |
+| `weaver_post_processing_attempts_total` | counter | `result` | Completed post-processing script executions by outcome. |
+| `weaver_post_processing_output_truncations` | counter | — | Post-processing script executions whose captured output was truncated. **Deprecated — use `weaver_post_processing_output_truncations_total`.** |
+| `weaver_post_processing_output_truncations_total` | counter | — | Post-processing script executions whose captured output was truncated. |
 | `weaver_server_article_attempts_total` | counter | `server_id`, `server`, `outcome`, `recovery` | Article fetch attempts per server by outcome, split by whether the attempt came from the recovery (PAR2 top-up) queue. Every combination is emitted, so the series pre-exist at zero. |
 | `weaver_server_article_latency_seconds` | histogram | `server_id`, `server` | Per-server article fetch latency. |
 | `weaver_jobs_submitted_total` | counter | `origin`, `category` | Jobs accepted into the queue, by intake origin and category. Category is empty when the job has none. |

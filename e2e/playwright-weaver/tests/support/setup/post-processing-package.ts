@@ -1,183 +1,130 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { APIRequestContext } from "@playwright/test";
 
-import { graphql } from "../../helpers";
+/**
+ * Post-processing fixtures.
+ *
+ * There is no seeding backdoor any more: a script is a file in
+ * `data_dir/scripts`, so the fixtures are exactly that. The flow enables
+ * execution through the UI, lists them, and lets a real job run them.
+ */
+const SCRIPTS_DIR = "/weaver-data/scripts";
 
-export const POST_PROCESSING_E2E_PROFILE = "e2e-extension-profile";
-export const POST_PROCESSING_E2E_EXTENSION_ID = "e2e.lifecycle-extension";
-export const POST_PROCESSING_E2E_SECRET = "weaver-e2e-secret-must-never-appear";
+export const POST_PROCESSING_NOTIFY_SCRIPT = "e2e-notify.sh";
+export const POST_PROCESSING_FAILING_SCRIPT = "e2e-failing.sh";
+export const POST_PROCESSING_NZBGET_PACKAGE = "e2e-nzbget-package";
+export const POST_PROCESSING_NZBGET_DISPLAY_NAME = "E2E NZBGet Package";
+export const POST_PROCESSING_BROKEN_PACKAGE = "e2e-broken-package";
+export const POST_PROCESSING_SECRET = "weaver-e2e-secret-must-never-appear";
+/** Marker each script drops into the job's output directory. */
+export const POST_PROCESSING_MARKER = "e2e-post-processing.txt";
 
-type PostProcessingSeed = {
-  jobIds: number[];
-  runIds: string[];
-};
+function writeScript(name: string, body: string): void {
+  const target = path.join(SCRIPTS_DIR, name);
+  fs.rmSync(target, { recursive: true, force: true });
+  fs.mkdirSync(SCRIPTS_DIR, { recursive: true });
+  fs.writeFileSync(target, body, { mode: 0o755 });
+}
 
-export function seedPostProcessingPackage(): void {
-  const packageRoot = "/weaver-data/scripts/e2e-lifecycle-extension";
-  const executable = path.join(packageRoot, "bin", "run");
-  const payload = "x".repeat(1024);
-  fs.rmSync(packageRoot, { recursive: true, force: true });
-  fs.mkdirSync(path.dirname(executable), { recursive: true });
+/**
+ * Seed every fixture the flow needs:
+ *
+ * - a bare SABnzbd script that succeeds and leaves evidence in the output dir,
+ * - a bare script that exits nonzero, which SABnzbd records as a warning,
+ * - an NZBGet manifest package with a secret option and exit 93,
+ * - a package whose manifest is unparseable, which must surface as a problem.
+ */
+export function seedPostProcessingScripts(): void {
+  writeScript(
+    POST_PROCESSING_NOTIFY_SCRIPT,
+    `#!/bin/sh
+printf 'notify ran for %s\\n' "$SAB_FINAL_NAME"
+printf 'notify\\n' >> "$SAB_COMPLETE_DIR/${POST_PROCESSING_MARKER}"
+`,
+  );
+  writeScript(
+    POST_PROCESSING_FAILING_SCRIPT,
+    `#!/bin/sh
+printf 'failing script refusing to process %s\\n' "$SAB_FINAL_NAME"
+printf 'failing\\n' >> "$SAB_COMPLETE_DIR/${POST_PROCESSING_MARKER}"
+exit 3
+`,
+  );
+
+  const nzbgetPackage = path.join(SCRIPTS_DIR, POST_PROCESSING_NZBGET_PACKAGE);
+  fs.rmSync(nzbgetPackage, { recursive: true, force: true });
+  fs.mkdirSync(nzbgetPackage, { recursive: true });
   fs.writeFileSync(
-    path.join(packageRoot, "weaver-extension.json"),
+    path.join(nzbgetPackage, "manifest.json"),
     `${JSON.stringify(
       {
-        schema_version: 1,
-        kind: "native",
-        id: POST_PROCESSING_E2E_EXTENSION_ID,
-        name: "E2E Lifecycle Extension",
+        main: "run.sh",
+        name: POST_PROCESSING_NZBGET_PACKAGE,
+        kind: "POST-PROCESSING",
+        displayName: POST_PROCESSING_NZBGET_DISPLAY_NAME,
         version: "1.0.0",
-        entrypoint: "bin/run",
+        author: "Weaver e2e",
+        homepage: "https://example.invalid",
+        license: "GNU",
+        about: "Records its NZBGet environment for the release gate.",
+        description: ["Writes NZBPO_* values into the job output directory."],
+        requirements: [],
+        queueEvents: "",
+        taskTime: "",
+        sections: [],
         commands: [],
-        options: [{ name: "TOKEN", type: "secret" }],
+        options: [
+          {
+            name: "Label",
+            displayName: "Label",
+            value: "default-label",
+            description: ["Text written next to the job name."],
+            select: [],
+          },
+          {
+            name: "Token",
+            displayName: "Token",
+            value: "",
+            description: ["Stored through the settings encryption envelope."],
+            select: [],
+            secret: true,
+          },
+        ],
       },
       null,
       2,
     )}\n`,
   );
   fs.writeFileSync(
-    executable,
+    path.join(nzbgetPackage, "run.sh"),
     `#!/bin/sh
-i=0
-payload='${payload}'
-while [ "$i" -lt 5000 ]; do
-  printf 'e2e-log-%s context=%s payload=%s\\n' "$i" "$WEAVER_PP_CONTEXT" "$payload"
-  i=$((i + 1))
-done
+printf 'nzbget package label=%s token=%s\\n' "$NZBPO_Label" "$NZBPO_Token"
+printf 'nzbget %s\\n' "$NZBPO_Label" >> "$NZBPP_DIRECTORY/${POST_PROCESSING_MARKER}"
+exit 93
 `,
     { mode: 0o755 },
   );
+
+  const broken = path.join(SCRIPTS_DIR, POST_PROCESSING_BROKEN_PACKAGE);
+  fs.rmSync(broken, { recursive: true, force: true });
+  fs.mkdirSync(broken, { recursive: true });
+  fs.writeFileSync(path.join(broken, "manifest.json"), "{ this is not json\n");
 }
 
-export const POST_PROCESSING_FAILING_EXTENSION_ID = "e2e.failing-extension";
-export const POST_PROCESSING_FAILING_EXTENSION_NAME = "E2E Failing Extension";
-export const POST_PROCESSING_QUIET_EXTENSION_ID = "e2e.quiet-extension";
-export const POST_PROCESSING_QUIET_EXTENSION_NAME = "E2E Quiet Extension";
-export const POST_PROCESSING_SLOW_EXTENSION_ID = "e2e.slow-extension";
-export const POST_PROCESSING_SLOW_EXTENSION_NAME = "E2E Slow Extension";
-
-type ExtensionPackageSpec = {
-  slug: string;
-  id: string;
-  name: string;
-  script: string;
-};
-
-function writeExtensionPackage({ slug, id, name, script }: ExtensionPackageSpec): void {
-  const packageRoot = `/weaver-data/scripts/${slug}`;
-  const executable = path.join(packageRoot, "bin", "run");
-  fs.rmSync(packageRoot, { recursive: true, force: true });
-  fs.mkdirSync(path.dirname(executable), { recursive: true });
-  fs.writeFileSync(
-    path.join(packageRoot, "weaver-extension.json"),
-    `${JSON.stringify(
-      {
-        schema_version: 1,
-        kind: "native",
-        id,
-        name,
-        version: "1.0.0",
-        entrypoint: "bin/run",
-        commands: [],
-        options: [],
-      },
-      null,
-      2,
-    )}\n`,
-  );
-  fs.writeFileSync(executable, script, { mode: 0o755 });
-}
-
-/**
- * Extensions whose *execution outcome* varies, so the suite can cover the
- * dispositions the always-succeeding lifecycle extension cannot reach:
- * failure, continue-after-failure, and timeout. They stay deliberately quiet
- * (a couple of lines) so these runs do not pay the lifecycle extension's
- * log-truncation cost.
- */
-export function seedPostProcessingExecutionPackages(): void {
-  writeExtensionPackage({
-    slug: "e2e-failing-extension",
-    id: POST_PROCESSING_FAILING_EXTENSION_ID,
-    name: POST_PROCESSING_FAILING_EXTENSION_NAME,
-    script: `#!/bin/sh
-printf 'e2e-failing-extension refusing to process %s\\n' "$WEAVER_PP_CONTEXT"
-exit 3
-`,
-  });
-  writeExtensionPackage({
-    slug: "e2e-quiet-extension",
-    id: POST_PROCESSING_QUIET_EXTENSION_ID,
-    name: POST_PROCESSING_QUIET_EXTENSION_NAME,
-    script: `#!/bin/sh
-printf 'e2e-quiet-extension processed %s\\n' "$WEAVER_PP_CONTEXT"
-`,
-  });
-  writeExtensionPackage({
-    slug: "e2e-slow-extension",
-    id: POST_PROCESSING_SLOW_EXTENSION_ID,
-    name: POST_PROCESSING_SLOW_EXTENSION_NAME,
-    script: `#!/bin/sh
-printf 'e2e-slow-extension sleeping for %s\\n' "$WEAVER_PP_CONTEXT"
-sleep 120
-`,
-  });
-}
-
-export async function preparePostProcessingJobs(
-  request: APIRequestContext,
-): Promise<PostProcessingSeed> {
-  return seedPostProcessingRuns(request);
-}
-
-
-/**
- * Prepare jobs for `profileId` and enqueue a run for each, returning the first
- * job ID for inspection.
- *
- * The seed mutation only accepts the exact pair of job IDs it prepared, so both
- * are always enqueued. The caller must have the post-processing queue paused:
- * the mutation refuses to enqueue otherwise.
- */
-export async function seedPostProcessingRunsForProfile(
-  request: APIRequestContext,
-  profileId: string,
-): Promise<number> {
-  const prepared = await seedPostProcessingRuns(request, undefined, profileId);
-  if (prepared.jobIds.length !== 2) {
-    throw new Error(
-      `expected the post-processing seed to prepare 2 jobs, got ${prepared.jobIds.length}`,
-    );
+/** Remove every fixture, so a rerun of the flow starts from a clean directory. */
+export function removePostProcessingScripts(): void {
+  for (const name of [
+    POST_PROCESSING_NOTIFY_SCRIPT,
+    POST_PROCESSING_FAILING_SCRIPT,
+    POST_PROCESSING_NZBGET_PACKAGE,
+    POST_PROCESSING_BROKEN_PACKAGE,
+  ]) {
+    fs.rmSync(path.join(SCRIPTS_DIR, name), { recursive: true, force: true });
   }
-  await seedPostProcessingRuns(request, prepared.jobIds, profileId);
-  return prepared.jobIds[0];
 }
 
-export async function enqueuePostProcessingRuns(
-  request: APIRequestContext,
-  jobIds: number[],
-): Promise<PostProcessingSeed> {
-  return seedPostProcessingRuns(request, jobIds);
-}
-
-async function seedPostProcessingRuns(
-  request: APIRequestContext,
-  jobIds?: number[],
-  profileId: string = POST_PROCESSING_E2E_PROFILE,
-): Promise<PostProcessingSeed> {
-  const data = await graphql<{ seedE2EPostProcessingRuns: PostProcessingSeed }>(
-    request,
-    `mutation WeaverE2ESeedPostProcessing($profileId: String!, $jobIds: [Int!]) {
-      seedE2EPostProcessingRuns(profileId: $profileId, jobIds: $jobIds) {
-        jobIds
-        runIds
-      }
-    }`,
-    {
-      profileId,
-      jobIds: jobIds ?? null,
-    },
-  );
-  return data.seedE2EPostProcessingRuns;
+/** Contents of the marker file a completed job's scripts appended to. */
+export function postProcessingMarker(outputDir: string): string {
+  const marker = path.join(outputDir, POST_PROCESSING_MARKER);
+  return fs.existsSync(marker) ? fs.readFileSync(marker, "utf8") : "";
 }

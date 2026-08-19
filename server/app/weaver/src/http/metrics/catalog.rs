@@ -388,21 +388,21 @@ metric_families! {
 
     // ---- post-processing --------------------------------------------------------
     PP_QUEUE_DEPTH = ("weaver_post_processing_queue_depth", Gauge, [],
-        "Post-processing scripts waiting to run.");
+        "Jobs waiting for a post-processing slot.");
     PP_ACTIVE_ATTEMPTS = ("weaver_post_processing_active_attempts", Gauge, [],
-        "Post-processing script attempts currently running.");
+        "Post-processing scripts currently running.");
     PP_ATTEMPT_DURATION = ("weaver_post_processing_attempt_duration_seconds", Summary, [],
-        "Wall-clock duration of completed post-processing script attempts.");
+        "Wall-clock duration of completed post-processing script executions.");
     PP_ATTEMPT_RESULTS = ("weaver_post_processing_attempt_results", Counter, ["result"],
-        "Completed post-processing script attempts by outcome.",
+        "Completed post-processing script executions by outcome.",
         deprecated_by = "weaver_post_processing_attempts_total");
     PP_ATTEMPTS = ("weaver_post_processing_attempts_total", Counter, ["result"],
-        "Completed post-processing script attempts by outcome.");
+        "Completed post-processing script executions by outcome.");
     PP_OUTPUT_TRUNCATIONS_LEGACY = ("weaver_post_processing_output_truncations", Counter, [],
-        "Post-processing script attempts whose captured output was truncated.",
+        "Post-processing script executions whose captured output was truncated.",
         deprecated_by = "weaver_post_processing_output_truncations_total");
     PP_OUTPUT_TRUNCATIONS = ("weaver_post_processing_output_truncations_total", Counter, [],
-        "Post-processing script attempts whose captured output was truncated.");
+        "Post-processing script executions whose captured output was truncated.");
 
     // ---- per-server article outcomes ---------------------------------------------
     SERVER_ARTICLE_ATTEMPTS = ("weaver_server_article_attempts_total", Counter,

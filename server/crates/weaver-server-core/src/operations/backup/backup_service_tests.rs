@@ -6,16 +6,7 @@ use std::sync::{Arc as StdArc, Mutex as StdMutex};
 use crate::JobHistoryRow;
 use crate::categories::CategoryConfig;
 use crate::operations::backup::manifest::BackupInstanceSecrets;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, StoreDatastore};
-use crate::post_processing::discovery::{
-    DiscoveryOptions, approve_discovered_extension, discover_and_record_extensions, hash_package,
-};
-use crate::post_processing::model::{
-    ApprovedFilesystemRoot, ApprovedFilesystemRoots, AttemptStatus, ExtensionSelection, OnFailure,
-    OrderedStep, OutcomeImpact, PipelineOutcome, PostProcessingSettings, PostProcessingSummary,
-    Profile, ProfileId, RunStatus, RunWhen, TimeoutPolicy,
-};
-use crate::post_processing::persistence::{LogStream, TerminalIntent};
+use crate::persistence::sql_runtime::StoreDatastore;
 use crate::settings::Config;
 use crate::{PipelineMetrics, SchedulerCommand, SharedPipelineState};
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -64,27 +55,6 @@ fn query_count(db: &Database, table: &'static str) -> i64 {
             .fetch_one(&mut *connection)
             .await
             .map_err(|error| crate::StateError::Database(error.to_string()))
-    })
-    .unwrap()
-}
-
-fn history_post_processing_state(db: &Database, job_id: u64) -> (String, Option<String>) {
-    let job_id = i64::try_from(job_id).expect("test job ID fits in i64");
-    let datastore = db.datastore();
-    db.run_sql_blocking_read(async move {
-        let row = SqlRuntime::fetch_optional(
-            datastore.read_exec(),
-            "SELECT post_processing_summary, post_processing_run_id
-               FROM job_history
-              WHERE job_id = {}",
-            &[SqlArg::I64(job_id)],
-        )
-        .await?
-        .ok_or_else(|| crate::StateError::Database("history row is missing".into()))?;
-        Ok((
-            row.text("post_processing_summary")?,
-            row.opt_text("post_processing_run_id")?,
-        ))
     })
     .unwrap()
 }
@@ -253,45 +223,6 @@ fn populate_source_db(db: &Database) {
         metadata: None,
     })
     .unwrap();
-}
-
-fn add_managed_extension(db: &Database, data_dir: &Path) -> PathBuf {
-    let package = data_dir.join("scripts/email");
-    std::fs::create_dir_all(&package).unwrap();
-    std::fs::write(
-        package.join("manifest.json"),
-        include_str!("../../post_processing/fixtures/nzbget-v2-post-processing-manifest.json"),
-    )
-    .unwrap();
-    std::fs::write(package.join("email.py"), "#!/usr/bin/env python3\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(
-            package.join("email.py"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-    }
-    let discovered = discover_and_record_extensions(
-        db,
-        data_dir,
-        DiscoveryOptions {
-            enabled: true,
-            bare_script_adapter: None,
-        },
-        10,
-    )
-    .unwrap();
-    let revision = discovered[0].manifest.revision();
-    approve_discovered_extension(
-        db,
-        data_dir,
-        revision.extension_id(),
-        revision.revision_id(),
-        20,
-    )
-    .unwrap()
 }
 
 #[test]
@@ -489,7 +420,7 @@ async fn logical_backup_rejects_a_master_key_that_cannot_decrypt_its_data() {
     )
     .unwrap();
     let tampered = tempfile::NamedTempFile::new().unwrap();
-    archive::write_bundle_archive(tampered.path(), "secret-pass", unpacked.path(), &[]).unwrap();
+    archive::write_bundle_archive(tampered.path(), "secret-pass", unpacked.path()).unwrap();
 
     let error = service
         .inspect_backup(tampered.path(), Some("secret-pass".into()))
@@ -596,426 +527,7 @@ async fn logical_backup_preserves_only_terminal_duplicate_identity_graphs() {
 }
 
 #[tokio::test]
-async fn encrypted_v2_backup_restores_managed_packages_under_the_target_data_dir() {
-    let source_root = tempfile::tempdir().unwrap();
-    let mut source_config = sample_config();
-    source_config.intermediate_dir = Some(
-        source_root
-            .path()
-            .join("intermediate")
-            .to_string_lossy()
-            .into_owned(),
-    );
-    source_config.complete_dir = Some(
-        source_root
-            .path()
-            .join("complete")
-            .to_string_lossy()
-            .into_owned(),
-    );
-    source_config.categories[0].dest_dir = Some(
-        source_root
-            .path()
-            .join("complete/tv")
-            .to_string_lossy()
-            .into_owned(),
-    );
-    let source_db = open_temp_db();
-    populate_source_db(&source_db);
-    source_db.save_config(&source_config).unwrap();
-    source_db
-        .set_setting("watch_folder.mode", "polling")
-        .unwrap();
-    source_db
-        .set_setting("watch_folder.path", "/host-only/incoming")
-        .unwrap();
-    let source_managed = add_managed_extension(&source_db, source_root.path());
-    let source_digest = hash_package(&source_managed).unwrap();
-    let revision_record = source_db.list_extension_revisions().unwrap().remove(0);
-    let revision = revision_record.manifest.revision();
-    let approved_roots = vec![
-        ApprovedFilesystemRoot::new("/old/data/approved").unwrap(),
-        ApprovedFilesystemRoot::new("/host-only/approved").unwrap(),
-    ];
-    source_db
-        .save_post_processing_settings(&PostProcessingSettings {
-            allowed_roots: approved_roots
-                .iter()
-                .map(|root| root.as_str().to_string())
-                .collect(),
-            ..PostProcessingSettings::default()
-        })
-        .unwrap();
-    let profile_id = ProfileId::new("backup-profile").unwrap();
-    let profile = Profile::new(
-        profile_id.clone(),
-        "Backup Profile".into(),
-        vec![
-            OrderedStep::new(
-                0,
-                ExtensionSelection::pinned(
-                    revision.extension_id().clone(),
-                    revision.revision_id().clone(),
-                ),
-                RunWhen::Always,
-                OnFailure::Stop,
-                OutcomeImpact::FailJob,
-                TimeoutPolicy::Default24Hours,
-                ApprovedFilesystemRoots::new(approved_roots),
-                vec![],
-            )
-            .unwrap(),
-        ],
-    )
-    .unwrap();
-    source_db
-        .save_post_processing_profile(&profile, true, 30)
-        .unwrap();
-    source_db
-        .assign_category_post_processing_profile("tv", Some(&profile_id))
-        .unwrap();
-    let frozen = source_db
-        .resolve_post_processing_plan(None, Some("tv"))
-        .unwrap();
-    source_db
-        .save_frozen_post_processing_plan(41, &frozen, 31)
-        .unwrap();
-    let run_id = source_db
-        .create_post_processing_run(
-            41,
-            &frozen,
-            &PipelineOutcome::Succeeded,
-            TerminalIntent::Complete,
-            None,
-            32,
-        )
-        .unwrap();
-    let attempt_id = source_db
-        .enqueue_post_processing_attempt(
-            &run_id,
-            &frozen.steps()[0],
-            revision_record.manifest.adapter(),
-            None,
-            33,
-        )
-        .unwrap();
-    source_db
-        .append_post_processing_log(&attempt_id, LogStream::Stdout, b"restored log", 34)
-        .unwrap();
-    source_db
-        .finish_post_processing_attempt(
-            &attempt_id,
-            AttemptStatus::Succeeded,
-            Some(0),
-            None,
-            None,
-            false,
-            35,
-        )
-        .unwrap();
-    source_db
-        .finish_post_processing_run(
-            &run_id,
-            RunStatus::Succeeded,
-            PostProcessingSummary::Succeeded,
-            36,
-        )
-        .unwrap();
-    let queued_run_id = source_db
-        .create_post_processing_run(
-            41,
-            &frozen,
-            &PipelineOutcome::Succeeded,
-            TerminalIntent::Complete,
-            Some(&run_id),
-            37,
-        )
-        .unwrap();
-    let (source_service, _, _) = build_service(source_db, source_config.clone());
-
-    let artifact = source_service
-        .create_backup(Some("package-secret".into()))
-        .await
-        .unwrap();
-    let archive = tempfile::NamedTempFile::new().unwrap();
-    std::fs::copy(&artifact.path, archive.path()).unwrap();
-    let inspect = source_service
-        .inspect_backup(archive.path(), Some("package-secret".into()))
-        .await
-        .unwrap();
-    assert!(inspect.manifest.format_version.is_bundle_v2());
-    assert_eq!(inspect.manifest.managed_packages.len(), 1);
-
-    let target_root = tempfile::tempdir().unwrap();
-    let mut target_db = open_temp_db();
-    let mut target_config = source_config;
-    target_config.data_dir = target_root.path().to_string_lossy().into_owned();
-    target_config.intermediate_dir = None;
-    target_config.complete_dir = None;
-    let (target_service, _, _) = build_service(target_db.clone(), target_config);
-    let report = target_service
-        .restore_backup(
-            archive.path(),
-            Some("package-secret".into()),
-            RestoreOptions {
-                data_dir: target_root.path().to_string_lossy().into_owned(),
-                intermediate_dir: None,
-                complete_dir: None,
-                category_remaps: vec![CategoryRemapInput {
-                    category_name: "movies".into(),
-                    new_dest_dir: target_root
-                        .path()
-                        .join("complete/movies")
-                        .to_string_lossy()
-                        .into_owned(),
-                }],
-            },
-        )
-        .await
-        .unwrap();
-
-    assert!(report.staged);
-    assert!(report.restart_required);
-    assert!(!report.restored);
-    assert!(report.warnings.is_empty());
-    let (restored_db, outcome) = apply_pending_restore(target_db, target_root.path()).unwrap();
-    target_db = restored_db;
-    let outcome = outcome.unwrap();
-    assert_eq!(outcome.managed_packages_restored, 1);
-    let restored = target_db.list_extension_revisions().unwrap();
-    let restored_path = PathBuf::from(restored[0].managed_path.as_deref().unwrap());
-    assert!(restored_path.starts_with(target_root.path()));
-    assert_eq!(hash_package(&restored_path).unwrap(), source_digest);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        assert_ne!(
-            std::fs::metadata(restored_path.join("email.py"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o100,
-            0
-        );
-    }
-    let restored_config = target_db.load_config().unwrap();
-    assert!(!restored_config.watch_folder.automatic_scanning_enabled());
-    assert!(restored_config.watch_folder.normalized_path().is_none());
-    let expected_approved_root = target_root.path().join("approved").display().to_string();
-    assert_eq!(
-        target_db.post_processing_settings().unwrap().allowed_roots,
-        vec![expected_approved_root.clone()]
-    );
-    let restored_profile = target_db
-        .post_processing_profile(&profile_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        restored_profile.profile.steps()[0]
-            .approved_roots()
-            .as_slice()[0]
-            .as_str(),
-        expected_approved_root
-    );
-    assert_eq!(
-        target_db
-            .resolve_post_processing_plan(None, Some("tv"))
-            .unwrap()
-            .steps()
-            .len(),
-        1
-    );
-    let restored_plan = target_db.frozen_post_processing_plan(41).unwrap().unwrap();
-    assert_eq!(
-        restored_plan.steps()[0].approved_roots().as_slice()[0].as_str(),
-        expected_approved_root
-    );
-    let restored_run = target_db.post_processing_run(&run_id).unwrap().unwrap();
-    assert_eq!(
-        restored_run.plan.steps()[0].approved_roots().as_slice()[0].as_str(),
-        expected_approved_root
-    );
-    assert!(
-        target_db
-            .post_processing_run(&queued_run_id)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(
-        target_db.post_processing_attempts(&run_id).unwrap().len(),
-        1
-    );
-    assert_eq!(
-        target_db
-            .post_processing_logs(&attempt_id, None, 10)
-            .unwrap()
-            .chunks
-            .len(),
-        1
-    );
-
-    let reuse_db = open_temp_db();
-    let mut reuse_config = sample_config();
-    reuse_config.data_dir = target_root.path().to_string_lossy().into_owned();
-    let (reuse_service, _, _) = build_service(reuse_db.clone(), reuse_config);
-    reuse_service
-        .restore_backup(
-            archive.path(),
-            Some("package-secret".into()),
-            RestoreOptions {
-                data_dir: target_root.path().to_string_lossy().into_owned(),
-                intermediate_dir: None,
-                complete_dir: None,
-                category_remaps: vec![CategoryRemapInput {
-                    category_name: "movies".into(),
-                    new_dest_dir: target_root
-                        .path()
-                        .join("complete/movies")
-                        .to_string_lossy()
-                        .into_owned(),
-                }],
-            },
-        )
-        .await
-        .unwrap();
-    let (_restored_reuse_db, reuse_outcome) =
-        apply_pending_restore(reuse_db, target_root.path()).unwrap();
-    let reuse_outcome = reuse_outcome.unwrap();
-    assert_eq!(reuse_outcome.managed_packages_restored, 0);
-    assert_eq!(hash_package(&restored_path).unwrap(), source_digest);
-
-    if let Some((mut postgres_db, admin, schema)) =
-        open_postgres_backup_test_db("managed_packages").await
-    {
-        let postgres_root = tempfile::tempdir().unwrap();
-        let mut postgres_config = sample_config();
-        postgres_config.data_dir = postgres_root.path().to_string_lossy().into_owned();
-        let (postgres_service, _, _) = build_service(postgres_db.clone(), postgres_config);
-        postgres_service
-            .restore_backup(
-                archive.path(),
-                Some("package-secret".into()),
-                RestoreOptions {
-                    data_dir: postgres_root.path().to_string_lossy().into_owned(),
-                    intermediate_dir: None,
-                    complete_dir: None,
-                    category_remaps: vec![CategoryRemapInput {
-                        category_name: "movies".into(),
-                        new_dest_dir: postgres_root
-                            .path()
-                            .join("complete/movies")
-                            .to_string_lossy()
-                            .into_owned(),
-                    }],
-                },
-            )
-            .await
-            .unwrap();
-        let (restored_postgres_db, outcome) =
-            apply_pending_restore(postgres_db, postgres_root.path()).unwrap();
-        postgres_db = restored_postgres_db;
-        outcome.unwrap();
-        assert!(
-            postgres_db
-                .post_processing_profile(&profile_id)
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            postgres_db
-                .frozen_post_processing_plan(41)
-                .unwrap()
-                .is_some()
-        );
-        let restored_run = postgres_db.post_processing_run(&run_id).unwrap().unwrap();
-        assert_eq!(
-            restored_run.plan.steps()[0].approved_roots().as_slice()[0].as_str(),
-            postgres_root.path().join("approved").to_string_lossy()
-        );
-        assert!(
-            postgres_db
-                .post_processing_run(&queued_run_id)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            postgres_db.post_processing_attempts(&run_id).unwrap().len(),
-            1
-        );
-        assert_eq!(
-            postgres_db
-                .post_processing_logs(&attempt_id, None, 10)
-                .unwrap()
-                .chunks
-                .len(),
-            1
-        );
-        drop(postgres_service);
-        drop(postgres_db);
-        drop_postgres_backup_test_schema(admin, schema).await;
-    }
-}
-
-#[tokio::test]
-async fn backup_rejects_a_managed_package_changed_after_approval() {
-    let source_root = tempfile::tempdir().unwrap();
-    let mut config = sample_config();
-    config.data_dir = source_root.path().to_string_lossy().into_owned();
-    let source_db = open_temp_db();
-    source_db.save_config(&config).unwrap();
-    let managed = add_managed_extension(&source_db, source_root.path());
-    std::fs::write(managed.join("email.py"), "tampered\n").unwrap();
-    let (service, _, _) = build_service(source_db, config);
-
-    assert!(matches!(
-        service.create_backup(Some("backup-secret".into())).await,
-        Err(BackupServiceError::Validation(_))
-    ));
-}
-
-#[tokio::test]
-async fn restore_rejects_manifest_inventory_that_omits_database_references() {
-    let source_root = tempfile::tempdir().unwrap();
-    let mut config = sample_config();
-    config.data_dir = source_root.path().to_string_lossy().into_owned();
-    let source_db = open_temp_db();
-    source_db.save_config(&config).unwrap();
-    add_managed_extension(&source_db, source_root.path());
-    let (service, _, _) = build_service(source_db, config);
-    let artifact = service
-        .create_backup(Some("backup-secret".into()))
-        .await
-        .unwrap();
-
-    let original = tempfile::NamedTempFile::new().unwrap();
-    std::fs::copy(&artifact.path, original.path()).unwrap();
-    let unpacked = tempfile::tempdir().unwrap();
-    let mut manifest = archive::unpack_bundle_archive(
-        original.path(),
-        unpacked.path(),
-        Some("backup-secret".into()),
-    )
-    .unwrap();
-    manifest.managed_packages.clear();
-    std::fs::write(
-        unpacked.path().join("manifest.json"),
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
-    let tampered = tempfile::NamedTempFile::new().unwrap();
-    archive::write_bundle_archive(tampered.path(), "backup-secret", unpacked.path(), &[]).unwrap();
-
-    assert!(matches!(
-        service
-            .inspect_backup(tampered.path(), Some("backup-secret".into()))
-            .await,
-        Err(BackupServiceError::Validation(message))
-            if message.contains("inventory")
-    ));
-}
-
-#[tokio::test]
-async fn restore_removes_new_packages_when_database_import_fails() {
+async fn a_failed_database_import_leaves_the_restore_pending_and_recoverable() {
     let source_root = tempfile::tempdir().unwrap();
     let mut source_config = sample_config();
     source_config.data_dir = source_root.path().to_string_lossy().into_owned();
@@ -1030,9 +542,8 @@ async fn restore_removes_new_packages_when_database_import_fails() {
         );
     }
     let source_db = open_temp_db();
+    populate_source_db(&source_db);
     source_db.save_config(&source_config).unwrap();
-    let package = add_managed_extension(&source_db, source_root.path());
-    let digest = hash_package(&package).unwrap();
     let (source_service, _, _) = build_service(source_db, source_config.clone());
     let artifact = source_service
         .create_backup(Some("backup-secret".into()))
@@ -1044,7 +555,6 @@ async fn restore_removes_new_packages_when_database_import_fails() {
     let target_root = tempfile::tempdir().unwrap();
     let target_db_path = target_root.path().join("target.db");
     let target_db = Database::open(&target_db_path).unwrap();
-
     let mut target_config = source_config;
     target_config.data_dir = target_root.path().to_string_lossy().into_owned();
     let (target_service, _, _) = build_service(target_db.clone(), target_config);
@@ -1072,148 +582,17 @@ async fn restore_removes_new_packages_when_database_import_fails() {
         )
         .await
         .unwrap();
+
     super::pending::set_restore_test_fail_database_import(true);
     assert!(apply_pending_restore(target_db, target_root.path()).is_err());
     let pending = super::pending::pending_restore_status(target_root.path()).unwrap();
-    assert!(pending.error.is_some());
-
-    let package_path = target_root
-        .path()
-        .join("managed-extensions/blake3")
-        .join(digest.as_str().trim_start_matches("blake3:"));
-    assert!(!package_path.exists());
-}
-
-#[tokio::test]
-async fn legacy_v1_restore_skips_post_processing_state_and_reports_a_warning() {
-    use sqlx::Connection as _;
-
-    let source_root = tempfile::tempdir().unwrap();
-    let source_db = open_temp_db();
-    populate_source_db(&source_db);
-    execute_sql(
-        &source_db,
-        vec![
-            "UPDATE job_history
-                SET post_processing_summary = 'succeeded',
-                    post_processing_run_id = 'legacy-run'",
-        ],
-    );
-    let source_config = sample_config();
-    source_db.save_config(&source_config).unwrap();
-    add_managed_extension(&source_db, source_root.path());
-    let exported_db = source_root.path().join("backup.db");
-    source_db.export_stable_state(&exported_db).unwrap();
-    let mut exported_connection = sqlx::sqlite::SqliteConnection::connect_with(
-        &sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&exported_db)
-            .create_if_missing(false),
-    )
-    .await
-    .unwrap();
-    let exported_history: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_history")
-        .fetch_one(&mut exported_connection)
-        .await
-        .unwrap();
-    assert_eq!(exported_history, 1);
-    exported_connection.close().await.unwrap();
-    let manifest: BackupManifest = serde_json::from_slice(&plain_test_manifest()).unwrap();
-    let archive_path = source_root.path().join("legacy.tar.zst");
-    archive::write_plain_archive(&archive_path, &manifest, &exported_db, &[]).unwrap();
-    let encrypted_archive_path = source_root.path().join("legacy.enc");
-    archive::encrypt_archive(&archive_path, &encrypted_archive_path, "legacy-secret").unwrap();
-
-    let target_root = tempfile::tempdir().unwrap();
-    let mut target_db = open_temp_db();
-    let mut target_config = source_config;
-    target_config.data_dir = target_root.path().to_string_lossy().into_owned();
-    target_config.intermediate_dir = None;
-    target_config.complete_dir = None;
-    let (target_service, _, _) = build_service(target_db.clone(), target_config);
-    let report = target_service
-        .restore_backup(
-            &encrypted_archive_path,
-            Some("legacy-secret".into()),
-            RestoreOptions {
-                data_dir: target_root.path().to_string_lossy().into_owned(),
-                intermediate_dir: None,
-                complete_dir: None,
-                category_remaps: vec![CategoryRemapInput {
-                    category_name: "movies".into(),
-                    new_dest_dir: target_root
-                        .path()
-                        .join("complete/movies")
-                        .to_string_lossy()
-                        .into_owned(),
-                }],
-            },
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(report.managed_packages_restored, 0);
-    assert_eq!(report.warnings.len(), 1);
-    let (restored_target_db, outcome) =
-        apply_pending_restore(target_db, target_root.path()).unwrap();
-    target_db = restored_target_db;
-    outcome.unwrap();
-    assert!(target_db.list_extension_revisions().unwrap().is_empty());
-    assert_eq!(
-        history_post_processing_state(&target_db, 41),
-        ("not_run".into(), None)
-    );
-    let restored_history = target_db
-        .list_job_history(&HistoryFilter::default())
-        .unwrap();
-    assert_eq!(
-        restored_history[0].output_dir.as_deref(),
-        Some(
-            target_root
-                .path()
-                .join("complete/tv/fixture")
-                .to_string_lossy()
-                .as_ref()
-        )
+    assert!(
+        pending.error.is_some(),
+        "a failed import must leave the pending restore visible so it can be retried"
     );
 
-    if let Some((postgres_target, admin, schema)) =
-        open_postgres_backup_test_db("legacy_post_processing_reset").await
-    {
-        let postgres_root = tempfile::tempdir().unwrap();
-        let mut postgres_config = sample_config();
-        postgres_config.data_dir = postgres_root.path().to_string_lossy().into_owned();
-        let (postgres_service, _, _) = build_service(postgres_target.clone(), postgres_config);
-        postgres_service
-            .restore_backup(
-                &encrypted_archive_path,
-                Some("legacy-secret".into()),
-                RestoreOptions {
-                    data_dir: postgres_root.path().to_string_lossy().into_owned(),
-                    intermediate_dir: None,
-                    complete_dir: None,
-                    category_remaps: vec![CategoryRemapInput {
-                        category_name: "movies".into(),
-                        new_dest_dir: postgres_root
-                            .path()
-                            .join("complete/movies")
-                            .to_string_lossy()
-                            .into_owned(),
-                    }],
-                },
-            )
-            .await
-            .unwrap();
-        drop(postgres_service);
-        let (postgres_restored, outcome) =
-            apply_pending_restore(postgres_target, postgres_root.path()).unwrap();
-        assert!(outcome.is_some());
-        assert_eq!(
-            history_post_processing_state(&postgres_restored, 41),
-            ("not_run".into(), None)
-        );
-        drop(postgres_restored);
-        drop_postgres_backup_test_schema(admin, schema).await;
-    }
+    let reopened = Database::open(&target_db_path).unwrap();
+    assert!(apply_pending_restore(reopened, target_root.path()).is_ok());
 }
 
 #[tokio::test]
@@ -1227,7 +606,7 @@ async fn plaintext_archive_cannot_claim_the_bundle_v2_format() {
     manifest.format_version =
         super::manifest::BackupFormatVersion::Named(super::manifest::BACKUP_FORMAT_VERSION.into());
     let archive_path = root.path().join("ambiguous-v2.tar.zst");
-    archive::write_plain_archive(&archive_path, &manifest, &exported_db, &[]).unwrap();
+    archive::write_plain_archive(&archive_path, &manifest, &exported_db).unwrap();
 
     let target_db = open_temp_db();
     let (service, _, _) = build_service(target_db, sample_config());
@@ -1253,7 +632,7 @@ async fn legacy_plaintext_archive_rejects_trailing_bytes() {
     source_db.export_stable_state(&exported_db).unwrap();
     let manifest: BackupManifest = serde_json::from_slice(&plain_test_manifest()).unwrap();
     let archive_path = root.path().join("legacy-trailing.tar.zst");
-    archive::write_plain_archive(&archive_path, &manifest, &exported_db, &[]).unwrap();
+    archive::write_plain_archive(&archive_path, &manifest, &exported_db).unwrap();
     std::fs::OpenOptions::new()
         .append(true)
         .open(&archive_path)
@@ -2074,11 +1453,8 @@ async fn backup_catalog_rejects_an_unclassified_application_table() {
 async fn sqlite_restore_resumes_after_every_promotion_phase() {
     use super::pending::{PromotionPhase, set_restore_test_fail_after};
 
-    let source_packages = tempfile::tempdir().unwrap();
     let source_db = open_temp_db();
     populate_source_db(&source_db);
-    let source_package = add_managed_extension(&source_db, source_packages.path());
-    let source_package_digest = hash_package(&source_package).unwrap();
     let (source_service, _, _) = build_service(source_db, sample_config());
     let artifact = source_service
         .create_backup(Some("crash-secret".into()))
@@ -2137,8 +1513,7 @@ async fn sqlite_restore_resumes_after_every_promotion_phase() {
         assert!(pending.error.is_some());
 
         let reopened = Database::open(&target_path).unwrap();
-        let (restored, outcome) = apply_pending_restore(reopened, current_root.path()).unwrap();
-        assert_eq!(outcome.unwrap().managed_packages_restored, 1);
+        let (restored, _) = apply_pending_restore(reopened, current_root.path()).unwrap();
         assert_eq!(
             restored.load_config().unwrap().data_dir,
             restored_root.path().to_string_lossy()
@@ -2150,16 +1525,6 @@ async fn sqlite_restore_resumes_after_every_promotion_phase() {
                 .len(),
             1,
             "restore did not recover after {phase:?}"
-        );
-        let restored_package = restored
-            .list_extension_revisions()
-            .unwrap()
-            .into_iter()
-            .find_map(|revision| revision.managed_path.map(PathBuf::from))
-            .expect("managed revision should survive crash recovery");
-        assert_eq!(
-            hash_package(&restored_package).unwrap(),
-            source_package_digest
         );
         assert!(!current_data_dir.join("restore-pending").exists());
         assert!(

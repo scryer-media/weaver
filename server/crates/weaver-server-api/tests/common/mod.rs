@@ -280,7 +280,7 @@ impl TestHarness {
             },
             nntp_pool: None,
             spawn_history_delete_worker,
-            post_processing_service: None,
+            post_processing_executor: None,
         });
 
         Self {

@@ -816,8 +816,6 @@ async fn import_postgres(
         )
         .await?;
     }
-    restore_postgres_rerun_references(&mut tx, &tables_dir.join("post_processing_runs.ndjson"))
-        .await?;
     validate_postgres_counts(&mut tx, expected).await?;
     repair_postgres_sequences(&mut tx).await?;
     tx.commit().await.map_err(db_err)
@@ -957,14 +955,7 @@ async fn import_postgres_table(
         )));
     }
     for row in read_ndjson_rows(path)? {
-        let (line_number, mut object) = row?;
-        if table == "post_processing_runs"
-            && object
-                .get("rerun_of_run_id")
-                .is_some_and(|value| !value.is_null())
-        {
-            object.insert("rerun_of_run_id".into(), JsonValue::Null);
-        }
+        let (line_number, object) = row?;
         let columns = target
             .iter()
             .filter(|column| object.contains_key(&column.name))
@@ -1002,39 +993,6 @@ async fn import_postgres_table(
                 line_number + 1
             ))
         })?;
-    }
-    Ok(())
-}
-
-async fn restore_postgres_rerun_references(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    path: &Path,
-) -> Result<(), StateError> {
-    for row in read_ndjson_rows(path)? {
-        let (line_number, object) = row?;
-        let Some(rerun_of_run_id) = object.get("rerun_of_run_id").and_then(JsonValue::as_str)
-        else {
-            continue;
-        };
-        let run_id = object
-            .get("run_id")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| {
-                StateError::Database(format!(
-                    "backup post_processing_runs:{} has no run_id",
-                    line_number + 1
-                ))
-            })?;
-        sqlx::query(
-            "UPDATE post_processing_runs
-                SET rerun_of_run_id = $1
-              WHERE run_id = $2",
-        )
-        .bind(rerun_of_run_id)
-        .bind(run_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(db_err)?;
     }
     Ok(())
 }

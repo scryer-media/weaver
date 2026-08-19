@@ -867,8 +867,7 @@ struct AppendRequest {
 
 async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
     let request = parse_append_params(params)?;
-    let frozen_post_processing_plan =
-        resolve_nzbget_append_post_processing_plan(ctx, &request).await?;
+    let script_override = resolve_nzbget_script_override(ctx, &request).await?;
     let (nzb_bytes, fetched_filename) = if is_http_url(&request.content_or_url) {
         match fetch_nzb_from_url(&ctx.http_client, &request.content_or_url).await {
             Ok(fetched) => fetched,
@@ -936,8 +935,15 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         });
     }
 
-    let metadata = submit_metadata(Some(attributes), client_request_id)
+    let mut metadata = submit_metadata(Some(attributes), client_request_id)
         .map_err(RpcError::invalid_parameter)?;
+    if let Some(scripts) = script_override {
+        metadata.push((
+            weaver_server_core::post_processing::settings::JOB_SCRIPT_OVERRIDE_METADATA_KEY
+                .to_string(),
+            scripts,
+        ));
+    }
     let submitted = submit_nzb_bytes_with_options(
         &ctx.db,
         &ctx.handle,
@@ -961,7 +967,6 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
                 )
             }),
             origin: weaver_server_core::SubmissionOrigin::NzbGet,
-            frozen_post_processing_plan,
             ..SubmissionOptions::default()
         },
     )
@@ -973,77 +978,72 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
     }
 }
 
-async fn resolve_nzbget_append_post_processing_plan(
+/// Turn NZBGet's per-job `<ScriptName>:` NZB parameters into weaver's ordered
+/// script override, recorded in the job's metadata.
+///
+/// NZBGet names a script by its file name (or a manifest package's `name`), so
+/// both are accepted. Returning `Some("")` is meaningful: the client listed
+/// scripts and disabled all of them, which must beat the configured list.
+async fn resolve_nzbget_script_override(
     ctx: &NzbgetFacadeContext,
     request: &AppendRequest,
-) -> Result<Option<weaver_server_core::post_processing::model::FrozenPlan>, RpcError> {
-    let db = ctx.db.clone();
-    let parameters = request.parameters.clone();
-    tokio::task::spawn_blocking(move || resolve_nzbget_post_processing_plan(&db, &parameters))
-        .await
-        .map_err(|error| RpcError::invalid_parameter(format!("append failed: {error}")))?
-        .map_err(|error| RpcError::invalid_parameter(format!("append failed: {error}")))
-}
-
-fn resolve_nzbget_post_processing_plan(
-    db: &Database,
-    parameters: &[(String, String)],
-) -> Result<
-    Option<weaver_server_core::post_processing::model::FrozenPlan>,
-    weaver_server_core::StateError,
-> {
-    let script_flags = parameters
+) -> Result<Option<String>, RpcError> {
+    let script_flags = request
+        .parameters
         .iter()
         .filter_map(|(name, value)| name.strip_suffix(':').map(|name| (name, value)))
         .collect::<Vec<_>>();
     if script_flags.is_empty() {
         return Ok(None);
     }
+    let data_dir = std::path::PathBuf::from(ctx.config.read().await.data_dir.clone());
+    let listing = tokio::task::spawn_blocking(move || {
+        weaver_server_core::post_processing::listing::list_scripts(&data_dir)
+    })
+    .await
+    .map_err(|error| RpcError::invalid_parameter(format!("append failed: {error}")))?
+    .map_err(|error| RpcError::invalid_parameter(format!("append failed: {error}")))?;
 
-    let revisions = db.list_extension_revisions()?;
+    script_override_from_listing(&listing, &script_flags).map_err(RpcError::invalid_parameter)
+}
+
+/// Pure half of the override resolution, so the naming rules are testable
+/// without a facade context.
+fn script_override_from_listing(
+    listing: &weaver_server_core::post_processing::listing::ScriptListing,
+    script_flags: &[(&str, &String)],
+) -> Result<Option<String>, String> {
     let mut recognized = false;
-    let mut selections = Vec::new();
+    let mut selected = Vec::new();
     for (name, value) in script_flags {
         let enabled = matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "yes" | "on" | "1"
         );
-        let record = revisions.iter().find(|record| {
-            record.trust_state == weaver_server_core::post_processing::model::TrustState::Approved
-                && record
+        let script = listing.scripts.iter().find(|script| {
+            script.name.as_str() == *name
+                || script
                     .manifest
                     .compatibility_name()
-                    .is_some_and(|compatibility| compatibility.as_str() == name)
+                    .is_some_and(|compatibility| compatibility.as_str() == *name)
         });
-        let Some(record) = record else {
+        let Some(script) = script else {
             if enabled {
-                return Err(weaver_server_core::StateError::Database(format!(
-                    "approved post-processing extension '{name}' was not found"
-                )));
+                return Err(format!(
+                    "append failed: post-processing script '{name}' was not found"
+                ));
             }
             continue;
         };
         recognized = true;
         if enabled {
-            selections.push(
-                weaver_server_core::post_processing::model::ExtensionSelection::pinned(
-                    record.manifest.revision().extension_id().clone(),
-                    record.manifest.revision().revision_id().clone(),
-                ),
-            );
+            selected.push(script.name.as_str().to_string());
         }
     }
-
     if !recognized {
         return Ok(None);
     }
-    let selection = if selections.is_empty() {
-        weaver_server_core::post_processing::model::SubmissionPlanSelection::disabled()
-    } else {
-        weaver_server_core::post_processing::model::SubmissionPlanSelection::extensions(selections)
-            .map_err(|error| weaver_server_core::StateError::Database(error.to_string()))?
-    };
-    db.freeze_submission_post_processing_plan(Some(&selection))
+    Ok(Some(selected.join(",")))
 }
 
 fn append_rejection_result(error: SubmitNzbError) -> Result<Value, RpcError> {
@@ -1185,13 +1185,7 @@ mod append_rejection_tests {
     }
 
     #[test]
-    fn nzbget_append_scripts_resolve_to_approved_pinned_revisions() {
-        use weaver_server_core::post_processing::discovery::{
-            DiscoveryOptions, discover_and_record_extensions,
-        };
-        use weaver_server_core::post_processing::model::FrozenPlanProvenance;
-
-        let db = Database::open_in_memory().unwrap();
+    fn nzbget_append_script_flags_select_scripts_by_file_or_manifest_name() {
         let data_dir = tempfile::tempdir().unwrap();
         let package = data_dir.path().join("scripts/email");
         std::fs::create_dir_all(&package).unwrap();
@@ -1203,55 +1197,36 @@ mod append_rejection_tests {
         )
         .unwrap();
         std::fs::write(package.join("email.py"), "#!/usr/bin/env python3\n").unwrap();
-        let discovered = discover_and_record_extensions(
-            &db,
-            data_dir.path(),
-            DiscoveryOptions {
-                enabled: true,
-                bare_script_adapter: None,
-            },
-            10,
+        std::fs::write(
+            data_dir.path().join("scripts/notify.sh"),
+            "#!/bin/sh\necho hi\n",
         )
         .unwrap();
-        let manifest = &discovered[0].manifest;
-        db.approve_extension_revision(
-            manifest.revision().extension_id(),
-            manifest.revision().revision_id(),
-            "/managed/example",
-            20,
-        )
-        .unwrap();
+        let listing =
+            weaver_server_core::post_processing::listing::list_scripts(data_dir.path()).unwrap();
 
-        let compatibility_name = manifest.compatibility_name().unwrap().as_str();
-        let flag = format!("{compatibility_name}:");
-        let plan = resolve_nzbget_post_processing_plan(&db, &[(flag.clone(), "yes".to_string())])
-            .unwrap()
-            .unwrap();
-        assert_eq!(plan.steps().len(), 1);
-        assert_eq!(plan.steps()[0].revision(), manifest.revision());
-        assert!(matches!(plan.provenance(), FrozenPlanProvenance::Explicit));
-
-        let disabled = resolve_nzbget_post_processing_plan(&db, &[(flag, "no".to_string())])
-            .unwrap()
-            .unwrap();
-        assert!(disabled.steps().is_empty());
-        assert!(matches!(
-            disabled.provenance(),
-            FrozenPlanProvenance::Disabled
-        ));
-        assert!(
-            resolve_nzbget_post_processing_plan(
-                &db,
-                &[("missing-script:".to_string(), "on".to_string())],
-            )
-            .is_err()
-        );
+        // The manifest's `name` is what NZBGet clients send.
+        let enabled = "yes".to_string();
         assert_eq!(
-            resolve_nzbget_post_processing_plan(
-                &db,
-                &[("missing-script:".to_string(), "off".to_string())],
-            )
-            .unwrap(),
+            script_override_from_listing(&listing, &[("email", &enabled)]).unwrap(),
+            Some("email".to_string())
+        );
+        // A bare script is named by its file name.
+        assert_eq!(
+            script_override_from_listing(&listing, &[("notify.sh", &enabled)]).unwrap(),
+            Some("notify.sh".to_string())
+        );
+        // Disabling every recognized script is an explicit "run nothing".
+        let disabled = "no".to_string();
+        assert_eq!(
+            script_override_from_listing(&listing, &[("email", &disabled)]).unwrap(),
+            Some(String::new())
+        );
+        // Enabling a script that is not there is an error the client must see.
+        assert!(script_override_from_listing(&listing, &[("missing", &enabled)]).is_err());
+        // Disabling one that is not there says nothing about the job's list.
+        assert_eq!(
+            script_override_from_listing(&listing, &[("missing", &disabled)]).unwrap(),
             None
         );
     }
@@ -1684,12 +1659,16 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
     let db = ctx.db.clone();
-    let post_processing_runs = tokio::task::spawn_blocking(move || {
-        let mut latest = HashMap::new();
-        for run in db.list_post_processing_runs(None, 1000)? {
-            latest.entry(run.job_id).or_insert(run);
+    let history_job_ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
+    let post_processing_results = tokio::task::spawn_blocking(move || {
+        let mut results = HashMap::new();
+        for job_id in history_job_ids {
+            let scripts = db.job_post_processing_results(job_id)?;
+            if !scripts.is_empty() {
+                results.insert(job_id, scripts);
+            }
         }
-        Ok::<_, weaver_server_core::StateError>(latest)
+        Ok::<_, weaver_server_core::StateError>(results)
     })
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
@@ -1765,30 +1744,36 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         let Some(job_id) = item.get("NZBID").and_then(Value::as_u64) else {
             continue;
         };
-        let Some(run) = post_processing_runs.get(&job_id) else {
+        let Some(scripts) = post_processing_results.get(&job_id) else {
             continue;
         };
-        let script_status = match run.summary {
-            weaver_server_core::post_processing::model::PostProcessingSummary::NotRun => "NONE",
-            weaver_server_core::post_processing::model::PostProcessingSummary::Succeeded
-            | weaver_server_core::post_processing::model::PostProcessingSummary::Warning => {
-                "SUCCESS"
-            }
-            weaver_server_core::post_processing::model::PostProcessingSummary::Failed
-            | weaver_server_core::post_processing::model::PostProcessingSummary::Cancelled
-            | weaver_server_core::post_processing::model::PostProcessingSummary::Interrupted => {
-                "FAILURE"
-            }
+        // NZBGet reports one (name, status) pair per script plus a rollup, which
+        // is exactly what weaver now records on the job.
+        let statuses = scripts
+            .iter()
+            .map(|script| {
+                json!({
+                    "Name": script.script.as_str(),
+                    "Status": nzbget_script_status(script.status),
+                })
+            })
+            .collect::<Vec<_>>();
+        let script_status = if scripts
+            .iter()
+            .any(|script| nzbget_script_status(script.status) == "FAILURE")
+        {
+            "FAILURE"
+        } else if scripts
+            .iter()
+            .any(|script| nzbget_script_status(script.status) == "SUCCESS")
+        {
+            "SUCCESS"
+        } else {
+            "NONE"
         };
         if let Some(object) = item.as_object_mut() {
             object.insert("ScriptStatus".to_string(), json!(script_status));
-            object.insert(
-                "ScriptStatuses".to_string(),
-                json!([{
-                    "Name": format!("weaver:{}", run.run_id.as_str()),
-                    "Status": script_status,
-                }]),
-            );
+            object.insert("ScriptStatuses".to_string(), json!(statuses));
         }
     }
     Ok(Value::Array(items))
@@ -2073,30 +2058,15 @@ async fn config(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         let settings = db.post_processing_settings()?;
         let mut defaults = HashMap::new();
         if settings.execution_enabled {
+            let lists = db.post_processing_script_lists()?;
             for category in category_names {
-                let plan = db.resolve_post_processing_plan(None, Some(&category))?;
-                let mut scripts = Vec::with_capacity(plan.steps().len());
-                for step in plan.steps() {
-                    let record = db
-                        .extension_revision(
-                            step.revision().extension_id(),
-                            step.revision().revision_id(),
-                        )?
-                        .ok_or_else(|| {
-                            weaver_server_core::StateError::Database(
-                                "frozen category extension revision disappeared".to_string(),
-                            )
-                        })?;
-                    scripts.push(
-                        record
-                            .manifest
-                            .compatibility_name()
-                            .map(|name| name.as_str())
-                            .unwrap_or_else(|| record.manifest.entrypoint())
-                            .to_string(),
-                    );
-                }
-                defaults.insert(category, scripts.join(","));
+                let scripts = lists
+                    .resolve(Some(&category))
+                    .enabled_entries()
+                    .map(|entry| entry.script.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                defaults.insert(category, scripts);
             }
         }
         Ok::<_, weaver_server_core::StateError>(defaults)
@@ -2671,21 +2641,6 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
 }
 
 async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let db = ctx.db.clone();
-    let run_details = tokio::task::spawn_blocking(move || {
-        let mut details = HashMap::new();
-        for run in db.list_post_processing_runs(None, 500)? {
-            if details.contains_key(&run.job_id) {
-                continue;
-            }
-            let attempt = db.post_processing_attempts(&run.run_id)?.pop();
-            details.insert(run.job_id, (run, attempt));
-        }
-        Ok::<_, weaver_server_core::StateError>(details)
-    })
-    .await
-    .map_err(|error| RpcError::invalid_parameter(format!("postqueue unavailable: {error}")))?
-    .map_err(|error| RpcError::invalid_parameter(format!("postqueue unavailable: {error}")))?;
     let entries = ctx
         .handle
         .list_jobs()
@@ -2707,17 +2662,14 @@ async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
                 QueueItemState::PostProcessing => "EXECUTING_SCRIPT",
                 _ => "QUEUED",
             };
-            let (script_name, script_status, script_progress) = run_details
-                .get(&item.id)
-                .and_then(|(_, attempt)| attempt.as_ref())
-                .map(|attempt| {
-                    (
-                        attempt.extension_id.as_str().to_string(),
-                        format!("{:?}", attempt.status).to_ascii_uppercase(),
-                        attempt.progress.clone().unwrap_or(serde_json::Value::Null),
-                    )
-                })
-                .unwrap_or_else(|| (String::new(), "QUEUED".to_string(), Value::Null));
+            // Per-script live state is no longer persisted: results land on the
+            // job when the pass finishes. The stage already says whether a
+            // script is executing, so report that rather than inventing detail.
+            let script_status = if matches!(item.state, QueueItemState::PostProcessing) {
+                "RUNNING"
+            } else {
+                "QUEUED"
+            };
             json!({
                 "ID": item.id,
                 "NZBID": item.id,
@@ -2730,9 +2682,9 @@ async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
                 "StageProgress": info.stage_progress,
                 "TotalTimeSec": info.total_time_sec,
                 "StageTimeSec": info.stage_time_sec,
-                "ScriptName": script_name,
+                "ScriptName": "",
                 "ScriptStatus": script_status,
-                "ScriptProgress": script_progress,
+                "ScriptProgress": Value::Null,
                 "Log": [],
             })
         })
@@ -3058,36 +3010,20 @@ async fn resume_post_processing(ctx: &NzbgetFacadeContext) -> Result<Value, RpcE
     Ok(json!(true))
 }
 
+/// NZBGet reloads extensions from disk on demand. Weaver lists the scripts
+/// directory live on every use, so this only has to confirm the directory reads.
 async fn loadextensions(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let db = ctx.db.clone();
-    let settings = tokio::task::spawn_blocking(move || db.post_processing_settings())
-        .await
-        .map_err(|error| RpcError::invalid_parameter(format!("loadextensions failed: {error}")))?
-        .map_err(|error| RpcError::invalid_parameter(format!("loadextensions failed: {error}")))?;
-    if !settings.discovery_enabled {
-        return Err(RpcError::invalid_parameter(
-            "post-processing extension discovery is disabled",
-        ));
-    }
     let data_dir = std::path::PathBuf::from(ctx.config.read().await.data_dir.clone());
-    let db = ctx.db.clone();
-    let discovered = tokio::task::spawn_blocking(move || {
-        weaver_server_core::post_processing::discovery::discover_and_record_extensions(
-            &db,
-            &data_dir,
-            weaver_server_core::post_processing::discovery::DiscoveryOptions {
-                enabled: true,
-                bare_script_adapter: None,
-            },
-            chrono::Utc::now().timestamp_millis(),
-        )
+    let listing = tokio::task::spawn_blocking(move || {
+        weaver_server_core::post_processing::listing::list_scripts(&data_dir)
     })
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("loadextensions failed: {error}")))?
     .map_err(|error| RpcError::invalid_parameter(format!("loadextensions failed: {error}")))?;
     tracing::info!(
-        count = discovered.len(),
-        "NZBGet facade refreshed extension discovery"
+        count = listing.scripts.len(),
+        problems = listing.problems.len(),
+        "NZBGet facade listed the scripts directory"
     );
     Ok(json!(true))
 }
@@ -3376,6 +3312,21 @@ fn nzbget_queue_status(state: QueueItemState) -> &'static str {
 /// Group status for listgroups. Downloads that finished transfer but wait for
 /// a repair/extraction slot report NZBGet's PP_QUEUED instead of QUEUED so
 /// clients render them as post-processing, not "not started".
+/// NZBGet's per-script status vocabulary: SUCCESS, FAILURE, or NONE.
+fn nzbget_script_status(
+    status: weaver_server_core::post_processing::model::ScriptStatus,
+) -> &'static str {
+    use weaver_server_core::post_processing::model::ScriptStatus;
+    match status {
+        ScriptStatus::Succeeded => "SUCCESS",
+        ScriptStatus::Skipped => "NONE",
+        ScriptStatus::Warning
+        | ScriptStatus::Failed
+        | ScriptStatus::TimedOut
+        | ScriptStatus::Cancelled => "FAILURE",
+    }
+}
+
 fn nzbget_group_status(item: &QueueItem) -> &'static str {
     use weaver_server_api::QueuePostState;
 

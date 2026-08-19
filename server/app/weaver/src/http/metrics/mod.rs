@@ -211,24 +211,20 @@ impl PrometheusMetricsExporter {
         // the filesystem — so they share one blocking task rather than stalling
         // the async runtime. The free-space sample is TTL-cached, so most
         // scrapes do not stat anything at all.
-        let db = self.db.clone();
+        // Post-processing counters live in the executor, so only the free-space
+        // sample still needs the blocking pool.
+        let post_processing =
+            Some(weaver_server_core::post_processing::executor::metrics_snapshot());
         let disk_collector = Arc::clone(disk_space);
-        let (post_processing, disk_space) = match tokio::task::spawn_blocking(move || {
-            (
-                db.post_processing_metrics_snapshot(),
-                disk_collector.sample(super::DISK_SPACE_SAMPLE_TTL),
-            )
+        let disk_space = match tokio::task::spawn_blocking(move || {
+            disk_collector.sample(super::DISK_SPACE_SAMPLE_TTL)
         })
         .await
         {
-            Ok((Ok(metrics), disk)) => (Some(metrics), disk),
-            Ok((Err(error), disk)) => {
-                tracing::debug!(error = %error, "failed to collect post-processing metrics");
-                (None, disk)
-            }
+            Ok(disk) => disk,
             Err(error) => {
                 tracing::debug!(error = %error, "scrape-time blocking collection failed");
-                (None, Vec::new())
+                Vec::new()
             }
         };
 

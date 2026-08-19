@@ -4418,8 +4418,8 @@ fn sample_job(job_id: u64, name: &str, status: JobStatus) -> JobInfo {
 }
 
 fn sample_post_processing_metrics()
--> weaver_server_core::post_processing::persistence::PostProcessingMetricsSnapshot {
-    weaver_server_core::post_processing::persistence::PostProcessingMetricsSnapshot {
+-> weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot {
+    weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot {
         queue_depth: 1,
         active_attempts: 2,
         duration_count: 3,

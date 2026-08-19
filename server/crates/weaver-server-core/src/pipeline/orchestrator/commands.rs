@@ -362,12 +362,12 @@ impl Pipeline {
                 let _ = reply.send(());
             }
             SchedulerCommand::PausePostProcessing { reply } => {
-                self.terminal_post_processing_service.pause();
+                self.terminal_post_processing_executor.pause();
                 self.shared_state.set_post_processing_paused(true);
                 let _ = reply.send(());
             }
             SchedulerCommand::ResumePostProcessing { reply } => {
-                self.terminal_post_processing_service.resume();
+                self.terminal_post_processing_executor.resume();
                 self.shared_state.set_post_processing_paused(false);
                 let _ = reply.send(());
             }
@@ -376,8 +376,9 @@ impl Pipeline {
                     .terminal_post_processing_cancellations
                     .get(&job_id)
                     .is_some_and(|sender| sender.send(true).is_ok());
-                let service_cancelled = self.terminal_post_processing_service.cancel_job(job_id.0);
-                let result = (pipeline_cancelled || service_cancelled)
+                let executor_cancelled =
+                    self.terminal_post_processing_executor.cancel_job(job_id.0);
+                let result = (pipeline_cancelled || executor_cancelled)
                     .then_some(())
                     .ok_or_else(|| {
                         crate::SchedulerError::Conflict(format!(

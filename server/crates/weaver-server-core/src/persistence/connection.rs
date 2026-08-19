@@ -1425,19 +1425,14 @@ impl Database {
                     }
                 }
             }
-            for query in [
-                "SELECT secret_options_json FROM post_processing_profile_steps",
-                "SELECT secret_options_json FROM post_processing_job_plans",
-                "SELECT secret_options_json FROM post_processing_runs",
-            ] {
-                let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
-                for row in rows {
-                    if !post_processing_secret_ciphertexts(&row.text("secret_options_json")?)?
-                        .is_empty()
-                    {
-                        return Ok(true);
-                    }
-                }
+            if !post_processing_secret_ciphertexts(
+                stored_post_processing_options(datastore.read_exec())
+                    .await?
+                    .as_deref(),
+            )?
+            .is_empty()
+            {
+                return Ok(true);
             }
             Ok(false)
         })?;
@@ -1483,37 +1478,21 @@ impl Database {
                     })?;
                 }
             }
-            for (kind, query) in [
-                (
-                    "profile",
-                    "SELECT secret_options_json FROM post_processing_profile_steps",
-                ),
-                (
-                    "frozen plan",
-                    "SELECT secret_options_json FROM post_processing_job_plans",
-                ),
-                (
-                    "run",
-                    "SELECT secret_options_json FROM post_processing_runs",
-                ),
-            ] {
-                let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
-                for row in rows {
-                    for ciphertext in post_processing_secret_ciphertexts(
-                        &row.text("secret_options_json")?,
-                    )? {
-                        if !is_encrypted(&ciphertext) {
-                            return Err(StateError::Conflict(format!(
-                                "persisted post-processing {kind} secret option is not encrypted"
-                            )));
-                        }
-                        decrypt_value(&credential_key, &ciphertext).map_err(|error| {
-                            StateError::Conflict(format!(
-                                "cannot decrypt persisted post-processing {kind} secret option: {error}"
-                            ))
-                        })?;
-                    }
+            for ciphertext in post_processing_secret_ciphertexts(
+                stored_post_processing_options(datastore.read_exec())
+                    .await?
+                    .as_deref(),
+            )? {
+                if !is_encrypted(&ciphertext) {
+                    return Err(StateError::Conflict(
+                        "persisted post-processing secret option is not encrypted".into(),
+                    ));
                 }
+                decrypt_value(&credential_key, &ciphertext).map_err(|error| {
+                    StateError::Conflict(format!(
+                        "cannot decrypt persisted post-processing secret option: {error}"
+                    ))
+                })?;
             }
             Ok(())
         })?;
@@ -1607,30 +1586,58 @@ impl Database {
     }
 }
 
-fn post_processing_secret_ciphertexts(raw: &str) -> Result<Vec<String>, StateError> {
+/// Read the raw stored post-processing option blob without decrypting anything.
+///
+/// This runs before a key is installed, so it must not go through the typed
+/// settings accessors that would try to decrypt.
+async fn stored_post_processing_options(
+    exec: crate::persistence::sql_runtime::SqlExec<'_, '_>,
+) -> Result<Option<String>, StateError> {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+
+    let row = SqlRuntime::fetch_optional(
+        exec,
+        "SELECT value FROM settings WHERE key = {}",
+        &[SqlArg::Text(
+            "post_processing.script_options.v1".to_string(),
+        )],
+    )
+    .await?;
+    row.map(|row| row.text("value")).transpose()
+}
+
+/// Every stored ciphertext across every script's secret options.
+fn post_processing_secret_ciphertexts(raw: Option<&str>) -> Result<Vec<String>, StateError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
     let value = serde_json::from_str::<serde_json::Value>(raw).map_err(|error| {
         StateError::Database(format!(
             "invalid persisted post-processing secret options: {error}"
         ))
     })?;
-    let entries = value.as_array().ok_or_else(|| {
-        StateError::Database("persisted post-processing secret options are not an array".into())
+    let scripts = value.as_object().ok_or_else(|| {
+        StateError::Database("persisted post-processing options are not an object".into())
     })?;
-    entries
-        .iter()
-        .map(|entry| {
-            entry
+    let mut ciphertexts = Vec::new();
+    for entry in scripts.values() {
+        let Some(secrets) = entry.get("secrets").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for secret in secrets {
+            let ciphertext = secret
                 .as_object()
-                .and_then(|entry| entry.get("ciphertext"))
+                .and_then(|secret| secret.get("ciphertext"))
                 .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
                 .ok_or_else(|| {
                     StateError::Database(
                         "persisted post-processing secret option has no ciphertext".into(),
                     )
-                })
-        })
-        .collect()
+                })?;
+            ciphertexts.push(ciphertext.to_string());
+        }
+    }
+    Ok(ciphertexts)
 }
 
 #[cfg(test)]

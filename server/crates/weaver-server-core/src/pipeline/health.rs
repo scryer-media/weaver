@@ -308,43 +308,31 @@ impl Pipeline {
                 _ => crate::post_processing::model::PipelineFailureStage::Download,
             })
             .unwrap_or(crate::post_processing::model::PipelineFailureStage::Download);
-        let plan = match self.db.post_processing_settings() {
-            Ok(settings) if settings.execution_enabled => {
-                match self.db.frozen_post_processing_plan(job_id.0) {
-                    Ok(Some(plan)) if !plan.steps().is_empty() => Some(plan),
-                    Ok(_) => None,
-                    Err(plan_error) => {
-                        tracing::warn!(
-                            job_id = job_id.0,
-                            error = %plan_error,
-                            "could not load failure post-processing plan; preserving legacy failure finalization"
-                        );
-                        None
-                    }
-                }
-            }
-            Ok(_) => None,
-            Err(settings_error) => {
+        // Scripts run on failure too, so the job's own failure survives them:
+        // the primary failure is carried through and re-applied afterwards.
+        let scripts_may_run = self
+            .terminal_post_processing_executor
+            .execution_enabled()
+            .unwrap_or_else(|settings_error| {
                 tracing::warn!(
                     job_id = job_id.0,
                     error = %settings_error,
                     "could not load post-processing settings; preserving legacy failure finalization"
                 );
-                None
-            }
-        };
+                false
+            });
         let extraction_rejected = JobExtractionBudget::is_rejection(&error);
         if extraction_rejected && let Some(budget) = self.extraction_budgets.get(&job_id) {
             budget.cancel_with_error(&error);
         }
         let should_defer = !extraction_rejected
-            && plan.is_some()
+            && scripts_may_run
             && self.jobs.contains_key(&job_id)
             && !self.inflight_terminal_post_processing.contains(&job_id);
         let (released_repair, released_extract) =
             self.prepare_failed_job_runtime(job_id, &error, should_defer);
 
-        if let Some(plan) = plan.filter(|_| should_defer) {
+        if should_defer {
             if released_repair {
                 self.promote_queued_repairs();
             }
@@ -353,13 +341,11 @@ impl Pipeline {
             }
             self.start_terminal_post_processing_with_outcome(
                 job_id,
-                plan,
                 crate::post_processing::model::PipelineOutcome::Failed {
                     stage: failure_stage,
                     code: "PIPELINE_FAILURE".to_string(),
                     message: error.clone(),
                 },
-                crate::post_processing::persistence::TerminalIntent::Fail,
                 Some(error),
             );
             return;

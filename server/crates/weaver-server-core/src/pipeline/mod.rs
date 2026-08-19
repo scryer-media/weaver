@@ -1348,8 +1348,8 @@ pub(super) struct TerminalPostProcessingDone {
     pub(super) job_id: JobId,
     pub(super) primary_failure: Option<String>,
     pub(super) result: Result<
-        crate::post_processing::service::RunExecutionReport,
-        crate::post_processing::service::PostProcessingServiceError,
+        crate::post_processing::executor::JobPostProcessingReport,
+        crate::post_processing::executor::PostProcessingExecutorError,
     >,
 }
 
@@ -2110,8 +2110,8 @@ pub struct Pipeline {
     pub(super) move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
     pub(super) terminal_post_processing_done_tx: mpsc::Sender<TerminalPostProcessingEvent>,
     pub(super) terminal_post_processing_done_rx: mpsc::Receiver<TerminalPostProcessingEvent>,
-    pub(super) terminal_post_processing_service:
-        crate::post_processing::service::PostProcessingService,
+    pub(super) terminal_post_processing_executor:
+        crate::post_processing::executor::PostProcessingExecutor,
     pub(super) inflight_terminal_post_processing: HashSet<JobId>,
     pub(super) terminal_post_processing_cancellations:
         HashMap<JobId, tokio::sync::watch::Sender<bool>>,
@@ -2275,10 +2275,6 @@ pub struct Pipeline {
     /// fallback recorded when a job ends with no PAR2 set can never
     /// double-count a job an actual pass already ruled on.
     pub(in crate::pipeline) jobs_with_verification_outcome: HashSet<JobId>,
-    /// Jobs that have consumed NZBGet's one permitted post-processing PAR re-entry.
-    pub(super) post_processing_repair_reentered: HashSet<JobId>,
-    /// Jobs returning from that PAR pass to terminal extension processing in place.
-    pub(super) post_processing_repair_return_to_terminal: HashSet<JobId>,
     /// Promoted PAR2 recovery segments that can no longer be fetched or decoded.
     pub(super) unavailable_promoted_recovery_segments: HashSet<SegmentId>,
     /// Finished jobs (Complete/Failed) from recovery — surfaced in list/get queries.

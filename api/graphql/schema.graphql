@@ -283,11 +283,6 @@ type DuplicateSummaryInfo {
 	semantic: SemanticCandidateSnapshotInfo
 }
 
-type E2EpostProcessingSeed {
-	jobIds: [Int!]!
-	runIds: [String!]!
-}
-
 enum EventKind {
 	JOB_CREATED
 	JOB_PAUSED
@@ -600,11 +595,6 @@ enum IspBandwidthCapWeekdayGql {
 	SAT
 	SUN
 }
-
-"""
-A scalar that can represent any JSON value.
-"""
-scalar JSON
 
 type Job {
 	id: Int!
@@ -1051,30 +1041,20 @@ type MutationRoot {
 	Set the queue speed limit in bytes/sec. 0 means unlimited.
 	"""
 	setQueueSpeedLimit(bytesPerSec: Int!): QueueCommandResult!
-	updatePostProcessingSettings(input: PostProcessingSettingsInput!): PostProcessingSettingsGql!
-	discoverPostProcessingExtensions(bareScriptAdapter: PostProcessingAdapterInput): [PostProcessingExtensionRevision!]!
-	runPostProcessingDiagnostic(input: PostProcessingDiagnosticInput!): PostProcessingDiagnosticResult!
-	approvePostProcessingRevision(extensionId: String!, revisionId: String!): PostProcessingExtensionRevision!
-	disablePostProcessingRevision(extensionId: String!, revisionId: String!): Boolean!
-	revokePostProcessingRevision(extensionId: String!, revisionId: String!): Boolean!
-	savePostProcessingProfile(input: PostProcessingProfileInput!): PostProcessingProfile!
-	deletePostProcessingProfile(profileId: String!): Boolean!
-	assignGlobalPostProcessingProfile(profileId: String): Boolean!
-	assignCategoryPostProcessingProfile(category: String!, profileId: String): Boolean!
-	setJobPostProcessingSelection(jobId: Int!, selection: PostProcessingSelectionInput!): PostProcessingJobPlan!
+	setPostProcessingSettings(input: PostProcessingSettingsInput!): PostProcessingSettingsGql!
 	"""
-	Creates deterministic, metadata-only jobs and real queued
-	post-processing runs for the isolated browser release gate. The first
-	call omits `job_ids` and prepares two paused jobs so the browser can
-	exercise selection controls. The second call supplies those exact IDs
-	after the browser pauses the post-processing queue.
+	Replace the global default list and every per-category override.
 	"""
-	seedE2EPostProcessingRuns(profileId: String!, jobIds: [Int!]): E2EpostProcessingSeed!
-	pausePostProcessingQueue: Boolean!
-	resumePostProcessingQueue: Boolean!
-	reorderPostProcessingQueue(runIds: [String!]!): [String!]!
+	setScriptLists(input: ScriptListsInput!): ScriptListsGql!
+	"""
+	Replace the stored option values for one script, validated against its manifest.
+	"""
+	setScriptOptions(script: String!, options: [ScriptOptionInput!]!): ScriptGql!
+	"""
+	Execute the job's script list again against its retained output directory.
+	"""
+	rerunPostProcessing(jobId: Int!): Boolean!
 	cancelJobPostProcessing(jobId: Int!): Boolean!
-	rerunPostProcessing(input: PostProcessingRerunInput!): PostProcessingRun!
 	"""
 	Add a new RSS feed.
 	"""
@@ -1201,217 +1181,30 @@ type PipelineEventGql {
 	message: String!
 }
 
-enum PostProcessingAdapterInput {
-	SABNZBD
-	NZBGET
-}
-
-type PostProcessingArtifact {
-	attemptId: String!
-	stepIndex: Int!
-	path: String!
-	exists: Boolean!
-	isFile: Boolean!
-	isDirectory: Boolean!
-	isSymlink: Boolean!
-	sizeBytes: Int
-}
-
-type PostProcessingAttempt {
-	attemptId: String!
-	runId: String!
-	stepIndex: Int!
-	status: String!
-	extensionId: String!
-	revisionId: String!
-	adapter: String!
-	workingDirectory: String
-	exitCode: Int
-	errorMessage: String
-	progress: JSON
-	outputTruncated: Boolean!
-	queuedAtEpochMs: Int!
-	startedAtEpochMs: Int
-	finishedAtEpochMs: Int
-}
-
-input PostProcessingDiagnosticInput {
-	extensionId: String!
-	revisionId: String!
-	command: String!
-	options: [PostProcessingOptionInput!]! = []
-}
-
-type PostProcessingDiagnosticOutputLine {
-	sequence: Int!
-	stream: String!
-	text: String!
-}
-
-type PostProcessingDiagnosticResult {
-	succeeded: Boolean!
-	exitCode: Int
-	errorMessage: String
-	outputTruncated: Boolean!
-	output: [PostProcessingDiagnosticOutputLine!]!
-}
-
-type PostProcessingExtensionRevision {
-	extensionId: String!
-	revisionId: String!
-	declaredVersion: String!
-	digest: String!
-	adapter: String!
-	displayName: String!
-	trustState: String!
-	managed: Boolean!
-	sourcePath: String
-	discoveredAtEpochMs: Int!
-	approvedAtEpochMs: Int
-	manifest: JSON!
-}
-
-type PostProcessingJobPlan {
-	jobId: Int!
-	definition: JSON!
-}
-
-type PostProcessingLogChunkGql {
-	sequence: Int!
-	stream: String!
-	text: String!
-	createdAtEpochMs: Int!
-}
-
-type PostProcessingLogPageGql {
-	chunks: [PostProcessingLogChunkGql!]!
-	nextCursor: Int
-	truncated: Boolean!
-}
-
-enum PostProcessingOnFailureInput {
-	STOP
-	CONTINUE
-}
-
-input PostProcessingOptionInput {
-	name: String!
-	kind: PostProcessingOptionValueKind!
-	value: String!
-}
-
-enum PostProcessingOptionValueKind {
-	STRING
-	INTEGER
-	NUMBER
-	BOOLEAN
-	SECRET
-}
-
-enum PostProcessingOutcomeImpactInput {
-	WARN
-	FAIL_JOB
-}
-
-type PostProcessingProfile {
-	profileId: String!
-	name: String!
-	enabled: Boolean!
-	createdAtEpochMs: Int!
-	updatedAtEpochMs: Int!
-	definition: JSON!
-}
-
-input PostProcessingProfileInput {
-	profileId: String!
-	name: String!
-	enabled: Boolean! = true
-	steps: [PostProcessingProfileStepInput!]!
-}
-
-input PostProcessingProfileStepInput {
-	extensionId: String!
-	revisionId: String
-	runWhen: PostProcessingRunWhenInput!
-	onFailure: PostProcessingOnFailureInput!
-	outcomeImpact: PostProcessingOutcomeImpactInput!
-	timeoutSeconds: Int
-	unlimitedTimeout: Boolean! = false
-	approvedRoots: [String!]! = []
-	requiredArtifactSuffixes: [String!]! = []
-	minimumArtifactCount: Int! = 0
-	options: [PostProcessingOptionInput!]! = []
-}
-
-input PostProcessingRerunInput {
-	runId: String!
-	mode: PostProcessingRerunModeInput!
-	stepIndexes: [Int!]! = []
-	rebindToLatestApproved: Boolean! = false
-}
-
-enum PostProcessingRerunModeInput {
-	ALL
-	SELECTED
-	FAILED_AND_LATER
-}
-
-type PostProcessingRun {
-	runId: String!
-	jobId: Int!
-	status: String!
-	pipelineOutcome: JSON!
-	summary: String!
-	terminalIntent: String!
-	plan: JSON!
-	rerunOfRunId: String
-	queuedAtEpochMs: Int!
-	queuePosition: Int!
-	startedAtEpochMs: Int
-	finishedAtEpochMs: Int
-}
-
-enum PostProcessingRunWhenInput {
-	ALWAYS
-	SUCCESS
-	FAILURE
-}
-
-input PostProcessingSelectionInput {
-	mode: PostProcessingSelectionModeInput!
-	profileId: String
-	extensionIds: [String!]! = []
-}
-
-enum PostProcessingSelectionModeInput {
-	INHERIT
-	DISABLED
-	PROFILE
-	EXTENSIONS
-}
-
 type PostProcessingSettingsGql {
-	discoveryEnabled: Boolean!
 	executionEnabled: Boolean!
 	concurrency: Int!
 	terminationGraceSeconds: Int!
 	pythonInterpreter: String
 	powershellInterpreter: String
 	batchInterpreter: String
-	webhooksEnabled: Boolean!
-	allowedRoots: [String!]!
+	"""
+	True when `WEAVER_STRICT_SECURITY` refuses script execution outright.
+	"""
+	strictSecurityRefusesExecution: Boolean!
+	"""
+	Global default list plus every per-category override.
+	"""
+	lists: ScriptListsGql!
 }
 
 input PostProcessingSettingsInput {
-	discoveryEnabled: Boolean!
 	executionEnabled: Boolean!
 	concurrency: Int!
 	terminationGraceSeconds: Int!
 	pythonInterpreter: String
 	powershellInterpreter: String
 	batchInterpreter: String
-	webhooksEnabled: Boolean! = false
-	allowedRoots: [String!]! = []
 }
 
 type QueryRoot {
@@ -1532,15 +1325,17 @@ type QueryRoot {
 	"""
 	jobOutputFiles(jobId: Int!): JobOutputResult
 	postProcessingSettings: PostProcessingSettingsGql!
-	postProcessingRevisions: [PostProcessingExtensionRevision!]!
-	postProcessingProfiles: [PostProcessingProfile!]!
-	postProcessingJobPlan(jobId: Int!): PostProcessingJobPlan
-	postProcessingRuns(jobId: Int, limit: Int! = 100): [PostProcessingRun!]!
-	postProcessingQueue: [PostProcessingRun!]!
-	postProcessingRun(runId: String!): PostProcessingRun
-	postProcessingAttempts(runId: String!): [PostProcessingAttempt!]!
-	postProcessingArtifacts(runId: String!): [PostProcessingArtifact!]!
-	postProcessingLogs(attemptId: String!, cursor: Int, limit: Int! = 200): PostProcessingLogPageGql!
+	"""
+	Live listing of `data_dir/scripts`, plus any stored option values.
+	
+	Nothing is cached: the directory is the source of truth, so a script
+	added a second ago is listed and one deleted a second ago is not.
+	"""
+	scripts: ScriptListingGql!
+	"""
+	Script results recorded for a job, from the live row or from history.
+	"""
+	postProcessingResults(jobId: Int!): [ScriptResultGql!]!
 	"""
 	List configured RSS feeds.
 	"""
@@ -1970,6 +1765,118 @@ input ScheduleInput {
 	speedLimitBytes: Int
 }
 
+enum ScriptAdapterGql {
+	SABNZBD
+	NZBGET
+}
+
+type ScriptCategoryListGql {
+	category: String!
+	entries: [ScriptListEntryGql!]!
+}
+
+input ScriptCategoryListInput {
+	category: String!
+	entries: [ScriptListEntryInput!]!
+}
+
+type ScriptGql {
+	name: String!
+	displayName: String!
+	adapter: ScriptAdapterGql!
+	version: String
+	options: [ScriptOptionGql!]!
+}
+
+type ScriptListEntryGql {
+	script: String!
+	enabled: Boolean!
+	timeoutSeconds: Int
+}
+
+input ScriptListEntryInput {
+	script: String!
+	enabled: Boolean! = true
+	timeoutSeconds: Int
+}
+
+type ScriptListingGql {
+	scripts: [ScriptGql!]!
+	"""
+	Entries that look like scripts but could not be listed, so an unparseable
+	manifest is visible instead of silently absent.
+	"""
+	problems: [ScriptProblemGql!]!
+}
+
+type ScriptListsGql {
+	global: [ScriptListEntryGql!]!
+	categories: [ScriptCategoryListGql!]!
+}
+
+input ScriptListsInput {
+	global: [ScriptListEntryInput!]! = []
+	categories: [ScriptCategoryListInput!]! = []
+}
+
+type ScriptOptionGql {
+	name: String!
+	section: String
+	optionType: ScriptOptionTypeGql!
+	displayName: String
+	description: [String!]!
+	select: [String!]!
+	required: Boolean!
+	"""
+	Manifest default, already masked when the option is secret.
+	"""
+	defaultValue: String
+	"""
+	Operator-supplied value, masked when the option is secret.
+	"""
+	value: String
+}
+
+input ScriptOptionInput {
+	name: String!
+	optionType: ScriptOptionTypeGql!
+	value: String!
+}
+
+enum ScriptOptionTypeGql {
+	STRING
+	INTEGER
+	NUMBER
+	BOOLEAN
+	SECRET
+}
+
+type ScriptProblemGql {
+	name: String!
+	message: String!
+}
+
+type ScriptResultGql {
+	script: String!
+	adapter: ScriptAdapterGql!
+	status: ScriptStatusGql!
+	exitCode: Int
+	durationMs: Int!
+	outputTail: String!
+	outputTruncated: Boolean!
+	errorMessage: String
+	finishedAtEpochMs: Int!
+}
+
+enum ScriptStatusGql {
+	SUCCEEDED
+	SKIPPED
+	WARNING
+	FAILED
+	TIMED_OUT
+	CANCELLED
+}
+
 type SemanticCandidateSnapshotInfo {
 	groupId: Int!
 	normalizedKey: String!
@@ -2267,7 +2174,6 @@ input SubmitNzbInput {
 	dupeKey: String
 	dupeScore: Int
 	dupeMode: DuplicateMode
-	postProcessing: PostProcessingSelectionInput
 }
 
 input SubmitStagedNzbsInput {
@@ -2281,7 +2187,6 @@ input SubmitStagedNzbsInput {
 	dupeKey: String
 	dupeScore: Int
 	dupeMode: DuplicateMode
-	postProcessing: PostProcessingSelectionInput
 }
 
 type SubmitStagedNzbsResult {
