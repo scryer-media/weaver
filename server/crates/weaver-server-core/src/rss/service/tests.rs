@@ -417,15 +417,11 @@ fn build_service(
     }));
     let handle = test_scheduler_handle(submissions);
     crate::ingest::init_job_counter(20_000);
-    RssService::new_with_security(
-        handle,
-        config,
-        db,
-        RuntimeSecurityConfig {
-            rss_allow_private_network: true,
-            ..RuntimeSecurityConfig::default()
-        },
-    )
+    RssService::new_with_security(handle, config, db, {
+        let mut security = RuntimeSecurityConfig::default();
+        security.rss_allow_private_network = true;
+        security
+    })
 }
 
 fn test_scheduler_handle(submissions: Arc<StdMutex<Vec<CapturedSubmission>>>) -> SchedulerHandle {

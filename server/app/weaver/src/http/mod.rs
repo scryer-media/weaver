@@ -9,7 +9,6 @@ mod nzbget;
 mod request_metrics;
 mod routes;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -150,9 +149,13 @@ fn cors_layer(
         .allow_credentials(true))
 }
 
+/// Runs the HTTP server on a listener the caller already bound. Binding
+/// happens in `serve.rs` so an unbindable configured address can fall back to
+/// loopback (and be reported) before the security snapshot is captured by the
+/// GraphQL schema — the never-brick rule for stored network settings.
 pub async fn run_server(
     runtime: ServerRuntime,
-    addr: SocketAddr,
+    listener: tokio::net::TcpListener,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let base_url = runtime.base_url.clone();
     let cors = cors_layer(&runtime.security)?;
@@ -169,10 +172,8 @@ pub async fn run_server(
         .layer(cors);
     let app = routes::with_http_host_validation(app, host_security);
 
+    let addr = listener.local_addr()?;
     info!(%addr, base_url = if base_url.is_empty() { "/" } else { &base_url }, "starting HTTP server");
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-        format!("failed to bind to {addr}: {e} — is another process using this port?")
-    })?;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

@@ -9,6 +9,42 @@ enum AcceptHistoryDeleteMode {
 	ALL_HISTORY
 }
 
+"""
+The browser-admission policy: mode, networks, and whether the UI may edit
+it (`WEAVER_TRUSTED_CIDRS` pins it read-only, like the bind variable).
+"""
+type AccessPolicyStatus {
+	"""
+	`login_required`, `login_except_local`, or `no_login`.
+	"""
+	mode: String!
+	"""
+	The trusted networks in force right now (live — policy edits apply
+	immediately, unlike the bind address).
+	"""
+	trustedNetworks: [String!]!
+	editable: Boolean!
+	"""
+	True when the environment supplied the list.
+	"""
+	envPinned: Boolean!
+	"""
+	True once an access mode has actually been stored and understood.
+	
+	Distinguishes "the operator chose login-required" from "nothing is
+	stored and the query defaulted to login-required", which is what an
+	install upgraded from a version without these settings looks like. The
+	UI uses it to offer the security wizard exactly once.
+	"""
+	configured: Boolean!
+	"""
+	`WEAVER_STRICT_SECURITY` is on, so every trusting mode will be refused.
+	Exposed so the UI can disable those choices with the real reason rather
+	than letting the operator pick one and fail on submit.
+	"""
+	strictSecurity: Boolean!
+}
+
 type ApiKey {
 	id: Int!
 	name: String!
@@ -474,6 +510,63 @@ enum HistoryStatusFilter {
 	FAILURE
 }
 
+"""
+Which layer decided the address Weaver is listening on.
+"""
+enum HttpBindAddressSource {
+	"""
+	`WEAVER_HTTP_BIND_ADDRESS` is set and wins; the field is read-only.
+	"""
+	ENVIRONMENT
+	"""
+	Chosen in this UI and stored in the settings table.
+	"""
+	SETTING
+	"""
+	Nothing configured; loopback.
+	"""
+	DEFAULT
+}
+
+"""
+The listening address, where it came from, and whether that combination
+leaves the admin interface reachable without a login.
+"""
+type HttpBindAddressStatus {
+	"""
+	The address in force for the running process.
+	"""
+	address: String!
+	"""
+	The stored setting, which differs from `address` only when the
+	environment is overriding it or a change is awaiting a restart.
+	"""
+	storedAddress: String
+	source: HttpBindAddressSource!
+	"""
+	False when the environment pins the address, in which case editing it
+	here would be ignored.
+	"""
+	editable: Boolean!
+	"""
+	True when the address the NEXT restart will use is reachable beyond
+	this machine while no login is configured — evaluated against the
+	pending choice, so the warning fires when the decision is made rather
+	than after the restart that already exposed the instance.
+	"""
+	exposedWithoutLogin: Boolean!
+	"""
+	True when the address the next restart will use differs from the
+	running one — including a cleared setting falling back to loopback.
+	"""
+	restartRequired: Boolean!
+	"""
+	Set when the process could not bind its configured address and is
+	serving on loopback instead; the reason, verbatim, for a banner.
+	"""
+	bindFallback: String
+}
+
 enum IspBandwidthCapPeriodGql {
 	DAILY
 	WEEKLY
@@ -800,6 +893,21 @@ type MutationRoot {
 	Delete an API key by ID.
 	"""
 	deleteApiKey(id: Int!): [ApiKey!]!
+	"""
+	Set the address Weaver listens on, applied at the next restart.
+	
+	Refused when `WEAVER_HTTP_BIND_ADDRESS` is set, rather than stored and
+	silently ignored: an operator who pinned the address in their
+	deployment should be told their edit would not take effect, not left to
+	discover it after a restart. An empty value clears the setting back to
+	the loopback default.
+	"""
+	setHttpBindAddress(address: String!): Boolean!
+	"""
+	Change the browser-admission policy: mode plus trusted networks.
+	Applies immediately — trust is live state, unlike the bind address.
+	"""
+	setAccessPolicy(mode: String!, trustedNetworks: [String!]): Boolean!
 	"""
 	Enable login protection with a username and password.
 	"""
@@ -1312,6 +1420,20 @@ type QueryRoot {
 	"""
 	adminLoginStatus: LoginStatusResult!
 	"""
+	The address Weaver is listening on, and whether it can be changed here.
+	
+	Exposed so the binding can be widened from the UI. That matters because
+	the loopback default is always reachable from the machine Weaver runs
+	on, which makes this the one place an operator can reliably get to —
+	unlike a service unit, a shortcut's environment, or a file under
+	Program Files.
+	"""
+	httpBindAddress: HttpBindAddressStatus!
+	"""
+	The browser-admission policy: who gets in without a login.
+	"""
+	accessPolicy: AccessPolicyStatus!
+	"""
 	List all API keys (without raw key values).
 	"""
 	apiKeys: [ApiKey!]!
@@ -1363,6 +1485,10 @@ type QueryRoot {
 	Public queue facade for active or in-flight items.
 	"""
 	queueItems(filter: QueueFilterInput, first: Int, after: String): [QueueItem!]!
+	"""
+	Server-paginated queue rows for the interactive queue table.
+	"""
+	queuePage(input: QueuePageInput!): QueuePage!
 	"""
 	Public queue facade for one active item.
 	"""
@@ -1618,6 +1744,25 @@ enum QueueMoveKind {
 	OFFSET
 }
 
+type QueuePage {
+	items: [QueueItem!]!
+	totalCount: Int!
+	summary: QueueSummary!
+	categories: [String!]!
+	latestCursor: String!
+}
+
+input QueuePageInput {
+	pageIndex: Int!
+	pageSize: Int!
+	search: String
+	states: [QueueItemState!]
+	priorities: [QueuePriority!]
+	categories: [String!]
+	sortField: QueueSortField!
+	sortDirection: QueueSortDirection!
+}
+
 enum QueuePhase {
 	DOWNLOADING
 	REPAIRING
@@ -1652,6 +1797,12 @@ enum QueuePostState {
 	FAILED
 }
 
+enum QueuePriority {
+	LOW
+	NORMAL
+	HIGH
+}
+
 type QueueSnapshot {
 	items: [QueueItem!]!
 	summary: QueueSummary!
@@ -1659,6 +1810,20 @@ type QueueSnapshot {
 	globalState: GlobalQueueState!
 	latestCursor: String!
 	generatedAt: DateTime!
+}
+
+enum QueueSortDirection {
+	ASC
+	DESC
+}
+
+enum QueueSortField {
+	NAME
+	STATE
+	PRIORITY
+	CATEGORY
+	PROGRESS
+	SIZE
 }
 
 type QueueSummary {

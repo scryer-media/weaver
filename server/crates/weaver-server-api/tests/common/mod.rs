@@ -140,6 +140,9 @@ pub struct TestHarness {
     pub server_transfer_policy:
         Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
     pub auth_cache: LoginAuthCache,
+    /// The same config the schema holds, so a policy mutation's live effect on
+    /// the trusted-network list is observable from a test.
+    pub security: weaver_server_core::security::RuntimeSecurityConfig,
     _scheduler_task: JoinHandle<()>,
     _tempdir: tempfile::TempDir,
 }
@@ -164,7 +167,29 @@ impl TestHarness {
         Self::new_with_options(false).await
     }
 
+    /// Like [`TestHarness::new`] but with an explicit security posture, for
+    /// tests that pin what strict security, an environment pin, or a widened
+    /// bind address refuse. The config is shared with the schema, so a policy
+    /// mutation's live effect is observable on the caller's copy.
+    pub async fn new_with_security(
+        security: weaver_server_core::security::RuntimeSecurityConfig,
+    ) -> Self {
+        Self::new_with_options_and_security(true, security).await
+    }
+
     async fn new_with_options(spawn_history_delete_worker: bool) -> Self {
+        Self::new_with_options_and_security(
+            spawn_history_delete_worker,
+            // Loopback, no environment override: the shape a fresh install has.
+            weaver_server_core::security::RuntimeSecurityConfig::default(),
+        )
+        .await
+    }
+
+    async fn new_with_options_and_security(
+        spawn_history_delete_worker: bool,
+        security: weaver_server_core::security::RuntimeSecurityConfig,
+    ) -> Self {
         let tempdir = tempfile::TempDir::new().expect("failed to create tempdir");
         let db = Database::open_in_memory().expect("failed to open in-memory DB");
 
@@ -220,6 +245,7 @@ impl TestHarness {
             server_transfer_policy: Arc::clone(&server_transfer_policy),
             auth_cache: auth_cache.clone(),
             api_key_cache,
+            security: security.clone(),
             rss,
             watch_folder,
             schedules: shared_schedules,
@@ -267,6 +293,7 @@ impl TestHarness {
             shared_state,
             server_transfer_policy,
             auth_cache,
+            security,
             _scheduler_task: scheduler_task,
             _tempdir: tempdir,
         }

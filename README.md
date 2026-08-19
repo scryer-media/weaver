@@ -40,7 +40,7 @@ Instead of the traditional sequential approach (download everything, then repair
 
 ## Install
 
-All unstallation instructions can be found on the [Weaver docs website](https://www.scryer.media/weaver/docs/installation/)
+All installation instructions can be found on the [Weaver docs website](https://www.scryer.media/weaver/docs/installation/)
 
 ## Docker
 
@@ -62,8 +62,6 @@ services:
       - PGID=1000
       - TZ=Etc/UTC
       - UMASK=022 # optional
-      # Docker and reverse-proxy deployments must explicitly bind beyond loopback.
-      - WEAVER_HTTP_BIND_ADDRESS=0.0.0.0
       - WEAVER_HTTP_ALLOWED_HOSTS=weaver,weaver.example.me # permit the Compose service name and any reverse proxy names
     volumes:
       - /path/to/weaver/config:/config # this is the critical volume with all your config data and encryption key
@@ -72,9 +70,18 @@ services:
     restart: unless-stopped
 ```
 
-Weaver binds to `127.0.0.1` by default. Set `WEAVER_HTTP_BIND_ADDRESS=0.0.0.0`
-for Docker, LAN, or reverse-proxy deployments, or use a specific non-loopback
-address. Binding and browser trust are separate: binding to a LAN interface
+Weaver binds to `127.0.0.1` by default, so a native install is never exposed by
+accident; the container image ships `WEAVER_HTTP_BIND_ADDRESS=0.0.0.0`, since a
+container's exposure is decided by the port you publish. Set that variable
+yourself for a native LAN or reverse-proxy deployment, or use a specific
+non-loopback address. The address is also editable in **Settings → Security**,
+which is the normal route for a desktop or service install; under Docker that
+setting only moves the address within the container's own network namespace,
+where the ports you publish with `-p` — or `--network host` — are what actually
+decide exposure, so pin `WEAVER_HTTP_BIND_ADDRESS` at the deployment level
+instead. The variable always wins over the stored setting.
+
+Binding and browser trust are separate: binding to a LAN interface
 does not trust its clients. To deliberately allow loginless browser access,
 configure `WEAVER_TRUSTED_CIDRS` with explicit client networks, for example
 `127.0.0.0/8,::1/128` for local access only. Matching clients receive full

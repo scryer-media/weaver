@@ -1187,6 +1187,68 @@ export const LOGIN_STATUS_QUERY = gql`
   }
 `;
 
+export const HTTP_BIND_ADDRESS_QUERY = gql`
+  query HttpBindAddress {
+    httpBindAddress {
+      address
+      storedAddress
+      source
+      editable
+      exposedWithoutLogin
+      restartRequired
+      bindFallback
+    }
+  }
+`;
+
+export const SET_HTTP_BIND_ADDRESS_MUTATION = gql`
+  mutation SetHttpBindAddress($address: String!) {
+    setHttpBindAddress(address: $address)
+  }
+`;
+
+export const ACCESS_POLICY_QUERY = gql`
+  query AccessPolicy {
+    accessPolicy {
+      mode
+      trustedNetworks
+      editable
+      envPinned
+    }
+  }
+`;
+
+export const SET_ACCESS_POLICY_MUTATION = gql`
+  mutation SetAccessPolicy($mode: String!, $trustedNetworks: [String!]) {
+    setAccessPolicy(mode: $mode, trustedNetworks: $trustedNetworks)
+  }
+`;
+
+// One probe for the upgrade wizard: whether an access mode was ever stored,
+// whether this deployment allows changing it, and what the bind question
+// should default to. Combined so an already-configured install pays a single
+// round trip before the app renders.
+export const SECURITY_SETUP_STATE_QUERY = gql`
+  query SecuritySetupState {
+    adminLoginStatus {
+      enabled
+    }
+    accessPolicy {
+      mode
+      trustedNetworks
+      editable
+      envPinned
+      configured
+      strictSecurity
+    }
+    httpBindAddress {
+      address
+      storedAddress
+      editable
+    }
+  }
+`;
+
 export const ENABLE_LOGIN_MUTATION = gql`
   mutation EnableLogin($username: String!, $password: String!) {
     enableLogin(username: $username, password: $password)

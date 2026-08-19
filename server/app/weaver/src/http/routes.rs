@@ -141,6 +141,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             post(super::backup::backup_export_handler),
         )
         .nest("/api/backup", backup_upload_routes)
+        .route("/api/auth/setup", post(super::auth::setup_handler))
         .route("/api/login", post(super::auth::login_handler))
         .route("/api/logout", post(super::auth::logout_handler))
         .route("/api/auth/status", get(super::auth::auth_status_handler))
@@ -300,9 +301,11 @@ mod tests {
 
     #[tokio::test]
     async fn host_guard_accepts_local_and_configured_authorities() {
-        let security = RuntimeSecurityConfig {
-            http_allowed_hosts: vec![HttpAuthority::parse("weaver.internal:8443").unwrap()],
-            ..RuntimeSecurityConfig::default()
+        let security = {
+            let mut security = RuntimeSecurityConfig::default();
+            security.http_allowed_hosts =
+                vec![HttpAuthority::parse("weaver.internal:8443").unwrap()];
+            security
         };
         let hits = Arc::new(AtomicUsize::new(0));
         let app = guarded_router(security, Arc::clone(&hits));

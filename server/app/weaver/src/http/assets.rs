@@ -115,12 +115,17 @@ pub(super) async fn static_handler(
         super::auth::extract_jwt_cookie(&headers)
             .is_some_and(|token| jwt::verify_jwt(&token, &auth.jwt_secret).is_ok())
     });
-    if !trusted_peer && !has_valid_jwt {
-        return if cached_auth.is_some() {
-            login_page_response()
-        } else {
-            setup_required_response()
-        };
+    // A fresh install — no credentials stored — serves the SPA so the browser
+    // can run the first-run wizard. That is the whole point of the loopback
+    // default: the machine's own browser is the operator, and setup happens in
+    // the UI like every peer product, not in environment variables. The wizard
+    // endpoint itself enforces loopback-or-trusted, so a remote visitor who
+    // somehow reaches a pre-setup instance sees the wizard but cannot submit
+    // it. Once credentials exist, an unauthenticated browser gets the login
+    // page exactly as before.
+    let setup_pending = cached_auth.is_none() && !trusted_peer;
+    if !trusted_peer && !has_valid_jwt && !setup_pending {
+        return login_page_response();
     }
 
     if let Some(index) = FrontendAssets::get("index.html") {
@@ -252,15 +257,6 @@ fn login_page_response() -> Response {
         .into_response()
 }
 
-fn setup_required_response() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string())],
-        "<!doctype html><title>Weaver setup required</title><h1>Weaver setup required</h1><p>Configure WEAVER_BOOTSTRAP_LOGIN_USERNAME with exactly one of WEAVER_BOOTSTRAP_LOGIN_PASSWORD or WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE, configure explicit WEAVER_TRUSTED_CIDRS for loginless browser administration, or use the supported login-management command.</p>",
-    )
-        .into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,18 +282,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untrusted_entry_without_login_requires_setup() {
+    async fn untrusted_entry_without_login_serves_the_setup_wizard_spa() {
+        // A fresh install serves the SPA so the browser can run the first-run
+        // wizard — the env-instructions 503 is gone deliberately. No session
+        // cookie: the peer is not trusted, and the wizard endpoint does its
+        // own loopback-or-trusted enforcement on submit.
         let response = entry_response("/", RuntimeSecurityConfig::default(), None).await;
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().get(header::SET_COOKIE).is_none());
     }
 
     #[tokio::test]
     async fn trusted_root_and_index_issue_peer_bound_browser_cookie() {
-        let security = RuntimeSecurityConfig {
-            trusted_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
-            ..Default::default()
+        let security = {
+            let security = weaver_server_core::security::RuntimeSecurityConfig::default();
+            security.set_trusted_cidrs(vec!["127.0.0.0/8".parse().unwrap()]);
+            security
         };
         let peer = "127.0.0.1:49152".parse().unwrap();
 

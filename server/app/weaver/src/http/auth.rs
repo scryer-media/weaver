@@ -380,6 +380,242 @@ pub(super) async fn login_handler(
         .into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SetupRequest {
+    mode: String,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    bind_address: Option<String>,
+    #[serde(default)]
+    trusted_networks: Option<Vec<String>>,
+}
+
+/// Complete first-run setup from the browser: pick an access mode, optionally
+/// create the login, optionally widen the binding.
+///
+/// This is the wizard's endpoint, and its whole reason to exist is that every
+/// peer product does setup in the browser while Weaver used to demand
+/// environment variables. It is callable exactly once — while no credentials
+/// are stored — and only from loopback or an already-trusted peer, which is
+/// the same trust argument the loopback bind default rests on: the first
+/// browser to reach a fresh instance from the machine itself is the operator.
+pub(super) async fn setup_handler(
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Extension(db): Extension<Database>,
+    Extension(auth_cache): Extension<LoginAuthCache>,
+    Extension(security): Extension<RuntimeSecurityConfig>,
+    Json(body): Json<SetupRequest>,
+) -> Response {
+    use weaver_server_core::security::{
+        AccessMode, LOCAL_NETWORK_PRESETS, LOOPBACK_NETWORKS, SETTING_ACCESS_MODE,
+        SETTING_HTTP_BIND_ADDRESS, SETTING_TRUSTED_NETWORKS, ip_is_loopback, resolve_bind_address,
+    };
+
+    if auth_cache.snapshot().is_some() {
+        return super::error_response(StatusCode::CONFLICT, "setup is already complete");
+    }
+    // Canonical loopback: on a dual-stack listener the machine's own browser
+    // arrives as `::ffff:127.0.0.1`, which must not be refused as remote.
+    if !ip_is_loopback(peer_addr.ip()) && !security.is_trusted_peer(Some(peer_addr)) {
+        return super::error_response(
+            StatusCode::FORBIDDEN,
+            "setup must be completed from the machine Weaver runs on",
+        );
+    }
+
+    let Some(mode) = AccessMode::parse_setting_value(&body.mode) else {
+        return super::error_response(StatusCode::BAD_REQUEST, "unknown access mode");
+    };
+
+    // Credentials: required for the two login modes, refused for no-login so a
+    // password can never be silently collected and ignored.
+    let credentials = match mode {
+        AccessMode::LoginRequired | AccessMode::LoginExceptLocal => {
+            let username = body.username.as_deref().unwrap_or("").trim().to_string();
+            let password = body.password.clone().unwrap_or_default();
+            if username.is_empty() || password.is_empty() {
+                return super::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "username and password are required for this access mode",
+                );
+            }
+            Some((username, password))
+        }
+        AccessMode::NoLogin => {
+            if body.username.is_some() || body.password.is_some() {
+                return super::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "no-login mode does not take credentials",
+                );
+            }
+            None
+        }
+    };
+
+    // Trusted networks: only meaningful for except-local; the preset when the
+    // wizard sends nothing. Validated all-or-nothing through the same parser
+    // startup settles with.
+    let trusted_networks: Vec<String> = match (&mode, &body.trusted_networks) {
+        (AccessMode::LoginExceptLocal, Some(entries)) => {
+            let cleaned: Vec<String> = entries
+                .iter()
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect();
+            if cleaned.is_empty() {
+                return super::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "trusted networks must not be empty for this access mode",
+                );
+            }
+            cleaned
+        }
+        (AccessMode::LoginExceptLocal, None) => LOCAL_NETWORK_PRESETS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        (AccessMode::NoLogin, _) => LOOPBACK_NETWORKS.iter().map(|s| s.to_string()).collect(),
+        (AccessMode::LoginRequired, _) => Vec::new(),
+    };
+    let networks_json = serde_json::to_string(&trusted_networks).unwrap_or_else(|_| "[]".into());
+    let parsed_networks =
+        match weaver_server_core::security::parse_trusted_networks_json(&networks_json) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return super::error_response(StatusCode::BAD_REQUEST, &error.to_string());
+            }
+        };
+
+    // Bind address: validated exactly as startup resolves it; ignored with a
+    // note when the environment pins it, because storing a value the process
+    // will never read is a lie waiting to be discovered.
+    let bind_pinned_by_env = !security.bind_address_source.is_editable();
+    let bind_to_store = match body
+        .bind_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None => None,
+        Some(_) if bind_pinned_by_env => None,
+        Some(value) => match resolve_bind_address(None, Some(value)) {
+            Ok(_) => Some(value.to_string()),
+            Err(error) => {
+                return super::error_response(StatusCode::BAD_REQUEST, &error.to_string());
+            }
+        },
+    };
+
+    // Persist everything, then apply the live effects.
+    let hashed = match credentials.clone() {
+        Some((username, password)) => {
+            let hash_result =
+                tokio::task::spawn_blocking(move || jwt::hash_password(&password)).await;
+            match hash_result {
+                Ok(Ok(hash)) => Some((username, hash)),
+                Ok(Err(error)) => {
+                    return super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &error);
+                }
+                Err(error) => {
+                    return super::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &error.to_string(),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+
+    let db_for_write = db.clone();
+    let mode_value = mode.as_setting_value().to_string();
+    let networks_json = networks_json.clone();
+    let bind_for_write = bind_to_store.clone();
+    let hashed_for_write = hashed.clone();
+    let store_trusted = matches!(mode, AccessMode::LoginExceptLocal);
+    let write_result = tokio::task::spawn_blocking(move || {
+        db_for_write.set_setting(SETTING_ACCESS_MODE, &mode_value)?;
+        if store_trusted {
+            db_for_write.set_setting(SETTING_TRUSTED_NETWORKS, &networks_json)?;
+        }
+        if let Some(address) = bind_for_write.as_deref() {
+            db_for_write.set_setting(SETTING_HTTP_BIND_ADDRESS, address)?;
+        }
+        let jwt_secret = match hashed_for_write {
+            Some((username, hash)) => {
+                db_for_write.set_auth_credentials(&username, &hash)?;
+                Some(db_for_write.rotate_jwt_signing_secret()?)
+            }
+            None => None,
+        };
+        Ok::<_, weaver_server_core::StateError>(jwt_secret)
+    })
+    .await;
+    let jwt_secret = match write_result {
+        Ok(Ok(secret)) => secret,
+        Ok(Err(error)) => {
+            return super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+        Err(error) => {
+            return super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+    };
+
+    // Live effects: trust applies immediately (the shared list every clone
+    // reads), credentials swap into the cache, and the wizard's own browser is
+    // signed in so completing setup lands in the app rather than at a login
+    // form. Only the bind address waits for a restart.
+    security.set_trusted_cidrs(parsed_networks);
+
+    let mut response_headers: Vec<(header::HeaderName, String)> = Vec::new();
+    if let (Some((username, hash)), Some(secret)) = (hashed, jwt_secret) {
+        let cached = weaver_server_core::auth::CachedLoginAuth::new(username, hash, secret);
+        let token = jwt::create_jwt(&cached.username, &cached.jwt_secret, JWT_TTL_SECS);
+        auth_cache.replace(Some(cached));
+        response_headers.push((
+            header::SET_COOKIE,
+            format!(
+                "{JWT_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={JWT_TTL_SECS}{}",
+                secure_cookie_suffix(&security)
+            ),
+        ));
+    }
+
+    let restart_required_for_bind = bind_to_store.is_some();
+    tracing::info!(
+        mode = mode.as_setting_value(),
+        login_created = credentials.is_some(),
+        bind_stored = restart_required_for_bind,
+        bind_ignored_env_pinned = bind_pinned_by_env
+            && body
+                .bind_address
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty()),
+        "first-run setup completed from the wizard"
+    );
+
+    let mut response = (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "restartRequiredForBind": restart_required_for_bind,
+            "bindIgnoredBecauseEnvPinned": bind_pinned_by_env
+                && body.bind_address.as_deref().is_some_and(|v| !v.trim().is_empty()),
+        })),
+    )
+        .into_response();
+    for (name, value) in response_headers {
+        if let Ok(value) = value.parse() {
+            response.headers_mut().append(name, value);
+        }
+    }
+    response
+}
+
 pub(super) async fn logout_handler(
     Extension(security): Extension<RuntimeSecurityConfig>,
 ) -> Response {

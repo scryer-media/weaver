@@ -20,12 +20,32 @@ pub(crate) async fn run(
     log_ring_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let started_at = std::time::Instant::now();
-    let security = RuntimeSecurityConfig::from_env()?;
+    let mut security = RuntimeSecurityConfig::from_env()?;
+    // The environment answers first, but a desktop or service install has no
+    // convenient environment to edit, so the stored settings are what the UI
+    // (and the first-run wizard) write. Settled here because this is the first
+    // point the database is readable. Both settlements are infallible by
+    // design: a bad stored bind address falls back to loopback and a bad
+    // stored trust list falls back to trusting nothing — a stored value must
+    // never cost the operator the process that edits it.
+    security.apply_stored_bind_address(
+        db.get_setting(weaver_server_core::security::SETTING_HTTP_BIND_ADDRESS)?
+            .as_deref(),
+    );
+    security.apply_stored_trust(
+        db.get_setting(weaver_server_core::security::SETTING_ACCESS_MODE)?
+            .as_deref(),
+        db.get_setting(weaver_server_core::security::SETTING_TRUSTED_NETWORKS)?
+            .as_deref(),
+    );
+    if let Some(reason) = security.bind_fallback.as_deref() {
+        warn!(reason, "stored bind address could not be honored");
+    }
     crate::bootstrap::bootstrap_login_if_needed(&db).await?;
-    if !security.trusted_cidrs.is_empty() {
+    if security.has_trusted_cidrs() {
         warn!(
-            trusted_cidrs = ?security.trusted_cidrs,
-            "matching WEAVER_TRUSTED_CIDRS clients receive loginless full administrative browser access"
+            trusted_cidrs = ?security.trusted_cidrs(),
+            "trusted-network clients receive loginless full administrative browser access"
         );
     }
     let data_dir = PathBuf::from(&config.data_dir);
@@ -183,6 +203,53 @@ pub(crate) async fn run(
     let scheduled_resume =
         weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
 
+    // Bind before the schema is built so the security snapshot the GraphQL
+    // context captures reflects what actually happened, including a fallback.
+    // The never-brick rule: a configured address this host cannot bind —
+    // a moved DHCP lease, a downed VPN interface, a restored backup from a
+    // different machine — must not cost the operator the process, because the
+    // UI it serves is the only reasonable place to fix the address. Loopback
+    // is retried instead and the deviation is surfaced as a banner. A loopback
+    // failure (the port itself is taken) remains fatal: there is nothing safer
+    // left to fall back to.
+    let desired_addr = SocketAddr::new(security.http_bind_address, port);
+    let listener = match tokio::net::TcpListener::bind(desired_addr).await {
+        Ok(listener) => listener,
+        // Raw, non-canonical loopback check on purpose: a configured
+        // `::ffff:127.0.0.1` that this host cannot bind should degrade to plain
+        // loopback, which canonicalizing here would turn into a fatal start.
+        Err(error) if !security.http_bind_address.is_loopback() => {
+            let fallback_addr = SocketAddr::new(
+                weaver_server_core::security::DEFAULT_HTTP_BIND_ADDRESS,
+                port,
+            );
+            warn!(
+                %desired_addr,
+                %error,
+                %fallback_addr,
+                "configured bind address is not usable on this host; falling back to loopback"
+            );
+            security.note_bind_fallback(format!(
+                "could not bind {desired_addr}: {error}; listening on {fallback_addr} instead — \
+                 fix or clear the address in Settings → Security"
+            ));
+            tokio::net::TcpListener::bind(fallback_addr)
+                .await
+                .map_err(|fallback_error| {
+                    format!(
+                        "failed to bind {fallback_addr} after {desired_addr} failed: \
+                         {fallback_error} — is another process using this port?"
+                    )
+                })?
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to bind to {desired_addr}: {error} — is another process using this port?"
+            )
+            .into());
+        }
+    };
+
     // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
     let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {
         handle: handle.clone(),
@@ -192,6 +259,7 @@ pub(crate) async fn run(
         server_transfer_policy: Arc::clone(&server_transfer_policy),
         auth_cache: login_auth_cache.clone(),
         api_key_cache: api_key_cache.clone(),
+        security: security.clone(),
         rss: rss.clone(),
         watch_folder: watch_folder.clone(),
         schedules: shared_schedules,
@@ -226,8 +294,7 @@ pub(crate) async fn run(
         maintenance_complete_dir,
     );
 
-    // Run HTTP server.
-    let addr = SocketAddr::new(security.http_bind_address, port);
+    // Run HTTP server on the listener bound above.
     let server_runtime = http::ServerRuntime {
         schema,
         handle: handle.clone(),
@@ -245,7 +312,7 @@ pub(crate) async fn run(
         security,
         disk_space: disk_space_collector,
     };
-    let mut server_task = tokio::spawn(http::run_server(server_runtime, addr));
+    let mut server_task = tokio::spawn(http::run_server(server_runtime, listener));
 
     // Restore in-progress jobs from SQLite after the listener is available so
     // long restore passes do not block process readiness.
