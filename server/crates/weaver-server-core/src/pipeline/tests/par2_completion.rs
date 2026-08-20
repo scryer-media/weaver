@@ -1873,9 +1873,13 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Complete)
     );
+    // Two: the pre-repair authoritative pass, then the post-repair pass that
+    // re-reads what the repair installed. Every repair path runs the second
+    // one now — it is the phase SABnzbd shows as "verifying repaired files"
+    // and NZBGet as `ptVerifyingRepaired`.
     assert_eq!(
         drain_job_verification_started(&mut verify_events, job_id),
-        1
+        2
     );
     assert_eq!(drain_job_repair_complete(&mut repair_events, job_id), 1);
     let output_dir = pipeline
@@ -2313,13 +2317,20 @@ async fn restored_repairing_payload_uses_single_repairer_analyze_and_execute_pas
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Complete)
     );
+    // Two: the pre-repair authoritative pass, then the post-repair pass that
+    // re-reads what the repair installed. Every repair path runs the second
+    // one now — it is the phase SABnzbd shows as "verifying repaired files"
+    // and NZBGet as `ptVerifyingRepaired`.
     assert_eq!(
         drain_job_verification_started(&mut verify_events, job_id),
-        1
+        2
     );
     assert_eq!(drain_job_repair_complete(&mut repair_events, job_id), 1);
     assert_eq!(pipeline.par2_lower_bound_preflight_calls, 0);
     assert_eq!(pipeline.par2_authoritative_verify_calls, 0);
+    // The post-repair re-read of what the repair installed. Selective: it
+    // reads only the files the repair rewrote, not the whole set.
+    assert_eq!(pipeline.par2_selective_verify_calls, 1);
     assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
     assert_eq!(pipeline.par2_repairer_execute_calls, 1);
 
@@ -2568,9 +2579,13 @@ async fn complete_direct_payload_with_loaded_par2_does_not_finalize_with_parked_
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Downloading)
     );
+    // Two: the pre-repair authoritative pass, then the post-repair pass that
+    // re-reads what the repair installed. Every repair path runs the second
+    // one now — it is the phase SABnzbd shows as "verifying repaired files"
+    // and NZBGet as `ptVerifyingRepaired`.
     assert_eq!(
         drain_job_verification_started(&mut verify_events, job_id),
-        1
+        2
     );
     let state = pipeline.jobs.get(&job_id).unwrap();
     assert!(state.download_queue.has_recovery_work() || state.recovery_queue.has_recovery_work());
@@ -4402,5 +4417,510 @@ async fn waiting_on_present_volumes_is_not_repair_ready_until_a_volume_is_truly_
     assert!(
         pipeline.job_has_live_rar_waiting_for_absent_volumes(job_id),
         "AwaitingRepair is unconditional — even while the pipeline is busy"
+    );
+}
+
+/// The job 11737 shape, end to end.
+///
+/// A standalone payload with one article that never arrived, a recovery block
+/// that covers the hole, and a PAR2 repair that puts the file right. The
+/// article bitmap is *not* backfilled by the repair — nothing rewrites history
+/// — so the job used to fail its final completeness veto despite holding a
+/// verified, byte-correct output.
+///
+/// Once PAR2 has repaired and re-verified a protected output, that verification
+/// is authoritative and the bitmap is diagnostic history. This is exactly what
+/// NZBGet pins in `test_parchecker_repair`, which makes a segment unavailable
+/// and asserts `SUCCESS/PAR`.
+#[tokio::test]
+async fn missing_article_repaired_by_par2_completes_despite_incomplete_bitmap() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(11737);
+    let payload_filename = "silver.horizon.mkv";
+    let index_filename = "silver.horizon.par2";
+    let recovery_filename = "silver.horizon.vol00+01.par2";
+    let original_payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    // The second article never landed, so its slice is a hole on disk.
+    let mut damaged_payload = original_payload.clone();
+    for byte in &mut damaged_payload[64..128] {
+        *byte = 0;
+    }
+    let par2_bytes = build_test_par2_index(payload_filename, &original_payload, 64);
+    let recovery_bytes = vec![0xAA; 64];
+    let spec = JobSpec {
+        name: "Silver Horizon Missing Article".to_string(),
+        password: None,
+        total_bytes: (original_payload.len() + par2_bytes.len() + recovery_bytes.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "silver-horizon-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "silver-horizon-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "silver-horizon-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: recovery_filename.to_string(),
+                role: FileRole::from_filename(recovery_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: recovery_bytes.len() as u32,
+                    message_id: "silver-horizon-recovery@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    tokio::fs::write(working_dir.join(payload_filename), &damaged_payload)
+        .await
+        .unwrap();
+    let payload_file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        // Only the first article ever arrived. This is the whole point of the
+        // test: the bitmap stays one segment short for the rest of the job.
+        state
+            .assembly
+            .file_mut(payload_file_id)
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+    }
+    assert!(
+        !pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .assembly
+            .file(payload_file_id)
+            .unwrap()
+            .is_complete(),
+        "precondition: the payload must start with a hole in its article bitmap"
+    );
+    write_and_complete_file(&mut pipeline, job_id, 1, index_filename, &par2_bytes).await;
+    write_and_complete_file(&mut pipeline, job_id, 2, recovery_filename, &recovery_bytes).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &original_payload, 64, 1),
+        &[
+            (1, index_filename, 0, false),
+            (2, recovery_filename, 1, true),
+        ],
+    );
+
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "a repaired, re-verified payload must not fail for its article bitmap; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    let drained = drain_job_events(&mut events, job_id);
+    let repair_completes: Vec<u32> = drained
+        .iter()
+        .filter_map(|event| match event {
+            PipelineEvent::RepairComplete {
+                slices_repaired, ..
+            } => Some(*slices_repaired),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        repair_completes.len(),
+        1,
+        "exactly one RepairComplete; events = {drained:?}"
+    );
+    // Counted from the pre-repair verdict. Read off the post-repair result it
+    // would always be zero, because a repair that succeeded leaves no missing
+    // blocks behind to count.
+    assert_eq!(
+        repair_completes[0], 1,
+        "the one reconstructed slice must be reported"
+    );
+
+    let repair_complete_at = drained
+        .iter()
+        .position(|event| matches!(event, PipelineEvent::RepairComplete { .. }))
+        .unwrap();
+    assert!(
+        !drained[repair_complete_at..]
+            .iter()
+            .any(|event| matches!(event, PipelineEvent::JobFailed { .. })),
+        "RepairComplete must never be followed by the job failing; events = {drained:?}"
+    );
+
+    // The promotion itself is durable, so a restart cannot resurrect the hole:
+    // the completed row carries the recovery set's digest, not the pre-repair
+    // bytes. (The in-memory assembly is gone by now — a completed job is
+    // dropped from the map, which is itself proof the veto let it through.)
+    let trusted = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_eq!(
+        trusted.get(&payload_file_id.file_index).copied(),
+        Some(par2_rs::checksum::md5(&original_payload)),
+        "the repaired payload must persist its verified digest"
+    );
+
+    let output_dir = pipeline
+        .complete_dir
+        .join(crate::jobs::working_dir::sanitize_dirname(
+            "Silver Horizon Missing Article",
+        ));
+    assert_eq!(
+        tokio::fs::read(output_dir.join(payload_filename))
+            .await
+            .unwrap(),
+        original_payload,
+        "the delivered file must be the repaired bytes"
+    );
+}
+
+/// A payload posted under an obfuscated name reconciles through PAR2 content
+/// identity, not string equality.
+///
+/// The reconciler this replaces matched the verification's filename against the
+/// assembly's stored names and did nothing at all when no exact string matched:
+/// no promotion, no error, just a silently unreconciled file for the
+/// completeness veto downstream to fail the whole job on. An obfuscated post is
+/// exactly the case that never matches — the subject lies about the name and
+/// tells the truth about the bytes — so the binding has to ask the bytes.
+#[tokio::test]
+async fn obfuscated_payload_reconciles_through_par2_content_identity() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30311);
+    let posted_filename = "a7f3e91c9b2d4e6f.bin";
+    let described_filename = "Silver Horizon.mkv";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+
+    let spec = JobSpec {
+        name: "Obfuscated PAR2 Reconciliation".to_string(),
+        password: None,
+        total_bytes: payload.len() as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: posted_filename.to_string(),
+            role: FileRole::from_filename(posted_filename),
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: vec![
+                segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "obfuscated-0@example.com".to_string(),
+                },
+                segment_spec! {
+                    number: 1,
+                    bytes: 64,
+                    message_id: "obfuscated-1@example.com".to_string(),
+                },
+            ],
+        }],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    tokio::fs::write(working_dir.join(posted_filename), &payload)
+        .await
+        .unwrap();
+
+    let payload_file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state
+            .assembly
+            .file_mut(payload_file_id)
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+    }
+    // The bytes are what the obfuscation did not touch, and what the content
+    // binding reads.
+    pipeline
+        .file_prefix_16k
+        .insert(payload_file_id, payload.clone());
+
+    let par2_set = build_repairable_par2_set(described_filename, &payload, 64, 1);
+    let par2_file_id = par2_set.recovery_file_ids[0];
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+
+    let verification = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: par2_file_id,
+            filename: described_filename.to_string(),
+            status: par2_rs::verify::FileStatus::Complete,
+            valid_slices: vec![true, true],
+            missing_slice_count: 0,
+        }],
+        recovery_blocks_available: 1,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+
+    let report = pipeline
+        .reconcile_verified_par2_files(job_id, &verification)
+        .await
+        .expect("reconciliation must not error");
+
+    assert_eq!(
+        report.completed, 1,
+        "the verified payload must be promoted even though its posted name \
+         matches no description; report = {report:?}"
+    );
+    assert!(
+        report.unbound.is_empty(),
+        "a content-bound file is not unbound; report = {report:?}"
+    );
+    assert!(report.contested.is_empty(), "report = {report:?}");
+    assert!(report.length_mismatch.is_empty(), "report = {report:?}");
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .assembly
+            .file(payload_file_id)
+            .unwrap()
+            .is_complete(),
+        "promotion must fill the article bitmap"
+    );
+}
+
+/// Two assembly files that both answer to one description bind to neither.
+///
+/// Content cannot break a tie that two files both satisfy, so the binding is
+/// refused outright and named. The reconciler this replaces resolved the same
+/// contest first-writer-wins — whichever file the iteration happened to reach
+/// first was promoted, and the other silently was not.
+#[tokio::test]
+async fn contested_par2_binding_is_refused_and_named() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30312);
+    let described_filename = "Silver Horizon.mkv";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    // Two obfuscated posts of byte-identical content: both answer to the one
+    // description, by content, equally well.
+    let first_posted = "aaaa1111.bin";
+    let second_posted = "bbbb2222.bin";
+
+    let file_spec = |filename: &str, tag: &str| FileSpec {
+        filename: filename.to_string(),
+        role: FileRole::from_filename(filename),
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: 128,
+            message_id: format!("contested-{tag}@example.com"),
+        }],
+    };
+    let spec = JobSpec {
+        name: "Contested PAR2 Binding".to_string(),
+        password: None,
+        total_bytes: (payload.len() * 2) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![file_spec(first_posted, "a"), file_spec(second_posted, "b")],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for name in [first_posted, second_posted] {
+        tokio::fs::write(working_dir.join(name), &payload)
+            .await
+            .unwrap();
+    }
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    for file_index in 0..2u32 {
+        pipeline
+            .file_prefix_16k
+            .insert(NzbFileId { job_id, file_index }, payload.clone());
+    }
+
+    let par2_set = build_repairable_par2_set(described_filename, &payload, 64, 1);
+    let par2_file_id = par2_set.recovery_file_ids[0];
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+
+    let verification = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: par2_file_id,
+            filename: described_filename.to_string(),
+            status: par2_rs::verify::FileStatus::Complete,
+            valid_slices: vec![true, true],
+            missing_slice_count: 0,
+        }],
+        recovery_blocks_available: 1,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+
+    let report = pipeline
+        .reconcile_verified_par2_files(job_id, &verification)
+        .await
+        .expect("a contest is reported, not an error from the pass itself");
+
+    assert_eq!(
+        report.completed, 0,
+        "neither contender may be promoted on a guess; report = {report:?}"
+    );
+    assert_eq!(
+        report.contested,
+        vec![described_filename.to_string()],
+        "the contest must name the description it could not resolve"
+    );
+}
+
+/// A PAR2 verdict does not launder an unprotected file's missing articles.
+///
+/// The invariant is narrow on purpose: repair-and-reverify is authoritative for
+/// the files the recovery set *describes*. A file the set never covered has no
+/// verdict standing behind it, so an incomplete one is still a genuine download
+/// failure — and the classification says which of the two it is, rather than
+/// reporting both as one bare count.
+#[tokio::test]
+async fn unprotected_incomplete_file_still_fails_the_job() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30313);
+    let protected_filename = "silver.horizon.mkv";
+    let unprotected_filename = "extras.nfo";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+
+    let spec = JobSpec {
+        name: "Unprotected Missing File".to_string(),
+        password: None,
+        total_bytes: (payload.len() + 128) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: protected_filename.to_string(),
+                role: FileRole::from_filename(protected_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 128,
+                    message_id: "unprotected-payload@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: unprotected_filename.to_string(),
+                role: FileRole::from_filename(unprotected_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "unprotected-nfo-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "unprotected-nfo-1@example.com".to_string(),
+                    },
+                ],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    tokio::fs::write(working_dir.join(protected_filename), &payload)
+        .await
+        .unwrap();
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        // The NFO lost an article and nothing protects it.
+        state
+            .assembly
+            .file_mut(NzbFileId {
+                job_id,
+                file_index: 1,
+            })
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+    }
+
+    // The recovery set covers the payload only.
+    let par2_set = build_repairable_par2_set(protected_filename, &payload, 64, 1);
+    let par2_file_id = par2_set.recovery_file_ids[0];
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+
+    let verification = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: par2_file_id,
+            filename: protected_filename.to_string(),
+            status: par2_rs::verify::FileStatus::Complete,
+            valid_slices: vec![true, true],
+            missing_slice_count: 0,
+        }],
+        recovery_blocks_available: 1,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+
+    let error = pipeline
+        .reconcile_and_classify_par2_verification(job_id, &verification, false, "clean PAR2 test")
+        .await
+        .expect_err("an unprotected file with a hole must still fail the job");
+
+    assert!(
+        error.contains("unprotected"),
+        "the failure must say the file was unprotected, not blame reconciliation: {error}"
+    );
+    assert!(
+        error.contains(unprotected_filename),
+        "the failure must name the file that could not be assembled: {error}"
+    );
+    assert!(
+        !error.contains(protected_filename),
+        "the repaired, verified payload must not be implicated: {error}"
     );
 }

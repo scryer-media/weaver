@@ -1059,6 +1059,7 @@ export function JobList() {
     (queuePage?.totalCount ?? 0)
       - rawQueuePageItems.filter((job) => optimisticallyRemovedJobIds.has(job.id)).length,
   );
+  const hasQueueItems = (queuePage?.summary.totalItems ?? 0) > 0;
   const pageCount = Math.max(1, Math.ceil(totalCount / queuePreferences.pageSize));
 
   useEffect(() => {
@@ -1659,7 +1660,7 @@ export function JobList() {
         <div role="status" className="py-8 text-center text-sm text-muted-foreground">
           {t("label.loading")}
         </div>
-      ) : totalCount === 0 ? (
+      ) : !hasQueueItems ? (
         <EmptyState
           title={t("jobs.empty")}
           description={t("jobs.emptyHint")}

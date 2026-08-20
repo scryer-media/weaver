@@ -1988,6 +1988,12 @@ pub struct Pipeline {
     pub(super) par2_lower_bound_preflight_calls: usize,
     #[cfg(test)]
     pub(super) par2_authoritative_verify_calls: usize,
+    /// Post-repair passes, which read only the files the repair rewrote.
+    /// Counted apart from the whole-set passes above so a test can still say
+    /// "no full verification happened here" now that every repair path ends
+    /// in a selective re-read of what it installed.
+    #[cfg(test)]
+    pub(super) par2_selective_verify_calls: usize,
     #[cfg(test)]
     pub(super) par2_repairer_analyze_calls: usize,
     #[cfg(test)]

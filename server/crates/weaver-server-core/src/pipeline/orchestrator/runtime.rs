@@ -191,6 +191,8 @@ impl Pipeline {
             #[cfg(test)]
             par2_authoritative_verify_calls: 0,
             #[cfg(test)]
+            par2_selective_verify_calls: 0,
+            #[cfg(test)]
             par2_repairer_analyze_calls: 0,
             #[cfg(test)]
             par2_repairer_execute_calls: 0,
