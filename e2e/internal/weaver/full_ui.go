@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -25,6 +26,11 @@ type fullPhaseContext struct {
 	SeedProfile      string
 	SkipSeed         bool
 	Datastore        string
+	Slug             string
+	NNTPDonor        string
+	DonorNNTPPort    int
+	DonorNNTP2Port   int
+	ToxiproxyConfig  string
 	ExtraEnv         map[string]string
 	WeaverBin        string
 	Project          string
@@ -45,6 +51,14 @@ type fullPhaseDefinition struct {
 	seedProfile string
 	skipSeed    bool
 	datastore   weaverDatastore
+	// Slug of another phase whose seeded NNTP this phase reads instead of
+	// seeding its own. Set only where the borrower's fixtures are a subset of
+	// the donor's and neither lane mutates server state during its test run:
+	// seeding damage (deleted articles) is applied per scenario slug at seed
+	// time, so an identical profile reproduces an identical server, and a
+	// borrower must never be a lane that resets NNTP metrics or injects
+	// server-level chaos mid-run.
+	nntpDonor string
 	// Extra environment for this phase only. It reaches the Weaver process
 	// because the phase subprocess launches it with its own environment, so a
 	// WEAVER_* key set here is a product-level toggle for the whole phase.
@@ -69,9 +83,22 @@ var fullPhaseDefinitions = []fullPhaseDefinition{
 	// those sets really did route — the only external evidence available, since
 	// direct output is byte-identical to the conventional path.
 	{name: "Functional SQLite", command: "test-all", slug: "functional-sqlite", seedProfile: "functional", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1"}},
-	{name: "Functional Postgres", command: "test-all", slug: "functional-postgres", seedProfile: "functional", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1"}},
+	// Reads the SQLite lane's NNTP rather than seeding an identical second
+	// copy: the two lanes differ only in Weaver's datastore, share the
+	// `functional` profile exactly, and `test-all` never resets NNTP metrics
+	// or injects chaos — it only sends the idempotent `CHAOS off`/`RELOAD`
+	// pair, and RELOAD re-indexes from disk so seeded deletions survive it.
+	// The restart lanes deliberately do NOT pair this way: `runOneRestartCase`
+	// resets NNTP metrics per case, so two concurrent restart lanes would zero
+	// each other's counters.
+	{name: "Functional Postgres", command: "test-all", slug: "functional-postgres", seedProfile: "functional", datastore: weaverDatastorePostgres, nntpDonor: "functional-sqlite", extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1"}},
 	{name: "NNTP Chaos", command: "chaos-test", slug: "nntp-chaos", seedProfile: "chaos", datastore: weaverDatastoreSQLite},
-	{name: "TCP Chaos", command: "tcp-chaos", slug: "tcp-chaos", seedProfile: "tcp-chaos", datastore: weaverDatastoreSQLite},
+	// Its 8 fixtures are a strict subset of the functional profile, and the
+	// suite resets no NNTP metrics — it degrades the transport through its own
+	// toxiproxy, whose upstream is retargeted at the donor. The server itself
+	// is never made to misbehave, which is what separates this lane from NNTP
+	// Chaos.
+	{name: "TCP Chaos", command: "tcp-chaos", slug: "tcp-chaos", seedProfile: "tcp-chaos", datastore: weaverDatastoreSQLite, nntpDonor: "functional-sqlite"},
 	{name: "Container Restart", command: "container-restart", slug: "container-restart", skipSeed: true, datastore: weaverDatastoreSQLite},
 	{name: "Restart SQLite", command: "restart-all", slug: "restart-sqlite", seedProfile: "restart", datastore: weaverDatastoreSQLite},
 	{name: "Restart Postgres", command: "restart-all", slug: "restart-postgres", seedProfile: "restart", datastore: weaverDatastorePostgres},
@@ -915,10 +942,14 @@ func newFullPhaseContextsFor(tempRoot string, includePhase func(fullPhaseDefinit
 		}
 
 		contexts = append(contexts, &fullPhaseContext{
-			Name:             def.name,
-			Command:          def.command,
-			SeedProfile:      def.seedProfile,
-			SkipSeed:         def.skipSeed,
+			Name:        def.name,
+			Command:     def.command,
+			SeedProfile: def.seedProfile,
+			Slug:        def.slug,
+			NNTPDonor:   def.nntpDonor,
+			// A borrower seeds nothing of its own; it waits for its donor and
+			// then reads that server.
+			SkipSeed:         def.skipSeed || def.nntpDonor != "",
 			Datastore:        string(def.datastore),
 			Project:          sanitizeProjectName(fmt.Sprintf("e2e-%s-%s", runID, def.slug)),
 			RootDir:          rootDir,
@@ -937,6 +968,38 @@ func newFullPhaseContextsFor(tempRoot string, includePhase func(fullPhaseDefinit
 		phase.RuntimePorts = states[i]
 		if err := saveRuntimePortState(phase.RuntimePortsFile, states[i]); err != nil {
 			return nil, fmt.Errorf("write %s runtime ports: %w", phase.Name, err)
+		}
+	}
+
+	// Ports are allocated up front, so a borrower can be pointed at its donor
+	// before either stack exists. A donor named but not selected (a filtered
+	// run) is a configuration error rather than a silent fallback to seeding
+	// twice, which is the behaviour this pairing exists to remove.
+	bySlug := make(map[string]*fullPhaseContext, len(contexts))
+	for _, phase := range contexts {
+		bySlug[phase.Slug] = phase
+	}
+	for _, phase := range contexts {
+		if phase.NNTPDonor == "" {
+			continue
+		}
+		donor, ok := bySlug[phase.NNTPDonor]
+		if !ok {
+			return nil, fmt.Errorf(
+				"%s reads NNTP from %q, which this run does not include; select it too or clear the pairing",
+				phase.Name, phase.NNTPDonor,
+			)
+		}
+		if donor.NNTPDonor != "" {
+			return nil, fmt.Errorf(
+				"%s reads NNTP from %s, which is itself a borrower; donors must seed their own server",
+				phase.Name, donor.Name,
+			)
+		}
+		phase.DonorNNTPPort = donor.RuntimePorts.NNTPPort
+		phase.DonorNNTP2Port = donor.RuntimePorts.NNTP2Port
+		if err := writeBorrowedToxiproxyConfig(phase); err != nil {
+			return nil, fmt.Errorf("write %s toxiproxy config: %w", phase.Name, err)
 		}
 	}
 
@@ -964,11 +1027,62 @@ func runFullPipeline(
 	seedResults := make(chan childRunResult, len(phases))
 	phaseResults := make(chan childRunResult, len(phases))
 
+	// A donor's seed gates the lanes that read its server. Closed on success,
+	// and on failure too — a borrower that then finds an unseeded server fails
+	// on its own assertions rather than hanging here, and the donor's own
+	// failure is already reported.
+	seeded := make(map[string]chan struct{}, len(phases))
+	for _, phase := range phases {
+		if phase.Slug != "" {
+			seeded[phase.Slug] = make(chan struct{})
+		}
+	}
+	donorFailed := make(map[string]*atomic.Bool, len(seeded))
+	for slug := range seeded {
+		donorFailed[slug] = &atomic.Bool{}
+	}
+	signalSeeded := func(phase *fullPhaseContext, failed bool) {
+		done, ok := seeded[phase.Slug]
+		if !ok {
+			return
+		}
+		if failed {
+			if flag := donorFailed[phase.Slug]; flag != nil {
+				flag.Store(true)
+			}
+		}
+		close(done)
+	}
+
 	var wg sync.WaitGroup
 	for _, phase := range phases {
 		wg.Add(1)
 		go func(phase *fullPhaseContext) {
 			defer wg.Done()
+
+			if phase.NNTPDonor != "" {
+				if done, ok := seeded[phase.NNTPDonor]; ok {
+					select {
+					case <-done:
+					case <-ctx.Done():
+						return
+					}
+					if flag := donorFailed[phase.NNTPDonor]; flag != nil && flag.Load() {
+						phaseResults <- childRunResult{
+							Phase:   phase.Name,
+							Command: phase.Command,
+							Err:     fmt.Errorf("donor phase %q failed to seed the shared NNTP", phase.NNTPDonor),
+						}
+						dashboard.markPhaseResult(phase.Name, "fail")
+						if !keepStacks {
+							if err := cleanupFullPhaseContext(phase); err != nil {
+								phase.LogTail.Add("cleanup error: " + err.Error())
+							}
+						}
+						return
+					}
+				}
+			}
 
 			if !phase.SkipSeed {
 				seedResult := runSelfWithEnv(ctx, phase, "seed-all", func(event progressEvent) {
@@ -976,6 +1090,7 @@ func runFullPipeline(
 				})
 				seedResults <- seedResult
 				if seedResult.Err != nil {
+					signalSeeded(phase, true)
 					dashboard.markPhaseResult(phase.Name, "fail")
 					if !keepStacks {
 						if err := cleanupFullPhaseContext(phase); err != nil {
@@ -984,6 +1099,10 @@ func runFullPipeline(
 					}
 					return
 				}
+				signalSeeded(phase, false)
+			} else {
+				// Nothing to seed, so anything waiting on this phase may go.
+				signalSeeded(phase, false)
 			}
 
 			weaverBin, err := ensureReleaseWeaverBinary()
@@ -1160,6 +1279,45 @@ func fullSeedJobsOverride() (string, bool) {
 	return defaultFullSeedJobs, true
 }
 
+// writeBorrowedToxiproxyConfig points a borrowing lane's toxiproxy at the
+// donor's published NNTP ports instead of the empty servers in its own project.
+//
+// Only the upstream moves. The lane's Weaver still dials this lane's own
+// toxiproxy, which is the whole point of the TCP-chaos suite: the toxics have
+// to sit between Weaver and the articles. Redirecting Weaver straight at the
+// donor would bypass the proxy and quietly test nothing.
+func writeBorrowedToxiproxyConfig(phase *fullPhaseContext) error {
+	if phase.DonorNNTPPort <= 0 {
+		return fmt.Errorf("donor NNTP port is unset")
+	}
+	backup := phase.DonorNNTP2Port
+	if backup <= 0 {
+		backup = phase.DonorNNTPPort
+	}
+	type proxy struct {
+		Name     string `json:"name"`
+		Listen   string `json:"listen"`
+		Upstream string `json:"upstream"`
+		Enabled  bool   `json:"enabled"`
+	}
+	// Ports are published on the host, so the proxy reaches them through the
+	// gateway alias the compose file grants this service.
+	proxies := []proxy{
+		{Name: "nntp1", Listen: "0.0.0.0:3119", Upstream: fmt.Sprintf("host.docker.internal:%d", phase.DonorNNTPPort), Enabled: true},
+		{Name: "nntp2", Listen: "0.0.0.0:4119", Upstream: fmt.Sprintf("host.docker.internal:%d", backup), Enabled: true},
+	}
+	body, err := json.MarshalIndent(proxies, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(phase.RunDir, "toxiproxy.json")
+	if err := os.WriteFile(path, append(body, '\n'), 0o644); err != nil {
+		return err
+	}
+	phase.ToxiproxyConfig = path
+	return nil
+}
+
 func (p *fullPhaseContext) env() map[string]string {
 	datastore := normalizedWeaverDatastoreForPhase(p.Datastore)
 	env := map[string]string{
@@ -1178,6 +1336,30 @@ func (p *fullPhaseContext) env() map[string]string {
 	if validateRuntimePortState(p.RuntimePorts) == nil {
 		for key, value := range runtimePortEnvValues(p.RuntimePorts) {
 			env[key] = value
+		}
+	}
+	// A borrower keeps its own stack for everything else and only redirects
+	// NNTP at the donor's already-seeded server. Two consumers need pointing,
+	// and they address it from different sides: the harness runs on the host
+	// and reaches the published port over loopback, while Weaver runs in a
+	// container and reaches the same port through the host gateway the compose
+	// file already grants it.
+	if p.NNTPDonor != "" && p.DonorNNTPPort > 0 {
+		primary := strconv.Itoa(p.DonorNNTPPort)
+		env["NNTP_HOST"] = "127.0.0.1"
+		env["NNTP_PORT"] = primary
+		env["E2E_NNTP_CLIENT_HOST"] = "host.docker.internal"
+		env["E2E_NNTP_CLIENT_PORT"] = primary
+		if p.DonorNNTP2Port > 0 {
+			backup := strconv.Itoa(p.DonorNNTP2Port)
+			env["NNTP_BACKUP_PORT"] = backup
+			env["E2E_NNTP_BACKUP_CLIENT_HOST"] = "host.docker.internal"
+			env["E2E_NNTP_BACKUP_CLIENT_PORT"] = backup
+		}
+		// The TCP-chaos lane reaches articles through its own toxiproxy, so it
+		// is the proxy's upstream that follows the donor, not Weaver's target.
+		if p.ToxiproxyConfig != "" {
+			env["E2E_TOXIPROXY_CONFIG"] = p.ToxiproxyConfig
 		}
 	}
 	if strings.TrimSpace(p.WeaverBin) != "" {

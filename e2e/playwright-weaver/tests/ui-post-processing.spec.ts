@@ -1,6 +1,6 @@
-import type { APIRequestContext, Page } from "@playwright/test";
+import type { Page } from "@playwright/test";
 
-import { expect, graphql, postProbeArticle, submitProbeNzb, test } from "./helpers";
+import { expect, test } from "./helpers";
 import {
   POST_PROCESSING_BROKEN_PACKAGE,
   POST_PROCESSING_FAILING_SCRIPT,
@@ -13,64 +13,10 @@ import {
   removePostProcessingScripts,
   seedPostProcessingScripts,
 } from "./support/setup/post-processing-package";
-
-type HistoryItem = { id: number; status: string; outputDir?: string | null };
-
-/** Poll history until `jobId` is terminal, and return its row. */
-async function waitForTerminalJob(
-  request: APIRequestContext,
-  jobId: number,
-): Promise<HistoryItem> {
-  let item: HistoryItem | null = null;
-  await expect
-    .poll(
-      async () => {
-        const data = await graphql<{ historyItem: HistoryItem | null }>(
-          request,
-          `query WeaverE2EPostProcessingHistory($id: Int!) {
-            historyItem(id: $id) { id status outputDir }
-          }`,
-          { id: jobId },
-        );
-        item = data.historyItem;
-        return item?.status ?? "PENDING";
-      },
-      { timeout: 120_000, intervals: [500, 1_000, 2_000] },
-    )
-    .toMatch(/COMPLETE|FAILED/);
-  if (!item) throw new Error(`job ${jobId} never reached history`);
-  return item;
-}
-
-/** Script results recorded on a job, whatever the UI is currently showing. */
-async function scriptResults(
-  request: APIRequestContext,
-  jobId: number,
-): Promise<Array<{ script: string; status: string; exitCode: number | null }>> {
-  const data = await graphql<{
-    postProcessingResults: Array<{ script: string; status: string; exitCode: number | null }>;
-  }>(
-    request,
-    `query WeaverE2EPostProcessingResults($jobId: Int!) {
-      postProcessingResults(jobId: $jobId) { script status exitCode }
-    }`,
-    { jobId },
-  );
-  return data.postProcessingResults;
-}
-
-/** Submit a one-article job that will run the configured scripts on completion. */
-async function runJobThroughPostProcessing(
-  request: APIRequestContext,
-  name: string,
-): Promise<HistoryItem> {
-  const messageId = `${name}@post-processing.e2e.invalid`;
-  await postProbeArticle(messageId, 1024);
-  const submission = await submitProbeNzb(request, name, [{ messageId, bytes: 1024 }]);
-  expect(submission.accepted, JSON.stringify(submission)).toBeTruthy();
-  expect(submission.jobId).not.toBeNull();
-  return waitForTerminalJob(request, submission.jobId!);
-}
+import {
+  runJobThroughPostProcessing,
+  scriptResults,
+} from "./support/setup/post-processing-job";
 
 async function addScriptToGlobalList(page: Page, displayName: string): Promise<void> {
   await page.getByRole("button", { name: `Add ${displayName}`, exact: true }).click();
@@ -168,10 +114,15 @@ test("post-processing settings, the live script list, and real script execution 
 
   // 6. The job's event log shows what each script did, and never the secret.
   await page.goto(`/jobs/${job.id}`);
-  const eventLog = page.getByText(POST_PROCESSING_NOTIFY_SCRIPT).first();
-  await expect(eventLog).toBeVisible({ timeout: 30_000 });
+  // Counted rather than picked positionally: the log legitimately mentions a
+  // script more than once, and which occurrence renders first is not something
+  // this test should assert. Presence is the claim — the secret's absence
+  // below is asserted the same way.
+  await expect(page.getByText(POST_PROCESSING_NOTIFY_SCRIPT)).not.toHaveCount(0, {
+    timeout: 30_000,
+  });
   await expect(page.getByText(POST_PROCESSING_SECRET)).toHaveCount(0);
-  await expect(page.getByText("[REDACTED]").first()).toBeVisible();
+  await expect(page.getByText("[REDACTED]")).not.toHaveCount(0);
 
   // 7. Re-running executes the list again against the retained output.
   await page.getByRole("button", { name: "Re-run scripts" }).click();

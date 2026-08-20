@@ -286,19 +286,39 @@ export type NntpConnectionMetrics = {
   configured_limit: number;
 };
 
+/// Read the server's connection counters.
+///
+/// Retried, because this probe competes for the very resource it measures: the
+/// connection cap counts every client, this one included. Callers reach it
+/// just after telling Weaver to stand down, and Weaver's sockets close
+/// asynchronously — so a greeting of `502 Too many connections` means the
+/// drain is still in flight, not that the product misbehaved. The last failure
+/// is rethrown, so a server that never frees a slot still fails the test.
 export async function nntpConnectionMetrics(
   host = "nntp",
   port = 119,
 ): Promise<NntpConnectionMetrics> {
-  let metrics: NntpConnectionMetrics | undefined;
-  await withNntpConnection(host, port, async (session) => {
-    expect(await session.command("AUTHINFO USER e2e-user")).toMatch(/^381 /);
-    expect(await session.command("AUTHINFO PASS e2e-pass")).toMatch(/^281 /);
-    const response = await session.command("METRICS CONNECTIONS");
-    expect(response).toMatch(/^290 /);
-    metrics = JSON.parse(response.replace(/^290\s+/, "")) as NntpConnectionMetrics;
-  });
-  return metrics!;
+  const deadline = Date.now() + 30_000;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      let metrics: NntpConnectionMetrics | undefined;
+      await withNntpConnection(host, port, async (session) => {
+        expect(await session.command("AUTHINFO USER e2e-user")).toMatch(/^381 /);
+        expect(await session.command("AUTHINFO PASS e2e-pass")).toMatch(/^281 /);
+        const response = await session.command("METRICS CONNECTIONS");
+        expect(response).toMatch(/^290 /);
+        metrics = JSON.parse(response.replace(/^290\s+/, "")) as NntpConnectionMetrics;
+      });
+      return metrics!;
+    } catch (error) {
+      if (Date.now() >= deadline) {
+        throw error;
+      }
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(1_000, 100 * (attempt + 1))),
+      );
+    }
+  }
 }
 
 export type NntpBodyMetrics = {

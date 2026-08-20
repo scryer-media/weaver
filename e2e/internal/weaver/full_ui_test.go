@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -141,9 +142,11 @@ func TestFullPhaseContextsIncludeContainerAndManagedRestarts(t *testing.T) {
 
 	want := []phaseKey{
 		{name: "Functional SQLite", command: "test-all", datastore: "sqlite"},
-		{name: "Functional Postgres", command: "test-all", datastore: "postgres"},
+		// Seeds nothing: it reads the SQLite lane's NNTP.
+		{name: "Functional Postgres", command: "test-all", datastore: "postgres", skipSeed: true},
 		{name: "NNTP Chaos", command: "chaos-test", datastore: "sqlite"},
-		{name: "TCP Chaos", command: "tcp-chaos", datastore: "sqlite"},
+		// Seeds nothing: it proxies to the SQLite lane's NNTP.
+		{name: "TCP Chaos", command: "tcp-chaos", datastore: "sqlite", skipSeed: true},
 		{name: "Container Restart", command: "container-restart", datastore: "sqlite", skipSeed: true},
 		{name: "Restart SQLite", command: "restart-all", datastore: "sqlite"},
 		{name: "Restart Postgres", command: "restart-all", datastore: "postgres"},
@@ -514,5 +517,82 @@ func TestFullDashboardRendersOneBarPerReleaseGateFlow(t *testing.T) {
 	// seed + phase + three flows
 	if bars != 5 {
 		t.Fatalf("expected 5 bars, got %d in frame:\n%s", bars, frame)
+	}
+}
+
+// The NNTP pairing is only safe under conditions that are easy to erode by
+// editing the phase table, so they are pinned here rather than left to review:
+// a borrower must not seed, must point both its consumers at the donor's
+// published ports, and the donor must seed a superset profile of its own.
+func TestBorrowedNNTPPhasesReadTheDonorInsteadOfSeeding(t *testing.T) {
+	tempRoot := t.TempDir()
+	phases, err := newFullPhaseContexts(tempRoot)
+	if err != nil {
+		t.Fatalf("build phases: %v", err)
+	}
+
+	bySlug := map[string]*fullPhaseContext{}
+	for _, phase := range phases {
+		bySlug[phase.Slug] = phase
+	}
+
+	borrowers := 0
+	for _, phase := range phases {
+		if phase.NNTPDonor == "" {
+			continue
+		}
+		borrowers++
+		donor, ok := bySlug[phase.NNTPDonor]
+		if !ok {
+			t.Fatalf("%s borrows from %q, which is not a selected phase", phase.Name, phase.NNTPDonor)
+		}
+		if donor.NNTPDonor != "" {
+			t.Fatalf("%s borrows from %s, which is itself a borrower", phase.Name, donor.Name)
+		}
+		if !phase.SkipSeed {
+			t.Fatalf("%s borrows an NNTP server but still seeds one", phase.Name)
+		}
+		if donor.SkipSeed {
+			t.Fatalf("%s borrows from %s, which seeds nothing", phase.Name, donor.Name)
+		}
+		// The donor need not seed the same profile, but it must seed a
+		// superset: every fixture the borrower's suite expects has to already
+		// be on the server it reads. Checked against the real slug lists
+		// rather than by comparing profile names, so narrowing a profile
+		// breaks this instead of silently starving a lane.
+		donorSlugs := map[string]bool{}
+		for _, slug := range fixtureSlugsForSeedProfile(donor.SeedProfile) {
+			donorSlugs[slug] = true
+		}
+		for _, slug := range fixtureSlugsForSeedProfile(phase.SeedProfile) {
+			if !donorSlugs[slug] {
+				t.Fatalf(
+					"%s needs fixture %q, which %s (profile %q) does not seed",
+					phase.Name, slug, donor.Name, donor.SeedProfile,
+				)
+			}
+		}
+
+		// Both consumers must be redirected: the host-side harness over
+		// loopback, and the containerised Weaver through the host gateway.
+		env := phase.env()
+		donorPort := strconv.Itoa(donor.RuntimePorts.NNTPPort)
+		for key, want := range map[string]string{
+			"NNTP_HOST":            "127.0.0.1",
+			"NNTP_PORT":            donorPort,
+			"E2E_NNTP_CLIENT_HOST": "host.docker.internal",
+			"E2E_NNTP_CLIENT_PORT": donorPort,
+		} {
+			if env[key] != want {
+				t.Fatalf("%s env[%s] = %q, want %q", phase.Name, key, env[key], want)
+			}
+		}
+		if env["E2E_NNTP_CLIENT_PORT"] == strconv.Itoa(phase.RuntimePorts.NNTPPort) {
+			t.Fatalf("%s points Weaver at its own NNTP port instead of the donor's", phase.Name)
+		}
+	}
+
+	if borrowers == 0 {
+		t.Fatal("no phase borrows an NNTP server; the pairing was removed without updating this test")
 	}
 }

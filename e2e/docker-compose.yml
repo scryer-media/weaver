@@ -63,9 +63,16 @@ services:
       - "${E2E_TOXIPROXY_API_PORT:-8474}:8474"   # toxiproxy API
       - "${E2E_TOXIPROXY_NNTP1_PORT:-3119}:3119" # proxied NNTP server 1
       - "${E2E_TOXIPROXY_NNTP2_PORT:-4119}:4119" # proxied NNTP server 2
+    # Overridable so a lane can proxy to another lane's already-seeded NNTP
+    # instead of seeding an identical one of its own. The default keeps the
+    # in-project upstreams, which is what a standalone `tcp-chaos` run wants.
     volumes:
-      - ./services/toxiproxy/config.json:/config/toxiproxy.json:ro
+      - ${E2E_TOXIPROXY_CONFIG:-./services/toxiproxy/config.json}:/config/toxiproxy.json:ro
     command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    # Present so a generated config can name host.docker.internal to reach the
+    # donor lane's published NNTP ports.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       nntp:
         condition: service_healthy

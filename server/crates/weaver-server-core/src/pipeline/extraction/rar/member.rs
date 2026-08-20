@@ -1155,10 +1155,16 @@ impl Pipeline {
         };
 
         if archive.is_solid() {
+            // The probe wants the decode, not the bytes: a wrong password is
+            // detected by verification failing, so the output goes nowhere.
+            // `skip_member_solid` is that exact operation, and it verifies
+            // slightly more than the chunked sink this replaced — it adds the
+            // legacy RAR1.4 stored-member data-hash check on top of the CRC32
+            // and BLAKE2sp both paths run under `verify`. Strictly more
+            // checking on a path whose whole purpose is to reject bad
+            // passwords.
             archive
-                .extract_member_solid_chunked(idx, &options, |_| {
-                    Ok(Box::new(std::io::sink()) as Box<dyn Write>)
-                })
+                .skip_member_solid(idx, &options)
                 .map(|_| ())
                 .map_err(crate::pipeline::RarPasswordAttemptError::from)?;
             return Ok(());
@@ -1304,6 +1310,46 @@ impl Pipeline {
 mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
+
+    /// The solid branch of the password probe, over a real solid archive.
+    ///
+    /// That branch swapped a hand-rolled `extract_member_solid_chunked` sink
+    /// factory for `skip_member_solid`, and had no coverage before: every
+    /// password fixture in this crate is a non-solid `store` archive, so the
+    /// existing probe tests exercise the streaming branch instead. This pins
+    /// that a legitimate solid member decodes and verifies clean through the
+    /// new call.
+    ///
+    /// Not covered, for want of a fixture: wrong-password rejection on a
+    /// *solid encrypted* archive. `tests/fixtures/rar5` has solid archives and
+    /// encrypted archives, but none that is both, and one would have to be
+    /// produced with real RAR tooling rather than synthesised.
+    #[test]
+    fn solid_password_probe_accepts_a_verifying_member() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rar5/rar5_solid.rar");
+        let mut archive =
+            unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        assert!(
+            archive.is_solid(),
+            "fixture must be solid or this exercises the wrong branch"
+        );
+
+        let index = (0..archive.member_names().len())
+            .find(|index| {
+                archive
+                    .member_info(*index)
+                    .is_some_and(|member| !member.is_directory)
+            })
+            .expect("fixture has a file member");
+
+        let volume_paths = std::collections::BTreeMap::from([(0u32, fixture.clone())]);
+        if let Err(error) =
+            Pipeline::probe_rar_member_password(&mut archive, &volume_paths, index, None, None)
+        {
+            panic!("an unencrypted solid member should verify clean: {error}");
+        }
+    }
 
     fn metadata_test_member(
         name: &str,

@@ -44,20 +44,33 @@ impl IntakeOutput {
         Ok(output)
     }
 
-    fn push_nzb(&mut self, nzb: ExtractedNzb, per_member_limit: u64) -> Result<(), String> {
+    /// Why a member of `len` bytes could not be accepted, if it could not.
+    ///
+    /// The same arithmetic [`Self::push_nzb`] enforces, asked before the bytes
+    /// exist so a member that cannot fit is never materialised into memory
+    /// just to be rejected. `push_nzb` stays the authority — this is an
+    /// optimisation in front of it, never a replacement for it.
+    fn rejection_for(&self, len: u64, per_member_limit: u64) -> Option<String> {
         if self.nzbs.len() >= MAX_NZB_MEMBERS_PER_INPUT {
-            return Err(format!(
+            return Some(format!(
                 "input contains more than {MAX_NZB_MEMBERS_PER_INPUT} NZB members"
             ));
         }
-        let next_total = self.total_nzb_bytes.saturating_add(nzb.bytes.len() as u64);
         let total_limit = total_nzb_bytes_limit(per_member_limit);
-        if next_total > total_limit {
-            return Err(format!(
+        if self.total_nzb_bytes.saturating_add(len) > total_limit {
+            return Some(format!(
                 "extracted NZB members exceed {total_limit} total bytes"
             ));
         }
-        self.total_nzb_bytes = next_total;
+        None
+    }
+
+    fn push_nzb(&mut self, nzb: ExtractedNzb, per_member_limit: u64) -> Result<(), String> {
+        let len = nzb.bytes.len() as u64;
+        if let Some(rejection) = self.rejection_for(len, per_member_limit) {
+            return Err(rejection);
+        }
+        self.total_nzb_bytes = self.total_nzb_bytes.saturating_add(len);
         self.nzbs.push(nzb);
         Ok(())
     }
@@ -510,6 +523,17 @@ fn extract_rar_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput,
                 }
             },
         };
+        // Ask the aggregate caps before materialising. `extracted.len()` is
+        // free on both `ExtractedMember` variants, so a member that cannot fit
+        // in the remaining budget is rejected without ever being pulled into
+        // memory — otherwise a crafted archive can charge us one full member
+        // of RAM per rejection, up to the member cap. Same rejection and same
+        // stop-processing behaviour as `push_nzb` below, because it is the
+        // same arithmetic.
+        if let Some(rejection) = output.rejection_for(extracted.len() as u64, limit) {
+            output.permanent_errors.push(rejection);
+            break;
+        }
         let bytes = match extracted.into_bytes() {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -753,6 +777,76 @@ mod tests {
 </nzb>"#
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn aggregate_rejection_matches_push_nzb_so_nothing_is_materialised_needlessly() {
+        // The pre-check runs before a member's bytes exist, so it has to reject
+        // exactly when `push_nzb` would: disagreeing either materialises a
+        // member that cannot fit, or drops one that could.
+        let limit = 1024;
+        let total_limit = total_nzb_bytes_limit(limit);
+        let mut output = IntakeOutput::default();
+
+        // Fill the budget exactly — that must still be accepted.
+        assert!(output.rejection_for(total_limit, limit).is_none());
+        output
+            .push_nzb(
+                ExtractedNzb {
+                    filename: "first.nzb".to_string(),
+                    bytes: vec![0u8; total_limit as usize],
+                },
+                limit,
+            )
+            .unwrap();
+
+        // One more byte cannot fit. The pre-check says so, with the message
+        // `push_nzb` produces for the same member.
+        let predicted = output.rejection_for(1, limit).expect("budget is exhausted");
+        let enforced = output
+            .push_nzb(
+                ExtractedNzb {
+                    filename: "second.nzb".to_string(),
+                    bytes: vec![0u8; 1],
+                },
+                limit,
+            )
+            .unwrap_err();
+        assert_eq!(predicted, enforced);
+        assert!(predicted.contains("total bytes"), "{predicted}");
+        assert_eq!(output.nzbs.len(), 1, "a rejected member is never recorded");
+    }
+
+    #[test]
+    fn member_cap_is_answerable_without_a_size() {
+        // At the member cap the pre-check refuses a zero-byte member, which is
+        // what lets the RAR loop stop before extracting anything further.
+        let limit = 1024 * 1024;
+        let mut output = IntakeOutput::default();
+        for index in 0..MAX_NZB_MEMBERS_PER_INPUT {
+            output
+                .push_nzb(
+                    ExtractedNzb {
+                        filename: format!("{index}.nzb"),
+                        bytes: vec![0u8; 1],
+                    },
+                    limit,
+                )
+                .unwrap();
+        }
+
+        let predicted = output.rejection_for(0, limit).expect("member cap reached");
+        let enforced = output
+            .push_nzb(
+                ExtractedNzb {
+                    filename: "overflow.nzb".to_string(),
+                    bytes: Vec::new(),
+                },
+                limit,
+            )
+            .unwrap_err();
+        assert_eq!(predicted, enforced);
+        assert!(predicted.contains("NZB members"), "{predicted}");
     }
 
     #[test]
