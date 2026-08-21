@@ -30,6 +30,35 @@ const (
 	TruncateBytes = 1 << 20
 )
 
+// The shapes the four recovery-gap fixtures are cut to. They are constants
+// rather than literals because each one appears in two places that must agree:
+// the recovery set is created at this block size, and the damage is expressed
+// in whole blocks of it, so "five of the sidecar's eight blocks" stays true
+// when a payload changes size.
+const (
+	// ignorableSliceSize keeps a 32 KiB sidecar at eight blocks while the
+	// 5 MiB payload beside it stays well inside PAR2's slice ceiling.
+	ignorableSliceSize    = 4096
+	ignorableSidecarBytes = 32768
+	// partialVolumeSliceSize puts the 5 MiB payload at eighty blocks, so
+	// forty-eight recovery blocks over two volumes is 60% redundancy and
+	// neither volume alone covers thirty destroyed blocks.
+	partialVolumeSliceSize = 65536
+	// splitPar2SliceSize and splitPar2Parts cut the same payload into three
+	// equal parts; three zeroed blocks inside the middle part touch at most
+	// four blocks of the joined file, well under the eight recovery blocks.
+	splitPar2SliceSize = 65536
+	splitPar2Parts     = 3
+	// twoSetsSliceSize is shared by both sets of the two-set posting so their
+	// block counts differ only by payload size.
+	twoSetsSliceSize = 65536
+)
+
+// ignorableSidecarNotesText is the sidecar payload of the ignorable-deficit
+// set. WriteText pads it to a fixed length, so what matters is that it is a
+// deterministic run of bytes; the title is invented.
+const ignorableSidecarNotesText = "Golden Meridian - season two, episode three. Release notes beside the payload; every name here is invented.\n"
+
 // The payload paths recipes name as provenance: ledger paths that carry
 // exactly the bytes the artifact cache feeds to the oracles.
 const (
@@ -784,6 +813,126 @@ func Recipes() []Recipe {
 		},
 	})
 
+	add(Recipe{
+		Slug: "par2-ignorable-deficit", Family: "PAR2",
+		Notes: "A 5 MiB payload and a 32 KiB text sidecar under one recovery set of 4 KiB blocks, with five of the sidecar's eight blocks zeroed against three recovery blocks. " +
+			"Every payload block verifies, so the only damage in the set is a short metadata file the recovery data cannot rebuild: the whole question the fixture asks is what a verdict does with that alone.",
+		Inputs: []string{previewPayloadPath},
+		Build: sequence(
+			publish("clip-preview", "test-media.mkv"),
+			func(ctx context.Context, env *Env) error {
+				return WriteText(env.OutputPath("info.nfo"), ignorableSidecarNotesText, ignorableSidecarBytes)
+			},
+			par2(PAR2Spec{Base: "release.par2", SliceSize: ignorableSliceSize, RecoveryBlocks: 3, RecoveryFiles: 1,
+				Sources: []string{"test-media.mkv", "info.nfo"}}),
+			// Five blocks damaged against three recovery blocks, starting one
+			// block in so the sidecar's first and last blocks still verify and
+			// the file reads as damaged rather than as something else entirely.
+			zeroOutput("info.nfo", ignorableSliceSize, 5*ignorableSliceSize),
+		),
+		ExpectedOutputs: previewClipExpectedOutput("test-media.mkv"),
+	})
+
+	add(Recipe{
+		Slug: "par2-partial-volume", Family: "PAR2",
+		Notes: "Thirty of a 5 MiB payload's eighty blocks destroyed against forty-eight recovery blocks split evenly over two volumes, so neither volume is enough on its own. " +
+			"The scenario then drops one interior article of the second volume, which leaves that volume short of its posted length while the packets on either side of the hole stay intact and self-checksummed on disk.",
+		Inputs: []string{previewPayloadPath},
+		Build: sequence(
+			publish("clip-preview", "test-media.mkv"),
+			par2(PAR2Spec{Base: "test-media.mkv.par2", SliceSize: partialVolumeSliceSize, RecoveryBlocks: 48, RecoveryFiles: 2,
+				Sources: []string{"test-media.mkv"}}),
+			zeroOutput("test-media.mkv", 20*partialVolumeSliceSize, 30*partialVolumeSliceSize),
+		),
+		ExpectedOutputs: previewClipExpectedOutput("test-media.mkv"),
+	})
+
+	add(Recipe{
+		Slug: "split-plain-par2", Family: "PAR2",
+		Notes: "A 5 MiB clip cut into three equal plain parts named .001/.002/.003, with a recovery set computed over the joined file rather than over the parts. " +
+			"Three blocks inside the middle part are zeroed, so the set is only whole again if the parts are read as one file: the recovery data names a file nothing in the posting is called.",
+		Inputs: []string{previewPayloadPath},
+		Build: func(ctx context.Context, env *Env) error {
+			if err := env.Publish(ctx, "clip-preview", "test-media.mkv"); err != nil {
+				return err
+			}
+			if err := env.PAR2(ctx, PAR2Spec{
+				Base: "test-media.mkv.par2", SliceSize: splitPar2SliceSize, RecoveryBlocks: 8, RecoveryFiles: 1,
+				Sources: []string{"test-media.mkv"},
+			}); err != nil {
+				return err
+			}
+			joined := env.OutputPath("test-media.mkv")
+			size, err := FileSize(joined)
+			if err != nil {
+				return err
+			}
+			// An explicit part size derived from the payload keeps the part
+			// count at three whatever the encoder produced, which is what makes
+			// ".002" the middle part rather than a part that happens to exist.
+			parts, err := SplitFile(joined, (size+splitPar2Parts-1)/splitPar2Parts, func(index int) string {
+				return env.OutputPath(fmt.Sprintf("test-media.mkv.%03d", index+1))
+			})
+			if err != nil {
+				return err
+			}
+			if len(parts) != splitPar2Parts {
+				return fmt.Errorf("splitting %d bytes produced %d parts, want %d", size, len(parts), splitPar2Parts)
+			}
+			// Only the parts are posted: the joined file is the recovery set's
+			// subject, not one of the release's files.
+			if err := removeOutput(env, "test-media.mkv"); err != nil {
+				return err
+			}
+			return ZeroRange(env.OutputPath("test-media.mkv.002"), splitPar2SliceSize, 3*splitPar2SliceSize)
+		},
+		ExpectedOutputs: previewClipExpectedOutput("test-media.mkv"),
+	})
+
+	add(Recipe{
+		Slug: "par2-two-sets", Family: "PAR2",
+		Notes: "One posting carrying two independent recovery sets: a 25 MiB payload with eight recovery blocks and a 5 MiB payload with four, each with two of its own blocks zeroed. " +
+			"The two sets describe different files and share no bytes, and the larger one is larger by five times, so which set is served has to be a decision rather than an accident of arrival order.",
+		Inputs: []string{samplePayloadPath, previewPayloadPath},
+		Build: func(ctx context.Context, env *Env) error {
+			episode, err := env.ArtifactFile(ctx, "clip-episodes", "episode1.mkv")
+			if err != nil {
+				return err
+			}
+			if err := CopyFile(episode, env.OutputPath("feature.mkv")); err != nil {
+				return err
+			}
+			if err := env.Publish(ctx, "clip-preview", "bonus.mkv"); err != nil {
+				return err
+			}
+			for _, set := range []struct {
+				base, source string
+				recovery     int
+			}{
+				{"feature.mkv.par2", "feature.mkv", 8},
+				{"bonus.mkv.par2", "bonus.mkv", 4},
+			} {
+				if err := env.PAR2(ctx, PAR2Spec{
+					Base: set.base, SliceSize: twoSetsSliceSize, RecoveryBlocks: set.recovery, RecoveryFiles: 1,
+					Sources: []string{set.source},
+				}); err != nil {
+					return err
+				}
+			}
+			if err := ZeroRange(env.OutputPath("feature.mkv"), 100*twoSetsSliceSize, 2*twoSetsSliceSize); err != nil {
+				return err
+			}
+			return ZeroRange(env.OutputPath("bonus.mkv"), 30*twoSetsSliceSize, 2*twoSetsSliceSize)
+		},
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			episode, err := env.ArtifactFile(ctx, "clip-episodes", "episode1.mkv")
+			if err != nil {
+				return nil, err
+			}
+			return map[string]string{"feature.mkv": episode}, nil
+		},
+	})
+
 	// ---------------------------------------------------------------- zip
 	add(Recipe{
 		Slug: "zip-unencrypted", Family: "zip", ByteReproducible: true,
@@ -1193,6 +1342,19 @@ func expectOutputs(env *Env, names []string) error {
 func sharedClipExpectedOutput(member string) func(context.Context, *Env) (map[string]string, error) {
 	return func(ctx context.Context, env *Env) (map[string]string, error) {
 		clip, err := env.ArtifactFile(ctx, "clip-shared", "short-720p-av1.mkv")
+		if err != nil {
+			return nil, err
+		}
+		return map[string]string{member: clip}, nil
+	}
+}
+
+// previewClipExpectedOutput pins a delivered member to the preview clip's
+// bytes: the payload of these fixtures is damaged on disk, so the oracle is the
+// artifact the damage was applied to, not the fixture file.
+func previewClipExpectedOutput(member string) func(context.Context, *Env) (map[string]string, error) {
+	return func(ctx context.Context, env *Env) (map[string]string, error) {
+		clip, err := env.ArtifactPath(ctx, "clip-preview")
 		if err != nil {
 			return nil, err
 		}

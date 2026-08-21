@@ -59,12 +59,14 @@ type Scenario struct {
 	DeleteSubjectContains        []string                   `json:"deleteSubjectContains,omitempty"`
 	DeleteSubjectTailArticles    int                        `json:"deleteSubjectTailArticles,omitempty"`
 	DeleteSegmentNumbers         []int                      `json:"deleteSegmentNumbers,omitempty"`
+	DeleteSegmentSubjectContains []string                   `json:"deleteSegmentSubjectContains,omitempty"`
 	PrimaryDeleteSubjectContains []string                   `json:"primaryDeleteSubjectContains,omitempty"`
 	PrimaryChaosConfig           string                     `json:"primaryChaosConfig,omitempty"`
 	RequiredJobEvents            []string                   `json:"requiredJobEvents,omitempty"`
 	ForbiddenJobEvents           []string                   `json:"forbiddenJobEvents,omitempty"`
 	MaxJobEventCounts            map[string]int             `json:"maxJobEventCounts,omitempty"`
 	ExpectedOutputBLAKE3         map[string]string          `json:"expectedOutputBLAKE3,omitempty"`
+	ForbiddenOutputPaths         []string                   `json:"forbiddenOutputPaths,omitempty"`
 	NewznabAttributes            map[string]string          `json:"newznabAttributes,omitempty"`
 	RuntimeAssertions            *ScenarioRuntimeAssertions `json:"runtimeAssertions,omitempty"`
 }
@@ -1026,6 +1028,9 @@ var canonicalFixtureSlugs = []string{
 	"par2-heavy-damage-c",
 	"par2-insufficient",
 	"par2-direct-repair",
+	"par2-ignorable-deficit",
+	"par2-partial-volume",
+	"par2-two-sets",
 	"par2-rar-placement-stripped-recovery",
 	"par2-7z-repair",
 	"par2-multivolume",
@@ -1075,6 +1080,7 @@ var canonicalFixtureSlugs = []string{
 	"single-mkv-sparse-nzb",
 	"multiserver-backup-par2-repair",
 	"split-plain-mkv",
+	"split-plain-par2",
 	"split-7z",
 	"split-7z-corrupted",
 	"split-7z-encrypted",
@@ -1816,7 +1822,7 @@ func seedScenarioRelease(absDir string, scenario *Scenario) error {
 	}
 
 	if len(scenario.DeleteSegmentNumbers) > 0 {
-		messageIDs, err := extractMessageIDsBySegmentNumbers(nzbData, scenario.DeleteSubjectContains, scenario.DeleteSegmentNumbers)
+		messageIDs, err := extractMessageIDsBySegmentNumbers(nzbData, segmentDeleteNeedles(scenario), scenario.DeleteSegmentNumbers)
 		if err != nil {
 			return fmt.Errorf("extract segment-number delete ids for %s: %w", scenario.Slug, err)
 		}
@@ -1902,6 +1908,22 @@ func scenarioNeedsBackupServerState(scenario *Scenario) bool {
 		scenario.PrimaryDeleteFirstMessageIDs > 0 ||
 		len(scenario.PrimaryDeleteSubjectContains) > 0 ||
 		strings.TrimSpace(scenario.PrimaryChaosConfig) != ""
+}
+
+// segmentDeleteNeedles narrows which files the segment-number deletion may
+// reach. It is its own field because deleteSubjectContains deletes whole files
+// wherever it is set: a scenario that wants one interior article of one named
+// file — and every other article of that file kept — cannot express that by
+// combining the two. With no needles of its own it falls back to the whole-file
+// filter, which is the shape the scenarios that predate this field rely on.
+func segmentDeleteNeedles(scenario *Scenario) []string {
+	if scenario == nil {
+		return nil
+	}
+	if len(scenario.DeleteSegmentSubjectContains) > 0 {
+		return scenario.DeleteSegmentSubjectContains
+	}
+	return scenario.DeleteSubjectContains
 }
 
 func scenarioUsesExclusiveNntpState(scenario *Scenario) bool {

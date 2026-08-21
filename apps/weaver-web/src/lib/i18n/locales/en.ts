@@ -294,6 +294,7 @@ const en: LocaleDictionary = {
   "history.filterFailure": "Failed",
   "history.searchPlaceholder": "filter by name",
   "history.noMatches": "No history jobs match the current filter.",
+  "queue.noMatches": "No queue jobs match the current filter.",
   "table.health": "Health",
   "table.category": "Category",
   "table.rowsPerPage": "Rows per page",

@@ -1,0 +1,20 @@
+{
+  "slug": "par2-partial-volume",
+  "title": "Cobalt.Harbor.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "Thirty destroyed payload blocks against two recovery volumes of twenty-four blocks each, with one interior article of the second volume deleted after posting. Twenty-four blocks do not cover thirty, so the repair only has enough to work with if the packets that survived on either side of the hole in the short volume are counted; each packet carries its own checksum, which is what makes counting them safe.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "segment_size": 262144,
+  "deleteSegmentSubjectContains": [
+    "test-media.mkv.vol24+24.par2"
+  ],
+  "deleteSegmentNumbers": [
+    3
+  ],
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "expectedOutputBLAKE3": {
+    "test-media.mkv": "bd8b3991787e2bc03ae0f47bda585f1b9dbd831448493fe3c4a9118f4f947cf2"
+  }
+}

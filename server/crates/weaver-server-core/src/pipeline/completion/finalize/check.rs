@@ -18,6 +18,17 @@ const PAR2_REPAIR_MEMORY_LIMIT_ENV: &str = "WEAVER_PAR2_REPAIR_MEMORY_LIMIT_BYTE
 // concurrent downloads; the env override remains for tuning.
 const DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
+const PAR2_IGNORE_EXTENSIONS_ENV: &str = "WEAVER_PAR2_IGNORE_EXTENSIONS";
+// Metadata that travels with a post rather than being part of it. Damage to
+// one of these never fails a job in either reference downloader: one clears its
+// "has damaged files" flag for them outright, so ignorable-only damage reports
+// as repair-not-needed even when the recovery set said repair was impossible;
+// the other's quick check passes such a file both on a checksum mismatch and
+// when it is missing entirely. This default is the union of the two lists,
+// overridable through the env var above (comma- or semicolon-separated; an
+// empty value disables the behaviour).
+const DEFAULT_PAR2_IGNORE_EXTENSIONS: [&str; 4] = ["nfo", "sfv", "srr", "nzb"];
+
 #[derive(Clone)]
 struct Par2SessionEvidenceCandidate {
     file_id: NzbFileId,
@@ -155,6 +166,53 @@ fn should_retry_par2_source_change<T>(
     !already_retried && matches!(result, Err(par2_rs::Par2SessionError::SourceChanged { .. }))
 }
 
+/// The operator-facing form of a resource-limited PAR2 verdict.
+///
+/// A refusal names either a transient workspace budget in bytes or a PAR2
+/// format cap on how many slices a set may address, and only the first is
+/// tunable. The reason already distinguishes them and already carries the
+/// numbers, so the tail this adds says which knob exists and what it applies to
+/// rather than promising that setting it will help.
+///
+/// Without this the failure read as an internal limit with no stated remedy,
+/// which is how a tunable refusal ends up looking like a dead end.
+fn par2_resource_limit_message(reason: &str) -> String {
+    format!(
+        "PAR2 verification resource limit exceeded: {reason}. A workspace budget is raised by \
+         setting {PAR2_REPAIR_MEMORY_LIMIT_ENV} above the byte figure named above; PAR2 \
+         slice-count caps are fixed by the format and cannot be raised."
+    )
+}
+
+/// Close one accepted-repair stage and open the next.
+///
+/// The tail that follows a successful repair is a sequence of whole-job passes
+/// — a re-read of what was installed, deobfuscation, placement, reconciliation,
+/// a digest refresh — and until they were stamped, "the repair took much longer
+/// than the repair" was an argument rather than a measurement. Naming each one
+/// turns it into a number.
+///
+/// Low-frequency by construction: this runs a handful of times per job, after a
+/// repair that has already spent seconds or minutes on the payload, and never
+/// on an article path — the same class as the lifecycle metric the same
+/// function records. The probe costs nothing at all unless hot-path profiling
+/// is switched on.
+fn note_par2_repair_stage(
+    job_id: JobId,
+    stage: &'static str,
+    started: std::time::Instant,
+) -> std::time::Instant {
+    let elapsed = started.elapsed();
+    crate::runtime::perf_probe::record(stage, elapsed);
+    debug!(
+        job_id = job_id.0,
+        stage,
+        stage_ms = elapsed.as_millis() as u64,
+        "PAR2 repair stage"
+    );
+    std::time::Instant::now()
+}
+
 fn ensure_par2_repair_completed(
     outcome: &par2_rs::Par2RepairOutcome,
     repair: bool,
@@ -164,12 +222,21 @@ fn ensure_par2_repair_completed(
     }
     match outcome.status {
         par2_rs::Par2RepairStatus::Verified | par2_rs::Par2RepairStatus::Repaired => Ok(()),
-        par2_rs::Par2RepairStatus::RepairPossible
-        | par2_rs::Par2RepairStatus::Insufficient
-        | par2_rs::Par2RepairStatus::ResourceLimited => Err(format!(
-            "PAR2 repairer did not complete repair: {:?}",
-            outcome.status
-        )),
+        // Carries the verdict's own reason rather than just the status name:
+        // this is the one arm whose refusal an operator can act on, and the
+        // status alone says nothing about which limit was hit.
+        par2_rs::Par2RepairStatus::ResourceLimited => Err(match &outcome.verification.repairable {
+            par2_rs::verify::Repairability::ResourceLimited { reason } => {
+                par2_resource_limit_message(reason)
+            }
+            _ => par2_resource_limit_message("the PAR2 repairer stopped at a resource limit"),
+        }),
+        par2_rs::Par2RepairStatus::RepairPossible | par2_rs::Par2RepairStatus::Insufficient => {
+            Err(format!(
+                "PAR2 repairer did not complete repair: {:?}",
+                outcome.status
+            ))
+        }
     }
 }
 
@@ -221,6 +288,63 @@ fn parse_par2_repair_memory_limit_bytes(raw: Option<&str>) -> usize {
     }
 }
 
+/// The extension list [`par2_damage_ignorable`] matches against, as read from
+/// the environment once per verdict.
+pub(in crate::pipeline) fn configured_par2_ignore_extensions() -> Vec<String> {
+    parse_par2_ignore_extensions(std::env::var(PAR2_IGNORE_EXTENSIONS_ENV).ok().as_deref())
+}
+
+/// Parse the override list. Unset takes the baked defaults; an explicitly empty
+/// value turns the behaviour off entirely, which is the only way to get the old
+/// "every described file must be whole" rule back.
+///
+/// Entries are separated by `,` or `;`, may carry a leading dot, and are
+/// compared case-insensitively.
+fn parse_par2_ignore_extensions(raw: Option<&str>) -> Vec<String> {
+    let Some(value) = raw else {
+        return DEFAULT_PAR2_IGNORE_EXTENSIONS
+            .iter()
+            .map(|extension| (*extension).to_string())
+            .collect();
+    };
+    let mut extensions: Vec<String> = value
+        .split([',', ';'])
+        .map(|entry| {
+            entry
+                .trim()
+                .trim_start_matches('.')
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    extensions.sort();
+    extensions.dedup();
+    extensions
+}
+
+/// Whether damage to this file is the kind both reference downloaders refuse to
+/// fail a job over.
+///
+/// The rule is by extension, not by size or by role: an `.nfo`, an `.sfv` and
+/// their relatives are furniture posted alongside the payload, and shipping one
+/// with a hole in it is strictly better for the user than refusing the payload
+/// it describes. Matching is on the file's own extension so a payload that
+/// merely *mentions* one of these names is unaffected.
+fn par2_damage_ignorable(filename: &str, ignore_extensions: &[String]) -> bool {
+    if ignore_extensions.is_empty() {
+        return false;
+    }
+    let Some(extension) = std::path::Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    else {
+        return false;
+    };
+    let extension = extension.to_ascii_lowercase();
+    ignore_extensions.contains(&extension)
+}
+
 /// A clean PAR2 verdict reached without the authoritative pass, plus the two
 /// strings that name which fast path produced it — one labelling the
 /// reconciliation for any failure it classifies, one for the retry log.
@@ -238,6 +362,18 @@ struct CleanPar2Verification {
 /// veto downstream has to tell those apart to decide whether it is looking at a
 /// download failure or at our own reconciliation failing. Every way a binding
 /// can fail is therefore carried out rather than swallowed.
+/// What a job still has outstanding after a PAR2 pass reconciled, and whether
+/// any of it is bad enough to refuse the job over.
+#[derive(Debug)]
+pub(in crate::pipeline) struct Par2IncompleteReport {
+    /// Operator-facing description of everything left standing.
+    pub(in crate::pipeline) message: String,
+    /// PAR2-protected files left incomplete whose verified bytes could not be
+    /// found. The one case that still fails: delivering would ship a hole under
+    /// a verification that claims otherwise.
+    pub(in crate::pipeline) unproven_protected: usize,
+}
+
 #[derive(Debug, Default)]
 pub(in crate::pipeline) struct Par2Reconciliation {
     /// Assembly files this pass promoted to complete.
@@ -326,6 +462,18 @@ fn forget_identity_filenames(
     if let Some(canonical) = identity.canonical_filename.as_ref() {
         forget_reserved_download_filename(canonical, occupied_filenames);
     }
+}
+
+/// The entry names a directory holds right now, or nothing if it cannot be
+/// read. Used to bracket a repair so its artefacts can be named by difference.
+fn directory_entry_names(dir: &Path) -> HashSet<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return HashSet::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .collect()
 }
 
 fn reserve_directory_filenames(dir: &Path, occupied_filenames: &mut HashSet<String>) {
@@ -1239,7 +1387,10 @@ impl Pipeline {
         existing_hashes.get(&file_id.file_index).copied()
     }
 
-    async fn try_deobfuscate_files_with_par2(&mut self, job_id: JobId) -> usize {
+    pub(in crate::pipeline) async fn try_deobfuscate_files_with_par2(
+        &mut self,
+        job_id: JobId,
+    ) -> usize {
         let Some(par2) = self.par2_set(job_id).cloned() else {
             return 0;
         };
@@ -1318,6 +1469,27 @@ impl Pipeline {
             }
             let correct_name =
                 allocate_unique_download_filename(&requested_correct_name, &mut target_occupied);
+            // A suggestion whose source is not an NZB entry is a stray on disk
+            // — most often the pre-repair backup par2-rs leaves behind, whose
+            // first 16 KiB still match the description because the damage the
+            // repair fixed lay further in. When the canonical name is already
+            // taken, renaming it here mints a `.duplicateN` sibling of the file
+            // that just passed verification, and the final move — which
+            // relocates the whole working directory — delivers both. That is
+            // how a 962 MB damaged copy shipped beside its repaired original.
+            //
+            // Renaming an unmatched stray into a *free* canonical slot is still
+            // allowed, so genuine deobfuscation is untouched; only the
+            // duplicate-minting branch is closed.
+            if matched.is_none() && correct_name != requested_correct_name {
+                warn!(
+                    job_id = job_id.0,
+                    from = %old.display(),
+                    requested = %requested_correct_name,
+                    "refusing to rename a file the NZB never declared into a duplicate name"
+                );
+                continue;
+            }
             let new = old.parent().unwrap().join(&correct_name);
             if old
                 .file_name()
@@ -1433,6 +1605,15 @@ impl Pipeline {
         working_dir: std::path::PathBuf,
         repair: bool,
     ) -> Result<par2_rs::Par2RepairOutcome, String> {
+        if repair {
+            // What the directory held before the repairer touched it, so the
+            // artefacts it leaves behind can be named afterwards by difference
+            // rather than by guessing at a backup-suffix convention that lives
+            // in another crate.
+            self.par2_pre_repair_dir_entries
+                .insert(job_id, directory_entry_names(&working_dir));
+        }
+
         #[cfg(test)]
         {
             if repair {
@@ -2022,6 +2203,11 @@ impl Pipeline {
     /// no path that marks a job verified without also letting its sets commit.
     async fn mark_par2_verified(&mut self, job_id: JobId) {
         self.par2_verified.insert(job_id);
+        // A fresh verdict starts the post-verdict re-entry budget over: whatever
+        // this pass reconciled, the next settled re-entry is a new question.
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
+            runtime.post_verdict_reconcile_attempts = 0;
+        }
         self.finalize_ready_direct_sets(job_id).await;
     }
 
@@ -2353,6 +2539,11 @@ impl Pipeline {
             return Ok(None);
         }
 
+        #[cfg(test)]
+        {
+            self.par2_quick_verify_calls += 1;
+        }
+
         Ok(Some((
             par2_rs::VerificationResult {
                 files,
@@ -2571,7 +2762,37 @@ impl Pipeline {
                 }
             }
 
+            // The PAR2 files that legitimately have no file on disk: volumes of
+            // a direct set that is still routing, which are verified through
+            // the set's own access layer and are never written under their own
+            // name. A finalized or demoted set has put its bytes at a real
+            // path, and every conventional file always had one, so for those
+            // absence contradicts the verdict rather than explaining it.
+            //
+            // Built once per pass: the overlay is derived, not cached.
+            let live_virtual_par2_files: HashSet<par2_rs::FileId> = self
+                .direct_par2_overlay(job_id)
+                .map(|overlay| {
+                    par2_set
+                        .files
+                        .keys()
+                        .copied()
+                        .filter(|par2_file_id| {
+                            overlay.owner_of(par2_file_id).is_some_and(|index| {
+                                self.direct_store
+                                    .set(job_id, index)
+                                    .is_some_and(|set| !set.is_demoted() && !set.is_finalized())
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
             let mut matched = HashMap::<NzbFileId, String>::new();
+            // Assembly files that more than one description laid claim to. Kept
+            // apart from `matched` so a third claimant is refused too, rather
+            // than filling the slot the second one vacated.
+            let mut contested_file_ids = HashSet::<NzbFileId>::new();
             for file_verification in &verification.files {
                 if !matches!(
                     file_verification.status,
@@ -2655,12 +2876,13 @@ impl Pipeline {
                 // lives and the current name is the fallback for one the plan
                 // left alone.
                 //
-                // Absence is deliberately *not* evidence against the verdict. A
-                // direct-store volume is verified through the set's own access
-                // layer and need never exist as a physical file, so demanding
-                // one here would refuse every virtual volume PAR2 had just
-                // proven. A file that is present and the wrong length is a real
-                // contradiction, and that is the case this refuses.
+                // Absence excuses only a live virtual volume. Requiring a file
+                // for *every* binding refused every routing direct-store volume
+                // PAR2 had just proven; excusing every binding went too far the
+                // other way and would call a file complete on the strength of a
+                // verdict about bytes that are no longer anywhere. The
+                // exemption is therefore exactly as wide as the thing that
+                // earns it.
                 let installed = [canonical_filename.as_str(), current_filename.as_str()]
                     .into_iter()
                     .filter(|name| !name.is_empty())
@@ -2671,17 +2893,44 @@ impl Pipeline {
                             .filter(|meta| meta.is_file())
                             .map(|meta| (path, meta.len()))
                     });
-                if let Some((path, length)) = installed
-                    && length != described_length
-                {
-                    report.length_mismatch.push(format!(
-                        "{} (on disk {length} bytes, PAR2 describes {described_length})",
-                        path.display()
-                    ));
-                    continue;
+                match installed {
+                    Some((path, length)) if length != described_length => {
+                        report.length_mismatch.push(format!(
+                            "{} (on disk {length} bytes, PAR2 describes {described_length})",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                    Some(_) => {}
+                    None if live_virtual_par2_files.contains(&file_verification.file_id) => {}
+                    None => {
+                        report.length_mismatch.push(format!(
+                            "{canonical_filename} (verdict vouched for bytes that are at neither \
+                             the canonical nor the current name, and no live direct set owns them)"
+                        ));
+                        continue;
+                    }
                 }
 
-                matched.entry(file_id).or_insert(current_filename);
+                if contested_file_ids.contains(&file_id) {
+                    report.contested.push(file_verification.filename.clone());
+                    continue;
+                }
+                match matched.entry(file_id) {
+                    std::collections::hash_map::Entry::Occupied(slot) => {
+                        // Two descriptions claiming one assembly file — the
+                        // mirror of the `by_identity` contest above, and refused
+                        // the same way. Silently keeping the first would call
+                        // the file complete under one of two names with no
+                        // reason to prefer either.
+                        slot.remove();
+                        contested_file_ids.insert(file_id);
+                        report.contested.push(file_verification.filename.clone());
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(current_filename);
+                    }
+                }
             }
 
             matched.into_iter().collect()
@@ -2765,15 +3014,43 @@ impl Pipeline {
     /// verdict from the repair's own re-verification and never re-consults the
     /// articles afterwards.
     ///
-    /// So a protected file left incomplete after an authoritative pass is *our*
-    /// reconciliation failing, not the download — the recovery set had a verdict
-    /// for it either way — and it is reported as the internal failure it is.
-    fn classify_incomplete_after_par2(
+    /// # Nothing here fails the job
+    ///
+    /// The invariant is about the *pass*, not about one file: once a PAR2
+    /// verification has succeeded, no article-completeness state may fail the
+    /// job — protected or unprotected. Both oracles are absolute about this.
+    /// NZBGet's `FAILURE/HEALTH` requires `(psNone || psSkipped)`, so a
+    /// successful par status takes health out of the verdict entirely
+    /// (`DownloadInfo.cpp` `MakeTextStatus`); SABnzbd never sets `fail_msg`
+    /// from missing articles at all — every one of its failure messages comes
+    /// from unpack, repair, encryption or an unwanted extension.
+    ///
+    /// The concrete case that forced this: a 1.09 GB job whose payload PAR2
+    /// repaired and re-verified, failed because a 738 KB `.nfo` — which no
+    /// recovery set ever covered — was short a few articles. Health 999. Both
+    /// oracles deliver that job. So does the final move, which relocates the
+    /// working directory wholesale rather than a completeness-filtered
+    /// selection, so the bytes reach the user either way and refusing them buys
+    /// nothing.
+    ///
+    /// What survives is the *distinction*. An unprotected file short of
+    /// articles is ordinary Usenet damage: warn, deliver, never fail. A
+    /// protected file left incomplete after an authoritative pass is our own
+    /// reconciliation failing — the recovery set had a verdict for it either
+    /// way — and what to do about that turns on one question: are the verified
+    /// bytes still reachable?
+    ///
+    /// If they are (a real file of the described length, or a volume of a
+    /// direct set still routing), the defect is bookkeeping. Warn loudly, keep
+    /// the download. If they are not, the verdict is vouching for bytes that
+    /// are nowhere, and delivering the job would ship a hole as if it were
+    /// verified — so that, and only that, still fails.
+    pub(in crate::pipeline) fn classify_incomplete_after_par2(
         &self,
         job_id: JobId,
         reconciliation: &Par2Reconciliation,
         context: &str,
-    ) -> Option<String> {
+    ) -> Option<Par2IncompleteReport> {
         let state = self.jobs.get(&job_id)?;
         let incomplete: Vec<NzbFileId> = state
             .assembly
@@ -2787,6 +3064,10 @@ impl Pipeline {
                             ..
                         }
                     )
+                    // A part of a split set the verdict already joined is a
+                    // spent input, not an outstanding file: its bytes are
+                    // inside the output that was vouched for.
+                    && !self.par2_join_consumed_split_part(job_id, file.file_id())
             })
             .map(|file| file.file_id())
             .collect();
@@ -2801,6 +3082,25 @@ impl Pipeline {
             .into_iter()
             .partition(|file_id| self.resolve_par2_file_binding(*file_id).is_some());
 
+        // Files another recovery set describes. Only one set is served, so
+        // these bind to nothing here — but calling them unprotected would say
+        // no recovery ever covered them, when in truth a set that covers them
+        // was posted and this job simply cannot act on it. They are delivered
+        // either way; what changes is that the report tells the truth about
+        // why they were not repaired.
+        let (unserved_set, unprotected): (Vec<_>, Vec<_>) = unprotected
+            .into_iter()
+            .partition(|file_id| self.file_is_described_by_an_unserved_recovery_set(*file_id));
+
+        // Furniture the recovery set happens to cover. It is delivered as it
+        // stands — the verdict arm above already declined to spend a full-set
+        // read repairing it — so it never reaches the proven/unproven question
+        // that decides whether a protected file can fail a job.
+        let ignore_extensions = self.par2_ignore_extensions();
+        let (ignorable, protected): (Vec<_>, Vec<_>) = protected.into_iter().partition(|file_id| {
+            self.par2_bound_file_is_ignorable(job_id, *file_id, &ignore_extensions)
+        });
+
         let names = |ids: &[NzbFileId]| -> String {
             ids.iter()
                 .filter_map(|file_id| self.current_filename_for_file_id(job_id, *file_id))
@@ -2808,28 +3108,273 @@ impl Pipeline {
                 .join(", ")
         };
 
+        let (proven, unproven): (Vec<_>, Vec<_>) = protected
+            .into_iter()
+            .partition(|file_id| self.par2_output_presence_proven(job_id, *file_id));
+
         let mut parts = Vec::new();
         if !unprotected.is_empty() {
+            // Ordinary Usenet damage on a file no recovery set covered. It is
+            // delivered as-is, short articles and all, exactly as both oracles
+            // deliver it.
             parts.push(format!(
-                "{} unprotected file(s) could not be assembled from articles: {}",
+                "delivering {} unprotected file(s) short of articles, unrepairable by design: {}",
                 unprotected.len(),
                 names(&unprotected)
             ));
         }
-        if !protected.is_empty() {
-            let detail = if reconciliation.has_failures() {
+        if !unserved_set.is_empty() {
+            parts.push(format!(
+                "delivering {} file(s) protected by an unserved recovery set (multi-set NZB; \
+                 only one set is served): {}",
+                unserved_set.len(),
+                names(&unserved_set)
+            ));
+        }
+        if !ignorable.is_empty() {
+            parts.push(format!(
+                "delivering {} damaged ignorable file(s) the recovery set covered: {}",
+                ignorable.len(),
+                names(&ignorable)
+            ));
+        }
+        let detail = || {
+            if reconciliation.has_failures() {
                 reconciliation.failure_detail()
             } else {
                 "no PAR2 verdict claimed them".to_string()
-            };
+            }
+        };
+        if !proven.is_empty() {
             parts.push(format!(
-                "internal reconciliation failure — {} PAR2-protected file(s) stayed incomplete \
-                 after an authoritative verification ({}): {detail}",
-                protected.len(),
-                names(&protected)
+                "BUG: {} PAR2-protected file(s) stayed incomplete after an authoritative \
+                 verification vouched for them ({}): {}. The verified bytes are on disk and \
+                 are delivered; this is a reconciliation defect, not a download failure",
+                proven.len(),
+                names(&proven),
+                detail()
             ));
         }
-        Some(format!("{context}: {}", parts.join("; ")))
+        if !unproven.is_empty() {
+            parts.push(format!(
+                "{} PAR2-protected file(s) stayed incomplete and their verified bytes are \
+                 nowhere on disk ({}): {}",
+                unproven.len(),
+                names(&unproven),
+                detail()
+            ));
+        }
+        Some(Par2IncompleteReport {
+            message: format!("{context}: {}", parts.join("; ")),
+            unproven_protected: unproven.len(),
+        })
+    }
+
+    /// Incomplete data files the recovery set actually describes.
+    ///
+    /// The completion gate's question after a PAR2 verdict is not "is every
+    /// file whole" but "is anything left that PAR2 could still act on".
+    /// Ignorable furniture is not: it is delivered as it stands, so counting it
+    /// here would re-arm the gate on a file nothing is going to change.
+    pub(in crate::pipeline) fn incomplete_par2_protected_data_file_count(
+        &self,
+        job_id: JobId,
+    ) -> usize {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return 0;
+        };
+        let ignore_extensions = self.par2_ignore_extensions();
+        state
+            .assembly
+            .files()
+            .filter(|file| {
+                !file.is_complete()
+                    && !matches!(
+                        file.role(),
+                        weaver_model::files::FileRole::Par2 {
+                            is_index: false,
+                            ..
+                        }
+                    )
+                    && self.resolve_par2_file_binding(file.file_id()).is_some()
+                    && !self.par2_bound_file_is_ignorable(
+                        job_id,
+                        file.file_id(),
+                        &ignore_extensions,
+                    )
+                    && !self.par2_join_consumed_split_part(job_id, file.file_id())
+            })
+            .count()
+    }
+
+    /// Whether a settled verdict has left protected files outstanding whose
+    /// verified bytes are demonstrably still on disk.
+    ///
+    /// The same set [`Self::incomplete_par2_protected_data_file_count`] counts
+    /// — an incomplete data file the recovery set describes, furniture
+    /// excluded — narrowed to the case where every one of them can be shown to
+    /// be present at its described length.
+    ///
+    /// That narrowing carries the whole distinction. Bytes that are present
+    /// under a verdict which already vouched for them mean the download is
+    /// sound and our own binding is not, and re-reading the recovery set cannot
+    /// change either fact. Bytes that are absent or short mean something really
+    /// is missing, which is a question the authoritative pass alone can answer.
+    fn settled_verdict_left_only_proven_protected_files(&self, job_id: JobId) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let ignore_extensions = self.par2_ignore_extensions();
+        let outstanding: Vec<NzbFileId> = state
+            .assembly
+            .files()
+            .filter(|file| {
+                !file.is_complete()
+                    && !matches!(
+                        file.role(),
+                        weaver_model::files::FileRole::Par2 {
+                            is_index: false,
+                            ..
+                        }
+                    )
+                    && self.resolve_par2_file_binding(file.file_id()).is_some()
+                    && !self.par2_bound_file_is_ignorable(
+                        job_id,
+                        file.file_id(),
+                        &ignore_extensions,
+                    )
+                    && !self.par2_join_consumed_split_part(job_id, file.file_id())
+            })
+            .map(|file| file.file_id())
+            .collect();
+        !outstanding.is_empty()
+            && outstanding
+                .into_iter()
+                .all(|file_id| self.par2_output_presence_proven(job_id, file_id))
+    }
+
+    /// The ignore-extension list in force for this job.
+    ///
+    /// Process-global configuration, read where it is used rather than cached,
+    /// exactly as the repair memory limit is. The test hook exists so the
+    /// "override disables it" case can be exercised without mutating a
+    /// process-global environment other tests are reading concurrently.
+    fn par2_ignore_extensions(&self) -> Vec<String> {
+        #[cfg(test)]
+        if let Some(extensions) = self.par2_ignore_extensions_override.as_ref() {
+            return extensions.clone();
+        }
+        configured_par2_ignore_extensions()
+    }
+
+    /// Whether the file this assembly entry binds to is ignorable furniture,
+    /// judged by the name the recovery set describes it under as well as the
+    /// name it currently carries.
+    fn par2_bound_file_is_ignorable(
+        &self,
+        job_id: JobId,
+        file_id: NzbFileId,
+        ignore_extensions: &[String],
+    ) -> bool {
+        if ignore_extensions.is_empty() {
+            return false;
+        }
+        if self
+            .current_filename_for_file_id(job_id, file_id)
+            .is_some_and(|filename| par2_damage_ignorable(&filename, ignore_extensions))
+        {
+            return true;
+        }
+        self.resolve_par2_file_binding(file_id)
+            .and_then(|(par2_file_id, _, _, _)| {
+                self.par2_set(job_id)
+                    .and_then(|set| set.file_description(&par2_file_id))
+                    .map(|description| description.filename.clone())
+            })
+            .is_some_and(|filename| par2_damage_ignorable(&filename, ignore_extensions))
+    }
+
+    /// The damaged and missing descriptions in a verdict, when every one of
+    /// them is ignorable furniture.
+    ///
+    /// `None` means the ordinary repair/fail ladder applies: either the verdict
+    /// carries no damage at all, or something that is not furniture is damaged
+    /// too. That second case still fails on short recovery, and deliberately —
+    /// a payload file's missing slices are unknowns in every equation the solve
+    /// has, so the furniture's blocks cannot be excused out of it. Both
+    /// reference downloaders draw the line in the same place.
+    ///
+    /// A `Renamed` verdict is not damage but it is not this function's business
+    /// either: placement decides what to do with it, so its presence sends the
+    /// verdict down the ordinary path untouched.
+    fn par2_damage_is_only_ignorable(
+        &self,
+        verification: &par2_rs::VerificationResult,
+    ) -> Option<Vec<String>> {
+        let ignore_extensions = self.par2_ignore_extensions();
+        if ignore_extensions.is_empty() {
+            return None;
+        }
+        let mut ignorable = Vec::new();
+        for file in &verification.files {
+            if matches!(file.status, par2_rs::verify::FileStatus::Complete) {
+                continue;
+            }
+            if !matches!(
+                file.status,
+                par2_rs::verify::FileStatus::Damaged(_) | par2_rs::verify::FileStatus::Missing
+            ) {
+                return None;
+            }
+            if !par2_damage_ignorable(&file.filename, &ignore_extensions) {
+                return None;
+            }
+            ignorable.push(file.filename.clone());
+        }
+        (!ignorable.is_empty()).then_some(ignorable)
+    }
+
+    /// Whether the bytes a PAR2 verdict vouched for are still reachable.
+    ///
+    /// Two ways they can be: a real file of the described length at the
+    /// canonical or the current name, or a volume of a direct set that is still
+    /// routing — those are verified through the set's own access layer and are
+    /// never written under their own name, so having no file is what correct
+    /// looks like for them.
+    fn par2_output_presence_proven(&self, job_id: JobId, file_id: NzbFileId) -> bool {
+        let Some((par2_file_id, described_length, current_path, _)) =
+            self.resolve_par2_file_binding(file_id)
+        else {
+            return false;
+        };
+        if self
+            .direct_par2_overlay(job_id)
+            .and_then(|overlay| overlay.owner_of(&par2_file_id))
+            .and_then(|index| self.direct_store.set(job_id, index))
+            .is_some_and(|set| !set.is_demoted() && !set.is_finalized())
+        {
+            return true;
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let canonical = self
+            .par2_set(job_id)
+            .and_then(|set| set.file_description(&par2_file_id))
+            .map(|desc| {
+                state
+                    .working_dir
+                    .join(sanitize_download_filename(&desc.filename))
+            });
+        canonical
+            .into_iter()
+            .chain(std::iter::once(current_path))
+            .any(|path| {
+                std::fs::metadata(&path)
+                    .ok()
+                    .filter(|meta| meta.is_file())
+                    .is_some_and(|meta| meta.len() == described_length)
+            })
     }
 
     /// Reconcile a PAR2 verification onto the assembly, then decide whether what
@@ -2866,10 +3411,14 @@ impl Pipeline {
         if has_crc_failures {
             return Ok(());
         }
-        match self.classify_incomplete_after_par2(job_id, &reconciliation, context) {
-            Some(message) => Err(message),
-            None => Ok(()),
+        if let Some(report) = self.classify_incomplete_after_par2(job_id, &reconciliation, context)
+        {
+            if report.unproven_protected > 0 {
+                return Err(report.message);
+            }
+            warn!(job_id = job_id.0, "{}", report.message);
         }
+        Ok(())
     }
 
     /// Everything that happens after the repairer returns, for every path that
@@ -2908,6 +3457,11 @@ impl Pipeline {
         outcome: par2_rs::Par2RepairOutcome,
         has_crc_failures: bool,
     ) {
+        // Covers the whole tail including every failure exit below, which the
+        // per-stage stamps cannot: a repair that is rejected still spent the
+        // time it spent.
+        let _finish_scope = crate::runtime::perf_probe::scope("par2_repair.finish");
+        let mut stage_start = std::time::Instant::now();
         let slices_repaired = par2_repair_slices_repaired(pre_repair);
         info!(
             job_id = job_id.0,
@@ -2935,6 +3489,8 @@ impl Pipeline {
             Ok(result) => result,
             Err(message) => return self.fail_par2_repair(job_id, message),
         };
+        stage_start =
+            note_par2_repair_stage(job_id, "par2_repair.finish.verify_repaired", stage_start);
 
         if par2_verification_needs_repair(&post_repair_verification) {
             let msg = format!(
@@ -2947,6 +3503,7 @@ impl Pipeline {
         // Rename obfuscated files using PAR2 metadata (16KB hash matching).
         // Must happen after repair and before extraction retry/finalize.
         self.try_deobfuscate_files_with_par2(job_id).await;
+        stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.deobfuscate", stage_start);
         if let Err(error) = self
             .apply_placement_plan_for_retry_or_repair(
                 job_id,
@@ -2957,15 +3514,22 @@ impl Pipeline {
         {
             return self.fail_par2_repair(job_id, error);
         }
+        stage_start =
+            note_par2_repair_stage(job_id, "par2_repair.finish.apply_placement", stage_start);
         self.retry_par2_authoritative_identity(job_id).await;
+        stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.identity", stage_start);
         if let Err(error) = self
             .register_verified_par2_rar_outputs(job_id, &post_repair_verification)
             .await
         {
             return self.fail_par2_repair(job_id, error);
         }
+        stage_start =
+            note_par2_repair_stage(job_id, "par2_repair.finish.register_outputs", stage_start);
         self.refresh_verified_complete_archive_topologies(job_id, &post_repair_verification)
             .await;
+        stage_start =
+            note_par2_repair_stage(job_id, "par2_repair.finish.refresh_topologies", stage_start);
         if let Err(error) = self
             .reconcile_and_classify_par2_verification(
                 job_id,
@@ -2977,6 +3541,7 @@ impl Pipeline {
         {
             return self.fail_par2_repair(job_id, error);
         }
+        stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.reconcile", stage_start);
         // Repair rewrote bytes; digests streamed before it describe content
         // that is gone. Every `Complete` entry in the merged result is vouched
         // by a pass that read the disk — the files the repair rewrote by the
@@ -2989,9 +3554,16 @@ impl Pipeline {
         {
             return self.fail_par2_repair(job_id, error);
         }
+        stage_start =
+            note_par2_repair_stage(job_id, "par2_repair.finish.refresh_hashes", stage_start);
 
-        // Installed, verified, bound to the assembly and persisted. Only now is
-        // the repair a fact worth announcing.
+        // Installed, verified, bound to the assembly and persisted. The repair
+        // has been accepted, so its leftovers stop being evidence and start
+        // being clutter that finalization would deliver.
+        self.purge_par2_repair_leftovers(job_id);
+        stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.purge", stage_start);
+
+        // Only now is the repair a fact worth announcing.
         //
         // Low-frequency: one observation per job-level repair, never on a
         // per-segment path. Records the metric next to the event that already
@@ -3006,6 +3578,8 @@ impl Pipeline {
         });
 
         self.mark_par2_verified(job_id).await;
+        stage_start =
+            note_par2_repair_stage(job_id, "par2_repair.finish.mark_verified", stage_start);
         self.transition_postprocessing_status(job_id, JobStatus::Downloading, Some("downloading"));
 
         if has_crc_failures {
@@ -3026,10 +3600,12 @@ impl Pipeline {
         if has_crc_failures || self.job_has_live_rar_waiting_for_missing_volumes(job_id) {
             self.retry_archive_extraction_after_verify_or_repair(job_id)
                 .await;
+            note_par2_repair_stage(job_id, "par2_repair.finish.retry_extraction", stage_start);
             return;
         }
 
         self.reconcile_job_progress(job_id).await;
+        note_par2_repair_stage(job_id, "par2_repair.finish.reconcile_progress", stage_start);
         self.schedule_job_completion_check(job_id);
     }
 
@@ -3038,7 +3614,73 @@ impl Pipeline {
     /// Every non-success exit from [`Self::finish_par2_repair`] comes through
     /// here, so a job can no longer fail silently after `RepairComplete` has
     /// already told the UI that the repair held.
-    fn fail_par2_repair(&mut self, job_id: JobId, error: String) {
+    /// Remove what the repair left behind, now that the repair has been
+    /// accepted.
+    ///
+    /// Mirrors NZBGet's `DeleteLeftovers()`, which it reaches only from the
+    /// branch where `Process(true)` came back successful, and SABnzbd's
+    /// `deletables` after a finished repair. The gating is the whole point: on
+    /// any failure these files are the evidence, and this is not reached.
+    ///
+    /// Only entries that *appeared during* the repair are candidates, and only
+    /// when they are neither an NZB entry under any of its names nor a file the
+    /// recovery set describes. A file the repair reconstructed from `Missing`
+    /// lands at a described name and is therefore never a candidate — the test
+    /// is membership, not a suffix convention borrowed from another crate.
+    pub(in crate::pipeline) fn purge_par2_repair_leftovers(&mut self, job_id: JobId) {
+        let Some(before) = self.par2_pre_repair_dir_entries.remove(&job_id) else {
+            return;
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let working_dir = state.working_dir.clone();
+
+        let mut keep = HashSet::<String>::new();
+        for file in state.assembly.files() {
+            keep.insert(sanitize_download_filename(file.filename()));
+            if let Some(identity) = self.effective_file_identity(job_id, file.file_id()) {
+                keep.insert(sanitize_download_filename(&identity.current_filename));
+                keep.insert(sanitize_download_filename(&identity.source_filename));
+                if let Some(canonical) = identity.canonical_filename.as_ref() {
+                    keep.insert(sanitize_download_filename(canonical));
+                }
+            }
+        }
+        if let Some(set) = self.par2_set(job_id) {
+            for desc in set.files.values() {
+                keep.insert(sanitize_download_filename(&desc.filename));
+            }
+        }
+
+        for name in directory_entry_names(&working_dir) {
+            if before.contains(&name) || keep.contains(&sanitize_download_filename(&name)) {
+                continue;
+            }
+            let path = working_dir.join(&name);
+            if !path.is_file() {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => info!(
+                    job_id = job_id.0,
+                    path = %path.display(),
+                    "removed repair leftover after acceptance"
+                ),
+                Err(error) => warn!(
+                    job_id = job_id.0,
+                    path = %path.display(),
+                    error = %error,
+                    "could not remove repair leftover"
+                ),
+            }
+        }
+    }
+
+    pub(in crate::pipeline) fn fail_par2_repair(&mut self, job_id: JobId, error: String) {
+        // Dropped unread: the artefacts stay on disk for diagnosis, and the
+        // snapshot must not survive into the next attempt.
+        self.par2_pre_repair_dir_entries.remove(&job_id);
         warn!(job_id = job_id.0, error = %error, "PAR2 repair failed");
         // Low-frequency: one observation per job-level repair, never on a
         // per-segment path. Records the metric next to the event that already
@@ -3293,7 +3935,174 @@ impl Pipeline {
             self.refresh_archive_state_for_completed_file(job_id, *file_id, false)
                 .await;
         }
+        // Every arm that accepts a verdict passes through here on its way to
+        // reconciliation, so a set the verdict has already joined is retired in
+        // one place rather than at each of them.
+        self.retire_par2_joined_split_topologies(job_id, verification);
         file_ids.len()
+    }
+
+    /// Retire the split topologies a verdict has already produced the output of.
+    ///
+    /// A plain split posting ships `<name>.001/.002/.003` while its recovery
+    /// data is computed over `<name>` — a file the posting never carries. The
+    /// recovery pass reads the parts as one file and installs `<name>` itself,
+    /// so by the time a verdict vouches for it the join has happened. Running
+    /// the joiner afterwards writes the parts' bytes back over the output that
+    /// was just verified, and waiting for every part to be whole fails a job
+    /// whose payload is already on disk and proven.
+    ///
+    /// The match is a plain key lookup: a split topology is named by
+    /// `archive_base_name` of its parts, which is exactly the joined-output
+    /// name, so a verdict naming the *parts* — the ordinary shape, where the
+    /// recovery set protects what the posting actually carries — finds no
+    /// topology and retires nothing.
+    ///
+    /// Paths are checked before use, as they are for rebuilt RAR volumes: a
+    /// PAR2 description names its own file, so an absolute path or one
+    /// containing `..` is refused rather than resolved.
+    fn retire_par2_joined_split_topologies(
+        &mut self,
+        job_id: JobId,
+        verification: &par2_rs::VerificationResult,
+    ) -> usize {
+        let Some(par2_set) = self.par2_set(job_id).cloned() else {
+            return 0;
+        };
+
+        let mut retired = 0usize;
+        for file in &verification.files {
+            if !matches!(file.status, par2_rs::verify::FileStatus::Complete) {
+                continue;
+            }
+            let path = Path::new(&file.filename);
+            if file.filename.is_empty()
+                || !path.is_relative()
+                || !path
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                continue;
+            }
+            let is_split_set = self.jobs.get(&job_id).is_some_and(|state| {
+                state
+                    .assembly
+                    .archive_topology_for(&file.filename)
+                    .is_some_and(|topology| {
+                        topology.archive_type == crate::jobs::assembly::ArchiveType::Split
+                    })
+            });
+            if !is_split_set {
+                continue;
+            }
+
+            // The verdict says the bytes hashed; this says they are still where
+            // the job can deliver them from, at the length the set describes.
+            let described_length = par2_set
+                .files
+                .values()
+                .find(|description| description.filename == file.filename)
+                .map(|description| description.length);
+            let output_present = self
+                .resolve_job_input_path(job_id, &file.filename)
+                .and_then(|path| std::fs::metadata(path).ok())
+                .is_some_and(|metadata| {
+                    metadata.is_file() && Some(metadata.len()) == described_length
+                });
+            if !output_present {
+                continue;
+            }
+
+            let Some(state) = self.jobs.get_mut(&job_id) else {
+                return retired;
+            };
+            let Some(topology) = state.assembly.remove_archive_topology(&file.filename) else {
+                continue;
+            };
+            let parts: HashSet<String> = topology.volume_map.keys().cloned().collect();
+            info!(
+                job_id = job_id.0,
+                set_name = %file.filename,
+                parts = parts.len(),
+                "recovery set produced the joined output — retiring the split topology"
+            );
+            self.par2_joined_split_sets
+                .entry(job_id)
+                .or_default()
+                .insert(file.filename.clone(), parts);
+            retired += 1;
+        }
+
+        retired
+    }
+
+    /// Whether a file is a posted part of a split set a verdict has already
+    /// joined.
+    ///
+    /// Such a part is a consumed input, not payload the job is short of: its
+    /// bytes are inside the output the recovery set vouched for, and there is
+    /// nothing left to download, repair or wait for. It therefore belongs in
+    /// none of the post-verdict incomplete buckets — which matters most for the
+    /// *first* part, whose 16 KiB prefix is the joined file's own, so PAR2
+    /// content identity answers the joined description with it.
+    fn par2_join_consumed_split_part(&self, job_id: JobId, file_id: NzbFileId) -> bool {
+        let Some(sets) = self.par2_joined_split_sets.get(&job_id) else {
+            return false;
+        };
+        if sets.is_empty() {
+            return false;
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let Some(file) = state.assembly.file(file_id) else {
+            return false;
+        };
+        let current = self.current_filename_for_file(job_id, file);
+        sets.values()
+            .any(|parts| parts.contains(&current) || parts.contains(file.filename()))
+    }
+
+    /// The parts of every split set a verdict has joined for this job.
+    pub(in crate::pipeline) fn par2_joined_split_part_names(&self, job_id: JobId) -> Vec<String> {
+        self.par2_joined_split_sets
+            .get(&job_id)
+            .map(|sets| sets.values().flatten().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Delete the parts a verified join consumed, before finalization ships
+    /// them alongside the file they joined into.
+    ///
+    /// This is the same removal the post-extraction cleanups perform for the
+    /// sources of an archive that was extracted, on the same unconditional
+    /// terms: the join happened, so the parts are spent inputs.
+    pub(in crate::pipeline) async fn cleanup_par2_joined_split_parts(&mut self, job_id: JobId) {
+        let parts = self.par2_joined_split_part_names(job_id);
+        if parts.is_empty() {
+            return;
+        }
+        let mut removed = 0u32;
+        for filename in &parts {
+            let Some(path) = self.resolve_job_input_path(job_id, filename) else {
+                continue;
+            };
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => warn!(
+                    file = %path.display(),
+                    error = %error,
+                    "failed to clean up a joined split part"
+                ),
+            }
+        }
+        info!(
+            job_id = job_id.0,
+            removed,
+            total = parts.len(),
+            "removed the split parts a verified join consumed"
+        );
     }
 
     /// Register RAR volumes that PAR2 *rebuilt* and that the NZB never carried.
@@ -3791,7 +4600,24 @@ impl Pipeline {
                 !state.download_queue.is_empty(),
             )
         };
-        let has_incomplete_data_files = complete_data_files < total_data_files;
+        // Once PAR2 has ruled on this job, a data file the recovery set never
+        // described stops being something this gate can act on: there is no
+        // repair for it and no download left to try, so counting it here only
+        // keeps the job out of finalization for good. That is the livelock
+        // removing the veto exposed — an unprotected `.nfo` three articles
+        // short kept `needs_completion_repair_evaluation` true, and the gate
+        // re-ran a full authoritative pass over a gigabyte every two seconds,
+        // forever.
+        //
+        // Both oracles stop counting at the same place. NZBGet's health
+        // failure requires par to have been *skipped*; SABnzbd's verdict is the
+        // PAR result alone. A file PAR2 *does* describe still counts, because
+        // for that one a verdict and a repair are genuinely still possible.
+        let has_incomplete_data_files = if self.par2_verified.contains(&job_id) {
+            self.incomplete_par2_protected_data_file_count(job_id) > 0
+        } else {
+            complete_data_files < total_data_files
+        };
 
         // Step 1: Are all data files (non-recovery) complete?
         {
@@ -3880,6 +4706,13 @@ impl Pipeline {
         let par2_verdict_stale_after_failed_extraction = self.par2_verified.contains(&job_id)
             && has_crc_failures
             && self.job_has_live_rar_waiting_for_absent_volumes(job_id);
+        if par2_verdict_stale_after_failed_extraction
+            && let Some(runtime) = self.par2_runtime.get_mut(&job_id)
+        {
+            // A reopened verdict is owed a fresh pass, so the post-verdict
+            // re-entry budget starts over with it.
+            runtime.post_verdict_reconcile_attempts = 0;
+        }
         let par2_verdict_open =
             !self.par2_verified.contains(&job_id) || par2_verdict_stale_after_failed_extraction;
         let par2_may_still_rule = par2_loaded && !par2_bypassed && par2_verdict_open;
@@ -3964,6 +4797,22 @@ impl Pipeline {
             }
             CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None => true,
         };
+        // What the quick pass can be blocked by: a file the recovery set
+        // *describes*, not any short file in the posting.
+        //
+        // Post-verdict this is already the question `has_incomplete_data_files`
+        // asks; asking it the same way before a verdict exists is what stops a
+        // clean payload beside a short unprotected file from paying for a
+        // whole-set read every time. Nothing is loosened by it: the quick pass
+        // skips incomplete files outright, so a described file that is short
+        // lands in its `unresolved` bucket and the pass declines, exactly as it
+        // does today. Only a file the set never describes — which the pass
+        // could not have spoken for either way — stops standing in the way.
+        let described_data_files_incomplete = if par2_loaded {
+            self.incomplete_par2_protected_data_file_count(job_id) > 0
+        } else {
+            has_incomplete_data_files
+        };
         let quick_par2_verification_allowed = par2_validation_needed
             && !matches!(current_status, JobStatus::Repairing)
             // A set waiting on a volume that never posted needs the
@@ -3976,7 +4825,7 @@ impl Pipeline {
             // own — swap correction, and the eager-delete retry frontier — and
             // forcing the authoritative pass there loses both.
             && !missing_rar_volume_par2_repair_ready
-            && (!has_incomplete_data_files || !download_pipeline_exhausted)
+            && (!described_data_files_incomplete || !download_pipeline_exhausted)
             && clean_par2_integrity_gate_allows_fast_path;
         let needs_completion_repair_evaluation = has_crc_failures
             || (has_incomplete_data_files && download_pipeline_exhausted)
@@ -4239,6 +5088,18 @@ impl Pipeline {
                 return;
             }
 
+            // Every promoted recovery wave has settled by here, so a volume
+            // still short of articles is short for good. Its surviving packets
+            // are read back before the set is cloned for the passes below:
+            // whichever of them runs, its view of how much recovery this job
+            // has is the merged set, and so is the fail-fast arithmetic that
+            // decides whether to wait, repair, or give up.
+            self.salvage_partial_promoted_recovery_volumes(job_id).await;
+
+            // Latched, so a posting carrying more than one recovery set says so
+            // once rather than on every entry to this gate.
+            self.warn_unserved_recovery_sets_once(job_id);
+
             let par2_set = self.par2_set(job_id).cloned();
 
             if par2_set.is_some() {
@@ -4455,14 +5316,31 @@ impl Pipeline {
                     if let par2_rs::verify::Repairability::ResourceLimited { reason } =
                         &verification.repairable
                     {
-                        let msg = format!("PAR2 verification resource limit exceeded: {reason}");
+                        let msg = par2_resource_limit_message(reason);
                         warn!(job_id = job_id.0, error = %msg);
                         self.fail_job(job_id, msg);
                         return;
                     }
 
-                    if !par2_verification_needs_repair(verification) {
-                        info!(job_id = job_id.0, "PAR2 analysis passed — no repair needed");
+                    // Damage confined to furniture is delivered rather than
+                    // repaired: rebuilding one slice of an `.nfo` would force a
+                    // read of the whole set to assemble the decode matrix, and
+                    // the file is shipped as-is either way if the blocks are
+                    // short. Anything else damaged alongside it sends the
+                    // verdict down the ordinary ladder, which repairs the
+                    // furniture in the same pass at no extra cost.
+                    let ignorable_damage = self.par2_damage_is_only_ignorable(verification);
+                    if !par2_verification_needs_repair(verification) || ignorable_damage.is_some() {
+                        if let Some(ignorable) = ignorable_damage.as_ref() {
+                            warn!(
+                                job_id = job_id.0,
+                                "delivering {} damaged ignorable file(s) without repair: {}",
+                                ignorable.len(),
+                                ignorable.join(", ")
+                            );
+                        } else {
+                            info!(job_id = job_id.0, "PAR2 analysis passed — no repair needed");
+                        }
 
                         self.retry_par2_authoritative_identity(job_id).await;
                         self.refresh_verified_complete_archive_topologies(job_id, verification)
@@ -4632,6 +5510,67 @@ impl Pipeline {
                     }
                 }
 
+                // A settled verdict re-entered because a *protected* file is
+                // still incomplete while its verified bytes sit on disk.
+                //
+                // Nothing about the recovery set has changed, so reading it
+                // again — seconds of it, over the whole payload — can only
+                // return the verdict it already returned, and the reconciler
+                // that failed to bind the file will fail to bind it again. The
+                // recovery set had an answer for that file either way, so the
+                // only thing that can put a job here is our own bookkeeping. It
+                // gets exactly one more lap to settle and is then reported as
+                // the bug it is: a named, reproducible failure beats an
+                // invisible loop burning a core.
+                //
+                // Two neighbouring states deliberately keep their read:
+                //
+                //  - A protected file whose bytes are not on disk, or are short
+                //    of the described length. Something really is missing
+                //    there, and the authoritative pass is the only thing that
+                //    names which blocks a recovery promotion has to fetch — a
+                //    set waiting on a volume that never posted arrives at this
+                //    gate in exactly that shape.
+                //  - A failed extraction. The pass it runs is also what applies
+                //    the placement correction that can make the retry succeed,
+                //    and there is no way to obtain that without a verification.
+                //    That path carries a single-retry latch of its own.
+                if !par2_verdict_open
+                    && !has_crc_failures
+                    && self.settled_verdict_left_only_proven_protected_files(job_id)
+                {
+                    let attempts = {
+                        let runtime = self.ensure_par2_runtime(job_id);
+                        runtime.post_verdict_reconcile_attempts =
+                            runtime.post_verdict_reconcile_attempts.saturating_add(1);
+                        runtime.post_verdict_reconcile_attempts
+                    };
+                    if attempts > 1 {
+                        let message = self
+                            .classify_incomplete_after_par2(
+                                job_id,
+                                &Par2Reconciliation::default(),
+                                "PAR2 verdict settled but reconciliation left files outstanding",
+                            )
+                            .map(|report| report.message)
+                            .unwrap_or_else(|| {
+                                "BUG: PAR2-protected file(s) stayed incomplete after a settled \
+                                 verification"
+                                    .to_string()
+                            });
+                        warn!(job_id = job_id.0, error = %message);
+                        self.fail_job(job_id, message);
+                        return;
+                    }
+                    info!(
+                        job_id = job_id.0,
+                        "PAR2 verdict is settled — retrying reconciliation once instead of \
+                         re-reading the recovery set"
+                    );
+                    self.reconcile_job_progress(job_id).await;
+                    return;
+                }
+
                 let emit_verification_events = !has_crc_failures
                     || !self.par2_verified.contains(&job_id)
                     || authoritative_par2_verification_needed
@@ -4702,17 +5641,29 @@ impl Pipeline {
                 if let par2_rs::verify::Repairability::ResourceLimited { reason } =
                     &verification.repairable
                 {
-                    let msg = format!("PAR2 verification resource limit exceeded: {reason}");
+                    let msg = par2_resource_limit_message(reason);
                     warn!(job_id = job_id.0, error = %msg);
                     self.fail_job(job_id, msg);
                     return;
                 }
 
-                if !par2_verification_needs_repair(&verification) {
-                    info!(
-                        job_id = job_id.0,
-                        "PAR2 verification passed — no damaged slices"
-                    );
+                // The same furniture rule the analysis arm applies, stated once
+                // per arm because each owns its own ladder.
+                let ignorable_damage = self.par2_damage_is_only_ignorable(&verification);
+                if !par2_verification_needs_repair(&verification) || ignorable_damage.is_some() {
+                    if let Some(ignorable) = ignorable_damage.as_ref() {
+                        warn!(
+                            job_id = job_id.0,
+                            "delivering {} damaged ignorable file(s) without repair: {}",
+                            ignorable.len(),
+                            ignorable.join(", ")
+                        );
+                    } else {
+                        info!(
+                            job_id = job_id.0,
+                            "PAR2 verification passed — no damaged slices"
+                        );
+                    }
 
                     // Rename obfuscated files using PAR2 metadata even when
                     // verification is clean (files may be intact but obfuscated).
@@ -4854,7 +5805,7 @@ impl Pipeline {
                     if let par2_rs::verify::Repairability::ResourceLimited { reason } =
                         &repair_preview.verification.repairable
                     {
-                        let msg = format!("PAR2 verification resource limit exceeded: {reason}");
+                        let msg = par2_resource_limit_message(reason);
                         warn!(job_id = job_id.0, error = %msg);
                         self.fail_job(job_id, msg);
                         return;
@@ -5091,6 +6042,11 @@ impl Pipeline {
                 if !par2_bypassed {
                     self.cleanup_par2_files(job_id).await;
                 }
+                // A split set the recovery data joined for us lands here rather
+                // than in the extraction arm, so its spent parts are removed
+                // here too — the final move relocates the whole directory, and
+                // the parts are not part of the release.
+                self.cleanup_par2_joined_split_parts(job_id).await;
                 // No archives — move to complete and finish.
                 if let Err(error) = self.start_move_to_complete(job_id).await {
                     self.fail_job(job_id, error);
@@ -5168,6 +6124,7 @@ impl Pipeline {
                     for topology in state.assembly.archive_topologies().values() {
                         cleanup_files.extend(topology.volume_map.keys().cloned());
                     }
+                    cleanup_files.extend(self.par2_joined_split_part_names(job_id));
                     cleanup_files
                 };
                 let nested_decision = match self.maybe_start_nested_extraction(job_id).await {
@@ -5647,6 +6604,52 @@ mod tests {
             parse_par2_repair_memory_limit_bytes(Some("0")),
             default_bytes
         );
+    }
+
+    #[test]
+    fn par2_ignore_extensions_default_to_the_baked_metadata_set() {
+        assert_eq!(
+            parse_par2_ignore_extensions(None),
+            DEFAULT_PAR2_IGNORE_EXTENSIONS
+                .iter()
+                .map(|extension| (*extension).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(parse_par2_ignore_extensions(None).contains(&"nfo".to_string()));
+        assert!(parse_par2_ignore_extensions(None).contains(&"sfv".to_string()));
+    }
+
+    #[test]
+    fn an_empty_par2_ignore_extension_override_disables_the_rule() {
+        assert!(parse_par2_ignore_extensions(Some("")).is_empty());
+        assert!(parse_par2_ignore_extensions(Some("   ")).is_empty());
+        assert!(!par2_damage_ignorable(
+            "silver.horizon.nfo",
+            &parse_par2_ignore_extensions(Some(""))
+        ));
+    }
+
+    #[test]
+    fn par2_ignore_extensions_accept_both_separators_and_normalize_entries() {
+        assert_eq!(
+            parse_par2_ignore_extensions(Some(" .NFO, sfv ;nfo;.Srr ")),
+            vec!["nfo".to_string(), "sfv".to_string(), "srr".to_string()]
+        );
+    }
+
+    #[test]
+    fn par2_damage_is_ignorable_by_extension_only() {
+        let extensions = parse_par2_ignore_extensions(None);
+        assert!(par2_damage_ignorable("silver.horizon.nfo", &extensions));
+        assert!(par2_damage_ignorable("SILVER.HORIZON.SFV", &extensions));
+        // The extension is the file's own, not a substring of its name: a
+        // payload that merely mentions one of these words is still payload.
+        assert!(!par2_damage_ignorable(
+            "silver.horizon.nfo.mkv",
+            &extensions
+        ));
+        assert!(!par2_damage_ignorable("silver.horizon.mkv", &extensions));
+        assert!(!par2_damage_ignorable("nfo", &extensions));
     }
 
     #[test]

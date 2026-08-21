@@ -244,6 +244,7 @@ const ko: LocaleDictionary = {
   "history.filterFailure": "실패",
   "history.searchPlaceholder": "이름, 카테고리 또는 경로로 기록 필터링",
   "history.noMatches": "현재 필터와 일치하는 기록 작업이 없습니다.",
+  "queue.noMatches": "현재 필터와 일치하는 대기열 작업이 없습니다.",
   "table.health": "상태",
   "table.category": "카테고리",
   "table.rowsPerPage": "페이지당 행 수",

@@ -73,6 +73,24 @@ struct RecoveryCandidate {
     source: RecoveryCountSource,
 }
 
+/// What reading a PAR2 file off disk turned out to be.
+///
+/// The distinction is made while the packets are still in the parse task,
+/// because it decides whether they are merged into the set already being served
+/// or built into a set of their own.
+enum ParsedPar2Metadata {
+    /// Packets belonging to the recovery set this job already serves.
+    ServedSet {
+        packets: Vec<par2_rs::Packet>,
+        observed: Vec<par2_rs::RecoverySetId>,
+    },
+    /// A set built from packets that answer to nobody currently served.
+    OtherSet {
+        set: Par2FileSet,
+        observed: Vec<par2_rs::RecoverySetId>,
+    },
+}
+
 fn par2_recovery_packet_size(slice_size: u64) -> u64 {
     let raw = slice_size.saturating_add(PAR2_RECOVERY_PACKET_OVERHEAD);
     let rem = raw % PAR2_PACKET_ALIGNMENT;
@@ -97,6 +115,32 @@ fn recovery_file_role(spec: &JobSpec, file_index: u32) -> Option<weaver_model::f
     spec.files
         .get(file_index as usize)
         .map(|file| file.role.clone())
+}
+
+/// The name a PAR2 file's whole collection shares: the filename with its
+/// `.par2` extension and any `.volNNN+CCC` part removed.
+///
+/// This is how a recovery volume is grouped onto a set when nothing has parsed
+/// its packets yet — `holiday.mkv.vol00+08.par2` and `holiday.mkv.par2` both
+/// reduce to `holiday.mkv`, so the volume is recognizably part of that
+/// collection before a byte of it has been read. Case is folded because the
+/// convention is not consistently cased on the wire, and the separator may be
+/// `+` or `-` for the same reason.
+///
+/// `None` means the name does not follow the convention at all, which callers
+/// read as "no opinion" rather than as "not this set" — an obfuscated posting
+/// names nothing recognizably, and refusing its volumes would cost it every
+/// recovery block it has.
+fn par2_set_base_name(filename: &str) -> Option<String> {
+    let lower = filename.trim().to_ascii_lowercase();
+    let stem = lower.strip_suffix(".par2")?;
+    let base = match stem.rfind('.') {
+        Some(dot) if stem[dot..].starts_with(".vol") && stem[dot + 4..].contains(['+', '-']) => {
+            &stem[..dot]
+        }
+        _ => stem,
+    };
+    (!base.is_empty()).then(|| base.to_string())
 }
 
 fn reserve_identity_filenames(
@@ -545,6 +589,60 @@ impl Pipeline {
         })
     }
 
+    /// Every name a file could be described under, sanitized.
+    ///
+    /// Sanitized on the way out, because these are matched against sanitized
+    /// descriptions. Comparing a raw posted name to a sanitized one silently
+    /// loses the binding — and with it in-stream verification for that file —
+    /// for every name that needed sanitizing at all.
+    fn par2_binding_candidate_names(&self, file_id: NzbFileId) -> Option<HashSet<String>> {
+        let state = self.jobs.get(&file_id.job_id)?;
+        let file = state.assembly.file(file_id)?;
+        let current_filename = self.current_filename_for_file(file_id.job_id, file);
+        let mut names = HashSet::from([
+            sanitize_download_filename(&current_filename),
+            sanitize_download_filename(file.filename()),
+        ]);
+        if let Some(identity) = self.effective_file_identity(file_id.job_id, file_id) {
+            names.insert(sanitize_download_filename(&identity.source_filename));
+            if let Some(canonical) = identity.canonical_filename.as_ref() {
+                names.insert(sanitize_download_filename(canonical));
+            }
+        }
+        Some(names)
+    }
+
+    /// Whether a recovery set the job knows about but does not serve is the one
+    /// that describes this file.
+    ///
+    /// Only one set is served, so a file belonging to any other binds to
+    /// nothing — and would otherwise be reported as though no recovery had ever
+    /// covered it, which is a different and much worse story than the truth.
+    pub(in crate::pipeline) fn file_is_described_by_an_unserved_recovery_set(
+        &self,
+        file_id: NzbFileId,
+    ) -> bool {
+        let Some(runtime) = self.par2_runtime(file_id.job_id) else {
+            return false;
+        };
+        let Some(primary_id) = runtime.set.as_ref().map(|set| set.recovery_set_id) else {
+            return false;
+        };
+        let Some(names) = self.par2_binding_candidate_names(file_id) else {
+            return false;
+        };
+        runtime
+            .known_sets
+            .iter()
+            .filter(|(set_id, _)| **set_id != primary_id)
+            .any(|(_, summary)| {
+                summary
+                    .described_filenames
+                    .iter()
+                    .any(|described| names.contains(described))
+            })
+    }
+
     /// Bind one pipeline file to the single PAR2 description that names it.
     ///
     /// This is the dual-CRC grid's name-to-description resolver: it is what
@@ -560,20 +658,7 @@ impl Pipeline {
         let state = self.jobs.get(&file_id.job_id)?;
         let file = state.assembly.file(file_id)?;
         let current_filename = self.current_filename_for_file(file_id.job_id, file);
-        // Sanitized on the way in, because they are matched against sanitized
-        // descriptions below. Comparing a raw posted name to a sanitized one
-        // silently loses the binding — and with it in-stream verification for
-        // that file — for every name that needed sanitizing at all.
-        let mut names = HashSet::from([
-            sanitize_download_filename(&current_filename),
-            sanitize_download_filename(file.filename()),
-        ]);
-        if let Some(identity) = self.effective_file_identity(file_id.job_id, file_id) {
-            names.insert(sanitize_download_filename(&identity.source_filename));
-            if let Some(canonical) = identity.canonical_filename.as_ref() {
-                names.insert(sanitize_download_filename(canonical));
-            }
-        }
+        let names = self.par2_binding_candidate_names(file_id)?;
         let candidates = set
             .files
             .iter()
@@ -1090,6 +1175,20 @@ impl Pipeline {
 
         if let Some(runtime) = self.par2_runtime(job_id) {
             for (&file_index, file) in &runtime.files {
+                // A salvaged volume's block count covers only the packets that
+                // survived it, while its declared byte total covers the whole
+                // file — so subtracting one from the other reports the missing
+                // packets as metadata overhead. That outlier would drag the
+                // median this returns, and with it every size-derived estimate.
+                if file.salvaged {
+                    continue;
+                }
+                // Another set's volumes are sized against another set's slice
+                // size, and mixing them into this median mis-calibrates every
+                // size-derived estimate the served set makes.
+                if !self.recovery_file_serves_primary_set(job_id, file_index) {
+                    continue;
+                }
                 let blocks = file.recovery_blocks;
                 let Some(total_bytes) = recovery_file_bytes(&state.spec, file_index) else {
                     continue;
@@ -1214,17 +1313,43 @@ impl Pipeline {
             return;
         }
 
+        let incumbent_id = self.par2_set(job_id).map(|set| set.recovery_set_id);
         let parse_path = file_path.clone();
-        let par2_set = match tokio::task::spawn_blocking(move || {
-            let packets = par2_rs::scan_packets_from_path(&parse_path)?
-                .into_iter()
-                .map(|(packet, _)| packet)
-                .collect::<Vec<_>>();
-            par2_rs::Par2FileSet::from_packets(packets)
+        let parsed = match tokio::task::spawn_blocking(move || {
+            let scanned = par2_rs::scan_packets_from_path_with_set_ids(&parse_path)?;
+            let mut observed: Vec<par2_rs::RecoverySetId> = Vec::new();
+            for packet in &scanned {
+                if !observed.contains(&packet.recovery_set_id) {
+                    observed.push(packet.recovery_set_id);
+                }
+            }
+            // A file that speaks for the set already being served is merged into
+            // it, never used to rebuild it. Rebuilding would hand back a set
+            // whose recovery slices are empty, silently discarding every volume
+            // merged so far — the packets are the same packets either way.
+            match incumbent_id {
+                Some(incumbent) if observed.contains(&incumbent) => {
+                    let packets = scanned
+                        .into_iter()
+                        .filter_map(|packet| {
+                            (packet.recovery_set_id == incumbent).then_some(packet.packet)
+                        })
+                        .collect::<Vec<_>>();
+                    Ok(ParsedPar2Metadata::ServedSet { packets, observed })
+                }
+                _ => {
+                    let packets = scanned
+                        .into_iter()
+                        .map(|packet| packet.packet)
+                        .collect::<Vec<_>>();
+                    par2_rs::Par2FileSet::from_packets(packets)
+                        .map(|set| ParsedPar2Metadata::OtherSet { set, observed })
+                }
+            }
         })
         .await
         {
-            Ok(Ok(set)) => set,
+            Ok(Ok(parsed)) => parsed,
             Ok(Err(e)) => {
                 warn!(filename = %filename, error = %e, "failed to parse PAR2 index");
                 return;
@@ -1233,6 +1358,36 @@ impl Pipeline {
                 warn!(filename = %filename, error = %e, "failed to join PAR2 index parse task");
                 return;
             }
+        };
+
+        let (par2_set, observed_set_ids) = match parsed {
+            ParsedPar2Metadata::ServedSet { packets, observed } => {
+                self.note_foreign_recovery_set_sightings(job_id, file_id.file_index, &observed);
+                let merged = {
+                    let Some(set) = self.ensure_par2_runtime(job_id).set.as_mut() else {
+                        return;
+                    };
+                    Arc::make_mut(set).merge_packets(packets)
+                };
+                match merged {
+                    Ok(result) => info!(
+                        job_id = job_id.0,
+                        filename = %filename,
+                        recovery_blocks_merged = result.new_recovery_slices,
+                        "merged PAR2 metadata into the recovery set already being served"
+                    ),
+                    Err(error) => warn!(
+                        job_id = job_id.0,
+                        filename = %filename,
+                        error = %error,
+                        "failed to merge PAR2 metadata into the recovery set already being served"
+                    ),
+                }
+                self.retry_par2_authoritative_identity(job_id).await;
+                self.warn_unserved_recovery_sets_once(job_id);
+                return;
+            }
+            ParsedPar2Metadata::OtherSet { set, observed } => (set, observed),
         };
 
         if let Err(error) = self
@@ -1248,12 +1403,43 @@ impl Pipeline {
 
         let slice_size = par2_set.slice_size;
         let recovery_block_count = par2_set.recovery_block_count();
+        let parsed_set_id = par2_set.recovery_set_id;
+
+        self.record_par2_set_summary(job_id, &par2_set, &filename, file_id.file_index);
+        self.note_foreign_recovery_set_sightings(job_id, file_id.file_index, &observed_set_ids);
 
         {
             let runtime = self.ensure_par2_runtime(job_id);
             let entry = runtime.files.entry(file_id.file_index).or_default();
             entry.filename = filename.clone();
             entry.recovery_blocks = recovery_block_count;
+            entry.recovery_set_id = Some(parsed_set_id);
+        }
+
+        // Selection is frozen once the job has a PAR2 verdict. Swapping the
+        // served set out from under a settled verdict would reopen it, which is
+        // the re-entry the settled-verdict guard exists to close; and the
+        // verdict bit lives only in memory, so a restart re-derives it from
+        // this same deterministic selection rather than inheriting a choice.
+        let verdict_settled = self.par2_verified.contains(&job_id);
+        let serve = if incumbent_id.is_none() {
+            true
+        } else if verdict_settled {
+            false
+        } else {
+            self.select_primary_recovery_set(job_id) == Some(parsed_set_id)
+        };
+
+        if !serve {
+            info!(
+                job_id = job_id.0,
+                filename = %filename,
+                slice_size,
+                described_files = par2_set.files.len(),
+                "PAR2 metadata loaded for a recovery set this job does not serve"
+            );
+            self.warn_unserved_recovery_sets_once(job_id);
+            return;
         }
 
         info!(
@@ -1264,15 +1450,292 @@ impl Pipeline {
             "PAR2 metadata loaded"
         );
 
-        {
-            let runtime = self.ensure_par2_runtime(job_id);
-            runtime.primary_path = Some(file_path);
-            runtime.set = Some(Arc::new(par2_set));
-        }
+        self.install_primary_recovery_set(job_id, par2_set, file_path)
+            .await;
+        self.warn_unserved_recovery_sets_once(job_id);
 
         let _ = self
             .event_tx
             .send(PipelineEvent::Par2MetadataLoaded { job_id });
+    }
+
+    /// Adopt a parsed recovery set as the one this job serves, discarding every
+    /// piece of state that spoke for the set it replaces.
+    ///
+    /// Nothing derived from the previous set survives the swap: its merged
+    /// volumes describe a different recovery equation, the retained session was
+    /// opened over its index, and the in-stream block grid measured files
+    /// against its descriptions. Volumes already on disk are re-read so the
+    /// incoming set starts with the recovery it is actually entitled to — the
+    /// repairer takes its slices from this set, not from a directory scan.
+    async fn install_primary_recovery_set(
+        &mut self,
+        job_id: JobId,
+        par2_set: Par2FileSet,
+        primary_path: std::path::PathBuf,
+    ) {
+        let replaced = self.par2_set(job_id).map(|set| set.recovery_set_id);
+        {
+            let runtime = self.ensure_par2_runtime(job_id);
+            if replaced.is_some() {
+                runtime.merged_recovery_paths.clear();
+                runtime.session = None;
+                runtime.session_last_used = None;
+                runtime.session_evidence_file_ids.clear();
+            }
+            runtime.primary_path = Some(primary_path);
+            runtime.set = Some(Arc::new(par2_set));
+            runtime.unserved_sets_warned = false;
+        }
+
+        let Some(previous) = replaced else {
+            return;
+        };
+        warn!(
+            job_id = job_id.0,
+            replaced = %previous,
+            "the recovery set this job serves changed; recovery state for the previous set was discarded"
+        );
+        self.block_crcs.forget_job(job_id);
+
+        let volumes: Vec<NzbFileId> = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                state
+                    .assembly
+                    .files()
+                    .filter(|file| {
+                        file.is_complete()
+                            && matches!(
+                                file.role(),
+                                weaver_model::files::FileRole::Par2 {
+                                    is_index: false,
+                                    ..
+                                }
+                            )
+                    })
+                    .map(|file| file.file_id())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for file_id in volumes {
+            self.try_merge_par2_recovery(job_id, file_id).await;
+        }
+    }
+
+    /// Record what a parsed set describes, so it can be weighed against the
+    /// others and its files recognized later.
+    fn record_par2_set_summary(
+        &mut self,
+        job_id: JobId,
+        par2_set: &Par2FileSet,
+        index_filename: &str,
+        index_file_index: u32,
+    ) {
+        let described_bytes = par2_set
+            .recovery_file_ids
+            .iter()
+            .filter_map(|file_id| par2_set.files.get(file_id))
+            .map(|desc| desc.length)
+            .sum();
+        let described_filenames = par2_set
+            .recovery_file_ids
+            .iter()
+            .filter_map(|file_id| par2_set.files.get(file_id))
+            .map(|desc| sanitize_download_filename(&desc.filename))
+            .collect();
+        let base_name = par2_set_base_name(index_filename);
+        let set_id = par2_set.recovery_set_id;
+
+        let runtime = self.ensure_par2_runtime(job_id);
+        let newly_known = !runtime.known_sets.contains_key(&set_id);
+        let summary = runtime.known_sets.entry(set_id).or_default();
+        summary.describes = true;
+        summary.index_filename = index_filename.to_string();
+        summary.index_file_index = index_file_index;
+        summary.base_name = base_name;
+        summary.described_filenames = described_filenames;
+        summary.described_bytes = described_bytes;
+        summary.volume_file_indices.insert(index_file_index);
+        if newly_known {
+            runtime.unserved_sets_warned = false;
+        }
+    }
+
+    /// Note every recovery set a PAR2 file's packets turned out to speak for.
+    ///
+    /// A set met only this way has no descriptions and can never be served — it
+    /// is recorded so its volumes are attributed away from the served set and
+    /// so the job can name it.
+    fn note_foreign_recovery_set_sightings(
+        &mut self,
+        job_id: JobId,
+        file_index: u32,
+        observed: &[par2_rs::RecoverySetId],
+    ) {
+        let runtime = self.ensure_par2_runtime(job_id);
+        let mut newly_known = false;
+        for set_id in observed {
+            if !runtime.known_sets.contains_key(set_id) {
+                newly_known = true;
+            }
+            runtime
+                .known_sets
+                .entry(*set_id)
+                .or_default()
+                .volume_file_indices
+                .insert(file_index);
+        }
+        if newly_known {
+            runtime.unserved_sets_warned = false;
+        }
+
+        // A file whose packets all answer to one set is that set's, whatever it
+        // is named. A file carrying more than one is not attributable at all,
+        // and is left to be grouped by name.
+        let learned = match observed {
+            [only] => Some(*only),
+            _ => None,
+        };
+        if let Some(learned) = learned {
+            let entry = runtime.files.entry(file_index).or_default();
+            entry.recovery_set_id = Some(learned);
+        }
+    }
+
+    /// The recovery set worth serving: the one protecting the most payload,
+    /// ties broken by position in the posting.
+    ///
+    /// Both keys are properties of the posting rather than of this run, so a
+    /// job that is restarted, replayed from disk, or whose files arrive in a
+    /// different order reaches the same answer every time. A set known only
+    /// through somebody else's packets describes nothing and is not eligible.
+    fn select_primary_recovery_set(&self, job_id: JobId) -> Option<par2_rs::RecoverySetId> {
+        let runtime = self.par2_runtime(job_id)?;
+        runtime
+            .known_sets
+            .iter()
+            .filter(|(_, summary)| summary.describes)
+            .max_by(|(_, left), (_, right)| {
+                left.described_bytes
+                    .cmp(&right.described_bytes)
+                    .then_with(|| right.index_file_index.cmp(&left.index_file_index))
+            })
+            .map(|(set_id, _)| *set_id)
+    }
+
+    /// Say once, loudly, that this posting carries recovery sets nothing will
+    /// act on.
+    ///
+    /// The files those sets describe are still delivered; what is lost is the
+    /// repair they were entitled to, and that is worth exactly one line naming
+    /// every set and every file it covers. Latched because the completion gate
+    /// is entered many times per job and nothing about this changes between
+    /// entries.
+    pub(in crate::pipeline) fn warn_unserved_recovery_sets_once(&mut self, job_id: JobId) {
+        let Some(primary_id) = self.par2_set(job_id).map(|set| set.recovery_set_id) else {
+            return;
+        };
+        let Some(runtime) = self.par2_runtime(job_id) else {
+            return;
+        };
+        if runtime.unserved_sets_warned || runtime.known_sets.len() < 2 {
+            return;
+        }
+
+        let mut unserved: Vec<String> = runtime
+            .known_sets
+            .iter()
+            .filter(|(set_id, _)| **set_id != primary_id)
+            .map(|(set_id, summary)| {
+                let name = if summary.index_filename.is_empty() {
+                    set_id.to_string()
+                } else {
+                    summary.index_filename.clone()
+                };
+                if summary.described_filenames.is_empty() {
+                    format!("{name} (no index of it was posted)")
+                } else {
+                    format!("{name} covering {}", summary.described_filenames.join(", "))
+                }
+            })
+            .collect();
+        unserved.sort();
+        warn!(
+            job_id = job_id.0,
+            "this posting carries {} recovery sets and only one can be served: {} \
+             unserved set(s) will neither verify nor repair the files they cover, \
+             which are delivered as they arrived — {}",
+            runtime.known_sets.len(),
+            unserved.len(),
+            unserved.join("; ")
+        );
+
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
+            runtime.unserved_sets_warned = true;
+        }
+        #[cfg(test)]
+        {
+            self.par2_unserved_set_warnings += 1;
+        }
+    }
+
+    /// Whether a PAR2 file's recovery blocks belong to the set being served.
+    ///
+    /// Recovery arithmetic — how much capacity the posting advertises, how much
+    /// of it has landed, which volumes are worth fetching — is only ever about
+    /// the served set. Another set's volumes repair another set's files;
+    /// counting them inflates the capacity of a repair they can take no part
+    /// in, and can send the fetcher after blocks that will never help.
+    ///
+    /// Attribution is by packets where they have been read, and by name where
+    /// they have not. A job that has met fewer than two sets skips the question
+    /// entirely: there is nothing to confuse its volumes with, and an
+    /// obfuscated posting names nothing recognizably.
+    fn recovery_file_serves_primary_set(&self, job_id: JobId, file_index: u32) -> bool {
+        let Some(runtime) = self.par2_runtime(job_id) else {
+            return true;
+        };
+        let Some(primary_id) = runtime.set.as_ref().map(|set| set.recovery_set_id) else {
+            return true;
+        };
+        if let Some(learned) = runtime
+            .files
+            .get(&file_index)
+            .and_then(|file| file.recovery_set_id)
+        {
+            return learned == primary_id;
+        }
+        if runtime.known_sets.len() < 2 {
+            return true;
+        }
+        let Some(primary_base) = runtime
+            .known_sets
+            .get(&primary_id)
+            .and_then(|summary| summary.base_name.as_deref())
+        else {
+            return true;
+        };
+        let filename = runtime
+            .files
+            .get(&file_index)
+            .map(|file| file.filename.as_str())
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                self.jobs
+                    .get(&job_id)
+                    .and_then(|state| state.spec.files.get(file_index as usize))
+                    .map(|file| file.filename.as_str())
+            })
+            .unwrap_or_default();
+        match par2_set_base_name(filename) {
+            Some(base) => base == primary_base,
+            // A name the convention does not cover is no evidence either way,
+            // and refusing it would cost the served set a volume that may well
+            // be its own.
+            None => true,
+        }
     }
 
     /// When a PAR2 recovery volume completes, parse it and merge recovery
@@ -1306,19 +1769,28 @@ impl Pipeline {
         };
 
         let parse_path = file_path.clone();
-        let packet_list = match tokio::task::spawn_blocking(move || {
+        // Packets that answer to another recovery set are still dropped, but
+        // the sighting is kept: it is the only proof a posting carries more
+        // than one set, and it is what tells this volume's blocks apart from
+        // the served set's.
+        let (packet_list, observed_set_ids) = match tokio::task::spawn_blocking(move || {
             par2_rs::scan_packets_from_path_with_set_ids(&parse_path).map(|packets| {
-                packets
-                    .into_iter()
-                    .filter_map(|packet| {
-                        (packet.recovery_set_id == expected_set_id).then_some(packet.packet)
-                    })
-                    .collect::<Vec<_>>()
+                let mut observed: Vec<par2_rs::RecoverySetId> = Vec::new();
+                let mut kept = Vec::new();
+                for packet in packets {
+                    if !observed.contains(&packet.recovery_set_id) {
+                        observed.push(packet.recovery_set_id);
+                    }
+                    if packet.recovery_set_id == expected_set_id {
+                        kept.push(packet.packet);
+                    }
+                }
+                (kept, observed)
             })
         })
         .await
         {
-            Ok(Ok(packet_list)) => packet_list,
+            Ok(Ok(scanned)) => scanned,
             Ok(Err(e)) => {
                 warn!(filename = %filename, error = %e, "failed to parse PAR2 recovery volume");
                 return;
@@ -1328,6 +1800,19 @@ impl Pipeline {
                 return;
             }
         };
+        self.note_foreign_recovery_set_sightings(job_id, file_id.file_index, &observed_set_ids);
+
+        // A volume proven to belong to another set has nothing to contribute
+        // here. Feeding it onward would register its path as merged recovery
+        // for a set it never covered.
+        if packet_list.is_empty() && !observed_set_ids.contains(&expected_set_id) {
+            debug!(
+                job_id = job_id.0,
+                filename = %filename,
+                "PAR2 recovery volume belongs to a recovery set this job does not serve"
+            );
+            return;
+        }
 
         self.ensure_par2_runtime(job_id)
             .merged_recovery_paths
@@ -1379,7 +1864,20 @@ impl Pipeline {
                     let runtime = self.ensure_par2_runtime(job_id);
                     let entry = runtime.files.entry(file_id.file_index).or_default();
                     entry.filename = filename.clone();
-                    entry.recovery_blocks = result.new_recovery_slices;
+                    // The merge reports the slices that were *new* to the set.
+                    // For a volume whose surviving packets were already read
+                    // back off disk that is only the remainder, so the two are
+                    // added rather than the second replacing the first — the
+                    // entry has to end up holding the whole volume's count.
+                    entry.recovery_blocks = if entry.salvaged {
+                        entry
+                            .recovery_blocks
+                            .saturating_add(result.new_recovery_slices)
+                    } else {
+                        result.new_recovery_slices
+                    };
+                    entry.salvaged = false;
+                    entry.salvage_attempted = false;
                     entry.promoted = promoted;
                 }
                 info!(
@@ -1399,6 +1897,280 @@ impl Pipeline {
                 );
             }
             _ => {}
+        }
+    }
+
+    /// Read back the recovery packets that survived on every PAR2 volume of
+    /// this job that can no longer complete.
+    ///
+    /// Recovery otherwise merges only on file *completion*, so a volume one
+    /// article short of fifty contributed **zero** blocks to the arithmetic
+    /// that decides whether a job is repairable — with its intact packets
+    /// sitting on disk the whole time. Both reference downloaders read such a
+    /// volume packet by packet instead of writing it off, and the PAR2 format
+    /// is what makes that safe: every packet carries its own MD5, and the
+    /// scanner resynchronises on the packet magic, so a hole costs the packets
+    /// it lands on and nothing else.
+    ///
+    /// Only packets that validate are merged. An unvalidated merge would be
+    /// worse than no merge at all: the set keys recovery slices by exponent and
+    /// ignores repeats, so a packet read out of a hole would occupy its
+    /// exponent permanently and a later good copy of the same block could never
+    /// replace it.
+    pub(in crate::pipeline) async fn salvage_partial_promoted_recovery_volumes(
+        &mut self,
+        job_id: JobId,
+    ) {
+        let Some(expected_set_id) = self.par2_set(job_id).map(|set| set.recovery_set_id) else {
+            return;
+        };
+
+        let candidates: Vec<u32> = self
+            .par2_runtime(job_id)
+            .map(|runtime| {
+                runtime
+                    .files
+                    .iter()
+                    .filter_map(|(&file_index, file)| {
+                        (!file.salvage_attempted).then_some(file_index)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for file_index in candidates {
+            // Another set's volume holds nothing this repair can use, and
+            // reading it back would be a whole-file scan for zero packets.
+            if !self.recovery_file_serves_primary_set(job_id, file_index) {
+                continue;
+            }
+            if !self.recovery_volume_is_stranded(job_id, file_index) {
+                continue;
+            }
+            self.salvage_stranded_recovery_volume(job_id, file_index, expected_set_id)
+                .await;
+        }
+    }
+
+    /// Whether this file is a PAR2 recovery volume that has bytes on disk, will
+    /// never complete, and has nothing left in flight that could change that.
+    fn recovery_volume_is_stranded(&self, job_id: JobId, file_index: u32) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let Some(file) = state.assembly.file(NzbFileId { job_id, file_index }) else {
+            return false;
+        };
+        if !matches!(
+            file.role(),
+            weaver_model::files::FileRole::Par2 {
+                is_index: false,
+                ..
+            }
+        ) {
+            return false;
+        }
+        if file.is_complete() {
+            return false;
+        }
+        // Bytes have to exist to be read. A volume is normally reached here
+        // because it was promoted, but a job whose NZB carries no index
+        // downloads its smallest volume eagerly without promoting anything, and
+        // that volume can strand in exactly the same way.
+        let promoted = self
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.files.get(&file_index))
+            .is_some_and(|entry| entry.promoted);
+        if !promoted && file.received_bytes() == 0 {
+            return false;
+        }
+        !self.promoted_recovery_file_has_pending_work(job_id, file_index)
+    }
+
+    async fn salvage_stranded_recovery_volume(
+        &mut self,
+        job_id: JobId,
+        file_index: u32,
+        expected_set_id: par2_rs::RecoverySetId,
+    ) {
+        let file_id = NzbFileId { job_id, file_index };
+        let Some((filename, file_path)) = self.jobs.get(&job_id).and_then(|state| {
+            let file_asm = state.assembly.file(file_id)?;
+            let filename = self.current_filename_for_file(job_id, file_asm);
+            let file_path = state.working_dir.join(&filename);
+            Some((filename, file_path))
+        }) else {
+            return;
+        };
+
+        {
+            let runtime = self.ensure_par2_runtime(job_id);
+            let entry = runtime.files.entry(file_index).or_default();
+            entry.filename = filename.clone();
+            entry.salvage_attempted = true;
+        }
+        #[cfg(test)]
+        {
+            self.par2_recovery_salvage_scans += 1;
+        }
+
+        let scan_path = file_path.clone();
+        let packet_list = match tokio::task::spawn_blocking(move || {
+            par2_rs::scan_packets_from_path_with_set_ids(&scan_path).map(|packets| {
+                packets
+                    .into_iter()
+                    .filter(|scanned| scanned.recovery_set_id == expected_set_id)
+                    .filter_map(|scanned| match scanned.packet {
+                        par2_rs::Packet::RecoverySlice(recovery) => {
+                            // Metadata packets were hashed by the scan itself;
+                            // recovery payloads are deliberately skipped there,
+                            // so this is where a payload sitting in a hole is
+                            // told apart from one that arrived.
+                            let exponent = recovery.exponent;
+                            match recovery
+                                .data
+                                .validate_packet_hash(expected_set_id.as_bytes(), exponent)
+                            {
+                                Ok(true) => Some(par2_rs::Packet::RecoverySlice(recovery)),
+                                _ => None,
+                            }
+                        }
+                        metadata => Some(metadata),
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await
+        {
+            Ok(Ok(packet_list)) => packet_list,
+            Ok(Err(error)) => {
+                warn!(
+                    job_id = job_id.0,
+                    filename = %filename,
+                    error = %error,
+                    "failed to read back a PAR2 recovery volume that cannot complete"
+                );
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    filename = %filename,
+                    error = %error,
+                    "failed to join PAR2 recovery read-back task"
+                );
+                return;
+            }
+        };
+
+        let salvaged_blocks = packet_list
+            .iter()
+            .filter(|packet| matches!(packet, par2_rs::Packet::RecoverySlice(_)))
+            .count() as u32;
+        if salvaged_blocks == 0 {
+            info!(
+                job_id = job_id.0,
+                filename = %filename,
+                "no PAR2 recovery packets survived on a volume that cannot complete"
+            );
+            return;
+        }
+
+        // The retained session is fed the same way the completed-file path and
+        // the restore path feed it — by path, which it scans itself. It holds
+        // scan-order packets and validates them lazily when a repair selects
+        // them; the set above holds only packets that already validated. The
+        // asymmetry is deliberate: the set is what weaver's own recovery
+        // arithmetic reads, and that has to be truthful.
+        self.ensure_par2_runtime(job_id)
+            .merged_recovery_paths
+            .insert(file_path.clone());
+        if let Some(mut session) = self
+            .par2_runtime
+            .get_mut(&job_id)
+            .and_then(|runtime| runtime.session.take())
+        {
+            let session_path = file_path.clone();
+            match tokio::task::spawn_blocking(move || {
+                let result = session.merge_recovery_paths([session_path]);
+                (session, result)
+            })
+            .await
+            {
+                Ok((session, Ok(_))) => self.restore_par2_repair_session(job_id, session),
+                Ok((session, Err(error))) => {
+                    self.restore_par2_repair_session(job_id, session);
+                    warn!(
+                        job_id = job_id.0,
+                        filename = %filename,
+                        error = %error,
+                        "failed to merge a read-back recovery volume into the retained PAR2 session"
+                    );
+                }
+                Err(error) => warn!(
+                    job_id = job_id.0,
+                    filename = %filename,
+                    error = %error,
+                    "retained PAR2 read-back merge task panicked; session was evicted"
+                ),
+            }
+        }
+
+        let merge_result = {
+            let Some(set) = self.ensure_par2_runtime(job_id).set.as_mut() else {
+                return;
+            };
+            let par2_set = Arc::make_mut(set);
+            let merge = par2_set.merge_packets(packet_list);
+            let total_recovery = par2_set.recovery_block_count();
+            (merge, total_recovery)
+        };
+        match merge_result {
+            (Ok(merge), total_recovery) => {
+                // What the merge accepted, not what the scan found. An exponent
+                // already held by the set is not new recovery, and counting the
+                // scan would credit this volume with a block the arithmetic
+                // already had.
+                let salvaged_blocks = merge.new_recovery_slices;
+                {
+                    let runtime = self.ensure_par2_runtime(job_id);
+                    let entry = runtime.files.entry(file_index).or_default();
+                    entry.recovery_blocks = salvaged_blocks;
+                    entry.salvaged = salvaged_blocks > 0;
+                    entry.recovery_set_id = Some(expected_set_id);
+                }
+                info!(
+                    job_id = job_id.0,
+                    filename = %filename,
+                    salvaged_blocks,
+                    total_recovery,
+                    "read back recovery blocks from a PAR2 volume that cannot complete"
+                );
+            }
+            (Err(error), _) => {
+                warn!(
+                    job_id = job_id.0,
+                    filename = %filename,
+                    error = %error,
+                    "failed to merge read-back PAR2 recovery packets"
+                );
+            }
+        }
+    }
+
+    /// Forget that a recovery volume was ever read back short.
+    ///
+    /// Called where the file re-opens for download, so a volume that does
+    /// arrive after all merges through the ordinary completion path and reports
+    /// its whole block count.
+    pub(in crate::pipeline) fn clear_par2_salvage_state_for_file(&mut self, file_id: NzbFileId) {
+        if let Some(entry) = self
+            .par2_runtime
+            .get_mut(&file_id.job_id)
+            .and_then(|runtime| runtime.files.get_mut(&file_id.file_index))
+        {
+            entry.salvaged = false;
+            entry.salvage_attempted = false;
         }
     }
 
@@ -1539,6 +2311,24 @@ impl Pipeline {
             .unwrap_or_default()
     }
 
+    /// Volumes that will never complete but whose surviving recovery packets
+    /// were read back off disk and merged.
+    ///
+    /// They are counted apart from the two sets above because both of those
+    /// bypass the runtime entry for exactly this file: the loaded set requires
+    /// a complete assembly, and the targeted set requires work still in flight.
+    fn salvaged_recovery_file_indices(&self, job_id: JobId) -> HashSet<u32> {
+        self.par2_runtime(job_id)
+            .map(|runtime| {
+                runtime
+                    .files
+                    .iter()
+                    .filter_map(|(&file_index, file)| file.salvaged.then_some(file_index))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn total_recovery_block_capacity(&self, job_id: JobId) -> u32 {
         let Some(state) = self.jobs.get(&job_id) else {
             return 0;
@@ -1549,7 +2339,9 @@ impl Pipeline {
             .files
             .iter()
             .enumerate()
-            .filter_map(|(file_index, _)| self.recovery_block_count_for(job_id, file_index as u32))
+            .map(|(file_index, _)| file_index as u32)
+            .filter(|file_index| self.recovery_file_serves_primary_set(job_id, *file_index))
+            .filter_map(|file_index| self.recovery_block_count_for(job_id, file_index))
             .map(|(blocks, _)| blocks)
             .sum()
     }
@@ -1557,8 +2349,10 @@ impl Pipeline {
     pub(crate) fn recovery_blocks_available_or_targeted(&self, job_id: JobId) -> u32 {
         let mut file_indices = self.loaded_recovery_file_indices(job_id);
         file_indices.extend(self.targeted_recovery_file_indices(job_id));
+        file_indices.extend(self.salvaged_recovery_file_indices(job_id));
         file_indices
             .into_iter()
+            .filter(|file_index| self.recovery_file_serves_primary_set(job_id, *file_index))
             .filter_map(|file_index| self.recovery_block_count_for(job_id, file_index))
             .map(|(blocks, _)| blocks)
             .sum()
@@ -1773,6 +2567,12 @@ impl Pipeline {
                 .and_then(|runtime| runtime.files.get(&file_index))
                 .is_some_and(|file| file.promoted)
             {
+                continue;
+            }
+            // Fetching another set's volume spends bandwidth on blocks that
+            // cannot enter this repair's equation. Its work stays parked below
+            // rather than being dropped.
+            if !self.recovery_file_serves_primary_set(job_id, file_index) {
                 continue;
             }
             if let Some(candidate) = self.recovery_candidate_for(job_id, file_index)

@@ -46,3 +46,45 @@ func TestExtractMessageIDsIncludesFirstArticleFromEverySegmentsContainer(t *test
 		t.Fatalf("extractMessageIDs() = %v, want %v", got, want)
 	}
 }
+
+// deleteSubjectContains deletes whole files, so a scenario that wants one
+// interior article of one named file kept out of NNTP — and the rest of that
+// file kept in it — needs its own filter for the segment-number selector.
+func TestSegmentDeleteNeedlesAreSeparateFromTheWholeFileFilter(t *testing.T) {
+	nzb := []byte(`<nzb>
+  <file subject="Cobalt.Harbor - test-media.mkv (1/2)"><segments>
+    <segment number="1">payload-1@e2e</segment>
+    <segment number="2">payload-2@e2e</segment>
+  </segments></file>
+  <file subject="Cobalt.Harbor - test-media.mkv.vol24+24.par2 (1/3)"><segments>
+    <segment number="1">volume-1@e2e</segment>
+    <segment number="2">volume-2@e2e</segment>
+    <segment number="3">volume-3@e2e</segment>
+  </segments></file>
+</nzb>`)
+
+	scenario := &Scenario{
+		DeleteSegmentSubjectContains: []string{"test-media.mkv.vol24+24.par2"},
+		DeleteSegmentNumbers:         []int{3},
+	}
+	if got := segmentDeleteNeedles(scenario); !reflect.DeepEqual(got, scenario.DeleteSegmentSubjectContains) {
+		t.Fatalf("segmentDeleteNeedles() = %v, want its own filter", got)
+	}
+	ids, err := extractMessageIDsBySegmentNumbers(nzb, segmentDeleteNeedles(scenario), scenario.DeleteSegmentNumbers)
+	if err != nil {
+		t.Fatalf("extract segment ids: %v", err)
+	}
+	if want := []string{"volume-3@e2e"}; !reflect.DeepEqual(ids, want) {
+		t.Fatalf("segment ids = %v, want %v", ids, want)
+	}
+
+	// With no filter of its own the field falls back to deleteSubjectContains,
+	// which is what every scenario predating it relies on.
+	fallback := &Scenario{DeleteSubjectContains: []string{"test-media.mkv.vol24+24.par2"}}
+	if got := segmentDeleteNeedles(fallback); !reflect.DeepEqual(got, fallback.DeleteSubjectContains) {
+		t.Fatalf("segmentDeleteNeedles() fallback = %v, want the whole-file filter", got)
+	}
+	if got := segmentDeleteNeedles(&Scenario{}); len(got) != 0 {
+		t.Fatalf("segmentDeleteNeedles() with no filters = %v, want none", got)
+	}
+}

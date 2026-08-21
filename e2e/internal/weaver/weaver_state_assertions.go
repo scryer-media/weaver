@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -615,6 +616,12 @@ func applyTerminalStateCheck(dbPath string, jobID int, slug string, status strin
 				return "OUTPUT_DIGEST_ERROR", err.Error()
 			}
 		}
+		if err == nil && len(scenario.ForbiddenOutputPaths) > 0 {
+			if err := assertForbiddenOutputPaths(dbPath, jobID, scenario.ForbiddenOutputPaths); err != nil {
+				log.Printf("  %s: forbidden output present after %s: %v", slug, status, err)
+				return "OUTPUT_LEFTOVER_ERROR", err.Error()
+			}
+		}
 	}
 	return status, ""
 }
@@ -801,6 +808,109 @@ func assertOutputBLAKE3(dbPath string, jobID int, expectedByRelativePath map[str
 	}
 
 	return nil
+}
+
+// assertForbiddenOutputPaths fails when the job's completed output still holds
+// a file the scenario says is not part of the release. It is the counterpart of
+// assertOutputBLAKE3: that one says the release is right, this one says nothing
+// the pipeline used along the way was handed over with it — split parts a join
+// consumed, backups a repair wrote, an archive an extraction opened.
+func assertForbiddenOutputPaths(dbPath string, jobID int, patterns []string) error {
+	db, datastore, err := openWeaverStateDB(dbPath)
+	if err != nil {
+		return fmt.Errorf("open weaver state db: %w", err)
+	}
+	defer db.Close()
+
+	var outputDir string
+	query := rebindWeaverSQL(datastore, `SELECT output_dir FROM job_history WHERE job_id = ?`)
+	if err := db.QueryRow(query, jobID).Scan(&outputDir); err != nil {
+		return fmt.Errorf("load output directory for job %d: %w", jobID, err)
+	}
+	if outputDir == "" {
+		return fmt.Errorf("job %d has no output directory", jobID)
+	}
+
+	var delivered []string
+	walkErr := filepath.WalkDir(outputDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relative, err := filepath.Rel(outputDir, path)
+		if err != nil {
+			return err
+		}
+		delivered = append(delivered, filepath.ToSlash(relative))
+		return nil
+	})
+	if walkErr != nil {
+		return fmt.Errorf("read output directory for job %d: %w", jobID, walkErr)
+	}
+
+	found, err := matchForbiddenOutputPaths(patterns, delivered)
+	if err != nil {
+		return fmt.Errorf("job %d: %w", jobID, err)
+	}
+	if len(found) > 0 {
+		sort.Strings(delivered)
+		return fmt.Errorf(
+			"job %d delivered forbidden output(s): %s; delivered: %s",
+			jobID,
+			strings.Join(found, ", "),
+			strings.Join(delivered, ", "),
+		)
+	}
+	return nil
+}
+
+// matchForbiddenOutputPaths reports which delivered paths a pattern claims. A
+// pattern carrying a separator is matched against the whole slash-relative path
+// under the output directory; one without is matched against a file's name
+// wherever in the tree it landed, so a scenario does not have to know which
+// subdirectory an extraction chose. Patterns are path.Match globs, and a
+// literal name is simply a glob with nothing to expand.
+func matchForbiddenOutputPaths(patterns []string, delivered []string) ([]string, error) {
+	var found []string
+	for _, pattern := range patterns {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+		if _, err := path.Match(pattern, ""); err != nil {
+			return nil, fmt.Errorf("forbidden output pattern %q is malformed: %w", pattern, err)
+		}
+		for _, relative := range delivered {
+			subject := relative
+			if !strings.Contains(pattern, "/") {
+				subject = path.Base(relative)
+			}
+			matched, err := path.Match(pattern, subject)
+			if err != nil {
+				return nil, fmt.Errorf("forbidden output pattern %q is malformed: %w", pattern, err)
+			}
+			if matched {
+				found = append(found, relative)
+			}
+		}
+	}
+	sort.Strings(found)
+	return uniqueStrings(found), nil
+}
+
+func uniqueStrings(values []string) []string {
+	if len(values) < 2 {
+		return values
+	}
+	out := values[:1]
+	for _, value := range values[1:] {
+		if value != out[len(out)-1] {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func missingJobEvents(events []string, required []string) []string {

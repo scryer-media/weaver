@@ -193,6 +193,14 @@ impl Pipeline {
             #[cfg(test)]
             par2_selective_verify_calls: 0,
             #[cfg(test)]
+            par2_quick_verify_calls: 0,
+            #[cfg(test)]
+            par2_ignore_extensions_override: None,
+            #[cfg(test)]
+            par2_recovery_salvage_scans: 0,
+            #[cfg(test)]
+            par2_unserved_set_warnings: 0,
+            #[cfg(test)]
             par2_repairer_analyze_calls: 0,
             #[cfg(test)]
             par2_repairer_execute_calls: 0,
@@ -310,6 +318,8 @@ impl Pipeline {
             pending_concat: HashMap::new(),
             par2_bypassed: HashSet::new(),
             par2_verified: HashSet::new(),
+            par2_joined_split_sets: HashMap::new(),
+            par2_pre_repair_dir_entries: HashMap::new(),
             sfv_checked: HashSet::new(),
             jobs_with_verification_outcome: HashSet::new(),
             unavailable_promoted_recovery_segments: HashSet::new(),

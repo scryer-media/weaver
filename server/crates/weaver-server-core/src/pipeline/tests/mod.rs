@@ -1103,6 +1103,7 @@ fn install_test_par2_runtime(
                 filename: (*filename).to_string(),
                 recovery_blocks: *recovery_blocks,
                 promoted: *promoted,
+                ..Default::default()
             },
         );
     }
@@ -1132,6 +1133,47 @@ fn build_test_par2_packet(
 
 pub(super) fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> Vec<u8> {
     build_test_par2_index_for_files(&[(filename, file_data)], slice_size)
+}
+
+/// A `.volNN+CC.par2` byte stream carrying only the named recovery packets.
+///
+/// The index builders above stop at descriptions and slice checksums, and
+/// [`build_repairable_par2_set`] keeps its recovery slices in memory. Neither
+/// produces a *volume file*, which is what a test needs when the question is
+/// what weaver can read back off the disk — including from a volume that only
+/// partly arrived.
+pub(super) fn build_test_par2_recovery_volume(
+    recovery_set_id: [u8; 16],
+    slices: &[(u32, &[u8])],
+) -> Vec<u8> {
+    let mut stream = Vec::new();
+    for (exponent, data) in slices {
+        let mut body = Vec::with_capacity(4 + data.len());
+        body.extend_from_slice(&exponent.to_le_bytes());
+        body.extend_from_slice(data);
+        stream.extend_from_slice(&build_test_par2_packet(
+            par2_rs::packet::header::TYPE_RECOVERY,
+            &body,
+            recovery_set_id,
+        ));
+    }
+    stream
+}
+
+/// Zero the payload of the recovery packet at `packet_index` in a volume built
+/// by [`build_test_par2_recovery_volume`], leaving its header intact.
+///
+/// That is the on-disk shape of a volume whose interior article never arrived:
+/// the scanner still finds the packet by its magic and header, and only the
+/// packet's own MD5 can tell that the bytes behind it are a hole.
+pub(super) fn punch_recovery_packet_payload(
+    volume: &mut [u8],
+    packet_index: usize,
+    slice_size: usize,
+) {
+    let packet_len = par2_rs::packet::header::HEADER_SIZE + 4 + slice_size;
+    let payload_start = packet_index * packet_len + par2_rs::packet::header::HEADER_SIZE + 4;
+    volume[payload_start..payload_start + slice_size].fill(0);
 }
 
 pub(super) fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_size: u64) -> Vec<u8> {
@@ -1351,6 +1393,42 @@ pub(super) fn build_repairable_par2_set_for_files(
         );
     }
 
+    par2_set
+}
+
+/// A recovery set whose recovery slices are placeholders rather than encoded
+/// blocks.
+///
+/// [`build_repairable_par2_set`] and its multi-file sibling encode real
+/// recovery data, at one field multiply per (input slice, recovery block) pair.
+/// That is nothing for the handful of slices those fixtures carry and
+/// completely impractical for a set shaped to stress a decode matrix, where the
+/// pair count runs into the hundreds of millions.
+///
+/// A *verdict* never looks at recovery bytes: availability is the count of
+/// recovery slices whose length matches the set's slice size, and repairability
+/// compares that count against the damage. So a fixture that only ever asks
+/// what the verdict is — and stops before anything plans or solves a repair —
+/// is served exactly as well by placeholders, in milliseconds instead of hours.
+///
+/// Never use this for a fixture that actually repairs: the bytes are zeros and
+/// would reconstruct garbage.
+pub(super) fn build_par2_set_with_uncomputed_recovery(
+    filename: &str,
+    file_data: &[u8],
+    slice_size: u64,
+    recovery_block_count: usize,
+) -> Par2FileSet {
+    let mut par2_set = build_repairable_par2_set_for_files(&[(filename, file_data)], slice_size, 0);
+    for exponent in 0..recovery_block_count as u32 {
+        par2_set.recovery_slices.insert(
+            exponent,
+            par2_rs::RecoverySlice {
+                exponent,
+                data: bytes::Bytes::from(vec![0u8; slice_size as usize]).into(),
+            },
+        );
+    }
     par2_set
 }
 

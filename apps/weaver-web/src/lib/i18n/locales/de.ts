@@ -244,6 +244,7 @@ const de: LocaleDictionary = {
   "history.filterFailure": "Fehlgeschlagen",
   "history.searchPlaceholder": "Verlauf nach Name, Kategorie oder Pfad filtern",
   "history.noMatches": "Keine Verlaufseinträge entsprechen dem aktuellen Filter.",
+  "queue.noMatches": "Keine Warteschlangenaufträge entsprechen dem aktuellen Filter.",
   "table.health": "Zustand",
   "table.category": "Kategorie",
   "table.rowsPerPage": "Zeilen pro Seite",

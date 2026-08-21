@@ -153,6 +153,16 @@ impl JobAssembly {
         self.archive_topologies.insert(set_name, topology);
     }
 
+    /// Forget a named set's topology, returning whatever was there.
+    ///
+    /// A set stops being something to extract once its output exists by other
+    /// means — a plain split set whose joined file the recovery data rebuilt
+    /// from the parts is the case this exists for. Removing the topology is
+    /// what stops readiness from waiting on parts nothing needs any more.
+    pub fn remove_archive_topology(&mut self, set_name: &str) -> Option<ArchiveTopology> {
+        self.archive_topologies.remove(set_name)
+    }
+
     /// Mark a volume as complete and verified within a named set.
     pub fn mark_volume_complete(&mut self, set_name: &str, volume_number: u32) {
         if let Some(topo) = self.archive_topologies.get_mut(set_name) {

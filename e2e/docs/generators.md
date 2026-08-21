@@ -188,7 +188,7 @@ zip/tar/gzip/DEFLATE/zstd/bzip2/brotli by Go.
 | nested | `nested-rar`, `nested-3deep`, `nested-5deep`, `nested-obfuscated-split-7z` | archives inside archives, two to five deep |
 | 7z | `single-7z`, `single-7z-corrupted`, `7z-encrypted`, `split-7z`, `split-7z-encrypted`, `split-7z-corrupted` | LZMA2, split by byte range |
 | obfuscated | `obfuscated-rar`, `obfuscated-rar-unknown-numeric`, `obfuscated-rar-split-topology`, `obfuscated-split-7z` | hex and numeric names: `.10/.11/.12`, `.100/.101/.102` |
-| PAR2 | 17 slugs: ordinary repair, heavy damage ×4, insufficient parity, small repair ×5, multivolume, RAR4, 7z, direct payload, sidecar-only rewrite, multi-swap placement | par2cmdline-turbo |
+| PAR2 | 21 slugs: ordinary repair, heavy damage ×4, insufficient parity, small repair ×5, multivolume, RAR4, 7z, direct payload, sidecar-only rewrite, multi-swap placement, ignorable-sidecar deficit, partial recovery volume, split parts under a joined-file set, two sets in one posting | par2cmdline-turbo |
 | zip | `zip-unencrypted`, `zip-encrypted`, `zip-corrupted` | stored members; ZipCrypto for the encrypted one |
 | tar | `tar-archive`, `tar-corrupted`, `tgz-archive`, `tar-gzip-archive`, `tbz2-archive`, `tar-bzip2-archive`, `targz-archive`, `targz-corrupted` | ustar padded to GNU tar's 10 KiB blocking factor |
 | stream codec | `gzip-single`, `gzip-corrupted`, `deflate-single`, `bzip2-single`, `zstd-single`, `brotli-single` | bare streams, no container |

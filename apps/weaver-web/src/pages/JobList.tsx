@@ -1059,7 +1059,7 @@ export function JobList() {
     (queuePage?.totalCount ?? 0)
       - rawQueuePageItems.filter((job) => optimisticallyRemovedJobIds.has(job.id)).length,
   );
-  const hasQueueItems = (queuePage?.summary.totalItems ?? 0) > 0;
+  const hasUnfilteredQueueItems = (queuePage?.summary.totalItems ?? 0) > 0;
   const pageCount = Math.max(1, Math.ceil(totalCount / queuePreferences.pageSize));
 
   useEffect(() => {
@@ -1660,12 +1660,12 @@ export function JobList() {
         <div role="status" className="py-8 text-center text-sm text-muted-foreground">
           {t("label.loading")}
         </div>
-      ) : !hasQueueItems ? (
+      ) : totalCount === 0 ? (
         <EmptyState
-          title={t("jobs.empty")}
-          description={t("jobs.emptyHint")}
-          actionLabel={t("jobs.emptyAction")}
-          onAction={() => setUploadOpen(true)}
+          title={hasUnfilteredQueueItems ? t("queue.noMatches") : t("jobs.empty")}
+          description={hasUnfilteredQueueItems ? undefined : t("jobs.emptyHint")}
+          actionLabel={hasUnfilteredQueueItems ? t("action.clearFilters") : t("jobs.emptyAction")}
+          onAction={hasUnfilteredQueueItems ? resetQueueView : () => setUploadOpen(true)}
         />
       ) : (
         <Card>
@@ -2019,7 +2019,7 @@ export function JobList() {
                 virtualization={queueTableVirtualization}
                 emptyState={
                   <div className="space-y-3 py-12 text-center">
-                    <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
+                    <div className="text-sm text-muted-foreground">{t("queue.noMatches")}</div>
                     <div>
                       <Button variant="outline" onClick={resetQueueView}>
                         {t("action.clearFilters")}
@@ -2030,7 +2030,7 @@ export function JobList() {
               />
             ) : queueTable.getRowModel().rows.length === 0 ? (
               <div className="space-y-3 py-12 text-center">
-                <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
+                <div className="text-sm text-muted-foreground">{t("queue.noMatches")}</div>
                 <div>
                   <Button variant="outline" onClick={resetQueueView}>
                     {t("action.clearFilters")}

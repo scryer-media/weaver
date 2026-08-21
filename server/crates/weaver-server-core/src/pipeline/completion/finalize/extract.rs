@@ -546,6 +546,7 @@ fn extract_bzip2(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_split(
     file_paths: &[PathBuf],
     root: &ExtractionRoot,
@@ -554,6 +555,7 @@ fn extract_split(
     job_id: JobId,
     set_name: &str,
     phase_counters: Option<Arc<PhaseCounters>>,
+    joined_output_already_present: Option<PathBuf>,
 ) -> Result<Vec<String>, String> {
     // Output filename: the base name from the set (e.g., "movie.mkv" from "movie.mkv.001")
     let first_name = file_paths[0]
@@ -574,6 +576,28 @@ fn extract_split(
         set_name: set_name.to_string(),
         member: output_name.to_string(),
     });
+
+    // Joining is never an overwrite. The file the parts concatenate into can
+    // already exist — a recovery set computed over it reads the parts as one
+    // file and installs it, damage repaired — and a second join would put the
+    // parts' bytes, hole and all, back over the copy that was verified. The
+    // member is still reported extracted: it exists, so the job moves on and
+    // finalization delivers the copy that is already there.
+    if let Some(existing) = joined_output_already_present {
+        let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
+            job_id,
+            set_name: set_name.to_string(),
+            member: output_name.to_string(),
+        });
+        tracing::info!(
+            job_id = job_id.0,
+            member = %output_name,
+            path = %existing.display(),
+            parts = file_paths.len(),
+            "split join skipped — the joined file is already present and verified"
+        );
+        return Ok(vec![output_name.to_string()]);
+    }
 
     let reader = crate::pipeline::archive::split_reader::SplitFileReader::open(file_paths)
         .map_err(|e| format!("failed to open split files: {e}"))?;
@@ -1114,6 +1138,52 @@ impl Pipeline {
         Ok(0)
     }
 
+    /// The file a split set's parts join into, when it is already on disk and
+    /// there is reason to believe it is the whole thing.
+    ///
+    /// Two ways to believe it, and either is enough:
+    ///
+    /// - it measures the sum of the parts, which is what a join of those parts
+    ///   would have produced anyway; or
+    /// - the job carries a settled PAR2 verdict and the recovery set describes
+    ///   a file of this name at exactly the length now on disk. That is the
+    ///   stronger arm and the one that matters when a part landed short of its
+    ///   articles: the sum of what arrived is then *under* the true length, and
+    ///   only the recovery set knows what the file should measure.
+    fn present_split_join_output(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        file_paths: &[std::path::PathBuf],
+    ) -> Option<std::path::PathBuf> {
+        let path = self.resolve_job_input_path(job_id, set_name)?;
+        let metadata = std::fs::metadata(&path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let present_len = metadata.len();
+
+        let parts_total: u64 = file_paths
+            .iter()
+            .filter_map(|part| std::fs::metadata(part).ok())
+            .map(|part| part.len())
+            .sum();
+        if parts_total > 0 && parts_total == present_len {
+            return Some(path);
+        }
+
+        if !self.par2_verified.contains(&job_id) {
+            return None;
+        }
+        let sanitized_set_name = weaver_model::files::sanitize_download_filename(set_name);
+        let described = self.par2_set(job_id)?.files.values().any(|description| {
+            weaver_model::files::sanitize_download_filename(&description.filename)
+                == sanitized_set_name
+                && description.length == present_len
+        });
+        described.then_some(path)
+    }
+
     /// Extract a simple (non-RAR, non-7z) archive: ZIP, tar, tar.gz, tar.bz2, gz, deflate, br,
     /// zstd, bz2, or split.
     pub(crate) async fn extract_simple_archive(
@@ -1152,6 +1222,9 @@ impl Pipeline {
                 .collect::<Vec<std::path::PathBuf>>()
         };
         let password = self.primary_archive_password_for_job(job_id);
+        let joined_output_already_present = matches!(kind, SimpleArchiveKind::Split)
+            .then(|| self.present_split_join_output(job_id, set_name, &file_paths))
+            .flatten();
 
         let output_dir = self.extraction_staging_dir(job_id);
         let budget = self.extraction_budget(job_id, &output_dir)?;
@@ -1259,6 +1332,7 @@ impl Pipeline {
                             job_id,
                             &set_name_owned,
                             Some(Arc::clone(&phase_counters)),
+                            joined_output_already_present,
                         )?,
                     };
 

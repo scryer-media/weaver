@@ -835,6 +835,8 @@ impl Pipeline {
         self.block_crcs.forget_job(job_id);
         self.par2_runtime.remove(&job_id);
         self.par2_verified.remove(&job_id);
+        self.par2_joined_split_sets.remove(&job_id);
+        self.par2_pre_repair_dir_entries.remove(&job_id);
         // A reprocessed job runs its verification again, so it must be able to
         // record a fresh outcome.
         self.sfv_checked.remove(&job_id);

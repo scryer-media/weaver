@@ -2527,6 +2527,7 @@ impl Pipeline {
                     let uu_filename = self.finish_uu_file(file_id);
                     self.unavailable_promoted_recovery_segments
                         .retain(|segment_id| segment_id.file_id != file_id);
+                    self.clear_par2_salvage_state_for_file(file_id);
                     if let Some(mut write_buf) = self.write_buffers.remove(&file_id) {
                         let leftovers = write_buf.flush_all();
                         if !leftovers.is_empty() {

@@ -798,3 +798,93 @@ func assertObservedFileIdentityRewriteRow(
 		)
 	}
 }
+
+func TestMatchForbiddenOutputPathsMatchesNamesGlobsAndPaths(t *testing.T) {
+	delivered := []string{
+		"test-media.mkv",
+		"test-media.mkv.001",
+		"test-media.mkv.002",
+		"Season 01/test-media.mkv.003",
+		"notes.nfo",
+	}
+
+	cases := []struct {
+		name     string
+		patterns []string
+		want     []string
+	}{
+		{
+			name:     "a bare glob reaches a file wherever it landed",
+			patterns: []string{"test-media.mkv.0*"},
+			want:     []string{"Season 01/test-media.mkv.003", "test-media.mkv.001", "test-media.mkv.002"},
+		},
+		{
+			name:     "a literal name is a glob with nothing to expand",
+			patterns: []string{"test-media.mkv.002"},
+			want:     []string{"test-media.mkv.002"},
+		},
+		{
+			name:     "a pattern with a separator is anchored to the relative path",
+			patterns: []string{"Season 01/*.003"},
+			want:     []string{"Season 01/test-media.mkv.003"},
+		},
+		{
+			name:     "the release itself is not claimed by a part glob",
+			patterns: []string{"test-media.mkv.0*"},
+			want:     []string{"Season 01/test-media.mkv.003", "test-media.mkv.001", "test-media.mkv.002"},
+		},
+		{
+			name:     "overlapping patterns report each file once",
+			patterns: []string{"test-media.mkv.001", "test-media.mkv.0*"},
+			want:     []string{"Season 01/test-media.mkv.003", "test-media.mkv.001", "test-media.mkv.002"},
+		},
+		{
+			name:     "nothing forbidden is nothing found",
+			patterns: []string{"*.rar", "  "},
+			want:     nil,
+		},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			found, err := matchForbiddenOutputPaths(test.patterns, delivered)
+			if err != nil {
+				t.Fatalf("match: %v", err)
+			}
+			if strings.Join(found, "|") != strings.Join(test.want, "|") {
+				t.Fatalf("found = %v, want %v", found, test.want)
+			}
+		})
+	}
+
+	if _, err := matchForbiddenOutputPaths([]string{"[bad"}, delivered); err == nil {
+		t.Fatal("a malformed pattern must be an error rather than a silent pass")
+	}
+}
+
+func TestAssertForbiddenOutputPathsReadsTheDeliveredTree(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	outputDir := t.TempDir()
+	writeStageTestFile(t, filepath.Join(outputDir, "test-media.mkv"), []byte("joined"))
+	mustExecWeaverStateSQL(t, db,
+		`INSERT INTO job_history (job_id, status, output_dir) VALUES (1, 'COMPLETED', '`+outputDir+`')`)
+
+	if err := assertForbiddenOutputPaths(dbPath, 1, []string{"test-media.mkv.0*"}); err != nil {
+		t.Fatalf("a delivered tree holding only the release must pass, got %v", err)
+	}
+
+	writeStageTestFile(t, filepath.Join(outputDir, "test-media.mkv.002"), []byte("part"))
+	err := assertForbiddenOutputPaths(dbPath, 1, []string{"test-media.mkv.0*"})
+	if err == nil {
+		t.Fatal("a leftover split part must fail the assertion")
+	}
+	if !strings.Contains(err.Error(), "test-media.mkv.002") {
+		t.Fatalf("the failure must name the leftover, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "delivered: ") {
+		t.Fatalf("the failure must list what was delivered, got %v", err)
+	}
+}

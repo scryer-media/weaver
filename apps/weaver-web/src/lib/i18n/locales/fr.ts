@@ -244,6 +244,7 @@ const fr: LocaleDictionary = {
   "history.filterFailure": "Échec",
   "history.searchPlaceholder": "Filtrer l'historique par nom, catégorie ou chemin",
   "history.noMatches": "Aucune tâche ne correspond au filtre actuel.",
+  "queue.noMatches": "Aucune tâche de la file d'attente ne correspond au filtre actuel.",
   "table.health": "Santé",
   "table.category": "Catégorie",
   "table.rowsPerPage": "Lignes par page",

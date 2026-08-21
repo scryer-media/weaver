@@ -2125,6 +2125,25 @@ impl Pipeline {
             None => return,
         };
 
+        // A split set whose joined output the recovery data already produced is
+        // retired for the rest of the job. Several paths re-offer its completed
+        // parts here — job restore, and the archive finalization that re-refreshes
+        // every unextracted source file — and rebuilding the topology from one of
+        // them would put the joiner back in front of a verified output.
+        if matches!(role, weaver_model::files::FileRole::SplitFile { .. })
+            && self
+                .par2_joined_split_sets
+                .get(&job_id)
+                .is_some_and(|sets| sets.contains_key(&set_name))
+        {
+            debug!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                "split set already joined by its recovery data — not re-registering it"
+            );
+            return;
+        }
+
         match role {
             weaver_model::files::FileRole::SevenZipArchive => {
                 if state.assembly.archive_topology_for(&set_name).is_some() {

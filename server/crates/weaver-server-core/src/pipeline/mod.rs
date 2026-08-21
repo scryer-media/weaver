@@ -1287,12 +1287,68 @@ pub(super) struct Par2FileRuntime {
     pub(super) filename: String,
     pub(super) recovery_blocks: u32,
     pub(super) promoted: bool,
+    /// Recovery packets were read back off a volume that can no longer
+    /// complete, and `recovery_blocks` is how many of them validated. Set only
+    /// when at least one block was recovered, because it is also what makes the
+    /// file count toward the recovery available to a repair.
+    pub(super) salvaged: bool,
+    /// One read-back attempt per download generation. Nothing about a volume
+    /// that cannot complete changes between completion-gate entries, and the
+    /// gate is entered many times per job.
+    pub(super) salvage_attempted: bool,
+    /// Which recovery set this PAR2 file speaks for, once its packets have
+    /// actually been read. `None` means nothing has parsed it yet — a volume
+    /// can be named, queued, promoted and counted long before a single one of
+    /// its packets is seen — and callers fall back to grouping it by name.
+    pub(super) recovery_set_id: Option<par2_rs::RecoverySetId>,
+}
+
+/// What a job knows about one recovery set it has encountered.
+///
+/// A posting may carry several independent recovery sets, each describing its
+/// own files and sharing no bytes with the others. Only one of them is served,
+/// so the rest have to be remembered rather than forgotten: their volumes must
+/// not be mistaken for the served set's capacity, and the files they describe
+/// must not be reported as if nothing ever protected them.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Par2SetSummary {
+    /// Whether an index of this set was actually parsed.
+    ///
+    /// A set first met through a foreign packet inside somebody else's volume
+    /// is *known* but has no descriptions at all, so it can never be served —
+    /// it exists here to be named in the warning and to attribute that volume.
+    pub(super) describes: bool,
+    /// The file whose packets described this set, and its position in the
+    /// posting. The position is the tiebreak that makes selection independent
+    /// of arrival order.
+    pub(super) index_filename: String,
+    pub(super) index_file_index: u32,
+    /// The index name with its `.par2` and any `.volNNN+CCC` part removed —
+    /// what groups a never-parsed volume onto this set by name alone.
+    pub(super) base_name: Option<String>,
+    /// Sanitized names of the files this set protects.
+    pub(super) described_filenames: Vec<String>,
+    /// How much payload this set protects. The selection key: the set covering
+    /// the most bytes is the one worth serving.
+    pub(super) described_bytes: u64,
+    /// Files whose packets were observed to belong to this set.
+    pub(super) volume_file_indices: HashSet<u32>,
 }
 
 #[derive(Default)]
 pub(super) struct Par2RuntimeState {
     pub(super) set: Option<Arc<Par2FileSet>>,
     pub(super) files: HashMap<u32, Par2FileRuntime>,
+    /// Every recovery set this job has met, served or not. `set` above is
+    /// whichever of these was selected to be served; the others are kept so
+    /// their volumes stop counting toward the served set's capacity and the
+    /// files they describe can be named for what they are.
+    pub(super) known_sets: HashMap<par2_rs::RecoverySetId, Par2SetSummary>,
+    /// Whether the job has already said out loud that it carries sets it does
+    /// not serve. Cleared whenever a set is newly met or the served set
+    /// changes, so the operator hears about a changed picture exactly once
+    /// rather than on every completion-gate entry.
+    pub(super) unserved_sets_warned: bool,
     /// The on-disk primary PAR2 file used to reopen an evicted retained session.
     pub(super) primary_path: Option<PathBuf>,
     /// Recovery files already incorporated into the scheduler view and any
@@ -1311,6 +1367,13 @@ pub(super) struct Par2RuntimeState {
     /// Completed files whose current identity/checksum evidence was admitted
     /// to the retained session.
     pub(super) session_evidence_file_ids: HashSet<NzbFileId>,
+    /// Completion-gate entries that found protected files still incomplete
+    /// *after* the job's PAR2 verdict was settled — a state only a
+    /// reconciliation defect of ours can produce. One retry is allowed; the
+    /// second entry fails the job with a named bug report rather than
+    /// re-reading the whole recovery set on every lap forever. Reset wherever
+    /// a verdict is taken or reopened.
+    pub(super) post_verdict_reconcile_attempts: u32,
 }
 
 pub(super) enum ExtractionDone {
@@ -1994,6 +2057,26 @@ pub struct Pipeline {
     /// in a selective re-read of what it installed.
     #[cfg(test)]
     pub(super) par2_selective_verify_calls: usize,
+    /// Passes that concluded from evidence already in hand, reading nothing.
+    /// The counters above can only say a whole-set read did *not* happen; this
+    /// is what lets a test say the quick pass is what answered instead.
+    #[cfg(test)]
+    pub(super) par2_quick_verify_calls: usize,
+    /// Forces the PAR2 ignore-extension list for a test, so the "override
+    /// disables it" case can be exercised without mutating a process-global
+    /// environment variable while other tests are running.
+    #[cfg(test)]
+    pub(super) par2_ignore_extensions_override: Option<Vec<String>>,
+    /// Read-backs of a recovery volume that can no longer complete. The
+    /// one-shot latch is what keeps this off the gate's hot path, so a test can
+    /// pin it.
+    #[cfg(test)]
+    pub(super) par2_recovery_salvage_scans: usize,
+    /// Times a job announced that it carries recovery sets it does not serve.
+    /// The announcement is latched, so a test can pin that a gate entered many
+    /// times says it once.
+    #[cfg(test)]
+    pub(super) par2_unserved_set_warnings: usize,
     #[cfg(test)]
     pub(super) par2_repairer_analyze_calls: usize,
     #[cfg(test)]
@@ -2272,6 +2355,27 @@ pub struct Pipeline {
     pub(super) par2_bypassed: HashSet<JobId>,
     /// Jobs whose PAR2 set has already validated the current payload bytes.
     pub(super) par2_verified: HashSet<JobId>,
+    /// Split sets a recovery set has already answered for, keyed by set name,
+    /// with the posted parts that join into it.
+    ///
+    /// A posting of `<name>.001/.002/.003` whose recovery data is computed over
+    /// `<name>` describes a file nothing in the posting is called. The recovery
+    /// pass reads the parts as one file and installs `<name>` itself, so the
+    /// join has already happened: the split topology that would run it again
+    /// is retired here, and the parts it names become consumed inputs rather
+    /// than payload the job is still short of.
+    pub(super) par2_joined_split_sets: HashMap<JobId, HashMap<String, HashSet<String>>>,
+    /// Working-directory entry names as they stood immediately before a repair
+    /// ran, per job.
+    ///
+    /// A repair leaves artefacts behind — par2-rs renames the damaged original
+    /// aside before installing the repaired file, and only purges it when asked
+    /// — and finalization relocates the whole directory, so anything still
+    /// sitting there ships. `Par2RepairOutcome` does not report those paths, so
+    /// the only way to name them without guessing at a suffix convention is to
+    /// know what was there first. Consumed once the repair is accepted; dropped
+    /// unread when it fails, which is what leaves the evidence in place.
+    pub(super) par2_pre_repair_dir_entries: HashMap<JobId, HashSet<String>>,
     /// Jobs the SFV fallback has already ruled on (one-shot guard). The
     /// completion gate is re-entered many times per job and the fallback's
     /// disk arm reads the whole payload, so it runs once.

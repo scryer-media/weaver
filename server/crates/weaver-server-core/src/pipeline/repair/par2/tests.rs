@@ -1,6 +1,6 @@
 use super::{
     RecoveryCandidate, RecoveryCountSource, is_terminal_status, par2_recovery_packet_size,
-    parse_stateful_par2_session_enabled, select_par2_session_eviction,
+    par2_set_base_name, parse_stateful_par2_session_enabled, select_par2_session_eviction,
     select_recovery_file_indices, unique_par2_binding_candidate,
 };
 use crate::{JobId, JobStatus};
@@ -218,4 +218,39 @@ fn terminal_status_detection_matches_history_contract() {
     }));
     assert!(!is_terminal_status(&JobStatus::Downloading));
     assert!(!is_terminal_status(&JobStatus::Paused));
+}
+
+#[test]
+fn par2_collection_base_name_groups_an_index_with_its_volumes() {
+    assert_eq!(
+        par2_set_base_name("silver.horizon.par2").as_deref(),
+        Some("silver.horizon")
+    );
+    assert_eq!(
+        par2_set_base_name("silver.horizon.vol00+08.par2").as_deref(),
+        Some("silver.horizon")
+    );
+    // The convention is not consistently cased on the wire, and the block
+    // separator is written both ways.
+    assert_eq!(
+        par2_set_base_name("Silver.Horizon.VOL000-008.PAR2").as_deref(),
+        Some("silver.horizon")
+    );
+    // A `.vol` part without a block count is part of the name, not a volume
+    // marker, and a stray `.par2` inside the name does not start a new one.
+    assert_eq!(
+        par2_set_base_name("silver.volume.par2").as_deref(),
+        Some("silver.volume")
+    );
+    assert_eq!(
+        par2_set_base_name("silver.par2.vol01+02.par2").as_deref(),
+        Some("silver.par2")
+    );
+}
+
+#[test]
+fn par2_collection_base_name_declines_names_outside_the_convention() {
+    assert!(par2_set_base_name("silver.horizon.mkv").is_none());
+    assert!(par2_set_base_name(".par2").is_none());
+    assert!(par2_set_base_name("").is_none());
 }

@@ -244,6 +244,7 @@ const ja: LocaleDictionary = {
   "history.filterFailure": "失敗",
   "history.searchPlaceholder": "名前、カテゴリ、パスで履歴を絞り込み",
   "history.noMatches": "現在のフィルターに一致する履歴がありません。",
+  "queue.noMatches": "現在のフィルターに一致するキューのジョブはありません。",
   "table.health": "健全性",
   "table.category": "カテゴリ",
   "table.rowsPerPage": "1ページあたりの行数",

@@ -160,6 +160,14 @@ impl Pipeline {
         self.pending_concat.remove(&job_id);
         self.par2_bypassed.remove(&job_id);
         self.par2_verified.remove(&job_id);
+        // The verdict that retired them is gone, so a reprocessed job rebuilds
+        // its split topologies and asks the recovery set again.
+        self.par2_joined_split_sets.remove(&job_id);
+        // The verdict is gone, so the post-verdict re-entry budget goes with it.
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
+            runtime.post_verdict_reconcile_attempts = 0;
+        }
+        self.par2_pre_repair_dir_entries.remove(&job_id);
         self.sfv_checked.remove(&job_id);
     }
 

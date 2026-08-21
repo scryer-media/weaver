@@ -244,6 +244,7 @@ const zh: LocaleDictionary = {
   "history.filterFailure": "失败",
   "history.searchPlaceholder": "按名称、分类或路径筛选历史记录",
   "history.noMatches": "没有符合当前筛选条件的历史任务。",
+  "queue.noMatches": "没有符合当前筛选条件的队列任务。",
   "table.health": "健康度",
   "table.category": "分类",
   "table.rowsPerPage": "每页行数",

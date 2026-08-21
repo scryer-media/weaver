@@ -244,6 +244,7 @@ const it: LocaleDictionary = {
   "history.filterFailure": "Fallimento",
   "history.searchPlaceholder": "Filtra cronologia per nome, categoria o percorso",
   "history.noMatches": "Nessun job nella cronologia corrisponde al filtro attuale.",
+  "queue.noMatches": "Nessun job in coda corrisponde al filtro attuale.",
   "table.health": "Salute",
   "table.category": "Categoria",
   "table.rowsPerPage": "Righe per pagina",
