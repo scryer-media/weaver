@@ -1619,6 +1619,7 @@ impl Pipeline {
                     let settle_result = self
                         .settle_rar_set_after_extraction_worker(job_id, &set_name)
                         .await;
+                    self.phase_end_extracting_if_idle(job_id);
                     self.reconcile_job_progress(job_id).await;
                     match settle_result {
                         RarExtractionSettle::Idle => {

@@ -18,9 +18,22 @@ import {
   scriptResults,
 } from "./support/setup/post-processing-job";
 
-async function addScriptToGlobalList(page: Page, displayName: string): Promise<void> {
-  await page.getByRole("button", { name: `Add ${displayName}`, exact: true }).click();
+async function waitForScriptListSave(page: Page, action: () => Promise<void>): Promise<void> {
+  const response = page.waitForResponse(
+    (candidate) =>
+      candidate.url().includes("/graphql") &&
+      candidate.request().method() === "POST" &&
+      candidate.request().postData()?.includes("mutation SetScriptLists") === true,
+  );
+  await action();
+  expect((await response).ok()).toBeTruthy();
   await expect(page.getByText("Script list saved.")).toBeVisible();
+}
+
+async function addScriptToGlobalList(page: Page, displayName: string): Promise<void> {
+  await waitForScriptListSave(page, () =>
+    page.getByRole("button", { name: `Add ${displayName}`, exact: true }).click(),
+  );
 }
 
 test("post-processing settings, the live script list, and real script execution are browser-owned", async ({
@@ -151,18 +164,15 @@ test("a disabled entry stays in the list without running", async ({
   }
 
   const list = page.getByRole("list", { name: "Script list" });
-  for (const entry of await list.getByRole("listitem").all()) {
+  while ((await list.getByRole("listitem").count()) > 0) {
+    const entry = list.getByRole("listitem").first();
     const remove = entry.getByRole("button", { name: "Remove" });
-    if (await remove.isVisible()) {
-      await remove.click();
-      await expect(page.getByText("Script list saved.")).toBeVisible();
-    }
+    await waitForScriptListSave(page, () => remove.click());
   }
   await addScriptToGlobalList(page, POST_PROCESSING_NOTIFY_SCRIPT);
-  await page
-    .getByRole("switch", { name: `Enable ${POST_PROCESSING_NOTIFY_SCRIPT}` })
-    .click();
-  await expect(page.getByText("Script list saved.")).toBeVisible();
+  await waitForScriptListSave(page, () =>
+    page.getByRole("switch", { name: `Enable ${POST_PROCESSING_NOTIFY_SCRIPT}` }).click(),
+  );
 
   const job = await runJobThroughPostProcessing(request, "weaver-e2e-post-processing-disabled");
   expect(await scriptResults(request, job.id)).toHaveLength(0);

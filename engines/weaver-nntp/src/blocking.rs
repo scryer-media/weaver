@@ -641,7 +641,12 @@ impl BlockingNntpConnection {
             read_buf: BytesMut::with_capacity(read_buf_capacity),
             read_scratch: vec![0; config.buffer_profile.socket_read_size.max(64 * 1024)],
             buffer_profile: config.buffer_profile,
-            capabilities: Capabilities::default(),
+            capabilities: match config.pipelining {
+                crate::connection::PipeliningCapability::Probe => Capabilities::default(),
+                crate::connection::PipeliningCapability::Known(supports) => {
+                    Capabilities::from_pipelining(supports)
+                }
+            },
             remote_addr,
             command_timeout: config.command_timeout.max(MIN_TIMEOUT),
             current_group: None,
@@ -661,18 +666,20 @@ impl BlockingNntpConnection {
             _ => return Err(NntpError::unexpected(greeting.code, &greeting.message)),
         }
 
-        conn.fetch_capabilities()?;
-        if conn.capabilities.mode_reader_required() {
-            let resp = conn.send_command(&Command::ModeReader)?;
-            if resp.code.is_error() && resp.code.raw() != 500 {
-                warn!(code = resp.code.raw(), "blocking MODE READER failed");
-            }
+        let resp = conn.send_command(&Command::ModeReader)?;
+        if resp.code.is_error() && resp.code.raw() != 500 {
+            warn!(code = resp.code.raw(), "blocking MODE READER failed");
         }
         if let (Some(user), Some(pass)) = (&config.username, &config.password) {
             let user = user.clone();
             let pass = pass.clone();
             conn.authenticate(&user, &pass)?;
             conn.credentials = Some((user, pass));
+        }
+        if matches!(
+            config.pipelining,
+            crate::connection::PipeliningCapability::Probe
+        ) {
             conn.fetch_capabilities()?;
         }
 
@@ -2036,6 +2043,8 @@ fn is_connection_error(err: &NntpError) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::io::BufRead;
+    use std::net::TcpListener;
     use std::sync::Arc;
     #[cfg(not(windows))]
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -2275,6 +2284,7 @@ mod tests {
             command_timeout: Duration::from_secs(5),
             buffer_profile: NntpBufferProfile::default(),
             tls_ca_cert: Some(ca_path.clone()),
+            pipelining: crate::connection::PipeliningCapability::Probe,
         };
         (config, handle, ca_path)
     }
@@ -2542,6 +2552,67 @@ mod tests {
         ));
         handle.join().unwrap();
         let _ = std::fs::remove_file(ca_path);
+    }
+
+    fn assert_blocking_known_pipelining_skips_capabilities_probe(supports_pipelining: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.write_all(b"200 ready\r\n").unwrap();
+            socket.flush().unwrap();
+
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut mode_reader = String::new();
+            reader.read_line(&mut mode_reader).unwrap();
+            assert!(mode_reader.starts_with("MODE READER"));
+            socket
+                .write_all(b"500 MODE READER unsupported\r\n")
+                .unwrap();
+            socket.flush().unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
+            let mut trailing = String::new();
+            match reader.read_line(&mut trailing) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                Ok(0) => {}
+                Ok(_) => panic!("known capability mode sent an unexpected command: {trailing:?}"),
+                Err(error) => panic!("unexpected read error: {error}"),
+            }
+        });
+
+        let config = ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            connect_timeout: Duration::from_secs(1),
+            command_timeout: Duration::from_secs(1),
+            pipelining: crate::connection::PipeliningCapability::Known(supports_pipelining),
+            ..Default::default()
+        };
+        let conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+        assert_eq!(
+            conn.capabilities().supports_pipelining(),
+            supports_pipelining
+        );
+        drop(conn);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn blocking_known_pipelining_skips_capabilities_probe() {
+        assert_blocking_known_pipelining_skips_capabilities_probe(true);
+    }
+
+    #[test]
+    fn blocking_known_non_pipelining_skips_capabilities_probe() {
+        assert_blocking_known_pipelining_skips_capabilities_probe(false);
     }
 
     #[test]

@@ -30,6 +30,7 @@ type fullPhaseContext struct {
 	NNTPDonor        string
 	DonorNNTPPort    int
 	DonorNNTP2Port   int
+	DonorFixturesDir string
 	ToxiproxyConfig  string
 	ExtraEnv         map[string]string
 	WeaverBin        string
@@ -998,6 +999,7 @@ func newFullPhaseContextsFor(tempRoot string, includePhase func(fullPhaseDefinit
 		}
 		phase.DonorNNTPPort = donor.RuntimePorts.NNTPPort
 		phase.DonorNNTP2Port = donor.RuntimePorts.NNTP2Port
+		phase.DonorFixturesDir = donor.FixturesDir
 		if err := writeBorrowedToxiproxyConfig(phase); err != nil {
 			return nil, fmt.Errorf("write %s toxiproxy config: %w", phase.Name, err)
 		}
@@ -1320,12 +1322,18 @@ func writeBorrowedToxiproxyConfig(phase *fullPhaseContext) error {
 
 func (p *fullPhaseContext) env() map[string]string {
 	datastore := normalizedWeaverDatastoreForPhase(p.Datastore)
+	fixturesDir := p.FixturesDir
+	if p.NNTPDonor != "" && p.DonorFixturesDir != "" {
+		// Borrowers still submit local NZBs to their own Weaver instance. Reuse
+		// the donor's already-built NZBs as well as its seeded NNTP server.
+		fixturesDir = p.DonorFixturesDir
+	}
 	env := map[string]string{
 		"E2E_DIR":                e2eDir(),
 		"E2E_PROJECT":            p.Project,
 		"E2E_SEED_PROFILE":       p.SeedProfile,
 		"E2E_WEAVER_DATASTORE":   datastore,
-		"FIXTURES_DIR":           p.FixturesDir,
+		"FIXTURES_DIR":           fixturesDir,
 		"E2E_RUN_DIR":            p.RunDir,
 		"E2E_RUNTIME_PORTS_FILE": p.RuntimePortsFile,
 		"E2E_EVENT_STREAM":       "1",

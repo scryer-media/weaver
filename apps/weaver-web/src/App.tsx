@@ -69,7 +69,7 @@ function AppProviders() {
     <TranslateContext.Provider value={contextValue}>
       <Provider value={client}>
         <SecurityUpgradeGate>
-          <RouterProvider router={router} />
+          <RouterProvider router={router} useTransitions={false} />
         </SecurityUpgradeGate>
         <Toaster />
       </Provider>

@@ -228,6 +228,20 @@ impl Default for NntpBufferProfile {
     }
 }
 
+/// How an NNTP connection determines PIPELINING support.
+///
+/// Application runtime connections use the persisted server setting. Explicit
+/// server validation opts into [`Self::Probe`] and performs one post-auth
+/// CAPABILITIES exchange instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PipeliningCapability {
+    /// Discover the capability from the server.
+    #[default]
+    Probe,
+    /// Use the persisted server setting and skip CAPABILITIES.
+    Known(bool),
+}
+
 /// Configuration for connecting to a single NNTP server.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -254,6 +268,8 @@ pub struct ServerConfig {
     /// Optional path to a PEM-encoded CA certificate to trust in addition
     /// to the system/Mozilla roots (e.g. self-signed or internal CAs).
     pub tls_ca_cert: Option<std::path::PathBuf>,
+    /// Source of the PIPELINING capability for this connection.
+    pub pipelining: PipeliningCapability,
 }
 
 impl Default for ServerConfig {
@@ -269,6 +285,7 @@ impl Default for ServerConfig {
             command_timeout: Duration::from_mins(1),
             buffer_profile: NntpBufferProfile::default(),
             tls_ca_cert: None,
+            pipelining: PipeliningCapability::Probe,
         }
     }
 }
@@ -376,7 +393,10 @@ impl NntpConnection {
             read_buf: BytesMut::with_capacity(read_buf_capacity),
             buffer_profile: config.buffer_profile,
             state: ConnectionState::Greeting,
-            capabilities: Capabilities::default(),
+            capabilities: match config.pipelining {
+                PipeliningCapability::Probe => Capabilities::default(),
+                PipeliningCapability::Known(supports) => Capabilities::from_pipelining(supports),
+            },
             host: config.host.clone(),
             remote_addr,
             created_at: now,
@@ -407,24 +427,22 @@ impl NntpConnection {
             conn.do_starttls().await?;
         }
 
-        // 4. Fetch capabilities
-        conn.fetch_capabilities().await?;
-
-        // 5. MODE READER if needed
-        if conn.capabilities.mode_reader_required() {
-            debug!("sending MODE READER");
-            let resp = conn.send_command(&Command::ModeReader).await?;
-            if resp.code.is_error() && resp.code.raw() != 500 {
-                warn!(code = resp.code.raw(), "MODE READER failed");
-            }
+        // 4. MODE READER is safe to issue even when unsupported, and avoids a
+        // capability round trip on every pooled runtime connection.
+        debug!("sending MODE READER");
+        let resp = conn.send_command(&Command::ModeReader).await?;
+        if resp.code.is_error() && resp.code.raw() != 500 {
+            warn!(code = resp.code.raw(), "MODE READER failed");
         }
 
-        // 6. Authenticate if credentials provided
+        // 5. Authenticate if credentials provided
         if let (Some(user), Some(pass)) = (&config.username, &config.password) {
             conn.authenticate(user, pass).await?;
             conn.credentials = Some((user.clone(), pass.clone()));
+        }
 
-            // 7. Re-fetch capabilities — some servers change them after auth
+        // 6. Validation uses exactly one post-auth capability exchange.
+        if matches!(config.pipelining, PipeliningCapability::Probe) {
             conn.fetch_capabilities().await?;
         }
 
@@ -2510,6 +2528,48 @@ mod tests {
         assert!(!cfg.starttls);
         assert!(cfg.username.is_none());
         assert!(cfg.password.is_none());
+        assert_eq!(cfg.pipelining, PipeliningCapability::Probe);
+    }
+
+    #[tokio::test]
+    async fn probe_fetches_capabilities_once_after_authentication() {
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("MODE READER"),
+                    response: b"500 MODE READER unsupported\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO USER"),
+                    response: b"381 password required\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO PASS"),
+                    response: b"281 authentication accepted\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"101 Capability list:\r\nPIPELINING\r\n.\r\n",
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let mut config = scripted_plain_config(port);
+        config.username = Some("user".into());
+        config.password = Some("pass".into());
+        let conn = NntpConnection::connect(&config).await.unwrap();
+        assert!(conn.capabilities().supports_pipelining());
     }
 
     #[tokio::test]
@@ -2561,11 +2621,6 @@ mod tests {
                 ScriptStep {
                     expect_prefix: None,
                     response: b"200 ready\r\n",
-                    delay: Duration::ZERO,
-                },
-                ScriptStep {
-                    expect_prefix: Some("CAPABILITIES"),
-                    response: b"500 unknown\r\n",
                     delay: Duration::ZERO,
                 },
                 ScriptStep {
@@ -2624,11 +2679,6 @@ mod tests {
                 ScriptStep {
                     expect_prefix: None,
                     response: b"200 ready\r\n",
-                    delay: Duration::ZERO,
-                },
-                ScriptStep {
-                    expect_prefix: Some("CAPABILITIES"),
-                    response: b"500 unknown\r\n",
                     delay: Duration::ZERO,
                 },
                 ScriptStep {
@@ -3177,11 +3227,6 @@ mod tests {
                 ScriptStep {
                     expect_prefix: None,
                     response: b"200 ready\r\n",
-                    delay: Duration::ZERO,
-                },
-                ScriptStep {
-                    expect_prefix: Some("CAPABILITIES"),
-                    response: b"500 unknown\r\n",
                     delay: Duration::ZERO,
                 },
                 ScriptStep {

@@ -146,6 +146,18 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    /// Build the minimal runtime capability set from a persisted server setting.
+    ///
+    /// Runtime connections only need the PIPELINING bit. Full capability
+    /// discovery is reserved for explicit server validation.
+    pub fn from_pipelining(supports_pipelining: bool) -> Self {
+        let mut raw = HashMap::new();
+        if supports_pipelining {
+            raw.insert("PIPELINING".to_string(), Vec::new());
+        }
+        Self { raw }
+    }
+
     /// Parse capabilities from the multi-line data body.
     ///
     /// Each line is `KEYWORD [arg1 arg2 ...]`.

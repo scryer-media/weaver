@@ -486,6 +486,45 @@ func saveRuntimePortState(path string, state runtimePortState) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+// reallocateRuntimePortsForDockerRetry picks a fresh set of host ports after
+// Docker loses the race between the probe listener closing and compose binding
+// its published ports. Preserve explicit borrower aliases such as NNTP_PORT:
+// their values deliberately target another phase's already-seeded NNTP server.
+func reallocateRuntimePortsForDockerRetry() error {
+	statePath := runtimePortsStatePath()
+	previous, err := loadRuntimePortState(statePath)
+	if err != nil {
+		return fmt.Errorf("load current runtime ports: %w", err)
+	}
+	next, err := allocateRuntimePortState()
+	if err != nil {
+		return fmt.Errorf("allocate fresh runtime ports: %w", err)
+	}
+	if err := saveRuntimePortState(statePath, next); err != nil {
+		return fmt.Errorf("save fresh runtime ports: %w", err)
+	}
+
+	previousEnv := runtimePortEnvValues(previous)
+	for key, value := range runtimePortEnvValues(next) {
+		// Compose consumes the E2E_* bindings directly. The compatibility
+		// aliases follow those bindings only when the phase has not explicitly
+		// overridden them (as NNTP borrower phases do).
+		if strings.HasPrefix(key, "E2E_") || os.Getenv(key) == previousEnv[key] {
+			setEnv(key, value)
+		}
+	}
+	return nil
+}
+
+func isDockerHostPortBindCollision(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "failed to bind host port") &&
+		strings.Contains(message, "address already in use")
+}
+
 func validateRuntimePortState(state runtimePortState) error {
 	ports := []int{
 		state.NNTPPort,
@@ -5866,11 +5905,21 @@ func dockerComposeUp(services ...string) error {
 			return err
 		}
 	}
-	log.Printf("starting docker services: %s", strings.Join(services, ", "))
-	args := append(dockerComposeArgs("up", "-d", "--quiet-pull"), services...)
-	cmd := exec.Command("docker", args...)
-	cmd.Dir = e2eDir()
-	return runExternalCommand(cmd, "docker compose up")
+	const maxPortBindRetries = 2
+	for attempt := 0; ; attempt++ {
+		log.Printf("starting docker services: %s", strings.Join(services, ", "))
+		args := append(dockerComposeArgs("up", "-d", "--quiet-pull"), services...)
+		cmd := exec.Command("docker", args...)
+		cmd.Dir = e2eDir()
+		err := runExternalCommand(cmd, "docker compose up")
+		if err == nil || !isDockerHostPortBindCollision(err) || attempt == maxPortBindRetries {
+			return err
+		}
+		if retryErr := reallocateRuntimePortsForDockerRetry(); retryErr != nil {
+			return fmt.Errorf("%w; reallocate runtime ports for retry: %v", err, retryErr)
+		}
+		log.Printf("docker host-port collision; retrying compose with fresh runtime ports (attempt %d/%d)", attempt+1, maxPortBindRetries)
+	}
 }
 
 func requiresWeaverService(services []string) bool {

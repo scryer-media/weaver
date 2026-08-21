@@ -3144,6 +3144,16 @@ mod tests {
         spawn_shared_scripted_server(steps, Duration::ZERO).await
     }
 
+    async fn reject_mode_reader(socket: &mut TcpStream) {
+        let mode_reader = read_command_line(socket).await;
+        assert!(mode_reader.starts_with("MODE READER"));
+        socket
+            .write_all(b"500 MODE READER unsupported\r\n")
+            .await
+            .unwrap();
+        socket.flush().await.unwrap();
+    }
+
     async fn spawn_trickling_body_server(line_delay: Duration) -> u16 {
         const LINE: &[u8] = b"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\r\n";
 
@@ -3153,6 +3163,7 @@ mod tests {
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.write_all(b"200 ready\r\n").await.unwrap();
+            reject_mode_reader(&mut socket).await;
 
             let capabilities = read_command_line(&mut socket).await;
             assert!(capabilities.starts_with("CAPABILITIES"));
@@ -3189,6 +3200,7 @@ mod tests {
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.write_all(b"200 ready\r\n").await.unwrap();
+            reject_mode_reader(&mut socket).await;
 
             let capabilities = read_command_line(&mut socket).await;
             assert!(capabilities.starts_with("CAPABILITIES"));
@@ -3218,13 +3230,7 @@ mod tests {
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.write_all(b"200 ready\r\n").await.unwrap();
-
-            let capabilities = read_command_line(&mut socket).await;
-            assert!(capabilities.starts_with("CAPABILITIES"));
-            socket
-                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
-                .await
-                .unwrap();
+            reject_mode_reader(&mut socket).await;
 
             let initial_user = read_command_line(&mut socket).await;
             assert!(initial_user.starts_with("AUTHINFO USER "));
@@ -3264,6 +3270,7 @@ mod tests {
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.write_all(b"200 ready\r\n").await.unwrap();
+            reject_mode_reader(&mut socket).await;
 
             let capabilities = read_command_line(&mut socket).await;
             assert!(capabilities.starts_with("CAPABILITIES"));
@@ -3327,6 +3334,15 @@ mod tests {
                     socket.flush().await.unwrap();
 
                     while let Some(line) = try_read_command_line(&mut socket).await {
+                        if line.starts_with("MODE READER") {
+                            socket
+                                .write_all(b"500 MODE READER unsupported\r\n")
+                                .await
+                                .unwrap();
+                            socket.flush().await.unwrap();
+                            continue;
+                        }
+
                         if line.starts_with("CAPABILITIES") {
                             socket
                                 .write_all(
@@ -3375,6 +3391,51 @@ mod tests {
             group: group as u32,
             ..ServerPoolConfig::default()
         }
+    }
+
+    async fn spawn_stat_server(expect_pipelined: bool) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"200 ready\r\n").await.unwrap();
+            socket.flush().await.unwrap();
+            reject_mode_reader(&mut socket).await;
+
+            let first = read_command_line(&mut socket).await;
+            assert!(first.starts_with("STAT <first@example.com>"));
+            if expect_pipelined {
+                let second = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    read_command_line(&mut socket),
+                )
+                .await
+                .expect("known pipelining mode must send the next STAT before a response");
+                assert!(second.starts_with("STAT <second@example.com>"));
+                socket
+                    .write_all(
+                        b"223 1 <first@example.com> article exists\r\n223 2 <second@example.com> article exists\r\n",
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                socket
+                    .write_all(b"223 1 <first@example.com> article exists\r\n")
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+                let second = read_command_line(&mut socket).await;
+                assert!(second.starts_with("STAT <second@example.com>"));
+                socket
+                    .write_all(b"223 2 <second@example.com> article exists\r\n")
+                    .await
+                    .unwrap();
+            }
+            socket.flush().await.unwrap();
+        });
+
+        port
     }
 
     fn scripted_blocking_s2n_server(port: u16, max_connections: usize) -> ServerPoolConfig {
@@ -4980,6 +5041,7 @@ mod tests {
                 accepted_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 socket.write_all(b"200 ready\r\n").await.unwrap();
                 socket.flush().await.unwrap();
+                reject_mode_reader(&mut socket).await;
                 let line = read_command_line(&mut socket).await;
                 assert!(line.starts_with("CAPABILITIES"));
                 socket
@@ -5036,6 +5098,7 @@ mod tests {
                 accepted_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 socket.write_all(b"200 ready\r\n").await.unwrap();
                 socket.flush().await.unwrap();
+                reject_mode_reader(&mut socket).await;
                 let line = read_command_line(&mut socket).await;
                 assert!(line.starts_with("CAPABILITIES"));
                 socket
@@ -5296,6 +5359,48 @@ mod tests {
 
         let order = client.build_server_order(&[]).await;
         assert_eq!(order, vec![1, 0]);
+    }
+
+    #[tokio::test]
+    async fn known_pipelining_pipelines_stats_without_capabilities() {
+        let port = spawn_stat_server(true).await;
+        let mut server = scripted_server(port, 0);
+        server.server.pipelining = crate::connection::PipeliningCapability::Known(true);
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![server],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        assert_eq!(
+            client
+                .stat_many(&["<first@example.com>", "<second@example.com>"])
+                .await
+                .unwrap(),
+            vec![true, true]
+        );
+    }
+
+    #[tokio::test]
+    async fn known_non_pipelining_serializes_stats_without_capabilities() {
+        let port = spawn_stat_server(false).await;
+        let mut server = scripted_server(port, 0);
+        server.server.pipelining = crate::connection::PipeliningCapability::Known(false);
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![server],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        assert_eq!(
+            client
+                .stat_many(&["<first@example.com>", "<second@example.com>"])
+                .await
+                .unwrap(),
+            vec![true, true]
+        );
     }
 
     #[tokio::test]

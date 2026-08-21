@@ -474,6 +474,11 @@ pub enum SchedulerCommand {
         total_connections: usize,
         reply: oneshot::Sender<Result<NntpRuntimeActivation, SchedulerError>>,
     },
+    /// Apply the asynchronous random-read disk measurement to the tuner.
+    UpdateRandomReadIops {
+        random_read_iops: f64,
+        reply: oneshot::Sender<()>,
+    },
     /// Update runtime storage directories after a restore.
     UpdateRuntimePaths {
         data_dir: PathBuf,
@@ -1037,6 +1042,23 @@ impl SchedulerHandle {
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+    }
+
+    /// Update disk tuning after the background startup measurement completes.
+    pub async fn update_random_read_iops(
+        &self,
+        random_read_iops: f64,
+    ) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::UpdateRandomReadIops {
+                random_read_iops,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        Ok(())
     }
 
     /// Update the pipeline's runtime directories for future jobs.

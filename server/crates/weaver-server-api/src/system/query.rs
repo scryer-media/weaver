@@ -39,7 +39,11 @@ impl SystemQuery {
         .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
 
         let environment = weaver_server_core::runtime::environment::detect_runtime_environment();
-        let profile = &runtime.profile;
+        let profile = runtime
+            .profile
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let simd = &profile.cpu.simd;
         let mut simd_features = Vec::new();
         if simd.sse42 {

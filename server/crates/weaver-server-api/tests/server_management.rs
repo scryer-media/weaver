@@ -37,11 +37,25 @@ async fn spawn_scripted_server(steps: Vec<ScriptStep>) -> u16 {
         let (mut socket, _) = listener.accept().await.unwrap();
         for step in steps {
             if let Some(prefix) = step.expect_prefix {
-                let line = read_command_line(&mut socket).await;
-                assert!(
-                    line.starts_with(prefix),
-                    "expected command starting with {prefix:?}, got {line:?}"
-                );
+                loop {
+                    let line = read_command_line(&mut socket).await;
+                    // Runtime setup sends this optional compatibility command
+                    // before the validation probe. Individual scripts can
+                    // still assert it explicitly when it matters.
+                    if line.starts_with("MODE READER") && !prefix.starts_with("MODE READER") {
+                        socket
+                            .write_all(b"500 MODE READER unsupported\r\n")
+                            .await
+                            .unwrap();
+                        socket.flush().await.unwrap();
+                        continue;
+                    }
+                    assert!(
+                        line.starts_with(prefix),
+                        "expected command starting with {prefix:?}, got {line:?}"
+                    );
+                    break;
+                }
             }
             if !step.response.is_empty() {
                 socket.write_all(step.response).await.unwrap();
@@ -337,10 +351,6 @@ async fn add_server_with_auth() {
             response: b"200 ready\r\n",
         },
         ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"500 unknown\r\n",
-        },
-        ScriptStep {
             expect_prefix: Some("AUTHINFO USER"),
             response: b"381 password required\r\n",
         },
@@ -474,6 +484,70 @@ async fn update_server_host() {
     assert_eq!(
         data["updateServer"]["host"].as_str().unwrap(),
         "new.example.com"
+    );
+}
+
+#[tokio::test]
+async fn inactive_update_preserves_persisted_pipelining_capability() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                addServer(input: {
+                    host: "news.example.com",
+                    port: 119,
+                    tls: false,
+                    connections: 5,
+                    active: false
+                }) { id }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let id = response_data(&resp)["addServer"]["id"].as_u64().unwrap() as u32;
+
+    let mut persisted =
+        h.db.list_servers()
+            .unwrap()
+            .into_iter()
+            .find(|server| server.id == id)
+            .unwrap();
+    persisted.supports_pipelining = true;
+    h.db.update_server(&persisted).unwrap();
+    h.config
+        .write()
+        .await
+        .servers
+        .iter_mut()
+        .find(|server| server.id == id)
+        .unwrap()
+        .supports_pipelining = true;
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{
+                updateServer(id: {id}, input: {{
+                    host: "new.example.com",
+                    port: 119,
+                    tls: false,
+                    connections: 5,
+                    active: false
+                }}) {{ supportsPipelining }}
+            }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        response_data(&resp)["updateServer"]["supportsPipelining"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        h.db.list_servers()
+            .unwrap()
+            .into_iter()
+            .find(|server| server.id == id)
+            .unwrap()
+            .supports_pipelining
     );
 }
 
@@ -907,10 +981,6 @@ async fn update_active_server_preserves_password_during_validation() {
         ScriptStep {
             expect_prefix: None,
             response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"500 unknown\r\n",
         },
         ScriptStep {
             expect_prefix: Some("AUTHINFO USER"),

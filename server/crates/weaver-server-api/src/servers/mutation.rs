@@ -113,7 +113,7 @@ impl ServersMutation {
 
         let validated_capabilities = validate_server_before_save(&normalized).await?;
         let mut server = normalized.as_runtime_server_config(id);
-        server.supports_pipelining = validated_capabilities.unwrap_or(false);
+        server.supports_pipelining = validated_capabilities.unwrap_or(existing.supports_pipelining);
 
         {
             let db = db.clone();

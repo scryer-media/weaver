@@ -41,10 +41,9 @@ pub(crate) async fn run(
         profile,
         buffers,
         write_buf_max,
-    } = wiring::build_runtime_context(data_dir);
+    } = wiring::build_runtime_context(weaver_server_core::runtime::detect_system_profile(data_dir));
 
-    // Detect server capabilities (pipelining, etc.) and build NNTP client.
-    wiring::detect_server_capabilities(config, db).await;
+    // Build the NNTP client from capability values validated when servers were saved.
     let policy_db = db.clone();
     let policy_servers = config.servers.clone();
     let server_transfer_policy = std::sync::Arc::new(

@@ -555,6 +555,14 @@ func TestBorrowedNNTPPhasesReadTheDonorInsteadOfSeeding(t *testing.T) {
 		if donor.SkipSeed {
 			t.Fatalf("%s borrows from %s, which seeds nothing", phase.Name, donor.Name)
 		}
+		if phase.DonorFixturesDir != donor.FixturesDir {
+			t.Fatalf(
+				"%s donor fixtures = %q, want %q",
+				phase.Name,
+				phase.DonorFixturesDir,
+				donor.FixturesDir,
+			)
+		}
 		// The donor need not seed the same profile, but it must seed a
 		// superset: every fixture the borrower's suite expects has to already
 		// be on the server it reads. Checked against the real slug lists
@@ -576,6 +584,14 @@ func TestBorrowedNNTPPhasesReadTheDonorInsteadOfSeeding(t *testing.T) {
 		// Both consumers must be redirected: the host-side harness over
 		// loopback, and the containerised Weaver through the host gateway.
 		env := phase.env()
+		if env["FIXTURES_DIR"] != donor.FixturesDir {
+			t.Fatalf(
+				"%s env[FIXTURES_DIR] = %q, want donor fixtures %q",
+				phase.Name,
+				env["FIXTURES_DIR"],
+				donor.FixturesDir,
+			)
+		}
 		donorPort := strconv.Itoa(donor.RuntimePorts.NNTPPort)
 		for key, want := range map[string]string{
 			"NNTP_HOST":            "127.0.0.1",

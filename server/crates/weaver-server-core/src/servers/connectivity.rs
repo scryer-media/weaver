@@ -16,6 +16,7 @@ pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivit
         username: config.username.clone(),
         password: config.password.clone(),
         tls_ca_cert: config.tls_ca_cert.clone(),
+        pipelining: weaver_nntp::PipeliningCapability::Probe,
         ..Default::default()
     };
     let start = std::time::Instant::now();

@@ -11,14 +11,32 @@ use std::process::Command;
 use super::system_profile::*;
 use tracing::debug;
 
-/// Probe the running system and return a [`SystemProfile`].
+/// Probe the running system and return a fully measured [`SystemProfile`].
 ///
 /// Detection is best-effort: any individual probe that fails silently
 /// falls back to a safe default rather than aborting startup.
 pub fn detect(output_dir: &Path) -> SystemProfile {
+    let mut profile = detect_startup_profile(output_dir);
+    profile.disk.random_read_iops = measure_random_read_iops(output_dir);
+    profile
+}
+
+/// Collect the fast system facts needed to start the runtime.
+///
+/// Random-read IOPS is intentionally left at zero until
+/// [`measure_random_read_iops`] runs. Zero is conservative: the tuner admits
+/// only one extraction until the measured value is applied.
+pub fn detect_startup_profile(output_dir: &Path) -> SystemProfile {
     let cpu = detect_cpu();
     let memory = detect_memory();
-    let disk = detect_disk(output_dir);
+    let (storage_class, filesystem) = detect_disk_info(output_dir);
+    let disk = DiskProfile {
+        storage_class,
+        filesystem,
+        sequential_write_mbps: 500.0,
+        random_read_iops: 0.0,
+        same_filesystem: true,
+    };
 
     SystemProfile { cpu, memory, disk }
 }
@@ -303,24 +321,15 @@ fn detect_cgroup_memory_limit() -> Option<u64> {
 // Disk
 // ---------------------------------------------------------------------------
 
-fn detect_disk(output_dir: &Path) -> DiskProfile {
-    let (storage_class, filesystem) = detect_disk_info(output_dir);
-    let iops = match startup_iops_override() {
+/// Measure random 4 KB read IOPS, including the explicit test/benchmark
+/// override. This runs after HTTP startup in the long-lived server process.
+pub fn measure_random_read_iops(output_dir: &Path) -> f64 {
+    match startup_iops_override() {
         Some(pinned) => {
             debug!(iops = pinned, "disk probe skipped: WEAVER_STARTUP_IOPS");
             pinned
         }
         None => benchmark_random_read_iops(output_dir).unwrap_or(10_000.0),
-    };
-
-    debug!(?storage_class, ?filesystem, iops, "disk probe");
-
-    DiskProfile {
-        storage_class,
-        filesystem,
-        sequential_write_mbps: 500.0,
-        random_read_iops: iops,
-        same_filesystem: true,
     }
 }
 

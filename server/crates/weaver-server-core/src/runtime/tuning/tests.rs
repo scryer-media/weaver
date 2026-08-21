@@ -360,3 +360,17 @@ fn set_connection_limit_decreases_capacity() {
     tuner.set_connection_limit(5);
     assert_eq!(tuner.params().max_concurrent_downloads, 5);
 }
+
+#[test]
+fn random_read_iops_update_changes_future_extraction_admission_limit() {
+    let mut profile = hdd_profile(4);
+    profile.disk.random_read_iops = 0.0;
+    let mut tuner = RuntimeTuner::with_connection_limit(profile, 8);
+    assert_eq!(tuner.max_concurrent_extractions(), 1);
+
+    tuner.set_random_read_iops(1_500.0);
+    assert_eq!(tuner.max_concurrent_extractions(), 4);
+
+    tuner.set_random_read_iops(200.0);
+    assert_eq!(tuner.max_concurrent_extractions(), 1);
+}

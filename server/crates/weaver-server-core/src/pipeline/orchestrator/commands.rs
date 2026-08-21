@@ -543,6 +543,22 @@ impl Pipeline {
                 };
                 let _ = reply.send(result);
             }
+            SchedulerCommand::UpdateRandomReadIops {
+                random_read_iops,
+                reply,
+            } => {
+                let prior_limit = self.tuner.max_concurrent_extractions();
+                self.tuner.set_random_read_iops(random_read_iops);
+                let next_limit = self.tuner.max_concurrent_extractions();
+                if next_limit > prior_limit {
+                    self.promote_queued_extractions();
+                }
+                info!(
+                    random_read_iops,
+                    prior_limit, next_limit, "applied startup disk measurement to runtime tuner"
+                );
+                let _ = reply.send(());
+            }
             SchedulerCommand::UpdateRuntimePaths {
                 data_dir,
                 intermediate_dir,

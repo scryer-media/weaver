@@ -35,6 +35,53 @@ func TestDetectE2EDirRecognizesCanonicalCLIs(t *testing.T) {
 	}
 }
 
+func TestDockerHostPortBindCollisionRecognition(t *testing.T) {
+	if !isDockerHostPortBindCollision(fmt.Errorf(
+		"docker compose up: exit status 1: failed to bind host port 0.0.0.0:55482/tcp: address already in use",
+	)) {
+		t.Fatal("expected Docker host-port bind collision to be retryable")
+	}
+	if isDockerHostPortBindCollision(fmt.Errorf("docker compose up: invalid compose file")) {
+		t.Fatal("non-bind Docker error must not be retried")
+	}
+}
+
+func TestReallocateRuntimePortsForDockerRetryPreservesBorrowedAliases(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "runtime-ports.json")
+	previous, err := allocateRuntimePortState()
+	if err != nil {
+		t.Fatalf("allocate previous runtime ports: %v", err)
+	}
+	if err := saveRuntimePortState(statePath, previous); err != nil {
+		t.Fatalf("save previous runtime ports: %v", err)
+	}
+	t.Setenv("E2E_RUNTIME_PORTS_FILE", statePath)
+	for key, value := range runtimePortEnvValues(previous) {
+		t.Setenv(key, value)
+	}
+	t.Setenv("NNTP_PORT", "39991")
+	t.Setenv("NNTP_BACKUP_PORT", "39992")
+
+	if err := reallocateRuntimePortsForDockerRetry(); err != nil {
+		t.Fatalf("reallocate runtime ports: %v", err)
+	}
+	next, err := loadRuntimePortState(statePath)
+	if err != nil {
+		t.Fatalf("load reallocated runtime ports: %v", err)
+	}
+	for key, want := range runtimePortEnvValues(next) {
+		if strings.HasPrefix(key, "E2E_") && os.Getenv(key) != want {
+			t.Fatalf("env[%s] = %q, want %q", key, os.Getenv(key), want)
+		}
+	}
+	if got := os.Getenv("NNTP_PORT"); got != "39991" {
+		t.Fatalf("borrowed NNTP_PORT = %q, want preserved donor port", got)
+	}
+	if got := os.Getenv("NNTP_BACKUP_PORT"); got != "39992" {
+		t.Fatalf("borrowed NNTP_BACKUP_PORT = %q, want preserved donor port", got)
+	}
+}
+
 func TestStatOnlyChaosConfigDropsBodyChaos(t *testing.T) {
 	got := statOnlyChaosConfig("stat_bad_code=100,drop_mid_body=5, stat_short=25")
 	want := "stat_bad_code=100,stat_short=25"

@@ -528,6 +528,9 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::CancelPostProcessing { reply, .. } => {
                     let _ = reply.send(Ok(()));
                 }
+                SchedulerCommand::UpdateRandomReadIops { reply, .. } => {
+                    let _ = reply.send(());
+                }
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.
@@ -562,6 +565,16 @@ fn sample_nzb_zstd() -> Vec<u8> {
         </nzb>"#,
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn update_random_read_iops_reaches_scheduler() {
+    let (handle, task) = test_scheduler();
+
+    handle.update_random_read_iops(1_500.0).await.unwrap();
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap();
 }
 
 #[tokio::test]

@@ -3,7 +3,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
+use std::sync::{
+    Arc, Condvar, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, RwLock as StdRwLock,
+};
 
 use async_graphql::{Request, Response, Variables};
 use serde_json::Value;
@@ -252,30 +254,33 @@ impl TestHarness {
             log_buffer:
                 weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
             system_runtime: SystemRuntimeContext {
-                profile: weaver_server_core::runtime::system_profile::SystemProfile {
-                    cpu: weaver_server_core::runtime::system_profile::CpuProfile {
-                        physical_cores: 4,
-                        logical_cores: 8,
-                        simd: weaver_server_core::runtime::system_profile::SimdSupport::default(),
-                        cgroup_limit: None,
-                    },
-                    memory: weaver_server_core::runtime::system_profile::MemoryProfile {
-                        total_bytes: 8 * 1024 * 1024 * 1024,
-                        available_bytes: 4 * 1024 * 1024 * 1024,
-                        cgroup_limit: None,
-                    },
-                    disk: weaver_server_core::runtime::system_profile::DiskProfile {
-                        storage_class:
-                            weaver_server_core::runtime::system_profile::StorageClass::Unknown,
-                        filesystem:
-                            weaver_server_core::runtime::system_profile::FilesystemType::Unknown(
-                                String::new(),
+                profile: Arc::new(StdRwLock::new(
+                    weaver_server_core::runtime::system_profile::SystemProfile {
+                        cpu: weaver_server_core::runtime::system_profile::CpuProfile {
+                            physical_cores: 4,
+                            logical_cores: 8,
+                            simd: weaver_server_core::runtime::system_profile::SimdSupport::default(
                             ),
-                        sequential_write_mbps: 0.0,
-                        random_read_iops: 0.0,
-                        same_filesystem: true,
+                            cgroup_limit: None,
+                        },
+                        memory: weaver_server_core::runtime::system_profile::MemoryProfile {
+                            total_bytes: 8 * 1024 * 1024 * 1024,
+                            available_bytes: 4 * 1024 * 1024 * 1024,
+                            cgroup_limit: None,
+                        },
+                        disk: weaver_server_core::runtime::system_profile::DiskProfile {
+                            storage_class:
+                                weaver_server_core::runtime::system_profile::StorageClass::Unknown,
+                            filesystem:
+                                weaver_server_core::runtime::system_profile::FilesystemType::Unknown(
+                                    String::new(),
+                                ),
+                            sequential_write_mbps: 0.0,
+                            random_read_iops: 0.0,
+                            same_filesystem: true,
+                        },
                     },
-                },
+                )),
                 started_at: std::time::Instant::now(),
             },
             nntp_pool: None,
@@ -844,6 +849,9 @@ fn spawn_test_scheduler(
                 }
                 SchedulerCommand::CancelPostProcessing { reply, .. } => {
                     let _ = reply.send(Ok(()));
+                }
+                SchedulerCommand::UpdateRandomReadIops { reply, .. } => {
+                    let _ = reply.send(());
                 }
                 SchedulerCommand::Shutdown => break,
             }

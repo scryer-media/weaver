@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Progress } from "@/components/ui/progress";
 import { formatSpeed } from "@/components/SpeedDisplay";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -18,6 +18,8 @@ const PHASE_COLOR: Record<JobPhase, string> = {
   EXTRACTING: "bg-violet-500",
   MOVING: "bg-cyan-500",
 };
+
+const EXTRACTION_VISIBILITY_DELAY_MS = 1_000;
 
 function clampPercent(value: number): number {
   if (!Number.isFinite(value)) {
@@ -48,9 +50,31 @@ export function JobPhaseProgressBars({
 }) {
   const t = useTranslate();
   const phases = useMemo(() => phaseProgress ?? [], [phaseProgress]);
+  const extractingStartedAt = phases.find(
+    (phase) => phase.phase === "EXTRACTING" && phase.totalBytes > 0,
+  )?.startedAtEpochMs;
+  const [revealedExtractionStartedAt, setRevealedExtractionStartedAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (extractingStartedAt == null) {
+      setRevealedExtractionStartedAt(null);
+      return;
+    }
+
+    // The phase timestamp originates on the server, so use a client-local
+    // delay from observation rather than comparing clocks across machines.
+    const timeoutId = window.setTimeout(() => {
+      setRevealedExtractionStartedAt(extractingStartedAt);
+    }, EXTRACTION_VISIBILITY_DELAY_MS);
+    return () => window.clearTimeout(timeoutId);
+  }, [extractingStartedAt]);
 
   const visible = phases
-    .filter((phase) => phase.totalBytes > 0)
+    .filter(
+      (phase) =>
+        phase.totalBytes > 0 &&
+        (phase.phase !== "EXTRACTING" || phase.startedAtEpochMs === revealedExtractionStartedAt),
+    )
     .sort((left, right) => PHASE_PRIORITY[left.phase] - PHASE_PRIORITY[right.phase])
     .slice(0, 2);
   const progressClassName = cn("rounded-pill bg-secondary", compact ? "h-1.5" : "h-2");

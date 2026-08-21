@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_graphql::{Schema, SchemaBuilder};
@@ -20,7 +20,7 @@ pub const GRAPHQL_MAX_DEPTH: usize = 16;
 
 #[derive(Clone)]
 pub struct SystemRuntimeContext {
-    pub profile: weaver_server_core::runtime::system_profile::SystemProfile,
+    pub profile: Arc<RwLock<weaver_server_core::runtime::system_profile::SystemProfile>>,
     pub started_at: std::time::Instant,
 }
 

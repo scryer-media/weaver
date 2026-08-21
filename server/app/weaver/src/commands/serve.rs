@@ -12,7 +12,7 @@ use weaver_server_core::settings::{Config, SharedConfig};
 use weaver_server_core::{Database, Pipeline, SchedulerCommand, SchedulerHandle};
 
 pub(crate) async fn run(
-    mut config: Config,
+    config: Config,
     db: Database,
     restore_locator_dir: PathBuf,
     port: u16,
@@ -64,11 +64,12 @@ pub(crate) async fn run(
         profile,
         buffers,
         write_buf_max,
-    } = wiring::build_runtime_context(&data_dir);
-    let system_profile = profile.clone();
+    } = wiring::build_runtime_context(weaver_server_core::runtime::detect_startup_profile(
+        &data_dir,
+    ));
+    let system_profile = Arc::new(std::sync::RwLock::new(profile.clone()));
 
-    // Detect server capabilities (pipelining, etc.) and build NNTP client.
-    wiring::detect_server_capabilities(&mut config, &db).await;
+    // Build the NNTP client from capability values validated when servers were saved.
     let policy_db = db.clone();
     let policy_servers = config.servers.clone();
     let server_transfer_policy = Arc::new(
@@ -179,6 +180,7 @@ pub(crate) async fn run(
             ("complete", complete_dir.clone()),
         ]),
     );
+    let iops_probe_dir = data_dir.clone();
     let mut pipeline = Pipeline::new(
         cmd_rx,
         event_tx,
@@ -265,7 +267,7 @@ pub(crate) async fn run(
         schedules: shared_schedules,
         log_buffer: log_ring_buffer,
         system_runtime: weaver_server_api::SystemRuntimeContext {
-            profile: system_profile,
+            profile: Arc::clone(&system_profile),
             started_at,
         },
         nntp_pool: Some(nntp_pool.clone()),
@@ -318,6 +320,40 @@ pub(crate) async fn run(
         restart: restart_controller.clone(),
     };
     let mut server_task = tokio::spawn(http::run_server(server_runtime, listener));
+
+    // Disk IOPS affects extraction admission only, so measure it after HTTP
+    // startup and apply the result to the live tuner without interrupting
+    // downloads or post-processing already in flight.
+    let _iops_probe_task = {
+        let handle = handle.clone();
+        let system_profile = Arc::clone(&system_profile);
+        let probe_dir = iops_probe_dir;
+        tokio::spawn(async move {
+            let random_read_iops = match tokio::task::spawn_blocking(move || {
+                weaver_server_core::runtime::measure_random_read_iops(&probe_dir)
+            })
+            .await
+            {
+                Ok(iops) => iops,
+                Err(error) => {
+                    warn!(error = %error, "disk probe task failed; using fallback IOPS");
+                    10_000.0
+                }
+            };
+            match handle.update_random_read_iops(random_read_iops).await {
+                Ok(()) => {
+                    system_profile
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .disk
+                        .random_read_iops = random_read_iops;
+                }
+                Err(error) => {
+                    warn!(error = %error, "failed to apply startup disk measurement");
+                }
+            }
+        })
+    };
 
     // Restore in-progress jobs from SQLite after the listener is available so
     // long restore passes do not block process readiness.

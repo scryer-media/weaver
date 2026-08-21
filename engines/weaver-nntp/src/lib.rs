@@ -63,7 +63,7 @@ pub use client::{
     DecodedBodyError, DecodedBodyTrace, NntpClient,
 };
 pub use codec::StreamChunk;
-pub use connection::{NntpConnection, ServerConfig};
+pub use connection::{NntpConnection, PipeliningCapability, ServerConfig};
 pub use error::{NntpError, Result};
 pub use health::{CooldownReason, HealthConfig, HealthTracker, ServerHealth, ServerState};
 pub use pool::{
