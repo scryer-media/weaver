@@ -802,6 +802,8 @@ func runtimePortEnvValues(state runtimePortState) map[string]string {
 	}
 }
 
+const nntpBorrowerEnv = "E2E_NNTP_BORROWER"
+
 func refreshRuntimePortEnvFromRunningStack() error {
 	state, err := discoverRuntimePortState()
 	if err != nil {
@@ -810,22 +812,37 @@ func refreshRuntimePortEnvFromRunningStack() error {
 	if err := saveRuntimePortState(runtimePortsStatePath(), state); err != nil {
 		return err
 	}
-	// A borrower runs its own supporting stack but deliberately points its
-	// managed Weaver at a donor's already-seeded NNTP endpoints. Refresh the
-	// discovered E2E_* bindings while retaining those explicit aliases.
-	applyRuntimePortEnvPreservingExplicitAliases(state, state)
+	applyRuntimePortEnvAfterStackRefresh(state)
 	return nil
 }
 
 func applyRuntimePortEnvPreservingExplicitAliases(previous, next runtimePortState) {
 	previousEnv := runtimePortEnvValues(previous)
 	for key, value := range runtimePortEnvValues(next) {
-		// Compose consumes the E2E_* bindings directly. The compatibility
-		// aliases follow those bindings only when the phase has not explicitly
-		// overridden them (as NNTP borrower phases do).
 		if strings.HasPrefix(key, "E2E_") || os.Getenv(key) == previousEnv[key] {
 			setEnv(key, value)
 		}
+	}
+}
+
+func applyRuntimePortEnvAfterStackRefresh(state runtimePortState) {
+	if os.Getenv(nntpBorrowerEnv) != "1" {
+		applyRuntimePortEnv(state)
+		return
+	}
+
+	// A borrower runs its own supporting stack but deliberately points its
+	// managed Weaver at a donor's already-seeded NNTP endpoints. Its explicit
+	// aliases must survive stack discovery, while the E2E_* bindings still
+	// follow the borrower's own Compose ports.
+	borrowedNNTPPort := os.Getenv("NNTP_PORT")
+	borrowedNNTPBackupPort := os.Getenv("NNTP_BACKUP_PORT")
+	applyRuntimePortEnv(state)
+	if borrowedNNTPPort != "" {
+		setEnv("NNTP_PORT", borrowedNNTPPort)
+	}
+	if borrowedNNTPBackupPort != "" {
+		setEnv("NNTP_BACKUP_PORT", borrowedNNTPBackupPort)
 	}
 }
 

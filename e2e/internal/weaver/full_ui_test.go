@@ -594,6 +594,7 @@ func TestBorrowedNNTPPhasesReadTheDonorInsteadOfSeeding(t *testing.T) {
 		}
 		donorPort := strconv.Itoa(donor.RuntimePorts.NNTPPort)
 		for key, want := range map[string]string{
+			nntpBorrowerEnv:        "1",
 			"NNTP_HOST":            "127.0.0.1",
 			"NNTP_PORT":            donorPort,
 			"E2E_NNTP_CLIENT_HOST": "host.docker.internal",

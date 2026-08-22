@@ -1354,6 +1354,7 @@ func (p *fullPhaseContext) env() map[string]string {
 	// file already grants it.
 	if p.NNTPDonor != "" && p.DonorNNTPPort > 0 {
 		primary := strconv.Itoa(p.DonorNNTPPort)
+		env[nntpBorrowerEnv] = "1"
 		env["NNTP_HOST"] = "127.0.0.1"
 		env["NNTP_PORT"] = primary
 		env["E2E_NNTP_CLIENT_HOST"] = "host.docker.internal"

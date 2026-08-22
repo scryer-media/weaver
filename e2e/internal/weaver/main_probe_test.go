@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -82,7 +83,7 @@ func TestReallocateRuntimePortsForDockerRetryPreservesBorrowedAliases(t *testing
 	}
 }
 
-func TestRefreshRuntimePortEnvPreservesBorrowedAliases(t *testing.T) {
+func TestApplyRuntimePortEnvAfterStackRefreshUpdatesNonBorrowerAliases(t *testing.T) {
 	state, err := allocateRuntimePortState()
 	if err != nil {
 		t.Fatalf("allocate runtime ports: %v", err)
@@ -93,7 +94,29 @@ func TestRefreshRuntimePortEnvPreservesBorrowedAliases(t *testing.T) {
 	t.Setenv("NNTP_PORT", "39991")
 	t.Setenv("NNTP_BACKUP_PORT", "39992")
 
-	applyRuntimePortEnvPreservingExplicitAliases(state, state)
+	applyRuntimePortEnvAfterStackRefresh(state)
+
+	if got, want := nntpPort(), strconv.Itoa(state.NNTPPort); got != want {
+		t.Fatalf("nntpPort() = %q, want refreshed port %q", got, want)
+	}
+	if got, want := backupNntpPort(), strconv.Itoa(state.NNTP2Port); got != want {
+		t.Fatalf("backupNntpPort() = %q, want refreshed port %q", got, want)
+	}
+}
+
+func TestApplyRuntimePortEnvAfterStackRefreshPreservesBorrowedAliases(t *testing.T) {
+	state, err := allocateRuntimePortState()
+	if err != nil {
+		t.Fatalf("allocate runtime ports: %v", err)
+	}
+	for key, value := range runtimePortEnvValues(state) {
+		t.Setenv(key, value)
+	}
+	t.Setenv(nntpBorrowerEnv, "1")
+	t.Setenv("NNTP_PORT", "39991")
+	t.Setenv("NNTP_BACKUP_PORT", "39992")
+
+	applyRuntimePortEnvAfterStackRefresh(state)
 
 	for key, want := range runtimePortEnvValues(state) {
 		if strings.HasPrefix(key, "E2E_") && os.Getenv(key) != want {
