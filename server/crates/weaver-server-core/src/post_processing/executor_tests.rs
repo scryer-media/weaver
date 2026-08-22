@@ -4,7 +4,9 @@ use super::model::{
     ScriptAdapter, ScriptList, ScriptListEntry, ScriptLists, ScriptName, ScriptResult,
     ScriptStatus, SecretOptionValue,
 };
-use super::settings::{encode_job_script_override, job_script_override};
+use super::settings::{
+    encode_job_script_override, job_script_override, normalize_script_directory,
+};
 use crate::persistence::Database;
 
 fn script(name: &str) -> ScriptName {
@@ -200,6 +202,52 @@ fn secret_options_are_stored_encrypted_and_returned_for_execution() {
         db.post_processing_scripts_with_options()
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn admission_pins_the_root_list_and_options_before_a_directory_change() {
+    let db = Database::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let old_root = normalize_script_directory(&root.path().join("old")).unwrap();
+    let new_root = normalize_script_directory(&root.path().join("new")).unwrap();
+    let script = script("notify.sh");
+    let settings = PostProcessingSettings {
+        execution_enabled: true,
+        ..PostProcessingSettings::default()
+    };
+    let options = vec![ResolvedOption::new(
+        OptionName::new("Host").unwrap(),
+        OptionValue::String("mail.example.invalid".into()),
+    )];
+
+    db.replace_post_processing_script_directory(&old_root)
+        .unwrap();
+    db.save_post_processing_settings(&settings).unwrap();
+    db.save_post_processing_script_lists(&ScriptLists {
+        global: ScriptList::new(vec![ScriptListEntry::new(script.clone())]).unwrap(),
+        ..ScriptLists::default()
+    })
+    .unwrap();
+    db.save_post_processing_script_options(&script, &options)
+        .unwrap();
+
+    let (_, admitted_lists, admitted_root, admitted_options) =
+        db.post_processing_script_admission().unwrap();
+    db.replace_post_processing_script_directory(&new_root)
+        .unwrap();
+
+    assert_eq!(admitted_root, old_root);
+    assert_eq!(names(&admitted_lists.global), ["notify.sh"]);
+    assert!(
+        db.post_processing_script_options(&script)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.resolve_post_processing_script_options(&admitted_options, &script)
+            .unwrap(),
+        options
     );
 }
 

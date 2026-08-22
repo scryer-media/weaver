@@ -24,16 +24,65 @@ async fn settings_are_admin_only_and_execution_is_off_by_default() {
 
     let response = harness
         .execute(
-            "{ postProcessingSettings { executionEnabled concurrency terminationGraceSeconds strictSecurityRefusesExecution lists { global { script } } } }",
+            "{ postProcessingSettings { scriptDirectory executionEnabled concurrency terminationGraceSeconds strictSecurityRefusesExecution lists { global { script } } } }",
         )
         .await;
     assert_no_errors(&response);
     let settings = &response_data(&response)["postProcessingSettings"];
+    assert!(std::path::Path::new(settings["scriptDirectory"].as_str().unwrap()).is_absolute());
     assert_eq!(settings["executionEnabled"], false);
     assert_eq!(settings["concurrency"], 1);
     assert_eq!(settings["terminationGraceSeconds"], 10);
     assert_eq!(settings["strictSecurityRefusesExecution"], false);
     assert_eq!(settings["lists"]["global"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn scripts_directory_is_admin_owned_and_clears_assignments_when_changed() {
+    let harness = TestHarness::new().await;
+    let denied = harness
+        .execute_as(
+            r#"mutation { setPostProcessingScriptDirectory(directory: "/tmp/scripts") { scriptDirectory } }"#,
+            CallerScope::Read,
+        )
+        .await;
+    assert_has_errors(&denied);
+
+    let lists = harness
+        .execute(
+            r#"mutation { setScriptLists(input: { global: [{ script: "notify.sh" }] }) { global { script } } }"#,
+        )
+        .await;
+    assert_no_errors(&lists);
+
+    let root = tempfile::tempdir().unwrap();
+    let requested = root.path().join("nested/scripts");
+    let requested_gql = serde_json::to_string(&requested).unwrap();
+    let response = harness
+        .execute(&format!(
+            "mutation {{ setPostProcessingScriptDirectory(directory: {requested_gql}) {{ scriptDirectory lists {{ global {{ script }} }} }} }}"
+        ))
+        .await;
+    assert_no_errors(&response);
+    let settings = &response_data(&response)["setPostProcessingScriptDirectory"];
+    let canonical = std::fs::canonicalize(&requested).unwrap();
+    assert_eq!(
+        settings["scriptDirectory"],
+        canonical.to_string_lossy().as_ref()
+    );
+    assert!(settings["lists"]["global"].as_array().unwrap().is_empty());
+
+    std::fs::write(
+        canonical.join("replacement.sh"),
+        "#!/bin/sh\necho replacement\n",
+    )
+    .unwrap();
+    let listing = harness.execute("{ scripts { scripts { name } } }").await;
+    assert_no_errors(&listing);
+    assert_eq!(
+        response_data(&listing)["scripts"]["scripts"][0]["name"],
+        "replacement.sh"
+    );
 }
 
 #[tokio::test]

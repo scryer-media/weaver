@@ -1,4 +1,4 @@
-//! Live listing of `data_dir/scripts`.
+//! Live listing of the configured scripts directory.
 //!
 //! Nothing here is persisted: a script is whatever is in the directory when the
 //! listing runs, which is also when execution resolves it. Editing or renaming a
@@ -15,11 +15,6 @@ use super::model::{PostProcessingValidationError, ScriptAdapter, ScriptManifest,
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const SHEBANG_PREFIX_BYTES: u64 = 8 * 1024;
-
-/// The scripts directory beneath the configured data directory.
-pub fn scripts_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("scripts")
-}
 
 /// A script that is present and parseable right now.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -56,14 +51,13 @@ pub enum ListingError {
     Io(#[from] io::Error),
 }
 
-/// List every script under `data_dir/scripts`, creating the directory when absent.
-pub fn list_scripts(data_dir: &Path) -> Result<ScriptListing, ListingError> {
-    let root = scripts_dir(data_dir);
+/// List every script under `root`, creating it when absent.
+pub fn list_scripts(root: &Path) -> Result<ScriptListing, ListingError> {
     if !root.exists() {
-        fs::create_dir_all(&root)?;
+        fs::create_dir_all(root)?;
         return Ok(ScriptListing::default());
     }
-    let mut entries = fs::read_dir(&root)?.collect::<Result<Vec<_>, _>>()?;
+    let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
 
     let mut listing = ScriptListing::default();
@@ -97,7 +91,7 @@ pub fn list_scripts(data_dir: &Path) -> Result<ScriptListing, ListingError> {
                 }),
             }
         } else if metadata.is_file() && is_bare_script_candidate(&path, &metadata) {
-            match read_bare_script(&root, &path, &name) {
+            match read_bare_script(root, &path, &name) {
                 Ok(script) => listing.scripts.push(script),
                 Err(error) => listing.problems.push(ScriptProblem {
                     name: raw_name,
@@ -110,11 +104,7 @@ pub fn list_scripts(data_dir: &Path) -> Result<ScriptListing, ListingError> {
 }
 
 /// Resolve one script by name at execution time.
-pub fn resolve_script(
-    data_dir: &Path,
-    name: &ScriptName,
-) -> Result<DiscoveredScript, ListingError> {
-    let root = scripts_dir(data_dir);
+pub fn resolve_script(root: &Path, name: &ScriptName) -> Result<DiscoveredScript, ListingError> {
     let path = root.join(name.as_str());
     let metadata =
         fs::symlink_metadata(&path).map_err(|_| ListingError::NotFound(name.to_string()))?;
@@ -126,7 +116,7 @@ pub fn resolve_script(
             .ok_or_else(|| ListingError::NotFound(name.to_string()));
     }
     if metadata.is_file() {
-        return read_bare_script(&root, &path, name);
+        return read_bare_script(root, &path, name);
     }
     Err(ListingError::NotFound(name.to_string()))
 }

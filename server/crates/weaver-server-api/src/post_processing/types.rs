@@ -12,6 +12,7 @@ pub const MASKED_SECRET: &str = "[REDACTED]";
 
 #[derive(Debug, Clone, SimpleObject)]
 pub struct PostProcessingSettingsGql {
+    pub script_directory: String,
     pub execution_enabled: bool,
     pub concurrency: u8,
     pub termination_grace_seconds: u64,
@@ -28,9 +29,11 @@ impl PostProcessingSettingsGql {
     pub fn from_settings(
         value: PostProcessingSettings,
         lists: ScriptLists,
+        script_directory: impl Into<String>,
         strict_security: bool,
     ) -> Self {
         Self {
+            script_directory: script_directory.into(),
             execution_enabled: value.execution_enabled,
             concurrency: value.concurrency,
             termination_grace_seconds: value.termination_grace_seconds,

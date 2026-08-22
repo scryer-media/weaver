@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { FolderPathInput } from "@/components/FolderPathInput";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -17,6 +19,7 @@ import { Switch } from "@/components/ui/switch";
 import {
   POST_PROCESSING_SETTINGS_QUERY,
   SET_POST_PROCESSING_SETTINGS_MUTATION,
+  SET_POST_PROCESSING_SCRIPT_DIRECTORY_MUTATION,
   SET_SCRIPT_LISTS_MUTATION,
   SET_SCRIPT_OPTIONS_MUTATION,
 } from "@/graphql/queries";
@@ -58,6 +61,7 @@ type ScriptLists = {
 };
 
 type Settings = {
+  scriptDirectory: string;
   executionEnabled: boolean;
   concurrency: number;
   terminationGraceSeconds: number;
@@ -122,11 +126,16 @@ export function PostProcessingSettingsPage() {
     requestPolicy: "cache-and-network",
   });
   const [, saveSettings] = useMutation(SET_POST_PROCESSING_SETTINGS_MUTATION);
+  const [saveDirectoryState, saveDirectory] = useMutation(
+    SET_POST_PROCESSING_SCRIPT_DIRECTORY_MUTATION,
+  );
   const [, saveLists] = useMutation(SET_SCRIPT_LISTS_MUTATION);
   const [, saveOptions] = useMutation(SET_SCRIPT_OPTIONS_MUTATION);
 
   const [notice, setNotice] = useState<string | null>(null);
   const [draft, setDraft] = useState<SettingsDraft | null>(null);
+  const [scriptDirectory, setScriptDirectory] = useState("");
+  const [directoryChangePending, setDirectoryChangePending] = useState(false);
   const [lists, setLists] = useState<ScriptLists | null>(null);
   const [scope, setScope] = useState<string>(GLOBAL_LIST);
   const [optionsScript, setOptionsScript] = useState<string | null>(null);
@@ -140,6 +149,7 @@ export function PostProcessingSettingsPage() {
     if (settings) {
       setDraft(settingsDraft(settings));
       setLists(settings.lists);
+      setScriptDirectory(settings.scriptDirectory);
     }
   }, [settings]);
 
@@ -186,6 +196,44 @@ export function PostProcessingSettingsPage() {
     });
     setNotice(result.error ? result.error.message : "Post-processing settings saved.");
     if (!result.error) refetch({ requestPolicy: "network-only" });
+  }
+
+  async function persistScriptDirectory() {
+    const directory = scriptDirectory.trim();
+    const result = await saveDirectory({ directory });
+    if (result.error) {
+      setNotice(result.error.message);
+      return;
+    }
+    const saved = result.data?.setPostProcessingScriptDirectory;
+    if (saved) {
+      setScriptDirectory(saved.scriptDirectory);
+      setLists(saved.lists);
+    }
+    setDirectoryChangePending(false);
+    setScope(GLOBAL_LIST);
+    setOptionsScript(null);
+    setNotice("Scripts directory saved. Script assignments and saved options were cleared.");
+    refetch({ requestPolicy: "network-only" });
+  }
+
+  function requestScriptDirectorySave() {
+    if (!settings) return;
+    if (scriptDirectory.trim() === settings.scriptDirectory) {
+      setNotice("Scripts directory is already saved.");
+      refetch({ requestPolicy: "network-only" });
+      return;
+    }
+    setDirectoryChangePending(true);
+  }
+
+  async function copyScriptDirectory() {
+    try {
+      await navigator.clipboard.writeText(scriptDirectory);
+      setNotice("Scripts directory copied.");
+    } catch {
+      setNotice("Could not copy the scripts directory.");
+    }
   }
 
   async function persistLists(next: ScriptLists) {
@@ -236,7 +284,7 @@ export function PostProcessingSettingsPage() {
     <div className="space-y-6">
       <PageHeader
         title="Post-processing"
-        description="Run scripts from the data directory's scripts folder when a job finishes."
+        description="Run scripts from a configured host folder when a job finishes."
       />
 
       {error ? (
@@ -250,9 +298,57 @@ export function PostProcessingSettingsPage() {
         </div>
       ) : null}
 
+      <ConfirmDialog
+        open={directoryChangePending}
+        title="Change scripts directory?"
+        message="This clears every script assignment and saved script option. It does not delete files or directories."
+        confirmLabel="Change directory"
+        confirmDisabled={saveDirectoryState.fetching}
+        testId="post-processing-directory-confirm"
+        onConfirm={() => void persistScriptDirectory()}
+        onCancel={() => setDirectoryChangePending(false)}
+      />
+
+      <SectionCard
+        title="Scripts directory"
+        description="Weaver discovers scripts live from this host-visible directory. It never uploads, edits, or deletes script files."
+      >
+        <div className="space-y-3">
+          <div className="space-y-2">
+            <Label htmlFor="pp-script-directory">Directory</Label>
+            <FolderPathInput
+              inputId="pp-script-directory"
+              value={scriptDirectory}
+              onChange={setScriptDirectory}
+              readOnly={false}
+              browseLabel="Browse"
+              disabled={!settings || saveDirectoryState.fetching}
+            />
+          </div>
+          <p className="text-sm text-muted-foreground">
+            In a container, bind-mount the host folder containing your scripts to this exact
+            container path. Scripts run with Weaver&apos;s service privileges.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              disabled={!settings || !scriptDirectory.trim() || saveDirectoryState.fetching}
+              onClick={requestScriptDirectorySave}
+            >
+              Save directory
+            </Button>
+            <Button variant="outline" disabled={!scriptDirectory} onClick={() => void copyScriptDirectory()}>
+              Copy path
+            </Button>
+            <Button variant="outline" onClick={() => refetch({ requestPolicy: "network-only" })}>
+              Refresh scripts
+            </Button>
+          </div>
+        </div>
+      </SectionCard>
+
       <SectionCard
         title="Scripts"
-        description="Every file or manifest package in the scripts folder is listed live. Enabling execution runs the enabled scripts below with Weaver's privileges."
+        description="Every runnable file or manifest package in the configured folder is listed live. Enabling execution runs the enabled scripts below with Weaver's privileges."
       >
         <div className="space-y-6">
           {settings?.strictSecurityRefusesExecution ? (
@@ -483,7 +579,9 @@ export function PostProcessingSettingsPage() {
             <div className="flex flex-wrap items-center gap-2">
               {available.length === 0 ? (
                 <span className="text-sm text-muted-foreground">
-                  Every discovered script is already in this list.
+                  {scripts.length === 0
+                    ? `No scripts found in ${settings?.scriptDirectory ?? "the configured directory"}. Add one through the host filesystem, then refresh.`
+                    : "Every discovered script is already in this list."}
                 </span>
               ) : (
                 available.map((script) => (

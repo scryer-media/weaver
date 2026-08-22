@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use super::*;
 use weaver_server_core::post_processing::executor::strict_security_enabled;
 use weaver_server_core::post_processing::listing::list_scripts;
@@ -15,10 +13,11 @@ impl PostProcessingQuery {
         ctx: &Context<'_>,
     ) -> Result<PostProcessingSettingsGql> {
         let db = ctx.data::<Database>()?.clone();
-        let (settings, lists) = tokio::task::spawn_blocking(move || {
+        let (settings, lists, script_directory) = tokio::task::spawn_blocking(move || {
             Ok::<_, weaver_server_core::StateError>((
                 db.post_processing_settings()?,
                 db.post_processing_script_lists()?,
+                db.post_processing_script_directory()?,
             ))
         })
         .await
@@ -27,23 +26,23 @@ impl PostProcessingQuery {
         Ok(PostProcessingSettingsGql::from_settings(
             settings,
             lists,
+            script_directory.to_string_lossy(),
             strict_security_enabled(),
         ))
     }
 
-    /// Live listing of `data_dir/scripts`, plus any stored option values.
+    /// Live listing of the configured scripts directory, plus stored option values.
     ///
     /// Nothing is cached: the directory is the source of truth, so a script
     /// added a second ago is listed and one deleted a second ago is not.
     #[graphql(guard = "AdminGuard")]
     async fn scripts(&self, ctx: &Context<'_>) -> Result<ScriptListingGql> {
         let db = ctx.data::<Database>()?.clone();
-        let data_dir = {
-            let config = ctx.data::<SharedConfig>()?;
-            PathBuf::from(config.read().await.data_dir.clone())
-        };
         tokio::task::spawn_blocking(move || {
-            let listing = list_scripts(&data_dir)
+            let script_directory = db
+                .post_processing_script_directory()
+                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+            let listing = list_scripts(&script_directory)
                 .map_err(|error| async_graphql::Error::new(error.to_string()))?;
             let mut scripts = Vec::with_capacity(listing.scripts.len());
             for script in &listing.scripts {

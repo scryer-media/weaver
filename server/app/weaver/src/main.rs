@@ -250,6 +250,24 @@ async fn async_main() {
         error!("{error}");
         std::process::exit(1);
     }
+    let canonical_data_dir = match std::fs::canonicalize(&data_dir) {
+        Ok(path) => path,
+        Err(error) => {
+            error!("failed to canonicalize data directory: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = db.initialize_post_processing_script_directory(
+        &canonical_data_dir,
+        env_seed
+            .core
+            .scripts_dir
+            .as_deref()
+            .map(std::path::Path::new),
+    ) {
+        error!("failed to initialize post-processing scripts directory: {error}");
+        std::process::exit(1);
+    }
 
     match command {
         Command::Download {

@@ -6,6 +6,8 @@
 //! rest of the product already reads.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -22,9 +24,37 @@ use crate::persistence::{Database, StateError};
 const SETTINGS_KEY: &str = "post_processing.settings.v2";
 const SCRIPT_LISTS_KEY: &str = "post_processing.script_lists.v1";
 const SCRIPT_OPTIONS_KEY: &str = "post_processing.script_options.v1";
+const SCRIPT_DIRECTORY_KEY: &str = "post_processing.script_directory.v1";
 
 /// Job metadata key carrying a submission-time script override from a facade.
 pub const JOB_SCRIPT_OVERRIDE_METADATA_KEY: &str = "weaver.post_processing.scripts";
+
+#[derive(Debug, thiserror::Error)]
+pub enum ScriptDirectoryError {
+    #[error("scripts directory must be an absolute path")]
+    RelativePath,
+    #[error("scripts directory is not a directory: {0}")]
+    NotDirectory(PathBuf),
+    #[error("scripts directory could not be prepared: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Create, canonicalize, and prove that a scripts root can be listed.
+///
+/// A read-only bind mount is valid when it already exists: only creating a
+/// previously absent directory requires write access to its parent.
+pub fn normalize_script_directory(path: &Path) -> Result<PathBuf, ScriptDirectoryError> {
+    if !path.is_absolute() {
+        return Err(ScriptDirectoryError::RelativePath);
+    }
+    fs::create_dir_all(path)?;
+    let canonical = fs::canonicalize(path)?;
+    if !canonical.is_dir() {
+        return Err(ScriptDirectoryError::NotDirectory(canonical));
+    }
+    fs::read_dir(&canonical)?;
+    Ok(canonical)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredSecretOption {
@@ -40,12 +70,162 @@ struct StoredScriptOptions {
     secrets: Vec<StoredSecretOption>,
 }
 
+/// Encrypted option values captured with a post-processing admission.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScriptOptionsSnapshot(BTreeMap<String, StoredScriptOptions>);
+
 impl Database {
+    /// Return the persisted scripts root, seeding it exactly once when absent.
+    ///
+    /// Environment input is intentionally accepted only here; a stored value
+    /// is always authoritative after this first settlement.
+    pub fn initialize_post_processing_script_directory(
+        &self,
+        data_dir: &Path,
+        env_seed: Option<&Path>,
+    ) -> Result<PathBuf, StateError> {
+        if let Some(directory) = self.get_setting(SCRIPT_DIRECTORY_KEY)? {
+            return Ok(PathBuf::from(directory));
+        }
+        let candidate = env_seed
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| data_dir.join("scripts"));
+        let directory = normalize_script_directory(&candidate)
+            .map_err(|error| StateError::Database(error.to_string()))?;
+        self.set_setting(SCRIPT_DIRECTORY_KEY, &directory.to_string_lossy())?;
+        Ok(directory)
+    }
+
+    pub fn post_processing_script_directory(&self) -> Result<PathBuf, StateError> {
+        self.get_setting(SCRIPT_DIRECTORY_KEY)?
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                StateError::Database("post-processing scripts directory is not initialized".into())
+            })
+    }
+
+    /// Persist a validated directory and drop every name-based assignment in
+    /// the same transaction. Script files themselves are never touched.
+    pub fn replace_post_processing_script_directory(
+        &self,
+        directory: &Path,
+    ) -> Result<bool, StateError> {
+        let datastore = self.datastore();
+        let directory = directory.to_string_lossy().to_string();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(
+                &datastore,
+                "replace_post_processing_script_directory",
+                |tx| {
+                    let directory = directory.clone();
+                    Box::pin(async move {
+                        let existing = tx
+                            .fetch_optional(
+                                "SELECT value FROM settings WHERE key = {}",
+                                &[SqlArg::Text(SCRIPT_DIRECTORY_KEY.to_string())],
+                            )
+                            .await?
+                            .map(|row| row.text("value"))
+                            .transpose()?;
+                        if existing.as_deref() == Some(directory.as_str()) {
+                            return Ok(false);
+                        }
+                        tx.execute(
+                            "INSERT INTO settings (key, value) VALUES ({}, {})
+                             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            &[
+                                SqlArg::Text(SCRIPT_DIRECTORY_KEY.to_string()),
+                                SqlArg::Text(directory),
+                            ],
+                        )
+                        .await?;
+                        for key in [SCRIPT_LISTS_KEY, SCRIPT_OPTIONS_KEY] {
+                            tx.execute(
+                                "DELETE FROM settings WHERE key = {}",
+                                &[SqlArg::Text(key.to_string())],
+                            )
+                            .await?;
+                        }
+                        Ok(true)
+                    })
+                },
+            )
+            .await
+        })
+    }
+
     pub fn post_processing_settings(&self) -> Result<PostProcessingSettings, StateError> {
         self.get_setting(SETTINGS_KEY)?
             .map(|raw| from_json(&raw))
             .transpose()
             .map(Option::unwrap_or_default)
+    }
+
+    /// Read the settings, script lists, and scripts root from one database
+    /// snapshot so post-processing admission cannot pair an old list with a
+    /// directory that has just replaced it.
+    pub(crate) fn post_processing_script_admission(
+        &self,
+    ) -> Result<
+        (
+            PostProcessingSettings,
+            ScriptLists,
+            PathBuf,
+            ScriptOptionsSnapshot,
+        ),
+        StateError,
+    > {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT key, value FROM settings WHERE key IN ({}, {}, {}, {})",
+                &[
+                    SqlArg::Text(SETTINGS_KEY.to_string()),
+                    SqlArg::Text(SCRIPT_LISTS_KEY.to_string()),
+                    SqlArg::Text(SCRIPT_DIRECTORY_KEY.to_string()),
+                    SqlArg::Text(SCRIPT_OPTIONS_KEY.to_string()),
+                ],
+            )
+            .await?;
+            let mut settings = None;
+            let mut lists = None;
+            let mut script_directory = None;
+            let mut options = None;
+            for row in rows {
+                match row.text("key")?.as_str() {
+                    SETTINGS_KEY => settings = Some(row.text("value")?),
+                    SCRIPT_LISTS_KEY => lists = Some(row.text("value")?),
+                    SCRIPT_DIRECTORY_KEY => script_directory = Some(row.text("value")?),
+                    SCRIPT_OPTIONS_KEY => options = Some(row.text("value")?),
+                    _ => {}
+                }
+            }
+            Ok((
+                settings
+                    .as_deref()
+                    .map(from_json)
+                    .transpose()?
+                    .unwrap_or_default(),
+                lists
+                    .as_deref()
+                    .map(from_json)
+                    .transpose()?
+                    .unwrap_or_default(),
+                script_directory.map(PathBuf::from).ok_or_else(|| {
+                    StateError::Database(
+                        "post-processing scripts directory is not initialized".into(),
+                    )
+                })?,
+                ScriptOptionsSnapshot(
+                    options
+                        .as_deref()
+                        .map(from_json)
+                        .transpose()?
+                        .unwrap_or_default(),
+                ),
+            ))
+        })
     }
 
     pub fn save_post_processing_settings(
@@ -72,8 +252,24 @@ impl Database {
         &self,
         script: &ScriptName,
     ) -> Result<Vec<ResolvedOption>, StateError> {
-        let stored = self.stored_script_options()?;
-        let Some(entry) = stored.get(script.as_str()) else {
+        self.resolve_post_processing_script_options(
+            &self.post_processing_script_options_snapshot()?,
+            script,
+        )
+    }
+
+    pub(crate) fn post_processing_script_options_snapshot(
+        &self,
+    ) -> Result<ScriptOptionsSnapshot, StateError> {
+        Ok(ScriptOptionsSnapshot(self.stored_script_options()?))
+    }
+
+    pub(crate) fn resolve_post_processing_script_options(
+        &self,
+        snapshot: &ScriptOptionsSnapshot,
+        script: &ScriptName,
+    ) -> Result<Vec<ResolvedOption>, StateError> {
+        let Some(entry) = snapshot.0.get(script.as_str()) else {
             return Ok(vec![]);
         };
         let key = self.encryption_key();

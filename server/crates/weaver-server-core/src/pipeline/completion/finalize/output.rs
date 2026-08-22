@@ -672,29 +672,36 @@ impl Pipeline {
         };
         let category = state.spec.category.clone();
         let metadata = state.spec.metadata.clone();
-        let scripts = match self.terminal_post_processing_executor.execution_enabled() {
-            Ok(true) => self
-                .terminal_post_processing_executor
-                .resolve_job_scripts(category.as_deref(), &metadata)
-                .unwrap_or_else(|error| {
-                    warn!(
-                        job_id = job_id.0,
-                        error = %error,
-                        "could not resolve the job's post-processing script list"
-                    );
-                    Default::default()
-                }),
-            Ok(false) => Default::default(),
+        let admission = match self
+            .terminal_post_processing_executor
+            .admit_job_scripts(category.as_deref(), &metadata)
+        {
+            Ok(Some(admission)) => admission,
+            Ok(None) => {
+                match primary_failure {
+                    Some(failure) => {
+                        self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
+                    }
+                    None => self.complete_job_after_terminal_post_processing(job_id),
+                }
+                return;
+            }
             Err(error) => {
                 warn!(
                     job_id = job_id.0,
                     error = %error,
-                    "could not read post-processing settings; skipping scripts"
+                    "could not admit post-processing scripts; skipping scripts"
                 );
-                Default::default()
+                match primary_failure {
+                    Some(failure) => {
+                        self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
+                    }
+                    None => self.complete_job_after_terminal_post_processing(job_id),
+                }
+                return;
             }
         };
-        if scripts.enabled_entries().next().is_none() {
+        if !admission.has_enabled_entries() {
             match primary_failure {
                 Some(failure) => {
                     self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
@@ -713,7 +720,7 @@ impl Pipeline {
         );
         self.launch_terminal_post_processing_run(
             job_id,
-            scripts,
+            admission,
             pipeline_outcome,
             primary_failure,
         );
@@ -722,7 +729,7 @@ impl Pipeline {
     fn launch_terminal_post_processing_run(
         &mut self,
         job_id: JobId,
-        scripts: crate::post_processing::model::ScriptList,
+        admission: crate::post_processing::executor::PostProcessingJobAdmission,
         pipeline_outcome: crate::post_processing::model::PipelineOutcome,
         primary_failure: Option<String>,
     ) {
@@ -833,9 +840,9 @@ impl Pipeline {
         let done_tx = self.terminal_post_processing_done_tx.clone();
         tokio::spawn(async move {
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-            let execution = executor.execute_job(
+            let execution = executor.execute_admitted_job(
                 job_id.0,
-                scripts,
+                admission,
                 context,
                 Some(cancellation_rx),
                 Some(started_tx),

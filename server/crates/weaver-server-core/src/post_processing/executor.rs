@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
@@ -22,6 +22,7 @@ use super::runner::{
     DEFAULT_TIMEOUT, ExecutionDisposition, InterpreterConfig, JobExecutionContext,
     NzbgetScriptStatus, ScriptExecutionRequest, execute_script,
 };
+use super::settings::ScriptOptionsSnapshot;
 use crate::persistence::{Database, StateError};
 
 const MAX_CONCURRENCY: usize = 8;
@@ -136,10 +137,23 @@ pub struct JobPostProcessingReport {
     pub results: Vec<ScriptResult>,
 }
 
+/// All name-based configuration captured when a job enters post-processing.
+pub struct PostProcessingJobAdmission {
+    scripts_directory: PathBuf,
+    scripts: ScriptList,
+    options: ScriptOptionsSnapshot,
+}
+
+impl PostProcessingJobAdmission {
+    pub fn has_enabled_entries(&self) -> bool {
+        self.scripts.enabled_entries().next().is_some()
+    }
+}
+
 #[derive(Clone)]
 pub struct PostProcessingExecutor {
     db: Database,
-    data_dir: PathBuf,
+    scripts_directory: Arc<RwLock<PathBuf>>,
     concurrency: Arc<Semaphore>,
     /// Admission gate for the NZBGet facade's `pausepost`/`resumepost`, which is
     /// the only reason a pause survives: it gates admission, never a running
@@ -173,11 +187,11 @@ impl Drop for CancellationRegistration {
 impl PostProcessingExecutor {
     /// `concurrency` sizes the admission semaphore for the process lifetime; a
     /// changed setting takes effect on the next restart, as it did before.
-    pub fn new(db: Database, data_dir: PathBuf, concurrency: usize) -> Self {
+    pub fn new(db: Database, scripts_directory: PathBuf, concurrency: usize) -> Self {
         let (paused, _) = watch::channel(false);
         Self {
             db,
-            data_dir,
+            scripts_directory: Arc::new(RwLock::new(scripts_directory)),
             concurrency: Arc::new(Semaphore::new(concurrency.clamp(1, MAX_CONCURRENCY))),
             paused,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
@@ -201,6 +215,23 @@ impl PostProcessingExecutor {
 
     pub fn is_paused(&self) -> bool {
         *self.paused.borrow()
+    }
+
+    /// Future post-processing jobs use `directory`; jobs that already entered
+    /// execution retain their admission-time snapshot.
+    pub fn set_script_directory(&self, directory: PathBuf) {
+        *self
+            .scripts_directory
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = directory;
+    }
+
+    /// Snapshot the configured root for a post-processing admission.
+    pub fn script_directory(&self) -> PathBuf {
+        self.scripts_directory
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Signal every in-flight script for `job_id` to stop.
@@ -241,6 +272,29 @@ impl PostProcessingExecutor {
         ))
     }
 
+    /// Atomically capture the root and resolved list for a newly admitted job.
+    pub fn admit_job_scripts(
+        &self,
+        category: Option<&str>,
+        job_metadata: &[(String, String)],
+    ) -> Result<Option<PostProcessingJobAdmission>, StateError> {
+        let (settings, lists, script_directory, options) =
+            self.db.post_processing_script_admission()?;
+        if !settings.execution_enabled {
+            return Ok(None);
+        }
+        let scripts = resolve_script_list(
+            &lists,
+            category,
+            super::settings::job_script_override(job_metadata),
+        );
+        Ok(Some(PostProcessingJobAdmission {
+            scripts_directory: script_directory,
+            scripts,
+            options,
+        }))
+    }
+
     pub fn execution_enabled(&self) -> Result<bool, StateError> {
         Ok(self.db.post_processing_settings()?.execution_enabled)
     }
@@ -250,6 +304,51 @@ impl PostProcessingExecutor {
         &self,
         job_id: u64,
         scripts: ScriptList,
+        context: JobExecutionContext,
+        cancellation: Option<watch::Receiver<bool>>,
+        started: Option<oneshot::Sender<()>>,
+    ) -> Result<JobPostProcessingReport, PostProcessingExecutorError> {
+        self.execute_job_at_script_directory(
+            self.script_directory(),
+            job_id,
+            scripts,
+            context,
+            cancellation,
+            started,
+        )
+        .await
+    }
+
+    /// Execute one already-admitted job from its immutable scripts-root snapshot.
+    pub async fn execute_job_at_script_directory(
+        &self,
+        scripts_directory: PathBuf,
+        job_id: u64,
+        scripts: ScriptList,
+        context: JobExecutionContext,
+        cancellation: Option<watch::Receiver<bool>>,
+        started: Option<oneshot::Sender<()>>,
+    ) -> Result<JobPostProcessingReport, PostProcessingExecutorError> {
+        let options = self.db.post_processing_script_options_snapshot()?;
+        self.execute_admitted_job(
+            job_id,
+            PostProcessingJobAdmission {
+                scripts_directory,
+                scripts,
+                options,
+            },
+            context,
+            cancellation,
+            started,
+        )
+        .await
+    }
+
+    /// Execute one already-admitted job from its immutable configuration snapshot.
+    pub async fn execute_admitted_job(
+        &self,
+        job_id: u64,
+        admission: PostProcessingJobAdmission,
         mut context: JobExecutionContext,
         cancellation: Option<watch::Receiver<bool>>,
         started: Option<oneshot::Sender<()>>,
@@ -263,7 +362,11 @@ impl PostProcessingExecutor {
                 results: vec![],
             });
         }
-        let entries = scripts.enabled_entries().cloned().collect::<Vec<_>>();
+        let entries = admission
+            .scripts
+            .enabled_entries()
+            .cloned()
+            .collect::<Vec<_>>();
         if entries.is_empty() {
             return Ok(JobPostProcessingReport {
                 summary: PostProcessingSummary::NotRun,
@@ -360,6 +463,7 @@ impl PostProcessingExecutor {
             let result = {
                 let _active = GaugeGuard::enter(&counters::ACTIVE);
                 self.execute_one(
+                    &admission,
                     entry,
                     &context,
                     &interpreters,
@@ -404,6 +508,7 @@ impl PostProcessingExecutor {
 
     async fn execute_one(
         &self,
+        admission: &PostProcessingJobAdmission,
         entry: &ScriptListEntry,
         context: &JobExecutionContext,
         interpreters: &InterpreterConfig,
@@ -411,13 +516,16 @@ impl PostProcessingExecutor {
         cancellation: Option<watch::Receiver<bool>>,
     ) -> ScriptResult {
         let started = Instant::now();
-        let script = match listing::resolve_script(&self.data_dir, &entry.script) {
+        let script = match listing::resolve_script(&admission.scripts_directory, &entry.script) {
             Ok(script) => script,
             Err(error) => {
                 return unavailable_result(entry, started, &error);
             }
         };
-        let supplied = match self.db.post_processing_script_options(&entry.script) {
+        let supplied = match self
+            .db
+            .resolve_post_processing_script_options(&admission.options, &entry.script)
+        {
             Ok(options) => options,
             Err(error) => {
                 return failed_result(entry, script.manifest.adapter(), started, error.to_string());

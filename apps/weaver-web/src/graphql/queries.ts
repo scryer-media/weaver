@@ -1490,6 +1490,7 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
 
 const POST_PROCESSING_SETTINGS_FIELDS = gql`
   fragment PostProcessingSettingsFields on PostProcessingSettingsGql {
+    scriptDirectory
     executionEnabled
     concurrency
     terminationGraceSeconds
@@ -1554,6 +1555,15 @@ export const POST_PROCESSING_SETTINGS_QUERY = gql`
 export const SET_POST_PROCESSING_SETTINGS_MUTATION = gql`
   mutation SetPostProcessingSettings($input: PostProcessingSettingsInput!) {
     setPostProcessingSettings(input: $input) {
+      ...PostProcessingSettingsFields
+    }
+  }
+  ${POST_PROCESSING_SETTINGS_FIELDS}
+`;
+
+export const SET_POST_PROCESSING_SCRIPT_DIRECTORY_MUTATION = gql`
+  mutation SetPostProcessingScriptDirectory($directory: String!) {
+    setPostProcessingScriptDirectory(directory: $directory) {
       ...PostProcessingSettingsFields
     }
   }

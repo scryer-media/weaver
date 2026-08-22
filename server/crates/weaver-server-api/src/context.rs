@@ -117,9 +117,13 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
             .try_read()
             .map(|config| std::path::PathBuf::from(&config.data_dir))
             .unwrap_or_default();
+        let script_directory = context
+            .db
+            .initialize_post_processing_script_directory(&data_dir, None)
+            .unwrap_or_else(|_| data_dir.join("scripts"));
         weaver_server_core::post_processing::executor::PostProcessingExecutor::new(
             context.db.clone(),
-            data_dir,
+            script_directory,
             usize::from(settings.concurrency),
         )
     });

@@ -1,5 +1,5 @@
-//! Post-processing scripts: files in `data_dir/scripts`, an ordered list per
-//! job, executed as a bounded step of job finalization.
+//! Post-processing scripts: files in an operator-configured directory, an
+//! ordered list per job, executed as a bounded step of job finalization.
 
 pub mod executor;
 pub mod listing;
@@ -18,3 +18,5 @@ mod manifest_tests;
 mod model_tests;
 #[cfg(test)]
 mod runner_tests;
+#[cfg(test)]
+mod settings_tests;

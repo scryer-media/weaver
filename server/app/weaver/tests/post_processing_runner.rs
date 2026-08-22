@@ -29,8 +29,11 @@ fn supervisor() -> PathBuf {
 }
 
 fn write_script(data_dir: &Path, name: &str, body: &str) -> ScriptName {
-    let scripts = data_dir.join("scripts");
-    fs::create_dir_all(&scripts).unwrap();
+    write_script_in(&data_dir.join("scripts"), name, body)
+}
+
+fn write_script_in(scripts: &Path, name: &str, body: &str) -> ScriptName {
+    fs::create_dir_all(scripts).unwrap();
     let path = scripts.join(name);
     fs::write(&path, body).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -60,7 +63,7 @@ fn request(
     working_directory: PathBuf,
     timeout: Option<Duration>,
 ) -> ScriptExecutionRequest {
-    let discovered = resolve_script(data_dir, script).unwrap();
+    let discovered = resolve_script(&data_dir.join("scripts"), script).unwrap();
     ScriptExecutionRequest {
         manifest: discovered.manifest,
         root: discovered.root,
@@ -77,7 +80,7 @@ fn request(
 }
 
 fn executor(db: &Database, data_dir: &Path) -> PostProcessingExecutor {
-    PostProcessingExecutor::new(db.clone(), data_dir.to_path_buf(), 1)
+    PostProcessingExecutor::new(db.clone(), data_dir.join("scripts"), 1)
         .with_supervisor_executable(supervisor())
 }
 
@@ -672,4 +675,88 @@ async fn a_script_outside_its_package_root_is_refused() {
     )
     .await;
     assert!(error.is_err(), "a symlinked entrypoint must not execute");
+}
+
+#[tokio::test]
+async fn changing_the_scripts_directory_pins_admitted_work_and_updates_future_jobs() {
+    let data = tempfile::tempdir().unwrap();
+    let old_root = data.path().join("scripts");
+    let new_root = data.path().join("replacement-scripts");
+    let first = write_script_in(
+        &old_root,
+        "first.sh",
+        "#!/bin/sh\nprintf 'started\\n' > \"$SAB_COMPLETE_DIR/started\"\nwhile [ ! -e \"$SAB_COMPLETE_DIR/release\" ]; do sleep 0.01; done\nprintf 'first\\n' >> \"$SAB_COMPLETE_DIR/order.txt\"\n",
+    );
+    let second = write_script_in(
+        &old_root,
+        "second.sh",
+        "#!/bin/sh\nprintf 'old-second\\n' >> \"$SAB_COMPLETE_DIR/order.txt\"\n",
+    );
+    write_script_in(
+        &new_root,
+        "second.sh",
+        "#!/bin/sh\nprintf 'new-second\\n' >> \"$SAB_COMPLETE_DIR/order.txt\"\n",
+    );
+
+    let first_working_directory = data.path().join("first-work");
+    fs::create_dir_all(&first_working_directory).unwrap();
+    let db = Database::open_in_memory().unwrap();
+    enable_execution(&db);
+    let executor = executor(&db, data.path());
+    let admitted = executor.clone();
+    let first_context = context(701, first_working_directory.clone());
+    let admitted_list = ScriptList::new(vec![
+        ScriptListEntry::new(first),
+        ScriptListEntry::new(second.clone()),
+    ])
+    .unwrap();
+
+    let admitted_root = executor.script_directory();
+    executor.set_script_directory(new_root);
+    let running = tokio::spawn(async move {
+        admitted
+            .execute_job_at_script_directory(
+                admitted_root,
+                701,
+                admitted_list,
+                first_context,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !first_working_directory.join("started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first script should begin");
+
+    fs::write(first_working_directory.join("release"), "").unwrap();
+    running.await.unwrap();
+    assert_eq!(
+        fs::read_to_string(first_working_directory.join("order.txt")).unwrap(),
+        "first\nold-second\n",
+        "the already admitted list must continue resolving from its original root"
+    );
+
+    let second_working_directory = data.path().join("second-work");
+    fs::create_dir_all(&second_working_directory).unwrap();
+    executor
+        .execute_job(
+            702,
+            ScriptList::new(vec![ScriptListEntry::new(second)]).unwrap(),
+            context(702, second_working_directory.clone()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(second_working_directory.join("order.txt")).unwrap(),
+        "new-second\n",
+        "a later job resolves scripts from the replacement root"
+    );
 }

@@ -9,6 +9,7 @@ use weaver_server_core::post_processing::model::{
     PipelineOutcome, PostProcessingSettings, ScriptName,
 };
 use weaver_server_core::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
+use weaver_server_core::post_processing::settings::normalize_script_directory;
 
 fn parse_script_name(value: String) -> Result<ScriptName> {
     ScriptName::new(value).map_err(|error| async_graphql::Error::new(error.to_string()))
@@ -39,9 +40,12 @@ impl PostProcessingMutation {
         }
         let db = ctx.data::<Database>()?.clone();
         let saved = settings.clone();
-        let lists = tokio::task::spawn_blocking(move || {
+        let (lists, script_directory) = tokio::task::spawn_blocking(move || {
             db.save_post_processing_settings(&saved)?;
-            db.post_processing_script_lists()
+            Ok::<_, weaver_server_core::StateError>((
+                db.post_processing_script_lists()?,
+                db.post_processing_script_directory()?,
+            ))
         })
         .await
         .map_err(|error| async_graphql::Error::new(error.to_string()))?
@@ -49,6 +53,49 @@ impl PostProcessingMutation {
         Ok(PostProcessingSettingsGql::from_settings(
             settings,
             lists,
+            script_directory.to_string_lossy(),
+            strict_security_enabled(),
+        ))
+    }
+
+    /// Select the sole live source of post-processing scripts. Changing it
+    /// clears name-based assignments and option values, never script files.
+    #[graphql(guard = "AdminGuard")]
+    async fn set_post_processing_script_directory(
+        &self,
+        ctx: &Context<'_>,
+        directory: String,
+    ) -> Result<PostProcessingSettingsGql> {
+        let requested = PathBuf::from(directory.trim());
+        let script_directory = tokio::task::spawn_blocking(move || {
+            normalize_script_directory(&requested)
+                .map_err(|error| async_graphql::Error::new(error.to_string()))
+        })
+        .await
+        .map_err(|error| async_graphql::Error::new(error.to_string()))??;
+
+        let db = ctx.data::<Database>()?.clone();
+        let saved_directory = script_directory.clone();
+        let (settings, lists, script_directory, changed) = tokio::task::spawn_blocking(move || {
+            let changed = db.replace_post_processing_script_directory(&saved_directory)?;
+            Ok::<_, weaver_server_core::StateError>((
+                db.post_processing_settings()?,
+                db.post_processing_script_lists()?,
+                db.post_processing_script_directory()?,
+                changed,
+            ))
+        })
+        .await
+        .map_err(|error| async_graphql::Error::new(error.to_string()))?
+        .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        if changed {
+            ctx.data::<PostProcessingExecutor>()?
+                .set_script_directory(script_directory.clone());
+        }
+        Ok(PostProcessingSettingsGql::from_settings(
+            settings,
+            lists,
+            script_directory.to_string_lossy(),
             strict_security_enabled(),
         ))
     }
@@ -85,12 +132,11 @@ impl PostProcessingMutation {
             .collect::<Result<Vec<_>, _>>()
             .map_err(async_graphql::Error::new)?;
         let db = ctx.data::<Database>()?.clone();
-        let data_dir = {
-            let config = ctx.data::<SharedConfig>()?;
-            PathBuf::from(config.read().await.data_dir.clone())
-        };
         tokio::task::spawn_blocking(move || {
-            let discovered = resolve_script(&data_dir, &script)
+            let script_directory = db
+                .post_processing_script_directory()
+                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+            let discovered = resolve_script(&script_directory, &script)
                 .map_err(|error| async_graphql::Error::new(error.to_string()))?;
             discovered
                 .manifest
@@ -120,23 +166,18 @@ impl PostProcessingMutation {
             .ok_or_else(|| {
                 async_graphql::Error::new("post-processing reruns require a terminal history job")
             })?;
-        if !executor
-            .execution_enabled()
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?
-        {
-            return Err(async_graphql::Error::new(
-                "post-processing script execution is disabled",
-            ));
-        }
         let metadata = history
             .metadata
             .as_deref()
             .and_then(|raw| serde_json::from_str::<Vec<(String, String)>>(raw).ok())
             .unwrap_or_default();
-        let scripts = executor
-            .resolve_job_scripts(history.category.as_deref(), &metadata)
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
-        if scripts.enabled_entries().next().is_none() {
+        let admission = executor
+            .admit_job_scripts(history.category.as_deref(), &metadata)
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?
+            .ok_or_else(|| {
+                async_graphql::Error::new("post-processing script execution is disabled")
+            })?;
+        if !admission.has_enabled_entries() {
             return Err(async_graphql::Error::new(
                 "no post-processing scripts are configured for this job",
             ));
@@ -187,7 +228,7 @@ impl PostProcessingMutation {
         };
         tokio::spawn(async move {
             if let Err(error) = executor
-                .execute_job(job_id, scripts, context, None, None)
+                .execute_admitted_job(job_id, admission, context, None, None)
                 .await
             {
                 tracing::error!(job_id, error = %error, "post-processing rerun failed");

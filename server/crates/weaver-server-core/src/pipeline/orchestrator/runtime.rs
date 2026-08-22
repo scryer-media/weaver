@@ -98,10 +98,19 @@ impl Pipeline {
             warn!(error = %error, "failed to load post-processing settings; using disabled defaults");
             crate::post_processing::model::PostProcessingSettings::default()
         });
+        let scripts_directory = db
+            .initialize_post_processing_script_directory(
+                &std::path::PathBuf::from(&data_dir),
+                None,
+            )
+            .unwrap_or_else(|error| {
+                warn!(error = %error, "failed to initialize post-processing scripts directory; using default");
+                std::path::PathBuf::from(&data_dir).join("scripts")
+            });
         let terminal_post_processing_executor =
             crate::post_processing::executor::PostProcessingExecutor::new(
                 db.clone(),
-                std::path::PathBuf::from(&data_dir),
+                scripts_directory,
                 usize::from(post_processing_settings.concurrency),
             );
         if let Err(error) = terminal_post_processing_executor.recover_interrupted() {

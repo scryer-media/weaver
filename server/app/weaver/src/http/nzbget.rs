@@ -996,9 +996,12 @@ async fn resolve_nzbget_script_override(
     if script_flags.is_empty() {
         return Ok(None);
     }
-    let data_dir = std::path::PathBuf::from(ctx.config.read().await.data_dir.clone());
+    let db = ctx.db.clone();
     let listing = tokio::task::spawn_blocking(move || {
-        weaver_server_core::post_processing::listing::list_scripts(&data_dir)
+        let script_directory = db
+            .post_processing_script_directory()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        weaver_server_core::post_processing::listing::list_scripts(&script_directory)
     })
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("append failed: {error}")))?
@@ -1202,8 +1205,10 @@ mod append_rejection_tests {
             "#!/bin/sh\necho hi\n",
         )
         .unwrap();
-        let listing =
-            weaver_server_core::post_processing::listing::list_scripts(data_dir.path()).unwrap();
+        let listing = weaver_server_core::post_processing::listing::list_scripts(
+            &data_dir.path().join("scripts"),
+        )
+        .unwrap();
 
         // The manifest's `name` is what NZBGet clients send.
         let enabled = "yes".to_string();
@@ -2006,13 +2011,16 @@ fn nzbget_history_queue_item(item: &QueueItem, timings: HistoryTimings) -> Value
 }
 
 async fn config(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
+    let db = ctx.db.clone();
+    let script_dir = tokio::task::spawn_blocking(move || db.post_processing_script_directory())
+        .await
+        .map_err(|error| RpcError::invalid_parameter(format!("config failed: {error}")))?
+        .map_err(|error| RpcError::invalid_parameter(format!("config failed: {error}")))?
+        .to_string_lossy()
+        .into_owned();
     let config = ctx.config.read().await;
     let main_dir = config.data_dir.clone();
     let dest_dir = config.complete_dir();
-    let script_dir = Path::new(&main_dir)
-        .join("scripts")
-        .to_string_lossy()
-        .into_owned();
     let mut entries = vec![
         config_entry("KeepHistory", "7"),
         config_entry("MainDir", &main_dir),
@@ -3013,9 +3021,12 @@ async fn resume_post_processing(ctx: &NzbgetFacadeContext) -> Result<Value, RpcE
 /// NZBGet reloads extensions from disk on demand. Weaver lists the scripts
 /// directory live on every use, so this only has to confirm the directory reads.
 async fn loadextensions(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let data_dir = std::path::PathBuf::from(ctx.config.read().await.data_dir.clone());
+    let db = ctx.db.clone();
     let listing = tokio::task::spawn_blocking(move || {
-        weaver_server_core::post_processing::listing::list_scripts(&data_dir)
+        let script_directory = db
+            .post_processing_script_directory()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        weaver_server_core::post_processing::listing::list_scripts(&script_directory)
     })
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("loadextensions failed: {error}")))?

@@ -9,6 +9,7 @@ use crate::servers::{ServerConfig, ServerDownloadQuotaConfig, ServerDownloadQuot
 use crate::settings::Config;
 
 pub const ENV_DATA_DIR: &str = "WEAVER_DATA_DIR";
+pub const ENV_SCRIPTS_DIR: &str = "WEAVER_SCRIPTS_DIR";
 pub const ENV_INTERMEDIATE_DIR: &str = "WEAVER_INTERMEDIATE_DIR";
 pub const ENV_COMPLETE_DIR: &str = "WEAVER_COMPLETE_DIR";
 pub const ENV_MAX_DOWNLOAD_SPEED: &str = "WEAVER_MAX_DOWNLOAD_SPEED";
@@ -51,6 +52,7 @@ impl EnvSeedConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvCoreSeed {
     pub data_dir: Option<String>,
+    pub scripts_dir: Option<String>,
     pub intermediate_dir: Option<String>,
     pub complete_dir: Option<String>,
     pub max_download_speed: Option<u64>,
@@ -60,6 +62,7 @@ pub struct EnvCoreSeed {
 impl EnvCoreSeed {
     pub fn is_empty(&self) -> bool {
         self.data_dir.is_none()
+            && self.scripts_dir.is_none()
             && self.intermediate_dir.is_none()
             && self.complete_dir.is_none()
             && self.max_download_speed.is_none()
@@ -129,6 +132,7 @@ where
 
     let core = EnvCoreSeed {
         data_dir: parse_required_string(&vars, ENV_DATA_DIR)?,
+        scripts_dir: parse_required_string(&vars, ENV_SCRIPTS_DIR)?,
         intermediate_dir: parse_required_string(&vars, ENV_INTERMEDIATE_DIR)?,
         complete_dir: parse_required_string(&vars, ENV_COMPLETE_DIR)?,
         max_download_speed: parse_optional_u64(&vars, ENV_MAX_DOWNLOAD_SPEED)?,
@@ -701,6 +705,12 @@ mod tests {
             db.get_setting("max_download_speed").unwrap().as_deref(),
             Some("1000")
         );
+    }
+
+    #[test]
+    fn parses_scripts_directory_seed_without_applying_it_as_a_general_setting() {
+        let seed = parse(&[("WEAVER_SCRIPTS_DIR", "/scripts")]).unwrap();
+        assert_eq!(seed.core.scripts_dir.as_deref(), Some("/scripts"));
     }
 
     #[test]

@@ -1043,6 +1043,11 @@ type MutationRoot {
 	setQueueSpeedLimit(bytesPerSec: Int!): QueueCommandResult!
 	setPostProcessingSettings(input: PostProcessingSettingsInput!): PostProcessingSettingsGql!
 	"""
+	Select the sole live source of post-processing scripts. Changing it
+	clears name-based assignments and option values, never script files.
+	"""
+	setPostProcessingScriptDirectory(directory: String!): PostProcessingSettingsGql!
+	"""
 	Replace the global default list and every per-category override.
 	"""
 	setScriptLists(input: ScriptListsInput!): ScriptListsGql!
@@ -1182,6 +1187,7 @@ type PipelineEventGql {
 }
 
 type PostProcessingSettingsGql {
+	scriptDirectory: String!
 	executionEnabled: Boolean!
 	concurrency: Int!
 	terminationGraceSeconds: Int!
@@ -1326,7 +1332,7 @@ type QueryRoot {
 	jobOutputFiles(jobId: Int!): JobOutputResult
 	postProcessingSettings: PostProcessingSettingsGql!
 	"""
-	Live listing of `data_dir/scripts`, plus any stored option values.
+	Live listing of the configured scripts directory, plus stored option values.
 	
 	Nothing is cached: the directory is the source of truth, so a script
 	added a second ago is listed and one deleted a second ago is not.

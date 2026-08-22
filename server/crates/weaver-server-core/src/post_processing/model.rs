@@ -1,7 +1,8 @@
 //! Typed contracts for post-processing scripts.
 //!
-//! A script has no identity beyond its name in `data_dir/scripts`: there are no
-//! revisions, digests, or trust states, so nothing here models package identity.
+//! A script has no identity beyond its name in the configured scripts directory:
+//! there are no revisions, digests, or trust states, so nothing here models
+//! package identity.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -106,7 +107,7 @@ impl<'de> Deserialize<'de> for OptionName {
     }
 }
 
-/// The name of a file or manifest package directory directly under `data_dir/scripts`.
+/// The name of a file or manifest package directory directly under the configured scripts root.
 ///
 /// This is the script's whole identity — the same one SABnzbd and NZBGet use.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
