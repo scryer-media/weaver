@@ -6691,6 +6691,635 @@ async fn a_volume_that_completes_after_salvage_reports_its_whole_block_count() {
     );
 }
 
+/// A volume read back short keeps the count it proved when a later article of
+/// it names the whole volume's size.
+///
+/// Every decoded article registers what its yEnc name claims the volume carries,
+/// and for a volume that stranded holding a fraction of that, the claim is a
+/// promise nothing can keep. Letting it stand in for the read-back's count told
+/// the repair arithmetic the shortfall was already covered, so it asked for
+/// nothing further and waited on articles that had already run out.
+#[tokio::test]
+async fn a_later_articles_yenc_name_does_not_re_credit_a_salvaged_volume() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30354);
+
+    let fixture = install_partial_volume_par2_job(
+        &mut pipeline,
+        job_id,
+        PartialVolumeJob {
+            name: "Silver Horizon Partial Volume Readvertised",
+            damaged_slices: 3,
+            holed_packets: &[1],
+        },
+    )
+    .await;
+    let set_id = pipeline.par2_served_set_id(job_id).unwrap();
+
+    pipeline
+        .salvage_partial_promoted_recovery_volumes(job_id)
+        .await;
+    assert_eq!(
+        pipeline.recovery_blocks_available_or_targeted(job_id, set_id),
+        3,
+        "precondition: the whole volume's two blocks and the one that survived; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    // The short volume's name advertises two blocks, and the decode path reads
+    // that name off every article of it that lands.
+    pipeline.note_recovery_count_from_yenc_name(job_id, 3, &fixture.short_volume_filename);
+
+    assert_eq!(
+        pipeline.recovery_blocks_available_or_targeted(job_id, set_id),
+        3,
+        "a stranded volume contributes what it proved, not what it advertises; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+}
+
+/// A promoted volume whose segments are parked is waiting, not stranded.
+///
+/// Parking is where a promoted file's work rests between the promotion and the
+/// completion gate that hands it back to the download queue. Reading "nothing in
+/// flight" as "cannot complete" makes that window look terminal, and the volume
+/// is read back for the fraction of itself that happens to be on disk.
+#[tokio::test]
+async fn a_promoted_volume_whose_segments_are_parked_is_not_read_back() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30355);
+
+    install_partial_volume_par2_job(
+        &mut pipeline,
+        job_id,
+        PartialVolumeJob {
+            name: "Silver Horizon Partial Volume Parked",
+            damaged_slices: 3,
+            holed_packets: &[1],
+        },
+    )
+    .await;
+    let set_id = pipeline.par2_served_set_id(job_id).unwrap();
+    let short_volume_id = NzbFileId {
+        job_id,
+        file_index: 3,
+    };
+    let missing_segment = SegmentId {
+        file_id: short_volume_id,
+        segment_number: 1,
+    };
+
+    // The fixture's article has run out of servers. Put it back in the state it
+    // passes through first: parked, waiting for the gate to promote it.
+    pipeline
+        .unavailable_promoted_recovery_segments
+        .retain(|segment_id| *segment_id != missing_segment);
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.recovery_queue.push(DownloadWork {
+            segment_id: missing_segment,
+            message_id: MessageId::new("silver-horizon-parked-vol02-1@example.com"),
+            groups: vec!["alt.binaries.test".to_string()],
+            priority: 1000,
+            byte_estimate: PARTIAL_VOLUME_SLICE_SIZE as u32,
+            retry_count: 0,
+            is_recovery: true,
+            exclude_servers: Vec::new(),
+            avoid_server: None,
+        });
+    }
+
+    pipeline
+        .salvage_partial_promoted_recovery_volumes(job_id)
+        .await;
+    assert_eq!(
+        pipeline.par2_recovery_salvage_scans,
+        0,
+        "a volume whose work is parked has not finished arriving; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    // Now the article really is gone.
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.recovery_queue.drain_all();
+    }
+    pipeline
+        .unavailable_promoted_recovery_segments
+        .insert(missing_segment);
+
+    pipeline
+        .salvage_partial_promoted_recovery_volumes(job_id)
+        .await;
+    assert_eq!(
+        pipeline.par2_recovery_salvage_scans,
+        1,
+        "a volume that can no longer complete is read back; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert_eq!(
+        pipeline.recovery_blocks_available_or_targeted(job_id, set_id),
+        3,
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
+}
+
+/// Recovery packets of a short volume posted one article per packet.
+///
+/// The two-article fixture above cannot express a volume that takes *more* bytes
+/// and is still short: its only outstanding article is the one that would
+/// complete it. This one loses its middle article and keeps its last, so the
+/// volume grows on disk twice while never completing.
+struct GrowingVolumeFixture {
+    working_dir: PathBuf,
+    volume_filename: String,
+    /// The volume's packets in posting order, one per article.
+    packets: Vec<Vec<u8>>,
+}
+
+impl GrowingVolumeFixture {
+    fn packet_len(&self) -> usize {
+        self.packets[0].len()
+    }
+
+    /// The volume as it looks on disk once `arrived` articles have landed: the
+    /// packets that came, and holes where the rest will go.
+    fn on_disk(&self, arrived: &[usize]) -> Vec<u8> {
+        let mut bytes = vec![0u8; self.packets.len() * self.packet_len()];
+        for index in arrived {
+            let start = index * self.packet_len();
+            bytes[start..start + self.packet_len()].copy_from_slice(&self.packets[*index]);
+        }
+        bytes
+    }
+}
+
+async fn install_growing_partial_volume_par2_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+) -> GrowingVolumeFixture {
+    let slice_size = PARTIAL_VOLUME_SLICE_SIZE;
+    let slice_bytes = slice_size as usize;
+    let payload_filename = "ivory.meadow.mkv";
+    let index_filename = "ivory.meadow.par2";
+    let whole_volume_filename = "ivory.meadow.vol00+01.par2";
+    let short_volume_filename = "ivory.meadow.vol01+03.par2";
+
+    let payload: Vec<u8> = (0..(PARTIAL_VOLUME_PAYLOAD_SLICES * slice_bytes) as u32)
+        .map(|value| (value % 241) as u8)
+        .collect();
+    let full_set = build_repairable_par2_set(payload_filename, &payload, slice_size, 4);
+    let recovery_set_id = *full_set.recovery_set_id.as_bytes();
+    let slice_data = |exponent: u32| -> Vec<u8> {
+        full_set.recovery_slices[&exponent]
+            .data
+            .as_bytes()
+            .expect("test recovery slices are built in memory")
+            .to_vec()
+    };
+    let whole_volume_bytes =
+        build_test_par2_recovery_volume(recovery_set_id, &[(0, &slice_data(0))]);
+    // One packet per article, so the volume can take an article without being
+    // finished by it.
+    let packets: Vec<Vec<u8>> = (1..4u32)
+        .map(|exponent| {
+            build_test_par2_recovery_volume(recovery_set_id, &[(exponent, &slice_data(exponent))])
+        })
+        .collect();
+    let packet_len = packets[0].len();
+
+    let par2_bytes = build_test_par2_index(payload_filename, &payload, slice_size);
+    let payload_segment_bytes = (payload.len() / 2) as u32;
+
+    let spec = JobSpec {
+        name: "Ivory Meadow Growing Volume".to_string(),
+        password: None,
+        total_bytes: (payload.len()
+            + par2_bytes.len()
+            + whole_volume_bytes.len()
+            + packets.len() * packet_len) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: payload_segment_bytes,
+                        message_id: "ivory-meadow-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: payload_segment_bytes,
+                        message_id: "ivory-meadow-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "ivory-meadow-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: whole_volume_filename.to_string(),
+                role: FileRole::from_filename(whole_volume_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: whole_volume_bytes.len() as u32,
+                    message_id: "ivory-meadow-vol00@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: short_volume_filename.to_string(),
+                role: FileRole::from_filename(short_volume_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: (0..3u32)
+                    .map(|ordinal| {
+                        segment_spec! {
+                            number: ordinal,
+                            bytes: packet_len as u32,
+                            message_id: format!("ivory-meadow-vol01-{ordinal}@example.com"),
+                        }
+                    })
+                    .collect(),
+            },
+        ],
+    };
+    let working_dir = insert_active_job(pipeline, job_id, spec).await;
+
+    tokio::fs::write(working_dir.join(payload_filename), &payload)
+        .await
+        .unwrap();
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        let payload_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        for segment_number in 0..2 {
+            state
+                .assembly
+                .file_mut(payload_id)
+                .unwrap()
+                .commit_segment(segment_number, payload_segment_bytes)
+                .unwrap();
+        }
+    }
+
+    write_and_complete_file(pipeline, job_id, 1, index_filename, &par2_bytes).await;
+    write_and_complete_file(
+        pipeline,
+        job_id,
+        2,
+        whole_volume_filename,
+        &whole_volume_bytes,
+    )
+    .await;
+
+    let fixture = GrowingVolumeFixture {
+        working_dir,
+        volume_filename: short_volume_filename.to_string(),
+        packets,
+    };
+
+    // Only the volume's first article has landed; its second has run out of
+    // servers, and its third has yet to arrive.
+    tokio::fs::write(
+        fixture.working_dir.join(&fixture.volume_filename),
+        fixture.on_disk(&[0]),
+    )
+    .await
+    .unwrap();
+    let short_volume_id = NzbFileId {
+        job_id,
+        file_index: 3,
+    };
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let file = state.assembly.file_mut(short_volume_id).unwrap();
+        file.record_placement(0, 0, packet_len as u32);
+        file.commit_segment(0, packet_len as u32).unwrap();
+    }
+    pipeline
+        .unavailable_promoted_recovery_segments
+        .insert(SegmentId {
+            file_id: short_volume_id,
+            segment_number: 1,
+        });
+
+    let mut installed_set = full_set.clone();
+    for exponent in 1..4u32 {
+        installed_set.recovery_slices.remove(&exponent);
+    }
+    install_test_par2_runtime(
+        pipeline,
+        job_id,
+        installed_set,
+        &[
+            (1, index_filename, 0, false),
+            (2, whole_volume_filename, 1, true),
+            (3, short_volume_filename, 0, true),
+        ],
+    );
+
+    fixture
+}
+
+/// A volume read back short is read again once more of it lands.
+///
+/// One read-back per *generation of bytes*, not one ever. A volume can strand,
+/// be read for what it holds, take another article and strand again — and the
+/// second stranding has more on disk than the first read saw. Latching the
+/// read-back to the file for good left those blocks unaccounted for the rest of
+/// the job, because the latch is only ever cleared by a completion the volume
+/// will never reach.
+#[tokio::test]
+async fn a_volume_read_back_short_is_read_again_once_more_of_it_lands() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30356);
+
+    let fixture = install_growing_partial_volume_par2_job(&mut pipeline, job_id).await;
+    let set_id = pipeline.par2_served_set_id(job_id).unwrap();
+
+    pipeline
+        .salvage_partial_promoted_recovery_volumes(job_id)
+        .await;
+    assert_eq!(pipeline.par2_recovery_salvage_scans, 1);
+    assert_eq!(
+        pipeline.recovery_blocks_available_or_targeted(job_id, set_id),
+        2,
+        "the whole volume's block and the one article of the short volume; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    pipeline
+        .salvage_partial_promoted_recovery_volumes(job_id)
+        .await;
+    assert_eq!(
+        pipeline.par2_recovery_salvage_scans, 1,
+        "nothing about the volume has moved, so it is not read again"
+    );
+
+    // The volume's last article lands. It still cannot complete — the middle one
+    // has run out of servers — but there is more on disk than the first read saw.
+    tokio::fs::write(
+        fixture.working_dir.join(&fixture.volume_filename),
+        fixture.on_disk(&[0, 2]),
+    )
+    .await
+    .unwrap();
+    let packet_len = fixture.packet_len() as u32;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let file = state
+            .assembly
+            .file_mut(NzbFileId {
+                job_id,
+                file_index: 3,
+            })
+            .unwrap();
+        file.record_placement(2, 2 * packet_len as u64, packet_len);
+        file.commit_segment(2, packet_len).unwrap();
+        assert!(!file.is_complete());
+    }
+
+    pipeline
+        .salvage_partial_promoted_recovery_volumes(job_id)
+        .await;
+    assert_eq!(
+        pipeline.par2_recovery_salvage_scans,
+        2,
+        "more bytes landed, so the volume is read again; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert_eq!(
+        pipeline.recovery_blocks_available_or_targeted(job_id, set_id),
+        3,
+        "the second read-back adds to the first rather than replacing it; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+}
+
+/// A repair short of blocks that nothing can still deliver is failed, not
+/// waited on.
+///
+/// The wait branch fails only when *capacity* is short. A job whose targeted
+/// total already covers the damage promotes nothing, and with nothing queued,
+/// active, retrying or decoding there is no arrival that could raise the
+/// available count — the one pass that could, the read-back, ran on the way in.
+/// The branch nonetheless moved the job to `Downloading` and returned, forever.
+#[tokio::test]
+async fn a_repair_waiting_on_recovery_that_cannot_arrive_is_failed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30357);
+    let payload_filename = "onyx.prairie.mkv";
+    let index_filename = "onyx.prairie.par2";
+    // A volume that arrived whole and whose bytes yielded no packet at all: its
+    // name is the only thing that ever said how much recovery it carries.
+    let recovery_filename = "onyx.prairie.vol00+02.par2";
+    let original_payload: Vec<u8> = (0..128u32).map(|value| ((value * 7) % 251) as u8).collect();
+    let damaged_payload = vec![0u8; original_payload.len()];
+    let par2_bytes = build_test_par2_index(payload_filename, &original_payload, 64);
+    let recovery_bytes = vec![0x55u8; 64];
+    let spec = JobSpec {
+        name: "Onyx Prairie Unreachable Recovery".to_string(),
+        password: None,
+        total_bytes: (original_payload.len() + par2_bytes.len() + recovery_bytes.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "onyx-prairie-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "onyx-prairie-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "onyx-prairie-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: recovery_filename.to_string(),
+                role: FileRole::from_filename(recovery_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: recovery_bytes.len() as u32,
+                    message_id: "onyx-prairie-recovery@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    tokio::fs::write(working_dir.join(payload_filename), &damaged_payload)
+        .await
+        .unwrap();
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    write_and_complete_file(&mut pipeline, job_id, 1, index_filename, &par2_bytes).await;
+    write_and_complete_file(&mut pipeline, job_id, 2, recovery_filename, &recovery_bytes).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &original_payload, 64, 0),
+        &[
+            (1, index_filename, 0, false),
+            (2, recovery_filename, 2, true),
+        ],
+    );
+
+    settle_job_completion(&mut pipeline, job_id).await;
+
+    let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {
+        panic!(
+            "a wait no arrival can end must be a failure; {}",
+            debug_job_state(&pipeline, job_id)
+        );
+    };
+    assert!(
+        error.contains("no further recovery can arrive"),
+        "the failure must say why waiting is pointless: {error}"
+    );
+}
+
+/// The state the hung job reached, end to end: one volume complete, one
+/// stranded holding a fraction of what it advertises, and nothing left in
+/// flight.
+#[tokio::test]
+async fn a_stranded_volume_advertising_more_than_it_holds_fails_instead_of_waiting() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30358);
+
+    let fixture = install_partial_volume_par2_job(
+        &mut pipeline,
+        job_id,
+        PartialVolumeJob {
+            name: "Silver Horizon Partial Volume Stall",
+            damaged_slices: 4,
+            holed_packets: &[1],
+        },
+    )
+    .await;
+
+    // The order the hung job reached it in: the volume is read back for what it
+    // holds, and only afterwards does an article of it decode and register what
+    // its name claims.
+    pipeline
+        .salvage_partial_promoted_recovery_volumes(job_id)
+        .await;
+    pipeline.note_recovery_count_from_yenc_name(job_id, 3, &fixture.short_volume_filename);
+
+    settle_job_completion(&mut pipeline, job_id).await;
+
+    let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {
+        panic!(
+            "a repair that can never afford its damage must be failed, not waited on; {}",
+            debug_job_state(&pipeline, job_id)
+        );
+    };
+    assert!(
+        error.contains("not repairable"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("only 3 recovery blocks"),
+        "the failure must count what the volume proved: {error}"
+    );
+}
+
+/// The same shape with the damage inside what the read-back recovered: the
+/// repair runs.
+///
+/// Guard for the failure above — counting a stranded volume honestly must not
+/// turn a job that can afford its damage into a failure.
+#[tokio::test]
+async fn a_stranded_volume_whose_read_back_covers_the_damage_still_repairs() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30359);
+    let job_name = "Silver Horizon Partial Volume Stall Averted";
+
+    let fixture = install_partial_volume_par2_job(
+        &mut pipeline,
+        job_id,
+        PartialVolumeJob {
+            name: job_name,
+            damaged_slices: 3,
+            holed_packets: &[1],
+        },
+    )
+    .await;
+
+    pipeline
+        .salvage_partial_promoted_recovery_volumes(job_id)
+        .await;
+    pipeline.note_recovery_count_from_yenc_name(job_id, 3, &fixture.short_volume_filename);
+
+    settle_job_completion(&mut pipeline, job_id).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
+    let output_dir = pipeline
+        .complete_dir
+        .join(crate::jobs::working_dir::sanitize_dirname(job_name));
+    assert_eq!(
+        tokio::fs::read(output_dir.join("silver.horizon.mkv"))
+            .await
+            .unwrap(),
+        fixture.payload,
+        "the repaired payload must be byte-identical"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Postings carrying more than one recovery set
 // ---------------------------------------------------------------------------

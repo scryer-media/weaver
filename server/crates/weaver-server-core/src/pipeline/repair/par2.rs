@@ -92,6 +92,23 @@ fn par2_recovery_packet_size(slice_size: u64) -> u64 {
     }
 }
 
+/// How many recovery blocks a PAR2 file has proven it carries for one set.
+///
+/// A file that answers to several sets keeps a count per set, because no single
+/// number describes it; one that answers to a single set is described by its own
+/// validated total. Neither figure is ever derived from a name or a byte size —
+/// that is what makes it safe for the arithmetic that decides whether a repair
+/// can go ahead.
+fn validated_recovery_blocks_for_set(
+    file: &Par2FileRuntime,
+    set_id: par2_rs::RecoverySetId,
+) -> u32 {
+    file.recovery_blocks_by_set
+        .get(&set_id)
+        .copied()
+        .unwrap_or(file.validated_recovery_blocks)
+}
+
 fn recovery_file_bytes(spec: &JobSpec, file_index: u32) -> Option<u64> {
     let file = spec.files.get(file_index as usize)?;
     Some(
@@ -1294,7 +1311,14 @@ impl Pipeline {
                 if !self.recovery_file_serves_set(job_id, file_index, set_id) {
                     continue;
                 }
-                let blocks = file.recovery_blocks;
+                // What the file proved, when it has proved anything. A volume
+                // whose packets were read answers this exactly; one that has
+                // only been named or sized answers it as well as it can.
+                let blocks = if file.validated_recovery_blocks > 0 {
+                    file.validated_recovery_blocks
+                } else {
+                    file.recovery_blocks
+                };
                 let Some(total_bytes) = recovery_file_bytes(&state.spec, file_index) else {
                     continue;
                 };
@@ -1334,15 +1358,9 @@ impl Pipeline {
         file_index: u32,
         set_id: par2_rs::RecoverySetId,
     ) -> Option<(u32, RecoveryCountSource)> {
-        if let Some(blocks) = self
+        if let Some(file) = self
             .par2_runtime(job_id)
             .and_then(|runtime| runtime.files.get(&file_index))
-            .and_then(|file| {
-                file.recovery_blocks_by_set
-                    .get(&set_id)
-                    .copied()
-                    .or(Some(file.recovery_blocks))
-            })
         {
             // Zero from the runtime is not a count — entries are created for
             // bookkeeping (identity binding, metadata promotion) with the
@@ -1351,9 +1369,16 @@ impl Pipeline {
             // promotion (`candidate.blocks > 0`). A recovery volume with
             // genuinely zero packets does not exist; only an index is exactly
             // zero, and the role branch below says so. So a zero falls through
-            // to the role-derived count.
-            if blocks > 0 {
-                return Some((blocks, RecoveryCountSource::Exact));
+            // to the counts below.
+            let validated = validated_recovery_blocks_for_set(file, set_id);
+            if validated > 0 {
+                return Some((validated, RecoveryCountSource::Exact));
+            }
+            // Nothing of this file has been read yet, so what it says about
+            // itself is the best answer available — and it is an estimate, said
+            // so, rather than a count the repair arithmetic may bank on.
+            if file.recovery_blocks > 0 {
+                return Some((file.recovery_blocks, RecoveryCountSource::FilenameFallback));
             }
         }
 
@@ -2087,13 +2112,15 @@ impl Pipeline {
                     let runtime = self.ensure_par2_runtime(job_id);
                     let entry = runtime.files.entry(file_id.file_index).or_default();
                     entry.filename = filename.clone();
-                    entry.recovery_blocks = if entry.salvaged {
-                        entry.recovery_blocks.saturating_add(new_recovery_blocks)
+                    entry.validated_recovery_blocks = if entry.salvaged {
+                        entry
+                            .validated_recovery_blocks
+                            .saturating_add(new_recovery_blocks)
                     } else {
                         new_recovery_blocks
                     };
                     entry.salvaged = false;
-                    entry.salvage_attempted = false;
+                    entry.salvaged_at_received_bytes = None;
                     entry.promoted = promoted;
                 }
                 info!(
@@ -2143,15 +2170,25 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) {
+        // A volume is read back once per generation of its bytes. Re-reading one
+        // that has not moved is a slow path run on a hot loop; never re-reading
+        // one that has taken more articles since is how a volume salvaged early
+        // and short keeps reporting the short count for the rest of the job.
         let candidate_file_indices: Vec<u32> = self
             .par2_runtime(job_id)
             .map(|runtime| {
                 runtime
                     .files
                     .iter()
-                    .filter_map(|(&file_index, file)| {
-                        (!file.salvage_attempted).then_some(file_index)
-                    })
+                    .filter_map(
+                        |(&file_index, file)| match file.salvaged_at_received_bytes {
+                            None => Some(file_index),
+                            Some(read_at_bytes) => (self
+                                .recovery_file_received_bytes(job_id, file_index)
+                                > read_at_bytes)
+                                .then_some(file_index),
+                        },
+                    )
                     .collect()
             })
             .unwrap_or_default();
@@ -2214,6 +2251,30 @@ impl Pipeline {
             .collect()
     }
 
+    /// How many bytes of this file have been committed to disk so far.
+    fn recovery_file_received_bytes(&self, job_id: JobId, file_index: u32) -> u64 {
+        self.jobs
+            .get(&job_id)
+            .and_then(|state| state.assembly.file(NzbFileId { job_id, file_index }))
+            .map(|file| file.received_bytes())
+            .unwrap_or(0)
+    }
+
+    /// Whether any of this file's work is parked in the recovery queue.
+    ///
+    /// Parked work is not in flight, but it is not lost either: the completion
+    /// gate moves a promoted file's parked segments back onto the download queue
+    /// on its way in. A volume in that state is waiting, not stranded.
+    fn recovery_file_has_parked_segments(&self, job_id: JobId, file_index: u32) -> bool {
+        let file_id = NzbFileId { job_id, file_index };
+        self.jobs.get(&job_id).is_some_and(|state| {
+            state
+                .recovery_queue
+                .count_matching(|work| work.segment_id.file_id == file_id)
+                > 0
+        })
+    }
+
     /// Whether this file is a PAR2 recovery volume that has bytes on disk, will
     /// never complete, and has nothing left in flight that could change that.
     fn recovery_volume_is_stranded(&self, job_id: JobId, file_index: u32) -> bool {
@@ -2246,7 +2307,20 @@ impl Pipeline {
         if !promoted && file.received_bytes() == 0 {
             return false;
         }
+        // A segment the servers have run out of answers for is the one fact that
+        // settles this on its own: the volume cannot complete, whatever else the
+        // job still has moving.
+        if self.promoted_recovery_file_has_unavailable_segment(job_id, file_index) {
+            return true;
+        }
+        // Otherwise "cannot complete" is a claim about the whole pipeline, not
+        // about this instant. Work parked for later, or anything of this job's
+        // still moving, means the articles that would finish this volume may yet
+        // arrive — and a volume read back while they were merely resting is one
+        // that reports the short count it happened to see.
         !self.promoted_recovery_file_has_pending_work(job_id, file_index)
+            && !self.recovery_file_has_parked_segments(job_id, file_index)
+            && !self.job_has_pending_download_pipeline_work(job_id)
     }
 
     async fn salvage_stranded_recovery_volume(
@@ -2256,12 +2330,14 @@ impl Pipeline {
         expected_set_id: par2_rs::RecoverySetId,
     ) {
         let file_id = NzbFileId { job_id, file_index };
-        let Some((filename, file_path)) = self.jobs.get(&job_id).and_then(|state| {
-            let file_asm = state.assembly.file(file_id)?;
-            let filename = self.current_filename_for_file(job_id, file_asm);
-            let file_path = state.working_dir.join(&filename);
-            Some((filename, file_path))
-        }) else {
+        let Some((filename, file_path, received_bytes)) =
+            self.jobs.get(&job_id).and_then(|state| {
+                let file_asm = state.assembly.file(file_id)?;
+                let filename = self.current_filename_for_file(job_id, file_asm);
+                let file_path = state.working_dir.join(&filename);
+                Some((filename, file_path, file_asm.received_bytes()))
+            })
+        else {
             return;
         };
 
@@ -2269,7 +2345,6 @@ impl Pipeline {
             let runtime = self.ensure_par2_runtime(job_id);
             let entry = runtime.files.entry(file_index).or_default();
             entry.filename = filename.clone();
-            entry.salvage_attempted = true;
         }
         #[cfg(test)]
         {
@@ -2304,7 +2379,16 @@ impl Pipeline {
         })
         .await
         {
-            Ok(Ok(packet_list)) => packet_list,
+            Ok(Ok(packet_list)) => {
+                // The bytes that were on disk have now been looked at, whatever
+                // they turned out to hold. A read that never got that far leaves
+                // no mark, so the next articles to land bring the volume back
+                // here rather than writing it off on a file that was not there.
+                let runtime = self.ensure_par2_runtime(job_id);
+                let entry = runtime.files.entry(file_index).or_default();
+                entry.salvaged_at_received_bytes = Some(received_bytes);
+                packet_list
+            }
             Ok(Err(error)) => {
                 warn!(
                     job_id = job_id.0,
@@ -2406,8 +2490,17 @@ impl Pipeline {
                 {
                     let runtime = self.ensure_par2_runtime(job_id);
                     let entry = runtime.files.entry(file_index).or_default();
-                    entry.recovery_blocks = salvaged_blocks;
-                    entry.salvaged = salvaged_blocks > 0;
+                    // A second read-back of the same volume reports only what
+                    // the first one did not already merge, so the file's total
+                    // is the sum of its read-backs rather than the last of them.
+                    entry.validated_recovery_blocks = if entry.salvaged {
+                        entry
+                            .validated_recovery_blocks
+                            .saturating_add(salvaged_blocks)
+                    } else {
+                        salvaged_blocks
+                    };
+                    entry.salvaged = entry.validated_recovery_blocks > 0;
                     entry.recovery_set_id = Some(expected_set_id);
                 }
                 info!(
@@ -2441,7 +2534,7 @@ impl Pipeline {
             .and_then(|runtime| runtime.files.get_mut(&file_id.file_index))
         {
             entry.salvaged = false;
-            entry.salvage_attempted = false;
+            entry.salvaged_at_received_bytes = None;
         }
     }
 
@@ -2626,6 +2719,19 @@ impl Pipeline {
             .sum()
     }
 
+    /// How much recovery this repair can count on: what has arrived, what is on
+    /// its way, and what was read back off a volume that will never arrive.
+    ///
+    /// The three groups are counted through [`Self::recovery_block_count_for`],
+    /// which answers with a validated count wherever there is one and only falls
+    /// back to what a file advertises while nothing of it has been read. That
+    /// ordering is what keeps a volume stranded holding three of its
+    /// twenty-four blocks from being credited with the other twenty-one — a
+    /// promise nothing can keep, which reads here as a shortfall already
+    /// covered, so no further recovery is promoted and the job waits for an
+    /// arrival that has no source. A volume still on its way has proved nothing
+    /// yet and rightly contributes what it advertises: that is what "targeted"
+    /// means.
     pub(crate) fn recovery_blocks_available_or_targeted(
         &self,
         job_id: JobId,

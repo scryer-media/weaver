@@ -1285,25 +1285,46 @@ pub(super) struct FullSetExtractionOutcome {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Par2FileRuntime {
     pub(super) filename: String,
+    /// How many recovery blocks this file *claims* to carry: the count spelled
+    /// out in a `volNN+CC` name, or an estimate derived from its encoded size.
+    ///
+    /// An advertisement, never evidence. A volume that lost an article
+    /// advertises exactly what an intact one does, so this may decide what is
+    /// worth fetching and may never decide whether a repair can go ahead.
     pub(super) recovery_blocks: u32,
+    /// How many recovery blocks this file has *proven* it carries: packets that
+    /// were read and whose own MD5 checked out, whether on completion or by
+    /// reading back past a hole.
+    ///
+    /// Kept apart from the advertised count because the two disagree for
+    /// exactly the volumes where it matters — a volume that stranded holding
+    /// three of its twenty-four blocks. Crediting it with the other twenty-one
+    /// leaves the arithmetic believing a repair is affordable while nothing is
+    /// left to download, which is a job that waits forever.
+    pub(super) validated_recovery_blocks: u32,
     pub(super) promoted: bool,
     /// Recovery packets were read back off a volume that can no longer
-    /// complete, and `recovery_blocks` is how many of them validated. Set only
-    /// when at least one block was recovered, because it is also what makes the
-    /// file count toward the recovery available to a repair.
+    /// complete, and `validated_recovery_blocks` is how many of them validated.
+    /// Set only when at least one block was recovered, because it is also what
+    /// makes the file count toward the recovery available to a repair.
     pub(super) salvaged: bool,
-    /// One read-back attempt per download generation. Nothing about a volume
-    /// that cannot complete changes between completion-gate entries, and the
-    /// gate is entered many times per job.
-    pub(super) salvage_attempted: bool,
+    /// The file's `received_bytes()` when it was last read back, or `None` if it
+    /// never was.
+    ///
+    /// One read-back per generation of bytes, not one ever: nothing about a
+    /// volume changes between completion-gate entries while it sits still, and
+    /// the gate is entered many times per job — but a volume that strands, is
+    /// read back short, and then takes more articles before stranding again has
+    /// more on disk than the first read saw.
+    pub(super) salvaged_at_received_bytes: Option<u64>,
     /// How many validated recovery blocks this file contributed to each set it
     /// carries packets for.
     ///
     /// A file whose packets all answer to one set is described by
-    /// `recovery_blocks` alone. One carrying several sets' packets has no
-    /// single answer, and its blocks are nonetheless merged into each of those
-    /// sets — so the arithmetic that decides whether a repair is possible has
-    /// to be able to see the same blocks the repairer already holds.
+    /// `validated_recovery_blocks` alone. One carrying several sets' packets has
+    /// no single answer, and its blocks are nonetheless merged into each of
+    /// those sets — so the arithmetic that decides whether a repair is possible
+    /// has to be able to see the same blocks the repairer already holds.
     pub(super) recovery_blocks_by_set: HashMap<par2_rs::RecoverySetId, u32>,
     /// Which recovery set this PAR2 file speaks for, once its packets have
     /// actually been read. A file carrying packets for more than one set stays

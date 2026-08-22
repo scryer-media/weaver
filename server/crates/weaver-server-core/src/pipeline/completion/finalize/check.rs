@@ -516,6 +516,47 @@ fn par2_verification_needs_repair(verification: &par2_rs::VerificationResult) ->
     verification.needs_repair()
 }
 
+/// Why waiting for targeted recovery is waiting for nothing, if it is.
+///
+/// The branch below hands a short repair back to `Downloading` on the promise
+/// that more recovery is on its way. Three things can keep that promise: a
+/// promotion that just put articles on the wire, work still moving through the
+/// pipeline, and a promoted volume's segments parked for the gate to hand back
+/// on its next entry. With none of them, nothing between now and the next entry
+/// can change a single number this branch just read — the one pass that could,
+/// the read-back of volumes that can no longer complete, already ran on the way
+/// in. So the job would return here forever, and the honest answer is the
+/// terminal one.
+///
+/// Reaching this at all means the shortfall gate above declined to fire, which
+/// means the targeted total is counting blocks the available count cannot see.
+/// That is an accounting disagreement rather than an ordinary shortfall, so it
+/// is said out loud: a regression here should cost a log line, not a hung job.
+fn par2_unreachable_recovery_failure(
+    job_id: JobId,
+    blocks_needed: u32,
+    recovery_now: u32,
+    targeted_total: u32,
+    promoted_blocks: u32,
+    recovery_still_settling: bool,
+    parked_promoted_recovery: usize,
+) -> Option<String> {
+    if promoted_blocks > 0 || recovery_still_settling || parked_promoted_recovery > 0 {
+        return None;
+    }
+    warn!(
+        job_id = job_id.0,
+        blocks_needed,
+        recovery_now,
+        targeted_total,
+        "targeted PAR2 recovery total counts blocks this repair can never reach"
+    );
+    Some(format!(
+        "not repairable: {blocks_needed} damaged slices, only {recovery_now} recovery blocks \
+         reachable and no further recovery can arrive ({targeted_total} targeted)"
+    ))
+}
+
 /// Why a post-repair verification should fail the repair, if it should.
 ///
 /// Damage and misplacement both make a verification "need repair", and only one
@@ -6111,17 +6152,29 @@ impl Pipeline {
                             job_id,
                             par2_set.recovery_set_id,
                         );
+                        let promoted_recovery = self.promoted_recovery_pipeline_state(job_id);
                         let recovery_still_settling = promoted > 0
                             || self.job_has_pending_download_pipeline_work(job_id)
-                            || self
-                                .promoted_recovery_pipeline_state(job_id)
-                                .has_pending_work();
+                            || promoted_recovery.has_pending_work();
 
                         if targeted_total < blocks_needed && !recovery_still_settling {
                             let msg = format!(
                                 "not repairable: {blocks_needed} damaged slices, \
                                  only {targeted_total} recovery blocks available in NZB"
                             );
+                            self.finish_par2_set_failure(job_id, set_id, msg).await;
+                            return;
+                        }
+
+                        if let Some(msg) = par2_unreachable_recovery_failure(
+                            job_id,
+                            blocks_needed,
+                            recovery_now,
+                            targeted_total,
+                            promoted,
+                            recovery_still_settling,
+                            promoted_recovery.parked_promoted_recovery,
+                        ) {
                             self.finish_par2_set_failure(job_id, set_id, msg).await;
                             return;
                         }
@@ -6508,11 +6561,10 @@ impl Pipeline {
                             job_id,
                             par2_set.recovery_set_id,
                         );
+                        let promoted_recovery = self.promoted_recovery_pipeline_state(job_id);
                         let recovery_still_settling = promoted > 0
                             || self.job_has_pending_download_pipeline_work(job_id)
-                            || self
-                                .promoted_recovery_pipeline_state(job_id)
-                                .has_pending_work();
+                            || promoted_recovery.has_pending_work();
 
                         // If all available/targeted recovery is still insufficient,
                         // fail immediately instead of waiting for downloads that
@@ -6522,6 +6574,19 @@ impl Pipeline {
                                 "not repairable: {damaged} damaged slices, \
                                  only {targeted_total} recovery blocks available in NZB"
                             );
+                            self.finish_par2_set_failure(job_id, set_id, msg).await;
+                            return;
+                        }
+
+                        if let Some(msg) = par2_unreachable_recovery_failure(
+                            job_id,
+                            damaged,
+                            recovery_now,
+                            targeted_total,
+                            promoted,
+                            recovery_still_settling,
+                            promoted_recovery.parked_promoted_recovery,
+                        ) {
                             self.finish_par2_set_failure(job_id, set_id, msg).await;
                             return;
                         }
