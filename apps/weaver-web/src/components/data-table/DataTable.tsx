@@ -54,6 +54,7 @@ function shouldIgnoreRowClick(target: EventTarget | null) {
 type VirtualizedDataTableRowProps<TData> = {
   row: Row<TData>;
   rowIndex: number;
+  isSelected: boolean;
   rowClassName?: (row: Row<TData>) => string | undefined;
   onRowClick?: (row: Row<TData>, event: ReactMouseEvent<HTMLTableRowElement>) => void;
   measureElement: (element: HTMLTableRowElement | null) => void;
@@ -62,6 +63,7 @@ type VirtualizedDataTableRowProps<TData> = {
 function VirtualizedDataTableRowInner<TData>({
   row,
   rowIndex,
+  isSelected,
   rowClassName,
   onRowClick,
   measureElement,
@@ -70,7 +72,7 @@ function VirtualizedDataTableRowInner<TData>({
     <TableRow
       ref={measureElement}
       data-index={rowIndex}
-      data-state={row.getIsSelected() ? "selected" : undefined}
+      data-state={isSelected ? "selected" : undefined}
       className={rowClassName?.(row)}
       onClick={(event) => {
         if (!onRowClick || shouldIgnoreRowClick(event.target)) {
@@ -162,6 +164,7 @@ function VirtualizedDataTableBody<TData>({
             key={virtualRow.key}
             row={row}
             rowIndex={virtualRow.index}
+            isSelected={row.getIsSelected()}
             rowClassName={rowClassName}
             onRowClick={onRowClick}
             measureElement={rowVirtualizer.measureElement}
