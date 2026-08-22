@@ -164,9 +164,14 @@ test("a disabled entry stays in the list without running", async ({
   }
 
   const list = page.getByRole("list", { name: "Script list" });
-  while ((await list.getByRole("listitem").count()) > 0) {
-    const entry = list.getByRole("listitem").first();
-    const remove = entry.getByRole("button", { name: "Remove" });
+  const scriptEntryLabels = await list.getByRole("listitem").evaluateAll((items) =>
+    items
+      .map((item) => item.getAttribute("aria-label"))
+      .filter((label): label is string => label?.startsWith("Script ") === true),
+  );
+  for (const label of scriptEntryLabels) {
+    const entry = list.getByRole("listitem", { name: label, exact: true });
+    const remove = entry.getByRole("button", { name: "Remove", exact: true });
     await waitForScriptListSave(page, () => remove.click());
   }
   await addScriptToGlobalList(page, POST_PROCESSING_NOTIFY_SCRIPT);

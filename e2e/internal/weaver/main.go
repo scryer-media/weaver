@@ -504,15 +504,7 @@ func reallocateRuntimePortsForDockerRetry() error {
 		return fmt.Errorf("save fresh runtime ports: %w", err)
 	}
 
-	previousEnv := runtimePortEnvValues(previous)
-	for key, value := range runtimePortEnvValues(next) {
-		// Compose consumes the E2E_* bindings directly. The compatibility
-		// aliases follow those bindings only when the phase has not explicitly
-		// overridden them (as NNTP borrower phases do).
-		if strings.HasPrefix(key, "E2E_") || os.Getenv(key) == previousEnv[key] {
-			setEnv(key, value)
-		}
-	}
+	applyRuntimePortEnvPreservingExplicitAliases(previous, next)
 	return nil
 }
 
@@ -818,8 +810,23 @@ func refreshRuntimePortEnvFromRunningStack() error {
 	if err := saveRuntimePortState(runtimePortsStatePath(), state); err != nil {
 		return err
 	}
-	applyRuntimePortEnv(state)
+	// A borrower runs its own supporting stack but deliberately points its
+	// managed Weaver at a donor's already-seeded NNTP endpoints. Refresh the
+	// discovered E2E_* bindings while retaining those explicit aliases.
+	applyRuntimePortEnvPreservingExplicitAliases(state, state)
 	return nil
+}
+
+func applyRuntimePortEnvPreservingExplicitAliases(previous, next runtimePortState) {
+	previousEnv := runtimePortEnvValues(previous)
+	for key, value := range runtimePortEnvValues(next) {
+		// Compose consumes the E2E_* bindings directly. The compatibility
+		// aliases follow those bindings only when the phase has not explicitly
+		// overridden them (as NNTP borrower phases do).
+		if strings.HasPrefix(key, "E2E_") || os.Getenv(key) == previousEnv[key] {
+			setEnv(key, value)
+		}
+	}
 }
 
 func runtimeStackRunning() bool {

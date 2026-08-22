@@ -82,6 +82,32 @@ func TestReallocateRuntimePortsForDockerRetryPreservesBorrowedAliases(t *testing
 	}
 }
 
+func TestRefreshRuntimePortEnvPreservesBorrowedAliases(t *testing.T) {
+	state, err := allocateRuntimePortState()
+	if err != nil {
+		t.Fatalf("allocate runtime ports: %v", err)
+	}
+	for key, value := range runtimePortEnvValues(state) {
+		t.Setenv(key, value)
+	}
+	t.Setenv("NNTP_PORT", "39991")
+	t.Setenv("NNTP_BACKUP_PORT", "39992")
+
+	applyRuntimePortEnvPreservingExplicitAliases(state, state)
+
+	for key, want := range runtimePortEnvValues(state) {
+		if strings.HasPrefix(key, "E2E_") && os.Getenv(key) != want {
+			t.Fatalf("env[%s] = %q, want %q", key, os.Getenv(key), want)
+		}
+	}
+	if got := nntpPort(); got != "39991" {
+		t.Fatalf("nntpPort() = %q, want preserved donor port", got)
+	}
+	if got := backupNntpPort(); got != "39992" {
+		t.Fatalf("backupNntpPort() = %q, want preserved donor port", got)
+	}
+}
+
 func TestStatOnlyChaosConfigDropsBodyChaos(t *testing.T) {
 	got := statOnlyChaosConfig("stat_bad_code=100,drop_mid_body=5, stat_short=25")
 	want := "stat_bad_code=100,stat_short=25"
