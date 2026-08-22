@@ -1296,9 +1296,18 @@ pub(super) struct Par2FileRuntime {
     /// that cannot complete changes between completion-gate entries, and the
     /// gate is entered many times per job.
     pub(super) salvage_attempted: bool,
+    /// How many validated recovery blocks this file contributed to each set it
+    /// carries packets for.
+    ///
+    /// A file whose packets all answer to one set is described by
+    /// `recovery_blocks` alone. One carrying several sets' packets has no
+    /// single answer, and its blocks are nonetheless merged into each of those
+    /// sets — so the arithmetic that decides whether a repair is possible has
+    /// to be able to see the same blocks the repairer already holds.
+    pub(super) recovery_blocks_by_set: HashMap<par2_rs::RecoverySetId, u32>,
     /// Which recovery set this PAR2 file speaks for, once its packets have
     /// actually been read. A file carrying packets for more than one set stays
-    /// `None`, because it cannot contribute capacity to any one set.
+    /// `None`, because no single set owns it.
     pub(super) recovery_set_id: Option<par2_rs::RecoverySetId>,
     /// Whether packets have been read from this file. A packet-read file with
     /// no single set ID is deliberately not grouped by filename.

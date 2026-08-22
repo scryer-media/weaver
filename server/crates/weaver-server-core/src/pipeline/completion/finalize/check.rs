@@ -1731,8 +1731,15 @@ impl Pipeline {
             // artefacts it leaves behind can be named afterwards by difference
             // rather than by guessing at a backup-suffix convention that lives
             // in another crate.
+            //
+            // The FIRST such state is the baseline for the whole job, not the
+            // most recent one. A second set's repair runs with the first set's
+            // backups already on disk, and re-snapshotting here would enrol
+            // them as though they had always been there — which is precisely
+            // how a damaged original survives into the delivered output.
             self.par2_pre_repair_dir_entries
-                .insert(job_id, directory_entry_names(&working_dir));
+                .entry(job_id)
+                .or_insert_with(|| directory_entry_names(&working_dir));
         }
 
         #[cfg(test)]
@@ -2602,6 +2609,15 @@ impl Pipeline {
         self.note_aggregate_par2_verification_result(job_id);
         if !was_verified {
             self.finalize_ready_direct_sets(job_id).await;
+            // The aggregate has just settled, so every set that was going to
+            // rewrite this directory has done so and the leftovers can be named
+            // by difference. This is the only place that is true: a job whose
+            // last set settled *clean* never re-enters the repair tail, so
+            // purging only from there leaves the earlier sets' backups on disk.
+            // Ordered after direct finalization so a set that renames its
+            // partials into place is already wearing its final names when the
+            // keep-set is built from the assembly.
+            self.purge_par2_repair_leftovers(job_id);
         }
     }
 
@@ -4091,11 +4107,10 @@ impl Pipeline {
             return;
         }
 
-        // A later recovery set can still describe files the repairer created.
-        // Purging by directory difference is therefore safe only after the
-        // aggregate has settled every servable set.
-        self.purge_par2_repair_leftovers(job_id);
-        stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.purge", stage_start);
+        // Leftovers are purged when the aggregate settles — see
+        // `mark_par2_verified`, which is reached from here through
+        // `mark_par2_set_verified` and also from a clean final set that never
+        // runs this tail at all.
         self.transition_postprocessing_status(job_id, JobStatus::Downloading, Some("downloading"));
 
         if has_crc_failures {
@@ -5039,7 +5054,10 @@ impl Pipeline {
         self.finalize_completed_archive_job(job_id).await;
     }
 
-    fn only_archive_residuals_or_loaded_par2_index_are_incomplete(&self, job_id: JobId) -> bool {
+    pub(in crate::pipeline) fn only_archive_residuals_or_loaded_par2_index_are_incomplete(
+        &self,
+        job_id: JobId,
+    ) -> bool {
         let Some(state) = self.jobs.get(&job_id) else {
             return false;
         };
@@ -5058,6 +5076,11 @@ impl Pipeline {
             .cloned()
             .unwrap_or_default();
         let par2_loaded = self.par2_set(job_id).is_some();
+        // An index that can still arrive is not a residual: it may carry a
+        // recovery set of its own, and this job would finalize without ever
+        // verifying or repairing what that set covers. Only an index nothing
+        // can deliver any more is furniture.
+        let metadata_discovery_closed = self.par2_metadata_discovery_closed(job_id);
         let mut saw_incomplete = false;
 
         for file in state.assembly.files() {
@@ -5068,7 +5091,9 @@ impl Pipeline {
                 weaver_model::files::FileRole::Par2 {
                     is_index: false, ..
                 } => {}
-                weaver_model::files::FileRole::Par2 { is_index: true, .. } if par2_loaded => {
+                weaver_model::files::FileRole::Par2 { is_index: true, .. }
+                    if par2_loaded && metadata_discovery_closed =>
+                {
                     saw_incomplete = true;
                 }
                 _ => {

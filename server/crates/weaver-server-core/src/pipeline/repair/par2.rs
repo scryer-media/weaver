@@ -1337,7 +1337,12 @@ impl Pipeline {
         if let Some(blocks) = self
             .par2_runtime(job_id)
             .and_then(|runtime| runtime.files.get(&file_index))
-            .map(|file| file.recovery_blocks)
+            .and_then(|file| {
+                file.recovery_blocks_by_set
+                    .get(&set_id)
+                    .copied()
+                    .or(Some(file.recovery_blocks))
+            })
         {
             // Zero from the runtime is not a count — entries are created for
             // bookkeeping (identity binding, metadata promotion) with the
@@ -1823,6 +1828,12 @@ impl Pipeline {
             return true;
         };
         if let Some(file) = runtime.files.get(&file_index) {
+            // Blocks this file demonstrably gave the set outrank any attribution
+            // question: they are merged, the repairer counts them, and capacity
+            // that pretended otherwise could refuse a repair the job can afford.
+            if file.recovery_blocks_by_set.contains_key(&set_id) {
+                return true;
+            }
             if let Some(learned) = file.recovery_set_id {
                 return learned == set_id;
             }
@@ -2054,6 +2065,20 @@ impl Pipeline {
                 }
             };
             if new_recovery_blocks > 0 {
+                if single_set_id != Some(set_id) {
+                    // Only a file that answers to more than one set needs this.
+                    // A single-set volume is fully described by
+                    // `recovery_blocks`, which the salvage path accumulates —
+                    // shadowing it here would report a partial count for a
+                    // volume that was salvaged and later completed.
+                    let entry = self
+                        .ensure_par2_runtime(job_id)
+                        .files
+                        .entry(file_id.file_index)
+                        .or_default();
+                    let by_set = entry.recovery_blocks_by_set.entry(set_id).or_insert(0);
+                    *by_set = (*by_set).max(new_recovery_blocks);
+                }
                 if single_set_id == Some(set_id) {
                     let promoted = self
                         .par2_runtime(job_id)

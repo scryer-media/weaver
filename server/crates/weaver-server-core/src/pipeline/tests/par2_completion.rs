@@ -7302,7 +7302,7 @@ async fn recovery_arithmetic_is_strictly_isolated_per_set() {
 }
 
 #[tokio::test]
-async fn a_multi_set_recovery_file_feeds_both_sets_without_counting_for_either() {
+async fn a_multi_set_recovery_file_feeds_both_sets_and_counts_for_each() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30810);
@@ -7368,13 +7368,20 @@ async fn a_multi_set_recovery_file_feeds_both_sets_without_counting_for_either()
             .recovery_block_count(),
         1
     );
+    // The blocks are merged into both sets and the repairer counts them, so
+    // the arithmetic that decides whether a repair is affordable has to see
+    // them too. Attributing the *file* to neither set is still right — no one
+    // set owns it — but that is a question about ownership, not about how much
+    // recovery each set actually holds.
     assert_eq!(
         pipeline.total_recovery_block_capacity(job_id, larger_set_id),
-        8
+        9,
+        "the larger set's own eight blocks plus the one this file gave it"
     );
     assert_eq!(
         pipeline.total_recovery_block_capacity(job_id, smaller_set_id),
-        0
+        1,
+        "and the smaller set sees the block it was actually given"
     );
 }
 
@@ -8827,5 +8834,191 @@ async fn a_metadata_candidate_still_in_flight_enqueues_nothing() {
     assert!(
         drain_promoted_segments(&mut pipeline, job_id).is_empty(),
         "but nothing is enqueued a second time"
+    );
+}
+
+/// A repair's leftovers are shed even when a *later* set settles the job clean.
+///
+/// Purging by directory difference only ever ran in the repair tail, so a job
+/// whose last set needed no repair never reached it: the earlier set's damaged
+/// original stayed on disk and shipped with the payload. The aggregate settling
+/// is the moment every set that was going to rewrite this directory has done
+/// so, whichever kind of verdict happened to close it.
+#[tokio::test]
+async fn repair_leftovers_are_shed_when_a_clean_set_settles_the_job() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30935);
+    let payload_filename = "onyx.prairie.mkv";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let (working_dir, _) = incomplete_protected_payload_job(
+        &mut pipeline,
+        job_id,
+        "Leftovers After A Clean Set",
+        payload_filename,
+        &payload,
+    )
+    .await;
+    tokio::fs::write(working_dir.join(payload_filename), &payload)
+        .await
+        .unwrap();
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &payload, 64, 1),
+        &[],
+    );
+
+    // An earlier set repaired here and left the damaged original behind.
+    pipeline
+        .par2_pre_repair_dir_entries
+        .insert(job_id, HashSet::from([payload_filename.to_string()]));
+    let leftover = working_dir.join(format!("{payload_filename}.1"));
+    tokio::fs::write(&leftover, &payload).await.unwrap();
+
+    // The job's last set settles clean — no repair tail runs for it at all.
+    let set_id = pipeline.par2_set(job_id).unwrap().recovery_set_id;
+    let _ = pipeline.mark_par2_set_verified(job_id, set_id).await;
+
+    assert!(
+        pipeline.par2_verified.contains(&job_id),
+        "precondition: the aggregate settled on a clean verdict"
+    );
+    let delivered: std::collections::HashSet<String> = std::fs::read_dir(&working_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !leftover.exists(),
+        "the damaged original must not be delivered; directory = {delivered:?}"
+    );
+    assert!(
+        delivered.contains(payload_filename),
+        "and the payload itself is untouched; directory = {delivered:?}"
+    );
+}
+
+/// An index that can still arrive is not a residual to finalize around.
+///
+/// The shortcut that finalizes a job whose only incomplete files are archive
+/// residuals also tolerated an incomplete PAR2 index, on the reasoning that a
+/// job which already loaded a set has all the recovery data it is going to use.
+/// That reasoning predates a posting carrying more than one set: a second index
+/// still on the wire may describe files nothing has verified yet, and taking
+/// the shortcut delivers them unchecked.
+#[tokio::test]
+async fn a_second_index_still_on_the_wire_is_not_an_ignorable_residual() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30936);
+    let payload_filename = "silver-horizon.mkv";
+    let first_index = "silver-horizon.par2";
+    let second_index = "onyx-prairie.par2";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let par2_file = |name: &str, tag: &str| FileSpec {
+        filename: name.to_string(),
+        role: FileRole::from_filename(name),
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: 64,
+            message_id: format!("residual-{tag}@example.com"),
+        }],
+    };
+    let spec = JobSpec {
+        name: "Second Index Still Downloading".to_string(),
+        password: None,
+        total_bytes: payload.len() as u64 + 128,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "residual-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "residual-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+            par2_file(first_index, "index-a"),
+            par2_file(second_index, "index-b"),
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    assert!(
+        matches!(
+            FileRole::from_filename(second_index),
+            FileRole::Par2 { is_index: true, .. }
+        ),
+        "precondition: the second candidate really is an index"
+    );
+
+    // The payload and the first index are in; a set is loaded from the first.
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        for segment in [0u32, 1] {
+            state
+                .assembly
+                .file_mut(NzbFileId {
+                    job_id,
+                    file_index: 0,
+                })
+                .unwrap()
+                .commit_segment(segment, 64)
+                .unwrap();
+        }
+        state
+            .assembly
+            .file_mut(NzbFileId {
+                job_id,
+                file_index: 1,
+            })
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+        // The second index is still coming: incomplete, and its article queued.
+        state.download_queue.push(DownloadWork {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 2,
+                },
+                segment_number: 0,
+            },
+            message_id: MessageId::new("residual-index-b@example.com"),
+            groups: vec!["alt.binaries.test".to_string()],
+            priority: 1000,
+            byte_estimate: 64,
+            retry_count: 0,
+            is_recovery: true,
+            exclude_servers: Vec::new(),
+            avoid_server: None,
+        });
+    }
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &payload, 64, 1),
+        &[],
+    );
+
+    assert!(
+        !pipeline.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id),
+        "a job whose second index is still downloading has not run out of \
+         recovery sets to serve, so it must not take the finalization shortcut"
     );
 }
