@@ -2617,8 +2617,129 @@ impl Pipeline {
             .sum()
     }
 
+    /// Which PAR2 files this job could still promote in order to obtain
+    /// metadata, and which of them have already had their turn.
+    ///
+    /// Index files rank ahead of any other PAR2 file, and within each tier the
+    /// posting's own order decides — both properties of the posting rather than
+    /// of this run, so a restart reaches the same answer.
+    fn par2_metadata_candidates(&self, job_id: JobId) -> (Vec<u32>, Vec<u32>) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return (Vec::new(), Vec::new());
+        };
+        let has_available_segment = |file_index: u32| {
+            state
+                .spec
+                .files
+                .get(file_index as usize)
+                .is_some_and(|file| {
+                    file.segments.iter().any(|segment| {
+                        !self
+                            .unavailable_promoted_recovery_segments
+                            .contains(&SegmentId {
+                                file_id: NzbFileId { job_id, file_index },
+                                segment_number: segment.ordinal,
+                            })
+                    })
+                })
+        };
+        let tier = |want_index: bool| {
+            let mut candidates = state
+                .spec
+                .files
+                .iter()
+                .enumerate()
+                .filter_map(|(file_index, file)| {
+                    let is_index = matches!(
+                        file.role,
+                        weaver_model::files::FileRole::Par2 { is_index: true, .. }
+                    );
+                    let is_par2 = matches!(file.role, weaver_model::files::FileRole::Par2 { .. });
+                    let wanted = if want_index { is_index } else { is_par2 };
+                    wanted.then_some(file_index as u32)
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_unstable();
+            candidates
+        };
+
+        // A promoted candidate is finished once it either arrived — whatever it
+        // turned out to contain — or can no longer arrive at all. Anything else
+        // is still on its way, and the job is waiting rather than stuck.
+        let outstanding = |file_index: u32| {
+            self.is_promoted_recovery_file(job_id, file_index)
+                && !self.promoted_recovery_file_is_complete(job_id, file_index)
+                && has_available_segment(file_index)
+        };
+
+        let mut untried = Vec::new();
+        let mut still_arriving = Vec::new();
+        for file_index in tier(true).into_iter().chain(tier(false)) {
+            if untried.contains(&file_index) || still_arriving.contains(&file_index) {
+                continue;
+            }
+            if outstanding(file_index) {
+                still_arriving.push(file_index);
+            } else if !self.is_promoted_recovery_file(job_id, file_index)
+                && has_available_segment(file_index)
+            {
+                untried.push(file_index);
+            }
+        }
+        (untried, still_arriving)
+    }
+
+    /// Put this job's next PAR2 metadata candidate on the wire, if there is one
+    /// left to try.
+    ///
+    /// `true` means metadata is on its way and the caller should wait; `false`
+    /// means nothing can produce it and the caller owns the terminal failure.
+    ///
+    /// Promotion is idempotent per file. A candidate that has already been
+    /// promoted is never promoted again: while its segments can still arrive
+    /// the job simply waits, and once they have arrived — or provably cannot —
+    /// the next untried candidate takes its turn. Re-pushing an already
+    /// promoted index is what turns "waiting for metadata" into a job that
+    /// re-enqueues the same file on every completion-gate entry forever,
+    /// because a file that completed without yielding a usable set looks
+    /// exactly like one that was never tried.
     pub(crate) fn promote_par2_metadata(&mut self, job_id: JobId) -> bool {
         if self.par2_set(job_id).is_some() {
+            return false;
+        }
+
+        let (untried, still_arriving) = self.par2_metadata_candidates(job_id);
+        // Something promoted is still on the wire. Nothing to enqueue — and no
+        // reason to spend a second candidate's articles while the first can
+        // still answer — but the job is waiting for something real, so it must
+        // not be failed either.
+        if !still_arriving.is_empty() {
+            return true;
+        }
+        if untried.is_empty() {
+            let already_tried: Vec<u32> = self
+                .par2_runtime(job_id)
+                .map(|runtime| {
+                    let mut tried = runtime
+                        .files
+                        .iter()
+                        .filter(|(_, file)| file.promoted)
+                        .map(|(file_index, _)| *file_index)
+                        .collect::<Vec<_>>();
+                    tried.sort_unstable();
+                    tried
+                })
+                .unwrap_or_default();
+            let runtime = self.ensure_par2_runtime(job_id);
+            if !runtime.metadata_exhausted_warned {
+                runtime.metadata_exhausted_warned = true;
+                warn!(
+                    job_id = job_id.0,
+                    promoted_candidates = ?already_tried,
+                    "every PAR2 metadata candidate this job could promote has settled without \
+                     yielding a usable recovery set"
+                );
+            }
             return false;
         }
 
@@ -2637,58 +2758,10 @@ impl Pipeline {
                 .push(work);
         }
 
-        let selected_file = self.jobs.get(&job_id).and_then(|state| {
-            let candidate_available = |file_index: u32| {
-                state
-                    .spec
-                    .files
-                    .get(file_index as usize)
-                    .is_some_and(|file| {
-                        file.segments.iter().any(|segment| {
-                            let segment_id = SegmentId {
-                                file_id: NzbFileId { job_id, file_index },
-                                segment_number: segment.ordinal,
-                            };
-                            !self
-                                .unavailable_promoted_recovery_segments
-                                .contains(&segment_id)
-                        })
-                    })
-            };
-
-            let mut index_candidates = state
-                .spec
-                .files
-                .iter()
-                .enumerate()
-                .filter_map(|(file_index, file)| {
-                    matches!(
-                        file.role,
-                        weaver_model::files::FileRole::Par2 { is_index: true, .. }
-                    )
-                    .then_some(file_index as u32)
-                })
-                .filter(|file_index| candidate_available(*file_index))
-                .collect::<Vec<_>>();
-            index_candidates.sort_unstable();
-            if let Some(file_index) = index_candidates.into_iter().next() {
-                return Some(file_index);
-            }
-
-            let mut par2_candidates = state
-                .spec
-                .files
-                .iter()
-                .enumerate()
-                .filter_map(|(file_index, file)| {
-                    matches!(file.role, weaver_model::files::FileRole::Par2 { .. })
-                        .then_some(file_index as u32)
-                })
-                .filter(|file_index| candidate_available(*file_index))
-                .collect::<Vec<_>>();
-            par2_candidates.sort_unstable();
-            par2_candidates.into_iter().next()
-        });
+        // The classification above already applied the index-first ordering and
+        // excluded anything promoted or unreachable, so the pick is just the
+        // first of what is left.
+        let selected_file = untried.first().copied();
 
         let Some(selected_file) = selected_file else {
             if let Some(state) = self.jobs.get_mut(&job_id) {

@@ -1399,6 +1399,11 @@ pub(super) struct Par2RuntimeState {
     /// Whether the job has already named its indexless recovery sets. Cleared
     /// whenever a set is newly met so a changed picture is reported once.
     pub(super) unserved_sets_warned: bool,
+    /// Whether the job has already reported that every PAR2 metadata candidate
+    /// it could promote is finished. The completion gate asks for metadata on
+    /// every entry, and the answer stops changing once the last candidate has
+    /// settled, so the operator hears it once rather than on every lap.
+    pub(super) metadata_exhausted_warned: bool,
 }
 
 impl Par2RuntimeState {

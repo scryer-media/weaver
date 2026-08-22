@@ -8613,3 +8613,219 @@ async fn a_short_unprotected_file_does_not_force_the_authoritative_pass() {
         debug_job_state(&pipeline, job_id)
     );
 }
+
+/// A job with no parsed recovery set and two PAR2 files it could promote for
+/// metadata: an index and a second index, neither yet tried.
+async fn metadata_promotion_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    job_name: &str,
+) -> (PathBuf, SegmentId, SegmentId) {
+    let payload_filename = "silver-horizon.mkv";
+    let first_index = "silver-horizon.par2";
+    let second_index = "silver-horizon.vol00+01.par2";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+
+    let spec = JobSpec {
+        name: job_name.to_string(),
+        password: None,
+        total_bytes: payload.len() as u64 + 128,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "metadata-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "metadata-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: first_index.to_string(),
+                role: FileRole::from_filename(first_index),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "metadata-index-a@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: second_index.to_string(),
+                role: FileRole::from_filename(second_index),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "metadata-index-b@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    let first_segment = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 1,
+        },
+        segment_number: 0,
+    };
+    let second_segment = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 2,
+        },
+        segment_number: 0,
+    };
+    (working_dir, first_segment, second_segment)
+}
+
+fn drain_promoted_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<SegmentId> {
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state
+        .download_queue
+        .drain_all()
+        .into_iter()
+        .map(|work| work.segment_id)
+        .collect()
+}
+
+/// A metadata candidate that arrived without yielding a set is finished.
+///
+/// The gate asks for metadata on every entry. A promoted index that completed
+/// and parsed into nothing looks exactly like one that was never tried, so
+/// without the promoted flag being consulted the same file is enqueued again on
+/// every lap, forever.
+#[tokio::test]
+async fn a_promoted_metadata_candidate_is_never_promoted_twice() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30931);
+    let (_, first_segment, _) =
+        metadata_promotion_job(&mut pipeline, job_id, "Metadata Promotion Once").await;
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+    assert_eq!(
+        drain_promoted_segments(&mut pipeline, job_id),
+        vec![first_segment]
+    );
+
+    // The index arrives and yields nothing a recovery set can be built from.
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state
+            .assembly
+            .file_mut(first_segment.file_id)
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+    }
+
+    assert!(
+        pipeline.promote_par2_metadata(job_id),
+        "a second candidate remains, so the job is still waiting"
+    );
+    let queued = drain_promoted_segments(&mut pipeline, job_id);
+    assert!(
+        !queued.contains(&first_segment),
+        "the exhausted candidate must not be enqueued again; queued = {queued:?}"
+    );
+}
+
+/// The second candidate takes its turn once the first is finished.
+#[tokio::test]
+async fn an_untried_metadata_candidate_follows_an_exhausted_one() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30932);
+    let (_, first_segment, second_segment) =
+        metadata_promotion_job(&mut pipeline, job_id, "Metadata Promotion Fallback").await;
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+    assert_eq!(
+        drain_promoted_segments(&mut pipeline, job_id),
+        vec![first_segment]
+    );
+    pipeline.mark_promoted_recovery_segment_unavailable(first_segment);
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+    assert_eq!(
+        drain_promoted_segments(&mut pipeline, job_id),
+        vec![second_segment],
+        "the untried candidate is the one that goes on the wire"
+    );
+}
+
+/// Once every candidate has settled, promotion reports that it is finished.
+///
+/// The callers read `false` as "nothing can produce metadata" and own the
+/// terminal failure from there; reporting `true` forever is what kept the job
+/// alive with nothing left to try.
+#[tokio::test]
+async fn exhausted_metadata_candidates_stop_promising_metadata() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30933);
+    let (_, first_segment, second_segment) =
+        metadata_promotion_job(&mut pipeline, job_id, "Metadata Promotion Exhausted").await;
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+    drain_promoted_segments(&mut pipeline, job_id);
+    pipeline.mark_promoted_recovery_segment_unavailable(first_segment);
+    assert!(pipeline.promote_par2_metadata(job_id));
+    drain_promoted_segments(&mut pipeline, job_id);
+    pipeline.mark_promoted_recovery_segment_unavailable(second_segment);
+
+    assert!(
+        !pipeline.promote_par2_metadata(job_id),
+        "every candidate has settled, so the caller must be allowed to fail the job"
+    );
+    assert!(
+        drain_promoted_segments(&mut pipeline, job_id).is_empty(),
+        "and nothing may be enqueued on the way out"
+    );
+}
+
+/// A candidate still on the wire keeps the job waiting without re-enqueuing it.
+#[tokio::test]
+async fn a_metadata_candidate_still_in_flight_enqueues_nothing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30934);
+    let (_, first_segment, _) =
+        metadata_promotion_job(&mut pipeline, job_id, "Metadata Promotion In Flight").await;
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+    assert_eq!(
+        drain_promoted_segments(&mut pipeline, job_id),
+        vec![first_segment]
+    );
+
+    // Neither complete nor unavailable: the segment is still coming.
+    assert!(
+        pipeline.promote_par2_metadata(job_id),
+        "the job is waiting for something real"
+    );
+    assert!(
+        drain_promoted_segments(&mut pipeline, job_id).is_empty(),
+        "but nothing is enqueued a second time"
+    );
+}

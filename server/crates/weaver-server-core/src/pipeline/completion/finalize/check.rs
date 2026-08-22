@@ -3934,7 +3934,7 @@ impl Pipeline {
         );
 
         self.emit_job_verification_started(job_id);
-        let (post_repair_verification, post_repair_placement_plan) = match self
+        let (mut post_repair_verification, post_repair_placement_plan) = match self
             .verify_repaired_par2_files_with_placement(
                 job_id,
                 Arc::clone(&par2_set),
@@ -3959,12 +3959,14 @@ impl Pipeline {
 
         // Rename obfuscated files using PAR2 metadata (16KB hash matching).
         // Must happen after repair and before extraction retry/finalize.
-        self.try_deobfuscate_files_with_par2(job_id).await;
+        let deobfuscated = self.try_deobfuscate_files_with_par2(job_id).await;
         stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.deobfuscate", stage_start);
+        let placement_moves_paths = !post_repair_placement_plan.swaps.is_empty()
+            || !post_repair_placement_plan.renames.is_empty();
         if let Err(error) = self
             .apply_placement_plan_for_retry_or_repair(
                 job_id,
-                working_dir,
+                working_dir.clone(),
                 &post_repair_placement_plan,
             )
             .await
@@ -3973,6 +3975,53 @@ impl Pipeline {
         }
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.apply_placement", stage_start);
+
+        // The pass above described the directory as the repairer left it. The
+        // two steps in between then renamed files — deobfuscation by content,
+        // placement by the plan — so that description no longer describes the
+        // disk. A verdict is only worth announcing about the layout the job
+        // will actually deliver, so when either step moved a path the whole set
+        // is read once more, in its final places, and that answer replaces the
+        // earlier one everywhere below.
+        //
+        // When nothing moved, the earlier answer still describes the disk
+        // exactly, and re-reading would throw away the whole point of the
+        // selective post-repair pass: it reads only what the repair rewrote.
+        if deobfuscated > 0 || placement_moves_paths {
+            info!(
+                job_id = job_id.0,
+                deobfuscated,
+                placement_moves_paths,
+                "paths moved after repair — verifying the whole set where it now sits"
+            );
+            let (settled, _) = match self
+                .verify_par2_with_placement(
+                    job_id,
+                    Arc::clone(&par2_set),
+                    working_dir.clone(),
+                    true,
+                    false,
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(message) => return self.fail_par2_repair(job_id, message),
+            };
+            if par2_verification_needs_repair(&settled) {
+                let msg = format!(
+                    "PAR2 repair completed but verification after deobfuscation and placement \
+                     found {} damaged slices or file placements remaining",
+                    settled.total_missing_blocks
+                );
+                return self.fail_par2_repair(job_id, msg);
+            }
+            post_repair_verification = settled;
+            stage_start = note_par2_repair_stage(
+                job_id,
+                "par2_repair.finish.verify_after_placement",
+                stage_start,
+            );
+        }
         self.retry_par2_authoritative_identity(job_id).await;
         stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.identity", stage_start);
         if let Err(error) = self
