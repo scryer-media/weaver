@@ -6471,14 +6471,20 @@ async fn a_partial_recovery_volume_contributes_its_surviving_blocks() {
     .await;
 
     assert_eq!(
-        pipeline.recovery_blocks_available_or_targeted(job_id),
+        pipeline.recovery_blocks_available_or_targeted(
+            job_id,
+            pipeline.par2_served_set_id(job_id).unwrap()
+        ),
         2,
         "precondition: only the complete volume's blocks are counted up front"
     );
 
     pipeline.check_job_completion(job_id).await;
     assert_eq!(
-        pipeline.recovery_blocks_available_or_targeted(job_id),
+        pipeline.recovery_blocks_available_or_targeted(
+            job_id,
+            pipeline.par2_served_set_id(job_id).unwrap()
+        ),
         3,
         "the surviving packet of the short volume must be counted; {}",
         debug_job_state(&pipeline, job_id)
@@ -6575,7 +6581,10 @@ async fn a_salvaged_recovery_volume_is_read_once_per_generation() {
 
     pipeline.check_job_completion(job_id).await;
     assert_eq!(
-        pipeline.recovery_blocks_available_or_targeted(job_id),
+        pipeline.recovery_blocks_available_or_targeted(
+            job_id,
+            pipeline.par2_served_set_id(job_id).unwrap()
+        ),
         3,
         "first entry salvages the surviving packet; {}",
         debug_job_state(&pipeline, job_id)
@@ -6584,7 +6593,10 @@ async fn a_salvaged_recovery_volume_is_read_once_per_generation() {
 
     pipeline.check_job_completion(job_id).await;
     assert_eq!(
-        pipeline.recovery_blocks_available_or_targeted(job_id),
+        pipeline.recovery_blocks_available_or_targeted(
+            job_id,
+            pipeline.par2_served_set_id(job_id).unwrap()
+        ),
         3,
         "a second entry must not re-count what it already merged; {}",
         debug_job_state(&pipeline, job_id)
@@ -6620,7 +6632,13 @@ async fn a_volume_that_completes_after_salvage_reports_its_whole_block_count() {
     pipeline
         .salvage_partial_promoted_recovery_volumes(job_id)
         .await;
-    assert_eq!(pipeline.recovery_blocks_available_or_targeted(job_id), 3);
+    assert_eq!(
+        pipeline.recovery_blocks_available_or_targeted(
+            job_id,
+            pipeline.par2_served_set_id(job_id).unwrap()
+        ),
+        3
+    );
 
     // The lost article arrives after all: the whole volume lands on disk and the
     // assembly entry completes.
@@ -6664,7 +6682,10 @@ async fn a_volume_that_completes_after_salvage_reports_its_whole_block_count() {
         .await;
 
     assert_eq!(
-        pipeline.recovery_blocks_available_or_targeted(job_id),
+        pipeline.recovery_blocks_available_or_targeted(
+            job_id,
+            pipeline.par2_served_set_id(job_id).unwrap()
+        ),
         4,
         "the completed volume reports both of its blocks, not just the remainder"
     );
@@ -6931,7 +6952,8 @@ async fn another_recovery_sets_volumes_do_not_count_toward_the_served_set() {
     load_par2_index(&mut pipeline, job_id, 4).await;
 
     assert_eq!(
-        pipeline.total_recovery_block_capacity(job_id),
+        pipeline
+            .total_recovery_block_capacity(job_id, pipeline.par2_served_set_id(job_id).unwrap()),
         8,
         "only the served set's volume advertises capacity for this repair"
     );
@@ -6957,7 +6979,10 @@ async fn another_recovery_sets_volumes_do_not_count_toward_the_served_set() {
         .await;
 
     assert_eq!(
-        pipeline.recovery_blocks_available_or_targeted(job_id),
+        pipeline.recovery_blocks_available_or_targeted(
+            job_id,
+            pipeline.par2_served_set_id(job_id).unwrap()
+        ),
         0,
         "a completed volume of another set contributes nothing to this repair"
     );
@@ -7079,7 +7104,8 @@ async fn a_single_recovery_set_job_announces_nothing_and_counts_every_volume() {
         "one set is not a multi-set posting"
     );
     assert_eq!(
-        pipeline.total_recovery_block_capacity(job_id),
+        pipeline
+            .total_recovery_block_capacity(job_id, pipeline.par2_served_set_id(job_id).unwrap()),
         12,
         "with one set known, every recovery volume in the posting still counts"
     );
@@ -7116,6 +7142,479 @@ async fn a_settled_verdict_freezes_which_recovery_set_is_served() {
     assert_eq!(
         pipeline.par2_unserved_set_warnings, 1,
         "the set that arrived too late is still worth announcing"
+    );
+}
+
+#[tokio::test]
+async fn targeted_promotion_routes_only_to_the_requested_recovery_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30807);
+    let posting = TwoSetPosting::build();
+    posting.install(&mut pipeline, job_id).await;
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    load_par2_index(&mut pipeline, job_id, 4).await;
+    let smaller_set_id = TwoSetPosting::recovery_set_id(&posting.smaller_index);
+
+    assert_eq!(
+        pipeline.promote_recovery_targeted(job_id, smaller_set_id, 4),
+        4,
+        "the requested set's smallest volume covers all four requested blocks"
+    );
+    let runtime = pipeline.par2_runtime(job_id).unwrap();
+    assert!(
+        runtime.files[&5].promoted,
+        "the requested set's volume was promoted"
+    );
+    assert!(
+        !runtime.files.get(&2).is_some_and(|file| file.promoted),
+        "the other set's volume stayed parked"
+    );
+}
+
+#[tokio::test]
+async fn a_volume_completed_before_its_index_is_replayed_into_that_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30808);
+    let posting = TwoSetPosting::build();
+    posting.install(&mut pipeline, job_id).await;
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    let smaller_set_id = TwoSetPosting::recovery_set_id(&posting.smaller_index);
+
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        5,
+        SMALLER_VOLUME,
+        &posting.smaller_volume,
+    )
+    .await;
+    pipeline
+        .try_merge_par2_recovery(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 5,
+            },
+        )
+        .await;
+    assert!(
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .set_runtime(smaller_set_id)
+            .is_some_and(|set_runtime| set_runtime.set.is_none()),
+        "the volume can identify its set before that set has an index"
+    );
+
+    load_par2_index(&mut pipeline, job_id, 4).await;
+    assert_eq!(
+        pipeline.recovery_blocks_available_or_targeted(job_id, smaller_set_id),
+        4,
+        "installing the index replays the already-complete volume into its own set"
+    );
+    assert_eq!(
+        pipeline
+            .par2_set_for(job_id, smaller_set_id)
+            .unwrap()
+            .recovery_block_count(),
+        4,
+        "replay must feed the set itself, not only filename-derived arithmetic"
+    );
+}
+
+#[tokio::test]
+async fn recovery_arithmetic_is_strictly_isolated_per_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30809);
+    let posting = TwoSetPosting::build();
+    posting.install(&mut pipeline, job_id).await;
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    load_par2_index(&mut pipeline, job_id, 4).await;
+    let larger_set_id = TwoSetPosting::recovery_set_id(&posting.larger_index);
+    let smaller_set_id = TwoSetPosting::recovery_set_id(&posting.smaller_index);
+
+    assert_eq!(
+        pipeline.total_recovery_block_capacity(job_id, larger_set_id),
+        8
+    );
+    assert_eq!(
+        pipeline.total_recovery_block_capacity(job_id, smaller_set_id),
+        4
+    );
+
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        2,
+        LARGER_VOLUME,
+        &posting.larger_volume,
+    )
+    .await;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        5,
+        SMALLER_VOLUME,
+        &posting.smaller_volume,
+    )
+    .await;
+    pipeline
+        .try_merge_par2_recovery(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 2,
+            },
+        )
+        .await;
+    pipeline
+        .try_merge_par2_recovery(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 5,
+            },
+        )
+        .await;
+
+    assert_eq!(
+        pipeline.recovery_blocks_available_or_targeted(job_id, larger_set_id),
+        8
+    );
+    assert_eq!(
+        pipeline.recovery_blocks_available_or_targeted(job_id, smaller_set_id),
+        4
+    );
+}
+
+#[tokio::test]
+async fn a_multi_set_recovery_file_feeds_both_sets_without_counting_for_either() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30810);
+    let posting = TwoSetPosting::build();
+    let packet_len = par2_rs::packet::header::HEADER_SIZE + 4 + TWO_SET_SLICE_SIZE as usize;
+    let mut multi_set_volume = posting.larger_volume[..packet_len].to_vec();
+    multi_set_volume.extend_from_slice(&posting.smaller_volume[..packet_len]);
+    let mut spec = posting.spec();
+    spec.files[5].segments[0].bytes = multi_set_volume.len() as u32;
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        1,
+        LARGER_INDEX,
+        &posting.larger_index,
+    )
+    .await;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        4,
+        SMALLER_INDEX,
+        &posting.smaller_index,
+    )
+    .await;
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    load_par2_index(&mut pipeline, job_id, 4).await;
+    let larger_set_id = TwoSetPosting::recovery_set_id(&posting.larger_index);
+    let smaller_set_id = TwoSetPosting::recovery_set_id(&posting.smaller_index);
+
+    write_and_complete_file(&mut pipeline, job_id, 5, SMALLER_VOLUME, &multi_set_volume).await;
+    pipeline
+        .try_merge_par2_recovery(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 5,
+            },
+        )
+        .await;
+
+    let runtime = pipeline.par2_runtime(job_id).unwrap();
+    assert_eq!(runtime.files[&5].recovery_set_id, None);
+    assert!(runtime.files[&5].recovery_set_packets_read);
+    assert_eq!(
+        runtime
+            .set_runtime(larger_set_id)
+            .unwrap()
+            .set
+            .as_ref()
+            .unwrap()
+            .recovery_block_count(),
+        1
+    );
+    assert_eq!(
+        runtime
+            .set_runtime(smaller_set_id)
+            .unwrap()
+            .set
+            .as_ref()
+            .unwrap()
+            .recovery_block_count(),
+        1
+    );
+    assert_eq!(
+        pipeline.total_recovery_block_capacity(job_id, larger_set_id),
+        8
+    );
+    assert_eq!(
+        pipeline.total_recovery_block_capacity(job_id, smaller_set_id),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_second_index_of_an_unserved_set_merges_its_packets() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30811);
+    let posting = TwoSetPosting::build();
+    let working_dir = posting.install(&mut pipeline, job_id).await;
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    load_par2_index(&mut pipeline, job_id, 4).await;
+    let smaller_set_id = TwoSetPosting::recovery_set_id(&posting.smaller_index);
+    let mut second_index = posting.smaller_index.clone();
+    second_index.extend_from_slice(&posting.smaller_volume);
+    tokio::fs::write(working_dir.join(SMALLER_INDEX), second_index)
+        .await
+        .unwrap();
+
+    load_par2_index(&mut pipeline, job_id, 4).await;
+    assert_eq!(
+        pipeline
+            .par2_set_for(job_id, smaller_set_id)
+            .unwrap()
+            .recovery_block_count(),
+        4,
+        "the later index augments the non-served set instead of replacing it"
+    );
+}
+
+#[tokio::test]
+async fn restart_replay_rebuilds_every_set_and_its_volumes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30812);
+    let posting = TwoSetPosting::build();
+    posting.install(&mut pipeline, job_id).await;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        2,
+        LARGER_VOLUME,
+        &posting.larger_volume,
+    )
+    .await;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        5,
+        SMALLER_VOLUME,
+        &posting.smaller_volume,
+    )
+    .await;
+    let larger_set_id = TwoSetPosting::recovery_set_id(&posting.larger_index);
+    let smaller_set_id = TwoSetPosting::recovery_set_id(&posting.smaller_index);
+
+    pipeline.restore_par2_state_from_disk(job_id).await;
+
+    assert_eq!(
+        pipeline
+            .par2_set_for(job_id, larger_set_id)
+            .unwrap()
+            .recovery_block_count(),
+        8
+    );
+    assert_eq!(
+        pipeline
+            .par2_set_for(job_id, smaller_set_id)
+            .unwrap()
+            .recovery_block_count(),
+        4
+    );
+}
+
+const VOLUME_BOOTSTRAP_PAYLOAD: &str = "copper.aurora.bin";
+const VOLUME_BOOTSTRAP_INDEX: &str = "copper.aurora.par2";
+const VOLUME_BOOTSTRAP_VOLUME: &str = "copper.aurora.vol00+01.par2";
+
+fn volume_only_par2_bootstrap_fixture() -> (JobSpec, Vec<u8>, par2_rs::RecoverySetId) {
+    let payload = b"copper aurora payload";
+    let metadata = build_test_par2_index(VOLUME_BOOTSTRAP_PAYLOAD, payload, 64);
+    let recovery_set_id = par2_rs::Par2FileSet::from_files(&[&metadata])
+        .expect("fixture metadata must parse")
+        .recovery_set_id;
+    let mut volume = metadata;
+    volume.extend_from_slice(&build_test_par2_recovery_volume(
+        *recovery_set_id.as_bytes(),
+        &[(0, &[0xC3; 64])],
+    ));
+    let spec = JobSpec {
+        name: "Volume Metadata Bootstrap".to_string(),
+        password: None,
+        total_bytes: (payload.len() + volume.len() + 1) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: VOLUME_BOOTSTRAP_PAYLOAD.to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: payload.len() as u32,
+                    message_id: "volume-bootstrap-payload@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: VOLUME_BOOTSTRAP_INDEX.to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 1,
+                    message_id: "volume-bootstrap-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: VOLUME_BOOTSTRAP_VOLUME.to_string(),
+                role: FileRole::Par2 {
+                    is_index: false,
+                    recovery_block_count: 1,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: volume.len() as u32,
+                    message_id: "volume-bootstrap-recovery@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    (spec, volume, recovery_set_id)
+}
+
+#[tokio::test]
+async fn a_complete_volume_bootstraps_its_recovery_set_without_its_index() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30815);
+    let (spec, volume, recovery_set_id) = volume_only_par2_bootstrap_fixture();
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    write_and_complete_file(&mut pipeline, job_id, 2, VOLUME_BOOTSTRAP_VOLUME, &volume).await;
+    pipeline
+        .try_merge_par2_recovery(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 2,
+            },
+        )
+        .await;
+
+    let set = pipeline
+        .par2_set_for(job_id, recovery_set_id)
+        .expect("the complete volume carries enough metadata to establish its set");
+    assert!(
+        set.files
+            .values()
+            .any(|file| file.filename == VOLUME_BOOTSTRAP_PAYLOAD),
+        "the volume-built set retains its file descriptions"
+    );
+    assert_eq!(set.recovery_block_count(), 1);
+    assert_eq!(
+        pipeline.recovery_blocks_available_or_targeted(job_id, recovery_set_id),
+        1,
+        "the volume's recovery block is available to its newly established set"
+    );
+}
+
+#[tokio::test]
+async fn restart_replay_bootstraps_a_set_from_its_only_complete_volume() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30816);
+    let (spec, volume, recovery_set_id) = volume_only_par2_bootstrap_fixture();
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    write_and_complete_file(&mut pipeline, job_id, 2, VOLUME_BOOTSTRAP_VOLUME, &volume).await;
+    pipeline.restore_par2_state_from_disk(job_id).await;
+
+    let set = pipeline
+        .par2_set_for(job_id, recovery_set_id)
+        .expect("restart replay must rebuild a set from the surviving volume");
+    assert!(
+        set.files
+            .values()
+            .any(|file| file.filename == VOLUME_BOOTSTRAP_PAYLOAD)
+    );
+    assert_eq!(set.recovery_block_count(), 1);
+}
+
+#[test]
+fn retained_sessions_evict_the_oldest_unprotected_job_and_set_pair() {
+    let job_id = JobId(30813);
+    let older = (job_id, par2_rs::RecoverySetId::from_bytes([1; 16]));
+    let protected = (job_id, par2_rs::RecoverySetId::from_bytes([2; 16]));
+    let now = std::time::Instant::now();
+
+    assert_eq!(
+        crate::pipeline::repair::par2::select_par2_session_eviction(
+            [
+                (older, true, Some(now - std::time::Duration::from_secs(2))),
+                (
+                    protected,
+                    true,
+                    Some(now - std::time::Duration::from_secs(1))
+                ),
+            ],
+            protected,
+        ),
+        Some(older),
+        "the unprotected set of the same job remains eligible for LRU eviction"
+    );
+}
+
+#[tokio::test]
+async fn a_single_set_keeps_capacity_promotion_salvage_and_sessions_available() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.stateful_par2_session_forced = Some(true);
+    let job_id = JobId(30814);
+    let posting = TwoSetPosting::build();
+    let working_dir = posting.install(&mut pipeline, job_id).await;
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    let set_id = TwoSetPosting::recovery_set_id(&posting.larger_index);
+
+    assert_eq!(pipeline.total_recovery_block_capacity(job_id, set_id), 12);
+    assert_eq!(pipeline.promote_recovery_targeted(job_id, set_id, 4), 4);
+    pipeline
+        .salvage_partial_promoted_recovery_volumes(job_id)
+        .await;
+    let session = pipeline
+        .take_or_open_par2_repair_session(job_id, set_id, working_dir, 8 * 1024 * 1024, None, None)
+        .await
+        .unwrap()
+        .expect("the single set has an index path for a retained session")
+        .0;
+    pipeline.restore_par2_repair_session(job_id, set_id, session);
+    assert!(
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .set_runtime(set_id)
+            .is_some_and(|set_runtime| set_runtime.session.is_some())
     );
 }
 

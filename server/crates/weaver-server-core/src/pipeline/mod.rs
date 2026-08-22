@@ -1297,10 +1297,12 @@ pub(super) struct Par2FileRuntime {
     /// gate is entered many times per job.
     pub(super) salvage_attempted: bool,
     /// Which recovery set this PAR2 file speaks for, once its packets have
-    /// actually been read. `None` means nothing has parsed it yet — a volume
-    /// can be named, queued, promoted and counted long before a single one of
-    /// its packets is seen — and callers fall back to grouping it by name.
+    /// actually been read. A file carrying packets for more than one set stays
+    /// `None`, because it cannot contribute capacity to any one set.
     pub(super) recovery_set_id: Option<par2_rs::RecoverySetId>,
+    /// Whether packets have been read from this file. A packet-read file with
+    /// no single set ID is deliberately not grouped by filename.
+    pub(super) recovery_set_packets_read: bool,
 }
 
 /// What a job knows about one recovery set it has encountered.

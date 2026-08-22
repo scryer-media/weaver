@@ -1306,7 +1306,7 @@ impl Pipeline {
         Ok(())
     }
 
-    async fn restore_par2_state_from_disk(&mut self, job_id: JobId) {
+    pub(crate) async fn restore_par2_state_from_disk(&mut self, job_id: JobId) {
         let files: Vec<(NzbFileId, weaver_model::files::FileRole)> = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
@@ -1337,11 +1337,7 @@ impl Pipeline {
                     ..
                 }
             ) {
-                if self.par2_set(job_id).is_some() {
-                    self.try_merge_par2_recovery(job_id, *file_id).await;
-                } else {
-                    self.try_load_par2_metadata(job_id, *file_id).await;
-                }
+                self.try_merge_par2_recovery(job_id, *file_id).await;
             }
         }
 

@@ -86,10 +86,12 @@ fn stateful_par2_session_parser_defaults_to_disabled() {
 
 #[test]
 fn retained_session_budget_evicts_other_job_before_protected_job() {
-    let protected = JobId(2);
+    let set_id = par2_rs::RecoverySetId::from_bytes([2; 16]);
+    let other = (JobId(1), par2_rs::RecoverySetId::from_bytes([1; 16]));
+    let protected = (JobId(2), set_id);
     assert_eq!(
-        select_par2_session_eviction([(JobId(1), true, None), (protected, true, None)], protected,),
-        Some(JobId(1))
+        select_par2_session_eviction([(other, true, None), (protected, true, None)], protected,),
+        Some(other)
     );
     assert_eq!(
         select_par2_session_eviction([(protected, true, None)], protected),
@@ -100,17 +102,20 @@ fn retained_session_budget_evicts_other_job_before_protected_job() {
 #[test]
 fn retained_session_budget_evicts_least_recently_used_session() {
     let now = Instant::now();
-    let protected = JobId(3);
+    let set_id = par2_rs::RecoverySetId::from_bytes([3; 16]);
+    let first = (JobId(1), par2_rs::RecoverySetId::from_bytes([1; 16]));
+    let second = (JobId(2), par2_rs::RecoverySetId::from_bytes([2; 16]));
+    let protected = (JobId(3), set_id);
     assert_eq!(
         select_par2_session_eviction(
             [
-                (JobId(1), true, Some(now - Duration::from_secs(1))),
-                (JobId(2), true, Some(now - Duration::from_secs(2))),
+                (first, true, Some(now - Duration::from_secs(1))),
+                (second, true, Some(now - Duration::from_secs(2))),
                 (protected, true, Some(now - Duration::from_secs(3))),
             ],
             protected,
         ),
-        Some(JobId(2))
+        Some(second)
     );
 }
 

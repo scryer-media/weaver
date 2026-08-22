@@ -1280,6 +1280,7 @@ impl Pipeline {
     async fn par2_session_evidence_candidates(
         &self,
         job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
         par2_set: &par2_rs::Par2FileSet,
     ) -> Result<Vec<Par2SessionEvidenceCandidate>, String> {
         let completed_hashes = self.load_existing_complete_file_hashes(job_id).await?;
@@ -1288,7 +1289,7 @@ impl Pipeline {
         };
         let completed_checksums = runtime.completed_checksums.clone();
         let already_seeded = runtime
-            .served()
+            .set_runtime(set_id)
             .map(|set_runtime| set_runtime.session_evidence_file_ids.clone())
             .unwrap_or_default();
         let Some(state) = self.jobs.get(&job_id) else {
@@ -1710,6 +1711,7 @@ impl Pipeline {
         working_dir: std::path::PathBuf,
         repair: bool,
     ) -> Result<par2_rs::Par2RepairOutcome, String> {
+        let set_id = par2_set.recovery_set_id;
         if repair {
             // What the directory held before the repairer touched it, so the
             // artefacts it leaves behind can be named afterwards by difference
@@ -1759,6 +1761,7 @@ impl Pipeline {
         let retained_session = match self
             .take_or_open_par2_repair_session(
                 job_id,
+                set_id,
                 working_dir.clone(),
                 memory_limit,
                 session_progress,
@@ -1777,18 +1780,18 @@ impl Pipeline {
         if let Some((session, newly_opened)) = retained_session {
             if newly_opened {
                 self.ensure_par2_runtime(job_id)
-                    .served_mut()
-                    .expect("PAR2 session evidence belongs to the served recovery set")
+                    .set_runtime_mut(set_id)
+                    .expect("PAR2 session evidence belongs to the active recovery set")
                     .session_evidence_file_ids
                     .clear();
             }
             let candidates = match self
-                .par2_session_evidence_candidates(job_id, &par2_set)
+                .par2_session_evidence_candidates(job_id, set_id, &par2_set)
                 .await
             {
                 Ok(candidates) => candidates,
                 Err(error) => {
-                    self.restore_par2_repair_session(job_id, session);
+                    self.restore_par2_repair_session(job_id, set_id, session);
                     if repair {
                         self.phase_end(job_id, JobPhase::Repairing);
                     }
@@ -1818,11 +1821,11 @@ impl Pipeline {
             }
             return match repair_result {
                 Ok((session, Ok((outcome, admitted_file_ids, retried_source_change)))) => {
-                    self.restore_par2_repair_session(job_id, session);
+                    self.restore_par2_repair_session(job_id, set_id, session);
                     let set_runtime = self
                         .ensure_par2_runtime(job_id)
-                        .served_mut()
-                        .expect("PAR2 session evidence belongs to the served recovery set");
+                        .set_runtime_mut(set_id)
+                        .expect("PAR2 session evidence belongs to the active recovery set");
                     if repair || retried_source_change {
                         set_runtime.session_evidence_file_ids.clear();
                         if repair && let Some(session) = set_runtime.session.as_mut() {
@@ -1837,7 +1840,7 @@ impl Pipeline {
                     Ok(outcome)
                 }
                 Ok((session, Err(error))) => {
-                    self.restore_par2_repair_session(job_id, session);
+                    self.restore_par2_repair_session(job_id, set_id, session);
                     Err(error)
                 }
                 Err(error) => Err(format!("retained PAR2 session task panicked: {error}")),
@@ -4854,11 +4857,12 @@ impl Pipeline {
         let missing_rar_volume_par2_repair_ready = par2_may_still_rule
             && extraction_settled
             && self.job_has_live_rar_waiting_for_absent_volumes(job_id)
-            && (self.recovery_blocks_available_or_targeted(job_id) > 0
-                || self
-                    .jobs
-                    .get(&job_id)
-                    .is_some_and(|state| state.recovery_queue.has_recovery_work()));
+            && (self.par2_served_set_id(job_id).is_some_and(|set_id| {
+                self.recovery_blocks_available_or_targeted(job_id, set_id) > 0
+            }) || self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| state.recovery_queue.has_recovery_work()));
         // 0.8 only: a direct set still taking articles has holes where its
         // outstanding ranges will go, and PAR2 cannot tell a hole from
         // corruption. Declaring a verdict owed while one is filling walks the
@@ -5425,7 +5429,8 @@ impl Pipeline {
                     let verification = &repair_analysis.verification;
                     let damaged = verification.total_missing_blocks;
                     let recovery_now = repair_analysis.recovery_blocks_available;
-                    let total_recovery_capacity = self.total_recovery_block_capacity(job_id);
+                    let total_recovery_capacity =
+                        self.total_recovery_block_capacity(job_id, par2_set.recovery_set_id);
                     let blocks_needed = match &verification.repairable {
                         par2_rs::verify::Repairability::NotNeeded => 0,
                         par2_rs::verify::Repairability::Repairable { blocks_needed, .. }
@@ -5558,8 +5563,15 @@ impl Pipeline {
                     }
 
                     if recovery_now < blocks_needed {
-                        let promoted = self.promote_recovery_targeted(job_id, blocks_needed);
-                        let targeted_total = self.recovery_blocks_available_or_targeted(job_id);
+                        let promoted = self.promote_recovery_targeted(
+                            job_id,
+                            par2_set.recovery_set_id,
+                            blocks_needed,
+                        );
+                        let targeted_total = self.recovery_blocks_available_or_targeted(
+                            job_id,
+                            par2_set.recovery_set_id,
+                        );
                         let recovery_still_settling = promoted > 0
                             || self.job_has_pending_download_pipeline_work(job_id)
                             || self
@@ -5761,7 +5773,8 @@ impl Pipeline {
                 }
                 let damaged = verification.total_missing_blocks;
                 let recovery_now = verification.recovery_blocks_available;
-                let total_recovery_capacity = self.total_recovery_block_capacity(job_id);
+                let total_recovery_capacity =
+                    self.total_recovery_block_capacity(job_id, par2_set.recovery_set_id);
 
                 if let par2_rs::verify::Repairability::ResourceLimited { reason } =
                     &verification.repairable
@@ -5947,8 +5960,15 @@ impl Pipeline {
                     }
 
                     if recovery_now < damaged {
-                        let promoted = self.promote_recovery_targeted(job_id, damaged);
-                        let targeted_total = self.recovery_blocks_available_or_targeted(job_id);
+                        let promoted = self.promote_recovery_targeted(
+                            job_id,
+                            par2_set.recovery_set_id,
+                            damaged,
+                        );
+                        let targeted_total = self.recovery_blocks_available_or_targeted(
+                            job_id,
+                            par2_set.recovery_set_id,
+                        );
                         let recovery_still_settling = promoted > 0
                             || self.job_has_pending_download_pipeline_work(job_id)
                             || self

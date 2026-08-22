@@ -373,6 +373,8 @@ impl DestinationSync for PreSyncedDestinations {
 /// adapter only ever uses the key to reach a reader, so any injective key works,
 /// and this one is already the identity the PAR2 binding is resolved through.
 pub(crate) struct DirectPar2Overlay {
+    /// The recovery set every virtual volume in this overlay belongs to.
+    pub(crate) recovery_set_id: par2_rs::RecoverySetId,
     pub(crate) provider: super::provider::HybridVolumeProvider,
     pub(crate) volumes: Vec<super::par2_access::VirtualPar2Volume>,
     /// Which direct set owns each bound PAR2 file, so damage demotes the set
@@ -923,6 +925,20 @@ impl Pipeline {
     /// volume outright, so what reaches here is either a fully bound set or no
     /// set at all.
     pub(crate) fn direct_par2_overlay(&self, job_id: JobId) -> Option<DirectPar2Overlay> {
+        self.direct_par2_overlay_for_set(job_id, self.par2_served_set_id(job_id)?)
+    }
+
+    /// The virtual direct volumes that bind wholly to one recovery set.
+    ///
+    /// The compatibility wrapper above still answers the served set. Callers
+    /// that already know which recovery set they are verifying must use this
+    /// form, so a direct set owned by another parsed set is neither read nor
+    /// damaged by the wrong pass.
+    pub(crate) fn direct_par2_overlay_for_set(
+        &self,
+        job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
+    ) -> Option<DirectPar2Overlay> {
         let mut volumes = Vec::new();
         let mut virtual_volumes = Vec::new();
         let mut sets = HashMap::new();
@@ -953,14 +969,20 @@ impl Pipeline {
             // partial-path map is built once rather than once per volume (nit).
             let mut lengths = std::collections::BTreeMap::new();
             let mut bindings = HashMap::new();
+            let mut belongs_to_recovery_set = true;
             for (volume_index, file_index) in &set.plan().volumes {
                 let file_id = NzbFileId {
                     job_id,
                     file_index: *file_index,
                 };
                 let Some(binding) = self.resolve_par2_file_binding(file_id) else {
-                    continue;
+                    belongs_to_recovery_set = false;
+                    break;
                 };
+                if binding.recovery_set_id != recovery_set_id {
+                    belongs_to_recovery_set = false;
+                    break;
+                }
                 // A retained image carries the lengths it was captured with, so
                 // it stops depending on an assembly the job may have moved on
                 // from.
@@ -981,17 +1003,25 @@ impl Pipeline {
                     }
                 };
                 lengths.insert(*volume_index, len);
-                bindings.insert(*volume_index, (*file_index, binding.par2_file_id));
+                bindings.insert(
+                    *volume_index,
+                    (*file_index, binding.par2_file_id, binding.recovery_set_id),
+                );
+            }
+            if !belongs_to_recovery_set {
+                continue;
             }
             let set_volumes = match retained {
                 Some(volumes) => volumes.to_vec(),
                 None => set.virtual_volumes(&lengths),
             };
             for mut volume in set_volumes {
-                let Some((file_index, par2_file_id)) = bindings.get(&volume.volume_index).copied()
+                let Some((file_index, par2_file_id, binding_set_id)) =
+                    bindings.get(&volume.volume_index).copied()
                 else {
                     continue;
                 };
+                debug_assert_eq!(binding_set_id, recovery_set_id);
                 // Re-keyed from the set's own volume index to the job's file
                 // index: a job can hold several sets, each numbering its volumes
                 // from zero, and one provider answers for all of them.
@@ -1012,6 +1042,7 @@ impl Pipeline {
             return None;
         }
         Some(DirectPar2Overlay {
+            recovery_set_id,
             provider: super::provider::HybridVolumeProvider::new(virtual_volumes),
             volumes,
             sets,
@@ -1404,7 +1435,8 @@ impl Pipeline {
         par2_set: std::sync::Arc<par2_rs::Par2FileSet>,
         working_dir: PathBuf,
     ) -> Option<par2_rs::VerificationResult> {
-        let overlay = self.direct_par2_overlay(job_id)?;
+        let overlay = self.direct_par2_overlay_for_set(job_id, par2_set.recovery_set_id)?;
+        let overlay_set_id = overlay.recovery_set_id;
         let volumes = overlay.volumes.clone();
         let provider = overlay.provider;
         // No placement scan: the direct volumes are absent from the directory
@@ -1431,8 +1463,14 @@ impl Pipeline {
         let session_verification = if post_repair {
             None
         } else {
-            self.verify_direct_sets_through_session(job_id, &par2_set, &working_dir, &access)
-                .await
+            self.verify_direct_sets_through_session(
+                job_id,
+                overlay_set_id,
+                &par2_set,
+                &working_dir,
+                &access,
+            )
+            .await
         };
 
         let mut verification = match session_verification {
@@ -1688,17 +1726,22 @@ impl Pipeline {
     async fn verify_direct_sets_through_session(
         &mut self,
         job_id: JobId,
+        overlay_set_id: par2_rs::RecoverySetId,
         par2_set: &std::sync::Arc<par2_rs::Par2FileSet>,
         working_dir: &std::path::Path,
         access: &std::sync::Arc<super::par2_access::DirectVolumeFileAccess>,
     ) -> Option<par2_rs::VerificationResult> {
+        if overlay_set_id != par2_set.recovery_set_id {
+            return None;
+        }
         if !self.grid_adjudicated_par2_bindings(job_id, par2_set) {
             return None;
         }
         // Blocks the decode pass already adjudicated are what this session
         // reports from: they cost no I/O, and the gate above proved they cover
         // every described slice.
-        let in_stream = self.in_stream_slice_evidence(job_id);
+        let set_id = overlay_set_id;
+        let in_stream = self.in_stream_slice_evidence_for_set(job_id, set_id);
         if in_stream.is_empty() {
             return None;
         }
@@ -1711,6 +1754,7 @@ impl Pipeline {
         let (mut session, _) = match self
             .take_or_open_par2_repair_session(
                 job_id,
+                set_id,
                 working_dir.to_path_buf(),
                 memory_limit,
                 None,
@@ -1752,7 +1796,7 @@ impl Pipeline {
                 return None;
             }
         };
-        self.restore_par2_repair_session(job_id, session);
+        self.restore_par2_repair_session(job_id, set_id, session);
         match outcome {
             Ok(outcome) => {
                 #[cfg(test)]
@@ -1983,7 +2027,10 @@ impl Pipeline {
         blocks_needed: u32,
         recovery_merged_now: u32,
     ) -> bool {
-        let total_capacity = self.total_recovery_block_capacity(job_id);
+        let Some(set_id) = self.par2_served_set_id(job_id) else {
+            return false;
+        };
+        let total_capacity = self.total_recovery_block_capacity(job_id, set_id);
         if total_capacity < blocks_needed {
             debug!(
                 job_id = job_id.0,
@@ -2007,7 +2054,7 @@ impl Pipeline {
         // whole defer exists to avoid — but nothing new is asked for, so the
         // next verdict with a quiet pipeline demotes.
         let promoted = if waves < MAX_DIRECT_REPAIR_DEFER_WAVES {
-            self.promote_recovery_targeted(job_id, blocks_needed)
+            self.promote_recovery_targeted(job_id, set_id, blocks_needed)
         } else {
             0
         };

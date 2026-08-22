@@ -975,6 +975,7 @@ impl Pipeline {
             };
             (state.working_dir.clone(), par2_set)
         };
+        let recovery_set_id = par2_set.recovery_set_id;
 
         #[cfg(test)]
         {
@@ -1004,7 +1005,8 @@ impl Pipeline {
 
         match lower_bound {
             Ok(Ok(blocks_needed)) if blocks_needed > 0 => {
-                let promoted = self.promote_recovery_targeted(job_id, blocks_needed);
+                let promoted =
+                    self.promote_recovery_targeted(job_id, recovery_set_id, blocks_needed);
                 info!(
                     job_id = job_id.0,
                     set_name = %set_name,

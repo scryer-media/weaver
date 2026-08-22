@@ -6336,7 +6336,13 @@ async fn missing_middle_rar_volume_enters_authoritative_par2_repair() {
             .count_matching(|work| work.segment_id.file_id.file_index == 5)
             > 0
     }));
-    assert_eq!(pipeline.recovery_blocks_available_or_targeted(job_id), 2);
+    assert_eq!(
+        pipeline.recovery_blocks_available_or_targeted(
+            job_id,
+            pipeline.par2_served_set_id(job_id).unwrap()
+        ),
+        2
+    );
 
     // Optional PAR2 files preserve the NZB's original classification, so they
     // are not necessarily marked `is_recovery`. A completion check triggered

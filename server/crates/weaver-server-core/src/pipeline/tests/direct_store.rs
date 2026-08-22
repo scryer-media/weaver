@@ -7489,7 +7489,9 @@ async fn a_direct_set_demotes_when_the_recovery_it_needs_cannot_arrive() {
 
     let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
-        pipeline.total_recovery_block_capacity(job_id) >= 1,
+        pipeline
+            .total_recovery_block_capacity(job_id, pipeline.par2_served_set_id(job_id).unwrap())
+            >= 1,
         "non-vacuity: the NZB still advertises enough recovery, so the demotion \
          below is about the recovery being unreachable and nothing else"
     );
@@ -7597,7 +7599,11 @@ async fn damage_beyond_every_advertised_recovery_block_never_waits() {
         )
         .await;
 
-    let capacity = pipeline.total_recovery_block_capacity(job_id);
+    let par2_set =
+        par2_rs::Par2FileSet::from_files(&[&index_bytes]).expect("fixture index must parse");
+    let recovery_set_id = par2_set.recovery_set_id;
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+    let capacity = pipeline.total_recovery_block_capacity(job_id, recovery_set_id);
     assert!(
         capacity > 0,
         "non-vacuity: the job must advertise recovery, so the refusal below is \
