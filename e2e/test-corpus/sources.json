@@ -1664,6 +1664,246 @@
       }
     },
     {
+      "path": "testdata/par2-multi-set-archives-insufficient/primary.rar",
+      "size": 85923257,
+      "blake3": "0319320f75e87fe1f9908ccffd5431fd3a3d021fe2e6c211f37d5b9995713e7b",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ],
+        "inputs": [
+          "testdata/single-mkv/test-media.mkv",
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-set-archives-insufficient/primary.rar.par2",
+      "size": 26652,
+      "blake3": "996788b765d0a34fc469bb0fc358c09ab67c29adf238de053818bf820b8da220",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ],
+        "inputs": [
+          "testdata/single-mkv/test-media.mkv",
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-set-archives-insufficient/primary.rar.vol0+8.par2",
+      "size": 631116,
+      "blake3": "21b8e12fa395362711be243f364dfbc2e82faf42f938aab0c6d9b536cc6d097e",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ],
+        "inputs": [
+          "testdata/single-mkv/test-media.mkv",
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-set-archives-insufficient/secondary.rar",
+      "size": 5243027,
+      "blake3": "c612deef195fffa2dc86a59b1471515eb6d650a753b88abd95fa90e04c3440ce",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ],
+        "inputs": [
+          "testdata/single-mkv/test-media.mkv",
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-set-archives-insufficient/secondary.rar.par2",
+      "size": 2036,
+      "blake3": "1705a595291eade157f8a8d00004b42b2f61e1904e4b510966fc42dab695db91",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ],
+        "inputs": [
+          "testdata/single-mkv/test-media.mkv",
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-set-archives-insufficient/secondary.rar.vol0+1.par2",
+      "size": 67640,
+      "blake3": "3d77fc23c22b9c84bd80dd7c7d0aaa71acbd5e1a79d9a8b23f2617c537cf063b",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ],
+        "inputs": [
+          "testdata/single-mkv/test-media.mkv",
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-set-archives/primary.rar",
+      "size": 85923257,
+      "blake3": "0319320f75e87fe1f9908ccffd5431fd3a3d021fe2e6c211f37d5b9995713e7b",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ],
+        "inputs": [
+          "testdata/single-mkv/test-media.mkv",
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-set-archives/primary.rar.par2",
+      "size": 26652,
+      "blake3": "996788b765d0a34fc469bb0fc358c09ab67c29adf238de053818bf820b8da220",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ],
+        "inputs": [
+          "testdata/single-mkv/test-media.mkv",
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-set-archives/primary.rar.vol0+8.par2",
+      "size": 631116,
+      "blake3": "21b8e12fa395362711be243f364dfbc2e82faf42f938aab0c6d9b536cc6d097e",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ],
+        "inputs": [
+          "testdata/single-mkv/test-media.mkv",
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-set-archives/secondary.rar",
+      "size": 5243027,
+      "blake3": "c612deef195fffa2dc86a59b1471515eb6d650a753b88abd95fa90e04c3440ce",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ],
+        "inputs": [
+          "testdata/single-mkv/test-media.mkv",
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-set-archives/secondary.rar.par2",
+      "size": 2036,
+      "blake3": "1705a595291eade157f8a8d00004b42b2f61e1904e4b510966fc42dab695db91",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ],
+        "inputs": [
+          "testdata/single-mkv/test-media.mkv",
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-set-archives/secondary.rar.vol0+4.par2",
+      "size": 268308,
+      "blake3": "836ab805f48cde4f009257137f10cb23eb5779f2adbdaf21e81a158b7b0705f4",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ],
+        "inputs": [
+          "testdata/single-mkv/test-media.mkv",
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
       "path": "testdata/par2-multivolume/archive.part1.rar",
       "size": 22020096,
       "blake3": "b5edb3e513d390754cc6455de37d3eaf0f68ffd899275804d822e2c8e7c18dfd",

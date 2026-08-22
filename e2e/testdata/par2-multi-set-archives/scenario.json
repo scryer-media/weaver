@@ -1,0 +1,17 @@
+{
+  "slug": "par2-multi-set-archives",
+  "title": "Amber.Forge.PAR2.MultiSet.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "One posting carrying two independent store-method RAR5 archives and one PAR2 set for each archive. Both archives have two damaged slices and sufficient recovery data, so both members must be repaired and extracted byte for byte.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ],
+  "expectedOutputBLAKE3": {
+    "bonus.mkv": "bd8b3991787e2bc03ae0f47bda585f1b9dbd831448493fe3c4a9118f4f947cf2",
+    "feature.mkv": "8139650c53be5684ab9cf20e34996fcfb510f118ee652ad7b949c32e8cb8b08a"
+  }
+}

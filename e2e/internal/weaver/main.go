@@ -1066,6 +1066,8 @@ var canonicalFixtureSlugs = []string{
 	"par2-heavy-damage-b",
 	"par2-heavy-damage-c",
 	"par2-insufficient",
+	"par2-multi-set-archives",
+	"par2-multi-set-archives-insufficient",
 	"par2-direct-repair",
 	"par2-ignorable-deficit",
 	"par2-partial-volume",
@@ -3736,12 +3738,12 @@ func assertDirectStoreEngagement(weaverURL string) error {
 			counters.Admitted, counters.Demoted,
 		)
 	}
-	if counters.FinalizedDirect < directStoreFixtureCount {
+	if counters.FinalizedDirect < directStoreArchiveSetCount {
 		return fmt.Errorf(
-			"only %d set(s) finalized direct, but the corpus carries %d fixtures built to route "+
+			"only %d set(s) finalized direct, but the corpus carries %d archive sets built to route "+
 				"direct end to end — at least one of them demoted; check the weaver log for "+
 				"`direct-store set demoted` and its reason",
-			counters.FinalizedDirect, directStoreFixtureCount,
+			counters.FinalizedDirect, directStoreArchiveSetCount,
 		)
 	}
 	// The corpus carries `direct-store-par2-repair`, a damaged set whose whole
@@ -3768,10 +3770,10 @@ func assertDirectStoreEngagement(weaverURL string) error {
 // corpus is full of these — compressed, solid and encrypted RAR sets that exist
 // to test the conventional path — so their presence says nothing about whether
 // direct routing is healthy.
-// Fixtures in the canonical corpus built to route direct end to end. Kept as a
-// count rather than a list because the assertion it feeds is about how many sets
-// finalized direct, which the counters report in aggregate.
-const directStoreFixtureCount = 6
+// Archive sets in the canonical corpus built to route direct end to end. Kept
+// as a count rather than a list because the counters report finalized sets in
+// aggregate; par2-multi-set-archives contributes two independent sets.
+const directStoreArchiveSetCount = 8
 
 // Demotion reasons that mean direct-store REFUSED an archive it is designed not
 // to carry. Refusal is the correct outcome and says nothing about health.

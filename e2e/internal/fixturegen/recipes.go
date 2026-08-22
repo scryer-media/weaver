@@ -892,7 +892,7 @@ func Recipes() []Recipe {
 	add(Recipe{
 		Slug: "par2-two-sets", Family: "PAR2",
 		Notes: "One posting carrying two independent recovery sets: a 25 MiB payload with eight recovery blocks and a 5 MiB payload with four, each with two of its own blocks zeroed. " +
-			"The two sets describe different files and share no bytes, and the larger one is larger by five times, so which set is served has to be a decision rather than an accident of arrival order.",
+			"The sets describe different files and share no bytes, so both must be repaired independently before the posting can complete.",
 		Inputs: []string{samplePayloadPath, previewPayloadPath},
 		Build: func(ctx context.Context, env *Env) error {
 			episode, err := env.ArtifactFile(ctx, "clip-episodes", "episode1.mkv")
@@ -929,8 +929,39 @@ func Recipes() []Recipe {
 			if err != nil {
 				return nil, err
 			}
-			return map[string]string{"feature.mkv": episode}, nil
+			bonus, err := env.ArtifactPath(ctx, "clip-preview")
+			if err != nil {
+				return nil, err
+			}
+			return map[string]string{"feature.mkv": episode, "bonus.mkv": bonus}, nil
 		},
+	})
+
+	add(Recipe{
+		Slug: "par2-multi-set-archives", Family: "PAR2",
+		Notes: "One posting carrying two independent store-method RAR5 archives and a PAR2 set for each archive. " +
+			"Both archives have two damaged slices and enough independent recovery data, so both members must be repaired and extracted.",
+		Inputs: []string{samplePayloadPath, previewPayloadPath},
+		Build:  multiPARSetArchives(4),
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			feature, err := env.ArtifactPath(ctx, "clip-sample")
+			if err != nil {
+				return nil, err
+			}
+			bonus, err := env.ArtifactPath(ctx, "clip-preview")
+			if err != nil {
+				return nil, err
+			}
+			return map[string]string{"feature.mkv": feature, "bonus.mkv": bonus}, nil
+		},
+	})
+
+	add(Recipe{
+		Slug: "par2-multi-set-archives-insufficient", Family: "PAR2",
+		Notes: "The mixed-recoverability counterpart: the primary archive has enough recovery data for its two damaged slices, " +
+			"while the secondary archive has only one recovery block and must make the aggregate job fail.",
+		Inputs: []string{samplePayloadPath, previewPayloadPath},
+		Build:  multiPARSetArchives(1),
 	})
 
 	// ---------------------------------------------------------------- zip
@@ -1231,6 +1262,45 @@ func obfuscatedNames(start int) []string {
 		names = append(names, fmt.Sprintf("%s.%d", stem, start+index))
 	}
 	return names
+}
+
+func multiPARSetArchives(secondaryRecoveryBlocks int) func(context.Context, *Env) error {
+	return func(ctx context.Context, env *Env) error {
+		sets := []struct {
+			artifact, member, archive string
+			recovery                  int
+		}{
+			{"clip-sample", "feature.mkv", "primary.rar", 8},
+			{"clip-preview", "bonus.mkv", "secondary.rar", secondaryRecoveryBlocks},
+		}
+		for _, set := range sets {
+			if err := env.Stage(ctx, set.artifact, set.member); err != nil {
+				return err
+			}
+			if err := env.RAR(ctx, RARSpec{
+				Toolchain: RAR5Writer,
+				Format:    RAR5,
+				Archive:   set.archive,
+				Members:   []string{set.member},
+				Method:    "-m0",
+			}); err != nil {
+				return err
+			}
+			if err := env.PAR2(ctx, PAR2Spec{
+				Base:           set.archive + ".par2",
+				SliceSize:      twoSetsSliceSize,
+				RecoveryBlocks: set.recovery,
+				RecoveryFiles:  1,
+				Sources:        []string{set.archive},
+			}); err != nil {
+				return err
+			}
+		}
+		if err := ZeroRange(env.OutputPath("primary.rar"), 100*twoSetsSliceSize, 2*twoSetsSliceSize); err != nil {
+			return err
+		}
+		return ZeroRange(env.OutputPath("secondary.rar"), 30*twoSetsSliceSize, 2*twoSetsSliceSize)
+	}
 }
 
 func singleMemberRAR(writer string, format RARFormat, member string, spec RARSpec) func(context.Context, *Env) error {

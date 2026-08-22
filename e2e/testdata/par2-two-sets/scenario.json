@@ -1,7 +1,7 @@
 {
   "slug": "par2-two-sets",
   "title": "Onyx.Prairie.2026.1080p.WEB-DL.H264-TESTGRP",
-  "description": "One posting carrying two independent PAR2 sets, each over its own payload and each with two damaged blocks. The set describing the most payload bytes is the one that must be served, whichever index lands first: it is repaired and its payload is delivered byte for byte, the job completes, and the files the other set describes are delivered with their damage reported rather than failing the release.",
+  "description": "One posting carrying two independent PAR2 sets, each over its own payload and each with two damaged blocks. Both sets have enough recovery data, so both payloads must be repaired and delivered byte for byte before the job completes.",
   "category": "2000",
   "expected_outcome": "repair_then_success",
   "requiredJobEvents": [
@@ -11,6 +11,7 @@
     "RepairFailed"
   ],
   "expectedOutputBLAKE3": {
+    "bonus.mkv": "bd8b3991787e2bc03ae0f47bda585f1b9dbd831448493fe3c4a9118f4f947cf2",
     "feature.mkv": "d84cb04cce2ddea11518597a5b268cb35e60f31c334d0b6ff7cb762b2423ce0f"
   }
 }
