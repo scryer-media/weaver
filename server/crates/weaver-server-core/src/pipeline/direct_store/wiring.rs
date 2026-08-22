@@ -1066,13 +1066,41 @@ impl Pipeline {
     ///
     /// `true` for every job with no live direct set, which is every conventional
     /// job — the gate is unchanged for them by construction.
-    pub(crate) fn direct_sets_ready_for_authoritative_par2(&self, job_id: JobId) -> bool {
+    fn direct_set_binds_to_par2_set(
+        &self,
+        job_id: JobId,
+        direct_set: &DirectSet,
+        recovery_set_id: par2_rs::RecoverySetId,
+    ) -> bool {
+        direct_set
+            .plan()
+            .volumes
+            .values()
+            .copied()
+            .any(|file_index| {
+                self.resolve_par2_file_binding(NzbFileId { job_id, file_index })
+                    .is_some_and(|binding| binding.recovery_set_id == recovery_set_id)
+            })
+    }
+
+    pub(crate) fn direct_sets_ready_for_authoritative_par2_for_set(
+        &self,
+        job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
+    ) -> bool {
         let waiting = self
             .direct_store
             .sets_for(job_id)
             .iter()
+            .filter(|set| self.direct_set_binds_to_par2_set(job_id, set, recovery_set_id))
             .any(|set| !set.is_demoted() && !set.is_finalized() && !set.all_volumes_complete());
         !waiting || !self.job_has_pending_download_pipeline_work(job_id)
+    }
+
+    pub(crate) fn direct_sets_ready_for_authoritative_par2(&self, job_id: JobId) -> bool {
+        self.par2_served_set_id(job_id).is_none_or(|set_id| {
+            self.direct_sets_ready_for_authoritative_par2_for_set(job_id, set_id)
+        })
     }
 
     /// Demotes every live direct set of `job_id` holding a source volume that
@@ -1090,7 +1118,11 @@ impl Pipeline {
     ///
     /// Demoting up front is what makes the pass's world binary: either a fully
     /// bound virtual set, or real files on disk.
-    pub(crate) async fn demote_unbindable_direct_sets(&mut self, job_id: JobId) -> bool {
+    pub(crate) async fn demote_unbindable_direct_sets_for_set(
+        &mut self,
+        job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
+    ) -> bool {
         // Without a parsed recovery set nothing can bind, and demoting every
         // direct set of a job whose PAR2 has simply not arrived yet would undo
         // the whole feature.
@@ -1109,6 +1141,7 @@ impl Pipeline {
             .sets_for(job_id)
             .iter()
             .enumerate()
+            .filter(|(_, set)| self.direct_set_binds_to_par2_set(job_id, set, recovery_set_id))
             .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
             .filter(|(_, set)| set.router.posted_bytes_unavailable())
             .map(|(set_index, _)| set_index)
@@ -1134,6 +1167,7 @@ impl Pipeline {
             .sets_for(job_id)
             .iter()
             .enumerate()
+            .filter(|(_, set)| self.direct_set_binds_to_par2_set(job_id, set, recovery_set_id))
             .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
             .filter_map(|(set_index, set)| {
                 set.plan()
@@ -1165,6 +1199,14 @@ impl Pipeline {
                 .await;
         }
         demoted_any
+    }
+
+    pub(crate) async fn demote_unbindable_direct_sets(&mut self, job_id: JobId) -> bool {
+        let Some(set_id) = self.par2_served_set_id(job_id) else {
+            return false;
+        };
+        self.demote_unbindable_direct_sets_for_set(job_id, set_id)
+            .await
     }
 
     /// Rewrites `Missing` to `Complete` for every source volume of a
@@ -1288,9 +1330,10 @@ impl Pipeline {
     /// 5. the stale composition gaps the rewrite left are re-read from the
     ///    partials that hold them, which re-arms the whole-member gates;
     /// 6. the scratch is deleted, and the set is back to fully virtual.
-    pub(crate) async fn resolve_direct_sets_with_par2_damage(
+    pub(crate) async fn resolve_direct_sets_with_par2_damage_for_set(
         &mut self,
         job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
         verification: &par2_rs::VerificationResult,
     ) -> DirectDamageResolution {
         match self
@@ -1302,13 +1345,25 @@ impl Pipeline {
             DirectRepairAnswer::Declined => {}
         }
         if self
-            .demote_direct_sets_with_par2_damage(job_id, verification)
+            .demote_direct_sets_with_par2_damage_for_set(job_id, recovery_set_id, verification)
             .await
         {
             DirectDamageResolution::Resolved
         } else {
             DirectDamageResolution::Unresolved
         }
+    }
+
+    pub(crate) async fn resolve_direct_sets_with_par2_damage(
+        &mut self,
+        job_id: JobId,
+        verification: &par2_rs::VerificationResult,
+    ) -> DirectDamageResolution {
+        let Some(set_id) = self.par2_served_set_id(job_id) else {
+            return DirectDamageResolution::Unresolved;
+        };
+        self.resolve_direct_sets_with_par2_damage_for_set(job_id, set_id, verification)
+            .await
     }
 
     /// The repair chance for a live direct set, taken **before** the completion
@@ -1329,18 +1384,18 @@ impl Pipeline {
     /// emits its own, so a job that falls through would report verifying twice;
     /// and this one exists to answer a question about direct sets, not to record
     /// the job's verdict.
-    pub(crate) async fn resolve_direct_sets_before_par2_repairer(
+    pub(crate) async fn resolve_direct_sets_before_par2_repairer_for_set(
         &mut self,
         job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
         par2_set: std::sync::Arc<par2_rs::Par2FileSet>,
         working_dir: PathBuf,
     ) -> DirectPar2Resolution {
-        if !self
-            .direct_store
-            .sets_for(job_id)
-            .iter()
-            .any(|set| !set.is_demoted() && !set.is_finalized())
-        {
+        if !self.direct_store.sets_for(job_id).iter().any(|set| {
+            self.direct_set_binds_to_par2_set(job_id, set, recovery_set_id)
+                && !set.is_demoted()
+                && !set.is_finalized()
+        }) {
             return DirectPar2Resolution::Unresolved;
         }
         // A job already waiting on a promoted recovery wave answers without
@@ -1373,6 +1428,21 @@ impl Pipeline {
             DirectRepairAnswer::Deferred => DirectPar2Resolution::Deferred,
             DirectRepairAnswer::Declined => DirectPar2Resolution::Unresolved,
         }
+    }
+
+    pub(crate) async fn resolve_direct_sets_before_par2_repairer(
+        &mut self,
+        job_id: JobId,
+        par2_set: std::sync::Arc<par2_rs::Par2FileSet>,
+        working_dir: PathBuf,
+    ) -> DirectPar2Resolution {
+        self.resolve_direct_sets_before_par2_repairer_for_set(
+            job_id,
+            par2_set.recovery_set_id,
+            par2_set,
+            working_dir,
+        )
+        .await
     }
 
     /// One verification pass over the job's recovery set, reading every live
@@ -2710,12 +2780,17 @@ impl Pipeline {
     /// could not verify, and hands the job to the conventional repair path —
     /// which is exactly the shape the same job would have had with the gate
     /// off.
-    pub(crate) async fn demote_direct_sets_with_par2_damage(
+    pub(crate) async fn demote_direct_sets_with_par2_damage_for_set(
         &mut self,
         job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
         verification: &par2_rs::VerificationResult,
     ) -> bool {
-        let Some(overlay) = self.direct_par2_overlay(job_id) else {
+        // Scoped to the set this pass is verifying, not to whichever set the
+        // gate currently has selected: the damage below is filtered by
+        // `recovery_set_id`, so the table its file ids are looked up in has to
+        // describe the same set or every lookup misses and nothing demotes.
+        let Some(overlay) = self.direct_par2_overlay_for_set(job_id, recovery_set_id) else {
             return false;
         };
         // The second settle guard, paired with
@@ -2748,11 +2823,11 @@ impl Pipeline {
             // direct mode. A caller that returned early on a set it did not
             // actually demote would leave the job waiting for a materialization
             // that never happens.
-            if !self
-                .direct_store
-                .set(job_id, set_index)
-                .is_some_and(|set| !set.is_demoted() && !set.is_finalized())
-            {
+            if !self.direct_store.set(job_id, set_index).is_some_and(|set| {
+                self.direct_set_binds_to_par2_set(job_id, set, recovery_set_id)
+                    && !set.is_demoted()
+                    && !set.is_finalized()
+            }) {
                 continue;
             }
             if !payload_settled
@@ -2782,17 +2857,35 @@ impl Pipeline {
         demoted
     }
 
+    #[allow(dead_code)]
+    pub(crate) async fn demote_direct_sets_with_par2_damage(
+        &mut self,
+        job_id: JobId,
+        verification: &par2_rs::VerificationResult,
+    ) -> bool {
+        let Some(set_id) = self.par2_served_set_id(job_id) else {
+            return false;
+        };
+        self.demote_direct_sets_with_par2_damage_for_set(job_id, set_id, verification)
+            .await
+    }
+
     /// Demotes every set of `job_id` that is still routing, because a PAR2
     /// **repair** is about to run and repair needs a file to write into.
     ///
     /// Returns whether anything demoted, so the caller can let the job go round
     /// again over materialized volumes rather than repairing against nothing.
-    pub(crate) async fn demote_live_direct_sets_for_par2_repair(&mut self, job_id: JobId) -> bool {
+    pub(crate) async fn demote_live_direct_sets_for_par2_repair_for_set(
+        &mut self,
+        job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
+    ) -> bool {
         let live: Vec<usize> = self
             .direct_store
             .sets_for(job_id)
             .iter()
             .enumerate()
+            .filter(|(_, set)| self.direct_set_binds_to_par2_set(job_id, set, recovery_set_id))
             .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
             .map(|(index, _)| index)
             .collect();
@@ -2804,6 +2897,14 @@ impl Pipeline {
                 .await;
         }
         true
+    }
+
+    pub(crate) async fn demote_live_direct_sets_for_par2_repair(&mut self, job_id: JobId) -> bool {
+        let Some(set_id) = self.par2_served_set_id(job_id) else {
+            return false;
+        };
+        self.demote_live_direct_sets_for_par2_repair_for_set(job_id, set_id)
+            .await
     }
 
     /// The routing seam. Replaces the conventional write for one decoded
@@ -3660,7 +3761,10 @@ impl Pipeline {
         if self.par2_bypassed.contains(&job_id) || self.par2_verified.contains(&job_id) {
             return false;
         }
-        if self.par2_set(job_id).is_some() {
+        // The aggregate remains open until every servable recovery set has
+        // settled, so any such set must retain direct source bytes for its own
+        // pass rather than letting an earlier set commit them away.
+        if !self.par2_servable_set_ids(job_id).is_empty() {
             return true;
         }
         self.job_has_pending_download_pipeline_work(job_id)

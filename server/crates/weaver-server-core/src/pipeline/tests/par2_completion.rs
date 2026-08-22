@@ -6988,19 +6988,47 @@ async fn another_recovery_sets_volumes_do_not_count_toward_the_served_set() {
     );
 }
 
-/// A file the served set never described, but another posted set did.
+/// A file can retain known coverage when its set's index never arrives.
 ///
-/// It is delivered either way — nothing here can fail a job — but reporting it
-/// as unprotected says no recovery ever covered it, which is not what happened.
+/// A foreign packet identifies the recovery set, but without an index no pass
+/// can verify or repair its files. That remains distinct from an unprotected
+/// file: delivery is the same, while the diagnostic explains why no recovery
+/// action was possible.
 #[tokio::test]
-async fn a_file_of_an_unserved_recovery_set_is_not_reported_as_unprotected() {
+async fn a_file_of_an_unservable_recovery_set_is_not_reported_as_unprotected() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30803);
     let posting = TwoSetPosting::build();
     let working_dir = posting.install(&mut pipeline, job_id).await;
     load_par2_index(&mut pipeline, job_id, 1).await;
-    load_par2_index(&mut pipeline, job_id, 4).await;
+    let smaller_set_id = TwoSetPosting::recovery_set_id(&posting.smaller_index);
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        5,
+        SMALLER_VOLUME,
+        &posting.smaller_volume,
+    )
+    .await;
+    pipeline
+        .try_merge_par2_recovery(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 5,
+            },
+        )
+        .await;
+    let unservable = pipeline
+        .ensure_par2_runtime(job_id)
+        .set_runtime_mut(smaller_set_id)
+        .expect("foreign packets must retain their recovery set");
+    assert!(unservable.set.is_none());
+    unservable
+        .summary
+        .described_filenames
+        .push(SMALLER_PAYLOAD.to_string());
 
     tokio::fs::write(working_dir.join(LARGER_PAYLOAD), &posting.larger_payload)
         .await
@@ -7035,8 +7063,8 @@ async fn a_file_of_an_unserved_recovery_set_is_not_reported_as_unprotected() {
         .expect("the file left short must still be reported");
 
     assert!(
-        report.message.contains("unserved recovery set"),
-        "the report must say another posted set covers the file: {}",
+        report.message.contains("no posted index"),
+        "the report must say the file's known set cannot receive a pass: {}",
         report.message
     );
     assert!(
@@ -7046,34 +7074,51 @@ async fn a_file_of_an_unserved_recovery_set_is_not_reported_as_unprotected() {
     );
     assert!(
         !report.message.contains("unprotected"),
-        "a file another posted set covers was never unprotected: {}",
+        "a file a set still covers was never unprotected: {}",
         report.message
     );
     assert_eq!(
         report.unproven_protected, 0,
-        "a file of an unserved set is not a reconciliation defect: {}",
+        "a file of an unservable set is not a reconciliation defect: {}",
         report.message
     );
     assert_eq!(
         pipeline.incomplete_par2_protected_data_file_count(job_id),
         0,
-        "nothing the served set can act on is left, so the gate must not re-arm"
+        "nothing a servable set can act on is left, so the gate must not re-arm"
     );
 }
 
-/// The announcement is worth exactly one line per job.
+/// The announcement is worth exactly one line per job for indexless sets.
 ///
-/// The completion gate is entered many times and nothing about the posting's
-/// shape changes between entries, so a warning that repeated would be noise.
+/// The completion gate is entered many times and no index appears between
+/// entries, so repeating the warning would add noise without new information.
 #[tokio::test]
-async fn an_unserved_recovery_set_is_announced_once_per_job() {
+async fn an_unservable_recovery_set_is_announced_once_per_job() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30804);
     let posting = TwoSetPosting::build();
     posting.install(&mut pipeline, job_id).await;
     load_par2_index(&mut pipeline, job_id, 1).await;
-    load_par2_index(&mut pipeline, job_id, 4).await;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        5,
+        SMALLER_VOLUME,
+        &posting.smaller_volume,
+    )
+    .await;
+    pipeline
+        .try_merge_par2_recovery(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 5,
+            },
+        )
+        .await;
+    pipeline.warn_unservable_recovery_sets_once(job_id);
 
     assert_eq!(
         pipeline.par2_unserved_set_warnings, 1,
@@ -7081,7 +7126,7 @@ async fn an_unserved_recovery_set_is_announced_once_per_job() {
     );
 
     for _ in 0..3 {
-        pipeline.warn_unserved_recovery_sets_once(job_id);
+        pipeline.warn_unservable_recovery_sets_once(job_id);
     }
     assert_eq!(
         pipeline.par2_unserved_set_warnings, 1,
@@ -7108,40 +7153,6 @@ async fn a_single_recovery_set_job_announces_nothing_and_counts_every_volume() {
             .total_recovery_block_capacity(job_id, pipeline.par2_served_set_id(job_id).unwrap()),
         12,
         "with one set known, every recovery volume in the posting still counts"
-    );
-}
-
-/// A settled PAR2 verdict freezes which set is served.
-///
-/// Swapping the served set out from under a verdict would reopen it, and a
-/// reopened verdict is exactly the re-entry the settled-verdict guard exists to
-/// close. The later set is still recorded and still announced — it is simply
-/// not acted on for the rest of this run, and the verdict bit lives only in
-/// memory, so a restart re-derives everything from the same selection.
-#[tokio::test]
-async fn a_settled_verdict_freezes_which_recovery_set_is_served() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(30806);
-    let posting = TwoSetPosting::build();
-    posting.install(&mut pipeline, job_id).await;
-
-    load_par2_index(&mut pipeline, job_id, 4).await;
-    assert!(
-        served_set_describes(&pipeline, job_id, SMALLER_PAYLOAD),
-        "the only set known so far is the one served"
-    );
-
-    pipeline.par2_verified.insert(job_id);
-    load_par2_index(&mut pipeline, job_id, 1).await;
-
-    assert!(
-        served_set_describes(&pipeline, job_id, SMALLER_PAYLOAD),
-        "a set that arrives after the verdict must not replace the one it ruled on"
-    );
-    assert_eq!(
-        pipeline.par2_unserved_set_warnings, 1,
-        "the set that arrived too late is still worth announcing"
     );
 }
 

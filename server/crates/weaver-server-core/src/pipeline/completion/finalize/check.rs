@@ -355,6 +355,20 @@ struct CleanPar2Verification {
     retry_message: &'static str,
 }
 
+/// The current recovery set's answer to one trip through the completion gate.
+///
+/// A waiting or running set owns the next re-entry.  A settled or failed set
+/// lets the driver advance in deterministic index order; failures are retained
+/// until every other set has had the same chance to repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::pipeline) enum SetGateOutcome {
+    Settled,
+    Waiting,
+    #[allow(dead_code)]
+    RepairRunning,
+    Failed(String),
+}
+
 /// What reconciling one PAR2 verification against the assembly established.
 ///
 /// A bare count cannot tell "nothing needed doing" apart from "a repaired,
@@ -1968,16 +1982,11 @@ impl Pipeline {
 
         outcome.missing_blocks = outcome.verification.total_missing_blocks;
         self.recompute_volume_safety_from_verification(job_id, &outcome.verification);
-
-        let passed = !par2_verification_needs_repair(&outcome.verification);
-        self.note_job_verification_result(
+        self.record_par2_set_verification_observation(job_id, &outcome.verification);
+        let _ = self.event_tx.send(PipelineEvent::JobVerificationComplete {
             job_id,
-            passed,
-            outcome.verification.total_missing_blocks,
-        );
-        let _ = self
-            .event_tx
-            .send(PipelineEvent::JobVerificationComplete { job_id, passed });
+            passed: !par2_verification_needs_repair(&outcome.verification),
+        });
 
         Ok(outcome)
     }
@@ -2117,10 +2126,10 @@ impl Pipeline {
         }
 
         self.recompute_volume_safety_from_verification(job_id, verification);
+        self.record_par2_set_verification_observation(job_id, verification);
 
         if emit_events {
             let passed = !par2_verification_needs_repair(verification);
-            self.note_job_verification_result(job_id, passed, verification.total_missing_blocks);
             let _ = self
                 .event_tx
                 .send(PipelineEvent::JobVerificationComplete { job_id, passed });
@@ -2308,24 +2317,323 @@ impl Pipeline {
         }
     }
 
-    /// Records the job as PAR2-verified and releases any direct set that was
-    /// holding its virtual volume image for the verifier.
-    ///
-    /// A par2-bearing direct set stays uncommitted until here: its envelopes and
-    /// `.direct.partial`s *are* the source volumes, and finalization renames the
-    /// partials away and deletes the envelopes. Releasing at the same statement
-    /// that records the verdict is what keeps the two from drifting — there is
-    /// no path that marks a job verified without also letting its sets commit.
-    async fn mark_par2_verified(&mut self, job_id: JobId) {
-        self.par2_verified.insert(job_id);
-        // A fresh verdict starts the post-verdict re-entry budget over: whatever
-        // this pass reconciled, the next settled re-entry is a new question.
-        if let Some(runtime) = self.par2_runtime.get_mut(&job_id)
-            && let Some(set_runtime) = runtime.served_mut()
-        {
+    pub(in crate::pipeline) fn par2_servable_set_ids(
+        &self,
+        job_id: JobId,
+    ) -> Vec<par2_rs::RecoverySetId> {
+        self.par2_runtime(job_id)
+            .map(|runtime| {
+                runtime
+                    .ordered_set_ids()
+                    .into_iter()
+                    .filter(|set_id| {
+                        // A parsed set necessarily carries its descriptions;
+                        // a set known only by sighting has no parsed set.
+                        runtime
+                            .set_runtime(*set_id)
+                            .is_some_and(|set_runtime| set_runtime.set.is_some())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// An index that is incomplete while work can still arrive keeps the
+    /// aggregate open: parsing it may add a recovery set the job has not yet
+    /// had a chance to serve.  Once no such index can land, absence is final.
+    fn par2_metadata_discovery_closed(&self, job_id: JobId) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return true;
+        };
+        let work_pending = self.job_has_pending_download_pipeline_work(job_id);
+        !state
+            .spec
+            .files
+            .iter()
+            .enumerate()
+            .any(|(file_index, file)| {
+                matches!(
+                    file.role,
+                    weaver_model::files::FileRole::Par2 { is_index: true, .. }
+                ) && state
+                    .assembly
+                    .file(NzbFileId {
+                        job_id,
+                        file_index: file_index as u32,
+                    })
+                    .is_some_and(|file| !file.is_complete())
+                    && work_pending
+            })
+    }
+
+    /// Whether every servable set has reached a final answer and no later
+    /// index can add one. A failed set is settled, but not verified.
+    fn par2_gate_settlement_complete(&self, job_id: JobId) -> bool {
+        let set_ids = self.par2_servable_set_ids(job_id);
+        !set_ids.is_empty()
+            && self.par2_metadata_discovery_closed(job_id)
+            && self.par2_runtime(job_id).is_some_and(|runtime| {
+                set_ids.iter().all(|set_id| {
+                    runtime
+                        .set_runtime(*set_id)
+                        .is_some_and(|set_runtime| set_runtime.settled)
+                })
+            })
+    }
+
+    /// Recompute the job-level verification answer from immutable per-set
+    /// answers. This is intentionally the sole writer of `par2_verified`: a
+    /// newly parsed set can reopen the aggregate without invalidating a verdict
+    /// another set has already reached.
+    fn recompute_par2_verified(&mut self, job_id: JobId) -> bool {
+        let set_ids = self.par2_servable_set_ids(job_id);
+        let verified = !set_ids.is_empty()
+            && self.par2_metadata_discovery_closed(job_id)
+            && self.par2_runtime(job_id).is_some_and(|runtime| {
+                set_ids.iter().all(|set_id| {
+                    runtime.set_runtime(*set_id).is_some_and(|set_runtime| {
+                        set_runtime.settled && set_runtime.failure.is_none()
+                    })
+                })
+            });
+        if verified {
+            self.par2_verified.insert(job_id);
+        } else {
+            self.par2_verified.remove(&job_id);
+        }
+        verified
+    }
+
+    /// Mark one set settled, reset only that set's re-entry latch, then update
+    /// the aggregate.  Direct outputs remain held until every servable set and
+    /// metadata discovery have reached a final answer.
+    pub(in crate::pipeline) async fn mark_par2_set_verified(
+        &mut self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) -> SetGateOutcome {
+        let Some(set_runtime) = self.ensure_par2_runtime(job_id).set_runtime_mut(set_id) else {
+            return SetGateOutcome::Waiting;
+        };
+        set_runtime.settled = true;
+        set_runtime.failure = None;
+        set_runtime.post_verdict_reconcile_attempts = 0;
+        self.mark_par2_verified(job_id).await;
+        SetGateOutcome::Settled
+    }
+
+    /// Records a set-local failure without aborting its siblings' passes.
+    fn mark_par2_set_failed(
+        &mut self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+        message: String,
+    ) -> SetGateOutcome {
+        let index_filename = self
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.set_runtime(set_id))
+            .map(|set_runtime| set_runtime.summary.index_filename.clone())
+            .filter(|filename| !filename.is_empty())
+            .unwrap_or_else(|| set_id.to_string());
+        if let Some(set_runtime) = self.ensure_par2_runtime(job_id).set_runtime_mut(set_id) {
+            set_runtime.settled = true;
+            set_runtime.failure = Some(message.clone());
             set_runtime.post_verdict_reconcile_attempts = 0;
         }
-        self.finalize_ready_direct_sets(job_id).await;
+        self.recompute_par2_verified(job_id);
+        self.note_aggregate_par2_verification_result(job_id);
+        warn!(
+            job_id = job_id.0,
+            recovery_set_id = %set_id,
+            index_filename = %index_filename,
+            error = %message,
+            "PAR2 recovery set failed after its own repair ladder"
+        );
+        SetGateOutcome::Failed(message)
+    }
+
+    async fn finish_par2_set_failure(
+        &mut self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+        message: String,
+    ) {
+        let _ = self.mark_par2_set_failed(job_id, set_id, message);
+        self.finish_or_rearm_after_par2_set_failure(job_id);
+    }
+
+    /// A failed set must leave its siblings time to settle, but once the last
+    /// one has answered the job failure belongs to this same gate entry.  In
+    /// particular, a one-set job must retain the immediate failure behaviour
+    /// it had before the aggregate existed.
+    fn finish_or_rearm_after_par2_set_failure(&mut self, job_id: JobId) {
+        if let Some(message) = self.aggregate_par2_failure_message(job_id) {
+            self.fail_job(job_id, message);
+        } else {
+            self.schedule_job_completion_check(job_id);
+        }
+    }
+
+    /// Make the earliest unsettled servable set the compatibility view used by
+    /// existing repair helpers.  The selection changes only at a set boundary;
+    /// a settled set is never selected again merely because another set arrives.
+    fn activate_next_par2_gate_set(&mut self, job_id: JobId) -> Option<par2_rs::RecoverySetId> {
+        let next_set_id = self
+            .par2_servable_set_ids(job_id)
+            .into_iter()
+            .find(|set_id| {
+                self.par2_runtime(job_id)
+                    .and_then(|runtime| runtime.set_runtime(*set_id))
+                    .is_some_and(|set_runtime| !set_runtime.settled)
+            });
+        if let Some(set_id) = next_set_id
+            && let Some(runtime) = self.par2_runtime.get_mut(&job_id)
+        {
+            runtime.served = Some(set_id);
+        }
+        next_set_id
+    }
+
+    fn served_par2_set_needs_reconciliation(&self, job_id: JobId) -> bool {
+        self.par2_served_set_id(job_id).is_some_and(|set_id| {
+            self.par2_runtime(job_id)
+                .and_then(|runtime| runtime.set_runtime(set_id))
+                .is_some_and(|set_runtime| {
+                    set_runtime.settled
+                        && set_runtime.failure.is_none()
+                        && self.settled_verdict_left_only_proven_protected_files(job_id, set_id)
+                })
+        })
+    }
+
+    /// A recovery set with no assembly binding and no bytes at any described
+    /// path has nothing this job can verify or repair.  The binding condition
+    /// is deliberately conservative: an empty but known assembly file still
+    /// takes the ordinary pass, because it may be waiting for recoverable data.
+    fn par2_set_is_absent_from_job(&self, job_id: JobId, set_id: par2_rs::RecoverySetId) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let Some(par2_set) = self.par2_set_for(job_id, set_id) else {
+            return false;
+        };
+        let has_assembly_binding = state.assembly.files().any(|file| {
+            self.resolve_par2_file_binding(file.file_id())
+                .is_some_and(|binding| binding.recovery_set_id == set_id)
+        });
+        if has_assembly_binding {
+            return false;
+        }
+        // A split topology can assemble the described output even when none
+        // of its individual fragments binds to that description.  Treat that
+        // relationship as evidence rather than skipping a recovery pass.
+        let described_names = par2_set
+            .files
+            .values()
+            .map(|description| sanitize_download_filename(&description.filename))
+            .collect::<HashSet<_>>();
+        if state
+            .assembly
+            .archive_topologies()
+            .keys()
+            .any(|name| described_names.contains(&sanitize_download_filename(name)))
+        {
+            return false;
+        }
+        par2_set.files.values().all(|description| {
+            let path = state
+                .working_dir
+                .join(sanitize_download_filename(&description.filename));
+            std::fs::metadata(path)
+                .ok()
+                .is_none_or(|metadata| metadata.len() == 0)
+        })
+    }
+
+    fn record_par2_set_verification_observation(
+        &mut self,
+        job_id: JobId,
+        verification: &par2_rs::VerificationResult,
+    ) {
+        let Some(set_id) = self.par2_served_set_id(job_id) else {
+            return;
+        };
+        if let Some(set_runtime) = self.ensure_par2_runtime(job_id).set_runtime_mut(set_id) {
+            set_runtime.missing_blocks = verification.total_missing_blocks;
+            set_runtime.needed_repair |= par2_verification_needs_repair(verification);
+        }
+    }
+
+    fn note_aggregate_par2_verification_result(&mut self, job_id: JobId) {
+        if !self.par2_gate_settlement_complete(job_id)
+            || self.jobs_with_verification_outcome.contains(&job_id)
+        {
+            return;
+        }
+        let (passed, missing_blocks) = self
+            .par2_runtime(job_id)
+            .map(|runtime| {
+                self.par2_servable_set_ids(job_id).into_iter().fold(
+                    (true, 0u32),
+                    |(passed, missing_blocks), set_id| {
+                        let set_runtime = runtime
+                            .set_runtime(set_id)
+                            .expect("servable recovery set remains in its runtime");
+                        (
+                            passed && !set_runtime.needed_repair && set_runtime.failure.is_none(),
+                            missing_blocks.saturating_add(set_runtime.missing_blocks),
+                        )
+                    },
+                )
+            })
+            .unwrap_or((true, 0));
+        self.note_job_verification_result(job_id, passed, missing_blocks);
+    }
+
+    /// Records the aggregate verdict and releases direct outputs exactly when
+    /// every servable set has verified. A per-set repair must not commit
+    /// neighbouring set B before B has had its own opportunity to verify or
+    /// repair.
+    pub(in crate::pipeline) async fn mark_par2_verified(&mut self, job_id: JobId) {
+        let was_verified = self.par2_verified.contains(&job_id);
+        if !self.recompute_par2_verified(job_id) {
+            return;
+        }
+        self.note_aggregate_par2_verification_result(job_id);
+        if !was_verified {
+            self.finalize_ready_direct_sets(job_id).await;
+        }
+    }
+
+    fn aggregate_par2_failure_message(&self, job_id: JobId) -> Option<String> {
+        if !self.par2_gate_settlement_complete(job_id) {
+            return None;
+        }
+        let failures = self
+            .par2_runtime(job_id)?
+            .ordered_set_ids()
+            .into_iter()
+            .filter_map(|set_id| {
+                let set_runtime = self.par2_runtime(job_id)?.set_runtime(set_id)?;
+                let failure = set_runtime.failure.as_ref()?;
+                let index = if set_runtime.summary.index_filename.is_empty() {
+                    set_id.to_string()
+                } else {
+                    set_runtime.summary.index_filename.clone()
+                };
+                Some(format!(
+                    "{index} ({}): {failure}",
+                    set_runtime.summary.described_filenames.join(", ")
+                ))
+            })
+            .collect::<Vec<_>>();
+        (!failures.is_empty()).then(|| {
+            format!(
+                "PAR2 recovery failed for {} set(s): {}",
+                failures.len(),
+                failures.join("; ")
+            )
+        })
     }
 
     pub(super) fn emit_job_verification_started(&mut self, job_id: JobId) {
@@ -2687,6 +2995,7 @@ impl Pipeline {
     async fn finish_clean_par2_verification(
         &mut self,
         job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
         working_dir: std::path::PathBuf,
         outcome: CleanPar2Verification,
         has_crc_failures: bool,
@@ -2705,7 +3014,7 @@ impl Pipeline {
             .apply_placement_plan_for_retry_or_repair(job_id, working_dir, &placement_plan)
             .await
         {
-            self.fail_job(job_id, error);
+            self.finish_par2_set_failure(job_id, set_id, error).await;
             return;
         }
         self.retry_par2_authoritative_identity(job_id).await;
@@ -2719,7 +3028,7 @@ impl Pipeline {
             .register_verified_par2_rar_outputs(job_id, &verification)
             .await
         {
-            self.fail_job(job_id, error);
+            self.finish_par2_set_failure(job_id, set_id, error).await;
             return;
         }
         self.refresh_verified_complete_archive_topologies(job_id, &verification)
@@ -2733,12 +3042,34 @@ impl Pipeline {
             )
             .await
         {
-            warn!(job_id = job_id.0, error = %error);
-            self.fail_job(job_id, error);
+            self.finish_par2_set_failure(job_id, set_id, error).await;
             return;
         }
 
-        self.mark_par2_verified(job_id).await;
+        let _ = self.mark_par2_set_verified(job_id, set_id).await;
+        self.continue_after_aggregate_clean_par2_settlement(
+            job_id,
+            has_crc_failures,
+            archive_extraction_applicable,
+            retry_message,
+        )
+        .await;
+    }
+
+    /// Run the pre-existing job-level continuation exactly once, after the
+    /// final clean set has settled. Earlier sets re-arm the gate instead, so a
+    /// one-set job still follows this path in the same completion check.
+    async fn continue_after_aggregate_clean_par2_settlement(
+        &mut self,
+        job_id: JobId,
+        has_crc_failures: bool,
+        archive_extraction_applicable: bool,
+        retry_message: &str,
+    ) {
+        if !self.par2_verified.contains(&job_id) {
+            self.schedule_job_completion_check(job_id);
+            return;
+        }
 
         if has_crc_failures {
             if self.normalization_retried.contains(&job_id) {
@@ -3195,22 +3526,22 @@ impl Pipeline {
             return None;
         }
 
-        // "Protected" means the recovery set this pass served describes it.
-        // A binding owned by another parsed set must not become a reconciliation
-        // defect for a pass that never verified that set.
-        let served_set_id = self.par2_served_set_id(job_id);
+        // Every parsed, described set receives its own gate pass.  A binding to
+        // any such set is protected, regardless of which set happens to be the
+        // compatibility view during this particular re-entry.
+        let servable_set_ids = self.par2_servable_set_ids(job_id);
         let (protected, unprotected): (Vec<_>, Vec<_>) =
             incomplete.into_iter().partition(|file_id| {
                 self.resolve_par2_file_binding(*file_id)
-                    .is_some_and(|binding| Some(binding.recovery_set_id) == served_set_id)
+                    .is_some_and(|binding| servable_set_ids.contains(&binding.recovery_set_id))
             });
 
-        // Files another recovery set describes are delivered either way, but
-        // calling them unprotected would say no recovery ever covered them.
-        // The report instead records that this job cannot act on their set.
-        let (unserved_set, unprotected): (Vec<_>, Vec<_>) = unprotected
-            .into_iter()
-            .partition(|file_id| self.file_is_described_by_an_unserved_recovery_set(*file_id));
+        // A set without a posted index cannot receive a pass at all.  Keep that
+        // distinct from an ordinary unprotected file in the diagnostic.
+        let (unservable_set, unprotected): (Vec<_>, Vec<_>) =
+            unprotected.into_iter().partition(|file_id| {
+                self.file_is_described_only_by_an_unservable_recovery_set(*file_id)
+            });
 
         // Furniture the recovery set happens to cover. It is delivered as it
         // stands — the verdict arm above already declined to spend a full-set
@@ -3243,12 +3574,11 @@ impl Pipeline {
                 names(&unprotected)
             ));
         }
-        if !unserved_set.is_empty() {
+        if !unservable_set.is_empty() {
             parts.push(format!(
-                "delivering {} file(s) protected by an unserved recovery set (multi-set NZB; \
-                 only one set is served): {}",
-                unserved_set.len(),
-                names(&unserved_set)
+                "delivering {} file(s) covered only by a recovery set with no posted index: {}",
+                unservable_set.len(),
+                names(&unservable_set)
             ));
         }
         if !ignorable.is_empty() {
@@ -3304,7 +3634,7 @@ impl Pipeline {
             return 0;
         };
         let ignore_extensions = self.par2_ignore_extensions();
-        let served_set_id = self.par2_served_set_id(job_id);
+        let servable_set_ids = self.par2_servable_set_ids(job_id);
         state
             .assembly
             .files()
@@ -3319,7 +3649,7 @@ impl Pipeline {
                     )
                     && self
                         .resolve_par2_file_binding(file.file_id())
-                        .is_some_and(|binding| Some(binding.recovery_set_id) == served_set_id)
+                        .is_some_and(|binding| servable_set_ids.contains(&binding.recovery_set_id))
                     && !self.par2_bound_file_is_ignorable(
                         job_id,
                         file.file_id(),
@@ -3333,22 +3663,25 @@ impl Pipeline {
     /// Whether a settled verdict has left protected files outstanding whose
     /// verified bytes are demonstrably still on disk.
     ///
-    /// The same set [`Self::incomplete_par2_protected_data_file_count`] counts
-    /// — an incomplete data file the recovery set describes, furniture
-    /// excluded — narrowed to the case where every one of them can be shown to
-    /// be present at its described length.
+    /// The current set's portion of
+    /// [`Self::incomplete_par2_protected_data_file_count`], narrowed to an
+    /// incomplete file whose verified bytes can be shown to be present at its
+    /// described length.
     ///
     /// That narrowing carries the whole distinction. Bytes that are present
     /// under a verdict which already vouched for them mean the download is
     /// sound and our own binding is not, and re-reading the recovery set cannot
     /// change either fact. Bytes that are absent or short mean something really
     /// is missing, which is a question the authoritative pass alone can answer.
-    fn settled_verdict_left_only_proven_protected_files(&self, job_id: JobId) -> bool {
+    fn settled_verdict_left_only_proven_protected_files(
+        &self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) -> bool {
         let Some(state) = self.jobs.get(&job_id) else {
             return false;
         };
         let ignore_extensions = self.par2_ignore_extensions();
-        let served_set_id = self.par2_served_set_id(job_id);
         let outstanding: Vec<NzbFileId> = state
             .assembly
             .files()
@@ -3363,7 +3696,7 @@ impl Pipeline {
                     )
                     && self
                         .resolve_par2_file_binding(file.file_id())
-                        .is_some_and(|binding| Some(binding.recovery_set_id) == served_set_id)
+                        .is_some_and(|binding| binding.recovery_set_id == set_id)
                     && !self.par2_bound_file_is_ignorable(
                         job_id,
                         file.file_id(),
@@ -3681,12 +4014,6 @@ impl Pipeline {
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.refresh_hashes", stage_start);
 
-        // Installed, verified, bound to the assembly and persisted. The repair
-        // has been accepted, so its leftovers stop being evidence and start
-        // being clutter that finalization would deliver.
-        self.purge_par2_repair_leftovers(job_id);
-        stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.purge", stage_start);
-
         // Only now is the repair a fact worth announcing.
         //
         // Low-frequency: one observation per job-level repair, never on a
@@ -3701,9 +4028,25 @@ impl Pipeline {
             slices_repaired,
         });
 
-        self.mark_par2_verified(job_id).await;
+        let set_id = par2_set.recovery_set_id;
+        let _ = self.mark_par2_set_verified(job_id, set_id).await;
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.mark_verified", stage_start);
+        if !self.par2_verified.contains(&job_id) {
+            self.transition_postprocessing_status(
+                job_id,
+                JobStatus::Downloading,
+                Some("downloading"),
+            );
+            self.schedule_job_completion_check(job_id);
+            return;
+        }
+
+        // A later recovery set can still describe files the repairer created.
+        // Purging by directory difference is therefore safe only after the
+        // aggregate has settled every servable set.
+        self.purge_par2_repair_leftovers(job_id);
+        stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.purge", stage_start);
         self.transition_postprocessing_status(job_id, JobStatus::Downloading, Some("downloading"));
 
         if has_crc_failures {
@@ -3771,9 +4114,11 @@ impl Pipeline {
                 }
             }
         }
-        if let Some(set) = self.par2_set(job_id) {
-            for desc in set.files.values() {
-                keep.insert(sanitize_download_filename(&desc.filename));
+        for set_id in self.par2_servable_set_ids(job_id) {
+            if let Some(set) = self.par2_set_for(job_id, set_id) {
+                for desc in set.files.values() {
+                    keep.insert(sanitize_download_filename(&desc.filename));
+                }
             }
         }
 
@@ -3817,7 +4162,12 @@ impl Pipeline {
             job_id,
             error: error.clone(),
         });
-        self.fail_job(job_id, error);
+        if let Some(set_id) = self.par2_served_set_id(job_id) {
+            let _ = self.mark_par2_set_failed(job_id, set_id, error);
+            self.finish_or_rearm_after_par2_set_failure(job_id);
+        } else {
+            self.fail_job(job_id, error);
+        }
     }
 
     /// After an *authoritative* post-repair verification, re-persist every
@@ -4774,6 +5124,24 @@ impl Pipeline {
 
         self.reapply_promoted_recovery_queue(job_id);
 
+        let par2_bypassed = self.par2_bypassed.contains(&job_id);
+        if !par2_bypassed && !self.served_par2_set_needs_reconciliation(job_id) {
+            self.activate_next_par2_gate_set(job_id);
+            let has_settled_set = self.par2_runtime(job_id).is_some_and(|runtime| {
+                runtime
+                    .ordered_set_ids()
+                    .into_iter()
+                    .any(|set_id| runtime.set_runtime(set_id).is_some_and(|set| set.settled))
+            });
+            if has_settled_set {
+                // Extraction topology maintenance may clear the compatibility
+                // bit without discarding the per-set answers. Recompute from
+                // those answers here rather than asking a clean set to run
+                // again.
+                self.mark_par2_verified(job_id).await;
+            }
+        }
+
         // A direct set whose job carries no PAR2 set to verify
         // against — bypassed, or no recovery article ever landed — would
         // otherwise wait forever for a verdict that is not coming. Asked here,
@@ -4781,8 +5149,11 @@ impl Pipeline {
         // is settled; `mark_par2_verified` covers the verdict case.
         self.finalize_ready_direct_sets(job_id).await;
 
-        let par2_bypassed = self.par2_bypassed.contains(&job_id);
-        let par2_loaded = self.par2_set(job_id).is_some();
+        if let Some(message) = self.aggregate_par2_failure_message(job_id) {
+            self.fail_job(job_id, message);
+            return;
+        }
+        let par2_loaded = !self.par2_servable_set_ids(job_id).is_empty();
         let download_pipeline_exhausted = !self.job_has_pending_download_pipeline_work(job_id);
         if download_pipeline_exhausted {
             self.emit_download_pipeline_drained_if_pending(job_id);
@@ -4838,8 +5209,19 @@ impl Pipeline {
             // re-entry budget starts over with it.
             set_runtime.post_verdict_reconcile_attempts = 0;
         }
-        let par2_verdict_open =
-            !self.par2_verified.contains(&job_id) || par2_verdict_stale_after_failed_extraction;
+        let served_set_settled = self.par2_served_set_id(job_id).is_some_and(|set_id| {
+            self.par2_runtime(job_id)
+                .and_then(|runtime| runtime.set_runtime(set_id))
+                .is_some_and(|set_runtime| {
+                    (set_runtime.settled && set_runtime.failure.is_none())
+                        // A retained job-level verdict predating per-set
+                        // runtime answers is already authoritative for its
+                        // one served set. Runtime reconstruction supplies the
+                        // set-local answer on the next metadata replay.
+                        || self.par2_verified.contains(&job_id)
+                })
+        });
+        let par2_verdict_open = !served_set_settled || par2_verdict_stale_after_failed_extraction;
         let par2_may_still_rule = par2_loaded && !par2_bypassed && par2_verdict_open;
         let extraction_settled = !self.job_has_active_extraction_tasks(job_id);
         // One: extraction was attempted and failed. The archives cannot be
@@ -5222,11 +5604,38 @@ impl Pipeline {
             // decides whether to wait, repair, or give up.
             self.salvage_partial_promoted_recovery_volumes(job_id).await;
 
-            // Latched, so a posting carrying more than one recovery set says so
-            // once rather than on every entry to this gate.
-            self.warn_unserved_recovery_sets_once(job_id);
+            // Latched, so an indexless recovery set is named once rather than
+            // on every entry to this gate.
+            self.warn_unservable_recovery_sets_once(job_id);
 
             let par2_set = self.par2_set(job_id).cloned();
+            let par2_set_id = self.par2_served_set_id(job_id);
+
+            if let Some(set_id) = par2_set_id
+                && self.par2_set_is_absent_from_job(job_id, set_id)
+            {
+                let index_filename = self
+                    .par2_runtime(job_id)
+                    .and_then(|runtime| runtime.set_runtime(set_id))
+                    .map(|set_runtime| set_runtime.summary.index_filename.clone())
+                    .filter(|filename| !filename.is_empty())
+                    .unwrap_or_else(|| set_id.to_string());
+                info!(
+                    job_id = job_id.0,
+                    recovery_set_id = %set_id,
+                    index_filename = %index_filename,
+                    "skipping absent PAR2 recovery set with no bound payload bytes"
+                );
+                let _ = self.mark_par2_set_verified(job_id, set_id).await;
+                self.continue_after_aggregate_clean_par2_settlement(
+                    job_id,
+                    has_crc_failures,
+                    archive_extraction_applicable,
+                    "skipped absent PAR2 recovery set",
+                )
+                .await;
+                return;
+            }
 
             if par2_set.is_some() {
                 // What the dual-CRC grid managed to claim off the download for
@@ -5263,6 +5672,7 @@ impl Pipeline {
                         );
                         self.finish_clean_par2_verification(
                             job_id,
+                            par2_set_id.expect("loaded PAR2 set has an active recovery-set ID"),
                             working_dir.clone(),
                             CleanPar2Verification {
                                 verification,
@@ -5284,8 +5694,9 @@ impl Pipeline {
                         );
                     }
                     Err(message) => {
-                        warn!(job_id = job_id.0, error = %message);
-                        self.fail_job(job_id, message);
+                        let set_id =
+                            par2_set_id.expect("loaded PAR2 set has an active recovery-set ID");
+                        self.finish_par2_set_failure(job_id, set_id, message).await;
                         return;
                     }
                 }
@@ -5301,7 +5712,14 @@ impl Pipeline {
 
                         self.try_deobfuscate_files_with_par2(job_id).await;
                         self.retry_par2_authoritative_identity(job_id).await;
-                        self.mark_par2_verified(job_id).await;
+                        let set_id =
+                            par2_set_id.expect("loaded PAR2 set has an active recovery-set ID");
+                        let _ = self.mark_par2_set_verified(job_id, set_id).await;
+
+                        if !self.par2_verified.contains(&job_id) {
+                            self.schedule_job_completion_check(job_id);
+                            return;
+                        }
 
                         if archive_extraction_applicable {
                             self.retry_archive_extraction_after_verify_or_repair(job_id)
@@ -5318,6 +5736,7 @@ impl Pipeline {
             }
 
             if let Some(par2_set) = par2_set {
+                let set_id = par2_set.recovery_set_id;
                 let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
                 // Two direct-store preconditions for *any*
                 // authoritative pass below, whichever branch it takes. Both are
@@ -5421,8 +5840,7 @@ impl Pipeline {
                     {
                         Ok(outcome) => outcome,
                         Err(message) => {
-                            warn!(job_id = job_id.0, error = %message);
-                            self.fail_job(job_id, message);
+                            self.finish_par2_set_failure(job_id, set_id, message).await;
                             return;
                         }
                     };
@@ -5444,8 +5862,7 @@ impl Pipeline {
                         &verification.repairable
                     {
                         let msg = par2_resource_limit_message(reason);
-                        warn!(job_id = job_id.0, error = %msg);
-                        self.fail_job(job_id, msg);
+                        self.finish_par2_set_failure(job_id, set_id, msg).await;
                         return;
                     }
 
@@ -5481,11 +5898,15 @@ impl Pipeline {
                             )
                             .await
                         {
-                            warn!(job_id = job_id.0, error = %error);
-                            self.fail_job(job_id, error);
+                            self.finish_par2_set_failure(job_id, set_id, error).await;
                             return;
                         }
-                        self.mark_par2_verified(job_id).await;
+                        let _ = self.mark_par2_set_verified(job_id, set_id).await;
+
+                        if !self.par2_verified.contains(&job_id) {
+                            self.schedule_job_completion_check(job_id);
+                            return;
+                        }
 
                         if has_crc_failures {
                             if self.normalization_retried.contains(&job_id) {
@@ -5553,12 +5974,14 @@ impl Pipeline {
                     );
 
                     if total_recovery_capacity < blocks_needed {
-                        self.fail_job(
+                        self.finish_par2_set_failure(
                             job_id,
+                            set_id,
                             format!(
                                 "not repairable: {blocks_needed} damaged slices, only {total_recovery_capacity} recovery blocks advertised"
                             ),
-                        );
+                        )
+                        .await;
                         return;
                     }
 
@@ -5583,8 +6006,7 @@ impl Pipeline {
                                 "not repairable: {blocks_needed} damaged slices, \
                                  only {targeted_total} recovery blocks available in NZB"
                             );
-                            warn!(job_id = job_id.0, %msg);
-                            self.fail_job(job_id, msg);
+                            self.finish_par2_set_failure(job_id, set_id, msg).await;
                             return;
                         }
 
@@ -5612,8 +6034,7 @@ impl Pipeline {
                         let msg = format!(
                             "not repairable: PAR2 analysis found incomplete critical repair metadata or unusable recovery despite {recovery_now} available recovery blocks"
                         );
-                        warn!(job_id = job_id.0, error = %msg);
-                        self.fail_job(job_id, msg);
+                        self.finish_par2_set_failure(job_id, set_id, msg).await;
                         return;
                     }
 
@@ -5671,7 +6092,7 @@ impl Pipeline {
                 //    That path carries a single-retry latch of its own.
                 if !par2_verdict_open
                     && !has_crc_failures
-                    && self.settled_verdict_left_only_proven_protected_files(job_id)
+                    && self.settled_verdict_left_only_proven_protected_files(job_id, set_id)
                 {
                     let attempts = {
                         let set_runtime = self.ensure_par2_runtime(job_id).served_mut().expect(
@@ -5724,8 +6145,7 @@ impl Pipeline {
                 {
                     Ok(result) => result,
                     Err(message) => {
-                        warn!(job_id = job_id.0, error = %message);
-                        self.fail_job(job_id, message);
+                        self.finish_par2_set_failure(job_id, set_id, message).await;
                         return;
                     }
                 };
@@ -5780,8 +6200,7 @@ impl Pipeline {
                     &verification.repairable
                 {
                     let msg = par2_resource_limit_message(reason);
-                    warn!(job_id = job_id.0, error = %msg);
-                    self.fail_job(job_id, msg);
+                    self.finish_par2_set_failure(job_id, set_id, msg).await;
                     return;
                 }
 
@@ -5814,7 +6233,7 @@ impl Pipeline {
                         )
                         .await
                     {
-                        self.fail_job(job_id, error);
+                        self.finish_par2_set_failure(job_id, set_id, error).await;
                         return;
                     }
                     self.retry_par2_authoritative_identity(job_id).await;
@@ -5829,11 +6248,15 @@ impl Pipeline {
                         )
                         .await
                     {
-                        warn!(job_id = job_id.0, error = %error);
-                        self.fail_job(job_id, error);
+                        self.finish_par2_set_failure(job_id, set_id, error).await;
                         return;
                     }
-                    self.mark_par2_verified(job_id).await;
+                    let _ = self.mark_par2_set_verified(job_id, set_id).await;
+
+                    if !self.par2_verified.contains(&job_id) {
+                        self.schedule_job_completion_check(job_id);
+                        return;
+                    }
 
                     if has_crc_failures {
                         if self.normalization_retried.contains(&job_id) {
@@ -5903,7 +6326,7 @@ impl Pipeline {
                         )
                         .await
                     {
-                        self.fail_job(job_id, error);
+                        self.finish_par2_set_failure(job_id, set_id, error).await;
                         return;
                     }
 
@@ -5918,8 +6341,7 @@ impl Pipeline {
                     {
                         Ok(outcome) => outcome,
                         Err(message) => {
-                            warn!(job_id = job_id.0, error = %message);
-                            self.fail_job(job_id, message);
+                            self.finish_par2_set_failure(job_id, set_id, message).await;
                             return;
                         }
                     };
@@ -5944,18 +6366,19 @@ impl Pipeline {
                         &repair_preview.verification.repairable
                     {
                         let msg = par2_resource_limit_message(reason);
-                        warn!(job_id = job_id.0, error = %msg);
-                        self.fail_job(job_id, msg);
+                        self.finish_par2_set_failure(job_id, set_id, msg).await;
                         return;
                     }
 
                     if total_recovery_capacity < damaged {
-                        self.fail_job(
+                        self.finish_par2_set_failure(
                             job_id,
+                            set_id,
                             format!(
                                 "not repairable: {damaged} damaged slices, only {total_recovery_capacity} recovery blocks advertised"
                             ),
-                        );
+                        )
+                        .await;
                         return;
                     }
 
@@ -5983,8 +6406,7 @@ impl Pipeline {
                                 "not repairable: {damaged} damaged slices, \
                                  only {targeted_total} recovery blocks available in NZB"
                             );
-                            warn!(job_id = job_id.0, %msg);
-                            self.fail_job(job_id, msg);
+                            self.finish_par2_set_failure(job_id, set_id, msg).await;
                             return;
                         }
 

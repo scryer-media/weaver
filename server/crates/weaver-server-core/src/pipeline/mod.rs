@@ -1321,7 +1321,7 @@ pub(super) struct Par2SetSummary {
     /// it exists here to be named in the warning and to attribute that volume.
     pub(super) describes: bool,
     /// The file whose packets described this set, and its position in the
-    /// posting. The position is the tiebreak that makes selection independent
+    /// posting. The position orders independent verification passes regardless
     /// of arrival order.
     pub(super) index_filename: String,
     pub(super) index_file_index: u32,
@@ -1330,8 +1330,8 @@ pub(super) struct Par2SetSummary {
     pub(super) base_name: Option<String>,
     /// Sanitized names of the files this set protects.
     pub(super) described_filenames: Vec<String>,
-    /// How much payload this set protects. The selection key: the set covering
-    /// the most bytes is the one worth serving.
+    /// How much payload this set protects. Retained for diagnostics and for
+    /// compatibility selection before the completion gate takes over.
     pub(super) described_bytes: u64,
     /// Files whose packets were observed to belong to this set.
     pub(super) volume_file_indices: HashSet<u32>,
@@ -1341,6 +1341,22 @@ pub(super) struct Par2SetSummary {
 pub(super) struct Par2SetRuntime {
     /// The parsed recovery set. `None` until an index of this set was parsed.
     pub(super) set: Option<Arc<Par2FileSet>>,
+    /// The completion gate has reached a final answer for this recovery set.
+    ///
+    /// A later index can add a different set and reopen the job aggregate, but
+    /// it must not make this set read the same bytes again.  Its own verdict
+    /// and reconciliation latch therefore live with the set rather than with
+    /// the job.
+    pub(super) settled: bool,
+    /// A final answer that could not verify or repair this set.  The gate keeps
+    /// processing later sets before turning these failures into the job result.
+    pub(super) failure: Option<String>,
+    /// Damage observed while deciding this set.  The aggregate reports one
+    /// job-level verification metric after every servable set has settled.
+    pub(super) missing_blocks: u32,
+    /// Whether any pass for this set required repair.  A clean post-repair pass
+    /// does not erase that fact from the aggregate verification result.
+    pub(super) needed_repair: bool,
     /// What this set describes and which volumes spoke for it.
     pub(super) summary: Par2SetSummary,
     /// The on-disk primary PAR2 file used to reopen an evicted retained session.
@@ -1369,21 +1385,19 @@ pub(super) struct Par2SetRuntime {
 
 #[derive(Default)]
 pub(super) struct Par2RuntimeState {
-    /// Every recovery set this job has met, served or not. The served entry is
-    /// selected for repair; the others are kept so their volumes stop counting
-    /// toward the served set's capacity and their files can be named for what
-    /// they are.
+    /// Every recovery set this job has met. Each parsed, described entry gets
+    /// its own completion-gate pass; entries without an index remain only for
+    /// attribution and an operator warning.
     pub(super) sets: HashMap<par2_rs::RecoverySetId, Par2SetRuntime>,
-    /// The recovery set this job serves, if an index has been selected.
+    /// The set currently exposed through the compatibility helpers while its
+    /// own gate pass is running.
     pub(super) served: Option<par2_rs::RecoverySetId>,
     pub(super) files: HashMap<u32, Par2FileRuntime>,
     /// Completion-time checksums retained only long enough to seed a session
     /// opened after a payload file finished downloading.
     pub(super) completed_checksums: HashMap<NzbFileId, CompletedFileChecksum>,
-    /// Whether the job has already said out loud that it carries sets it does
-    /// not serve. Cleared whenever a set is newly met or the served set
-    /// changes, so the operator hears about a changed picture exactly once
-    /// rather than on every completion-gate entry.
+    /// Whether the job has already named its indexless recovery sets. Cleared
+    /// whenever a set is newly met so a changed picture is reported once.
     pub(super) unserved_sets_warned: bool,
 }
 

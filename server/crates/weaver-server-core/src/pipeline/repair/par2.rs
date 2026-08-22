@@ -629,20 +629,16 @@ impl Pipeline {
         Some(names)
     }
 
-    /// Whether a recovery set the job knows about but does not serve is the one
-    /// that describes this file.
+    /// Whether a file is covered only by a set whose index never arrived.
     ///
-    /// Only one set is served, so a file belonging to any other binds to
-    /// nothing — and would otherwise be reported as though no recovery had ever
-    /// covered it, which is a different and much worse story than the truth.
-    pub(in crate::pipeline) fn file_is_described_by_an_unserved_recovery_set(
+    /// Parsed sets are all served by the completion gate.  The remaining case
+    /// is a set known from foreign packets but lacking descriptions and an
+    /// index, so no verifier or repairer can ever act on its claimed files.
+    pub(in crate::pipeline) fn file_is_described_only_by_an_unservable_recovery_set(
         &self,
         file_id: NzbFileId,
     ) -> bool {
         let Some(runtime) = self.par2_runtime(file_id.job_id) else {
-            return false;
-        };
-        let Some(primary_id) = runtime.served_set_id() else {
             return false;
         };
         let Some(names) = self.par2_binding_candidate_names(file_id) else {
@@ -651,7 +647,7 @@ impl Pipeline {
         runtime
             .sets
             .iter()
-            .filter(|(set_id, _)| **set_id != primary_id)
+            .filter(|(_, set_runtime)| !set_runtime.summary.describes)
             .any(|(_, set_runtime)| {
                 set_runtime
                     .summary
@@ -1540,11 +1536,16 @@ impl Pipeline {
             entry.recovery_blocks = recovery_blocks;
         }
 
-        // Selection is frozen once the job has a PAR2 verdict. Swapping the
-        // served set out from under a settled verdict would reopen it, which is
-        // the re-entry the settled-verdict guard exists to close; and the
-        // verdict bit lives only in memory, so a restart re-derives it from
-        // this same deterministic selection rather than inheriting a choice.
+        // A newly parsed index can expose a set that was not part of an
+        // earlier aggregate.  Recompute before choosing the compatibility view
+        // so that the old set keeps its settled verdict while the new one is
+        // queued for its own pass.
+        self.mark_par2_verified(job_id).await;
+
+        // The compatibility view still starts from deterministic metadata
+        // selection.  The completion gate replaces it with the earliest
+        // unsettled set before every pass, so this cannot re-judge a set that
+        // already settled when a later index appears.
         let selected = (!self.par2_verified.contains(&job_id))
             .then(|| self.select_primary_recovery_set(job_id))
             .flatten();
@@ -1556,7 +1557,7 @@ impl Pipeline {
         for set_id in observed_set_ids {
             self.install_recovery_set(job_id, set_id).await;
         }
-        self.warn_unserved_recovery_sets_once(job_id);
+        self.warn_unservable_recovery_sets_once(job_id);
 
         let _ = self
             .event_tx
@@ -1746,32 +1747,29 @@ impl Pipeline {
             .map(|(set_id, _)| *set_id)
     }
 
-    /// Say once, loudly, that this posting carries recovery sets nothing will
-    /// act on.
+    /// Say once, loudly, that this posting carries recovery sets without an
+    /// index and therefore without a possible verification pass.
     ///
     /// The files those sets describe are still delivered; what is lost is the
     /// repair they were entitled to, and that is worth exactly one line naming
     /// every set and every file it covers. Latched because the completion gate
     /// is entered many times per job and nothing about this changes between
     /// entries.
-    pub(in crate::pipeline) fn warn_unserved_recovery_sets_once(&mut self, job_id: JobId) {
-        let Some(primary_id) = self.par2_served_set_id(job_id) else {
-            return;
-        };
+    pub(in crate::pipeline) fn warn_unservable_recovery_sets_once(&mut self, job_id: JobId) {
         let Some(runtime) = self.par2_runtime(job_id) else {
             return;
         };
-        if runtime.unserved_sets_warned || runtime.sets.len() < 2 {
+        if runtime.unserved_sets_warned {
             return;
         }
 
-        let mut unserved: Vec<String> = runtime
+        let mut unservable: Vec<String> = runtime
             .ordered_set_ids()
             .into_iter()
-            .filter(|set_id| *set_id != primary_id)
             .filter_map(|set_id| {
                 runtime
                     .set_runtime(set_id)
+                    .filter(|set_runtime| !set_runtime.summary.describes)
                     .map(|set_runtime| (set_id, set_runtime))
             })
             .map(|(set_id, set_runtime)| {
@@ -1788,15 +1786,16 @@ impl Pipeline {
                 }
             })
             .collect();
-        unserved.sort();
+        if unservable.is_empty() {
+            return;
+        }
+        unservable.sort();
         warn!(
             job_id = job_id.0,
-            "this posting carries {} recovery sets and only one can be served: {} \
-             unserved set(s) will neither verify nor repair the files they cover, \
-             which are delivered as they arrived — {}",
+            "this posting carries {} recovery set(s) with no posted index: they cannot verify \
+             or repair the files they cover — {}",
             runtime.sets.len(),
-            unserved.len(),
-            unserved.join("; ")
+            unservable.join("; ")
         );
 
         if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
@@ -2094,7 +2093,7 @@ impl Pipeline {
             {
                 Box::pin(self.install_primary_recovery_set(job_id, set_id)).await;
             }
-            self.warn_unserved_recovery_sets_once(job_id);
+            self.warn_unservable_recovery_sets_once(job_id);
         }
     }
 

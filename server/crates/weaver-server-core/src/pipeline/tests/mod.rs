@@ -51,6 +51,7 @@ mod download_dispatch;
 mod health_probe;
 mod par2_completion;
 mod par2_multiset_binding;
+mod par2_multiset_gate;
 mod par2_multiset_grid;
 mod rar_extraction;
 mod restore_history;

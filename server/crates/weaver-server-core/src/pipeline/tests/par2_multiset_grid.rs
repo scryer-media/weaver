@@ -552,9 +552,9 @@ async fn direct_sets_stay_isolated_by_their_recovery_set() {
     };
     assert!(
         pipeline
-            .demote_direct_sets_with_par2_damage(job_id, &damaged)
+            .demote_direct_sets_with_par2_damage_for_set(job_id, served.recovery_set_id, &damaged)
             .await,
-        "damage in the served set demotes its direct archive set"
+        "damage in one set demotes that set's direct archive set"
     );
     assert!(
         !pipeline.is_direct_source_file(NzbFileId {
