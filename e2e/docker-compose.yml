@@ -32,7 +32,7 @@ services:
   # Second NNTP server — backup/failover target for multi-server testing.
   # Independent data volume; chaos can be enabled per-server.
   nntp2:
-    image: ${E2E_NNTP_IMAGE:-weaver-e2e-nntp:local}
+    image: ${E2E_NNTP2_IMAGE:-${E2E_NNTP_IMAGE:-weaver-e2e-nntp:local}}
     pull_policy: never
     ports:
       - "${E2E_NNTP2_PORT:-2119}:119"

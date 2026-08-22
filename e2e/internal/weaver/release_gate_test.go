@@ -347,6 +347,21 @@ func TestWeaverCleanupUsesExactComposeProject(t *testing.T) {
 	}
 }
 
+func TestPreseededNntpComposeArgsUseTheNoVolumeOverride(t *testing.T) {
+	t.Setenv("E2E_PROJECT", "weaver-seeded-images")
+	t.Setenv(nntpSeedImageActiveEnv, "1")
+	got := dockerComposeArgs("up", "-d", "nntp", "nntp2")
+	want := []string{
+		"compose", "-p", "weaver-seeded-images",
+		"-f", filepath.Join(e2eDir(), "docker-compose.yml"),
+		"-f", filepath.Join(e2eDir(), "docker-compose.preseeded-nntp.yml"),
+		"up", "-d", "nntp", "nntp2",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("pre-seeded image compose args = %q, want %q", got, want)
+	}
+}
+
 func TestWeaverReleaseCleanupRejectsMissingExactProject(t *testing.T) {
 	t.Setenv("E2E_PROJECT", "")
 	err := cleanupExactWeaverReleaseProject()

@@ -1188,6 +1188,13 @@ func (p *fullPhaseContext) env() map[string]string {
 	if seedJobs, ok := fullSeedJobsOverride(); ok {
 		env["E2E_SEED_JOBS"] = seedJobs
 	}
+	if nntpSeedImageCacheEnabled() && strings.TrimSpace(p.SeedProfile) != "" {
+		if set, err := nntpSeedImageSetForProfile(p.SeedProfile, fixtureSlugsForSeedProfile(p.SeedProfile)); err == nil && set.ready() {
+			env["E2E_NNTP_IMAGE"] = set.Primary
+			env["E2E_NNTP2_IMAGE"] = set.Backup
+			env[nntpSeedImageActiveEnv] = "1"
+		}
+	}
 	if p.Command == "container-restart" {
 		env["E2E_WEAVER_ENCRYPTION_KEY"] = ""
 	}

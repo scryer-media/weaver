@@ -724,7 +724,15 @@ func discoverRuntimePortState() (runtimePortState, error) {
 }
 
 func dockerComposeArgs(args ...string) []string {
-	return append([]string{"compose", "-p", composeProject()}, args...)
+	composeArgs := []string{"compose", "-p", composeProject()}
+	if envBool(nntpSeedImageActiveEnv, false) {
+		composeArgs = append(
+			composeArgs,
+			"-f", filepath.Join(e2eDir(), "docker-compose.yml"),
+			"-f", filepath.Join(e2eDir(), "docker-compose.preseeded-nntp.yml"),
+		)
+	}
+	return append(composeArgs, args...)
 }
 
 func dockerComposeServiceContainerID(service string) (string, error) {
@@ -1620,6 +1628,9 @@ func ensureSeedingInfrastructureErr() error {
 }
 
 func ensureStandardDockerInfrastructure() {
+	if err := applyNntpSeedImageCacheForProfile(os.Getenv("E2E_SEED_PROFILE")); err != nil {
+		log.Fatalf("prepare pre-seeded NNTP images: %v", err)
+	}
 	services := []string{"nntp", "newznab", "nntp2"}
 	if weaverUsesPostgresDatastore() {
 		services = append(services, "weaver-postgres")
@@ -2224,6 +2235,32 @@ func seedAllForProfile(profile string) {
 	}
 
 	ensureFixtureProfiles(profile)
+	var seedImages nntpSeedImageSet
+	if nntpSeedImageCacheEnabled() {
+		var err error
+		seedImages, err = nntpSeedImageSetForProfile(profile, slugs)
+		if err != nil {
+			log.Fatalf("fingerprint pre-seeded NNTP images for profile %s: %v", profile, err)
+		}
+		if seedImages.ready() {
+			emitProgressEvent(progressEvent{Kind: "seed_total", Total: len(dirs), Detail: "fixtures (pre-seeded NNTP images)"})
+			if err := restoreSeedImageCache(seedImages, slugs); err != nil {
+				emitProgressEvent(progressEvent{Kind: "seed_done", Current: len(dirs), Total: len(dirs), Status: "fail"})
+				log.Fatalf("restore pre-seeded NNTP images for profile %s: %v", profile, err)
+			}
+			for index, slug := range slugs {
+				emitProgressEvent(progressEvent{
+					Kind:    "seed_progress",
+					Current: index + 1,
+					Total:   len(dirs),
+					Status:  "pass",
+					Detail:  slug + " (pre-seeded image)",
+				})
+			}
+			emitProgressEvent(progressEvent{Kind: "seed_done", Current: len(dirs), Total: len(dirs), Status: "pass"})
+			return
+		}
+	}
 	ensureSeedingInfrastructure()
 	emitProgressEvent(progressEvent{Kind: "seed_total", Total: len(dirs), Detail: "fixtures"})
 
@@ -2330,6 +2367,14 @@ func seedAllForProfile(profile string) {
 	if err := applyPrimarySeedMutationsForSlugs(slugs); err != nil {
 		emitProgressEvent(progressEvent{Kind: "seed_done", Current: len(dirs), Total: len(dirs), Status: "fail"})
 		log.Fatalf("apply primary-only fixture mutations after seed-all: %v", err)
+	}
+	if nntpSeedImageCacheEnabled() {
+		if err := captureSeedImageCache(seedImages, slugs); err != nil {
+			// The completed seed remains valid for this phase. The image cache is
+			// a local acceleration layer, so a disk or Docker image-build problem
+			// must not turn a correctly seeded E2E phase into a false failure.
+			log.Printf("warning: pre-seed NNTP image cache unavailable for profile=%s: %v", profile, err)
+		}
 	}
 	emitProgressEvent(progressEvent{Kind: "seed_done", Current: len(dirs), Total: len(dirs), Status: "pass"})
 }
