@@ -75,7 +75,7 @@ fn sab_adapter_supplies_the_documented_eight_arguments_and_sab_variables() {
     assert_eq!(
         args,
         vec![
-            "/work/job".to_string(),
+            "/complete/job".to_string(),
             "example.nzb".to_string(),
             "Example Job".to_string(),
             String::new(),
@@ -91,7 +91,7 @@ fn sab_adapter_supplies_the_documented_eight_arguments_and_sab_variables() {
     assert_eq!(env.get("SAB_FILENAME").unwrap(), "example.nzb");
     assert_eq!(env.get("SAB_CAT").unwrap(), "movies");
     assert_eq!(env.get("SAB_GROUP").unwrap(), "alt.binaries.test");
-    assert_eq!(env.get("SAB_COMPLETE_DIR").unwrap(), "/work/job");
+    assert_eq!(env.get("SAB_COMPLETE_DIR").unwrap(), "/complete/job");
     assert_eq!(env.get("SAB_STATUS").unwrap(), "Running");
     assert_eq!(env.get("SAB_PP_STATUS").unwrap(), "2");
     assert_eq!(
@@ -165,7 +165,7 @@ fn nzbget_adapter_supplies_nzbpp_nzbpo_and_nzbop_variables_with_no_positional_ar
     assert!(args.is_empty(), "NZBGet scripts read the environment only");
     assert_eq!(env.get("NZBPP_NZBID").unwrap(), "42");
     assert_eq!(env.get("NZBPP_NZBNAME").unwrap(), "Example Job");
-    assert_eq!(env.get("NZBPP_DIRECTORY").unwrap(), "/work/job");
+    assert_eq!(env.get("NZBPP_DIRECTORY").unwrap(), "/complete/job");
     assert_eq!(env.get("NZBPP_NZBFILENAME").unwrap(), "example.nzb");
     assert_eq!(env.get("NZBPP_QUEUEDFILE").unwrap(), "example.nzb");
     assert_eq!(env.get("NZBPP_FINALDIR").unwrap(), "/complete/job");

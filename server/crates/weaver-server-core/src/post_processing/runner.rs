@@ -256,7 +256,7 @@ fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecuti
     let adapter_args = adapter_environment_and_args(request, &mut env)?;
     args.extend(adapter_args);
 
-    let working_directory = fs::canonicalize(&request.context.working_directory)?;
+    let final_directory = fs::canonicalize(&request.context.final_directory)?;
 
     Ok(PreparedExecution {
         supervisor_executable: request.supervisor_executable.clone(),
@@ -267,7 +267,7 @@ fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecuti
                 .map(OsStringWire::from_os)
                 .collect::<Result<_, _>>()?,
             env,
-            cwd: working_directory,
+            cwd: final_directory,
         },
         adapter: request.manifest.adapter(),
     })
@@ -380,7 +380,7 @@ fn adapter_environment_and_args(
                 ("SAB_GROUP", context.group.clone().unwrap_or_default()),
                 (
                     "SAB_COMPLETE_DIR",
-                    path_text(&context.working_directory)?.to_string(),
+                    path_text(&context.final_directory)?.to_string(),
                 ),
                 ("SAB_STATUS", "Running".to_string()),
                 ("SAB_PP_STATUS", status.clone()),
@@ -433,7 +433,7 @@ fn adapter_environment_and_args(
             }
             insert_options(env, "SAB_OPTION_", &request.options)?;
             Ok(vec![
-                context.working_directory.as_os_str().to_owned(),
+                context.final_directory.as_os_str().to_owned(),
                 OsString::from(&context.nzb_filename),
                 OsString::from(&context.name),
                 OsString::new(),
@@ -448,11 +448,7 @@ fn adapter_environment_and_args(
             let total_status = status.split_once('/').map_or(status, |(total, _)| total);
             insert_env(env, "NZBPP_NZBID", &context.job_id.to_string())?;
             insert_env(env, "NZBPP_NZBNAME", &context.name)?;
-            insert_env(
-                env,
-                "NZBPP_DIRECTORY",
-                path_text(&context.working_directory)?,
-            )?;
+            insert_env(env, "NZBPP_DIRECTORY", path_text(&context.final_directory)?)?;
             insert_env(env, "NZBPP_NZBFILENAME", &context.nzb_filename)?;
             insert_env(env, "NZBPP_QUEUEDFILE", &context.nzb_filename)?;
             insert_env(

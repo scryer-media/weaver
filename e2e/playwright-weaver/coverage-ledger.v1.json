@@ -331,6 +331,11 @@
       "oracle": "browser"
     },
     {
+      "name": "setPostProcessingScriptDirectory",
+      "owner": "ui-post-processing",
+      "oracle": "browser"
+    },
+    {
       "name": "setScriptLists",
       "owner": "ui-post-processing",
       "oracle": "browser"

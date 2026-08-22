@@ -516,6 +516,42 @@ fn par2_verification_needs_repair(verification: &par2_rs::VerificationResult) ->
     verification.needs_repair()
 }
 
+/// Why a post-repair verification should fail the repair, if it should.
+///
+/// Damage and misplacement both make a verification "need repair", and only one
+/// of them is a failure. A file that is intact but sitting under the wrong name
+/// verifies as `Renamed` — not `Complete`, so `needs_repair()` is true — and
+/// that same status is what the placement plan turns into a rename entry. A
+/// repair rejected on it is refused for the one thing the placement about to
+/// run would fix, and the message can only report zero damaged slices, because
+/// nothing was damaged. Misplacement is judged after placement instead, by
+/// re-reading the set where it then sits.
+fn par2_post_repair_damage_failure(verification: &par2_rs::VerificationResult) -> Option<String> {
+    let damaged = verification
+        .files
+        .iter()
+        .filter(|file| {
+            matches!(
+                file.status,
+                par2_rs::verify::FileStatus::Damaged(_) | par2_rs::verify::FileStatus::Missing
+            )
+        })
+        .count();
+    if verification.total_missing_blocks == 0 && damaged == 0 {
+        return None;
+    }
+    let misplaced = verification
+        .files
+        .iter()
+        .filter(|file| matches!(file.status, par2_rs::verify::FileStatus::Renamed(_)))
+        .count();
+    Some(format!(
+        "PAR2 repair completed but {} damaged slice(s) across {} file(s) remain \
+         ({} file(s) still to be placed)",
+        verification.total_missing_blocks, damaged, misplaced
+    ))
+}
+
 /// What an authoritative PAR2 pass is asked to read.
 enum Par2PassScope {
     /// Every recovery file, over a plan observed by a fresh directory scan.
@@ -3965,11 +4001,7 @@ impl Pipeline {
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.verify_repaired", stage_start);
 
-        if par2_verification_needs_repair(&post_repair_verification) {
-            let msg = format!(
-                "PAR2 repair completed but {} damaged slices or file placements remain",
-                post_repair_verification.total_missing_blocks
-            );
+        if let Some(msg) = par2_post_repair_damage_failure(&post_repair_verification) {
             return self.fail_par2_repair(job_id, msg);
         }
 
@@ -4003,11 +4035,21 @@ impl Pipeline {
         // When nothing moved, the earlier answer still describes the disk
         // exactly, and re-reading would throw away the whole point of the
         // selective post-repair pass: it reads only what the repair rewrote.
-        if deobfuscated > 0 || placement_moves_paths {
+        // `misplaced_before_placement` closes the gap the other two conditions
+        // leave: a file can verify as `Renamed` and still produce no plan entry
+        // (a rename whose path has no file name lands in `unresolved`), and
+        // accepting a repair whose set was never re-read where it now sits is
+        // exactly what this pass exists to prevent.
+        let misplaced_before_placement = post_repair_verification
+            .files
+            .iter()
+            .any(|file| !matches!(file.status, par2_rs::verify::FileStatus::Complete));
+        if deobfuscated > 0 || placement_moves_paths || misplaced_before_placement {
             info!(
                 job_id = job_id.0,
                 deobfuscated,
                 placement_moves_paths,
+                misplaced_before_placement,
                 "paths moved after repair — verifying the whole set where it now sits"
             );
             let (settled, _) = match self
@@ -6955,6 +6997,101 @@ mod tests {
                 blocks_available: 8,
             },
         }
+    }
+
+    /// Six intact parts at the wrong names is not a failed repair.
+    ///
+    /// This is the shape the placement-normalization fixture produces: every
+    /// article arrived, nothing is damaged, and the parts simply need to be
+    /// moved to the names the recovery set describes. The post-repair guard
+    /// used to reject it — `needs_repair()` is true for a `Renamed` file — and
+    /// report it as "0 damaged slices", the zero being the tell that there was
+    /// nothing to repair at all. The rename entries the plan carries are
+    /// derived from those very statuses, so the guard was refusing the repair
+    /// for the one thing the next step fixes.
+    fn multi_rename_post_repair_verification() -> par2_rs::VerificationResult {
+        let files = (1..=6u8)
+            .map(|part| {
+                file_verification(
+                    part,
+                    &format!("fixture_rar5_lz_plain.part{part}.rar"),
+                    par2_rs::verify::FileStatus::Renamed(std::path::PathBuf::from(format!(
+                        "misplaced-{part}.rar"
+                    ))),
+                    vec![true, true],
+                )
+            })
+            .collect::<Vec<_>>();
+        par2_rs::verify::VerificationResult {
+            files,
+            recovery_blocks_available: 0,
+            total_missing_blocks: 0,
+            repairable: par2_rs::verify::Repairability::NotNeeded,
+        }
+    }
+
+    #[test]
+    fn a_placement_only_post_repair_result_is_not_damage() {
+        let verification = multi_rename_post_repair_verification();
+
+        assert!(
+            par2_verification_needs_repair(&verification),
+            "precondition: misplacement alone still makes the crate's own \
+             predicate report that something needs doing"
+        );
+        assert_eq!(
+            verification.total_missing_blocks, 0,
+            "precondition: and yet nothing is damaged, which is why the old \
+             message could only ever say zero"
+        );
+
+        assert_eq!(
+            par2_post_repair_damage_failure(&verification),
+            None,
+            "so the repair tail must not fail here: there is no damaged or \
+             missing file to fail over"
+        );
+
+        let plan = placement_plan_from_verification(&verification);
+        assert_eq!(
+            plan.renames.len(),
+            6,
+            "and every one of them is a rename the plan already knows how to \
+             apply; plan = {plan:?}"
+        );
+        assert!(
+            plan.unresolved.is_empty(),
+            "none of it is unresolvable; plan = {plan:?}"
+        );
+        assert!(
+            plan.swaps.is_empty(),
+            "the derived plan never emits swaps, so a swap-shaped fixture would \
+             not reproduce this at all; plan = {plan:?}"
+        );
+    }
+
+    #[test]
+    fn post_repair_damage_still_fails_and_counts_what_remains() {
+        let mut verification = multi_rename_post_repair_verification();
+        verification.files.push(file_verification(
+            9,
+            "fixture_rar5_lz_plain.part7.rar",
+            par2_rs::verify::FileStatus::Damaged(2),
+            vec![false, false],
+        ));
+        verification.total_missing_blocks = 2;
+
+        let failure = par2_post_repair_damage_failure(&verification)
+            .expect("a damaged file after repair is still a failed repair");
+        assert!(
+            failure.contains("2 damaged slice(s) across 1 file(s)"),
+            "and the message names what actually remains rather than a bare \
+             zero; failure = {failure}"
+        );
+        assert!(
+            failure.contains("6 file(s) still to be placed"),
+            "including the misplacement it is not failing over; failure = {failure}"
+        );
     }
 
     #[test]

@@ -268,14 +268,16 @@ printf 'FINAL-LINE\n'
 async fn the_executor_runs_a_list_in_order_and_rolls_the_worst_outcome_up() {
     let data = tempfile::tempdir().unwrap();
     let working_directory = data.path().join("work");
+    let final_directory = data.path().join("complete");
     fs::create_dir_all(&working_directory).unwrap();
+    fs::create_dir_all(&final_directory).unwrap();
     let db = Database::open_in_memory().unwrap();
     enable_execution(&db);
 
     let first = write_script(
         data.path(),
         "first.sh",
-        "#!/bin/sh\nprintf 'first\\n' >> \"$SAB_COMPLETE_DIR/order.txt\"\n",
+        "#!/bin/sh\nprintf 'first\\n' >> \"$SAB_COMPLETE_DIR/order.txt\"\npwd > \"$SAB_COMPLETE_DIR/cwd.txt\"\n",
     );
     let second = write_script(
         data.path(),
@@ -294,21 +296,29 @@ async fn the_executor_runs_a_list_in_order_and_rolls_the_worst_outcome_up() {
     ])
     .unwrap();
 
+    let mut job_context = context(101, working_directory.clone());
+    job_context.final_directory = final_directory.clone();
     let report = executor(&db, data.path())
-        .execute_job(
-            101,
-            list,
-            context(101, working_directory.clone()),
-            None,
-            None,
-        )
+        .execute_job(101, list, job_context, None, None)
         .await
         .unwrap();
 
     assert_eq!(
-        fs::read_to_string(working_directory.join("order.txt")).unwrap(),
+        fs::read_to_string(final_directory.join("order.txt")).unwrap(),
         "first\nsecond\nthird\n",
         "scripts run sequentially in list order"
+    );
+    assert_eq!(
+        fs::read_to_string(final_directory.join("cwd.txt")).unwrap(),
+        format!(
+            "{}\n",
+            fs::canonicalize(&final_directory).unwrap().display()
+        ),
+        "scripts run from the retained output directory"
+    );
+    assert!(
+        !working_directory.join("order.txt").exists(),
+        "scripts do not write post-processing output into the staging directory"
     );
     // A nonzero SABnzbd exit is a warning, and one warning degrades the rollup
     // without stopping the rest of the list.
