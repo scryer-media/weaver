@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::*;
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
@@ -258,6 +258,16 @@ fn unique_par2_binding_candidate(candidates: &[par2_rs::FileId]) -> Option<par2_
         return None;
     };
     Some(*candidate)
+}
+
+/// The one recovery-set description a pipeline file unambiguously identifies.
+#[derive(Debug, Clone)]
+pub(crate) struct Par2FileBinding {
+    pub(crate) recovery_set_id: par2_rs::RecoverySetId,
+    pub(crate) par2_file_id: par2_rs::FileId,
+    pub(crate) described_length: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) is_complete: bool,
 }
 
 impl Pipeline {
@@ -568,8 +578,23 @@ impl Pipeline {
     }
 
     pub(crate) fn par2_set(&self, job_id: JobId) -> Option<&Arc<Par2FileSet>> {
+        self.par2_served_set_id(job_id)
+            .and_then(|set_id| self.par2_set_for(job_id, set_id))
+    }
+
+    pub(crate) fn par2_set_for(
+        &self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) -> Option<&Arc<Par2FileSet>> {
         self.par2_runtime(job_id)
-            .and_then(|runtime| runtime.set.as_ref())
+            .and_then(|runtime| runtime.set_runtime(set_id))
+            .and_then(|set_runtime| set_runtime.set.as_ref())
+    }
+
+    pub(crate) fn par2_served_set_id(&self, job_id: JobId) -> Option<par2_rs::RecoverySetId> {
+        self.par2_runtime(job_id)
+            .and_then(crate::pipeline::Par2RuntimeState::served_set_id)
     }
 
     pub(crate) fn ensure_par2_runtime(
@@ -625,36 +650,38 @@ impl Pipeline {
         let Some(runtime) = self.par2_runtime(file_id.job_id) else {
             return false;
         };
-        let Some(primary_id) = runtime.set.as_ref().map(|set| set.recovery_set_id) else {
+        let Some(primary_id) = runtime.served_set_id() else {
             return false;
         };
         let Some(names) = self.par2_binding_candidate_names(file_id) else {
             return false;
         };
         runtime
-            .known_sets
+            .sets
             .iter()
             .filter(|(set_id, _)| **set_id != primary_id)
-            .any(|(_, summary)| {
-                summary
+            .any(|(_, set_runtime)| {
+                set_runtime
+                    .summary
                     .described_filenames
                     .iter()
                     .any(|described| names.contains(described))
             })
     }
 
-    /// Bind one pipeline file to the single PAR2 description that names it.
+    /// Bind one pipeline file to a description in one particular recovery set.
     ///
     /// This is the dual-CRC grid's name-to-description resolver: it is what
     /// [`Self::block_crc_verdicts`] and [`Self::in_stream_verified_par2_match`]
     /// use to decide which description a file's in-stream block verdicts are
-    /// measured against. Ambiguity is refused outright — a name matching two
-    /// descriptions yields no binding at all.
-    pub(crate) fn resolve_par2_file_binding(
+    /// measured against. Ambiguity inside the set is refused outright — a name
+    /// matching two descriptions yields no binding at all.
+    pub(crate) fn resolve_par2_file_binding_in_set(
         &self,
         file_id: NzbFileId,
-    ) -> Option<(par2_rs::FileId, u64, std::path::PathBuf, bool)> {
-        let set = self.par2_set(file_id.job_id)?;
+        set_id: par2_rs::RecoverySetId,
+    ) -> Option<Par2FileBinding> {
+        let set = self.par2_set_for(file_id.job_id, set_id)?;
         let state = self.jobs.get(&file_id.job_id)?;
         let file = state.assembly.file(file_id)?;
         let current_filename = self.current_filename_for_file(file_id.job_id, file);
@@ -687,12 +714,32 @@ impl Pipeline {
         // [`Self::in_stream_verified_par2_match`], which compares
         // `file.received_bytes()` against this same `desc.length`.
         let described_length = set.file_description(&par2_file_id)?.length;
-        Some((
+        Some(Par2FileBinding {
+            recovery_set_id: set_id,
             par2_file_id,
             described_length,
-            state.working_dir.join(current_filename),
-            file.is_complete(),
-        ))
+            path: state.working_dir.join(current_filename),
+            is_complete: file.is_complete(),
+        })
+    }
+
+    /// Bind one pipeline file to exactly one parsed recovery-set description.
+    ///
+    /// A description that answers from two recovery sets is ambiguous even when
+    /// each set resolves it uniquely on its own, so neither may claim it.
+    pub(crate) fn resolve_par2_file_binding(&self, file_id: NzbFileId) -> Option<Par2FileBinding> {
+        let set_ids = self.par2_runtime(file_id.job_id)?.ordered_set_ids();
+        let mut binding = None;
+        for set_id in set_ids {
+            let Some(candidate) = self.resolve_par2_file_binding_in_set(file_id, set_id) else {
+                continue;
+            };
+            if binding.is_some() {
+                return None;
+            }
+            binding = Some(candidate);
+        }
+        binding
     }
 
     /// The one description whose `hash_16k` the file's captured prefix
@@ -737,10 +784,30 @@ impl Pipeline {
         if prefix.is_empty() {
             return None;
         }
+        let state = self.jobs.get(&file_id.job_id)?;
+        let file = state.assembly.file(file_id)?;
+        let current_filename = self.current_filename_for_file(file_id.job_id, file);
+        let source_filename = self
+            .effective_file_identity(file_id.job_id, file_id)
+            .map(|identity| identity.source_filename);
+        let declared_size = self.file_declared_size.get(&file_id).copied();
         let matches = set
             .files
             .iter()
             .filter(|(_, desc)| {
+                let length_contradicts = if file.is_complete() {
+                    file.received_bytes() != desc.length
+                } else {
+                    file.received_bytes() > desc.length
+                } || declared_size.is_some_and(|size| size != desc.length);
+                if length_contradicts
+                    || crate::pipeline::is_split_fragment_of(&current_filename, &desc.filename)
+                    || source_filename.as_ref().is_some_and(|source_filename| {
+                        crate::pipeline::is_split_fragment_of(source_filename, &desc.filename)
+                    })
+                {
+                    return false;
+                }
                 let window = (desc.length as usize).min(crate::pipeline::PAR2_HASH_16K_BYTES);
                 // A zero-length description has no content to be identified by.
                 // A window the capture does not reach cannot be tested without
@@ -807,9 +874,11 @@ impl Pipeline {
         &self,
         file_id: NzbFileId,
     ) -> Option<std::collections::BTreeMap<u32, crate::pipeline::integrity::BlockVerdict>> {
-        let set = self.par2_set(file_id.job_id)?;
-        let (par2_file_id, ..) = self.resolve_par2_file_binding(file_id)?;
-        let verdicts = self.block_crcs.verdicts_against(file_id, set, par2_file_id);
+        let binding = self.resolve_par2_file_binding(file_id)?;
+        let set = self.par2_set_for(file_id.job_id, binding.recovery_set_id)?;
+        let verdicts = self
+            .block_crcs
+            .verdicts_against(file_id, set, binding.par2_file_id);
         (!verdicts.is_empty()).then_some(verdicts)
     }
 
@@ -829,8 +898,11 @@ impl Pipeline {
         file_id: NzbFileId,
         par2_set: &par2_rs::Par2FileSet,
     ) -> Option<(par2_rs::FileId, String)> {
-        let (par2_file_id, ..) = self.resolve_par2_file_binding(file_id)?;
-        let description = par2_set.file_description(&par2_file_id)?;
+        let binding = self.resolve_par2_file_binding(file_id)?;
+        if binding.recovery_set_id != par2_set.recovery_set_id {
+            return None;
+        }
+        let description = par2_set.file_description(&binding.par2_file_id)?;
         if description.length == 0 {
             // A zero-length description has no slices; "every slice intact"
             // would be vacuously true on no evidence at all.
@@ -842,7 +914,7 @@ impl Pipeline {
         // what PAR2 describes. `total_bytes()` is the NZB's declared segment
         // sum, which is yEnc-ENCODED (~3% larger on real posts) and must
         // never be compared against a description.
-        if !file.is_complete() || file.received_bytes() != description.length {
+        if !binding.is_complete || file.received_bytes() != description.length {
             return None;
         }
         let verdicts = self.block_crc_verdicts(file_id)?;
@@ -859,7 +931,7 @@ impl Pipeline {
             return None;
         }
         Some((
-            par2_file_id,
+            binding.par2_file_id,
             sanitize_download_filename(&description.filename),
         ))
     }
@@ -944,7 +1016,20 @@ impl Pipeline {
     /// claimed in stream and seeded here, or unclaimed and left for the
     /// authoritative pass to read back.
     pub(crate) fn in_stream_slice_evidence(&self, job_id: JobId) -> Vec<par2_rs::SliceEvidence> {
-        let Some(set) = self.par2_set(job_id) else {
+        let Some(set_id) = self.par2_served_set_id(job_id) else {
+            return Vec::new();
+        };
+        self.in_stream_slice_evidence_for_set(job_id, set_id)
+    }
+
+    /// Every file's in-stream block verdicts for one recovery set, shaped as
+    /// PAR2 slice evidence a repair session can be seeded with.
+    pub(crate) fn in_stream_slice_evidence_for_set(
+        &self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) -> Vec<par2_rs::SliceEvidence> {
+        let Some(set) = self.par2_set_for(job_id, set_id) else {
             return Vec::new();
         };
         let Some(state) = self.jobs.get(&job_id) else {
@@ -959,15 +1044,21 @@ impl Pipeline {
             let Some(verdicts) = self.block_crc_verdicts(file_id) else {
                 continue;
             };
-            let Some((par2_file_id, ..)) = self.resolve_par2_file_binding(file_id) else {
+            let Some(binding) = self.resolve_par2_file_binding(file_id) else {
                 continue;
             };
-            let Some(length) = set.file_description(&par2_file_id).map(|desc| desc.length) else {
+            if binding.recovery_set_id != set_id {
+                continue;
+            }
+            let Some(length) = set
+                .file_description(&binding.par2_file_id)
+                .map(|desc| desc.length)
+            else {
                 continue;
             };
             evidence.extend(crate::pipeline::integrity::slice_evidence_from_verdicts(
                 recovery_set_id,
-                par2_file_id,
+                binding.par2_file_id,
                 length,
                 slice_size,
                 &verdicts,
@@ -999,7 +1090,8 @@ impl Pipeline {
             return Ok(None);
         }
         if let Some(runtime) = self.par2_runtime.get_mut(&job_id)
-            && let Some(mut session) = runtime.session.take()
+            && let Some(set_runtime) = runtime.served_mut()
+            && let Some(mut session) = set_runtime.session.take()
         {
             {
                 // A session is reusable only if it reads sources the way this
@@ -1012,11 +1104,11 @@ impl Pipeline {
                 match (&source_access, session.is_access_backed()) {
                     (Some(access), true) => {
                         session.set_source_access(std::sync::Arc::clone(access));
-                        runtime.session_last_used = Some(Instant::now());
+                        set_runtime.session_last_used = Some(Instant::now());
                         return Ok(Some((session, false)));
                     }
                     (None, false) => {
-                        runtime.session_last_used = Some(Instant::now());
+                        set_runtime.session_last_used = Some(Instant::now());
                         return Ok(Some((session, false)));
                     }
                     _ => {}
@@ -1025,10 +1117,12 @@ impl Pipeline {
         }
 
         let Some((primary_path, recovery_paths)) = self.par2_runtime(job_id).and_then(|runtime| {
-            runtime
-                .primary_path
-                .clone()
-                .map(|primary_path| (primary_path, runtime.merged_recovery_paths.clone()))
+            runtime.served().and_then(|set_runtime| {
+                set_runtime
+                    .primary_path
+                    .clone()
+                    .map(|primary_path| (primary_path, set_runtime.merged_recovery_paths.clone()))
+            })
         }) else {
             return Ok(None);
         };
@@ -1066,9 +1160,12 @@ impl Pipeline {
         job_id: JobId,
         session: par2_rs::Par2RepairSession,
     ) {
-        let runtime = self.ensure_par2_runtime(job_id);
-        runtime.session = Some(session);
-        runtime.session_last_used = Some(Instant::now());
+        let set_runtime = self
+            .ensure_par2_runtime(job_id)
+            .served_mut()
+            .expect("PAR2 repair sessions belong to the served recovery set");
+        set_runtime.session = Some(session);
+        set_runtime.session_last_used = Some(Instant::now());
         self.enforce_par2_retained_session_budget(job_id);
     }
 
@@ -1077,7 +1174,11 @@ impl Pipeline {
             let retained_bytes = self
                 .par2_runtime
                 .values()
-                .filter_map(|runtime| runtime.session.as_ref())
+                .filter_map(|runtime| {
+                    runtime
+                        .served()
+                        .and_then(|set_runtime| set_runtime.session.as_ref())
+                })
                 .map(par2_rs::Par2RepairSession::estimated_retained_bytes)
                 .sum::<usize>();
             if retained_bytes <= PAR2_RETAINED_SESSION_BUDGET_BYTES {
@@ -1086,10 +1187,11 @@ impl Pipeline {
 
             let victim = select_par2_session_eviction(
                 self.par2_runtime.iter().map(|(job_id, runtime)| {
+                    let set_runtime = runtime.served();
                     (
                         *job_id,
-                        runtime.session.is_some(),
-                        runtime.session_last_used,
+                        set_runtime.is_some_and(|set_runtime| set_runtime.session.is_some()),
+                        set_runtime.and_then(|set_runtime| set_runtime.session_last_used),
                     )
                 }),
                 protected_job_id,
@@ -1101,9 +1203,12 @@ impl Pipeline {
                 .par2_runtime
                 .get_mut(&victim)
                 .expect("PAR2 session eviction target exists");
-            runtime.session = None;
-            runtime.session_last_used = None;
-            runtime.session_evidence_file_ids.clear();
+            let set_runtime = runtime
+                .served_mut()
+                .expect("PAR2 session eviction target serves a recovery set");
+            set_runtime.session = None;
+            set_runtime.session_last_used = None;
+            set_runtime.session_evidence_file_ids.clear();
             info!(
                 job_id = victim.0,
                 retained_bytes,
@@ -1121,9 +1226,11 @@ impl Pipeline {
             return;
         };
         runtime.completed_checksums.remove(&file_id);
-        runtime.session_evidence_file_ids.clear();
-        if let Some(session) = runtime.session.as_mut() {
-            session.invalidate_all_sources();
+        if let Some(set_runtime) = runtime.served_mut() {
+            set_runtime.session_evidence_file_ids.clear();
+            if let Some(session) = set_runtime.session.as_mut() {
+                session.invalidate_all_sources();
+            }
         }
     }
 
@@ -1131,9 +1238,11 @@ impl Pipeline {
     /// downloaded bytes. A retained location must nevertheless be discarded:
     /// repair always derives a fresh location from the current identity.
     pub(crate) fn invalidate_par2_session_for_identity_rebind(&mut self, job_id: JobId) {
-        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
-            runtime.session_evidence_file_ids.clear();
-            if let Some(session) = runtime.session.as_mut() {
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id)
+            && let Some(set_runtime) = runtime.served_mut()
+        {
+            set_runtime.session_evidence_file_ids.clear();
+            if let Some(session) = set_runtime.session.as_mut() {
                 session.invalidate_all_sources();
             }
         }
@@ -1364,7 +1473,11 @@ impl Pipeline {
             ParsedPar2Metadata::ServedSet { packets, observed } => {
                 self.note_foreign_recovery_set_sightings(job_id, file_id.file_index, &observed);
                 let merged = {
-                    let Some(set) = self.ensure_par2_runtime(job_id).set.as_mut() else {
+                    let Some(set) = self
+                        .ensure_par2_runtime(job_id)
+                        .served_mut()
+                        .and_then(|set_runtime| set_runtime.set.as_mut())
+                    else {
                         return;
                     };
                     Arc::make_mut(set).merge_packets(packets)
@@ -1403,6 +1516,7 @@ impl Pipeline {
 
         let slice_size = par2_set.slice_size;
         let recovery_block_count = par2_set.recovery_block_count();
+        let described_files = par2_set.files.len();
         let parsed_set_id = par2_set.recovery_set_id;
 
         self.record_par2_set_summary(job_id, &par2_set, &filename, file_id.file_index);
@@ -1431,11 +1545,17 @@ impl Pipeline {
         };
 
         if !serve {
+            let set_runtime = self
+                .ensure_par2_runtime(job_id)
+                .ensure_set_runtime(parsed_set_id);
+            if set_runtime.set.is_none() {
+                set_runtime.set = Some(Arc::new(par2_set));
+            }
             info!(
                 job_id = job_id.0,
                 filename = %filename,
                 slice_size,
-                described_files = par2_set.files.len(),
+                described_files,
                 "PAR2 metadata loaded for a recovery set this job does not serve"
             );
             self.warn_unserved_recovery_sets_once(job_id);
@@ -1474,17 +1594,22 @@ impl Pipeline {
         par2_set: Par2FileSet,
         primary_path: std::path::PathBuf,
     ) {
-        let replaced = self.par2_set(job_id).map(|set| set.recovery_set_id);
+        let replaced = self.par2_served_set_id(job_id);
+        let new_set_id = par2_set.recovery_set_id;
         {
             let runtime = self.ensure_par2_runtime(job_id);
-            if replaced.is_some() {
-                runtime.merged_recovery_paths.clear();
-                runtime.session = None;
-                runtime.session_last_used = None;
-                runtime.session_evidence_file_ids.clear();
+            if let Some(replaced) = replaced
+                && let Some(set_runtime) = runtime.set_runtime_mut(replaced)
+            {
+                set_runtime.merged_recovery_paths.clear();
+                set_runtime.session = None;
+                set_runtime.session_last_used = None;
+                set_runtime.session_evidence_file_ids.clear();
             }
-            runtime.primary_path = Some(primary_path);
-            runtime.set = Some(Arc::new(par2_set));
+            let set_runtime = runtime.ensure_set_runtime(new_set_id);
+            set_runtime.primary_path = Some(primary_path);
+            set_runtime.set = Some(Arc::new(par2_set));
+            runtime.served = Some(new_set_id);
             runtime.unserved_sets_warned = false;
         }
 
@@ -1549,8 +1674,8 @@ impl Pipeline {
         let set_id = par2_set.recovery_set_id;
 
         let runtime = self.ensure_par2_runtime(job_id);
-        let newly_known = !runtime.known_sets.contains_key(&set_id);
-        let summary = runtime.known_sets.entry(set_id).or_default();
+        let newly_known = runtime.set_runtime(set_id).is_none();
+        let summary = &mut runtime.ensure_set_runtime(set_id).summary;
         summary.describes = true;
         summary.index_filename = index_filename.to_string();
         summary.index_file_index = index_file_index;
@@ -1577,13 +1702,12 @@ impl Pipeline {
         let runtime = self.ensure_par2_runtime(job_id);
         let mut newly_known = false;
         for set_id in observed {
-            if !runtime.known_sets.contains_key(set_id) {
+            if runtime.set_runtime(*set_id).is_none() {
                 newly_known = true;
             }
             runtime
-                .known_sets
-                .entry(*set_id)
-                .or_default()
+                .ensure_set_runtime(*set_id)
+                .summary
                 .volume_file_indices
                 .insert(file_index);
         }
@@ -1614,13 +1738,19 @@ impl Pipeline {
     fn select_primary_recovery_set(&self, job_id: JobId) -> Option<par2_rs::RecoverySetId> {
         let runtime = self.par2_runtime(job_id)?;
         runtime
-            .known_sets
+            .sets
             .iter()
-            .filter(|(_, summary)| summary.describes)
+            .filter(|(_, set_runtime)| set_runtime.summary.describes)
             .max_by(|(_, left), (_, right)| {
-                left.described_bytes
-                    .cmp(&right.described_bytes)
-                    .then_with(|| right.index_file_index.cmp(&left.index_file_index))
+                left.summary
+                    .described_bytes
+                    .cmp(&right.summary.described_bytes)
+                    .then_with(|| {
+                        right
+                            .summary
+                            .index_file_index
+                            .cmp(&left.summary.index_file_index)
+                    })
             })
             .map(|(set_id, _)| *set_id)
     }
@@ -1634,21 +1764,27 @@ impl Pipeline {
     /// is entered many times per job and nothing about this changes between
     /// entries.
     pub(in crate::pipeline) fn warn_unserved_recovery_sets_once(&mut self, job_id: JobId) {
-        let Some(primary_id) = self.par2_set(job_id).map(|set| set.recovery_set_id) else {
+        let Some(primary_id) = self.par2_served_set_id(job_id) else {
             return;
         };
         let Some(runtime) = self.par2_runtime(job_id) else {
             return;
         };
-        if runtime.unserved_sets_warned || runtime.known_sets.len() < 2 {
+        if runtime.unserved_sets_warned || runtime.sets.len() < 2 {
             return;
         }
 
         let mut unserved: Vec<String> = runtime
-            .known_sets
-            .iter()
-            .filter(|(set_id, _)| **set_id != primary_id)
-            .map(|(set_id, summary)| {
+            .ordered_set_ids()
+            .into_iter()
+            .filter(|set_id| *set_id != primary_id)
+            .filter_map(|set_id| {
+                runtime
+                    .set_runtime(set_id)
+                    .map(|set_runtime| (set_id, set_runtime))
+            })
+            .map(|(set_id, set_runtime)| {
+                let summary = &set_runtime.summary;
                 let name = if summary.index_filename.is_empty() {
                     set_id.to_string()
                 } else {
@@ -1667,7 +1803,7 @@ impl Pipeline {
             "this posting carries {} recovery sets and only one can be served: {} \
              unserved set(s) will neither verify nor repair the files they cover, \
              which are delivered as they arrived — {}",
-            runtime.known_sets.len(),
+            runtime.sets.len(),
             unserved.len(),
             unserved.join("; ")
         );
@@ -1697,7 +1833,7 @@ impl Pipeline {
         let Some(runtime) = self.par2_runtime(job_id) else {
             return true;
         };
-        let Some(primary_id) = runtime.set.as_ref().map(|set| set.recovery_set_id) else {
+        let Some(primary_id) = runtime.served_set_id() else {
             return true;
         };
         if let Some(learned) = runtime
@@ -1707,13 +1843,12 @@ impl Pipeline {
         {
             return learned == primary_id;
         }
-        if runtime.known_sets.len() < 2 {
+        if runtime.sets.len() < 2 {
             return true;
         }
         let Some(primary_base) = runtime
-            .known_sets
-            .get(&primary_id)
-            .and_then(|summary| summary.base_name.as_deref())
+            .set_runtime(primary_id)
+            .and_then(|set_runtime| set_runtime.summary.base_name.as_deref())
         else {
             return true;
         };
@@ -1764,7 +1899,7 @@ impl Pipeline {
             return;
         }
 
-        let Some(expected_set_id) = self.par2_set(job_id).map(|set| set.recovery_set_id) else {
+        let Some(expected_set_id) = self.par2_served_set_id(job_id) else {
             return;
         };
 
@@ -1815,12 +1950,15 @@ impl Pipeline {
         }
 
         self.ensure_par2_runtime(job_id)
+            .served_mut()
+            .expect("PAR2 recovery volumes merge into the served recovery set")
             .merged_recovery_paths
             .insert(file_path.clone());
         if let Some(mut session) = self
             .par2_runtime
             .get_mut(&job_id)
-            .and_then(|runtime| runtime.session.take())
+            .and_then(|runtime| runtime.served_mut())
+            .and_then(|set_runtime| set_runtime.session.take())
         {
             let session_path = file_path.clone();
             match tokio::task::spawn_blocking(move || {
@@ -1849,7 +1987,12 @@ impl Pipeline {
         }
 
         let merge_result = {
-            let par2_set = Arc::make_mut(self.ensure_par2_runtime(job_id).set.as_mut().unwrap());
+            let par2_set = Arc::make_mut(
+                self.ensure_par2_runtime(job_id)
+                    .served_mut()
+                    .and_then(|set_runtime| set_runtime.set.as_mut())
+                    .unwrap(),
+            );
             let merge = par2_set.merge_packets(packet_list);
             let total_recovery = par2_set.recovery_block_count();
             (merge, total_recovery)
@@ -1921,7 +2064,7 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) {
-        let Some(expected_set_id) = self.par2_set(job_id).map(|set| set.recovery_set_id) else {
+        let Some(expected_set_id) = self.par2_served_set_id(job_id) else {
             return;
         };
 
@@ -2083,12 +2226,15 @@ impl Pipeline {
         // asymmetry is deliberate: the set is what weaver's own recovery
         // arithmetic reads, and that has to be truthful.
         self.ensure_par2_runtime(job_id)
+            .served_mut()
+            .expect("PAR2 recovery volumes merge into the served recovery set")
             .merged_recovery_paths
             .insert(file_path.clone());
         if let Some(mut session) = self
             .par2_runtime
             .get_mut(&job_id)
-            .and_then(|runtime| runtime.session.take())
+            .and_then(|runtime| runtime.served_mut())
+            .and_then(|set_runtime| set_runtime.session.take())
         {
             let session_path = file_path.clone();
             match tokio::task::spawn_blocking(move || {
@@ -2117,7 +2263,11 @@ impl Pipeline {
         }
 
         let merge_result = {
-            let Some(set) = self.ensure_par2_runtime(job_id).set.as_mut() else {
+            let Some(set) = self
+                .ensure_par2_runtime(job_id)
+                .served_mut()
+                .and_then(|set_runtime| set_runtime.set.as_mut())
+            else {
                 return;
             };
             let par2_set = Arc::make_mut(set);

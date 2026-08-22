@@ -1287,7 +1287,10 @@ impl Pipeline {
             return Ok(Vec::new());
         };
         let completed_checksums = runtime.completed_checksums.clone();
-        let already_seeded = runtime.session_evidence_file_ids.clone();
+        let already_seeded = runtime
+            .served()
+            .map(|set_runtime| set_runtime.session_evidence_file_ids.clone())
+            .unwrap_or_default();
         let Some(state) = self.jobs.get(&job_id) else {
             return Ok(Vec::new());
         };
@@ -1391,9 +1394,6 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) -> usize {
-        let Some(par2) = self.par2_set(job_id).cloned() else {
-            return 0;
-        };
         let Some(state) = self.jobs.get(&job_id) else {
             return 0;
         };
@@ -1407,17 +1407,48 @@ impl Pipeline {
             return 0;
         }
 
-        let suggestions = match par2_rs::scan_for_renames(&rename_dir, &par2) {
-            Ok(suggestions) => suggestions,
-            Err(error) => {
-                warn!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "PAR2 rename scan failed"
-                );
-                return 0;
+        let mut suggestions = Vec::new();
+        let mut seen_current_paths = HashSet::new();
+        let mut seen_hashes = HashSet::<[u8; 16]>::new();
+        let mut ambiguous_hashes = HashSet::<[u8; 16]>::new();
+        let mut descriptions_by_name =
+            HashMap::<String, Vec<(par2_rs::RecoverySetId, u64, [u8; 16])>>::new();
+        let set_ids = self
+            .par2_runtime(job_id)
+            .map(crate::pipeline::Par2RuntimeState::ordered_set_ids)
+            .unwrap_or_default();
+        for set_id in set_ids {
+            let Some(par2) = self.par2_set_for(job_id, set_id) else {
+                continue;
+            };
+            for description in par2.files.values() {
+                if !seen_hashes.insert(description.hash_16k) {
+                    ambiguous_hashes.insert(description.hash_16k);
+                }
+                descriptions_by_name
+                    .entry(sanitize_download_filename(&description.filename))
+                    .or_default()
+                    .push((set_id, description.length, description.hash_16k));
             }
-        };
+
+            let set_suggestions = match par2_rs::scan_for_renames(&rename_dir, par2) {
+                Ok(suggestions) => suggestions,
+                Err(error) => {
+                    warn!(
+                        job_id = job_id.0,
+                        recovery_set_id = %set_id,
+                        error = %error,
+                        "PAR2 rename scan failed"
+                    );
+                    continue;
+                }
+            };
+            for suggestion in set_suggestions {
+                if seen_current_paths.insert(suggestion.current_path.clone()) {
+                    suggestions.push((set_id, suggestion));
+                }
+            }
+        }
 
         let file_rows: Vec<(NzbFileId, crate::jobs::record::ActiveFileIdentity, bool)> = state
             .assembly
@@ -1447,7 +1478,7 @@ impl Pipeline {
         let mut renamed = 0usize;
         let mut touched_files = Vec::<NzbFileId>::new();
         let mut touched_rar_files = HashMap::<String, HashSet<String>>::new();
-        for suggestion in &suggestions {
+        for (set_id, suggestion) in &suggestions {
             let old = &suggestion.current_path;
             let requested_correct_name = sanitize_download_filename(&suggestion.correct_name);
             let old_name = old
@@ -1459,6 +1490,80 @@ impl Pipeline {
                 .copied()
                 .or_else(|| by_source.get(&old_name).copied())
                 .or_else(|| by_canonical.get(&old_name).copied());
+            let Some(description) = self
+                .par2_set_for(job_id, *set_id)
+                .and_then(|set| set.file_description(&suggestion.file_id))
+            else {
+                debug!(
+                    job_id = job_id.0,
+                    from = %old.display(),
+                    "refusing PAR2 rename with an unknown description"
+                );
+                continue;
+            };
+            if ambiguous_hashes.contains(&description.hash_16k) {
+                debug!(
+                    job_id = job_id.0,
+                    from = %old.display(),
+                    "refusing PAR2 rename with an ambiguous 16 KiB hash"
+                );
+                continue;
+            }
+            if descriptions_by_name
+                .get(&requested_correct_name)
+                .is_some_and(|descriptions| {
+                    descriptions
+                        .iter()
+                        .any(|(described_set_id, length, hash_16k)| {
+                            *described_set_id != *set_id
+                                && (*length != description.length
+                                    || *hash_16k != description.hash_16k)
+                        })
+                })
+            {
+                debug!(
+                    job_id = job_id.0,
+                    from = %old.display(),
+                    to = %requested_correct_name,
+                    "refusing PAR2 rename with conflicting recovery-set descriptions"
+                );
+                continue;
+            }
+            if crate::pipeline::is_split_fragment_of(&old_name, &suggestion.correct_name) {
+                debug!(
+                    job_id = job_id.0,
+                    from = %old.display(),
+                    to = %suggestion.correct_name,
+                    "refusing PAR2 rename of a split fragment"
+                );
+                continue;
+            }
+            let disk_len = match std::fs::metadata(old) {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    debug!(
+                        job_id = job_id.0,
+                        from = %old.display(),
+                        error = %error,
+                        "refusing PAR2 rename whose source length could not be read"
+                    );
+                    continue;
+                }
+            };
+            let length_contradicts = match matched {
+                Some((_, true)) | None => disk_len != description.length,
+                Some((_, false)) => disk_len > description.length,
+            };
+            if length_contradicts {
+                debug!(
+                    job_id = job_id.0,
+                    from = %old.display(),
+                    observed_length = disk_len,
+                    described_length = description.length,
+                    "refusing PAR2 rename with a contradictory file length"
+                );
+                continue;
+            }
             let mut target_occupied = occupied_filenames.clone();
             if let Some((file_id, _)) = matched
                 && let Some((_, identity, _)) = file_rows
@@ -1672,6 +1777,8 @@ impl Pipeline {
         if let Some((session, newly_opened)) = retained_session {
             if newly_opened {
                 self.ensure_par2_runtime(job_id)
+                    .served_mut()
+                    .expect("PAR2 session evidence belongs to the served recovery set")
                     .session_evidence_file_ids
                     .clear();
             }
@@ -1712,14 +1819,19 @@ impl Pipeline {
             return match repair_result {
                 Ok((session, Ok((outcome, admitted_file_ids, retried_source_change)))) => {
                     self.restore_par2_repair_session(job_id, session);
-                    let runtime = self.ensure_par2_runtime(job_id);
+                    let set_runtime = self
+                        .ensure_par2_runtime(job_id)
+                        .served_mut()
+                        .expect("PAR2 session evidence belongs to the served recovery set");
                     if repair || retried_source_change {
-                        runtime.session_evidence_file_ids.clear();
-                        if repair && let Some(session) = runtime.session.as_mut() {
+                        set_runtime.session_evidence_file_ids.clear();
+                        if repair && let Some(session) = set_runtime.session.as_mut() {
                             session.invalidate_all_sources();
                         }
                     } else {
-                        runtime.session_evidence_file_ids.extend(admitted_file_ids);
+                        set_runtime
+                            .session_evidence_file_ids
+                            .extend(admitted_file_ids);
                     }
                     ensure_par2_repair_completed(&outcome, repair)?;
                     Ok(outcome)
@@ -2205,8 +2317,10 @@ impl Pipeline {
         self.par2_verified.insert(job_id);
         // A fresh verdict starts the post-verdict re-entry budget over: whatever
         // this pass reconciled, the next settled re-entry is a new question.
-        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
-            runtime.post_verdict_reconcile_attempts = 0;
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id)
+            && let Some(set_runtime) = runtime.served_mut()
+        {
+            set_runtime.post_verdict_reconcile_attempts = 0;
         }
         self.finalize_ready_direct_sets(job_id).await;
     }
@@ -2719,11 +2833,14 @@ impl Pipeline {
             // instead of degrading into a name match that would guess.
             let mut by_identity = HashMap::<par2_rs::FileId, Option<NzbFileId>>::new();
             for file_id in &assembly_file_ids {
-                let Some((par2_file_id, _, _, _)) = self.resolve_par2_file_binding(*file_id) else {
+                let Some(binding) = self.resolve_par2_file_binding(*file_id) else {
                     continue;
                 };
+                if binding.recovery_set_id != par2_set.recovery_set_id {
+                    continue;
+                }
                 by_identity
-                    .entry(par2_file_id)
+                    .entry(binding.par2_file_id)
                     .and_modify(|slot| {
                         if *slot != Some(*file_id) {
                             *slot = None;
@@ -3075,19 +3192,19 @@ impl Pipeline {
             return None;
         }
 
-        // "Protected" means the recovery set describes it. That is the same
-        // binding the reconciler just used, so a file that is protected here and
-        // still incomplete is one the reconciler should have promoted.
-        let (protected, unprotected): (Vec<_>, Vec<_>) = incomplete
-            .into_iter()
-            .partition(|file_id| self.resolve_par2_file_binding(*file_id).is_some());
+        // "Protected" means the recovery set this pass served describes it.
+        // A binding owned by another parsed set must not become a reconciliation
+        // defect for a pass that never verified that set.
+        let served_set_id = self.par2_served_set_id(job_id);
+        let (protected, unprotected): (Vec<_>, Vec<_>) =
+            incomplete.into_iter().partition(|file_id| {
+                self.resolve_par2_file_binding(*file_id)
+                    .is_some_and(|binding| Some(binding.recovery_set_id) == served_set_id)
+            });
 
-        // Files another recovery set describes. Only one set is served, so
-        // these bind to nothing here — but calling them unprotected would say
-        // no recovery ever covered them, when in truth a set that covers them
-        // was posted and this job simply cannot act on it. They are delivered
-        // either way; what changes is that the report tells the truth about
-        // why they were not repaired.
+        // Files another recovery set describes are delivered either way, but
+        // calling them unprotected would say no recovery ever covered them.
+        // The report instead records that this job cannot act on their set.
         let (unserved_set, unprotected): (Vec<_>, Vec<_>) = unprotected
             .into_iter()
             .partition(|file_id| self.file_is_described_by_an_unserved_recovery_set(*file_id));
@@ -3184,6 +3301,7 @@ impl Pipeline {
             return 0;
         };
         let ignore_extensions = self.par2_ignore_extensions();
+        let served_set_id = self.par2_served_set_id(job_id);
         state
             .assembly
             .files()
@@ -3196,7 +3314,9 @@ impl Pipeline {
                             ..
                         }
                     )
-                    && self.resolve_par2_file_binding(file.file_id()).is_some()
+                    && self
+                        .resolve_par2_file_binding(file.file_id())
+                        .is_some_and(|binding| Some(binding.recovery_set_id) == served_set_id)
                     && !self.par2_bound_file_is_ignorable(
                         job_id,
                         file.file_id(),
@@ -3225,6 +3345,7 @@ impl Pipeline {
             return false;
         };
         let ignore_extensions = self.par2_ignore_extensions();
+        let served_set_id = self.par2_served_set_id(job_id);
         let outstanding: Vec<NzbFileId> = state
             .assembly
             .files()
@@ -3237,7 +3358,9 @@ impl Pipeline {
                             ..
                         }
                     )
-                    && self.resolve_par2_file_binding(file.file_id()).is_some()
+                    && self
+                        .resolve_par2_file_binding(file.file_id())
+                        .is_some_and(|binding| Some(binding.recovery_set_id) == served_set_id)
                     && !self.par2_bound_file_is_ignorable(
                         job_id,
                         file.file_id(),
@@ -3286,9 +3409,9 @@ impl Pipeline {
             return true;
         }
         self.resolve_par2_file_binding(file_id)
-            .and_then(|(par2_file_id, _, _, _)| {
-                self.par2_set(job_id)
-                    .and_then(|set| set.file_description(&par2_file_id))
+            .and_then(|binding| {
+                self.par2_set_for(job_id, binding.recovery_set_id)
+                    .and_then(|set| set.file_description(&binding.par2_file_id))
                     .map(|description| description.filename.clone())
             })
             .is_some_and(|filename| par2_damage_ignorable(&filename, ignore_extensions))
@@ -3342,14 +3465,12 @@ impl Pipeline {
     /// never written under their own name, so having no file is what correct
     /// looks like for them.
     fn par2_output_presence_proven(&self, job_id: JobId, file_id: NzbFileId) -> bool {
-        let Some((par2_file_id, described_length, current_path, _)) =
-            self.resolve_par2_file_binding(file_id)
-        else {
+        let Some(binding) = self.resolve_par2_file_binding(file_id) else {
             return false;
         };
         if self
             .direct_par2_overlay(job_id)
-            .and_then(|overlay| overlay.owner_of(&par2_file_id))
+            .and_then(|overlay| overlay.owner_of(&binding.par2_file_id))
             .and_then(|index| self.direct_store.set(job_id, index))
             .is_some_and(|set| !set.is_demoted() && !set.is_finalized())
         {
@@ -3359,8 +3480,8 @@ impl Pipeline {
             return false;
         };
         let canonical = self
-            .par2_set(job_id)
-            .and_then(|set| set.file_description(&par2_file_id))
+            .par2_set_for(job_id, binding.recovery_set_id)
+            .and_then(|set| set.file_description(&binding.par2_file_id))
             .map(|desc| {
                 state
                     .working_dir
@@ -3368,12 +3489,12 @@ impl Pipeline {
             });
         canonical
             .into_iter()
-            .chain(std::iter::once(current_path))
+            .chain(std::iter::once(binding.path))
             .any(|path| {
                 std::fs::metadata(&path)
                     .ok()
                     .filter(|meta| meta.is_file())
-                    .is_some_and(|meta| meta.len() == described_length)
+                    .is_some_and(|meta| meta.len() == binding.described_length)
             })
     }
 
@@ -4708,10 +4829,11 @@ impl Pipeline {
             && self.job_has_live_rar_waiting_for_absent_volumes(job_id);
         if par2_verdict_stale_after_failed_extraction
             && let Some(runtime) = self.par2_runtime.get_mut(&job_id)
+            && let Some(set_runtime) = runtime.served_mut()
         {
             // A reopened verdict is owed a fresh pass, so the post-verdict
             // re-entry budget starts over with it.
-            runtime.post_verdict_reconcile_attempts = 0;
+            set_runtime.post_verdict_reconcile_attempts = 0;
         }
         let par2_verdict_open =
             !self.par2_verified.contains(&job_id) || par2_verdict_stale_after_failed_extraction;
@@ -5540,10 +5662,13 @@ impl Pipeline {
                     && self.settled_verdict_left_only_proven_protected_files(job_id)
                 {
                     let attempts = {
-                        let runtime = self.ensure_par2_runtime(job_id);
-                        runtime.post_verdict_reconcile_attempts =
-                            runtime.post_verdict_reconcile_attempts.saturating_add(1);
-                        runtime.post_verdict_reconcile_attempts
+                        let set_runtime = self.ensure_par2_runtime(job_id).served_mut().expect(
+                            "post-verdict reconciliation belongs to the served recovery set",
+                        );
+                        set_runtime.post_verdict_reconcile_attempts = set_runtime
+                            .post_verdict_reconcile_attempts
+                            .saturating_add(1);
+                        set_runtime.post_verdict_reconcile_attempts
                     };
                     if attempts > 1 {
                         let message = self

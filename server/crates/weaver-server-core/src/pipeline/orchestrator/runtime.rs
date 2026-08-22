@@ -282,6 +282,7 @@ impl Pipeline {
             write_buffered_segments: 0,
             write_buffers: HashMap::new(),
             file_prefix_16k: HashMap::new(),
+            file_declared_size: HashMap::new(),
             uu_files: HashMap::new(),
             uu_park_requeues: HashMap::new(),
             par2_runtime: HashMap::new(),

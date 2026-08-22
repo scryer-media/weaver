@@ -1336,19 +1336,11 @@ pub(super) struct Par2SetSummary {
 }
 
 #[derive(Default)]
-pub(super) struct Par2RuntimeState {
+pub(super) struct Par2SetRuntime {
+    /// The parsed recovery set. `None` until an index of this set was parsed.
     pub(super) set: Option<Arc<Par2FileSet>>,
-    pub(super) files: HashMap<u32, Par2FileRuntime>,
-    /// Every recovery set this job has met, served or not. `set` above is
-    /// whichever of these was selected to be served; the others are kept so
-    /// their volumes stop counting toward the served set's capacity and the
-    /// files they describe can be named for what they are.
-    pub(super) known_sets: HashMap<par2_rs::RecoverySetId, Par2SetSummary>,
-    /// Whether the job has already said out loud that it carries sets it does
-    /// not serve. Cleared whenever a set is newly met or the served set
-    /// changes, so the operator hears about a changed picture exactly once
-    /// rather than on every completion-gate entry.
-    pub(super) unserved_sets_warned: bool,
+    /// What this set describes and which volumes spoke for it.
+    pub(super) summary: Par2SetSummary,
     /// The on-disk primary PAR2 file used to reopen an evicted retained session.
     pub(super) primary_path: Option<PathBuf>,
     /// Recovery files already incorporated into the scheduler view and any
@@ -1361,9 +1353,6 @@ pub(super) struct Par2RuntimeState {
     /// Last time the retained session was taken or restored, for global LRU
     /// eviction when the shared retained-state budget is exceeded.
     pub(super) session_last_used: Option<Instant>,
-    /// Completion-time checksums retained only long enough to seed a session
-    /// opened after a payload file finished downloading.
-    pub(super) completed_checksums: HashMap<NzbFileId, CompletedFileChecksum>,
     /// Completed files whose current identity/checksum evidence was admitted
     /// to the retained session.
     pub(super) session_evidence_file_ids: HashSet<NzbFileId>,
@@ -1374,6 +1363,74 @@ pub(super) struct Par2RuntimeState {
     /// re-reading the whole recovery set on every lap forever. Reset wherever
     /// a verdict is taken or reopened.
     pub(super) post_verdict_reconcile_attempts: u32,
+}
+
+#[derive(Default)]
+pub(super) struct Par2RuntimeState {
+    /// Every recovery set this job has met, served or not. The served entry is
+    /// selected for repair; the others are kept so their volumes stop counting
+    /// toward the served set's capacity and their files can be named for what
+    /// they are.
+    pub(super) sets: HashMap<par2_rs::RecoverySetId, Par2SetRuntime>,
+    /// The recovery set this job serves, if an index has been selected.
+    pub(super) served: Option<par2_rs::RecoverySetId>,
+    pub(super) files: HashMap<u32, Par2FileRuntime>,
+    /// Completion-time checksums retained only long enough to seed a session
+    /// opened after a payload file finished downloading.
+    pub(super) completed_checksums: HashMap<NzbFileId, CompletedFileChecksum>,
+    /// Whether the job has already said out loud that it carries sets it does
+    /// not serve. Cleared whenever a set is newly met or the served set
+    /// changes, so the operator hears about a changed picture exactly once
+    /// rather than on every completion-gate entry.
+    pub(super) unserved_sets_warned: bool,
+}
+
+impl Par2RuntimeState {
+    pub(super) fn served_set_id(&self) -> Option<par2_rs::RecoverySetId> {
+        self.served
+    }
+
+    pub(super) fn served(&self) -> Option<&Par2SetRuntime> {
+        self.served.and_then(|set_id| self.set_runtime(set_id))
+    }
+
+    pub(super) fn served_mut(&mut self) -> Option<&mut Par2SetRuntime> {
+        self.served.and_then(|set_id| self.set_runtime_mut(set_id))
+    }
+
+    pub(super) fn set_runtime(&self, set_id: par2_rs::RecoverySetId) -> Option<&Par2SetRuntime> {
+        self.sets.get(&set_id)
+    }
+
+    pub(super) fn set_runtime_mut(
+        &mut self,
+        set_id: par2_rs::RecoverySetId,
+    ) -> Option<&mut Par2SetRuntime> {
+        self.sets.get_mut(&set_id)
+    }
+
+    pub(super) fn ensure_set_runtime(
+        &mut self,
+        set_id: par2_rs::RecoverySetId,
+    ) -> &mut Par2SetRuntime {
+        self.sets.entry(set_id).or_default()
+    }
+
+    /// Returns recovery set IDs in the deterministic order later per-set
+    /// iteration relies on.
+    pub(super) fn ordered_set_ids(&self) -> Vec<par2_rs::RecoverySetId> {
+        let mut set_ids = self.sets.keys().copied().collect::<Vec<_>>();
+        set_ids.sort_by_key(|set_id| {
+            (
+                self.sets
+                    .get(set_id)
+                    .map(|set_runtime| set_runtime.summary.index_file_index)
+                    .unwrap_or_default(),
+                *set_id.as_bytes(),
+            )
+        });
+        set_ids
+    }
 }
 
 pub(super) enum ExtractionDone {
@@ -1558,6 +1615,23 @@ pub(super) struct YencLayoutAssertions {
     pub(super) total: Option<u32>,
     pub(super) begin: Option<u64>,
     pub(super) end: Option<u64>,
+}
+
+/// Whether a filename is a numeric split fragment of the described filename.
+///
+/// A fragment begins with the complete described name, so its first 16 KiB can
+/// match the joined file even though the fragment cannot stand in for it.
+pub(in crate::pipeline) fn is_split_fragment_of(
+    candidate_name: &str,
+    described_name: &str,
+) -> bool {
+    let described_name = weaver_model::files::sanitize_download_filename(described_name);
+    candidate_name
+        .strip_prefix(&described_name)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .is_some_and(|extension| {
+            !extension.is_empty() && extension.as_bytes().iter().all(u8::is_ascii_digit)
+        })
 }
 
 #[derive(Debug)]
@@ -2271,6 +2345,11 @@ pub struct Pipeline {
     /// has landed have an entry at all. Dropped with the rest of the job's
     /// per-file runtime.
     pub(super) file_prefix_16k: HashMap<NzbFileId, Vec<u8>>,
+    /// First non-zero decoded size declared by a yEnc header for each file.
+    ///
+    /// This is independent evidence about the file the poster intended to
+    /// send. A later article cannot revise an earlier declaration.
+    pub(super) file_declared_size: HashMap<NzbFileId, u64>,
     /// Sequential-assembly state for uuencode files, created on the first
     /// uuencode part of a file and dropped with that file's write buffer.
     pub(super) uu_files: HashMap<NzbFileId, UuFileAssembly>,

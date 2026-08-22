@@ -14728,7 +14728,7 @@ async fn an_obfuscated_direct_set_still_reaches_zero_io_grid_adjudication() {
             .resolve_par2_file_binding(file_id)
             .unwrap_or_else(|| panic!("volume {ordinal} must bind to a description"));
         let described_name = &par2_set
-            .file_description(&bound.0)
+            .file_description(&bound.par2_file_id)
             .expect("the bound description")
             .filename;
         assert_eq!(

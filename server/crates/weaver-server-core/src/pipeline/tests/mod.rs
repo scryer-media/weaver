@@ -50,6 +50,7 @@ mod direct_store;
 mod download_dispatch;
 mod health_probe;
 mod par2_completion;
+mod par2_multiset_binding;
 mod rar_extraction;
 mod restore_history;
 mod sfv_completion;
@@ -1093,8 +1094,10 @@ fn install_test_par2_runtime(
     par2_set: Par2FileSet,
     files: &[(u32, &str, u32, bool)],
 ) {
+    let set_id = par2_set.recovery_set_id;
     let runtime = pipeline.ensure_par2_runtime(job_id);
-    runtime.set = Some(Arc::new(par2_set));
+    runtime.served = Some(set_id);
+    runtime.ensure_set_runtime(set_id).set = Some(Arc::new(par2_set));
     runtime.files.clear();
     for (file_index, filename, recovery_blocks, promoted) in files {
         runtime.files.insert(

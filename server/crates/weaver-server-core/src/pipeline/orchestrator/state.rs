@@ -145,6 +145,7 @@ impl Pipeline {
             self.uu_park_requeues
                 .retain(|segment_id, _| segment_id.file_id != file_id);
             self.file_prefix_16k.remove(&file_id);
+            self.file_declared_size.remove(&file_id);
         }
 
         if released_bytes > 0 || released_segments > 0 {
@@ -164,8 +165,10 @@ impl Pipeline {
         // its split topologies and asks the recovery set again.
         self.par2_joined_split_sets.remove(&job_id);
         // The verdict is gone, so the post-verdict re-entry budget goes with it.
-        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
-            runtime.post_verdict_reconcile_attempts = 0;
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id)
+            && let Some(set_runtime) = runtime.served_mut()
+        {
+            set_runtime.post_verdict_reconcile_attempts = 0;
         }
         self.par2_pre_repair_dir_entries.remove(&job_id);
         self.sfv_checked.remove(&job_id);

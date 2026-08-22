@@ -1471,6 +1471,7 @@ impl Pipeline {
             // overwhelming majority of articles not even that — the first thing
             // it does is compare `file_offset` against 16 KiB and return.
             self.note_par2_binding_prefix(file_id, file_offset, &data);
+            self.note_par2_binding_declared_size(file_id, yenc_layout.file_size);
 
             // The per-segment bounds above cannot see across segments, so they
             // would still let an article claim a range an earlier ordinal
@@ -1804,6 +1805,16 @@ impl Pipeline {
             }
             prefix.extend_from_slice(&slice[..slice.len().min(room)]);
         });
+    }
+
+    /// Retain the first usable yEnc total for content-binding corroboration.
+    fn note_par2_binding_declared_size(&mut self, file_id: NzbFileId, declared_size: u64) {
+        if declared_size == 0 {
+            return;
+        }
+        self.file_declared_size
+            .entry(file_id)
+            .or_insert(declared_size);
     }
 
     /// Retain the name a uuencode `begin` header stated for this file.

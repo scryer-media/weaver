@@ -3491,7 +3491,10 @@ async fn obfuscated_binding_fixture(
     )
     .await;
     let par2_set = build_repairable_par2_set_for_files(described, 1024, 1);
-    pipeline.ensure_par2_runtime(job_id).set = Some(std::sync::Arc::new(par2_set));
+    let set_id = par2_set.recovery_set_id;
+    let runtime = pipeline.ensure_par2_runtime(job_id);
+    runtime.served = Some(set_id);
+    runtime.ensure_set_runtime(set_id).set = Some(std::sync::Arc::new(par2_set));
     let file_id = NzbFileId {
         job_id,
         file_index: 0,
@@ -3506,6 +3509,162 @@ fn binding_payload(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
         .collect()
+}
+
+#[tokio::test]
+async fn a_complete_content_match_with_the_wrong_length_is_refused() {
+    let payload = binding_payload(29, 49_152);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id) = obfuscated_binding_fixture(
+        &temp_dir,
+        JobId(20110),
+        "c841ef20.bin",
+        &[("silver-horizon.mkv", &payload)],
+        &payload[..crate::pipeline::PAR2_HASH_16K_BYTES],
+    )
+    .await;
+
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        &payload[..4_096],
+        "c841ef20.bin",
+        None,
+    )
+    .await;
+    pipeline.file_prefix_16k.insert(
+        file_id,
+        payload[..crate::pipeline::PAR2_HASH_16K_BYTES].to_vec(),
+    );
+    pipeline.file_declared_size.remove(&file_id);
+
+    let file = pipeline
+        .jobs
+        .get(&file_id.job_id)
+        .and_then(|state| state.assembly.file(file_id))
+        .expect("test file");
+    assert!(file.is_complete(), "the fixture must be complete");
+    assert_ne!(file.received_bytes(), payload.len() as u64);
+    assert!(
+        pipeline.resolve_par2_file_binding(file_id).is_none(),
+        "a complete file with contradictory decoded length must not content-bind"
+    );
+}
+
+#[tokio::test]
+async fn an_incomplete_content_match_at_or_under_the_described_length_still_binds() {
+    let payload = binding_payload(31, 49_152);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, file_id) = obfuscated_binding_fixture(
+        &temp_dir,
+        JobId(20111),
+        "9d2a18ce.bin",
+        &[("silver-horizon.mkv", &payload)],
+        &payload[..crate::pipeline::PAR2_HASH_16K_BYTES],
+    )
+    .await;
+
+    let file = pipeline
+        .jobs
+        .get(&file_id.job_id)
+        .and_then(|state| state.assembly.file(file_id))
+        .expect("test file");
+    assert!(!file.is_complete(), "the fixture must remain incomplete");
+    assert!(file.received_bytes() <= payload.len() as u64);
+    assert!(!pipeline.file_declared_size.contains_key(&file_id));
+    assert!(
+        pipeline.resolve_par2_file_binding(file_id).is_some(),
+        "in-stream verification needs incomplete, noncontradictory files to bind"
+    );
+}
+
+#[tokio::test]
+async fn an_incomplete_fragment_with_a_contradictory_declared_size_is_refused() {
+    let payload = binding_payload(37, 49_152);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id) = obfuscated_binding_fixture(
+        &temp_dir,
+        JobId(20112),
+        "onyx-prairie.mkv.001",
+        &[("onyx-prairie.mkv", &payload)],
+        &payload[..crate::pipeline::PAR2_HASH_16K_BYTES],
+    )
+    .await;
+    pipeline.file_declared_size.insert(file_id, 16_384);
+
+    assert!(
+        pipeline.resolve_par2_file_binding(file_id).is_none(),
+        "a contradictory yEnc declaration must refuse the content match"
+    );
+}
+
+#[tokio::test]
+async fn an_incomplete_obfuscated_file_with_a_contradictory_declared_size_is_refused() {
+    let payload = binding_payload(39, 49_152);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id) = obfuscated_binding_fixture(
+        &temp_dir,
+        JobId(20115),
+        "7e4c19ab.bin",
+        &[("onyx-prairie.mkv", &payload)],
+        &payload[..crate::pipeline::PAR2_HASH_16K_BYTES],
+    )
+    .await;
+    pipeline.file_declared_size.insert(file_id, 16_384);
+
+    let file = pipeline
+        .jobs
+        .get(&file_id.job_id)
+        .and_then(|state| state.assembly.file(file_id))
+        .expect("test file");
+    assert!(!file.is_complete(), "the fixture must remain incomplete");
+    assert!(file.received_bytes() <= payload.len() as u64);
+    assert!(
+        pipeline.resolve_par2_file_binding(file_id).is_none(),
+        "a contradictory yEnc declaration must refuse an otherwise matching content bind"
+    );
+}
+
+#[tokio::test]
+async fn an_absent_declared_size_does_not_change_content_binding() {
+    let payload = binding_payload(41, 49_152);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, file_id) = obfuscated_binding_fixture(
+        &temp_dir,
+        JobId(20113),
+        "b0d0c6aa.bin",
+        &[("ivory-meadow.mkv", &payload)],
+        &payload[..crate::pipeline::PAR2_HASH_16K_BYTES],
+    )
+    .await;
+
+    assert!(!pipeline.file_declared_size.contains_key(&file_id));
+    assert!(
+        pipeline.resolve_par2_file_binding(file_id).is_some(),
+        "without a declared size, a matching prefix remains usable"
+    );
+}
+
+#[tokio::test]
+async fn a_split_fragment_prefix_match_is_refused() {
+    let payload = binding_payload(43, 49_152);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, file_id) = obfuscated_binding_fixture(
+        &temp_dir,
+        JobId(20114),
+        "ivory-meadow.mkv.001",
+        &[("ivory-meadow.mkv", &payload)],
+        &payload[..crate::pipeline::PAR2_HASH_16K_BYTES],
+    )
+    .await;
+
+    assert!(!pipeline.file_declared_size.contains_key(&file_id));
+    assert!(
+        pipeline.resolve_par2_file_binding(file_id).is_none(),
+        "a numeric split fragment cannot bind to the joined description by prefix"
+    );
 }
 
 #[tokio::test]
@@ -3531,14 +3690,14 @@ async fn an_obfuscated_file_binds_to_its_description_by_content() {
     assert_eq!(
         pipeline
             .resolve_par2_file_binding(file_id)
-            .map(|bound| bound.0),
+            .map(|bound| bound.par2_file_id),
         Some(expected),
         "the bytes are what the obfuscation did not touch"
     );
     assert_eq!(
         pipeline
             .resolve_par2_file_binding(file_id)
-            .map(|bound| bound.1),
+            .map(|bound| bound.described_length),
         Some(payload.len() as u64),
         "and the binding carries the DESCRIBED length, never a declared one"
     );
@@ -3567,7 +3726,7 @@ async fn a_short_description_binds_from_its_whole_file_hash() {
     assert_eq!(
         pipeline
             .resolve_par2_file_binding(file_id)
-            .map(|bound| bound.0),
+            .map(|bound| bound.par2_file_id),
         Some(expected)
     );
 }
@@ -3645,7 +3804,7 @@ async fn a_name_match_still_wins_over_content() {
     assert_eq!(
         pipeline
             .resolve_par2_file_binding(file_id)
-            .map(|bound| bound.0),
+            .map(|bound| bound.par2_file_id),
         Some(by_name),
         "the name path runs first and returns before any hashing happens"
     );

@@ -5380,6 +5380,120 @@ async fn stray_file_is_not_renamed_into_a_duplicate() {
     );
 }
 
+async fn install_par2_rename_candidate(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    posted_filename: &str,
+    payload: &[u8],
+    described: &[(&str, &[u8])],
+) -> PathBuf {
+    let (working_dir, _) = incomplete_protected_payload_job(
+        pipeline,
+        job_id,
+        "PAR2 Rename Candidate",
+        posted_filename,
+        payload,
+    )
+    .await;
+    tokio::fs::write(working_dir.join(posted_filename), payload)
+        .await
+        .unwrap();
+    install_test_par2_runtime(
+        pipeline,
+        job_id,
+        build_repairable_par2_set_for_files(described, 1024, 1),
+        &[],
+    );
+    working_dir
+}
+
+#[tokio::test]
+async fn a_rename_suggestion_with_an_ambiguous_prefix_hash_is_dropped() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30326);
+    let posted_filename = "a9e3d04c.bin";
+    let payload: Vec<u8> = (0..49_152u32).map(|value| (value % 251) as u8).collect();
+    let mut alternate = payload.clone();
+    alternate[16_384..].fill(0x5a);
+    let working_dir = install_par2_rename_candidate(
+        &mut pipeline,
+        job_id,
+        posted_filename,
+        &payload,
+        &[
+            ("silver-horizon.mkv", &payload),
+            ("ivory-meadow.mkv", &alternate),
+        ],
+    )
+    .await;
+
+    pipeline.try_deobfuscate_files_with_par2(job_id).await;
+
+    assert!(
+        working_dir.join(posted_filename).exists(),
+        "a shared 16 KiB hash must not choose either target"
+    );
+    assert!(!working_dir.join("silver-horizon.mkv").exists());
+    assert!(!working_dir.join("ivory-meadow.mkv").exists());
+}
+
+#[tokio::test]
+async fn a_split_fragment_rename_suggestion_is_dropped_before_target_exists() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30327);
+    let fragment_filename = "onyx-prairie.mkv.001";
+    let payload: Vec<u8> = (0..49_152u32).map(|value| (value % 239) as u8).collect();
+    let working_dir = install_par2_rename_candidate(
+        &mut pipeline,
+        job_id,
+        fragment_filename,
+        &payload,
+        &[("onyx-prairie.mkv", &payload)],
+    )
+    .await;
+    assert!(!working_dir.join("onyx-prairie.mkv").exists());
+
+    pipeline.try_deobfuscate_files_with_par2(job_id).await;
+
+    assert!(
+        working_dir.join(fragment_filename).exists(),
+        "the fragment must remain under its own name"
+    );
+    assert!(
+        !working_dir.join("onyx-prairie.mkv").exists(),
+        "the target was free, so keeping it absent proves the suggestion was filtered"
+    );
+}
+
+#[tokio::test]
+async fn a_unique_same_length_obfuscated_rename_still_lands() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30328);
+    let posted_filename = "d90f27ac.bin";
+    let correct_filename = "silver-horizon.mkv";
+    let payload: Vec<u8> = (0..49_152u32).map(|value| (value % 241) as u8).collect();
+    let working_dir = install_par2_rename_candidate(
+        &mut pipeline,
+        job_id,
+        posted_filename,
+        &payload,
+        &[(correct_filename, &payload)],
+    )
+    .await;
+
+    pipeline.try_deobfuscate_files_with_par2(job_id).await;
+
+    assert!(!working_dir.join(posted_filename).exists());
+    assert_eq!(
+        std::fs::read(working_dir.join(correct_filename)).unwrap(),
+        payload,
+        "a unique suggestion with matching length must still deobfuscate"
+    );
+}
+
 /// Job 10000 whole: a repaired payload delivered alongside an unprotected file
 /// that stayed short of articles.
 ///
@@ -7412,14 +7526,71 @@ async fn a_split_part_short_of_articles_does_not_fail_a_rejoined_job() {
     );
 }
 
+/// A split fragment is not PAR2-protected before any join verdict exists.
+#[tokio::test]
+async fn a_part_sharing_the_joined_files_first_16_kib_is_unprotected_before_join_verdict() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30821);
+    let slice_size = PAR2_HASH_16K_BYTES;
+    let joined = split_join_payload(slice_size * 4);
+    let posting = SplitJoinPosting {
+        job_name: "Ivory Meadow Fragment Before Verdict",
+        joined: joined.clone(),
+        slice_size: slice_size as u64,
+        parts: vec![
+            SplitJoinPart {
+                filename: "Ivory.Meadow.mkv.001".to_string(),
+                segments: vec![slice_size as u32, slice_size as u32],
+                arrived_segments: 1,
+                on_disk: joined[..slice_size].to_vec(),
+            },
+            whole_split_join_part(
+                "Ivory.Meadow.mkv.002",
+                &joined[slice_size * 2..slice_size * 3],
+            ),
+            whole_split_join_part(
+                "Ivory.Meadow.mkv.003",
+                &joined[slice_size * 3..slice_size * 4],
+            ),
+        ],
+        prefix_captured: vec![0],
+        describes_parts: false,
+    };
+    posting.install(&mut pipeline, job_id).await;
+
+    assert_eq!(
+        pipeline.incomplete_par2_protected_data_file_count(job_id),
+        0,
+        "a numeric split fragment must not content-bind to the joined description"
+    );
+    let report = pipeline
+        .classify_incomplete_after_par2(
+            job_id,
+            &crate::pipeline::completion::finalize::check::Par2Reconciliation::default(),
+            "pre-verdict split fragment probe",
+        )
+        .expect("the incomplete fragment must still be classified");
+    assert_eq!(
+        report.unproven_protected, 0,
+        "the fragment must not enter the protected bucket: {}",
+        report.message
+    );
+    assert!(
+        report.message.contains("unprotected"),
+        "the report must identify the fragment as unprotected: {}",
+        report.message
+    );
+}
+
 /// A part sharing the joined file's first 16 KiB is not a hole in the payload.
 ///
-/// PAR2 identifies a file by the MD5 of its first 16 KiB, and the first part of
-/// a split set begins exactly where the joined file begins — so content binding
-/// answers the joined description with the first part. Left in the incomplete
-/// buckets, that part reads as a PAR2-protected file whose verified bytes are
-/// nowhere on disk, and the job fails for a hole that does not exist: the bytes
-/// are in the join the recovery set just vouched for.
+/// The first part begins where the joined file begins, so its prefix matches
+/// the joined description. Content binding refuses the part because its name
+/// is a numeric split fragment of that description, and any declared yEnc size
+/// that disagrees with the joined length corroborates the refusal. Even without
+/// that refusal, the consumed-split exclusion after the join verdict shields
+/// the part; this test keeps both layers honest.
 #[tokio::test]
 async fn a_part_sharing_the_joined_files_first_16_kib_is_not_reported_as_a_hole() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -7461,8 +7632,9 @@ async fn a_part_sharing_the_joined_files_first_16_kib_is_not_reported_as_a_hole(
         file_index: 0,
     };
     assert!(
-        pipeline.resolve_par2_file_binding(first_part).is_some(),
-        "precondition: the first part answers the joined description by content"
+        pipeline.resolve_par2_file_binding(first_part).is_none(),
+        "the first part shares the joined file's first 16 KiB but is refused as its split \
+         fragment — it must not bind to the joined description"
     );
 
     pipeline.check_job_completion(job_id).await;
