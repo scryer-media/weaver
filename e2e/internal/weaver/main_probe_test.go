@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -47,7 +46,7 @@ func TestDockerHostPortBindCollisionRecognition(t *testing.T) {
 	}
 }
 
-func TestReallocateRuntimePortsForDockerRetryPreservesBorrowedAliases(t *testing.T) {
+func TestReallocateRuntimePortsForDockerRetryPreservesExplicitNNTPAliases(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "runtime-ports.json")
 	previous, err := allocateRuntimePortState()
 	if err != nil {
@@ -76,58 +75,10 @@ func TestReallocateRuntimePortsForDockerRetryPreservesBorrowedAliases(t *testing
 		}
 	}
 	if got := os.Getenv("NNTP_PORT"); got != "39991" {
-		t.Fatalf("borrowed NNTP_PORT = %q, want preserved donor port", got)
+		t.Fatalf("NNTP_PORT = %q, want preserved explicit port", got)
 	}
 	if got := os.Getenv("NNTP_BACKUP_PORT"); got != "39992" {
-		t.Fatalf("borrowed NNTP_BACKUP_PORT = %q, want preserved donor port", got)
-	}
-}
-
-func TestApplyRuntimePortEnvAfterStackRefreshUpdatesNonBorrowerAliases(t *testing.T) {
-	state, err := allocateRuntimePortState()
-	if err != nil {
-		t.Fatalf("allocate runtime ports: %v", err)
-	}
-	for key, value := range runtimePortEnvValues(state) {
-		t.Setenv(key, value)
-	}
-	t.Setenv("NNTP_PORT", "39991")
-	t.Setenv("NNTP_BACKUP_PORT", "39992")
-
-	applyRuntimePortEnvAfterStackRefresh(state)
-
-	if got, want := nntpPort(), strconv.Itoa(state.NNTPPort); got != want {
-		t.Fatalf("nntpPort() = %q, want refreshed port %q", got, want)
-	}
-	if got, want := backupNntpPort(), strconv.Itoa(state.NNTP2Port); got != want {
-		t.Fatalf("backupNntpPort() = %q, want refreshed port %q", got, want)
-	}
-}
-
-func TestApplyRuntimePortEnvAfterStackRefreshPreservesBorrowedAliases(t *testing.T) {
-	state, err := allocateRuntimePortState()
-	if err != nil {
-		t.Fatalf("allocate runtime ports: %v", err)
-	}
-	for key, value := range runtimePortEnvValues(state) {
-		t.Setenv(key, value)
-	}
-	t.Setenv(nntpBorrowerEnv, "1")
-	t.Setenv("NNTP_PORT", "39991")
-	t.Setenv("NNTP_BACKUP_PORT", "39992")
-
-	applyRuntimePortEnvAfterStackRefresh(state)
-
-	for key, want := range runtimePortEnvValues(state) {
-		if strings.HasPrefix(key, "E2E_") && os.Getenv(key) != want {
-			t.Fatalf("env[%s] = %q, want %q", key, os.Getenv(key), want)
-		}
-	}
-	if got := nntpPort(); got != "39991" {
-		t.Fatalf("nntpPort() = %q, want preserved donor port", got)
-	}
-	if got := backupNntpPort(); got != "39992" {
-		t.Fatalf("backupNntpPort() = %q, want preserved donor port", got)
+		t.Fatalf("NNTP_BACKUP_PORT = %q, want preserved explicit port", got)
 	}
 }
 

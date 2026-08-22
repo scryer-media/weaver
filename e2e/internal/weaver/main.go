@@ -488,8 +488,8 @@ func saveRuntimePortState(path string, state runtimePortState) error {
 
 // reallocateRuntimePortsForDockerRetry picks a fresh set of host ports after
 // Docker loses the race between the probe listener closing and compose binding
-// its published ports. Preserve explicit borrower aliases such as NNTP_PORT:
-// their values deliberately target another phase's already-seeded NNTP server.
+// its published ports. Preserve explicit NNTP aliases when a caller has
+// deliberately overridden the runtime-assigned endpoint.
 func reallocateRuntimePortsForDockerRetry() error {
 	statePath := runtimePortsStatePath()
 	previous, err := loadRuntimePortState(statePath)
@@ -802,8 +802,6 @@ func runtimePortEnvValues(state runtimePortState) map[string]string {
 	}
 }
 
-const nntpBorrowerEnv = "E2E_NNTP_BORROWER"
-
 func refreshRuntimePortEnvFromRunningStack() error {
 	state, err := discoverRuntimePortState()
 	if err != nil {
@@ -812,7 +810,7 @@ func refreshRuntimePortEnvFromRunningStack() error {
 	if err := saveRuntimePortState(runtimePortsStatePath(), state); err != nil {
 		return err
 	}
-	applyRuntimePortEnvAfterStackRefresh(state)
+	applyRuntimePortEnv(state)
 	return nil
 }
 
@@ -822,27 +820,6 @@ func applyRuntimePortEnvPreservingExplicitAliases(previous, next runtimePortStat
 		if strings.HasPrefix(key, "E2E_") || os.Getenv(key) == previousEnv[key] {
 			setEnv(key, value)
 		}
-	}
-}
-
-func applyRuntimePortEnvAfterStackRefresh(state runtimePortState) {
-	if os.Getenv(nntpBorrowerEnv) != "1" {
-		applyRuntimePortEnv(state)
-		return
-	}
-
-	// A borrower runs its own supporting stack but deliberately points its
-	// managed Weaver at a donor's already-seeded NNTP endpoints. Its explicit
-	// aliases must survive stack discovery, while the E2E_* bindings still
-	// follow the borrower's own Compose ports.
-	borrowedNNTPPort := os.Getenv("NNTP_PORT")
-	borrowedNNTPBackupPort := os.Getenv("NNTP_BACKUP_PORT")
-	applyRuntimePortEnv(state)
-	if borrowedNNTPPort != "" {
-		setEnv("NNTP_PORT", borrowedNNTPPort)
-	}
-	if borrowedNNTPBackupPort != "" {
-		setEnv("NNTP_BACKUP_PORT", borrowedNNTPBackupPort)
 	}
 }
 
