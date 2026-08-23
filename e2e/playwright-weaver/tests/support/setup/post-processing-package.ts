@@ -9,6 +9,8 @@ import path from "node:path";
  * execution through the UI, lists them, and lets a real job run them.
  */
 const SCRIPTS_DIR = "/weaver-data/scripts";
+const WEAVER_OUTPUTS_DIR = "/data/complete";
+const PLAYWRIGHT_OUTPUTS_DIR = "/weaver-downloads";
 
 export const POST_PROCESSING_NOTIFY_SCRIPT = "e2e-notify.sh";
 export const POST_PROCESSING_FAILING_SCRIPT = "e2e-failing.sh";
@@ -123,8 +125,17 @@ export function removePostProcessingScripts(): void {
   }
 }
 
-/** Contents of the marker file a completed job's scripts appended to. */
+/** Contents of a completed job's marker file on Playwright's shared-volume mount. */
 export function postProcessingMarker(outputDir: string): string {
-  const marker = path.join(outputDir, POST_PROCESSING_MARKER);
+  const relative = path.relative(WEAVER_OUTPUTS_DIR, outputDir);
+  if (
+    relative === ""
+    || relative === ".."
+    || relative.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relative)
+  ) {
+    throw new Error(`unexpected Weaver completed-job output directory: ${outputDir}`);
+  }
+  const marker = path.join(PLAYWRIGHT_OUTPUTS_DIR, relative, POST_PROCESSING_MARKER);
   return fs.existsSync(marker) ? fs.readFileSync(marker, "utf8") : "";
 }

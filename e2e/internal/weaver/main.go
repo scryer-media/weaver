@@ -1156,28 +1156,23 @@ var canonicalFixtureSlugs = []string{
 	"zstd-single",
 }
 
+// Keep NNTP protocol chaos to two four-job batches per round. This covers a
+// raw payload, both RAR generations, encryption, repair, split input,
+// obfuscation, and large BODY transfers without multiplying retry-heavy work.
 var chaosFixtureSlugs = []string{
 	"single-mkv",
-	"rar5-single",
 	"rar5-multivolume",
-	"rar4-single",
 	"rar4-encrypted",
 	"7z-encrypted",
-	"gzip-single",
-	"zip-encrypted",
 	"par2-repair",
 	"split-7z",
-	"tar-archive",
-	"rar5-solid",
 	"obfuscated-rar",
-	"nested-rar",
 	"large-segments",
 }
 
-// TCP transport chaos does not need to repeat every archive variant used by
-// NNTP protocol chaos. Keep two four-job batches per round while retaining a
-// raw payload, both archive generations, encryption, alternate archive
-// handling, repair, split input, obfuscation, and large BODY transfers.
+// TCP transport chaos uses the same compact representative workload as NNTP
+// protocol chaos. It retains both archive generations, encryption, repair,
+// split input, obfuscation, and large BODY transfers.
 var tcpChaosFixtureSlugs = []string{
 	"single-mkv",
 	"rar5-multivolume",

@@ -25,7 +25,6 @@ const unlimitedQuota = {
   monthlyResetDay: 1,
 };
 const labels = { server: "nntp:119" };
-const providerActivationGraceMs = 31_000;
 const providerConnectionLimit = 2;
 
 test(`provider connection cap behavior: ${stage}`, async ({ request }) => {
@@ -72,7 +71,6 @@ async function configureAndProveReduction(
     maxDownloadSpeed: 0,
     downloadQuota: unlimitedQuota,
   });
-  await waitForProviderCapacityLearning();
   expect(
     await submitProbeNzb(
       request,
@@ -121,7 +119,6 @@ async function provePersistedConfigurationAndRelearning(
     maxDownloadSpeed: 0,
     downloadQuota: unlimitedQuota,
   });
-  await waitForProviderCapacityLearning();
   expect(
     await submitProbeNzb(
       request,
@@ -192,10 +189,6 @@ async function createProbeArticles(prefix: string) {
     });
   }
   return articles;
-}
-
-async function waitForProviderCapacityLearning() {
-  await new Promise((resolve) => setTimeout(resolve, providerActivationGraceMs));
 }
 
 async function expectReducedEffectiveCapacity(request: Parameters<typeof metrics>[0]) {

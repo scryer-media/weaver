@@ -2204,6 +2204,108 @@ async fn post_repair_verification_accepts_a_file_corrupted_after_the_pre_repair_
     assert!(plan.swaps.is_empty() && plan.renames.is_empty());
 }
 
+/// A file the pre-repair verdict called `Renamed` is read back at its canonical
+/// name, not carried.
+///
+/// The repairer treats a misplaced file as work: it is not complete at the path
+/// its description names, so the repair copies the bytes onto that path and
+/// moves whatever held the name aside. Carrying the pre-repair entry through
+/// that would report a file as still misplaced after the repair had already
+/// placed it, and hand the placement step a rename onto a name the repair had
+/// just filled.
+#[tokio::test]
+async fn post_repair_verification_reads_back_a_renamed_file_at_its_canonical_name() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30290);
+    let (working_dir, damaged_original, intact_original) = two_payload_repair_job(
+        &mut pipeline,
+        job_id,
+        "Post Repair Verification Renamed Read Back",
+    )
+    .await;
+    let par2_set = pipeline.par2_set(job_id).cloned().unwrap();
+    let misplaced_file_id = par2_set.recovery_file_ids[0];
+    let intact_file_id = par2_set.recovery_file_ids[1];
+
+    // The pre-repair verdict for a set whose one fault was placement: the
+    // repairer's scanner found the payload's content under another name.
+    let pre_repair = par2_rs::VerificationResult {
+        files: vec![
+            par2_rs::verify::FileVerification {
+                file_id: misplaced_file_id,
+                filename: "damaged.zip".to_string(),
+                status: par2_rs::verify::FileStatus::Renamed(working_dir.join("elsewhere.bin")),
+                valid_slices: vec![true, true],
+                missing_slice_count: 0,
+            },
+            par2_rs::verify::FileVerification {
+                file_id: intact_file_id,
+                filename: "intact.mkv".to_string(),
+                status: par2_rs::verify::FileStatus::Complete,
+                valid_slices: vec![true, true],
+                missing_slice_count: 0,
+            },
+        ],
+        recovery_blocks_available: par2_set.recovery_block_count(),
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+
+    // What the repair leaves on disk: the content installed at the canonical
+    // name, with the copy it was found under still sitting where it was.
+    tokio::fs::write(working_dir.join("damaged.zip"), &damaged_original)
+        .await
+        .unwrap();
+    tokio::fs::write(working_dir.join("elsewhere.bin"), &damaged_original)
+        .await
+        .unwrap();
+
+    let (merged, plan) = pipeline
+        .verify_repaired_par2_files_with_placement(
+            job_id,
+            Arc::clone(&par2_set),
+            working_dir.clone(),
+            &pre_repair,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pipeline.par2_post_repair_read_splits,
+        vec![(1usize, 1usize)],
+        "the misplaced file belongs to the rewritten set, not the carried one — \
+         only the file that was already complete at its canonical name may be \
+         carried. splits = {:?}",
+        pipeline.par2_post_repair_read_splits
+    );
+    let placed = merged
+        .files
+        .iter()
+        .find(|file| file.file_id == misplaced_file_id)
+        .unwrap();
+    assert!(
+        matches!(placed.status, par2_rs::verify::FileStatus::Complete),
+        "read at the canonical name the repair installed it to, it is complete; \
+         status = {:?}",
+        placed.status
+    );
+    assert!(
+        plan.swaps.is_empty() && plan.renames.is_empty(),
+        "so the derived plan has nothing left to move; plan = {plan:?}"
+    );
+    assert!(
+        !merged.needs_repair(),
+        "and the merged verdict clears the post-repair gate"
+    );
+    assert_eq!(
+        tokio::fs::read(working_dir.join("intact.mkv"))
+            .await
+            .unwrap(),
+        intact_original
+    );
+}
+
 #[tokio::test]
 async fn restored_repairing_payload_uses_single_repairer_analyze_and_execute_pass() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -5492,6 +5594,586 @@ async fn a_unique_same_length_obfuscated_rename_still_lands() {
         payload,
         "a unique suggestion with matching length must still deobfuscate"
     );
+}
+
+/// A complete, PAR2-protected payload whose bytes are not where their names say.
+///
+/// `described` gives the recovery set (and the NZB) its file names and the
+/// content each name is supposed to hold; `on_disk[i]` is what is actually
+/// written at `described[i]`'s name, so a caller expresses a swap by handing the
+/// two entries each other's bytes and damage by handing one entry holed bytes.
+/// Every article has arrived either way — this is a posting fault, not a
+/// download one.
+///
+/// No archive topology is installed, so the completion gate's integrity gate
+/// reads `None` and the job takes the repairer-analysis arm. That is the arm the
+/// field job took, and the one that has to tell "nothing to repair, only to
+/// place" from "damaged".
+async fn misplaced_payload_par2_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    job_name: &str,
+    described: &[(&str, Vec<u8>)],
+    on_disk: &[Vec<u8>],
+    recovery_blocks: usize,
+) -> PathBuf {
+    assert_eq!(described.len(), on_disk.len());
+    let index_filename = "silver-horizon.par2";
+    let recovery_filename = "silver-horizon.vol00+01.par2";
+    let described_refs: Vec<(&str, &[u8])> = described
+        .iter()
+        .map(|(name, bytes)| (*name, bytes.as_slice()))
+        .collect();
+    let par2_bytes = build_test_par2_index_for_files(&described_refs, 64);
+    let recovery_bytes = vec![0xAA; 64];
+
+    let mut files: Vec<FileSpec> = described
+        .iter()
+        .enumerate()
+        .map(|(index, (filename, bytes))| FileSpec {
+            filename: (*filename).to_string(),
+            role: FileRole::from_filename(filename),
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: (0..bytes.len() as u32 / 64)
+                .map(|segment| {
+                    segment_spec! {
+                        number: segment,
+                        bytes: 64,
+                        message_id: format!("misplaced-{index}-{segment}@example.com"),
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+    let payload_count = files.len() as u32;
+    files.push(FileSpec {
+        filename: index_filename.to_string(),
+        role: FileRole::from_filename(index_filename),
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: par2_bytes.len() as u32,
+            message_id: "misplaced-index@example.com".to_string(),
+        }],
+    });
+    files.push(FileSpec {
+        filename: recovery_filename.to_string(),
+        role: FileRole::from_filename(recovery_filename),
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: recovery_bytes.len() as u32,
+            message_id: "misplaced-recovery@example.com".to_string(),
+        }],
+    });
+
+    let total_bytes = (described
+        .iter()
+        .map(|(_, bytes)| bytes.len())
+        .sum::<usize>()
+        + par2_bytes.len()
+        + recovery_bytes.len()) as u64;
+    let spec = JobSpec {
+        name: job_name.to_string(),
+        password: None,
+        total_bytes,
+        category: None,
+        metadata: vec![],
+        files,
+    };
+    let working_dir = insert_active_job(pipeline, job_id, spec).await;
+
+    for ((filename, _), bytes) in described.iter().zip(on_disk.iter()) {
+        tokio::fs::write(working_dir.join(filename), bytes)
+            .await
+            .unwrap();
+    }
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        for file_index in 0..payload_count {
+            let file_id = NzbFileId { job_id, file_index };
+            let file = state.assembly.file_mut(file_id).unwrap();
+            let segment_count = described[file_index as usize].1.len() as u32 / 64;
+            for segment in 0..segment_count {
+                file.commit_segment(segment, 64).unwrap();
+            }
+        }
+    }
+    write_and_complete_file(pipeline, job_id, payload_count, index_filename, &par2_bytes).await;
+    write_and_complete_file(
+        pipeline,
+        job_id,
+        payload_count + 1,
+        recovery_filename,
+        &recovery_bytes,
+    )
+    .await;
+    install_test_par2_runtime(
+        pipeline,
+        job_id,
+        build_repairable_par2_set_for_files(&described_refs, 64, recovery_blocks),
+        &[
+            (payload_count, index_filename, 0, false),
+            (payload_count + 1, recovery_filename, 1, true),
+        ],
+    );
+
+    working_dir
+}
+
+fn misplacement_payload(seed: u32) -> Vec<u8> {
+    (0..128u32)
+        .map(|value| ((value * 7 + seed * 31) % 251) as u8)
+        .collect()
+}
+
+/// Two pairs of files posted under each other's names, nothing damaged: the
+/// repairer must never be asked to fix a set whose only fault is placement.
+///
+/// The repairer's own scanner reports every one of them `Renamed`, which makes
+/// `needs_repair()` true, and the old ladder read that as "repair required" —
+/// with zero damaged slices and zero blocks needed, the tell that there was
+/// nothing to repair. Running it anyway installed each file at its canonical
+/// name and left the displaced originals behind as `<name>.N`, after which the
+/// job's own post-repair pass could no longer tell a backup from the file it had
+/// been displaced by. Placement is the whole job here, and the plan for it has
+/// to come from a directory scan: a swap is two files each holding the other's
+/// content, and only something that looks at what is on each name can see it.
+#[tokio::test]
+async fn a_placement_only_verdict_is_placed_without_running_the_repairer() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut repair_events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30344);
+    let job_name = "Silver Horizon Swapped Parts";
+    let described: Vec<(&str, Vec<u8>)> = vec![
+        ("silver-horizon-a.bin", misplacement_payload(1)),
+        ("silver-horizon-b.bin", misplacement_payload(2)),
+        ("silver-horizon-c.bin", misplacement_payload(3)),
+        ("silver-horizon-d.bin", misplacement_payload(4)),
+    ];
+    // a<->b and c<->d, exactly as posted: two physical swaps, four misplaced
+    // files, not one damaged byte anywhere.
+    let on_disk = vec![
+        described[1].1.clone(),
+        described[0].1.clone(),
+        described[3].1.clone(),
+        described[2].1.clone(),
+    ];
+    let working_dir =
+        misplaced_payload_par2_job(&mut pipeline, job_id, job_name, &described, &on_disk, 1).await;
+
+    settle_job_completion(&mut pipeline, job_id).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert_eq!(
+        pipeline.par2_repairer_analyze_calls, 1,
+        "precondition: this shape reaches the repairer-analysis arm, which is \
+         where the misplacement is seen at all"
+    );
+    assert_eq!(
+        pipeline.par2_repairer_execute_calls, 0,
+        "a set with nothing damaged has nothing for the repairer to write"
+    );
+    assert_eq!(
+        pipeline.par2_authoritative_verify_calls, 1,
+        "the analysis is answered with one scanned whole-set pass — the scan is \
+         what sees a swap — and that answer stands as the set's verdict"
+    );
+    assert_eq!(
+        drain_job_repair_complete(&mut repair_events, job_id),
+        0,
+        "and no repair happened, so none may be announced"
+    );
+    let output_dir = pipeline
+        .complete_dir
+        .join(crate::jobs::working_dir::sanitize_dirname(job_name));
+    for (filename, bytes) in &described {
+        assert_eq!(
+            tokio::fs::read(output_dir.join(filename)).await.unwrap(),
+            *bytes,
+            "{filename} must be delivered holding its own content"
+        );
+    }
+    assert!(
+        !working_dir.exists() || std::fs::read_dir(&working_dir).unwrap().next().is_none(),
+        "and nothing may be left behind in the working directory"
+    );
+}
+
+/// Damage alongside misplacement still runs the repairer, and the files it
+/// placed are read back where it placed them.
+///
+/// This is the row the placement-only rule must not swallow: one holed file
+/// means slices to reconstruct, so the ladder below it — capacity, promotion,
+/// repair — is exactly what the job needs. The renamed files then come back
+/// through the post-repair read at their canonical names, because that is where
+/// the repair put them.
+#[tokio::test]
+async fn damage_alongside_misplacement_still_repairs_and_reads_back_the_placed_files() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut repair_events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30345);
+    let job_name = "Silver Horizon Swapped And Holed";
+    let described: Vec<(&str, Vec<u8>)> = vec![
+        ("silver-horizon-a.bin", misplacement_payload(5)),
+        ("silver-horizon-b.bin", misplacement_payload(6)),
+        ("silver-horizon-c.bin", misplacement_payload(7)),
+    ];
+    let mut holed = described[2].1.clone();
+    holed[64..].fill(0);
+    let on_disk = vec![described[1].1.clone(), described[0].1.clone(), holed];
+    let working_dir =
+        misplaced_payload_par2_job(&mut pipeline, job_id, job_name, &described, &on_disk, 1).await;
+
+    settle_job_completion(&mut pipeline, job_id).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert_eq!(
+        pipeline.par2_repairer_execute_calls, 1,
+        "a damaged slice is still a repair"
+    );
+    assert_eq!(
+        drain_job_repair_complete(&mut repair_events, job_id),
+        1,
+        "and a repair that held is announced"
+    );
+    let splits = pipeline
+        .par2_post_repair_read_splits
+        .last()
+        .copied()
+        .expect("the repair tail ran its post-repair read");
+    assert_eq!(
+        splits,
+        (0usize, 3usize),
+        "nothing was complete at its canonical name before the repair, so \
+         nothing may be carried: two misplaced files and one holed one all get \
+         read back where the repair installed them"
+    );
+    let output_dir = pipeline
+        .complete_dir
+        .join(crate::jobs::working_dir::sanitize_dirname(job_name));
+    for (filename, bytes) in &described {
+        assert_eq!(
+            tokio::fs::read(output_dir.join(filename)).await.unwrap(),
+            *bytes,
+            "{filename} must be delivered holding its own content"
+        );
+    }
+    assert!(
+        !working_dir.exists() || std::fs::read_dir(&working_dir).unwrap().next().is_none(),
+        "and the repair's backups may not follow the payload out"
+    );
+}
+
+/// Describe a file the set lists but does not protect.
+///
+/// A PAR2 set's non-recovery files carry a name and the two digests every
+/// description carries, and nothing else: no slice checksums, no recovery data.
+/// `verify_all` reads only the protected files, while the deobfuscator reads
+/// every description — which is what lets a file arrive under a posted name and
+/// be given the one the set says it should have.
+fn describe_non_recovery_file(
+    par2_set: &mut Par2FileSet,
+    filename: &str,
+    bytes: &[u8],
+) -> par2_rs::FileId {
+    let length = bytes.len() as u64;
+    let hash_full = par2_rs::checksum::md5(bytes);
+    let hash_16k = par2_rs::checksum::md5(&bytes[..bytes.len().min(16 * 1024)]);
+    let mut id_input = Vec::new();
+    id_input.extend_from_slice(&hash_16k);
+    id_input.extend_from_slice(&length.to_le_bytes());
+    id_input.extend_from_slice(filename.as_bytes());
+    let file_id = par2_rs::FileId::from_bytes(par2_rs::checksum::md5(&id_input));
+    par2_set.files.insert(
+        file_id,
+        par2_rs::FileDescription {
+            file_id,
+            hash_full,
+            hash_16k,
+            length,
+            par2_name: filename.to_string(),
+            filename: filename.to_string(),
+        },
+    );
+    par2_set.non_recovery_file_ids.push(file_id);
+    file_id
+}
+
+/// The repair's own leftovers must not fail the repair that produced them.
+///
+/// par2-rs installs a file at the name its description gives it and moves
+/// whatever held that name aside as `<name>.N`. After a swap that leaves the
+/// backup holding exactly the content of the file it was displaced by, so a
+/// directory scan — the only way a disk file is matched to a description —
+/// finds two files for one description and calls the pair a conflict. The
+/// settled-layout pass used to be that scan, and it refused accepted repairs
+/// over artefacts the repair had just written. It asks the narrower question
+/// now: is every described file intact at its canonical name. A leftover cannot
+/// answer that one, and it is swept with the rest once the aggregate settles.
+#[tokio::test]
+async fn repair_leftovers_do_not_fail_the_pass_that_verifies_the_settled_layout() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut repair_events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30346);
+    let index_filename = "silver-horizon.par2";
+    let posted_notes_filename = "9f2c1a5e.dat";
+    let notes_filename = "silver-horizon.nfo";
+    let alpha = misplacement_payload(11);
+    let beta = misplacement_payload(12);
+    let gamma = misplacement_payload(13);
+    let notes = misplacement_payload(14);
+    let par2_bytes = build_test_par2_index_for_files(
+        &[
+            ("silver-horizon-a.bin", &alpha),
+            ("silver-horizon-b.bin", &beta),
+            ("silver-horizon-c.bin", &gamma),
+        ],
+        64,
+    );
+
+    let payload_spec = |index: u32, filename: &str, len: usize| FileSpec {
+        filename: filename.to_string(),
+        role: FileRole::from_filename(filename),
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: (0..len as u32 / 64)
+            .map(|segment| {
+                segment_spec! {
+                    number: segment,
+                    bytes: 64,
+                    message_id: format!("leftover-{index}-{segment}@example.com"),
+                }
+            })
+            .collect(),
+    };
+    let spec = JobSpec {
+        name: "Silver Horizon Repair Leftovers".to_string(),
+        password: None,
+        total_bytes: (alpha.len() + beta.len() + gamma.len() + notes.len() + par2_bytes.len())
+            as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            payload_spec(0, "silver-horizon-a.bin", alpha.len()),
+            payload_spec(1, "silver-horizon-b.bin", beta.len()),
+            payload_spec(2, "silver-horizon-c.bin", gamma.len()),
+            payload_spec(3, posted_notes_filename, notes.len()),
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "leftover-index@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // What the repair found, and what it left. Two files were posted under each
+    // other's names and one was holed; the repair installed all three at their
+    // canonical names, which put the two swapped originals aside as `.1`
+    // backups holding each other's content.
+    for (filename, bytes) in [
+        ("silver-horizon-a.bin", &alpha),
+        ("silver-horizon-b.bin", &beta),
+        ("silver-horizon-c.bin", &gamma),
+        (posted_notes_filename, &notes),
+    ] {
+        tokio::fs::write(working_dir.join(filename), bytes)
+            .await
+            .unwrap();
+    }
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        for file_index in 0..4u32 {
+            let file = state
+                .assembly
+                .file_mut(NzbFileId { job_id, file_index })
+                .unwrap();
+            for segment in 0..2u32 {
+                file.commit_segment(segment, 64).unwrap();
+            }
+        }
+    }
+    write_and_complete_file(&mut pipeline, job_id, 4, index_filename, &par2_bytes).await;
+
+    let mut par2_set = build_repairable_par2_set_for_files(
+        &[
+            ("silver-horizon-a.bin", &alpha),
+            ("silver-horizon-b.bin", &beta),
+            ("silver-horizon-c.bin", &gamma),
+        ],
+        64,
+        1,
+    );
+    describe_non_recovery_file(&mut par2_set, notes_filename, &notes);
+    let alpha_id = par2_set.recovery_file_ids[0];
+    let beta_id = par2_set.recovery_file_ids[1];
+    let gamma_id = par2_set.recovery_file_ids[2];
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        par2_set,
+        &[(4, index_filename, 0, false)],
+    );
+    let par2_set = pipeline.par2_set(job_id).cloned().unwrap();
+
+    // The snapshot the repairer takes on its way in, and the backups it then
+    // leaves behind.
+    pipeline.par2_pre_repair_dir_entries.insert(
+        job_id,
+        HashSet::from([
+            "silver-horizon-a.bin".to_string(),
+            "silver-horizon-b.bin".to_string(),
+            "silver-horizon-c.bin".to_string(),
+            posted_notes_filename.to_string(),
+            index_filename.to_string(),
+        ]),
+    );
+    tokio::fs::write(working_dir.join("silver-horizon-a.bin.1"), &beta)
+        .await
+        .unwrap();
+    tokio::fs::write(working_dir.join("silver-horizon-b.bin.1"), &alpha)
+        .await
+        .unwrap();
+
+    let pre_repair = par2_rs::VerificationResult {
+        files: vec![
+            par2_rs::verify::FileVerification {
+                file_id: alpha_id,
+                filename: "silver-horizon-a.bin".to_string(),
+                status: par2_rs::verify::FileStatus::Renamed(
+                    working_dir.join("silver-horizon-b.bin"),
+                ),
+                valid_slices: vec![true, true],
+                missing_slice_count: 0,
+            },
+            par2_rs::verify::FileVerification {
+                file_id: beta_id,
+                filename: "silver-horizon-b.bin".to_string(),
+                status: par2_rs::verify::FileStatus::Renamed(
+                    working_dir.join("silver-horizon-a.bin"),
+                ),
+                valid_slices: vec![true, true],
+                missing_slice_count: 0,
+            },
+            par2_rs::verify::FileVerification {
+                file_id: gamma_id,
+                filename: "silver-horizon-c.bin".to_string(),
+                status: par2_rs::verify::FileStatus::Damaged(1),
+                valid_slices: vec![true, false],
+                missing_slice_count: 1,
+            },
+        ],
+        recovery_blocks_available: 1,
+        total_missing_blocks: 1,
+        repairable: par2_rs::verify::Repairability::Repairable {
+            blocks_needed: 1,
+            blocks_available: 1,
+        },
+    };
+    let outcome = par2_rs::Par2RepairOutcome {
+        status: par2_rs::Par2RepairStatus::Repaired,
+        files_complete: 3,
+        files_renamed: 2,
+        files_damaged: 0,
+        files_missing: 0,
+        available_blocks: 1,
+        missing_blocks: 0,
+        recovery_blocks_available: 1,
+        recovery_blocks_used: 1,
+        bytes_copied: (alpha.len() + beta.len()) as u64,
+        bytes_reconstructed: 64,
+        packets: par2_rs::PacketDiagnostics::default(),
+        scan: par2_rs::ScanDiagnostics::default(),
+        carry: par2_rs::repairer::CarryDiagnostics::default(),
+        verification: pre_repair.clone(),
+    };
+
+    pipeline
+        .finish_par2_repair(
+            job_id,
+            Arc::clone(&par2_set),
+            working_dir.clone(),
+            &pre_repair,
+            outcome,
+            false,
+        )
+        .await;
+
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "the repair held; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert_eq!(
+        drain_job_repair_complete(&mut repair_events, job_id),
+        1,
+        "a repair whose set is intact where it now sits is a repair that held"
+    );
+    let mut remaining: Vec<String> = std::fs::read_dir(&working_dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .collect();
+    remaining.sort();
+    assert_eq!(
+        remaining,
+        vec![
+            index_filename.to_string(),
+            "silver-horizon-a.bin".to_string(),
+            "silver-horizon-b.bin".to_string(),
+            "silver-horizon-c.bin".to_string(),
+            notes_filename.to_string(),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>(),
+        "exactly the described files and the recovery index survive: the two \
+         backups are swept once the aggregate settles, and the posted name the \
+         set describes otherwise has been given its own"
+    );
+    for (filename, bytes) in [
+        ("silver-horizon-a.bin", &alpha),
+        ("silver-horizon-b.bin", &beta),
+        ("silver-horizon-c.bin", &gamma),
+        (notes_filename, &notes),
+    ] {
+        assert_eq!(
+            tokio::fs::read(working_dir.join(filename)).await.unwrap(),
+            **bytes,
+            "{filename} must hold its own content"
+        );
+    }
 }
 
 /// Job 10000 whole: a repaired payload delivered alongside an unprotected file

@@ -353,10 +353,30 @@ func hasDockerComposePort(ports []dockerComposePort, published string, target in
 	return false
 }
 
-func TestChaosSeedProfileIncludesStatProbeOutsideSuccessWorkload(t *testing.T) {
+func TestNNTPChaosUsesCompactRepresentativeFixtureProfile(t *testing.T) {
 	seedSlugs := fixtureSlugsForSeedProfile("chaos")
+	if got, want := len(chaosFixtureSlugs), 8; got != want {
+		t.Fatalf("expected two four-job NNTP chaos batches, got %d fixtures: %v", got, chaosFixtureSlugs)
+	}
+	for _, required := range []string{
+		"single-mkv",
+		"rar5-multivolume",
+		"rar4-encrypted",
+		"7z-encrypted",
+		"par2-repair",
+		"split-7z",
+		"obfuscated-rar",
+		"large-segments",
+	} {
+		if !containsString(chaosFixtureSlugs, required) {
+			t.Fatalf("NNTP chaos profile is missing representative fixture %q: %v", required, chaosFixtureSlugs)
+		}
+	}
 	if !containsString(seedSlugs, chaosStatProbeSlug) {
 		t.Fatalf("expected chaos seed profile to include STAT probe fixture %q", chaosStatProbeSlug)
+	}
+	if got, want := len(seedSlugs), 9; got != want {
+		t.Fatalf("expected NNTP chaos seed profile to include eight workload fixtures plus STAT probe, got %d: %v", got, seedSlugs)
 	}
 	if containsString(chaosFixtureSlugs, chaosStatProbeSlug) {
 		t.Fatalf("expected STAT probe fixture %q to stay out of the success chaos workload", chaosStatProbeSlug)

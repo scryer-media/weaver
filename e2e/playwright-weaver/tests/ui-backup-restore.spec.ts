@@ -318,7 +318,7 @@ async function createSourceMarkersThroughUI(
 
   await page.goto("/settings/security");
   await page.getByTestId("api-key-name").fill(matrix.apiKeyName);
-  await page.getByRole("combobox").click();
+  await page.getByLabel("Scope", { exact: true }).click();
   await page.getByRole("option", { name: "Read" }).click();
   await page.getByRole("button", { name: "Create API Key" }).click();
   const createdDialog = page.getByRole("dialog", { name: "API Key Created" });
@@ -420,8 +420,9 @@ async function analyzeBackup(page: Page, file: string, password: string) {
 async function fillRequiredCategoryRemaps(page: Page) {
   const panel = page.getByTestId("backup-category-remaps");
   await expect(panel).toBeVisible();
-  const inputs = await panel.getByRole("textbox").all();
-  expect(inputs.length, "backup preview did not require a category path remap").toBeGreaterThan(0);
+  const remapInputs = panel.getByRole("textbox");
+  await expect(remapInputs).not.toHaveCount(0);
+  const inputs = await remapInputs.all();
   for (const [index, input] of inputs.entries()) {
     const relativePath = `complete/restored-category-${index + 1}`;
     const destination = `/data/${relativePath}`;

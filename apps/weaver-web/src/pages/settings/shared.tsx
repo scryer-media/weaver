@@ -824,14 +824,16 @@ export function ApiKeysSection() {
             />
           </div>
           <div>
-            <Label className="mb-2">{t("settings.apiKeyScope")}</Label>
+            <Label className="mb-2" htmlFor="api-key-scope">
+              {t("settings.apiKeyScope")}
+            </Label>
             <Select
               value={newKeyScope}
               onValueChange={(value) =>
                 setNewKeyScope(value as ApiKeyScope)
               }
             >
-              <SelectTrigger className="min-w-44">
+              <SelectTrigger className="min-w-44" id="api-key-scope">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>

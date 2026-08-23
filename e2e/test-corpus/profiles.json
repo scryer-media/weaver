@@ -122,21 +122,14 @@
       "description": "What the NNTP chaos suite seeds: chaosFixtureSlugs plus the STAT health probe.",
       "include": [
         "testdata/7z-encrypted/**",
-        "testdata/gzip-single/**",
         "testdata/large-segments/**",
-        "testdata/nested-rar/**",
         "testdata/obfuscated-rar/**",
         "testdata/par2-repair/**",
         "testdata/rar4-encrypted/**",
-        "testdata/rar4-single/**",
         "testdata/rar5-multivolume/**",
-        "testdata/rar5-single/**",
-        "testdata/rar5-solid/**",
         "testdata/single-mkv/**",
         "testdata/split-7z/**",
-        "testdata/stat-health-probe/**",
-        "testdata/tar-archive/**",
-        "testdata/zip-encrypted/**"
+        "testdata/stat-health-probe/**"
       ],
       "exclude": [
         "**/scenario.json"

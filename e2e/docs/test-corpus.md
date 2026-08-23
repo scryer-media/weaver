@@ -78,7 +78,7 @@ Exit codes: `0` success, `1` findings or failure, `2` usage.
 | Profile | What it is |
 | --- | --- |
 | `functional` | `canonicalFixtureSlugs` — the full functional corpus (232 files, ~5.9 GiB) |
-| `chaos` | `chaosFixtureSlugs` plus the STAT health probe (23 files, ~1.2 GiB) |
+| `chaos` | `chaosFixtureSlugs` plus the STAT health probe (16 files, ~0.7 GiB) |
 | `tcp-chaos` | `tcpChaosFixtureSlugs` (16 files, ~0.7 GiB) |
 | `restart` | `restartFixtureSlugs` (18 files, ~0.4 GiB) |
 | `release-gate` | the union of the four seed profiles the gate's phases run |

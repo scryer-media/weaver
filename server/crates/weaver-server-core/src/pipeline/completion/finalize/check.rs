@@ -557,6 +557,23 @@ fn par2_unreachable_recovery_failure(
     ))
 }
 
+/// Whether the only work a verdict leaves outstanding is placement.
+///
+/// Nothing damaged, nothing missing, no slice to reconstruct — every described
+/// file's content is on disk and whole, and some of it is sitting under a name
+/// that is not its own. That is a verdict `needs_repair()` reports as true and
+/// a repairer has nothing to do about: moving a file is what the placement plan
+/// is for.
+fn par2_verification_is_placement_only(verification: &par2_rs::VerificationResult) -> bool {
+    verification.total_missing_blocks == 0
+        && !verification.files.iter().any(|file| {
+            matches!(
+                file.status,
+                par2_rs::verify::FileStatus::Damaged(_) | par2_rs::verify::FileStatus::Missing
+            )
+        })
+}
+
 /// Why a post-repair verification should fail the repair, if it should.
 ///
 /// Damage and misplacement both make a verification "need repair", and only one
@@ -568,6 +585,9 @@ fn par2_unreachable_recovery_failure(
 /// nothing was damaged. Misplacement is judged after placement instead, by
 /// re-reading the set where it then sits.
 fn par2_post_repair_damage_failure(verification: &par2_rs::VerificationResult) -> Option<String> {
+    if par2_verification_is_placement_only(verification) {
+        return None;
+    }
     let damaged = verification
         .files
         .iter()
@@ -578,9 +598,6 @@ fn par2_post_repair_damage_failure(verification: &par2_rs::VerificationResult) -
             )
         })
         .count();
-    if verification.total_missing_blocks == 0 && damaged == 0 {
-        return None;
-    }
     let misplaced = verification
         .files
         .iter()
@@ -602,13 +619,27 @@ enum Par2PassScope {
     /// merge with whatever it is standing in for, and the placement plan it
     /// returns is derived from that merged result rather than scanned.
     Selected(Vec<par2_rs::FileId>),
+    /// Every recovery file, read at the name its description gives it, with no
+    /// directory scan behind it.
+    ///
+    /// The question is "is the whole set intact where it now sits", and that
+    /// question needs no scan — a scan answers a different one, which disk file
+    /// stands for which description, and it can be asked at a moment when the
+    /// directory holds two honest answers. A repair installs a rewritten file at
+    /// its canonical name and moves whatever held that name aside as
+    /// `<name>.N`, so backup and installed file carry the same content and match
+    /// the same description; the scan reports that as a conflict and refuses.
+    /// Reading at canonical names cannot be confused by a leftover, which is
+    /// swept with the rest of the repair's artefacts once the aggregate settles.
+    WholeSetAtCanonicalNames,
 }
 
 /// Run the read the scope asks for. `verify_all` is `verify_selected_file_ids`
 /// over the whole recovery set, so the two arms are one pipeline reached with
 /// different file lists — the same per-slice and whole-file rules, the same
 /// verdicts, over fewer files. The selective arm alone opts into the crate's
-/// fast-verify mode; the conventional arm stays strict.
+/// fast-verify mode; both whole-set shapes stay strict, and differ only in the
+/// placement plan the caller reads them through.
 ///
 /// # Why the selective arm verifies from slice proof
 ///
@@ -637,14 +668,19 @@ enum Par2PassScope {
 /// true for a fresh install) and falls back to the strict pipeline otherwise,
 /// so the verdicts are byte-identical either way. The conventional whole-set
 /// arm keeps the strict default because it *is* the scan that establishes
-/// identity.
+/// identity, and the canonical-name whole-set arm keeps it because it stands
+/// alone for the whole set: it is the one pass behind that verdict, so it
+/// establishes each file's identity rather than inheriting it from a pass that
+/// just installed the bytes.
 fn verify_in_scope(
     scope: &Par2PassScope,
     par2_set: &par2_rs::Par2FileSet,
     access: &dyn par2_rs::FileAccess,
 ) -> par2_rs::VerificationResult {
     match scope {
-        Par2PassScope::WholeSet => par2_rs::verify_all(par2_set, access),
+        Par2PassScope::WholeSet | Par2PassScope::WholeSetAtCanonicalNames => {
+            par2_rs::verify_all(par2_set, access)
+        }
         Par2PassScope::Selected(file_ids) => par2_rs::verify_selected_file_ids_with_options(
             par2_set,
             access,
@@ -677,8 +713,8 @@ pub(in crate::pipeline) fn selective_pass_verify_options() -> par2_rs::VerifyOpt
 /// `is_canonical_complete`, reconstructs or copies them into a staging
 /// directory, reads them back against their IFSC slice checksums, and installs
 /// them over their canonical targets. `Complete` therefore means untouched —
-/// the repair had nothing to write — while `Damaged` and `Missing` are the two
-/// verdicts that put a file in the write set.
+/// the repair had nothing to write — while `Damaged`, `Missing` and `Renamed`
+/// are the three verdicts that put a file in the write set.
 ///
 /// Untouchedness is the ordinary case, not the guarantee. A set holding two
 /// files with identical content can have the placement scan's first-match-wins
@@ -691,22 +727,23 @@ pub(in crate::pipeline) fn selective_pass_verify_options() -> par2_rs::VerifyOpt
 /// and content that matches the description matches it whichever file wrote it.
 /// A `Complete` entry therefore stays true across a repair that did touch it.
 ///
-/// `Renamed` is carried, not read: it names content that already exists intact
-/// somewhere else, which the placement normalization moves rather than
-/// rewrites. It is also unreachable from this producer — only the repairer's
-/// own scanner emits `Renamed`, never `verify_all`/`verify_selected_file_ids`
-/// — and is matched here so the rule is stated where the classification lives
-/// instead of relying on that.
+/// `Renamed` is read too, because the repair acts on it. A file whose content
+/// matches a description it is not named for is not complete at its canonical
+/// path either, so the repair copies those bytes onto that path — that copy is
+/// what `bytes_copied` counts on a run that reconstructed no slice at all — and
+/// moves whatever held the name aside as `<name>.N`. Carrying the pre-repair
+/// entry instead would report the file as still misplaced after the repair had
+/// already placed it, and hand the placement step that follows a rename onto a
+/// name the repair has just filled.
+///
+/// What is left carried is therefore exactly the files that were already intact
+/// at their canonical names before the repair ran, which is the only set whose
+/// pre-repair verdict still describes the disk afterwards.
 fn par2_repair_write_set(verification: &par2_rs::VerificationResult) -> Vec<par2_rs::FileId> {
     verification
         .files
         .iter()
-        .filter(|file| {
-            matches!(
-                file.status,
-                par2_rs::verify::FileStatus::Damaged(_) | par2_rs::verify::FileStatus::Missing
-            )
-        })
+        .filter(|file| !matches!(file.status, par2_rs::verify::FileStatus::Complete))
         .map(|file| file.file_id)
         .collect()
 }
@@ -2113,6 +2150,34 @@ impl Pipeline {
         Ok((verification, placement_plan))
     }
 
+    /// The whole set, read where its files now sit, once something moved them
+    /// after the repair.
+    ///
+    /// The verdict it returns is final for the set: every described file is read
+    /// at the name its description gives it, strictly, so a file that is not
+    /// there comes back `Missing` and one whose bytes are wrong comes back
+    /// `Damaged`. Nothing is inferred from a directory scan, which is what
+    /// [`Par2PassScope::WholeSetAtCanonicalNames`] exists to avoid — the
+    /// repairer's own leftovers are indistinguishable from the files they were
+    /// displaced by, and a scan can only call that a conflict.
+    async fn verify_par2_set_at_canonical_names(
+        &mut self,
+        job_id: JobId,
+        par2_set: Arc<par2_rs::Par2FileSet>,
+        working_dir: std::path::PathBuf,
+    ) -> Result<par2_rs::VerificationResult, String> {
+        let (mut verification, _) = self
+            .run_par2_placement_pass(
+                job_id,
+                par2_set,
+                working_dir,
+                Par2PassScope::WholeSetAtCanonicalNames,
+            )
+            .await?;
+        self.settle_par2_pass_result(job_id, &mut verification, false);
+        Ok(verification)
+    }
+
     /// The post-repair authoritative pass, reading only the files the repair
     /// rewrote and standing in for the rest with the pre-repair pass's own
     /// entries.
@@ -2220,7 +2285,7 @@ impl Pipeline {
         }
     }
 
-    /// The authoritative PAR2 read, in whichever of its two shapes
+    /// The authoritative PAR2 read, in whichever of its shapes
     /// [`Par2PassScope`] asks for. Returns the raw result and the plan the pass
     /// read through; settling it is the caller's, so the selective shape can
     /// merge first and settle once over the combined set.
@@ -2233,10 +2298,13 @@ impl Pipeline {
     ) -> Result<(par2_rs::VerificationResult, par2_rs::PlacementPlan), String> {
         #[cfg(test)]
         {
-            if matches!(scope, Par2PassScope::WholeSet) {
-                self.par2_authoritative_verify_calls += 1;
-            } else {
+            // Counted by what the pass reads, not by how it resolves names: both
+            // whole-set shapes read every described file, only the selective one
+            // reads fewer.
+            if matches!(scope, Par2PassScope::Selected(_)) {
                 self.par2_selective_verify_calls += 1;
+            } else {
+                self.par2_authoritative_verify_calls += 1;
             }
         }
 
@@ -2253,15 +2321,15 @@ impl Pipeline {
         let direct = self.direct_par2_overlay(job_id);
         let verify_result = tokio::task::spawn_blocking(move || {
             pp_pool.install(move || {
-                // The whole-set shape observes placement; the selective shape
-                // asserts it. `scan_placement` is not the cheap half of this
-                // pass — it computes the FULL-file MD5 of every disk file whose
-                // 16k hash matches a description — so a post-repair pass that
-                // scanned would re-read the whole set to build a plan that can
-                // only come back the identity: this job applied the pre-repair
-                // plan before repairing, and par2-rs installs every file it
-                // rewrote at that file's canonical name. An empty plan *is* the
-                // identity placement for reading, because
+                // The scanning shape observes placement; the other two assert
+                // it. `scan_placement` is not the cheap half of this pass — it
+                // computes the FULL-file MD5 of every disk file whose 16k hash
+                // matches a description — so a post-repair pass that scanned
+                // would re-read the whole set to build a plan that can only come
+                // back the identity: this job applied the pre-repair plan before
+                // repairing, and par2-rs installs every file it rewrote at that
+                // file's canonical name. An empty plan *is* the identity
+                // placement for reading, because
                 // `PlacementFileAccess::from_plan` takes its overrides from
                 // `swaps` and `renames` alone and otherwise resolves a file at
                 // the name its description gives it.
@@ -2277,13 +2345,15 @@ impl Pipeline {
                         }
                         plan
                     }
-                    Par2PassScope::Selected(_) => par2_rs::PlacementPlan {
-                        exact: Vec::new(),
-                        swaps: Vec::new(),
-                        renames: Vec::new(),
-                        unresolved: Vec::new(),
-                        conflicts: Vec::new(),
-                    },
+                    Par2PassScope::Selected(_) | Par2PassScope::WholeSetAtCanonicalNames => {
+                        par2_rs::PlacementPlan {
+                            exact: Vec::new(),
+                            swaps: Vec::new(),
+                            renames: Vec::new(),
+                            unresolved: Vec::new(),
+                            conflicts: Vec::new(),
+                        }
+                    }
                 };
 
                 let Some(direct) = direct else {
@@ -3998,7 +4068,7 @@ impl Pipeline {
     /// an explicit "verifying repaired files" phase before it accepts a repair,
     /// and NZBGet reaches `psRepaired` only from a `Process(true)` that came
     /// back successful, having passed through `ptVerifyingRepaired` first.
-    async fn finish_par2_repair(
+    pub(in crate::pipeline) async fn finish_par2_repair(
         &mut self,
         job_id: JobId,
         par2_set: Arc<par2_rs::Par2FileSet>,
@@ -4070,8 +4140,9 @@ impl Pipeline {
         // placement by the plan — so that description no longer describes the
         // disk. A verdict is only worth announcing about the layout the job
         // will actually deliver, so when either step moved a path the whole set
-        // is read once more, in its final places, and that answer replaces the
-        // earlier one everywhere below.
+        // is read once more, at the names the descriptions give it — the final
+        // places, if the repair and the two steps did their job — and that
+        // answer replaces the earlier one everywhere below.
         //
         // When nothing moved, the earlier answer still describes the disk
         // exactly, and re-reading would throw away the whole point of the
@@ -4093,13 +4164,11 @@ impl Pipeline {
                 misplaced_before_placement,
                 "paths moved after repair — verifying the whole set where it now sits"
             );
-            let (settled, _) = match self
-                .verify_par2_with_placement(
+            let settled = match self
+                .verify_par2_set_at_canonical_names(
                     job_id,
                     Arc::clone(&par2_set),
                     working_dir.clone(),
-                    true,
-                    false,
                 )
                 .await
             {
@@ -6031,7 +6100,98 @@ impl Pipeline {
                     // verdict down the ordinary ladder, which repairs the
                     // furniture in the same pass at no extra cost.
                     let ignorable_damage = self.par2_damage_is_only_ignorable(verification);
-                    if !par2_verification_needs_repair(verification) || ignorable_damage.is_some() {
+                    // A verdict with nothing damaged, nothing missing and no
+                    // slice to reconstruct has no repair in it: every described
+                    // file's content is on disk and whole, and the only work
+                    // left is moving some of it onto the names the descriptions
+                    // give it. Running the repairer over that shape is how a set
+                    // that was never damaged ends up with a directory full of
+                    // `<name>.N` backups — it installs each file at its
+                    // canonical name and moves the occupant aside — and the
+                    // placement that follows is then asked to rename files onto
+                    // names those installs already filled.
+                    //
+                    // So it takes the road the verify arm takes for a clean
+                    // verdict instead. The plan has to come from a directory
+                    // scan: a pairwise swap is only visible to something that
+                    // looks at what is actually on each name, and the plan
+                    // derived from statuses can express it only as two renames
+                    // into occupied targets. The scan's own read is what stands
+                    // as this set's verdict from here on.
+                    //
+                    // Ordered after the furniture rule above, which owns any
+                    // verdict whose damage is all ignorable; a `Renamed` entry
+                    // sends that rule to `None`, so the two never contend.
+                    let placement_only = par2_verification_needs_repair(verification)
+                        && ignorable_damage.is_none()
+                        && par2_verification_is_placement_only(verification);
+                    let mut placement_pass: Option<par2_rs::VerificationResult> = None;
+                    if placement_only {
+                        info!(
+                            job_id = job_id.0,
+                            files_renamed = repair_analysis.files_renamed,
+                            "PAR2 analysis — placement only, nothing to repair"
+                        );
+                        let (scanned, placement_plan) = match self
+                            .verify_par2_with_placement(
+                                job_id,
+                                Arc::clone(&par2_set),
+                                working_dir.clone(),
+                                matches!(current_status, JobStatus::Repairing),
+                                true,
+                            )
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(message) => {
+                                self.finish_par2_set_failure(job_id, set_id, message).await;
+                                return;
+                            }
+                        };
+                        // The scan is a second read of a directory the analysis
+                        // described a moment ago, and it is the one this arm
+                        // stands its verdict on. If the two disagree —
+                        // `verify_all` cannot report misplacement, so a
+                        // disagreement is damage or an absence that appeared in
+                        // between — then "placement only" was concluded from a
+                        // state that no longer holds, and marking the set
+                        // verified on it would accept a verdict nothing re-read.
+                        // Nothing is moved and the gate is re-armed instead: the
+                        // next lap analyses the disk as it is now and takes
+                        // whichever ladder that answer deserves.
+                        if par2_verification_needs_repair(&scanned) {
+                            warn!(
+                                job_id = job_id.0,
+                                damaged = scanned.total_missing_blocks,
+                                "PAR2 placement pass disagreed with the analysis it stood in \
+                                 for — re-checking before placing anything"
+                            );
+                            self.schedule_job_completion_check(job_id);
+                            return;
+                        }
+                        self.try_deobfuscate_files_with_par2(job_id).await;
+                        if let Err(error) = self
+                            .apply_placement_plan_for_retry_or_repair(
+                                job_id,
+                                working_dir.clone(),
+                                &placement_plan,
+                            )
+                            .await
+                        {
+                            self.finish_par2_set_failure(job_id, set_id, error).await;
+                            return;
+                        }
+                        placement_pass = Some(scanned);
+                    }
+                    // From here the placement-only arm carries the scanned
+                    // pass's answer, which read every file through the plan it
+                    // just applied. Every other arm is unchanged: nothing was
+                    // scanned, so this resolves to the analysis result itself.
+                    let verification = placement_pass.as_ref().unwrap_or(verification);
+                    if !par2_verification_needs_repair(verification)
+                        || ignorable_damage.is_some()
+                        || placement_only
+                    {
                         if let Some(ignorable) = ignorable_damage.as_ref() {
                             warn!(
                                 job_id = job_id.0,
@@ -6039,7 +6199,7 @@ impl Pipeline {
                                 ignorable.len(),
                                 ignorable.join(", ")
                             );
-                        } else {
+                        } else if !placement_only {
                             info!(job_id = job_id.0, "PAR2 analysis passed — no repair needed");
                         }
 
@@ -7159,17 +7319,29 @@ mod tests {
         );
     }
 
+    /// The write set is every file the repair could have acted on, which is
+    /// every file that was not already complete at its canonical name.
+    ///
+    /// `Renamed` belongs in it. The rule used to read "Damaged and Missing",
+    /// on the reasoning that misplaced content already exists intact somewhere
+    /// else and is moved by placement rather than rewritten. A repair over a set
+    /// whose only fault was misplacement disproved it: the repairer copied every
+    /// one of those files onto its canonical name — the run reconstructed no
+    /// slice and still reported bytes copied — and left the displaced originals
+    /// as `<name>.N`. Carrying the pre-repair `Renamed` entries through that
+    /// reported six placed files as still misplaced, and the placement step then
+    /// tried to rename them onto names the repair had just filled.
     #[test]
-    fn par2_repair_write_set_is_the_damaged_and_missing_files() {
+    fn par2_repair_write_set_is_everything_not_already_complete() {
         let write_set = par2_repair_write_set(&mixed_pre_repair_verification());
 
         assert_eq!(
             write_set,
-            vec![file_id_from(2), file_id_from(3)],
-            "a repair writes exactly the files that were not already complete at \
-             their canonical name — Damaged and Missing. Complete is untouched by \
-             construction, and Renamed is content that already exists intact \
-             somewhere else and is moved by placement, never rewritten."
+            vec![file_id_from(2), file_id_from(3), file_id_from(4)],
+            "Damaged, Missing and Renamed are all files the repair installs at a \
+             canonical name, so all three have to be re-read there afterwards. \
+             Only Complete is carried: it is the one verdict a repair cannot \
+             have invalidated."
         );
     }
 

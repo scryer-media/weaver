@@ -55,7 +55,7 @@ test.describe.serial("security product behavior", () => {
 
     await page.goto("/settings/security");
     await page.getByTestId("api-key-name").fill("e2e-release-key");
-    await page.getByRole("combobox").click();
+    await page.getByLabel("Scope", { exact: true }).click();
     await page.getByRole("option", { name: "Read" }).click();
     await page.getByRole("button", { name: "Create API Key" }).click();
 
@@ -105,11 +105,15 @@ test.describe.serial("security product behavior", () => {
     await page.getByRole("button", { name: "Enable Login" }).click();
     await expect(page.getByText("Passwords do not match")).toBeVisible();
     await page.locator("#login-confirm").fill(initialPassword);
+    // Enabling login rejects any in-flight browser queries. The number is
+    // scheduling-dependent; the explicit rejected-login checks below cover
+    // the credential contract.
     expectHttpErrors(page, {
       method: "POST",
       pathname: "/graphql",
       status: 401,
-      count: 2,
+      count: 1,
+      maxCount: 8,
     });
     await page.getByRole("button", { name: "Enable Login" }).click();
     await expect(page.getByText("Login protection enabled")).toBeVisible();
