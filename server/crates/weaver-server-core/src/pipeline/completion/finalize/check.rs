@@ -3149,6 +3149,24 @@ impl Pipeline {
         )))
     }
 
+    /// Test-only entry onto [`Self::quick_verify_par2_with_placement`].
+    ///
+    /// The quick pass is private to this module, but its `Some`/`None` verdict
+    /// and the placement plan it hands back are exactly what a diagnostic for a
+    /// misplaced-payload shape needs to read first-hand, rather than inferring
+    /// them from the completion gate's downstream effects. Compiled only under
+    /// test, so it adds nothing to the shipped path.
+    #[cfg(test)]
+    pub(in crate::pipeline) async fn quick_verify_par2_with_placement_for_test(
+        &mut self,
+        job_id: JobId,
+        par2_set: Arc<par2_rs::Par2FileSet>,
+        working_dir: std::path::PathBuf,
+    ) -> Result<Option<(par2_rs::VerificationResult, par2_rs::PlacementPlan)>, String> {
+        self.quick_verify_par2_with_placement(job_id, par2_set, working_dir)
+            .await
+    }
+
     /// Shared completion handling for a clean PAR2 verdict.
     ///
     /// Every fast path that proves a job clean without the authoritative pass

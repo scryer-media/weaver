@@ -6,8 +6,8 @@
   "expected_outcome": "success",
   "segment_size": 65536,
   "forbiddenJobEvents": [
-    "JobVerificationStarted",
-    "JobVerificationComplete"
+    "RepairStarted",
+    "RepairComplete"
   ],
   "runtimeAssertions": {
     "fileIdentityRewrite": {

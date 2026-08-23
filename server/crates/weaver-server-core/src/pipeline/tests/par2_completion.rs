@@ -5882,6 +5882,316 @@ async fn damage_alongside_misplacement_still_repairs_and_reads_back_the_placed_f
     );
 }
 
+/// Stage the identity-rebound misplaced-payload shape as a conventional
+/// (non-direct) job and hand back the two pieces a direct quick-verify call
+/// needs: the working directory and the served recovery set.
+///
+/// `described[i]` is the name the recovery set gives file `i` and the content it
+/// says that name should hold; `on_disk[i]` is what is actually written at that
+/// name — `None` leaves the file absent (never completed). A caller expresses a
+/// swap by handing two present entries each other's bytes, damage by handing one
+/// holed bytes, and a missing partner by handing `None`. Every present file is
+/// completed and its identity rebound to its canonical name with a PAR2 source,
+/// which is the post-rebind state the completion gate meets in the field. No
+/// article is fed to the dual-CRC grid and no whole-file digest is recorded, so
+/// this is the metadata-early shape that streams no MD5 at all — callers that
+/// want content evidence add it explicitly.
+async fn stage_misplaced_payload_shape(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    job_name: &str,
+    described: &[(&str, Vec<u8>)],
+    on_disk: &[Option<Vec<u8>>],
+) -> (PathBuf, Arc<Par2FileSet>) {
+    assert_eq!(described.len(), on_disk.len());
+    let files: Vec<(String, u32)> = described
+        .iter()
+        .zip(on_disk.iter())
+        .map(|((name, canonical), disk)| {
+            let bytes = disk.as_ref().map_or(canonical.len(), Vec::len);
+            ((*name).to_string(), bytes as u32)
+        })
+        .collect();
+    let spec = standalone_job_spec(job_name, &files);
+    let working_dir = insert_active_job(pipeline, job_id, spec).await;
+
+    for (index, ((name, _), disk)) in described.iter().zip(on_disk.iter()).enumerate() {
+        let Some(bytes) = disk else {
+            continue;
+        };
+        write_and_complete_file(pipeline, job_id, index as u32, name, bytes).await;
+        pipeline
+            .set_file_identity(
+                job_id,
+                crate::jobs::record::ActiveFileIdentity {
+                    file_index: index as u32,
+                    source_filename: (*name).to_string(),
+                    current_filename: (*name).to_string(),
+                    canonical_filename: Some((*name).to_string()),
+                    classification: None,
+                    classification_source: crate::jobs::record::FileIdentitySource::Par2,
+                },
+            )
+            .unwrap();
+    }
+
+    let described_pairs: Vec<(String, Vec<u8>)> = described
+        .iter()
+        .map(|(name, canonical)| ((*name).to_string(), canonical.clone()))
+        .collect();
+    install_test_par2_runtime(
+        pipeline,
+        job_id,
+        placement_par2_file_set(&described_pairs),
+        &[],
+    );
+    let par2_set = Arc::clone(pipeline.par2_set(job_id).expect("served recovery set"));
+    (working_dir, par2_set)
+}
+
+/// Record a trusted whole-file MD5 for a completed file, the current-generation
+/// evidence a metadata-early download deliberately never streams.
+fn set_measured_md5(pipeline: &mut Pipeline, job_id: JobId, file_index: u32, content: &[u8]) {
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .completed_checksums
+        .insert(
+            NzbFileId { job_id, file_index },
+            crate::pipeline::CompletedFileChecksum {
+                md5: Some(par2_rs::checksum::md5(content)),
+                crc32: par2_rs::checksum::crc32(content),
+                all_parts_crc_verified: false,
+            },
+        );
+}
+
+/// The field shape: a clean swapped pair under canonical names, downloaded
+/// metadata-early, so no whole-file MD5 was ever streamed and no article closed
+/// a block on the dual-CRC grid. Quick verify has no evidence keyed to content
+/// — only names and lengths — and names are exactly what a swap makes lie, so it
+/// must stay inconclusive and leave the authoritative read to decide.
+///
+/// This is the `no_current_generation_digest` arm: the per-file loop finds
+/// neither a closed in-stream block verdict nor a current-generation measured
+/// digest, so `measured_md5` is `None` and the loop bails. The companion test
+/// `a_misplaced_pair_proven_by_measured_digests_returns_a_swap_plan` shows the
+/// identical fixture resolving the swap the moment a digest is present, which is
+/// what pins the absence of evidence — not a broken fixture — as the cause here.
+#[tokio::test]
+async fn a_misplaced_pair_with_no_content_evidence_is_correctly_inconclusive() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30360);
+    let a = misplacement_payload(1);
+    let b = misplacement_payload(2);
+    let (working_dir, par2_set) = stage_misplaced_payload_shape(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon Swap No Evidence",
+        &[
+            ("silver-horizon-a.bin", a.clone()),
+            ("silver-horizon-b.bin", b.clone()),
+        ],
+        &[Some(b.clone()), Some(a.clone())],
+    )
+    .await;
+
+    let file0 = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let file1 = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    // Pin the arm. Neither file carries a closed in-stream block verdict ...
+    assert!(pipeline.block_crc_verdicts(file0).is_none());
+    assert!(pipeline.block_crc_verdicts(file1).is_none());
+    // ... nor a current-generation measured digest, in the runtime or the db.
+    let runtime = pipeline.par2_runtime(job_id).unwrap();
+    assert!(!runtime.completed_checksums.contains_key(&file0));
+    assert!(!runtime.completed_checksums.contains_key(&file1));
+    let persisted = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert!(
+        persisted.is_empty(),
+        "no persisted digest either: {persisted:?}"
+    );
+
+    let result = pipeline
+        .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
+        .await
+        .expect("quick verify does not error on a clean-but-unproven shape");
+    assert!(
+        result.is_none(),
+        "with no digest and no grid verdict the content is unproven, so the \
+         quick pass must stay inconclusive and let the authoritative read decide"
+    );
+    assert_eq!(
+        pipeline.par2_quick_verify_calls, 0,
+        "an inconclusive pass never counts as a quick verification"
+    );
+}
+
+/// The same swapped pair, now carrying the trusted whole-file MD5 that a
+/// non-metadata-early download would have streamed. The measured digest keys the
+/// match to the description its *content* reproduces, not the one its current
+/// name implies, so the swap already resolves today: `Ok(Some(..))` with a
+/// two-entry swap plan and a clean verdict. This is the control that proves the
+/// swap machinery is sound and the inconclusive verdict above is caused solely
+/// by absent content evidence.
+#[tokio::test]
+async fn a_misplaced_pair_proven_by_measured_digests_returns_a_swap_plan() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30361);
+    let a = misplacement_payload(3);
+    let b = misplacement_payload(4);
+    let (working_dir, par2_set) = stage_misplaced_payload_shape(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon Swap Measured",
+        &[
+            ("silver-horizon-a.bin", a.clone()),
+            ("silver-horizon-b.bin", b.clone()),
+        ],
+        &[Some(b.clone()), Some(a.clone())],
+    )
+    .await;
+    set_measured_md5(&mut pipeline, job_id, 0, &b);
+    set_measured_md5(&mut pipeline, job_id, 1, &a);
+
+    let (verification, plan) = pipeline
+        .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
+        .await
+        .expect("quick verify does not error")
+        .expect("measured digests prove the content, so the swap resolves clean");
+
+    assert_eq!(plan.swaps.len(), 1, "the two files are one swap pair");
+    assert!(plan.exact.is_empty());
+    assert!(plan.renames.is_empty());
+    assert!(plan.unresolved.is_empty());
+    assert!(plan.conflicts.is_empty());
+    assert_eq!(verification.files.len(), 2);
+    let (left, right) = &plan.swaps[0];
+    let mut correct = [left.correct_name.as_str(), right.correct_name.as_str()];
+    correct.sort_unstable();
+    assert_eq!(correct, ["silver-horizon-a.bin", "silver-horizon-b.bin"]);
+    assert_eq!(pipeline.par2_quick_verify_calls, 1);
+}
+
+/// Fail-closed: damage alongside the swap. `silver-horizon-a.bin` holds its
+/// partner's clean bytes (a valid swap half), but `silver-horizon-b.bin` holds
+/// bytes that reproduce no description's hash. The damaged file matches nothing,
+/// its partner description is left unresolved, and the pass refuses — a damaged
+/// file must never leave this path with a clean verdict, even with digests
+/// present that would otherwise resolve the swap.
+#[tokio::test]
+async fn a_damaged_file_in_the_misplaced_shape_is_never_quick_verified() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30362);
+    let a = misplacement_payload(5);
+    let b = misplacement_payload(6);
+    let mut damaged = b.clone();
+    damaged[10] ^= 0xFF; // same length, reproduces no description's hash
+    let (working_dir, par2_set) = stage_misplaced_payload_shape(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon Swap With Damage",
+        &[
+            ("silver-horizon-a.bin", a.clone()),
+            ("silver-horizon-b.bin", b.clone()),
+        ],
+        &[Some(b.clone()), Some(damaged.clone())],
+    )
+    .await;
+    set_measured_md5(&mut pipeline, job_id, 0, &b);
+    set_measured_md5(&mut pipeline, job_id, 1, &damaged);
+
+    let result = pipeline
+        .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
+        .await
+        .expect("quick verify does not error");
+    assert!(
+        result.is_none(),
+        "a file whose bytes match no description leaves its partner unresolved, \
+         so the pass must refuse"
+    );
+    assert_eq!(pipeline.par2_quick_verify_calls, 0);
+}
+
+/// Fail-closed: one hash claimed by two descriptions. Both descriptions carry
+/// the same `hash_full`, so a file matching it is ambiguous — the match count
+/// for the chosen id trips two, the id is dropped as a conflict, and its partner
+/// description is left unresolved. Ambiguity of this kind is exactly what the
+/// authoritative read owns, so the quick pass refuses.
+#[tokio::test]
+async fn a_hash_claimed_by_two_descriptions_is_never_quick_verified() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30363);
+    let shared = misplacement_payload(7);
+    let (working_dir, par2_set) = stage_misplaced_payload_shape(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon Shared Hash",
+        &[
+            ("silver-horizon-a.bin", shared.clone()),
+            ("silver-horizon-b.bin", shared.clone()),
+        ],
+        &[Some(shared.clone()), Some(shared.clone())],
+    )
+    .await;
+    set_measured_md5(&mut pipeline, job_id, 0, &shared);
+    set_measured_md5(&mut pipeline, job_id, 1, &shared);
+
+    let result = pipeline
+        .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
+        .await
+        .expect("quick verify does not error");
+    assert!(
+        result.is_none(),
+        "a hash two descriptions answer to is ambiguous, so the pass must refuse"
+    );
+    assert_eq!(pipeline.par2_quick_verify_calls, 0);
+}
+
+/// Fail-closed: a swap whose partner never arrived. One file is present at
+/// `silver-horizon-b.bin`'s canonical name but holds `silver-horizon-a.bin`'s
+/// content; the file that should hold the other half never completed. The
+/// present half resolves to its content's description, but the absent partner's
+/// description has no disk file, so it is left unresolved and the pass refuses.
+#[tokio::test]
+async fn a_swap_whose_partner_is_absent_is_never_quick_verified() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30364);
+    let a = misplacement_payload(11);
+    let b = misplacement_payload(12);
+    let (working_dir, par2_set) = stage_misplaced_payload_shape(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon Absent Partner",
+        &[
+            ("silver-horizon-a.bin", a.clone()),
+            ("silver-horizon-b.bin", b.clone()),
+        ],
+        &[None, Some(a.clone())],
+    )
+    .await;
+    set_measured_md5(&mut pipeline, job_id, 1, &a);
+
+    let result = pipeline
+        .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
+        .await
+        .expect("quick verify does not error");
+    assert!(
+        result.is_none(),
+        "the partner description has no disk file, so the pass must refuse"
+    );
+    assert_eq!(pipeline.par2_quick_verify_calls, 0);
+}
+
 /// Describe a file the set lists but does not protect.
 ///
 /// A PAR2 set's non-recovery files carry a name and the two digests every
