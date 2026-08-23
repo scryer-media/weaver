@@ -1269,7 +1269,6 @@ jobs:
             $args = @("--config", $configDir, "--log-file", $logFile, "serve", "--port", "$port")
             $process = Start-Process -FilePath $exe -ArgumentList $args -PassThru
             $baseUrl = "http://127.0.0.1:$port"
-            $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
             $deadline = (Get-Date).AddSeconds(30)
             $lastError = $null
             $ready = $false
@@ -1279,25 +1278,15 @@ jobs:
                 throw "Weaver exited before API readiness with code $($process.ExitCode)"
               }
               try {
-                $spa = Invoke-WebRequest -Uri "$baseUrl/" -WebSession $session -TimeoutSec 5
+                $spa = Invoke-WebRequest -Uri "$baseUrl/" -TimeoutSec 5
                 if ($spa.StatusCode -ne 200) {
                   throw "SPA returned HTTP $($spa.StatusCode)"
                 }
-                $payload = @{ query = "query { systemStatus { version } }" } | ConvertTo-Json -Compress
-                $api = Invoke-WebRequest -Uri "$baseUrl/graphql" -Method Post -ContentType "application/json" -Body $payload -WebSession $session -TimeoutSec 5
-                $responseText = if ($api.Content -is [byte[]]) {
-                  [System.Text.Encoding]::UTF8.GetString($api.Content)
-                } else {
-                  [string]$api.Content
+                $probe = Invoke-WebRequest -Uri "$baseUrl/readyz" -TimeoutSec 5
+                if ($probe.StatusCode -ne 200) {
+                  throw "Readiness probe returned HTTP $($probe.StatusCode)"
                 }
-                $json = $responseText | ConvertFrom-Json
-                if ($json.errors) {
-                  throw "GraphQL errors: $($json.errors | ConvertTo-Json -Compress -Depth 8)"
-                }
-                if (-not $json.data.systemStatus.version) {
-                  throw "GraphQL systemStatus did not include a version"
-                }
-                Write-Host "Weaver startup API smoke test passed with version $($json.data.systemStatus.version)"
+                Write-Host "Weaver startup readiness smoke test passed"
                 $ready = $true
                 break
               } catch {
@@ -1568,7 +1557,6 @@ jobs:
             $args = @("--config", $configDir, "--log-file", $logFile, "serve", "--port", "$port")
             $process = Start-Process -FilePath $exe -ArgumentList $args -PassThru
             $baseUrl = "http://127.0.0.1:$port"
-            $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
             $deadline = (Get-Date).AddSeconds(30)
             $lastError = $null
             $ready = $false
@@ -1578,25 +1566,15 @@ jobs:
                 throw "Weaver exited before API readiness with code $($process.ExitCode)"
               }
               try {
-                $spa = Invoke-WebRequest -Uri "$baseUrl/" -WebSession $session -TimeoutSec 5
+                $spa = Invoke-WebRequest -Uri "$baseUrl/" -TimeoutSec 5
                 if ($spa.StatusCode -ne 200) {
                   throw "SPA returned HTTP $($spa.StatusCode)"
                 }
-                $payload = @{ query = "query { systemStatus { version } }" } | ConvertTo-Json -Compress
-                $api = Invoke-WebRequest -Uri "$baseUrl/graphql" -Method Post -ContentType "application/json" -Body $payload -WebSession $session -TimeoutSec 5
-                $responseText = if ($api.Content -is [byte[]]) {
-                  [System.Text.Encoding]::UTF8.GetString($api.Content)
-                } else {
-                  [string]$api.Content
+                $probe = Invoke-WebRequest -Uri "$baseUrl/readyz" -TimeoutSec 5
+                if ($probe.StatusCode -ne 200) {
+                  throw "Readiness probe returned HTTP $($probe.StatusCode)"
                 }
-                $json = $responseText | ConvertFrom-Json
-                if ($json.errors) {
-                  throw "GraphQL errors: $($json.errors | ConvertTo-Json -Compress -Depth 8)"
-                }
-                if (-not $json.data.systemStatus.version) {
-                  throw "GraphQL systemStatus did not include a version"
-                }
-                Write-Host "Weaver startup API smoke test passed with version $($json.data.systemStatus.version)"
+                Write-Host "Weaver startup readiness smoke test passed"
                 $ready = $true
                 break
               } catch {

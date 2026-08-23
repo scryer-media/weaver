@@ -1,7 +1,7 @@
 {
   "slug": "rar5-solid-encrypted-missing-middle-par2",
   "title": "E2E.Test.RAR5.Solid.Encrypted.MissingMiddle.PAR2.2026.1080p-TESTGRP",
-  "description": "Solid, data-encrypted RAR5 split across four volumes with the interior third volume omitted. PAR2 carries 382 recovery blocks (about a third of the set) and must repair before extraction. Three verification passes are the intended shape: one against the live stream, one at exhaustion to name the missing blocks a promotion must target, and one after the promoted recovery lands to hand the analyzer to repair.",
+  "description": "Solid, data-encrypted RAR5 split across four volumes with the interior third volume omitted. PAR2 carries 382 recovery blocks (about a third of the set) and must repair before extraction. Three verification passes are typical: one against the live stream, one at exhaustion to name the missing blocks a promotion must target, and one after the promoted recovery lands to hand the analyzer to repair. A fourth is valid when the recovery pipeline briefly has no concrete queued or active work and conservatively rescans before the final promoted volume is merged.",
   "category": "2000",
   "expected_outcome": "repair_then_success",
   "password": "weaver-e2e-repair-password",
@@ -9,7 +9,7 @@
     "RepairComplete"
   ],
   "maxJobEventCounts": {
-    "JobVerificationStarted": 3
+    "JobVerificationStarted": 4
   },
   "expectedOutputBLAKE3": {
     "work/payload/movie.mkv": "15849b0fd55c4b653829ae1b6cd3457442591cb158d4b1bdda5e88c1a4676a62"

@@ -3,7 +3,7 @@
 //! already uses to compose part CRCs into a completed-file CRC without
 //! re-reading the file.
 //!
-//! D2 requires one combine, not three. `weaver_yenc::crc32_combine` forwards to
+//! The pipeline requires one combine, not three. `weaver_yenc::crc32_combine` forwards to
 //! `crc-fast`'s `checksum_combine` (already in this crate's dependency set,
 //! same Mark Adler GF(2) zeros-operator construction) rather than pulling the
 //! PAR2 library down into the yEnc codec. This differential is what makes that
@@ -71,7 +71,7 @@ fn combine_matches_par2_rs_combine_op() {
 }
 
 /// The one input on which the two combines disagree, pinned so the difference
-/// is a recorded fact rather than a latent surprise for the D2-P2 collector.
+/// is a recorded fact rather than a latent surprise for the downstream collector.
 ///
 /// `Crc32CombineOp::new(0)` short-circuits to `crc1`, discarding `crc2`;
 /// `crc32_combine(a, b, 0)` returns `a ^ b`. The CRC32 of an empty range is 0,
@@ -99,7 +99,7 @@ fn zero_length_combine_agrees_on_well_formed_input_only() {
     }
 }
 
-/// The whole D2 derivation, end to end, with par2-rs as the oracle on both
+/// The whole CRC derivation, end to end, with par2-rs as the oracle on both
 /// sides: segment CRCs against `par2_rs::checksum::crc32`, and the block/article
 /// folds against `Crc32CombineOp`.
 #[test]

@@ -308,7 +308,7 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
     let mut out = out_base;
     let mut i: isize = -(span as isize);
 
-    // r11: on Neoverse-N1 the SEARCH_END = false span runs the frozen-roll
+    // On Neoverse-N1 the SEARCH_END = false span runs the frozen assembly
     // kernel (see `n1_span` at the end of this file); it consumes the whole
     // span (`i` -> 0), so the Rust loop below no-ops at runtime and the shared
     // exit glue takes over unchanged. Every other core — Apple silicon in
@@ -325,7 +325,7 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
         );
     }
 
-    // r12: the SEARCH_END = true twin. Kind protocol: 0 span done; 1
+    // The SEARCH_END = true twin. Kind protocol: 0 span done; 1
     // terminator break (no-backtrack state from the exported mask); 2/3/4
     // pending-tail resume (Cr/CrLf/CrLfEq); 5 = a rare dot-window terminator
     // candidate — the window is left unconsumed and the Rust loop below
@@ -1832,22 +1832,20 @@ pub(super) unsafe fn decode_normal_run_neon(
 }
 
 // ---------------------------------------------------------------------------
-// r11: the Neoverse-N1 frozen span kernel (SEARCH_END = false).
+// Neoverse-N1 frozen span kernel (SEARCH_END = false).
 //
-// MAINTENANCE CONTRACT — mirror of the AVX2 raw kernels' contract:
+// Maintenance contract — mirror of the AVX2 raw kernels' contract:
 // `decode_kernel_neon64_raw` above remains the SOURCE OF TRUTH and the escape
 // hatch (WEAVER_YENC_N1_ASM=0, or any non-N1 core — Apple silicon never enters
 // here). This block freezes the emission for issue-width-bound Neoverse-N1,
 // where the Rust loop's LLVM allocation pays +20% instructions and +44-86%
-// branches vs the same algorithm hand-scheduled (perf-counter localized,
-// JOURNAL r11). Tune the Rust loop, measure via the escape hatch, then
-// re-derive this block if the Rust loop wins.
+// branches versus the same algorithm hand-scheduled in local perf-counter
+// measurements. Tune the Rust loop, measure via the escape hatch, then
+// update this block if the Rust loop wins.
 //
 // The body is an instruction-for-instruction transliteration of rapidyenc
 // 27f435a's compiled do_decode_simd<isRaw=1, searchEnd=0, 64, do_decode_neon>
-// aarch64 emission (spec archived: yenc-program/results/r11/n1-oracle-se0.txt,
-// 0x39030; loop body 0x39120-0x392b4 + dot-arm 0x393d8-0x394ac + collision
-// block 0x3954c-0x395e4), register-for-register, with these deviations:
+// AArch64 emission, register-for-register, with these deviations:
 //   1. the dot-arm's stp/ldp d12/d13 stack spills -> spare v14/v15 (nostack);
 //   2. the collision block's bit-lane + 0x2a/0x6a reloads -> the already-
 //      resident v17/v18/v25 (the reloads exist in the oracle only because gcc
@@ -2195,7 +2193,7 @@ pub(super) mod n1_span_se {
         table: *const u8,
     ) {
         use std::arch::aarch64::*;
-        let mut cur = unsafe { sp.offset(*i) };
+        let cur = unsafe { sp.offset(*i) };
         let mut i_v = *i;
         let mut out_v = *out;
         let mut ef = *esc_first;

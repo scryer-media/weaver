@@ -7755,8 +7755,8 @@ fn direct_envelopes_left(working_dir: &Path) -> usize {
 
 #[tokio::test]
 async fn two_sets_sharing_a_clamped_partial_keep_their_bytes_apart() {
-    // Post-completion review, 2026-08-04 (P0). Internal direct-store paths were
-    // derived from names alone, and `path_component_with_suffix` clamps a long
+    // Internal direct-store paths were derived from names alone, and
+    // `path_component_with_suffix` clamps a long
     // name's stem to fit `DOWNLOAD_FILENAME_MAX_BYTES` — so two members whose
     // names differ only past the clamp point reached the *same*
     // `.direct.partial` while their final destinations stayed distinct. Both

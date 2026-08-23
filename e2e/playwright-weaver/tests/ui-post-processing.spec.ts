@@ -127,6 +127,7 @@ test("post-processing settings, the live script list, and real script execution 
 
   // 6. The job's event log shows what each script did, and never the secret.
   await page.goto(`/jobs/${job.id}`);
+  await page.getByRole("button", { name: "Event Log" }).click();
   // Counted rather than picked positionally: the log legitimately mentions a
   // script more than once, and which occurrence renders first is not something
   // this test should assert. Presence is the claim — the secret's absence

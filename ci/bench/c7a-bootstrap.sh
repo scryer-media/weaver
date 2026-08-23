@@ -3,7 +3,7 @@
 # differential + parity bench (and the rarpar GFNI/AVX-512 GF16 phase) on an AWS
 # c7a.xlarge (AMD Zen 4) Ubuntu 24.04 box.
 #
-# PREBUILT-BINARY MODEL (plan v2). Nothing is compiled from Rust on this box:
+# PREBUILT-BINARY MODEL. Nothing is compiled from Rust on this box:
 # no rustup, no cargo, no toolchain, no rapidyenc cmake build. Every executable
 # — test binaries, bench binaries and librapidyenc.so — is built ahead of time
 # on the local Linux builder (Ubuntu 24.04, same glibc as the AMI, plain
@@ -14,9 +14,8 @@
 # binaries compile their C oracle at RUNTIME via $CXX
 # (engines/weaver-yenc/tests/rapidyenc_decode_diff.rs:146-159). Hence g++.
 #
-# AWS RUNS ONLY, and the instance type is LOCKED to c7a.xlarge. Local-box runs
-# (SYLIX / codex-x86-2) keep their own recipes and are not affected by anything
-# in this script.
+# AWS runs use c7a.xlarge because the benchmark protocol requires its Zen 4
+# feature set. Other targets use separate recipes.
 #
 # The only AWS calls made here are `ecr:GetAuthorizationToken` (via
 # `aws ecr get-login-password`) and the layer reads `docker pull` performs.
@@ -43,8 +42,8 @@ set -euo pipefail
 # (as ci/bench/avx2-aws-run.sh:94 does for the AVX2 box). Without it this only
 # STOPS the instance and the EBS root volume keeps billing.
 #
-# This is a safety net, not a schedule — no estimates anywhere in this runbook
-# by standing rule; c7a-run.sh MEASURES each phase and records the numbers in
+# This is a safety net, not a schedule. c7a-run.sh measures each phase and
+# records the numbers in
 # metadata.json. Raise DEADMAN_MINUTES if a run ever approaches it; set 0 to
 # skip (e.g. re-running on an already-armed box).
 DEADMAN_MINUTES="${DEADMAN_MINUTES:-120}"
@@ -74,7 +73,7 @@ arm_deadman
 # The corpus image extracts /corpus/. into $CORPUS_DEST, which yields
 # $CORPUS_DEST/{weaver,rarpar,rapidyenc,prebuilt}.
 CORPUS_DEST="${CORPUS_DEST:-$HOME}"
-CORPUS_IMAGE="${CORPUS_IMAGE:-651588424025.dkr.ecr.us-east-1.amazonaws.com/weaver-bench-corpus:latest}"
+CORPUS_IMAGE="${CORPUS_IMAGE:?set CORPUS_IMAGE to a digest-pinned ECR image}"
 CORPUS_REGION="${CORPUS_REGION:-us-east-1}"
 CORPUS_REGISTRY="${CORPUS_IMAGE%%/*}"
 CORPUS_FORCE="${CORPUS_FORCE:-0}"   # 1 = re-pull and re-extract even if present
@@ -93,6 +92,11 @@ log()  { printf '\033[1;34m[bootstrap]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[bootstrap:warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[bootstrap:FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 
+assert_corpus_image_pinned() {
+  printf '%s' "$CORPUS_IMAGE" | grep -Eq '@sha256:[0-9a-fA-F]{64}$' \
+    || die "CORPUS_IMAGE must use an immutable @sha256 digest, not a mutable tag"
+}
+
 # True when one rev is a prefix of the other and the shorter side is ≥7 chars
 # (REVISION.json carries full 40-char revs; BUILDINFO the short form).
 revs_agree() {
@@ -109,7 +113,7 @@ revs_agree() {
 # ── CPU feature assertion (the precondition that makes this run meaningful) ──
 # avx512vl is load-bearing twice over: it selects the VBMI2 decode kernel
 # (simd/mod.rs:362-368) AND it is the feature that DISABLES weaver's own VPCLMUL
-# CRC port (crc.rs:123) — the C1 proof.
+# CRC port (crc.rs:123) — the CRC gate proof.
 REQUIRED_FEATURES="avx512f avx512bw avx512vl avx512vbmi avx512vbmi2 gfni vpclmulqdq vaes"
 assert_cpu_features() {
   log "Asserting Zen 4 CPU features: ${REQUIRED_FEATURES}"
@@ -132,9 +136,8 @@ assert_cpu_features() {
     warn "CPU model: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
     die "missing CPU feature(s):${missing}
      This is NOT a real AVX-512/VBMI2/GFNI Zen 4 core.
-     The instance type is LOCKED to c7a.xlarge (doc §1) — changing it needs
-     the project owner's explicit permission. (c6a/c5a/t3/m6i etc. will NOT
-     have avx512vbmi2 + gfni on real silicon.)"
+     The benchmark protocol requires c7a.xlarge (doc §1); other instance
+     families may not expose avx512vbmi2 + gfni on real silicon."
   fi
   log "CPU feature gate PASSED — real AVX-512 VBMI2 + GFNI present."
 }
@@ -169,10 +172,9 @@ install_system_deps() {
 #
 # `.git` does NOT ship, so every tree carries its own REVISION.json
 # ({repo, rev, dirty_files, staged_at_utc}) and provenance is read from that
-# rather than from git. weaver ships as WORKING-TREE state (uncommitted
-# increments included), rarpar with its LFS fixtures already hydrated, and
-# rapidyenc as a clean tree pinned at 27f435a. /corpus/prebuilt/ carries the
-# executables built from exactly those revisions.
+# rather than from git. Every source tree must be clean; rarpar ships with its
+# LFS fixtures already hydrated, and rapidyenc is pinned at 27f435a.
+# /corpus/prebuilt/ carries executables built from exactly those revisions.
 revision_field() {   # <tree-dir> <field> [default]
   local f="$1/REVISION.json" out=""
   if [ -f "$f" ] && command -v jq >/dev/null 2>&1; then
@@ -312,7 +314,7 @@ fetch_corpus() {
 # ── Prebuilt bundle integrity ────────────────────────────────────────────────
 # The single most dangerous failure mode of the prebuilt model is a STALE
 # bundle: binaries built from an older revision than the source trees shipped
-# beside them. Every gate downstream (the C1 proof, the differential counts,
+# beside them. Every gate downstream (the CRC proof, the differential counts,
 # the forced-tier coverage) would then be measuring something other than the
 # source the operator believes they are testing — and would report green.
 # Rev mismatch is therefore a HARD FAIL, not a warning.
@@ -376,12 +378,15 @@ EOF
   [ -x "$PREBUILT_DIR/bin/oracle-unrar-624" ] && log "  optional spare also present: oracle-unrar-624"
 
   # BUILDINFO revs must match the source trees shipped alongside them.
-  local pair name binfo_rev tree_rev tree
+  local pair name binfo_rev tree_rev tree dirty
   for pair in "weaver:weaver_rev:$WEAVER_DIR" "rarpar:rarpar_rev:$RARPAR_DIR" "rapidyenc:rapidyenc_rev:$RAPIDYENC_ROOT"; do
     name="${pair%%:*}"
     tree="${pair##*:}"
     binfo_rev="$(buildinfo_field "$(printf '%s' "$pair" | cut -d: -f2)")"
     tree_rev="$(revision_field "$tree" rev)"
+    dirty="$(revision_field "$tree" dirty_files 0)"
+    [ "$dirty" = "0" ] \
+      || die "$name source has $dirty dirty file(s); rebuild the corpus from a clean revision"
     if [ "$binfo_rev" = "unknown" ] || [ "$tree_rev" = "unknown" ]; then
       die "cannot compare $name revisions (BUILDINFO='$binfo_rev' REVISION.json='$tree_rev') — refusing to run a bundle of unknown provenance"
     fi
@@ -569,6 +574,8 @@ write_env_file() {
   cat > "$PREBUILT_DIR/weaver-bench.env" <<EOF
 # sourced by ci/bench/c7a-run.sh — discovery for the prebuilt bundle
 export PREBUILT_DIR="$PREBUILT_DIR"
+export CORPUS_IMAGE="$CORPUS_IMAGE"
+export CORPUS_REGION="$CORPUS_REGION"
 export RAPIDYENC_ROOT="$RAPIDYENC_ROOT"
 export WEAVER_RAPIDYENC_LIB="$WEAVER_RAPIDYENC_LIB"
 export RARPAR_BENCH_DIR="$RARPAR_BENCH_DIR"
@@ -577,6 +584,7 @@ EOF
 }
 
 main() {
+  assert_corpus_image_pinned
   log "CORPUS_IMAGE=$CORPUS_IMAGE"
   log "CORPUS_DEST=$CORPUS_DEST"
   log "WEAVER_DIR=$WEAVER_DIR"

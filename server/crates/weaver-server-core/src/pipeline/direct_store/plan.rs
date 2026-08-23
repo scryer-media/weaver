@@ -207,8 +207,8 @@ impl DirectSetPlan {
     /// describes: `sanitize_dirname` is many-to-one, `path_component_with_suffix`
     /// clamps, and member names are shared freely between archives, so *any*
     /// path derived from names alone can be reached by two sets of one job.
-    /// Envelopes, repair scratch and member partials all found that out the slow
-    /// way (post-completion review, 2026-08-04): two sets sharing a partial
+    /// Envelopes, repair scratch and member partials all require the same
+    /// isolation: two sets sharing a partial
     /// interleave their writes into one file while each router's in-memory
     /// gates pass over its own buffers — silent mixed bytes on a PAR2-less set,
     /// which is exactly the set direct-store exists for.

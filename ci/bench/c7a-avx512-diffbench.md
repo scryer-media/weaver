@@ -5,14 +5,9 @@ Validate weaver's SIMD yEnc decode kernels — **especially the AVX-512 VBMI2
 for correctness and performance on **real** AMD Zen 4 silicon, against the
 `rapidyenc` reference library.
 
-> Authoring note: every command below is grounded in a real repo path + line,
-> verified against the working tree on 2026-08-11. Anything not verifiable from
-> the repo is marked `TODO(verify on box)`.
-
-**No time or cost estimates appear in this runbook — by standing rule.** The run
-*measures* its own wall time per phase and records it in
+The run measures its own wall time per phase and records it in
 `metadata.json.phase_timings_seconds`, and `summary.txt` prints the same table.
-Use those numbers; do not predict them. The bootstrap arms a dead-man
+Use those measurements when comparing runs. The bootstrap arms a dead-man
 `shutdown -h +120` as a safety net, not as a schedule — it only terminates if
 the instance's shutdown-behavior is `terminate` (§11).
 
@@ -22,21 +17,13 @@ the instance's shutdown-behavior is `terminate` (§11).
 
 > ### Instance type is LOCKED to `c7a.xlarge`
 >
-> **Changing the instance size requires the project owner's explicit permission.**
-> Not the
-> family, not the size, not "just this once for a faster build" — the build is
-> not on the box any more anyway (§6). Both scripts assume it and the CPU gate
-> aborts on anything that is not a real Zen 4.
+> The protocol requires `c7a.xlarge`; using a different instance type creates a
+> different benchmark and is out of scope for this runbook. The build is not on
+> the box (§6), and the CPU gate aborts on anything that is not a real Zen 4.
 >
-> Two supporting facts, both checked:
+> The bench lanes are single-threaded, so a larger instance adds capacity but
+> does not improve the measured lane throughput.
 >
-> - **Account vCPU quota**: the Standard on-demand limit is **16 vCPU**.
->   `c7a.xlarge` is **4 vCPU**, so a single instance fits with plenty of
->   headroom — but it also means a careless jump to, say, `c7a.8xlarge`
->   (32 vCPU) would be *refused by the quota*, not merely expensive.
-> - **No performance argument for a bigger box**: the bench lanes here are
->   single-threaded, so extra vCPUs would add noise, not throughput.
-
 
 `c7a` = AWS instances on **AMD EPYC 4th gen (Zen 4, "Genoa")**. On real silicon a
 Zen 4 core exposes, all at once:
@@ -47,15 +34,9 @@ Zen 4 core exposes, all at once:
 - **`gfni`** (Galois-field affine — the PAR2 / Reed-Solomon GF16 accelerator)
 - **`vpclmulqdq`**, `vaes`
 
-None of our existing hardware has this combination on real silicon:
-
-| Box | uarch | AVX-512 | VBMI2 | GFNI | VPCLMULQDQ |
-|-----|-------|---------|-------|------|------------|
-| SYLIX (Windows) | Ryzen 5 3600 (Zen 2) | no | no | no | no |
-| codex-x86 | Core i7-1240P (Alder Lake) | no | no | no | yes |
-| codex-x86-2 | Core Ultra 9 285H (Arrow Lake-H) | **no** | no | yes | yes |
-| Mac | Apple Silicon (M5 Max) | n/a (ARM/NEON) | n/a | n/a | n/a |
-| **c7a.xlarge** | **EPYC Zen 4** | **yes** | **yes** | **yes** | **yes** |
+Common non-Zen4 development systems do not expose this full feature
+combination. `c7a.xlarge` provides a reproducible target for exercising it on
+physical silicon.
 
 Three consequences, and they are the whole reason for the run:
 
@@ -67,9 +48,8 @@ Three consequences, and they are the whole reason for the run:
    can hide real-silicon issues (micro-arch corner cases, real masking/permute
    behavior, alignment/store faults) and tells us nothing about performance.
    **c7a replaces the `sde64 -spr` wrapper with a real Zen 4 core.**
-2. weaver's **VPCLMUL CRC port gate now excludes `avx512vl`** (§4). Every box we
-   own is on the *enabled* side of that gate or lacks VPCLMULQDQ entirely — none
-   can prove the *disabled* side. c7a is the first machine that can.
+2. weaver's **VPCLMUL CRC port gate excludes `avx512vl`** (§4). Systems without
+   the full Zen 4 feature set cannot prove the *disabled* side. c7a can.
 3. rarpar's **`gfni,avx512bw,avx512vl` GF16 tier** has likewise never run
    natively (285H has GFNI but no AVX-512). §8 makes that a mandatory phase, not
    a stretch goal.
@@ -299,7 +279,7 @@ The bootstrap produces the first two.
 
 ---
 
-## 4. C1 proof: the VPCLMUL CRC port gate on Zen 4 (NEW — read before running)
+## 4. CRC gate proof: the VPCLMUL CRC port on Zen 4
 
 weaver carries its own 2x256-bit VPCLMULQDQ CRC folding port
 (`engines/weaver-yenc/src/crc.rs:101-308`). Its availability gate is
@@ -349,15 +329,14 @@ Expected behavior on Zen 4, and exactly what to grep for:
 
 **What this run does *not* prove:** with the gate disabled, weaver's `folded:
 Option<u32>` streak-batching path (`crc.rs:44-71`) is inert on c7a. Its
-hand-off behavior was validated on codex-x86 (ADL) where `available()` is true.
-c7a proves the *gate*, ADL proves the *path*. Record both facts together or the
-CRC story reads as half-tested.
+hand-off behavior must be validated separately on an AVX2-capable Alder Lake
+host where `available()` is true. c7a proves the *gate*; that host proves the
+*path*.
 
-**Precondition — the box must run a rev that contains all of this.** The C1 gate,
+**Precondition — the box must run a rev that contains all of this.** The CRC gate,
 the skip `eprintln!`, and the §3b CRC parity assert landed in **`a3e3f68d`**
-("yenc updates, CI fixes"); they were uncommitted while this runbook was being
-written, so any checkout older than that cannot prove a thing here and will still
-report a cheerful green. `c7a-run.sh` grep-checks the *source on the box* for all
+("yenc updates, CI fixes"). Any checkout older than that cannot prove this gate.
+`c7a-run.sh` checks the *source on the box* for all
 of these markers before it runs anything and aborts if the tree is stale — keep
 that gate even though the markers are now committed, because the box is populated
 from the corpus image (§7a) and an image built before an increment landed would
@@ -412,7 +391,7 @@ the corpus image as `/corpus/prebuilt/`.
 
 Why this is safe — and why it is *better* than building on the box:
 
-- The builder (**codex-x86-2**, Ubuntu 24.04) matches the AMI's glibc, so the
+- The builder runs Ubuntu 24.04 to match the AMI's glibc, so the
   binaries load unmodified. The bootstrap compares `BUILDINFO.json`'s `glibc`
   against the host's and warns if that assumption ever breaks.
 - The build uses the plain `x86_64-unknown-linux-gnu` target with
@@ -540,13 +519,12 @@ obscurely on "malformed archive".
 ### 7a. Get the sources onto the box — **pre-pushed ECR corpus image**
 
 > **AWS runs only.** This section describes source delivery for the c7a run.
-> Local-box runs (SYLIX, codex-x86) keep their own rsync recipes and are
-> completely unaffected by anything here.
+> Other environments use separate delivery recipes.
 
 Source delivery is a single pre-built image:
 
 ```
-651588424025.dkr.ecr.us-east-1.amazonaws.com/weaver-bench-corpus:latest
+<aws-account-id>.dkr.ecr.us-east-1.amazonaws.com/weaver-bench-corpus@sha256:<digest>
 ```
 
 It carries `/corpus/weaver`, `/corpus/rarpar` and `/corpus/rapidyenc` — each with
@@ -556,11 +534,9 @@ its own `REVISION.json` (`{repo, rev, dirty_files, staged_at_utc}`) — plus
 **Why an image and not a clone** — the same two reasons that used to make rsync
 mandatory, now handled once at image-build time instead of on every run:
 
-- weaver must be tested as **working-tree state**. Its C1 gate / skip line / CRC
-  parity assert only exist from `a3e3f68d` onward (§4), and any increment in
-  flight is by definition not yet pushed. The image stages the working tree,
-  uncommitted work included — hence `dirty_files` in `REVISION.json`, which is
-  recorded rather than assumed to be zero.
+- weaver must be tested from a clean revision containing the CRC gate, skip
+  line, and parity assertion (§4). The harness rejects any source tree whose
+  `REVISION.json` reports a non-zero `dirty_files` count.
 - rarpar's `archive_hotspots` fixtures are **git-LFS**
   (`rarpar/.gitattributes`: `crates/weaver-unrar/tests/fixtures/**/*.rar filter=lfs …`).
   A `git clone` on the box yields LFS *pointer* files and the bench dies on a
@@ -590,7 +566,7 @@ instance; the bootstrap fails with this list if login is refused.
 #### Pull and extract
 
 ```sh
-CORPUS_IMAGE="651588424025.dkr.ecr.us-east-1.amazonaws.com/weaver-bench-corpus:latest"
+CORPUS_IMAGE="<aws-account-id>.dkr.ecr.us-east-1.amazonaws.com/weaver-bench-corpus@sha256:<digest>"
 CORPUS_REGISTRY="${CORPUS_IMAGE%%/*}"
 
 sudo apt-get update -y && sudo apt-get install -y docker.io awscli
@@ -661,13 +637,13 @@ scripts live); the bootstrap fetches the rest.
 1. CPU feature gate (abort if not a real Zen 4).
 2. Prebuilt-bundle check — manifest parses, `BUILDINFO.json` revs match all
    three trees (§6c), then source-precondition check (§4): the box's tree must
-   carry the C1 gate, the skip line, the CRC parity assert and the
+   carry the CRC gate, the skip line, the CRC parity assert and the
    production-shape forced-tier test.
 3. **Tests first**, straight from `$PREBUILT_DIR/bin`: weaver-yenc **debug**
    (`weaver-yenc-lib-debug`, `weaver-yenc-diff-debug`), then **release**, all
    with `RAPIDYENC_ROOT` + `CXX` set and `--nocapture` so the §3a case counts and
    the §4 skip line reach the log.
-4. Grep-asserts: the C1 skip line is present; all four differential case counts
+4. Grep-asserts: the CRC skip line is present; all four differential case counts
    are present and non-zero.
 5. Steady-state wait (1-min loadavg below `LOAD_THRESHOLD`, or `STEADY_TIMEOUT`).
 6. **Discarded warm pass** of each bench binary (`rapidyenc_parity`,
@@ -676,11 +652,11 @@ scripts live); the bootstrap fetches the rest.
 7. **rarpar phase** (§8): tests, then the same warm/2x/drift bench protocol.
 8. Summary + **teardown checklist**.
 
-Env overrides (both scripts, all have defaults):
+Env overrides:
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `CORPUS_IMAGE` | `651588424025.dkr.ecr.us-east-1.amazonaws.com/weaver-bench-corpus:latest` | ECR corpus image (§7a); recorded in `metadata.json` |
+| `CORPUS_IMAGE` | **required, digest-pinned** | ECR corpus image (§7a); recorded in `metadata.json` |
 | `CORPUS_DEST` | `~` | where `/corpus/.` is extracted; the three tree defaults derive from it |
 | `CORPUS_REGION` | `us-east-1` | region for `aws ecr get-login-password` (bootstrap) |
 | `CORPUS_FORCE` | `0` | `1` re-pulls and re-extracts even when the trees are present (bootstrap) |
@@ -699,8 +675,9 @@ Env overrides (both scripts, all have defaults):
 | `WEAVER_PAR2_BENCH_SCENARIOS` | **force-unset by the run script** | scenario filter for the rarpar par2 bench (`crates/weaver-par2/benches/par2_repair.rs:20`). `c7a-run.sh` clears it before benching (warning if it was set) so an inherited value cannot narrow the recorded suite — see §9g |
 | `METADATA_INSTANCE_TYPE` | *(unset ⇒ IMDS)* | fallback instance type for `metadata.json` when IMDS is unreachable (§9g) |
 
-Neither script makes an AWS API call. Provisioning and teardown are the
-operator's, by hand.
+The bootstrap makes only the ECR authentication and image-read calls documented
+above. The run script makes no AWS API calls. Provisioning and teardown remain
+operator actions.
 
 ---
 
@@ -944,18 +921,16 @@ Prerequisites, all already satisfied by §6/§7:
   loudly if the par2 files are missing (`:130-135`) — that assertion firing means
   unhydrated LFS, not a code bug.
 
-**External A/B (par2cmdline-turbo, unrar 7.x)** — the head-to-head comparisons
-quoted in our comparison write-ups are **not driven by a repo bench target I
-could ground to an exact command**. `TODO(verify on box)`: locate the external-A/B
-harness (the par2cmdline-turbo / unrar-7.x oracles live in local supporting
-checkouts) and add its concrete invocation here before running — do not invent
-flags. The internal Criterion benches above are the grounded, in-scope coverage.
+**External A/B (par2cmdline-turbo, unrar 7.x)** is not reproducible from this
+repository and remains out of scope until a concrete, versioned harness is
+added. Do not quote those comparisons as repository evidence. The internal
+Criterion benches above are the reproducible coverage.
 
 ---
 
 ### 8d. Failure containment — save partials, resume don't restart
 
-Standing order, and it shapes the whole run script:
+The run script applies these failure-containment rules:
 
 - **Every suite phase is independently failable.** `run_phase` never propagates
   a non-zero status; it records the outcome, then returns 0 so the run
@@ -987,7 +962,7 @@ Standing order, and it shapes the whole run script:
    `avx512f avx512bw avx512vl avx512vbmi avx512vbmi2 gfni vpclmulqdq vaes`.
    Missing any ⇒ **wrong instance family** (not a real c7a / Zen 4) ⇒ hard abort.
    This is the precondition that makes the whole run meaningful.
-2. **Source-precondition green** (§4) — the box's tree carries the C1 gate, the
+2. **Source-precondition green** (§4) — the box's tree carries the CRC gate, the
    skip line, the CRC parity assert and
    `forced_tier_kernels_match_scalar_in_production_shape`.
 3. **weaver-yenc suite green on real silicon, in debug *and* release** (§2a), with
@@ -1003,7 +978,7 @@ Standing order, and it shapes the whole run script:
    these counts (§3a): `5978`, `2989`, `3997`, `41986` — **54 950 total**. Any
    `0`, or a missing line, means `RAPIDYENC_ROOT` was not honored and the run
    proved nothing new.
-5. **C1 proof recorded** (§4): the exact line
+5. **CRC proof recorded** (§4): the exact line
    `skipping crc32_forced_vpclmul_matches_crc_fast: VPCLMUL port unavailable on this CPU`
    appears in the test log, and `crc32_mixed_size_interleaved_updates` passes.
 6. **Parity bench pre-timing asserts pass** for all five fixtures — length, bytes
@@ -1041,16 +1016,11 @@ table in §3b. Record verbatim.
 | esc_only | _fill_ | _fill_ | _fill_ |
 | dots_body | _fill_ | _fill_ | _fill_ |
 
-Cross-arch context for the same fixtures (ratios >1 = weaver behind):
+Historical cross-machine baselines are intentionally not committed. Compare
+the two recorded passes from the same clean corpus and retain raw output
+locally.
 
-| box | realshape | clean | dots_body | note |
-|-----|-----------|-------|-----------|------|
-| M5 Max (NEON) | 0.95 (weaver +5.4%) | ~1.06 | ~1.06 | `crlf_only` weaver +11.1%, `esc_only` parity |
-| SYLIX Zen 2 (in-process static, MSVC) | 0.98 | 1.11 | 1.17 | weaver ahead on realshape only |
-| codex-x86 ADL | 1.13–1.17 | 0.86 | 0.88 | **inverted vs Zen 2** |
-| **c7a Zen 4 (VBMI2 both sides)** | _fill_ | _fill_ | _fill_ | first 512b-vs-256b A/B |
-
-This lane answers the open A13 question: weaver's VBMI2 kernel is a **true
+This lane answers the open performance question: weaver's VBMI2 kernel is a **true
 512-bit** kernel while rapidyenc deliberately caps its decode at 256-bit. Whether
 that is a win on Zen 4 (downclocking, 512-bit port pressure) is unmeasured until
 this run. Do not claim it in either direction beforehand.
@@ -1063,23 +1033,14 @@ this run. Do not claim it in either direction beforehand.
 | `parity_rapidyenc_crc_decoded` | _fill_ | rapidyenc `RYKERN_VPCLMUL` 0x440 (2x256-class) |
 | ratio (weaver/rapidyenc) | _fill_ | headline number |
 
-Cross-arch context:
-
-| box | weaver CRC | rapidyenc CRC | ratio | which weaver tier |
-|-----|-----------|---------------|-------|-------------------|
-| M5 Max | 102 GiB/s | 11.1 GiB/s | **9.2x weaver** | crc-fast ARM (oracle uses a single serial `crc32d` chain) |
-| codex-x86 ADL | ~47 GiB/s (15.3 µs) | _n/a_ | — | weaver's own **VPCLMUL port active** (`available()==true`) |
-| SYLIX Zen 2 | ~37 µs | _n/a_ | — | crc-fast **SSE** tier (no vpclmulqdq on Zen 2) |
-| **c7a Zen 4** | _fill_ | _fill_ | _fill_ | crc-fast **ZMM** tier, weaver port gated OFF |
-
-The c7a row is the one that justifies the C1 change: if crc-fast's ZMM tier does
-**not** beat the ADL-measured ~47 GiB/s of weaver's own port by a clear margin,
-the `!avx512vl` exclusion needs re-examining.
+Historical cross-machine CRC baselines are intentionally not committed. Use the
+same-run ratio above to evaluate whether the `!avx512vl` exclusion remains
+appropriate.
 
 ### 9e. Record: production-shape lanes (`decode_simd` bench)
 
 The end-detecting production entry point costs more than raw decode. That "family
-gap" is the acceptance metric the whole Y1 searchEnd port was judged on, and c7a
+gap" is the acceptance metric for the search-end optimization, and c7a
 is the first VBMI2 measurement of it.
 
 | lane | bench id (`decode_simd`) | source | c7a |
@@ -1089,20 +1050,9 @@ is the first VBMI2 measurement of it.
 | until-control, bigbang, 3 chunks | `yenc_decode_bigbang_like_until_control_3_chunks` | `:487` (helper `:166-187`) | _fill_ |
 | **family gap** = until_control / decode_only_bigbang | — | — | **_fill_** |
 
-Cross-arch baselines for the family gap (pre-Y1 → post-Y1):
-
-| box | tier | until_control pre → post | decode_only | family gap pre → post |
-|-----|------|--------------------------|-------------|-----------------------|
-| M5 Max | NEON | 79.4 → 66.5 µs (−16.2%) | ~55.9 µs | **1.44 → 1.19** |
-| codex-x86 ADL 1240P (P-core pinned) | AVX2 | 89.0 → 70.5 µs (−20.7%) | 49.8 µs (−1.4%, in band) | **1.79 → 1.44** |
-| SYLIX Zen 2 3600 | AVX2 | 144.6 → 120.4 µs (−16.8%) | 77.8 → 63.9 µs (−17.9%, unattributed) | **1.86 → 1.88** |
-| **c7a Zen 4** | **VBMI2** | _fill_ | _fill_ | **_fill_** |
-
-Reading the c7a number: the post-Y1 band across owned boxes is **1.19–1.88**, and
-the two AVX2 x86 boxes disagree because Zen 2's `decode_only` control lane itself
-moved (its ratio is not a clean measurement). A c7a gap at or below ADL's 1.44
-says the 512-bit `searchEnd` probe carries its weight; materially above 1.88 says
-the 512-bit probe is *more* expensive than the 256-bit one and A13 needs revisiting.
+Historical cross-machine family-gap baselines are intentionally not committed.
+Interpret the c7a result against its same-run decode-only control and retain the
+raw pass data locally.
 
 Also record the whole-body lanes for completeness — `yenc_decode_realshape_128col`,
 `yenc_decode_bigbang_like_body`, `yenc_decode_article_realshape_128col`,
@@ -1190,7 +1140,7 @@ distributions, and the drift check are all reconstructable offline.
   summary.json                 # flat per-lane estimates, both passes, both repos
   summary.txt                  # human summary
   revisions.txt                # REVISION.json provenance per tree
-  proof-gates.txt              # C1 proof + differential case counts
+  proof-gates.txt              # CRC gate proof + differential case counts
   lane-to-bench.tsv            # lane -> bench-target map used to build summary.json
   cpu-features.log
   weaver-yenc-tests-debug.log
@@ -1209,8 +1159,8 @@ builder, `built_at_utc`, toolchains, the empty build `rustflags`, and build-vs-h
 glibc — all read from `BUILDINFO.json`, since there is no `rustc` on the box to
 ask. Plus `rev` + `dirty_files` for
 weaver / rarpar / rapidyenc — read from each tree's `REVISION.json`, **not** from
-git, because the corpus image ships no `.git`; weaver deliberately ships with
-uncommitted increments, so `dirty_files` is recorded rather than assumed zero —
+git, because the corpus image ships no `.git`; `dirty_files` is recorded and
+must be zero —
 plus `staged_at_utc`, the `corpus_image` reference, the UTC run stamp,
 **`phase_timings_seconds`** (measured, never estimated — one entry per phase),
 and

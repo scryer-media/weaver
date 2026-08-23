@@ -1224,7 +1224,7 @@ mod tests {
     // pipelined response's bytes in `src` no matter where the chunk boundary
     // lands.
 
-    /// D6: `=ybegin` is scanned for, not required on the first body line --
+    /// `=ybegin` is scanned for, not required on the first body line --
     /// including junk that contains `=` and partial `=yb` prefixes.
     #[test]
     fn fused_tolerates_leading_junk_at_every_split_point() {
@@ -1250,7 +1250,7 @@ mod tests {
         assert_eq!(decoded.yenc_result().crc_status, CrcVerification::Verified);
     }
 
-    /// D7: `line=`/`size=`/`name=` are all optional -- reference decoders do
+    /// `line=`/`size=`/`name=` are all optional -- reference decoders do
     /// not even parse `line=`. Every combination the references tolerate.
     #[test]
     fn fused_tolerates_every_missing_ybegin_field_combination_at_every_split_point() {
@@ -1273,7 +1273,7 @@ mod tests {
         }
     }
 
-    /// D7 continued: a `=ybegin` whose numeric fields are unparseable degrades
+    /// A `=ybegin` whose numeric fields are unparseable degrades
     /// exactly like one that omitted them.
     #[test]
     fn fused_tolerates_unparseable_ybegin_numbers_at_every_split_point() {
@@ -1285,7 +1285,7 @@ mod tests {
         assert_fused_matches_at_every_split_point(&article, b"223 next\r\n");
     }
 
-    /// D8: `=ypart end=` past the `=ybegin size=` file size. The part length
+    /// `=ypart end=` past the `=ybegin size=` file size. The part length
     /// (end - begin + 1) is still checked against the decoded byte count.
     #[test]
     fn fused_tolerates_ypart_end_past_declared_size_at_every_split_point() {
@@ -1327,7 +1327,7 @@ mod tests {
         assert_eq!(decoded.yenc_result().crc_status, CrcVerification::Verified);
     }
 
-    /// D9: a mangled `crc32=` is treated as absent, leaving the article decoded
+    /// A mangled `crc32=` is treated as absent, leaving the article decoded
     /// but explicitly *unverified* -- never silently "valid".
     #[test]
     fn fused_tolerates_garbage_crc_at_every_split_point() {
@@ -1374,7 +1374,7 @@ mod tests {
         assert!(!decoded.yenc_result().defects.invalid_crc32);
     }
 
-    /// D10: one byte-wise parser behind every entry point, so tab separators
+    /// One byte-wise parser serves every entry point, so tab separators
     /// and mixed-case field names behave identically in the fused path.
     #[test]
     fn fused_tolerates_tab_and_case_field_variants_at_every_split_point() {

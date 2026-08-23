@@ -30,7 +30,7 @@ type AccessPolicyStatus {
 	envPinned: Boolean!
 	"""
 	True once an access mode has actually been stored and understood.
-	
+
 	Distinguishes "the operator chose login-required" from "nothing is
 	stored and the query defaulted to login-required", which is what an
 	install upgraded from a version without these settings looks like. The
@@ -885,7 +885,7 @@ type MutationRoot {
 	deleteApiKey(id: Int!): [ApiKey!]!
 	"""
 	Set the address Weaver listens on, applied at the next restart.
-	
+
 	Refused when `WEAVER_HTTP_BIND_ADDRESS` is set, rather than stored and
 	silently ignored: an operator who pinned the address in their
 	deployment should be told their edit would not take effect, not left to
@@ -1220,7 +1220,7 @@ type QueryRoot {
 	adminLoginStatus: LoginStatusResult!
 	"""
 	The address Weaver is listening on, and whether it can be changed here.
-	
+
 	Exposed so the binding can be widened from the UI. That matters because
 	the loopback default is always reachable from the machine Weaver runs
 	on, which makes this the one place an operator can reliably get to —
@@ -1258,7 +1258,7 @@ type QueryRoot {
 	historyItemsCount(filter: QueueFilterInput): Int!
 	"""
 	Compatibility facade for recent queue lifecycle history.
-	
+
 	This is backed by the bounded in-memory replay window rather than
 	persisted queue events. Older entries fall out of the ring buffer, and
 	stale cursors degrade to `[]` for compatibility with the old table.
@@ -1333,7 +1333,7 @@ type QueryRoot {
 	postProcessingSettings: PostProcessingSettingsGql!
 	"""
 	Live listing of the configured scripts directory, plus stored option values.
-	
+
 	Nothing is cached: the directory is the source of truth, so a script
 	added a second ago is listed and one deleted a second ago is not.
 	"""
@@ -1382,7 +1382,7 @@ type QueryRoot {
 	"""
 	Whether Weaver can restart itself here, and the deployment that decided
 	it — everything the security wizard needs in one field.
-	
+
 	Deliberately its own small field rather than part of `systemInfo`,
 	whose resolver probes storage: the wizard asks this on every app load,
 	so the answer has to stay cheap.
@@ -2216,7 +2216,7 @@ type SubscriptionRoot {
 	jobDetailUpdates(jobId: Int!): JobDetailSnapshot!
 	"""
 	Subscribe to real-time job state snapshots.
-	
+
 	Pushes a full snapshot whenever a pipeline event fires, throttled to
 	at most once per 100ms so rapid-fire segment events don't flood the
 	client. Also ticks every 2s during idle so speed gauges stay fresh.
@@ -2228,7 +2228,7 @@ type SubscriptionRoot {
 	queueSnapshots(filter: QueueFilterInput): QueueSnapshot!
 	"""
 	Subscribe to live public queue events.
-	
+
 	Replays recent in-memory queue events after `after`, then continues
 	streaming live events from the same bounded replay buffer.
 	"""

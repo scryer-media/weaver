@@ -4,7 +4,7 @@ use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
 use common::TestHarness;
 use serde_json::Value;
 use weaver_server_api::context::{
-    GRAPHQL_MAX_COMPLEXITY, GRAPHQL_MAX_DEPTH, apply_graphql_query_guards,
+    GRAPHQL_MAX_COMPLEXITY, GRAPHQL_MAX_DEPTH, apply_graphql_query_guards, export_schema_sdl,
 };
 
 struct DeepQuery;
@@ -17,6 +17,18 @@ impl DeepQuery {
 
     async fn value(&self) -> &str {
         "ok"
+    }
+}
+
+#[test]
+fn exported_schema_has_no_trailing_whitespace() {
+    for (index, line) in export_schema_sdl().lines().enumerate() {
+        assert_eq!(
+            line,
+            line.trim_end(),
+            "exported schema line {} has trailing whitespace",
+            index + 1
+        );
     }
 }
 

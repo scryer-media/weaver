@@ -1471,7 +1471,7 @@ mod tests {
         assert!(small.capacity() < CAP);
     }
 
-    /// D6: junk before `=ybegin`, including `=`-bearing and partial-prefix junk.
+    /// Junk before `=ybegin`, including `=`-bearing and partial-prefix junk.
     #[test]
     fn tolerates_leading_junk_before_ybegin_at_every_split_point() {
         let article = broken_poster_article(
@@ -1489,7 +1489,7 @@ mod tests {
         assert_eq!(result.metadata.name, "junk.bin");
     }
 
-    /// D7: every combination of missing `line=`/`size=`/`name=`.
+    /// Every combination of missing `line=`/`size=`/`name=`.
     #[test]
     fn tolerates_every_missing_ybegin_field_combination_at_every_split_point() {
         for line_field in [None, Some("line=128")] {
@@ -1518,7 +1518,7 @@ mod tests {
         }
     }
 
-    /// D9: garbage `crc32=` leaves the article decoded but explicitly
+    /// Garbage `crc32=` leaves the article decoded but explicitly
     /// unverified -- it must never read back as "verified".
     #[test]
     fn tolerates_garbage_crc32_at_every_split_point() {
@@ -1543,7 +1543,7 @@ mod tests {
         }
     }
 
-    /// D8: `=ypart end=` past `=ybegin size=`, and the healthy inverse.
+    /// `=ypart end=` past `=ybegin size=`, and the healthy inverse.
     #[test]
     fn tolerates_ypart_end_past_declared_size_at_every_split_point() {
         for (declared_size, expect_defect) in [(10u64, true), (100_000u64, false)] {
@@ -1567,7 +1567,7 @@ mod tests {
         }
     }
 
-    /// D10: tab and case variants of field names behave identically on the
+    /// Tab and case variants of field names behave identically on the
     /// whole-buffer, streaming, and `parse_ybegin_line` entry points.
     #[test]
     fn tolerates_tab_and_case_field_variants_at_every_split_point() {

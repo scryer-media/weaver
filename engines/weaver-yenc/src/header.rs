@@ -661,7 +661,7 @@ mod tests {
         assert_eq!(metadata.end, Some(512));
     }
 
-    /// D8: `=ypart end=` past `=ybegin size=` is a known broken-poster class.
+    /// `=ypart end=` past `=ybegin size=` is a known broken-poster class.
     /// Neither sabctools nor nzbget cross-checks the two, so weaver records the
     /// inconsistency instead of failing the article.
     #[test]
@@ -830,7 +830,7 @@ mod tests {
         assert_eq!(parsed.data_end, input.len());
     }
 
-    /// D7: no `=ybegin` field is required. sabctools defaults every numeric
+    /// No `=ybegin` field is required. sabctools defaults every numeric
     /// field to 0 and leaves `file_name` unset; nothing raises.
     #[test]
     fn missing_size_field_is_tolerated() {
@@ -882,7 +882,7 @@ mod tests {
         assert!(parsed.metadata.defects.junk_before_ybegin);
     }
 
-    // ── D10: one byte-wise field parser behind every entry point ─────────
+    // ── One byte-wise field parser behind every entry point ──────────────
 
     #[test]
     fn fields_tolerate_tabs_and_runs_of_spaces() {
@@ -923,7 +923,7 @@ mod tests {
         assert_eq!(metadata.name, "x.bin");
     }
 
-    // ── D9: crc32 parsing degrades to "absent", never to a failure ───────
+    // ── crc32 parsing degrades to "absent", never to a failure ──────────
 
     #[test]
     fn short_crc_hex() {
@@ -982,7 +982,7 @@ mod tests {
         assert!(yend.defects.invalid_yend_size);
     }
 
-    // ── D7: every combination of missing =ybegin fields ──────────────────
+    // ── Every combination of missing =ybegin fields ─────────────────────
 
     #[test]
     fn every_combination_of_missing_ybegin_fields_parses() {
@@ -1059,7 +1059,7 @@ mod tests {
         assert_eq!(metadata.line_length, u32::MAX);
     }
 
-    // ── D6: control-line detection ───────────────────────────────────────
+    // ── Control-line detection ──────────────────────────────────────────
 
     #[test]
     fn keyword_detection_requires_a_separator() {

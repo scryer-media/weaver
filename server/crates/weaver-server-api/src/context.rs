@@ -76,13 +76,23 @@ pub struct SchemaContext {
 /// [`build_schema`] only bound complexity/depth and introspection, none of
 /// which change the emitted SDL.
 pub fn export_schema_sdl() -> String {
-    Schema::build(
+    let sdl = Schema::build(
         QueryRoot::default(),
         MutationRoot::default(),
         SubscriptionRoot::default(),
     )
     .finish()
-    .sdl()
+    .sdl();
+    let had_trailing_newline = sdl.ends_with('\n');
+    let mut normalized = sdl
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if had_trailing_newline {
+        normalized.push('\n');
+    }
+    normalized
 }
 
 pub fn build_schema(context: SchemaContext) -> WeaverSchema {

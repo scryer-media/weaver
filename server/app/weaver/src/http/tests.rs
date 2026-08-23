@@ -178,6 +178,11 @@ fn nzbget_test_router(
     config: SharedConfig,
     api_key_cache: ApiKeyCache,
 ) -> Router {
+    // Production initializes the scripts directory before constructing HTTP
+    // routes. Mirror that bootstrap contract for the in-memory facade fixture.
+    let data_dir = std::env::temp_dir().join("weaver-nzbget-http-tests");
+    db.initialize_post_processing_script_directory(&data_dir, None)
+        .unwrap();
     let auth_cache = LoginAuthCache::default();
     let session_token = SessionToken(Arc::new("browser-session-token".to_string()));
     // Historical facade fixtures used the process token as a stand-in. Keep

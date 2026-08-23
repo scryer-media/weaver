@@ -1,15 +1,12 @@
 use super::*;
 
-/// MAINTENANCE CONTRACT (operator-set): this Rust kernel — and the whole
-/// intrinsic path selected by `WEAVER_YENC_RAW_ASM=0` — is preserved
-/// permanently as the tunable source of truth behind the frozen `asm!`
-/// kernels. The workflow for any future tuning or bugfix is: change the
-/// Rust here, validate + measure through the `=0` escape hatch, and only
-/// then re-transliterate the winning emission into the asm blocks (see
-/// `avx2_raw_kernel_oracle` / `avx2_raw_span_setrue_asm` and the
-/// yenc-program JOURNAL for the transliteration method). Never let the asm
-/// and this Rust drift semantically: the oracle differential suite is the
-/// drift detector.
+/// Maintenance contract: this Rust kernel and the intrinsic path selected by
+/// `WEAVER_YENC_RAW_ASM=0` are the tunable source of truth behind the frozen
+/// `asm!` kernels. For future tuning or bug fixes, change this implementation,
+/// validate and measure it through the `=0` escape hatch, and only then update
+/// `avx2_raw_kernel_oracle` and `avx2_raw_span_setrue_asm` from the winning
+/// emission. The oracle differential suite detects semantic drift between the
+/// Rust and assembly implementations.
 ///
 /// Faithful port of rapidyenc `do_decode_avx2` (decoder_avx2_base.h), the
 /// `isRaw=true, searchEnd=false` instantiation — the realshape decode path.
@@ -33,7 +30,7 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
     use std::arch::x86_64::*;
     const WIDTH: usize = 64;
 
-    // Rung 3 r9g: the SEARCH_END=false span runs the oracle-model asm kernel
+    // The SEARCH_END=false span runs the oracle-model asm kernel
     // (aligned single-cursor loop transliterated from rapidyenc's own emission
     // on the measurement host — see avx2_raw_kernel_oracle). Isolated function
     // so the generic body below stays byte-identical for SEARCH_END=true and
@@ -175,7 +172,7 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
         let span = (simd_limit / WIDTH) * WIDTH;
         let sp = input.as_ptr().add(span);
         let mut i: isize = -(span as isize);
-        // r10: the SEARCH_END=true span runs the frozen-roll asm kernel; on a
+        // The SEARCH_END=true span runs the frozen-roll asm kernel; on a
         // terminator hit it exits with the window unconsumed (i != 0) and the
         // pre-merge mask, feeding the same no-backtrack break glue the Rust
         // loop used. The Rust loop below remains the =0 escape hatch and the
@@ -948,12 +945,10 @@ static AVX2_SPECIAL_LUT: Align32 = Align32([
     0x2e, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0a, 0xff, 0xff, 0x0d, 0x3d, 0xff,
 ]);
 
-/// Rung 3 r9g: the whole `SEARCH_END = false` kernel in the ORACLE'S OWN
+/// The whole `SEARCH_END = false` kernel in the oracle's own
 /// shape — a transliteration of rapidyenc's compiled `do_decode_avx2`
-/// (`isRaw=true, searchEnd=false`) as emitted by the measurement host's gcc
-/// (extracted from the same-run harness binary; archived as
-/// `yenc-program/oracle-adl.txt`). That emission IS the code the parity
-/// ratio is measured against, so matching it is parity by construction.
+/// (`isRaw=true, searchEnd=false`) as emitted by GCC. The differential suite
+/// verifies byte-for-byte parity with the reference implementation.
 ///
 /// The oracle's structure, faithfully kept:
 /// - the input cursor is HEAD-ALIGNED to 64 bytes by a scalar prelude (in
@@ -1419,14 +1414,11 @@ unsafe fn avx2_raw_kernel_oracle(
     })
 }
 
-/// r10: the `SEARCH_END = true` span loop as one `asm!` block — a
-/// transliteration of WEAVER'S OWN emission of this loop from the build
-/// whose fused-lane timing measured well on BOTH Alder Lake and Zen2
-/// (archived as `yenc-program/setrue-adl.txt`). Unlike the SE=false kernel
-/// (which copies the oracle, since the oracle was faster there), weaver's
-/// fused searchEnd path BEATS the oracle's — the problem was only that its
-/// register allocation re-rolled every build (±15% swings on the fused
-/// clean/dots lanes). Freezing the good roll ends that permanently.
+/// The `SEARCH_END = true` span loop as one `asm!` block, transliterated from
+/// Weaver's emitted loop after validating it on Alder Lake and Zen 2. Unlike
+/// the SE=false kernel, this is Weaver's fused search-end path. Freezing the
+/// register allocation avoids the performance variance previously observed
+/// when LLVM regenerated the loop.
 ///
 /// Deviations from the source emission, each strictly smaller:
 /// - its two ymm stack spills around the dot arm (`yenc_offset`, `eq_va`)

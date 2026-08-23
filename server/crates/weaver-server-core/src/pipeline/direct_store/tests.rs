@@ -2440,7 +2440,7 @@ fn a_barrier_destination_resolves_against_the_root_its_key_names() {
 }
 
 /// Every derived namespace carries the set discriminator, because every one of
-/// them can be reached by two sets of one job (post-completion review, P0):
+/// them can be reached by two sets of one job:
 /// member names are shared freely between archives, and `sanitize_dirname` is
 /// many-to-one, so `A/B` and `A_B` are one stem. The discriminator — the set's
 /// lowest NZB file index, unique per job by construction — is what keeps them
@@ -3731,7 +3731,7 @@ fn a_no_ifsc_whole_file_md5_streams_through_the_sequential_reader() {
     assert_eq!(
         counters.ranged_reads(),
         0,
-        "D5 requires the sequential path so a no-IFSC set does not degrade into \
+        "verification requires the sequential path so a no-IFSC set does not degrade into \
          ranged reads across member partials"
     );
 }
@@ -4934,7 +4934,7 @@ fn a_drain_run_straddling_repaired_and_duplicate_bytes_splits_at_the_boundary() 
     assert!(
         router.has_stale_gaps(),
         "the repaired sub-range must have overwritten the composition, which is \
-         what opens the stale gap D4's re-read then closes"
+         what opens the stale gap the subsequent re-read then closes"
     );
     assert_eq!(
         router

@@ -9,14 +9,13 @@
 # Sequence (grounded in ci/bench/c7a-avx512-diffbench.md):
 #   (a) assert CPU features (avx512vbmi2 + gfni …) — abort if wrong instance
 #   (b) assert the SOURCE ON THE BOX carries the markers this run exists to
-#       prove (C1 gate, skip line, CRC parity assert, production-shape test) —
-#       they were uncommitted on the dev mac, so a `git clone` box is stale
+#       prove (CRC gate, skip line, CRC parity assert, production-shape test)
 #   (c) weaver-yenc tests FIRST, DEBUG then RELEASE, with RAPIDYENC_ROOT + CXX
 #       set so the runtime-compiled rapidyenc differential oracle RUNS (not
-#       skips), and `--nocapture` so their case counts and the C1 skip line
+#       skips), and `--nocapture` so their case counts and the CRC skip line
 #       reach the log. debug != release here: the VBMI2 searchEnd probe carries
 #       a `debug_assert_eq!` (simd/x86_avx512.rs:272) compiled out in release.
-#   (d) grep-assert the C1 proof line and non-zero differential case counts
+#   (d) grep-assert the CRC proof line and non-zero differential case counts
 #   (e) weaver benches: steady-state wait, DISCARDED warm pass, then the
 #       recorded pass TWICE, then a drift check (>DRIFT_PCT warns)
 #   (f) rarpar phase (MANDATORY): EVERY manifest test binary for repo=rarpar
@@ -26,7 +25,7 @@
 #       summary.json (doc §9g) — the input for later SVG generation
 #   (h) summary + teardown checklist
 #
-# PREBUILT-BINARY MODEL (plan v2). There is NO cargo and NO Rust toolchain on
+# PREBUILT-BINARY MODEL. There is NO cargo and NO Rust toolchain on
 # this box. Every test and bench executable is resolved from the prebuilt
 # bundle's manifest.json ($PREBUILT_DIR/bin/<id>) and invoked directly:
 #   * libtest binaries take `--nocapture` as a direct argument (no `--`
@@ -52,7 +51,7 @@ set -euo pipefail
 # $CORPUS_DEST, giving $CORPUS_DEST/{weaver,rarpar,rapidyenc}. CORPUS_IMAGE is
 # recorded in metadata.json so a chart can always be traced back to its input.
 CORPUS_DEST="${CORPUS_DEST:-$HOME}"
-CORPUS_IMAGE="${CORPUS_IMAGE:-651588424025.dkr.ecr.us-east-1.amazonaws.com/weaver-bench-corpus:latest}"
+CORPUS_IMAGE="${CORPUS_IMAGE:-}"
 WEAVER_DIR="${WEAVER_DIR:-$CORPUS_DEST/weaver}"
 RARPAR_DIR="${RARPAR_DIR:-$CORPUS_DEST/rarpar}"
 RAPIDYENC_ROOT="${RAPIDYENC_ROOT:-$CORPUS_DEST/rapidyenc}"
@@ -80,6 +79,11 @@ log()  { printf '\033[1;34m[run]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[run:warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[run:FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 
+assert_corpus_image_pinned() {
+  printf '%s' "$CORPUS_IMAGE" | grep -Eq '@sha256:[0-9a-fA-F]{64}$' \
+    || die "CORPUS_IMAGE must use an immutable @sha256 digest, not a mutable tag"
+}
+
 # True when one rev is a prefix of the other and the shorter side is ≥7 chars
 # (REVISION.json carries full 40-char revs; BUILDINFO the short form).
 revs_agree() {
@@ -98,7 +102,7 @@ gate_fail() { printf '\033[1;31m[run:GATE]\033[0m %s\n' "$*" >&2; GATE_FAILURES=
 
 # ── Retired knobs ────────────────────────────────────────────────────────────
 # BENCH_RUSTFLAGS used to default to `-C target-cpu=native` so weaver's driver
-# code was tuned for the host in the parity A/B. v2 deletes the idea outright:
+# code was tuned for the host in the parity A/B. The prebuilt model removes it:
 # both sides of that A/B are now prebuilt with plain flags (weaver via the
 # bundle, rapidyenc via a generic cmake Release .so), and the AVX-512 kernels
 # are `#[target_feature]`-compiled regardless of tuning — so native tuning would
@@ -176,11 +180,14 @@ assert_bundle_present() {
   # Cheap re-check of the bootstrap's hard gate: this script can be run on its
   # own, and a re-extracted corpus without a re-bootstrap would otherwise slip
   # a stale bundle past every downstream gate while reporting green.
-  local pair name field tree bi tr
+  local pair name field tree bi tr dirty
   for pair in "weaver:weaver_rev:$WEAVER_DIR" "rarpar:rarpar_rev:$RARPAR_DIR" "rapidyenc:rapidyenc_rev:$RAPIDYENC_ROOT"; do
     name="${pair%%:*}"; tree="${pair##*:}"
     field="$(printf '%s' "$pair" | cut -d: -f2)"
     bi="$(buildinfo_field "$field")"; tr="$(revision_field "$tree" rev)"
+    dirty="$(revision_field "$tree" dirty_files 0)"
+    [ "$dirty" = "0" ] \
+      || die "$name source has $dirty dirty file(s); rebuild the corpus from a clean revision"
     # Prefix-tolerant (short vs full rev forms), ≥7 chars — mirrors bootstrap.
     revs_agree "$bi" "$tr" || die "STALE BUNDLE: $name built from $bi but tree is $tr — re-run c7a-bootstrap.sh (doc §6)"
   done
@@ -228,9 +235,9 @@ assert_source_preconditions() {
   [ -f "$avx512" ] || die "missing $avx512"
 
   grep -q '!is_x86_feature_detected!("avx512vl")' "$crc" \
-    || die "crc.rs has no '&& !avx512vl' exclusion in available() — stale tree, the C1 proof is impossible (doc §4)"
+    || die "crc.rs has no '&& !avx512vl' exclusion in available() — stale tree, the CRC proof is impossible (doc §4)"
   grep -q 'VPCLMUL port unavailable on this CPU' "$crc" \
-    || die "crc.rs has no visible-skip eprintln in crc32_forced_vpclmul_matches_crc_fast — stale tree, the C1 proof cannot be grepped (doc §4)"
+    || die "crc.rs has no visible-skip eprintln in crc32_forced_vpclmul_matches_crc_fast — stale tree, the CRC proof cannot be grepped (doc §4)"
   grep -q 'decoded CRC parity' "$bench" \
     || die "rapidyenc_parity.rs does not assert CRC parity — stale tree (doc §3b)"
   grep -q 'fn forced_tier_kernels_match_scalar_in_production_shape' "$tests" \
@@ -238,7 +245,7 @@ assert_source_preconditions() {
   grep -q 'debug_assert_eq!(m34eqy' "$avx512" \
     || die "simd/x86_avx512.rs has no m34eqy debug_assert_eq! — stale tree (doc §2a)"
 
-  log "Source preconditions PASSED (C1 gate + skip line + CRC parity assert + production-shape test + m34eqy assert)."
+  log "Source preconditions PASSED (CRC gate + skip line + CRC parity assert + production-shape test + search-end assert)."
 }
 
 record_revisions() {
@@ -289,6 +296,7 @@ wait_for_steady_state() {
 # ── Criterion parsing ────────────────────────────────────────────────────────
 # Emits "<bench id>\t<point estimate in ns>". Handles both Criterion layouts:
 # id padded onto the same line as `time:`, and id on its own line above it.
+# shellcheck disable=SC2016 # `$0` and `$1` are evaluated by awk.
 CRIT_AWK='
 function tons(v, u) {
   if (u == "ns") return v;
@@ -319,6 +327,7 @@ function tons(v, u) {
 }
 '
 
+# shellcheck disable=SC2016 # `$1` and `$2` are evaluated by awk.
 DRIFT_AWK='
 BEGIN { FS = "\t" }
 NR == FNR { a[$1] = $2; next }
@@ -418,24 +427,24 @@ expected_lane_count() {
 }
 
 # ── (d) Proof greps ──────────────────────────────────────────────────────────
-# The C1 proof and the differential case counts are printed by eprintln! from
+# The CRC proof and the differential case counts are printed by eprintln! from
 # PASSING tests, so they only exist in the log because every test binary below
 # is invoked with `--nocapture`. Without that flag libtest swallows them and
 # this whole section silently reports "not found".
-C1_SKIP_LINE='skipping crc32_forced_vpclmul_matches_crc_fast: VPCLMUL port unavailable on this CPU'
+CRC_GATE_SKIP_LINE='skipping crc32_forced_vpclmul_matches_crc_fast: VPCLMUL port unavailable on this CPU'
 
-assert_c1_proof() {
+assert_crc_gate_proof() {
   local logs=("$@")
-  echo "----- C1 proof: VPCLMUL port gate excludes avx512vl (doc §4) -----"
-  if grep -h -F "$C1_SKIP_LINE" "${logs[@]}" >/dev/null 2>&1; then
+  echo "----- CRC proof: VPCLMUL port gate excludes avx512vl (doc §4) -----"
+  if grep -h -F "$CRC_GATE_SKIP_LINE" "${logs[@]}" >/dev/null 2>&1; then
     echo "  PROVEN — the gate stood aside on this CPU. Recorded line:"
-    { grep -h -F "$C1_SKIP_LINE" "${logs[@]}" 2>/dev/null | head -1 | sed 's/^/    /'; } || true
+    { grep -h -F "$CRC_GATE_SKIP_LINE" "${logs[@]}" 2>/dev/null | head -1 | sed 's/^/    /'; } || true
     echo "    => crc-fast's 4x512 ZMM tier carried every >=256B update instead"
     echo "       (crc.rs:47-58 never taken; crc.rs:70 always taken)"
   else
     echo "  NOT FOUND — expected line was:"
-    echo "    $C1_SKIP_LINE"
-    gate_fail "C1 proof line absent from the test logs (missing --nocapture, stale crc.rs, or available() unexpectedly true)"
+    echo "    $CRC_GATE_SKIP_LINE"
+    gate_fail "CRC proof line absent from the test logs (missing --nocapture, stale crc.rs, or available() unexpectedly true)"
   fi
 }
 
@@ -472,7 +481,7 @@ assert_differential_counts() {
   fi
 }
 
-# ── Failure containment (standing order: save partials, resume-not-restart) ──
+# ── Failure containment (save partials, resume without restarting) ───────────
 #
 # Every suite phase is independently resumable and independently failable. A
 # phase that dies must not take the rest of the run with it: if full-corpus
@@ -591,7 +600,7 @@ weaver_tests() {
   # Brace group with a plain redirect, NOT a pipeline: a `| tee` here would run
   # the asserts in a subshell and silently discard their gate_fail increments.
   {
-    assert_c1_proof "$debug_log" "$release_log"
+    assert_crc_gate_proof "$debug_log" "$release_log"
     echo
     assert_differential_counts "$debug_log" "$release_log"
   } > "$RESULTS_DIR/proof-gates.txt"
@@ -1060,8 +1069,7 @@ rarpar_bench_suite() {
 # Provenance comes from each tree's REVISION.json, NOT from git: the corpus
 # image ships working-tree state without `.git`, so `git rev-parse` would fail
 # on every tree. Schema: {repo, rev, dirty_files, staged_at_utc}. `dirty_files`
-# is recorded rather than assumed zero — weaver deliberately ships with
-# uncommitted increments staged into the image.
+# is recorded and validated so the harness can reject a dirty corpus.
 revision_field() {   # <tree-dir> <field> [default]
   local f="$1/REVISION.json" out=""
   if [ -f "$f" ] && command -v jq >/dev/null 2>&1; then
@@ -1137,7 +1145,7 @@ write_metadata_json() {
     crc_id="$(printf '%s' "$kernels" | sed -n 's/.*crc=\(-\{0,1\}[0-9]\{1,\}\).*/\1/p')"
   fi
 
-  jq -n \
+  if jq -n \
     --arg timestamp_utc  "$STAMP" \
     --arg instance_type  "$(detect_instance_type)" \
     --arg cpu_model      "$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || true)" \
@@ -1199,9 +1207,11 @@ write_metadata_json() {
         new:  "recorded pass 2",
         note: "the discarded warm pass was rotated out before pass 1 landed in base/"
       }
-    }' > "$out" \
-    && log "wrote $out" \
-    || gate_fail "could not write $out"
+    }' > "$out"; then
+    log "wrote $out"
+  else
+    gate_fail "could not write $out"
+  fi
 }
 
 # Flat array of every criterion estimate, both passes, both repos.
@@ -1471,6 +1481,7 @@ main() {
     # shellcheck disable=SC1091
     . "$PREBUILT_DIR/weaver-bench.env"
   fi
+  assert_corpus_image_pinned
   # Exported so the prebuilt binaries see them; the manifest's needs_env is
   # checked against these in resolve_bin.
   export RAPIDYENC_ROOT WEAVER_RAPIDYENC_LIB CXX
