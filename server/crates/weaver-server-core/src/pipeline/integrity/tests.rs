@@ -51,7 +51,10 @@ fn decode_article_segments(
     block_size: Option<NonZeroU64>,
     chunk: usize,
 ) -> (u32, Vec<Segment>) {
-    let mut pass = weaver_yenc::SegmentedCrc32::new(file_offset, block_size);
+    let checkpoint_plan = block_size
+        .map(weaver_yenc::CheckpointPlan::Single)
+        .unwrap_or(weaver_yenc::CheckpointPlan::None);
+    let mut pass = weaver_yenc::SegmentedCrc32::new(file_offset, checkpoint_plan);
     for slice in data.chunks(chunk.max(1)) {
         pass.update(slice);
     }
@@ -247,6 +250,89 @@ fn a_missing_article_leaves_its_blocks_unclaimed() {
 }
 
 #[test]
+fn aligned_segments_close_without_pending_runs() {
+    let payload = random_bytes(0xa12, 2048);
+    let block_size = block(1024);
+    let file_id = file(1);
+    let mut collector = BlockCrcCollector::new();
+
+    for start in (0..payload.len()).step_by(1024) {
+        let end = start + 1024;
+        let (part_crc, segments) =
+            decode_article_segments(&payload[start..end], start as u64, Some(block_size), 97);
+        collector.note_article(
+            file_id,
+            block_size,
+            start as u64,
+            1024,
+            part_crc,
+            true,
+            false,
+            &segments,
+        );
+    }
+
+    assert_eq!(
+        collector.entry_counts_for_job(JOB),
+        EntryCounts {
+            pending: 0,
+            derived: 2
+        }
+    );
+    assert_eq!(
+        collector.derived_block_crc(file_id, 1),
+        Some(direct_crc(&payload[1024..]))
+    );
+}
+
+#[test]
+fn known_short_final_segment_closes_without_a_pending_run() {
+    let payload = random_bytes(0xa13, 1536);
+    let block_size = block(1024);
+    let file_id = file(2);
+    let mut collector = BlockCrcCollector::new();
+
+    let (first_crc, first_segments) =
+        decode_article_segments(&payload[..1024], 0, Some(block_size), 97);
+    collector.note_article(
+        file_id,
+        block_size,
+        0,
+        1024,
+        first_crc,
+        true,
+        false,
+        &first_segments,
+    );
+    collector.note_file_len(file_id, payload.len() as u64);
+
+    let (last_crc, last_segments) =
+        decode_article_segments(&payload[1024..], 1024, Some(block_size), 97);
+    collector.note_article(
+        file_id,
+        block_size,
+        1024,
+        512,
+        last_crc,
+        true,
+        false,
+        &last_segments,
+    );
+
+    assert_eq!(
+        collector.entry_counts_for_job(JOB),
+        EntryCounts {
+            pending: 0,
+            derived: 2
+        }
+    );
+    assert_eq!(
+        collector.derived_block_crc(file_id, 1),
+        Some(direct_crc(&payload[1024..]))
+    );
+}
+
+#[test]
 fn segments_contradicting_the_pipeline_placement_are_reduced_to_one_record() {
     let payload = random_bytes(0xbad0, 2048);
     let block_size = block(512);
@@ -303,10 +389,153 @@ fn pending_segments_are_retired_as_blocks_close() {
     assert_eq!(collector.derived_blocks(file_id).count(), 8);
     let entry = collector.files.get(&file_id).expect("file tracked");
     assert!(
-        entry.pending.is_empty(),
-        "closed blocks must not retain their segments: {} left",
-        entry.pending.len()
+        entry.grids.values().all(|grid| grid.pending.is_empty()),
+        "closed blocks must not retain their runs: {} left",
+        entry.pending_entries
     );
+}
+
+#[test]
+fn out_of_order_islands_merge_only_when_their_boundaries_meet() {
+    let payload = random_bytes(0xc0df, 1024);
+    let block_size = block(1024);
+    let file_id = file(1);
+    let mut collector = BlockCrcCollector::new();
+
+    // Three distinct islands arrive right-to-left. The first two must both
+    // remain pending until the final left-hand segment bridges them.
+    for (start, end) in [(768usize, 1024usize), (512, 768), (0, 512)] {
+        let (part_crc, segments) =
+            decode_article_segments(&payload[start..end], start as u64, Some(block_size), 64);
+        collector.note_article(
+            file_id,
+            block_size,
+            start as u64,
+            (end - start) as u64,
+            part_crc,
+            true,
+            false,
+            &segments,
+        );
+    }
+
+    assert_eq!(
+        collector.derived_block_crc(file_id, 0),
+        Some(direct_crc(&payload))
+    );
+    assert_eq!(collector.files[&file_id].pending_entries, 0);
+}
+
+#[test]
+fn job_totals_follow_promotion_invalidation_and_retirement() {
+    let block_size = block(1024);
+    let data = random_bytes(0xc0e0, 2048);
+    let mut collector = BlockCrcCollector::new();
+    let primary = file(2);
+
+    let (left_crc, left_segments) = decode_article_segments(&data[..512], 0, Some(block_size), 128);
+    collector.note_article(
+        primary,
+        block_size,
+        0,
+        512,
+        left_crc,
+        true,
+        false,
+        &left_segments,
+    );
+    assert_eq!(
+        collector.entry_counts_for_job(JOB),
+        EntryCounts {
+            pending: 1,
+            derived: 0,
+        }
+    );
+
+    let (right_crc, right_segments) =
+        decode_article_segments(&data[512..1024], 512, Some(block_size), 128);
+    collector.note_article(
+        primary,
+        block_size,
+        512,
+        512,
+        right_crc,
+        true,
+        false,
+        &right_segments,
+    );
+    assert_eq!(
+        collector.entry_counts_for_job(JOB),
+        EntryCounts {
+            pending: 0,
+            derived: 1,
+        }
+    );
+
+    // A duplicate spanning the block boundary invalidates the retired block,
+    // but cannot itself be retained because its CRC cannot be split.
+    collector.note_article(primary, block_size, 512, 1024, 0x9a7b_6c5d, true, true, &[]);
+    assert_eq!(collector.entry_counts_for_job(JOB), EntryCounts::default());
+
+    // A rewrite/repair of one file must not retire a different recovery set's
+    // raw bytes merely because both belong to the same job.
+    let untouched_file = file(4);
+    let (untouched_crc, untouched_segments) =
+        decode_article_segments(&data[..1024], 0, Some(block_size), 128);
+    collector.note_article(
+        untouched_file,
+        block_size,
+        0,
+        1024,
+        untouched_crc,
+        true,
+        false,
+        &untouched_segments,
+    );
+    assert_eq!(collector.entry_counts_for_job(JOB).derived, 1);
+
+    let pending_file = file(3);
+    collector.note_article(
+        pending_file,
+        block_size,
+        0,
+        512,
+        left_crc,
+        true,
+        false,
+        &left_segments,
+    );
+    assert_eq!(
+        collector.entry_counts_for_job(JOB),
+        EntryCounts {
+            pending: 1,
+            derived: 1,
+        }
+    );
+    collector.forget_file(pending_file);
+    assert_eq!(
+        collector.entry_counts_for_job(JOB),
+        EntryCounts {
+            pending: 0,
+            derived: 1,
+        }
+    );
+    assert!(collector.derived_block_crc(untouched_file, 0).is_some());
+
+    let teardown_file = file(5);
+    collector.note_article(
+        teardown_file,
+        block_size,
+        0,
+        512,
+        left_crc,
+        true,
+        false,
+        &left_segments,
+    );
+    collector.forget_job(JOB);
+    assert_eq!(collector.entry_counts_for_job(JOB), EntryCounts::default());
+    assert!(collector.files.is_empty());
 }
 
 // --- PAR2 fixture plumbing, matching the shape the live-PAR2 tests use. ---
@@ -395,7 +624,7 @@ fn decode_articles_into(
         .expect("encode");
 
         let mut decoder = weaver_yenc::StreamingArticleDecoder::new();
-        decoder.set_par2_block_size(Some(block_size));
+        decoder.set_checkpoint_plan(weaver_yenc::CheckpointPlan::Single(block_size));
         let mut output = Vec::new();
         // Feed in awkward chunks: the segments must not depend on them.
         for slice in article.chunks(37) {
@@ -959,8 +1188,8 @@ fn duplicate_at_a_different_offset_invalidates_what_it_overlaps() {
     // coverage again; both blocks re-derive over the disk as it is NOW.
     let (crc_l, segs_l) = decode_article_segments(&data[..512], 0, Some(block_size), 256);
     let (crc_t, segs_t) = decode_article_segments(&data[1536..], 1536, Some(block_size), 256);
-    collector.note_article(file_id, block_size, 0, 512, crc_l, true, true, &segs_l);
-    collector.note_article(file_id, block_size, 1536, 512, crc_t, true, true, &segs_t);
+    collector.note_article(file_id, block_size, 0, 512, crc_l, true, false, &segs_l);
+    collector.note_article(file_id, block_size, 1536, 512, crc_t, true, false, &segs_t);
     let mut expected_block0 = data[..512].to_vec();
     expected_block0.extend_from_slice(&rewrite[..512]);
     let mut expected_block1 = rewrite[512..].to_vec();
@@ -1007,7 +1236,7 @@ fn shorter_duplicate_invalidates_only_the_bytes_it_rewrote() {
 }
 
 #[test]
-fn overflow_fails_closed_and_clears_prior_claims() {
+fn pending_pressure_clears_only_incomplete_runs() {
     let block_size = block(1024);
     let file_id = file(95);
     let data = random_bytes(0x9e5, 1024);
@@ -1020,12 +1249,11 @@ fn overflow_fails_closed_and_clears_prior_claims() {
     collector.note_file_len(file_id, 1024);
     assert!(collector.derived_block_crc(file_id, 0).is_some());
 
-    // Non-tiling one-byte articles pile up in a far block until pending
-    // overflows. Every earlier claim must die with the overflow: this file
-    // has stopped observing arrivals, so a later rewrite would go unnoticed
-    // and nothing previously derived can be trusted to describe the disk.
-    let mut offset = 10 * 1024;
-    while collector.derived_block_crc(file_id, 0).is_some() {
+    // Non-tiling one-byte articles pile up until the per-file pending cap
+    // clears that grid's incomplete runs. Retired evidence is already exact
+    // and must survive this bounded-memory pressure.
+    for index in 0..=MAX_PENDING_RUNS_PER_FILE {
+        let offset = 10 * 1024 + (index as u64 * 2);
         let segment = Segment {
             file_offset: offset,
             len: 1,
@@ -1041,24 +1269,23 @@ fn overflow_fails_closed_and_clears_prior_claims() {
             false,
             &[segment],
         );
-        offset += 2; // gapped: nothing ever tiles, pending only grows
     }
-    assert_eq!(collector.derived_block_crc(file_id, 0), None);
-    assert!(
-        collector
-            .verdicts_against(file_id, &set, par2_id)
-            .is_empty()
+    assert_eq!(collector.derived_block_crc(file_id, 0), Some(crc));
+    assert_eq!(collector.verdicts_against(file_id, &set, par2_id).len(), 1);
+    assert_eq!(
+        collector.entry_counts_for_job(JOB),
+        EntryCounts {
+            pending: 1,
+            derived: 1,
+        }
     );
 
-    // A conflicting rewrite of the once-claimed range arrives after the
-    // overflow; the file stays claim-free rather than resurrecting anything.
+    // A later conflicting rewrite replaces exactly the affected retired
+    // evidence. Its whole-block fallback is sufficient to retain the new
+    // bytes, which then compare as a contradiction against the old PAR2 set.
     collector.note_article(file_id, block_size, 0, 1024, !crc, true, true, &[]);
-    assert_eq!(collector.derived_block_crc(file_id, 0), None);
-    assert!(
-        collector
-            .verdicts_against(file_id, &set, par2_id)
-            .is_empty()
-    );
+    assert_eq!(collector.derived_block_crc(file_id, 0), Some(!crc));
+    assert_eq!(collector.verdicts_against(file_id, &set, par2_id).len(), 1);
 }
 
 #[test]
@@ -1217,5 +1444,108 @@ fn partial_block_replay_keeps_unrewritten_contributions() {
     assert_eq!(
         collector.derived_block_crc(file_id, 0),
         Some(direct_crc(&rewritten))
+    );
+}
+
+#[test]
+fn common_refinement_segments_close_each_admitted_grid_independently() {
+    let file_id = file(95);
+    let bytes = random_bytes(0x1eaf_cafe, 192);
+    let mut collector = BlockCrcCollector::new();
+    let segments = [
+        Segment {
+            file_offset: 0,
+            len: 64,
+            crc32: direct_crc(&bytes[..64]),
+        },
+        Segment {
+            file_offset: 64,
+            len: 32,
+            crc32: direct_crc(&bytes[64..96]),
+        },
+        Segment {
+            file_offset: 96,
+            len: 32,
+            crc32: direct_crc(&bytes[96..128]),
+        },
+        Segment {
+            file_offset: 128,
+            len: 64,
+            crc32: direct_crc(&bytes[128..]),
+        },
+    ];
+
+    collector.note_article_on_grids(
+        file_id,
+        &[block(64), block(96)],
+        0,
+        bytes.len() as u64,
+        direct_crc(&bytes),
+        true,
+        false,
+        &segments,
+    );
+    collector.note_file_len(file_id, bytes.len() as u64);
+
+    let entry = collector.files.get(&file_id).expect("file tracked");
+    assert_eq!(entry.grids.get(&64).expect("64 KiB grid").derived.len(), 3);
+    assert_eq!(entry.grids.get(&96).expect("96 KiB grid").derived.len(), 2);
+    assert_eq!(
+        entry.grids.get(&64).expect("64 KiB grid").derived[&1].crc32,
+        direct_crc(&bytes[64..128])
+    );
+    assert_eq!(
+        entry.grids.get(&96).expect("96 KiB grid").derived[&1].crc32,
+        direct_crc(&bytes[96..])
+    );
+}
+
+#[test]
+fn a_coarse_fallback_crossing_a_grid_boundary_is_not_retained() {
+    let file_id = file(96);
+    let bytes = random_bytes(0x715e_5afe, 100);
+    let segment = Segment {
+        file_offset: 0,
+        len: bytes.len() as u64,
+        crc32: direct_crc(&bytes),
+    };
+    let mut collector = BlockCrcCollector::new();
+
+    collector.note_article_on_grids(
+        file_id,
+        &[block(64), block(96)],
+        0,
+        bytes.len() as u64,
+        segment.crc32,
+        true,
+        false,
+        &[segment],
+    );
+    collector.note_file_len(file_id, bytes.len() as u64);
+
+    let entry = collector.files.get(&file_id).expect("file tracked");
+    assert!(
+        entry
+            .grids
+            .get(&64)
+            .is_none_or(|grid| grid.pending.is_empty())
+    );
+    assert!(
+        entry
+            .grids
+            .get(&96)
+            .is_none_or(|grid| grid.pending.is_empty())
+    );
+    assert!(
+        entry
+            .grids
+            .get(&64)
+            .is_none_or(|grid| grid.derived.is_empty())
+    );
+    assert!(
+        entry
+            .grids
+            .get(&96)
+            .is_none_or(|grid| grid.derived.is_empty())
     );
 }

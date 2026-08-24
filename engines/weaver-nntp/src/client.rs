@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::net::IpAddr;
-use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,7 +9,7 @@ use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, trace, warn};
-use weaver_yenc::YencError;
+use weaver_yenc::{CheckpointPlan, YencError};
 
 use crate::connection::ServerConfig;
 use crate::error::{NntpError, Result};
@@ -332,7 +331,7 @@ pub struct BodyLaneLease {
     mode: BodyLaneMode,
     rtt_ewma: Option<Duration>,
     rtt_samples: VecDeque<Duration>,
-    par2_block_size: Option<NonZeroU64>,
+    checkpoint_plan: CheckpointPlan,
 }
 
 struct DecodedBatchItem {
@@ -384,15 +383,14 @@ impl BodyLaneLease {
             .is_some_and(|conn| conn.capabilities().supports_pipelining())
     }
 
-    /// Checkpoint the CRC pass of every article decoded on this lane at
-    /// multiples of the recovery set's PAR2 block size, so the decoder's
-    /// segment records fold into block CRC32s.
+    /// Checkpoint every decoded article according to the immutable geometry
+    /// snapshot captured by its batch.
     ///
     /// A download batch belongs to one job, so the caller sets this once per
-    /// batch. It is re-applied to the pooled connection on every fetch, so a
-    /// connection returning to the pool never carries another job's grid.
-    pub fn set_par2_block_size(&mut self, block_size: Option<NonZeroU64>) {
-        self.par2_block_size = block_size;
+    /// batch. It is re-applied before every response, including `None`, so a
+    /// pooled connection cannot carry another job's geometry.
+    pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
+        self.checkpoint_plan = checkpoint_plan;
     }
 
     pub fn park(self) {}
@@ -597,6 +595,10 @@ impl BodyLaneLease {
         for (response_idx, message_id) in message_ids.iter().take(requested).enumerate() {
             let item_started = Instant::now();
             let mut budget = ActiveTransferBudget::new(self.client.soft_timeout);
+            self.conn
+                .as_mut()
+                .expect("connection is available while reading pipeline body")
+                .set_checkpoint_plan(self.checkpoint_plan.clone());
             let result = NntpClient::read_decoded_pipelined_body(
                 self.conn
                     .as_mut()
@@ -742,11 +744,11 @@ impl BodyLaneLease {
         estimated_body_bytes: u64,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
         let mut budget = ActiveTransferBudget::new(self.client.soft_timeout);
-        let par2_block_size = self.par2_block_size;
+        let checkpoint_plan = self.checkpoint_plan.clone();
         let Some(conn) = self.conn.as_mut() else {
             return Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed));
         };
-        conn.set_par2_block_size(par2_block_size);
+        conn.set_checkpoint_plan(checkpoint_plan);
 
         let stream_result = conn
             .stream_yenc_article_with_active_budget(
@@ -990,7 +992,7 @@ impl NntpClient {
                 mode: BodyLaneMode::Sequential,
                 rtt_ewma: None,
                 rtt_samples: VecDeque::with_capacity(16),
-                par2_block_size: None,
+                checkpoint_plan: CheckpointPlan::None,
             }),
             Ok(Err(error)) => {
                 if is_connection_error(&error) {
@@ -3393,6 +3395,85 @@ mod tests {
         }
     }
 
+    fn yenc_body_response(message_id: &str, data: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        weaver_yenc::encode(data, &mut encoded, 128, "checkpoint-plan.bin").unwrap();
+
+        let mut response = format!("222 0 {message_id} body follows\r\n").into_bytes();
+        response.extend_from_slice(&encoded);
+        response.extend_from_slice(b".\r\n");
+        response
+    }
+
+    async fn spawn_checkpoint_plan_pipelining_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"200 ready\r\n").await.unwrap();
+            socket.flush().await.unwrap();
+            reject_mode_reader(&mut socket).await;
+
+            let capabilities = read_command_line(&mut socket).await;
+            assert!(capabilities.starts_with("CAPABILITIES"));
+            socket
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n")
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            let first = read_command_line(&mut socket).await;
+            assert_eq!(first, "BODY <first@checkpoint.test>\r\n");
+            let second =
+                tokio::time::timeout(Duration::from_secs(1), read_command_line(&mut socket))
+                    .await
+                    .expect("depth-2 lane must issue both BODY commands before a response");
+            assert_eq!(second, "BODY <second@checkpoint.test>\r\n");
+            socket
+                .write_all(&yenc_body_response(
+                    "<first@checkpoint.test>",
+                    &(0..512u16).map(|byte| byte as u8).collect::<Vec<_>>(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .write_all(&yenc_body_response(
+                    "<second@checkpoint.test>",
+                    &(0..512u16)
+                        .map(|byte| (byte.wrapping_mul(17)) as u8)
+                        .collect::<Vec<_>>(),
+                ))
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            let refill = read_command_line(&mut socket).await;
+            assert_eq!(refill, "BODY <refill@checkpoint.test>\r\n");
+            socket
+                .write_all(&yenc_body_response(
+                    "<refill@checkpoint.test>",
+                    &vec![0x5a; 512],
+                ))
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            let pooled = read_command_line(&mut socket).await;
+            assert_eq!(pooled, "BODY <pooled@checkpoint.test>\r\n");
+            socket
+                .write_all(&yenc_body_response(
+                    "<pooled@checkpoint.test>",
+                    &vec![0xa5; 512],
+                ))
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+        });
+
+        port
+    }
+
     async fn spawn_stat_server(expect_pipelined: bool) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -3460,6 +3541,73 @@ mod tests {
         let kind = FetchKind::Body;
         let _copy = kind;
         let _another = kind;
+    }
+
+    #[tokio::test]
+    async fn body_lane_multi_checkpoint_plan_resets_for_refill_and_pool_reuse() {
+        let port = spawn_checkpoint_plan_pipelining_server().await;
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_server(port, 0)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+        let checkpoint_plan = CheckpointPlan::from_sizes([
+            std::num::NonZeroU64::new(64).unwrap(),
+            std::num::NonZeroU64::new(96).unwrap(),
+        ])
+        .plan;
+
+        let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
+        assert!(lane.supports_pipelining());
+        lane.set_checkpoint_plan(checkpoint_plan.clone());
+        let message_ids = vec![
+            "<first@checkpoint.test>".to_string(),
+            "<second@checkpoint.test>".to_string(),
+        ];
+        let mut callbacks = Vec::new();
+        let stats = lane
+            .fetch_decoded_pipeline_depth2(&message_ids, |index, trace, meta| {
+                callbacks.push((index, trace, meta));
+                std::future::ready(())
+            })
+            .await;
+
+        assert_eq!(stats.offered, 2);
+        assert_eq!(stats.requested, 2);
+        assert_eq!(stats.completed, 2);
+        assert_eq!(callbacks.len(), 2);
+        for (expected_index, (index, trace, _)) in callbacks.iter().enumerate() {
+            assert_eq!(*index, expected_index);
+            let body = trace.result.as_ref().unwrap().body.yenc().unwrap();
+            assert_eq!(body.checkpoint_plan, checkpoint_plan);
+            assert!(
+                body.segments.len() > 1,
+                "multi-grid plan must refine segments"
+            );
+        }
+
+        lane.set_checkpoint_plan(CheckpointPlan::None);
+        let refill = lane
+            .fetch_decoded_sequential("<refill@checkpoint.test>")
+            .await;
+        let refill = refill.result.unwrap();
+        let refill_body = refill.body.yenc().unwrap();
+        assert_eq!(refill_body.checkpoint_plan, CheckpointPlan::None);
+        assert_eq!(refill_body.segments.len(), 1);
+        lane.park();
+        // Returning a pooled connection is spawned on drop; let that task park
+        // the sole fixture connection before proving the next lane reuses it.
+        tokio::task::yield_now().await;
+
+        let mut reused_lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
+        let pooled = reused_lane
+            .fetch_decoded_sequential("<pooled@checkpoint.test>")
+            .await;
+        let pooled = pooled.result.unwrap();
+        let pooled_body = pooled.body.yenc().unwrap();
+        assert_eq!(pooled_body.checkpoint_plan, CheckpointPlan::None);
+        assert_eq!(pooled_body.segments.len(), 1);
     }
 
     #[test]

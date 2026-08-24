@@ -1097,21 +1097,55 @@ fn install_test_par2_runtime(
     files: &[(u32, &str, u32, bool)],
 ) {
     let set_id = par2_set.recovery_set_id;
+    let candidates = pipeline
+        .par2_metadata_candidate_indices(job_id)
+        .into_iter()
+        .map(|(file_index, is_index, _)| {
+            let filename = pipeline
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.spec.files.get(file_index as usize))
+                .map(|file| file.filename.clone())
+                .unwrap_or_default();
+            (file_index, is_index, filename)
+        })
+        .collect::<Vec<_>>();
     let runtime = pipeline.ensure_par2_runtime(job_id);
     runtime.served = Some(set_id);
     runtime.ensure_set_runtime(set_id).set = Some(Arc::new(par2_set));
     runtime.files.clear();
-    for (file_index, filename, recovery_blocks, promoted) in files {
+    for (file_index, is_index, filename) in candidates {
+        let discovery = if is_index {
+            Par2DiscoveryState::Parsed {
+                set_ids: vec![set_id],
+            }
+        } else {
+            Par2DiscoveryState::PrefixProbed {
+                set_ids: vec![set_id],
+            }
+        };
         runtime.files.insert(
-            *file_index,
+            file_index,
             Par2FileRuntime {
-                filename: (*filename).to_string(),
-                recovery_blocks: *recovery_blocks,
-                promoted: *promoted,
+                filename,
+                discovery,
                 ..Default::default()
             },
         );
     }
+    for (file_index, filename, recovery_blocks, promoted) in files {
+        let file = runtime.files.entry(*file_index).or_default();
+        file.filename = (*filename).to_string();
+        file.recovery_blocks = *recovery_blocks;
+        file.promoted = *promoted;
+        if matches!(file.discovery, Par2DiscoveryState::Unseen) {
+            file.discovery = Par2DiscoveryState::PrefixProbed {
+                set_ids: vec![set_id],
+            };
+        }
+    }
+    pipeline.refresh_par2_checkpoint_plan(job_id);
+    pipeline.refresh_par2_md5_substitution_bindings(job_id);
 }
 
 fn build_test_par2_packet(
@@ -2072,6 +2106,7 @@ async fn submit_decoded_segment_with_segments(
                 expected_file_crc,
                 data: DecodedChunk::from(data.to_vec()),
                 yenc_name: filename.to_string(),
+                checkpoint_plan: pipeline.par2_checkpoint_plan(file_id.job_id),
                 segments,
             },
             SegmentSource {
@@ -2123,6 +2158,7 @@ async fn submit_decoded_segment_from_server(
                 expected_file_crc,
                 data: DecodedChunk::from(data.to_vec()),
                 yenc_name: filename.to_string(),
+                checkpoint_plan: pipeline.par2_checkpoint_plan(file_id.job_id),
                 // What a decoder with no PAR2 block size declared emits: one
                 // segment covering the whole article, based where `=ypart`
                 // places it.

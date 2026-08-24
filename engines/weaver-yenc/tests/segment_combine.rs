@@ -17,7 +17,7 @@ use std::num::NonZeroU64;
 
 use par2_rs::checksum::{Crc32CombineOp, crc32 as par2_crc32};
 use weaver_yenc::segment::{SegmentedCrc32, combine_contiguous};
-use weaver_yenc::{Segment, crc32_combine};
+use weaver_yenc::{CheckpointPlan, Segment, crc32_combine};
 
 /// Deterministic xorshift64* stream.
 struct Rng(u64);
@@ -123,7 +123,7 @@ fn derived_block_crcs_match_par2_rs_over_an_article_tiling() {
         let mut segments: Vec<Segment> = Vec::new();
         for window in bounds.windows(2) {
             let (start, end) = (window[0], window[1]);
-            let mut pass = SegmentedCrc32::new(start as u64, Some(block_size));
+            let mut pass = SegmentedCrc32::new(start as u64, CheckpointPlan::Single(block_size));
             let mut cursor = start;
             while cursor < end {
                 let chunk = (1 + rng.below(900)) as usize;

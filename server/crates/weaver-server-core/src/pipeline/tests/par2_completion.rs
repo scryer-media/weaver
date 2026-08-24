@@ -635,6 +635,22 @@ async fn metadata_early_clean_download_quick_completes_from_the_dual_crc_grid_al
         "precondition: both slices must close Intact with independent coverage"
     );
 
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    let payload_path = working_dir.join(payload_filename);
+    let hidden_path = working_dir.join("payload-hidden-during-quick-verify");
+    std::fs::rename(&payload_path, &hidden_path).unwrap();
+    let par2_set = pipeline.par2_set(job_id).cloned().unwrap();
+    let (_, _, in_stream_grid_only) = pipeline
+        .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
+        .await
+        .unwrap()
+        .unwrap();
+    std::fs::rename(hidden_path, payload_path).unwrap();
+    assert!(
+        in_stream_grid_only,
+        "grid-only quick verification must succeed while the payload path is unreadable"
+    );
+
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.download_queue = DownloadQueue::new();
@@ -1487,6 +1503,13 @@ async fn restore_job_reparses_par2_without_promoted_recovery_state() {
         .unwrap();
 
     assert!(restored.par2_set(job_id).is_some());
+    assert!(matches!(
+        restored
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.files.get(&0))
+            .map(|file| &file.discovery),
+        Some(Par2DiscoveryState::Parsed { .. })
+    ));
     assert_eq!(
         restored
             .par2_runtime(job_id)
@@ -6060,7 +6083,7 @@ async fn a_misplaced_pair_proven_by_measured_digests_returns_a_swap_plan() {
     set_measured_md5(&mut pipeline, job_id, 0, &b);
     set_measured_md5(&mut pipeline, job_id, 1, &a);
 
-    let (verification, plan) = pipeline
+    let (verification, plan, in_stream_grid_only) = pipeline
         .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
         .await
         .expect("quick verify does not error")
@@ -6072,6 +6095,10 @@ async fn a_misplaced_pair_proven_by_measured_digests_returns_a_swap_plan() {
     assert!(plan.unresolved.is_empty());
     assert!(plan.conflicts.is_empty());
     assert_eq!(verification.files.len(), 2);
+    assert!(
+        !in_stream_grid_only,
+        "measured digests must not claim the in-stream-grid-only settlement marker"
+    );
     let (left, right) = &plan.swaps[0];
     let mut correct = [left.correct_name.as_str(), right.correct_name.as_str()];
     correct.sort_unstable();
@@ -7608,6 +7635,7 @@ async fn a_salvaged_recovery_volume_is_read_once_per_generation() {
 async fn a_volume_that_completes_after_salvage_reports_its_whole_block_count() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.stateful_par2_session_forced = Some(true);
     let job_id = JobId(30353);
 
     let fixture = install_partial_volume_par2_job(
@@ -7621,9 +7649,45 @@ async fn a_volume_that_completes_after_salvage_reports_its_whole_block_count() {
     )
     .await;
 
+    let set_id = pipeline.par2_served_set_id(job_id).unwrap();
+    let (session, fresh) = pipeline
+        .take_or_open_par2_repair_session(
+            job_id,
+            set_id,
+            fixture.working_dir.clone(),
+            8 * 1024 * 1024,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("the partial set opens a retained filesystem session");
+    assert!(fresh);
+    pipeline.restore_par2_repair_session(job_id, set_id, session);
     pipeline
         .salvage_partial_promoted_recovery_volumes(job_id)
         .await;
+    assert!(
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .set_runtime(set_id)
+            .is_some_and(|set_runtime| set_runtime.session.is_none()),
+        "salvage changed the validated set, so the retained session is discarded"
+    );
+    let (_, fresh) = pipeline
+        .take_or_open_par2_repair_session(
+            job_id,
+            set_id,
+            fixture.working_dir.clone(),
+            8 * 1024 * 1024,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("salvage reopens the filesystem session from its validated snapshot");
+    assert!(fresh);
     assert_eq!(
         pipeline.recovery_blocks_available_or_targeted(
             job_id,
@@ -7707,6 +7771,22 @@ async fn a_later_articles_yenc_name_does_not_re_credit_a_salvaged_volume() {
         },
     )
     .await;
+    // The fixture seeds a retained set for its partial-volume tests. Discard
+    // that shortcut here: replay the normal completed-index, completed-carrier,
+    // and first short-volume-article transitions before the corrupt volume is
+    // read back.
+    pipeline.par2_runtime.remove(&job_id);
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    pipeline
+        .try_merge_par2_recovery(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 2,
+            },
+        )
+        .await;
+    pipeline.note_recovery_count_from_yenc_name(job_id, 3, &fixture.short_volume_filename);
     let set_id = pipeline.par2_served_set_id(job_id).unwrap();
 
     pipeline
@@ -8500,10 +8580,164 @@ async fn load_par2_index(pipeline: &mut Pipeline, job_id: JobId, file_index: u32
         .await;
 }
 
+fn observe_recovery_prefix(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    file_index: u32,
+    set_id: par2_rs::RecoverySetId,
+) {
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .files
+        .entry(file_index)
+        .or_default()
+        .discovery = Par2DiscoveryState::PrefixProbed {
+        set_ids: vec![set_id],
+    };
+}
+
 fn served_set_describes(pipeline: &Pipeline, job_id: JobId, filename: &str) -> bool {
     pipeline
         .par2_set(job_id)
         .is_some_and(|set| set.files.values().any(|desc| desc.filename == filename))
+}
+
+#[tokio::test]
+async fn two_indexless_metadata_carriers_build_two_mixed_grid_sets() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30800);
+    let first_payload = vec![0x31; 256];
+    let second_payload = vec![0x72; 288];
+    let first_metadata = build_test_par2_index_for_files(&[("first.bin", &first_payload)], 64);
+    let second_metadata = build_test_par2_index_for_files(&[("second.bin", &second_payload)], 96);
+    let first_carrier = "opaque-a.vol00+01.par2";
+    let second_carrier = "opaque-b.vol00+01.par2";
+    let spec = JobSpec {
+        name: "Two Indexless Recovery Sets".to_string(),
+        password: None,
+        total_bytes: (first_payload.len() + second_payload.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: first_carrier.to_string(),
+                role: FileRole::from_filename(first_carrier),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: first_metadata.len() as u32,
+                    message_id: "indexless-first@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: second_carrier.to_string(),
+                role: FileRole::from_filename(second_carrier),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: second_metadata.len() as u32,
+                    message_id: "indexless-second@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 0, first_carrier, &first_metadata).await;
+    write_and_complete_file(&mut pipeline, job_id, 1, second_carrier, &second_metadata).await;
+
+    load_par2_index(&mut pipeline, job_id, 0).await;
+    load_par2_index(&mut pipeline, job_id, 1).await;
+
+    let runtime = pipeline.par2_runtime(job_id).unwrap();
+    let mut slice_sizes = runtime
+        .sets
+        .values()
+        .filter_map(|runtime| runtime.set.as_ref().map(|set| set.slice_size))
+        .collect::<Vec<_>>();
+    slice_sizes.sort_unstable();
+    assert_eq!(slice_sizes, vec![64, 96]);
+    let expected_plan = weaver_yenc::CheckpointPlan::from_slice_sizes([64, 96]).plan;
+    assert_eq!(runtime.checkpoint_plan.as_ref(), Some(&expected_plan));
+    assert!(
+        runtime
+            .files
+            .values()
+            .all(|file| matches!(file.discovery, Par2DiscoveryState::Parsed { .. }))
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_grid_admission_keeps_only_the_overflow_sentinel() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30807);
+    let payload = vec![0x5a; 128];
+    let grid_count = weaver_yenc::MAX_CHECKPOINT_GRIDS + 2;
+    let metadata = (0..grid_count)
+        .map(|index| {
+            let filename = format!("grid-{index}.par2");
+            let bytes = build_test_par2_index(
+                &format!("grid-payload-{index}.bin"),
+                &payload,
+                64 + (index as u64 * 4),
+            );
+            (filename, bytes)
+        })
+        .collect::<Vec<_>>();
+    let spec = JobSpec {
+        name: "Checkpoint Grid Admission Cap".to_string(),
+        password: None,
+        total_bytes: metadata.iter().map(|(_, bytes)| bytes.len() as u64).sum(),
+        category: None,
+        metadata: vec![],
+        files: metadata
+            .iter()
+            .enumerate()
+            .map(|(index, (filename, bytes))| FileSpec {
+                filename: filename.clone(),
+                role: FileRole::from_filename(filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: bytes.len() as u32,
+                    message_id: format!("checkpoint-grid-{index}@example.com"),
+                }],
+            })
+            .collect(),
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (index, (filename, bytes)) in metadata.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, index as u32, filename, bytes).await;
+        load_par2_index(&mut pipeline, job_id, index as u32).await;
+    }
+
+    let runtime = pipeline.par2_runtime(job_id).unwrap();
+    assert_eq!(runtime.sets.len(), grid_count);
+    assert_eq!(
+        runtime.admitted_checkpoint_sizes.len(),
+        weaver_yenc::MAX_CHECKPOINT_GRIDS + 1,
+        "one retained extra size is the permanent overflow sentinel"
+    );
+    assert_eq!(
+        runtime.checkpoint_plan,
+        Some(weaver_yenc::CheckpointPlan::None)
+    );
+
+    pipeline.refresh_par2_checkpoint_plan(job_id);
+    assert_eq!(
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .admitted_checkpoint_sizes
+            .len(),
+        weaver_yenc::MAX_CHECKPOINT_GRIDS + 1,
+        "later parsed sets cannot grow or rebuild a degraded plan"
+    );
 }
 
 /// Whichever index lands first, the set protecting the most payload is served.
@@ -8571,6 +8805,8 @@ async fn another_recovery_sets_volumes_do_not_count_toward_the_served_set() {
     posting.install(&mut pipeline, job_id).await;
     load_par2_index(&mut pipeline, job_id, 1).await;
     load_par2_index(&mut pipeline, job_id, 4).await;
+    let larger_set_id = TwoSetPosting::recovery_set_id(&posting.larger_index);
+    observe_recovery_prefix(&mut pipeline, job_id, 2, larger_set_id);
 
     assert_eq!(
         pipeline
@@ -8778,6 +9014,38 @@ async fn a_single_recovery_set_job_announces_nothing_and_counts_every_volume() {
 }
 
 #[tokio::test]
+async fn unread_multi_set_volume_is_not_attributed_by_its_filename() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30806);
+    let posting = TwoSetPosting::build();
+    posting.install(&mut pipeline, job_id).await;
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    load_par2_index(&mut pipeline, job_id, 4).await;
+    let larger_set_id = TwoSetPosting::recovery_set_id(&posting.larger_index);
+    let smaller_set_id = TwoSetPosting::recovery_set_id(&posting.smaller_index);
+
+    assert_eq!(
+        pipeline.total_recovery_block_capacity(job_id, larger_set_id),
+        0
+    );
+    assert_eq!(
+        pipeline.total_recovery_block_capacity(job_id, smaller_set_id),
+        0
+    );
+
+    observe_recovery_prefix(&mut pipeline, job_id, 2, larger_set_id);
+    assert_eq!(
+        pipeline.total_recovery_block_capacity(job_id, larger_set_id),
+        8
+    );
+    assert_eq!(
+        pipeline.total_recovery_block_capacity(job_id, smaller_set_id),
+        0
+    );
+}
+
+#[tokio::test]
 async fn targeted_promotion_routes_only_to_the_requested_recovery_set() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -8786,7 +9054,10 @@ async fn targeted_promotion_routes_only_to_the_requested_recovery_set() {
     posting.install(&mut pipeline, job_id).await;
     load_par2_index(&mut pipeline, job_id, 1).await;
     load_par2_index(&mut pipeline, job_id, 4).await;
+    let larger_set_id = TwoSetPosting::recovery_set_id(&posting.larger_index);
     let smaller_set_id = TwoSetPosting::recovery_set_id(&posting.smaller_index);
+    observe_recovery_prefix(&mut pipeline, job_id, 2, larger_set_id);
+    observe_recovery_prefix(&mut pipeline, job_id, 5, smaller_set_id);
 
     assert_eq!(
         pipeline.promote_recovery_targeted(job_id, smaller_set_id, 4),
@@ -8867,6 +9138,8 @@ async fn recovery_arithmetic_is_strictly_isolated_per_set() {
     load_par2_index(&mut pipeline, job_id, 4).await;
     let larger_set_id = TwoSetPosting::recovery_set_id(&posting.larger_index);
     let smaller_set_id = TwoSetPosting::recovery_set_id(&posting.smaller_index);
+    observe_recovery_prefix(&mut pipeline, job_id, 2, larger_set_id);
+    observe_recovery_prefix(&mut pipeline, job_id, 5, smaller_set_id);
 
     assert_eq!(
         pipeline.total_recovery_block_capacity(job_id, larger_set_id),
@@ -8955,6 +9228,10 @@ async fn a_multi_set_recovery_file_feeds_both_sets_and_counts_for_each() {
     let larger_set_id = TwoSetPosting::recovery_set_id(&posting.larger_index);
     let smaller_set_id = TwoSetPosting::recovery_set_id(&posting.smaller_index);
 
+    // The unread standard volume has a validated prefix for the larger set.
+    // Its name alone must not contribute capacity once two sets are known.
+    observe_recovery_prefix(&mut pipeline, job_id, 2, larger_set_id);
+
     write_and_complete_file(&mut pipeline, job_id, 5, SMALLER_VOLUME, &multi_set_volume).await;
     pipeline
         .try_merge_par2_recovery(
@@ -9003,6 +9280,292 @@ async fn a_multi_set_recovery_file_feeds_both_sets_and_counts_for_each() {
         pipeline.total_recovery_block_capacity(job_id, smaller_set_id),
         1,
         "and the smaller set sees the block it was actually given"
+    );
+}
+
+/// Every carrier keeps only the recovery slices it itself contributed.
+///
+/// A later metadata-only volume used to copy the set's accumulated total into
+/// its own entry, so one real recovery volume was advertised twice.  Its
+/// arrival also replaced the explicit index in the deterministic summary.
+#[tokio::test]
+async fn metadata_only_and_duplicate_carriers_do_not_recount_or_replace_the_index() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30811);
+    let posting = TwoSetPosting::build();
+    let metadata_carrier = "later-metadata.vol01+01.par2";
+    let mut spec = posting.spec();
+    spec.files.push(FileSpec {
+        filename: metadata_carrier.to_string(),
+        role: FileRole::from_filename(metadata_carrier),
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: posting.larger_index.len() as u32,
+            message_id: "later-metadata@example.com".to_string(),
+        }],
+    });
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        1,
+        LARGER_INDEX,
+        &posting.larger_index,
+    )
+    .await;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        4,
+        SMALLER_INDEX,
+        &posting.smaller_index,
+    )
+    .await;
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    load_par2_index(&mut pipeline, job_id, 4).await;
+    let larger_set_id = TwoSetPosting::recovery_set_id(&posting.larger_index);
+
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        2,
+        LARGER_VOLUME,
+        &posting.larger_volume,
+    )
+    .await;
+    load_par2_index(&mut pipeline, job_id, 2).await;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        6,
+        metadata_carrier,
+        &posting.larger_index,
+    )
+    .await;
+    load_par2_index(&mut pipeline, job_id, 6).await;
+    load_par2_index(&mut pipeline, job_id, 6).await;
+
+    let runtime = pipeline.par2_runtime(job_id).unwrap();
+    let summary = &runtime.set_runtime(larger_set_id).unwrap().summary;
+    assert_eq!(summary.index_file_index, 1);
+    assert_eq!(summary.index_filename, LARGER_INDEX);
+    assert_eq!(
+        runtime.files[&6].recovery_blocks_by_set[&larger_set_id], 0,
+        "the metadata-only carrier contributed no recovery slices"
+    );
+    assert_eq!(
+        pipeline.total_recovery_block_capacity(job_id, larger_set_id),
+        8,
+        "the real volume is counted once despite repeated metadata carriers"
+    );
+}
+
+/// A completed recovery carrier replaces the retained snapshot with the
+/// current validated set before the next filesystem session opens.
+#[tokio::test]
+async fn completed_recovery_carrier_reopens_the_filesystem_session_from_the_current_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.stateful_par2_session_forced = Some(true);
+    let job_id = JobId(30817);
+    let posting = TwoSetPosting::build();
+    let working_dir = posting.install(&mut pipeline, job_id).await;
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    let set_id = TwoSetPosting::recovery_set_id(&posting.larger_index);
+    let (session, fresh) = pipeline
+        .take_or_open_par2_repair_session(
+            job_id,
+            set_id,
+            working_dir.clone(),
+            8 * 1024 * 1024,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("the parsed index opens a filesystem-backed session");
+    assert!(fresh);
+    pipeline.restore_par2_repair_session(job_id, set_id, session);
+
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        2,
+        LARGER_VOLUME,
+        &posting.larger_volume,
+    )
+    .await;
+    load_par2_index(&mut pipeline, job_id, 2).await;
+
+    assert!(
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .set_runtime(set_id)
+            .and_then(|set_runtime| set_runtime.session.as_ref())
+            .is_none(),
+        "a recovery arrival invalidates the stale retained snapshot"
+    );
+    assert_eq!(
+        pipeline
+            .par2_set_for(job_id, set_id)
+            .unwrap()
+            .recovery_block_count(),
+        8
+    );
+    let (_, fresh) = pipeline
+        .take_or_open_par2_repair_session(job_id, set_id, working_dir, 8 * 1024 * 1024, None, None)
+        .await
+        .unwrap()
+        .expect("the validated set reopens a filesystem-backed session");
+    assert!(fresh);
+}
+
+/// A completed recovery volume whose packet headers survive but whose payloads
+/// do not validate is a final zero-capacity answer, not permission to trust
+/// the count encoded in its filename.
+#[tokio::test]
+async fn completed_payload_corrupt_recovery_volume_contributes_zero_capacity() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.stateful_par2_session_forced = Some(true);
+    let job_id = JobId(30818);
+    let fixture = install_partial_volume_par2_job(
+        &mut pipeline,
+        job_id,
+        PartialVolumeJob {
+            name: "Silver Horizon Completed Corrupt Volume",
+            // The repair needs four blocks. The valid complete volume proves
+            // two; this volume's headers name the remaining two, but neither
+            // payload validates against its packet MD5.
+            damaged_slices: 4,
+            holed_packets: &[0, 1],
+        },
+    )
+    .await;
+    let set_id = pipeline.par2_served_set_id(job_id).unwrap();
+    let source_file_id = *pipeline
+        .par2_set_for(job_id, set_id)
+        .unwrap()
+        .files
+        .keys()
+        .next()
+        .unwrap();
+    let mut damaged_source = fixture.payload.clone();
+    damaged_source[..4 * PARTIAL_VOLUME_SLICE_SIZE as usize].fill(0);
+    let mut access = par2_rs::MemoryFileAccess::new();
+    access.add_file(source_file_id, damaged_source);
+    let source_access: std::sync::Arc<dyn par2_rs::FileAccess + Send + Sync> =
+        std::sync::Arc::new(access);
+    let (session, fresh) = pipeline
+        .take_or_open_par2_repair_session(
+            job_id,
+            set_id,
+            fixture.working_dir.clone(),
+            8 * 1024 * 1024,
+            None,
+            Some(std::sync::Arc::clone(&source_access)),
+        )
+        .await
+        .unwrap()
+        .expect("the direct source opens an access-backed session");
+    assert!(fresh);
+    pipeline.restore_par2_repair_session(job_id, set_id, session);
+    let corrupt_packets = par2_rs::scan_packets_from_path_with_set_ids(
+        &fixture.working_dir.join(&fixture.short_volume_filename),
+    )
+    .unwrap()
+    .into_iter()
+    .filter(|scanned| match &scanned.packet {
+        par2_rs::Packet::RecoverySlice(recovery) => !matches!(
+            recovery
+                .data
+                .validate_packet_hash(scanned.recovery_set_id.as_bytes(), recovery.exponent),
+            Ok(true)
+        ),
+        _ => false,
+    })
+    .count();
+    assert_eq!(
+        corrupt_packets, 2,
+        "test precondition: both header-valid recovery payloads are corrupt"
+    );
+
+    let volume_id = NzbFileId {
+        job_id,
+        file_index: 3,
+    };
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let file = state.assembly.file_mut(volume_id).unwrap();
+        file.commit_segment(1, PARTIAL_VOLUME_SLICE_SIZE as u32)
+            .unwrap();
+        assert!(file.is_complete());
+    }
+    pipeline
+        .unavailable_promoted_recovery_segments
+        .retain(|segment_id| segment_id.file_id != volume_id);
+
+    pipeline.try_merge_par2_recovery(job_id, volume_id).await;
+
+    assert!(
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .set_runtime(set_id)
+            .and_then(|set_runtime| set_runtime.session.as_ref())
+            .is_none(),
+        "the corrupt carrier must evict the pre-arrival direct snapshot"
+    );
+    let (mut session, fresh) = pipeline
+        .take_or_open_par2_repair_session(
+            job_id,
+            set_id,
+            fixture.working_dir.clone(),
+            8 * 1024 * 1024,
+            None,
+            Some(source_access),
+        )
+        .await
+        .unwrap()
+        .expect("the filtered set reopens an access-backed session");
+    assert!(fresh);
+    let assessment = session.analyze().unwrap();
+    assert_eq!(assessment.recovery_blocks_available, 2);
+
+    assert_eq!(
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .files
+            .get(&volume_id.file_index)
+            .and_then(|file| file.recovery_blocks_by_set.get(&set_id)),
+        Some(&0),
+        "the completed carrier records an exact zero instead of a filename estimate"
+    );
+
+    assert_eq!(
+        pipeline.total_recovery_block_capacity(job_id, set_id),
+        2,
+        "the complete payload-corrupt carrier contributes exactly zero blocks"
+    );
+    settle_job_completion(&mut pipeline, job_id).await;
+    let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {
+        panic!(
+            "a repair short by two invalid packets must fail; {}",
+            debug_job_state(&pipeline, job_id)
+        );
+    };
+    assert!(
+        error.contains("not repairable"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("only 2 recovery blocks"),
+        "the failure must report only valid recovery payloads: {error}"
     );
 }
 
@@ -9172,6 +9735,8 @@ async fn a_complete_volume_bootstraps_its_recovery_set_without_its_index() {
         "the volume-built set retains its file descriptions"
     );
     assert_eq!(set.recovery_block_count(), 1);
+    let expected_plan = weaver_yenc::CheckpointPlan::from_slice_sizes([set.slice_size]).plan;
+    assert_eq!(pipeline.par2_checkpoint_plan(job_id), expected_plan);
     assert_eq!(
         pipeline.recovery_blocks_available_or_targeted(job_id, recovery_set_id),
         1,
@@ -10402,6 +10967,105 @@ async fn an_untried_metadata_candidate_follows_an_exhausted_one() {
     );
 }
 
+#[tokio::test]
+async fn metadata_probe_extracts_a_nonbootstrap_volume_from_its_recovery_queue() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30937);
+    let payload_filename = "metadata-queue-payload.bin";
+    let selected_volume = "metadata-queue-first.vol00+01.par2";
+    let bootstrap_volume = "metadata-queue-second.vol00+01.par2";
+    let spec = JobSpec {
+        name: "Metadata Queue Extraction".to_string(),
+        password: None,
+        total_bytes: 256,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "metadata-queue-payload@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: selected_volume.to_string(),
+                role: FileRole::from_filename(selected_volume),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "metadata-queue-first-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "metadata-queue-first-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: bootstrap_volume.to_string(),
+                role: FileRole::from_filename(bootstrap_volume),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "metadata-queue-second@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let selected_file = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert_eq!(
+            state
+                .download_queue
+                .count_matching(|work| work.segment_id.file_id == selected_file),
+            0,
+            "the larger volume is not the no-index bootstrap"
+        );
+        assert_eq!(
+            state
+                .recovery_queue
+                .count_matching(|work| work.segment_id.file_id == selected_file),
+            2
+        );
+    }
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(
+        state
+            .download_queue
+            .count_matching(|work| work.segment_id.file_id == selected_file),
+        1,
+        "the prefix probe is the only selected-volume copy left queued"
+    );
+    assert_eq!(
+        state
+            .recovery_queue
+            .count_matching(|work| work.segment_id.file_id == selected_file),
+        0,
+        "the parked original must not race the promoted probe"
+    );
+}
+
 /// Once every candidate has settled, promotion reports that it is finished.
 ///
 /// The callers read `false` as "nothing can produce metadata" and own the
@@ -10429,6 +11093,152 @@ async fn exhausted_metadata_candidates_stop_promising_metadata() {
     assert!(
         drain_promoted_segments(&mut pipeline, job_id).is_empty(),
         "and nothing may be enqueued on the way out"
+    );
+    assert_eq!(
+        pipeline.aggregate_par2_failure_message(job_id),
+        Some("PAR2 metadata discovery exhausted without finding a recovery set".to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_failed_full_carrier_scan_preserves_prefix_discovery_and_restart_reopens_it() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(30936);
+    let payload_filename = "prefix-discovery.bin";
+    let volume_filename = "prefix-discovery.vol00+01.par2";
+    let mut par2_bytes = build_test_par2_index(payload_filename, b"prefix-discovery", 8);
+    par2_bytes.extend(build_test_par2_index(
+        "second-prefix-discovery.bin",
+        b"second-prefix-discovery",
+        8,
+    ));
+    let spec = JobSpec {
+        name: "Prefix Discovery Failure".to_string(),
+        password: None,
+        total_bytes: 192,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "prefix-discovery-payload@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: volume_filename.to_string(),
+                role: FileRole::from_filename(volume_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "prefix-discovery-volume-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "prefix-discovery-volume-1@example.com".to_string(),
+                    },
+                ],
+            },
+        ],
+    };
+
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec.clone()).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    let volume_file_id = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+    assert_eq!(drain_promoted_segments(&mut pipeline, job_id).len(), 1);
+    pipeline
+        .file_prefix_16k
+        .insert(volume_file_id, par2_bytes.clone());
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+    assert_eq!(drain_promoted_segments(&mut pipeline, job_id).len(), 1);
+    let set_ids = pipeline.par2_runtime(job_id).unwrap().ordered_set_ids();
+    assert_eq!(set_ids.len(), 2);
+
+    // The carrier completed on the wire, so the full readback is warranted;
+    // this fixture deliberately omits the resulting file from disk.
+    let file = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .assembly
+        .file_mut(volume_file_id)
+        .unwrap();
+    file.commit_segment(0, 64).unwrap();
+    file.commit_segment(1, 64).unwrap();
+    assert!(file.is_complete());
+
+    // No carrier exists on disk: the full scan fails after the valid prefix
+    // already proved which set this volume belongs to.
+    pipeline
+        .try_load_par2_metadata(job_id, volume_file_id)
+        .await;
+    let runtime = pipeline.par2_runtime(job_id).unwrap();
+    let file = runtime.files.get(&1).unwrap();
+    assert!(matches!(
+        &file.discovery,
+        Par2DiscoveryState::Exhausted { set_ids: exhausted } if exhausted == &set_ids
+    ));
+    assert!(
+        set_ids
+            .iter()
+            .all(|set_id| file.metadata_targets_attempted.contains(set_id))
+    );
+    assert!(pipeline.par2_metadata_discovery_closed(job_id));
+    assert!(
+        pipeline
+            .aggregate_par2_failure_message(job_id)
+            .unwrap()
+            .contains("metadata discovery exhausted")
+    );
+
+    drop(pipeline);
+    let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
+    restored
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !restored.par2_metadata_discovery_closed(job_id),
+        "restart must re-open non-durable discovery instead of trusting stale exhaustion"
     );
 }
 
@@ -10636,6 +11446,14 @@ async fn a_second_index_still_on_the_wire_is_not_an_ignorable_residual() {
         build_repairable_par2_set(payload_filename, &payload, 64, 1),
         &[],
     );
+    // The helper models a fully replayed single-set job. This candidate is
+    // still on the wire, so leave it unseen as the live promotion path would.
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .files
+        .get_mut(&2)
+        .unwrap()
+        .discovery = Par2DiscoveryState::Unseen;
 
     assert!(
         !pipeline.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id),

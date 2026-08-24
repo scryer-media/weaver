@@ -5079,9 +5079,7 @@ async fn check_job_completion_retains_par2_until_rar_extraction_finishes() {
     }
 
     let par2_filename = &files[4].0;
-    tokio::fs::write(working_dir.join(par2_filename), &files[4].1)
-        .await
-        .unwrap();
+    write_and_complete_file(&mut pipeline, job_id, 4, par2_filename, &files[4].1).await;
     install_test_par2_runtime(
         &mut pipeline,
         job_id,
@@ -5098,6 +5096,7 @@ async fn check_job_completion_retains_par2_until_rar_extraction_finishes() {
     if let Some(plan) = set_state.plan.as_mut() {
         plan.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
     }
+    pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Extracting;
 
     pipeline.check_job_completion(job_id).await;
 

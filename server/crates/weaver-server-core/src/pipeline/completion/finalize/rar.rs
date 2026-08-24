@@ -496,9 +496,9 @@ impl Pipeline {
         .await
         .map_err(|e| format!("placement normalization task panicked: {e}"))??;
 
-        // Placement moved bytes out from under the names the grid bound, so the
-        // job's block state is retired rather than re-resolved.
-        self.block_crcs.forget_job(job_id);
+        // Placement changes paths, not the bytes still owned by each
+        // NzbFileId. Binding and archive identity are refreshed below; raw
+        // grid evidence remains valid for every set.
 
         info!(
             job_id = job_id.0,

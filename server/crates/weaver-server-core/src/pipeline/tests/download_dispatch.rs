@@ -68,7 +68,7 @@ async fn recovery_async_handoff_resets_owned_lane_caches() {
         server_modes: Vec::new(),
         compatibility,
         effective_exclude_servers: Vec::new(),
-        par2_block_size: None,
+        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         works: vec![work],
     };
 
@@ -3089,6 +3089,7 @@ async fn dispatch_downloads_respects_hard_write_byte_pressure() {
         part_crc: par2_rs::checksum::crc32(&vec![7u8; 4096]),
         part_crc_verified: true,
         yenc_name: "queued.bin".to_string(),
+        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         segments: Vec::new(),
     };
     let buffered_len = buffered.len_bytes();
@@ -4787,7 +4788,7 @@ async fn owned_download_lane_capacity_failure_requeues_without_async_fallback() 
         server_modes: Vec::new(),
         compatibility,
         effective_exclude_servers: Vec::new(),
-        par2_block_size: None,
+        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         works: vec![work],
     };
     pipeline
@@ -6012,6 +6013,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
                 expected_file_crc: None,
                 data: DecodedChunk::from(payload.clone()),
                 yenc_name: filename.to_string(),
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
                 segments: Vec::new(),
             })),
             attempts: Vec::new(),
@@ -7402,9 +7404,8 @@ async fn a_deferred_job_issues_nothing_until_it_is_eligible() {
 
 #[tokio::test]
 async fn the_deferral_boundary_is_posted_at_plus_the_delay() {
-    // The arithmetic, pinned either side of the line without waiting on a
-    // clock: the same delay, two posts, one a second short of eligible and one
-    // a second past it.
+    // Pin both sides of the boundary with enough margin that a wall-clock
+    // second ticking during fixture setup cannot change the expected side.
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.propagation_delay_forced = Some(Duration::from_secs(3600));
@@ -7414,19 +7415,19 @@ async fn the_deferral_boundary_is_posted_at_plus_the_delay() {
     insert_active_job(
         &mut pipeline,
         young,
-        posted_job_spec("Silver Horizon Young", Some(now - 3599)),
+        posted_job_spec("Silver Horizon Young", Some(now - 3540)),
     )
     .await;
     assert!(
         pipeline.propagation_hold_until(young).is_some(),
-        "one second short of the delay is still deferred"
+        "a post inside the delay is still deferred"
     );
 
     let old = JobId(20202);
     insert_active_job(
         &mut pipeline,
         old,
-        posted_job_spec("Silver Horizon Old", Some(now - 3601)),
+        posted_job_spec("Silver Horizon Old", Some(now - 3660)),
     )
     .await;
     assert!(

@@ -182,6 +182,7 @@ impl Pipeline {
                                 expected_file_crc: decode_result.expected_file_crc,
                                 data: decoded,
                                 yenc_name: decode_result.metadata.name,
+                                checkpoint_plan: decode_result.checkpoint_plan,
                                 segments: decode_result.segments,
                             },
                             source: SegmentSource {
@@ -254,6 +255,7 @@ impl Pipeline {
                                 expected_file_crc: decode_result.expected_file_crc,
                                 data: DecodedChunk::from(output),
                                 yenc_name: decode_result.metadata.name,
+                                checkpoint_plan: decode_result.checkpoint_plan,
                                 segments: decode_result.segments,
                             },
                             source: SegmentSource {
@@ -497,7 +499,7 @@ impl Pipeline {
                     server_modes,
                     compatibility,
                     effective_exclude_servers: _,
-                    par2_block_size,
+                    checkpoint_plan,
                     works,
                 } = lease;
                 current_job_id = job_id;
@@ -512,9 +514,9 @@ impl Pipeline {
                 );
                 let is_recovery = compatibility.is_recovery;
                 let exclude_servers = compatibility.exclude_servers.clone();
-                // Declared per batch, which is per job: this is the checkpoint
-                // grid every article decoded below cuts its CRC segments on.
-                lane.set_par2_block_size(par2_block_size);
+                // Every lease reapplies its immutable plan, including `None`,
+                // so pooled responses cannot retain a prior job's geometry.
+                lane.set_checkpoint_plan(checkpoint_plan);
                 let mut batch_clean_for_refill = true;
                 let mut policy_blocked_for_refill = false;
                 let mut pending_works: std::collections::VecDeque<DownloadWork> =

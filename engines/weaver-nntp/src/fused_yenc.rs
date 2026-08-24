@@ -1,10 +1,9 @@
-use std::num::NonZeroU64;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use thiserror::Error;
 use weaver_yenc::{
-    DecodeResult, DecodeState, RapidyencDecodeEnd, YencError, YencMetadata,
+    CheckpointPlan, DecodeResult, DecodeState, RapidyencDecodeEnd, YencError, YencMetadata,
     decode_body_chunk_until_control, finish_streaming_result, header,
 };
 
@@ -240,7 +239,7 @@ pub struct FusedYencArticleDecoder {
     output_chunks: Vec<Box<[u8]>>,
     output_reserved: bool,
     profile_cpu: bool,
-    par2_block_size: Option<NonZeroU64>,
+    checkpoint_plan: CheckpointPlan,
     stats: FusedYencArticleStats,
 }
 
@@ -259,7 +258,7 @@ impl FusedYencArticleDecoder {
             output_chunks: Vec::new(),
             output_reserved: false,
             profile_cpu: false,
-            par2_block_size: None,
+            checkpoint_plan: CheckpointPlan::None,
             stats: FusedYencArticleStats::default(),
         }
     }
@@ -339,15 +338,14 @@ impl FusedYencArticleDecoder {
         self.state == FusedArticleState::Done
     }
 
-    /// Checkpoint the decode CRC pass at multiples of the recovery set's PAR2
-    /// block size, so the article's [`weaver_yenc::DecodeResult::segments`] fold
-    /// into block CRC32s without a second pass over the decoded bytes.
+    /// Set the immutable geometry that checkpoints the decode CRC pass, so the
+    /// article's [`weaver_yenc::DecodeResult::segments`] can compose into every
+    /// grid present when this article began decoding without a second pass.
     ///
     /// Set before the article's yEnc header is consumed. `None` (the default)
-    /// is the pre-block-size policy: one segment per article, which composes
-    /// only where article boundaries happen to tile blocks.
-    pub fn set_par2_block_size(&mut self, block_size: Option<NonZeroU64>) {
-        self.par2_block_size = block_size;
+    /// emits one coarse segment for the article.
+    pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
+        self.checkpoint_plan = checkpoint_plan;
     }
 
     pub fn set_profile_cpu(&mut self, enabled: bool) {
@@ -480,8 +478,10 @@ impl FusedYencArticleDecoder {
     /// wire-chunk boundaries.
     fn begin_body(&mut self) {
         if let Some(metadata) = self.metadata.as_ref() {
-            self.decode_state
-                .set_segment_plan(metadata.article_file_offset(), self.par2_block_size);
+            self.decode_state.set_segment_plan(
+                metadata.article_file_offset(),
+                std::mem::take(&mut self.checkpoint_plan),
+            );
         }
         self.state = FusedArticleState::Body;
     }
@@ -824,11 +824,14 @@ fn expected_decoded_size(metadata: &YencMetadata) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
     use super::*;
     use crate::codec::{NntpCodec, NntpFrame, StreamChunk};
     use tokio_util::codec::Decoder;
     use weaver_yenc::{
-        CrcVerification, DecodedArticle, StreamingArticleDecoder, encode, encode_part,
+        CheckpointPlan, CrcVerification, DecodedArticle, StreamingArticleDecoder, encode,
+        encode_part,
     };
 
     fn transcript(article: &[u8], leftover: &[u8]) -> Vec<u8> {
@@ -853,12 +856,12 @@ mod tests {
     }
 
     fn decode_current(transcript: &[u8]) -> (DecodedArticle, Vec<u8>) {
-        decode_current_with_block_size(transcript, None)
+        decode_current_with_checkpoint_plan(transcript, CheckpointPlan::None)
     }
 
-    fn decode_current_with_block_size(
+    fn decode_current_with_checkpoint_plan(
         transcript: &[u8],
-        par2_block_size: Option<NonZeroU64>,
+        checkpoint_plan: CheckpointPlan,
     ) -> (DecodedArticle, Vec<u8>) {
         let mut codec = NntpCodec::new();
         let mut src = BytesMut::from(transcript);
@@ -875,7 +878,7 @@ mod tests {
         codec.set_raw_multiline(true);
 
         let mut decoder = StreamingArticleDecoder::new();
-        decoder.set_par2_block_size(par2_block_size);
+        decoder.set_checkpoint_plan(checkpoint_plan);
         let mut output = Vec::new();
         while let StreamChunk::Data(data) =
             codec.decode_streaming_raw_chunk(&mut src).unwrap().unwrap()
@@ -886,20 +889,30 @@ mod tests {
         (decoder.finish(output).unwrap(), src.to_vec())
     }
 
+    fn decode_current_with_block_size(
+        transcript: &[u8],
+        par2_block_size: Option<NonZeroU64>,
+    ) -> (DecodedArticle, Vec<u8>) {
+        decode_current_with_checkpoint_plan(
+            transcript,
+            par2_block_size.map_or(CheckpointPlan::None, CheckpointPlan::Single),
+        )
+    }
+
     fn decode_fused_with_chunks(
         transcript: &[u8],
         chunks: &[usize],
     ) -> (FusedYencArticle, Vec<u8>) {
-        decode_fused_with_chunks_and_block_size(transcript, chunks, None)
+        decode_fused_with_chunks_and_checkpoint_plan(transcript, chunks, CheckpointPlan::None)
     }
 
-    fn decode_fused_with_chunks_and_block_size(
+    fn decode_fused_with_chunks_and_checkpoint_plan(
         transcript: &[u8],
         chunks: &[usize],
-        par2_block_size: Option<NonZeroU64>,
+        checkpoint_plan: CheckpointPlan,
     ) -> (FusedYencArticle, Vec<u8>) {
         let mut decoder = FusedYencArticleDecoder::new();
-        decoder.set_par2_block_size(par2_block_size);
+        decoder.set_checkpoint_plan(checkpoint_plan);
         let mut src = BytesMut::new();
         let mut offset = 0;
         let mut article = None;
@@ -924,6 +937,18 @@ mod tests {
         }
 
         (article.expect("fused decoder did not finish"), src.to_vec())
+    }
+
+    fn decode_fused_with_chunks_and_block_size(
+        transcript: &[u8],
+        chunks: &[usize],
+        par2_block_size: Option<NonZeroU64>,
+    ) -> (FusedYencArticle, Vec<u8>) {
+        decode_fused_with_chunks_and_checkpoint_plan(
+            transcript,
+            chunks,
+            par2_block_size.map_or(CheckpointPlan::None, CheckpointPlan::Single),
+        )
     }
 
     fn assert_same_article(expected: &DecodedArticle, actual: &FusedYencArticle) {
@@ -957,6 +982,10 @@ mod tests {
         // two decoders must emit byte-identical segment records however the
         // wire bytes were split -- not merely agree on the article CRC.
         assert_eq!(expected.result.segments, actual.yenc_result().segments);
+        assert_eq!(
+            expected.result.checkpoint_plan,
+            actual.yenc_result().checkpoint_plan
+        );
         assert_eq!(
             weaver_yenc::combine_contiguous(&actual.yenc_result().segments)
                 .map_or(0, |folded| folded.crc32),
@@ -1095,6 +1124,36 @@ mod tests {
             actual.stats.leftover_bytes_after_terminator,
             leftover.len() as u64
         );
+    }
+
+    #[test]
+    fn fused_and_streaming_share_multi_grid_snapshot_and_refinement() {
+        let original: Vec<u8> = (0..8_192u32).map(|value| (value * 17 + 3) as u8).collect();
+        let mut article = Vec::new();
+        encode(&original, &mut article, 128, "multi-grid.bin").unwrap();
+        let transcript = transcript(&article, b"223 next response\r\n");
+        let checkpoint_plan = CheckpointPlan::from_sizes([
+            NonZeroU64::new(64).unwrap(),
+            NonZeroU64::new(96).unwrap(),
+        ])
+        .plan;
+
+        let (expected, expected_leftover) =
+            decode_current_with_checkpoint_plan(&transcript, checkpoint_plan.clone());
+        let (actual, actual_leftover) = decode_fused_with_chunks_and_checkpoint_plan(
+            &transcript,
+            &[7, 1, 257, 11, 1024, 3, 4096],
+            checkpoint_plan.clone(),
+        );
+
+        assert_same_article(&expected, &actual);
+        assert_eq!(expected_leftover, actual_leftover);
+        assert_eq!(expected.result.checkpoint_plan, checkpoint_plan);
+        assert!(matches!(
+            expected.result.checkpoint_plan,
+            CheckpointPlan::Multi(_)
+        ));
+        assert!(expected.result.segments.len() > 100);
     }
 
     #[test]

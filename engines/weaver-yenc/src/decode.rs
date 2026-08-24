@@ -1,9 +1,7 @@
-use std::num::NonZeroU64;
-
 use crate::crc::Crc32;
 use crate::error::YencError;
 use crate::header;
-use crate::segment::{Segment, SegmentedCrc32};
+use crate::segment::{CheckpointPlan, Segment, SegmentedCrc32};
 use crate::types::{CrcVerification, DecodeResult, YencHeaderDefects, YencMetadata};
 
 /// Decoder state equivalent to rapidyenc's public `RapidYencDecoderState`.
@@ -210,6 +208,8 @@ fn finalize_decode(
     bytes_written: usize,
     part_crc: u32,
     segments: Vec<Segment>,
+    checkpoint_plan: CheckpointPlan,
+    checkpoint_collapse_reason: Option<crate::segment::CheckpointCollapseReason>,
 ) -> Result<DecodeResult, YencError> {
     let (expected_part_crc, expected_file_crc, yend_size, yend_defects, has_trailer) = match yend {
         Some(yend) => (yend.pcrc32, yend.crc32, yend.size, yend.defects, true),
@@ -280,6 +280,8 @@ fn finalize_decode(
         has_trailer,
         defects,
         segments,
+        checkpoint_plan,
+        checkpoint_collapse_reason,
     })
 }
 
@@ -336,6 +338,8 @@ pub fn decode_with_options(
         bytes_written,
         part_crc,
         segments,
+        CheckpointPlan::None,
+        None,
     )
 }
 
@@ -368,9 +372,18 @@ pub fn finish_streaming_result(
     decode_state: DecodeState,
 ) -> Result<DecodeResult, YencError> {
     let bytes_written = decode_state.bytes_decoded as usize;
-    let (part_crc, segments) = decode_state.finish_segments();
+    let (part_crc, segments, checkpoint_plan, checkpoint_collapse_reason) =
+        decode_state.finish_segments_with_reason();
 
-    finalize_decode(metadata, yend, bytes_written, part_crc, segments)
+    finalize_decode(
+        metadata,
+        yend,
+        bytes_written,
+        part_crc,
+        segments,
+        checkpoint_plan,
+        checkpoint_collapse_reason,
+    )
 }
 
 /// How much leading junk may precede `=ybegin` before the article is declared
@@ -399,7 +412,7 @@ pub struct StreamingArticleDecoder {
     yend_line: Option<Vec<u8>>,
     decode_state: DecodeState,
     output_reserved: bool,
-    par2_block_size: Option<NonZeroU64>,
+    checkpoint_plan: CheckpointPlan,
 }
 
 impl StreamingArticleDecoder {
@@ -412,17 +425,17 @@ impl StreamingArticleDecoder {
             yend_line: None,
             decode_state: DecodeState::new(),
             output_reserved: false,
-            par2_block_size: None,
+            checkpoint_plan: CheckpointPlan::None,
         }
     }
 
     /// Checkpoint this article's CRC pass at multiples of `block_size` so its
     /// [`DecodeResult::segments`] can be folded into PAR2 block CRC32s.
     ///
-    /// Must be set before the yEnc header is consumed; `None` (the default) is
-    /// the pre-block-size policy of one segment per article.
-    pub fn set_par2_block_size(&mut self, block_size: Option<NonZeroU64>) {
-        self.par2_block_size = block_size;
+    /// Must be set before the yEnc header is consumed. `None` (the default)
+    /// produces one coarse segment for the article.
+    pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
+        self.checkpoint_plan = checkpoint_plan;
     }
 
     /// Feed the next raw NNTP BODY chunk into the decoder.
@@ -560,8 +573,10 @@ impl StreamingArticleDecoder {
             Ok(parsed) => {
                 self.decode_state
                     .set_line_length_hint(Some(parsed.metadata.line_length));
-                self.decode_state
-                    .set_segment_plan(parsed.metadata.article_file_offset(), self.par2_block_size);
+                self.decode_state.set_segment_plan(
+                    parsed.metadata.article_file_offset(),
+                    std::mem::take(&mut self.checkpoint_plan),
+                );
                 self.metadata = Some(parsed.metadata);
                 self.stage = StreamingStage::Body;
             }
@@ -774,7 +789,7 @@ impl DecodeState {
     }
 
     /// Declare where this article's decoded bytes land in the reconstructed
-    /// file, and the PAR2 block size to checkpoint the CRC pass at.
+    /// file, and the immutable checkpoint geometry for its CRC pass.
     ///
     /// The decoders call this once the yEnc header is parsed — `file_offset`
     /// comes from the article's own `=ypart begin` (`0` for a single-part
@@ -785,7 +800,7 @@ impl DecodeState {
     ///
     /// Only meaningful before the first body byte is decoded; calling it later
     /// would discard the CRC accumulated so far, so it is a no-op then.
-    pub fn set_segment_plan(&mut self, file_offset: u64, block_size: Option<NonZeroU64>) {
+    pub fn set_segment_plan(&mut self, file_offset: u64, checkpoint_plan: CheckpointPlan) {
         if !self.crc.is_empty() {
             debug_assert!(
                 false,
@@ -793,7 +808,7 @@ impl DecodeState {
             );
             return;
         }
-        self.crc = SegmentedCrc32::new(file_offset, block_size);
+        self.crc = SegmentedCrc32::new(file_offset, checkpoint_plan);
     }
 
     /// Finalize and return the CRC32 of all decoded data. Consumes the state.
@@ -804,6 +819,25 @@ impl DecodeState {
     /// Finalize and return both the article CRC32 and its segment records.
     pub fn finish_segments(self) -> (u32, Vec<Segment>) {
         self.crc.finish_article()
+    }
+
+    /// Finalize segments with any defensive-collapse reason retained for the
+    /// transport/server handoff. The ordinary [`Self::finish_segments`] API
+    /// remains for callers that only need CRC evidence.
+    pub fn finish_segments_with_reason(
+        self,
+    ) -> (
+        u32,
+        Vec<Segment>,
+        CheckpointPlan,
+        Option<crate::segment::CheckpointCollapseReason>,
+    ) {
+        self.crc.finish_article_with_reason_and_plan()
+    }
+
+    #[inline]
+    pub fn checkpoint_plan(&self) -> &CheckpointPlan {
+        self.crc.checkpoint_plan()
     }
 
     /// Get the current CRC32 value without consuming the state.
@@ -1469,6 +1503,27 @@ mod tests {
             .unwrap();
         assert!(small.capacity() >= 1024 * 1024);
         assert!(small.capacity() < CAP);
+    }
+
+    #[test]
+    fn streaming_result_retains_checkpoint_collapse_reason() {
+        let data = vec![b'x'; crate::segment::MAX_CHECKPOINT_SEGMENTS + 1];
+        let mut article = Vec::new();
+        crate::encode(&data, &mut article, 128, "collapse.bin").unwrap();
+
+        let mut decoder = StreamingArticleDecoder::new();
+        decoder.set_checkpoint_plan(CheckpointPlan::Single(
+            std::num::NonZeroU64::new(1).unwrap(),
+        ));
+        let mut output = Vec::new();
+        decoder.feed_chunk(&article, &mut output).unwrap();
+        let result = decoder.finish(output).unwrap().result;
+
+        assert_eq!(result.segments.len(), 1);
+        assert_eq!(
+            result.checkpoint_collapse_reason,
+            Some(crate::segment::CheckpointCollapseReason::SegmentCount)
+        );
     }
 
     /// Junk before `=ybegin`, including `=`-bearing and partial-prefix junk.

@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -9,6 +8,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
+use weaver_yenc::CheckpointPlan;
 
 use crate::codec::{NntpCodec, NntpFrame, StreamChunk};
 use crate::commands::Command;
@@ -318,21 +318,19 @@ pub struct NntpConnection {
     tls_ca_cert: Option<std::path::PathBuf>,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
-    /// PAR2 block size the next decoded article's CRC pass checkpoints at.
+    /// Immutable geometry the next decoded article's CRC pass checkpoints at.
     ///
     /// Set per fetch by the lane rather than at connect time: connections are
-    /// pooled across jobs, and a checkpoint grid belongs to a recovery set, not
-    /// to a socket. `None` -- the state a reused connection is always left in
-    /// unless the current fetch declares otherwise -- is one segment per
-    /// article.
-    par2_block_size: Option<NonZeroU64>,
+    /// pooled across jobs, and checkpoint geometry belongs to a job snapshot,
+    /// not to a socket. `None` is deliberately applied per response.
+    checkpoint_plan: CheckpointPlan,
 }
 
 impl NntpConnection {
-    /// Declare the PAR2 block size for articles decoded on this connection
-    /// from now on. See [`Self::par2_block_size`].
-    pub fn set_par2_block_size(&mut self, block_size: Option<NonZeroU64>) {
-        self.par2_block_size = block_size;
+    /// Declare the checkpoint geometry for articles decoded on this connection
+    /// from now on. See [`Self::checkpoint_plan`].
+    pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
+        self.checkpoint_plan = checkpoint_plan;
     }
 
     /// Connect to an NNTP server, perform TLS negotiation and authentication.
@@ -408,7 +406,7 @@ impl NntpConnection {
             tls_ca_cert: config.tls_ca_cert.clone(),
             transfer_control: None,
             body_accounting: VecDeque::new(),
-            par2_block_size: None,
+            checkpoint_plan: CheckpointPlan::None,
         };
 
         // 2. Read greeting
@@ -1367,7 +1365,7 @@ impl NntpConnection {
             }
         };
         decoder.set_profile_cpu(profile_cpu);
-        decoder.set_par2_block_size(self.par2_block_size);
+        decoder.set_checkpoint_plan(self.checkpoint_plan.clone());
         let mut read_calls = 0u64;
         let mut read_bytes = 0u64;
         let mut transport_read = TransportReadStats::default();
@@ -1847,7 +1845,7 @@ mod tests {
             tls_ca_cert: None,
             transfer_control: None,
             body_accounting: VecDeque::new(),
-            par2_block_size: None,
+            checkpoint_plan: CheckpointPlan::None,
         }
     }
 

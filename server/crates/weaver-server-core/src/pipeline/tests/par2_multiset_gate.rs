@@ -153,6 +153,9 @@ fn install_repairable_set(
             promoted: true,
             recovery_set_id: Some(set_id),
             recovery_set_packets_read: true,
+            discovery: Par2DiscoveryState::Parsed {
+                set_ids: vec![set_id],
+            },
             ..Default::default()
         },
     );
@@ -377,7 +380,11 @@ fn install_servable_set(
             .values()
             .map(|description| description.length)
             .sum();
-        set_runtime.summary.clone()
+        let summary = set_runtime.summary.clone();
+        runtime.files.entry(index_file_index).or_default().discovery = Par2DiscoveryState::Parsed {
+            set_ids: vec![set_id],
+        };
+        summary
     };
     assert!(summary.describes);
     set_id

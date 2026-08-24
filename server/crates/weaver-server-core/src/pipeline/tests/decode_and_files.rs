@@ -508,6 +508,7 @@ async fn queued_yenc_layout_mismatch_retries_before_decode_acceptance() {
                 expected_file_crc: None,
                 data: DecodedChunk::from(b"data".to_vec()),
                 yenc_name: filename.to_string(),
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
                 segments: Vec::new(),
             },
             source: SegmentSource {
@@ -586,6 +587,7 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
                 expected_file_crc: None,
                 data: DecodedChunk::from(b"data".to_vec()),
                 yenc_name: filename.to_string(),
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
                 segments: Vec::new(),
             })),
             attempts: Vec::new(),
@@ -831,6 +833,7 @@ async fn fail_job_clears_write_backlog_accounting() {
         part_crc: par2_rs::checksum::crc32(&vec![3u8; 4096]),
         part_crc_verified: true,
         yenc_name: "stalled.bin".to_string(),
+        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         segments: Vec::new(),
     };
     let buffered_len = buffered.len_bytes();
@@ -1223,6 +1226,7 @@ async fn disk_write_failure_fails_job_before_commit() {
                 segments: Vec::new(),
                 data: DecodedChunk::from(b"fail".to_vec()),
                 yenc_name: "blocked.bin".to_string(),
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
             },
             SegmentSource {
                 source_server_idx: None,
@@ -1312,6 +1316,145 @@ async fn completed_par2_covered_file_skips_streamed_md5_without_posted_file_crc(
     assert!(checksum.all_parts_crc_verified);
     let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
     assert!(!hashes.contains_key(&0));
+}
+
+#[tokio::test]
+async fn par2_md5_substitution_resolves_once_at_lifecycle_not_per_chunk() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(200180);
+    let covered_name = "covered.bin";
+    let unbound_name = "unbound.bin";
+    let covered = b"covered";
+    let unbound = b"unbound";
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Lifecycle MD5 Binding",
+            &[
+                (covered_name.to_string(), covered.len() as u32),
+                (unbound_name.to_string(), unbound.len() as u32),
+            ],
+        ),
+    )
+    .await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(covered_name, covered, 4, 0),
+        &[],
+    );
+    let covered_file = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let unbound_file = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+
+    pipeline
+        .par2_binding_resolver_calls
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    pipeline.refresh_par2_md5_substitution_bindings(job_id);
+    assert_eq!(
+        pipeline
+            .par2_binding_resolver_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "the lifecycle pass resolves each assembly file once"
+    );
+    assert!(pipeline.par2_md5_substitution_is_cached(covered_file));
+    assert!(!pipeline.par2_md5_substitution_is_cached(unbound_file));
+
+    pipeline
+        .par2_binding_resolver_calls
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    pipeline.note_file_hash_chunk(
+        covered_file,
+        0,
+        &covered[..3],
+        par2_rs::checksum::crc32(&covered[..3]),
+        true,
+    );
+    pipeline.note_file_hash_chunk(
+        covered_file,
+        3,
+        &covered[3..],
+        par2_rs::checksum::crc32(&covered[3..]),
+        true,
+    );
+    pipeline.note_file_hash_chunk(
+        unbound_file,
+        0,
+        unbound,
+        par2_rs::checksum::crc32(unbound),
+        true,
+    );
+
+    assert_eq!(
+        pipeline
+            .par2_binding_resolver_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "article chunks only read the positive cache"
+    );
+    assert!(
+        !pipeline.file_hash_states[&covered_file].tracks_md5()
+            && pipeline.file_hash_states[&unbound_file].tracks_md5(),
+        "an unbound file keeps streaming MD5"
+    );
+}
+
+#[tokio::test]
+async fn an_unbound_file_cannot_borrow_another_sets_grid_to_skip_md5() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(200181);
+    let covered_name = "covered.bin";
+    let unbound_name = "unbound.bin";
+    let covered = b"covered";
+    let unbound = b"unbound";
+    let spec = standalone_job_spec(
+        "Bound Set Cannot Lend MD5 Evidence",
+        &[
+            (covered_name.to_string(), covered.len() as u32),
+            (unbound_name.to_string(), unbound.len() as u32),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(covered_name, covered, 4, 0),
+        &[],
+    );
+    let unbound_file = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+
+    submit_decoded_segment(
+        &mut pipeline,
+        unbound_file,
+        0,
+        0,
+        unbound,
+        unbound_name,
+        None,
+    )
+    .await;
+
+    assert!(
+        pipeline.resolve_par2_file_binding(unbound_file).is_none(),
+        "the second file is not described by the first set"
+    );
+    let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert!(
+        hashes.contains_key(&1),
+        "an unbound file must retain its own streamed MD5 rather than borrowing set A's proof"
+    );
 }
 
 #[test]
@@ -1548,6 +1691,7 @@ async fn completed_file_uses_decoded_size_when_raw_article_bytes_are_larger() {
                 segments: Vec::new(),
                 data: DecodedChunk::from(payload.to_vec()),
                 yenc_name: filename.to_string(),
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
             },
             SegmentSource {
                 source_server_idx: None,
@@ -2074,6 +2218,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
         ],
     };
     insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.par2_bypassed.insert(job_id);
 
     let file_id = NzbFileId {
         job_id,
@@ -2091,6 +2236,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
         part_crc: par2_rs::checksum::crc32(&buffered_payload),
         part_crc_verified: true,
         yenc_name: "episode.bin".to_string(),
+        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         segments: Vec::new(),
     };
     let buffered_len = buffered.len_bytes();
@@ -2215,6 +2361,7 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
         part_crc: par2_rs::checksum::crc32(&original_payload[64..]),
         part_crc_verified: true,
         yenc_name: payload_filename.to_string(),
+        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         segments: Vec::new(),
     };
     let buffered_len = buffered.len_bytes();
@@ -2563,6 +2710,7 @@ pub(super) async fn submit_uu_segment_named(
                 segments: Vec::new(),
                 data: DecodedChunk::from(data.to_vec()),
                 yenc_name: begin_name.to_string(),
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
             },
             SegmentSource {
                 source_server_idx: None,
@@ -3700,6 +3848,40 @@ async fn an_obfuscated_file_binds_to_its_description_by_content() {
             .map(|bound| bound.described_length),
         Some(payload.len() as u64),
         "and the binding carries the DESCRIBED length, never a declared one"
+    );
+}
+
+#[tokio::test]
+async fn content_binding_disambiguates_equal_length_obfuscated_descriptions() {
+    let first = binding_payload(73, 40_000);
+    let second = binding_payload(74, 40_000);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, file_id) = obfuscated_binding_fixture(
+        &temp_dir,
+        JobId(200901),
+        "a7f3e91c8b2d.bin",
+        &[
+            ("silver-horizon.s01e01.mkv", &first),
+            ("silver-horizon.s01e02.mkv", &second),
+        ],
+        &first[..crate::pipeline::PAR2_HASH_16K_BYTES],
+    )
+    .await;
+
+    let set = pipeline.par2_set(file_id.job_id).cloned().expect("a set");
+    let expected = set
+        .files
+        .iter()
+        .find_map(|(id, description)| {
+            (description.filename == "silver-horizon.s01e01.mkv").then_some(*id)
+        })
+        .expect("first description");
+    assert_eq!(
+        pipeline
+            .resolve_par2_file_binding(file_id)
+            .map(|bound| bound.par2_file_id),
+        Some(expected),
+        "the hash identifies one description even though length alone is ambiguous"
     );
 }
 

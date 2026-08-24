@@ -421,8 +421,6 @@ async fn two_direct_sets_with_indexes(
         .expect("the served index parses");
     let other = par2_rs::Par2FileSet::from_files(&[other_index.as_slice()])
         .expect("the other index parses");
-    let served_id = served.recovery_set_id;
-    let other_id = other.recovery_set_id;
     let spec = direct_store_job_spec_with_par2_indexes(&volumes, &served_index, &other_index);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
     let served_path = working_dir.join("ember.cove.par2");
@@ -430,15 +428,6 @@ async fn two_direct_sets_with_indexes(
     std::fs::write(&served_path, &served_index).unwrap();
     std::fs::write(&other_path, &other_index).unwrap();
     install_two_parsed_sets(&mut pipeline, job_id, served.clone(), other.clone());
-    let runtime = pipeline.ensure_par2_runtime(job_id);
-    runtime
-        .set_runtime_mut(served_id)
-        .expect("the served runtime")
-        .primary_path = Some(served_path);
-    runtime
-        .set_runtime_mut(other_id)
-        .expect("the other runtime")
-        .primary_path = Some(other_path);
 
     submit_direct_volume(
         &mut pipeline,

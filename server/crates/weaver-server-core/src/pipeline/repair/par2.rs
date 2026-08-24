@@ -14,6 +14,24 @@ const PAR2_PACKET_ALIGNMENT: u64 = 4;
 const PAR2_RECOVERY_PACKET_OVERHEAD: u64 = 68; // 64-byte header + 4-byte exponent
 const PAR2_RETAINED_SESSION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const STATEFUL_PAR2_SESSION_ENV: &str = "WEAVER_STATEFUL_PAR2_SESSION";
+const PAR2_METADATA_PREFIX_CAP_BYTES: usize = PAR2_HASH_16K_BYTES;
+
+fn par2_prefix_set_ids(prefix: &[u8]) -> Vec<par2_rs::RecoverySetId> {
+    let budget = par2_rs::PacketScanBudget::new(par2_rs::PacketScanLimits::default());
+    let mut set_ids = Vec::new();
+    let mut sink =
+        |_: par2_rs::Packet, _: u64, set_id: par2_rs::RecoverySetId| -> par2_rs::Result<()> {
+            if !set_ids.contains(&set_id) {
+                set_ids.push(set_id);
+            }
+            Ok(())
+        };
+    if par2_rs::scan_packets_bounded(prefix, 0, &budget, &mut sink).is_err() {
+        return Vec::new();
+    }
+    set_ids.sort_by_key(|set_id| *set_id.as_bytes());
+    set_ids
+}
 
 fn parse_stateful_par2_session_enabled(raw: Option<&str>) -> bool {
     matches!(
@@ -80,6 +98,45 @@ struct RecoveryCandidate {
 struct ParsedPar2Set {
     set_id: par2_rs::RecoverySetId,
     packets: Vec<par2_rs::Packet>,
+}
+
+/// Scan a completed PAR2 carrier into per-set packet groups. The packet scan
+/// authenticates metadata, but intentionally defers recovery-payload hashes;
+/// validate those here before any caller can merge or count a slice.
+fn scan_completed_par2_packet_groups(path: &Path) -> par2_rs::Result<Vec<ParsedPar2Set>> {
+    let scanned = par2_rs::scan_packets_from_path_with_set_ids(path)?;
+    let mut groups: Vec<ParsedPar2Set> = Vec::new();
+    for scanned_packet in scanned {
+        let group = if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.set_id == scanned_packet.recovery_set_id)
+        {
+            group
+        } else {
+            groups.push(ParsedPar2Set {
+                set_id: scanned_packet.recovery_set_id,
+                packets: Vec::new(),
+            });
+            groups.last_mut().expect("just pushed a PAR2 packet group")
+        };
+        let packet_is_valid = match &scanned_packet.packet {
+            par2_rs::Packet::RecoverySlice(recovery) => {
+                recovery
+                    .data
+                    .validate_packet_hash(
+                        scanned_packet.recovery_set_id.as_bytes(),
+                        recovery.exponent,
+                    )
+                    .ok()
+                    == Some(true)
+            }
+            _ => true,
+        };
+        if packet_is_valid {
+            group.packets.push(scanned_packet.packet);
+        }
+    }
+    Ok(groups)
 }
 
 fn par2_recovery_packet_size(slice_size: u64) -> u64 {
@@ -646,6 +703,68 @@ impl Pipeline {
         Some(names)
     }
 
+    /// Admit newly parsed PAR2 slice sizes and publish one immutable snapshot
+    /// for future leases. Existing grids never disappear mid-job: an older
+    /// batch may still carry evidence for them, while a newly learned grid is
+    /// safe only for later batches.
+    pub(crate) fn refresh_par2_checkpoint_plan(&mut self, job_id: JobId) {
+        let Some(runtime) = self.par2_runtime(job_id) else {
+            return;
+        };
+        if runtime.admitted_checkpoint_sizes.len() > weaver_yenc::MAX_CHECKPOINT_GRIDS {
+            return;
+        }
+        let mut sizes = runtime.admitted_checkpoint_sizes.clone();
+        for slice_size in runtime
+            .sets
+            .values()
+            .filter_map(|set_runtime| set_runtime.set.as_deref())
+            .map(|set| set.slice_size)
+        {
+            sizes.insert(slice_size);
+            if sizes.len() > weaver_yenc::MAX_CHECKPOINT_GRIDS {
+                break;
+            }
+        }
+        if sizes == runtime.admitted_checkpoint_sizes {
+            return;
+        }
+        let build = weaver_yenc::CheckpointPlan::from_slice_sizes(sizes.iter().copied());
+        if crate::runtime::perf_probe::enabled() {
+            let shape = match &build.plan {
+                weaver_yenc::CheckpointPlan::None => "par2.checkpoint_plan.build.none",
+                weaver_yenc::CheckpointPlan::Single(_) => "par2.checkpoint_plan.build.single",
+                weaver_yenc::CheckpointPlan::Multi(_) => "par2.checkpoint_plan.build.multi",
+            };
+            crate::runtime::perf_probe::record_value(shape, 1);
+            crate::runtime::perf_probe::record_value(
+                "par2.checkpoint_plan.grid_count",
+                build.plan.grid_count() as u64,
+            );
+            if let Some(reason) = build.degradation {
+                let label = match reason {
+                    weaver_yenc::CheckpointPlanDegradation::TooManyGrids => {
+                        "par2.checkpoint_plan.degraded.too_many_grids"
+                    }
+                    weaver_yenc::CheckpointPlanDegradation::InvalidSliceSize => {
+                        "par2.checkpoint_plan.degraded.invalid_slice_size"
+                    }
+                };
+                crate::runtime::perf_probe::record_value(label, 1);
+            }
+        }
+        let degraded = build.degradation.is_some();
+        let runtime = self.ensure_par2_runtime(job_id);
+        runtime.admitted_checkpoint_sizes = sizes;
+        runtime.checkpoint_plan = Some(build.plan);
+        if degraded {
+            crate::runtime::perf_probe::record(
+                "par2.checkpoint_plan.degraded",
+                std::time::Duration::from_nanos(1),
+            );
+        }
+    }
+
     /// Whether a file is covered only by a set whose index never arrived.
     ///
     /// Parsed sets are all served by the completion gate.  The remaining case
@@ -733,6 +852,9 @@ impl Pipeline {
     /// A description that answers from two recovery sets is ambiguous even when
     /// each set resolves it uniquely on its own, so neither may claim it.
     pub(crate) fn resolve_par2_file_binding(&self, file_id: NzbFileId) -> Option<Par2FileBinding> {
+        #[cfg(test)]
+        self.par2_binding_resolver_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let set_ids = self.par2_runtime(file_id.job_id)?.ordered_set_ids();
         let mut binding = None;
         for set_id in set_ids {
@@ -745,6 +867,74 @@ impl Pipeline {
             binding = Some(candidate);
         }
         binding
+    }
+
+    fn resolve_par2_md5_substitution_binding(
+        &self,
+        file_id: NzbFileId,
+    ) -> Option<crate::pipeline::Par2Md5SubstitutionBinding> {
+        let binding = self.resolve_par2_file_binding(file_id)?;
+        self.par2_set_for(file_id.job_id, binding.recovery_set_id)
+            .is_some_and(|set| {
+                !set.slice_checksums.is_empty()
+                    && set.file_description(&binding.par2_file_id).is_some()
+            })
+            .then_some(crate::pipeline::Par2Md5SubstitutionBinding {
+                recovery_set_id: binding.recovery_set_id,
+                par2_file_id: binding.par2_file_id,
+            })
+    }
+
+    /// Rebuild the positive-only MD5-substitution cache after a bounded
+    /// metadata or identity transition. Articles only read this result.
+    pub(crate) fn refresh_par2_md5_substitution_bindings(&mut self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let file_ids = state
+            .assembly
+            .files()
+            .map(|file| file.file_id())
+            .collect::<Vec<_>>();
+        let bindings = file_ids
+            .into_iter()
+            .filter_map(|file_id| {
+                self.resolve_par2_md5_substitution_binding(file_id)
+                    .map(|binding| (file_id, binding))
+            })
+            .collect();
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
+            runtime.md5_substitution_bindings = bindings;
+        }
+    }
+
+    pub(crate) fn refresh_par2_md5_substitution_binding(&mut self, file_id: NzbFileId) {
+        let binding = self.resolve_par2_md5_substitution_binding(file_id);
+        let Some(runtime) = self.par2_runtime.get_mut(&file_id.job_id) else {
+            return;
+        };
+        match binding {
+            Some(binding) => {
+                runtime.md5_substitution_bindings.insert(file_id, binding);
+            }
+            None => {
+                runtime.md5_substitution_bindings.remove(&file_id);
+            }
+        }
+    }
+
+    pub(crate) fn par2_md5_substitution_is_cached(&self, file_id: NzbFileId) -> bool {
+        let Some(binding) = self
+            .par2_runtime(file_id.job_id)
+            .and_then(|runtime| runtime.md5_substitution_bindings.get(&file_id))
+        else {
+            return false;
+        };
+        self.par2_set_for(file_id.job_id, binding.recovery_set_id)
+            .is_some_and(|set| {
+                !set.slice_checksums.is_empty()
+                    && set.file_description(&binding.par2_file_id).is_some()
+            })
     }
 
     /// The one description whose `hash_16k` the file's captured prefix
@@ -833,8 +1023,18 @@ impl Pipeline {
 
     /// The recovery set's block size for a job, once its PAR2 packets have been
     /// parsed. This is the checkpoint grid the decoder cuts CRC segments on.
+    #[cfg(test)]
     pub(crate) fn par2_block_size(&self, job_id: JobId) -> Option<std::num::NonZeroU64> {
         std::num::NonZeroU64::new(self.par2_set(job_id)?.slice_size)
+    }
+
+    /// The common-refinement checkpoint geometry for every parsed set known
+    /// when a batch is leased. Served-set selection is a UI/repair view and
+    /// must not remove geometry needed by another file in the same job.
+    pub(crate) fn par2_checkpoint_plan(&self, job_id: JobId) -> weaver_yenc::CheckpointPlan {
+        self.par2_runtime(job_id)
+            .and_then(|runtime| runtime.checkpoint_plan.clone())
+            .unwrap_or(weaver_yenc::CheckpointPlan::None)
     }
 
     /// The block size of the recovery set that currently owns `file_id`.
@@ -844,6 +1044,7 @@ impl Pipeline {
     /// KiB prefix arrives, which is also the first moment a grid claim could be
     /// useful. In particular, we must not cut an earlier article on the served
     /// set's grid and later reinterpret it after the file binds elsewhere.
+    #[cfg(test)]
     pub(crate) fn par2_block_size_for_file(
         &self,
         file_id: NzbFileId,
@@ -863,6 +1064,7 @@ impl Pipeline {
     /// durability seam — after the write for this segment returned — so a block
     /// claimed here describes content that is actually on disk.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn note_block_crc_segments(
         &mut self,
         file_id: NzbFileId,
@@ -876,9 +1078,39 @@ impl Pipeline {
         let Some(block_size) = self.par2_block_size_for_file(file_id) else {
             return;
         };
-        self.block_crcs.note_article(
+        self.note_block_crc_segments_for_plan(
             file_id,
-            block_size,
+            &weaver_yenc::CheckpointPlan::Single(block_size),
+            file_offset,
+            decoded_len,
+            part_crc,
+            part_crc_verified,
+            was_duplicate,
+            segments,
+        );
+    }
+
+    /// Record an article using exactly the checkpoint geometry that its decoder
+    /// applied. Evidence is offered independently of binding, so article
+    /// commits do not scan recovery-set metadata or hash a prefix.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn note_block_crc_segments_for_plan(
+        &mut self,
+        file_id: NzbFileId,
+        checkpoint_plan: &weaver_yenc::CheckpointPlan,
+        file_offset: u64,
+        decoded_len: u64,
+        part_crc: u32,
+        part_crc_verified: bool,
+        was_duplicate: bool,
+        segments: &[weaver_yenc::Segment],
+    ) {
+        if checkpoint_plan.is_none() {
+            return;
+        }
+        self.block_crcs.note_article_on_grids(
+            file_id,
+            checkpoint_plan.sizes(),
             file_offset,
             decoded_len,
             part_crc,
@@ -1125,38 +1357,31 @@ impl Pipeline {
             }
         }
 
-        let Some((primary_path, recovery_paths)) = self.par2_runtime(job_id).and_then(|runtime| {
-            runtime.set_runtime(set_id).and_then(|set_runtime| {
-                set_runtime
-                    .primary_path
-                    .clone()
-                    .map(|primary_path| (primary_path, set_runtime.merged_recovery_paths.clone()))
-            })
+        let Some(par2_set) = self.par2_runtime(job_id).and_then(|runtime| {
+            runtime
+                .set_runtime(set_id)
+                .and_then(|set_runtime| set_runtime.set.as_deref())
+                .cloned()
         }) else {
             return Ok(None);
         };
 
         let session_result = tokio::task::spawn_blocking(move || {
             let mut options = match source_access {
-                Some(access) => par2_rs::Par2RepairSessionOptions::with_source_access(
-                    working_dir,
-                    vec![primary_path],
-                    access,
-                ),
-                None => par2_rs::Par2RepairSessionOptions::new(working_dir, vec![primary_path]),
+                Some(access) => {
+                    par2_rs::Par2RepairSessionOptions::from_set(working_dir, par2_set, access)
+                }
+                None => {
+                    let mut options =
+                        par2_rs::Par2RepairSessionOptions::new(working_dir, Vec::new());
+                    options.file_set = Some(par2_set);
+                    options
+                }
             };
             options.memory_limit = Some(memory_limit);
             options.progress = progress;
-            let mut session = par2_rs::Par2RepairSession::open(options)
-                .map_err(|error| format!("failed to open retained PAR2 session: {error}"))?;
-            if !recovery_paths.is_empty() {
-                session
-                    .merge_recovery_paths(recovery_paths)
-                    .map_err(|error| {
-                        format!("failed to replay retained PAR2 recovery paths: {error}")
-                    })?;
-            }
-            Ok::<_, String>(session)
+            par2_rs::Par2RepairSession::open(options)
+                .map_err(|error| format!("failed to open retained PAR2 session: {error}"))
         })
         .await
         .map_err(|error| format!("retained PAR2 session task panicked: {error}"))??;
@@ -1177,6 +1402,21 @@ impl Pipeline {
         set_runtime.session = Some(session);
         set_runtime.session_last_used = Some(Instant::now());
         self.enforce_par2_retained_session_budget((job_id, set_id));
+    }
+
+    /// The retained session owns a snapshot of the validated set. Packet
+    /// arrivals update that set first, then make the snapshot stale.
+    fn evict_par2_repair_session(&mut self, job_id: JobId, set_id: par2_rs::RecoverySetId) {
+        let Some(set_runtime) = self
+            .par2_runtime
+            .get_mut(&job_id)
+            .and_then(|runtime| runtime.set_runtime_mut(set_id))
+        else {
+            return;
+        };
+        set_runtime.session = None;
+        set_runtime.session_last_used = None;
+        set_runtime.session_evidence_file_ids.clear();
     }
 
     fn enforce_par2_retained_session_budget(&mut self, protected: (JobId, par2_rs::RecoverySetId)) {
@@ -1362,14 +1602,18 @@ impl Pipeline {
             .par2_runtime(job_id)
             .and_then(|runtime| runtime.files.get(&file_index))
         {
-            // Zero from the runtime is not a count — entries are created for
-            // bookkeeping (identity binding, metadata promotion) with the
-            // default of 0 long before any packet is parsed, and treating that
-            // as exact silently disqualifies the volume from targeted
-            // promotion (`candidate.blocks > 0`). A recovery volume with
-            // genuinely zero packets does not exist; only an index is exactly
-            // zero, and the role branch below says so. So a zero falls through
-            // to the counts below.
+            if let Some(&validated) = file.recovery_blocks_by_set.get(&set_id) {
+                return Some((validated, RecoveryCountSource::Exact));
+            }
+            // A completed scan answered the capacity question even when it
+            // found no usable recovery.  Filename counts are predictions for
+            // unread volumes only; after this point zero is the safe answer.
+            if file.recovery_capacity_accounted {
+                return Some((
+                    validated_recovery_blocks_for_set(file, set_id),
+                    RecoveryCountSource::Exact,
+                ));
+            }
             let validated = validated_recovery_blocks_for_set(file, set_id);
             if validated > 0 {
                 return Some((validated, RecoveryCountSource::Exact));
@@ -1421,65 +1665,82 @@ impl Pipeline {
         None
     }
 
-    /// If the completed file is a PAR2 index, read it from disk, parse it,
-    /// retain the Par2FileSet for repair, and adopt canonical filenames as
-    /// authoritative file identity when available.
+    /// Read a completed PAR2 metadata candidate from disk. Recovery volumes
+    /// repeat enough critical packets to be valid metadata carriers, so an
+    /// indexless posting must not require an index-looking filename here.
     pub(crate) async fn try_load_par2_metadata(&mut self, job_id: JobId, file_id: NzbFileId) {
-        let (filename, file_path, is_par2, is_index) = {
+        let (filename, file_path) = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
             let Some(file_asm) = state.assembly.file(file_id) else {
                 return;
             };
-
-            let is_par2 = matches!(file_asm.role(), weaver_model::files::FileRole::Par2 { .. });
-            let is_index = matches!(
-                file_asm.role(),
-                weaver_model::files::FileRole::Par2 { is_index: true, .. }
-            );
+            if !matches!(file_asm.role(), weaver_model::files::FileRole::Par2 { .. })
+                || !file_asm.is_complete()
+            {
+                return;
+            }
             let filename = self.current_filename_for_file(job_id, file_asm);
             let file_path = state.working_dir.join(&filename);
-            (filename, file_path, is_par2, is_index)
+            (filename, file_path)
         };
-
-        if !is_par2 || !is_index {
-            return;
-        }
         let parse_path = file_path.clone();
         let parsed = match tokio::task::spawn_blocking(move || {
-            let scanned = par2_rs::scan_packets_from_path_with_set_ids(&parse_path)?;
-            let mut groups: Vec<ParsedPar2Set> = Vec::new();
-            for scanned_packet in scanned {
-                if let Some(group) = groups
-                    .iter_mut()
-                    .find(|group| group.set_id == scanned_packet.recovery_set_id)
-                {
-                    group.packets.push(scanned_packet.packet);
-                } else {
-                    groups.push(ParsedPar2Set {
-                        set_id: scanned_packet.recovery_set_id,
-                        packets: vec![scanned_packet.packet],
-                    });
-                }
-            }
-            Ok::<_, par2_rs::Par2Error>(groups)
+            scan_completed_par2_packet_groups(&parse_path)
         })
         .await
         {
             Ok(Ok(parsed)) => parsed,
             Ok(Err(e)) => {
-                warn!(filename = %filename, error = %e, "failed to parse PAR2 index");
+                warn!(filename = %filename, error = %e, "failed to parse PAR2 metadata candidate");
+                let entry = self
+                    .ensure_par2_runtime(job_id)
+                    .files
+                    .entry(file_id.file_index)
+                    .or_default();
+                let set_ids = entry.discovery.observed_set_ids().to_vec();
+                if let Par2DiscoveryState::MetadataCarrierQueued {
+                    target_set_id: Some(target_set_id),
+                    ..
+                } = &entry.discovery
+                {
+                    entry.metadata_targets_attempted.insert(*target_set_id);
+                }
+                entry
+                    .metadata_targets_attempted
+                    .extend(set_ids.iter().copied());
+                entry.recovery_capacity_accounted = true;
+                entry.discovery = Par2DiscoveryState::Exhausted { set_ids };
                 return;
             }
             Err(e) => {
-                warn!(filename = %filename, error = %e, "failed to join PAR2 index parse task");
+                warn!(filename = %filename, error = %e, "failed to join PAR2 metadata parse task");
+                let entry = self
+                    .ensure_par2_runtime(job_id)
+                    .files
+                    .entry(file_id.file_index)
+                    .or_default();
+                let set_ids = entry.discovery.observed_set_ids().to_vec();
+                if let Par2DiscoveryState::MetadataCarrierQueued {
+                    target_set_id: Some(target_set_id),
+                    ..
+                } = &entry.discovery
+                {
+                    entry.metadata_targets_attempted.insert(*target_set_id);
+                }
+                entry
+                    .metadata_targets_attempted
+                    .extend(set_ids.iter().copied());
+                entry.recovery_capacity_accounted = true;
+                entry.discovery = Par2DiscoveryState::Exhausted { set_ids };
                 return;
             }
         };
 
         let observed_set_ids = parsed.iter().map(|group| group.set_id).collect::<Vec<_>>();
         self.note_foreign_recovery_set_sightings(job_id, file_id.file_index, &observed_set_ids);
+        let mut accepted_recovery_blocks = HashMap::new();
 
         for group in parsed {
             let set_id = group.set_id;
@@ -1487,20 +1748,26 @@ impl Pipeline {
                 .par2_runtime(job_id)
                 .and_then(|runtime| runtime.set_runtime(set_id))
                 .is_some_and(|set_runtime| set_runtime.set.is_some());
-            let par2_set = if already_installed {
+            let (par2_set, new_recovery_blocks) = if already_installed {
                 let merge = self
                     .ensure_par2_runtime(job_id)
                     .set_runtime_mut(set_id)
                     .and_then(|set_runtime| set_runtime.set.as_mut())
                     .map(|set| Arc::make_mut(set).merge_packets(group.packets));
                 match merge {
-                    Some(Ok(result)) => info!(
-                        job_id = job_id.0,
-                        filename = %filename,
-                        recovery_set_id = %set_id,
-                        recovery_blocks_merged = result.new_recovery_slices,
-                        "merged PAR2 metadata into an existing recovery set"
-                    ),
+                    Some(Ok(result)) => {
+                        info!(
+                            job_id = job_id.0,
+                            filename = %filename,
+                            recovery_set_id = %set_id,
+                            recovery_blocks_merged = result.new_recovery_slices,
+                            "merged PAR2 metadata into an existing recovery set"
+                        );
+                        (
+                            self.par2_set_for(job_id, set_id).cloned(),
+                            result.new_recovery_slices,
+                        )
+                    }
                     Some(Err(error)) => {
                         warn!(
                             job_id = job_id.0,
@@ -1513,10 +1780,12 @@ impl Pipeline {
                     }
                     None => continue,
                 }
-                self.par2_set_for(job_id, set_id).cloned()
             } else {
                 match par2_rs::Par2FileSet::from_packets(group.packets) {
-                    Ok(set) => Some(Arc::new(set)),
+                    Ok(set) => {
+                        let recovery_blocks = set.recovery_block_count();
+                        (Some(Arc::new(set)), recovery_blocks)
+                    }
                     Err(error) => {
                         warn!(
                             job_id = job_id.0,
@@ -1525,13 +1794,14 @@ impl Pipeline {
                             error = %error,
                             "failed to build PAR2 recovery set from metadata"
                         );
-                        None
+                        (None, 0)
                     }
                 }
             };
             let Some(par2_set) = par2_set else {
                 continue;
             };
+            accepted_recovery_blocks.insert(set_id, new_recovery_blocks);
 
             if let Err(error) = self
                 .apply_par2_authoritative_identity(job_id, par2_set.as_ref())
@@ -1547,23 +1817,53 @@ impl Pipeline {
 
             self.record_par2_set_summary(job_id, par2_set.as_ref(), &filename, file_id.file_index);
             let set_runtime = self.ensure_par2_runtime(job_id).ensure_set_runtime(set_id);
-            set_runtime.primary_path = Some(file_path.clone());
             if set_runtime.set.is_none() {
                 set_runtime.set = Some(par2_set);
             }
+            self.refresh_par2_checkpoint_plan(job_id);
+            self.evict_par2_repair_session(job_id, set_id);
         }
 
         {
-            let recovery_blocks = match observed_set_ids.as_slice() {
-                [set_id] => self
-                    .par2_set_for(job_id, *set_id)
-                    .map_or(0, |set| set.recovery_block_count()),
-                _ => 0,
-            };
             let runtime = self.ensure_par2_runtime(job_id);
             let entry = runtime.files.entry(file_id.file_index).or_default();
             entry.filename = filename.clone();
-            entry.recovery_blocks = recovery_blocks;
+            for set_id in &observed_set_ids {
+                let accepted = accepted_recovery_blocks.remove(set_id).unwrap_or(0);
+                let blocks = entry.recovery_blocks_by_set.entry(*set_id).or_insert(0);
+                *blocks = blocks.saturating_add(accepted);
+                if observed_set_ids.as_slice() == [*set_id] {
+                    entry.validated_recovery_blocks = *blocks;
+                }
+            }
+            entry.recovery_blocks = observed_set_ids
+                .first()
+                .and_then(|set_id| entry.recovery_blocks_by_set.get(set_id))
+                .copied()
+                .unwrap_or(0);
+            entry.recovery_capacity_accounted = true;
+            if let Par2DiscoveryState::MetadataCarrierQueued {
+                target_set_id: Some(target_set_id),
+                ..
+            } = &entry.discovery
+            {
+                entry.metadata_targets_attempted.insert(*target_set_id);
+            }
+            entry
+                .metadata_targets_attempted
+                .extend(observed_set_ids.iter().copied());
+            let mut set_ids = entry.discovery.observed_set_ids().to_vec();
+            set_ids.extend(observed_set_ids.iter().copied());
+            set_ids.sort_by_key(|set_id| *set_id.as_bytes());
+            set_ids.dedup();
+            entry
+                .metadata_targets_attempted
+                .extend(set_ids.iter().copied());
+            entry.discovery = if observed_set_ids.is_empty() {
+                Par2DiscoveryState::Exhausted { set_ids }
+            } else {
+                Par2DiscoveryState::Parsed { set_ids }
+            };
         }
 
         // A newly parsed index can expose a set that was not part of an
@@ -1584,52 +1884,28 @@ impl Pipeline {
         {
             self.install_primary_recovery_set(job_id, set_id).await;
         }
-        for set_id in observed_set_ids {
+        for set_id in observed_set_ids.iter().copied() {
             self.install_recovery_set(job_id, set_id).await;
         }
-        self.warn_unservable_recovery_sets_once(job_id);
+        self.refresh_par2_md5_substitution_bindings(job_id);
 
         let _ = self
             .event_tx
             .send(PipelineEvent::Par2MetadataLoaded { job_id });
     }
 
-    /// Adopt a parsed recovery set as the one this job serves, discarding every
-    /// piece of state that spoke for the set it replaces.
-    ///
-    /// Nothing derived from the previous set survives the swap: its merged
-    /// volumes describe a different recovery equation, the retained session was
-    /// opened over its index, and the in-stream block grid measured files
-    /// against its descriptions. Volumes already on disk are re-read so the
-    /// incoming set starts with the recovery it is actually entitled to — the
-    /// repairer takes its slices from this set, not from a directory scan.
+    /// Select the compatibility view used by legacy single-set helpers.
+    /// Per-set sessions and byte-derived grid evidence survive this view change;
+    /// only an actual identity or byte mutation may retire them.
     async fn install_primary_recovery_set(
         &mut self,
         job_id: JobId,
         new_set_id: par2_rs::RecoverySetId,
     ) {
-        let replaced = self.par2_served_set_id(job_id);
         {
             let runtime = self.ensure_par2_runtime(job_id);
-            if let Some(replaced) = replaced.filter(|replaced| *replaced != new_set_id)
-                && let Some(set_runtime) = runtime.set_runtime_mut(replaced)
-            {
-                set_runtime.merged_recovery_paths.clear();
-                set_runtime.session = None;
-                set_runtime.session_last_used = None;
-                set_runtime.session_evidence_file_ids.clear();
-            }
             runtime.served = Some(new_set_id);
             runtime.unserved_sets_warned = false;
-        }
-
-        if let Some(previous) = replaced.filter(|previous| *previous != new_set_id) {
-            warn!(
-                job_id = job_id.0,
-                replaced = %previous,
-                "the recovery set this job serves changed; recovery state for the previous set was discarded"
-            );
-            self.block_crcs.forget_job(job_id);
         }
 
         self.install_recovery_set(job_id, new_set_id).await;
@@ -1695,16 +1971,49 @@ impl Pipeline {
             .collect();
         let base_name = par2_set_base_name(index_filename);
         let set_id = par2_set.recovery_set_id;
+        let candidate_is_index = self.jobs.get(&job_id).is_some_and(|state| {
+            matches!(
+                state
+                    .spec
+                    .files
+                    .get(index_file_index as usize)
+                    .map(|file| &file.role),
+                Some(weaver_model::files::FileRole::Par2 { is_index: true, .. })
+            )
+        });
+        let current_index_file_index = self
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.set_runtime(set_id))
+            .filter(|set_runtime| set_runtime.summary.describes)
+            .map(|set_runtime| set_runtime.summary.index_file_index);
+        let current_is_index = current_index_file_index.is_some_and(|file_index| {
+            self.jobs.get(&job_id).is_some_and(|state| {
+                matches!(
+                    state
+                        .spec
+                        .files
+                        .get(file_index as usize)
+                        .map(|file| &file.role),
+                    Some(weaver_model::files::FileRole::Par2 { is_index: true, .. })
+                )
+            })
+        });
 
         let runtime = self.ensure_par2_runtime(job_id);
         let newly_known = runtime.set_runtime(set_id).is_none();
         let summary = &mut runtime.ensure_set_runtime(set_id).summary;
+        let replaces_summary = !summary.describes
+            || (candidate_is_index && !current_is_index)
+            || (candidate_is_index == current_is_index
+                && index_file_index < summary.index_file_index);
+        if replaces_summary {
+            summary.index_filename = index_filename.to_string();
+            summary.index_file_index = index_file_index;
+            summary.base_name = base_name;
+            summary.described_filenames = described_filenames;
+            summary.described_bytes = described_bytes;
+        }
         summary.describes = true;
-        summary.index_filename = index_filename.to_string();
-        summary.index_file_index = index_file_index;
-        summary.base_name = base_name;
-        summary.described_filenames = described_filenames;
-        summary.described_bytes = described_bytes;
         summary.volume_file_indices.insert(index_file_index);
         if newly_known {
             runtime.unserved_sets_warned = false;
@@ -1777,14 +2086,13 @@ impl Pipeline {
             .map(|(set_id, _)| *set_id)
     }
 
-    /// Say once, loudly, that this posting carries recovery sets without an
-    /// index and therefore without a possible verification pass.
+    /// Say once, after bounded discovery is exhausted, that this posting
+    /// carries recovery sets without enough critical metadata for a pass.
     ///
     /// The files those sets describe are still delivered; what is lost is the
     /// repair they were entitled to, and that is worth exactly one line naming
-    /// every set and every file it covers. Latched because the completion gate
-    /// is entered many times per job and nothing about this changes between
-    /// entries.
+    /// every set and every file it covers. The caller invokes this only after
+    /// every observed carrier has had its turn; the latch then avoids repeats.
     pub(in crate::pipeline) fn warn_unservable_recovery_sets_once(&mut self, job_id: JobId) {
         let Some(runtime) = self.par2_runtime(job_id) else {
             return;
@@ -1810,7 +2118,7 @@ impl Pipeline {
                     summary.index_filename.clone()
                 };
                 if summary.described_filenames.is_empty() {
-                    format!("{name} (no index of it was posted)")
+                    format!("{name} (critical metadata unavailable)")
                 } else {
                     format!("{name} covering {}", summary.described_filenames.join(", "))
                 }
@@ -1822,8 +2130,8 @@ impl Pipeline {
         unservable.sort();
         warn!(
             job_id = job_id.0,
-            "this posting carries {} recovery set(s) with no posted index: they cannot verify \
-             or repair the files they cover — {}",
+            "this posting carries {} recovery set(s) whose metadata carriers were exhausted: \
+             they cannot verify or repair the files they cover — {}",
             runtime.sets.len(),
             unservable.join("; ")
         );
@@ -1839,10 +2147,9 @@ impl Pipeline {
 
     /// Whether a PAR2 file's recovery blocks belong to one recovery set.
     ///
-    /// Attribution is by packets where they have been read, and by name only
-    /// where packets have never been read. A job that has met fewer than two
-    /// sets skips the filename question entirely: there is nothing to confuse
-    /// its volumes with, and an obfuscated posting names nothing recognizably.
+    /// Attribution is by validated packets. A job that has met fewer than two
+    /// sets needs no attribution; once two sets exist, an unread filename is no
+    /// evidence at all.
     fn recovery_file_serves_set(
         &self,
         job_id: JobId,
@@ -1862,6 +2169,10 @@ impl Pipeline {
             if let Some(learned) = file.recovery_set_id {
                 return learned == set_id;
             }
+            let observed = file.discovery.observed_set_ids();
+            if !observed.is_empty() {
+                return observed.contains(&set_id);
+            }
             if file.recovery_set_packets_read {
                 return false;
             }
@@ -1869,37 +2180,13 @@ impl Pipeline {
         if runtime.sets.len() < 2 {
             return true;
         }
-        let Some(set_base) = runtime
-            .set_runtime(set_id)
-            .and_then(|set_runtime| set_runtime.summary.base_name.as_deref())
-        else {
-            return true;
-        };
-        let filename = runtime
-            .files
-            .get(&file_index)
-            .map(|file| file.filename.as_str())
-            .filter(|name| !name.is_empty())
-            .or_else(|| {
-                self.jobs
-                    .get(&job_id)
-                    .and_then(|state| state.spec.files.get(file_index as usize))
-                    .map(|file| file.filename.as_str())
-            })
-            .unwrap_or_default();
-        match par2_set_base_name(filename) {
-            Some(base) => base == set_base,
-            // A name the convention does not cover is no evidence either way,
-            // and refusing it would cost the served set a volume that may well
-            // be its own.
-            None => true,
-        }
+        false
     }
 
     /// When a PAR2 recovery volume completes, parse it and merge recovery
     /// slices into the retained Par2FileSet (avoids re-reading at repair time).
     pub(crate) async fn try_merge_par2_recovery(&mut self, job_id: JobId, file_id: NzbFileId) {
-        let (filename, file_path, is_par2_volume) = {
+        let (filename, file_path, is_par2_volume, is_complete) = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
@@ -1916,50 +2203,63 @@ impl Pipeline {
             );
             let filename = self.current_filename_for_file(job_id, file_asm);
             let file_path = state.working_dir.join(&filename);
-            (filename, file_path, is_par2_volume)
+            (filename, file_path, is_par2_volume, file_asm.is_complete())
         };
-        if !is_par2_volume {
+        if !is_par2_volume || !is_complete {
             return;
         }
 
         let parse_path = file_path.clone();
         let groups = match tokio::task::spawn_blocking(move || {
-            par2_rs::scan_packets_from_path_with_set_ids(&parse_path).map(|packets| {
-                let mut groups: Vec<(par2_rs::RecoverySetId, Vec<par2_rs::Packet>)> = Vec::new();
-                for scanned_packet in packets {
-                    if let Some((_, group)) = groups
-                        .iter_mut()
-                        .find(|(set_id, _)| *set_id == scanned_packet.recovery_set_id)
-                    {
-                        group.push(scanned_packet.packet);
-                    } else {
-                        groups.push((scanned_packet.recovery_set_id, vec![scanned_packet.packet]));
-                    }
-                }
-                groups
-            })
+            scan_completed_par2_packet_groups(&parse_path)
         })
         .await
         {
             Ok(Ok(scanned)) => scanned,
             Ok(Err(e)) => {
                 warn!(filename = %filename, error = %e, "failed to parse PAR2 recovery volume");
+                self.ensure_par2_runtime(job_id)
+                    .files
+                    .entry(file_id.file_index)
+                    .or_default()
+                    .recovery_capacity_accounted = true;
                 return;
             }
             Err(e) => {
                 warn!(filename = %filename, error = %e, "failed to join PAR2 recovery parse task");
+                self.ensure_par2_runtime(job_id)
+                    .files
+                    .entry(file_id.file_index)
+                    .or_default()
+                    .recovery_capacity_accounted = true;
                 return;
             }
         };
-        let observed_set_ids = groups.iter().map(|(set_id, _)| *set_id).collect::<Vec<_>>();
+        let observed_set_ids = groups.iter().map(|group| group.set_id).collect::<Vec<_>>();
         self.note_foreign_recovery_set_sightings(job_id, file_id.file_index, &observed_set_ids);
+        {
+            let entry = self
+                .ensure_par2_runtime(job_id)
+                .files
+                .entry(file_id.file_index)
+                .or_default();
+            entry.filename = filename.clone();
+            entry.recovery_capacity_accounted = true;
+            for set_id in &observed_set_ids {
+                entry.recovery_blocks_by_set.entry(*set_id).or_insert(0);
+            }
+        }
         let single_set_id = match observed_set_ids.as_slice() {
             [set_id] => Some(*set_id),
             _ => None,
         };
         let mut bootstrapped_set_ids = Vec::new();
 
-        for (set_id, packet_list) in groups {
+        for ParsedPar2Set {
+            set_id,
+            packets: packet_list,
+        } in groups
+        {
             let mut packet_list = Some(packet_list);
             let bootstrapped_recovery_blocks = if self.par2_set_for(job_id, set_id).is_none() {
                 match par2_rs::Par2FileSet::from_packets(
@@ -1990,8 +2290,8 @@ impl Pipeline {
                         );
                         let set_runtime =
                             self.ensure_par2_runtime(job_id).ensure_set_runtime(set_id);
-                        set_runtime.primary_path = Some(file_path.clone());
                         set_runtime.set = Some(par2_set);
+                        self.refresh_par2_checkpoint_plan(job_id);
                         bootstrapped_set_ids.push(set_id);
                         Some(recovery_blocks)
                     }
@@ -2012,49 +2312,6 @@ impl Pipeline {
             } else {
                 None
             };
-            let path_was_new = self
-                .ensure_par2_runtime(job_id)
-                .set_runtime_mut(set_id)
-                .expect("parsed PAR2 recovery set exists")
-                .merged_recovery_paths
-                .insert(file_path.clone());
-            if path_was_new
-                && let Some(mut session) = self
-                    .par2_runtime
-                    .get_mut(&job_id)
-                    .and_then(|runtime| runtime.set_runtime_mut(set_id))
-                    .and_then(|set_runtime| set_runtime.session.take())
-            {
-                let session_path = file_path.clone();
-                match tokio::task::spawn_blocking(move || {
-                    let result = session.merge_recovery_paths([session_path]);
-                    (session, result)
-                })
-                .await
-                {
-                    Ok((session, Ok(_))) => {
-                        self.restore_par2_repair_session(job_id, set_id, session)
-                    }
-                    Ok((session, Err(error))) => {
-                        self.restore_par2_repair_session(job_id, set_id, session);
-                        warn!(
-                            job_id = job_id.0,
-                            filename = %filename,
-                            recovery_set_id = %set_id,
-                            error = %error,
-                            "failed to merge recovery path into retained PAR2 session"
-                        );
-                    }
-                    Err(error) => warn!(
-                        job_id = job_id.0,
-                        filename = %filename,
-                        recovery_set_id = %set_id,
-                        error = %error,
-                        "retained PAR2 recovery merge task panicked; session was evicted"
-                    ),
-                }
-            }
-
             let (new_recovery_blocks, total_recovery) = if let Some(recovery_blocks) =
                 bootstrapped_recovery_blocks
             {
@@ -2089,40 +2346,26 @@ impl Pipeline {
                     }
                 }
             };
+            self.evict_par2_repair_session(job_id, set_id);
+            let promoted = self
+                .par2_runtime(job_id)
+                .and_then(|runtime| runtime.files.get(&file_id.file_index))
+                .is_some_and(|file| file.promoted);
+            let entry = self
+                .ensure_par2_runtime(job_id)
+                .files
+                .entry(file_id.file_index)
+                .or_default();
+            let blocks = entry.recovery_blocks_by_set.entry(set_id).or_insert(0);
+            *blocks = blocks.saturating_add(new_recovery_blocks);
+            if single_set_id == Some(set_id) {
+                entry.validated_recovery_blocks = *blocks;
+                entry.recovery_blocks = *blocks;
+                entry.salvaged = false;
+                entry.salvaged_at_received_bytes = None;
+                entry.promoted = promoted;
+            }
             if new_recovery_blocks > 0 {
-                if single_set_id != Some(set_id) {
-                    // Only a file that answers to more than one set needs this.
-                    // A single-set volume is fully described by
-                    // `recovery_blocks`, which the salvage path accumulates —
-                    // shadowing it here would report a partial count for a
-                    // volume that was salvaged and later completed.
-                    let entry = self
-                        .ensure_par2_runtime(job_id)
-                        .files
-                        .entry(file_id.file_index)
-                        .or_default();
-                    let by_set = entry.recovery_blocks_by_set.entry(set_id).or_insert(0);
-                    *by_set = (*by_set).max(new_recovery_blocks);
-                }
-                if single_set_id == Some(set_id) {
-                    let promoted = self
-                        .par2_runtime(job_id)
-                        .and_then(|runtime| runtime.files.get(&file_id.file_index))
-                        .is_some_and(|file| file.promoted);
-                    let runtime = self.ensure_par2_runtime(job_id);
-                    let entry = runtime.files.entry(file_id.file_index).or_default();
-                    entry.filename = filename.clone();
-                    entry.validated_recovery_blocks = if entry.salvaged {
-                        entry
-                            .validated_recovery_blocks
-                            .saturating_add(new_recovery_blocks)
-                    } else {
-                        new_recovery_blocks
-                    };
-                    entry.salvaged = false;
-                    entry.salvaged_at_received_bytes = None;
-                    entry.promoted = promoted;
-                }
                 info!(
                     job_id = job_id.0,
                     filename = %filename,
@@ -2139,6 +2382,7 @@ impl Pipeline {
             Box::pin(self.install_recovery_set(job_id, set_id)).await;
         }
         if bootstrapped_any {
+            self.refresh_par2_md5_substitution_bindings(job_id);
             if self.par2_served_set_id(job_id).is_none()
                 && !self.par2_verified.contains(&job_id)
                 && let Some(set_id) = self.select_primary_recovery_set(job_id)
@@ -2422,51 +2666,6 @@ impl Pipeline {
             return;
         }
 
-        // The retained session is fed the same way the completed-file path and
-        // the restore path feed it — by path, which it scans itself. It holds
-        // scan-order packets and validates them lazily when a repair selects
-        // them; the set above holds only packets that already validated. The
-        // asymmetry is deliberate: the set is what weaver's own recovery
-        // arithmetic reads, and that has to be truthful.
-        self.ensure_par2_runtime(job_id)
-            .set_runtime_mut(expected_set_id)
-            .expect("PAR2 recovery volumes merge into their parsed recovery set")
-            .merged_recovery_paths
-            .insert(file_path.clone());
-        if let Some(mut session) = self
-            .par2_runtime
-            .get_mut(&job_id)
-            .and_then(|runtime| runtime.set_runtime_mut(expected_set_id))
-            .and_then(|set_runtime| set_runtime.session.take())
-        {
-            let session_path = file_path.clone();
-            match tokio::task::spawn_blocking(move || {
-                let result = session.merge_recovery_paths([session_path]);
-                (session, result)
-            })
-            .await
-            {
-                Ok((session, Ok(_))) => {
-                    self.restore_par2_repair_session(job_id, expected_set_id, session)
-                }
-                Ok((session, Err(error))) => {
-                    self.restore_par2_repair_session(job_id, expected_set_id, session);
-                    warn!(
-                        job_id = job_id.0,
-                        filename = %filename,
-                        error = %error,
-                        "failed to merge a read-back recovery volume into the retained PAR2 session"
-                    );
-                }
-                Err(error) => warn!(
-                    job_id = job_id.0,
-                    filename = %filename,
-                    error = %error,
-                    "retained PAR2 read-back merge task panicked; session was evicted"
-                ),
-            }
-        }
-
         let merge_result = {
             let Some(set) = self
                 .ensure_par2_runtime(job_id)
@@ -2482,6 +2681,7 @@ impl Pipeline {
         };
         match merge_result {
             (Ok(merge), total_recovery) => {
+                self.evict_par2_repair_session(job_id, expected_set_id);
                 // What the merge accepted, not what the scan found. An exponent
                 // already held by the set is not new recovery, and counting the
                 // scan would credit this volume with a block the arithmetic
@@ -2493,14 +2693,14 @@ impl Pipeline {
                     // A second read-back of the same volume reports only what
                     // the first one did not already merge, so the file's total
                     // is the sum of its read-backs rather than the last of them.
-                    entry.validated_recovery_blocks = if entry.salvaged {
-                        entry
-                            .validated_recovery_blocks
-                            .saturating_add(salvaged_blocks)
-                    } else {
-                        salvaged_blocks
-                    };
-                    entry.salvaged = entry.validated_recovery_blocks > 0;
+                    let blocks = entry
+                        .recovery_blocks_by_set
+                        .entry(expected_set_id)
+                        .or_insert(0);
+                    *blocks = blocks.saturating_add(salvaged_blocks);
+                    entry.validated_recovery_blocks = *blocks;
+                    entry.recovery_capacity_accounted = true;
+                    entry.salvaged = *blocks > 0;
                     entry.recovery_set_id = Some(expected_set_id);
                 }
                 info!(
@@ -2584,7 +2784,12 @@ impl Pipeline {
     }
 
     pub(crate) fn mark_promoted_recovery_segment_unavailable(&mut self, segment_id: SegmentId) {
+        let discovery_work = self
+            .par2_runtime(segment_id.file_id.job_id)
+            .and_then(|runtime| runtime.files.get(&segment_id.file_id.file_index))
+            .is_some_and(|file| file.discovery.work_is_queued());
         if !self.is_promoted_recovery_file(segment_id.file_id.job_id, segment_id.file_id.file_index)
+            && !discovery_work
         {
             return;
         }
@@ -2712,6 +2917,18 @@ impl Pipeline {
             .files
             .iter()
             .enumerate()
+            .filter(|(file_index, file)| {
+                matches!(
+                    file.role,
+                    weaver_model::files::FileRole::Par2 {
+                        is_index: false,
+                        ..
+                    }
+                ) || self
+                    .par2_runtime(job_id)
+                    .and_then(|runtime| runtime.files.get(&(*file_index as u32)))
+                    .is_some_and(|file| file.recovery_set_packets_read || file.recovery_blocks > 0)
+            })
             .map(|(file_index, _)| file_index as u32)
             .filter(|file_index| self.recovery_file_serves_set(job_id, *file_index, set_id))
             .filter_map(|file_index| self.recovery_block_count_for(job_id, file_index, set_id))
@@ -2748,230 +2965,425 @@ impl Pipeline {
             .sum()
     }
 
-    /// Which PAR2 files this job could still promote in order to obtain
-    /// metadata, and which of them have already had their turn.
-    ///
-    /// Index files rank ahead of any other PAR2 file, and within each tier the
-    /// posting's own order decides — both properties of the posting rather than
-    /// of this run, so a restart reaches the same answer.
-    fn par2_metadata_candidates(&self, job_id: JobId) -> (Vec<u32>, Vec<u32>) {
+    pub(in crate::pipeline) fn par2_metadata_candidate_indices(
+        &self,
+        job_id: JobId,
+    ) -> Vec<(u32, bool, u64)> {
         let Some(state) = self.jobs.get(&job_id) else {
-            return (Vec::new(), Vec::new());
+            return Vec::new();
         };
-        let has_available_segment = |file_index: u32| {
-            state
-                .spec
-                .files
-                .get(file_index as usize)
-                .is_some_and(|file| {
-                    file.segments.iter().any(|segment| {
-                        !self
-                            .unavailable_promoted_recovery_segments
-                            .contains(&SegmentId {
-                                file_id: NzbFileId { job_id, file_index },
-                                segment_number: segment.ordinal,
-                            })
-                    })
-                })
-        };
-        let tier = |want_index: bool| {
-            let mut candidates = state
-                .spec
-                .files
-                .iter()
-                .enumerate()
-                .filter_map(|(file_index, file)| {
-                    let is_index = matches!(
-                        file.role,
-                        weaver_model::files::FileRole::Par2 { is_index: true, .. }
-                    );
-                    let is_par2 = matches!(file.role, weaver_model::files::FileRole::Par2 { .. });
-                    let wanted = if want_index { is_index } else { is_par2 };
-                    wanted.then_some(file_index as u32)
-                })
-                .collect::<Vec<_>>();
-            candidates.sort_unstable();
-            candidates
-        };
-
-        // A promoted candidate is finished once it either arrived — whatever it
-        // turned out to contain — or can no longer arrive at all. Anything else
-        // is still on its way, and the job is waiting rather than stuck.
-        let outstanding = |file_index: u32| {
-            self.is_promoted_recovery_file(job_id, file_index)
-                && !self.promoted_recovery_file_is_complete(job_id, file_index)
-                && has_available_segment(file_index)
-        };
-
-        let mut untried = Vec::new();
-        let mut still_arriving = Vec::new();
-        for file_index in tier(true).into_iter().chain(tier(false)) {
-            if untried.contains(&file_index) || still_arriving.contains(&file_index) {
-                continue;
-            }
-            if outstanding(file_index) {
-                still_arriving.push(file_index);
-            } else if !self.is_promoted_recovery_file(job_id, file_index)
-                && has_available_segment(file_index)
-            {
-                untried.push(file_index);
-            }
-        }
-        (untried, still_arriving)
+        state
+            .spec
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(file_index, file)| match file.role {
+                weaver_model::files::FileRole::Par2 { is_index, .. } => Some((
+                    file_index as u32,
+                    is_index,
+                    file.segments
+                        .iter()
+                        .map(|segment| segment.bytes as u64)
+                        .sum(),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
-    /// Put this job's next PAR2 metadata candidate on the wire, if there is one
-    /// left to try.
-    ///
-    /// `true` means metadata is on its way and the caller should wait; `false`
-    /// means nothing can produce it and the caller owns the terminal failure.
-    ///
-    /// Promotion is idempotent per file. A candidate that has already been
-    /// promoted is never promoted again: while its segments can still arrive
-    /// the job simply waits, and once they have arrived — or provably cannot —
-    /// the next untried candidate takes its turn. Re-pushing an already
-    /// promoted index is what turns "waiting for metadata" into a job that
-    /// re-enqueues the same file on every completion-gate entry forever,
-    /// because a file that completed without yielding a usable set looks
-    /// exactly like one that was never tried.
-    pub(crate) fn promote_par2_metadata(&mut self, job_id: JobId) -> bool {
-        if self.par2_set(job_id).is_some() {
-            return false;
+    pub(in crate::pipeline) fn par2_discovery_state_for_candidate(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+    ) -> Par2DiscoveryState {
+        let Some(runtime) = self.par2_runtime(job_id) else {
+            return Par2DiscoveryState::Unseen;
+        };
+        if let Some(file) = runtime.files.get(&file_index) {
+            return file.discovery.clone();
         }
+        // Restored and test-built runtimes can install parsed set state without
+        // replaying the file-complete callback. The set summary is durable
+        // proof that this exact candidate already parsed; do not requeue it.
+        let mut set_ids = runtime
+            .sets
+            .iter()
+            .filter_map(|(set_id, set_runtime)| {
+                (set_runtime.set.is_some() && set_runtime.summary.index_file_index == file_index)
+                    .then_some(*set_id)
+            })
+            .collect::<Vec<_>>();
+        set_ids.sort_by_key(|set_id| *set_id.as_bytes());
+        if set_ids.is_empty() {
+            Par2DiscoveryState::Unseen
+        } else {
+            Par2DiscoveryState::Parsed { set_ids }
+        }
+    }
 
-        let (untried, still_arriving) = self.par2_metadata_candidates(job_id);
-        // Something promoted is still on the wire. Nothing to enqueue — and no
-        // reason to spend a second candidate's articles while the first can
-        // still answer — but the job is waiting for something real, so it must
-        // not be failed either.
-        if !still_arriving.is_empty() {
-            return true;
-        }
-        if untried.is_empty() {
-            let already_tried: Vec<u32> = self
+    /// Move finished probe/carrier attempts to a state that can make the next
+    /// deterministic discovery decision. The prefix scanner validates packet
+    /// headers and hashes through par2-rs before any SetID becomes authority.
+    fn refresh_par2_metadata_discovery(&mut self, job_id: JobId) {
+        let candidates = self.par2_metadata_candidate_indices(job_id);
+        for (file_index, _is_index, _) in candidates {
+            let discovery = self
                 .par2_runtime(job_id)
-                .map(|runtime| {
-                    let mut tried = runtime
-                        .files
-                        .iter()
-                        .filter(|(_, file)| file.promoted)
-                        .map(|(file_index, _)| *file_index)
-                        .collect::<Vec<_>>();
-                    tried.sort_unstable();
-                    tried
-                })
+                .and_then(|runtime| runtime.files.get(&file_index))
+                .map(|file| file.discovery.clone())
                 .unwrap_or_default();
-            let runtime = self.ensure_par2_runtime(job_id);
-            if !runtime.metadata_exhausted_warned {
-                runtime.metadata_exhausted_warned = true;
-                warn!(
-                    job_id = job_id.0,
-                    promoted_candidates = ?already_tried,
-                    "every PAR2 metadata candidate this job could promote has settled without \
-                     yielding a usable recovery set"
-                );
+            if !discovery.work_is_queued()
+                || self.promoted_recovery_file_has_pending_work(job_id, file_index)
+            {
+                continue;
             }
-            return false;
-        }
 
-        let queued = {
-            let Some(state) = self.jobs.get_mut(&job_id) else {
-                return false;
-            };
-            state.recovery_queue.drain_all()
-        };
-
-        let mut work_by_file: HashMap<u32, Vec<DownloadWork>> = HashMap::new();
-        for work in queued {
-            work_by_file
-                .entry(work.segment_id.file_id.file_index)
-                .or_default()
-                .push(work);
-        }
-
-        // The classification above already applied the index-first ordering and
-        // excluded anything promoted or unreachable, so the pick is just the
-        // first of what is left.
-        let selected_file = untried.first().copied();
-
-        let Some(selected_file) = selected_file else {
-            if let Some(state) = self.jobs.get_mut(&job_id) {
-                for (_, works) in work_by_file {
-                    for work in works {
-                        state.recovery_queue.push(work);
-                    }
-                }
-            }
-            return false;
-        };
-
-        let (filename, promoted_segments) = {
-            let Some(state) = self.jobs.get_mut(&job_id) else {
-                return false;
-            };
-            let filename = state
-                .spec
-                .files
-                .get(selected_file as usize)
-                .map(|file| file.filename.clone())
-                .unwrap_or_default();
-            let mut promoted_segments = 0usize;
-            if let Some(file_spec) = state.spec.files.get(selected_file as usize) {
-                for segment_spec in &file_spec.segments {
-                    let segment_id = SegmentId {
-                        file_id: NzbFileId {
-                            job_id,
-                            file_index: selected_file,
-                        },
-                        segment_number: segment_spec.ordinal,
-                    };
-                    if self
-                        .unavailable_promoted_recovery_segments
-                        .contains(&segment_id)
+            match discovery {
+                Par2DiscoveryState::PrefixProbeQueued => {
+                    let file_id = NzbFileId { job_id, file_index };
+                    let prefix = self.file_prefix_16k.get(&file_id);
+                    let set_ids = prefix
+                        .map(|prefix| par2_prefix_set_ids(prefix))
+                        .unwrap_or_default();
+                    let probe_may_arrive = self
+                        .par2_runtime(job_id)
+                        .and_then(|runtime| runtime.files.get(&file_index))
+                        .is_some_and(|file| {
+                            file.discovery_probe_ordinals.iter().any(|ordinal| {
+                                !self
+                                    .unavailable_promoted_recovery_segments
+                                    .contains(&SegmentId {
+                                        file_id,
+                                        segment_number: *ordinal,
+                                    })
+                            })
+                        });
+                    if set_ids.is_empty()
+                        && prefix.is_none_or(Vec::is_empty)
+                        && !self.promoted_recovery_file_is_complete(job_id, file_index)
+                        && probe_may_arrive
                     {
                         continue;
                     }
-                    state.download_queue.push(DownloadWork {
-                        segment_id,
-                        message_id: crate::jobs::ids::MessageId::new(&segment_spec.message_id),
-                        groups: file_spec.groups.clone(),
-                        priority: PROMOTED_RECOVERY_PRIORITY,
-                        byte_estimate: segment_spec.bytes,
-                        retry_count: 0,
-                        is_recovery: true,
-                        exclude_servers: Vec::new(),
-                        avoid_server: None,
-                    });
-                    promoted_segments += 1;
-                }
-            }
-            for (file_index, works) in work_by_file {
-                if file_index != selected_file {
-                    for work in works {
-                        state.recovery_queue.push(work);
+                    if set_ids.is_empty() {
+                        self.ensure_par2_runtime(job_id)
+                            .files
+                            .entry(file_index)
+                            .or_default()
+                            .discovery = Par2DiscoveryState::ProbeInconclusive;
+                    } else {
+                        self.note_foreign_recovery_set_sightings(job_id, file_index, &set_ids);
+                        self.ensure_par2_runtime(job_id)
+                            .files
+                            .entry(file_index)
+                            .or_default()
+                            .discovery = Par2DiscoveryState::PrefixProbed { set_ids };
                     }
                 }
+                Par2DiscoveryState::MetadataCarrierQueued {
+                    target_set_id,
+                    set_ids,
+                } => {
+                    let carrier_may_arrive = self.jobs.get(&job_id).is_some_and(|state| {
+                        state
+                            .spec
+                            .files
+                            .get(file_index as usize)
+                            .is_some_and(|file| {
+                                file.segments.iter().any(|segment| {
+                                    !self.unavailable_promoted_recovery_segments.contains(
+                                        &SegmentId {
+                                            file_id: NzbFileId { job_id, file_index },
+                                            segment_number: segment.ordinal,
+                                        },
+                                    )
+                                })
+                            })
+                    });
+                    if !self.promoted_recovery_file_is_complete(job_id, file_index)
+                        && carrier_may_arrive
+                    {
+                        continue;
+                    }
+                    if let Some(target_set_id) = target_set_id {
+                        self.ensure_par2_runtime(job_id)
+                            .files
+                            .entry(file_index)
+                            .or_default()
+                            .metadata_targets_attempted
+                            .insert(target_set_id);
+                    }
+                    self.ensure_par2_runtime(job_id)
+                        .files
+                        .entry(file_index)
+                        .or_default()
+                        .metadata_targets_attempted
+                        .extend(set_ids.iter().copied());
+                    self.ensure_par2_runtime(job_id)
+                        .files
+                        .entry(file_index)
+                        .or_default()
+                        .discovery = Par2DiscoveryState::Exhausted { set_ids };
+                }
+                _ => {}
             }
-            (filename, promoted_segments)
-        };
+        }
+    }
 
-        {
-            let runtime = self.ensure_par2_runtime(job_id);
-            let entry = runtime.files.entry(selected_file).or_default();
-            entry.filename = filename.clone();
-            entry.recovery_blocks = 0;
-            entry.promoted = true;
+    /// Select the next bounded discovery action as
+    /// `(file_index, prefix_only, target_set_id)`.
+    fn next_par2_metadata_action(
+        &self,
+        job_id: JobId,
+    ) -> Option<(u32, bool, Option<par2_rs::RecoverySetId>)> {
+        let candidates = self.par2_metadata_candidate_indices(job_id);
+        let discovery_for =
+            |file_index: u32| self.par2_discovery_state_for_candidate(job_id, file_index);
+
+        // Explicit indexes remain the cheapest and strongest metadata source.
+        if let Some((file_index, _, _)) = candidates.iter().find(|(file_index, is_index, _)| {
+            *is_index && matches!(discovery_for(*file_index), Par2DiscoveryState::Unseen)
+        }) {
+            return Some((*file_index, false, None));
         }
 
+        // Every indexless volume gets a bounded prefix turn. Discovering one
+        // set never prevents a later candidate from revealing another.
+        if let Some((file_index, _, _)) = candidates.iter().find(|(file_index, is_index, _)| {
+            !*is_index && matches!(discovery_for(*file_index), Par2DiscoveryState::Unseen)
+        }) {
+            return Some((*file_index, true, None));
+        }
+
+        // An inconclusive prefix gets at most the retained prefix cap worth of
+        // additional article probes, then escalates to one bounded full-file
+        // metadata attempt.
+        if let Some((file_index, _, _)) = candidates
+            .iter()
+            .filter(|(file_index, is_index, _)| {
+                !*is_index
+                    && matches!(
+                        discovery_for(*file_index),
+                        Par2DiscoveryState::ProbeInconclusive
+                    )
+            })
+            .min_by_key(|(file_index, _, _)| *file_index)
+        {
+            let prefix_len = self
+                .file_prefix_16k
+                .get(&NzbFileId {
+                    job_id,
+                    file_index: *file_index,
+                })
+                .map_or(0, Vec::len);
+            return Some((
+                *file_index,
+                prefix_len < PAR2_METADATA_PREFIX_CAP_BYTES,
+                None,
+            ));
+        }
+
+        let runtime = self.par2_runtime(job_id)?;
+        for set_id in runtime.ordered_set_ids() {
+            if runtime
+                .set_runtime(set_id)
+                .is_some_and(|set_runtime| set_runtime.set.is_some())
+            {
+                continue;
+            }
+            let selected = candidates
+                .iter()
+                .filter(|(file_index, _, _)| {
+                    runtime.files.get(file_index).is_some_and(|file| {
+                        file.discovery.observed_set_ids().contains(&set_id)
+                            && !file.metadata_targets_attempted.contains(&set_id)
+                            && !matches!(file.discovery, Par2DiscoveryState::Exhausted { .. })
+                    })
+                })
+                .min_by_key(|(file_index, _, total_bytes)| (*total_bytes, *file_index));
+            if let Some((file_index, _, _)) = selected {
+                return Some((*file_index, false, Some(set_id)));
+            }
+        }
+        None
+    }
+
+    fn queue_par2_metadata_action(
+        &mut self,
+        job_id: JobId,
+        file_index: u32,
+        prefix_only: bool,
+        target_set_id: Option<par2_rs::RecoverySetId>,
+    ) -> bool {
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state
+                .download_queue
+                .extract_matching(|work| work.segment_id.file_id.file_index == file_index);
+            state
+                .recovery_queue
+                .extract_matching(|work| work.segment_id.file_id.file_index == file_index);
+        } else {
+            return false;
+        }
+
+        let already_probed = self
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.files.get(&file_index))
+            .map(|file| file.discovery_probe_ordinals.clone())
+            .unwrap_or_default();
+        let unavailable = &self.unavailable_promoted_recovery_segments;
+        let (filename, work) = {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return false;
+            };
+            let Some(file) = state.spec.files.get(file_index as usize) else {
+                return false;
+            };
+            let mut segments = file
+                .segments
+                .iter()
+                .filter(|segment| {
+                    let segment_id = SegmentId {
+                        file_id: NzbFileId { job_id, file_index },
+                        segment_number: segment.ordinal,
+                    };
+                    !unavailable.contains(&segment_id) && !already_probed.contains(&segment.ordinal)
+                })
+                .collect::<Vec<_>>();
+            segments.sort_by_key(|segment| segment.ordinal);
+            if prefix_only {
+                segments.truncate(1);
+            }
+            let work = segments
+                .into_iter()
+                .map(|segment| DownloadWork {
+                    segment_id: SegmentId {
+                        file_id: NzbFileId { job_id, file_index },
+                        segment_number: segment.ordinal,
+                    },
+                    message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
+                    groups: file.groups.clone(),
+                    priority: PROMOTED_RECOVERY_PRIORITY,
+                    byte_estimate: segment.bytes,
+                    retry_count: 0,
+                    is_recovery: true,
+                    exclude_servers: Vec::new(),
+                    avoid_server: None,
+                })
+                .collect::<Vec<_>>();
+            (file.filename.clone(), work)
+        };
+
+        let promoted_segments = work.len();
+        let probe_ordinal = prefix_only
+            .then(|| work.first().map(|work| work.segment_id.segment_number))
+            .flatten();
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            for work in work {
+                state.download_queue.push(work);
+            }
+        }
+
+        let runtime = self.ensure_par2_runtime(job_id);
+        let file = runtime.files.entry(file_index).or_default();
+        file.filename = filename.clone();
+        file.recovery_blocks = 0;
+        if prefix_only {
+            if let Some(ordinal) = probe_ordinal {
+                file.discovery_probe_ordinals.insert(ordinal);
+            }
+            file.discovery = Par2DiscoveryState::PrefixProbeQueued;
+        } else {
+            file.promoted = true;
+            let set_ids = file.discovery.observed_set_ids().to_vec();
+            file.discovery = Par2DiscoveryState::MetadataCarrierQueued {
+                target_set_id,
+                set_ids,
+            };
+        }
+
+        if promoted_segments == 0 {
+            let set_ids = file.discovery.observed_set_ids().to_vec();
+            if let Par2DiscoveryState::MetadataCarrierQueued {
+                target_set_id: Some(target_set_id),
+                ..
+            } = &file.discovery
+            {
+                file.metadata_targets_attempted.insert(*target_set_id);
+            }
+            file.metadata_targets_attempted
+                .extend(set_ids.iter().copied());
+            file.discovery = Par2DiscoveryState::Exhausted { set_ids };
+            return false;
+        }
         info!(
             job_id = job_id.0,
-            file_index = selected_file,
+            file_index,
             filename = %filename,
             promoted_segments,
-            "promoted PAR2 metadata file"
+            prefix_only,
+            target_set_id = ?target_set_id,
+            "queued PAR2 metadata discovery work"
         );
         self.update_queue_metrics();
         true
+    }
+
+    /// Put the next finite metadata probe or set-specific carrier on the wire.
+    /// Discovery continues even after one usable set exists.
+    pub(crate) fn promote_par2_metadata(&mut self, job_id: JobId) -> bool {
+        self.refresh_par2_metadata_discovery(job_id);
+        if self
+            .par2_metadata_candidate_indices(job_id)
+            .iter()
+            .any(|(file_index, _, _)| {
+                self.par2_runtime(job_id)
+                    .and_then(|runtime| runtime.files.get(file_index))
+                    .is_some_and(|file| file.discovery.work_is_queued())
+            })
+        {
+            return true;
+        }
+
+        while let Some((file_index, prefix_only, target_set_id)) =
+            self.next_par2_metadata_action(job_id)
+        {
+            if self.queue_par2_metadata_action(job_id, file_index, prefix_only, target_set_id) {
+                return true;
+            }
+        }
+
+        let exhausted = self
+            .par2_runtime(job_id)
+            .map(|runtime| {
+                let mut exhausted = runtime
+                    .files
+                    .iter()
+                    .filter_map(|(&file_index, file)| {
+                        file.discovery
+                            .candidate_probe_is_terminal()
+                            .then_some(file_index)
+                    })
+                    .collect::<Vec<_>>();
+                exhausted.sort_unstable();
+                exhausted
+            })
+            .unwrap_or_default();
+        let should_warn = {
+            let runtime = self.ensure_par2_runtime(job_id);
+            let should_warn = !runtime.metadata_exhausted_warned;
+            runtime.metadata_exhausted_warned = true;
+            should_warn
+        };
+        if should_warn {
+            warn!(
+                job_id = job_id.0,
+                exhausted_candidates = ?exhausted,
+                "PAR2 metadata discovery exhausted every declared candidate"
+            );
+        }
+        self.warn_unservable_recovery_sets_once(job_id);
+        false
     }
 
     /// Promote the smallest byte set of recovery files needed to cover the requested block count.

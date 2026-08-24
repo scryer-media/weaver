@@ -295,6 +295,8 @@ impl Pipeline {
             uu_files: HashMap::new(),
             uu_park_requeues: HashMap::new(),
             par2_runtime: HashMap::new(),
+            #[cfg(test)]
+            par2_binding_resolver_calls: std::sync::atomic::AtomicU64::new(0),
             block_crcs: crate::pipeline::integrity::BlockCrcCollector::new(),
             direct_store: crate::pipeline::direct_store::wiring::DirectStoreRuntime::with_settings(
                 direct_store_settings,
@@ -2089,6 +2091,7 @@ mod disk_write_handle_cache_tests {
             part_crc: 0,
             part_crc_verified: false,
             yenc_name: String::new(),
+            checkpoint_plan: weaver_yenc::CheckpointPlan::None,
             segments: Vec::new(),
         }
     }

@@ -1,7 +1,7 @@
 use super::{
-    RecoveryCandidate, RecoveryCountSource, is_terminal_status, par2_recovery_packet_size,
-    par2_set_base_name, parse_stateful_par2_session_enabled, select_par2_session_eviction,
-    select_recovery_file_indices, unique_par2_binding_candidate,
+    RecoveryCandidate, RecoveryCountSource, is_terminal_status, par2_prefix_set_ids,
+    par2_recovery_packet_size, par2_set_base_name, parse_stateful_par2_session_enabled,
+    select_par2_session_eviction, select_recovery_file_indices, unique_par2_binding_candidate,
 };
 use crate::{JobId, JobStatus};
 use std::time::{Duration, Instant};
@@ -14,6 +14,24 @@ fn par2_file_binding_requires_one_matching_description() {
     assert_eq!(unique_par2_binding_candidate(&[]), None);
     assert_eq!(unique_par2_binding_candidate(&[first]), Some(first));
     assert_eq!(unique_par2_binding_candidate(&[first, second]), None);
+}
+
+#[test]
+fn metadata_prefix_scanning_reports_every_valid_set_id() {
+    let first = crate::pipeline::tests::build_test_par2_index("first.bin", b"first", 4);
+    let second = crate::pipeline::tests::build_test_par2_index("second.bin", b"second", 4);
+    let first_ids = par2_prefix_set_ids(&first);
+    let second_ids = par2_prefix_set_ids(&second);
+    assert_eq!(first_ids.len(), 1);
+    assert_eq!(second_ids.len(), 1);
+    assert_ne!(first_ids, second_ids);
+
+    let mut mixed = first;
+    mixed.extend_from_slice(&second);
+    let mut expected = [first_ids, second_ids].concat();
+    expected.sort_by_key(|set_id| *set_id.as_bytes());
+    assert_eq!(par2_prefix_set_ids(&mixed), expected);
+    assert!(par2_prefix_set_ids(b"PAR2\0PKT invalid").is_empty());
 }
 
 #[test]

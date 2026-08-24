@@ -1023,9 +1023,18 @@ async fn run_par2_direct_gate_with_password(
         }
     }
 
-    // Snapshotted here, not at the end: the PAR2 index completing is what runs
-    // the verification, and a job that then completes has its direct-store
-    // runtime pruned, so the sets are gone by the time extraction is terminal.
+    // The harness supplies decoded articles directly.  Once they have all
+    // arrived, model the dispatcher's exhausted discovery state and let the
+    // completion gate observe it.
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+        state.recovery_queue = crate::DownloadQueue::new();
+    }
+    pipeline.check_job_completion(job_id).await;
+
+    // Snapshotted here, not at the end: the exhausted download pass runs the
+    // verification, and a job that then completes has its direct-store runtime
+    // pruned, so the sets are gone by the time extraction is terminal.
     let sets_after_verification = format!("{:?}", pipeline.direct_store.sets_for(job_id));
 
     drain_rar_refreshes(&mut pipeline).await;
@@ -1192,6 +1201,9 @@ async fn run_damaged_par2_gate(
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         submit_volume_article(&mut pipeline, job_id, volumes, file_index, segment_number).await;
+    }
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
     }
     submit_decoded_segment(
         &mut pipeline,
@@ -4002,6 +4014,13 @@ async fn direct_job_after_verification(
         None,
     )
     .await;
+    // The fixture submits articles directly rather than dequeuing them.  Model
+    // the exhausted discovery state before a later completion pass.
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+        state.recovery_queue = crate::DownloadQueue::new();
+    }
+    pipeline.check_job_completion(job_id).await;
     (pipeline, working_dir)
 }
 
@@ -6899,6 +6918,7 @@ async fn live_damaged_direct_job(
         state.download_queue = crate::DownloadQueue::new();
         state.recovery_queue = crate::DownloadQueue::new();
     }
+    pipeline.check_job_completion(job_id).await;
     (pipeline, working_dir)
 }
 
@@ -7148,6 +7168,18 @@ async fn direct_job_with_undownloaded_recovery(
     let recovery_file_index =
         append_par2_recovery_volume(&mut spec, recovery_volume_name, recovery_volume_bytes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let set_id = par2_rs::Par2FileSet::from_files(&[index_bytes])
+        .expect("fixture index parses")
+        .recovery_set_id;
+    let recovery = pipeline
+        .ensure_par2_runtime(job_id)
+        .files
+        .entry(recovery_file_index)
+        .or_default();
+    recovery.filename = recovery_volume_name.to_string();
+    recovery.discovery = Par2DiscoveryState::PrefixProbed {
+        set_ids: vec![set_id],
+    };
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         submit_volume_article(&mut pipeline, job_id, volumes, file_index, segment_number).await;
     }
@@ -10770,6 +10802,17 @@ async fn a_par2_bearing_encrypted_set_restarted_mid_download_verifies_and_comple
         )
         .await;
     }
+    take_queued_segment(
+        &mut pipeline,
+        job_id,
+        SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: index_file_index,
+            },
+            segment_number: 0,
+        },
+    );
     submit_decoded_segment(
         &mut pipeline,
         NzbFileId {
@@ -14762,6 +14805,7 @@ async fn an_obfuscated_direct_set_still_reaches_zero_io_grid_adjudication() {
     let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
         sets.contains("Finalized"),
-        "and the verdict cleared the set; got {sets}"
+        "and the verdict has to settle the aggregate gate and clear the set, or the \
+         zero-I/O pass concluded something the job could not act on; got {sets}"
     );
 }

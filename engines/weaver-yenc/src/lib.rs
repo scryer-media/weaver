@@ -43,5 +43,8 @@ pub use decode::{
 pub use encode::{encode, encode_part};
 pub use error::YencError;
 pub use header::extract_filename_from_subject;
-pub use segment::{Segment, SegmentedCrc32, combine_contiguous};
+pub use segment::{
+    CheckpointCollapseReason, CheckpointPlan, CheckpointPlanBuild, CheckpointPlanDegradation,
+    MAX_CHECKPOINT_GRIDS, Segment, SegmentedCrc32, combine_contiguous,
+};
 pub use types::{CrcVerification, DecodeResult, YencHeaderDefects, YencMetadata};

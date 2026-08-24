@@ -1,5 +1,58 @@
 use super::*;
 
+/// Record checkpoint geometry after an article has finished decoding. This is
+/// intentionally a completion-side probe: disabled profiling does one cached
+/// enable check and the decoder's cut loop stays free of locks, clocks, and
+/// metric allocations.
+fn record_checkpoint_observability(result: &weaver_yenc::DecodeResult) {
+    if !crate::runtime::perf_probe::enabled() {
+        return;
+    }
+
+    let shape = match &result.checkpoint_plan {
+        weaver_yenc::CheckpointPlan::None => "download.checkpoint_plan.none",
+        weaver_yenc::CheckpointPlan::Single(_) => "download.checkpoint_plan.single",
+        weaver_yenc::CheckpointPlan::Multi(_) => "download.checkpoint_plan.multi",
+    };
+    crate::runtime::perf_probe::record_value(shape, 1);
+    crate::runtime::perf_probe::record_value(
+        "download.checkpoint_plan.grid_count",
+        result.checkpoint_plan.grid_count() as u64,
+    );
+    crate::runtime::perf_probe::record_value(
+        "download.checkpoint_segments.emitted",
+        result.segments.len() as u64,
+    );
+
+    let Some(reason) = result.checkpoint_collapse_reason else {
+        return;
+    };
+    let label = match reason {
+        weaver_yenc::CheckpointCollapseReason::SegmentCount => {
+            "download.checkpoint_collapse.segment_count"
+        }
+        weaver_yenc::CheckpointCollapseReason::SegmentStorage => {
+            "download.checkpoint_collapse.segment_storage"
+        }
+        weaver_yenc::CheckpointCollapseReason::OfferWork => {
+            "download.checkpoint_collapse.offer_work"
+        }
+        weaver_yenc::CheckpointCollapseReason::BoundaryOverflow => {
+            "download.checkpoint_collapse.boundary_overflow"
+        }
+        weaver_yenc::CheckpointCollapseReason::MissingBoundary => {
+            "download.checkpoint_collapse.missing_boundary"
+        }
+        weaver_yenc::CheckpointCollapseReason::NonAdvancingBoundary => {
+            "download.checkpoint_collapse.nonadvancing_boundary"
+        }
+        weaver_yenc::CheckpointCollapseReason::OffsetOverflow => {
+            "download.checkpoint_collapse.offset_overflow"
+        }
+    };
+    crate::runtime::perf_probe::record_value(label, 1);
+}
+
 impl Pipeline {
     pub(in crate::pipeline::download::worker) fn log_download_dispatch_liveness_stall(
         &mut self,
@@ -295,6 +348,7 @@ impl Pipeline {
 
                 Ok(DownloadPayload::Decoded(match body {
                     weaver_nntp::fused_yenc::FusedArticleBody::Yenc(result) => {
+                        record_checkpoint_observability(&result);
                         let yenc_layout = YencLayoutAssertions {
                             file_size: result.metadata.size,
                             part: result.metadata.part,
@@ -315,6 +369,7 @@ impl Pipeline {
                             expected_file_crc: result.expected_file_crc,
                             data,
                             yenc_name: result.metadata.name,
+                            checkpoint_plan: result.checkpoint_plan,
                             segments: result.segments,
                         }
                     }
@@ -345,6 +400,7 @@ impl Pipeline {
                         expected_file_crc: None,
                         data,
                         yenc_name: outcome.filename.unwrap_or_default(),
+                        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
                         segments: Vec::new(),
                     },
                 }))

@@ -44,13 +44,18 @@ use weaver_yenc::Segment;
 
 use crate::jobs::ids::NzbFileId;
 
-/// How many segments a file may hold for blocks that are not yet complete.
+/// Maximum incomplete per-grid runs retained for one file.
 ///
-/// Segments are retired as soon as the block they belong to is closed, so this
-/// only bounds genuinely out-of-order arrival. A file that exceeds it stops
-/// claiming blocks and falls back to settle-time verification rather than
-/// growing without limit.
-const MAX_PENDING_SEGMENTS_PER_FILE: usize = 4096;
+/// A run is eagerly folded inside one PAR2 block, so normal ordered traffic
+/// needs at most one entry per grid even when a fine checkpoint plan produces
+/// many cuts in the block.
+const MAX_PENDING_RUNS_PER_FILE: usize = 4096;
+/// Maximum closed block claims retained for one file across all PAR2 grids.
+const MAX_DERIVED_BLOCKS_PER_FILE: usize = 16_384;
+/// Maximum incomplete per-grid runs retained for one job.
+const MAX_PENDING_RUNS_PER_JOB: usize = 16_384;
+/// Maximum closed block claims retained for one job across all files/grids.
+const MAX_DERIVED_BLOCKS_PER_JOB: usize = 65_536;
 
 /// What in-stream verification concluded about one PAR2 block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,12 +143,20 @@ fn fold_tiling(segments: &[Segment], start: u64, end: u64) -> Option<u32> {
     (cursor == end).then_some(crc).flatten()
 }
 
-/// One pending segment plus the attestation of the article that carried it.
+/// One contiguous, in-block run plus the attestation of every article that
+/// contributed to it.
 #[derive(Debug, Clone, Copy)]
-struct PendingSegment {
-    segment: Segment,
-    /// The carrying article verified its declared yEnc `pcrc32`.
-    pcrc_verified: bool,
+struct PendingRun {
+    file_offset: u64,
+    len: u64,
+    crc32: u32,
+    independently_covered: bool,
+}
+
+impl PendingRun {
+    fn end_offset(self) -> Option<u64> {
+        self.file_offset.checked_add(self.len)
+    }
 }
 
 /// One closed block: the derived CRC32 plus whether every contributing
@@ -154,80 +167,274 @@ struct DerivedBlock {
     independently_covered: bool,
 }
 
-/// Per-file assembly of block CRC32s from decoded-article segments.
-#[derive(Debug)]
-struct FileBlockCrcs {
-    block_size: NonZeroU64,
-    /// Segments belonging to blocks that are not closed yet, keyed by file
-    /// offset so a duplicate arrival replaces rather than duplicates.
-    pending: BTreeMap<u64, PendingSegment>,
-    /// Derived CRC32 (+ attestation) per zero-based block index.
-    derived: BTreeMap<u32, DerivedBlock>,
-    /// Set once the file's length is known, which is what makes the short final
-    /// block closable.
-    file_len: Option<u64>,
-    /// Pending grew past its bound; this file stops claiming blocks.
-    overflowed: bool,
+/// The change in retained incomplete runs after adding one observation.
+#[derive(Debug, Clone, Copy, Default)]
+struct PendingMutation {
+    added: usize,
+    removed: usize,
+    adjacent_merges: usize,
 }
 
-impl FileBlockCrcs {
+/// One target PAR2 grid's incomplete and closed evidence for a file.
+#[derive(Debug)]
+struct GridAccumulator {
+    block_size: NonZeroU64,
+    /// Eagerly combined, non-overlapping runs, keyed by their file offset.
+    ///
+    /// A PAR2 block may accumulate several islands while articles arrive out
+    /// of order. Keeping every island is required to derive the block when a
+    /// later article bridges them; only adjacency lets us combine CRCs.
+    pending: BTreeMap<u64, PendingRun>,
+    /// Derived CRC32 (+ attestation) per zero-based block index.
+    derived: BTreeMap<u32, DerivedBlock>,
+}
+
+impl GridAccumulator {
     fn new(block_size: NonZeroU64) -> Self {
         Self {
             block_size,
             pending: BTreeMap::new(),
             derived: BTreeMap::new(),
-            file_len: None,
-            overflowed: false,
         }
     }
 
-    fn block_bounds(&self, block_index: u32) -> Option<(u64, u64)> {
+    fn block_bounds(&self, block_index: u32, file_len: Option<u64>) -> Option<(u64, u64)> {
         let size = self.block_size.get();
         let start = u64::from(block_index).checked_mul(size)?;
         let end = start.checked_add(size)?;
-        match self.file_len {
+        match file_len {
             Some(file_len) if end > file_len => (start < file_len).then_some((start, file_len)),
             Some(_) | None => Some((start, end)),
         }
     }
 
-    /// Close every block the newly inserted segments completed, retiring their
-    /// segments from `pending`.
-    fn close_blocks(&mut self, first_block: u32, last_block: u32) {
-        let size = self.block_size.get();
-        for block_index in first_block..=last_block {
-            if self.derived.contains_key(&block_index) {
-                continue;
-            }
-            let Some((start, end)) = self.block_bounds(block_index) else {
-                continue;
-            };
-            // The final block of a file whose length is not known yet cannot be
-            // closed: its extent is undecided, so a tiling that reaches the last
-            // arrived byte may or may not be the whole block.
-            if self.file_len.is_none() && end - start < size {
-                continue;
-            }
-            let mut independently_covered = true;
-            let mut segments: Vec<Segment> = Vec::new();
-            for pending in self.pending.range(start..end).map(|(_, pending)| pending) {
-                independently_covered &= pending.pcrc_verified;
-                segments.push(pending.segment);
-            }
-            let Some(crc32) = fold_tiling(&segments, start, end) else {
-                continue;
-            };
-            self.derived.insert(
-                block_index,
-                DerivedBlock {
-                    crc32,
-                    independently_covered,
-                },
-            );
-            for segment in &segments {
-                self.pending.remove(&segment.file_offset);
-            }
+    /// Add one segment when it stays inside this grid's one target block.
+    /// Segments crossing a grid boundary cannot be split from their CRC alone,
+    /// so they remain deliberately unclaimed for this grid.
+    fn offer_segment(
+        &mut self,
+        segment: Segment,
+        independently_covered: bool,
+    ) -> Option<PendingMutation> {
+        let end = segment.file_offset.checked_add(segment.len)?;
+        if segment.len == 0 {
+            return None;
         }
+        let size = self.block_size.get();
+        let block_index = u32::try_from(segment.file_offset / size).ok()?;
+        if end.saturating_sub(1) / size != u64::from(block_index) {
+            return None;
+        }
+        let block_start = u64::from(block_index).checked_mul(size)?;
+        let block_end = block_start.checked_add(size)?;
+        if self.derived.contains_key(&block_index) {
+            return Some(PendingMutation::default());
+        }
+
+        let mut incoming = PendingRun {
+            file_offset: segment.file_offset,
+            len: segment.len,
+            crc32: segment.crc32,
+            independently_covered,
+        };
+        let mut removed = 0;
+        let mut adjacent_merges = 0;
+        let mut overlaps = Vec::new();
+        for (&offset, existing) in self.pending.range(..end).rev() {
+            let Some(existing_end) = existing.end_offset() else {
+                overlaps.push(offset);
+                continue;
+            };
+            if existing_end <= incoming.file_offset {
+                break;
+            }
+            if existing.file_offset == incoming.file_offset && existing.len == incoming.len {
+                // Replaying an identical observation cannot add coverage. A
+                // missing pCRC still denies independent attestation.
+                let existing = self.pending.get_mut(&offset)?;
+                existing.independently_covered &= incoming.independently_covered;
+                return Some(PendingMutation::default());
+            }
+            overlaps.push(offset);
+        }
+        for offset in overlaps {
+            self.pending.remove(&offset);
+            removed += 1;
+        }
+
+        if let Some((&offset, previous)) = self.pending.range(..incoming.file_offset).next_back()
+            && previous.file_offset >= block_start
+            && previous.end_offset() == Some(incoming.file_offset)
+        {
+            let previous = self.pending.remove(&offset)?;
+            incoming.crc32 = par2_rs::checksum::Crc32CombineOp::new(incoming.len)
+                .combine(previous.crc32, incoming.crc32);
+            incoming.file_offset = previous.file_offset;
+            incoming.len = previous.len.checked_add(incoming.len)?;
+            incoming.independently_covered &= previous.independently_covered;
+            removed += 1;
+            adjacent_merges += 1;
+        }
+        while incoming.end_offset()? < block_end {
+            let Some(next) = self.pending.get(&incoming.end_offset()?).copied() else {
+                break;
+            };
+            if next.end_offset()? > block_end {
+                break;
+            }
+            self.pending.remove(&next.file_offset);
+            incoming.crc32 = par2_rs::checksum::Crc32CombineOp::new(next.len)
+                .combine(incoming.crc32, next.crc32);
+            incoming.len = incoming.len.checked_add(next.len)?;
+            incoming.independently_covered &= next.independently_covered;
+            removed += 1;
+            adjacent_merges += 1;
+        }
+
+        self.pending.insert(incoming.file_offset, incoming);
+        Some(PendingMutation {
+            added: 1,
+            removed,
+            adjacent_merges,
+        })
+    }
+
+    /// Retire one exact in-block run into a derived block, if it closes now.
+    fn take_closed_block(
+        &mut self,
+        block_index: u32,
+        file_len: Option<u64>,
+    ) -> Option<DerivedBlock> {
+        if self.derived.contains_key(&block_index) {
+            return None;
+        }
+        let (start, end) = self.block_bounds(block_index, file_len)?;
+        let run = *self.pending.get(&start)?;
+        (run.file_offset == start && run.len == end - start).then(|| {
+            self.pending.remove(&start);
+            DerivedBlock {
+                crc32: run.crc32,
+                independently_covered: run.independently_covered,
+            }
+        })
+    }
+
+    fn clear_pending(&mut self) -> usize {
+        let count = self.pending.len();
+        self.pending.clear();
+        count
+    }
+
+    /// Close the ordinary one-segment block without first round-tripping it
+    /// through the pending-run map. Existing partial evidence deliberately
+    /// takes the general path, which reconciles its accounting and attestation.
+    fn take_direct_block(
+        &mut self,
+        segment: Segment,
+        independently_covered: bool,
+        file_len: Option<u64>,
+    ) -> Option<(u32, DerivedBlock)> {
+        let block_index = u32::try_from(segment.file_offset / self.block_size.get()).ok()?;
+        let (start, end) = self.block_bounds(block_index, file_len)?;
+        (segment.file_offset == start
+            && segment.len == end.checked_sub(start)?
+            && !self.derived.contains_key(&block_index)
+            && self.pending.range(start..end).next().is_none())
+        .then_some((
+            block_index,
+            DerivedBlock {
+                crc32: segment.crc32,
+                independently_covered,
+            },
+        ))
+    }
+}
+
+/// Per-file evidence for every grid the decoded batch actually knew about.
+#[derive(Debug, Default)]
+struct FileBlockCrcs {
+    grids: BTreeMap<u64, GridAccumulator>,
+    file_len: Option<u64>,
+    pending_entries: usize,
+    derived_entries: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+struct EntryCounts {
+    pending: usize,
+    derived: usize,
+}
+
+/// Completion-side accounting for one article's collector work. The counters
+/// are plain integers in the collector, then emitted only when the existing
+/// hot-path profiler is enabled; normal article processing takes no metric
+/// locks or clock reads.
+#[derive(Debug, Default)]
+struct CollectorArticleAccounting {
+    adjacent_merges: u64,
+    pending_budget_pressure_events: u64,
+    pending_runs_dropped: u64,
+    derived_budget_drops: u64,
+    derived_blocks_preserved: u64,
+}
+
+fn record_collector_article_observability(
+    entry: &FileBlockCrcs,
+    job: EntryCounts,
+    accounting: &CollectorArticleAccounting,
+) {
+    if !crate::runtime::perf_probe::enabled() {
+        return;
+    }
+
+    crate::runtime::perf_probe::record_value(
+        "par2.collector.pending_runs.file",
+        entry.pending_entries as u64,
+    );
+    crate::runtime::perf_probe::record_value("par2.collector.pending_runs.job", job.pending as u64);
+    for grid in entry.grids.values() {
+        crate::runtime::perf_probe::record_value(
+            "par2.collector.pending_runs.per_grid",
+            grid.pending.len() as u64,
+        );
+        crate::runtime::perf_probe::record_value(
+            "par2.collector.derived_blocks.per_grid",
+            grid.derived.len() as u64,
+        );
+    }
+    if accounting.adjacent_merges > 0 {
+        crate::runtime::perf_probe::record_value(
+            "par2.collector.pending_runs.adjacent_merges",
+            accounting.adjacent_merges,
+        );
+    }
+    if accounting.pending_budget_pressure_events > 0 {
+        crate::runtime::perf_probe::record_value(
+            "par2.collector.pending_budget_pressure.events",
+            accounting.pending_budget_pressure_events,
+        );
+        crate::runtime::perf_probe::record_value(
+            "par2.collector.pending_budget_pressure.runs_dropped",
+            accounting.pending_runs_dropped,
+        );
+        crate::runtime::perf_probe::record_value(
+            "par2.collector.pending_budget_pressure.derived_preserved",
+            accounting.derived_blocks_preserved,
+        );
+    }
+    if accounting.derived_budget_drops > 0 {
+        crate::runtime::perf_probe::record_value(
+            "par2.collector.derived_budget_pressure.blocks_dropped",
+            accounting.derived_budget_drops,
+        );
+    }
+}
+
+impl FileBlockCrcs {
+    fn grid_mut(&mut self, block_size: NonZeroU64) -> &mut GridAccumulator {
+        self.grids
+            .entry(block_size.get())
+            .or_insert_with(|| GridAccumulator::new(block_size))
     }
 }
 
@@ -293,6 +500,9 @@ pub(crate) fn slice_evidence_from_verdicts(
 #[derive(Debug, Default)]
 pub(crate) struct BlockCrcCollector {
     files: HashMap<NzbFileId, FileBlockCrcs>,
+    /// Exact entry counts across each job. These are maintained on every
+    /// insert/removal so limits never need a map walk in the article path.
+    job_entries: HashMap<crate::jobs::ids::JobId, EntryCounts>,
     /// Blocks closed with a derived CRC, for observability.
     blocks_derived: u64,
     /// Articles whose segments did not describe the range the pipeline placed
@@ -319,6 +529,7 @@ impl BlockCrcCollector {
     // ordinal, checkpoint segments); bundling them into a struct would only
     // rename the tuple.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn note_article(
         &mut self,
         file_id: NzbFileId,
@@ -330,62 +541,42 @@ impl BlockCrcCollector {
         was_duplicate: bool,
         segments: &[Segment],
     ) {
+        self.note_article_on_grids(
+            file_id,
+            std::slice::from_ref(&block_size),
+            file_offset,
+            len,
+            part_crc,
+            part_crc_verified,
+            was_duplicate,
+            segments,
+        );
+    }
+
+    /// Offer one decoded article to every grid in the immutable checkpoint-plan
+    /// snapshot captured before that article was decoded. A grid learned later
+    /// cannot consume these segments; claiming it would imply cuts the decoder
+    /// never emitted.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn note_article_on_grids(
+        &mut self,
+        file_id: NzbFileId,
+        grids: &[NonZeroU64],
+        file_offset: u64,
+        len: u64,
+        part_crc: u32,
+        part_crc_verified: bool,
+        was_duplicate: bool,
+        segments: &[Segment],
+    ) {
         if len == 0 {
             return;
         }
-        let end = file_offset.saturating_add(len);
-        let entry = self
-            .files
-            .entry(file_id)
-            .or_insert_with(|| FileBlockCrcs::new(block_size));
-        if entry.block_size != block_size {
-            // The recovery set's grid changed under us (a second set bound to
-            // the same file). Everything derived on the old grid is meaningless.
-            *entry = FileBlockCrcs::new(block_size);
-        }
-        if entry.overflowed {
+        let Some(end) = file_offset.checked_add(len) else {
             return;
-        }
-
-        // Replay adjudication. Duplicate identity is the NZB segment ordinal
-        // — the assembly's `was_duplicate` — not this arrival's offset: a
-        // re-delivered article may legally carry a different bounded `=ypart
-        // begin` or a shorter extent, so it can rewrite bytes that earlier
-        // evidence was derived over WITHOUT landing at the offset that
-        // evidence was keyed by. Every duplicate therefore invalidates by
-        // RANGE: every derived block and every pending segment overlapping
-        // the bytes this arrival just rewrote describes content that may no
-        // longer be there — even when CRCs match, because CRC32 equality
-        // cannot establish byte identity. The segments fed below then
-        // re-enter `pending`, so a block the rewrite fully tiles closes
-        // right back from the new observation; contributions outside the
-        // rewritten range but inside a touched block survive, and the block
-        // may close again once segments observed at or after the rewrite
-        // tile the rest. If they never do, it stays unclaimed and the read
-        // paths own it. First deliveries never rewrote anything — placement
-        // conflicts are refused upstream before the write — so the clean
-        // path skips all of this.
-        if was_duplicate {
-            let size = entry.block_size.get();
-            let first_block = u32::try_from(file_offset / size).unwrap_or(u32::MAX);
-            let last_block = u32::try_from((end - 1) / size).unwrap_or(u32::MAX);
-            for block_index in first_block..=last_block {
-                entry.derived.remove(&block_index);
-            }
-            // Pending entries are mutually disjoint (placement discipline on
-            // the way in, this purge on rewrites), so walking backwards from
-            // `end` and stopping at the first segment that ends at or before
-            // `file_offset` visits only the overlap plus one neighbour.
-            let stale: Vec<u64> = entry
-                .pending
-                .range(..end)
-                .rev()
-                .take_while(|(_, pending)| pending.segment.end_offset() > file_offset)
-                .map(|(&offset, _)| offset)
-                .collect();
-            for offset in stale {
-                entry.pending.remove(&offset);
-            }
+        };
+        if grids.is_empty() {
+            return;
         }
 
         let article_matches_placement = fold_tiling(segments, file_offset, end) == Some(part_crc);
@@ -401,52 +592,234 @@ impl BlockCrcCollector {
             &whole_article
         };
 
-        for segment in accepted {
-            entry.pending.insert(
-                segment.file_offset,
-                PendingSegment {
-                    segment: *segment,
-                    pcrc_verified: part_crc_verified,
-                },
-            );
-        }
-        if entry.pending.len() > MAX_PENDING_SEGMENTS_PER_FILE {
-            // Fail closed: once this file stops observing arrivals, a later
-            // rewrite would go unnoticed, so no previously derived claim may
-            // survive either — settle-time verification owns the whole file.
-            entry.overflowed = true;
-            entry.pending.clear();
-            entry.derived.clear();
-            return;
+        let mut derived = 0u64;
+        let mut accounting = CollectorArticleAccounting::default();
+        let job_id = file_id.job_id;
+        let (files, job_entries) = (&mut self.files, &mut self.job_entries);
+        let entry = files.entry(file_id).or_default();
+        let job = job_entries.entry(job_id).or_default();
+
+        if was_duplicate {
+            for grid in entry.grids.values_mut() {
+                let size = grid.block_size.get();
+                let first = u32::try_from(file_offset / size).unwrap_or(u32::MAX);
+                let last = u32::try_from((end - 1) / size).unwrap_or(u32::MAX);
+                let stale_pending: Vec<_> = grid
+                    .pending
+                    .iter()
+                    .filter_map(|(&index, run)| {
+                        (run.end_offset()
+                            .is_some_and(|run_end| run_end > file_offset)
+                            && run.file_offset < end)
+                            .then_some(index)
+                    })
+                    .collect();
+                for index in stale_pending {
+                    if grid.pending.remove(&index).is_some() {
+                        entry.pending_entries = entry.pending_entries.saturating_sub(1);
+                        job.pending = job.pending.saturating_sub(1);
+                    }
+                }
+                let stale_derived: Vec<_> = grid
+                    .derived
+                    .range(first..=last)
+                    .map(|(&index, _)| index)
+                    .collect();
+                for index in stale_derived {
+                    if grid.derived.remove(&index).is_some() {
+                        entry.derived_entries = entry.derived_entries.saturating_sub(1);
+                        job.derived = job.derived.saturating_sub(1);
+                    }
+                }
+            }
         }
 
+        for &block_size in grids {
+            for segment in accepted {
+                derived = derived.saturating_add(Self::offer_segment(
+                    entry,
+                    job,
+                    block_size,
+                    *segment,
+                    part_crc_verified,
+                    &mut accounting,
+                ));
+            }
+        }
+        record_collector_article_observability(entry, *job, &accounting);
+        self.blocks_derived = self.blocks_derived.saturating_add(derived);
+    }
+
+    fn offer_segment(
+        entry: &mut FileBlockCrcs,
+        job: &mut EntryCounts,
+        block_size: NonZeroU64,
+        segment: Segment,
+        independently_covered: bool,
+        accounting: &mut CollectorArticleAccounting,
+    ) -> u64 {
+        let end = match segment.file_offset.checked_add(segment.len) {
+            Some(end) if segment.len > 0 => end,
+            _ => return 0,
+        };
         let size = block_size.get();
-        let first_block = u32::try_from(file_offset / size).unwrap_or(u32::MAX);
-        let last_block = u32::try_from((end - 1) / size).unwrap_or(u32::MAX);
-        let before = entry.derived.len();
-        entry.close_blocks(first_block, last_block);
-        self.blocks_derived = self
-            .blocks_derived
-            .saturating_add((entry.derived.len() - before) as u64);
+        let Some(block_index) = u32::try_from(segment.file_offset / size).ok() else {
+            return 0;
+        };
+        if end.saturating_sub(1) / size != u64::from(block_index) {
+            return 0;
+        }
+
+        let file_len = entry.file_len;
+        if let Some((block_index, closed)) =
+            entry
+                .grid_mut(block_size)
+                .take_direct_block(segment, independently_covered, file_len)
+        {
+            if entry.derived_entries >= MAX_DERIVED_BLOCKS_PER_FILE
+                || job.derived >= MAX_DERIVED_BLOCKS_PER_JOB
+            {
+                accounting.derived_budget_drops = accounting.derived_budget_drops.saturating_add(1);
+                accounting.derived_blocks_preserved = accounting
+                    .derived_blocks_preserved
+                    .saturating_add(entry.derived_entries as u64);
+                return 0;
+            }
+            entry
+                .grid_mut(block_size)
+                .derived
+                .insert(block_index, closed);
+            entry.derived_entries = entry.derived_entries.saturating_add(1);
+            job.derived = job.derived.saturating_add(1);
+            return 1;
+        }
+
+        if entry.pending_entries >= MAX_PENDING_RUNS_PER_FILE
+            || job.pending >= MAX_PENDING_RUNS_PER_JOB
+        {
+            accounting.pending_budget_pressure_events =
+                accounting.pending_budget_pressure_events.saturating_add(1);
+            accounting.derived_blocks_preserved = accounting
+                .derived_blocks_preserved
+                .saturating_add(entry.derived_entries as u64);
+            let cleared = entry.grid_mut(block_size).clear_pending();
+            accounting.pending_runs_dropped = accounting
+                .pending_runs_dropped
+                .saturating_add(cleared as u64);
+            entry.pending_entries = entry.pending_entries.saturating_sub(cleared);
+            job.pending = job.pending.saturating_sub(cleared);
+        }
+        if entry.pending_entries >= MAX_PENDING_RUNS_PER_FILE
+            || job.pending >= MAX_PENDING_RUNS_PER_JOB
+        {
+            return 0;
+        }
+
+        let mutation = entry
+            .grid_mut(block_size)
+            .offer_segment(segment, independently_covered);
+        let Some(mutation) = mutation else {
+            return 0;
+        };
+        accounting.adjacent_merges = accounting
+            .adjacent_merges
+            .saturating_add(mutation.adjacent_merges as u64);
+        entry.pending_entries = entry
+            .pending_entries
+            .saturating_add(mutation.added)
+            .saturating_sub(mutation.removed);
+        job.pending = job
+            .pending
+            .saturating_add(mutation.added)
+            .saturating_sub(mutation.removed);
+
+        let file_len = entry.file_len;
+        let closed = entry
+            .grid_mut(block_size)
+            .take_closed_block(block_index, file_len);
+        let Some(closed) = closed else {
+            return 0;
+        };
+        entry.pending_entries = entry.pending_entries.saturating_sub(1);
+        job.pending = job.pending.saturating_sub(1);
+        if entry.derived_entries >= MAX_DERIVED_BLOCKS_PER_FILE
+            || job.derived >= MAX_DERIVED_BLOCKS_PER_JOB
+        {
+            accounting.derived_budget_drops = accounting.derived_budget_drops.saturating_add(1);
+            accounting.derived_blocks_preserved = accounting
+                .derived_blocks_preserved
+                .saturating_add(entry.derived_entries as u64);
+            return 0;
+        }
+        entry
+            .grid_mut(block_size)
+            .derived
+            .insert(block_index, closed);
+        entry.derived_entries = entry.derived_entries.saturating_add(1);
+        job.derived = job.derived.saturating_add(1);
+        1
     }
 
     /// Declare the file's final length, which is what lets the short final block
     /// close. Idempotent.
     pub(crate) fn note_file_len(&mut self, file_id: NzbFileId, file_len: u64) {
-        let Some(entry) = self.files.get_mut(&file_id) else {
+        if file_len == 0 {
+            return;
+        }
+        let (files, job_entries) = (&mut self.files, &mut self.job_entries);
+        let Some(entry) = files.get_mut(&file_id) else {
             return;
         };
-        if entry.file_len == Some(file_len) || entry.overflowed {
+        if entry.file_len == Some(file_len) {
             return;
         }
         entry.file_len = Some(file_len);
-        let size = entry.block_size.get();
-        let last_block = u32::try_from(file_len.saturating_sub(1) / size).unwrap_or(u32::MAX);
-        let before = entry.derived.len();
-        entry.close_blocks(0, last_block);
-        self.blocks_derived = self
-            .blocks_derived
-            .saturating_add((entry.derived.len() - before) as u64);
+        let Some(job) = job_entries.get_mut(&file_id.job_id) else {
+            return;
+        };
+        let last_blocks: Vec<_> = entry
+            .grids
+            .iter()
+            .filter_map(|(&size, _)| {
+                u32::try_from((file_len - 1) / size)
+                    .ok()
+                    .map(|last| (size, last))
+            })
+            .collect();
+        let mut derived = 0u64;
+        let mut accounting = CollectorArticleAccounting::default();
+        for (size, block_index) in last_blocks {
+            let Some(block_size) = NonZeroU64::new(size) else {
+                continue;
+            };
+            let file_len = entry.file_len;
+            let closed = entry
+                .grid_mut(block_size)
+                .take_closed_block(block_index, file_len);
+            let Some(closed) = closed else {
+                continue;
+            };
+            entry.pending_entries = entry.pending_entries.saturating_sub(1);
+            job.pending = job.pending.saturating_sub(1);
+            if entry.derived_entries >= MAX_DERIVED_BLOCKS_PER_FILE
+                || job.derived >= MAX_DERIVED_BLOCKS_PER_JOB
+            {
+                accounting.derived_budget_drops = accounting.derived_budget_drops.saturating_add(1);
+                accounting.derived_blocks_preserved = accounting
+                    .derived_blocks_preserved
+                    .saturating_add(entry.derived_entries as u64);
+                continue;
+            }
+            entry
+                .grid_mut(block_size)
+                .derived
+                .insert(block_index, closed);
+            entry.derived_entries = entry.derived_entries.saturating_add(1);
+            job.derived = job.derived.saturating_add(1);
+            derived = derived.saturating_add(1);
+        }
+        record_collector_article_observability(entry, *job, &accounting);
+        self.blocks_derived = self.blocks_derived.saturating_add(derived);
     }
 
     /// Derived CRC32 for one block, if in-stream evidence closed it.
@@ -457,6 +830,9 @@ impl BlockCrcCollector {
     pub(crate) fn derived_block_crc(&self, file_id: NzbFileId, block_index: u32) -> Option<u32> {
         self.files
             .get(&file_id)?
+            .grids
+            .values()
+            .next()?
             .derived
             .get(&block_index)
             .map(|block| block.crc32)
@@ -467,10 +843,18 @@ impl BlockCrcCollector {
     pub(crate) fn derived_blocks(&self, file_id: NzbFileId) -> impl Iterator<Item = (u32, u32)> {
         self.files.get(&file_id).into_iter().flat_map(|entry| {
             entry
-                .derived
-                .iter()
+                .grids
+                .values()
+                .next()
+                .into_iter()
+                .flat_map(|grid| grid.derived.iter())
                 .map(|(index, block)| (*index, block.crc32))
         })
+    }
+
+    #[cfg(test)]
+    fn entry_counts_for_job(&self, job_id: crate::jobs::ids::JobId) -> EntryCounts {
+        self.job_entries.get(&job_id).copied().unwrap_or_default()
     }
 
     /// Compare this file's derived block CRC32s against a recovery set's IFSC
@@ -490,15 +874,11 @@ impl BlockCrcCollector {
         let Some(entry) = self.files.get(&file_id) else {
             return verdicts;
         };
-        if entry.overflowed {
-            // Fail closed: an overflowed file stopped observing arrivals, so
-            // nothing it once derived can be trusted to describe the disk.
+        let Some(grid) = entry.grids.get(&par2_set.slice_size) else {
+            // A batch that did not know this grid never produced a composable
+            // segment belt for it.
             return verdicts;
-        }
-        if par2_set.slice_size != entry.block_size.get() {
-            // A verdict derived on one grid says nothing about another.
-            return verdicts;
-        }
+        };
         let Some(description) = par2_set.file_description(&par2_file_id) else {
             // Length congruence below is what licenses the final short
             // block's zero-padded comparison; without the description there
@@ -506,9 +886,9 @@ impl BlockCrcCollector {
             return verdicts;
         };
         let checksums = par2_set.file_checksums(&par2_file_id);
-        let block_size = entry.block_size.get();
-        for (&block_index, derived) in &entry.derived {
-            let Some((start, end)) = entry.block_bounds(block_index) else {
+        let block_size = grid.block_size.get();
+        for (&block_index, derived) in &grid.derived {
+            let Some((start, end)) = grid.block_bounds(block_index, entry.file_len) else {
                 continue;
             };
             // Length congruence, per block. A full-size block within the
@@ -562,6 +942,7 @@ impl BlockCrcCollector {
     /// Drop everything retained for every file of a job.
     pub(crate) fn forget_job(&mut self, job_id: crate::jobs::ids::JobId) {
         self.files.retain(|file_id, _| file_id.job_id != job_id);
+        self.job_entries.remove(&job_id);
     }
 
     /// Drop everything retained for **one** file.
@@ -575,7 +956,17 @@ impl BlockCrcCollector {
     /// and merging the two would let evidence from one image adjudicate blocks
     /// of another.
     pub(crate) fn forget_file(&mut self, file_id: NzbFileId) {
-        self.files.remove(&file_id);
+        let Some(entry) = self.files.remove(&file_id) else {
+            return;
+        };
+        let Some(job) = self.job_entries.get_mut(&file_id.job_id) else {
+            return;
+        };
+        job.pending = job.pending.saturating_sub(entry.pending_entries);
+        job.derived = job.derived.saturating_sub(entry.derived_entries);
+        if job.pending == 0 && job.derived == 0 {
+            self.job_entries.remove(&file_id.job_id);
+        }
     }
 
     pub(crate) fn blocks_derived(&self) -> u64 {

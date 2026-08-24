@@ -26,10 +26,13 @@
 //!
 //! ```rust
 //! use std::num::NonZeroU64;
-//! use weaver_yenc::segment::{SegmentedCrc32, combine_contiguous};
+//! use weaver_yenc::segment::{CheckpointPlan, SegmentedCrc32, combine_contiguous};
 //!
 //! // Article starts 3 MiB into the file; PAR2 block size is 1 MiB.
-//! let mut pass = SegmentedCrc32::new(3 << 20, NonZeroU64::new(1 << 20));
+//! let mut pass = SegmentedCrc32::new(
+//!     3 << 20,
+//!     CheckpointPlan::Single(NonZeroU64::new(1 << 20).expect("non-zero")),
+//! );
 //! pass.update(&[b'a'; 700 * 1024]); // fed in arbitrary chunks by the driver
 //! pass.update(&[b'b'; 700 * 1024]);
 //! let segments = pass.finish();
@@ -40,15 +43,164 @@
 //! assert_eq!(article.len, 1_400 * 1024);
 //! ```
 //!
-//! Before the PAR2 block size is known, construct with `block_size = None`: the
+//! Before PAR2 geometry is known, construct with `CheckpointPlan::None`: the
 //! pass emits one segment for the whole article. Such segments still compose
 //! whenever they happen to tile a block; blocks they do not tile fall back to
 //! settle-time read-back. An article is never delayed or re-decoded to obtain
 //! checkpoints.
 
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use crate::crc::{Crc32, crc32_combine};
+
+/// Maximum number of distinct PAR2 slice grids admitted to one checkpoint
+/// plan. Keeping this small bounds both boundary selection and the work a
+/// decoded segment can offer to downstream collectors.
+pub const MAX_CHECKPOINT_GRIDS: usize = 32;
+
+/// Hard cap for checkpoint segment storage for one article. The count below is
+/// deliberately derived from the representation so a future `Segment` layout
+/// change cannot silently raise the allocation bound.
+pub const MAX_CHECKPOINT_SEGMENT_BYTES: usize = 64 * 1024;
+pub const MAX_CHECKPOINT_SEGMENTS: usize =
+    MAX_CHECKPOINT_SEGMENT_BYTES / std::mem::size_of::<Segment>();
+
+/// Maximum downstream grid offers represented by one decoded article.
+pub const MAX_CHECKPOINT_OFFER_WORK: usize = 65_536;
+
+/// An immutable snapshot of every PAR2 slice geometry known when an article
+/// began decoding. It describes cuts only; file/set ownership remains a
+/// durable-commit decision.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CheckpointPlan {
+    #[default]
+    None,
+    Single(NonZeroU64),
+    Multi(Arc<[NonZeroU64]>),
+}
+
+/// Why a plan was safely degraded to [`CheckpointPlan::None`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointPlanDegradation {
+    TooManyGrids,
+    InvalidSliceSize,
+}
+
+/// Why a checkpointing pass safely discarded fine-grained segments for one
+/// article. The decoded bytes and article CRC remain valid; downstream PAR2
+/// evidence must simply read back any block the coarse segment cannot tile.
+///
+/// This deliberately records only a small, stable classification. It crosses
+/// the yEnc/server boundary so the server can profile defensive fallbacks once
+/// per completed article without adding instrumentation to the cut loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointCollapseReason {
+    SegmentCount,
+    SegmentStorage,
+    OfferWork,
+    BoundaryOverflow,
+    MissingBoundary,
+    NonAdvancingBoundary,
+    OffsetOverflow,
+}
+
+/// Result of normalizing untrusted parsed slice sizes into a safe plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointPlanBuild {
+    pub plan: CheckpointPlan,
+    pub degradation: Option<CheckpointPlanDegradation>,
+}
+
+impl CheckpointPlan {
+    /// Normalize, sort, and deduplicate slice sizes without ever growing a
+    /// temporary list beyond the admitted-grid cap. An oversized distinct set
+    /// degrades as a whole rather than keeping an order-dependent prefix.
+    pub fn from_sizes<I>(sizes: I) -> CheckpointPlanBuild
+    where
+        I: IntoIterator<Item = NonZeroU64>,
+    {
+        let mut normalized = Vec::with_capacity(MAX_CHECKPOINT_GRIDS.min(8));
+        for size in sizes {
+            match normalized.binary_search(&size) {
+                Ok(_) => {}
+                Err(index) if normalized.len() < MAX_CHECKPOINT_GRIDS => {
+                    normalized.insert(index, size);
+                }
+                Err(_) => {
+                    return CheckpointPlanBuild {
+                        plan: Self::None,
+                        degradation: Some(CheckpointPlanDegradation::TooManyGrids),
+                    };
+                }
+            }
+        }
+
+        Self::from_normalized(normalized)
+    }
+
+    fn from_normalized(normalized: Vec<NonZeroU64>) -> CheckpointPlanBuild {
+        let plan = match normalized.as_slice() {
+            [] => Self::None,
+            [size] => Self::Single(*size),
+            _ => Self::Multi(normalized.into()),
+        };
+        CheckpointPlanBuild {
+            plan,
+            degradation: None,
+        }
+    }
+
+    /// Normalize raw PAR2 slice sizes. A zero value is malformed metadata, so
+    /// it disables checkpointing for the whole snapshot instead of being
+    /// silently filtered out and changing the plan's meaning.
+    pub fn from_slice_sizes<I>(slice_sizes: I) -> CheckpointPlanBuild
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let mut normalized = Vec::with_capacity(MAX_CHECKPOINT_GRIDS.min(8));
+        for raw_size in slice_sizes {
+            let Some(size) = NonZeroU64::new(raw_size) else {
+                return CheckpointPlanBuild {
+                    plan: Self::None,
+                    degradation: Some(CheckpointPlanDegradation::InvalidSliceSize),
+                };
+            };
+            match normalized.binary_search(&size) {
+                Ok(_) => {}
+                Err(index) if normalized.len() < MAX_CHECKPOINT_GRIDS => {
+                    normalized.insert(index, size);
+                }
+                Err(_) => {
+                    return CheckpointPlanBuild {
+                        plan: Self::None,
+                        degradation: Some(CheckpointPlanDegradation::TooManyGrids),
+                    };
+                }
+            }
+        }
+        Self::from_normalized(normalized)
+    }
+
+    #[inline]
+    pub fn sizes(&self) -> &[NonZeroU64] {
+        match self {
+            Self::None => &[],
+            Self::Single(size) => std::slice::from_ref(size),
+            Self::Multi(sizes) => sizes,
+        }
+    }
+
+    #[inline]
+    pub fn grid_count(&self) -> usize {
+        self.sizes().len()
+    }
+
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
 
 /// A contiguous run of decoded output bytes and its standalone CRC32.
 ///
@@ -88,33 +240,92 @@ pub struct SegmentedCrc32 {
     open_offset: u64,
     /// File offset one past the last byte fed.
     cursor: u64,
-    /// Bytes remaining until the next checkpoint; `None` when no block size is
-    /// known and the whole article becomes a single segment.
+    /// Bytes remaining until the next fixed-stride checkpoint.
     until_boundary: Option<u64>,
-    block_size: Option<NonZeroU64>,
+    checkpoint_plan: CheckpointPlan,
+    /// Next boundary for each admitted grid. The plan cap makes this fixed.
+    next_boundaries: [u64; MAX_CHECKPOINT_GRIDS],
+    next_boundary_count: usize,
     segments: Vec<Segment>,
     /// In-order combine-fold of every closed segment, i.e. the CRC32 over
     /// `[base_offset, open_offset)`. Maintained at each cut so the whole-pass
     /// CRC is available in O(1) without re-folding the segment list.
     closed_crc: u32,
+    /// Bytes covered by closed segments. Kept independently of absolute file
+    /// offsets so an address overflow can fail closed without corrupting the
+    /// article CRC calculation.
+    closed_len: u64,
+    /// Total decoded bytes in this article.
+    total_len: u64,
+    /// Fine-grained evidence was discarded after a defensive limit or offset
+    /// arithmetic failure. The final result is one coarse article segment.
+    collapsed: bool,
+    collapse_reason: Option<CheckpointCollapseReason>,
 }
 
 impl SegmentedCrc32 {
     /// Start a pass whose first byte lands at `file_offset` in the
-    /// reconstructed file, checkpointing at every multiple of `block_size`.
-    ///
-    /// `block_size = None` is the pre-block-size policy: no checkpoints, one
-    /// segment for the whole article.
-    pub fn new(file_offset: u64, block_size: Option<NonZeroU64>) -> Self {
+    /// reconstructed file, checkpointing according to an immutable geometry
+    /// snapshot.
+    pub fn new(file_offset: u64, mut checkpoint_plan: CheckpointPlan) -> Self {
+        let oversized_multi = matches!(
+            &checkpoint_plan,
+            CheckpointPlan::Multi(sizes) if sizes.len() > MAX_CHECKPOINT_GRIDS
+        );
+        if oversized_multi {
+            checkpoint_plan = CheckpointPlan::None;
+        }
+        let (until_boundary, next_boundaries, next_boundary_count, collapse_reason) =
+            match &checkpoint_plan {
+                CheckpointPlan::None => (
+                    None,
+                    [0; MAX_CHECKPOINT_GRIDS],
+                    0,
+                    oversized_multi.then_some(CheckpointCollapseReason::OfferWork),
+                ),
+                CheckpointPlan::Single(size) => (
+                    Some(bytes_to_next_boundary(file_offset, *size)),
+                    [0; MAX_CHECKPOINT_GRIDS],
+                    0,
+                    None,
+                ),
+                CheckpointPlan::Multi(sizes) => {
+                    let mut boundaries = [0; MAX_CHECKPOINT_GRIDS];
+                    let mut valid = true;
+                    for (index, &size) in sizes.iter().enumerate() {
+                        let Some(boundary) = next_boundary_after(file_offset, size) else {
+                            valid = false;
+                            break;
+                        };
+                        boundaries[index] = boundary;
+                    }
+                    if valid {
+                        (None, boundaries, sizes.len(), None)
+                    } else {
+                        (
+                            None,
+                            [0; MAX_CHECKPOINT_GRIDS],
+                            0,
+                            Some(CheckpointCollapseReason::BoundaryOverflow),
+                        )
+                    }
+                }
+            };
         Self {
             crc: Crc32::new(),
             base_offset: file_offset,
             open_offset: file_offset,
             cursor: file_offset,
-            until_boundary: block_size.map(|size| bytes_to_next_boundary(file_offset, size)),
-            block_size,
+            until_boundary,
+            checkpoint_plan,
+            next_boundaries,
+            next_boundary_count,
             segments: Vec::new(),
             closed_crc: 0,
+            closed_len: 0,
+            total_len: 0,
+            collapsed: collapse_reason.is_some(),
+            collapse_reason,
         }
     }
 
@@ -133,19 +344,25 @@ impl SegmentedCrc32 {
     /// Bytes fed so far.
     #[inline]
     pub fn len(&self) -> u64 {
-        self.cursor - self.base_offset
+        self.total_len
     }
 
     /// Whether no bytes have been fed yet.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.cursor == self.base_offset
+        self.total_len == 0
     }
 
-    /// The PAR2 block size this pass checkpoints at, if one was declared.
+    /// Immutable geometry this article used for checkpointing.
     #[inline]
-    pub fn block_size(&self) -> Option<NonZeroU64> {
-        self.block_size
+    pub fn checkpoint_plan(&self) -> &CheckpointPlan {
+        &self.checkpoint_plan
+    }
+
+    /// Why this article was reduced to one coarse segment, if it was.
+    #[inline]
+    pub fn collapse_reason(&self) -> Option<CheckpointCollapseReason> {
+        self.collapse_reason
     }
 
     /// CRC32 over every byte fed so far — the article `pcrc32` as of the
@@ -159,7 +376,7 @@ impl SegmentedCrc32 {
         crc32_combine(
             self.closed_crc,
             self.crc.current(),
-            self.cursor - self.open_offset,
+            self.total_len - self.closed_len,
         )
     }
 
@@ -170,34 +387,19 @@ impl SegmentedCrc32 {
         &self.segments
     }
 
-    /// Feed decoded output bytes, closing a segment at every block boundary
-    /// crossed.
+    /// Feed decoded output bytes, closing a segment at every checkpoint-plan
+    /// boundary crossed.
     pub fn update(&mut self, mut data: &[u8]) {
-        let Some(mut remaining) = self.until_boundary else {
-            // No checkpoints: the dominant path stays a single CRC update with
-            // no per-call arithmetic beyond the cursor bump.
-            self.crc.update(data);
-            self.cursor += data.len() as u64;
+        if self.collapsed || self.checkpoint_plan.is_none() {
+            self.consume(data);
             return;
-        };
-
-        while !data.is_empty() {
-            let take = usize::try_from(remaining)
-                .unwrap_or(usize::MAX)
-                .min(data.len());
-            self.crc.update(&data[..take]);
-            self.cursor += take as u64;
-            data = &data[take..];
-            remaining -= take as u64;
-
-            if remaining == 0 {
-                self.cut();
-                // `cut` recomputes the stride from the (block-aligned) cursor.
-                remaining = self.until_boundary.expect("block size is known");
-            }
         }
 
-        self.until_boundary = Some(remaining);
+        match &self.checkpoint_plan {
+            CheckpointPlan::Single(_) => self.update_single(&mut data),
+            CheckpointPlan::Multi(_) => self.update_multi(&mut data),
+            CheckpointPlan::None => unreachable!("the no-plan fast path returned above"),
+        }
     }
 
     /// Close the segment currently open at the current cursor.
@@ -207,7 +409,7 @@ impl SegmentedCrc32 {
     /// have been fed since the previous checkpoint — zero-length segments are
     /// never emitted.
     pub fn checkpoint(&mut self) {
-        if self.cursor > self.open_offset {
+        if !self.collapsed && self.total_len > self.closed_len {
             self.cut();
         }
     }
@@ -215,7 +417,7 @@ impl SegmentedCrc32 {
     /// Close the open segment and return every segment in file order.
     pub fn finish(mut self) -> Vec<Segment> {
         self.checkpoint();
-        self.segments
+        self.finish_segments()
     }
 
     /// Close the open segment and return both the CRC32 over everything fed
@@ -224,16 +426,61 @@ impl SegmentedCrc32 {
     /// This is the decoder-facing finish: the CRC is the value an unsegmented
     /// pass would have produced, so checkpointing cannot move an article's
     /// verdict, and the segments are the block-aligned evidence.
-    pub fn finish_article(mut self) -> (u32, Vec<Segment>) {
+    pub fn finish_article(self) -> (u32, Vec<Segment>) {
+        let (crc, segments, _) = self.finish_article_with_reason();
+        (crc, segments)
+    }
+
+    /// Like [`Self::finish_article`], retaining the defensive-collapse
+    /// classification for once-per-article observability.
+    pub fn finish_article_with_reason(
+        self,
+    ) -> (u32, Vec<Segment>, Option<CheckpointCollapseReason>) {
+        let (crc, segments, _, reason) = self.finish_article_with_reason_and_plan();
+        (crc, segments, reason)
+    }
+
+    /// Like [`Self::finish_article_with_reason`], returning the immutable
+    /// plan by move for the transport result.
+    pub fn finish_article_with_reason_and_plan(
+        mut self,
+    ) -> (
+        u32,
+        Vec<Segment>,
+        CheckpointPlan,
+        Option<CheckpointCollapseReason>,
+    ) {
         self.checkpoint();
         // Every closed segment has been folded into `closed_crc`, and
         // `checkpoint` just closed the last open one, so this is the whole-pass
         // CRC without re-folding the list.
-        (self.closed_crc, self.segments)
+        let crc = self.current_crc();
+        let segments = self.finish_segments();
+        (crc, segments, self.checkpoint_plan, self.collapse_reason)
     }
 
     fn cut(&mut self) {
-        let len = self.cursor - self.open_offset;
+        if let Some(reason) = self.budget_collapse_reason() {
+            self.collapse(reason);
+            return;
+        }
+        if self.segments.len() == self.segments.capacity() {
+            let target = self
+                .segments
+                .capacity()
+                .saturating_mul(2)
+                .clamp(4, MAX_CHECKPOINT_SEGMENTS);
+            if self
+                .segments
+                .try_reserve_exact(target - self.segments.len())
+                .is_err()
+                || self.segments.capacity() > MAX_CHECKPOINT_SEGMENTS
+            {
+                self.collapse(CheckpointCollapseReason::SegmentStorage);
+                return;
+            }
+        }
+        let len = self.total_len - self.closed_len;
         let crc32 = self.crc.checkpoint();
         self.segments.push(Segment {
             file_offset: self.open_offset,
@@ -241,10 +488,143 @@ impl SegmentedCrc32 {
             crc32,
         });
         self.closed_crc = crc32_combine(self.closed_crc, crc32, len);
+        self.closed_len = self.total_len;
         self.open_offset = self.cursor;
-        self.until_boundary = self
-            .block_size
-            .map(|size| bytes_to_next_boundary(self.cursor, size));
+        if let CheckpointPlan::Single(size) = self.checkpoint_plan {
+            self.until_boundary = Some(bytes_to_next_boundary(self.cursor, size));
+        }
+    }
+
+    fn update_single(&mut self, data: &mut &[u8]) {
+        let mut remaining = self
+            .until_boundary
+            .expect("single checkpoint plans always have a boundary");
+        while !data.is_empty() {
+            let take = usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(data.len());
+            self.consume(&data[..take]);
+            *data = &data[take..];
+            if self.collapsed {
+                self.consume(data);
+                return;
+            }
+            remaining -= take as u64;
+            if remaining == 0 {
+                self.cut();
+                if self.collapsed {
+                    self.consume(data);
+                    return;
+                }
+                remaining = self
+                    .until_boundary
+                    .expect("single checkpoint plans always have a boundary");
+            }
+        }
+        self.until_boundary = Some(remaining);
+    }
+
+    fn update_multi(&mut self, data: &mut &[u8]) {
+        while !data.is_empty() {
+            let Some(next_boundary) = self.next_boundaries[..self.next_boundary_count]
+                .iter()
+                .copied()
+                .min()
+            else {
+                self.collapse(CheckpointCollapseReason::MissingBoundary);
+                self.consume(data);
+                return;
+            };
+            let remaining = next_boundary.saturating_sub(self.cursor);
+            if remaining == 0 {
+                self.collapse(CheckpointCollapseReason::NonAdvancingBoundary);
+                self.consume(data);
+                return;
+            }
+            let take = usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(data.len());
+            self.consume(&data[..take]);
+            *data = &data[take..];
+            if self.collapsed {
+                self.consume(data);
+                return;
+            }
+            if self.cursor == next_boundary {
+                self.cut();
+                if self.collapsed || !self.advance_multi_boundaries(next_boundary) {
+                    self.collapse(CheckpointCollapseReason::BoundaryOverflow);
+                    self.consume(data);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn consume(&mut self, data: &[u8]) {
+        self.crc.update(data);
+        let len = data.len() as u64;
+        self.total_len = self.total_len.saturating_add(len);
+        match self.cursor.checked_add(len) {
+            Some(cursor) => self.cursor = cursor,
+            None => {
+                self.cursor = u64::MAX;
+                self.collapse(CheckpointCollapseReason::OffsetOverflow);
+            }
+        }
+    }
+
+    fn advance_multi_boundaries(&mut self, emitted_cut: u64) -> bool {
+        let CheckpointPlan::Multi(sizes) = &self.checkpoint_plan else {
+            return false;
+        };
+        for (boundary, &size) in self.next_boundaries[..self.next_boundary_count]
+            .iter_mut()
+            .zip(sizes.iter())
+        {
+            if *boundary == emitted_cut {
+                let Some(next) = boundary.checked_add(size.get()) else {
+                    return false;
+                };
+                *boundary = next;
+            }
+        }
+        true
+    }
+
+    fn budget_collapse_reason(&self) -> Option<CheckpointCollapseReason> {
+        let segment_count = self.segments.len().saturating_add(1);
+        if segment_count > MAX_CHECKPOINT_SEGMENTS {
+            Some(CheckpointCollapseReason::SegmentCount)
+        } else if segment_count.saturating_mul(self.checkpoint_plan.grid_count())
+            > MAX_CHECKPOINT_OFFER_WORK
+        {
+            Some(CheckpointCollapseReason::OfferWork)
+        } else {
+            None
+        }
+    }
+
+    fn collapse(&mut self, reason: CheckpointCollapseReason) {
+        self.collapsed = true;
+        self.collapse_reason.get_or_insert(reason);
+        self.until_boundary = None;
+        self.next_boundary_count = 0;
+        self.segments = Vec::new();
+    }
+
+    fn finish_segments(&mut self) -> Vec<Segment> {
+        if self.collapsed {
+            return (self.total_len > 0)
+                .then_some(Segment {
+                    file_offset: self.base_offset,
+                    len: self.total_len,
+                    crc32: self.current_crc(),
+                })
+                .into_iter()
+                .collect();
+        }
+        std::mem::take(&mut self.segments)
     }
 }
 
@@ -253,7 +633,7 @@ impl Default for SegmentedCrc32 {
     /// block grid: one segment based at offset 0, i.e. exactly an unsegmented
     /// [`Crc32`] plus a byte counter.
     fn default() -> Self {
-        Self::new(0, None)
+        Self::new(0, CheckpointPlan::None)
     }
 }
 
@@ -262,6 +642,10 @@ impl Default for SegmentedCrc32 {
 fn bytes_to_next_boundary(offset: u64, block_size: NonZeroU64) -> u64 {
     let size = block_size.get();
     size - offset % size
+}
+
+fn next_boundary_after(offset: u64, block_size: NonZeroU64) -> Option<u64> {
+    offset.checked_add(bytes_to_next_boundary(offset, block_size))
 }
 
 /// Fold segments that tile a contiguous file range into the single segment
@@ -320,6 +704,10 @@ mod tests {
         crc_fast::crc32_iso_hdlc(data)
     }
 
+    fn single_plan(block_size: Option<NonZeroU64>) -> CheckpointPlan {
+        block_size.map_or(CheckpointPlan::None, CheckpointPlan::Single)
+    }
+
     /// Run one article's bytes through the checkpointing pass with a chunking
     /// schedule, returning the emitted segments.
     fn run_pass(
@@ -328,7 +716,7 @@ mod tests {
         block_size: Option<NonZeroU64>,
         chunks: &[usize],
     ) -> Vec<Segment> {
-        let mut pass = SegmentedCrc32::new(file_offset, block_size);
+        let mut pass = SegmentedCrc32::new(file_offset, single_plan(block_size));
         let mut cursor = 0usize;
         let mut idx = 0usize;
         while cursor < data.len() {
@@ -345,15 +733,69 @@ mod tests {
         pass.finish()
     }
 
+    fn run_plan(
+        data: &[u8],
+        file_offset: u64,
+        checkpoint_plan: CheckpointPlan,
+        chunks: &[usize],
+    ) -> Vec<Segment> {
+        let mut pass = SegmentedCrc32::new(file_offset, checkpoint_plan);
+        let mut cursor = 0usize;
+        let mut chunk_index = 0usize;
+        while cursor < data.len() {
+            let want = chunks
+                .get(chunk_index % chunks.len().max(1))
+                .copied()
+                .unwrap_or(data.len())
+                .max(1);
+            let end = (cursor + want).min(data.len());
+            pass.update(&data[cursor..end]);
+            cursor = end;
+            chunk_index += 1;
+        }
+        pass.finish()
+    }
+
+    fn assert_full_blocks_match_direct(
+        data: &[u8],
+        file_offset: u64,
+        segments: &[Segment],
+        block_size: NonZeroU64,
+    ) {
+        let article_end = file_offset + data.len() as u64;
+        let size = block_size.get();
+        let mut block_start = file_offset.div_ceil(size) * size;
+        while block_start
+            .checked_add(size)
+            .is_some_and(|end| end <= article_end)
+        {
+            let block_end = block_start + size;
+            let block_segments: Vec<_> = segments
+                .iter()
+                .copied()
+                .filter(|segment| {
+                    segment.file_offset >= block_start && segment.end_offset() <= block_end
+                })
+                .collect();
+            let combined = combine_contiguous(&block_segments).expect("refinement tiles block");
+            assert_eq!(combined.file_offset, block_start);
+            assert_eq!(combined.len, size);
+            let start = usize::try_from(block_start - file_offset).expect("fixture-sized");
+            let end = start + usize::try_from(size).expect("fixture-sized");
+            assert_eq!(combined.crc32, direct(&data[start..end]));
+            block_start += size;
+        }
+    }
+
     #[test]
     fn empty_pass_emits_no_segments() {
-        let pass = SegmentedCrc32::new(0, NonZeroU64::new(1024));
+        let pass = SegmentedCrc32::new(0, single_plan(NonZeroU64::new(1024)));
         assert_eq!(pass.finish(), Vec::new());
     }
 
     #[test]
     fn empty_pass_reports_the_empty_crc() {
-        let pass = SegmentedCrc32::new(4096, NonZeroU64::new(1024));
+        let pass = SegmentedCrc32::new(4096, single_plan(NonZeroU64::new(1024)));
         assert!(pass.is_empty());
         assert_eq!(pass.current_crc(), direct(&[]));
         assert_eq!(pass.finish_article(), (direct(&[]), Vec::new()));
@@ -371,7 +813,7 @@ mod tests {
             let block_size = NonZeroU64::new(block_size).expect("non-zero");
             for offset in [0u64, 1, 255, 1000, 4096] {
                 for schedule in [vec![1usize], vec![255, 1, 256], vec![4096, 7], vec![20_000]] {
-                    let mut pass = SegmentedCrc32::new(offset, Some(block_size));
+                    let mut pass = SegmentedCrc32::new(offset, CheckpointPlan::Single(block_size));
                     let mut fed = 0usize;
                     let mut idx = 0usize;
                     while fed < data.len() {
@@ -388,7 +830,7 @@ mod tests {
                         assert_eq!(pass.cursor(), offset + fed as u64);
                     }
                     assert_eq!(pass.base_offset(), offset);
-                    assert_eq!(pass.block_size(), Some(block_size));
+                    assert_eq!(pass.checkpoint_plan(), &CheckpointPlan::Single(block_size));
 
                     let (article_crc, segments) = pass.finish_article();
                     assert_eq!(article_crc, direct(&data));
@@ -662,7 +1104,7 @@ mod tests {
                     "block {block_size} offset {offset}"
                 );
                 for split in 0..=data.len() {
-                    let mut pass = SegmentedCrc32::new(offset, Some(block_size));
+                    let mut pass = SegmentedCrc32::new(offset, CheckpointPlan::Single(block_size));
                     pass.update(&data[..split]);
                     pass.update(&data[split..]);
                     assert_eq!(
@@ -712,6 +1154,187 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn checkpoint_plan_normalizes_and_bounds_distinct_grids() {
+        let single = CheckpointPlan::from_sizes([
+            NonZeroU64::new(96).expect("non-zero"),
+            NonZeroU64::new(96).expect("non-zero"),
+        ]);
+        assert_eq!(single.degradation, None);
+        assert_eq!(
+            single.plan,
+            CheckpointPlan::Single(NonZeroU64::new(96).unwrap())
+        );
+
+        let multi = CheckpointPlan::from_sizes([
+            NonZeroU64::new(96).expect("non-zero"),
+            NonZeroU64::new(64).expect("non-zero"),
+            NonZeroU64::new(96).expect("non-zero"),
+        ]);
+        assert_eq!(
+            multi.plan.sizes(),
+            &[NonZeroU64::new(64).unwrap(), NonZeroU64::new(96).unwrap()]
+        );
+        assert!(matches!(multi.plan, CheckpointPlan::Multi(_)));
+
+        let oversized = CheckpointPlan::from_sizes(
+            (1..=u64::try_from(MAX_CHECKPOINT_GRIDS + 1).unwrap())
+                .map(|size| NonZeroU64::new(size).unwrap()),
+        );
+        assert_eq!(oversized.plan, CheckpointPlan::None);
+        assert_eq!(
+            oversized.degradation,
+            Some(CheckpointPlanDegradation::TooManyGrids)
+        );
+    }
+
+    #[test]
+    fn multi_plan_common_refinement_tiles_every_grid_across_chunking() {
+        let grids = [
+            NonZeroU64::new(64).unwrap(),
+            NonZeroU64::new(96).unwrap(),
+            NonZeroU64::new(160).unwrap(),
+        ];
+        let plan = CheckpointPlan::from_sizes(grids).plan;
+        let data = random_bytes(0xc0_1100, 8_192);
+        let file_offset = 37;
+        let reference = run_plan(&data, file_offset, plan.clone(), &[data.len()]);
+        for schedule in [&[1usize][..], &[7, 257, 3, 1024][..], &[4_096, 13][..]] {
+            let actual = run_plan(&data, file_offset, plan.clone(), schedule);
+            assert_eq!(actual, reference, "schedule {schedule:?}");
+        }
+        for grid in grids {
+            assert_full_blocks_match_direct(&data, file_offset, &reference, grid);
+        }
+    }
+
+    #[test]
+    fn single_plan_matches_fixed_stride_output() {
+        let data = random_bytes(0x51_061e, 10_003);
+        let block_size = NonZeroU64::new(257).unwrap();
+        let legacy = run_pass(&data, 19, Some(block_size), &[5, 997, 3, 1_024]);
+        let single = run_plan(
+            &data,
+            19,
+            CheckpointPlan::Single(block_size),
+            &[5, 997, 3, 1_024],
+        );
+        assert_eq!(single, legacy);
+    }
+
+    #[test]
+    fn checkpoint_budget_collapses_to_one_coarse_article_segment() {
+        let data = random_bytes(0x00b0_d6e7, MAX_CHECKPOINT_SEGMENTS + 1);
+        let segments = run_plan(
+            &data,
+            0,
+            CheckpointPlan::Single(NonZeroU64::new(1).unwrap()),
+            &[data.len()],
+        );
+        assert_eq!(
+            segments,
+            vec![Segment {
+                file_offset: 0,
+                len: data.len() as u64,
+                crc32: direct(&data),
+            }]
+        );
+
+        let work_plan = CheckpointPlan::from_sizes(
+            (1..=u64::try_from(MAX_CHECKPOINT_GRIDS).unwrap())
+                .map(|size| NonZeroU64::new(size).unwrap()),
+        )
+        .plan;
+        let work_data = random_bytes(
+            0x000f_fee0,
+            MAX_CHECKPOINT_OFFER_WORK / MAX_CHECKPOINT_GRIDS + 1,
+        );
+        let work_segments = run_plan(&work_data, 0, work_plan, &[work_data.len()]);
+        assert_eq!(work_segments.len(), 1);
+        assert_eq!(work_segments[0].len, work_data.len() as u64);
+        assert_eq!(work_segments[0].crc32, direct(&work_data));
+    }
+
+    #[test]
+    fn public_oversized_multi_plan_collapses_before_the_cut_loop() {
+        let plan = CheckpointPlan::Multi(Arc::from(
+            (1..=u64::try_from(MAX_CHECKPOINT_GRIDS + 1).unwrap())
+                .map(|size| NonZeroU64::new(size).unwrap())
+                .collect::<Vec<_>>(),
+        ));
+        let data = random_bytes(0x00c0_ffee, 4_096);
+        let mut pass = SegmentedCrc32::new(0, plan);
+
+        // Construction rejects the direct public variant before `update`, so
+        // the article cannot pay a per-byte multi-grid boundary scan.
+        assert_eq!(
+            pass.collapse_reason(),
+            Some(CheckpointCollapseReason::OfferWork)
+        );
+        assert_eq!(pass.checkpoint_plan(), &CheckpointPlan::None);
+        pass.update(&data);
+        assert!(pass.segments().is_empty());
+
+        let (crc, segments, returned_plan, reason) = pass.finish_article_with_reason_and_plan();
+        assert_eq!(crc, direct(&data));
+        assert_eq!(returned_plan, CheckpointPlan::None);
+        assert_eq!(reason, Some(CheckpointCollapseReason::OfferWork));
+        assert_eq!(
+            segments,
+            vec![Segment {
+                file_offset: 0,
+                len: data.len() as u64,
+                crc32: direct(&data),
+            }]
+        );
+    }
+
+    #[test]
+    fn checkpoint_collapse_reports_the_budget_that_forced_coarse_evidence() {
+        let data = random_bytes(0x0b5e_cafe, MAX_CHECKPOINT_SEGMENTS + 1);
+        let mut segment_limited =
+            SegmentedCrc32::new(0, CheckpointPlan::Single(NonZeroU64::new(1).unwrap()));
+        segment_limited.update(&data[..MAX_CHECKPOINT_SEGMENTS]);
+        assert!(
+            segment_limited.segments.capacity() * std::mem::size_of::<Segment>()
+                <= MAX_CHECKPOINT_SEGMENT_BYTES
+        );
+        assert_eq!(segment_limited.collapse_reason(), None);
+        segment_limited.update(&data[MAX_CHECKPOINT_SEGMENTS..]);
+        let (_, segments, reason) = segment_limited.finish_article_with_reason();
+        assert_eq!(reason, Some(CheckpointCollapseReason::SegmentCount));
+        assert_eq!(segments.len(), 1);
+
+        let work_plan = CheckpointPlan::from_sizes(
+            (1..=u64::try_from(MAX_CHECKPOINT_GRIDS).unwrap())
+                .map(|size| NonZeroU64::new(size).unwrap()),
+        )
+        .plan;
+        let work_data = random_bytes(
+            0x000f_fee1,
+            MAX_CHECKPOINT_OFFER_WORK / MAX_CHECKPOINT_GRIDS + 1,
+        );
+        let mut work_limited = SegmentedCrc32::new(0, work_plan);
+        work_limited.update(&work_data);
+        let (_, segments, reason) = work_limited.finish_article_with_reason();
+        assert_eq!(reason, Some(CheckpointCollapseReason::OfferWork));
+        assert_eq!(segments.len(), 1);
+    }
+
+    #[test]
+    fn address_overflow_degrades_without_panicking_or_wrapping() {
+        let segments = run_plan(
+            b"ab",
+            u64::MAX - 1,
+            CheckpointPlan::Single(NonZeroU64::new(1).unwrap()),
+            &[1],
+        );
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].file_offset, u64::MAX - 1);
+        assert_eq!(segments[0].len, 2);
+        assert_eq!(segments[0].crc32, direct(b"ab"));
     }
 
     /// The checkpoint primitive on the raw CRC state: a cut must restart from

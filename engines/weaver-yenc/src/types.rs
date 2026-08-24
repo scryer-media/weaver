@@ -154,6 +154,15 @@ pub struct DecodeResult {
     /// [`crate::DecodeState::set_segment_plan`]) reports one segment covering
     /// the whole article.
     pub segments: Vec<crate::segment::Segment>,
+    /// Immutable geometry snapshot used to produce `segments`. Consumers must
+    /// offer evidence only to these grids, never grids parsed after this
+    /// article began decoding.
+    pub checkpoint_plan: crate::segment::CheckpointPlan,
+    /// Defensive reason that fine-grained checkpoint evidence was safely
+    /// reduced to one coarse article segment. This never changes the decoded
+    /// bytes or article CRC; it lets the caller account for the read-back
+    /// fallback once, after the article has finished decoding.
+    pub checkpoint_collapse_reason: Option<crate::segment::CheckpointCollapseReason>,
 }
 
 #[cfg(test)]

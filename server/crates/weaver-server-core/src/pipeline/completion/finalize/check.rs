@@ -351,6 +351,7 @@ fn par2_damage_ignorable(filename: &str, ignore_extensions: &[String]) -> bool {
 struct CleanPar2Verification {
     verification: par2_rs::VerificationResult,
     placement_plan: par2_rs::PlacementPlan,
+    in_stream_grid_slice_size: Option<u64>,
     reconcile_context: &'static str,
     retry_message: &'static str,
 }
@@ -1488,7 +1489,7 @@ impl Pipeline {
                 })
                 .map(|description| description.file_id)
                 .collect::<Vec<_>>();
-            let bound_file_id = (bound_candidates.len() == 1).then_some(bound_candidates[0]);
+            let bound_file_id = (bound_candidates.len() == 1).then(|| bound_candidates[0]);
             candidates.push(Par2SessionEvidenceCandidate {
                 file_id,
                 path: state.working_dir.join(&current_filename),
@@ -1823,9 +1824,9 @@ impl Pipeline {
         }
 
         if renamed > 0 {
-            // Renames move the bytes the grid bound to a name, so the job's
-            // block state is retired rather than re-resolved.
-            self.block_crcs.forget_job(job_id);
+            // Identity changed, not the bytes owned by this NzbFileId. The
+            // binding resolver revalidates names live; raw grid evidence stays
+            // available for every recovery set.
             info!(job_id = job_id.0, renamed, "PAR2 deobfuscation complete");
         }
 
@@ -1866,9 +1867,21 @@ impl Pipeline {
         }
 
         if repair {
-            // A repair rewrites bytes the grid never saw, so its block state is
-            // retired rather than trusted afterwards.
-            self.block_crcs.forget_job(job_id);
+            // Retire only files the repairing set can write. Other parsed
+            // sets may still have byte-exact evidence for their own files.
+            let files: Vec<_> = self
+                .jobs
+                .get(&job_id)
+                .map(|state| state.assembly.files().map(|file| file.file_id()).collect())
+                .unwrap_or_default();
+            for file_id in files {
+                if self
+                    .resolve_par2_file_binding(file_id)
+                    .is_some_and(|binding| binding.recovery_set_id == set_id)
+                {
+                    self.block_crcs.forget_file(file_id);
+                }
+            }
         }
 
         let memory_limit = configured_par2_repair_memory_limit_bytes();
@@ -2492,32 +2505,42 @@ impl Pipeline {
             .unwrap_or_default()
     }
 
-    /// An index that is incomplete while work can still arrive keeps the
-    /// aggregate open: parsing it may add a recovery set the job has not yet
-    /// had a chance to serve.  Once no such index can land, absence is final.
-    fn par2_metadata_discovery_closed(&self, job_id: JobId) -> bool {
-        let Some(state) = self.jobs.get(&job_id) else {
+    /// Discovery closes only after every explicit index and every indexless
+    /// candidate has reached a terminal probe state, and every sighted SetID
+    /// has either become servable or exhausted all of its observed carriers.
+    pub(in crate::pipeline) fn par2_metadata_discovery_closed(&self, job_id: JobId) -> bool {
+        let candidates = self.par2_metadata_candidate_indices(job_id);
+        if candidates.is_empty() {
             return true;
+        }
+        let Some(runtime) = self.par2_runtime(job_id) else {
+            return false;
         };
-        let work_pending = self.job_has_pending_download_pipeline_work(job_id);
-        !state
-            .spec
-            .files
-            .iter()
-            .enumerate()
-            .any(|(file_index, file)| {
-                matches!(
-                    file.role,
-                    weaver_model::files::FileRole::Par2 { is_index: true, .. }
-                ) && state
-                    .assembly
-                    .file(NzbFileId {
-                        job_id,
-                        file_index: file_index as u32,
-                    })
-                    .is_some_and(|file| !file.is_complete())
-                    && work_pending
+        // `try_load_par2_metadata` reaches `Parsed` before the decode worker
+        // drops its bookkeeping. That trailing work cannot change the parsed
+        // packet set, and waiting for it here leaves an already-settled gate
+        // with no completion re-arm to release direct outputs.
+        if candidates.iter().any(|(file_index, _, _)| {
+            let discovery = self.par2_discovery_state_for_candidate(job_id, *file_index);
+            !discovery.candidate_probe_is_terminal() || discovery.work_is_queued()
+        }) {
+            return false;
+        }
+
+        runtime.ordered_set_ids().into_iter().all(|set_id| {
+            if runtime
+                .set_runtime(set_id)
+                .is_some_and(|set_runtime| set_runtime.set.is_some())
+            {
+                return true;
+            }
+            !candidates.iter().any(|(file_index, _, _)| {
+                runtime.files.get(file_index).is_some_and(|file| {
+                    file.discovery.observed_set_ids().contains(&set_id)
+                        && !file.metadata_targets_attempted.contains(&set_id)
+                })
             })
+        })
     }
 
     /// Whether every servable set has reached a final answer and no later
@@ -2768,22 +2791,42 @@ impl Pipeline {
         }
     }
 
-    fn aggregate_par2_failure_message(&self, job_id: JobId) -> Option<String> {
-        if !self.par2_gate_settlement_complete(job_id) {
+    pub(in crate::pipeline) fn aggregate_par2_failure_message(
+        &self,
+        job_id: JobId,
+    ) -> Option<String> {
+        if !self.par2_metadata_discovery_closed(job_id) {
             return None;
         }
-        let failures = self
-            .par2_runtime(job_id)?
-            .ordered_set_ids()
+        let runtime = self.par2_runtime(job_id)?;
+        let set_ids = runtime.ordered_set_ids();
+        if set_ids.is_empty() {
+            return (!self.par2_metadata_candidate_indices(job_id).is_empty()).then(|| {
+                "PAR2 metadata discovery exhausted without finding a recovery set".to_string()
+            });
+        }
+        if set_ids.iter().any(|set_id| {
+            runtime
+                .set_runtime(*set_id)
+                .is_some_and(|set_runtime| set_runtime.set.is_some() && !set_runtime.settled)
+        }) {
+            return None;
+        }
+        let failures = set_ids
             .into_iter()
             .filter_map(|set_id| {
-                let set_runtime = self.par2_runtime(job_id)?.set_runtime(set_id)?;
-                let failure = set_runtime.failure.as_ref()?;
+                let set_runtime = runtime.set_runtime(set_id)?;
                 let index = if set_runtime.summary.index_filename.is_empty() {
                     set_id.to_string()
                 } else {
                     set_runtime.summary.index_filename.clone()
                 };
+                if set_runtime.set.is_none() {
+                    return Some(format!(
+                        "{index}: metadata discovery exhausted before the recovery set could be parsed"
+                    ));
+                }
+                let failure = set_runtime.failure.as_ref()?;
                 Some(format!(
                     "{index} ({}): {failure}",
                     set_runtime.summary.described_filenames.join(", ")
@@ -2877,7 +2920,7 @@ impl Pipeline {
         job_id: JobId,
         par2_set: Arc<par2_rs::Par2FileSet>,
         _working_dir: std::path::PathBuf,
-    ) -> Result<Option<(par2_rs::VerificationResult, par2_rs::PlacementPlan)>, String> {
+    ) -> Result<Option<(par2_rs::VerificationResult, par2_rs::PlacementPlan, bool)>, String> {
         // A live direct set's source volumes are not files. This pass answers in
         // *placement* terms — it hands back a plan whose swaps and renames move
         // real paths, and a clean verdict from it skips the direct-aware pass
@@ -3027,6 +3070,8 @@ impl Pipeline {
                 .push((*file_id, sanitize_download_filename(&desc.filename)));
         }
 
+        let in_stream_grid_only =
+            !grid_matches_by_name.is_empty() && current_hashes_by_name.is_empty();
         let mut matches = grid_matches_by_name;
         let mut match_counts = HashMap::<par2_rs::FileId, u32>::new();
         for (file_id, _) in matches.values() {
@@ -3146,6 +3191,7 @@ impl Pipeline {
                 unresolved,
                 conflicts: conflict_ids.into_iter().collect(),
             },
+            in_stream_grid_only,
         )))
     }
 
@@ -3162,7 +3208,7 @@ impl Pipeline {
         job_id: JobId,
         par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
-    ) -> Result<Option<(par2_rs::VerificationResult, par2_rs::PlacementPlan)>, String> {
+    ) -> Result<Option<(par2_rs::VerificationResult, par2_rs::PlacementPlan, bool)>, String> {
         self.quick_verify_par2_with_placement(job_id, par2_set, working_dir)
             .await
     }
@@ -3185,6 +3231,7 @@ impl Pipeline {
         let CleanPar2Verification {
             verification,
             placement_plan,
+            in_stream_grid_slice_size,
             reconcile_context,
             retry_message,
         } = outcome;
@@ -3227,7 +3274,17 @@ impl Pipeline {
             return;
         }
 
-        let _ = self.mark_par2_set_verified(job_id, set_id).await;
+        let settled = self.mark_par2_set_verified(job_id, set_id).await;
+        if let (SetGateOutcome::Settled, Some(slice_size)) = (settled, in_stream_grid_slice_size) {
+            info!(
+                job_id = job_id.0,
+                recovery_set_id = %set_id,
+                slice_size,
+                verdict = "clean",
+                verification_read_bytes = 0u64,
+                "PAR2 set settled clean from in-stream grid evidence"
+            );
+        }
         self.continue_after_aggregate_clean_par2_settlement(
             job_id,
             has_crc_failures,
@@ -5369,6 +5426,22 @@ impl Pipeline {
         self.reapply_promoted_recovery_queue(job_id);
 
         let par2_bypassed = self.par2_bypassed.contains(&job_id);
+        if !par2_bypassed
+            && self.job_spec_has_par2_file(job_id)
+            && !self.par2_metadata_discovery_closed(job_id)
+            && self.promote_par2_metadata(job_id)
+        {
+            info!(
+                job_id = job_id.0,
+                "waiting for bounded PAR2 metadata discovery before finalization"
+            );
+            self.transition_postprocessing_status(
+                job_id,
+                JobStatus::Downloading,
+                Some("downloading"),
+            );
+            return;
+        }
         if !par2_bypassed && !self.served_par2_set_needs_reconciliation(job_id) {
             self.activate_next_par2_gate_set(job_id);
             let has_settled_set = self.par2_runtime(job_id).is_some_and(|runtime| {
@@ -5909,7 +5982,7 @@ impl Pipeline {
                     )
                     .await
                 {
-                    Ok(Some((verification, placement_plan))) => {
+                    Ok(Some((verification, placement_plan, in_stream_grid_only))) => {
                         info!(
                             job_id = job_id.0,
                             "quick PAR2 verification passed for clean exhausted job"
@@ -5921,6 +5994,8 @@ impl Pipeline {
                             CleanPar2Verification {
                                 verification,
                                 placement_plan,
+                                in_stream_grid_slice_size: in_stream_grid_only
+                                    .then_some(par2_set.slice_size),
                                 reconcile_context: "clean PAR2 quick verification",
                                 retry_message:
                                     "cleared failed extractions after quick verify — retrying",

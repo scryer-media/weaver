@@ -504,8 +504,7 @@ impl Pipeline {
     /// combined CRC32 equality where this path demands two independent
     /// alignments agree.
     fn completed_file_md5_substitutable(&self, file_id: NzbFileId) -> bool {
-        self.par2_set(file_id.job_id)
-            .is_some_and(|set| !set.slice_checksums.is_empty())
+        self.par2_md5_substitution_is_cached(file_id)
     }
 
     fn should_stream_md5_for_file(&self, file_id: NzbFileId) -> bool {
@@ -903,9 +902,9 @@ impl Pipeline {
         // CRC recovery rewrites this file's bytes through `write_segment_to_disk`
         // directly — its early returns never reach the dual-CRC seam — so
         // blocks the grid already claimed would sit `Intact` over changed disk
-        // content. The job's block state is retired here for the same reason
-        // the yEnc hash state is invalidated above.
-        self.block_crcs.forget_job(file_id.job_id);
+        // content. Only this file's byte-owned state is retired; other PAR2
+        // sets in the job can still prove their untouched files.
+        self.block_crcs.forget_file(file_id);
 
         self.file_crc_recoveries.insert(
             file_id,
@@ -1300,6 +1299,7 @@ impl Pipeline {
                 expected_file_crc: None,
                 data,
                 yenc_name: String::new(),
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
                 segments: Vec::new(),
             };
             self.handle_decode_success_inner(
@@ -1326,6 +1326,7 @@ impl Pipeline {
             expected_file_crc,
             data,
             yenc_name,
+            checkpoint_plan,
             segments,
         } = result;
 
@@ -1470,8 +1471,8 @@ impl Pipeline {
             // One bounded memcpy for the obfuscation binder, and for the
             // overwhelming majority of articles not even that — the first thing
             // it does is compare `file_offset` against 16 KiB and return.
-            self.note_par2_binding_prefix(file_id, file_offset, &data);
             self.note_par2_binding_declared_size(file_id, yenc_layout.file_size);
+            self.note_par2_binding_prefix(file_id, file_offset, &data);
 
             // The per-segment bounds above cannot see across segments, so they
             // would still let an article claim a range an earlier ordinal
@@ -1614,6 +1615,7 @@ impl Pipeline {
                 part_crc,
                 part_crc_verified,
                 yenc_name,
+                checkpoint_plan,
                 segments,
             };
 
@@ -1782,29 +1784,35 @@ impl Pipeline {
         if file_offset >= crate::pipeline::PAR2_HASH_16K_BYTES as u64 {
             return;
         }
-        let prefix = self.file_prefix_16k.entry(file_id).or_default();
-        let captured = prefix.len() as u64;
-        // A gap the buffer cannot close, or a range already wholly captured.
-        if file_offset > captured {
-            return;
-        }
-        let mut skip = (captured - file_offset) as usize;
-        if skip >= data.len_bytes() {
-            return;
-        }
-        data.for_each_slice(|slice| {
-            if skip >= slice.len() {
-                skip -= slice.len();
+        let prefix_complete = {
+            let prefix = self.file_prefix_16k.entry(file_id).or_default();
+            let captured = prefix.len() as u64;
+            // A gap the buffer cannot close, or a range already wholly captured.
+            if file_offset > captured {
                 return;
             }
-            let slice = &slice[skip..];
-            skip = 0;
-            let room = crate::pipeline::PAR2_HASH_16K_BYTES.saturating_sub(prefix.len());
-            if room == 0 {
+            let mut skip = (captured - file_offset) as usize;
+            if skip >= data.len_bytes() {
                 return;
             }
-            prefix.extend_from_slice(&slice[..slice.len().min(room)]);
-        });
+            data.for_each_slice(|slice| {
+                if skip >= slice.len() {
+                    skip -= slice.len();
+                    return;
+                }
+                let slice = &slice[skip..];
+                skip = 0;
+                let room = crate::pipeline::PAR2_HASH_16K_BYTES.saturating_sub(prefix.len());
+                if room == 0 {
+                    return;
+                }
+                prefix.extend_from_slice(&slice[..slice.len().min(room)]);
+            });
+            prefix.len() == crate::pipeline::PAR2_HASH_16K_BYTES
+        };
+        if prefix_complete {
+            self.refresh_par2_md5_substitution_binding(file_id);
+        }
     }
 
     /// Retain the first usable yEnc total for content-binding corroboration.
@@ -2370,6 +2378,7 @@ impl Pipeline {
             part_crc,
             part_crc_verified,
             yenc_name,
+            checkpoint_plan,
             segments,
         } = segment;
         let job_id = segment_id.file_id.job_id;
@@ -2434,8 +2443,9 @@ impl Pipeline {
                 // the substitution the grid exists to avoid. These files are
                 // verified by reading them, like every unclaimed block.
                 if !encoding.is_uu() {
-                    self.note_block_crc_segments(
+                    self.note_block_crc_segments_for_plan(
                         file_id,
+                        &checkpoint_plan,
                         file_offset,
                         data.len_bytes() as u64,
                         part_crc,

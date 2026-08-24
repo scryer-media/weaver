@@ -3,7 +3,6 @@ use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::num::NonZeroU64;
 #[cfg(not(windows))]
 use std::os::fd::AsRawFd;
 #[cfg(not(windows))]
@@ -18,6 +17,7 @@ use bytes::BytesMut;
 use s2n_tls_sys as s2n;
 use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
+use weaver_yenc::CheckpointPlan;
 
 use crate::client::{
     BodyLaneMode, BodyLaneTraceMeta, DecodedBody, DecodedBodyCpu, DecodedBodyError, DecodedBodyIo,
@@ -114,7 +114,7 @@ struct RawS2nConnection {
 
 pub struct BlockingBodyLane {
     conn: BlockingNntpConnection,
-    par2_block_size: Option<NonZeroU64>,
+    checkpoint_plan: CheckpointPlan,
     server_id: ServerId,
     stable_server_id: StableServerId,
     remote_ip: IpAddr,
@@ -139,18 +139,16 @@ pub struct BlockingNntpConnection {
     poisoned: bool,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
-    /// PAR2 block size the next decoded article's CRC pass checkpoints at.
-    /// Set per fetch by the lane; see [`NntpConnection::set_par2_block_size`].
-    par2_block_size: Option<NonZeroU64>,
+    /// Immutable geometry the next decoded article's CRC pass checkpoints at.
+    /// Set per fetch by the lane; never inherited from a prior job.
+    checkpoint_plan: CheckpointPlan,
 }
 
 impl BlockingBodyLane {
-    /// Checkpoint the CRC pass of every article decoded on this lane at
-    /// multiples of the recovery set's PAR2 block size. Re-applied to the
-    /// connection on every fetch, so an owned lane reused by another job never
-    /// carries the previous job's grid.
-    pub fn set_par2_block_size(&mut self, block_size: Option<NonZeroU64>) {
-        self.par2_block_size = block_size;
+    /// Apply the batch's immutable geometry before every decoded response, so
+    /// a lane reused by another job cannot carry previous checkpoint state.
+    pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
+        self.checkpoint_plan = checkpoint_plan;
     }
 
     // These are independent lane identity, transfer policy, address-selection,
@@ -184,7 +182,7 @@ impl BlockingBodyLane {
                     let remote_ip = conn.remote_ip();
                     return Ok(Self {
                         conn,
-                        par2_block_size: None,
+                        checkpoint_plan: CheckpointPlan::None,
                         server_id,
                         stable_server_id,
                         remote_ip,
@@ -204,7 +202,7 @@ impl BlockingBodyLane {
             let remote_ip = conn.remote_ip();
             Ok(Self {
                 conn,
-                par2_block_size: None,
+                checkpoint_plan: CheckpointPlan::None,
                 server_id,
                 stable_server_id,
                 remote_ip,
@@ -442,7 +440,7 @@ impl BlockingBodyLane {
         estimated_body_bytes: u64,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
         let mut budget = ActiveTransferBudget::new(self.soft_timeout);
-        self.conn.set_par2_block_size(self.par2_block_size);
+        self.conn.set_checkpoint_plan(self.checkpoint_plan.clone());
         match self.conn.stream_yenc_article_with_active_budget(
             message_id,
             estimated_body_bytes,
@@ -458,7 +456,7 @@ impl BlockingBodyLane {
 
     fn read_next_decoded_body(&mut self) -> std::result::Result<DecodedBody, DecodedBodyError> {
         let mut budget = ActiveTransferBudget::new(self.soft_timeout);
-        self.conn.set_par2_block_size(self.par2_block_size);
+        self.conn.set_checkpoint_plan(self.checkpoint_plan.clone());
         match self
             .conn
             .stream_next_yenc_article_with_active_budget(&mut budget)
@@ -551,10 +549,9 @@ impl BlockingBodyLane {
 }
 
 impl BlockingNntpConnection {
-    /// Declare the PAR2 block size for articles decoded on this connection from
-    /// now on. `None` is one segment per article.
-    pub fn set_par2_block_size(&mut self, block_size: Option<NonZeroU64>) {
-        self.par2_block_size = block_size;
+    /// Declare immutable checkpoint geometry for subsequent decoded articles.
+    pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
+        self.checkpoint_plan = checkpoint_plan;
     }
 
     pub fn connect_with_ip_policy(
@@ -654,7 +651,7 @@ impl BlockingNntpConnection {
             poisoned: false,
             transfer_control: None,
             body_accounting: VecDeque::new(),
-            par2_block_size: None,
+            checkpoint_plan: CheckpointPlan::None,
         };
 
         let greeting = conn.read_response()?;
@@ -1162,7 +1159,7 @@ impl BlockingNntpConnection {
         };
         let profile_cpu = profile_cpu_timings_enabled();
         decoder.set_profile_cpu(profile_cpu);
-        decoder.set_par2_block_size(self.par2_block_size);
+        decoder.set_checkpoint_plan(self.checkpoint_plan.clone());
         let mut read_calls = 0u64;
         let mut read_bytes = 0u64;
         let mut transport_read = TransportReadStats::default();
@@ -2425,12 +2422,34 @@ mod tests {
     }
 
     fn tls_lane_reads_pipelined_body_responses(backend: NntpTlsBackend) {
+        let sequential_data = vec![0x11; 512];
+        let first_data = vec![0x22; 512];
+        let second_data = vec![0x33; 512];
+        let reset_data = vec![0x44; 512];
         let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
-            ("<one@test>", TestArticle::Body(b"first article".to_vec())),
-            ("<two@test>", TestArticle::Body(b"second article".to_vec())),
+            (
+                "<sequential@test>",
+                TestArticle::Body(sequential_data.clone()),
+            ),
+            ("<one@test>", TestArticle::Body(first_data.clone())),
+            ("<two@test>", TestArticle::Body(second_data.clone())),
+            ("<reset@test>", TestArticle::Body(reset_data.clone())),
         ]);
+        let checkpoint_plan = CheckpointPlan::from_sizes([
+            std::num::NonZeroU64::new(64).unwrap(),
+            std::num::NonZeroU64::new(96).unwrap(),
+        ])
+        .plan;
         let mut conn = connect_with_backend(&config, backend);
         conn.select_group("alt.test").unwrap();
+        conn.set_checkpoint_plan(checkpoint_plan.clone());
+
+        let sequential = conn.stream_yenc_article("<sequential@test>").unwrap();
+        let sequential_result = sequential.body.yenc().unwrap();
+        assert_eq!(sequential_result.checkpoint_plan, checkpoint_plan);
+        assert!(sequential_result.segments.len() > 1);
+        assert_eq!(sequential.into_data(), sequential_data);
+
         conn.write_body_request("<one@test>").unwrap();
         conn.write_body_request("<two@test>").unwrap();
         conn.flush_commands().unwrap();
@@ -2438,8 +2457,24 @@ mod tests {
         let first = conn.stream_next_yenc_article().unwrap();
         let second = conn.stream_next_yenc_article().unwrap();
 
-        assert_eq!(first.into_data(), b"first article");
-        assert_eq!(second.into_data(), b"second article");
+        let first_result = first.body.yenc().unwrap();
+        assert_eq!(first_result.checkpoint_plan, checkpoint_plan);
+        assert!(first_result.segments.len() > 1);
+        assert_eq!(first.into_data(), first_data);
+        let second_result = second.body.yenc().unwrap();
+        assert_eq!(second_result.checkpoint_plan, checkpoint_plan);
+        assert!(second_result.segments.len() > 1);
+        assert_eq!(second.into_data(), second_data);
+
+        conn.set_checkpoint_plan(CheckpointPlan::None);
+        conn.write_body_request("<reset@test>").unwrap();
+        conn.flush_commands().unwrap();
+        let reset = conn.stream_next_yenc_article().unwrap();
+        let reset_result = reset.body.yenc().unwrap();
+        assert_eq!(reset_result.checkpoint_plan, CheckpointPlan::None);
+        assert_eq!(reset_result.segments.len(), 1);
+        assert_eq!(reset.into_data(), reset_data);
+
         assert!(conn.stats().tls_recv_calls > 0);
         assert!(conn.stats().tls_send_calls > 0);
         conn.quit().unwrap();

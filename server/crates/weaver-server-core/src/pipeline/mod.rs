@@ -301,12 +301,10 @@ pub(super) struct DownloadBatchLease {
     /// server ordering and lane acquisition use. Results keep reporting the
     /// compatibility (failure-only) excludes; retention stays job-derived.
     pub(super) effective_exclude_servers: Vec<usize>,
-    /// The job's PAR2 block size at the moment the batch was leased, if its
-    /// recovery set has been parsed. Every article decoded on this batch's lane
-    /// checkpoints its CRC pass on that grid; `None` means one segment per
-    /// article, which is what a batch leased before the PAR2 files arrived gets
-    /// and is never worth delaying a download for.
-    pub(super) par2_block_size: Option<std::num::NonZeroU64>,
+    /// Immutable common-refinement geometry captured when this batch was
+    /// leased. Each response carries this same snapshot through durable commit
+    /// so grids admitted later cannot reinterpret old decoder output.
+    pub(super) checkpoint_plan: weaver_yenc::CheckpointPlan,
     pub(super) works: Vec<DownloadWork>,
 }
 
@@ -1282,6 +1280,58 @@ pub(super) struct FullSetExtractionOutcome {
     pub(super) selected_password: Option<String>,
 }
 
+/// Bounded metadata-discovery progress for one PAR2 candidate.
+///
+/// This is deliberately separate from `promoted`: probing an indexless
+/// volume queues only its leading article, while promotion means the whole
+/// volume is eligible to move out of the recovery queue.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) enum Par2DiscoveryState {
+    #[default]
+    Unseen,
+    PrefixProbeQueued,
+    PrefixProbed {
+        set_ids: Vec<par2_rs::RecoverySetId>,
+    },
+    ProbeInconclusive,
+    MetadataCarrierQueued {
+        target_set_id: Option<par2_rs::RecoverySetId>,
+        set_ids: Vec<par2_rs::RecoverySetId>,
+    },
+    Parsed {
+        set_ids: Vec<par2_rs::RecoverySetId>,
+    },
+    Exhausted {
+        set_ids: Vec<par2_rs::RecoverySetId>,
+    },
+}
+
+impl Par2DiscoveryState {
+    pub(super) fn observed_set_ids(&self) -> &[par2_rs::RecoverySetId] {
+        match self {
+            Self::PrefixProbed { set_ids }
+            | Self::MetadataCarrierQueued { set_ids, .. }
+            | Self::Parsed { set_ids }
+            | Self::Exhausted { set_ids } => set_ids,
+            _ => &[],
+        }
+    }
+
+    pub(super) fn work_is_queued(&self) -> bool {
+        matches!(
+            self,
+            Self::PrefixProbeQueued | Self::MetadataCarrierQueued { .. }
+        )
+    }
+
+    pub(super) fn candidate_probe_is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::PrefixProbed { .. } | Self::Parsed { .. } | Self::Exhausted { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Par2FileRuntime {
     pub(super) filename: String,
@@ -1302,6 +1352,10 @@ pub(super) struct Par2FileRuntime {
     /// leaves the arithmetic believing a repair is affordable while nothing is
     /// left to download, which is a job that waits forever.
     pub(super) validated_recovery_blocks: u32,
+    /// A completed parse or read-back reached a final answer for this file's
+    /// recovery capacity.  Once set, even zero is authoritative: a malformed
+    /// or metadata-only carrier must never fall back to its filename claim.
+    pub(super) recovery_capacity_accounted: bool,
     pub(super) promoted: bool,
     /// Recovery packets were read back off a volume that can no longer
     /// complete, and `validated_recovery_blocks` is how many of them validated.
@@ -1333,6 +1387,15 @@ pub(super) struct Par2FileRuntime {
     /// Whether packets have been read from this file. A packet-read file with
     /// no single set ID is deliberately not grouped by filename.
     pub(super) recovery_set_packets_read: bool,
+    /// Explicit progress through index/indexless metadata discovery.
+    pub(super) discovery: Par2DiscoveryState,
+    /// Set-specific full-file metadata attempts. This prevents a completed
+    /// carrier from being selected repeatedly when it contains valid packets
+    /// but not enough critical metadata to construct that set.
+    pub(super) metadata_targets_attempted: HashSet<par2_rs::RecoverySetId>,
+    /// Article ordinals already used for bounded prefix probing. Full-carrier
+    /// escalation skips them because their decoded bytes are already retained.
+    pub(super) discovery_probe_ordinals: HashSet<u32>,
 }
 
 /// What a job knows about one recovery set it has encountered.
@@ -1389,12 +1452,6 @@ pub(super) struct Par2SetRuntime {
     pub(super) needed_repair: bool,
     /// What this set describes and which volumes spoke for it.
     pub(super) summary: Par2SetSummary,
-    /// The on-disk primary PAR2 file used to reopen an evicted retained session.
-    pub(super) primary_path: Option<PathBuf>,
-    /// Recovery files already incorporated into the scheduler view and any
-    /// retained repair session. They are replayed only when a session is
-    /// evicted and reopened.
-    pub(super) merged_recovery_paths: HashSet<PathBuf>,
     /// Stateful assessment/repair engine. It intentionally owns no open file
     /// handles, and is invalidated before payload paths are rewritten.
     pub(super) session: Option<par2_rs::Par2RepairSession>,
@@ -1413,6 +1470,14 @@ pub(super) struct Par2SetRuntime {
     pub(super) post_verdict_reconcile_attempts: u32,
 }
 
+/// A positive authoritative binding whose PAR2 slice CRCs make streamed MD5
+/// unnecessary. It is rebuilt only after metadata or identity changes.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Par2Md5SubstitutionBinding {
+    pub(super) recovery_set_id: par2_rs::RecoverySetId,
+    pub(super) par2_file_id: par2_rs::FileId,
+}
+
 #[derive(Default)]
 pub(super) struct Par2RuntimeState {
     /// Every recovery set this job has met. Each parsed, described entry gets
@@ -1426,6 +1491,13 @@ pub(super) struct Par2RuntimeState {
     /// Completion-time checksums retained only long enough to seed a session
     /// opened after a payload file finished downloading.
     pub(super) completed_checksums: HashMap<NzbFileId, CompletedFileChecksum>,
+    /// Positive bindings only: an absent entry keeps streaming MD5 without
+    /// retrying a recovery-set scan for every decoded article.
+    pub(super) md5_substitution_bindings: HashMap<NzbFileId, Par2Md5SubstitutionBinding>,
+    /// Monotonic parsed-grid admission and its immutable lease snapshot.
+    /// Rebuilt only when parsed metadata changes, never while leasing work.
+    pub(super) admitted_checkpoint_sizes: BTreeSet<u64>,
+    pub(super) checkpoint_plan: Option<weaver_yenc::CheckpointPlan>,
     /// Whether the job has already named its indexless recovery sets. Cleared
     /// whenever a set is newly met so a changed picture is reported once.
     pub(super) unserved_sets_warned: bool,
@@ -1653,6 +1725,8 @@ pub(super) struct DecodeResult {
     pub(super) data: DecodedChunk,
     /// Original filename from the yEnc header (for swap detection observability).
     pub(super) yenc_name: String,
+    /// Geometry actually applied by the decoder for this response.
+    pub(super) checkpoint_plan: weaver_yenc::CheckpointPlan,
     /// The decode pass's CRC32 segments, cut at PAR2 block boundaries when the
     /// recovery set's block size was known to the decoder. [`Self::part_crc`] is
     /// their fold, so they add evidence without changing any verdict.
@@ -1927,6 +2001,10 @@ pub(super) struct BufferedDecodedSegment {
     /// Carried from the decoder so the durability seam can tell whether this
     /// segment is allowed to feed the dual-CRC grid.
     pub(super) encoding: SegmentEncoding,
+    /// Immutable geometry snapshot captured before this article was decoded.
+    /// Durable commit must never reinterpret its segments against grids that
+    /// were admitted only after the response was already in flight.
+    pub(super) checkpoint_plan: weaver_yenc::CheckpointPlan,
     pub(super) data: DecodedChunk,
     pub(super) part_crc: u32,
     pub(super) part_crc_verified: bool,
@@ -2411,6 +2489,8 @@ pub struct Pipeline {
     pub(super) uu_park_requeues: HashMap<SegmentId, u32>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
+    #[cfg(test)]
+    pub(super) par2_binding_resolver_calls: std::sync::atomic::AtomicU64,
     /// Direct-store routing state: admitted archive sets, their routers and
     /// their coverage barriers. Inert while the gate is off.
     pub(super) direct_store: direct_store::wiring::DirectStoreRuntime,

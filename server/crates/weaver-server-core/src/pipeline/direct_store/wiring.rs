@@ -1700,11 +1700,10 @@ impl Pipeline {
     ///
     /// # This is defence in depth, and it is worth having anyway
     ///
-    /// The grid is already empty on a post-repair pass without this: the repair
-    /// retires the whole job's grid state before it rewrites a byte
-    /// (`block_crcs.forget_job`, in the repair path above), and the session arm
-    /// is gated on the same evidence. A counterfactual run with both guards
-    /// removed still reads every volume back.
+    /// The repaired set's grid claims are already retired on a post-repair pass:
+    /// the repair drops its affected files before it rewrites a byte, and the
+    /// session arm is gated on that evidence. A counterfactual run with both
+    /// guards removed still reads every volume back.
     ///
     /// It stays because the emptiness is a *consequence* of a decision made
     /// several hundred lines away, for a different reason — retiring claims over
@@ -2207,10 +2206,12 @@ impl Pipeline {
         // by the job's file index, which is what makes one provider answer for
         // every set of a job; the set's plan translates back.
         let mut damaged = Vec::new();
+        let mut affected_files = Vec::new();
         for file_id in files {
             let Some(file_index) = overlay.file_index_of(file_id) else {
                 return Err(super::repair::DirectRepairFailure::DamageOutsideDirectSets);
             };
+            affected_files.push(NzbFileId { job_id, file_index });
             let Some(volume_index) = set.plan().volume_for_file(file_index) else {
                 return Err(super::repair::DirectRepairFailure::DamageOutsideDirectSets);
             };
@@ -2327,10 +2328,12 @@ impl Pipeline {
                 "checkpoint delete failed: {error}"
             )));
         }
-        // A repair rewrites bytes the dual-CRC grid already claimed as intact
-        // blocks, so its state for this job is retired rather than trusted —
-        // the same stance `run_par2_repairer` takes for a conventional repair.
-        self.block_crcs.forget_job(job_id);
+        // A repair rewrites only these direct volumes. Retire their byte-owned
+        // grid evidence before the first rewrite without discarding another
+        // set's untouched claims.
+        for file_id in affected_files {
+            self.block_crcs.forget_file(file_id);
+        }
         // Announced from here rather than from a status transition: the set
         // never enters `JobStatus::Repairing` — that status carries the repair
         // concurrency queue, and this repair holds no slot in it — so the event
@@ -2926,6 +2929,7 @@ impl Pipeline {
         // payload can be dropped the moment the spans are written while these
         // two facts about it travel on.
         let part_crc_verified = segment.part_crc_verified;
+        let checkpoint_plan = segment.checkpoint_plan;
         let segments = segment.segments;
         let bytes = contiguous_bytes(&segment.data);
         // The article the seam is holding: if the set demotes here it is
@@ -2981,6 +2985,7 @@ impl Pipeline {
             file_offset,
             part_crc,
             part_crc_verified,
+            &checkpoint_plan,
             &segments,
         )
         .await;
@@ -3496,6 +3501,7 @@ impl Pipeline {
         file_offset: u64,
         part_crc: u32,
         part_crc_verified: bool,
+        checkpoint_plan: &weaver_yenc::CheckpointPlan,
         segments: &[weaver_yenc::Segment],
     ) {
         let file_id = segment_id.file_id;
@@ -3555,8 +3561,9 @@ impl Pipeline {
         // invalidate the verdicts derived over it whether or not its bytes
         // agreed. Withholding the feed would leave a claim describing content
         // that may no longer be there.
-        self.note_block_crc_segments(
+        self.note_block_crc_segments_for_plan(
             file_id,
+            checkpoint_plan,
             file_offset,
             u64::from(decoded_size),
             part_crc,

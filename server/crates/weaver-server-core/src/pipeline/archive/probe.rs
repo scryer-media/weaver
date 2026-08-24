@@ -112,29 +112,26 @@ impl Pipeline {
         job_id: JobId,
         identity: ActiveFileIdentity,
     ) -> Result<(), String> {
-        // Only a change of *name* rebinds what live verification bound its
-        // evidence to. Recording an identity for the first time, or re-saving
-        // one whose filename is unchanged, moves no bytes — and with a
-        // retained session invalidating there would discard every
-        // slice verdict the job had accumulated. Compare against the name in
-        // effect now, which falls back to the NZB's own, so a first record
-        // that renames still invalidates.
-        let previous_filename = self.current_filename_for_file_id(
+        let file_id = NzbFileId {
             job_id,
-            NzbFileId {
-                job_id,
-                file_index: identity.file_index,
-            },
-        );
+            file_index: identity.file_index,
+        };
+        let previous = self.effective_file_identity(job_id, file_id);
+        let filename_changed = previous
+            .as_ref()
+            .is_none_or(|previous| previous.current_filename != identity.current_filename);
         self.db
             .save_file_identity(job_id, &identity)
             .map_err(|error| format!("failed to save file identity: {error}"))?;
-        if previous_filename.as_deref() != Some(identity.current_filename.as_str()) {
+        // Only a current-name change moves the bytes a retained PAR2 session
+        // refers to. Binding reads source and canonical aliases live.
+        if filename_changed {
             self.invalidate_par2_session_for_identity_rebind(job_id);
         }
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.file_identities.insert(identity.file_index, identity);
         }
+        self.refresh_par2_md5_substitution_binding(file_id);
         Ok(())
     }
 
