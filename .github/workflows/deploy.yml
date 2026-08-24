@@ -1308,6 +1308,8 @@ jobs:
             if (-not $ready) {
               throw "Timed out waiting for Weaver API readiness. Last error: $lastError"
             }
+
+            & .\.github\scripts\assert-graphql-version.ps1 -BaseUrl $baseUrl
           } catch {
             Write-Error $_
             Show-SmokeLog
@@ -1596,6 +1598,8 @@ jobs:
             if (-not $ready) {
               throw "Timed out waiting for Weaver API readiness. Last error: $lastError"
             }
+
+            & .\.github\scripts\assert-graphql-version.ps1 -BaseUrl $baseUrl
           } catch {
             Write-Error $_
             Show-SmokeLog
