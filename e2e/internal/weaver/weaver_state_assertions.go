@@ -634,6 +634,7 @@ func applyTerminalStateCheck(dbPath string, jobID int, slug string, status strin
 }
 
 const cleanPar2SettlementMessage = "PAR2 set settled clean from in-stream grid evidence"
+const cleanPar2VerificationSourceMessage = "PAR2 clean set verification source"
 
 func assertPar2CleanSettlement(jobID int, assertion *ScenarioPar2CleanSettlementAssertion) error {
 	if assertion == nil || len(assertion.ExpectedSetSliceSizes) == 0 {
@@ -644,7 +645,18 @@ func assertPar2CleanSettlement(jobID int, assertion *ScenarioPar2CleanSettlement
 		return fmt.Errorf("read weaver log: %w", err)
 	}
 	wantJobID := strconv.Itoa(jobID)
-	observed := make(map[string]uint64, len(assertion.ExpectedSetSliceSizes))
+	expectedGridSets := assertion.ExpectedSetSliceSizes
+	if len(assertion.ExpectedGridSetIDs) > 0 {
+		expectedGridSets = make(map[string]uint64, len(assertion.ExpectedGridSetIDs))
+		for _, setID := range assertion.ExpectedGridSetIDs {
+			sliceSize, ok := assertion.ExpectedSetSliceSizes[setID]
+			if !ok {
+				return fmt.Errorf("grid-only PAR2 set %s has no expected slice size", setID)
+			}
+			expectedGridSets[setID] = sliceSize
+		}
+	}
+	observed := make(map[string]uint64, len(expectedGridSets))
 	for _, rawLine := range strings.Split(string(raw), "\n") {
 		line := ansiEscape.ReplaceAllString(rawLine, "")
 		if !strings.Contains(line, cleanPar2SettlementMessage) || directLogJobID(line) != wantJobID {
@@ -668,7 +680,7 @@ func assertPar2CleanSettlement(jobID int, assertion *ScenarioPar2CleanSettlement
 		if readBytes != assertion.VerificationReadBytes {
 			return fmt.Errorf("clean PAR2 settlement for set %s read %d verification bytes, want %d", setID, readBytes, assertion.VerificationReadBytes)
 		}
-		wantSliceSize, wanted := assertion.ExpectedSetSliceSizes[setID]
+		wantSliceSize, wanted := expectedGridSets[setID]
 		if !wanted {
 			return fmt.Errorf("clean PAR2 settlement observed unexpected set %s", setID)
 		}
@@ -680,15 +692,56 @@ func assertPar2CleanSettlement(jobID int, assertion *ScenarioPar2CleanSettlement
 		}
 		observed[setID] = sliceSize
 	}
-	if len(observed) != len(assertion.ExpectedSetSliceSizes) {
-		missing := make([]string, 0, len(assertion.ExpectedSetSliceSizes)-len(observed))
-		for setID := range assertion.ExpectedSetSliceSizes {
+	if len(observed) != len(expectedGridSets) {
+		missing := make([]string, 0, len(expectedGridSets)-len(observed))
+		for setID := range expectedGridSets {
 			if _, ok := observed[setID]; !ok {
 				missing = append(missing, setID)
 			}
 		}
 		sort.Strings(missing)
 		return fmt.Errorf("clean PAR2 settlement did not observe set(s): %s", strings.Join(missing, ", "))
+	}
+	if len(assertion.ExpectedSetVerificationMode) == 0 {
+		return nil
+	}
+
+	observedModes := make(map[string]string, len(assertion.ExpectedSetVerificationMode))
+	for _, rawLine := range strings.Split(string(raw), "\n") {
+		line := ansiEscape.ReplaceAllString(rawLine, "")
+		if !strings.Contains(line, cleanPar2VerificationSourceMessage) || directLogJobID(line) != wantJobID {
+			continue
+		}
+		setID := weaverLogField(line, "recovery_set_id")
+		wantMode, wanted := assertion.ExpectedSetVerificationMode[setID]
+		if !wanted {
+			return fmt.Errorf("clean PAR2 verification source observed unexpected set %s", setID)
+		}
+		mode := weaverLogField(line, "verification_mode")
+		if mode != wantMode {
+			return fmt.Errorf("clean PAR2 verification source for set %s has mode %q, want %q", setID, mode, wantMode)
+		}
+		sliceSize, err := parseWeaverLogUint(line, "slice_size")
+		if err != nil {
+			return fmt.Errorf("clean PAR2 verification source for set %s: %w", setID, err)
+		}
+		if wantSliceSize, ok := assertion.ExpectedSetSliceSizes[setID]; !ok || sliceSize != wantSliceSize {
+			return fmt.Errorf("clean PAR2 verification source for set %s has slice size %d, want %d", setID, sliceSize, wantSliceSize)
+		}
+		if _, duplicate := observedModes[setID]; duplicate {
+			return fmt.Errorf("clean PAR2 verification source observed set %s more than once", setID)
+		}
+		observedModes[setID] = mode
+	}
+	if len(observedModes) != len(assertion.ExpectedSetVerificationMode) {
+		missing := make([]string, 0, len(assertion.ExpectedSetVerificationMode)-len(observedModes))
+		for setID := range assertion.ExpectedSetVerificationMode {
+			if _, ok := observedModes[setID]; !ok {
+				missing = append(missing, setID)
+			}
+		}
+		sort.Strings(missing)
+		return fmt.Errorf("clean PAR2 verification source did not observe set(s): %s", strings.Join(missing, ", "))
 	}
 	return nil
 }

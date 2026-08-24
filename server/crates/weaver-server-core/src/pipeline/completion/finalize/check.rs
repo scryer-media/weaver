@@ -351,9 +351,25 @@ fn par2_damage_ignorable(filename: &str, ignore_extensions: &[String]) -> bool {
 struct CleanPar2Verification {
     verification: par2_rs::VerificationResult,
     placement_plan: par2_rs::PlacementPlan,
+    slice_size: u64,
     in_stream_grid_slice_size: Option<u64>,
     reconcile_context: &'static str,
     retry_message: &'static str,
+}
+
+fn log_clean_par2_verification_source(
+    job_id: JobId,
+    set_id: par2_rs::RecoverySetId,
+    slice_size: u64,
+    verification_mode: &'static str,
+) {
+    info!(
+        job_id = job_id.0,
+        recovery_set_id = %set_id,
+        slice_size,
+        verification_mode,
+        "PAR2 clean set verification source"
+    );
 }
 
 /// The current recovery set's answer to one trip through the completion gate.
@@ -3231,6 +3247,7 @@ impl Pipeline {
         let CleanPar2Verification {
             verification,
             placement_plan,
+            slice_size,
             in_stream_grid_slice_size,
             reconcile_context,
             retry_message,
@@ -3275,7 +3292,17 @@ impl Pipeline {
         }
 
         let settled = self.mark_par2_set_verified(job_id, set_id).await;
-        if let (SetGateOutcome::Settled, Some(slice_size)) = (settled, in_stream_grid_slice_size) {
+        if settled == SetGateOutcome::Settled {
+            let verification_mode = if in_stream_grid_slice_size.is_some() {
+                "grid"
+            } else {
+                "quick_digest"
+            };
+            log_clean_par2_verification_source(job_id, set_id, slice_size, verification_mode);
+        }
+        if settled == SetGateOutcome::Settled
+            && let Some(slice_size) = in_stream_grid_slice_size
+        {
             info!(
                 job_id = job_id.0,
                 recovery_set_id = %set_id,
@@ -5994,6 +6021,7 @@ impl Pipeline {
                             CleanPar2Verification {
                                 verification,
                                 placement_plan,
+                                slice_size: par2_set.slice_size,
                                 in_stream_grid_slice_size: in_stream_grid_only
                                     .then_some(par2_set.slice_size),
                                 reconcile_context: "clean PAR2 quick verification",
@@ -6033,7 +6061,19 @@ impl Pipeline {
                         self.retry_par2_authoritative_identity(job_id).await;
                         let set_id =
                             par2_set_id.expect("loaded PAR2 set has an active recovery-set ID");
-                        let _ = self.mark_par2_set_verified(job_id, set_id).await;
+                        let slice_size = par2_set
+                            .as_ref()
+                            .expect("PAR2 validation has a parsed recovery set")
+                            .slice_size;
+                        let settled = self.mark_par2_set_verified(job_id, set_id).await;
+                        if settled == SetGateOutcome::Settled {
+                            log_clean_par2_verification_source(
+                                job_id,
+                                set_id,
+                                slice_size,
+                                "strong_decode",
+                            );
+                        }
 
                         if !self.par2_verified.contains(&job_id) {
                             self.schedule_job_completion_check(job_id);
@@ -6311,7 +6351,15 @@ impl Pipeline {
                             self.finish_par2_set_failure(job_id, set_id, error).await;
                             return;
                         }
-                        let _ = self.mark_par2_set_verified(job_id, set_id).await;
+                        let settled = self.mark_par2_set_verified(job_id, set_id).await;
+                        if settled == SetGateOutcome::Settled {
+                            log_clean_par2_verification_source(
+                                job_id,
+                                set_id,
+                                par2_set.slice_size,
+                                "authoritative",
+                            );
+                        }
 
                         if !self.par2_verified.contains(&job_id) {
                             self.schedule_job_completion_check(job_id);

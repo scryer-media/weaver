@@ -157,9 +157,9 @@ fn queue_item_maps_checking_to_verifying() {
 }
 
 #[test]
-fn queue_item_prefers_downloading_over_extracting_display_state() {
+fn queue_item_shows_extracting_while_download_pipeline_still_drains() {
     let item = queue_item_from_job(&base_job(JobStatus::Extracting));
-    assert_eq!(item.state, QueueItemState::Downloading);
+    assert_eq!(item.state, QueueItemState::Extracting);
     assert_eq!(item.download_state, QueueDownloadState::Downloading);
     assert_eq!(item.post_state, QueuePostState::Extracting);
 }
@@ -177,16 +177,62 @@ fn queue_item_uses_extracting_after_download_work_finishes() {
 }
 
 #[test]
-fn queue_item_prefers_verifying_over_extracting_display_state() {
+fn queue_item_uses_authoritative_status_over_lane_snapshot() {
     let mut job = base_job(JobStatus::Extracting);
     job.download_state = weaver_server_core::DownloadState::Complete;
     job.post_state = weaver_server_core::PostState::Verifying;
 
     let item = queue_item_from_job(&job);
 
-    assert_eq!(item.state, QueueItemState::Verifying);
+    assert_eq!(item.state, QueueItemState::Extracting);
     assert_eq!(item.download_state, QueueDownloadState::Complete);
     assert_eq!(item.post_state, QueuePostState::Verifying);
+}
+
+#[test]
+fn queue_item_shows_verifying_while_download_pipeline_still_drains() {
+    let mut job = base_job(JobStatus::Verifying);
+    job.download_state = weaver_server_core::DownloadState::Downloading;
+
+    let item = queue_item_from_job(&job);
+
+    assert_eq!(item.state, QueueItemState::Verifying);
+    assert_eq!(item.download_state, QueueDownloadState::Downloading);
+    assert_eq!(item.post_state, QueuePostState::Verifying);
+    assert_eq!(
+        queue_item_state_from_job_info_for_download_accounting(&job),
+        QueueItemState::Downloading
+    );
+}
+
+#[test]
+fn queue_item_preserves_every_first_party_lifecycle_state_during_download_overlap() {
+    for (status, expected) in [
+        (JobStatus::Queued, QueueItemState::Queued),
+        (JobStatus::Downloading, QueueItemState::Downloading),
+        (JobStatus::Checking, QueueItemState::Verifying),
+        (JobStatus::Verifying, QueueItemState::Verifying),
+        (JobStatus::QueuedRepair, QueueItemState::Queued),
+        (JobStatus::Repairing, QueueItemState::Repairing),
+        (JobStatus::QueuedExtract, QueueItemState::Queued),
+        (JobStatus::Extracting, QueueItemState::Extracting),
+        (JobStatus::Moving, QueueItemState::Finalizing),
+        (JobStatus::QueuedPostProcessing, QueueItemState::Queued),
+        (JobStatus::PostProcessing, QueueItemState::PostProcessing),
+        (JobStatus::Complete, QueueItemState::Completed),
+        (
+            JobStatus::Failed {
+                error: "failed".to_string(),
+            },
+            QueueItemState::Failed,
+        ),
+        (JobStatus::Paused, QueueItemState::Paused),
+    ] {
+        let mut job = base_job(status);
+        job.download_state = weaver_server_core::DownloadState::Downloading;
+
+        assert_eq!(queue_item_from_job(&job).state, expected);
+    }
 }
 
 #[test]

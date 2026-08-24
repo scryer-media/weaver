@@ -83,8 +83,10 @@ type ScenarioFileIdentityRewriteAssertion struct {
 }
 
 type ScenarioPar2CleanSettlementAssertion struct {
-	ExpectedSetSliceSizes map[string]uint64 `json:"expectedSetSliceSizes,omitempty"`
-	VerificationReadBytes uint64            `json:"verificationReadBytes"`
+	ExpectedSetSliceSizes       map[string]uint64 `json:"expectedSetSliceSizes,omitempty"`
+	ExpectedGridSetIDs          []string          `json:"expectedGridSetIDs,omitempty"`
+	ExpectedSetVerificationMode map[string]string `json:"expectedSetVerificationMode,omitempty"`
+	VerificationReadBytes       uint64            `json:"verificationReadBytes"`
 }
 
 func (s *Scenario) fileIdentityRewriteAssertion() *ScenarioFileIdentityRewriteAssertion {
@@ -1088,6 +1090,8 @@ var canonicalFixtureSlugs = []string{
 	"par2-heavy-damage-b",
 	"par2-heavy-damage-c",
 	"par2-insufficient",
+	"par2-multi-grid-late-discovery",
+	"par2-multi-grid-overlap-clean",
 	"par2-multi-set-archives",
 	"par2-multi-set-archives-clean",
 	"par2-multi-set-archives-insufficient",

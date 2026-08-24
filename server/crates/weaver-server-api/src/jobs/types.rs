@@ -1493,12 +1493,18 @@ fn wait_reason_for_post_state(
     }
 }
 
-/// Resolve the public queue state from a job's projected runtime lanes
-/// (`download_state`/`post_state`), not just its coarse `status`. The pipeline
-/// force-projects `download_state = Downloading` for a post-processing job that
-/// still has pending download work, so callers that classify off `status`
-/// alone (e.g. NZBGet `status` counters) would misreport such jobs.
+/// Resolve the user-facing queue state from the job's authoritative lifecycle
+/// status. The first-party UI needs the actual active stage, not the synthetic
+/// download lane used for compatibility accounting.
 pub fn queue_item_state_from_job_info(info: &weaver_server_core::JobInfo) -> QueueItemState {
+    QueueItemState::from(&info.status)
+}
+
+/// Resolve the queue state for compatibility counters that must treat a live
+/// download lane as active, even while post-processing overlaps it.
+pub fn queue_item_state_from_job_info_for_download_accounting(
+    info: &weaver_server_core::JobInfo,
+) -> QueueItemState {
     match &info.status {
         weaver_server_core::JobStatus::Paused => return QueueItemState::Paused,
         weaver_server_core::JobStatus::Failed { .. } => return QueueItemState::Failed,

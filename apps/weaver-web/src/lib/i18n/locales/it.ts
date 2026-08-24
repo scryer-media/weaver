@@ -16,6 +16,7 @@ const it: LocaleDictionary = {
   "status.verifying": "Verifica in corso",
   "status.repairing": "Riparazione in corso",
   "status.extracting": "Estrazione in corso",
+  "status.postProcessing": "Post-elaborazione",
   "status.moving": "Spostamento in corso",
   "status.complete": "Completato",
   "status.failed": "Fallito",

@@ -107,6 +107,7 @@ var ScenarioOnly = map[string]string{
 	"multiserver-primary-corrupt-direct":   "stages single-mkv's payload; the damage is injected by the fake NNTP server",
 	"multiserver-primary-missing-direct":   "stages single-mkv's payload; articles are withheld at post time",
 	"obfuscated-rar-retry-7z":              "stages rar5-corrupted and single-7z under one obfuscated name",
+	"par2-multi-grid-late-discovery":       "stages one index, one late recovery carrier, and the shared payload from par2-multi-grid-overlap-clean",
 	"par2-rar-placement-normalization":     "stages rar5-multivolume under swapped names beside par2-obfuscated-rar-rewrite's sidecars",
 	"par2-rar-placement-stripped-recovery": "the same staging, with the recovery volumes stripped after posting",
 	"rar5-multivolume-missing-tail":        "stages the first two volumes of rar5-multivolume and omits the third",
@@ -963,6 +964,15 @@ func Recipes() []Recipe {
 	})
 
 	add(Recipe{
+		Slug: "par2-multi-grid-overlap-clean", Family: "PAR2",
+		Notes: "One clean payload described by independent 64 KiB and 96 KiB recovery sets. " +
+			"Both indexes lead the payload so one decode pass must close both slice grids without read-back verification.",
+		Inputs:          []string{previewPayloadPath},
+		Build:           multiPARGridOverlapClean(),
+		ExpectedOutputs: previewClipExpectedOutput("payload.mkv"),
+	})
+
+	add(Recipe{
 		Slug: "par2-multi-set-archives-insufficient", Family: "PAR2",
 		Notes: "The 64 KiB/96 KiB mixed-grid counterpart: the primary archive has enough recovery data for its two damaged slices, " +
 			"while the secondary archive has only one recovery block and must make the aggregate job fail.",
@@ -1270,6 +1280,40 @@ func obfuscatedNames(start int) []string {
 	return names
 }
 
+func multiPARGridOverlapClean() func(context.Context, *Env) error {
+	return func(ctx context.Context, env *Env) error {
+		const payload = "payload.mkv"
+		if err := env.Publish(ctx, "clip-preview", payload); err != nil {
+			return err
+		}
+		sets := []struct {
+			index     string
+			sliceSize int64
+		}{
+			{"00-grid64.par2", twoSetsPrimarySliceSize},
+			{"01-grid96.par2", twoSetsSecondarySliceSize},
+		}
+		for _, set := range sets {
+			if err := env.PAR2(ctx, PAR2Spec{
+				Base:           set.index,
+				SliceSize:      set.sliceSize,
+				RecoveryBlocks: 1,
+				RecoveryFiles:  1,
+				Sources:        []string{payload},
+			}); err != nil {
+				return err
+			}
+		}
+		for _, set := range sets {
+			dataBlocks := int((PreviewPayloadBytes + set.sliceSize - 1) / set.sliceSize)
+			if err := verifyCleanPAR2Set(ctx, env, set.index, payload, set.sliceSize, dataBlocks); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
 func multiPARSetArchives(secondaryRecoveryBlocks int) func(context.Context, *Env) error {
 	return func(ctx context.Context, env *Env) error {
 		if err := buildMultiPARSetArchives(ctx, env, secondaryRecoveryBlocks); err != nil {
@@ -1351,19 +1395,26 @@ func verifyCleanMultiPARSetArchives(ctx context.Context, env *Env) error {
 		{"secondary.rar.par2", "secondary.rar", twoSetsSecondarySliceSize, 54},
 	}
 	for _, set := range sets {
-		report, err := env.PAR2Verify(ctx, set.index)
-		if err != nil {
-			return fmt.Errorf("verify clean mixed-grid set %s: %w", set.index, err)
+		if err := verifyCleanPAR2Set(ctx, env, set.index, set.archive, set.sliceSize, set.dataBlocks); err != nil {
+			return err
 		}
-		for _, expected := range []string{
-			fmt.Sprintf("The block size used was %d bytes.", set.sliceSize),
-			fmt.Sprintf("There are a total of %d data blocks.", set.dataBlocks),
-			fmt.Sprintf(`Target: "%s" - found.`, set.archive),
-			"All files are correct, repair is not required.",
-		} {
-			if !strings.Contains(report, expected) {
-				return fmt.Errorf("clean mixed-grid PAR2 report for %s does not contain %q", set.index, expected)
-			}
+	}
+	return nil
+}
+
+func verifyCleanPAR2Set(ctx context.Context, env *Env, index, target string, sliceSize int64, dataBlocks int) error {
+	report, err := env.PAR2Verify(ctx, index)
+	if err != nil {
+		return fmt.Errorf("verify clean mixed-grid set %s: %w", index, err)
+	}
+	for _, expected := range []string{
+		fmt.Sprintf("The block size used was %d bytes.", sliceSize),
+		fmt.Sprintf("There are a total of %d data blocks.", dataBlocks),
+		fmt.Sprintf(`Target: "%s" - found.`, target),
+		"All files are correct, repair is not required.",
+	} {
+		if !strings.Contains(report, expected) {
+			return fmt.Errorf("clean mixed-grid PAR2 report for %s does not contain %q", index, expected)
 		}
 	}
 	return nil

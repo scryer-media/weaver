@@ -52,6 +52,7 @@ const en: LocaleDictionary = {
   "status.verifying": "Verifying",
   "status.repairing": "Repairing",
   "status.extracting": "Extracting",
+  "status.postProcessing": "Post-processing",
   "status.moving": "Moving",
   "status.complete": "Complete",
   "status.failed": "Failed",

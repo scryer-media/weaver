@@ -16,6 +16,7 @@ const fr: LocaleDictionary = {
   "status.verifying": "Vérification",
   "status.repairing": "Réparation",
   "status.extracting": "Extraction",
+  "status.postProcessing": "Post-traitement",
   "status.moving": "Déplacement",
   "status.complete": "Terminé",
   "status.failed": "Échoué",

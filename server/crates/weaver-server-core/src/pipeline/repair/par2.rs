@@ -1140,8 +1140,8 @@ impl Pipeline {
     /// A completed file's PAR2 identity, provable from the in-stream dual-CRC
     /// grid alone.
     ///
-    /// `Some` means: the file binds uniquely by name/identity to one PAR2
-    /// description, its assembled length equals the described length exactly,
+    /// `Some` means: the file binds uniquely by name/identity within this
+    /// recovery set, its assembled length equals the described length exactly,
     /// and every described slice closed `Intact` with independent (pCRC
     /// verified) article coverage — the same bar `InStreamCrc32Proof`
     /// enforces per slice, demanded here for all of them. Anything less —
@@ -1153,10 +1153,7 @@ impl Pipeline {
         file_id: NzbFileId,
         par2_set: &par2_rs::Par2FileSet,
     ) -> Option<(par2_rs::FileId, String)> {
-        let binding = self.resolve_par2_file_binding(file_id)?;
-        if binding.recovery_set_id != par2_set.recovery_set_id {
-            return None;
-        }
+        let binding = self.resolve_par2_file_binding_in_set(file_id, par2_set.recovery_set_id)?;
         let description = par2_set.file_description(&binding.par2_file_id)?;
         if description.length == 0 {
             // A zero-length description has no slices; "every slice intact"
@@ -1172,7 +1169,9 @@ impl Pipeline {
         if !binding.is_complete || file.received_bytes() != description.length {
             return None;
         }
-        let verdicts = self.block_crc_verdicts(file_id)?;
+        let verdicts = self
+            .block_crcs
+            .verdicts_against(file_id, par2_set, binding.par2_file_id);
         let slice_count = par2_set.slice_count_for_file(description.length);
         let all_slices_independently_intact = (0..slice_count).all(|slice_index| {
             matches!(

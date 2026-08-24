@@ -105,6 +105,7 @@ type QueueStatusFilter =
   | "VERIFYING"
   | "REPAIRING"
   | "EXTRACTING"
+  | "POST_PROCESSING"
   | "MOVING";
 
 type QueuePriorityFilter = "LOW" | "NORMAL" | "HIGH";
@@ -194,6 +195,7 @@ const QUEUE_STATUS_OPTIONS: QueueStatusFilter[] = [
   "VERIFYING",
   "REPAIRING",
   "EXTRACTING",
+  "POST_PROCESSING",
   "MOVING",
 ];
 const QUEUE_PRIORITY_OPTIONS: QueuePriorityFilter[] = ["HIGH", "NORMAL", "LOW"];
@@ -202,6 +204,7 @@ const QUEUE_ACTIVE_STATUSES: QueueStatusFilter[] = [
   "VERIFYING",
   "REPAIRING",
   "EXTRACTING",
+  "POST_PROCESSING",
   "MOVING",
 ];
 const NO_CATEGORY_SELECT_VALUE = "__no_category__";
@@ -397,7 +400,7 @@ const QueueNameCell = memo(function QueueNameCell({
     <div className="min-w-0">
       <Link
         to={`/jobs/${jobId}`}
-        className="block min-h-6 whitespace-normal break-words text-xs font-medium leading-snug text-foreground"
+        className="block whitespace-normal break-words text-xs font-medium leading-snug text-foreground"
       >
         {displayName}
       </Link>
@@ -549,6 +552,8 @@ function queueStatusLabel(status: QueueStatusFilter, t: ReturnType<typeof useTra
       return t("status.repairing");
     case "EXTRACTING":
       return t("status.extracting");
+    case "POST_PROCESSING":
+      return t("status.postProcessing");
     case "MOVING":
       return t("status.moving");
     default:
@@ -1205,7 +1210,7 @@ export function JobList() {
         ),
         meta: {
           headerClassName: "h-7 w-[52px] px-2 text-center",
-          cellClassName: "p-0 text-center",
+          cellClassName: "p-0 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1217,7 +1222,7 @@ export function JobList() {
         ),
         meta: {
           headerClassName: "h-7 w-[34%] px-2 text-left",
-          cellClassName: "w-[34%] px-2 py-1.5 text-left",
+          cellClassName: "w-[34%] px-2 py-1.5 text-left align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1239,7 +1244,7 @@ export function JobList() {
         ),
         meta: {
           headerClassName: "h-7 w-[104px] px-2 text-center",
-          cellClassName: "w-[104px] px-2 py-1.5 text-center",
+          cellClassName: "w-[104px] px-2 py-1.5 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1265,7 +1270,7 @@ export function JobList() {
         ),
         meta: {
           headerClassName: "h-7 w-[124px] px-2 text-center",
-          cellClassName: "w-[124px] px-2 py-1.5 text-center",
+          cellClassName: "w-[124px] px-2 py-1.5 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1290,7 +1295,7 @@ export function JobList() {
         ),
         meta: {
           headerClassName: "h-7 w-[152px] px-2 text-center",
-          cellClassName: "w-[152px] px-2 py-1.5 text-center",
+          cellClassName: "w-[152px] px-2 py-1.5 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1315,7 +1320,19 @@ export function JobList() {
         ),
         meta: {
           headerClassName: "h-7 w-[188px] px-2 text-center",
-          cellClassName: "w-[188px] px-2 py-1.5 text-center",
+          cellClassName: "w-[188px] px-2 py-1.5 text-center align-middle",
+        } satisfies DataTableColumnMeta,
+      },
+      {
+        id: "eta",
+        enableSorting: false,
+        header: () => <div className="text-center">{t("table.eta")}</div>,
+        cell: ({ row }) => (
+          <span className="tabular-nums text-muted-foreground">{row.original.etaDisplay}</span>
+        ),
+        meta: {
+          headerClassName: "h-7 w-[96px] px-2 text-center",
+          cellClassName: "w-[96px] px-2 py-1.5 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1331,7 +1348,7 @@ export function JobList() {
         cell: ({ row }) => <QueueSizeCell totalBytes={row.original.totalBytes} />,
         meta: {
           headerClassName: "h-7 w-[132px] px-2 text-center",
-          cellClassName: "w-[132px] px-2 py-1.5 text-center",
+          cellClassName: "w-[132px] px-2 py-1.5 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1352,7 +1369,7 @@ export function JobList() {
         ),
         meta: {
           headerClassName: "h-7 w-[116px] px-2 text-right",
-          cellClassName: "w-[116px] p-0 text-right",
+          cellClassName: "w-[116px] p-0 text-right align-middle",
         } satisfies DataTableColumnMeta,
       },
     ],

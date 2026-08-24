@@ -188,6 +188,69 @@ async fn a_served_file_keeps_its_grid_when_another_set_is_present() {
 }
 
 #[tokio::test]
+async fn one_file_can_close_two_independent_slice_grids() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(32204);
+    let filename = "ember.delta.bin";
+    let bytes = fixture_bytes(19, 509);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Ember Delta Shared Grids",
+            &[(filename.to_string(), bytes.len() as u32)],
+        ),
+    )
+    .await;
+    let first =
+        build_repairable_par2_set_for_files(&[(filename, bytes.as_slice())], SERVED_SLICE_SIZE, 0);
+    let second =
+        build_repairable_par2_set_for_files(&[(filename, bytes.as_slice())], OTHER_SLICE_SIZE, 0);
+    install_two_parsed_sets(&mut pipeline, job_id, first.clone(), second.clone());
+    pipeline.refresh_par2_checkpoint_plan(job_id);
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    write_and_complete_file(&mut pipeline, job_id, 0, filename, &bytes).await;
+    let plan = pipeline.par2_checkpoint_plan(job_id);
+    assert!(matches!(plan, weaver_yenc::CheckpointPlan::Multi(_)));
+    let mut crc = weaver_yenc::SegmentedCrc32::new(0, plan.clone());
+    crc.update(&bytes);
+    let (part_crc, segments) = crc.finish_article();
+    pipeline.note_block_crc_segments_for_plan(
+        file_id,
+        &plan,
+        0,
+        bytes.len() as u64,
+        part_crc,
+        true,
+        false,
+        &segments,
+    );
+    pipeline
+        .block_crcs
+        .note_file_len(file_id, bytes.len() as u64);
+
+    assert!(
+        pipeline.resolve_par2_file_binding(file_id).is_none(),
+        "job-wide binding remains ambiguous across recovery sets"
+    );
+    assert!(
+        pipeline
+            .in_stream_verified_par2_match(file_id, &first)
+            .is_some()
+    );
+    assert!(
+        pipeline
+            .in_stream_verified_par2_match(file_id, &second)
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn a_rebound_file_drops_blocks_cut_on_the_old_grid() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

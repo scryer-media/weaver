@@ -16,6 +16,7 @@ const ja: LocaleDictionary = {
   "status.verifying": "検証中",
   "status.repairing": "修復中",
   "status.extracting": "展開中",
+  "status.postProcessing": "後処理中",
   "status.moving": "移動中",
   "status.complete": "完了",
   "status.failed": "失敗",

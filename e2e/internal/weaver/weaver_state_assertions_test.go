@@ -615,6 +615,54 @@ func TestApplyRuntimeFileIdentityRewriteTerminalCheckFailsWhenJobCompletesBefore
 	}
 }
 
+func TestAssertPar2CleanSettlementDistinguishesGridAndAuthoritativeSets(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logLines := []string{
+		`job_id=42 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
+		`job_id=42 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
+		`job_id=42 recovery_set_id=late-set slice_size=96 verification_mode=authoritative PAR2 clean set verification source`,
+	}
+	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	assertion := &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes:       map[string]uint64{"grid-set": 64, "late-set": 96},
+		ExpectedGridSetIDs:          []string{"grid-set"},
+		ExpectedSetVerificationMode: map[string]string{"grid-set": "grid", "late-set": "authoritative"},
+	}
+	if err := assertPar2CleanSettlement(42, assertion); err != nil {
+		t.Fatalf("expected mixed settlement sources to pass: %v", err)
+	}
+}
+
+func TestAssertPar2CleanSettlementRejectsUnexpectedGridSettlement(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logLines := []string{
+		`job_id=43 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
+		`job_id=43 recovery_set_id=late-set slice_size=96 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
+	}
+	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := assertPar2CleanSettlement(43, &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64, "late-set": 96},
+		ExpectedGridSetIDs:    []string{"grid-set"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "unexpected set late-set") {
+		t.Fatalf("expected unexpected grid settlement failure, got %v", err)
+	}
+}
+
 func newTestWeaverStateDB(t *testing.T) string {
 	t.Helper()
 

@@ -1310,9 +1310,8 @@ async fn append_url(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<
 async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     // Iterate `JobInfo` directly instead of mapping every job through
     // `queue_item_from_job` (which deep-clones name/metadata/phase_progress)
-    // just to sum bytes and count states. Classify via
-    // `queue_item_state_from_job_info` — the SAME projection `queue_item_from_job`
-    // uses — not `QueueItemState::from(&status)`: the pipeline force-projects
+    // just to sum bytes and count states. Use the download-accounting
+    // projection, not the user-facing queue state: the pipeline force-projects
     // `download_state = Downloading` for a post-processing job with pending
     // download work, so classifying off `status` alone would flip `ServerStandBy`
     // and the post/par counts for those jobs.
@@ -1321,7 +1320,7 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         .iter()
         .map(|job| {
             (
-                weaver_server_api::queue_item_state_from_job_info(job),
+                weaver_server_api::queue_item_state_from_job_info_for_download_accounting(job),
                 job.total_bytes,
                 job.downloaded_bytes,
             )

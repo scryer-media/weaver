@@ -854,7 +854,7 @@ export function History() {
         ),
         meta: {
           headerClassName: "h-7 w-[52px] px-2 text-center",
-          cellClassName: "p-0 text-center",
+          cellClassName: "p-0 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {

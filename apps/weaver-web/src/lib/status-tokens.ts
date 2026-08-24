@@ -32,6 +32,7 @@ const STATUS_TO_TOKEN: Record<string, StatusToken> = {
   VERIFYING: "verifying",
   REPAIRING: "repairing",
   EXTRACTING: "extracting",
+  POST_PROCESSING: "copying",
   MOVING: "copying",
   FINALIZING: "copying",
   COMPLETE: "completed",
@@ -52,6 +53,7 @@ const STATUS_TO_I18N_KEY: Record<string, string> = {
   VERIFYING: "status.verifying",
   REPAIRING: "status.repairing",
   EXTRACTING: "status.extracting",
+  POST_PROCESSING: "status.postProcessing",
   MOVING: "status.moving",
   FINALIZING: "status.finalizing",
   COMPLETE: "status.complete",
@@ -67,6 +69,7 @@ const ACTIVE_STATUSES = new Set([
   "VERIFYING",
   "REPAIRING",
   "EXTRACTING",
+  "POST_PROCESSING",
   "MOVING",
   "FINALIZING",
 ]);

@@ -16,6 +16,7 @@ const zh: LocaleDictionary = {
   "status.verifying": "校验中",
   "status.repairing": "修复中",
   "status.extracting": "解压中",
+  "status.postProcessing": "后处理中",
   "status.moving": "移动中",
   "status.complete": "已完成",
   "status.failed": "失败",

@@ -16,6 +16,7 @@ const ko: LocaleDictionary = {
   "status.verifying": "검증 중",
   "status.repairing": "복구 중",
   "status.extracting": "추출 중",
+  "status.postProcessing": "후처리 중",
   "status.moving": "이동 중",
   "status.complete": "완료",
   "status.failed": "실패",

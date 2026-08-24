@@ -16,6 +16,7 @@ const es: LocaleDictionary = {
   "status.verifying": "Verificando",
   "status.repairing": "Reparando",
   "status.extracting": "Extrayendo",
+  "status.postProcessing": "Posprocesamiento",
   "status.moving": "Moviendo",
   "status.complete": "Completado",
   "status.failed": "Fallido",

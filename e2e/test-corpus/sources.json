@@ -1664,6 +1664,96 @@
       }
     },
     {
+      "path": "testdata/par2-multi-grid-overlap-clean/00-grid64.par2",
+      "size": 2012,
+      "blake3": "d9f6ac501d5c861837c15298bb0ad80eb1d8e99147db140c1375e23e35d276cf",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ],
+        "inputs": [
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-grid-overlap-clean/00-grid64.vol0+1.par2",
+      "size": 67616,
+      "blake3": "d5735efc17a01e8009bb0a8c86b01d73d979891e46c8f3f3810e28681c90ce07",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ],
+        "inputs": [
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-grid-overlap-clean/01-grid96.par2",
+      "size": 1492,
+      "blake3": "a7950d47a45c9609efcc7fec880d1ab6ca73205c72d1287cf2efeeb5382bacab",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ],
+        "inputs": [
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-grid-overlap-clean/01-grid96.vol0+1.par2",
+      "size": 99864,
+      "blake3": "0f8010c0916348aeed1aa24cc34649cd16531c406f4baabe7834370cf0d0fd45",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ],
+        "inputs": [
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-grid-overlap-clean/payload.mkv",
+      "size": 5242880,
+      "blake3": "bd8b3991787e2bc03ae0f47bda585f1b9dbd831448493fe3c4a9118f4f947cf2",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ],
+        "inputs": [
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
       "path": "testdata/par2-multi-set-archives-clean/00-primary.par2",
       "size": 26652,
       "blake3": "996788b765d0a34fc469bb0fc358c09ab67c29adf238de053818bf820b8da220",
