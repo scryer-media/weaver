@@ -342,6 +342,13 @@ impl JobExtractionBudget {
         self.cancelled.store(true, Ordering::Release);
     }
 
+    /// Stop active decoders at their next budgeted read, write, or admission
+    /// checkpoint. The task permits notify cleanup once every worker has left.
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.idle.notify_all();
+    }
+
     pub(crate) fn wait_for_idle(&self) {
         let mut active = self
             .active
@@ -1082,6 +1089,15 @@ mod tests {
         let error = writer.write_all(&[0; 16]).unwrap_err();
         assert!(error.to_string().contains("member_bytes"));
         assert_eq!(budget.total_written(), 16);
+    }
+
+    #[test]
+    fn user_cancellation_stops_budgeted_io() {
+        let (_temp, root, budget) = root_and_budget();
+        let mut writer = root.create_file(Path::new("member.bin"), &budget).unwrap();
+        budget.cancel();
+        let error = writer.write_all(&[0; 1]).unwrap_err();
+        assert!(error.to_string().contains("job extraction was cancelled"));
     }
 
     #[test]

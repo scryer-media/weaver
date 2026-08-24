@@ -6151,6 +6151,160 @@ async fn verified_par2_output_registers_missing_rar_volume_for_retry() {
 }
 
 #[tokio::test]
+async fn reconciled_obfuscated_rar_keeps_the_verified_canonical_volume() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30195);
+    let files = build_multifile_multivolume_rar_set();
+    let source_filename = "ae282dbe64861b7171e041b55057e3dd.40";
+    let canonical_filename = files[1].0.as_str();
+    let duplicate_filename = "show.part02.duplicate1.rar";
+    let posted_files = vec![
+        files[0].clone(),
+        (source_filename.to_string(), files[1].1.clone()),
+        files[2].clone(),
+        files[3].clone(),
+    ];
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Obfuscated RAR Repair Reconciliation", &posted_files),
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for file_index in [0usize, 2, 3] {
+        write_and_complete_rar_volume(
+            &mut pipeline,
+            job_id,
+            file_index as u32,
+            &posted_files[file_index].0,
+            &posted_files[file_index].1,
+        )
+        .await;
+    }
+    tokio::fs::write(working_dir.join(canonical_filename), &files[1].1)
+        .await
+        .unwrap();
+    let mut damaged_duplicate = files[1].1.clone();
+    let payload_offset = damaged_duplicate
+        .windows(b"a-payload".len())
+        .position(|window| window == b"a-payload")
+        .unwrap();
+    damaged_duplicate[payload_offset] ^= 1;
+    tokio::fs::write(working_dir.join(duplicate_filename), damaged_duplicate)
+        .await
+        .unwrap();
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    pipeline
+        .set_file_identity(
+            job_id,
+            crate::jobs::record::ActiveFileIdentity {
+                file_index: file_id.file_index,
+                source_filename: source_filename.to_string(),
+                current_filename: duplicate_filename.to_string(),
+                canonical_filename: Some(duplicate_filename.to_string()),
+                classification: Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                    kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
+                    set_name: "show".to_string(),
+                    volume_index: Some(1),
+                }),
+                classification_source: FileIdentitySource::Par2,
+            },
+        )
+        .unwrap();
+    pipeline.file_prefix_16k.insert(
+        file_id,
+        files[1].1[..files[1].1.len().min(16 * 1024)].to_vec(),
+    );
+
+    let par2_set = placement_par2_file_set(&files);
+    let verification = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: par2_set.recovery_file_ids[1],
+            filename: canonical_filename.to_string(),
+            status: par2_rs::verify::FileStatus::Complete,
+            valid_slices: vec![true],
+            missing_slice_count: 0,
+        }],
+        recovery_blocks_available: 1,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+
+    assert_eq!(
+        pipeline
+            .register_verified_par2_rar_outputs(job_id, &verification)
+            .await
+            .unwrap(),
+        1
+    );
+    let report = pipeline
+        .reconcile_verified_par2_files(job_id, &verification)
+        .await
+        .unwrap();
+    assert_eq!(report.completed, 1);
+    pipeline
+        .recompute_rar_set_state(job_id, "show")
+        .await
+        .unwrap();
+
+    let identity = pipeline.file_identity(job_id, file_id).unwrap();
+    assert_eq!(identity.source_filename, source_filename);
+    assert_eq!(identity.current_filename, canonical_filename);
+    assert_eq!(
+        identity.canonical_filename.as_deref(),
+        Some(canonical_filename)
+    );
+    let volume_paths = pipeline.volume_paths_for_rar_set(job_id, "show");
+    assert_eq!(
+        volume_paths.get(&1),
+        Some(&working_dir.join(canonical_filename))
+    );
+
+    let mut archive =
+        unrar_rs::RarArchive::open(std::fs::File::open(volume_paths.get(&0).unwrap()).unwrap())
+            .unwrap();
+    for volume in 1..files.len() {
+        archive
+            .add_volume(
+                volume,
+                Box::new(std::fs::File::open(volume_paths.get(&(volume as u32)).unwrap()).unwrap()),
+            )
+            .unwrap();
+    }
+    let output_dir = working_dir.join("regression-output");
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let member_index = archive.find_member_sanitized("E01.mkv").unwrap();
+    Pipeline::extract_rar_member_to_output(
+        &mut archive,
+        crate::pipeline::extraction::RarExtractionContext::new(
+            &volume_paths,
+            &pipeline.event_tx,
+            job_id,
+            "show",
+            &output_dir,
+            &unrar_rs::ExtractOptions {
+                verify: true,
+                password: None,
+                restore_owners: false,
+            },
+        ),
+        member_index,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(output_dir.join("E01.mkv")).unwrap(),
+        b"episode-a-payload"
+    );
+}
+
+#[tokio::test]
 async fn failed_rar_member_with_par2_is_not_incrementally_retried() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

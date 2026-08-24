@@ -72,6 +72,48 @@ impl Pipeline {
                         "cancel is not supported while the final move is running".to_string(),
                     ))
                 } else if self.jobs.contains_key(&job_id) {
+                    // Normal job cancellation must also interrupt terminal
+                    // post-processing. The pipeline-level signal covers a run
+                    // waiting for admission; the executor-level signal covers a
+                    // script that is already running.
+                    let post_processing_done = self
+                        .terminal_post_processing_cancellations
+                        .get(&job_id)
+                        .map(tokio::sync::watch::Sender::subscribe);
+                    let pipeline_cancelled = self
+                        .terminal_post_processing_cancellations
+                        .get(&job_id)
+                        .is_some_and(|sender| sender.send(true).is_ok());
+                    let executor_cancelled =
+                        self.terminal_post_processing_executor.cancel_job(job_id.0);
+                    let par2_cancelled =
+                        if let Some(cancellation) = self.par2_cancellations.get(&job_id) {
+                            cancellation.cancel();
+                            true
+                        } else {
+                            false
+                        };
+                    let extraction_cleanup_wait = self.extraction_budgets.get(&job_id).cloned();
+                    let extraction_cancelled = if let Some(budget) = &extraction_cleanup_wait {
+                        budget.cancel();
+                        true
+                    } else {
+                        false
+                    };
+                    if pipeline_cancelled || executor_cancelled {
+                        tracing::debug!(
+                            job_id = job_id.0,
+                            "requested cancellation of active post-processing"
+                        );
+                    }
+                    if par2_cancelled || extraction_cancelled {
+                        tracing::debug!(
+                            job_id = job_id.0,
+                            par2_cancelled,
+                            extraction_cancelled,
+                            "requested cancellation of active repair or extraction"
+                        );
+                    }
                     let state = self
                         .jobs
                         .get(&job_id)
@@ -174,6 +216,19 @@ impl Pipeline {
                         let working_dir = state.working_dir.clone();
                         let staging_dir = state.staging_dir.clone();
                         tokio::spawn(async move {
+                            // Let a cancelled post-processing script leave its
+                            // process group before its working directory is
+                            // removed. The sender is dropped by the terminal
+                            // completion handler once that run has ended.
+                            if let Some(mut post_processing_done) = post_processing_done {
+                                while post_processing_done.changed().await.is_ok() {}
+                            }
+                            if let Some(extraction_budget) = extraction_cleanup_wait {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    extraction_budget.wait_for_idle();
+                                })
+                                .await;
+                            }
                             // Close cached write handles first: the working-dir
                             // path may be reused verbatim by a re-added job, and a
                             // stale handle would swallow its writes. The staging

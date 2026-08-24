@@ -83,10 +83,10 @@ type ScenarioFileIdentityRewriteAssertion struct {
 }
 
 type ScenarioPar2CleanSettlementAssertion struct {
-	ExpectedSetSliceSizes       map[string]uint64 `json:"expectedSetSliceSizes,omitempty"`
-	ExpectedGridSetIDs          []string          `json:"expectedGridSetIDs,omitempty"`
-	ExpectedSetVerificationMode map[string]string `json:"expectedSetVerificationMode,omitempty"`
-	VerificationReadBytes       uint64            `json:"verificationReadBytes"`
+	ExpectedSetSliceSizes        map[string]uint64   `json:"expectedSetSliceSizes,omitempty"`
+	ExpectedGridSetIDs           []string            `json:"expectedGridSetIDs,omitempty"`
+	ExpectedSetVerificationModes map[string][]string `json:"expectedSetVerificationModes,omitempty"`
+	VerificationReadBytes        uint64              `json:"verificationReadBytes"`
 }
 
 func (s *Scenario) fileIdentityRewriteAssertion() *ScenarioFileIdentityRewriteAssertion {
@@ -1082,6 +1082,7 @@ var canonicalFixtureSlugs = []string{
 	"obfuscated-rar-split-topology",
 	"obfuscated-split-7z",
 	"obfuscated-rar-unknown-numeric",
+	"par2-obfuscated-rar-repair",
 	"par2-obfuscated-rar-rewrite",
 	"par2-rar-placement-normalization",
 	"par2-rar-placement-normalization-multi-swap",

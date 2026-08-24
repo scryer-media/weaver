@@ -631,12 +631,41 @@ func TestAssertPar2CleanSettlementDistinguishesGridAndAuthoritativeSets(t *testi
 	}
 
 	assertion := &ScenarioPar2CleanSettlementAssertion{
-		ExpectedSetSliceSizes:       map[string]uint64{"grid-set": 64, "late-set": 96},
-		ExpectedGridSetIDs:          []string{"grid-set"},
-		ExpectedSetVerificationMode: map[string]string{"grid-set": "grid", "late-set": "authoritative"},
+		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64, "late-set": 96},
+		ExpectedGridSetIDs:    []string{"grid-set"},
+		ExpectedSetVerificationModes: map[string][]string{
+			"grid-set": {"grid"},
+			"late-set": {"authoritative"},
+		},
 	}
 	if err := assertPar2CleanSettlement(42, assertion); err != nil {
 		t.Fatalf("expected mixed settlement sources to pass: %v", err)
+	}
+}
+
+func TestAssertPar2CleanSettlementAcceptsAllowedNonGridModes(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logLines := []string{
+		`job_id=43 recovery_set_id=first-set slice_size=64 verification_mode=strong_decode PAR2 clean set verification source`,
+		`job_id=43 recovery_set_id=second-set slice_size=96 verification_mode=authoritative PAR2 clean set verification source`,
+	}
+	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	assertion := &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"first-set": 64, "second-set": 96},
+		ExpectedSetVerificationModes: map[string][]string{
+			"first-set":  {"strong_decode", "authoritative"},
+			"second-set": {"strong_decode", "authoritative"},
+		},
+	}
+	if err := assertPar2CleanSettlement(43, assertion); err != nil {
+		t.Fatalf("expected allowed non-grid settlement modes to pass: %v", err)
 	}
 }
 

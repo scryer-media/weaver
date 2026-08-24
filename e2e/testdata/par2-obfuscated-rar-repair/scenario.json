@@ -1,0 +1,49 @@
+{
+  "slug": "par2-obfuscated-rar-repair",
+  "title": "E2E.Test.PAR2.Obfuscated.RAR.Repair.2026.1080p-TESTGRP",
+  "description": "Three-volume RAR5 set posted under obfuscated names with the tail of the interior volume withheld. PAR2 must rebuild the canonical volume, retain it through identity reconciliation, and extract without touching the damaged duplicate alias.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "segment_size": 65536,
+  "fixtureAssets": [
+    "rar5-multivolume/archive.part1.rar::51273aad56a8b904e96928935278a627.101",
+    "rar5-multivolume/archive.part2.rar::51273aad56a8b904e96928935278a627.102",
+    "rar5-multivolume/archive.part3.rar::51273aad56a8b904e96928935278a627.103",
+    "par2-obfuscated-rar-rewrite/archive.rar.par2",
+    "par2-obfuscated-rar-rewrite/archive.rar.vol00+1.par2",
+    "par2-obfuscated-rar-rewrite/archive.rar.vol01+2.par2",
+    "par2-obfuscated-rar-rewrite/archive.rar.vol03+4.par2",
+    "par2-obfuscated-rar-rewrite/archive.rar.vol07+8.par2"
+  ],
+  "deleteSubjectContains": [
+    "51273aad56a8b904e96928935278a627.102"
+  ],
+  "deleteSubjectTailArticles": 1,
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed",
+    "ExtractionMemberFailed",
+    "ExtractionFailed"
+  ],
+  "expectedOutputBLAKE3": {
+    "work/sample.mkv": "8139650c53be5684ab9cf20e34996fcfb510f118ee652ad7b949c32e8cb8b08a"
+  },
+  "runtimeAssertions": {
+    "fileIdentityRewrite": {
+      "requiredCurrentFilenames": [
+        "archive.part1.rar",
+        "archive.part2.rar",
+        "archive.part3.rar"
+      ],
+      "forbiddenCurrentFilenames": [
+        "51273aad56a8b904e96928935278a627.101",
+        "51273aad56a8b904e96928935278a627.102",
+        "51273aad56a8b904e96928935278a627.103",
+        "archive.part2.duplicate1.rar"
+      ],
+      "requiredClassificationSource": "par2"
+    }
+  }
+}

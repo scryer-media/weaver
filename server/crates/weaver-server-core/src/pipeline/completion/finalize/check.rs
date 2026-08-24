@@ -2011,6 +2011,7 @@ impl Pipeline {
             };
         }
 
+        let cancellation = self.par2_cancellation_token(job_id);
         let mut repair_task = tokio::task::spawn_blocking(move || {
             if repair {
                 crate::e2e_failpoint::maybe_delay("repair.task_start");
@@ -2019,6 +2020,7 @@ impl Pipeline {
             options.file_set = Some((*par2_set).clone());
             options.repair = repair;
             options.memory_limit = Some(memory_limit);
+            options.cancel = Some(cancellation);
             if let Some(counters) = phase_counters {
                 options.progress = Some(Arc::new(move |update: par2_rs::ProgressUpdate| {
                     if !matches!(
@@ -3086,9 +3088,9 @@ impl Pipeline {
                 .push((*file_id, sanitize_download_filename(&desc.filename)));
         }
 
-        let in_stream_grid_only =
-            !grid_matches_by_name.is_empty() && current_hashes_by_name.is_empty();
         let mut matches = grid_matches_by_name;
+        let had_grid_match = !matches.is_empty();
+        let mut digest_matched_description = false;
         let mut match_counts = HashMap::<par2_rs::FileId, u32>::new();
         for (file_id, _) in matches.values() {
             *match_counts.entry(*file_id).or_default() += 1;
@@ -3101,8 +3103,10 @@ impl Pipeline {
             if let Some((file_id, correct_name)) = candidates.first() {
                 matches.insert(current_name.clone(), (*file_id, correct_name.clone()));
                 *match_counts.entry(*file_id).or_default() += 1;
+                digest_matched_description = true;
             }
         }
+        let in_stream_grid_only = had_grid_match && !digest_matched_description;
 
         let conflict_ids: HashSet<par2_rs::FileId> = match_counts
             .iter()
@@ -3602,23 +3606,25 @@ impl Pipeline {
                 let installed = [canonical_filename.as_str(), current_filename.as_str()]
                     .into_iter()
                     .filter(|name| !name.is_empty())
-                    .map(|name| working_dir.join(name))
-                    .find_map(|path| {
+                    .find_map(|name| {
+                        let path = working_dir.join(name);
                         std::fs::metadata(&path)
                             .ok()
                             .filter(|meta| meta.is_file())
-                            .map(|meta| (path, meta.len()))
+                            .map(|meta| (name.to_string(), path, meta.len()))
                     });
-                match installed {
-                    Some((path, length)) if length != described_length => {
+                let verified_filename = match installed {
+                    Some((_, path, length)) if length != described_length => {
                         report.length_mismatch.push(format!(
                             "{} (on disk {length} bytes, PAR2 describes {described_length})",
                             path.display()
                         ));
                         continue;
                     }
-                    Some(_) => {}
-                    None if live_virtual_par2_files.contains(&file_verification.file_id) => {}
+                    Some((filename, _, _)) => filename,
+                    None if live_virtual_par2_files.contains(&file_verification.file_id) => {
+                        current_filename.clone()
+                    }
                     None => {
                         report.length_mismatch.push(format!(
                             "{canonical_filename} (verdict vouched for bytes that are at neither \
@@ -3626,7 +3632,7 @@ impl Pipeline {
                         ));
                         continue;
                     }
-                }
+                };
 
                 if contested_file_ids.contains(&file_id) {
                     report.contested.push(file_verification.filename.clone());
@@ -3644,7 +3650,7 @@ impl Pipeline {
                         report.contested.push(file_verification.filename.clone());
                     }
                     std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert(current_filename);
+                        slot.insert(verified_filename);
                     }
                 }
             }
@@ -3654,6 +3660,24 @@ impl Pipeline {
 
         if files_to_complete.is_empty() {
             return Ok(report);
+        }
+
+        for (file_id, verified_filename) in &files_to_complete {
+            let Some(mut identity) = self.effective_file_identity(job_id, *file_id) else {
+                continue;
+            };
+            if identity.current_filename == *verified_filename {
+                continue;
+            }
+            identity.current_filename = verified_filename.clone();
+            identity.canonical_filename = Some(verified_filename.clone());
+            if let Some(classification) =
+                Self::canonical_archive_identity_from_filename(verified_filename)
+            {
+                identity.classification = Some(classification);
+            }
+            identity.classification_source = crate::jobs::record::FileIdentitySource::Par2;
+            self.set_file_identity(job_id, identity)?;
         }
 
         {
@@ -6146,6 +6170,9 @@ impl Pipeline {
                         )
                         .await
                     {
+                        _ if self.shared_state.is_job_cancellation_requested(job_id) => {
+                            return;
+                        }
                         DirectPar2Resolution::Repaired => {
                             self.schedule_job_completion_check(job_id);
                             return;
@@ -6198,6 +6225,9 @@ impl Pipeline {
                         .await
                     {
                         Ok(outcome) => outcome,
+                        Err(_) if self.shared_state.is_job_cancellation_requested(job_id) => {
+                            return;
+                        }
                         Err(message) => {
                             self.finish_par2_set_failure(job_id, set_id, message).await;
                             return;

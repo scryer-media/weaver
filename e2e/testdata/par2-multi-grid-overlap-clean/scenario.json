@@ -15,9 +15,9 @@
         "6a197aef97785caa4d20e5ed8628be6f": 65536,
         "617ae7848ecc6d3878e8b1567b7e19f0": 98304
       },
-      "expectedSetVerificationMode": {
-        "6a197aef97785caa4d20e5ed8628be6f": "grid",
-        "617ae7848ecc6d3878e8b1567b7e19f0": "grid"
+      "expectedSetVerificationModes": {
+        "6a197aef97785caa4d20e5ed8628be6f": ["grid"],
+        "617ae7848ecc6d3878e8b1567b7e19f0": ["grid"]
       },
       "verificationReadBytes": 0
     }

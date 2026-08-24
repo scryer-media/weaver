@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::events::model::PipelineEvent;
@@ -936,4 +937,30 @@ async fn reorder_jobs_batch_rejects_unknown_id_without_partial_application() {
 
     handle.shutdown().await.unwrap();
     task.await.unwrap();
+}
+
+#[test]
+fn job_cancellation_callbacks_fire_before_scheduler_work_and_can_be_cleared() {
+    let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let callback_cancelled = Arc::clone(&cancelled);
+    state.register_job_cancellation(
+        JobId(42),
+        Arc::new(move || callback_cancelled.store(true, Ordering::Release)),
+    );
+
+    assert!(state.cancel_active_job_work(JobId(42)));
+    assert!(cancelled.load(Ordering::Acquire));
+
+    state.clear_job_cancellations(JobId(42));
+    assert!(!state.cancel_active_job_work(JobId(42)));
+
+    assert!(!state.cancel_active_job_work(JobId(43)));
+    let late_cancelled = Arc::new(AtomicBool::new(false));
+    let late_callback_cancelled = Arc::clone(&late_cancelled);
+    state.register_job_cancellation(
+        JobId(43),
+        Arc::new(move || late_callback_cancelled.store(true, Ordering::Release)),
+    );
+    assert!(late_cancelled.load(Ordering::Acquire));
 }

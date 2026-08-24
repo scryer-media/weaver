@@ -794,6 +794,8 @@ function formatMetadataKey(key: string): string {
 type OutputFile = { name: string; path: string; sizeBytes: number };
 type OutputResult = { outputDir: string; files: OutputFile[]; totalBytes: number };
 
+const OUTPUT_DIR_MARKER = ".weaver-output-dir";
+
 function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }) {
   const t = useTranslate();
   const isTerminal = status === "COMPLETE" || status === "FAILED";
@@ -813,6 +815,8 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
   if (!isTerminal) return null;
 
   const result = data?.jobOutputFiles;
+  const files = result?.files.filter((file) => file.name !== OUTPUT_DIR_MARKER) ?? [];
+  const visibleTotalBytes = files.reduce((total, file) => total + file.sizeBytes, 0);
   const outputFileDownloadHref = new URL(`api/jobs/${jobId}/output-file`, document.baseURI).href;
 
   if (fetching) {
@@ -828,7 +832,7 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
     );
   }
 
-  if (!result || result.files.length === 0) {
+  if (!result || files.length === 0) {
     return (
       <Card>
         <CardHeader>
@@ -856,9 +860,9 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
     }, 1000);
   }
 
-  const filesOpen = filesOpenOverride ?? (result.files.length <= 10);
+  const filesOpen = filesOpenOverride ?? (files.length <= 10);
   const outputFilesRegionId = `job-${jobId}-output-files`;
-  const outputFileCountLabel = `${result.files.length} file${result.files.length !== 1 ? "s" : ""}`;
+  const outputFileCountLabel = `${files.length} file${files.length !== 1 ? "s" : ""}`;
 
   return (
     <Card>
@@ -881,7 +885,7 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
             <CardTitle>Output Files</CardTitle>
           </div>
           <span className="text-xs text-muted-foreground">
-            {outputFileCountLabel} &middot; {formatBytes(result.totalBytes)}
+            {outputFileCountLabel} &middot; {formatBytes(visibleTotalBytes)}
           </span>
         </button>
         <div className="font-mono text-xs text-muted-foreground">{result.outputDir}</div>
@@ -898,7 +902,7 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
               </TableRow>
             </TableHeader>
             <TableBody>
-              {result.files.map((file) => (
+              {files.map((file) => (
                 <TableRow key={file.path}>
                   <TableCell className="font-mono text-xs">{file.name}</TableCell>
                   <TableCell className="text-right text-xs text-muted-foreground">

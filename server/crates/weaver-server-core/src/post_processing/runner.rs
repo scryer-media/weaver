@@ -24,12 +24,18 @@ use super::model::{OptionValue, PipelineOutcome, ResolvedOption, ScriptAdapter, 
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 pub const DEFAULT_TERMINATION_GRACE: Duration = Duration::from_secs(10);
+/// A user cancellation must not inherit an arbitrarily long script shutdown grace.
+const MAX_USER_CANCELLATION_GRACE: Duration = Duration::from_secs(5);
 /// Per-script output retained on the job. Anything beyond this keeps the tail.
 pub const MAX_SCRIPT_OUTPUT_BYTES: u64 = 256 * 1024;
 pub const MAX_LOGICAL_LINE_BYTES: usize = 64 * 1024;
 
 const SUPERVISOR_ARG: &str = "__post-processing-supervisor";
 const MAX_SUPERVISOR_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
+
+fn user_cancellation_grace(grace: Duration) -> Duration {
+    grace.min(MAX_USER_CANCELLATION_GRACE)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct InterpreterConfig {
@@ -774,7 +780,12 @@ async fn execute_supervised(
             biased;
             status = child.wait() => (Some(status?), None),
             () = cancelled => {
-                terminate_supervisor(&mut child, supervisor_pid, grace).await?;
+                terminate_supervisor(
+                    &mut child,
+                    supervisor_pid,
+                    user_cancellation_grace(grace),
+                )
+                .await?;
                 (None, Some(ExecutionDisposition::Cancelled))
             }
             () = timed_out => {
@@ -1102,6 +1113,11 @@ pub(crate) fn bounded_output_for_test(lines: Vec<Vec<u8>>) -> (Vec<u8>, bool) {
 #[cfg(test)]
 pub(crate) fn redact_bytes_for_test(input: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
     redact_bytes(input, secrets)
+}
+
+#[cfg(test)]
+pub(crate) fn cancellation_grace_for_test(grace: Duration) -> Duration {
+    user_cancellation_grace(grace)
 }
 
 #[cfg(windows)]

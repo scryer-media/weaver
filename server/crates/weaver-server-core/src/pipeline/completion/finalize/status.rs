@@ -834,6 +834,8 @@ impl Pipeline {
     pub(crate) fn clear_par2_runtime_state(&mut self, job_id: JobId) {
         self.block_crcs.forget_job(job_id);
         self.par2_runtime.remove(&job_id);
+        self.par2_cancellations.remove(&job_id);
+        self.shared_state.clear_job_cancellations(job_id);
         self.par2_verified.remove(&job_id);
         self.par2_joined_split_sets.remove(&job_id);
         self.par2_pre_repair_dir_entries.remove(&job_id);

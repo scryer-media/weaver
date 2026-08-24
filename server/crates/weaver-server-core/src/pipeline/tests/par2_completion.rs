@@ -4,8 +4,21 @@ use super::*;
 async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
     let temp_dir = tempfile::tempdir().unwrap();
     let par2_filename = "repair.par2";
-    let par2_bytes = build_test_par2_index("payload.bin", b"payload-data", 8);
-    let spec = par2_only_job_spec("PAR2 Restore", par2_filename, par2_bytes.len() as u32);
+    let payload = b"payload-data";
+    let par2_bytes = build_test_par2_index("payload.bin", payload, 8);
+    let mut spec = par2_only_job_spec("PAR2 Restore", par2_filename, par2_bytes.len() as u32);
+    spec.total_bytes += payload.len() as u64;
+    spec.files.push(FileSpec {
+        filename: "payload.bin".to_string(),
+        role: FileRole::Standalone,
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: payload.len() as u32,
+            message_id: "restored-payload@example.com".to_string(),
+        }],
+    });
     let job_id = JobId(30030);
     let working_dir = {
         let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -16,23 +29,26 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
         working_dir
     };
 
-    let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (mut restored, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        4,
+    )
+    .await;
     restored
         .restore_job(RestoreJobRequest {
             job_id,
             job_hash: [0; 32],
             spec,
             file_progress: HashMap::new(),
-            complete_files: HashSet::from([
-                NzbFileId {
-                    job_id,
-                    file_index: 0,
-                },
-                NzbFileId {
-                    job_id,
-                    file_index: 1,
-                },
-            ]),
+            complete_files: HashSet::from([NzbFileId {
+                job_id,
+                file_index: 0,
+            }]),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -54,6 +70,40 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
     let par2_set = restored.par2_set(job_id).unwrap();
     assert_eq!(par2_set.files.len(), 1);
     assert_eq!(par2_set.recovery_block_count(), 0);
+    assert!(
+        !restored
+            .par2_runtime(job_id)
+            .unwrap()
+            .explicit_index_bootstrap_closed,
+        "restored runtime must recompute the lease gate from durable metadata"
+    );
+    assert!(matches!(
+        restored.par2_discovery_state_for_candidate(job_id, 0),
+        Par2DiscoveryState::Parsed { .. }
+    ));
+
+    let restored_state = restored.jobs.get(&job_id).unwrap();
+    assert_eq!(
+        restored_state.download_queue.len(),
+        1,
+        "restored payload queue must survive progress reconciliation (status {:?}, recovery {})",
+        restored_state.status,
+        restored_state.recovery_queue.len()
+    );
+    let pressure = restored.refresh_download_pressure();
+    let payload_lease = restored
+        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .expect("restored parsed index must not leave payload blocked");
+    assert!(matches!(
+        payload_lease.checkpoint_plan,
+        weaver_yenc::CheckpointPlan::Single(_)
+    ));
+    assert!(
+        restored
+            .par2_runtime(job_id)
+            .unwrap()
+            .explicit_index_bootstrap_closed
+    );
 }
 
 #[tokio::test]
@@ -567,10 +617,18 @@ async fn metadata_early_clean_download_quick_completes_from_the_dual_crc_grid_al
     let mut events = pipeline.event_tx.subscribe();
     let job_id = JobId(30178);
     let payload_filename = "payload.mkv";
+    let unrelated_par2_filename = "00-unrelated.par2";
     let payload: Vec<u8> = (0..64u32).map(|value| (value % 251) as u8).collect();
+    let unrelated_par2 = b"unrelated completed PAR2 metadata".to_vec();
     let spec = standalone_job_spec(
         "Metadata Early Clean Grid Quick Verify",
-        &[(payload_filename.to_string(), payload.len() as u32)],
+        &[
+            (payload_filename.to_string(), payload.len() as u32),
+            (
+                unrelated_par2_filename.to_string(),
+                unrelated_par2.len() as u32,
+            ),
+        ],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
 
@@ -592,10 +650,26 @@ async fn metadata_early_clean_download_quick_completes_from_the_dual_crc_grid_al
     par2_set
         .slice_checksums
         .insert(par2_file_id, slice_checksums);
+    assert_ne!(
+        par2_rs::checksum::md5(&unrelated_par2),
+        par2_set.file_description(&par2_file_id).unwrap().hash_full,
+        "precondition: the unrelated PAR2 digest must not describe the payload"
+    );
     install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
 
     write_and_complete_file(&mut pipeline, job_id, 0, payload_filename, &payload).await;
-    // Deliberately NO persisted digest: the grid is the only evidence.
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        1,
+        unrelated_par2_filename,
+        &unrelated_par2,
+    )
+    .await;
+    // The payload deliberately has no digest: its grid is the only evidence.
+    // The completed PAR2 metadata carries a digest but is not described by this
+    // recovery set, so it must not change the payload's attribution.
+    set_measured_md5(&mut pipeline, job_id, 1, &unrelated_par2);
 
     let file_id = NzbFileId {
         job_id,
@@ -4850,6 +4924,71 @@ async fn obfuscated_payload_reconciles_through_par2_content_identity() {
             .is_complete(),
         "promotion must fill the article bitmap"
     );
+    assert_eq!(
+        pipeline
+            .current_filename_for_file_id(job_id, payload_file_id)
+            .as_deref(),
+        Some(posted_filename),
+        "without a canonical file on disk reconciliation must retain the installed alias"
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_adopts_the_verified_canonical_file_over_a_duplicate_alias() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30329);
+    let source_filename = "a7f3e91c9b2d4e6f.bin";
+    let duplicate_filename = "Silver Horizon.duplicate1.mkv";
+    let canonical_filename = "Silver Horizon.mkv";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let (working_dir, file_id) = incomplete_protected_payload_job(
+        &mut pipeline,
+        job_id,
+        "Verified Canonical PAR2 Reconciliation",
+        source_filename,
+        &payload,
+    )
+    .await;
+    tokio::fs::write(working_dir.join(duplicate_filename), &payload)
+        .await
+        .unwrap();
+    tokio::fs::write(working_dir.join(canonical_filename), &payload)
+        .await
+        .unwrap();
+    pipeline
+        .set_file_identity(
+            job_id,
+            crate::jobs::record::ActiveFileIdentity {
+                file_index: file_id.file_index,
+                source_filename: source_filename.to_string(),
+                current_filename: duplicate_filename.to_string(),
+                canonical_filename: Some(duplicate_filename.to_string()),
+                classification: None,
+                classification_source: FileIdentitySource::Par2,
+            },
+        )
+        .unwrap();
+    pipeline.file_prefix_16k.insert(file_id, payload.clone());
+
+    let par2_set = build_repairable_par2_set(canonical_filename, &payload, 64, 1);
+    let verification = complete_verification_for(&par2_set, canonical_filename);
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+
+    let report = pipeline
+        .reconcile_verified_par2_files(job_id, &verification)
+        .await
+        .unwrap();
+
+    assert_eq!(report.completed, 1);
+    let identity = pipeline.file_identity(job_id, file_id).unwrap();
+    assert_eq!(identity.source_filename, source_filename);
+    assert_eq!(identity.current_filename, canonical_filename);
+    assert_eq!(
+        identity.canonical_filename.as_deref(),
+        Some(canonical_filename)
+    );
+    assert_eq!(identity.classification_source, FileIdentitySource::Par2);
 }
 
 /// Two assembly files that both answer to one description bind to neither.
@@ -11063,6 +11202,317 @@ async fn metadata_probe_extracts_a_nonbootstrap_volume_from_its_recovery_queue()
             .count_matching(|work| work.segment_id.file_id == selected_file),
         0,
         "the parked original must not race the promoted probe"
+    );
+}
+
+#[tokio::test]
+async fn committed_carrier_segment_does_not_keep_metadata_discovery_waiting() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30938);
+    let carrier_filename = "metadata-carrier.vol00+01.par2";
+    let carrier_file_id = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    let missing_segment = SegmentId {
+        file_id: carrier_file_id,
+        segment_number: 1,
+    };
+    let spec = JobSpec {
+        name: "Committed Metadata Carrier".to_string(),
+        password: None,
+        total_bytes: 129,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "metadata-carrier-payload.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 1,
+                    message_id: "metadata-carrier-payload@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: carrier_filename.to_string(),
+                role: FileRole::from_filename(carrier_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "metadata-carrier-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "metadata-carrier-1@example.com".to_string(),
+                    },
+                ],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state
+            .assembly
+            .file_mut(carrier_file_id)
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+    }
+    {
+        let carrier = pipeline
+            .ensure_par2_runtime(job_id)
+            .files
+            .entry(carrier_file_id.file_index)
+            .or_default();
+        carrier.promoted = true;
+        carrier.discovery = Par2DiscoveryState::MetadataCarrierQueued {
+            target_set_id: None,
+            set_ids: vec![],
+        };
+    }
+    pipeline.mark_promoted_recovery_segment_unavailable(missing_segment);
+
+    assert!(
+        !pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .assembly
+            .file(carrier_file_id)
+            .unwrap()
+            .is_complete(),
+        "precondition: one carrier segment is present and the other is unavailable"
+    );
+    assert!(
+        !pipeline.promote_par2_metadata(job_id),
+        "a committed carrier segment cannot keep metadata discovery waiting"
+    );
+    assert!(matches!(
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .files
+            .get(&carrier_file_id.file_index)
+            .unwrap()
+            .discovery,
+        Par2DiscoveryState::Exhausted { .. }
+    ));
+    assert!(
+        pipeline.par2_metadata_discovery_closed(job_id),
+        "the completion gate must observe the exhausted sole carrier"
+    );
+}
+
+#[tokio::test]
+async fn queued_prefix_probe_rearms_only_its_selected_recovery_ordinal_once() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30939);
+    let volume_filename = "metadata-prefix-rearm.vol00+01.par2";
+    let volume_file_id = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    let prior_probe_segment = SegmentId {
+        file_id: volume_file_id,
+        segment_number: 0,
+    };
+    let selected_segment = SegmentId {
+        file_id: volume_file_id,
+        segment_number: 1,
+    };
+    let unselected_segment = SegmentId {
+        file_id: volume_file_id,
+        segment_number: 2,
+    };
+    let spec = JobSpec {
+        name: "Prefix Probe Rearm".to_string(),
+        password: None,
+        total_bytes: 257,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "metadata-prefix-rearm-payload.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 1,
+                    message_id: "metadata-prefix-rearm-payload@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: volume_filename.to_string(),
+                role: FileRole::from_filename(volume_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "metadata-prefix-rearm-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "metadata-prefix-rearm-1@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 2,
+                        bytes: 64,
+                        message_id: "metadata-prefix-rearm-2@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: "metadata-prefix-bootstrap.vol00+01.par2".to_string(),
+                role: FileRole::from_filename("metadata-prefix-bootstrap.vol00+01.par2"),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "metadata-prefix-bootstrap@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        assert_eq!(
+            state
+                .recovery_queue
+                .extract_matching(|work| work.segment_id == prior_probe_segment)
+                .len(),
+            1,
+            "precondition: the earlier probe already left the recovery queue"
+        );
+        assert_eq!(
+            state
+                .recovery_queue
+                .count_matching(|work| work.segment_id.file_id == volume_file_id),
+            2,
+            "precondition: only the current probe and later ordinal remain parked"
+        );
+        let mut blocker = state
+            .recovery_queue
+            .extract_matching(|work| work.segment_id == unselected_segment);
+        assert_eq!(blocker.len(), 1);
+        blocker[0].priority = 0;
+        state.recovery_queue.push(blocker.pop().unwrap());
+        assert_eq!(
+            state
+                .recovery_queue
+                .peek_next_matching(|_| true)
+                .map(|work| work.segment_id),
+            Some(unselected_segment),
+            "precondition: unrelated recovery work must hide the selected probe below the heap head"
+        );
+    }
+    pipeline
+        .file_prefix_16k
+        .insert(volume_file_id, b"retained earlier prefix".to_vec());
+    {
+        let probe = pipeline
+            .ensure_par2_runtime(job_id)
+            .files
+            .entry(volume_file_id.file_index)
+            .or_default();
+        probe.filename = volume_filename.to_string();
+        probe.discovery = Par2DiscoveryState::PrefixProbeQueued;
+        probe
+            .discovery_probe_ordinals
+            .insert(prior_probe_segment.segment_number);
+        probe
+            .discovery_probe_ordinals
+            .insert(selected_segment.segment_number);
+    }
+    assert!(
+        !pipeline.promoted_recovery_file_has_pending_work(job_id, volume_file_id.file_index),
+        "precondition: only recovery-queue work exists"
+    );
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert_eq!(
+            state
+                .download_queue
+                .count_matching(|work| work.segment_id == selected_segment),
+            1,
+            "the existing selected probe ordinal is rearmed"
+        );
+        assert_eq!(
+            state
+                .download_queue
+                .count_matching(|work| work.segment_id == unselected_segment),
+            0,
+            "no second ordinal is selected"
+        );
+        assert_eq!(
+            state
+                .recovery_queue
+                .count_matching(|work| work.segment_id == selected_segment),
+            0,
+            "the selected work moved out of the recovery queue"
+        );
+        assert_eq!(
+            state
+                .recovery_queue
+                .count_matching(|work| work.segment_id == unselected_segment),
+            1,
+            "the unselected recovery work remains parked"
+        );
+    }
+    assert!(
+        !pipeline.is_promoted_recovery_file(job_id, volume_file_id.file_index),
+        "a prefix probe must not promote the full volume"
+    );
+    assert_eq!(
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .files
+            .get(&volume_file_id.file_index)
+            .unwrap()
+            .discovery_probe_ordinals,
+        HashSet::from([
+            prior_probe_segment.segment_number,
+            selected_segment.segment_number,
+        ]),
+        "rearming retains the existing bounded probe"
+    );
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(
+        state
+            .download_queue
+            .count_matching(|work| work.segment_id == selected_segment),
+        1,
+        "the pending-work guard prevents a duplicate rearm"
+    );
+    assert_eq!(
+        state
+            .recovery_queue
+            .count_matching(|work| work.segment_id == unselected_segment),
+        1,
+        "the second promotion still does not select another ordinal"
     );
 }
 

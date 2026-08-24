@@ -1498,6 +1498,9 @@ pub(super) struct Par2RuntimeState {
     /// Rebuilt only when parsed metadata changes, never while leasing work.
     pub(super) admitted_checkpoint_sizes: BTreeSet<u64>,
     pub(super) checkpoint_plan: Option<weaver_yenc::CheckpointPlan>,
+    /// Monotonic lease gate: every declared explicit index is parsed or
+    /// exhausted. Indexless discovery remains completion-bounded.
+    pub(super) explicit_index_bootstrap_closed: bool,
     /// Whether the job has already named its indexless recovery sets. Cleared
     /// whenever a set is newly met so a changed picture is reported once.
     pub(super) unserved_sets_warned: bool,
@@ -2407,6 +2410,8 @@ pub struct Pipeline {
     pub(super) inflight_terminal_post_processing: HashSet<JobId>,
     pub(super) terminal_post_processing_cancellations:
         HashMap<JobId, tokio::sync::watch::Sender<bool>>,
+    /// Cooperative cancellation tokens for PAR2 verification and repair work.
+    pub(super) par2_cancellations: HashMap<JobId, par2_rs::CancellationToken>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
     /// Whether the active global pause came from a bandwidth schedule rather

@@ -3,7 +3,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod};
@@ -17,6 +17,76 @@ use crate::jobs::model::{JobSpec, JobStatus, JobUpdate};
 use crate::operations::metrics::{MetricsSnapshot, PipelineMetrics};
 
 pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
+
+type JobCancellationCallback = Arc<dyn Fn() + Send + Sync>;
+
+/// Signals active job work without waiting for the single-threaded scheduler
+/// loop. This lets a user cancellation interrupt a repair that currently owns
+/// that loop before the queued cancellation command is handled.
+#[derive(Clone, Default)]
+struct JobCancellationRegistry {
+    state: Arc<Mutex<JobCancellationState>>,
+}
+
+#[derive(Default)]
+struct JobCancellationState {
+    callbacks: HashMap<JobId, Vec<JobCancellationCallback>>,
+    requested: HashSet<JobId>,
+}
+
+impl JobCancellationRegistry {
+    fn register(&self, job_id: JobId, callback: JobCancellationCallback) {
+        let cancel_now = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("job cancellation registry poisoned");
+            let cancel_now = state.requested.contains(&job_id);
+            state
+                .callbacks
+                .entry(job_id)
+                .or_default()
+                .push(Arc::clone(&callback));
+            cancel_now
+        };
+        if cancel_now {
+            callback();
+        }
+    }
+
+    fn cancel(&self, job_id: JobId) -> bool {
+        let callbacks = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("job cancellation registry poisoned");
+            state.requested.insert(job_id);
+            state.callbacks.get(&job_id).cloned().unwrap_or_default()
+        };
+        let cancelled = !callbacks.is_empty();
+        for callback in callbacks {
+            callback();
+        }
+        cancelled
+    }
+
+    fn requested(&self, job_id: JobId) -> bool {
+        self.state
+            .lock()
+            .expect("job cancellation registry poisoned")
+            .requested
+            .contains(&job_id)
+    }
+
+    fn clear(&self, job_id: JobId) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("job cancellation registry poisoned");
+        state.callbacks.remove(&job_id);
+        state.requested.remove(&job_id);
+    }
+}
 
 /// Shared read-only view of pipeline state for the control plane.
 ///
@@ -36,6 +106,7 @@ pub struct SharedPipelineState {
         Arc<RwLock<Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>>>,
     nntp_pool: Arc<RwLock<Option<Arc<weaver_nntp::pool::NntpPool>>>>,
     nntp_runtime_activation: Arc<RwLock<Option<NntpRuntimeActivation>>>,
+    job_cancellations: JobCancellationRegistry,
 }
 
 impl SharedPipelineState {
@@ -54,6 +125,7 @@ impl SharedPipelineState {
             server_transfer_policy: Arc::new(RwLock::new(None)),
             nntp_pool: Arc::new(RwLock::new(None)),
             nntp_runtime_activation: Arc::new(RwLock::new(None)),
+            job_cancellations: JobCancellationRegistry::default(),
         }
     }
 
@@ -90,6 +162,26 @@ impl SharedPipelineState {
 
     pub fn raw_metrics_snapshot(&self) -> MetricsSnapshot {
         self.metrics.raw_snapshot()
+    }
+
+    pub(crate) fn register_job_cancellation(
+        &self,
+        job_id: JobId,
+        callback: JobCancellationCallback,
+    ) {
+        self.job_cancellations.register(job_id, callback);
+    }
+
+    pub(crate) fn cancel_active_job_work(&self, job_id: JobId) -> bool {
+        self.job_cancellations.cancel(job_id)
+    }
+
+    pub(crate) fn is_job_cancellation_requested(&self, job_id: JobId) -> bool {
+        self.job_cancellations.requested(job_id)
+    }
+
+    pub(crate) fn clear_job_cancellations(&self, job_id: JobId) {
+        self.job_cancellations.clear(job_id);
     }
 
     pub fn metrics(&self) -> &Arc<PipelineMetrics> {
@@ -672,6 +764,9 @@ impl SchedulerHandle {
         job_id: JobId,
         origin: CancellationOrigin,
     ) -> Result<(), SchedulerError> {
+        if matches!(origin, CancellationOrigin::User) {
+            self.state.cancel_active_job_work(job_id);
+        }
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::CancelJob {

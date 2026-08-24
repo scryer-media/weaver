@@ -81,6 +81,9 @@ impl Pipeline {
             Arc::clone(&self.metrics),
         )?;
         self.extraction_budgets.insert(job_id, Arc::clone(&budget));
+        let cancellation_budget = Arc::clone(&budget);
+        self.shared_state
+            .register_job_cancellation(job_id, Arc::new(move || cancellation_budget.cancel()));
         Ok(budget)
     }
 

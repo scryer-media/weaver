@@ -315,6 +315,7 @@ impl Pipeline {
             job_retention_exclude_cache: HashMap::new(),
             last_no_eligible_server_warn: None,
             last_body_fetch_failure_log_at: None,
+            par2_cancellations: HashMap::new(),
             inflight_moves: HashSet::new(),
             reserved_complete_destinations: HashMap::new(),
             failed_extractions: HashMap::new(),

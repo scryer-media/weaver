@@ -107,6 +107,7 @@ var ScenarioOnly = map[string]string{
 	"multiserver-primary-corrupt-direct":   "stages single-mkv's payload; the damage is injected by the fake NNTP server",
 	"multiserver-primary-missing-direct":   "stages single-mkv's payload; articles are withheld at post time",
 	"obfuscated-rar-retry-7z":              "stages rar5-corrupted and single-7z under one obfuscated name",
+	"par2-obfuscated-rar-repair":           "stages obfuscated rar5-multivolume beside par2-obfuscated-rar-rewrite's sidecars and withholds an interior tail article",
 	"par2-multi-grid-late-discovery":       "stages one index, one late recovery carrier, and the shared payload from par2-multi-grid-overlap-clean",
 	"par2-rar-placement-normalization":     "stages rar5-multivolume under swapped names beside par2-obfuscated-rar-rewrite's sidecars",
 	"par2-rar-placement-stripped-recovery": "the same staging, with the recovery volumes stripped after posting",

@@ -1364,6 +1364,7 @@ impl Pipeline {
         }) else {
             return Ok(None);
         };
+        let cancellation = self.par2_cancellation_token(job_id);
 
         let session_result = tokio::task::spawn_blocking(move || {
             let mut options = match source_access {
@@ -1378,6 +1379,7 @@ impl Pipeline {
                 }
             };
             options.memory_limit = Some(memory_limit);
+            options.cancel = Some(cancellation);
             options.progress = progress;
             par2_rs::Par2RepairSession::open(options)
                 .map_err(|error| format!("failed to open retained PAR2 session: {error}"))
@@ -1386,6 +1388,20 @@ impl Pipeline {
         .map_err(|error| format!("retained PAR2 session task panicked: {error}"))??;
 
         Ok(Some((session_result, true)))
+    }
+
+    pub(crate) fn par2_cancellation_token(&mut self, job_id: JobId) -> par2_rs::CancellationToken {
+        if let Some(cancellation) = self.par2_cancellations.get(&job_id) {
+            return cancellation.clone();
+        }
+        let cancellation = par2_rs::CancellationToken::new();
+        let callback_cancellation = cancellation.clone();
+        self.shared_state.register_job_cancellation(
+            job_id,
+            std::sync::Arc::new(move || callback_cancellation.cancel()),
+        );
+        self.par2_cancellations.insert(job_id, cancellation.clone());
+        cancellation
     }
 
     pub(crate) fn restore_par2_repair_session(
@@ -2800,6 +2816,7 @@ impl Pipeline {
                 segment = %segment_id,
                 "promoted PAR2 recovery segment became unavailable"
             );
+            self.refresh_par2_metadata_discovery(segment_id.file_id.job_id);
             self.schedule_job_completion_check(segment_id.file_id.job_id);
         }
     }
@@ -3084,6 +3101,13 @@ impl Pipeline {
                     set_ids,
                 } => {
                     let carrier_may_arrive = self.jobs.get(&job_id).is_some_and(|state| {
+                        let file_id = NzbFileId { job_id, file_index };
+                        let has_segment = |ordinal| {
+                            state
+                                .assembly
+                                .file(file_id)
+                                .is_some_and(|file| file.has_segment(ordinal))
+                        };
                         state
                             .spec
                             .files
@@ -3092,10 +3116,10 @@ impl Pipeline {
                                 file.segments.iter().any(|segment| {
                                     !self.unavailable_promoted_recovery_segments.contains(
                                         &SegmentId {
-                                            file_id: NzbFileId { job_id, file_index },
+                                            file_id,
                                             segment_number: segment.ordinal,
                                         },
-                                    )
+                                    ) && !has_segment(segment.ordinal)
                                 })
                             })
                     });
@@ -3238,6 +3262,14 @@ impl Pipeline {
             let Some(file) = state.spec.files.get(file_index as usize) else {
                 return false;
             };
+            let (priority, is_recovery) = if matches!(
+                file.role,
+                weaver_model::files::FileRole::Par2 { is_index: true, .. }
+            ) {
+                (file.role.download_priority(), false)
+            } else {
+                (PROMOTED_RECOVERY_PRIORITY, true)
+            };
             let mut segments = file
                 .segments
                 .iter()
@@ -3262,10 +3294,10 @@ impl Pipeline {
                     },
                     message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
                     groups: file.groups.clone(),
-                    priority: PROMOTED_RECOVERY_PRIORITY,
+                    priority,
                     byte_estimate: segment.bytes,
                     retry_count: 0,
-                    is_recovery: true,
+                    is_recovery,
                     exclude_servers: Vec::new(),
                     avoid_server: None,
                 })
@@ -3328,9 +3360,66 @@ impl Pipeline {
         true
     }
 
+    fn rearm_prefix_probe_from_recovery_queue(&mut self, job_id: JobId) -> bool {
+        let mut probe = None;
+        for (file_index, _, _) in self.par2_metadata_candidate_indices(job_id) {
+            let Some(file) = self
+                .par2_runtime(job_id)
+                .and_then(|runtime| runtime.files.get(&file_index))
+            else {
+                continue;
+            };
+            if !matches!(&file.discovery, Par2DiscoveryState::PrefixProbeQueued)
+                || file.promoted
+                || self.promoted_recovery_file_has_pending_work(job_id, file_index)
+            {
+                continue;
+            }
+            // Prefix probing chooses the lowest untried ordinal, so the most
+            // recently recorded ordinal is the one this queued state owns.
+            let Some(ordinal) = file.discovery_probe_ordinals.iter().max().copied() else {
+                continue;
+            };
+            let segment_id = SegmentId {
+                file_id: NzbFileId { job_id, file_index },
+                segment_number: ordinal,
+            };
+            if self
+                .unavailable_promoted_recovery_segments
+                .contains(&segment_id)
+            {
+                continue;
+            }
+            probe = Some(segment_id);
+            break;
+        }
+
+        let Some(segment_id) = probe else {
+            return false;
+        };
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return false;
+        };
+        let mut queued = state
+            .recovery_queue
+            .extract_matching(|work| work.segment_id == segment_id);
+        let Some(work) = queued.pop() else {
+            return false;
+        };
+        for duplicate in queued {
+            state.recovery_queue.push(duplicate);
+        }
+        state.download_queue.push(work);
+        self.update_queue_metrics();
+        true
+    }
+
     /// Put the next finite metadata probe or set-specific carrier on the wire.
     /// Discovery continues even after one usable set exists.
     pub(crate) fn promote_par2_metadata(&mut self, job_id: JobId) -> bool {
+        if self.rearm_prefix_probe_from_recovery_queue(job_id) {
+            return true;
+        }
         self.refresh_par2_metadata_discovery(job_id);
         if self
             .par2_metadata_candidate_indices(job_id)

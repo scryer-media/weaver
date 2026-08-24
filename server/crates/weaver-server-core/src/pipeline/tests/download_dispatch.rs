@@ -39,6 +39,803 @@ async fn owned_download_lane_pool_respects_configured_connection_count_at_startu
 }
 
 #[tokio::test]
+async fn par2_metadata_bootstrap_defers_payload_until_checkpoint_plan_is_known() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        4,
+    )
+    .await;
+    let job_id = JobId(40143);
+    let payload = (0..(7 * 128))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let mut grid64 = placement_par2_file_set(&[("payload.mkv".to_string(), payload.clone())]);
+    grid64.slice_size = 64;
+    let mut grid96 = placement_par2_file_set(&[("payload.mkv".to_string(), payload.clone())]);
+    grid96.recovery_set_id = par2_rs::RecoverySetId::from_bytes([10; 16]);
+    grid96.slice_size = 96;
+
+    let index64 = build_test_par2_index("payload.mkv", &payload, 64);
+    let index96 = build_test_par2_index("payload.mkv", &payload, 96);
+    let payload_segments = (0..7)
+        .map(|number| {
+            segment_spec! {
+                number: number,
+                bytes: 128,
+                message_id: format!("payload-{number}@example.com"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let spec = JobSpec {
+        name: "PAR2 Metadata Bootstrap".to_string(),
+        password: None,
+        total_bytes: (index64.len() + index96.len() + payload.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "00-grid64.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: index64.len() as u32,
+                    message_id: "grid64@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "01-grid96.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: index96.len() as u32,
+                    message_id: "grid96@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "payload.mkv".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: payload_segments,
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let pressure = pipeline.refresh_download_pressure();
+    let grid64_id = grid64.recovery_set_id;
+    let grid96_id = grid96.recovery_set_id;
+    let index64_priority = pipeline
+        .jobs
+        .get(&job_id)
+        .unwrap()
+        .download_queue
+        .peek_next_matching(|work| work.segment_id.file_id.file_index == 0)
+        .expect("the first explicit index must be the ordinary queue head")
+        .priority;
+
+    let index64_lease = pipeline
+        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .expect("the first explicit index must lease first");
+    assert_eq!(index64_lease.works.len(), 1);
+    assert!(matches!(
+        index64_lease.checkpoint_plan,
+        weaver_yenc::CheckpointPlan::None
+    ));
+    assert!(
+        index64_lease
+            .works
+            .iter()
+            .all(|work| work.segment_id.file_id.file_index == 0)
+    );
+    assert!(
+        !index64_lease.compatibility.is_recovery
+            && index64_lease
+                .works
+                .iter()
+                .all(|work| !work.is_recovery && work.priority == index64_priority),
+        "explicit indexes must retain primary lane and accounting classification"
+    );
+
+    {
+        let runtime = pipeline.ensure_par2_runtime(job_id);
+        runtime.served = Some(grid64_id);
+        runtime.ensure_set_runtime(grid64_id).set = Some(std::sync::Arc::new(grid64));
+        runtime.files.insert(
+            0,
+            Par2FileRuntime {
+                filename: "00-grid64.par2".to_string(),
+                discovery: Par2DiscoveryState::Parsed {
+                    set_ids: vec![grid64_id],
+                },
+                ..Default::default()
+            },
+        );
+    }
+    pipeline.refresh_par2_checkpoint_plan(job_id);
+    assert!(pipeline.promote_par2_metadata(job_id));
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        assert_eq!(
+            state.download_queue.reprioritize_matching(|work| {
+                (work.segment_id.file_id.file_index == 2)
+                    .then_some(super::repair::PROMOTED_RECOVERY_PRIORITY - 1)
+            }),
+            7
+        );
+        assert_eq!(
+            state
+                .download_queue
+                .peek_next_matching(|_| true)
+                .map(|work| work.segment_id.file_id.file_index),
+            Some(1),
+            "metadata promotion must preserve the explicit index's primary priority"
+        );
+    }
+
+    let index96_lease = pipeline
+        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .expect("the second explicit index must lease before the payload");
+    assert_eq!(index96_lease.works.len(), 1);
+    assert!(matches!(
+        index96_lease.checkpoint_plan,
+        weaver_yenc::CheckpointPlan::Single(_)
+    ));
+    assert!(
+        index96_lease
+            .works
+            .iter()
+            .all(|work| work.segment_id.file_id.file_index == 1)
+    );
+    assert!(
+        index96_lease
+            .works
+            .iter()
+            .all(|work| !work.is_recovery && work.priority == index64_priority)
+    );
+
+    assert!(
+        pipeline
+            .try_lease_initial_download_batch_for_test(job_id, pressure)
+            .is_none(),
+        "payload work must wait for PAR2 metadata instead of receiving a stale None plan"
+    );
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 7);
+
+    let runtime = pipeline.ensure_par2_runtime(job_id);
+    runtime.ensure_set_runtime(grid96_id).set = Some(std::sync::Arc::new(grid96));
+    runtime.files.insert(
+        1,
+        Par2FileRuntime {
+            filename: "01-grid96.par2".to_string(),
+            discovery: Par2DiscoveryState::Parsed {
+                set_ids: vec![grid96_id],
+            },
+            ..Default::default()
+        },
+    );
+    pipeline.refresh_par2_checkpoint_plan(job_id);
+    assert!(pipeline.par2_metadata_discovery_closed(job_id));
+
+    let payload_lease = pipeline
+        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .expect("payload work must lease after both grids are known");
+    assert!(
+        !payload_lease.works.is_empty(),
+        "the released payload lease must contain work"
+    );
+    assert!(
+        payload_lease
+            .works
+            .iter()
+            .all(|work| work.segment_id.file_id.file_index == 2)
+    );
+    assert!(matches!(
+        payload_lease.checkpoint_plan,
+        weaver_yenc::CheckpointPlan::Multi(_)
+    ));
+}
+
+#[tokio::test]
+async fn par2_metadata_bootstrap_claims_every_explicit_index_in_one_primary_batch() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        4,
+    )
+    .await;
+    let job_id = JobId(40146);
+    let spec = JobSpec {
+        name: "Batched Explicit PAR2 Metadata Bootstrap".to_string(),
+        password: None,
+        total_bytes: 256,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "00-first.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "batched-first@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "01-second.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "batched-second@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "payload.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "batched-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "batched-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let priority = FileRole::Par2 {
+        is_index: true,
+        recovery_block_count: 0,
+    }
+    .download_priority();
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let mut queued = state.download_queue.drain_all();
+        for work in &mut queued {
+            work.priority = priority;
+        }
+        queued.sort_by_key(|work| work.segment_id.file_id.file_index);
+        for work in queued {
+            state.download_queue.push(work);
+        }
+    }
+    pipeline.hot_dispatch_job = Some(job_id);
+    let pressure = pipeline.refresh_download_pressure();
+
+    let lease = pipeline
+        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .expect("same-priority explicit indexes must batch");
+    assert_eq!(lease.works.len(), 2);
+    assert!(
+        lease.works.iter().all(|work| {
+            work.segment_id.file_id.file_index < 2 && !work.is_recovery && work.priority == priority
+        }),
+        "the bootstrap lease must contain only primary explicit-index work"
+    );
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .download_queue
+            .count_matching(|work| work.segment_id.file_id.file_index == 2)
+            == 2,
+        "an otherwise compatible ordinary payload must remain queued"
+    );
+    let payload_head = pipeline
+        .jobs
+        .get(&job_id)
+        .unwrap()
+        .download_queue
+        .peek_next_matching(|_| true)
+        .map(|work| work.segment_id)
+        .unwrap();
+    for _ in 0..2 {
+        assert!(
+            pipeline
+                .try_lease_initial_download_batch_for_test(job_id, pressure)
+                .is_none(),
+            "in-flight indexes keep compatible payload work behind the gate"
+        );
+    }
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .download_queue
+            .peek_next_matching(|_| true)
+            .map(|work| work.segment_id),
+        Some(payload_head),
+        "a blocked lease attempt must not rotate equal-priority payload work"
+    );
+    assert!(matches!(
+        pipeline.par2_discovery_state_for_candidate(job_id, 0),
+        Par2DiscoveryState::MetadataCarrierQueued { .. }
+    ));
+    assert!(matches!(
+        pipeline.par2_discovery_state_for_candidate(job_id, 1),
+        Par2DiscoveryState::MetadataCarrierQueued { .. }
+    ));
+
+    let second_index = lease
+        .works
+        .iter()
+        .find(|work| work.segment_id.file_id.file_index == 1)
+        .expect("the second explicit index must be in the lease")
+        .segment_id;
+    pipeline.mark_promoted_recovery_segment_unavailable(second_index);
+    assert!(pipeline.promote_par2_metadata(job_id));
+    assert!(matches!(
+        pipeline.par2_discovery_state_for_candidate(job_id, 1),
+        Par2DiscoveryState::Exhausted { .. }
+    ));
+}
+
+#[tokio::test]
+async fn par2_metadata_bootstrap_blocks_compatible_payload_refill_until_plan_is_published() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        4,
+    )
+    .await;
+    let job_id = JobId(40147);
+    let payload = b"refill-payload".to_vec();
+    let mut grid = placement_par2_file_set(&[("payload.bin".to_string(), payload.clone())]);
+    grid.slice_size = 8;
+    let spec = JobSpec {
+        name: "PAR2 Bootstrap Refill".to_string(),
+        password: None,
+        total_bytes: 128,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "index.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "refill-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "payload.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: payload.len() as u32,
+                    message_id: "refill-payload@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let priority = FileRole::Par2 {
+        is_index: true,
+        recovery_block_count: 0,
+    }
+    .download_priority();
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let mut queued = state.download_queue.drain_all();
+        for work in &mut queued {
+            work.priority = priority;
+        }
+        queued.sort_by_key(|work| work.segment_id.file_id.file_index);
+        for work in queued {
+            state.download_queue.push(work);
+        }
+    }
+    let pressure = pipeline.refresh_download_pressure();
+
+    let index_lease = pipeline
+        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .expect("the explicit index must establish the primary compatibility");
+    assert!(
+        index_lease
+            .works
+            .iter()
+            .all(|work| work.segment_id.file_id.file_index == 0)
+    );
+    assert!(
+        pipeline
+            .try_lease_refill_download_batch_for_test(
+                job_id,
+                index_lease.compatibility.clone(),
+                pressure,
+            )
+            .is_none(),
+        "an open bootstrap must requeue a compatible payload refill"
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .download_queue
+            .count_matching(|work| work.segment_id.file_id.file_index == 1),
+        1
+    );
+
+    let grid_id = grid.recovery_set_id;
+    {
+        let runtime = pipeline.ensure_par2_runtime(job_id);
+        runtime.served = Some(grid_id);
+        runtime.ensure_set_runtime(grid_id).set = Some(std::sync::Arc::new(grid));
+        runtime.files.insert(
+            0,
+            Par2FileRuntime {
+                filename: "index.par2".to_string(),
+                discovery: Par2DiscoveryState::Parsed {
+                    set_ids: vec![grid_id],
+                },
+                ..Default::default()
+            },
+        );
+    }
+    pipeline.refresh_par2_checkpoint_plan(job_id);
+
+    let payload_refill = pipeline
+        .try_lease_refill_download_batch_for_test(job_id, index_lease.compatibility, pressure)
+        .expect("the payload refill must resume once the plan is published");
+    assert!(
+        payload_refill
+            .works
+            .iter()
+            .all(|work| work.segment_id.file_id.file_index == 1)
+    );
+    assert!(matches!(
+        payload_refill.checkpoint_plan,
+        weaver_yenc::CheckpointPlan::Single(_)
+    ));
+}
+
+#[tokio::test]
+async fn par2_metadata_bootstrap_blocks_compatible_ip_replacement_trial_payloads() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        4,
+    )
+    .await;
+    let job_id = JobId(40148);
+    let spec = JobSpec {
+        name: "PAR2 Bootstrap IP Trial".to_string(),
+        password: None,
+        total_bytes: 320,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "index.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "trial-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "payload.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: (0..4)
+                    .map(|number| {
+                        segment_spec! {
+                            number: number,
+                            bytes: 64,
+                            message_id: format!("trial-payload-{number}@example.com"),
+                        }
+                    })
+                    .collect(),
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let priority = FileRole::Par2 {
+        is_index: true,
+        recovery_block_count: 0,
+    }
+    .download_priority();
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let mut queued = state.download_queue.drain_all();
+        for work in &mut queued {
+            work.priority = priority;
+        }
+        queued.sort_by_key(|work| work.segment_id.file_id.file_index);
+        for work in queued {
+            state.download_queue.push(work);
+        }
+    }
+
+    assert!(
+        pipeline
+            .try_lease_ip_replacement_trial_batch_for_test(job_id, 0)
+            .is_none(),
+        "an IP trial must not build its sample from an open index plus ordinary payloads"
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .download_queue
+            .count_matching(|work| work.segment_id.file_id.file_index == 1),
+        4,
+        "all compatible payload samples must remain queued"
+    );
+    assert!(matches!(
+        pipeline.par2_discovery_state_for_candidate(job_id, 0),
+        Par2DiscoveryState::MetadataCarrierQueued { .. }
+    ));
+}
+
+#[tokio::test]
+async fn par2_metadata_bootstrap_releases_payload_after_an_explicit_index_is_unavailable() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        4,
+    )
+    .await;
+    let job_id = JobId(40144);
+    let spec = JobSpec {
+        name: "Missing Explicit PAR2 Index Bootstrap".to_string(),
+        password: None,
+        total_bytes: 192,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "missing.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "missing-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "payload.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 128,
+                    message_id: "missing-index-payload@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let pressure = pipeline.refresh_download_pressure();
+
+    let index_lease = pipeline
+        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .expect("the explicit index must lease before the payload");
+    assert!(
+        !index_lease.compatibility.is_recovery
+            && index_lease.works.iter().all(|work| !work.is_recovery),
+        "the unavailable callback must track an explicit primary index"
+    );
+    pipeline.mark_promoted_recovery_segment_unavailable(index_lease.works[0].segment_id);
+
+    let payload_lease = pipeline
+        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .expect("terminally unavailable metadata must not leave payload blocked forever");
+    assert!(
+        payload_lease
+            .works
+            .iter()
+            .all(|work| work.segment_id.file_id.file_index == 1)
+    );
+    assert!(pipeline.par2_metadata_discovery_closed(job_id));
+}
+
+#[tokio::test]
+async fn par2_metadata_bootstrap_does_not_hold_payload_for_late_indexless_discovery() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        4,
+    )
+    .await;
+    let job_id = JobId(40145);
+    let payload = b"late-carrier-payload".to_vec();
+    let mut grid = placement_par2_file_set(&[("payload.bin".to_string(), payload.clone())]);
+    grid.slice_size = 8;
+    let index = build_test_par2_index("payload.bin", &payload, 8);
+    let spec = JobSpec {
+        name: "Late Indexless PAR2 Carrier Bootstrap".to_string(),
+        password: None,
+        total_bytes: (index.len() + payload.len() + 64) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "00-index.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: index.len() as u32,
+                    message_id: "late-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "01-late.vol00+01.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: false,
+                    recovery_block_count: 1,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "late-carrier@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "payload.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: payload.len() as u32,
+                    message_id: "late-payload@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let pressure = pipeline.refresh_download_pressure();
+
+    let index_lease = pipeline
+        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .expect("the explicit index must lease first");
+    assert!(
+        index_lease
+            .works
+            .iter()
+            .all(|work| { work.segment_id.file_id.file_index == 0 && !work.is_recovery })
+    );
+
+    let grid_id = grid.recovery_set_id;
+    {
+        let runtime = pipeline.ensure_par2_runtime(job_id);
+        runtime.served = Some(grid_id);
+        runtime.ensure_set_runtime(grid_id).set = Some(std::sync::Arc::new(grid));
+        runtime.files.insert(
+            0,
+            Par2FileRuntime {
+                filename: "00-index.par2".to_string(),
+                discovery: Par2DiscoveryState::Parsed {
+                    set_ids: vec![grid_id],
+                },
+                ..Default::default()
+            },
+        );
+    }
+    pipeline.refresh_par2_checkpoint_plan(job_id);
+
+    let payload_lease = pipeline
+        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .expect("a late indexless candidate must not become a payload barrier");
+    assert!(
+        !payload_lease.compatibility.is_recovery
+            && payload_lease
+                .works
+                .iter()
+                .all(|work| { work.segment_id.file_id.file_index == 2 && !work.is_recovery }),
+        "the known explicit grid must flow into the payload lease"
+    );
+    assert!(matches!(
+        payload_lease.checkpoint_plan,
+        weaver_yenc::CheckpointPlan::Single(_)
+    ));
+    assert!(
+        !pipeline.par2_metadata_discovery_closed(job_id),
+        "completion must still discover the late indexless set"
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .recovery_queue
+            .count_matching(|work| work.segment_id.file_id.file_index == 1),
+        1,
+        "late recovery work stays parked until completion discovery"
+    );
+}
+
+#[tokio::test]
 async fn recovery_async_handoff_resets_owned_lane_caches() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

@@ -954,6 +954,12 @@ impl Pipeline {
         );
         self.terminal_post_processing_cancellations
             .remove(&done.job_id);
+        // User cancellation archives and removes the runtime state before the
+        // interrupted script reports completion. Its delayed result must not
+        // recreate or overwrite that cancelled job history.
+        if !self.jobs.contains_key(&done.job_id) {
+            return;
+        }
         if let Some(primary_failure) = done.primary_failure {
             match &done.result {
                 Ok(report) => info!(

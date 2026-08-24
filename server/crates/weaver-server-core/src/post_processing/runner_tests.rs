@@ -9,7 +9,8 @@ use super::model::{
 use super::runner::{
     CompatibilityFacts, ExecutionDisposition, InterpreterConfig, JobExecutionContext,
     MAX_SCRIPT_OUTPUT_BYTES, NzbgetScriptStatus, ScriptExecutionRequest, adapter_contract_for_test,
-    adapter_disposition_for_test, bounded_output_for_test, redact_bytes_for_test,
+    adapter_disposition_for_test, bounded_output_for_test, cancellation_grace_for_test,
+    redact_bytes_for_test,
 };
 
 fn manifest(adapter: ScriptAdapter) -> ScriptManifest {
@@ -286,6 +287,18 @@ fn exit_codes_map_onto_each_ecosystem_contract() {
     assert_eq!(
         adapter_disposition_for_test(ScriptAdapter::Nzbget, None),
         Failed
+    );
+}
+
+#[test]
+fn user_cancellation_grace_is_capped_at_five_seconds() {
+    assert_eq!(
+        cancellation_grace_for_test(Duration::from_secs(10)),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        cancellation_grace_for_test(Duration::from_secs(3)),
+        Duration::from_secs(3)
     );
 }
 

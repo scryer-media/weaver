@@ -1,7 +1,7 @@
 {
   "slug": "par2-multi-grid-late-discovery",
   "title": "Lattice.Harbor.PAR2.MultiGrid.LateDiscovery.2026.1080p.WEB-DL.H264-TESTGRP",
-  "description": "One clean payload belongs to independent 64 KiB and 96 KiB PAR2 sets, but the second set is discovered from a trailing recovery volume after payload decoding. The known grid must settle without read-back while the late set falls back to authoritative verification.",
+  "description": "One clean payload belongs to independent 64 KiB and 96 KiB PAR2 sets. The declared 64 KiB index must publish its grid before payload leasing; the set discovered later from an optional recovery volume must use the safe digest fallback without read-back verification.",
   "category": "2000",
   "expected_outcome": "success",
   "fixtureAssets": [
@@ -23,9 +23,9 @@
       "expectedGridSetIDs": [
         "6a197aef97785caa4d20e5ed8628be6f"
       ],
-      "expectedSetVerificationMode": {
-        "6a197aef97785caa4d20e5ed8628be6f": "grid",
-        "617ae7848ecc6d3878e8b1567b7e19f0": "authoritative"
+      "expectedSetVerificationModes": {
+        "6a197aef97785caa4d20e5ed8628be6f": ["grid"],
+        "617ae7848ecc6d3878e8b1567b7e19f0": ["quick_digest"]
       },
       "verificationReadBytes": 0
     }
