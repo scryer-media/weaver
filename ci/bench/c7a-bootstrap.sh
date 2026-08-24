@@ -34,8 +34,8 @@
 set -euo pipefail
 
 # ── Dead-man shutdown ────────────────────────────────────────────────────────
-# Armed FIRST, before anything can fail, so a session abandoned mid-bootstrap
-# still self-destructs.
+# Armed only after configuration preflight succeeds, so invalid input cannot
+# alter host shutdown state before the script reports the real error.
 #
 # REQUIRES the instance to have been launched with
 #   --instance-initiated-shutdown-behavior terminate
@@ -49,7 +49,7 @@ set -euo pipefail
 DEADMAN_MINUTES="${DEADMAN_MINUTES:-120}"
 
 arm_deadman() {
-  if [ "$DEADMAN_MINUTES" -le 0 ] 2>/dev/null; then
+  if [ "$DEADMAN_MINUTES" = 0 ]; then
     printf '\033[1;33m[bootstrap:warn]\033[0m dead-man shutdown DISABLED (DEADMAN_MINUTES=%s)\n' \
       "$DEADMAN_MINUTES" >&2
     return 0
@@ -67,13 +67,12 @@ arm_deadman() {
     printf '\033[1;33m[bootstrap:warn]\033[0m could not arm dead-man shutdown (no sudo?)\n' >&2
   fi
 }
-arm_deadman
 
 # ── Config (all overridable) ─────────────────────────────────────────────────
 # The corpus image extracts /corpus/. into $CORPUS_DEST, which yields
 # $CORPUS_DEST/{weaver,rarpar,rapidyenc,prebuilt}.
 CORPUS_DEST="${CORPUS_DEST:-$HOME}"
-CORPUS_IMAGE="${CORPUS_IMAGE:?set CORPUS_IMAGE to a digest-pinned ECR image}"
+CORPUS_IMAGE="${CORPUS_IMAGE:-}"
 CORPUS_REGION="${CORPUS_REGION:-us-east-1}"
 CORPUS_REGISTRY="${CORPUS_IMAGE%%/*}"
 CORPUS_FORCE="${CORPUS_FORCE:-0}"   # 1 = re-pull and re-extract even if present
@@ -87,14 +86,81 @@ BUILDINFO_JSON="$PREBUILT_DIR/BUILDINFO.json"
 # The parity bench dlopens the PREBUILT .so — there is no cmake build any more.
 WEAVER_RAPIDYENC_LIB="${WEAVER_RAPIDYENC_LIB:-$PREBUILT_DIR/lib/librapidyenc.so}"
 DOCKER=""   # resolved by resolve_docker()
+BOOTSTRAP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 log()  { printf '\033[1;34m[bootstrap]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[bootstrap:warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[bootstrap:FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 
 assert_corpus_image_pinned() {
-  printf '%s' "$CORPUS_IMAGE" | grep -Eq '@sha256:[0-9a-fA-F]{64}$' \
+  [ -n "$CORPUS_IMAGE" ] \
+    || die "set CORPUS_IMAGE to a digest-pinned ECR image"
+  printf '%s' "$CORPUS_IMAGE" | grep -Eq '.+/.+@sha256:[0-9a-fA-F]{64}$' \
     || die "CORPUS_IMAGE must use an immutable @sha256 digest, not a mutable tag"
+}
+
+assert_safe_destination() {
+  local name="$1" path="$2"
+  case "$path" in
+    ""|/) die "$name must be a non-root absolute path" ;;
+    /*) ;;
+    *) die "$name must be an absolute path" ;;
+  esac
+  case "$path" in
+    *$'\n'*|*$'\r'*|*//*|*/./*|*/../*|*/.|*/..)
+      die "$name must not contain empty, dot, or parent path components"
+      ;;
+  esac
+}
+
+assert_child_destination() {
+  local name="$1" path="$2"
+  case "$path" in
+    "$CORPUS_DEST"/*) ;;
+    *) die "$name must remain below CORPUS_DEST" ;;
+  esac
+}
+
+assert_preflight_prerequisites() {
+  local tool
+  for tool in awk bash cut dirname find grep head id ldd sed sort; do
+    command -v "$tool" >/dev/null 2>&1 \
+      || die "required bootstrap prerequisite '$tool' is not available"
+  done
+  if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
+    die "sudo is required when bootstrap does not run as root"
+  fi
+  [ -r "$BOOTSTRAP_DIR/c7a-run.sh" ] \
+    || die "missing script-local companion $BOOTSTRAP_DIR/c7a-run.sh"
+}
+
+preflight() {
+  assert_preflight_prerequisites
+  assert_corpus_image_pinned
+  case "$DEADMAN_MINUTES" in
+    0|[1-9]|[1-9][0-9]*) ;;
+    *) die "DEADMAN_MINUTES must be zero or a positive whole number" ;;
+  esac
+
+  assert_safe_destination "CORPUS_DEST" "$CORPUS_DEST"
+  assert_safe_destination "WEAVER_DIR" "$WEAVER_DIR"
+  assert_safe_destination "RARPAR_DIR" "$RARPAR_DIR"
+  assert_safe_destination "RAPIDYENC_ROOT" "$RAPIDYENC_ROOT"
+  assert_safe_destination "PREBUILT_DIR" "$PREBUILT_DIR"
+  assert_safe_destination "WEAVER_RAPIDYENC_LIB" "$WEAVER_RAPIDYENC_LIB"
+  assert_child_destination "WEAVER_DIR" "$WEAVER_DIR"
+  assert_child_destination "RARPAR_DIR" "$RARPAR_DIR"
+  assert_child_destination "RAPIDYENC_ROOT" "$RAPIDYENC_ROOT"
+  assert_child_destination "PREBUILT_DIR" "$PREBUILT_DIR"
+  case "$WEAVER_RAPIDYENC_LIB" in
+    "$PREBUILT_DIR"/*) ;;
+    *) die "WEAVER_RAPIDYENC_LIB must remain below PREBUILT_DIR" ;;
+  esac
+  if [ "$WEAVER_DIR" = "$RARPAR_DIR" ] || [ "$WEAVER_DIR" = "$RAPIDYENC_ROOT" ] || \
+     [ "$WEAVER_DIR" = "$PREBUILT_DIR" ] || [ "$RARPAR_DIR" = "$RAPIDYENC_ROOT" ] || \
+     [ "$RARPAR_DIR" = "$PREBUILT_DIR" ] || [ "$RAPIDYENC_ROOT" = "$PREBUILT_DIR" ]; then
+    die "WEAVER_DIR, RARPAR_DIR, RAPIDYENC_ROOT, and PREBUILT_DIR must be distinct"
+  fi
 }
 
 # True when one rev is a prefix of the other and the shorter side is ≥7 chars
@@ -584,7 +650,8 @@ EOF
 }
 
 main() {
-  assert_corpus_image_pinned
+  preflight
+  arm_deadman
   log "CORPUS_IMAGE=$CORPUS_IMAGE"
   log "CORPUS_DEST=$CORPUS_DEST"
   log "WEAVER_DIR=$WEAVER_DIR"
@@ -623,4 +690,6 @@ BANNER
   printf '\033[0m\n'
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

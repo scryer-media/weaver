@@ -95,6 +95,16 @@ jobs:
 
   # ── Parallel lint / check jobs (no dependencies) ─────────────────────────
 
+  c7a-bootstrap-preflight:
+    name: c7a-bootstrap-preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Verify bootstrap preflight has no host side effects
+        shell: bash
+        run: bash ci/bench/c7a-bootstrap-preflight-test.sh
+
   web-build:
     name: web-build
     needs: [changes]
