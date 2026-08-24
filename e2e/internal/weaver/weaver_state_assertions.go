@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -622,8 +623,100 @@ func applyTerminalStateCheck(dbPath string, jobID int, slug string, status strin
 				return "OUTPUT_LEFTOVER_ERROR", err.Error()
 			}
 		}
+		if err == nil && scenario.par2CleanSettlementAssertion() != nil {
+			if err := assertPar2CleanSettlement(jobID, scenario.par2CleanSettlementAssertion()); err != nil {
+				log.Printf("  %s: PAR2 clean-set settlement mismatch after %s: %v", slug, status, err)
+				return "PAR2_SETTLEMENT_ERROR", err.Error()
+			}
+		}
 	}
 	return status, ""
+}
+
+const cleanPar2SettlementMessage = "PAR2 set settled clean from in-stream grid evidence"
+
+func assertPar2CleanSettlement(jobID int, assertion *ScenarioPar2CleanSettlementAssertion) error {
+	if assertion == nil || len(assertion.ExpectedSetSliceSizes) == 0 {
+		return nil
+	}
+	raw, err := os.ReadFile(localWeaverLogPath())
+	if err != nil {
+		return fmt.Errorf("read weaver log: %w", err)
+	}
+	wantJobID := strconv.Itoa(jobID)
+	observed := make(map[string]uint64, len(assertion.ExpectedSetSliceSizes))
+	for _, rawLine := range strings.Split(string(raw), "\n") {
+		line := ansiEscape.ReplaceAllString(rawLine, "")
+		if !strings.Contains(line, cleanPar2SettlementMessage) || directLogJobID(line) != wantJobID {
+			continue
+		}
+		setID := weaverLogField(line, "recovery_set_id")
+		if setID == "" {
+			return fmt.Errorf("clean PAR2 settlement for job %d omitted recovery_set_id", jobID)
+		}
+		sliceSize, err := parseWeaverLogUint(line, "slice_size")
+		if err != nil {
+			return fmt.Errorf("clean PAR2 settlement for set %s: %w", setID, err)
+		}
+		if verdict := weaverLogField(line, "verdict"); verdict != "clean" {
+			return fmt.Errorf("clean PAR2 settlement for set %s has verdict %q, want clean", setID, verdict)
+		}
+		readBytes, err := parseWeaverLogUint(line, "verification_read_bytes")
+		if err != nil {
+			return fmt.Errorf("clean PAR2 settlement for set %s: %w", setID, err)
+		}
+		if readBytes != assertion.VerificationReadBytes {
+			return fmt.Errorf("clean PAR2 settlement for set %s read %d verification bytes, want %d", setID, readBytes, assertion.VerificationReadBytes)
+		}
+		wantSliceSize, wanted := assertion.ExpectedSetSliceSizes[setID]
+		if !wanted {
+			return fmt.Errorf("clean PAR2 settlement observed unexpected set %s", setID)
+		}
+		if sliceSize != wantSliceSize {
+			return fmt.Errorf("clean PAR2 settlement for set %s has slice size %d, want %d", setID, sliceSize, wantSliceSize)
+		}
+		if _, duplicate := observed[setID]; duplicate {
+			return fmt.Errorf("clean PAR2 settlement observed set %s more than once", setID)
+		}
+		observed[setID] = sliceSize
+	}
+	if len(observed) != len(assertion.ExpectedSetSliceSizes) {
+		missing := make([]string, 0, len(assertion.ExpectedSetSliceSizes)-len(observed))
+		for setID := range assertion.ExpectedSetSliceSizes {
+			if _, ok := observed[setID]; !ok {
+				missing = append(missing, setID)
+			}
+		}
+		sort.Strings(missing)
+		return fmt.Errorf("clean PAR2 settlement did not observe set(s): %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func parseWeaverLogUint(line, field string) (uint64, error) {
+	value := weaverLogField(line, field)
+	if value == "" {
+		return 0, fmt.Errorf("omitted %s", field)
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", field, value, err)
+	}
+	return parsed, nil
+}
+
+func weaverLogField(line, field string) string {
+	key := field + "="
+	start := strings.Index(line, key)
+	if start < 0 {
+		return ""
+	}
+	rest := strings.TrimLeft(line[start+len(key):], `"`)
+	end := strings.IndexAny(rest, "\" \t")
+	if end < 0 {
+		return strings.TrimSpace(rest)
+	}
+	return rest[:end]
 }
 
 func assertTerminalFixtureStateEventually(dbPath string, jobID int, expectedStatus string) error {

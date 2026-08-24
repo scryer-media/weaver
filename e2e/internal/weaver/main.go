@@ -73,6 +73,7 @@ type Scenario struct {
 
 type ScenarioRuntimeAssertions struct {
 	FileIdentityRewrite *ScenarioFileIdentityRewriteAssertion `json:"fileIdentityRewrite,omitempty"`
+	Par2CleanSettlement *ScenarioPar2CleanSettlementAssertion `json:"par2CleanSettlement,omitempty"`
 }
 
 type ScenarioFileIdentityRewriteAssertion struct {
@@ -81,11 +82,23 @@ type ScenarioFileIdentityRewriteAssertion struct {
 	RequiredClassificationSource string   `json:"requiredClassificationSource,omitempty"`
 }
 
+type ScenarioPar2CleanSettlementAssertion struct {
+	ExpectedSetSliceSizes map[string]uint64 `json:"expectedSetSliceSizes,omitempty"`
+	VerificationReadBytes uint64            `json:"verificationReadBytes"`
+}
+
 func (s *Scenario) fileIdentityRewriteAssertion() *ScenarioFileIdentityRewriteAssertion {
 	if s == nil || s.RuntimeAssertions == nil {
 		return nil
 	}
 	return s.RuntimeAssertions.FileIdentityRewrite
+}
+
+func (s *Scenario) par2CleanSettlementAssertion() *ScenarioPar2CleanSettlementAssertion {
+	if s == nil || s.RuntimeAssertions == nil {
+		return nil
+	}
+	return s.RuntimeAssertions.Par2CleanSettlement
 }
 
 type runtimePortState struct {
@@ -1076,6 +1089,7 @@ var canonicalFixtureSlugs = []string{
 	"par2-heavy-damage-c",
 	"par2-insufficient",
 	"par2-multi-set-archives",
+	"par2-multi-set-archives-clean",
 	"par2-multi-set-archives-insufficient",
 	"par2-direct-repair",
 	"par2-ignorable-deficit",

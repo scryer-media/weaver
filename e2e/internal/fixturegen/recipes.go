@@ -2,6 +2,7 @@ package fixturegen
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -49,9 +50,15 @@ const (
 	// four blocks of the joined file, well under the eight recovery blocks.
 	splitPar2SliceSize = 65536
 	splitPar2Parts     = 3
-	// twoSetsSliceSize is shared by both sets of the two-set posting so their
-	// block counts differ only by payload size.
-	twoSetsSliceSize = 65536
+	// The multi-set archive fixture exercises common-refinement checkpointing:
+	// its PAR2 sets deliberately use non-dividing grids. Keep the secondary
+	// damage window in primary-grid units so changing the secondary grid cannot
+	// silently change the recoverability shape.
+	twoSetsSliceSize          = 65536
+	twoSetsPrimarySliceSize   = twoSetsSliceSize
+	twoSetsSecondarySliceSize = 98304
+	twoSetsDamageOffset       = 30 * twoSetsPrimarySliceSize
+	twoSetsDamageLength       = 2 * twoSetsPrimarySliceSize
 )
 
 // ignorableSidecarNotesText is the sidecar payload of the ignorable-deficit
@@ -940,25 +947,24 @@ func Recipes() []Recipe {
 	add(Recipe{
 		Slug: "par2-multi-set-archives", Family: "PAR2",
 		Notes: "One posting carrying two independent store-method RAR5 archives and a PAR2 set for each archive. " +
-			"Both archives have two damaged slices and enough independent recovery data, so both members must be repaired and extracted.",
-		Inputs: []string{samplePayloadPath, previewPayloadPath},
-		Build:  multiPARSetArchives(4),
-		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
-			feature, err := env.ArtifactPath(ctx, "clip-sample")
-			if err != nil {
-				return nil, err
-			}
-			bonus, err := env.ArtifactPath(ctx, "clip-preview")
-			if err != nil {
-				return nil, err
-			}
-			return map[string]string{"feature.mkv": feature, "bonus.mkv": bonus}, nil
-		},
+			"The primary uses 64 KiB slices and the secondary 96 KiB slices; both have two damaged slices and enough recovery data to repair and extract.",
+		Inputs:          []string{samplePayloadPath, previewPayloadPath},
+		Build:           multiPARSetArchives(4),
+		ExpectedOutputs: multiPARSetArchiveExpectedOutputs,
+	})
+
+	add(Recipe{
+		Slug: "par2-multi-set-archives-clean", Family: "PAR2",
+		Notes: "A clean transport counterpart carrying independent 64 KiB and 96 KiB PAR2 grids. " +
+			"Both index files are staged before the archive payloads so the completion gate can settle both clean sets without recovery.",
+		Inputs:          []string{samplePayloadPath, previewPayloadPath},
+		Build:           multiPARSetArchivesClean(),
+		ExpectedOutputs: multiPARSetArchiveExpectedOutputs,
 	})
 
 	add(Recipe{
 		Slug: "par2-multi-set-archives-insufficient", Family: "PAR2",
-		Notes: "The mixed-recoverability counterpart: the primary archive has enough recovery data for its two damaged slices, " +
+		Notes: "The 64 KiB/96 KiB mixed-grid counterpart: the primary archive has enough recovery data for its two damaged slices, " +
 			"while the secondary archive has only one recovery block and must make the aggregate job fail.",
 		Inputs: []string{samplePayloadPath, previewPayloadPath},
 		Build:  multiPARSetArchives(1),
@@ -1266,41 +1272,197 @@ func obfuscatedNames(start int) []string {
 
 func multiPARSetArchives(secondaryRecoveryBlocks int) func(context.Context, *Env) error {
 	return func(ctx context.Context, env *Env) error {
-		sets := []struct {
-			artifact, member, archive string
-			recovery                  int
-		}{
-			{"clip-sample", "feature.mkv", "primary.rar", 8},
-			{"clip-preview", "bonus.mkv", "secondary.rar", secondaryRecoveryBlocks},
-		}
-		for _, set := range sets {
-			if err := env.Stage(ctx, set.artifact, set.member); err != nil {
-				return err
-			}
-			if err := env.RAR(ctx, RARSpec{
-				Toolchain: RAR5Writer,
-				Format:    RAR5,
-				Archive:   set.archive,
-				Members:   []string{set.member},
-				Method:    "-m0",
-			}); err != nil {
-				return err
-			}
-			if err := env.PAR2(ctx, PAR2Spec{
-				Base:           set.archive + ".par2",
-				SliceSize:      twoSetsSliceSize,
-				RecoveryBlocks: set.recovery,
-				RecoveryFiles:  1,
-				Sources:        []string{set.archive},
-			}); err != nil {
-				return err
-			}
-		}
-		if err := ZeroRange(env.OutputPath("primary.rar"), 100*twoSetsSliceSize, 2*twoSetsSliceSize); err != nil {
+		if err := buildMultiPARSetArchives(ctx, env, secondaryRecoveryBlocks); err != nil {
 			return err
 		}
-		return ZeroRange(env.OutputPath("secondary.rar"), 30*twoSetsSliceSize, 2*twoSetsSliceSize)
+		if err := ZeroRange(env.OutputPath("primary.rar"), 100*twoSetsPrimarySliceSize, 2*twoSetsPrimarySliceSize); err != nil {
+			return err
+		}
+		if err := ZeroRange(env.OutputPath("secondary.rar"), twoSetsDamageOffset, twoSetsDamageLength); err != nil {
+			return err
+		}
+		return verifyMultiPARSetArchiveDamage(ctx, env, secondaryRecoveryBlocks)
 	}
+}
+
+func multiPARSetArchivesClean() func(context.Context, *Env) error {
+	return func(ctx context.Context, env *Env) error {
+		if err := buildMultiPARSetArchives(ctx, env, 4); err != nil {
+			return err
+		}
+		if err := verifyCleanMultiPARSetArchives(ctx, env); err != nil {
+			return err
+		}
+		for _, names := range [][2]string{
+			{"primary.rar.par2", "00-primary.par2"},
+			{"secondary.rar.par2", "01-secondary.par2"},
+		} {
+			if err := os.Rename(env.OutputPath(names[0]), env.OutputPath(names[1])); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+func buildMultiPARSetArchives(ctx context.Context, env *Env, secondaryRecoveryBlocks int) error {
+	sets := []struct {
+		artifact, member, archive string
+		recovery                  int
+		sliceSize                 int64
+	}{
+		{"clip-sample", "feature.mkv", "primary.rar", 8, twoSetsPrimarySliceSize},
+		{"clip-preview", "bonus.mkv", "secondary.rar", secondaryRecoveryBlocks, twoSetsSecondarySliceSize},
+	}
+	for _, set := range sets {
+		if err := env.Stage(ctx, set.artifact, set.member); err != nil {
+			return err
+		}
+		if err := env.RAR(ctx, RARSpec{
+			Toolchain: RAR5Writer,
+			Format:    RAR5,
+			Archive:   set.archive,
+			Members:   []string{set.member},
+			Method:    "-m0",
+		}); err != nil {
+			return err
+		}
+		if err := env.PAR2(ctx, PAR2Spec{
+			Base:           set.archive + ".par2",
+			SliceSize:      set.sliceSize,
+			RecoveryBlocks: set.recovery,
+			RecoveryFiles:  1,
+			Sources:        []string{set.archive},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyCleanMultiPARSetArchives(ctx context.Context, env *Env) error {
+	sets := []struct {
+		index      string
+		archive    string
+		sliceSize  int64
+		dataBlocks int
+	}{
+		{"primary.rar.par2", "primary.rar", twoSetsPrimarySliceSize, 1312},
+		{"secondary.rar.par2", "secondary.rar", twoSetsSecondarySliceSize, 54},
+	}
+	for _, set := range sets {
+		report, err := env.PAR2Verify(ctx, set.index)
+		if err != nil {
+			return fmt.Errorf("verify clean mixed-grid set %s: %w", set.index, err)
+		}
+		for _, expected := range []string{
+			fmt.Sprintf("The block size used was %d bytes.", set.sliceSize),
+			fmt.Sprintf("There are a total of %d data blocks.", set.dataBlocks),
+			fmt.Sprintf(`Target: "%s" - found.`, set.archive),
+			"All files are correct, repair is not required.",
+		} {
+			if !strings.Contains(report, expected) {
+				return fmt.Errorf("clean mixed-grid PAR2 report for %s does not contain %q", set.index, expected)
+			}
+		}
+	}
+	return nil
+}
+
+func multiPARSetArchiveExpectedOutputs(ctx context.Context, env *Env) (map[string]string, error) {
+	feature, err := env.ArtifactPath(ctx, "clip-sample")
+	if err != nil {
+		return nil, err
+	}
+	bonus, err := env.ArtifactPath(ctx, "clip-preview")
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{"feature.mkv": feature, "bonus.mkv": bonus}, nil
+}
+
+// verifyMultiPARSetArchiveDamage makes the asymmetric PAR2 grids a persisted
+// fixture contract rather than a recipe-only property. PAR2's nonzero status is
+// expected because the generated archive has intentionally been damaged.
+func verifyMultiPARSetArchiveDamage(ctx context.Context, env *Env, recoveryBlocks int) error {
+	report, verifyErr := env.PAR2Verify(ctx, "secondary.rar.par2")
+	if verifyErr == nil {
+		return fmt.Errorf("PAR2 verification unexpectedly succeeded for damaged secondary.rar")
+	}
+	if err := validateMultiPARSetArchiveDamageReport(report, recoveryBlocks); err != nil {
+		return fmt.Errorf("PAR2 verification did not preserve the secondary grid: %w (expected nonzero status: %v)", err, verifyErr)
+	}
+	if recoveryBlocks == 4 {
+		if err := repairMultiPARSetArchiveSecondary(ctx, env, recoveryBlocks); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func repairMultiPARSetArchiveSecondary(ctx context.Context, env *Env, recoveryBlocks int) error {
+	repairDir, err := os.MkdirTemp(env.Work, "multi-par2-repair-")
+	if err != nil {
+		return fmt.Errorf("create isolated PAR2 repair directory: %w", err)
+	}
+	defer os.RemoveAll(repairDir)
+
+	for _, name := range []string{
+		"secondary.rar",
+		"secondary.rar.par2",
+		fmt.Sprintf("secondary.rar.vol0+%d.par2", recoveryBlocks),
+	} {
+		if err := CopyFile(env.OutputPath(name), filepath.Join(repairDir, name)); err != nil {
+			return fmt.Errorf("copy %s into isolated PAR2 repair directory: %w", name, err)
+		}
+	}
+
+	toolchain, err := env.Lock.Find(PAR2Toolchain)
+	if err != nil {
+		return err
+	}
+	if err := env.Docker.Prepare(ctx, toolchain); err != nil {
+		return err
+	}
+	env.usedToolchain(PAR2Toolchain)
+	if err := env.Docker.Run(ctx, toolchain, env.Work, filepath.Base(repairDir), "r", "secondary.rar.par2"); err != nil {
+		return fmt.Errorf("repair isolated secondary PAR2 set: %w", err)
+	}
+
+	repaired, err := os.ReadFile(filepath.Join(repairDir, "secondary.rar"))
+	if err != nil {
+		return fmt.Errorf("read repaired secondary archive: %w", err)
+	}
+	if got, want := fmt.Sprintf("%x", sha256.Sum256(repaired)), "7f4717c488c1bb71948fefc6cdd2b77d41457b7bbd7325fcac626c5d184595df"; got != want {
+		return fmt.Errorf("repaired secondary archive SHA-256 = %s, want %s", got, want)
+	}
+	return nil
+}
+
+func validateMultiPARSetArchiveDamageReport(report string, recoveryBlocks int) error {
+	want := []string{
+		"The block size used was 98304 bytes.",
+		"There are a total of 54 data blocks.",
+		`Target: "secondary.rar" - damaged. Found 52 of 54 data blocks.`,
+		fmt.Sprintf("You have %d recovery blocks available.", recoveryBlocks),
+	}
+	switch recoveryBlocks {
+	case 4:
+		want = append(want, "Repair is possible.")
+	case 1:
+		want = append(want,
+			"Repair is not possible.",
+			"You need 1 more recovery blocks to be able to repair.",
+		)
+	default:
+		return fmt.Errorf("unexpected secondary recovery block count %d", recoveryBlocks)
+	}
+	for _, expected := range want {
+		if !strings.Contains(report, expected) {
+			return fmt.Errorf("PAR2 report does not contain %q", expected)
+		}
+	}
+	return nil
 }
 
 func singleMemberRAR(writer string, format RARFormat, member string, spec RARSpec) func(context.Context, *Env) error {

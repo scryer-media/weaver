@@ -259,7 +259,7 @@ func (env *Env) PAR2Verify(ctx context.Context, index string) (string, error) {
 	if err := env.Docker.Prepare(ctx, toolchain); err != nil {
 		return "", err
 	}
-	return env.Docker.Capture(ctx, toolchain, env.Work, outputDir, "v", "-q", index)
+	return env.Docker.Capture(ctx, toolchain, env.Work, outputDir, "v", index)
 }
 
 // ClipSpec renders one synthetic video clip. Sources are FFmpeg's own

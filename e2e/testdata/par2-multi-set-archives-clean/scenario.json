@@ -1,0 +1,25 @@
+{
+  "slug": "par2-multi-set-archives-clean",
+  "title": "Ivory.Current.PAR2.MultiSet.Clean.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A normal corpus transport run with two clean independent PAR2 sets on 64 KiB and 96 KiB grids. The index files are posted before both archive payloads so the completion path must preserve both clean-set diagnostics without recovery.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "forbiddenJobEvents": [
+    "RepairStarted",
+    "RepairComplete",
+    "RepairFailed"
+  ],
+  "runtimeAssertions": {
+    "par2CleanSettlement": {
+      "expectedSetSliceSizes": {
+        "3db2e2755a7c29a00609c5234aec02fe": 65536,
+        "88d893a266b3f27a99f486a8a72d28e9": 98304
+      },
+      "verificationReadBytes": 0
+    }
+  },
+  "expectedOutputBLAKE3": {
+    "bonus.mkv": "bd8b3991787e2bc03ae0f47bda585f1b9dbd831448493fe3c4a9118f4f947cf2",
+    "feature.mkv": "8139650c53be5684ab9cf20e34996fcfb510f118ee652ad7b949c32e8cb8b08a"
+  }
+}
