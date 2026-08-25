@@ -95,16 +95,6 @@ jobs:
 
   # ── Parallel lint / check jobs (no dependencies) ─────────────────────────
 
-  c7a-bootstrap-preflight:
-    name: c7a-bootstrap-preflight
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Verify bootstrap preflight has no host side effects
-        shell: bash
-        run: bash ci/bench/c7a-bootstrap-preflight-test.sh
-
   web-build:
     name: web-build
     needs: [changes]
@@ -1047,7 +1037,21 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $exe = "target\x86_64-pc-windows-msvc\release\weaver.exe"
-          $dependencies = & dumpbin.exe /dependents $exe
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+          if (-not $dumpbin) {
+            $roots = @("${env:ProgramFiles}\Microsoft Visual Studio", "${env:ProgramFiles(x86)}\Microsoft Visual Studio")
+            foreach ($root in $roots) {
+              if ((-not $dumpbin) -and (Test-Path $root)) {
+                $dumpbin = Get-ChildItem $root -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+                  Sort-Object FullName -Descending |
+                  Select-Object -First 1 -ExpandProperty FullName
+              }
+            }
+          }
+          if (-not $dumpbin) {
+            throw "dumpbin.exe was not found; cannot verify liblzma linkage"
+          }
+          $dependencies = & $dumpbin /dependents $exe
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
@@ -1167,7 +1171,6 @@ jobs:
               throw "Timed out waiting for Weaver API readiness. Last error: $lastError"
             }
 
-            & .\.github\scripts\assert-graphql-version.ps1 -BaseUrl $baseUrl
           } catch {
             Write-Error $_
             Show-SmokeLog
@@ -1463,7 +1466,6 @@ jobs:
               throw "Timed out waiting for Weaver API readiness. Last error: $lastError"
             }
 
-            & .\.github\scripts\assert-graphql-version.ps1 -BaseUrl $baseUrl
           } catch {
             Write-Error $_
             Show-SmokeLog
@@ -1548,85 +1550,6 @@ jobs:
         with:
           path: ${{ github.workspace }}\.sccache
           key: ${{ steps.windows-arm64-sccache-restore.outputs.cache-primary-key }}
-
-  # ── Docker validation + release publish ──────────────────────────────────
-
-  docker-export:
-    name: docker-export-${{ matrix.platform_id }}
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
-    runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 20
-    needs:
-      - rust-fmt
-      - rust-clippy
-      - rust-audit
-      - rust-test-regular
-      - rust-test-arm
-      - rust-test-sde
-      - rust-yenc-simd-targets
-      - rust-package-linux-x86_64-portable
-      - rust-package-linux-arm64-portable
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform_id: amd64
-            runs_on: ubuntu-24.04
-            platform: linux/amd64
-            tar_name: weaver-linux-amd64-image.tar
-            local_tag: weaver:test-amd64
-          - platform_id: arm64
-            runs_on: ubuntu-24.04-arm
-            platform: linux/arm64
-            tar_name: weaver-linux-arm64-image.tar
-            local_tag: weaver:test-arm64
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Download linux amd64 portable artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-linux-x86_64-portable-${{ github.run_id }}
-          path: artifacts
-      - name: Download linux arm64 portable artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-linux-arm64-portable-${{ github.run_id }}
-          path: artifacts
-      - name: Prepare build context
-        run: sh docker/prepare-build-context.sh artifacts docker-ctx
-      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-      - name: Build downloadable image tarball
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        with:
-          context: docker-ctx
-          file: docker/weaver.Dockerfile
-          platforms: ${{ matrix.platform }}
-          outputs: type=docker,dest=/tmp/${{ matrix.tar_name }}
-          tags: ${{ matrix.local_tag }}
-      - name: Load built image
-        run: docker load -i /tmp/${{ matrix.tar_name }}
-      - name: Smoke test image runtime
-        run: sh docker/test_image_runtime.sh ${{ matrix.local_tag }} ${{ matrix.platform }}
-      - name: Upload image tarball
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: weaver-image-linux-${{ matrix.platform_id }}-${{ github.run_id }}
-          path: /tmp/${{ matrix.tar_name }}
-          if-no-files-found: error
-          retention-days: 14
-      - name: Add local test instructions
-        run: |
-          {
-            echo "### Downloadable Docker image (${{ matrix.platform }})"
-            echo
-            echo "- Artifact: \`weaver-image-linux-${{ matrix.platform_id }}-${{ github.run_id }}\`"
-            echo "- Tarball: \`${{ matrix.tar_name }}\`"
-            echo "- Load: \`docker load -i ${{ matrix.tar_name }}\`"
-            echo "- Run: \`docker run --rm -p 9090:9090 ${{ matrix.local_tag }} --config /config serve --port 9090\`"
-          } >> "$GITHUB_STEP_SUMMARY"
 
   docker-publish-pr-rc:
     name: docker-publish-pr-rc

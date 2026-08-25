@@ -1,10 +1,13 @@
 use std::path::PathBuf;
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 use std::sync::{
     Once,
     atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 const DISABLE_PLATFORM_KEYSTORE_ENV: &str = "WEAVER_DISABLE_PLATFORM_KEYSTORE";
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 static DISABLE_PLATFORM_KEYSTORE_FOR_PROCESS: AtomicBool = AtomicBool::new(false);
 
 pub trait KeyStore: Send + Sync {
@@ -34,6 +37,7 @@ pub trait KeyStore: Send + Sync {
 /// covers the tests that don't.
 #[doc(hidden)]
 #[allow(dead_code)] // for test helpers that spawn children; harness auto-detection covers today's tests
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 pub fn disable_platform_keystore_for_tests() {
     DISABLE_PLATFORM_KEYSTORE_FOR_PROCESS.store(true, Ordering::SeqCst);
 
@@ -45,6 +49,7 @@ pub fn disable_platform_keystore_for_tests() {
     });
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn platform_keystore_disabled() -> bool {
     if DISABLE_PLATFORM_KEYSTORE_FOR_PROCESS.load(Ordering::SeqCst) {
         return true;
@@ -61,6 +66,7 @@ fn platform_keystore_disabled() -> bool {
     platform_keystore_disabled_by_env()
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn platform_keystore_disabled_by_env() -> bool {
     std::env::var(DISABLE_PLATFORM_KEYSTORE_ENV)
         .ok()
@@ -80,6 +86,7 @@ fn platform_keystore_disabled_by_env() -> bool {
 /// `CARGO_TARGET_TMPDIR` to integration tests and benches (inherited by child
 /// processes), and test binaries live in `deps/` with a trailing metadata
 /// hash. Treat that process tree as non-interactive for keystore use.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn running_under_rust_test_harness() -> bool {
     if std::env::var_os("CARGO_TARGET_TMPDIR").is_some() {
         return true;
@@ -100,6 +107,7 @@ fn running_under_rust_test_harness() -> bool {
         .is_some_and(has_rust_test_binary_hash_suffix)
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn has_rust_test_binary_hash_suffix(stem: &str) -> bool {
     stem.rsplit_once('-').is_some_and(|(_, suffix)| {
         suffix.len() >= 8 && suffix.chars().all(|ch| ch.is_ascii_hexdigit())
