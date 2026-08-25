@@ -6,7 +6,7 @@ use std::num::NonZeroU64;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tempfile::TempDir;
 use zip::ZipWriter;
@@ -15,6 +15,15 @@ use zip::write::SimpleFileOptions;
 use lzma_rust2::{XzOptions, XzWriter, XzWriterMt};
 
 static XZ_MT_DECODER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_xz_mt_decoder_test() -> MutexGuard<'static, ()> {
+    let guard = XZ_MT_DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    XZ_MT_DECODER_TEST_LOCK.clear_poison();
+    XZ_MT_DECODER_PERMIT.clear_poison();
+    guard
+}
 
 fn create_test_files(dir: &Path) -> HashMap<String, Vec<u8>> {
     let mut files = HashMap::new();
@@ -254,7 +263,6 @@ fn extract_with_weaver_tar_result(
         &event_tx,
         JobId(1),
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
-        2,
     )
 }
 
@@ -262,7 +270,7 @@ fn extract_with_weaver_xz_result(
     archive_path: &Path,
     output_dir: &Path,
 ) -> Result<Vec<String>, String> {
-    let _test_guard = XZ_MT_DECODER_TEST_LOCK.lock().unwrap();
+    let _test_guard = lock_xz_mt_decoder_test();
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
     let (root, budget) = test_extraction_security(output_dir);
     extract_xz(
@@ -638,7 +646,7 @@ fn multi_block_xz_extracts_with_the_filesystem_decoder() {
 
 #[test]
 fn filesystem_xz_decoder_uses_parallel_for_a_multiblock_single_stream() {
-    let _test_guard = XZ_MT_DECODER_TEST_LOCK.lock().unwrap();
+    let _test_guard = lock_xz_mt_decoder_test();
     let temp = TempDir::new().unwrap();
     let archive_path = temp.path().join("payload.bin.xz");
     let output_dir = temp.path().join("out");
@@ -659,7 +667,7 @@ fn filesystem_xz_decoder_uses_parallel_for_a_multiblock_single_stream() {
 
 #[test]
 fn filesystem_xz_decoder_falls_back_to_sequential_when_mt_is_busy() {
-    let _test_guard = XZ_MT_DECODER_TEST_LOCK.lock().unwrap();
+    let _test_guard = lock_xz_mt_decoder_test();
     let temp = TempDir::new().unwrap();
     let archive_path = temp.path().join("payload.bin.xz");
     let output_dir = temp.path().join("out");
