@@ -817,10 +817,10 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	if err := ensureNyuuImageBuilt(); err != nil {
 		log.Fatalf("prepare nyuu image for full suite: %v", err)
 	}
-	dashboard.setSeedDetail("running", "seeding while weaver release build runs")
+	dashboard.setSeedDetail("running", "seeding while weaver e2e build runs")
 	go func() {
-		if _, err := ensureReleaseWeaverBinary(); err != nil {
-			log.Printf("warning: background weaver release build failed: %v", err)
+		if _, err := ensureE2EWeaverBinary(); err != nil {
+			log.Printf("warning: background weaver e2e build failed: %v", err)
 		}
 	}()
 	awaitWeaverImage := prepareFullSuiteWeaverImage(phases)
@@ -988,12 +988,12 @@ func runFullPipeline(
 				}
 			}
 
-			weaverBin, err := ensureReleaseWeaverBinary()
+			weaverBin, err := ensureE2EWeaverBinary()
 			if err != nil {
 				phaseResults <- childRunResult{
 					Phase:   phase.Name,
 					Command: phase.Command,
-					Err:     fmt.Errorf("prepare release weaver binary: %w", err),
+					Err:     fmt.Errorf("prepare e2e weaver binary: %w", err),
 				}
 				dashboard.markPhaseResult(phase.Name, "fail")
 				if !keepStacks {

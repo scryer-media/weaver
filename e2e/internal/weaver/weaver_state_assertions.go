@@ -637,88 +637,35 @@ func applyTerminalStateCheck(dbPath string, jobID int, slug string, status strin
 const cleanPar2SettlementMessage = "PAR2 set settled clean from in-stream grid evidence"
 const cleanPar2VerificationSourceMessage = "PAR2 clean set verification source"
 
+var cleanPar2VerificationModes = []string{"grid", "quick_digest", "strong_decode", "authoritative"}
+
 func assertPar2CleanSettlement(jobID int, assertion *ScenarioPar2CleanSettlementAssertion) error {
 	if assertion == nil || len(assertion.ExpectedSetSliceSizes) == 0 {
 		return nil
+	}
+	if len(assertion.ExpectedSetVerificationModes) == 0 {
+		return fmt.Errorf("clean PAR2 settlement assertion requires expected verification modes")
+	}
+	for setID := range assertion.ExpectedSetSliceSizes {
+		if _, ok := assertion.ExpectedSetVerificationModes[setID]; !ok {
+			return fmt.Errorf("clean PAR2 set %s has no expected verification mode", setID)
+		}
+	}
+	for setID, modes := range assertion.ExpectedSetVerificationModes {
+		if _, ok := assertion.ExpectedSetSliceSizes[setID]; !ok {
+			return fmt.Errorf("clean PAR2 set %s has no expected slice size", setID)
+		}
+		for _, mode := range modes {
+			if !slices.Contains(cleanPar2VerificationModes, mode) {
+				return fmt.Errorf("clean PAR2 set %s has unknown verification mode %q", setID, mode)
+			}
+		}
 	}
 	raw, err := os.ReadFile(localWeaverLogPath())
 	if err != nil {
 		return fmt.Errorf("read weaver log: %w", err)
 	}
 	wantJobID := strconv.Itoa(jobID)
-	expectedGridSets := assertion.ExpectedSetSliceSizes
-	if len(assertion.ExpectedGridSetIDs) > 0 {
-		expectedGridSets = make(map[string]uint64, len(assertion.ExpectedGridSetIDs))
-		for _, setID := range assertion.ExpectedGridSetIDs {
-			sliceSize, ok := assertion.ExpectedSetSliceSizes[setID]
-			if !ok {
-				return fmt.Errorf("grid-only PAR2 set %s has no expected slice size", setID)
-			}
-			expectedGridSets[setID] = sliceSize
-		}
-	} else if len(assertion.ExpectedSetVerificationModes) > 0 {
-		expectedGridSets = make(map[string]uint64)
-		for setID, modes := range assertion.ExpectedSetVerificationModes {
-			if !slices.Contains(modes, "grid") {
-				continue
-			}
-			sliceSize, ok := assertion.ExpectedSetSliceSizes[setID]
-			if !ok {
-				return fmt.Errorf("grid-mode PAR2 set %s has no expected slice size", setID)
-			}
-			expectedGridSets[setID] = sliceSize
-		}
-	}
-	observed := make(map[string]uint64, len(expectedGridSets))
-	for _, rawLine := range strings.Split(string(raw), "\n") {
-		line := ansiEscape.ReplaceAllString(rawLine, "")
-		if !strings.Contains(line, cleanPar2SettlementMessage) || directLogJobID(line) != wantJobID {
-			continue
-		}
-		setID := weaverLogField(line, "recovery_set_id")
-		if setID == "" {
-			return fmt.Errorf("clean PAR2 settlement for job %d omitted recovery_set_id", jobID)
-		}
-		sliceSize, err := parseWeaverLogUint(line, "slice_size")
-		if err != nil {
-			return fmt.Errorf("clean PAR2 settlement for set %s: %w", setID, err)
-		}
-		if verdict := weaverLogField(line, "verdict"); verdict != "clean" {
-			return fmt.Errorf("clean PAR2 settlement for set %s has verdict %q, want clean", setID, verdict)
-		}
-		readBytes, err := parseWeaverLogUint(line, "verification_read_bytes")
-		if err != nil {
-			return fmt.Errorf("clean PAR2 settlement for set %s: %w", setID, err)
-		}
-		if readBytes != assertion.VerificationReadBytes {
-			return fmt.Errorf("clean PAR2 settlement for set %s read %d verification bytes, want %d", setID, readBytes, assertion.VerificationReadBytes)
-		}
-		wantSliceSize, wanted := expectedGridSets[setID]
-		if !wanted {
-			return fmt.Errorf("clean PAR2 settlement observed unexpected set %s", setID)
-		}
-		if sliceSize != wantSliceSize {
-			return fmt.Errorf("clean PAR2 settlement for set %s has slice size %d, want %d", setID, sliceSize, wantSliceSize)
-		}
-		if _, duplicate := observed[setID]; duplicate {
-			return fmt.Errorf("clean PAR2 settlement observed set %s more than once", setID)
-		}
-		observed[setID] = sliceSize
-	}
-	if len(observed) != len(expectedGridSets) {
-		missing := make([]string, 0, len(expectedGridSets)-len(observed))
-		for setID := range expectedGridSets {
-			if _, ok := observed[setID]; !ok {
-				missing = append(missing, setID)
-			}
-		}
-		sort.Strings(missing)
-		return fmt.Errorf("clean PAR2 settlement did not observe set(s): %s", strings.Join(missing, ", "))
-	}
-	if len(assertion.ExpectedSetVerificationModes) == 0 {
-		return nil
-	}
-
 	observedModes := make(map[string]string, len(assertion.ExpectedSetVerificationModes))
 	for _, rawLine := range strings.Split(string(raw), "\n") {
 		line := ansiEscape.ReplaceAllString(rawLine, "")
@@ -738,7 +685,7 @@ func assertPar2CleanSettlement(jobID int, assertion *ScenarioPar2CleanSettlement
 		if err != nil {
 			return fmt.Errorf("clean PAR2 verification source for set %s: %w", setID, err)
 		}
-		if wantSliceSize, ok := assertion.ExpectedSetSliceSizes[setID]; !ok || sliceSize != wantSliceSize {
+		if wantSliceSize := assertion.ExpectedSetSliceSizes[setID]; sliceSize != wantSliceSize {
 			return fmt.Errorf("clean PAR2 verification source for set %s has slice size %d, want %d", setID, sliceSize, wantSliceSize)
 		}
 		if _, duplicate := observedModes[setID]; duplicate {
@@ -755,6 +702,55 @@ func assertPar2CleanSettlement(jobID int, assertion *ScenarioPar2CleanSettlement
 		}
 		sort.Strings(missing)
 		return fmt.Errorf("clean PAR2 verification source did not observe set(s): %s", strings.Join(missing, ", "))
+	}
+
+	observedGridSets := make(map[string]uint64)
+	for _, rawLine := range strings.Split(string(raw), "\n") {
+		line := ansiEscape.ReplaceAllString(rawLine, "")
+		if !strings.Contains(line, cleanPar2SettlementMessage) || directLogJobID(line) != wantJobID {
+			continue
+		}
+		setID := weaverLogField(line, "recovery_set_id")
+		mode, wanted := observedModes[setID]
+		if !wanted {
+			return fmt.Errorf("clean PAR2 settlement observed unexpected set %s", setID)
+		}
+		if mode != "grid" {
+			return fmt.Errorf("clean PAR2 settlement observed set %s with non-grid mode %q", setID, mode)
+		}
+		sliceSize, err := parseWeaverLogUint(line, "slice_size")
+		if err != nil {
+			return fmt.Errorf("clean PAR2 settlement for set %s: %w", setID, err)
+		}
+		if wantSliceSize := assertion.ExpectedSetSliceSizes[setID]; sliceSize != wantSliceSize {
+			return fmt.Errorf("clean PAR2 settlement for set %s has slice size %d, want %d", setID, sliceSize, wantSliceSize)
+		}
+		if verdict := weaverLogField(line, "verdict"); verdict != "clean" {
+			return fmt.Errorf("clean PAR2 settlement for set %s has verdict %q, want clean", setID, verdict)
+		}
+		readBytes, err := parseWeaverLogUint(line, "verification_read_bytes")
+		if err != nil {
+			return fmt.Errorf("clean PAR2 settlement for set %s: %w", setID, err)
+		}
+		if readBytes != assertion.VerificationReadBytes {
+			return fmt.Errorf("clean PAR2 settlement for set %s read %d verification bytes, want %d", setID, readBytes, assertion.VerificationReadBytes)
+		}
+		if _, duplicate := observedGridSets[setID]; duplicate {
+			return fmt.Errorf("clean PAR2 settlement observed set %s more than once", setID)
+		}
+		observedGridSets[setID] = sliceSize
+	}
+	missingGridSets := make([]string, 0)
+	for setID, mode := range observedModes {
+		if mode == "grid" {
+			if _, ok := observedGridSets[setID]; !ok {
+				missingGridSets = append(missingGridSets, setID)
+			}
+		}
+	}
+	if len(missingGridSets) > 0 {
+		sort.Strings(missingGridSets)
+		return fmt.Errorf("clean PAR2 settlement did not observe grid set(s): %s", strings.Join(missingGridSets, ", "))
 	}
 	return nil
 }

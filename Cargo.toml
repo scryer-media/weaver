@@ -125,6 +125,12 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+[profile.e2e]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+debug-assertions = true
+
 [profile.test]
 debug = 0
 split-debuginfo = "off"

@@ -45,6 +45,9 @@ func TestScenarioNeedsBackupServerState(t *testing.T) {
 	if !scenarioNeedsBackupServerState(&Scenario{PrimaryChaosConfig: "corrupt_body=100"}) {
 		t.Fatal("primary chaos should require backup state")
 	}
+	if !scenarioNeedsBackupServerState(&Scenario{BackupUnavailableUntilFileComplete: "payload.mkv"}) {
+		t.Fatal("backup availability gate should require backup state")
+	}
 	if !scenarioNeedsBackupServerState(&Scenario{BackupFixtureAssets: []string{"single-mkv/test-media.mkv"}}) {
 		t.Fatal("backup fixture override should require backup state")
 	}
@@ -56,6 +59,9 @@ func TestScenarioNeedsBackupServerState(t *testing.T) {
 func TestScenarioUsesExclusiveNntpState(t *testing.T) {
 	if !scenarioUsesExclusiveNntpState(&Scenario{PrimaryChaosConfig: "corrupt_body=100"}) {
 		t.Fatal("primary chaos should force exclusive NNTP state")
+	}
+	if !scenarioUsesExclusiveNntpState(&Scenario{BackupUnavailableUntilFileComplete: "payload.mkv"}) {
+		t.Fatal("backup availability gate should force exclusive NNTP state")
 	}
 	if scenarioUsesExclusiveNntpState(&Scenario{}) {
 		t.Fatal("plain scenario should not force exclusive NNTP state")

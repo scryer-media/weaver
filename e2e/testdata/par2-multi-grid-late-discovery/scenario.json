@@ -1,14 +1,19 @@
 {
   "slug": "par2-multi-grid-late-discovery",
   "title": "Lattice.Harbor.PAR2.MultiGrid.LateDiscovery.2026.1080p.WEB-DL.H264-TESTGRP",
-  "description": "One clean payload belongs to independent 64 KiB and 96 KiB PAR2 sets. The declared 64 KiB index must publish its grid before payload leasing; the set discovered later from an optional recovery volume must use the safe digest fallback without read-back verification.",
+  "description": "Two clean payloads belong to independent 96 KiB and 64 KiB PAR2 sets. Explicit-index bootstrap holds payload leasing until the 96 KiB grid is published. The independent 64 KiB recovery carrier is available only on the gated backup and is released after its payload completes with a streamed digest, deterministically exercising the safe quick-digest fallback without read-back verification.",
   "category": "2000",
   "expected_outcome": "success",
   "fixtureAssets": [
-    "par2-multi-grid-overlap-clean/00-grid64.par2",
+    "par2-multi-grid-overlap-clean/01-grid96.par2",
     "par2-multi-grid-overlap-clean/payload.mkv",
-    "par2-multi-grid-overlap-clean/01-grid96.vol0+1.par2"
+    "single-mkv/test-media.mkv",
+    "par2-direct-repair/test-media.mkv.vol0+1.par2"
   ],
+  "primaryDeleteSubjectContains": [
+    "test-media.mkv.vol0+1.par2"
+  ],
+  "backupUnavailableUntilFileComplete": "test-media.mkv",
   "forbiddenJobEvents": [
     "RepairStarted",
     "RepairComplete",
@@ -17,20 +22,18 @@
   "runtimeAssertions": {
     "par2CleanSettlement": {
       "expectedSetSliceSizes": {
-        "6a197aef97785caa4d20e5ed8628be6f": 65536,
-        "617ae7848ecc6d3878e8b1567b7e19f0": 98304
+        "617ae7848ecc6d3878e8b1567b7e19f0": 98304,
+        "67bf769f86c961a3489112982cc5480c": 65536
       },
-      "expectedGridSetIDs": [
-        "6a197aef97785caa4d20e5ed8628be6f"
-      ],
       "expectedSetVerificationModes": {
-        "6a197aef97785caa4d20e5ed8628be6f": ["grid"],
-        "617ae7848ecc6d3878e8b1567b7e19f0": ["quick_digest"]
+        "617ae7848ecc6d3878e8b1567b7e19f0": ["grid"],
+        "67bf769f86c961a3489112982cc5480c": ["quick_digest"]
       },
       "verificationReadBytes": 0
     }
   },
   "expectedOutputBLAKE3": {
-    "payload.mkv": "bd8b3991787e2bc03ae0f47bda585f1b9dbd831448493fe3c4a9118f4f947cf2"
+    "payload.mkv": "bd8b3991787e2bc03ae0f47bda585f1b9dbd831448493fe3c4a9118f4f947cf2",
+    "test-media.mkv": "8139650c53be5684ab9cf20e34996fcfb510f118ee652ad7b949c32e8cb8b08a"
   }
 }

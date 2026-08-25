@@ -632,7 +632,6 @@ func TestAssertPar2CleanSettlementDistinguishesGridAndAuthoritativeSets(t *testi
 
 	assertion := &ScenarioPar2CleanSettlementAssertion{
 		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64, "late-set": 96},
-		ExpectedGridSetIDs:    []string{"grid-set"},
 		ExpectedSetVerificationModes: map[string][]string{
 			"grid-set": {"grid"},
 			"late-set": {"authoritative"},
@@ -694,26 +693,176 @@ func TestAssertPar2CleanSettlementAcceptsAllowedNonGridModes(t *testing.T) {
 	}
 }
 
-func TestAssertPar2CleanSettlementRejectsUnexpectedGridSettlement(t *testing.T) {
+func TestAssertPar2CleanSettlementConditionsGridEvidenceOnObservedMode(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assertion := &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"variable-set": 64},
+		ExpectedSetVerificationModes: map[string][]string{
+			"variable-set": {"grid", "quick_digest"},
+		},
+	}
+
+	for _, test := range []struct {
+		name  string
+		lines []string
+	}{
+		{
+			name: "quick digest needs no grid record",
+			lines: []string{
+				`job_id=45 recovery_set_id=variable-set slice_size=64 verification_mode=quick_digest PAR2 clean set verification source`,
+			},
+		},
+		{
+			name: "grid requires its matching record",
+			lines: []string{
+				`job_id=45 recovery_set_id=variable-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
+				`job_id=45 recovery_set_id=variable-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := assertPar2CleanSettlement(45, assertion); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestAssertPar2CleanSettlementRejectsGridEvidenceForNonGridMode(t *testing.T) {
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	logLines := []string{
-		`job_id=43 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
-		`job_id=43 recovery_set_id=late-set slice_size=96 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
+		`job_id=46 recovery_set_id=late-set slice_size=96 verification_mode=quick_digest PAR2 clean set verification source`,
+		`job_id=46 recovery_set_id=late-set slice_size=96 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
 	}
 	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
 		t.Fatal(err)
 	}
-
-	err := assertPar2CleanSettlement(43, &ScenarioPar2CleanSettlementAssertion{
-		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64, "late-set": 96},
-		ExpectedGridSetIDs:    []string{"grid-set"},
+	err := assertPar2CleanSettlement(46, &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"late-set": 96},
+		ExpectedSetVerificationModes: map[string][]string{
+			"late-set": {"grid", "quick_digest", "authoritative"},
+		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "unexpected set late-set") {
-		t.Fatalf("expected unexpected grid settlement failure, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), `non-grid mode "quick_digest"`) {
+		t.Fatalf("expected non-grid settlement evidence failure, got %v", err)
+	}
+}
+
+func TestAssertPar2CleanSettlementRejectsMissingGridEvidence(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		localWeaverLogPath(),
+		[]byte(`job_id=47 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	err := assertPar2CleanSettlement(47, &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64},
+		ExpectedSetVerificationModes: map[string][]string{
+			"grid-set": {"grid"},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "did not observe grid set(s): grid-set") {
+		t.Fatalf("expected missing grid settlement failure, got %v", err)
+	}
+}
+
+func TestAssertPar2CleanSettlementRejectsDuplicateAndUnknownRecords(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assertion := &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64},
+		ExpectedSetVerificationModes: map[string][]string{
+			"grid-set": {"grid"},
+		},
+	}
+	for _, test := range []struct {
+		name    string
+		lines   []string
+		message string
+	}{
+		{
+			name: "duplicate source",
+			lines: []string{
+				`job_id=48 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
+				`job_id=48 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
+			},
+			message: "verification source observed set grid-set more than once",
+		},
+		{
+			name: "unknown source",
+			lines: []string{
+				`job_id=48 recovery_set_id=unknown-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
+			},
+			message: "verification source observed unexpected set unknown-set",
+		},
+		{
+			name: "duplicate grid record",
+			lines: []string{
+				`job_id=48 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
+				`job_id=48 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
+				`job_id=48 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
+			},
+			message: "settlement observed set grid-set more than once",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err := assertPar2CleanSettlement(48, assertion)
+			if err == nil || !strings.Contains(err.Error(), test.message) {
+				t.Fatalf("expected %q, got %v", test.message, err)
+			}
+		})
+	}
+}
+
+func TestAssertPar2CleanSettlementRejectsUnknownVerificationMode(t *testing.T) {
+	err := assertPar2CleanSettlement(49, &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"typed-set": 64},
+		ExpectedSetVerificationModes: map[string][]string{
+			"typed-set": {"mystery"},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), `unknown verification mode "mystery"`) {
+		t.Fatalf("expected unknown verification mode failure, got %v", err)
+	}
+}
+
+func TestWaitForActiveFileCompleteMatchesExactJobAndFilename(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO active_files (job_id, file_index, filename) VALUES (51, 0, 'other.mkv')`)
+	mustExecWeaverStateSQL(t, db, `INSERT INTO active_files (job_id, file_index, filename) VALUES (52, 0, 'payload.mkv')`)
+	if err := waitForActiveFileComplete(dbPath, 51, "payload.mkv", 100*time.Millisecond); err == nil {
+		t.Fatal("wrong-job and wrong-filename rows must not release the gate")
+	}
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO active_files (job_id, file_index, filename) VALUES (51, 1, 'payload.mkv')`)
+	if err := waitForActiveFileComplete(dbPath, 51, "payload.mkv", time.Second); err != nil {
+		t.Fatalf("exact completed file did not release the gate: %v", err)
 	}
 }
 
@@ -743,6 +892,15 @@ func newTestWeaverStateDB(t *testing.T) string {
 				classification_set_name TEXT,
 				classification_volume_index INTEGER,
 				classification_source TEXT NOT NULL DEFAULT 'declared',
+				PRIMARY KEY (job_id, file_index)
+			)`)
+			continue
+		}
+		if table.Name == "active_files" {
+			mustExecWeaverStateSQL(t, db, `CREATE TABLE active_files (
+				job_id INTEGER NOT NULL,
+				file_index INTEGER NOT NULL,
+				filename TEXT NOT NULL,
 				PRIMARY KEY (job_id, file_index)
 			)`)
 			continue

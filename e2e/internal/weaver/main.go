@@ -38,37 +38,38 @@ import (
 
 // Scenario is the JSON manifest for a pre-built test fixture.
 type Scenario struct {
-	Slug                         string                     `json:"slug"`
-	Title                        string                     `json:"title"`
-	IndexerTitle                 string                     `json:"indexerTitle,omitempty"`
-	Description                  string                     `json:"description"`
-	Category                     string                     `json:"category"`
-	ExpectedOutcome              string                     `json:"expected_outcome"`
-	Password                     string                     `json:"password,omitempty"`
-	SegmentSize                  int                        `json:"segment_size,omitempty"`
-	NZBSegmentNumbers            []int                      `json:"nzb_segment_numbers,omitempty"`
-	NZBSegmentNumberStart        int                        `json:"nzb_segment_number_start,omitempty"`
-	NZBSegmentNumberStep         int                        `json:"nzb_segment_number_step,omitempty"`
-	SkipArticlesPct              int                        `json:"skip_articles_pct,omitempty"`
-	DeleteFirstMessageIDs        int                        `json:"deleteFirstMessageIDs,omitempty"`
-	DeleteFirstProbeSampleHits   int                        `json:"deleteFirstProbeSampleHits,omitempty"`
-	PrimaryDeleteFirstMessageIDs int                        `json:"primaryDeleteFirstMessageIDs,omitempty"`
-	SharedAssets                 []string                   `json:"sharedAssets,omitempty"`
-	FixtureAssets                []string                   `json:"fixtureAssets,omitempty"`
-	BackupFixtureAssets          []string                   `json:"backupFixtureAssets,omitempty"`
-	DeleteSubjectContains        []string                   `json:"deleteSubjectContains,omitempty"`
-	DeleteSubjectTailArticles    int                        `json:"deleteSubjectTailArticles,omitempty"`
-	DeleteSegmentNumbers         []int                      `json:"deleteSegmentNumbers,omitempty"`
-	DeleteSegmentSubjectContains []string                   `json:"deleteSegmentSubjectContains,omitempty"`
-	PrimaryDeleteSubjectContains []string                   `json:"primaryDeleteSubjectContains,omitempty"`
-	PrimaryChaosConfig           string                     `json:"primaryChaosConfig,omitempty"`
-	RequiredJobEvents            []string                   `json:"requiredJobEvents,omitempty"`
-	ForbiddenJobEvents           []string                   `json:"forbiddenJobEvents,omitempty"`
-	MaxJobEventCounts            map[string]int             `json:"maxJobEventCounts,omitempty"`
-	ExpectedOutputBLAKE3         map[string]string          `json:"expectedOutputBLAKE3,omitempty"`
-	ForbiddenOutputPaths         []string                   `json:"forbiddenOutputPaths,omitempty"`
-	NewznabAttributes            map[string]string          `json:"newznabAttributes,omitempty"`
-	RuntimeAssertions            *ScenarioRuntimeAssertions `json:"runtimeAssertions,omitempty"`
+	Slug                               string                     `json:"slug"`
+	Title                              string                     `json:"title"`
+	IndexerTitle                       string                     `json:"indexerTitle,omitempty"`
+	Description                        string                     `json:"description"`
+	Category                           string                     `json:"category"`
+	ExpectedOutcome                    string                     `json:"expected_outcome"`
+	Password                           string                     `json:"password,omitempty"`
+	SegmentSize                        int                        `json:"segment_size,omitempty"`
+	NZBSegmentNumbers                  []int                      `json:"nzb_segment_numbers,omitempty"`
+	NZBSegmentNumberStart              int                        `json:"nzb_segment_number_start,omitempty"`
+	NZBSegmentNumberStep               int                        `json:"nzb_segment_number_step,omitempty"`
+	SkipArticlesPct                    int                        `json:"skip_articles_pct,omitempty"`
+	DeleteFirstMessageIDs              int                        `json:"deleteFirstMessageIDs,omitempty"`
+	DeleteFirstProbeSampleHits         int                        `json:"deleteFirstProbeSampleHits,omitempty"`
+	PrimaryDeleteFirstMessageIDs       int                        `json:"primaryDeleteFirstMessageIDs,omitempty"`
+	SharedAssets                       []string                   `json:"sharedAssets,omitempty"`
+	FixtureAssets                      []string                   `json:"fixtureAssets,omitempty"`
+	BackupFixtureAssets                []string                   `json:"backupFixtureAssets,omitempty"`
+	DeleteSubjectContains              []string                   `json:"deleteSubjectContains,omitempty"`
+	DeleteSubjectTailArticles          int                        `json:"deleteSubjectTailArticles,omitempty"`
+	DeleteSegmentNumbers               []int                      `json:"deleteSegmentNumbers,omitempty"`
+	DeleteSegmentSubjectContains       []string                   `json:"deleteSegmentSubjectContains,omitempty"`
+	PrimaryDeleteSubjectContains       []string                   `json:"primaryDeleteSubjectContains,omitempty"`
+	PrimaryChaosConfig                 string                     `json:"primaryChaosConfig,omitempty"`
+	BackupUnavailableUntilFileComplete string                     `json:"backupUnavailableUntilFileComplete,omitempty"`
+	RequiredJobEvents                  []string                   `json:"requiredJobEvents,omitempty"`
+	ForbiddenJobEvents                 []string                   `json:"forbiddenJobEvents,omitempty"`
+	MaxJobEventCounts                  map[string]int             `json:"maxJobEventCounts,omitempty"`
+	ExpectedOutputBLAKE3               map[string]string          `json:"expectedOutputBLAKE3,omitempty"`
+	ForbiddenOutputPaths               []string                   `json:"forbiddenOutputPaths,omitempty"`
+	NewznabAttributes                  map[string]string          `json:"newznabAttributes,omitempty"`
+	RuntimeAssertions                  *ScenarioRuntimeAssertions `json:"runtimeAssertions,omitempty"`
 }
 
 type ScenarioRuntimeAssertions struct {
@@ -84,7 +85,6 @@ type ScenarioFileIdentityRewriteAssertion struct {
 
 type ScenarioPar2CleanSettlementAssertion struct {
 	ExpectedSetSliceSizes        map[string]uint64   `json:"expectedSetSliceSizes,omitempty"`
-	ExpectedGridSetIDs           []string            `json:"expectedGridSetIDs,omitempty"`
 	ExpectedSetVerificationModes map[string][]string `json:"expectedSetVerificationModes,omitempty"`
 	VerificationReadBytes        uint64              `json:"verificationReadBytes"`
 }
@@ -1978,7 +1978,8 @@ func scenarioNeedsBackupServerState(scenario *Scenario) bool {
 	return scenarioHasBackupFixtureOverride(scenario) ||
 		scenario.PrimaryDeleteFirstMessageIDs > 0 ||
 		len(scenario.PrimaryDeleteSubjectContains) > 0 ||
-		strings.TrimSpace(scenario.PrimaryChaosConfig) != ""
+		strings.TrimSpace(scenario.PrimaryChaosConfig) != "" ||
+		strings.TrimSpace(scenario.BackupUnavailableUntilFileComplete) != ""
 }
 
 // segmentDeleteNeedles narrows which files the segment-number deletion may
@@ -1998,7 +1999,8 @@ func segmentDeleteNeedles(scenario *Scenario) []string {
 }
 
 func scenarioUsesExclusiveNntpState(scenario *Scenario) bool {
-	return scenario != nil && strings.TrimSpace(scenario.PrimaryChaosConfig) != ""
+	return scenario != nil && (strings.TrimSpace(scenario.PrimaryChaosConfig) != "" ||
+		strings.TrimSpace(scenario.BackupUnavailableUntilFileComplete) != "")
 }
 
 func applyBackupFixtureOverridesForSlugs(slugs []string) error {
@@ -3258,14 +3260,49 @@ func finalizeTestJobFromSnapshot(job *testJob, dbPath string, snapshot facadeIte
 	}
 }
 
+func waitForActiveFileComplete(dbPath string, jobID int, filename string, timeout time.Duration) error {
+	db, datastore, err := openWeaverStateDB(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	query := rebindWeaverSQL(
+		datastore,
+		`SELECT COUNT(*) FROM active_files WHERE job_id = ? AND filename = ?`,
+	)
+	deadline := time.Now().Add(timeout)
+	for {
+		var count int
+		err := db.QueryRow(query, jobID, filename).Scan(&count)
+		if err == nil && count > 0 {
+			return nil
+		}
+		if err != nil && !isTransientSQLiteBusy(err) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("job %d did not complete file %q within %s", jobID, filename, timeout)
+		}
+		mustSleepWithSuspendDetection(50*time.Millisecond, fmt.Sprintf("job %d file-completion gate", jobID))
+	}
+}
+
 func runExclusiveFunctionalJob(weaverURL, dbPath string, job *testJob) {
 	config := strings.TrimSpace(job.scenario.PrimaryChaosConfig)
+	backupGateFilename := strings.TrimSpace(job.scenario.BackupUnavailableUntilFileComplete)
+	var releaseBackupGate func() error
 	if err := ensureNntpChaosOff(); err != nil {
 		job.status = "setup_error"
 		job.errMsg = err.Error()
 		return
 	}
 	defer func() {
+		if releaseBackupGate != nil {
+			if err := releaseBackupGate(); err != nil {
+				log.Printf("warning: release backup gate after exclusive scenario %s: %v", job.slug, err)
+			}
+		}
 		if err := ensureNntpChaosOff(); err != nil {
 			log.Printf("warning: reset NNTP chaos after exclusive scenario %s: %v", job.slug, err)
 		}
@@ -3279,6 +3316,32 @@ func runExclusiveFunctionalJob(weaverURL, dbPath string, job *testJob) {
 		}
 		log.Printf("  %s: primary NNTP chaos enabled: %s", job.slug, config)
 	}
+	if backupGateFilename != "" {
+		if !backupNntpRunning() {
+			job.status = "setup_error"
+			job.errMsg = "backup-unavailable gate requires the backup NNTP server"
+			return
+		}
+		if len(job.scenario.PrimaryDeleteSubjectContains) == 0 {
+			job.status = "setup_error"
+			job.errMsg = "backup-unavailable gate requires primaryDeleteSubjectContains"
+			return
+		}
+		// Refuse new sessions and make any pooled session re-authenticate on
+		// BODY, so earlier scenarios cannot leave a connection around the gate.
+		release, err := holdNntpChaosOnServer(
+			nntpHost(),
+			backupNntpPort(),
+			"greet_400=100,reauth_body=100",
+		)
+		if err != nil {
+			job.status = "setup_error"
+			job.errMsg = err.Error()
+			return
+		}
+		releaseBackupGate = release
+		log.Printf("  %s: backup NNTP unavailable until %s completes", job.slug, backupGateFilename)
+	}
 
 	jobID, err := submitOneNZB(weaverURL, job.scenario)
 	if err != nil {
@@ -3288,6 +3351,21 @@ func runExclusiveFunctionalJob(weaverURL, dbPath string, job *testJob) {
 	}
 	job.jobID = jobID
 	log.Printf("  %s: submitted exclusive job=%d", job.slug, jobID)
+	if backupGateFilename != "" {
+		if err := waitForActiveFileComplete(dbPath, jobID, backupGateFilename, 60*time.Second); err != nil {
+			job.status = "setup_error"
+			job.errMsg = err.Error()
+			return
+		}
+		release := releaseBackupGate
+		releaseBackupGate = nil
+		if err := release(); err != nil {
+			job.status = "setup_error"
+			job.errMsg = err.Error()
+			return
+		}
+		log.Printf("  %s: backup NNTP released after %s completed", job.slug, backupGateFilename)
+	}
 
 	deadline := time.Now().Add(180 * time.Second)
 	firstPoll := true
@@ -5766,45 +5844,70 @@ func sendNntpCommandToOnce(host, port, cmd string) (string, error) {
 	return sendNntpCommandToOnceWithAuth(host, port, cmd, true)
 }
 
-func sendNntpCommandToOnceWithAuth(host, port, cmd string, authenticate bool) (string, error) {
+type nntpCommandSession struct {
+	addr   string
+	conn   net.Conn
+	reader *bufio.Reader
+}
+
+func openNntpCommandSession(host, port string, authenticate bool) (*nntpCommandSession, error) {
 	addr := host + ":" + port
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
-		return "", fmt.Errorf("connect %s: %w", addr, err)
+		return nil, fmt.Errorf("connect %s: %w", addr, err)
 	}
-	defer conn.Close()
 
-	r := bufio.NewReader(conn)
+	reader := bufio.NewReader(conn)
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	greeting, err := r.ReadString('\n')
+	greeting, err := reader.ReadString('\n')
 	if err != nil {
-		return "", fmt.Errorf("read greeting from %s: %w", addr, err)
+		conn.Close()
+		return nil, fmt.Errorf("read greeting from %s: %w", addr, err)
 	}
 	if !strings.HasPrefix(greeting, "200") && !strings.HasPrefix(greeting, "201") {
-		return "", fmt.Errorf("unexpected greeting from %s: %s", addr, strings.TrimSpace(greeting))
+		conn.Close()
+		return nil, fmt.Errorf("unexpected greeting from %s: %s", addr, strings.TrimSpace(greeting))
 	}
 	if authenticate {
-		if err := authenticateNNTPConnection(conn, r, addr); err != nil {
-			return "", err
+		if err := authenticateNNTPConnection(conn, reader, addr); err != nil {
+			conn.Close()
+			return nil, err
 		}
 	}
+	return &nntpCommandSession{addr: addr, conn: conn, reader: reader}, nil
+}
 
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if _, err := conn.Write([]byte(cmd + "\r\n")); err != nil {
-		return "", fmt.Errorf("write command %q to %s: %w", cmd, addr, err)
+func (session *nntpCommandSession) send(cmd string) (string, error) {
+	session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := session.conn.Write([]byte(cmd + "\r\n")); err != nil {
+		return "", fmt.Errorf("write command %q to %s: %w", cmd, session.addr, err)
 	}
 
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	line, err := r.ReadString('\n')
+	session.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	line, err := session.reader.ReadString('\n')
 	if err != nil {
-		return "", fmt.Errorf("read response for %q from %s: %w", cmd, addr, err)
+		return "", fmt.Errorf("read response for %q from %s: %w", cmd, session.addr, err)
 	}
-	_, _ = conn.Write([]byte("QUIT\r\n"))
 	line = strings.TrimSpace(line)
 	if line == "" {
-		return "", fmt.Errorf("empty response for %q from %s", cmd, addr)
+		return "", fmt.Errorf("empty response for %q from %s", cmd, session.addr)
 	}
 	return line, nil
+}
+
+func (session *nntpCommandSession) close() {
+	_ = session.conn.SetWriteDeadline(time.Now().Add(time.Second))
+	_, _ = session.conn.Write([]byte("QUIT\r\n"))
+	_ = session.conn.Close()
+}
+
+func sendNntpCommandToOnceWithAuth(host, port, cmd string, authenticate bool) (string, error) {
+	session, err := openNntpCommandSession(host, port, authenticate)
+	if err != nil {
+		return "", err
+	}
+	defer session.close()
+	return session.send(cmd)
 }
 
 func resetNntpServer(host, port, label string) error {
@@ -6054,9 +6157,9 @@ func findWeaverBin() string {
 	if configured := strings.TrimSpace(os.Getenv("WEAVER_BIN")); configured != "" {
 		return absolutePath(configured)
 	}
-	bin, err := ensureReleaseWeaverBinary()
+	bin, err := ensureE2EWeaverBinary()
 	if err != nil {
-		log.Fatalf("build release weaver binary: %v", err)
+		log.Fatalf("build e2e weaver binary: %v", err)
 	}
 	return bin
 }
@@ -6074,7 +6177,7 @@ func findWeaverBin() string {
 // The failure is not subtle when it lands, but it is very indirect: a bare
 // `cargo` resolves to an older toolchain than the tree pins, `cargo build`
 // refuses with "rustc X is not supported by the following packages", and
-// *every* phase dies at `ensureReleaseWeaverBinary` — the phases that skip
+// *every* phase dies at `ensureE2EWeaverBinary` — the phases that skip
 // seeding instantly and the rest a few minutes later, which reads like several
 // broken phases rather than one broken build.
 //
@@ -6135,14 +6238,14 @@ func prependPathEnv(env []string, dir string) []string {
 	return out
 }
 
-func ensureReleaseWeaverBinary() (string, error) {
+func ensureE2EWeaverBinary() (string, error) {
 	// Stable across runs, deliberately. A per-PID dir made every run a cold
-	// fat-LTO release build (~6.5 min) and orphaned ~1.4 GB of artifacts each
-	// time. The only thing it has to stay clear of is the dev `weaver/target`,
+	// optimized build and orphaned ~1.4 GB of artifacts each time. The only
+	// thing it has to stay clear of is the dev `weaver/target`,
 	// which a stable name outside the repo keeps just as well. If the cache
 	// ever goes bad the retry below wipes it and rebuilds clean.
-	targetDir := filepath.Join(os.TempDir(), "weaver-e2e-release-target")
-	weaverBin := filepath.Join(targetDir, "release", "weaver")
+	targetDir := filepath.Join(os.TempDir(), "weaver-e2e-target")
+	weaverBin := filepath.Join(targetDir, "e2e", "weaver")
 
 	weaverBuildOnce.Do(func() {
 		build := func() error {
@@ -6150,27 +6253,13 @@ func ensureReleaseWeaverBinary() (string, error) {
 			if cargoPath == "" {
 				cargoPath = "cargo"
 			}
-			cmd := exec.Command(cargoPath, "build", "--release", "-p", "weaver", "--locked")
+			cmd := exec.Command(cargoPath, "build", "--profile", "e2e", "-p", "weaver", "--locked")
 			cmd.Dir = weaverRepoPath()
-			cmd.Env = prependPathEnv(os.Environ(), toolchainBin)
-			cmd.Env = append(cmd.Env,
-				"CARGO_TARGET_DIR="+targetDir,
-				// Weaver's release profile leaves debug assertions off, so every
-				// `debug_assert!` in weaver and its dependencies compiles out — and
-				// the first sign of a broken invariant is whatever hard `.expect()`
-				// it reaches later, as an abort (the profile is also
-				// `panic = "abort"`). That is exactly how an archive-engine
-				// refactor once took the whole server down seconds into a run,
-				// scored as dozens of scenario timeouts. e2e would rather trip the
-				// assertion that names the invariant than the abort that does not,
-				// so it opts back in here. This only affects the e2e binary;
-				// released artifacts still build with the profile as written.
-				"CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true",
-			)
-			return runExternalCommand(cmd, "cargo build --release -p weaver --locked for e2e")
+			cmd.Env = append(prependPathEnv(os.Environ(), toolchainBin), "CARGO_TARGET_DIR="+targetDir)
+			return runExternalCommand(cmd, "cargo build --profile e2e -p weaver --locked")
 		}
 
-		log.Printf("building clean release weaver binary for e2e from %s at %s", weaverRepoPath(), targetDir)
+		log.Printf("building optimized e2e weaver binary from %s at %s", weaverRepoPath(), targetDir)
 		weaverBuildErr = build()
 		if weaverBuildErr == nil {
 			weaverBuildPath = weaverBin
@@ -6182,7 +6271,7 @@ func ensureReleaseWeaverBinary() (string, error) {
 			return
 		}
 
-		log.Printf("e2e release weaver build failed; retrying with a clean target dir %s", targetDir)
+		log.Printf("e2e weaver build failed; retrying with a clean target dir %s", targetDir)
 		weaverBuildErr = build()
 		if weaverBuildErr == nil {
 			weaverBuildPath = weaverBin
@@ -6196,7 +6285,7 @@ func ensureReleaseWeaverBinary() (string, error) {
 		weaverBuildPath = weaverBin
 	}
 	if _, err := os.Stat(weaverBuildPath); err != nil {
-		return "", fmt.Errorf("e2e release weaver binary missing at %s: %w", weaverBuildPath, err)
+		return "", fmt.Errorf("e2e weaver binary missing at %s: %w", weaverBuildPath, err)
 	}
 	return weaverBuildPath, nil
 }

@@ -583,7 +583,7 @@ func ensureRestartWeaverBinary() (string, error) {
 	if configured := strings.TrimSpace(os.Getenv("WEAVER_BIN")); configured != "" {
 		return configured, nil
 	}
-	return ensureReleaseWeaverBinary()
+	return ensureE2EWeaverBinary()
 }
 
 func (ctx *restartCaseContext) restartWeaver() error {
@@ -833,10 +833,41 @@ func setNntpChaosOnServer(host, port, config string) error {
 	if err != nil {
 		return err
 	}
+	return validateNntpChaosResponse(resp)
+}
+
+func validateNntpChaosResponse(resp string) error {
 	if !strings.HasPrefix(resp, "290 ") {
 		return fmt.Errorf("unexpected chaos response: %s", resp)
 	}
 	return nil
+}
+
+// holdNntpChaosOnServer keeps the authenticated control connection alive so
+// greeting failures cannot lock the harness out of clearing its own gate.
+func holdNntpChaosOnServer(host, port, config string) (func() error, error) {
+	session, err := openNntpCommandSession(host, port, true)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := session.send("CHAOS " + config)
+	if err != nil {
+		session.close()
+		return nil, err
+	}
+	if err := validateNntpChaosResponse(resp); err != nil {
+		session.close()
+		return nil, err
+	}
+
+	return func() error {
+		defer session.close()
+		resp, err := session.send("CHAOS off")
+		if err != nil {
+			return err
+		}
+		return validateNntpChaosResponse(resp)
+	}, nil
 }
 
 func fetchNntpStatMetricsFrom(host, port, prefix string) (restartNntpMetrics, error) {
