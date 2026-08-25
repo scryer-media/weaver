@@ -781,6 +781,18 @@ async fn member_checksum_demotion_hands_the_live_tail_to_a_reconstructed_prefix(
         }),
         "conventional assembly must own and complete both demoted volumes"
     );
+    let (tail_start, tail_end) = article_extent(volumes[1].1.len(), 2, 3);
+    assert_eq!(
+        state
+            .assembly
+            .file(NzbFileId {
+                job_id,
+                file_index: 1,
+            })
+            .and_then(|file| file.placement_of(2)),
+        Some((tail_start as u64, (tail_end - tail_start) as u32)),
+        "the in-hand article must restore the placement erased by demotion reset"
+    );
     assert_eq!(
         state.downloaded_bytes,
         volumes
@@ -820,6 +832,11 @@ async fn member_checksum_demotion_hands_the_live_tail_to_a_reconstructed_prefix(
     assert!(
         !direct_partial(&temp_dir, job_id, member_name).exists(),
         "demotion must delete the set's partial direct output"
+    );
+    assert_eq!(
+        pipeline.direct_store.pending_materialization_files(job_id),
+        0,
+        "durable conventional completion must clear the demotion gate"
     );
 }
 
@@ -1027,6 +1044,166 @@ fn append_par2_index(spec: &mut JobSpec, par2_bytes: &[u8]) -> u32 {
         }],
     });
     file_index
+}
+
+#[tokio::test]
+async fn demotion_materialization_gate_is_scoped_to_its_bound_par2_set() {
+    let first_member = "Silver.Horizon.S01E30.mkv";
+    let second_member = "Amber.Sky.S01E30.mkv";
+    let first_payload: Vec<u8> = (0..1800u32).map(|index| (index % 173) as u8).collect();
+    let second_payload: Vec<u8> = (0..1800u32).map(|index| (index % 181) as u8).collect();
+    let first = single_member_store_set(first_member, &first_payload, 2);
+    let second: Vec<(String, Vec<u8>)> = single_member_store_set(second_member, &second_payload, 2)
+        .into_iter()
+        .map(|(filename, bytes)| (filename.replace("silver.horizon", "amber.sky"), bytes))
+        .collect();
+    let first_par2 = par2_index_over_volumes(&first);
+    let second_par2 = par2_index_over_volumes(&second);
+    let mut volumes = first.clone();
+    volumes.extend(second.clone());
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41058);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let mut spec = direct_store_job_spec("Two direct sets", &volumes);
+    let first_index = append_par2_index(&mut spec, &first_par2);
+    let second_index = spec.files.len() as u32;
+    let second_index_name = "amber.sky.par2".to_string();
+    spec.total_bytes += u64::from(yenc_declared_bytes(second_par2.len() as u32));
+    spec.files.push(FileSpec {
+        role: FileRole::from_filename(&second_index_name),
+        filename: second_index_name,
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: yenc_declared_bytes(second_par2.len() as u32),
+            message_id: "second-direct-par2-index@example.com".to_string(),
+        }],
+    });
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    deliver_par2_index(&mut pipeline, job_id, first_index, &first_par2).await;
+    deliver_par2_index(&mut pipeline, job_id, second_index, &second_par2).await;
+
+    take_queued_segment(
+        &mut pipeline,
+        job_id,
+        SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number: 0,
+        },
+    );
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    let first_set_index = pipeline
+        .direct_store
+        .sets_for(job_id)
+        .iter()
+        .position(|set| {
+            set.plan()
+                .volumes
+                .values()
+                .any(|file_index| *file_index == 0)
+        })
+        .expect("the first archive set was admitted");
+    std::fs::remove_file(working_dir.join("silver.horizon.f0.vol00000.envelope")).unwrap();
+    pipeline
+        .demote_direct_set(
+            job_id,
+            first_set_index,
+            DemotionReason::MemberChecksumMismatch,
+        )
+        .await;
+
+    let first_set_id = pipeline
+        .resolve_par2_file_binding(NzbFileId {
+            job_id,
+            file_index: 0,
+        })
+        .expect("first volume binding")
+        .recovery_set_id;
+    let second_set_id = pipeline
+        .resolve_par2_file_binding(NzbFileId {
+            job_id,
+            file_index: first.len() as u32,
+        })
+        .expect("second volume binding")
+        .recovery_set_id;
+    assert_ne!(first_set_id, second_set_id);
+    assert_eq!(pipeline.par2_served_set_id(job_id), Some(first_set_id));
+    let _drained = queued_segments(&mut pipeline, job_id);
+    let verifies_before = pipeline.par2_authoritative_verify_calls;
+    pipeline.check_job_completion(job_id).await;
+    assert_eq!(
+        pipeline.par2_authoritative_verify_calls, verifies_before,
+        "the shared completion funnel must stop before starting PAR2"
+    );
+    assert_eq!(
+        pipeline.direct_store.pending_materialization_files(job_id),
+        first.len(),
+        "the first set remains pending while its rescued articles are queued"
+    );
+    assert!(
+        !pipeline.demoted_materializations_ready_for_par2(job_id, first_set_id),
+        "the demoted set's own PAR2 verdict must wait"
+    );
+    let original_identity = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .file_identities
+        .insert(
+            0,
+            crate::jobs::record::ActiveFileIdentity {
+                file_index: 0,
+                source_filename: first[0].0.clone(),
+                current_filename: first[0].0.clone(),
+                canonical_filename: Some(first[1].0.clone()),
+                classification: None,
+                classification_source: crate::jobs::record::FileIdentitySource::Par2,
+            },
+        );
+    assert!(
+        pipeline
+            .resolve_par2_file_binding(NzbFileId {
+                job_id,
+                file_index: 0,
+            })
+            .is_none(),
+        "the conflicting canonical candidate must make this pending set unresolved"
+    );
+    assert!(
+        !pipeline.demoted_materializations_ready_for_par2(job_id, second_set_id),
+        "an unresolved pending set must conservatively block the served set"
+    );
+    if let Some(identity) = original_identity {
+        pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .file_identities
+            .insert(0, identity);
+    } else {
+        pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .file_identities
+            .remove(&0);
+    }
+    assert!(
+        pipeline.demoted_materializations_ready_for_par2(job_id, second_set_id),
+        "an unrelated bound recovery set must not wait behind the demotion"
+    );
+    pipeline.clear_par2_runtime_state(job_id);
+    assert_eq!(
+        pipeline.direct_store.pending_materialization_files(job_id),
+        0,
+        "the shared cancellation/failure/teardown seam must clear the gate"
+    );
 }
 
 /// What one par2-bearing job gate produced.
@@ -1778,10 +1955,62 @@ async fn a_demotion_falls_back_to_refetching_when_its_envelope_is_gone() {
         !working_dir.join(&volumes[0].0).exists(),
         "a failed reconstruction must not leave a partly written volume behind"
     );
+    let expected = vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)];
     assert_eq!(
         queued_segments(&mut pipeline, job_id),
-        vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)],
+        expected,
         "the fallback refetches every article exactly once"
+    );
+    assert_eq!(
+        pipeline.direct_store.pending_materialization_files(job_id),
+        volumes.len(),
+        "every reset source volume remains behind the PAR2 gate"
+    );
+
+    let set_id = par2_rs::RecoverySetId::from_bytes([41; 16]);
+    assert!(
+        !pipeline.demoted_materializations_ready_for_par2(job_id, set_id),
+        "quiescent missing articles must be rescued before PAR2 can observe them"
+    );
+    assert_eq!(
+        pipeline
+            .direct_store
+            .rescued_materialization_segments(job_id),
+        expected.len(),
+        "each ownerless segment receives one ordinary retry lineage"
+    );
+    assert!(
+        !pipeline.demoted_materializations_ready_for_par2(job_id, set_id),
+        "the queued rescue remains an owner and must not be duplicated"
+    );
+    assert_eq!(
+        pipeline
+            .direct_store
+            .rescued_materialization_segments(job_id),
+        expected.len()
+    );
+    let rescued = queued_segments(&mut pipeline, job_id);
+    assert_eq!(rescued, expected);
+    pipeline
+        .terminal_segment_failures
+        .extend(
+            rescued
+                .iter()
+                .map(|(file_index, segment_number)| SegmentId {
+                    file_id: NzbFileId {
+                        job_id,
+                        file_index: *file_index,
+                    },
+                    segment_number: *segment_number,
+                }),
+        );
+    assert!(
+        pipeline.demoted_materializations_ready_for_par2(job_id, set_id),
+        "terminally unavailable articles release the demotion gate"
+    );
+    assert_eq!(
+        pipeline.direct_store.pending_materialization_files(job_id),
+        0
     );
     assert_eq!(
         pipeline.jobs.get(&job_id).unwrap().downloaded_bytes,
@@ -4721,6 +4950,112 @@ fn member_after_gate(
         (None, None, Some(bytes)) => (Some(bytes), Some("working")),
         (None, None, None) => (None, None),
     }
+}
+
+#[tokio::test]
+async fn restart_after_refetch_demotion_restores_incomplete_source_ownership() {
+    let member_name = "Silver.Horizon.S01E25.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41057);
+
+    let (pipeline, working_dir, _) =
+        demote_mid_download(&temp_dir, job_id, &volumes, |_, working_dir| {
+            std::fs::remove_file(working_dir.join("silver.horizon.f0.vol00000.envelope")).unwrap();
+        })
+        .await;
+    assert!(
+        pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "the direct checkpoint must be retired before the simulated crash"
+    );
+    let (persisted_progress, persisted_complete) =
+        pipeline.db.load_active_file_runtime(job_id).unwrap();
+    assert!(persisted_progress.is_empty() && persisted_complete.is_empty());
+    let file_progress = persisted_progress;
+    let complete_files = persisted_complete
+        .into_iter()
+        .map(|file_index| NzbFileId { job_id, file_index })
+        .collect();
+    assert_eq!(
+        pipeline.direct_store.pending_materialization_files(job_id),
+        volumes.len(),
+        "the live process still owns the demotion gate before the crash"
+    );
+    drop(pipeline);
+
+    let (mut restarted, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    restarted.direct_store.set_gate(DirectStoreGate::Enabled);
+    restarted
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec: direct_store_job_spec("Silver Horizon", &volumes),
+            complete_files,
+            file_progress,
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: working_dir.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        restarted.direct_store.pending_materialization_files(job_id),
+        0,
+        "the in-memory gate is intentionally not persisted"
+    );
+    let expected: Vec<(u32, u32)> = (0..volumes.len() as u32)
+        .flat_map(|file_index| [(file_index, 0), (file_index, 1)])
+        .collect();
+    assert_eq!(peek_queued_segments(&mut restarted, job_id), expected);
+    assert!(
+        restarted.job_has_pending_download_pipeline_work(job_id),
+        "ordinary restart assembly must hold PAR2 behind the queued source articles"
+    );
+
+    for (file_index, segment_number) in expected {
+        dispatch_and_submit(
+            &mut restarted,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            2,
+        )
+        .await;
+    }
+    assert!(
+        volumes
+            .iter()
+            .all(|(filename, _)| !working_dir.join(filename).exists()),
+        "a checkpoint-free restart may re-admit the incomplete set, but it must \
+         retain the no-source-volume direct path"
+    );
+    assert!(
+        format!("{:?}", restarted.direct_store.sets_for(job_id)).contains("Finalized"),
+        "the restarted set must not settle until all source articles have been rerouted"
+    );
+
+    restarted.schedule_job_completion_check(job_id);
+    drain_rar_refreshes(&mut restarted).await;
+    drive_extractions_to_terminal(&mut restarted, job_id, 64).await;
+    let (member, _) = member_after_gate(&complete_dir, &working_dir, member_name);
+    assert_eq!(member.as_deref(), Some(payload.as_slice()));
+    assert!(matches!(
+        job_status_for_assert(&restarted, job_id),
+        Some(JobStatus::Complete)
+    ));
 }
 
 /// The headline restart differential.

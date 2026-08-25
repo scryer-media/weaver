@@ -833,6 +833,7 @@ impl Pipeline {
 
     pub(crate) fn clear_par2_runtime_state(&mut self, job_id: JobId) {
         self.block_crcs.forget_job(job_id);
+        self.direct_store.clear_pending_materializations(job_id);
         self.par2_runtime.remove(&job_id);
         self.par2_cancellations.remove(&job_id);
         self.shared_state.clear_job_cancellations(job_id);

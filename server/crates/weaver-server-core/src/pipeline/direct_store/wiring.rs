@@ -65,6 +65,13 @@ use crate::pipeline::{BufferedDecodedSegment, DecodedChunk, Pipeline};
 /// keep the whole plan's resident cost to one buffer.
 const REARM_CHUNK_BYTES: usize = 256 * 1024;
 
+#[derive(Clone, Default)]
+struct PendingDemotionMaterialization {
+    files: HashSet<NzbFileId>,
+    handoffs: HashSet<SegmentId>,
+    rescued: HashSet<SegmentId>,
+}
+
 /// Per-pipeline direct-store state. Empty and inert while the gate is off.
 #[derive(Default)]
 pub(crate) struct DirectStoreRuntime {
@@ -107,6 +114,9 @@ pub(crate) struct DirectStoreRuntime {
     /// restart the damage is re-detected from scratch and the defer re-derives
     /// itself, so a stale count would only shorten a fresh job's budget.
     repair_defer_waves: HashMap<JobId, u32>,
+    /// Demoted source volumes that have not reached the conventional durable
+    /// seam yet, grouped by the direct set that owned them.
+    pending_materializations: HashMap<JobId, HashMap<usize, PendingDemotionMaterialization>>,
     /// Test-only holds ceiling applied to every set this runtime admits.
     #[cfg(test)]
     holds_budget_override: Option<u64>,
@@ -272,6 +282,108 @@ impl DirectStoreRuntime {
         self.prepared_destinations.remove(&job_id);
         self.direct_extracted_members.remove(&job_id);
         self.repair_defer_waves.remove(&job_id);
+        self.pending_materializations.remove(&job_id);
+    }
+
+    fn begin_materialization(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        files: impl IntoIterator<Item = NzbFileId>,
+    ) {
+        self.pending_materializations
+            .entry(job_id)
+            .or_default()
+            .entry(set_index)
+            .or_default()
+            .files
+            .extend(files);
+    }
+
+    fn note_materialization_handoff(&mut self, set_index: usize, segment_id: SegmentId) {
+        if let Some(pending) = self
+            .pending_materializations
+            .get_mut(&segment_id.file_id.job_id)
+            .and_then(|sets| sets.get_mut(&set_index))
+        {
+            pending.handoffs.insert(segment_id);
+        }
+    }
+
+    pub(crate) fn finish_materialization_handoff(&mut self, segment_id: SegmentId) {
+        if let Some(sets) = self
+            .pending_materializations
+            .get_mut(&segment_id.file_id.job_id)
+        {
+            for pending in sets.values_mut() {
+                pending.handoffs.remove(&segment_id);
+            }
+        }
+    }
+
+    pub(crate) fn settle_materialized_file(&mut self, file_id: NzbFileId) {
+        let job_id = file_id.job_id;
+        if let Some(sets) = self.pending_materializations.get_mut(&job_id) {
+            sets.retain(|_, pending| {
+                pending.files.remove(&file_id);
+                pending
+                    .handoffs
+                    .retain(|segment_id| segment_id.file_id != file_id);
+                pending
+                    .rescued
+                    .retain(|segment_id| segment_id.file_id != file_id);
+                !pending.files.is_empty()
+            });
+            if sets.is_empty() {
+                self.pending_materializations.remove(&job_id);
+            }
+        }
+    }
+
+    fn pending_materializations(
+        &self,
+        job_id: JobId,
+    ) -> Vec<(usize, PendingDemotionMaterialization)> {
+        self.pending_materializations
+            .get(&job_id)
+            .map(|sets| {
+                sets.iter()
+                    .map(|(set_index, pending)| (*set_index, pending.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn note_materialization_rescue(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        segment_id: SegmentId,
+    ) -> bool {
+        self.pending_materializations
+            .get_mut(&job_id)
+            .and_then(|sets| sets.get_mut(&set_index))
+            .is_some_and(|pending| pending.rescued.insert(segment_id))
+    }
+
+    pub(crate) fn clear_pending_materializations(&mut self, job_id: JobId) {
+        self.pending_materializations.remove(&job_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_materialization_files(&self, job_id: JobId) -> usize {
+        self.pending_materializations
+            .get(&job_id)
+            .map(|sets| sets.values().map(|pending| pending.files.len()).sum())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rescued_materialization_segments(&self, job_id: JobId) -> usize {
+        self.pending_materializations
+            .get(&job_id)
+            .map(|sets| sets.values().map(|pending| pending.rescued.len()).sum())
+            .unwrap_or(0)
     }
 
     /// Whether this job has a repair defer outstanding — a wave of targeted
@@ -1097,6 +1209,173 @@ impl Pipeline {
         self.par2_served_set_id(job_id).is_none_or(|set_id| {
             self.direct_sets_ready_for_authoritative_par2_for_set(job_id, set_id)
         })
+    }
+
+    /// The one ownership gate between direct demotion and every PAR2 verdict.
+    /// A pending file leaves through the durable conventional completion seam,
+    /// or once every article it still lacks is terminally unavailable.
+    pub(crate) fn demoted_materializations_ready_for_par2(
+        &mut self,
+        job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
+    ) -> bool {
+        let pending = self.direct_store.pending_materializations(job_id);
+        if pending.is_empty() {
+            return true;
+        }
+        if !self.jobs.contains_key(&job_id) {
+            self.direct_store.clear_pending_materializations(job_id);
+            return true;
+        }
+
+        let mut ready = true;
+        for (set_index, pending) in pending {
+            let applicability = self.direct_store.set(job_id, set_index).map(|set| {
+                let mut unresolved = false;
+                let binds_served =
+                    set.plan().volumes.values().copied().any(|file_index| {
+                        match self.resolve_par2_file_binding(NzbFileId { job_id, file_index }) {
+                            Some(binding) => binding.recovery_set_id == recovery_set_id,
+                            None => {
+                                unresolved = true;
+                                false
+                            }
+                        }
+                    });
+                binds_served || unresolved
+            });
+            match applicability {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    for file_id in pending.files {
+                        self.direct_store.settle_materialized_file(file_id);
+                    }
+                    continue;
+                }
+            }
+
+            for file_id in pending.files {
+                let Some((missing, file_has_owner)) = self.jobs.get(&job_id).and_then(|state| {
+                    let file = state.spec.files.get(file_id.file_index as usize)?;
+                    let assembly = state.assembly.file(file_id)?;
+                    let mut owned = HashSet::new();
+                    state.download_queue.extend_segment_ids(&mut owned);
+                    state.recovery_queue.extend_segment_ids(&mut owned);
+                    owned.extend(state.held_segments.iter().map(|work| work.segment_id));
+
+                    let missing = file
+                        .segments
+                        .iter()
+                        .filter(|segment| !assembly.has_segment(segment.ordinal))
+                        .map(|segment| {
+                            let segment_id = SegmentId {
+                                file_id,
+                                segment_number: segment.ordinal,
+                            };
+                            (
+                                segment_id,
+                                DownloadWork {
+                                    segment_id,
+                                    message_id: crate::jobs::ids::MessageId::new(
+                                        &segment.message_id,
+                                    ),
+                                    groups: file.groups.clone(),
+                                    priority: file.role.download_priority(),
+                                    byte_estimate: segment.bytes,
+                                    retry_count: 0,
+                                    is_recovery: false,
+                                    exclude_servers: vec![],
+                                    avoid_server: None,
+                                },
+                                owned.contains(&segment_id),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let file_has_owner = self
+                        .active_downloads_by_file
+                        .get(&file_id)
+                        .is_some_and(|count| *count > 0)
+                        || self
+                            .active_decodes_by_file
+                            .get(&file_id)
+                            .is_some_and(|count| *count > 0)
+                        || self
+                            .write_buffers
+                            .get(&file_id)
+                            .is_some_and(|buffer| !buffer.is_empty())
+                        || self
+                            .pending_released_download_results_by_job
+                            .get(&job_id)
+                            .is_some_and(|count| *count > 0);
+                    Some((missing, file_has_owner))
+                }) else {
+                    self.direct_store.settle_materialized_file(file_id);
+                    continue;
+                };
+
+                // No missing article does not mean durable yet: the completing
+                // commit still owes its buffer flush, handle release and row.
+                if missing.is_empty() {
+                    ready = false;
+                    continue;
+                }
+                if missing
+                    .iter()
+                    .all(|(segment_id, _, _)| self.terminal_segment_failures.contains(segment_id))
+                {
+                    self.direct_store.settle_materialized_file(file_id);
+                    continue;
+                }
+
+                let has_owner = file_has_owner
+                    || pending
+                        .handoffs
+                        .iter()
+                        .any(|segment_id| segment_id.file_id == file_id)
+                    || missing.iter().any(|(segment_id, _, queued)| {
+                        *queued
+                            || self.pending_retries_by_segment.contains_key(segment_id)
+                            || self.server_quota_parked.contains(segment_id)
+                    });
+                if has_owner {
+                    ready = false;
+                    continue;
+                }
+
+                let missing_ids: Vec<SegmentId> = missing
+                    .iter()
+                    .map(|(segment_id, _, _)| *segment_id)
+                    .collect();
+                let mut rescued = Vec::new();
+                for (segment_id, work, _) in missing {
+                    if self.terminal_segment_failures.contains(&segment_id) {
+                        continue;
+                    }
+                    if pending.rescued.contains(&segment_id) {
+                        self.book_failed_segment(segment_id);
+                    } else if self
+                        .direct_store
+                        .note_materialization_rescue(job_id, set_index, segment_id)
+                    {
+                        rescued.push(work);
+                    }
+                }
+                for work in rescued {
+                    self.requeue_retry_work(work);
+                    ready = false;
+                }
+                if missing_ids
+                    .iter()
+                    .all(|segment_id| self.terminal_segment_failures.contains(segment_id))
+                {
+                    self.direct_store.settle_materialized_file(file_id);
+                } else {
+                    ready = false;
+                }
+            }
+        }
+        ready
     }
 
     /// Demotes every live direct set of `job_id` holding a source volume that
@@ -2473,7 +2752,10 @@ impl Pipeline {
                     )));
                 }
             };
-            if !self.place_direct_spans(job_id, set_index, &spans).await {
+            if !self
+                .place_direct_spans(job_id, set_index, None, &spans)
+                .await
+            {
                 return Err(super::repair::DirectRepairFailure::ExecuteFailed(
                     "a confirming parse's spans could not be written".to_string(),
                 ));
@@ -2617,7 +2899,10 @@ impl Pipeline {
                     return false;
                 }
             };
-            if !self.place_direct_spans(job_id, set_index, &routed).await {
+            if !self
+                .place_direct_spans(job_id, set_index, None, &routed)
+                .await
+            {
                 return false;
             }
         }
@@ -2931,7 +3216,8 @@ impl Pipeline {
         let spans = match routed {
             Ok(spans) => spans,
             Err(reason) => {
-                self.demote_direct_set(job_id, set_index, reason).await;
+                self.demote_direct_set_with_handoff(job_id, set_index, reason, Some(segment_id))
+                    .await;
                 return DirectRouteOutcome::Conventional(segment);
             }
         };
@@ -2942,7 +3228,10 @@ impl Pipeline {
         // is two writes per volume for the life of the job.
         self.cache_direct_volume_facts(job_id, set_index).await;
 
-        if !self.place_direct_spans(job_id, set_index, &spans).await {
+        if !self
+            .place_direct_spans(job_id, set_index, Some(segment_id), &spans)
+            .await
+        {
             return DirectRouteOutcome::Conventional(segment);
         }
 
@@ -2975,6 +3264,7 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         set_index: usize,
+        handoff: Option<SegmentId>,
         spans: &[RoutedSpan],
     ) -> bool {
         if spans.is_empty() {
@@ -2990,8 +3280,13 @@ impl Pipeline {
                 path = %path.display(),
                 "could not mark a direct-store destination sparse; demoting the set"
             );
-            self.demote_direct_set(job_id, set_index, DemotionReason::SparseMarkFailed)
-                .await;
+            self.demote_direct_set_with_handoff(
+                job_id,
+                set_index,
+                DemotionReason::SparseMarkFailed,
+                handoff,
+            )
+            .await;
             return false;
         }
         if let Err(error) = crate::pipeline::orchestrator::write_direct_batches(batches).await {
@@ -3003,8 +3298,13 @@ impl Pipeline {
                 error = %error,
                 "direct-store destination write failed; demoting the set"
             );
-            self.demote_direct_set(job_id, set_index, DemotionReason::DestinationWriteFailed)
-                .await;
+            self.demote_direct_set_with_handoff(
+                job_id,
+                set_index,
+                DemotionReason::DestinationWriteFailed,
+                handoff,
+            )
+            .await;
             if !self
                 .direct_store
                 .set(job_id, set_index)
@@ -3617,7 +3917,10 @@ impl Pipeline {
             // set is allowed to finalize and delete its envelopes.
             Some(Ok(spans)) => {
                 self.cache_direct_volume_facts(job_id, set_index).await;
-                if !self.place_direct_spans(job_id, set_index, &spans).await {
+                if !self
+                    .place_direct_spans(job_id, set_index, None, &spans)
+                    .await
+                {
                     return;
                 }
             }
@@ -4480,6 +4783,17 @@ impl Pipeline {
         set_index: usize,
         reason: DemotionReason,
     ) {
+        self.demote_direct_set_with_handoff(job_id, set_index, reason, None)
+            .await;
+    }
+
+    async fn demote_direct_set_with_handoff(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        reason: DemotionReason,
+        handoff: Option<SegmentId>,
+    ) {
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
             return;
         };
@@ -4489,6 +4803,10 @@ impl Pipeline {
         // flipped to `Demoted` and have its committed members deleted out from
         // under a job that had already counted them.
         if !set.claim_demotion(reason) {
+            if let Some(segment_id) = handoff {
+                self.direct_store
+                    .note_materialization_handoff(set_index, segment_id);
+            }
             return;
         }
         let set_name = set.set_name().to_string();
@@ -4516,6 +4834,15 @@ impl Pipeline {
                 file_index: *file_index,
             })
             .collect();
+        self.direct_store.begin_materialization(
+            job_id,
+            set_index,
+            demoted_volume_files.iter().copied(),
+        );
+        if let Some(segment_id) = handoff {
+            self.direct_store
+                .note_materialization_handoff(set_index, segment_id);
+        }
         for file_id in demoted_volume_files {
             self.block_crcs.forget_file(file_id);
         }
@@ -4749,6 +5076,14 @@ impl Pipeline {
         self.delete_direct_outputs(job_id, set_index).await;
         self.requeue_after_reconstruction(job_id, set_index, &keep)
             .await;
+        for (outcome, (_, file_index, _, plan)) in rebuilt.iter().zip(targets.iter()) {
+            if outcome.complete && outcome.contiguous >= plan.len {
+                self.direct_store.settle_materialized_file(NzbFileId {
+                    job_id,
+                    file_index: *file_index,
+                });
+            }
+        }
         Ok(materialized)
     }
 

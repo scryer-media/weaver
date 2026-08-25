@@ -6081,6 +6081,22 @@ impl Pipeline {
             let par2_set_id = self.par2_served_set_id(job_id);
 
             if let Some(set_id) = par2_set_id
+                && !self.demoted_materializations_ready_for_par2(job_id, set_id)
+            {
+                debug!(
+                    job_id = job_id.0,
+                    recovery_set_id = %set_id,
+                    "deferring PAR2 settlement — a demoted direct set is still materializing"
+                );
+                self.transition_postprocessing_status(
+                    job_id,
+                    JobStatus::Downloading,
+                    Some("downloading"),
+                );
+                return;
+            }
+
+            if let Some(set_id) = par2_set_id
                 && self.par2_set_is_absent_from_job(job_id, set_id)
             {
                 let index_filename = self

@@ -1669,6 +1669,7 @@ impl Pipeline {
             // path here, before the write reorder buffer and its legacy file
             // state. A demotion returns the same owned buffer and rejoins that
             // path below.
+            let mut direct_handoff = false;
             match direct_target {
                 Some(DirectFileTarget::Route {
                     set_index,
@@ -1700,6 +1701,21 @@ impl Pipeline {
                             // decoded article in hand and let the ordinary
                             // reorder/write/commit path below own it instead.
                             buffered_segment = segment;
+                            direct_handoff = true;
+                            if let Some(file) = self
+                                .jobs
+                                .get_mut(&job_id)
+                                .and_then(|state| state.assembly.file_mut(file_id))
+                            {
+                                // Demotion rebuilds conventional assembly with
+                                // `reset`, which also clears the placement this
+                                // article recorded before trying direct mode.
+                                file.record_placement(
+                                    segment_id.segment_number,
+                                    file_offset,
+                                    decoded_size,
+                                );
+                            }
                         }
                     }
                 }
@@ -1730,6 +1746,9 @@ impl Pipeline {
                 write_buf.insert(file_offset, buffered_segment);
                 write_buf.drain_ready_with_contiguous_end()
             };
+            if direct_handoff {
+                self.direct_store.finish_materialization_handoff(segment_id);
+            }
             self.note_write_buffered(buffered_len, 1);
             ready
         };
@@ -2733,6 +2752,7 @@ impl Pipeline {
                             error!(error = %e, "db write failed for complete_file");
                         }
                     }
+                    self.direct_store.settle_materialized_file(file_id);
                     self.pending_file_progress.remove(&file_id);
                     self.persisted_file_progress.remove(&file_id);
                     self.file_hash_states.remove(&file_id);
