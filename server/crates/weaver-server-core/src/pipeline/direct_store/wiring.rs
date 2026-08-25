@@ -19,10 +19,11 @@
 //!
 //! # Suppression points
 //!
-//! The routing seam returns before `persist_ready_segments`, so for a direct
+//! Successful routing returns before `persist_ready_segments`, so for a direct
 //! source volume there is no physical write, **no `active_file_progress` floor
-//! upsert**, and no `commit_persisted_segment`. The file-complete work it would
-//! have done is re-implemented here without the parts that need a file:
+//! upsert**, and no `commit_persisted_segment`. A demotion returns the still-live
+//! article to that conventional seam instead. The file-complete work successful
+//! routing would have done is re-implemented here without the parts that need a file:
 //! **no completed-file row**, no whole-volume hashing, no archive re-probe and
 //! no incremental-extraction dispatch. Live reporting keeps using
 //! `FileAssembly`, which is source-space truth either way.
@@ -38,7 +39,7 @@
 //!   `try_update_archive_topology`, whose only non-test caller is the refresh
 //!   above. A direct set therefore never enters the topology at all.
 //! - The completed-file row has exactly one pipeline writer, in the conventional
-//!   file-complete path the routing seam returns before.
+//!   file-complete path successful routing returns before.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -55,6 +56,7 @@ use super::sparse::SparseMarking;
 use super::{DirectStoreGate, DirectStoreSettings};
 use crate::DownloadWork;
 use crate::events::model::PipelineEvent;
+use crate::jobs::assembly::write_buffer::WriteReorderBuffer;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::pipeline::{BufferedDecodedSegment, DecodedChunk, Pipeline};
 
@@ -509,13 +511,12 @@ pub(crate) enum DirectRepairAnswer {
 pub(crate) const MAX_DIRECT_REPAIR_DEFER_WAVES: u32 = 3;
 
 /// What the routing seam did with an article.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectRouteOutcome {
     /// The bytes were routed; the caller must not write the source volume.
     Routed,
-    /// The set demoted; the caller must not write the source volume either,
-    /// because the volume is being refetched from scratch.
-    Demoted,
+    /// The set demoted before taking ownership. The caller must pass this same
+    /// decoded article through the conventional assembly path.
+    Conventional(BufferedDecodedSegment),
 }
 
 /// What the decode seam should do with one file's bytes.
@@ -833,13 +834,8 @@ impl Pipeline {
             })
             .collect();
         for set_index in set_indices {
-            self.demote_direct_set(
-                job_id,
-                set_index,
-                DemotionReason::UuencodedSourceVolume,
-                None,
-            )
-            .await;
+            self.demote_direct_set(job_id, set_index, DemotionReason::UuencodedSourceVolume)
+                .await;
         }
     }
 
@@ -1158,7 +1154,6 @@ impl Pipeline {
                 job_id,
                 set_index,
                 DemotionReason::EncryptedPostedBytesUnavailable,
-                None,
             )
             .await;
         }
@@ -1195,7 +1190,7 @@ impl Pipeline {
                  so the authoritative pass reads a real file instead of a volume it \
                  cannot name"
             );
-            self.demote_direct_set(job_id, set_index, DemotionReason::Par2Unbindable, None)
+            self.demote_direct_set(job_id, set_index, DemotionReason::Par2Unbindable)
                 .await;
         }
         demoted_any
@@ -2478,10 +2473,7 @@ impl Pipeline {
                     )));
                 }
             };
-            if !self
-                .place_direct_spans(job_id, set_index, &spans, None)
-                .await
-            {
+            if !self.place_direct_spans(job_id, set_index, &spans).await {
                 return Err(super::repair::DirectRepairFailure::ExecuteFailed(
                     "a confirming parse's spans could not be written".to_string(),
                 ));
@@ -2621,15 +2613,11 @@ impl Pipeline {
                         reason = reason.metric(),
                         "a repaired span could not be routed back into its direct set"
                     );
-                    self.demote_direct_set(job_id, set_index, reason, None)
-                        .await;
+                    self.demote_direct_set(job_id, set_index, reason).await;
                     return false;
                 }
             };
-            if !self
-                .place_direct_spans(job_id, set_index, &routed, None)
-                .await
-            {
+            if !self.place_direct_spans(job_id, set_index, &routed).await {
                 return false;
             }
         }
@@ -2720,13 +2708,8 @@ impl Pipeline {
                     set_name = %set_name,
                     "failed to re-read a repaired member's composition gaps; demoting the set"
                 );
-                self.demote_direct_set(
-                    job_id,
-                    set_index,
-                    DemotionReason::RepairGapUnreadable,
-                    None,
-                )
-                .await;
+                self.demote_direct_set(job_id, set_index, DemotionReason::RepairGapUnreadable)
+                    .await;
                 return;
             }
         };
@@ -2753,8 +2736,7 @@ impl Pipeline {
                 reason = reason.metric(),
                 "a repaired member failed its gate once its composition gaps were re-read"
             );
-            self.demote_direct_set(job_id, set_index, reason, None)
-                .await;
+            self.demote_direct_set(job_id, set_index, reason).await;
             return;
         }
         // Same terminating condition as the restart re-arm: the pass read every
@@ -2770,7 +2752,7 @@ impl Pipeline {
                 set_name = %set_name,
                 "a repaired member's composition gaps survived their re-read; demoting the set"
             );
-            self.demote_direct_set(job_id, set_index, DemotionReason::RepairGapUnreadable, None)
+            self.demote_direct_set(job_id, set_index, DemotionReason::RepairGapUnreadable)
                 .await;
         }
     }
@@ -2853,7 +2835,7 @@ impl Pipeline {
                 "PAR2 verification found damage on a direct set's virtual volume; \
                  demoting so the conventional path can repair a materialized volume"
             );
-            self.demote_direct_set(job_id, set_index, DemotionReason::Par2Damaged, None)
+            self.demote_direct_set(job_id, set_index, DemotionReason::Par2Damaged)
                 .await;
             demoted = true;
         }
@@ -2896,7 +2878,7 @@ impl Pipeline {
             return false;
         }
         for set_index in live {
-            self.demote_direct_set(job_id, set_index, DemotionReason::Par2Damaged, None)
+            self.demote_direct_set(job_id, set_index, DemotionReason::Par2Damaged)
                 .await;
         }
         true
@@ -2924,22 +2906,15 @@ impl Pipeline {
         let job_id = file_id.job_id;
         let decoded_size = segment.decoded_size;
         let part_crc = segment.part_crc;
-        // The dual-CRC grid's half of the article, carried past the routing to
-        // the commit seam below. `contiguous_bytes` copies, so the decoded
-        // payload can be dropped the moment the spans are written while these
-        // two facts about it travel on.
+        // The dual-CRC grid's half of the article, carried past routing to the
+        // commit seam. `contiguous_bytes` gives the router a contiguous view
+        // while the original decoded buffer stays owned here for fallback.
         let part_crc_verified = segment.part_crc_verified;
-        let checkpoint_plan = segment.checkpoint_plan;
-        let segments = segment.segments;
         let bytes = contiguous_bytes(&segment.data);
-        // The article the seam is holding: if the set demotes here it is
-        // dropped without ever reaching the assembly, so nothing else would
-        // ever ask for it again.
-        let dropped = Some((segment_id, u64::from(decoded_size)));
 
         let routed = {
             let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
-                return DirectRouteOutcome::Demoted;
+                return DirectRouteOutcome::Conventional(segment);
             };
             set.note_volume_part_crc(volume_index, file_offset, u64::from(decoded_size), part_crc);
             // The decoded geometry of this article, which only the decoder
@@ -2956,9 +2931,8 @@ impl Pipeline {
         let spans = match routed {
             Ok(spans) => spans,
             Err(reason) => {
-                self.demote_direct_set(job_id, set_index, reason, dropped)
-                    .await;
-                return DirectRouteOutcome::Demoted;
+                self.demote_direct_set(job_id, set_index, reason).await;
+                return DirectRouteOutcome::Conventional(segment);
             }
         };
 
@@ -2968,11 +2942,8 @@ impl Pipeline {
         // is two writes per volume for the life of the job.
         self.cache_direct_volume_facts(job_id, set_index).await;
 
-        if !self
-            .place_direct_spans(job_id, set_index, &spans, dropped)
-            .await
-        {
-            return DirectRouteOutcome::Demoted;
+        if !self.place_direct_spans(job_id, set_index, &spans).await {
+            return DirectRouteOutcome::Conventional(segment);
         }
 
         drop(bytes);
@@ -2985,8 +2956,8 @@ impl Pipeline {
             file_offset,
             part_crc,
             part_crc_verified,
-            &checkpoint_plan,
-            &segments,
+            &segment.checkpoint_plan,
+            &segment.segments,
         )
         .await;
         DirectRouteOutcome::Routed
@@ -3005,7 +2976,6 @@ impl Pipeline {
         job_id: JobId,
         set_index: usize,
         spans: &[RoutedSpan],
-        dropped: Option<(SegmentId, u64)>,
     ) -> bool {
         if spans.is_empty() {
             return true;
@@ -3020,7 +2990,7 @@ impl Pipeline {
                 path = %path.display(),
                 "could not mark a direct-store destination sparse; demoting the set"
             );
-            self.demote_direct_set(job_id, set_index, DemotionReason::SparseMarkFailed, dropped)
+            self.demote_direct_set(job_id, set_index, DemotionReason::SparseMarkFailed)
                 .await;
             return false;
         }
@@ -3033,13 +3003,8 @@ impl Pipeline {
                 error = %error,
                 "direct-store destination write failed; demoting the set"
             );
-            self.demote_direct_set(
-                job_id,
-                set_index,
-                DemotionReason::DestinationWriteFailed,
-                dropped,
-            )
-            .await;
+            self.demote_direct_set(job_id, set_index, DemotionReason::DestinationWriteFailed)
+                .await;
             if !self
                 .direct_store
                 .set(job_id, set_index)
@@ -3184,13 +3149,8 @@ impl Pipeline {
                     error = %error,
                     "failed to re-read restart-seeded direct-store coverage; demoting the set"
                 );
-                self.demote_direct_set(
-                    job_id,
-                    set_index,
-                    DemotionReason::RestartRereadFailed,
-                    None,
-                )
-                .await;
+                self.demote_direct_set(job_id, set_index, DemotionReason::RestartRereadFailed)
+                    .await;
                 return;
             }
             Err(error) => {
@@ -3200,13 +3160,8 @@ impl Pipeline {
                     error = %error,
                     "the restart-seeded re-read task did not complete; demoting the set"
                 );
-                self.demote_direct_set(
-                    job_id,
-                    set_index,
-                    DemotionReason::RestartRereadFailed,
-                    None,
-                )
-                .await;
+                self.demote_direct_set(job_id, set_index, DemotionReason::RestartRereadFailed)
+                    .await;
                 return;
             }
         };
@@ -3233,8 +3188,7 @@ impl Pipeline {
                 reason = reason.metric(),
                 "restart-seeded direct-store coverage failed its checksum on re-read"
             );
-            self.demote_direct_set(job_id, set_index, reason, None)
-                .await;
+            self.demote_direct_set(job_id, set_index, reason).await;
             return;
         }
 
@@ -3254,13 +3208,8 @@ impl Pipeline {
                 set_name = %set_name,
                 "restart-seeded direct-store coverage survived its re-read pass; demoting the set"
             );
-            self.demote_direct_set(
-                job_id,
-                set_index,
-                DemotionReason::RestartRearmUnplaceable,
-                None,
-            )
-            .await;
+            self.demote_direct_set(job_id, set_index, DemotionReason::RestartRearmUnplaceable)
+                .await;
         }
     }
 
@@ -3643,7 +3592,7 @@ impl Pipeline {
                 composed = format!("{composed:08x}"),
                 "direct source volume failed its yEnc whole-file CRC32"
             );
-            self.demote_direct_set(job_id, set_index, DemotionReason::VolumeCrcMismatch, None)
+            self.demote_direct_set(job_id, set_index, DemotionReason::VolumeCrcMismatch)
                 .await;
             return;
         }
@@ -3659,8 +3608,7 @@ impl Pipeline {
             .map(|set| set.note_volume_complete(volume_index, total_bytes));
         match outcome {
             Some(Err(reason)) => {
-                self.demote_direct_set(job_id, set_index, reason, None)
-                    .await;
+                self.demote_direct_set(job_id, set_index, reason).await;
                 return;
             }
             // The confirming parse can make the volume's trailing region
@@ -3669,10 +3617,7 @@ impl Pipeline {
             // set is allowed to finalize and delete its envelopes.
             Some(Ok(spans)) => {
                 self.cache_direct_volume_facts(job_id, set_index).await;
-                if !self
-                    .place_direct_spans(job_id, set_index, &spans, None)
-                    .await
-                {
+                if !self.place_direct_spans(job_id, set_index, &spans).await {
                     return;
                 }
             }
@@ -4006,7 +3951,6 @@ impl Pipeline {
                     job_id,
                     set_index,
                     DemotionReason::ToleratedExtractionFailed,
-                    None,
                 )
                 .await;
                 return;
@@ -4036,7 +3980,7 @@ impl Pipeline {
                 && let Err(error) = tokio::fs::create_dir_all(parent).await
             {
                 warn!(job_id = job_id.0, error = %error, "failed to create direct-store destination directory; demoting the set");
-                self.demote_direct_set(job_id, set_index, DemotionReason::FinalizationFailed, None)
+                self.demote_direct_set(job_id, set_index, DemotionReason::FinalizationFailed)
                     .await;
                 return;
             }
@@ -4059,7 +4003,7 @@ impl Pipeline {
                     error = %error,
                     "failed to commit a direct-store member to its destination; demoting the set"
                 );
-                self.demote_direct_set(job_id, set_index, DemotionReason::FinalizationFailed, None)
+                self.demote_direct_set(job_id, set_index, DemotionReason::FinalizationFailed)
                     .await;
                 return;
             }
@@ -4535,7 +4479,6 @@ impl Pipeline {
         job_id: JobId,
         set_index: usize,
         reason: DemotionReason,
-        dropped: Option<(SegmentId, u64)>,
     ) {
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
             return;
@@ -4594,10 +4537,7 @@ impl Pipeline {
             "direct-store set demoted"
         );
 
-        match self
-            .reconstruct_demoted_set(job_id, set_index, dropped)
-            .await
-        {
+        match self.reconstruct_demoted_set(job_id, set_index).await {
             Ok(volumes) => {
                 crate::runtime::perf_probe::record(
                     "direct_store.demoted.reconstructed",
@@ -4630,7 +4570,7 @@ impl Pipeline {
                     failure = %failure,
                     "direct-store reconstruction is not possible; refetching the set's volumes"
                 );
-                self.refetch_demoted_set(job_id, set_index, dropped).await;
+                self.refetch_demoted_set(job_id, set_index).await;
             }
         }
         // The other moment a retained image can lose its last possible reader: a
@@ -4645,7 +4585,6 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         set_index: usize,
-        dropped: Option<(SegmentId, u64)>,
     ) -> Result<usize, ReconstructionFailure> {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return Err(ReconstructionFailure::NoLayout);
@@ -4808,19 +4747,14 @@ impl Pipeline {
             warn!(job_id = job_id.0, error = %error, "failed to retire a reconstructed direct-store checkpoint");
         }
         self.delete_direct_outputs(job_id, set_index).await;
-        self.requeue_after_reconstruction(job_id, set_index, &keep, dropped)
+        self.requeue_after_reconstruction(job_id, set_index, &keep)
             .await;
         Ok(materialized)
     }
 
-    /// The first shape's demotion, kept as the fallback: throw the routed bytes
-    /// away and hand every article back to the download queue.
-    async fn refetch_demoted_set(
-        &mut self,
-        job_id: JobId,
-        set_index: usize,
-        dropped: Option<(SegmentId, u64)>,
-    ) {
+    /// The last-resort demotion: retire routed storage and requeue only articles
+    /// whose previously committed bytes cannot be reconstructed.
+    async fn refetch_demoted_set(&mut self, job_id: JobId, set_index: usize) {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
         };
@@ -4838,7 +4772,7 @@ impl Pipeline {
         }
 
         self.delete_direct_outputs(job_id, set_index).await;
-        self.refetch_direct_volumes(job_id, &volumes, dropped).await;
+        self.refetch_direct_volumes(job_id, &volumes).await;
     }
 
     /// Deletes a set's partial members, envelope files and holds scratch.
@@ -4874,13 +4808,13 @@ impl Pipeline {
     /// Hands a reconstructed set back to the conventional path, keeping the
     /// articles that are now genuinely on disk.
     ///
-    /// This is the difference between demotion by reconstruction and the first
-    /// shape's: `keep` names, per NZB file, the articles whose decoded extents
+    /// Unlike the full-refetch fallback, `keep` names, per NZB file, the
+    /// articles whose decoded extents
     /// lie wholly below the contiguous prefix the sweep rebuilt. Those stay
-    /// committed in the assembly and are never fetched again. Everything else —
-    /// an article held in RAM and never written, an article above a coverage
-    /// hole, the one article the routing seam dropped — comes back, exactly as
-    /// the refetch path would have brought it back.
+    /// committed in the assembly and are never fetched again. Everything else
+    /// that the direct path had committed comes back exactly as the refetch path
+    /// would have brought it back. The decode seam still owns its current
+    /// article and carries it directly into conventional assembly.
     ///
     /// A file with nothing kept takes the full refetch treatment, including
     /// `mark_file_incomplete`: there is no reconstructed state to protect.
@@ -4889,7 +4823,6 @@ impl Pipeline {
         job_id: JobId,
         set_index: usize,
         keep: &HashMap<u32, Vec<u32>>,
-        dropped: Option<(SegmentId, u64)>,
     ) {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
@@ -4914,6 +4847,7 @@ impl Pipeline {
 
         let mut work = Vec::new();
         let mut fully_reset: Vec<u32> = Vec::new();
+        let write_buf_max_pending = self.write_buf_max_pending;
         {
             let Some(state) = self.jobs.get_mut(&job_id) else {
                 return;
@@ -4972,6 +4906,25 @@ impl Pipeline {
                 }
                 lost_bytes =
                     lost_bytes.saturating_add(previously_received.saturating_sub(kept_bytes));
+                let needs_more_bytes = state
+                    .assembly
+                    .file(file_id)
+                    .is_some_and(|file| !file.is_complete());
+                if kept_bytes > 0 && needs_more_bytes {
+                    // Reconstruction made this prefix durable without passing
+                    // through the sequential writer. Seed the same cursor a
+                    // conventional write would have advanced, so the decoded
+                    // article that triggered demotion can land immediately at
+                    // the prefix boundary instead of waiting for offset zero.
+                    let write_buf = self
+                        .write_buffers
+                        .entry(file_id)
+                        .or_insert_with(|| WriteReorderBuffer::new(write_buf_max_pending));
+                    write_buf.mark_persisted(0, kept_bytes as usize);
+                    let (unexpected, contiguous_end) = write_buf.drain_ready_with_contiguous_end();
+                    debug_assert!(unexpected.is_empty());
+                    debug_assert_eq!(contiguous_end, kept_bytes);
+                }
 
                 for segment in &file.segments {
                     if kept.contains(&segment.ordinal) {
@@ -4984,8 +4937,7 @@ impl Pipeline {
                     if queued.contains(&segment_id) || scheduled_retries.contains(&segment_id) {
                         continue;
                     }
-                    let was_dropped = dropped.is_some_and(|(id, _)| id == segment_id);
-                    if !committed.contains(&segment.ordinal) && !was_dropped {
+                    if !committed.contains(&segment.ordinal) {
                         continue;
                     }
                     work.push(DownloadWork {
@@ -5001,10 +4953,7 @@ impl Pipeline {
                     });
                 }
             }
-            let dropped_bytes = dropped.map(|(_, bytes)| bytes).unwrap_or(0);
-            state.downloaded_bytes = state
-                .downloaded_bytes
-                .saturating_sub(lost_bytes.saturating_add(dropped_bytes));
+            state.downloaded_bytes = state.downloaded_bytes.saturating_sub(lost_bytes);
         }
 
         // Only files the sweep rebuilt nothing for: everything else has legacy
@@ -5030,21 +4979,14 @@ impl Pipeline {
     /// Hands a demoted set's source volumes back to the conventional path.
     ///
     /// Requeues **only what nothing else owns**: the articles whose bytes were
-    /// routed into direct destinations that have just been deleted, plus the
-    /// one article the routing seam dropped without ever committing it. A
-    /// segment still sitting in a queue, still in flight, or waiting on a
-    /// scheduled retry is left alone — the set is demoted, so when it lands it
-    /// takes the conventional path by itself, and requeueing it would fetch the
-    /// same article from the server twice.
+    /// routed into direct destinations that have just been deleted. A segment
+    /// still sitting in a queue, still in flight, waiting on a scheduled retry,
+    /// or held by the decode seam is left alone; each reaches the conventional
+    /// path through its existing owner.
     ///
     /// The job's byte counter is *adjusted*, never zeroed: it is job-wide, and
     /// the other files' contribution to it has nothing to do with this set.
-    async fn refetch_direct_volumes(
-        &mut self,
-        job_id: JobId,
-        file_indices: &[u32],
-        dropped: Option<(SegmentId, u64)>,
-    ) {
+    async fn refetch_direct_volumes(&mut self, job_id: JobId, file_indices: &[u32]) {
         // Snapshotted before the job borrow: a segment whose retry is already
         // scheduled re-enters the queue on its own.
         let scheduled_retries: HashSet<SegmentId> = self
@@ -5084,12 +5026,10 @@ impl Pipeline {
                     if queued.contains(&segment_id) || scheduled_retries.contains(&segment_id) {
                         continue;
                     }
-                    // Committed articles lost their bytes with the partials;
-                    // the dropped one never reached the assembly at all. Every
-                    // other segment is somebody else's outstanding work.
+                    // Committed articles lost their bytes with the partials.
+                    // Every other segment is somebody else's outstanding work.
                     let committed = file_asm.has_segment(segment.ordinal);
-                    let was_dropped = dropped.is_some_and(|(id, _)| id == segment_id);
-                    if !committed && !was_dropped {
+                    if !committed {
                         continue;
                     }
                     work.push(DownloadWork {
@@ -5108,12 +5048,7 @@ impl Pipeline {
                     file_asm.reset();
                 }
             }
-            // The dropped article was counted into the job total before routing
-            // and never reached the assembly, so it is not in `routed_bytes`.
-            let dropped_bytes = dropped.map(|(_, bytes)| bytes).unwrap_or(0);
-            state.downloaded_bytes = state
-                .downloaded_bytes
-                .saturating_sub(routed_bytes.saturating_add(dropped_bytes));
+            state.downloaded_bytes = state.downloaded_bytes.saturating_sub(routed_bytes);
         }
         for file_index in file_indices {
             let file_id = NzbFileId {

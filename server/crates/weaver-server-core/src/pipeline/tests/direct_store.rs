@@ -707,35 +707,118 @@ async fn direct_store_ignores_a_duplicate_article() {
 }
 
 #[tokio::test]
-async fn direct_store_demotes_and_still_completes_when_the_member_checksum_is_wrong() {
-    let member_name = "Silver.Horizon.S01E04.mkv";
-    let payload: Vec<u8> = (0..2000u32).map(|index| (index % 173) as u8).collect();
-    let mut volumes = single_member_store_set(member_name, &payload, 3);
-
-    // Corrupt the final part's payload while leaving its packed layer alone:
-    // the yEnc layer is regenerated per article by the harness, so only the RAR
-    // whole-member gate can catch this.
-    let last = volumes.len() - 1;
-    let length = volumes[last].1.len();
-    volumes[last].1[length - 9] ^= 0xFF;
-
-    let arrivals = in_order_arrivals(volumes.len());
+async fn a_clean_three_article_member_stays_virtual_and_routes_once() {
+    let member_name = "Silver.Horizon.S01E04.Clean.mkv";
+    let payload: Vec<u8> = (0..3000u32).map(|index| (index % 173) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 2);
     let temp_dir = tempfile::tempdir().unwrap();
-    let (shape, _working_dir) =
-        run_direct_store_routing_only(&temp_dir, JobId(41005), &volumes, &arrivals).await;
+    let job_id = JobId(410051);
+
+    let (mut pipeline, working_dir) =
+        route_articles_as_dispatched(&temp_dir, job_id, &volumes, 3).await;
+
+    assert!(
+        format!("{:?}", pipeline.direct_store.sets_for(job_id)).contains("Finalized"),
+        "the clean twin must finish without demoting"
+    );
+    assert!(
+        volumes
+            .iter()
+            .all(|(filename, _)| !working_dir.join(filename).exists()),
+        "clean direct routing must not materialize either source volume"
+    );
+    assert_eq!(
+        std::fs::read(payload_root(&temp_dir, job_id).join(member_name))
+            .ok()
+            .as_deref(),
+        Some(payload.as_slice()),
+        "the clean twin must retain the exact routed member"
+    );
+    assert_eq!(queued_segments(&mut pipeline, job_id), Vec::new());
+}
+
+#[tokio::test]
+async fn member_checksum_demotion_hands_the_live_tail_to_a_reconstructed_prefix() {
+    let member_name = "Silver.Horizon.S01E04.mkv";
+    let payload: Vec<u8> = (0..3000u32).map(|index| (index % 173) as u8).collect();
+    let mut volumes = single_member_store_set(member_name, &payload, 2);
+
+    // The final volume's header closes the member chain before its payload has
+    // arrived. Corrupt a payload byte in article three so the fused member CRC
+    // refuses that article inside `route`, before direct ownership transfers.
+    let end_header_len = build_test_rar_end_header(false).len();
+    let corrupt_at = volumes[1].1.len() - end_header_len - 1;
+    assert!(
+        corrupt_at >= article_extent(volumes[1].1.len(), 2, 3).0,
+        "the corruption must live in the triggering article"
+    );
+    volumes[1].1[corrupt_at] ^= 0xFF;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41005);
+    let (mut pipeline, working_dir) =
+        route_articles_as_dispatched(&temp_dir, job_id, &volumes, 3).await;
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
 
     assert!(
         shape.contains("Demoted(MemberChecksumMismatch)"),
         "the whole-member gate should have demoted the set, got {shape}"
     );
+    for (filename, posted) in &volumes {
+        assert_eq!(
+            std::fs::read(working_dir.join(filename)).ok().as_deref(),
+            Some(posted.as_slice()),
+            "reconstruction plus the in-hand final article must reproduce {filename}"
+        );
+    }
+    let state = pipeline.jobs.get(&job_id).unwrap();
     assert!(
-        !payload_root(&temp_dir, JobId(41005))
-            .join(member_name)
-            .exists(),
+        (0..volumes.len() as u32).all(|file_index| {
+            state
+                .assembly
+                .file(NzbFileId { job_id, file_index })
+                .is_some_and(|file| file.is_complete())
+        }),
+        "conventional assembly must own and complete both demoted volumes"
+    );
+    assert_eq!(
+        state.downloaded_bytes,
+        volumes
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>(),
+        "the triggering article remains counted exactly once"
+    );
+    assert!(
+        !pipeline.write_buffers.contains_key(&NzbFileId {
+            job_id,
+            file_index: 0,
+        }),
+        "a fully reconstructed volume must not retain an empty write buffer"
+    );
+    assert_eq!(
+        queued_segments(&mut pipeline, job_id),
+        Vec::<(u32, u32)>::new(),
+        "no article, especially the triggering one, should be refetched"
+    );
+    assert!(
+        !pipeline
+            .pending_retries_by_segment
+            .contains_key(&SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 1,
+                },
+                segment_number: 2,
+            }),
+        "the triggering article must not enter delayed retry state"
+    );
+    assert!(
+        !payload_root(&temp_dir, job_id).join(member_name).exists(),
         "a member failing its whole-member gate must not be committed as if it passed"
     );
     assert!(
-        !direct_partial(&temp_dir, JobId(41005), member_name).exists(),
+        !direct_partial(&temp_dir, job_id, member_name).exists(),
         "demotion must delete the set's partial direct output"
     );
 }
@@ -1481,6 +1564,42 @@ fn take_queued_segment(pipeline: &mut Pipeline, job_id: JobId, segment_id: Segme
     );
 }
 
+async fn route_articles_as_dispatched(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    articles: usize,
+) -> (Pipeline, PathBuf) {
+    let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = direct_store_job_spec_with_articles("Silver Horizon", volumes, articles);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for file_index in 0..volumes.len() as u32 {
+        for segment_number in 0..articles as u32 {
+            take_queued_segment(
+                &mut pipeline,
+                job_id,
+                SegmentId {
+                    file_id: NzbFileId { job_id, file_index },
+                    segment_number,
+                },
+            );
+            submit_volume_article_of(
+                &mut pipeline,
+                job_id,
+                volumes,
+                file_index,
+                segment_number,
+                articles,
+            )
+            .await;
+        }
+    }
+
+    (pipeline, working_dir)
+}
+
 fn queued_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(u32, u32)> {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let work = state.download_queue.drain_all();
@@ -1551,7 +1670,7 @@ async fn demote_mid_download(
 
     before_demotion(&pipeline, &working_dir);
     pipeline
-        .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded, None)
+        .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded)
         .await;
     (pipeline, working_dir, OTHER_FILE_BYTES)
 }
@@ -10627,7 +10746,7 @@ async fn an_encrypted_set_that_demotes_rebuilds_byte_exact_posted_volumes() {
     );
 
     pipeline
-        .demote_direct_set(job_id, 0, DemotionReason::HoldsScratchFailed, None)
+        .demote_direct_set(job_id, 0, DemotionReason::HoldsScratchFailed)
         .await;
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
@@ -11808,9 +11927,9 @@ async fn run_hp_gate(
 /// It stops at the demotion because that is where its caller's claim ends, and
 /// **not** because a refused set has nowhere to go: it very much does, and
 /// [`hp_fallback_outcome`] is where that is proved. Every header-encryption
-/// refusal reason the set can reach hands the set back to the conventional path
-/// with its articles re-queued, and for a job that holds the password the
-/// conventional path then opens the archive and produces the member. Anything
+/// refusal reason the set can reach hands its current article back to the
+/// conventional path, and for a job that holds the password that path then
+/// opens the archive and produces the member. Anything
 /// asserting *that* has to use the other helper; this one would report a job
 /// still `Downloading`, because nothing here ever re-feeds the refetch the
 /// demotion asked for.
@@ -11862,9 +11981,10 @@ async fn hp_routing_outcome_named(
 /// first half of it: a demotion by name, and a volume file existing on disk. A
 /// volume file existing is not the floor; the *member* coming out of it is.
 ///
-/// So this keeps going. A demotion re-queues every article the direct set
-/// swallowed, which in the real pipeline the dispatcher refetches; here
-/// [`dispatch_and_submit`] stands in for it, exactly as the restart tests do.
+/// So this keeps going. A demotion gives the article still held by the decoder
+/// to conventional assembly and re-queues only previously committed coverage
+/// that cannot be reconstructed; here [`dispatch_and_submit`] stands in for any
+/// such refetch, exactly as the restart tests do.
 /// The volumes then materialize, extraction runs, and the job reaches a terminal
 /// state — and the volumes are byte-compared against the fixtures, because a
 /// handoff that materialized *something* at every path is not the same as one
@@ -11881,7 +12001,7 @@ async fn hp_routing_outcome_named(
 struct HpFallbackOutcome {
     /// What the routing decided, read at the demotion and before the refetch.
     routing: EncryptedRoutingOutcome,
-    /// The articles the demotion put back on the download queue.
+    /// Previously direct-owned articles the demotion put back on the queue.
     refetched: Vec<(u32, u32)>,
     /// Whether every source volume the fallback materialized is byte-identical
     /// to the fixture that was posted.
@@ -11984,7 +12104,7 @@ async fn hp_fallback_outcome(
     };
     sample(&mut materialized);
 
-    // The refetch the demotion asked for. Looped because materializing one
+    // Any refetch the demotion still needs. Looped because materializing one
     // volume can put the next one's articles back on the queue, and bounded so a
     // pipeline that re-queued forever fails here rather than spinning.
     let refetched = peek_queued_segments(&mut pipeline, job_id);
@@ -12007,7 +12127,7 @@ async fn hp_fallback_outcome(
         }
     }
     // Extraction is only driven once the fallback has something to extract. A
-    // handoff that dropped articles leaves the job in `Downloading` forever, and
+    // handoff that loses articles leaves the job in `Downloading` forever, and
     // driving it there would spend the harness's three-minute extraction timeout
     // to report a fact the caller's `refetched` and `volumes_byte_exact`
     // assertions state precisely and immediately.
@@ -12269,8 +12389,8 @@ async fn a_header_encrypted_set_keys_from_the_filename_password_convention() {
 async fn a_header_encrypted_set_with_the_wrong_password_demotes_by_name() {
     // And then the operator corrects it, which is the half that matters. A
     // refusal here is only survivable because the set leaves direct mode
-    // *intact*: the demotion re-queues every article, the volumes materialize
-    // byte for byte, and the conventional path — which re-harvests the job's
+    // *intact*: the in-hand article continues conventionally, the volumes
+    // materialize byte for byte, and that path — which re-harvests the job's
     // passwords per volume parse rather than memoizing them — opens the archive
     // with the corrected one and produces the member. `setJobPassword` and the
     // NZBGet facade's `*Unpack:Password` are the real mutations this stands in
@@ -12309,13 +12429,11 @@ async fn a_header_encrypted_set_with_the_wrong_password_demotes_by_name() {
         "nothing may have been written on the strength of a refuted password"
     );
 
-    assert_eq!(
-        outcome.refetched,
-        vec![(0, 0)],
-        "the refusal lands on the very first parse, so exactly one article had been \
-         swallowed and exactly that one must come back. The other three were still in \
-         flight and take the conventional path when they land — re-queueing those would \
-         fetch them from the server twice"
+    assert!(
+        outcome.refetched.is_empty(),
+        "the refusal lands on the first parse, so its live article must continue \
+         conventionally without a refetch; got {:?}",
+        outcome.refetched
     );
     assert!(
         outcome.volumes_byte_exact,
@@ -12392,7 +12510,7 @@ async fn a_header_encrypted_set_with_no_password_demotes_by_name() {
     // Refusing early is only better than waiting because the wait was never
     // buying anything: the set still reaches the conventional path with every
     // byte intact, and a password supplied afterwards still produces the member.
-    assert_eq!(outcome.refetched, vec![(0, 0)]);
+    assert!(outcome.refetched.is_empty());
     assert!(
         outcome.volumes_byte_exact,
         "{} of {} volumes reached disk",
@@ -12517,12 +12635,11 @@ async fn a_header_encrypted_set_with_no_usable_check_refuses_rather_than_guessin
         );
 
         // The floor, run rather than assumed.
-        assert_eq!(
-            outcome.refetched,
-            vec![(0, 0)],
-            "{label}: the demotion must put the article the direct set swallowed back on the \
-             download queue, or the conventional path is handed a hole — and only that one, \
-             because the rest were never taken from it"
+        assert!(
+            outcome.refetched.is_empty(),
+            "{label}: the decoder must hand its live article directly to conventional \
+             assembly rather than refetching it; got {:?}",
+            outcome.refetched
         );
         assert!(
             outcome.volumes_byte_exact,
@@ -12617,7 +12734,7 @@ async fn a_rar4_header_encrypted_set_refuses_by_name() {
     // is the handoff, and it is the entire remedy available: the conventional
     // path is given the archive exactly as posted, and reaches its own terminal
     // verdict on it rather than leaving the job wedged.
-    assert_eq!(outcome.refetched, vec![(0, 0)]);
+    assert!(outcome.refetched.is_empty());
     assert!(
         outcome.volumes_byte_exact,
         "{} of {} volumes reached disk",
@@ -12672,8 +12789,8 @@ async fn a_header_encrypted_set_whose_kdf_count_is_over_the_ceiling_refuses_by_n
 
     // As with the RAR4 refusal: no member is asserted because the fixture is a
     // hostile type-4 record over filler and there is none, but the handoff is —
-    // refusing the *derivation* must still cost the job nothing but the redownload.
-    assert_eq!(outcome.refetched, vec![(0, 0)]);
+    // refusing the *derivation* must still preserve the posted bytes.
+    assert!(outcome.refetched.is_empty());
     assert!(
         outcome.volumes_byte_exact,
         "{} of {} volumes reached disk",
@@ -13839,7 +13956,7 @@ async fn demoting_a_direct_set_forgets_the_grid_state_its_volumes_carried() {
     );
 
     pipeline
-        .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded, None)
+        .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded)
         .await;
 
     assert!(

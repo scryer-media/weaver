@@ -1607,7 +1607,7 @@ impl Pipeline {
                     .insert(segment_id.segment_number, source);
             }
 
-            let buffered_segment = BufferedDecodedSegment {
+            let mut buffered_segment = BufferedDecodedSegment {
                 segment_id,
                 decoded_size,
                 encoding,
@@ -1665,10 +1665,10 @@ impl Pipeline {
                 self.direct_route_target(file_id)
             };
 
-            // A direct set's source volume never becomes a file, so its bytes
-            // leave the conventional path here — before the write reorder
-            // buffer, before `write_segments_to_disk`, and therefore before any
-            // legacy progress floor or completed-file row.
+            // A successfully routed source article leaves the conventional
+            // path here, before the write reorder buffer and its legacy file
+            // state. A demotion returns the same owned buffer and rejoins that
+            // path below.
             match direct_target {
                 Some(DirectFileTarget::Route {
                     set_index,
@@ -1683,18 +1683,25 @@ impl Pipeline {
                             file_offset,
                         )
                         .await;
-                    // The per-article half of `sets == direct + materialized`:
-                    // an article either reached a destination or handed its
-                    // volume back, and the two counts must add up to the
-                    // articles that entered the seam.
-                    crate::runtime::perf_probe::record(
-                        match outcome {
-                            DirectRouteOutcome::Routed => "direct_store.article.routed",
-                            DirectRouteOutcome::Demoted => "direct_store.article.demoted",
-                        },
-                        std::time::Duration::from_nanos(1),
-                    );
-                    return;
+                    match outcome {
+                        DirectRouteOutcome::Routed => {
+                            crate::runtime::perf_probe::record(
+                                "direct_store.article.routed",
+                                std::time::Duration::from_nanos(1),
+                            );
+                            return;
+                        }
+                        DirectRouteOutcome::Conventional(segment) => {
+                            crate::runtime::perf_probe::record(
+                                "direct_store.article.demoted",
+                                std::time::Duration::from_nanos(1),
+                            );
+                            // Direct routing never took ownership. Keep the
+                            // decoded article in hand and let the ordinary
+                            // reorder/write/commit path below own it instead.
+                            buffered_segment = segment;
+                        }
+                    }
                 }
                 Some(DirectFileTarget::Discard) => {
                     drop(_cpu_scope);
