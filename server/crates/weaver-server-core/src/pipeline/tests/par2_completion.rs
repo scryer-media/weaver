@@ -1,5 +1,9 @@
 use super::*;
 
+use crate::pipeline::completion::finalize::check::{
+    CleanPar2VerificationMode, Par2SetSettlementReason,
+};
+
 #[tokio::test]
 async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -6133,9 +6137,9 @@ fn set_measured_md5(pipeline: &mut Pipeline, job_id: JobId, file_index: u32, con
 /// — only names and lengths — and names are exactly what a swap makes lie, so it
 /// must stay inconclusive and leave the authoritative read to decide.
 ///
-/// This is the `no_current_generation_digest` arm: the per-file loop finds
-/// neither a closed in-stream block verdict nor a current-generation measured
-/// digest, so `measured_md5` is `None` and the loop bails. The companion test
+/// The per-file loop finds neither a closed in-stream block verdict nor a
+/// current-generation measured digest, so neither protected description is
+/// matched and the final unresolved check refuses the verdict. The companion test
 /// `a_misplaced_pair_proven_by_measured_digests_returns_a_swap_plan` shows the
 /// identical fixture resolving the swap the moment a digest is present, which is
 /// what pins the absence of evidence — not a broken fixture — as the cause here.
@@ -6192,6 +6196,62 @@ async fn a_misplaced_pair_with_no_content_evidence_is_correctly_inconclusive() {
         pipeline.par2_quick_verify_calls, 0,
         "an inconclusive pass never counts as a quick verification"
     );
+}
+
+/// A complete file outside the current recovery set must not veto a digest
+/// match for that set merely because the unrelated file has no MD5. This is the
+/// multi-set late-discovery shape: an earlier grid-only payload remains in the
+/// assembly while a later set is proved by the digest its own payload streamed.
+#[tokio::test]
+async fn an_unrelated_grid_only_file_does_not_veto_a_digest_proven_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30365);
+    let unrelated = misplacement_payload(13);
+    let target = misplacement_payload(14);
+    let unrelated_name = "earlier-grid-only.bin";
+    let target_name = "late-digest.bin";
+    let spec = standalone_job_spec(
+        "Silver Horizon Independent Late Set",
+        &[
+            (unrelated_name.to_string(), unrelated.len() as u32),
+            (target_name.to_string(), target.len() as u32),
+        ],
+    );
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 0, unrelated_name, &unrelated).await;
+    write_and_complete_file(&mut pipeline, job_id, 1, target_name, &target).await;
+
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        placement_par2_file_set(&[(target_name.to_string(), target.clone())]),
+        &[],
+    );
+    set_measured_md5(&mut pipeline, job_id, 1, &target);
+    assert!(
+        !pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .completed_checksums
+            .contains_key(&NzbFileId {
+                job_id,
+                file_index: 0,
+            }),
+        "the unrelated earlier payload deliberately has no whole-file digest"
+    );
+
+    let par2_set = Arc::clone(pipeline.par2_set(job_id).expect("served recovery set"));
+    let (verification, plan, in_stream_grid_only) = pipeline
+        .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
+        .await
+        .expect("quick verify does not error")
+        .expect("the current set is fully proved by its own payload digest");
+
+    assert_eq!(verification.files.len(), 1);
+    assert_eq!(plan.exact.len(), 1);
+    assert!(plan.unresolved.is_empty());
+    assert!(!in_stream_grid_only);
 }
 
 /// The same swapped pair, now carrying the trusted whole-file MD5 that a
@@ -12147,8 +12207,19 @@ async fn repair_leftovers_are_shed_when_a_clean_set_settles_the_job() {
     tokio::fs::write(&leftover, &payload).await.unwrap();
 
     // The job's last set settles clean — no repair tail runs for it at all.
-    let set_id = pipeline.par2_set(job_id).unwrap().recovery_set_id;
-    let _ = pipeline.mark_par2_set_verified(job_id, set_id).await;
+    let par2_set = pipeline.par2_set(job_id).unwrap();
+    let set_id = par2_set.recovery_set_id;
+    let slice_size = par2_set.slice_size;
+    let _ = pipeline
+        .settle_par2_set(
+            job_id,
+            set_id,
+            Par2SetSettlementReason::Clean {
+                slice_size,
+                verification_mode: CleanPar2VerificationMode::Authoritative,
+            },
+        )
+        .await;
 
     assert!(
         pipeline.par2_verified.contains(&job_id),

@@ -1,6 +1,11 @@
 use super::*;
 
-use crate::pipeline::direct_store::DirectStoreGate;
+use crate::pipeline::{
+    completion::finalize::check::{
+        CleanPar2VerificationMode, Par2SetSettlementReason, SetGateOutcome,
+    },
+    direct_store::DirectStoreGate,
+};
 
 const FIRST_PAYLOAD: &str = "Silver.Horizon.bin";
 const SECOND_PAYLOAD: &str = "Ivory.Meadow.bin";
@@ -342,7 +347,9 @@ async fn settle_set_ids_in_installation_order(reverse: bool) -> (Vec<String>, bo
         })
         .collect();
     for set_id in set_ids {
-        let _ = pipeline.mark_par2_set_verified(job_id, set_id).await;
+        let _ = pipeline
+            .settle_par2_set(job_id, set_id, Par2SetSettlementReason::Repaired)
+            .await;
     }
     (sequence, pipeline.par2_verified.contains(&job_id))
 }
@@ -430,14 +437,93 @@ async fn aggregate_records_one_verification_result_for_a_two_set_job() {
             .sum::<u64>()
     };
     let before = verification_count(&pipeline);
-    let _ = pipeline.mark_par2_set_verified(job_id, first).await;
+    let _ = pipeline
+        .settle_par2_set(job_id, first, Par2SetSettlementReason::Repaired)
+        .await;
     assert!(!pipeline.par2_verified.contains(&job_id));
     assert_eq!(verification_count(&pipeline), before);
-    let _ = pipeline.mark_par2_set_verified(job_id, second).await;
+    let _ = pipeline
+        .settle_par2_set(job_id, second, Par2SetSettlementReason::Repaired)
+        .await;
     assert!(pipeline.par2_verified.contains(&job_id));
     assert_eq!(verification_count(&pipeline), before + 1);
     pipeline.mark_par2_verified(job_id).await;
     assert_eq!(verification_count(&pipeline), before + 1);
+}
+
+#[tokio::test]
+async fn settlement_gate_requires_a_reason_for_every_settlement() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30910);
+    let missing = par2_rs::RecoverySetId::from_bytes([90; 16]);
+
+    assert_eq!(
+        pipeline
+            .settle_par2_set(
+                job_id,
+                missing,
+                Par2SetSettlementReason::Clean {
+                    slice_size: 64,
+                    verification_mode: CleanPar2VerificationMode::Grid,
+                },
+            )
+            .await,
+        SetGateOutcome::Waiting
+    );
+
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Settlement reasons", &[(FIRST_PAYLOAD.to_string(), 8)]),
+    )
+    .await;
+    let install = |pipeline: &mut Pipeline, seed, filename, file_index| {
+        install_servable_set(
+            pipeline,
+            job_id,
+            placement_par2_file_set(&[(FIRST_PAYLOAD.to_string(), vec![seed; 8])]),
+            [seed; 16],
+            filename,
+            file_index,
+        )
+    };
+    let clean = install(&mut pipeline, 91, "clean.par2", 1);
+    let repaired = install(&mut pipeline, 92, "repaired.par2", 2);
+    let absent = install(&mut pipeline, 93, "absent.par2", 3);
+
+    assert_eq!(
+        pipeline
+            .settle_par2_set(
+                job_id,
+                clean,
+                Par2SetSettlementReason::Clean {
+                    slice_size: 64,
+                    verification_mode: CleanPar2VerificationMode::QuickDigest,
+                },
+            )
+            .await,
+        SetGateOutcome::Settled
+    );
+    assert!(!pipeline.par2_verified.contains(&job_id));
+    assert_eq!(
+        pipeline
+            .settle_par2_set(job_id, repaired, Par2SetSettlementReason::Repaired)
+            .await,
+        SetGateOutcome::Settled
+    );
+    assert!(!pipeline.par2_verified.contains(&job_id));
+    assert_eq!(
+        pipeline
+            .settle_par2_set(
+                job_id,
+                absent,
+                Par2SetSettlementReason::AbsentUnboundPayload,
+            )
+            .await,
+        SetGateOutcome::Settled
+    );
+    assert!(pipeline.par2_verified.contains(&job_id));
 }
 
 #[tokio::test]
@@ -471,7 +557,9 @@ async fn late_servable_set_reopens_the_aggregate_without_clearing_the_first_verd
         "Onyx.Prairie.par2",
         1,
     );
-    let _ = pipeline.mark_par2_set_verified(job_id, first).await;
+    let _ = pipeline
+        .settle_par2_set(job_id, first, Par2SetSettlementReason::Repaired)
+        .await;
     assert!(pipeline.par2_verified.contains(&job_id));
 
     let second = install_servable_set(
@@ -569,7 +657,9 @@ async fn a_repaired_single_set_finalizes_its_direct_output() {
         .unwrap()
         .needed_repair = true;
 
-    let _ = pipeline.mark_par2_set_verified(job_id, set_id).await;
+    let _ = pipeline
+        .settle_par2_set(job_id, set_id, Par2SetSettlementReason::Repaired)
+        .await;
 
     assert!(pipeline.par2_verified.contains(&job_id));
     assert_eq!(pipeline.direct_store.finalized_sets, 1);
@@ -709,7 +799,9 @@ async fn a_settled_sets_reconciliation_latch_does_not_spend_its_siblings_budget(
     let second = install_repairable_set(&mut pipeline, job_id, SECOND_PAYLOAD, &second_original, 3);
     write_and_complete_file(&mut pipeline, job_id, 2, FIRST_VOLUME, b"A").await;
     write_and_complete_file(&mut pipeline, job_id, 3, SECOND_VOLUME, b"B").await;
-    let _ = pipeline.mark_par2_set_verified(job_id, first).await;
+    let _ = pipeline
+        .settle_par2_set(job_id, first, Par2SetSettlementReason::Repaired)
+        .await;
     assert!(
         !pipeline.par2_verified.contains(&job_id),
         "a sibling still owed a pass keeps the aggregate open"
@@ -857,7 +949,9 @@ async fn cleanup_after_one_set_settles_keeps_an_unsettled_siblings_described_fil
     pipeline
         .par2_pre_repair_dir_entries
         .insert(job_id, HashSet::new());
-    let _ = pipeline.mark_par2_set_verified(job_id, first_set).await;
+    let _ = pipeline
+        .settle_par2_set(job_id, first_set, Par2SetSettlementReason::Repaired)
+        .await;
 
     assert!(
         !pipeline.par2_verified.contains(&job_id),

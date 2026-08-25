@@ -363,12 +363,42 @@ pub(in crate::pipeline) struct Par2DeobfuscationOutcome {
     canonical_description_file_ids: HashMap<par2_rs::RecoverySetId, HashSet<par2_rs::FileId>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::pipeline) enum CleanPar2VerificationMode {
+    Grid,
+    QuickDigest,
+    StrongDecode,
+    Authoritative,
+}
+
+impl CleanPar2VerificationMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Grid => "grid",
+            Self::QuickDigest => "quick_digest",
+            Self::StrongDecode => "strong_decode",
+            Self::Authoritative => "authoritative",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::pipeline) enum Par2SetSettlementReason {
+    Clean {
+        slice_size: u64,
+        verification_mode: CleanPar2VerificationMode,
+    },
+    Repaired,
+    AbsentUnboundPayload,
+}
+
 fn log_clean_par2_verification_source(
     job_id: JobId,
     set_id: par2_rs::RecoverySetId,
     slice_size: u64,
-    verification_mode: &'static str,
+    verification_mode: CleanPar2VerificationMode,
 ) {
+    let verification_mode = verification_mode.as_str();
     info!(
         job_id = job_id.0,
         recovery_set_id = %set_id,
@@ -2645,10 +2675,11 @@ impl Pipeline {
     /// Mark one set settled, reset only that set's re-entry latch, then update
     /// the aggregate.  Direct outputs remain held until every servable set and
     /// metadata discovery have reached a final answer.
-    pub(in crate::pipeline) async fn mark_par2_set_verified(
+    pub(in crate::pipeline) async fn settle_par2_set(
         &mut self,
         job_id: JobId,
         set_id: par2_rs::RecoverySetId,
+        reason: Par2SetSettlementReason,
     ) -> SetGateOutcome {
         let Some(set_runtime) = self.ensure_par2_runtime(job_id).set_runtime_mut(set_id) else {
             return SetGateOutcome::Waiting;
@@ -2657,6 +2688,13 @@ impl Pipeline {
         set_runtime.failure = None;
         set_runtime.post_verdict_reconcile_attempts = 0;
         self.mark_par2_verified(job_id).await;
+        if let Par2SetSettlementReason::Clean {
+            slice_size,
+            verification_mode,
+        } = reason
+        {
+            log_clean_par2_verification_source(job_id, set_id, slice_size, verification_mode);
+        }
         SetGateOutcome::Settled
     }
 
@@ -3098,15 +3136,16 @@ impl Pipeline {
             // `measured_md5` is generation-ordered (runtime first) and the
             // persisted side is provenance-filtered: a row without trusted
             // `md5_provenance` (legacy — possibly a PAR2 expectation
-            // recorded by the removed substitution) never loads. A file
-            // with no current-generation digest gets no quick verification
-            // and runs the authoritative pass.
+            // recorded by the removed substitution) never loads. An
+            // evidence-less file may belong to another recovery set, so it is
+            // not itself a reason to reject this set. Any protected file that
+            // remains unproved is caught by the unresolved check below.
             let Some(file_hash) = measured_md5 else {
                 crate::runtime::perf_probe::record(
-                    "completion.quick_verify.rejected.no_current_generation_digest",
+                    "completion.quick_verify.skipped.no_current_generation_digest",
                     std::time::Duration::from_nanos(1),
                 );
-                return Ok(None);
+                continue;
             };
             current_hashes_by_name.insert(current_filename.to_string(), file_hash);
         }
@@ -3338,15 +3377,21 @@ impl Pipeline {
             return;
         }
 
-        let settled = self.mark_par2_set_verified(job_id, set_id).await;
-        if settled == SetGateOutcome::Settled {
-            let verification_mode = if in_stream_grid_slice_size.is_some() {
-                "grid"
-            } else {
-                "quick_digest"
-            };
-            log_clean_par2_verification_source(job_id, set_id, slice_size, verification_mode);
-        }
+        let verification_mode = if in_stream_grid_slice_size.is_some() {
+            CleanPar2VerificationMode::Grid
+        } else {
+            CleanPar2VerificationMode::QuickDigest
+        };
+        let settled = self
+            .settle_par2_set(
+                job_id,
+                set_id,
+                Par2SetSettlementReason::Clean {
+                    slice_size,
+                    verification_mode,
+                },
+            )
+            .await;
         if settled == SetGateOutcome::Settled
             && let Some(slice_size) = in_stream_grid_slice_size
         {
@@ -4424,7 +4469,9 @@ impl Pipeline {
         });
 
         let set_id = par2_set.recovery_set_id;
-        let _ = self.mark_par2_set_verified(job_id, set_id).await;
+        let _ = self
+            .settle_par2_set(job_id, set_id, Par2SetSettlementReason::Repaired)
+            .await;
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.mark_verified", stage_start);
         if !self.par2_verified.contains(&job_id) {
@@ -4439,7 +4486,7 @@ impl Pipeline {
 
         // Leftovers are purged when the aggregate settles — see
         // `mark_par2_verified`, which is reached from here through
-        // `mark_par2_set_verified` and also from a clean final set that never
+        // `settle_par2_set` and also from a clean final set that never
         // runs this tail at all.
         self.transition_postprocessing_status(job_id, JobStatus::Downloading, Some("downloading"));
 
@@ -6048,7 +6095,13 @@ impl Pipeline {
                     index_filename = %index_filename,
                     "skipping absent PAR2 recovery set with no bound payload bytes"
                 );
-                let _ = self.mark_par2_set_verified(job_id, set_id).await;
+                let _ = self
+                    .settle_par2_set(
+                        job_id,
+                        set_id,
+                        Par2SetSettlementReason::AbsentUnboundPayload,
+                    )
+                    .await;
                 self.continue_after_aggregate_clean_par2_settlement(
                     job_id,
                     has_crc_failures,
@@ -6143,15 +6196,16 @@ impl Pipeline {
                             .as_ref()
                             .expect("PAR2 validation has a parsed recovery set")
                             .slice_size;
-                        let settled = self.mark_par2_set_verified(job_id, set_id).await;
-                        if settled == SetGateOutcome::Settled {
-                            log_clean_par2_verification_source(
+                        let _ = self
+                            .settle_par2_set(
                                 job_id,
                                 set_id,
-                                slice_size,
-                                "strong_decode",
-                            );
-                        }
+                                Par2SetSettlementReason::Clean {
+                                    slice_size,
+                                    verification_mode: CleanPar2VerificationMode::StrongDecode,
+                                },
+                            )
+                            .await;
 
                         if !self.par2_verified.contains(&job_id) {
                             self.schedule_job_completion_check(job_id);
@@ -6435,15 +6489,16 @@ impl Pipeline {
                             self.finish_par2_set_failure(job_id, set_id, error).await;
                             return;
                         }
-                        let settled = self.mark_par2_set_verified(job_id, set_id).await;
-                        if settled == SetGateOutcome::Settled {
-                            log_clean_par2_verification_source(
+                        let _ = self
+                            .settle_par2_set(
                                 job_id,
                                 set_id,
-                                par2_set.slice_size,
-                                "authoritative",
-                            );
-                        }
+                                Par2SetSettlementReason::Clean {
+                                    slice_size: par2_set.slice_size,
+                                    verification_mode: CleanPar2VerificationMode::Authoritative,
+                                },
+                            )
+                            .await;
 
                         if !self.par2_verified.contains(&job_id) {
                             self.schedule_job_completion_check(job_id);
@@ -6805,7 +6860,16 @@ impl Pipeline {
                         self.finish_par2_set_failure(job_id, set_id, error).await;
                         return;
                     }
-                    let _ = self.mark_par2_set_verified(job_id, set_id).await;
+                    let _ = self
+                        .settle_par2_set(
+                            job_id,
+                            set_id,
+                            Par2SetSettlementReason::Clean {
+                                slice_size: par2_set.slice_size,
+                                verification_mode: CleanPar2VerificationMode::Authoritative,
+                            },
+                        )
+                        .await;
 
                     if !self.par2_verified.contains(&job_id) {
                         self.schedule_job_completion_check(job_id);
@@ -7383,6 +7447,23 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_par2_verification_mode_labels_are_stable() {
+        assert_eq!(CleanPar2VerificationMode::Grid.as_str(), "grid");
+        assert_eq!(
+            CleanPar2VerificationMode::QuickDigest.as_str(),
+            "quick_digest"
+        );
+        assert_eq!(
+            CleanPar2VerificationMode::StrongDecode.as_str(),
+            "strong_decode"
+        );
+        assert_eq!(
+            CleanPar2VerificationMode::Authoritative.as_str(),
+            "authoritative"
+        );
+    }
 
     fn file_id_from(seed: u8) -> par2_rs::FileId {
         par2_rs::FileId::from_bytes([seed; 16])
