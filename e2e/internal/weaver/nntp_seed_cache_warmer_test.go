@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +43,7 @@ func TestNntpSeedCacheWarmerSharesOneBackgroundWarm(t *testing.T) {
 	fixturesRoot := t.TempDir()
 	var captures int
 	var capturedFixturesDir string
+	var capturedCommitContainers bool
 	var captureMu sync.Mutex
 	warmer := newNntpSeedCacheWarmerWith(
 		context.Background(),
@@ -52,6 +54,7 @@ func TestNntpSeedCacheWarmerSharesOneBackgroundWarm(t *testing.T) {
 			captureMu.Lock()
 			captures++
 			capturedFixturesDir = config.FixturesDir
+			capturedCommitContainers = config.CommitContainers
 			captureMu.Unlock()
 			close(started)
 			config.Progress(0, nntpSeedCacheStageCount, "blocked test capture")
@@ -94,6 +97,9 @@ func TestNntpSeedCacheWarmerSharesOneBackgroundWarm(t *testing.T) {
 	}
 	if capturedFixturesDir != fixturesRoot {
 		t.Fatalf("capture fixtures dir = %q, want owning phase %q", capturedFixturesDir, fixturesRoot)
+	}
+	if !capturedCommitContainers {
+		t.Fatal("full-run cache warm did not request direct container commits")
 	}
 	if warmer.dashboard.cache.Status != "pass" {
 		t.Fatalf("completed cache dashboard status = %q, want pass", warmer.dashboard.cache.Status)
@@ -167,6 +173,100 @@ func TestCaptureSeedImageCacheResolvesEachContainerAtSnapshotTime(t *testing.T) 
 	}
 	if !slices.Equal(snapshots, []string{"primary-container", "backup-after-restart"}) {
 		t.Fatalf("snapshot containers = %v", snapshots)
+	}
+}
+
+func TestCaptureSeedImageCacheCommitsEmbeddedArticleStores(t *testing.T) {
+	set := nntpSeedImageSet{
+		Profile:     "functional",
+		Fingerprint: "0123456789abcdef",
+		Primary:     "primary-image",
+		Backup:      "backup-image",
+	}
+	var staged, committed []string
+	var progress []int
+	ops := nntpSeedCacheCaptureOps{
+		imageExists: func(string) bool { return false },
+		resolveContainer: func(_ context.Context, _ string, service string) (string, error) {
+			return service + "-container", nil
+		},
+		usesDataMount: func(context.Context, string) (bool, error) { return false, nil },
+		stageFixtures: func(_ context.Context, containerID, _ string) error {
+			staged = append(staged, containerID)
+			return nil
+		},
+		commit: func(_ context.Context, containerID, tag string, _ nntpSeedImageSet) error {
+			committed = append(committed, containerID+"->"+tag)
+			return nil
+		},
+		snapshot: func(context.Context, string, string) error {
+			t.Fatal("direct commit path copied the article store to the host")
+			return nil
+		},
+		build: func(context.Context, string, string, string, nntpSeedImageSet) error {
+			t.Fatal("direct commit path rebuilt the article store")
+			return nil
+		},
+		removeImage:  func(context.Context, string) error { return nil },
+		processAlive: func(int) bool { return false },
+	}
+
+	err := captureSeedImageCacheWithOps(context.Background(), set, nil, nntpSeedCacheCaptureConfig{
+		Project:          "test-project",
+		StageRoot:        t.TempDir(),
+		LockRoot:         t.TempDir(),
+		OwnerPID:         123,
+		CommitContainers: true,
+		Progress: func(current, _ int, _ string) {
+			progress = append(progress, current)
+		},
+	}, ops)
+	if err != nil {
+		t.Fatalf("capture cache: %v", err)
+	}
+	if !slices.Equal(staged, []string{"nntp-container", "nntp2-container"}) {
+		t.Fatalf("staged containers = %v", staged)
+	}
+	if !slices.Equal(committed, []string{
+		"nntp-container->primary-image",
+		"nntp2-container->backup-image",
+	}) {
+		t.Fatalf("committed images = %v", committed)
+	}
+	if !slices.Equal(progress, []int{0, 1, 2, 3, 4}) {
+		t.Fatalf("cache progress = %v", progress)
+	}
+}
+
+func TestCaptureSeedImageCacheRefusesMountedArticleStoreCommit(t *testing.T) {
+	set := nntpSeedImageSet{
+		Profile:     "functional",
+		Fingerprint: "0123456789abcdef",
+		Primary:     "primary-image",
+		Backup:      "backup-image",
+	}
+	ops := nntpSeedCacheCaptureOps{
+		imageExists: func(string) bool { return false },
+		resolveContainer: func(context.Context, string, string) (string, error) {
+			return "mounted-container", nil
+		},
+		usesDataMount: func(context.Context, string) (bool, error) { return true, nil },
+		stageFixtures: func(context.Context, string, string) error {
+			t.Fatal("mounted article store reached fixture staging")
+			return nil
+		},
+		removeImage:  func(context.Context, string) error { return nil },
+		processAlive: func(int) bool { return false },
+	}
+	err := captureSeedImageCacheWithOps(context.Background(), set, nil, nntpSeedCacheCaptureConfig{
+		Project:          "test-project",
+		StageRoot:        t.TempDir(),
+		LockRoot:         t.TempDir(),
+		OwnerPID:         123,
+		CommitContainers: true,
+	}, ops)
+	if err == nil || !strings.Contains(err.Error(), "refusing an article-free commit") {
+		t.Fatalf("mounted article store error = %v", err)
 	}
 }
 

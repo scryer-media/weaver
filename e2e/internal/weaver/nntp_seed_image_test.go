@@ -26,6 +26,24 @@ func TestNntpSeedFingerprintInputsAreLengthDelimited(t *testing.T) {
 	}
 }
 
+func TestNntpSeedPhaseEnvEmbedsMissesAndSelectsReadyImages(t *testing.T) {
+	set := nntpSeedImageSet{Primary: "primary-image", Backup: "backup-image"}
+	miss := map[string]string{}
+	set.applyToPhaseEnv(miss, false)
+	if miss[nntpSeedImageActiveEnv] != "1" {
+		t.Fatal("cache miss did not select embedded container storage")
+	}
+	if miss["E2E_NNTP_IMAGE"] != "" || miss["E2E_NNTP2_IMAGE"] != "" {
+		t.Fatalf("cache miss selected unavailable images: %#v", miss)
+	}
+
+	hit := map[string]string{}
+	set.applyToPhaseEnv(hit, true)
+	if hit["E2E_NNTP_IMAGE"] != set.Primary || hit["E2E_NNTP2_IMAGE"] != set.Backup {
+		t.Fatalf("cache hit images = %#v", hit)
+	}
+}
+
 func TestSnapshotSeededNZBsUsesExplicitFixtureRoot(t *testing.T) {
 	const slug = "fixture-root-regression"
 	ambientRoot := t.TempDir()

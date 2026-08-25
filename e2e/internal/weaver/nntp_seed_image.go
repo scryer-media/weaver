@@ -115,6 +115,14 @@ func (set nntpSeedImageSet) apply() {
 	setEnv(nntpSeedImageActiveEnv, "1")
 }
 
+func (set nntpSeedImageSet) applyToPhaseEnv(env map[string]string, ready bool) {
+	env[nntpSeedImageActiveEnv] = "1"
+	if ready {
+		env["E2E_NNTP_IMAGE"] = set.Primary
+		env["E2E_NNTP2_IMAGE"] = set.Backup
+	}
+}
+
 func applyNntpSeedImageCacheForProfile(profile string) error {
 	if !nntpSeedImageCacheEnabled() || strings.TrimSpace(profile) == "" {
 		return nil
@@ -236,17 +244,21 @@ const nntpSeedCacheStageCount = 4
 type nntpSeedCacheProgressFunc func(current, total int, detail string)
 
 type nntpSeedCacheCaptureConfig struct {
-	Project     string
-	FixturesDir string
-	StageRoot   string
-	LockRoot    string
-	OwnerPID    int
-	Progress    nntpSeedCacheProgressFunc
+	Project          string
+	FixturesDir      string
+	StageRoot        string
+	LockRoot         string
+	OwnerPID         int
+	CommitContainers bool
+	Progress         nntpSeedCacheProgressFunc
 }
 
 type nntpSeedCacheCaptureOps struct {
 	imageExists      func(string) bool
 	resolveContainer func(context.Context, string, string) (string, error)
+	usesDataMount    func(context.Context, string) (bool, error)
+	stageFixtures    func(context.Context, string, string) error
+	commit           func(context.Context, string, string, nntpSeedImageSet) error
 	snapshot         func(context.Context, string, string) error
 	build            func(context.Context, string, string, string, nntpSeedImageSet) error
 	removeImage      func(context.Context, string) error
@@ -257,6 +269,9 @@ func defaultNntpSeedCacheCaptureOps() nntpSeedCacheCaptureOps {
 	return nntpSeedCacheCaptureOps{
 		imageExists:      dockerImageExists,
 		resolveContainer: dockerComposeServiceContainerIDForProject,
+		usesDataMount:    dockerContainerUsesDataMount,
+		stageFixtures:    stageSeededNZBsInContainer,
+		commit:           commitSeededNntpImage,
 		snapshot:         snapshotNntpData,
 		build:            buildSeededNntpImage,
 		removeImage:      removeNntpSeedImage,
@@ -344,6 +359,9 @@ func captureSeedImageCacheWithOps(
 			config.Progress(current, nntpSeedCacheStageCount, detail)
 		}
 	}
+	if config.CommitContainers {
+		return commitSeedImageCacheFromContainers(ctx, set, slugs, config, stage, report, ops)
+	}
 	primaryContext := filepath.Join(stage, "primary")
 	backupContext := filepath.Join(stage, "backup")
 
@@ -394,6 +412,65 @@ func captureSeedImageCacheWithOps(
 	return nil
 }
 
+func commitSeedImageCacheFromContainers(
+	ctx context.Context,
+	set nntpSeedImageSet,
+	slugs []string,
+	config nntpSeedCacheCaptureConfig,
+	stage string,
+	report func(int, string),
+	ops nntpSeedCacheCaptureOps,
+) error {
+	manifestContext := filepath.Join(stage, "manifests")
+	if err := snapshotSeededNZBs(manifestContext, config.FixturesDir, slugs); err != nil {
+		return err
+	}
+
+	complete := false
+	defer func() {
+		if complete {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = ops.removeImage(cleanupCtx, set.Primary)
+		_ = ops.removeImage(cleanupCtx, set.Backup)
+	}()
+
+	for index, source := range []struct {
+		service string
+		tag     string
+		role    string
+	}{
+		{service: "nntp", tag: set.Primary, role: "primary"},
+		{service: "nntp2", tag: set.Backup, role: "backup"},
+	} {
+		report(index*2, "preparing "+source.role+" cache container")
+		containerID, err := ops.resolveContainer(ctx, config.Project, source.service)
+		if err != nil {
+			return fmt.Errorf("resolve %s NNTP cache source: %w", source.role, err)
+		}
+		mounted, err := ops.usesDataMount(ctx, containerID)
+		if err != nil {
+			return fmt.Errorf("inspect %s NNTP cache source: %w", source.role, err)
+		}
+		if mounted {
+			return fmt.Errorf("%s NNTP cache source still mounts /data; refusing an article-free commit", source.role)
+		}
+		if err := ops.stageFixtures(ctx, containerID, manifestContext); err != nil {
+			return fmt.Errorf("stage %s NNTP cache manifests: %w", source.role, err)
+		}
+		report(index*2+1, "committing "+source.role+" cache image")
+		if err := ops.commit(ctx, containerID, source.tag, set); err != nil {
+			return fmt.Errorf("commit %s NNTP cache image: %w", source.role, err)
+		}
+	}
+
+	complete = true
+	report(4, "cache images ready")
+	return nil
+}
+
 func removeIncompleteNntpSeedImagePair(ctx context.Context, set nntpSeedImageSet, ops nntpSeedCacheCaptureOps) error {
 	primaryExists := ops.imageExists(set.Primary)
 	backupExists := ops.imageExists(set.Backup)
@@ -438,6 +515,46 @@ func snapshotNntpData(ctx context.Context, containerID, contextDir string) error
 		return err
 	}
 	return nil
+}
+
+func dockerContainerUsesDataMount(ctx context.Context, containerID string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{json .Mounts}}", containerID)
+	cmd.Dir = e2eDir()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("docker inspect %s: %w: %s", containerID, err, strings.TrimSpace(string(output)))
+	}
+	var mounts []struct {
+		Destination string `json:"Destination"`
+	}
+	if err := json.Unmarshal(output, &mounts); err != nil {
+		return false, fmt.Errorf("decode docker mounts for %s: %w", containerID, err)
+	}
+	for _, mount := range mounts {
+		if filepath.Clean(mount.Destination) == "/data" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func stageSeededNZBsInContainer(ctx context.Context, containerID, contextDir string) error {
+	source := filepath.Join(contextDir, "e2e-seed-fixtures")
+	cmd := exec.CommandContext(ctx, "docker", "cp", source, containerID+":/")
+	cmd.Dir = e2eDir()
+	return runExternalCommand(cmd, "stage generated NZBs in seeded NNTP container")
+}
+
+func commitSeededNntpImage(ctx context.Context, containerID, tag string, set nntpSeedImageSet) error {
+	cmd := exec.CommandContext(
+		ctx,
+		"docker", "commit", "--pause=false",
+		"--change", fmt.Sprintf("LABEL %s=%s", nntpSeedImageLabel, set.Fingerprint),
+		"--change", fmt.Sprintf("LABEL org.scryer-media.weaver.e2e.seed-profile=%s", set.Profile),
+		containerID, tag,
+	)
+	cmd.Dir = e2eDir()
+	return runExternalCommand(cmd, "commit pre-seeded NNTP image")
 }
 
 func snapshotSeededNZBs(contextDir, fixturesRoot string, slugs []string) error {
