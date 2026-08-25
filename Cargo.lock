@@ -3216,27 +3216,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.4.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f9e23d8833b723201bfbe10e9eb6e31ee85af5cb32b7bb44daf7d6580e4a0b0"
-dependencies = [
- "bytes",
- "cap-std",
- "crc-fast",
- "libc",
- "md-5",
- "memmap2",
- "rayon",
- "reedsolomon-rs",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
-name = "par2-rs"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d763a00ab5b5380111f04eff5178b9968ad5f50aef33231459b56e16b42274d"
+checksum = "2f33269d89244b1b5fdd3b9e244f076e4d4f1b57f1e30ac21598e8e32491b9ab"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -5497,7 +5479,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "mime_guess",
- "par2-rs 0.6.0",
+ "par2-rs",
  "quick-xml",
  "rayon",
  "reqwest",
@@ -5640,7 +5622,7 @@ dependencies = [
  "liblzma",
  "lzma-rust2",
  "notify",
- "par2-rs 0.6.0",
+ "par2-rs",
  "pbkdf2 0.13.0",
  "quick-xml",
  "rayon",
@@ -5681,7 +5663,7 @@ dependencies = [
  "criterion",
  "libloading",
  "memchr",
- "par2-rs 0.4.1",
+ "par2-rs",
  "thiserror 2.0.20",
 ]
 

@@ -102,7 +102,7 @@ windows-sys = { version = "0.61", default-features = false }
 # `objc2-foundation` + `objc2-metal`, all target-gated to macOS aarch64, so the
 # Apple-silicon build was the only one that ever compiled it.
 #
-# In par2-rs 0.4.x it gates the GPU arm of both PAR2 creation (which weaver
+# In par2-rs it gates the GPU arm of both PAR2 creation (which weaver
 # never calls) and PAR2 *repair* (which weaver does call). With the feature off
 # the GPU arm is compiled out entirely — `GpuSession` does not exist, every hook
 # is a no-op, and the CPU streaming path is the only path — and creation's
@@ -111,7 +111,7 @@ windows-sys = { version = "0.61", default-features = false }
 #
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
-par2-rs = { version = "0.6", default-features = false, features = ["native-crypto"] }
+par2-rs = { version = "0.7", default-features = false, features = ["native-crypto"] }
 # Floor is 0.5.5, not 0.5: 0.5.1 through 0.5.4 decode some RAR5 members with
 # filters to the wrong bytes. Extraction here always runs with `verify: true`,
 # so those versions fail loudly rather than silently — but a resolver must not
