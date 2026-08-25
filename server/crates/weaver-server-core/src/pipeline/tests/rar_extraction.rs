@@ -1340,7 +1340,12 @@ async fn identity_rebind_rejects_an_older_rar_refresh_snapshot() {
             .extraction_generation,
         stale_generation.saturating_add(1)
     );
-    assert!(pipeline.load_rar_snapshot(job_id, "show").is_none());
+    assert_eq!(
+        pipeline.load_rar_snapshot(job_id, "show").as_deref(),
+        Some(stale_headers.as_slice()),
+        "identity rebinding retains the snapshot only as a base for rebuilding sets whose \
+         volume zero may already be gone"
+    );
 
     pipeline
         .handle_rar_refresh_done(RarRefreshDone {
@@ -1350,7 +1355,7 @@ async fn identity_rebind_rejects_an_older_rar_refresh_snapshot() {
             extraction_generation: stale_generation,
             result: Ok(ComputedRarSetState {
                 plan: stale_plan,
-                headers: stale_headers,
+                headers: stale_headers.clone(),
                 rebuild_source:
                     crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
             }),
@@ -1366,9 +1371,10 @@ async fn identity_rebind_rejects_an_older_rar_refresh_snapshot() {
         set_state.plan.is_none(),
         "the stale plan must stay discarded"
     );
-    assert!(
-        pipeline.load_rar_snapshot(job_id, "show").is_none(),
-        "the stale refresh must not reinstall its header snapshot"
+    assert_eq!(
+        pipeline.load_rar_snapshot(job_id, "show").as_deref(),
+        Some(stale_headers.as_slice()),
+        "the older refresh must not alter the retained rebuild base"
     );
 
     drain_rar_refreshes(&mut pipeline).await;
@@ -4705,9 +4711,10 @@ async fn rar_identity_rebind_preserves_in_flight_workers() {
         set_state.extraction_generation,
         generation_before_rebind.saturating_add(1)
     );
-    assert!(
-        pipeline.load_rar_snapshot(job_id, "show").is_none(),
-        "identity rebinding must clear both the in-memory and persisted header snapshot"
+    assert_eq!(
+        pipeline.load_rar_snapshot(job_id, "show").as_deref(),
+        Some(stale_headers.as_slice()),
+        "identity rebinding retains the snapshot as a rebuild base without retaining its plan"
     );
 
     pipeline.try_rar_extraction(job_id).await;

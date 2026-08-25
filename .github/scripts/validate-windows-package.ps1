@@ -268,22 +268,18 @@ function Invoke-NoArgStartupSmoke {
           throw "SPA returned HTTP $($spa.StatusCode)"
         }
 
-        $payload = @{ query = "query { systemStatus { version } }" } | ConvertTo-Json -Compress
-        $api = Invoke-WebRequest -Uri "http://127.0.0.1:9090/graphql" -Method Post -ContentType "application/json" -Body $payload -WebSession $session -TimeoutSec 5 -UseBasicParsing
-        $responseText = if ($api.Content -is [byte[]]) {
-          [System.Text.Encoding]::UTF8.GetString($api.Content)
-        } else {
-          [string]$api.Content
-        }
-        $json = $responseText | ConvertFrom-Json
-        if ($json.errors) {
-          throw "GraphQL errors: $($json.errors | ConvertTo-Json -Compress -Depth 8)"
-        }
-        if (-not $json.data.systemStatus.version) {
-          throw "GraphQL systemStatus did not include a version"
+        $readiness = Invoke-WebRequest -Uri "http://127.0.0.1:9090/readyz" -WebSession $session -TimeoutSec 5 -UseBasicParsing
+        if ($readiness.StatusCode -ne 200) {
+          throw "readiness probe returned HTTP $($readiness.StatusCode)"
         }
 
-        Write-Log $startupLog "No-arg startup API smoke passed with version $($json.data.systemStatus.version)"
+        $payload = @{ query = "query { systemStatus { version } }" } | ConvertTo-Json -Compress
+        $api = Invoke-WebRequest -Uri "http://127.0.0.1:9090/graphql" -Method Post -ContentType "application/json" -Body $payload -WebSession $session -TimeoutSec 5 -UseBasicParsing -SkipHttpErrorCheck
+        if ([int]$api.StatusCode -ne 401) {
+          throw "unauthenticated GraphQL returned HTTP $($api.StatusCode), expected 401"
+        }
+
+        Write-Log $startupLog "No-arg startup API smoke passed; readiness is healthy and GraphQL authentication is enforced"
         $ready = $true
         break
       } catch {

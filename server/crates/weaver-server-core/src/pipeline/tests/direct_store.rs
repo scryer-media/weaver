@@ -3451,19 +3451,14 @@ async fn a_member_that_turns_ineligible_after_routing_never_materializes_fabrica
     );
 
     assert_volumes_are_never_fabricated(&working_dir, &volumes);
-    for volume_index in [0usize, 1] {
-        let (filename, bytes) = &volumes[volume_index];
+    for (volume_index, (filename, bytes)) in volumes.iter().enumerate() {
         assert_eq!(
             std::fs::read(working_dir.join(filename)).ok().as_deref(),
             Some(bytes.as_slice()),
-            "volume {volume_index} must come back byte for byte: its member bytes from the \
-             partial the router wrote them to, its recovery record from the envelope"
+            "volume {volume_index} must come back byte for byte, whether reconstructed from \
+             routed extents or completed by the conventional handoff"
         );
     }
-    assert!(
-        !working_dir.join(&volumes[2].0).exists(),
-        "the volume the demotion fired on covered nothing, so it is refetched whole"
-    );
     assert!(
         !direct_partial(&temp_dir, JobId(41051), member_name).exists(),
         "the direct outputs are deleted once the volumes are real"
