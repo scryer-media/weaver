@@ -39,7 +39,9 @@ func TestNntpSeedCacheWarmerReusesCompletePair(t *testing.T) {
 func TestNntpSeedCacheWarmerSharesOneBackgroundWarm(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
+	fixturesRoot := t.TempDir()
 	var captures int
+	var capturedFixturesDir string
 	var captureMu sync.Mutex
 	warmer := newNntpSeedCacheWarmerWith(
 		context.Background(),
@@ -49,6 +51,7 @@ func TestNntpSeedCacheWarmerSharesOneBackgroundWarm(t *testing.T) {
 		func(_ context.Context, _ nntpSeedImageSet, _ []string, config nntpSeedCacheCaptureConfig) error {
 			captureMu.Lock()
 			captures++
+			capturedFixturesDir = config.FixturesDir
 			captureMu.Unlock()
 			close(started)
 			config.Progress(0, nntpSeedCacheStageCount, "blocked test capture")
@@ -58,7 +61,11 @@ func TestNntpSeedCacheWarmerSharesOneBackgroundWarm(t *testing.T) {
 		},
 	)
 
-	first, firstOwner := warmer.start(&fullPhaseContext{SeedProfile: "functional", Project: "sqlite"})
+	first, firstOwner := warmer.start(&fullPhaseContext{
+		SeedProfile: "functional",
+		Project:     "sqlite",
+		FixturesDir: fixturesRoot,
+	})
 	if first == nil || !firstOwner {
 		t.Fatal("first seeded phase did not own the cache warm")
 	}
@@ -84,6 +91,9 @@ func TestNntpSeedCacheWarmerSharesOneBackgroundWarm(t *testing.T) {
 	defer captureMu.Unlock()
 	if captures != 1 {
 		t.Fatalf("matching phases captured %d times, want 1", captures)
+	}
+	if capturedFixturesDir != fixturesRoot {
+		t.Fatalf("capture fixtures dir = %q, want owning phase %q", capturedFixturesDir, fixturesRoot)
 	}
 	if warmer.dashboard.cache.Status != "pass" {
 		t.Fatalf("completed cache dashboard status = %q, want pass", warmer.dashboard.cache.Status)

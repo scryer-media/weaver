@@ -107,6 +107,13 @@ func TestRestartSuiteEncryptionKeyIsStableForRun(t *testing.T) {
 	}
 }
 
+func TestPreseededRestartSkipsFixturePosting(t *testing.T) {
+	t.Setenv(nntpSeedImageActiveEnv, "1")
+	if err := ensureRestartFixturesSeeded([]string{"fixture-that-does-not-exist"}); err != nil {
+		t.Fatalf("preseeded restart fixtures should not be reposted: %v", err)
+	}
+}
+
 func TestRestartSuiteEncryptionKeyReplacesDuplicateEnvEntries(t *testing.T) {
 	ctx := &restartCaseContext{
 		Profile: restartProfileCurrent,

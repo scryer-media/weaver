@@ -458,6 +458,11 @@ func uniqueRestartSlugs(cases []restartCase) []string {
 }
 
 func ensureRestartFixturesSeeded(slugs []string) error {
+	if envBool(nntpSeedImageActiveEnv, false) {
+		log.Printf("restart NNTP fixtures already present in preseeded image")
+		return nil
+	}
+
 	for _, slug := range slugs {
 		log.Printf("ensuring restart fixture seeded: %s", slug)
 		if err := seedFixture(filepath.Join(testdataDir(), slug)); err != nil {

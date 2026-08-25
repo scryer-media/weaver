@@ -113,10 +113,11 @@ func (warmer *nntpSeedCacheWarmer) start(phase *fullPhaseContext) (*nntpSeedCach
 	go func() {
 		started := time.Now()
 		job.err = warmer.capture(warmer.ctx, set, slugs, nntpSeedCacheCaptureConfig{
-			Project:   phase.Project,
-			StageRoot: filepath.Join(warmer.tempRoot, "nntp-seed-cache"),
-			LockRoot:  os.TempDir(),
-			OwnerPID:  os.Getpid(),
+			Project:     phase.Project,
+			FixturesDir: phase.FixturesDir,
+			StageRoot:   filepath.Join(warmer.tempRoot, "nntp-seed-cache"),
+			LockRoot:    os.TempDir(),
+			OwnerPID:    os.Getpid(),
 			Progress: func(current, total int, detail string) {
 				warmer.logf(
 					"profile=%s corpus=%s stage=%d/%d detail=%s elapsed=%s",

@@ -66,7 +66,7 @@ func nntpSeedImageTag(profile, role, fingerprint string) string {
 // digests, making this check quick even when the corpus itself is large.
 func nntpSeedCorpusFingerprint(profile string, slugs []string) (string, error) {
 	hash := sha256.New()
-	writeNntpSeedFingerprintInput(hash, "format", []byte("nntp-seed-image-v1"))
+	writeNntpSeedFingerprintInput(hash, "format", []byte("nntp-seed-image-v2"))
 	writeNntpSeedFingerprintInput(hash, "profile", []byte(profile))
 
 	for _, relative := range []string{
@@ -236,11 +236,12 @@ const nntpSeedCacheStageCount = 4
 type nntpSeedCacheProgressFunc func(current, total int, detail string)
 
 type nntpSeedCacheCaptureConfig struct {
-	Project   string
-	StageRoot string
-	LockRoot  string
-	OwnerPID  int
-	Progress  nntpSeedCacheProgressFunc
+	Project     string
+	FixturesDir string
+	StageRoot   string
+	LockRoot    string
+	OwnerPID    int
+	Progress    nntpSeedCacheProgressFunc
 }
 
 type nntpSeedCacheCaptureOps struct {
@@ -362,10 +363,10 @@ func captureSeedImageCacheWithOps(
 	if err := ops.snapshot(ctx, backupID, backupContext); err != nil {
 		return err
 	}
-	if err := snapshotSeededNZBs(primaryContext, slugs); err != nil {
+	if err := snapshotSeededNZBs(primaryContext, config.FixturesDir, slugs); err != nil {
 		return err
 	}
-	if err := snapshotSeededNZBs(backupContext, slugs); err != nil {
+	if err := snapshotSeededNZBs(backupContext, config.FixturesDir, slugs); err != nil {
 		return err
 	}
 
@@ -439,9 +440,12 @@ func snapshotNntpData(ctx context.Context, containerID, contextDir string) error
 	return nil
 }
 
-func snapshotSeededNZBs(contextDir string, slugs []string) error {
+func snapshotSeededNZBs(contextDir, fixturesRoot string, slugs []string) error {
+	if fixturesRoot == "" {
+		fixturesRoot = fixturesDir()
+	}
 	for _, slug := range slugs {
-		source := filepath.Join(fixturesDir(), slug, slug+".nzb")
+		source := filepath.Join(fixturesRoot, slug, slug+".nzb")
 		dest := filepath.Join(contextDir, "e2e-seed-fixtures", slug, slug+".nzb")
 		if err := copyFile(source, dest); err != nil {
 			return fmt.Errorf("stage generated NZB for %s: %w", slug, err)
