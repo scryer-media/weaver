@@ -94,7 +94,12 @@ impl Pipeline {
             self.persist_verified_suspect_volumes(job_id, set_name, &suspect_volumes);
         }
 
-        self.clear_rar_snapshot(job_id, set_name);
+        // The affected volume facts force the next rebuild to refresh these
+        // headers from disk. Retain the snapshot while the set survives so an
+        // eagerly deleted volume zero remains available as the topology base.
+        if remove_empty_set {
+            self.clear_rar_snapshot(job_id, set_name);
+        }
         self.mark_rar_unlock_priorities_dirty(job_id);
 
         if let Err(error) = self.db.clear_extraction_chunks_for_set(job_id, set_name) {
