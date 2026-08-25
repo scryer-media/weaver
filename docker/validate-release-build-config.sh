@@ -70,13 +70,9 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$check_dir/amd64" "$check_dir/arm64"
-touch \
-    "$check_dir/amd64/weaver-portable" \
-    "$check_dir/amd64/weaver-haswell" \
-    "$check_dir/arm64/weaver-portable" \
-    "$check_dir/arm64/weaver-cortex-a76"
+touch "$check_dir/amd64/weaver" "$check_dir/arm64/weaver"
 cp "$dockerfile" "$check_dir/Dockerfile"
-cp docker/entrypoint.sh docker/runtime-select.sh "$check_dir/"
+cp docker/entrypoint.sh "$check_dir/"
 
 docker buildx build \
     --check \

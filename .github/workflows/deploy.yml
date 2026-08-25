@@ -545,6 +545,12 @@ jobs:
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
+      AWS_LC_SYS_USE_SYSTEM: "0"
+      AWS_LC_SYS_STATIC: "1"
+      AWS_LC_SYS_SMALL: "0"
+      AWS_LC_SYS_CMAKE_BUILDER: "0"
+      CFLAGS_x86_64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CXXFLAGS_x86_64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -590,13 +596,16 @@ jobs:
         run: |
           if [ "${WEAVER_SCCACHE_ENABLED:-false}" = "true" ]; then
             export CC_x86_64_unknown_linux_musl="sccache musl-gcc"
+          else
+            export CC_x86_64_unknown_linux_musl="musl-gcc"
           fi
           mold -run cargo build -p weaver --release --locked --target x86_64-unknown-linux-musl
-      - name: Verify liblzma is statically bundled
+      - name: Verify native libraries are statically bundled
         run: |
           BINARY="target/x86_64-unknown-linux-musl/release/weaver"
-          if readelf -d "$BINARY" | grep -q 'liblzma'; then
-            echo "release binary dynamically links liblzma" >&2
+          readelf -d "$BINARY" | tee weaver-linux-x86_64-portable-native-linkage.txt
+          if grep -q '(NEEDED)' weaver-linux-x86_64-portable-native-linkage.txt; then
+            echo "release binary has dynamic native dependencies" >&2
             exit 1
           fi
       - name: Package tarball
@@ -616,84 +625,6 @@ jobs:
         if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         run: sccache --show-stats || true
 
-  rust-package-linux-x86_64-haswell:
-    name: rust-package-linux-x86_64-haswell
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    needs: [changes, verify-release-tag, web-build]
-    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
-    env:
-      SCCACHE_BASEDIRS: ${{ github.workspace }}
-      SCCACHE_CACHE_SIZE: 10G
-      SCCACHE_DIR: ${{ github.workspace }}/.sccache
-      SCCACHE_IDLE_TIMEOUT: "0"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install target
-        run: rustup target add x86_64-unknown-linux-musl
-      - name: Install musl toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools mold nasm
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: false
-          cache-on-failure: false
-          key: package-linux-x86_64-haswell
-      - name: Install sccache
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: v0.17.0
-      - name: Configure trusted tag sccache
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-        uses: ./.github/actions/configure-sccache-r2
-        with:
-          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
-          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
-          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
-          key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-musl/
-      - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ${{ env.WEB_ARTIFACT_NAME }}
-          path: apps/weaver-web/dist
-      - name: Set target CPU flags
-        run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl" --lane haswell)" >> "$GITHUB_ENV"
-      - name: Build release binary
-        run: |
-          if [ "${WEAVER_SCCACHE_ENABLED:-false}" = "true" ]; then
-            export CC_x86_64_unknown_linux_musl="sccache musl-gcc"
-          fi
-          mold -run cargo build -p weaver --release --locked --target x86_64-unknown-linux-musl
-      - name: Verify liblzma is statically bundled
-        run: |
-          BINARY="target/x86_64-unknown-linux-musl/release/weaver"
-          if readelf -d "$BINARY" | grep -q 'liblzma'; then
-            echo "release binary dynamically links liblzma" >&2
-            exit 1
-          fi
-      - name: Package tarball
-        run: |
-          mkdir -p dist/package
-          cp target/x86_64-unknown-linux-musl/release/weaver dist/package/weaver
-          tar -czf weaver-linux-x86_64-haswell.tar.gz -C dist/package .
-          test -f weaver-linux-x86_64-haswell.tar.gz
-      - name: Upload release package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: weaver-linux-x86_64-haswell-${{ github.run_id }}
-          path: weaver-linux-x86_64-haswell.tar.gz
-          if-no-files-found: error
-          retention-days: 14
-      - name: Show trusted tag sccache stats
-        if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-        run: sccache --show-stats || true
-
   rust-package-linux-arm64-portable:
     name: rust-package-linux-arm64-portable
     runs-on: ubuntu-24.04-arm
@@ -701,6 +632,12 @@ jobs:
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
+      AWS_LC_SYS_USE_SYSTEM: "0"
+      AWS_LC_SYS_STATIC: "1"
+      AWS_LC_SYS_SMALL: "0"
+      AWS_LC_SYS_CMAKE_BUILDER: "0"
+      CFLAGS_aarch64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CXXFLAGS_aarch64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -746,13 +683,16 @@ jobs:
         run: |
           if [ "${WEAVER_SCCACHE_ENABLED:-false}" = "true" ]; then
             export CC_aarch64_unknown_linux_musl="sccache musl-gcc"
+          else
+            export CC_aarch64_unknown_linux_musl="musl-gcc"
           fi
           mold -run cargo build -p weaver --release --locked --target aarch64-unknown-linux-musl
-      - name: Verify liblzma is statically bundled
+      - name: Verify native libraries are statically bundled
         run: |
           BINARY="target/aarch64-unknown-linux-musl/release/weaver"
-          if readelf -d "$BINARY" | grep -q 'liblzma'; then
-            echo "release binary dynamically links liblzma" >&2
+          readelf -d "$BINARY" | tee weaver-linux-arm64-portable-native-linkage.txt
+          if grep -q '(NEEDED)' weaver-linux-arm64-portable-native-linkage.txt; then
+            echo "release binary has dynamic native dependencies" >&2
             exit 1
           fi
       - name: Package tarball
@@ -772,91 +712,19 @@ jobs:
         if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         run: sccache --show-stats || true
 
-  rust-package-linux-arm64-cortex-a76:
-    name: rust-package-linux-arm64-cortex-a76
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
-    needs: [changes, verify-release-tag, web-build]
-    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
-    env:
-      SCCACHE_BASEDIRS: ${{ github.workspace }}
-      SCCACHE_CACHE_SIZE: 10G
-      SCCACHE_DIR: ${{ github.workspace }}/.sccache
-      SCCACHE_IDLE_TIMEOUT: "0"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install target
-        run: rustup target add aarch64-unknown-linux-musl
-      - name: Install musl toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools mold
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: false
-          cache-on-failure: false
-          key: package-linux-arm64-cortex-a76
-      - name: Install sccache
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: v0.17.0
-      - name: Configure trusted tag sccache
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-        uses: ./.github/actions/configure-sccache-r2
-        with:
-          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
-          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
-          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
-          key-prefix: weaver/trusted-release/v1/rust-1.97.1/aarch64-unknown-linux-musl/
-      - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ${{ env.WEB_ARTIFACT_NAME }}
-          path: apps/weaver-web/dist
-      - name: Set target CPU flags
-        run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-unknown-linux-musl" --lane cortex-a76)" >> "$GITHUB_ENV"
-      - name: Build release binary
-        run: |
-          if [ "${WEAVER_SCCACHE_ENABLED:-false}" = "true" ]; then
-            export CC_aarch64_unknown_linux_musl="sccache musl-gcc"
-          fi
-          mold -run cargo build -p weaver --release --locked --target aarch64-unknown-linux-musl
-      - name: Verify liblzma is statically bundled
-        run: |
-          BINARY="target/aarch64-unknown-linux-musl/release/weaver"
-          if readelf -d "$BINARY" | grep -q 'liblzma'; then
-            echo "release binary dynamically links liblzma" >&2
-            exit 1
-          fi
-      - name: Package tarball
-        run: |
-          mkdir -p dist/package
-          cp target/aarch64-unknown-linux-musl/release/weaver dist/package/weaver
-          tar -czf weaver-linux-arm64-cortex-a76.tar.gz -C dist/package .
-          test -f weaver-linux-arm64-cortex-a76.tar.gz
-      - name: Upload release package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
-          path: weaver-linux-arm64-cortex-a76.tar.gz
-          if-no-files-found: error
-          retention-days: 14
-      - name: Show trusted tag sccache stats
-        if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-        run: sccache --show-stats || true
-
-  rust-package-darwin-x86_64-haswell:
-    name: rust-package-darwin-x86_64-haswell
+  rust-package-darwin-x86_64-portable:
+    name: rust-package-darwin-x86_64-portable
     runs-on: macos-26
     timeout-minutes: 90
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
+      AWS_LC_SYS_USE_SYSTEM: "0"
+      AWS_LC_SYS_STATIC: "1"
+      AWS_LC_SYS_SMALL: "0"
+      AWS_LC_SYS_CMAKE_BUILDER: "0"
+      CFLAGS_x86_64_apple_darwin: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CXXFLAGS_x86_64_apple_darwin: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -874,7 +742,7 @@ jobs:
         with:
           cache-bin: false
           cache-on-failure: false
-          key: package-darwin-x86_64-haswell
+          key: package-darwin-x86_64-portable
       - name: Install sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -895,21 +763,27 @@ jobs:
           path: apps/weaver-web/dist
       - name: Set target CPU flags
         run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-apple-darwin" --lane haswell)" >> "$GITHUB_ENV"
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-apple-darwin" --lane portable)" >> "$GITHUB_ENV"
       - name: Build release binary
         run: |
+          export CMAKE_C_COMPILER="clang"
+          export CMAKE_CXX_COMPILER="clang++"
           if [ "${WEAVER_SCCACHE_ENABLED:-false}" = "true" ]; then
             export CC="sccache clang"
             export CXX="sccache clang++"
             export CMAKE_C_COMPILER_LAUNCHER="sccache"
             export CMAKE_CXX_COMPILER_LAUNCHER="sccache"
+          else
+            export CC="clang"
+            export CXX="clang++"
           fi
           cargo build -p weaver --release --locked --target x86_64-apple-darwin
-      - name: Verify liblzma is statically bundled
+      - name: Verify native libraries are statically bundled
         run: |
           BINARY="target/x86_64-apple-darwin/release/weaver"
-          if otool -L "$BINARY" | grep -q 'liblzma'; then
-            echo "release binary dynamically links liblzma" >&2
+          otool -L "$BINARY" | tee weaver-darwin-x86_64-portable-native-linkage.txt
+          if grep -Eiq 'liblzma|aws[-_]?lc|libcrypto' weaver-darwin-x86_64-portable-native-linkage.txt; then
+            echo "release binary dynamically links a bundled native library" >&2
             exit 1
           fi
       - name: Codesign binary
@@ -935,13 +809,13 @@ jobs:
         run: |
           mkdir -p dist/package
           cp target/x86_64-apple-darwin/release/weaver dist/package/weaver
-          tar -czf weaver-darwin-x86_64-haswell.tar.gz -C dist/package .
-          test -f weaver-darwin-x86_64-haswell.tar.gz
+          tar -czf weaver-darwin-x86_64-portable.tar.gz -C dist/package .
+          test -f weaver-darwin-x86_64-portable.tar.gz
       - name: Upload release package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: weaver-darwin-x86_64-haswell-${{ github.run_id }}
-          path: weaver-darwin-x86_64-haswell.tar.gz
+          name: weaver-darwin-x86_64-portable-${{ github.run_id }}
+          path: weaver-darwin-x86_64-portable.tar.gz
           if-no-files-found: error
           retention-days: 14
       - name: Show trusted tag sccache stats
@@ -955,6 +829,12 @@ jobs:
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
+      AWS_LC_SYS_USE_SYSTEM: "0"
+      AWS_LC_SYS_STATIC: "1"
+      AWS_LC_SYS_SMALL: "0"
+      AWS_LC_SYS_CMAKE_BUILDER: "0"
+      CFLAGS_aarch64_apple_darwin: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CXXFLAGS_aarch64_apple_darwin: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -994,18 +874,24 @@ jobs:
           printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-apple-darwin" --lane portable)" >> "$GITHUB_ENV"
       - name: Build release binary
         run: |
+          export CMAKE_C_COMPILER="clang"
+          export CMAKE_CXX_COMPILER="clang++"
           if [ "${WEAVER_SCCACHE_ENABLED:-false}" = "true" ]; then
             export CC="sccache clang"
             export CXX="sccache clang++"
             export CMAKE_C_COMPILER_LAUNCHER="sccache"
             export CMAKE_CXX_COMPILER_LAUNCHER="sccache"
+          else
+            export CC="clang"
+            export CXX="clang++"
           fi
           cargo build -p weaver --release --locked --target aarch64-apple-darwin
-      - name: Verify liblzma is statically bundled
+      - name: Verify native libraries are statically bundled
         run: |
           BINARY="target/aarch64-apple-darwin/release/weaver"
-          if otool -L "$BINARY" | grep -q 'liblzma'; then
-            echo "release binary dynamically links liblzma" >&2
+          otool -L "$BINARY" | tee weaver-darwin-arm64-portable-native-linkage.txt
+          if grep -Eiq 'liblzma|aws[-_]?lc|libcrypto' weaver-darwin-arm64-portable-native-linkage.txt; then
+            echo "release binary dynamically links a bundled native library" >&2
             exit 1
           fi
       - name: Codesign binary
@@ -1044,102 +930,6 @@ jobs:
         if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         run: sccache --show-stats || true
 
-  rust-package-darwin-arm64-apple-m1:
-    name: rust-package-darwin-arm64-apple-m1
-    runs-on: macos-26
-    timeout-minutes: 90
-    needs: [changes, verify-release-tag, web-build]
-    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
-    env:
-      SCCACHE_BASEDIRS: ${{ github.workspace }}
-      SCCACHE_CACHE_SIZE: 10G
-      SCCACHE_DIR: ${{ github.workspace }}/.sccache
-      SCCACHE_IDLE_TIMEOUT: "0"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install target
-        run: rustup target add aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: false
-          cache-on-failure: false
-          key: package-darwin-arm64-apple-m1
-      - name: Install sccache
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: v0.17.0
-      - name: Configure trusted tag sccache
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-        uses: ./.github/actions/configure-sccache-r2
-        with:
-          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
-          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
-          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
-          key-prefix: weaver/trusted-release/v1/rust-1.97.1/aarch64-apple-darwin/
-      - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ${{ env.WEB_ARTIFACT_NAME }}
-          path: apps/weaver-web/dist
-      - name: Set target CPU flags
-        run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-apple-darwin" --lane apple-m1)" >> "$GITHUB_ENV"
-      - name: Build release binary
-        run: |
-          if [ "${WEAVER_SCCACHE_ENABLED:-false}" = "true" ]; then
-            export CC="sccache clang"
-            export CXX="sccache clang++"
-            export CMAKE_C_COMPILER_LAUNCHER="sccache"
-            export CMAKE_CXX_COMPILER_LAUNCHER="sccache"
-          fi
-          cargo build -p weaver --release --locked --target aarch64-apple-darwin
-      - name: Verify liblzma is statically bundled
-        run: |
-          BINARY="target/aarch64-apple-darwin/release/weaver"
-          if otool -L "$BINARY" | grep -q 'liblzma'; then
-            echo "release binary dynamically links liblzma" >&2
-            exit 1
-          fi
-      - name: Codesign binary
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-        env:
-          CERT_P12: ${{ secrets.APPLE_SIGNING_CERT_P12 }}
-          CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
-        run: |
-          KEYCHAIN="build.keychain-db"
-          KEYCHAIN_PASS="ci-ephemeral"
-          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security set-keychain-settings -lut 900 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          echo -n "$CERT_P12" | base64 --decode > /tmp/cert.p12
-          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/aarch64-apple-darwin/release/weaver
-          codesign --verify --verbose target/aarch64-apple-darwin/release/weaver
-          rm /tmp/cert.p12
-          security delete-keychain "$KEYCHAIN"
-      - name: Package tarball
-        run: |
-          mkdir -p dist/package
-          cp target/aarch64-apple-darwin/release/weaver dist/package/weaver
-          tar -czf weaver-darwin-arm64-apple-m1.tar.gz -C dist/package .
-          test -f weaver-darwin-arm64-apple-m1.tar.gz
-      - name: Upload release package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: weaver-darwin-arm64-apple-m1-${{ github.run_id }}
-          path: weaver-darwin-arm64-apple-m1.tar.gz
-          if-no-files-found: error
-          retention-days: 14
-      - name: Show trusted tag sccache stats
-        if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-        run: sccache --show-stats || true
-
   rust-package-windows-x86_64:
     name: rust-package-windows-x86_64
     runs-on: windows-2025-vs2026
@@ -1148,6 +938,13 @@ jobs:
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
       CARGO_INCREMENTAL: "0"
+      AWS_LC_SYS_USE_SYSTEM: "0"
+      AWS_LC_SYS_STATIC: "1"
+      AWS_LC_SYS_SMALL: "0"
+      AWS_LC_SYS_CMAKE_BUILDER: "0"
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      CFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
+      CXXFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
       # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
       # cfg(not(windows)) dependency and is never compiled here.
       CC_x86_64_pc_windows_msvc: clang-cl
@@ -1304,8 +1101,8 @@ jobs:
             exit $LASTEXITCODE
           }
           $dependents = Get-Content $out -Raw
-          if ($dependents -match '(?i)\b(?:vcruntime|msvcp)\d*[^\\/\s]*\.dll\b') {
-            throw "Windows package depends on Visual C++ runtime DLLs; expected static CRT"
+          if ($dependents -match '(?i)\b(?:vcruntime|msvcp)\d*[^\\/\s]*\.dll\b|aws[-_]?lc|\blibcrypto[^\s]*\.dll\b|\bcrypto\.dll\b') {
+            throw "Windows package depends on an external native runtime or crypto DLL"
           }
       - name: Smoke test release binary startup
         shell: pwsh
@@ -1464,6 +1261,12 @@ jobs:
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
       CARGO_INCREMENTAL: "0"
+      AWS_LC_SYS_USE_SYSTEM: "0"
+      AWS_LC_SYS_STATIC: "1"
+      AWS_LC_SYS_SMALL: "0"
+      AWS_LC_SYS_CMAKE_BUILDER: "0"
+      CFLAGS_aarch64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
+      CXXFLAGS_aarch64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
       # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
       # cfg(not(windows)) dependency and is never compiled here.
       CC_aarch64_pc_windows_msvc: clang-cl
@@ -1594,8 +1397,8 @@ jobs:
             exit $LASTEXITCODE
           }
           $dependents = Get-Content $out -Raw
-          if ($dependents -match '(?i)\b(?:vcruntime|msvcp)\d*[^\\/\s]*\.dll\b') {
-            throw "Windows package depends on Visual C++ runtime DLLs; expected static CRT"
+          if ($dependents -match '(?i)\b(?:vcruntime|msvcp)\d*[^\\/\s]*\.dll\b|aws[-_]?lc|\blibcrypto[^\s]*\.dll\b|\bcrypto\.dll\b') {
+            throw "Windows package depends on an external native runtime or crypto DLL"
           }
       - name: Smoke test release binary startup
         shell: pwsh
@@ -1762,9 +1565,7 @@ jobs:
       - rust-test-sde
       - rust-yenc-simd-targets
       - rust-package-linux-x86_64-portable
-      - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
-      - rust-package-linux-arm64-cortex-a76
     permissions:
       contents: read
     strategy:
@@ -1788,23 +1589,11 @@ jobs:
         with:
           name: weaver-linux-x86_64-portable-${{ github.run_id }}
           path: artifacts
-      - name: Download linux amd64 haswell artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-linux-x86_64-haswell-${{ github.run_id }}
-          path: artifacts
       - name: Download linux arm64 portable artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: weaver-linux-arm64-portable-${{ github.run_id }}
           path: artifacts
-      - name: Download linux arm64 cortex-a76 artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
-          path: artifacts
-      - name: Validate Docker runtime selector
-        run: sh docker/test_runtime_select.sh
       - name: Prepare build context
         run: sh docker/prepare-build-context.sh artifacts docker-ctx
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
@@ -1853,9 +1642,7 @@ jobs:
       - rust-test-sde
       - rust-yenc-simd-targets
       - rust-package-linux-x86_64-portable
-      - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
-      - rust-package-linux-arm64-cortex-a76
     permissions:
       contents: read
       packages: write
@@ -1866,23 +1653,11 @@ jobs:
         with:
           name: weaver-linux-x86_64-portable-${{ github.run_id }}
           path: artifacts
-      - name: Download linux amd64 haswell artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-linux-x86_64-haswell-${{ github.run_id }}
-          path: artifacts
       - name: Download linux arm64 portable artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: weaver-linux-arm64-portable-${{ github.run_id }}
           path: artifacts
-      - name: Download linux arm64 cortex-a76 artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
-          path: artifacts
-      - name: Validate Docker runtime selector
-        run: sh docker/test_runtime_select.sh
       - name: Prepare build context
         run: sh docker/prepare-build-context.sh artifacts docker-ctx
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
@@ -1935,9 +1710,7 @@ jobs:
       - rust-test-sde
       - rust-yenc-simd-targets
       - rust-package-linux-x86_64-portable
-      - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
-      - rust-package-linux-arm64-cortex-a76
     permissions:
       contents: read
       packages: write
@@ -1953,23 +1726,11 @@ jobs:
         with:
           name: weaver-linux-x86_64-portable-${{ github.run_id }}
           path: artifacts
-      - name: Download linux amd64 haswell artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-linux-x86_64-haswell-${{ github.run_id }}
-          path: artifacts
       - name: Download linux arm64 portable artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: weaver-linux-arm64-portable-${{ github.run_id }}
           path: artifacts
-      - name: Download linux arm64 cortex-a76 artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
-          path: artifacts
-      - name: Validate Docker runtime selector
-        run: sh docker/test_runtime_select.sh
       - name: Prepare build context
         run: sh docker/prepare-build-context.sh artifacts docker-ctx
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
@@ -2108,12 +1869,9 @@ jobs:
       - rust-test-sde
       - rust-yenc-simd-targets
       - rust-package-linux-x86_64-portable
-      - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
-      - rust-package-linux-arm64-cortex-a76
-      - rust-package-darwin-x86_64-haswell
+      - rust-package-darwin-x86_64-portable
       - rust-package-darwin-arm64-portable
-      - rust-package-darwin-arm64-apple-m1
       - rust-package-windows-x86_64
       - rust-package-windows-arm64
       - prepare-release-provenance
@@ -2135,35 +1893,20 @@ jobs:
         with:
           name: weaver-linux-x86_64-portable-${{ github.run_id }}
           path: artifacts
-      - name: Download linux x86_64 haswell artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-linux-x86_64-haswell-${{ github.run_id }}
-          path: artifacts
       - name: Download linux arm64 portable artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: weaver-linux-arm64-portable-${{ github.run_id }}
           path: artifacts
-      - name: Download linux arm64 cortex-a76 artifact
+      - name: Download darwin x86_64 portable artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
-          path: artifacts
-      - name: Download darwin x86_64 haswell artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-darwin-x86_64-haswell-${{ github.run_id }}
+          name: weaver-darwin-x86_64-portable-${{ github.run_id }}
           path: artifacts
       - name: Download darwin arm64 portable artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: weaver-darwin-arm64-portable-${{ github.run_id }}
-          path: artifacts
-      - name: Download darwin arm64 apple-m1 artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-darwin-arm64-apple-m1-${{ github.run_id }}
           path: artifacts
       - name: Download windows x86_64 artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -2191,7 +1934,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t release_assets < <(find artifacts -maxdepth 1 -type f \( -name 'weaver-*.tar.gz' -o -name 'weaver-*.zip' -o -name 'weaver-*.msi' -o -name 'weaver-*.spdx.json' \) -printf '%f\n' | sort)
-          test "${#release_assets[@]}" -eq 22
+          test "${#release_assets[@]}" -eq 16
           for asset in "${release_assets[@]}"; do
             slsa-verifier verify-artifact "artifacts/${asset}" \
               --provenance-path artifacts/weaver-provenance.intoto.jsonl \
@@ -2240,61 +1983,16 @@ jobs:
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#weaver-v}"
           LINUX_X86_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-linux-x86_64-portable.tar.gz | cut -d ' ' -f1)
-          LINUX_X86_HASWELL_SHA=$(shasum -a 256 artifacts/weaver-linux-x86_64-haswell.tar.gz | cut -d ' ' -f1)
           LINUX_ARM_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-linux-arm64-portable.tar.gz | cut -d ' ' -f1)
-          LINUX_ARM_CORTEX_A76_SHA=$(shasum -a 256 artifacts/weaver-linux-arm64-cortex-a76.tar.gz | cut -d ' ' -f1)
-          DARWIN_X86_HASWELL_SHA=$(shasum -a 256 artifacts/weaver-darwin-x86_64-haswell.tar.gz | cut -d ' ' -f1)
+          DARWIN_X86_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-darwin-x86_64-portable.tar.gz | cut -d ' ' -f1)
           DARWIN_ARM_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-darwin-arm64-portable.tar.gz | cut -d ' ' -f1)
-          DARWIN_ARM_APPLE_M1_SHA=$(shasum -a 256 artifacts/weaver-darwin-arm64-apple-m1.tar.gz | cut -d ' ' -f1)
           REPO="${{ github.repository }}"
 
           mkdir -p formula
           cat > formula/weaver-usenet.rb << FORMULA
-          require "open3"
           require "rbconfig"
-          require "set"
 
           module WeaverUsenetReleaseSelection
-            X86_HASWELL_FEATURES = %w[
-              avx
-              avx2
-              bmi1
-              bmi2
-              f16c
-              fma
-              lzcnt
-              movbe
-              pclmulqdq
-              popcnt
-              rdrand
-              sse3
-              sse4.1
-              sse4.2
-              ssse3
-              xsave
-              xsaveopt
-            ].freeze
-
-            LINUX_ARM64_CORTEX_A76_FEATURES = %w[
-              aes
-              crc32
-              dotprod
-              fp16
-              lse
-              neon
-              rdm
-              sha2
-            ].freeze
-
-            MACOS_ARM64_APPLE_M1_FEATURES = %w[
-              aes
-              dotprod
-              fp16
-              lse
-              neon
-              sha2
-            ].freeze
-
             def self.current_os
               host_os = RbConfig::CONFIG["host_os"].to_s.downcase
               return "macos" if host_os.include?("darwin")
@@ -2311,178 +2009,25 @@ jobs:
               "unknown"
             end
 
-            def self.current_lane
-              detect_lane(
-                os: current_os,
-                arch: current_arch,
-                linux_cpuinfo: current_os == "linux" ? read_linux_cpuinfo : nil,
-                sysctl_values: current_os == "macos" ? read_macos_sysctl_values(current_arch) : {},
-              )
-            end
-
-            def self.detect_lane(os:, arch:, linux_cpuinfo: nil, sysctl_values: {})
+            def self.asset_name(os:, arch:)
               case [os, arch]
-              when ["macos", "x86_64"]
-                normalized = normalize_x86_features(
-                  sysctl_feature_tokens(
-                    sysctl_values["machdep.cpu.features"],
-                    sysctl_values["machdep.cpu.leaf7_features"],
-                  ),
-                )
-                unless normalized.superset?(X86_HASWELL_FEATURES.to_set)
-                  raise "macOS x86_64 release requires Haswell CPU features; no portable macOS x86_64 artifact is published"
-                end
-                "haswell"
-              when ["linux", "x86_64"]
-                normalized = normalize_x86_features(cpuinfo_feature_tokens(linux_cpuinfo))
-                normalized.superset?(X86_HASWELL_FEATURES.to_set) ? "haswell" : "portable"
-              when ["macos", "arm64"]
-                required = {
-                  "aes" => "hw.optional.arm.FEAT_AES",
-                  "dotprod" => "hw.optional.arm.FEAT_DotProd",
-                  "fp16" => "hw.optional.arm.FEAT_FP16",
-                  "lse" => "hw.optional.arm.FEAT_LSE",
-                  "neon" => "hw.optional.arm.AdvSIMD",
-                  "sha2" => "hw.optional.arm.FEAT_SHA256",
-                }
-                present = required.all? do |_feature, key|
-                  truthy_sysctl?(sysctl_values[key])
-                end
-                present ? "apple-m1" : "portable"
-              when ["linux", "arm64"]
-                normalized = normalize_linux_arm64_features(cpuinfo_feature_tokens(linux_cpuinfo))
-                normalized.superset?(LINUX_ARM64_CORTEX_A76_FEATURES.to_set) ? "cortex-a76" : "portable"
+              when ["linux", "x86_64"] then "weaver-linux-x86_64-portable.tar.gz"
+              when ["linux", "arm64"] then "weaver-linux-arm64-portable.tar.gz"
+              when ["macos", "x86_64"] then "weaver-darwin-x86_64-portable.tar.gz"
+              when ["macos", "arm64"] then "weaver-darwin-arm64-portable.tar.gz"
               else
-                "portable"
+                raise "unsupported asset mapping: #{[os, arch].inspect}"
               end
             end
 
-            def self.asset_name(os:, arch:, lane:)
-              case [os, arch, lane]
-              when ["linux", "x86_64", "portable"] then "weaver-linux-x86_64-portable.tar.gz"
-              when ["linux", "x86_64", "haswell"] then "weaver-linux-x86_64-haswell.tar.gz"
-              when ["linux", "arm64", "portable"] then "weaver-linux-arm64-portable.tar.gz"
-              when ["linux", "arm64", "cortex-a76"] then "weaver-linux-arm64-cortex-a76.tar.gz"
-              when ["macos", "x86_64", "haswell"] then "weaver-darwin-x86_64-haswell.tar.gz"
-              when ["macos", "arm64", "portable"] then "weaver-darwin-arm64-portable.tar.gz"
-              when ["macos", "arm64", "apple-m1"] then "weaver-darwin-arm64-apple-m1.tar.gz"
-              else
-                raise "unsupported asset mapping: #{[os, arch, lane].inspect}"
-              end
+            def self.asset_url(repo:, version:, os:, arch:)
+              "https://github.com/#{repo}/releases/download/weaver-v#{version}/#{asset_name(os: os, arch: arch)}"
             end
 
-            def self.asset_url(repo:, version:, os:, arch:, lane:)
-              "https://github.com/#{repo}/releases/download/weaver-v#{version}/#{asset_name(os: os, arch: arch, lane: lane)}"
+            def self.asset_sha256(os:, arch:, checksums:)
+              checksums.fetch(asset_name(os: os, arch: arch))
             end
 
-            def self.asset_sha256(os:, arch:, lane:, checksums:)
-              checksums.fetch(asset_name(os: os, arch: arch, lane: lane))
-            end
-
-            def self.read_linux_cpuinfo
-              File.read("/proc/cpuinfo")
-            rescue StandardError
-              nil
-            end
-
-            def self.read_macos_sysctl_values(arch)
-              values = {}
-              if arch == "x86_64"
-                %w[
-                  machdep.cpu.features
-                  machdep.cpu.leaf7_features
-                ].each do |key|
-                  values[key] = read_sysctl(key)
-                end
-              elsif arch == "arm64"
-                %w[
-                  hw.optional.arm.FEAT_AES
-                  hw.optional.arm.FEAT_DotProd
-                  hw.optional.arm.FEAT_FP16
-                  hw.optional.arm.FEAT_LSE
-                  hw.optional.arm.AdvSIMD
-                  hw.optional.arm.FEAT_SHA256
-                ].each do |key|
-                  values[key] = read_sysctl(key)
-                end
-              end
-              values
-            end
-
-            def self.read_sysctl(name)
-              output, status = Open3.capture2("sysctl", "-n", name)
-              status.success? ? output.strip : nil
-            rescue StandardError
-              nil
-            end
-
-            def self.cpuinfo_feature_tokens(cpuinfo_text)
-              return [] if cpuinfo_text.to_s.empty?
-
-              cpuinfo_text.each_line.filter_map do |line|
-                match = line.match(/^\s*(flags|Features)\s*:\s*(.+)$/i)
-                next unless match
-
-                match[2].split(/\s+/)
-              end.flatten
-            end
-
-            def self.sysctl_feature_tokens(*values)
-              values.compact.flat_map { |value| value.split(/\s+/) }
-            end
-
-            def self.normalize_x86_features(tokens)
-              tokens.each_with_object(Set.new) do |token, features|
-                normalized = normalize_x86_feature(token)
-                features << normalized if normalized
-              end
-            end
-
-            def self.normalize_linux_arm64_features(tokens)
-              tokens.each_with_object(Set.new) do |token, features|
-                normalized = normalize_linux_arm64_feature(token)
-                features << normalized if normalized
-              end
-            end
-
-            def self.normalize_x86_feature(token)
-              case token.to_s.downcase
-              when "avx", "avx1.0" then "avx"
-              when "avx2", "avx2.0" then "avx2"
-              when "bmi1" then "bmi1"
-              when "bmi2" then "bmi2"
-              when "f16c" then "f16c"
-              when "fma" then "fma"
-              when "abm", "lzcnt" then "lzcnt"
-              when "movbe" then "movbe"
-              when "pclmul", "pclmulqdq" then "pclmulqdq"
-              when "popcnt" then "popcnt"
-              when "rdrand" then "rdrand"
-              when "sse3" then "sse3"
-              when "sse4_1", "sse4.1" then "sse4.1"
-              when "sse4_2", "sse4.2" then "sse4.2"
-              when "ssse3" then "ssse3"
-              when "osxsave", "xsave" then "xsave"
-              when "xsaveopt" then "xsaveopt"
-              end
-            end
-
-            def self.normalize_linux_arm64_feature(token)
-              case token.to_s.downcase
-              when "aes" then "aes"
-              when "crc", "crc32" then "crc32"
-              when "asimddp", "dotprod" then "dotprod"
-              when "fphp", "asimdhp", "fp16" then "fp16"
-              when "atomics", "lse" then "lse"
-              when "asimd", "neon" then "neon"
-              when "asimdrdm", "rdm" then "rdm"
-              when "sha2" then "sha2"
-              end
-            end
-
-            def self.truthy_sysctl?(value)
-              value.to_s.strip == "1"
-            end
           end
 
           class WeaverUsenet < Formula
@@ -2494,28 +2039,22 @@ jobs:
             RELEASE_VERSION = "${VERSION}"
             CHECKSUMS = {
               "weaver-linux-x86_64-portable.tar.gz" => "${LINUX_X86_PORTABLE_SHA}",
-              "weaver-linux-x86_64-haswell.tar.gz" => "${LINUX_X86_HASWELL_SHA}",
               "weaver-linux-arm64-portable.tar.gz" => "${LINUX_ARM_PORTABLE_SHA}",
-              "weaver-linux-arm64-cortex-a76.tar.gz" => "${LINUX_ARM_CORTEX_A76_SHA}",
-              "weaver-darwin-x86_64-haswell.tar.gz" => "${DARWIN_X86_HASWELL_SHA}",
+              "weaver-darwin-x86_64-portable.tar.gz" => "${DARWIN_X86_PORTABLE_SHA}",
               "weaver-darwin-arm64-portable.tar.gz" => "${DARWIN_ARM_PORTABLE_SHA}",
-              "weaver-darwin-arm64-apple-m1.tar.gz" => "${DARWIN_ARM_APPLE_M1_SHA}",
             }.freeze
             SELECTED_OS = WeaverUsenetReleaseSelection.current_os
             SELECTED_ARCH = WeaverUsenetReleaseSelection.current_arch
-            SELECTED_LANE = WeaverUsenetReleaseSelection.current_lane
 
             url WeaverUsenetReleaseSelection.asset_url(
               repo: RELEASE_REPO,
               version: RELEASE_VERSION,
               os: SELECTED_OS,
               arch: SELECTED_ARCH,
-              lane: SELECTED_LANE,
             )
             sha256 WeaverUsenetReleaseSelection.asset_sha256(
               os: SELECTED_OS,
               arch: SELECTED_ARCH,
-              lane: SELECTED_LANE,
               checksums: CHECKSUMS,
             )
 
@@ -2596,85 +2135,26 @@ jobs:
             raise "#{label}: expected #{expected.inspect}, got #{actual.inspect}" unless expected == actual
           end
 
-          def assert_raises_message(expected_message, label)
-            yield
-          rescue RuntimeError => error
-            unless error.message.include?(expected_message)
-              raise "#{label}: expected error containing #{expected_message.inspect}, got #{error.message.inspect}"
-            end
-          else
-            raise "#{label}: expected error containing #{expected_message.inspect}"
-          end
-
-          linux_x86_full = <<~CPUINFO
-            flags : sse3 ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave xsaveopt
-          CPUINFO
-          linux_x86_abm = <<~CPUINFO
-            flags : sse3 ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 f16c fma abm movbe pclmulqdq popcnt rdrand xsave xsaveopt
-          CPUINFO
-          linux_x86_portable = <<~CPUINFO
-            flags : sse3 ssse3 sse4_1 sse4_2 avx bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave xsaveopt
-          CPUINFO
-          linux_arm_full = <<~CPUINFO
-            Features : fp asimd aes sha2 crc32 atomics fphp asimdrdm asimddp
-          CPUINFO
-          linux_arm_portable = <<~CPUINFO
-            Features : fp asimd aes sha2 crc32 atomics fphp asimdrdm
-          CPUINFO
-          macos_x86_full = {
-            "machdep.cpu.features" => "SSE3 SSSE3 SSE4.1 SSE4.2 FMA MOVBE POPCNT AVX1.0 RDRAND F16C XSAVE OSXSAVE",
-            "machdep.cpu.leaf7_features" => "AVX2 BMI1 BMI2 LZCNT PCLMULQDQ XSAVEOPT",
-          }
-          macos_x86_portable = {
-            "machdep.cpu.features" => "SSE3 SSSE3 SSE4.1 SSE4.2 FMA MOVBE POPCNT AVX1.0 RDRAND F16C XSAVE OSXSAVE",
-            "machdep.cpu.leaf7_features" => "BMI1 BMI2 LZCNT PCLMULQDQ XSAVEOPT",
-          }
-          macos_arm_full = {
-            "hw.optional.arm.FEAT_AES" => "1",
-            "hw.optional.arm.FEAT_DotProd" => "1",
-            "hw.optional.arm.FEAT_FP16" => "1",
-            "hw.optional.arm.FEAT_LSE" => "1",
-            "hw.optional.arm.AdvSIMD" => "1",
-            "hw.optional.arm.FEAT_SHA256" => "1",
-          }
-          macos_arm_portable = macos_arm_full.merge("hw.optional.arm.FEAT_DotProd" => "0")
-
-          assert_equal("haswell", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "x86_64", linux_cpuinfo: linux_x86_full), "linux x86 optimized lane")
-          assert_equal("haswell", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "x86_64", linux_cpuinfo: linux_x86_abm), "linux x86 abm optimized lane")
-          assert_equal("portable", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "x86_64", linux_cpuinfo: linux_x86_portable), "linux x86 portable lane")
-          assert_equal("cortex-a76", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "arm64", linux_cpuinfo: linux_arm_full), "linux arm optimized lane")
-          assert_equal("portable", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "arm64", linux_cpuinfo: linux_arm_portable), "linux arm portable lane")
-          assert_equal("haswell", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "x86_64", sysctl_values: macos_x86_full), "macos x86 optimized lane")
-          assert_raises_message("macOS x86_64 release requires Haswell CPU features", "macos x86 pre-Haswell lane") do
-            WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "x86_64", sysctl_values: macos_x86_portable)
-          end
-          assert_equal("apple-m1", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "arm64", sysctl_values: macos_arm_full), "macos arm optimized lane")
-          assert_equal("portable", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "arm64", sysctl_values: macos_arm_portable), "macos arm portable lane")
-
           checksums = {
             "weaver-linux-x86_64-portable.tar.gz" => "linux-x86-portable",
-            "weaver-linux-x86_64-haswell.tar.gz" => "linux-x86-haswell",
             "weaver-linux-arm64-portable.tar.gz" => "linux-arm-portable",
-            "weaver-linux-arm64-cortex-a76.tar.gz" => "linux-arm-cortex-a76",
-            "weaver-darwin-x86_64-haswell.tar.gz" => "darwin-x86-haswell",
+            "weaver-darwin-x86_64-portable.tar.gz" => "darwin-x86-portable",
             "weaver-darwin-arm64-portable.tar.gz" => "darwin-arm-portable",
-            "weaver-darwin-arm64-apple-m1.tar.gz" => "darwin-arm-apple-m1",
           }
 
+          {
+            ["linux", "x86_64"] => "weaver-linux-x86_64-portable.tar.gz",
+            ["linux", "arm64"] => "weaver-linux-arm64-portable.tar.gz",
+            ["macos", "x86_64"] => "weaver-darwin-x86_64-portable.tar.gz",
+            ["macos", "arm64"] => "weaver-darwin-arm64-portable.tar.gz",
+          }.each do |(os, arch), asset|
+            assert_equal(asset, WeaverUsenetReleaseSelection.asset_name(os: os, arch: arch), "#{os} #{arch} asset")
+            assert_equal(checksums.fetch(asset), WeaverUsenetReleaseSelection.asset_sha256(os: os, arch: arch, checksums: checksums), "#{os} #{arch} checksum")
+          end
           assert_equal(
-            "https://github.com/scryer-media/weaver/releases/download/weaver-v1.2.3/weaver-linux-x86_64-haswell.tar.gz",
-            WeaverUsenetReleaseSelection.asset_url(repo: "scryer-media/weaver", version: "1.2.3", os: "linux", arch: "x86_64", lane: "haswell"),
-            "linux x86 url",
-          )
-          assert_equal(
-            "linux-arm-cortex-a76",
-            WeaverUsenetReleaseSelection.asset_sha256(os: "linux", arch: "arm64", lane: "cortex-a76", checksums: checksums),
-            "linux arm sha",
-          )
-          assert_equal(
-            "darwin-x86-haswell",
-            WeaverUsenetReleaseSelection.asset_sha256(os: "macos", arch: "x86_64", lane: "haswell", checksums: checksums),
-            "macos x86 sha",
+            "https://github.com/scryer-media/weaver/releases/download/weaver-v1.2.3/weaver-darwin-x86_64-portable.tar.gz",
+            WeaverUsenetReleaseSelection.asset_url(repo: "scryer-media/weaver", version: "1.2.3", os: "macos", arch: "x86_64"),
+            "macos x86 url",
           )
           RUBY
       - name: Publish Homebrew tap update
@@ -2918,12 +2398,9 @@ jobs:
     needs:
       - verify-release-tag
       - rust-package-linux-x86_64-portable
-      - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
-      - rust-package-linux-arm64-cortex-a76
-      - rust-package-darwin-x86_64-haswell
+      - rust-package-darwin-x86_64-portable
       - rust-package-darwin-arm64-portable
-      - rust-package-darwin-arm64-apple-m1
       - rust-package-windows-x86_64
       - rust-package-windows-arm64
       - winget-prep
@@ -2947,7 +2424,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-inputs
           mapfile -t archives < <(find artifacts -maxdepth 1 -type f \( -name 'weaver-*.tar.gz' -o -name 'weaver-*.zip' \) -printf '%f\n' | sort)
-          test "${#archives[@]}" -eq 10
+          test "${#archives[@]}" -eq 7
           mapfile -t msi_packages < <(find artifacts -maxdepth 1 -type f -name 'weaver-*.msi' -printf '%f\n' | sort)
           test "${#msi_packages[@]}" -eq 2
           for archive in "${archives[@]}"; do
@@ -2965,7 +2442,7 @@ jobs:
               sha256sum "release-inputs/${asset}"
             done
           } | sed -e 's#artifacts/##' -e 's#release-inputs/##' > slsa-subjects.txt
-          test "$(wc -l < slsa-subjects.txt)" -eq 22
+          test "$(wc -l < slsa-subjects.txt)" -eq 16
       - name: Upload release provenance inputs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

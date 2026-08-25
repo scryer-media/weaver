@@ -600,8 +600,8 @@
     },
     {
       "path": "testdata/nested-xz-rar/archive.rar",
-      "size": 5232970,
-      "blake3": "8532c0a6a569bd0fa83fc66c2c20f8f2489ef713d026087de53de2ec52eb4efa",
+      "size": 5232961,
+      "blake3": "727255bdd3d641b37f83f3705ee21d4ddb563380e7d7c9a38ae6198b4061b0a7",
       "format": "rar5",
       "source": {
         "kind": "generated",
@@ -4822,7 +4822,7 @@
     {
       "path": "testdata/split-xz/test-media.mkv.xz.001",
       "size": 2097152,
-      "blake3": "5ca1302e155aea6144e8c5819de04c96b32dc3f65d5c70300b403cbd150652a9",
+      "blake3": "3bdd42a751745ada9604ef7ff3e42da799adfe256f514f6bff1f8dd1c02f9afc",
       "format": "xz",
       "source": {
         "kind": "generated",
@@ -5562,7 +5562,7 @@
     {
       "path": "testdata/xz-video/test-media.mkv.xz",
       "size": 5243380,
-      "blake3": "b6390a9ab8f3165154a5943ff80655a4a9b7bfad7706fd636b0d3118301a66ca",
+      "blake3": "cdb45297628cfac188ba609d33a3024cc6cca2800bb83b9390b1f9825427b0b9",
       "format": "xz",
       "source": {
         "kind": "generated",

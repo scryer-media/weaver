@@ -295,9 +295,8 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata util-linux wget && \
     rm -rf /var/lib/apt/lists/*
 COPY docker/entrypoint.sh /entrypoint.sh
-COPY docker/runtime-select.sh /runtime-select.sh
-COPY --from=builder /tmp/weaver-portable /opt/weaver/weaver-portable
-RUN chmod +x /entrypoint.sh /runtime-select.sh /opt/weaver/weaver-portable && mkdir -p /config /data
+COPY --from=builder /tmp/weaver-portable /opt/weaver/weaver
+RUN chmod +x /entrypoint.sh /opt/weaver/weaver && mkdir -p /config /data
 EXPOSE 9090
 VOLUME /config
 VOLUME /data
