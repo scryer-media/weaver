@@ -637,7 +637,7 @@ func applyTerminalStateCheck(dbPath string, jobID int, slug string, status strin
 const cleanPar2SettlementMessage = "PAR2 set settled clean from in-stream grid evidence"
 const cleanPar2VerificationSourceMessage = "PAR2 clean set verification source"
 
-var cleanPar2VerificationModes = []string{"grid", "quick_digest", "strong_decode", "authoritative"}
+var cleanPar2VerificationModes = []string{"grid", "file_crc", "quick_digest", "strong_decode", "authoritative"}
 
 func assertPar2CleanSettlement(jobID int, assertion *ScenarioPar2CleanSettlementAssertion) error {
 	if assertion == nil || len(assertion.ExpectedSetSliceSizes) == 0 {

@@ -2287,6 +2287,11 @@ pub struct Pipeline {
     pub(super) par2_repairer_analyze_calls: usize,
     #[cfg(test)]
     pub(super) par2_repairer_execute_calls: usize,
+    /// Bytes each damaged-job authoritative analysis actually read, in order.
+    /// The shipped build reports this through the pass's own outcome log line
+    /// and a perf probe; a test needs it as a number it can bound.
+    #[cfg(test)]
+    pub(super) par2_authoritative_bytes_read: Vec<u64>,
     /// Forces the retained-session gate on or off for a test, so a
     /// differential can run both arms without mutating a process-global
     /// environment variable while other tests are running.

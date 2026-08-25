@@ -1165,6 +1165,11 @@ fn install_test_par2_runtime(
             };
         }
     }
+    // Installing a set is this helper's stand-in for the packet arrivals that
+    // build one, and those evict any retained session before they touch the
+    // set. Without the same step here a test that swaps in a wider set keeps a
+    // session holding the narrower snapshot, and the next pass answers from it.
+    pipeline.evict_par2_repair_session(job_id, set_id);
     pipeline.refresh_par2_checkpoint_plan(job_id);
     pipeline.refresh_par2_md5_substitution_bindings(job_id);
 }

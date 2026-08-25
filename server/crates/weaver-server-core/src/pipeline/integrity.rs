@@ -85,7 +85,7 @@ pub(crate) enum BlockVerdict {
 /// bytes has to be padded the same way before the two can be compared. Doing it
 /// by combining rather than by hashing keeps the cost logarithmic in the
 /// padding length instead of linear.
-fn crc32_of_zeros(len: u64) -> u32 {
+pub(crate) fn crc32_of_zeros(len: u64) -> u32 {
     if len == 0 {
         return par2_rs::checksum::crc32(&[]);
     }

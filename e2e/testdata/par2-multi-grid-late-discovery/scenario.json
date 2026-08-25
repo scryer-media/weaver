@@ -27,7 +27,7 @@
       },
       "expectedSetVerificationModes": {
         "617ae7848ecc6d3878e8b1567b7e19f0": ["grid"],
-        "67bf769f86c961a3489112982cc5480c": ["quick_digest"]
+        "67bf769f86c961a3489112982cc5480c": ["quick_digest", "file_crc"]
       },
       "verificationReadBytes": 0
     }

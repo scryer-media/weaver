@@ -16,8 +16,8 @@
         "88d893a266b3f27a99f486a8a72d28e9": 98304
       },
       "expectedSetVerificationModes": {
-        "3db2e2755a7c29a00609c5234aec02fe": ["grid", "strong_decode", "authoritative"],
-        "88d893a266b3f27a99f486a8a72d28e9": ["strong_decode", "authoritative"]
+        "3db2e2755a7c29a00609c5234aec02fe": ["grid", "file_crc", "strong_decode", "authoritative"],
+        "88d893a266b3f27a99f486a8a72d28e9": ["file_crc", "strong_decode", "authoritative"]
       },
       "verificationReadBytes": 0
     }

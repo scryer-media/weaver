@@ -96,10 +96,12 @@ fn retained_session_invalidation_drops_cached_assessment() {
 }
 
 #[test]
-fn stateful_par2_session_parser_defaults_to_disabled() {
-    assert!(!parse_stateful_par2_session_enabled(None));
-    assert!(!parse_stateful_par2_session_enabled(Some("false")));
+fn stateful_par2_session_parser_defaults_to_enabled() {
+    assert!(parse_stateful_par2_session_enabled(None));
     assert!(parse_stateful_par2_session_enabled(Some("true")));
+    assert!(!parse_stateful_par2_session_enabled(Some("false")));
+    assert!(!parse_stateful_par2_session_enabled(Some("0")));
+    assert!(!parse_stateful_par2_session_enabled(Some("off")));
 }
 
 #[test]

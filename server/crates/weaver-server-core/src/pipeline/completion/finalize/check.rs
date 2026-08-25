@@ -110,8 +110,32 @@ fn committed_evidence_from_candidate(
 fn run_retained_par2_session(
     mut session: par2_rs::Par2RepairSession,
     candidates: Vec<Par2SessionEvidenceCandidate>,
+    slice_evidence: Vec<(std::path::PathBuf, Vec<par2_rs::SliceEvidence>)>,
     repair: bool,
 ) -> (par2_rs::Par2RepairSession, RetainedPar2SessionResult) {
+    // Per-slice evidence from the in-stream grid, alongside the whole-file
+    // evidence below. The two answer different questions and neither subsumes
+    // the other: committed evidence retires a file the pipeline can vouch for
+    // end to end, while slice evidence places the individual blocks of a file
+    // it can only vouch for in part — which is most of a damaged set. Seeding
+    // both is what lets an authoritative pass over a damaged job read the
+    // damaged files and nothing else.
+    //
+    // Path-keyed, because a session that finds its sources in a directory
+    // refuses the `FileId`-keyed seat; the paths carry each file's effective
+    // identity. A refusal here costs read savings and never correctness, so it
+    // is counted and stepped over rather than failing the pass.
+    for (path, evidence) in slice_evidence {
+        for slice in evidence {
+            if session.add_slice_evidence(path.clone(), slice).is_err() {
+                crate::runtime::perf_probe::record(
+                    "completion.par2_evidence.slice.rejected",
+                    std::time::Duration::from_nanos(1),
+                );
+            }
+        }
+    }
+
     let mut admitted_file_ids = Vec::new();
     for candidate in candidates {
         let evidence = match committed_evidence_from_candidate(&candidate) {
@@ -352,7 +376,7 @@ struct CleanPar2Verification {
     verification: par2_rs::VerificationResult,
     placement_plan: par2_rs::PlacementPlan,
     slice_size: u64,
-    in_stream_grid_slice_size: Option<u64>,
+    verification_mode: CleanPar2VerificationMode,
     reconcile_context: &'static str,
     retry_message: &'static str,
 }
@@ -366,6 +390,7 @@ pub(in crate::pipeline) struct Par2DeobfuscationOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::pipeline) enum CleanPar2VerificationMode {
     Grid,
+    FileCrc,
     QuickDigest,
     StrongDecode,
     Authoritative,
@@ -375,9 +400,32 @@ impl CleanPar2VerificationMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Grid => "grid",
+            Self::FileCrc => "file_crc",
             Self::QuickDigest => "quick_digest",
             Self::StrongDecode => "strong_decode",
             Self::Authoritative => "authoritative",
+        }
+    }
+}
+
+/// Which zero-read arm of the quick pass actually decided a set.
+///
+/// Ordered weakest-last, and the set is named for the weakest arm that
+/// contributed: a verdict is only as strong as the thinnest evidence any one of
+/// its files rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::pipeline) enum QuickPar2Evidence {
+    Grid,
+    FileCrc,
+    Digest,
+}
+
+impl QuickPar2Evidence {
+    fn verification_mode(self) -> CleanPar2VerificationMode {
+        match self {
+            Self::Grid => CleanPar2VerificationMode::Grid,
+            Self::FileCrc => CleanPar2VerificationMode::FileCrc,
+            Self::Digest => CleanPar2VerificationMode::QuickDigest,
         }
     }
 }
@@ -390,6 +438,101 @@ pub(in crate::pipeline) enum Par2SetSettlementReason {
     },
     Repaired,
     AbsentUnboundPayload,
+}
+
+/// Fold one description's per-slice IFSC CRC32s into a CRC32 over the whole
+/// file *as PAR2 checksums it* — every slice padded out to the full slice size,
+/// including the short final one.
+///
+/// `None` when the set carries no checksum table for this description, or when
+/// the table is shorter than the description's own slice count: a partial fold
+/// would be a CRC32 over a prefix and would be compared as though it covered
+/// the file.
+fn par2_description_padded_file_crc32(
+    par2_set: &par2_rs::Par2FileSet,
+    file_id: &par2_rs::FileId,
+    length: u64,
+    slice_size: u64,
+) -> Option<u32> {
+    if slice_size == 0 {
+        return None;
+    }
+    let slice_count = par2_set.slice_count_for_file(length) as usize;
+    if slice_count == 0 {
+        // No slices is no evidence; "the CRCs agree" would be vacuously true.
+        return None;
+    }
+    let checksums = par2_set.file_checksums(file_id)?;
+    if checksums.len() < slice_count {
+        return None;
+    }
+    let combine = par2_rs::checksum::Crc32CombineOp::new(slice_size);
+    let mut folded = checksums[0].crc32;
+    for checksum in &checksums[1..slice_count] {
+        // Every slice's IFSC CRC32 covers exactly `slice_size` bytes in the
+        // padded domain, so one operator serves the whole fold.
+        folded = combine.combine(folded, checksum.crc32);
+    }
+    Some(folded)
+}
+
+/// Carry a CRC32 measured over `length` real bytes into the padded domain the
+/// PAR2 slice checksums live in, by extending it with the zeros PAR2 pads the
+/// final slice with.
+fn pad_measured_file_crc32_to_slice_grid(
+    measured_crc32: u32,
+    length: u64,
+    slice_count: u64,
+    slice_size: u64,
+) -> u32 {
+    let padded_length = slice_count.saturating_mul(slice_size);
+    let padding = padded_length.saturating_sub(length);
+    if padding == 0 {
+        return measured_crc32;
+    }
+    par2_rs::checksum::Crc32CombineOp::new(padding).combine(
+        measured_crc32,
+        crate::pipeline::integrity::crc32_of_zeros(padding),
+    )
+}
+
+/// Descriptions of one set indexed by the pair a streamed whole-file CRC32 is
+/// looked up on: the described length, and the description's CRC32 in the
+/// padded domain PAR2's slice checksums live in.
+type PaddedFileCrcLookup = HashMap<(u64, u32), Vec<(par2_rs::FileId, String)>>;
+
+/// Every description of a set, indexed by the pair a streamed whole-file CRC32
+/// can be looked up on.
+///
+/// Length is half the key on purpose. CRC32 alone is a 32-bit binding and the
+/// arm that consumes this acts on a *unique* hit, so the cheapest available
+/// discriminator is folded into the key rather than left to chance; a candidate
+/// has to agree on both before it is even a candidate.
+fn par2_padded_file_crc_lookup(par2_set: &par2_rs::Par2FileSet) -> PaddedFileCrcLookup {
+    let mut lookup = PaddedFileCrcLookup::new();
+    for file_id in par2_set
+        .recovery_file_ids
+        .iter()
+        .chain(par2_set.non_recovery_file_ids.iter())
+    {
+        let Some(description) = par2_set.file_description(file_id) else {
+            continue;
+        };
+        let Some(folded) = par2_description_padded_file_crc32(
+            par2_set,
+            file_id,
+            description.length,
+            par2_set.slice_size,
+        ) else {
+            continue;
+        };
+        let entry = lookup.entry((description.length, folded)).or_default();
+        if entry.iter().any(|(known, _)| known == file_id) {
+            continue;
+        }
+        entry.push((*file_id, sanitize_download_filename(&description.filename)));
+    }
+    lookup
 }
 
 fn log_clean_par2_verification_source(
@@ -2034,11 +2177,15 @@ impl Pipeline {
                     return Err(error);
                 }
             };
+            // Built here rather than at session-open time so it can never
+            // outlive the block-CRC retirement above: a repairing set forgets
+            // its files' verdicts first, and this reads whatever survived that.
+            let slice_evidence = self.in_stream_slice_evidence_paths_for_set(job_id, set_id);
             let mut repair_task = tokio::task::spawn_blocking(move || {
                 if repair {
                     crate::e2e_failpoint::maybe_delay("repair.task_start");
                 }
-                run_retained_par2_session(session, candidates, repair)
+                run_retained_par2_session(session, candidates, slice_evidence, repair)
             });
             let repair_result = if repair {
                 loop {
@@ -3019,7 +3166,14 @@ impl Pipeline {
         job_id: JobId,
         par2_set: Arc<par2_rs::Par2FileSet>,
         _working_dir: std::path::PathBuf,
-    ) -> Result<Option<(par2_rs::VerificationResult, par2_rs::PlacementPlan, bool)>, String> {
+    ) -> Result<
+        Option<(
+            par2_rs::VerificationResult,
+            par2_rs::PlacementPlan,
+            QuickPar2Evidence,
+        )>,
+        String,
+    > {
         // A live direct set's source volumes are not files. This pass answers in
         // *placement* terms — it hands back a plan whose swaps and renames move
         // real paths, and a clean verdict from it skips the direct-aware pass
@@ -3056,11 +3210,17 @@ impl Pipeline {
         };
 
         let mut current_hashes_by_name = HashMap::<String, [u8; 16]>::new();
-        // Two arms decide a file: the dual-CRC grid's per-slice proof, and the
-        // persisted/runtime whole-file MD5. Neither computes a digest here —
-        // both read evidence already in hand — and an in-stream `Damaged`
-        // verdict vetoes both before either runs.
+        // Three arms decide a file, strongest first: the dual-CRC grid's
+        // per-slice proof, the streamed whole-file CRC32 against the CRC the
+        // description's own slice checksums fold to, and the persisted/runtime
+        // whole-file MD5. None of them computes anything over the payload —
+        // all three read evidence already in hand — and an in-stream `Damaged`
+        // verdict vetoes all of them before any runs.
         let mut grid_matches_by_name = HashMap::<String, (par2_rs::FileId, String)>::new();
+        let mut file_crc_matches_by_name = HashMap::<String, (par2_rs::FileId, String)>::new();
+        // Built on first use: a set whose every file the grid already covered
+        // never pays for the fold.
+        let mut padded_file_crc_lookup: Option<PaddedFileCrcLookup> = None;
         for file in state.assembly.files() {
             if !file.is_complete() {
                 continue;
@@ -3133,6 +3293,88 @@ impl Pipeline {
                 grid_matches_by_name.insert(current_filename.to_string(), grid_match);
                 continue;
             }
+            // Whole-file-CRC arm. The grid proves a file slice by slice and
+            // needs every slice; this proves the same file in one comparison
+            // and needs none of them, so it picks up exactly what the grid
+            // could not cover — a file whose articles all verified their yEnc
+            // part CRC but whose bytes never composed onto the block grid.
+            // Those files already stopped streaming an MD5, so without this
+            // they fall to the authoritative pass and are re-read whole.
+            //
+            // The streamed CRC32 is a fold of part CRCs in arrival order, so it
+            // means what it says only over a gapless, duplicate-free,
+            // in-order assembly — the same three conditions the committed
+            // evidence path requires before it will call an assembly
+            // contiguous.
+            if let Some(streamed) = runtime_checksums.get(&file_id).filter(|checksum| {
+                checksum.all_parts_crc_verified
+                    && !file.has_duplicate_segments()
+                    && file.contiguous_placements_proven()
+            }) {
+                let measured_length = file.received_bytes();
+                let slice_count = par2_set.slice_count_for_file(measured_length);
+                let lookup = padded_file_crc_lookup
+                    .get_or_insert_with(|| par2_padded_file_crc_lookup(&par2_set));
+                let padded = pad_measured_file_crc32_to_slice_grid(
+                    streamed.crc32,
+                    measured_length,
+                    u64::from(slice_count),
+                    par2_set.slice_size,
+                );
+                match lookup
+                    .get(&(measured_length, padded))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                {
+                    [] => {
+                        crate::runtime::perf_probe::record(
+                            "completion.quick_verify.skipped.file_crc_no_match",
+                            std::time::Duration::from_nanos(1),
+                        );
+                    }
+                    [(par2_file_id, correct_name)] => {
+                        // A measured digest outranks the CRC, exactly as it
+                        // outranks the grid: a trusted MD5 for this generation
+                        // that disagrees with the description this arm picked
+                        // is a stronger instrument contradicting a weaker one,
+                        // and only the authoritative pass may adjudicate that.
+                        if let Some(measured) = measured_md5
+                            && par2_set
+                                .file_description(par2_file_id)
+                                .is_some_and(|description| description.hash_full != measured)
+                        {
+                            crate::runtime::perf_probe::record(
+                                "completion.quick_verify.rejected.file_crc_contradicts_measured_md5",
+                                std::time::Duration::from_nanos(1),
+                            );
+                            return Ok(None);
+                        }
+                        crate::runtime::perf_probe::record(
+                            "completion.quick_verify.par2_match.file_crc",
+                            std::time::Duration::from_nanos(1),
+                        );
+                        file_crc_matches_by_name.insert(
+                            current_filename.to_string(),
+                            (*par2_file_id, correct_name.clone()),
+                        );
+                        continue;
+                    }
+                    _ => {
+                        // Two descriptions of the same length folding to the
+                        // same CRC32 is exactly where a 32-bit binding stops
+                        // being a proof. Neither may claim the file.
+                        crate::runtime::perf_probe::record(
+                            "completion.quick_verify.skipped.file_crc_ambiguous",
+                            std::time::Duration::from_nanos(1),
+                        );
+                    }
+                }
+            } else {
+                crate::runtime::perf_probe::record(
+                    "completion.quick_verify.skipped.file_crc_unproven_assembly",
+                    std::time::Duration::from_nanos(1),
+                );
+            }
             // `measured_md5` is generation-ordered (runtime first) and the
             // persisted side is provenance-filtered: a row without trusted
             // `md5_provenance` (legacy — possibly a PAR2 expectation
@@ -3172,6 +3414,8 @@ impl Pipeline {
 
         let mut matches = grid_matches_by_name;
         let had_grid_match = !matches.is_empty();
+        let had_file_crc_match = !file_crc_matches_by_name.is_empty();
+        matches.extend(file_crc_matches_by_name);
         let mut digest_matched_description = false;
         let mut match_counts = HashMap::<par2_rs::FileId, u32>::new();
         for (file_id, _) in matches.values() {
@@ -3188,7 +3432,16 @@ impl Pipeline {
                 digest_matched_description = true;
             }
         }
-        let in_stream_grid_only = had_grid_match && !digest_matched_description;
+        // Weakest arm that contributed. The `Digest` fallback also owns the
+        // "nothing matched at all" shape — a set with no descriptions to match
+        // — which claims no zero-read evidence and never did.
+        let evidence = if digest_matched_description || !(had_grid_match || had_file_crc_match) {
+            QuickPar2Evidence::Digest
+        } else if had_file_crc_match {
+            QuickPar2Evidence::FileCrc
+        } else {
+            QuickPar2Evidence::Grid
+        };
 
         let conflict_ids: HashSet<par2_rs::FileId> = match_counts
             .iter()
@@ -3293,7 +3546,7 @@ impl Pipeline {
                 unresolved,
                 conflicts: conflict_ids.into_iter().collect(),
             },
-            in_stream_grid_only,
+            evidence,
         )))
     }
 
@@ -3310,7 +3563,14 @@ impl Pipeline {
         job_id: JobId,
         par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
-    ) -> Result<Option<(par2_rs::VerificationResult, par2_rs::PlacementPlan, bool)>, String> {
+    ) -> Result<
+        Option<(
+            par2_rs::VerificationResult,
+            par2_rs::PlacementPlan,
+            QuickPar2Evidence,
+        )>,
+        String,
+    > {
         self.quick_verify_par2_with_placement(job_id, par2_set, working_dir)
             .await
     }
@@ -3334,7 +3594,7 @@ impl Pipeline {
             verification,
             placement_plan,
             slice_size,
-            in_stream_grid_slice_size,
+            verification_mode,
             reconcile_context,
             retry_message,
         } = outcome;
@@ -3377,11 +3637,6 @@ impl Pipeline {
             return;
         }
 
-        let verification_mode = if in_stream_grid_slice_size.is_some() {
-            CleanPar2VerificationMode::Grid
-        } else {
-            CleanPar2VerificationMode::QuickDigest
-        };
         let settled = self
             .settle_par2_set(
                 job_id,
@@ -3393,7 +3648,7 @@ impl Pipeline {
             )
             .await;
         if settled == SetGateOutcome::Settled
-            && let Some(slice_size) = in_stream_grid_slice_size
+            && verification_mode == CleanPar2VerificationMode::Grid
         {
             info!(
                 job_id = job_id.0,
@@ -6156,7 +6411,7 @@ impl Pipeline {
                     )
                     .await
                 {
-                    Ok(Some((verification, placement_plan, in_stream_grid_only))) => {
+                    Ok(Some((verification, placement_plan, evidence))) => {
                         info!(
                             job_id = job_id.0,
                             "quick PAR2 verification passed for clean exhausted job"
@@ -6169,8 +6424,7 @@ impl Pipeline {
                                 verification,
                                 placement_plan,
                                 slice_size: par2_set.slice_size,
-                                in_stream_grid_slice_size: in_stream_grid_only
-                                    .then_some(par2_set.slice_size),
+                                verification_mode: evidence.verification_mode(),
                                 reconcile_context: "clean PAR2 quick verification",
                                 retry_message:
                                     "cleared failed extractions after quick verify — retrying",
@@ -6574,6 +6828,24 @@ impl Pipeline {
                         return;
                     }
 
+                    // What the authoritative analysis of a damaged job actually
+                    // read. Evidence seeding is supposed to make this the size
+                    // of the damaged files rather than the size of the job, and
+                    // this is the only number that says whether it does.
+                    //
+                    // It is also the number that decides whether intra-file
+                    // slice skipping is ever worth building: while a damaged
+                    // file is read whole, the floor is its length, and only a
+                    // figure that stays far above the damaged bytes would
+                    // justify going finer than per-file.
+                    let authoritative_bytes_read = repair_analysis.scan.bytes_scanned;
+                    crate::runtime::perf_probe::record_value(
+                        "par2.authoritative.bytes_read",
+                        authoritative_bytes_read,
+                    );
+                    #[cfg(test)]
+                    self.par2_authoritative_bytes_read
+                        .push(authoritative_bytes_read);
                     info!(
                         job_id = job_id.0,
                         damaged,
@@ -6583,6 +6855,7 @@ impl Pipeline {
                         files_renamed = repair_analysis.files_renamed,
                         files_damaged = repair_analysis.files_damaged,
                         files_missing = repair_analysis.files_missing,
+                        authoritative_bytes_read,
                         "PAR2 analysis — repair required"
                     );
 
@@ -7467,6 +7740,7 @@ mod tests {
     #[test]
     fn clean_par2_verification_mode_labels_are_stable() {
         assert_eq!(CleanPar2VerificationMode::Grid.as_str(), "grid");
+        assert_eq!(CleanPar2VerificationMode::FileCrc.as_str(), "file_crc");
         assert_eq!(
             CleanPar2VerificationMode::QuickDigest.as_str(),
             "quick_digest"

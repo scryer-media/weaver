@@ -33,16 +33,24 @@ fn par2_prefix_set_ids(prefix: &[u8]) -> Vec<par2_rs::RecoverySetId> {
     set_ids
 }
 
+/// Whether the retained repair session is in play, from the raw env value.
+///
+/// On by default, and the default is what makes evidence reachable at all: the
+/// one-shot repairer has no seat for evidence in the crate's published API, so
+/// a job that routes there re-reads every described file no matter how much the
+/// in-stream grid already proved. Only the retained session can be seeded, so
+/// only the retained session can make a damaged job read its damaged files and
+/// nothing else. The variable remains as an off switch.
 fn parse_stateful_par2_session_enabled(raw: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         raw.map(str::trim),
-        Some("1")
-            | Some("true")
-            | Some("TRUE")
-            | Some("yes")
-            | Some("YES")
-            | Some("on")
-            | Some("ON")
+        Some("0")
+            | Some("false")
+            | Some("FALSE")
+            | Some("no")
+            | Some("NO")
+            | Some("off")
+            | Some("OFF")
     )
 }
 
@@ -1268,6 +1276,62 @@ impl Pipeline {
         job_id: JobId,
         set_id: par2_rs::RecoverySetId,
     ) -> Vec<par2_rs::SliceEvidence> {
+        self.in_stream_slice_evidence_by_file(job_id, set_id)
+            .into_iter()
+            .flat_map(|(_, evidence)| evidence)
+            .collect()
+    }
+
+    /// [`Self::in_stream_slice_evidence_for_set`] keyed by the path each file
+    /// actually occupies, for a session that finds its sources in the directory
+    /// rather than through a handle.
+    ///
+    /// A path-backed session refuses the `FileId`-keyed seat outright, so the
+    /// conventional pass has to name a path — and the only path that names the
+    /// bytes is the file's *effective* identity. A file the deobfuscation or
+    /// reconciliation passes renamed is seeded under the name it now carries,
+    /// because that is the name the session will open; seeding the NZB's
+    /// original name would attach every verdict to a path that no longer
+    /// exists, and the file would be read in full after all.
+    pub(crate) fn in_stream_slice_evidence_paths_for_set(
+        &self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) -> Vec<(std::path::PathBuf, Vec<par2_rs::SliceEvidence>)> {
+        let Some(working_dir) = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.working_dir.clone())
+        else {
+            return Vec::new();
+        };
+        self.in_stream_slice_evidence_by_file(job_id, set_id)
+            .into_iter()
+            .filter_map(|(file_id, evidence)| {
+                if evidence.is_empty() {
+                    return None;
+                }
+                let current_filename = self
+                    .effective_file_identity(job_id, file_id)
+                    .map(|identity| identity.current_filename)
+                    .or_else(|| {
+                        self.jobs
+                            .get(&job_id)?
+                            .assembly
+                            .file(file_id)
+                            .map(|file| file.filename().to_string())
+                    })?;
+                Some((working_dir.join(current_filename), evidence))
+            })
+            .collect()
+    }
+
+    /// The per-file grouping both evidence shapes are built from.
+    fn in_stream_slice_evidence_by_file(
+        &self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) -> Vec<(NzbFileId, Vec<par2_rs::SliceEvidence>)> {
         let Some(set) = self.par2_set_for(job_id, set_id) else {
             return Vec::new();
         };
@@ -1295,13 +1359,16 @@ impl Pipeline {
             else {
                 continue;
             };
-            evidence.extend(crate::pipeline::integrity::slice_evidence_from_verdicts(
+            let file_evidence = crate::pipeline::integrity::slice_evidence_from_verdicts(
                 recovery_set_id,
                 binding.par2_file_id,
                 length,
                 slice_size,
                 &verdicts,
-            ));
+            );
+            if !file_evidence.is_empty() {
+                evidence.push((file_id, file_evidence));
+            }
         }
         evidence
     }
@@ -1381,6 +1448,12 @@ impl Pipeline {
             options.memory_limit = Some(memory_limit);
             options.cancel = Some(cancellation);
             options.progress = progress;
+            // The in-stream grid seeds this session with per-slice verdicts, so
+            // the analysis need not re-read what those verdicts already account
+            // for. Every seeded verdict is admitted only on dual-alignment
+            // evidence, and the crate re-stats each path before honouring a
+            // skip, so a file that moved under us is read in full instead.
+            options.trust_seeded_evidence_for_scan = true;
             par2_rs::Par2RepairSession::open(options)
                 .map_err(|error| format!("failed to open retained PAR2 session: {error}"))
         })
@@ -1421,7 +1494,11 @@ impl Pipeline {
 
     /// The retained session owns a snapshot of the validated set. Packet
     /// arrivals update that set first, then make the snapshot stale.
-    fn evict_par2_repair_session(&mut self, job_id: JobId, set_id: par2_rs::RecoverySetId) {
+    pub(in crate::pipeline) fn evict_par2_repair_session(
+        &mut self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) {
         let Some(set_runtime) = self
             .par2_runtime
             .get_mut(&job_id)

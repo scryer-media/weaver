@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::pipeline::completion::finalize::check::{
-    CleanPar2VerificationMode, Par2SetSettlementReason,
+    CleanPar2VerificationMode, Par2SetSettlementReason, QuickPar2Evidence,
 };
 
 #[tokio::test]
@@ -718,14 +718,15 @@ async fn metadata_early_clean_download_quick_completes_from_the_dual_crc_grid_al
     let hidden_path = working_dir.join("payload-hidden-during-quick-verify");
     std::fs::rename(&payload_path, &hidden_path).unwrap();
     let par2_set = pipeline.par2_set(job_id).cloned().unwrap();
-    let (_, _, in_stream_grid_only) = pipeline
+    let (_, _, evidence) = pipeline
         .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
         .await
         .unwrap()
         .unwrap();
     std::fs::rename(hidden_path, payload_path).unwrap();
-    assert!(
-        in_stream_grid_only,
+    assert_eq!(
+        evidence,
+        QuickPar2Evidence::Grid,
         "grid-only quick verification must succeed while the payload path is unreadable"
     );
 
@@ -6242,7 +6243,7 @@ async fn an_unrelated_grid_only_file_does_not_veto_a_digest_proven_set() {
     );
 
     let par2_set = Arc::clone(pipeline.par2_set(job_id).expect("served recovery set"));
-    let (verification, plan, in_stream_grid_only) = pipeline
+    let (verification, plan, evidence) = pipeline
         .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
         .await
         .expect("quick verify does not error")
@@ -6251,7 +6252,7 @@ async fn an_unrelated_grid_only_file_does_not_veto_a_digest_proven_set() {
     assert_eq!(verification.files.len(), 1);
     assert_eq!(plan.exact.len(), 1);
     assert!(plan.unresolved.is_empty());
-    assert!(!in_stream_grid_only);
+    assert_ne!(evidence, QuickPar2Evidence::Grid);
 }
 
 /// The same swapped pair, now carrying the trusted whole-file MD5 that a
@@ -6282,7 +6283,7 @@ async fn a_misplaced_pair_proven_by_measured_digests_returns_a_swap_plan() {
     set_measured_md5(&mut pipeline, job_id, 0, &b);
     set_measured_md5(&mut pipeline, job_id, 1, &a);
 
-    let (verification, plan, in_stream_grid_only) = pipeline
+    let (verification, plan, evidence) = pipeline
         .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
         .await
         .expect("quick verify does not error")
@@ -6294,8 +6295,9 @@ async fn a_misplaced_pair_proven_by_measured_digests_returns_a_swap_plan() {
     assert!(plan.unresolved.is_empty());
     assert!(plan.conflicts.is_empty());
     assert_eq!(verification.files.len(), 2);
-    assert!(
-        !in_stream_grid_only,
+    assert_ne!(
+        evidence,
+        QuickPar2Evidence::Grid,
         "measured digests must not claim the in-stream-grid-only settlement marker"
     );
     let (left, right) = &plan.swaps[0];
@@ -12369,5 +12371,726 @@ async fn a_second_index_still_on_the_wire_is_not_an_ignorable_residual() {
         !pipeline.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id),
         "a job whose second index is still downloading has not run out of \
          recovery sets to serve, so it must not take the finalization shortcut"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The whole-file-CRC quick-verification arm.
+// ---------------------------------------------------------------------------
+
+/// [`placement_par2_file_set`] with the per-slice IFSC CRC32s the whole-file-CRC
+/// arm folds. The base helper ships none, which is the shape that proves the arm
+/// refuses rather than guesses when the table is absent.
+fn placement_par2_file_set_with_slice_checksums(files: &[(String, Vec<u8>)]) -> Par2FileSet {
+    let mut set = placement_par2_file_set(files);
+    let slice_size = set.slice_size;
+    let file_ids = set.recovery_file_ids.clone();
+    for (file_id, (_, bytes)) in file_ids.iter().zip(files.iter()) {
+        let mut checksums = Vec::new();
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let end = (offset + slice_size as usize).min(bytes.len());
+            let slice = &bytes[offset..end];
+            let mut state = par2_rs::SliceChecksumState::new();
+            state.update(slice);
+            let (crc32, md5) =
+                state.finalize(((slice.len() as u64) < slice_size).then_some(slice_size));
+            checksums.push(par2_rs::SliceChecksum { crc32, md5 });
+            offset = end;
+        }
+        set.slice_checksums.insert(*file_id, checksums);
+    }
+    set
+}
+
+/// The streamed state a metadata-early download leaves behind: the folded
+/// whole-file CRC32, whether every article's declared yEnc part CRC verified,
+/// and whatever digest that generation carries — usually none at all.
+fn set_streamed_file_crc(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    file_index: u32,
+    crc32: u32,
+    all_parts_crc_verified: bool,
+    md5: Option<[u8; 16]>,
+) {
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .completed_checksums
+        .insert(
+            NzbFileId { job_id, file_index },
+            crate::pipeline::CompletedFileChecksum {
+                md5,
+                crc32,
+                all_parts_crc_verified,
+            },
+        );
+}
+
+/// Stage a job whose files sit at their described names, served by a set that
+/// carries slice checksums.
+async fn stage_file_crc_shape(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    job_name: &str,
+    described: &[(&str, Vec<u8>)],
+    on_disk: &[Vec<u8>],
+) -> (PathBuf, Arc<Par2FileSet>) {
+    assert_eq!(described.len(), on_disk.len());
+    let files: Vec<(String, u32)> = described
+        .iter()
+        .zip(on_disk.iter())
+        .map(|((name, _), disk)| ((*name).to_string(), disk.len() as u32))
+        .collect();
+    let spec = standalone_job_spec(job_name, &files);
+    let working_dir = insert_active_job(pipeline, job_id, spec).await;
+    for (index, ((name, _), disk)) in described.iter().zip(on_disk.iter()).enumerate() {
+        write_and_complete_file(pipeline, job_id, index as u32, name, disk).await;
+    }
+    let described_pairs: Vec<(String, Vec<u8>)> = described
+        .iter()
+        .map(|(name, canonical)| ((*name).to_string(), canonical.clone()))
+        .collect();
+    install_test_par2_runtime(
+        pipeline,
+        job_id,
+        placement_par2_file_set_with_slice_checksums(&described_pairs),
+        &[],
+    );
+    let par2_set = Arc::clone(pipeline.par2_set(job_id).expect("served recovery set"));
+    (working_dir, par2_set)
+}
+
+/// The arm's whole point: a file the grid never covered, carrying no MD5, is
+/// proved against the description's own slice CRC32s without a byte being read.
+///
+/// The payloads are moved off their paths for the duration of the pass, so a
+/// verdict that needed to read them could not have been reached at all.
+#[tokio::test]
+async fn a_clean_file_settles_from_its_streamed_whole_file_crc_without_reading_it() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30930);
+    let a = misplacement_payload(11);
+    let b = misplacement_payload(12);
+    let (working_dir, par2_set) = stage_file_crc_shape(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon File CRC Clean",
+        &[
+            ("silver-horizon-a.bin", a.clone()),
+            ("silver-horizon-b.bin", b.clone()),
+        ],
+        &[a.clone(), b.clone()],
+    )
+    .await;
+    set_streamed_file_crc(
+        &mut pipeline,
+        job_id,
+        0,
+        par2_rs::checksum::crc32(&a),
+        true,
+        None,
+    );
+    set_streamed_file_crc(
+        &mut pipeline,
+        job_id,
+        1,
+        par2_rs::checksum::crc32(&b),
+        true,
+        None,
+    );
+
+    // Neither file has a grid verdict, so the arm above this one cannot answer.
+    for file_index in 0..2 {
+        assert!(
+            pipeline
+                .block_crc_verdicts(NzbFileId { job_id, file_index })
+                .is_none(),
+            "precondition: the grid must not cover these files"
+        );
+    }
+
+    let hidden_a = working_dir.join("hidden-a");
+    let hidden_b = working_dir.join("hidden-b");
+    std::fs::rename(working_dir.join("silver-horizon-a.bin"), &hidden_a).unwrap();
+    std::fs::rename(working_dir.join("silver-horizon-b.bin"), &hidden_b).unwrap();
+    let outcome = pipeline
+        .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir.clone())
+        .await
+        .expect("quick verify does not error");
+    std::fs::rename(&hidden_a, working_dir.join("silver-horizon-a.bin")).unwrap();
+    std::fs::rename(&hidden_b, working_dir.join("silver-horizon-b.bin")).unwrap();
+
+    let (verification, plan, evidence) =
+        outcome.expect("the streamed whole-file CRC32s prove both described files");
+    assert_eq!(verification.files.len(), 2);
+    assert_eq!(plan.exact.len(), 2);
+    assert!(plan.unresolved.is_empty());
+    assert!(plan.conflicts.is_empty());
+    assert_eq!(
+        evidence,
+        QuickPar2Evidence::FileCrc,
+        "the whole-file CRC arm, not the grid and not a digest, decided this set"
+    );
+}
+
+/// A trusted digest is the stronger instrument. When it contradicts the
+/// description the CRC arm binds, nothing here may settle the set.
+#[tokio::test]
+async fn a_streamed_file_crc_that_contradicts_a_measured_digest_falls_to_the_authoritative_pass() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30931);
+    let a = misplacement_payload(13);
+    let b = misplacement_payload(14);
+    let (working_dir, par2_set) = stage_file_crc_shape(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon File CRC MD5 Conflict",
+        &[
+            ("silver-horizon-a.bin", a.clone()),
+            ("silver-horizon-b.bin", b.clone()),
+        ],
+        &[a.clone(), b.clone()],
+    )
+    .await;
+    // The CRC binds file 0 to its own description; the digest of the same
+    // generation says the bytes are something no description carries.
+    set_streamed_file_crc(
+        &mut pipeline,
+        job_id,
+        0,
+        par2_rs::checksum::crc32(&a),
+        true,
+        Some(par2_rs::checksum::md5(b"a digest no description carries")),
+    );
+    set_streamed_file_crc(
+        &mut pipeline,
+        job_id,
+        1,
+        par2_rs::checksum::crc32(&b),
+        true,
+        None,
+    );
+
+    assert!(
+        pipeline
+            .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
+            .await
+            .expect("quick verify does not error")
+            .is_none(),
+        "a measured digest contradicting the CRC binding sends the set to the \
+         authoritative pass"
+    );
+}
+
+/// The length gate. A file whose decoded length is not the described length is
+/// never a candidate, wherever its CRC32 might land.
+#[tokio::test]
+async fn a_streamed_file_crc_at_the_wrong_length_never_binds_a_description() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30932);
+    let a = misplacement_payload(15);
+    let b = misplacement_payload(16);
+    let truncated = a[..a.len() - 8].to_vec();
+    let (working_dir, par2_set) = stage_file_crc_shape(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon File CRC Short",
+        &[
+            ("silver-horizon-a.bin", a.clone()),
+            ("silver-horizon-b.bin", b.clone()),
+        ],
+        &[truncated.clone(), b.clone()],
+    )
+    .await;
+    set_streamed_file_crc(
+        &mut pipeline,
+        job_id,
+        0,
+        par2_rs::checksum::crc32(&truncated),
+        true,
+        None,
+    );
+    set_streamed_file_crc(
+        &mut pipeline,
+        job_id,
+        1,
+        par2_rs::checksum::crc32(&b),
+        true,
+        None,
+    );
+
+    assert!(
+        pipeline
+            .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
+            .await
+            .expect("quick verify does not error")
+            .is_none(),
+        "the short file matches no description's length, so it stays unresolved"
+    );
+}
+
+/// The in-stream `Damaged` veto runs before every arm, this one included.
+#[tokio::test]
+async fn a_damaged_in_stream_verdict_vetoes_the_whole_file_crc_arm() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30933);
+    let expected = misplacement_payload(17);
+    let mut actual = expected.clone();
+    actual[3] ^= 0xFF;
+    let (working_dir, par2_set) = stage_file_crc_shape(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon File CRC Damaged Veto",
+        &[("silver-horizon-a.bin", expected.clone())],
+        &[actual.clone()],
+    )
+    .await;
+
+    // The grid saw the real bytes and contradicted the recovery set.
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let wire_crc = par2_rs::checksum::crc32(&actual);
+    pipeline.note_block_crc_segments(
+        file_id,
+        0,
+        actual.len() as u64,
+        wire_crc,
+        true,
+        false,
+        &[weaver_yenc::Segment {
+            file_offset: 0,
+            len: actual.len() as u64,
+            crc32: wire_crc,
+        }],
+    );
+    assert!(
+        pipeline
+            .block_crc_verdicts(file_id)
+            .is_some_and(|verdicts| {
+                verdicts.values().any(|verdict| {
+                    matches!(verdict, crate::pipeline::integrity::BlockVerdict::Damaged)
+                })
+            }),
+        "precondition: the grid must call this file Damaged"
+    );
+    // A CRC that would otherwise bind the description outright.
+    set_streamed_file_crc(
+        &mut pipeline,
+        job_id,
+        0,
+        par2_rs::checksum::crc32(&expected),
+        true,
+        None,
+    );
+
+    assert!(
+        pipeline
+            .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
+            .await
+            .expect("quick verify does not error")
+            .is_none(),
+        "a Damaged verdict vetoes the whole-file CRC arm exactly as it vetoes \
+         the grid and the digest"
+    );
+}
+
+/// The streamed CRC32 is a fold of part CRCs. An article that never verified its
+/// declared part CRC leaves that fold unattested, and the arm refuses it.
+#[tokio::test]
+async fn a_file_with_an_unverified_part_crc_does_not_take_the_whole_file_crc_arm() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30934);
+    let a = misplacement_payload(18);
+
+    // One fixture, one flag apart, so the refusal is pinned to the flag and not
+    // to anything else about the shape.
+    let (working_dir, par2_set) = stage_file_crc_shape(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon File CRC Unverified Part",
+        &[("silver-horizon-a.bin", a.clone())],
+        std::slice::from_ref(&a),
+    )
+    .await;
+    set_streamed_file_crc(
+        &mut pipeline,
+        job_id,
+        0,
+        par2_rs::checksum::crc32(&a),
+        false,
+        None,
+    );
+    assert!(
+        pipeline
+            .quick_verify_par2_with_placement_for_test(
+                job_id,
+                Arc::clone(&par2_set),
+                working_dir.clone()
+            )
+            .await
+            .expect("quick verify does not error")
+            .is_none(),
+        "an unverified part CRC leaves the streamed fold unattested"
+    );
+
+    set_streamed_file_crc(
+        &mut pipeline,
+        job_id,
+        0,
+        par2_rs::checksum::crc32(&a),
+        true,
+        None,
+    );
+    let (_, _, evidence) = pipeline
+        .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
+        .await
+        .expect("quick verify does not error")
+        .expect("the same fixture settles once every part CRC verified");
+    assert_eq!(evidence, QuickPar2Evidence::FileCrc);
+}
+
+/// The whole arm, driven by the production decode path rather than a hand-set
+/// checksum — and the shape that shows why there is nothing left for the MD5
+/// substitution to retire.
+///
+/// The first article lands before the recovery set is served, so it streams an
+/// MD5 and closes nothing on the block grid. The second lands after, so the
+/// substitution retires the hash — discarding the half-built digest — and the
+/// grid closes only the block that article covers. What survives is exactly the
+/// arm's input: no digest of any generation, a folded whole-file CRC32, every
+/// part CRC verified, and a grid that covers one of the two slices. Before the
+/// arm this set had no evidence at all and re-read every byte it had just
+/// written.
+#[tokio::test]
+async fn a_partly_gridded_file_that_streamed_no_md5_settles_from_its_whole_file_crc() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30935);
+    let filename = "silver.horizon.mkv";
+    let slice_size = 64u64;
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let spec =
+        two_segment_standalone_job_spec("Silver Horizon Late Set File CRC", filename, 64, 64);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    // Article one, before the set is served: nothing to bind to, so the hash is
+    // streamed and no block closes.
+    submit_decoded_segment(&mut pipeline, file_id, 0, 0, &payload[..64], filename, None).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(filename, &payload, slice_size, 0),
+        &[],
+    );
+    // Article two, after: the substitution retires the hash and the grid closes
+    // the one block this article covers.
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        1,
+        64,
+        &payload[64..],
+        filename,
+        None,
+    )
+    .await;
+
+    let checksum = pipeline
+        .par2_runtime(job_id)
+        .and_then(|runtime| runtime.completed_checksums.get(&file_id))
+        .copied()
+        .expect("the completed file records a checksum");
+    assert!(
+        checksum.md5.is_none(),
+        "the substitution retired the hash mid-file, so no digest survives"
+    );
+    assert!(checksum.all_parts_crc_verified);
+    assert_eq!(checksum.crc32, par2_rs::checksum::crc32(&payload));
+
+    let par2_set = Arc::clone(pipeline.par2_set(job_id).expect("served recovery set"));
+    assert!(
+        pipeline
+            .in_stream_verified_par2_match(file_id, &par2_set)
+            .is_none(),
+        "precondition: the grid must not cover every slice, or the arm above \
+         this one would answer"
+    );
+
+    let (_, plan, evidence) = pipeline
+        .quick_verify_par2_with_placement_for_test(job_id, par2_set, working_dir)
+        .await
+        .expect("quick verify does not error")
+        .expect("the streamed whole-file CRC32 proves the described file");
+    assert_eq!(plan.exact.len(), 1);
+    assert!(plan.unresolved.is_empty());
+    assert_eq!(evidence, QuickPar2Evidence::FileCrc);
+}
+
+// ---------------------------------------------------------------------------
+// Evidence seeding on the authoritative pass.
+// ---------------------------------------------------------------------------
+
+const SEEDED_SLICE_SIZE: u64 = 64;
+const SEEDED_FILE_SLICES: usize = 4;
+const SEEDED_INTACT: &str = "silver.horizon.e01.mkv";
+const SEEDED_DAMAGED: &str = "silver.horizon.e02.mkv";
+
+/// A two-payload job whose second file is damaged on disk, with a real PAR2
+/// index beside them.
+///
+/// The first file is intact and — when `cover_intact_with_grid` — carries an
+/// in-stream verdict for every one of its slices, which is the evidence the
+/// authoritative pass is supposed to be able to act on. Neither file carries a
+/// completed-file checksum, so no *committed* evidence can be built for either:
+/// whatever the analysis manages to skip, it skipped on slice evidence alone.
+async fn install_seeded_evidence_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    job_name: &str,
+    cover_intact_with_grid: bool,
+) -> (PathBuf, Vec<u8>, Vec<u8>) {
+    let slice_bytes = SEEDED_SLICE_SIZE as usize;
+    let width = SEEDED_FILE_SLICES * slice_bytes;
+    let intact: Vec<u8> = (0..width as u32).map(|value| (value % 251) as u8).collect();
+    let other: Vec<u8> = (0..width as u32)
+        .map(|value| ((value * 7 + 3) % 251) as u8)
+        .collect();
+    let mut damaged_on_disk = other.clone();
+    damaged_on_disk[..slice_bytes].fill(0);
+
+    let index_filename = "silver.horizon.par2";
+    let par2_bytes = build_test_par2_index_for_files(
+        &[(SEEDED_INTACT, &intact), (SEEDED_DAMAGED, &other)],
+        SEEDED_SLICE_SIZE,
+    );
+    let spec = standalone_job_spec(
+        job_name,
+        &[
+            (SEEDED_INTACT.to_string(), intact.len() as u32),
+            (SEEDED_DAMAGED.to_string(), other.len() as u32),
+            (index_filename.to_string(), par2_bytes.len() as u32),
+        ],
+    );
+    let working_dir = insert_active_job(pipeline, job_id, spec).await;
+    write_and_complete_file(pipeline, job_id, 0, SEEDED_INTACT, &intact).await;
+    write_and_complete_file(pipeline, job_id, 1, SEEDED_DAMAGED, &damaged_on_disk).await;
+    write_and_complete_file(pipeline, job_id, 2, index_filename, &par2_bytes).await;
+
+    install_test_par2_runtime(
+        pipeline,
+        job_id,
+        build_repairable_par2_set_for_files(
+            &[(SEEDED_INTACT, &intact), (SEEDED_DAMAGED, &other)],
+            SEEDED_SLICE_SIZE,
+            0,
+        ),
+        &[(2, index_filename, 0, false)],
+    );
+
+    if cover_intact_with_grid {
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        for slice_index in 0..SEEDED_FILE_SLICES {
+            let start = slice_index * slice_bytes;
+            let block = &intact[start..start + slice_bytes];
+            let block_crc = par2_rs::checksum::crc32(block);
+            pipeline.note_block_crc_segments(
+                file_id,
+                start as u64,
+                slice_bytes as u64,
+                block_crc,
+                true,
+                false,
+                &[weaver_yenc::Segment {
+                    file_offset: start as u64,
+                    len: slice_bytes as u64,
+                    crc32: block_crc,
+                }],
+            );
+        }
+    }
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+    }
+    (working_dir, intact, other)
+}
+
+/// Bytes the whole set would cost to read, so a bound can be stated in terms of
+/// the fixture rather than a magic number.
+fn seeded_evidence_total_payload_bytes(intact: &[u8], other: &[u8]) -> u64 {
+    (intact.len() + other.len()) as u64
+}
+
+/// F2a, on the path a conventional job actually takes. The intact file's
+/// in-stream verdicts place its slices, so the analysis reads the damaged file
+/// and stops there.
+#[tokio::test]
+async fn a_damaged_job_reads_only_its_damaged_file_when_the_grid_seeded_evidence() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30940);
+    // No forcing: this is the shipped default, and the point of the test is
+    // that the default is the arm evidence can reach.
+    assert!(
+        pipeline.stateful_par2_session_forced.is_none(),
+        "the default gate is what this test measures"
+    );
+    let (_, intact, other) = install_seeded_evidence_job(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon Seeded Evidence",
+        true,
+    )
+    .await;
+
+    pipeline.check_job_completion(job_id).await;
+
+    let read = *pipeline
+        .par2_authoritative_bytes_read
+        .first()
+        .expect("the damaged job ran an authoritative analysis");
+    assert!(
+        read < seeded_evidence_total_payload_bytes(&intact, &other),
+        "the seeded intact file must not be read: {read} bytes covers the whole set"
+    );
+    assert_eq!(
+        read,
+        other.len() as u64,
+        "the analysis reads the damaged file whole and nothing else"
+    );
+}
+
+/// The same job with the retained session switched off falls to the one-shot
+/// repairer, which has no seat for evidence in the crate's published API — so it
+/// reads both files. This is the control that pins the saving above to the
+/// seeding rather than to anything else about the fixture.
+#[tokio::test]
+async fn the_one_shot_repairer_reads_every_file_because_it_has_no_seat_for_evidence() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.stateful_par2_session_forced = Some(false);
+    let job_id = JobId(30941);
+    let (_, intact, other) = install_seeded_evidence_job(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon One Shot Control",
+        true,
+    )
+    .await;
+
+    pipeline.check_job_completion(job_id).await;
+
+    let read = *pipeline
+        .par2_authoritative_bytes_read
+        .first()
+        .expect("the damaged job ran an authoritative analysis");
+    assert_eq!(
+        read,
+        seeded_evidence_total_payload_bytes(&intact, &other),
+        "the one-shot repairer reads every described file, evidence or not"
+    );
+}
+
+/// A job the grid never covered is unchanged: every described file is read, and
+/// the verdict is reached the way it always was.
+#[tokio::test]
+async fn a_damaged_job_with_no_in_stream_evidence_still_reads_and_verifies_every_file() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30942);
+    let (_, intact, other) =
+        install_seeded_evidence_job(&mut pipeline, job_id, "Silver Horizon No Evidence", false)
+            .await;
+
+    pipeline.check_job_completion(job_id).await;
+
+    let read = *pipeline
+        .par2_authoritative_bytes_read
+        .first()
+        .expect("the damaged job ran an authoritative analysis");
+    assert_eq!(
+        read,
+        seeded_evidence_total_payload_bytes(&intact, &other),
+        "with nothing seeded the analysis reads the whole set, as before"
+    );
+}
+
+/// A path-backed session refuses `FileId`-keyed evidence, so the conventional
+/// pass names a path — and it has to be the name the file now carries, not the
+/// one the NZB gave it.
+#[tokio::test]
+async fn slice_evidence_is_keyed_to_the_name_a_renamed_file_now_carries() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30943);
+    let (working_dir, _, _) = install_seeded_evidence_job(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon Renamed Evidence",
+        true,
+    )
+    .await;
+    let set_id = pipeline.par2_served_set_id(job_id).expect("a served set");
+
+    let under_source_name = pipeline.in_stream_slice_evidence_paths_for_set(job_id, set_id);
+    assert!(
+        under_source_name.iter().any(
+            |(path, evidence)| path == &working_dir.join(SEEDED_INTACT) && !evidence.is_empty()
+        ),
+        "the covered file seeds evidence under the name it currently carries"
+    );
+
+    // Reconciliation moves the file to the name the description gives it.
+    let reconciled = "silver.horizon.e01.reconciled.mkv";
+    std::fs::rename(
+        working_dir.join(SEEDED_INTACT),
+        working_dir.join(reconciled),
+    )
+    .unwrap();
+    pipeline
+        .set_file_identity(
+            job_id,
+            crate::jobs::record::ActiveFileIdentity {
+                file_index: 0,
+                source_filename: SEEDED_INTACT.to_string(),
+                current_filename: reconciled.to_string(),
+                canonical_filename: Some(reconciled.to_string()),
+                classification: None,
+                classification_source: crate::jobs::record::FileIdentitySource::Par2,
+            },
+        )
+        .unwrap();
+
+    let under_current_name = pipeline.in_stream_slice_evidence_paths_for_set(job_id, set_id);
+    let seeded_paths: Vec<_> = under_current_name
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect();
+    assert!(
+        seeded_paths.contains(&working_dir.join(reconciled)),
+        "evidence must follow the file to its effective identity, got {seeded_paths:?}"
+    );
+    assert!(
+        !seeded_paths.contains(&working_dir.join(SEEDED_INTACT)),
+        "the vacated source name must not be seeded, got {seeded_paths:?}"
     );
 }

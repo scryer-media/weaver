@@ -212,6 +212,8 @@ impl Pipeline {
             #[cfg(test)]
             par2_repairer_analyze_calls: 0,
             #[cfg(test)]
+            par2_authoritative_bytes_read: Vec::new(),
+            #[cfg(test)]
             par2_repairer_execute_calls: 0,
             #[cfg(test)]
             stateful_par2_session_forced: None,
