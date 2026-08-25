@@ -306,6 +306,7 @@ jobs:
 
   rust-test-regular:
     name: rust-test-regular
+    if: ${{ always() && needs.rust-test-build.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [rust-test-build]
@@ -1553,7 +1554,21 @@ jobs:
 
   docker-publish-pr-rc:
     name: docker-publish-pr-rc
-    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        needs.rust-fmt.result == 'success' &&
+        needs.rust-clippy.result == 'success' &&
+        needs.rust-audit.result == 'success' &&
+        needs.rust-test-regular.result == 'success' &&
+        needs.rust-test-arm.result == 'success' &&
+        needs.rust-test-sde.result == 'success' &&
+        needs.rust-yenc-simd-targets.result == 'success' &&
+        needs.rust-package-linux-x86_64-portable.result == 'success' &&
+        needs.rust-package-linux-arm64-portable.result == 'success'
+      }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs:
