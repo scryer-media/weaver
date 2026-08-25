@@ -15,6 +15,7 @@ package weaver
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
@@ -26,6 +27,7 @@ import (
 	"net/http/cookiejar"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -2388,15 +2390,22 @@ func seedAllForProfile(profile string) {
 		emitProgressEvent(progressEvent{Kind: "seed_done", Current: len(dirs), Total: len(dirs), Status: "fail"})
 		log.Fatalf("apply primary-only fixture mutations after seed-all: %v", err)
 	}
-	if nntpSeedImageCacheEnabled() {
-		if err := captureSeedImageCache(seedImages, slugs); err != nil {
+	emitProgressEvent(progressEvent{Kind: "seed_done", Current: len(dirs), Total: len(dirs), Status: "pass"})
+	if nntpSeedImageCaptureEnabled() {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := captureSeedImageCache(ctx, seedImages, slugs, nntpSeedCacheCaptureConfig{
+			Project:   composeProject(),
+			StageRoot: os.TempDir(),
+			LockRoot:  os.TempDir(),
+			OwnerPID:  os.Getpid(),
+		}); err != nil {
 			// The completed seed remains valid for this phase. The image cache is
 			// a local acceleration layer, so a disk or Docker image-build problem
 			// must not turn a correctly seeded E2E phase into a false failure.
 			log.Printf("warning: pre-seed NNTP image cache unavailable for profile=%s: %v", profile, err)
 		}
 	}
-	emitProgressEvent(progressEvent{Kind: "seed_done", Current: len(dirs), Total: len(dirs), Status: "pass"})
 }
 
 func cmdSeedAll() {

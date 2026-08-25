@@ -227,6 +227,7 @@ type fullDashboard struct {
 	title       string
 	start       time.Time
 	seed        dashboardBar
+	cache       dashboardBar
 	phases      map[string]*dashboardBar
 	order       []string
 	// Sub-bars for phases that fan out into named flows — the release gate runs
@@ -234,6 +235,9 @@ type fullDashboard struct {
 	flows       map[string]map[string]*dashboardBar
 	flowOrder   map[string][]string
 	seedByPhase map[string]int
+	cacheByKey  map[string]int
+	cacheTotals map[string]int
+	cacheWarn   map[string]bool
 	dirty       bool
 	lastFrame   string
 	stopCh      chan struct{}
@@ -277,11 +281,19 @@ func newFullDashboard(title string, phaseNames []string, seedTotal int) *fullDas
 			Status: "running",
 			Detail: "isolated stacks",
 		},
+		cache: dashboardBar{
+			Label:  "NNTP Cache",
+			Status: "waiting",
+			Detail: "checking fingerprints",
+		},
 		phases:      make(map[string]*dashboardBar, len(phaseNames)),
 		order:       append([]string(nil), phaseNames...),
 		flows:       make(map[string]map[string]*dashboardBar, len(phaseNames)),
 		flowOrder:   make(map[string][]string, len(phaseNames)),
 		seedByPhase: make(map[string]int, len(phaseNames)),
+		cacheByKey:  make(map[string]int),
+		cacheTotals: make(map[string]int),
+		cacheWarn:   make(map[string]bool),
 		dirty:       true,
 	}
 	for _, name := range phaseNames {
@@ -386,6 +398,49 @@ func (d *fullDashboard) setSeedDetail(status, detail string) {
 	}
 	if strings.TrimSpace(detail) != "" {
 		d.seed.Detail = detail
+	}
+	d.scheduleRenderLocked()
+}
+
+func (d *fullDashboard) noteNntpCacheHit(profile string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.cache.Total == 0 && d.cache.Status != "warning" {
+		d.cache.Status = "pass"
+		d.cache.Detail = profile + ": current"
+		d.scheduleRenderLocked()
+	}
+}
+
+func (d *fullDashboard) updateNntpCache(key, profile string, current, total int, status, detail string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if total > 0 {
+		d.cacheTotals[key] = total
+		d.cacheByKey[key] = current
+	}
+	if status == "warning" {
+		d.cacheWarn[key] = true
+	}
+
+	d.cache.Current = 0
+	d.cache.Total = 0
+	for cacheKey, cacheTotal := range d.cacheTotals {
+		d.cache.Total += cacheTotal
+		d.cache.Current += d.cacheByKey[cacheKey]
+	}
+	switch {
+	case len(d.cacheWarn) > 0:
+		d.cache.Status = "warning"
+	case d.cache.Total > 0 && d.cache.Current >= d.cache.Total:
+		d.cache.Status = "pass"
+	case d.cache.Total > 0:
+		d.cache.Status = "running"
+	case strings.TrimSpace(status) != "":
+		d.cache.Status = status
+	}
+	if strings.TrimSpace(detail) != "" {
+		d.cache.Detail = profile + ": " + detail
 	}
 	d.scheduleRenderLocked()
 }
@@ -541,6 +596,8 @@ func (d *fullDashboard) buildFrameLocked() string {
 	b.WriteString(fmt.Sprintf("%s   %s\n\n", title, elapsedText))
 	b.WriteString(renderDashboardBar(d.seed, d.interactive, layout))
 	b.WriteString("\n")
+	b.WriteString(renderDashboardBar(d.cache, d.interactive, layout))
+	b.WriteString("\n")
 	for _, name := range d.order {
 		b.WriteString(renderDashboardBar(*d.phases[name], d.interactive, layout))
 		b.WriteString("\n")
@@ -555,6 +612,9 @@ func (d *fullDashboard) buildFrameLocked() string {
 func (d *fullDashboard) dashboardLayoutLocked() dashboardLayout {
 	labelWidth := dashboardMinLabelWidth
 	if width := len(d.seed.Label); width > labelWidth {
+		labelWidth = width
+	}
+	if width := len(d.cache.Label); width > labelWidth {
 		labelWidth = width
 	}
 	for _, name := range d.order {
@@ -712,7 +772,7 @@ func statusDisplay(status string) string {
 
 func labelColor(label string) string {
 	switch strings.ToLower(strings.TrimSpace(label)) {
-	case "seeding":
+	case "seeding", "nntp cache":
 		return ansiBlue
 	case "functional", "functional sqlite", "functional postgres":
 		return ansiCyan
@@ -827,8 +887,9 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 
 	keepStacks := envBool("E2E_KEEP_STACKS", false)
 	var cleanupErrors []error
+	cacheWarmer := newNntpSeedCacheWarmer(ctx, tempRoot, dashboard)
 
-	seedResults, phaseResults := runFullPipeline(ctx, phases, dashboard, keepStacks, awaitWeaverImage)
+	seedResults, phaseResults := runFullPipeline(ctx, phases, dashboard, keepStacks, awaitWeaverImage, cacheWarmer)
 	seedFailed := false
 	for _, result := range seedResults {
 		if result.Err != nil {
@@ -962,6 +1023,7 @@ func runFullPipeline(
 	dashboard *fullDashboard,
 	keepStacks bool,
 	awaitWeaverImage func() error,
+	cacheWarmer *nntpSeedCacheWarmer,
 ) ([]childRunResult, []childRunResult) {
 	seedResults := make(chan childRunResult, len(phases))
 	phaseResults := make(chan childRunResult, len(phases))
@@ -971,6 +1033,20 @@ func runFullPipeline(
 		wg.Add(1)
 		go func(phase *fullPhaseContext) {
 			defer wg.Done()
+			var cacheJob *nntpSeedCacheWarmJob
+			ownsCacheWarm := false
+			defer func() {
+				if ownsCacheWarm {
+					if err := cacheJob.wait(); err != nil {
+						phase.LogTail.Add("NNTP cache warning: " + err.Error())
+					}
+				}
+				if !keepStacks {
+					if err := cleanupFullPhaseContext(phase); err != nil {
+						phase.LogTail.Add("cleanup error: " + err.Error())
+					}
+				}
+			}()
 
 			if !phase.SkipSeed {
 				seedResult := runSelfWithEnv(ctx, phase, "seed-all", func(event progressEvent) {
@@ -979,44 +1055,26 @@ func runFullPipeline(
 				seedResults <- seedResult
 				if seedResult.Err != nil {
 					dashboard.markPhaseResult(phase.Name, "fail")
-					if !keepStacks {
-						if err := cleanupFullPhaseContext(phase); err != nil {
-							phase.LogTail.Add("cleanup error: " + err.Error())
-						}
-					}
 					return
 				}
+				cacheJob, ownsCacheWarm = cacheWarmer.start(phase)
 			}
 
+			setupStarted := time.Now()
 			weaverBin, err := ensureE2EWeaverBinary()
 			if err != nil {
-				phaseResults <- childRunResult{
-					Phase:   phase.Name,
-					Command: phase.Command,
-					Err:     fmt.Errorf("prepare e2e weaver binary: %w", err),
-				}
+				setupErr := fmt.Errorf("prepare e2e weaver binary: %w", err)
+				phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)
 				dashboard.markPhaseResult(phase.Name, "fail")
-				if !keepStacks {
-					if err := cleanupFullPhaseContext(phase); err != nil {
-						phase.LogTail.Add("cleanup error: " + err.Error())
-					}
-				}
 				return
 			}
 			phase.WeaverBin = weaverBin
 			if fullPhaseNeedsLocalWeaverImage(phase) && awaitWeaverImage != nil {
+				setupStarted = time.Now()
 				if err := awaitWeaverImage(); err != nil {
-					phaseResults <- childRunResult{
-						Phase:   phase.Name,
-						Command: phase.Command,
-						Err:     fmt.Errorf("prepare local Weaver image: %w", err),
-					}
+					setupErr := fmt.Errorf("prepare local Weaver image: %w", err)
+					phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)
 					dashboard.markPhaseResult(phase.Name, "fail")
-					if !keepStacks {
-						if err := cleanupFullPhaseContext(phase); err != nil {
-							phase.LogTail.Add("cleanup error: " + err.Error())
-						}
-					}
 					return
 				}
 			}
@@ -1030,11 +1088,6 @@ func runFullPipeline(
 				dashboard.markPhaseResult(phase.Name, "fail")
 			} else {
 				dashboard.markPhaseResult(phase.Name, "pass")
-			}
-			if !keepStacks {
-				if err := cleanupFullPhaseContext(phase); err != nil {
-					phase.LogTail.Add("cleanup error: " + err.Error())
-				}
 			}
 		}(phase)
 	}
@@ -1053,6 +1106,43 @@ func runFullPipeline(
 		phaseOut = append(phaseOut, result)
 	}
 	return seedOut, phaseOut
+}
+
+func recordPhaseSetupFailure(
+	phase *fullPhaseContext,
+	command string,
+	startedAt time.Time,
+	setupErr error,
+) childRunResult {
+	duration := time.Since(startedAt).Round(time.Second)
+	logLine := setupErr.Error()
+	phase.LogTail.Add(logLine)
+
+	logPath := filepath.Join(phase.RootDir, command+".log")
+	statusPath := filepath.Join(phase.RootDir, command+".status.json")
+	recorder, err := newPhaseRunRecorderAt(statusPath, phase, command, logPath, startedAt)
+	if err != nil {
+		return childRunResult{
+			Phase:    phase.Name,
+			Command:  command,
+			Duration: duration,
+			Err:      errors.Join(setupErr, fmt.Errorf("record phase setup failure: %w", err)),
+		}
+	}
+
+	recordedErr := setupErr
+	if err := os.WriteFile(logPath, []byte(logLine+"\n"), 0o644); err != nil {
+		recordedErr = errors.Join(setupErr, fmt.Errorf("write phase setup failure log: %w", err))
+	}
+	recorder.UpdateLogLine(logLine)
+	recorder.Finish("fail", duration, recordedErr)
+
+	return childRunResult{
+		Phase:    phase.Name,
+		Command:  command,
+		Duration: duration,
+		Err:      recordedErr,
+	}
 }
 
 func runSelfWithEnv(ctx context.Context, phase *fullPhaseContext, command string, onEvent func(progressEvent)) childRunResult {
@@ -1173,6 +1263,7 @@ func (p *fullPhaseContext) env() map[string]string {
 		"E2E_RUN_DIR":            p.RunDir,
 		"E2E_RUNTIME_PORTS_FILE": p.RuntimePortsFile,
 		"E2E_EVENT_STREAM":       "1",
+		nntpSeedImageCaptureEnv:  "0",
 	}
 	if datastore == string(weaverDatastorePostgres) {
 		applyWeaverPostgresPhaseEnv(env)
@@ -1362,6 +1453,16 @@ func printFullSummary(
 }
 
 func newPhaseRunRecorder(path string, phase *fullPhaseContext, command, logPath string) (*phaseRunRecorder, error) {
+	return newPhaseRunRecorderAt(path, phase, command, logPath, time.Now())
+}
+
+func newPhaseRunRecorderAt(
+	path string,
+	phase *fullPhaseContext,
+	command string,
+	logPath string,
+	startedAt time.Time,
+) (*phaseRunRecorder, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
@@ -1376,7 +1477,7 @@ func newPhaseRunRecorder(path string, phase *fullPhaseContext, command, logPath 
 			RunDir:           phase.RunDir,
 			RuntimePortsFile: phase.RuntimePortsFile,
 			LogPath:          logPath,
-			StartedAt:        time.Now(),
+			StartedAt:        startedAt,
 			Status:           "running",
 		},
 	}

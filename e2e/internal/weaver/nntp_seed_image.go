@@ -1,8 +1,10 @@
 package weaver
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +22,7 @@ import (
 // that the NNTP article bytes are exactly those from this corpus revision.
 const (
 	nntpSeedImageCacheEnv   = "E2E_NNTP_SEED_IMAGE_CACHE"
+	nntpSeedImageCaptureEnv = "E2E_NNTP_SEED_IMAGE_CAPTURE"
 	nntpSeedImageActiveEnv  = "E2E_NNTP_SEED_IMAGE_ACTIVE"
 	nntpSeedImageRepository = "weaver-e2e-nntp"
 	nntpSeedFixtureRoot     = "/e2e-seed-fixtures"
@@ -35,6 +38,10 @@ type nntpSeedImageSet struct {
 
 func nntpSeedImageCacheEnabled() bool {
 	return envBool(nntpSeedImageCacheEnv, true)
+}
+
+func nntpSeedImageCaptureEnabled() bool {
+	return nntpSeedImageCacheEnabled() && envBool(nntpSeedImageCaptureEnv, true)
 }
 
 func nntpSeedImageSetForProfile(profile string, slugs []string) (nntpSeedImageSet, error) {
@@ -224,15 +231,77 @@ func seedPayloadBytes(absDir string, scenario *Scenario) (int64, error) {
 	return total, nil
 }
 
+const nntpSeedCacheStageCount = 4
+
+type nntpSeedCacheProgressFunc func(current, total int, detail string)
+
+type nntpSeedCacheCaptureConfig struct {
+	Project   string
+	StageRoot string
+	LockRoot  string
+	OwnerPID  int
+	Progress  nntpSeedCacheProgressFunc
+}
+
+type nntpSeedCacheCaptureOps struct {
+	imageExists      func(string) bool
+	resolveContainer func(context.Context, string, string) (string, error)
+	snapshot         func(context.Context, string, string) error
+	build            func(context.Context, string, string, string, nntpSeedImageSet) error
+	removeImage      func(context.Context, string) error
+	processAlive     func(int) bool
+}
+
+func defaultNntpSeedCacheCaptureOps() nntpSeedCacheCaptureOps {
+	return nntpSeedCacheCaptureOps{
+		imageExists:      dockerImageExists,
+		resolveContainer: dockerComposeServiceContainerIDForProject,
+		snapshot:         snapshotNntpData,
+		build:            buildSeededNntpImage,
+		removeImage:      removeNntpSeedImage,
+		processAlive:     processAlive,
+	}
+}
+
 // captureSeedImageCache bakes the already-seeded article stores and generated
 // NZBs into two local images. Docker commit cannot see named-volume contents,
 // so the snapshot is deliberately rebuilt from a temporary Docker build
 // context instead.
-func captureSeedImageCache(set nntpSeedImageSet, slugs []string) error {
-	if set.ready() {
+func captureSeedImageCache(
+	ctx context.Context,
+	set nntpSeedImageSet,
+	slugs []string,
+	config nntpSeedCacheCaptureConfig,
+) error {
+	return captureSeedImageCacheWithOps(ctx, set, slugs, config, defaultNntpSeedCacheCaptureOps())
+}
+
+func captureSeedImageCacheWithOps(
+	ctx context.Context,
+	set nntpSeedImageSet,
+	slugs []string,
+	config nntpSeedCacheCaptureConfig,
+	ops nntpSeedCacheCaptureOps,
+) error {
+	if ops.imageExists(set.Primary) && ops.imageExists(set.Backup) {
 		return nil
 	}
-	release, acquired, err := tryAcquireNntpSeedImageLock(set)
+	if config.OwnerPID <= 0 {
+		config.OwnerPID = os.Getpid()
+	}
+	if strings.TrimSpace(config.StageRoot) == "" {
+		config.StageRoot = os.TempDir()
+	}
+	if strings.TrimSpace(config.LockRoot) == "" {
+		config.LockRoot = os.TempDir()
+	}
+
+	release, acquired, err := tryAcquireNntpSeedImageLock(
+		set,
+		config.LockRoot,
+		config.OwnerPID,
+		ops.processAlive,
+	)
 	if err != nil {
 		return err
 	}
@@ -241,31 +310,56 @@ func captureSeedImageCache(set nntpSeedImageSet, slugs []string) error {
 		return nil
 	}
 	defer release()
-	if set.ready() {
+	if ops.imageExists(set.Primary) && ops.imageExists(set.Backup) {
 		return nil
 	}
 
-	primaryID, err := dockerComposeServiceContainerID("nntp")
-	if err != nil {
-		return fmt.Errorf("resolve primary NNTP snapshot source: %w", err)
-	}
-	backupID, err := dockerComposeServiceContainerID("nntp2")
-	if err != nil {
-		return fmt.Errorf("resolve backup NNTP snapshot source: %w", err)
+	if err := removeIncompleteNntpSeedImagePair(ctx, set, ops); err != nil {
+		return err
 	}
 
-	stage, err := os.MkdirTemp("", "weaver-e2e-nntp-seed-image-")
+	if err := os.MkdirAll(config.StageRoot, 0o755); err != nil {
+		return fmt.Errorf("create NNTP image staging root: %w", err)
+	}
+	stage, err := os.MkdirTemp(
+		config.StageRoot,
+		fmt.Sprintf("weaver-e2e-nntp-seed-image-%s-%s-", set.Profile, set.Fingerprint[:12]),
+	)
 	if err != nil {
 		return fmt.Errorf("create NNTP image staging directory: %w", err)
 	}
 	defer os.RemoveAll(stage)
 
+	started := time.Now()
+	report := func(current int, detail string) {
+		log.Printf(
+			"NNTP cache profile=%s corpus=%s elapsed=%s %s",
+			set.Profile,
+			set.Fingerprint[:12],
+			time.Since(started).Round(time.Second),
+			detail,
+		)
+		if config.Progress != nil {
+			config.Progress(current, nntpSeedCacheStageCount, detail)
+		}
+	}
 	primaryContext := filepath.Join(stage, "primary")
 	backupContext := filepath.Join(stage, "backup")
-	if err := snapshotNntpData(primaryID, primaryContext); err != nil {
+
+	report(0, "snapshotting primary article store")
+	primaryID, err := ops.resolveContainer(ctx, config.Project, "nntp")
+	if err != nil {
+		return fmt.Errorf("resolve primary NNTP snapshot source: %w", err)
+	}
+	if err := ops.snapshot(ctx, primaryID, primaryContext); err != nil {
 		return err
 	}
-	if err := snapshotNntpData(backupID, backupContext); err != nil {
+	report(1, "snapshotting backup article store")
+	backupID, err := ops.resolveContainer(ctx, config.Project, "nntp2")
+	if err != nil {
+		return fmt.Errorf("resolve backup NNTP snapshot source: %w", err)
+	}
+	if err := ops.snapshot(ctx, backupID, backupContext); err != nil {
 		return err
 	}
 	if err := snapshotSeededNZBs(primaryContext, slugs); err != nil {
@@ -275,14 +369,40 @@ func captureSeedImageCache(set nntpSeedImageSet, slugs []string) error {
 		return err
 	}
 
-	if err := buildSeededNntpImage(nntpSeedBaseImage("E2E_NNTP_IMAGE"), set.Primary, primaryContext, set); err != nil {
+	complete := false
+	defer func() {
+		if complete {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = ops.removeImage(cleanupCtx, set.Primary)
+		_ = ops.removeImage(cleanupCtx, set.Backup)
+	}()
+
+	report(2, "building primary cache image")
+	if err := ops.build(ctx, nntpSeedBaseImage("E2E_NNTP_IMAGE"), set.Primary, primaryContext, set); err != nil {
 		return err
 	}
-	if err := buildSeededNntpImage(nntpSeedBaseImage("E2E_NNTP2_IMAGE"), set.Backup, backupContext, set); err != nil {
+	report(3, "building backup cache image")
+	if err := ops.build(ctx, nntpSeedBaseImage("E2E_NNTP2_IMAGE"), set.Backup, backupContext, set); err != nil {
 		return err
 	}
-	log.Printf("built pre-seeded NNTP images for profile=%s (corpus=%s)", set.Profile, set.Fingerprint[:12])
+	complete = true
+	report(4, "cache images ready")
 	return nil
+}
+
+func removeIncompleteNntpSeedImagePair(ctx context.Context, set nntpSeedImageSet, ops nntpSeedCacheCaptureOps) error {
+	primaryExists := ops.imageExists(set.Primary)
+	backupExists := ops.imageExists(set.Backup)
+	if primaryExists == backupExists {
+		return nil
+	}
+	if primaryExists {
+		return ops.removeImage(ctx, set.Primary)
+	}
+	return ops.removeImage(ctx, set.Backup)
 }
 
 func nntpSeedBaseImage(envKey string) string {
@@ -292,12 +412,26 @@ func nntpSeedBaseImage(envKey string) string {
 	return weaverNNTPDefaultImage
 }
 
-func snapshotNntpData(containerID, contextDir string) error {
+func dockerComposeServiceContainerIDForProject(ctx context.Context, project, service string) (string, error) {
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-p", project, "ps", "-q", service)
+	cmd.Dir = e2eDir()
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve container for service %s: %w", service, err)
+	}
+	id := strings.TrimSpace(string(out))
+	if id == "" {
+		return "", fmt.Errorf("service %s is not running", service)
+	}
+	return id, nil
+}
+
+func snapshotNntpData(ctx context.Context, containerID, contextDir string) error {
 	dest := filepath.Join(contextDir, "data", "articles")
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return fmt.Errorf("create NNTP data image context: %w", err)
 	}
-	cmd := exec.Command("docker", "cp", containerID+":/data/articles/.", dest)
+	cmd := exec.CommandContext(ctx, "docker", "cp", containerID+":/data/articles/.", dest)
 	cmd.Dir = e2eDir()
 	if err := runExternalCommand(cmd, "snapshot seeded NNTP article store"); err != nil {
 		return err
@@ -316,7 +450,7 @@ func snapshotSeededNZBs(contextDir string, slugs []string) error {
 	return nil
 }
 
-func buildSeededNntpImage(baseImage, tag, contextDir string, set nntpSeedImageSet) error {
+func buildSeededNntpImage(ctx context.Context, baseImage, tag, contextDir string, set nntpSeedImageSet) error {
 	dockerfile := strings.Join([]string{
 		"ARG BASE_IMAGE",
 		"FROM ${BASE_IMAGE}",
@@ -329,7 +463,8 @@ func buildSeededNntpImage(baseImage, tag, contextDir string, set nntpSeedImageSe
 	if err := os.WriteFile(filepath.Join(contextDir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
 		return fmt.Errorf("write pre-seeded NNTP Dockerfile: %w", err)
 	}
-	cmd := exec.Command(
+	cmd := exec.CommandContext(
+		ctx,
 		"docker", "build",
 		"--build-arg", "BASE_IMAGE="+baseImage,
 		"--tag", tag,
@@ -343,13 +478,66 @@ func buildSeededNntpImage(baseImage, tag, contextDir string, set nntpSeedImageSe
 	return nil
 }
 
-func tryAcquireNntpSeedImageLock(set nntpSeedImageSet) (func(), bool, error) {
-	path := filepath.Join(os.TempDir(), "weaver-e2e-nntp-seed-image-"+set.Fingerprint+".lock")
-	if err := os.Mkdir(path, 0o755); err != nil {
-		if os.IsExist(err) {
+func removeNntpSeedImage(ctx context.Context, tag string) error {
+	cmd := exec.CommandContext(ctx, "docker", "image", "rm", tag)
+	cmd.Dir = e2eDir()
+	return runExternalCommand(cmd, "remove incomplete pre-seeded NNTP image")
+}
+
+type nntpSeedImageLockOwner struct {
+	PID         int    `json:"pid"`
+	Profile     string `json:"profile"`
+	Fingerprint string `json:"fingerprint"`
+}
+
+func tryAcquireNntpSeedImageLock(
+	set nntpSeedImageSet,
+	root string,
+	ownerPID int,
+	alive func(int) bool,
+) (func(), bool, error) {
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, false, fmt.Errorf("create pre-seeded NNTP image lock root: %w", err)
+	}
+	path := filepath.Join(root, "weaver-e2e-nntp-seed-image-"+set.Fingerprint+".lock")
+	owner := nntpSeedImageLockOwner{PID: ownerPID, Profile: set.Profile, Fingerprint: set.Fingerprint}
+	body, err := json.Marshal(owner)
+	if err != nil {
+		return nil, false, fmt.Errorf("encode pre-seeded NNTP image lock owner: %w", err)
+	}
+
+	for attempts := 0; attempts < 2; attempts++ {
+		candidate, err := os.CreateTemp(root, filepath.Base(path)+".candidate-")
+		if err != nil {
+			return nil, false, fmt.Errorf("create pre-seeded NNTP image lock candidate: %w", err)
+		}
+		candidatePath := candidate.Name()
+		if _, err := candidate.Write(body); err != nil {
+			_ = candidate.Close()
+			_ = os.Remove(candidatePath)
+			return nil, false, fmt.Errorf("write pre-seeded NNTP image lock candidate: %w", err)
+		}
+		if err := candidate.Close(); err != nil {
+			_ = os.Remove(candidatePath)
+			return nil, false, fmt.Errorf("close pre-seeded NNTP image lock candidate: %w", err)
+		}
+		err = os.Link(candidatePath, path)
+		_ = os.Remove(candidatePath)
+		if err == nil {
+			return func() { _ = os.Remove(path) }, true, nil
+		}
+		if !os.IsExist(err) {
+			return nil, false, fmt.Errorf("acquire pre-seeded NNTP image lock: %w", err)
+		}
+
+		existingBody, readErr := os.ReadFile(path)
+		var existing nntpSeedImageLockOwner
+		if readErr == nil && json.Unmarshal(existingBody, &existing) == nil && alive(existing.PID) {
 			return func() {}, false, nil
 		}
-		return nil, false, fmt.Errorf("acquire pre-seeded NNTP image lock: %w", err)
+		if err := os.RemoveAll(path); err != nil {
+			return nil, false, fmt.Errorf("remove stale pre-seeded NNTP image lock: %w", err)
+		}
 	}
-	return func() { _ = os.Remove(path) }, true, nil
+	return nil, false, fmt.Errorf("acquire pre-seeded NNTP image lock after reclaim")
 }

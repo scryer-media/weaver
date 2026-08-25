@@ -2,6 +2,7 @@ package weaver
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -53,6 +54,9 @@ func TestFullPhaseEnvKeepsRestartSeedRetries(t *testing.T) {
 	}
 	if got := env["E2E_RESTART_PROFILE"]; got != "hardened" {
 		t.Fatalf("expected default restart profile hardened, got %q", got)
+	}
+	if got := env[nntpSeedImageCaptureEnv]; got != "0" {
+		t.Fatalf("expected full runner to own NNTP cache warming, got child capture setting %q", got)
 	}
 }
 
@@ -111,6 +115,58 @@ func TestFullSuitePreparesOneSharedWeaverImage(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("native-only phase selection prepared local Weaver image %d times", calls)
+	}
+}
+
+func TestRecordPhaseSetupFailurePersistsDiagnosticArtifacts(t *testing.T) {
+	root := t.TempDir()
+	phase := &fullPhaseContext{
+		Name:             "Container Restart",
+		Command:          "container-restart",
+		Datastore:        "sqlite",
+		Project:          "test-project",
+		RootDir:          root,
+		RunDir:           filepath.Join(root, "run"),
+		RuntimePortsFile: filepath.Join(root, "runtime-ports.env"),
+		LogTail:          &lineTail{},
+	}
+	startedAt := time.Now().Add(-2 * time.Second)
+	setupErr := errors.New("prepare local Weaver image: fixture build failed")
+
+	result := recordPhaseSetupFailure(phase, phase.Command, startedAt, setupErr)
+	if !errors.Is(result.Err, setupErr) {
+		t.Fatalf("result error = %v", result.Err)
+	}
+	if result.Duration < time.Second {
+		t.Fatalf("result duration = %s, want setup wait", result.Duration)
+	}
+
+	logPath := filepath.Join(root, phase.Command+".log")
+	logBody, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read setup failure log: %v", err)
+	}
+	if string(logBody) != setupErr.Error()+"\n" {
+		t.Fatalf("setup failure log = %q", logBody)
+	}
+
+	statusPath := filepath.Join(root, phase.Command+".status.json")
+	statusBody, err := os.ReadFile(statusPath)
+	if err != nil {
+		t.Fatalf("read setup failure status: %v", err)
+	}
+	var status phaseRunStatus
+	if err := json.Unmarshal(statusBody, &status); err != nil {
+		t.Fatalf("decode setup failure status: %v", err)
+	}
+	if status.Status != "fail" || status.Error != setupErr.Error() {
+		t.Fatalf("setup failure status = %q error = %q", status.Status, status.Error)
+	}
+	if status.LastLogLine != setupErr.Error() || status.LogPath != logPath {
+		t.Fatalf("setup failure diagnostic pointers = %#v", status)
+	}
+	if status.Duration != result.Duration || !status.StartedAt.Equal(startedAt) {
+		t.Fatalf("setup failure timing = %s from %s", status.Duration, status.StartedAt)
 	}
 }
 
@@ -431,6 +487,7 @@ func TestFullDashboardAlignsProgressBarsForDatastorePhaseNames(t *testing.T) {
 			Status:  "pass",
 			Detail:  "Functional Postgres: zstd-single",
 		},
+		cache:  dashboardBar{Label: "NNTP Cache", Status: "waiting", Detail: "checking fingerprints"},
 		phases: make(map[string]*dashboardBar, len(phaseNames)),
 		order:  append([]string(nil), phaseNames...),
 	}
@@ -460,8 +517,8 @@ func TestFullDashboardAlignsProgressBarsForDatastorePhaseNames(t *testing.T) {
 		}
 		checked++
 	}
-	if checked != len(phaseNames)+1 {
-		t.Fatalf("expected %d dashboard bars, checked %d in frame:\n%s", len(phaseNames)+1, checked, frame)
+	if checked != len(phaseNames)+2 {
+		t.Fatalf("expected %d dashboard bars, checked %d in frame:\n%s", len(phaseNames)+2, checked, frame)
 	}
 }
 
@@ -532,9 +589,9 @@ func TestFullDashboardRendersOneBarPerReleaseGateFlow(t *testing.T) {
 		}
 		bars++
 	}
-	// seed + phase + three flows
-	if bars != 5 {
-		t.Fatalf("expected 5 bars, got %d in frame:\n%s", bars, frame)
+	// seed + cache + phase + three flows
+	if bars != 6 {
+		t.Fatalf("expected 6 bars, got %d in frame:\n%s", bars, frame)
 	}
 }
 
