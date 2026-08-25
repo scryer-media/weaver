@@ -68,6 +68,9 @@ impl Pipeline {
             weaver_model::files::FileRole::TarBz2Archive => {
                 Some(crate::jobs::assembly::ArchiveType::TarBz2)
             }
+            weaver_model::files::FileRole::TarXzArchive => {
+                Some(crate::jobs::assembly::ArchiveType::TarXz)
+            }
             weaver_model::files::FileRole::GzArchive => {
                 Some(crate::jobs::assembly::ArchiveType::Gz)
             }
@@ -82,6 +85,9 @@ impl Pipeline {
             }
             weaver_model::files::FileRole::Bzip2Archive => {
                 Some(crate::jobs::assembly::ArchiveType::Bzip2)
+            }
+            weaver_model::files::FileRole::XzArchive => {
+                Some(crate::jobs::assembly::ArchiveType::Xz)
             }
             weaver_model::files::FileRole::SplitFile { .. } => {
                 Some(crate::jobs::assembly::ArchiveType::Split)

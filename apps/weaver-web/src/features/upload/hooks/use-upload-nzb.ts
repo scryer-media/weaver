@@ -4,6 +4,7 @@ import { authHeaders, fetchWithSessionRetry } from "@/graphql/client";
 import { CATEGORIES_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { shouldCloseAfterSubmit } from "@/features/upload/close-decision";
+import { isSupportedNzbUploadFilename } from "@/features/upload/upload-file-types";
 import {
   duplicateSubmissionInput,
   type DuplicateSubmissionMode,
@@ -461,7 +462,10 @@ export function useUploadNzb(options?: {
   const handleFiles = useCallback(
     (nextFiles: File[]) => {
       setError(null);
-      if (nextFiles.length > 0 && nextFiles.some((file) => !file.name.toLowerCase().endsWith(".nzb"))) {
+      if (
+        nextFiles.length > 0 &&
+        nextFiles.some((file) => !isSupportedNzbUploadFilename(file.name))
+      ) {
         setError(t("upload.invalidFiles"));
         return;
       }

@@ -3,7 +3,26 @@ use crate::pipeline::extraction::{BudgetedReader, RarExtractionOpenRequest};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+static XZ_MT_DECODER_PERMIT: Mutex<()> = Mutex::new(());
+
+enum FilesystemXzDecoder<R: std::io::Read> {
+    Sequential(liblzma::read::XzDecoder<R>),
+    Parallel {
+        decoder: liblzma::read::XzDecoder<R>,
+        _permit: MutexGuard<'static, ()>,
+    },
+}
+
+impl<R: std::io::Read> std::io::Read for FilesystemXzDecoder<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Sequential(decoder) => decoder.read(buffer),
+            Self::Parallel { decoder, .. } => decoder.read(buffer),
+        }
+    }
+}
 
 struct CountingWriter<W> {
     inner: W,
@@ -106,6 +125,9 @@ fn simple_decoder_memory_bytes(kind: SimpleArchiveKind, max_memory_bytes: u64) -
     const MIB: u64 = 1024 * 1024;
     match kind {
         SimpleArchiveKind::Zstd => max_memory_bytes,
+        SimpleArchiveKind::Xz | SimpleArchiveKind::TarXz => {
+            max_memory_bytes.min(crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES)
+        }
         SimpleArchiveKind::Brotli => 32 * MIB,
         SimpleArchiveKind::Zip | SimpleArchiveKind::TarBz2 | SimpleArchiveKind::Bzip2 => 8 * MIB,
         SimpleArchiveKind::Tar
@@ -253,6 +275,19 @@ fn extract_tar_bz2(
     let file = BudgetedReader::new(file, Arc::clone(budget));
     let bz2 = bzip2::read::BzDecoder::new(file);
     extract_tar_from_reader(bz2, root, budget, event_tx, job_id, set_name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_tar_xz(
+    archive_path: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+) -> Result<Vec<String>, String> {
+    let xz = open_sequential_xz_decoder(archive_path, budget)?;
+    extract_tar_from_reader(xz, root, budget, event_tx, job_id, set_name)
 }
 
 fn extract_tar_from_reader<R: std::io::Read>(
@@ -544,6 +579,76 @@ fn extract_bzip2(
         job_id,
         set_name,
     )
+}
+
+fn extract_xz(
+    archive_path: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+    xz_worker_threads: usize,
+) -> Result<Vec<String>, String> {
+    let xz = open_filesystem_xz_decoder(archive_path, budget, xz_worker_threads)?;
+    extract_single_stream_to_file(
+        xz,
+        archive_path,
+        root,
+        budget,
+        &[".xz"],
+        "xz",
+        event_tx,
+        job_id,
+        set_name,
+    )
+}
+
+fn open_sequential_xz_decoder(
+    archive_path: &Path,
+    budget: &Arc<JobExtractionBudget>,
+) -> Result<impl std::io::Read, String> {
+    let file =
+        std::fs::File::open(archive_path).map_err(|error| format!("failed to open xz: {error}"))?;
+    let file = BudgetedReader::new(file, Arc::clone(budget));
+    let memory_limit = crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES.min(budget.max_memory_bytes());
+    crate::ingest::xz_multistream_decoder(file, memory_limit)
+        .map_err(|error| format!("failed to open xz decoder: {error}"))
+}
+
+fn open_filesystem_xz_decoder(
+    archive_path: &Path,
+    budget: &Arc<JobExtractionBudget>,
+    xz_worker_threads: usize,
+) -> Result<FilesystemXzDecoder<BudgetedReader<std::fs::File>>, String> {
+    let mut probe =
+        std::fs::File::open(archive_path).map_err(|error| format!("failed to open xz: {error}"))?;
+    let memory_limit = crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES.min(budget.max_memory_bytes());
+
+    if matches!(
+        crate::ingest::xz_filesystem_decoder_kind(&mut probe),
+        crate::ingest::XzFilesystemDecoderKind::Parallel
+    ) && let Ok(permit) = XZ_MT_DECODER_PERMIT.try_lock()
+    {
+        let file = std::fs::File::open(archive_path)
+            .map_err(|error| format!("failed to open xz: {error}"))?;
+        let file = BudgetedReader::new(file, Arc::clone(budget));
+        if let Ok(decoder) =
+            crate::ingest::xz_parallel_decoder(file, memory_limit, xz_worker_threads)
+        {
+            return Ok(FilesystemXzDecoder::Parallel {
+                decoder,
+                _permit: permit,
+            });
+        }
+    }
+
+    let file =
+        std::fs::File::open(archive_path).map_err(|error| format!("failed to open xz: {error}"))?;
+    let file = BudgetedReader::new(file, Arc::clone(budget));
+    crate::ingest::xz_multistream_decoder(file, memory_limit)
+        .map(FilesystemXzDecoder::Sequential)
+        .map_err(|error| format!("failed to open xz decoder: {error}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -860,6 +965,10 @@ impl Pipeline {
                     self.extract_simple_archive(job_id, name, SimpleArchiveKind::TarBz2)
                         .await
                 }
+                crate::jobs::assembly::ArchiveType::TarXz => {
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::TarXz)
+                        .await
+                }
                 crate::jobs::assembly::ArchiveType::Gz => {
                     self.extract_simple_archive(job_id, name, SimpleArchiveKind::Gz)
                         .await
@@ -878,6 +987,10 @@ impl Pipeline {
                 }
                 crate::jobs::assembly::ArchiveType::Bzip2 => {
                     self.extract_simple_archive(job_id, name, SimpleArchiveKind::Bzip2)
+                        .await
+                }
+                crate::jobs::assembly::ArchiveType::Xz => {
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Xz)
                         .await
                 }
                 crate::jobs::assembly::ArchiveType::Split => {
@@ -1184,8 +1297,8 @@ impl Pipeline {
         described.then_some(path)
     }
 
-    /// Extract a simple (non-RAR, non-7z) archive: ZIP, tar, tar.gz, tar.bz2, gz, deflate, br,
-    /// zstd, bz2, or split.
+    /// Extract a simple (non-RAR, non-7z) archive: ZIP, tar, tar.gz, tar.bz2, tar.xz, gz,
+    /// deflate, br, zstd, bz2, xz, or split.
     pub(crate) async fn extract_simple_archive(
         &mut self,
         job_id: JobId,
@@ -1235,6 +1348,7 @@ impl Pipeline {
         let extract_done_tx = self.extract_done_tx.clone();
         let set_name_for_channel = set_name.to_string();
         let pp_pool = self.pp_pool.clone();
+        let xz_worker_threads = pp_pool.current_num_threads();
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
 
         tokio::task::spawn(async move {
@@ -1284,6 +1398,14 @@ impl Pipeline {
                             job_id,
                             &set_name_owned,
                         )?,
+                        SimpleArchiveKind::TarXz => extract_tar_xz(
+                            &file_paths[0],
+                            &root,
+                            &budget,
+                            &event_tx,
+                            job_id,
+                            &set_name_owned,
+                        )?,
                         SimpleArchiveKind::Gz => extract_gz(
                             &file_paths[0],
                             &root,
@@ -1323,6 +1445,15 @@ impl Pipeline {
                             &event_tx,
                             job_id,
                             &set_name_owned,
+                        )?,
+                        SimpleArchiveKind::Xz => extract_xz(
+                            &file_paths[0],
+                            &root,
+                            &budget,
+                            &event_tx,
+                            job_id,
+                            &set_name_owned,
+                            xz_worker_threads,
                         )?,
                         SimpleArchiveKind::Split => extract_split(
                             &file_paths,

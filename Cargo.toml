@@ -87,6 +87,8 @@ zip = { version = "8", default-features = false, features = ["aes-crypto", "defl
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 brotli = { version = "8", default-features = false, features = ["std"] }
 bzip2 = "0.6"
+lzma-rust2 = { version = "0.18.1", default-features = false, features = ["std", "xz"] }
+liblzma = { version = "0.4.8", default-features = false, features = ["static", "parallel"] }
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 age = { version = "0.12", default-features = false }
 security-framework = { version = "3", default-features = false }

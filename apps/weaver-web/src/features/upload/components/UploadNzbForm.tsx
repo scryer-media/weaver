@@ -2,6 +2,7 @@ import { FileText, RotateCcw, UploadCloud, X } from "lucide-react";
 import type { Ref } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useUploadNzb, type UploadNzbEntry } from "@/features/upload/hooks/use-upload-nzb";
+import { NZB_UPLOAD_ACCEPT } from "@/features/upload/upload-file-types";
 import {
   semanticStateI18nKey,
   submissionOutcomeI18nKey,
@@ -160,7 +161,7 @@ export function UploadNzbForm({
             <input
               ref={fileInputRef}
               type="file"
-              accept=".nzb"
+              accept={NZB_UPLOAD_ACCEPT}
               multiple
               className="hidden"
               onChange={onFileInputChange}

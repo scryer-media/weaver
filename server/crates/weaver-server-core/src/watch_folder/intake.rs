@@ -102,11 +102,13 @@ pub(super) fn is_supported_candidate(path: &Path) -> bool {
                 | FileRole::TarArchive
                 | FileRole::TarGzArchive
                 | FileRole::TarBz2Archive
+                | FileRole::TarXzArchive
                 | FileRole::GzArchive
                 | FileRole::DeflateArchive
                 | FileRole::BrotliArchive
                 | FileRole::ZstdArchive
                 | FileRole::Bzip2Archive
+                | FileRole::XzArchive
                 | FileRole::SplitFile { number: 0 }
         )
 }
@@ -167,6 +169,17 @@ pub(super) fn read_nzbs_from_path_with_name(
             let reader = bzip2::read::BzDecoder::new(file);
             extract_tar_nzbs(reader, limit)
         }
+        FileRole::TarXzArchive => {
+            let file = File::open(path).map_err(transient_io)?;
+            let reader = crate::ingest::xz_multistream_decoder(
+                file,
+                crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES,
+            )
+            .map_err(|error| {
+                IntakeError::Permanent(format!("failed to open xz decoder: {error}"))
+            })?;
+            extract_tar_nzbs(reader, limit)
+        }
         FileRole::GzArchive => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = flate2::read::GzDecoder::new(file);
@@ -198,6 +211,17 @@ pub(super) fn read_nzbs_from_path_with_name(
             let file = File::open(path).map_err(transient_io)?;
             let reader = bzip2::read::BzDecoder::new(file);
             IntakeOutput::one_checked(single_stream_nzb(name, &[".bz2"], reader, limit)?, limit)
+        }
+        FileRole::XzArchive => {
+            let file = File::open(path).map_err(transient_io)?;
+            let reader = crate::ingest::xz_multistream_decoder(
+                file,
+                crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES,
+            )
+            .map_err(|error| {
+                IntakeError::Permanent(format!("failed to open xz decoder: {error}"))
+            })?;
+            IntakeOutput::one_checked(single_stream_nzb(name, &[".xz"], reader, limit)?, limit)
         }
         FileRole::SevenZipArchive | FileRole::SevenZipSplit { number: 0 } => {
             extract_7z_nzbs(path, name, limit)
@@ -766,6 +790,8 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    use lzma_rust2::{XzOptions, XzWriter};
+
     fn minimal_nzb(name: &str) -> Vec<u8> {
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -777,6 +803,12 @@ mod tests {
 </nzb>"#
         )
         .into_bytes()
+    }
+
+    fn xz_compress(bytes: &[u8]) -> Vec<u8> {
+        let mut writer = XzWriter::new(Vec::new(), XzOptions::with_preset(0)).unwrap();
+        writer.write_all(bytes).unwrap();
+        writer.finish().unwrap()
     }
 
     #[test]
@@ -854,6 +886,45 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("release.nzb");
         fs::write(&path, minimal_nzb("raw")).unwrap();
+
+        let output = read_nzbs_from_path(&path).unwrap();
+
+        assert_eq!(output.nzbs.len(), 1);
+        assert_eq!(output.nzbs[0].filename, "release.nzb");
+    }
+
+    #[test]
+    fn reads_xz_nzb() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("release.nzb.xz");
+        fs::write(&path, xz_compress(&minimal_nzb("xz"))).unwrap();
+
+        let output = read_nzbs_from_path(&path).unwrap();
+
+        assert_eq!(output.nzbs.len(), 1);
+        assert_eq!(output.nzbs[0].filename, "release.nzb");
+    }
+
+    #[test]
+    fn reads_tar_xz_nzb_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let tar_path = temp.path().join("release.tar");
+        let path = temp.path().join("release.tar.xz");
+        let file = File::create(&tar_path).unwrap();
+        let mut tar = tar::Builder::new(file);
+        let bytes = minimal_nzb("tar-xz");
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(
+            &mut header,
+            "folder/release.nzb",
+            std::io::Cursor::new(bytes),
+        )
+        .unwrap();
+        tar.finish().unwrap();
+        fs::write(&path, xz_compress(&fs::read(&tar_path).unwrap())).unwrap();
 
         let output = read_nzbs_from_path(&path).unwrap();
 

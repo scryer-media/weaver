@@ -450,6 +450,19 @@ fn tar_bz2_archive() {
 }
 
 #[test]
+fn tar_xz_archive() {
+    assert_eq!(
+        FileRole::from_filename("backup.tar.xz"),
+        FileRole::TarXzArchive
+    );
+    assert_eq!(FileRole::from_filename("data.txz"), FileRole::TarXzArchive);
+    assert_eq!(
+        FileRole::from_filename("Archive.TAR.XZ"),
+        FileRole::TarXzArchive
+    );
+}
+
+#[test]
 fn gz_archive() {
     assert_eq!(FileRole::from_filename("file.gz"), FileRole::GzArchive);
     assert_eq!(FileRole::from_filename("data.GZ"), FileRole::GzArchive);
@@ -495,9 +508,23 @@ fn bzip2_archive() {
 }
 
 #[test]
+fn xz_archive() {
+    assert_eq!(FileRole::from_filename("file.xz"), FileRole::XzArchive);
+    assert_eq!(FileRole::from_filename("data.XZ"), FileRole::XzArchive);
+    assert_ne!(
+        FileRole::from_filename("backup.tar.xz"),
+        FileRole::XzArchive
+    );
+}
+
+#[test]
 fn split_files() {
     assert_eq!(
         FileRole::from_filename("movie.mkv.001"),
+        FileRole::SplitFile { number: 0 }
+    );
+    assert_eq!(
+        FileRole::from_filename("release.xz.001"),
         FileRole::SplitFile { number: 0 }
     );
     assert_eq!(
@@ -519,6 +546,18 @@ fn archive_base_name_zip() {
     assert_eq!(
         archive_base_name("archive.zip", &FileRole::ZipArchive),
         Some("archive.zip".into())
+    );
+}
+
+#[test]
+fn archive_base_name_xz() {
+    assert_eq!(
+        archive_base_name("archive.xz", &FileRole::XzArchive),
+        Some("archive.xz".into())
+    );
+    assert_eq!(
+        archive_base_name("archive.tar.xz", &FileRole::TarXzArchive),
+        Some("archive.tar.xz".into())
     );
 }
 

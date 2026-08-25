@@ -567,6 +567,25 @@ func Recipes() []Recipe {
 		Build: nestRAR(1),
 	})
 	add(Recipe{
+		Slug: "nested-xz-rar", Family: "nested",
+		Notes:  "A RAR5 containing an XZ-compressed preview clip, so the nested pass must classify and unpack the extracted .xz file.",
+		Inputs: []string{previewPayloadPath},
+		Build: sequence(
+			xzCodec("test-media.mkv.xz", "clip-preview", "test-media.mkv"),
+			func(ctx context.Context, env *Env) error {
+				if err := CopyFile(env.OutputPath("test-media.mkv.xz"), env.StagePath("test-media.mkv.xz")); err != nil {
+					return err
+				}
+				return env.RAR(ctx, RARSpec{
+					Toolchain: RAR5Writer, Format: RAR5, Archive: "archive.rar",
+					Method: "-m1", Dictionary: "-md32m", Members: []string{"test-media.mkv.xz"},
+				})
+			},
+			dropOutput("test-media.mkv.xz"),
+		),
+		ExpectedOutputs: previewClipExpectedOutput("test-media.mkv"),
+	})
+	add(Recipe{
 		Slug: "nested-3deep", Family: "nested",
 		Notes: "Three levels of nesting, the deepest the extractor is expected to follow.", Inputs: []string{samplePayloadPath},
 		Build: nestRAR(2),
@@ -1046,6 +1065,41 @@ func Recipes() []Recipe {
 		Notes:  "The same season pack with the standard 1 MiB window zeroed inside the DEFLATE stream.",
 		Inputs: []string{samplePayloadPath},
 		Build:  sequence(seasonTarball, zeroOutput("archive.tar.gz", CorruptOffset, CorruptLength)),
+	})
+
+	// ------------------------------------------------------------------ XZ
+	add(Recipe{
+		Slug: "xz-text", Family: "XZ",
+		Notes: "A plain text member in a standalone XZ stream.",
+		Build: func(ctx context.Context, env *Env) error {
+			if err := WriteText(env.StagePath("readme.txt"), "Weaver XZ text fixture", 1024); err != nil {
+				return err
+			}
+			return env.SevenZip(ctx, SevenZipSpec{
+				Format: "xz", Archive: "readme.txt.xz", Members: []string{"readme.txt"}, Level: "-mx1",
+			})
+		},
+		ExpectedOutputs: func(_ context.Context, env *Env) (map[string]string, error) {
+			return map[string]string{"readme.txt": env.StagePath("readme.txt")}, nil
+		},
+	})
+	add(Recipe{
+		Slug: "xz-video", Family: "XZ",
+		Notes:           "The 5 MiB preview clip in a standalone XZ stream.",
+		Inputs:          []string{previewPayloadPath},
+		Build:           xzCodec("test-media.mkv.xz", "clip-preview", "test-media.mkv"),
+		ExpectedOutputs: previewClipExpectedOutput("test-media.mkv"),
+	})
+	add(Recipe{
+		Slug: "split-xz", Family: "XZ",
+		Notes:  "The XZ preview stream split into 2 MiB numbered parts, so join must run before nested XZ extraction.",
+		Inputs: []string{previewPayloadPath},
+		Build: sequence(
+			xzCodec("test-media.mkv.xz", "clip-preview", "test-media.mkv"),
+			splitXz,
+			dropOutput("test-media.mkv.xz"),
+		),
+		ExpectedOutputs: previewClipExpectedOutput("test-media.mkv"),
 	})
 
 	// ------------------------------------------------------ stream codecs
@@ -1700,6 +1754,13 @@ func splitSevenZip(artifact string) func(context.Context, *Env) error {
 	}
 }
 
+func splitXz(_ context.Context, env *Env) error {
+	_, err := SplitFile(env.OutputPath("test-media.mkv.xz"), 2<<20, func(index int) string {
+		return env.OutputPath(fmt.Sprintf("test-media.mkv.xz.%03d", index+1))
+	})
+	return err
+}
+
 func renameMultivolume(artifact string, start int) func(context.Context, *Env) error {
 	return func(ctx context.Context, env *Env) error {
 		files, err := env.Artifacts.Files(ctx, env, artifact)
@@ -1765,6 +1826,21 @@ func streamCodec(codec, output, artifact, innerName string) func(context.Context
 			return err
 		}
 		return CompressFile(codec, env.OutputPath(output), staged)
+	}
+}
+
+func xzCodec(output, artifact, innerName string) func(context.Context, *Env) error {
+	return func(ctx context.Context, env *Env) error {
+		source, err := env.ArtifactPath(ctx, artifact)
+		if err != nil {
+			return err
+		}
+		if err := CopyFile(source, env.StagePath(innerName)); err != nil {
+			return err
+		}
+		return env.SevenZip(ctx, SevenZipSpec{
+			Format: "xz", Archive: output, Members: []string{innerName}, Level: "-mx1",
+		})
 	}
 }
 

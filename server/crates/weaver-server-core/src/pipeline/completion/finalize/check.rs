@@ -1291,11 +1291,13 @@ impl Pipeline {
                 | crate::jobs::assembly::ArchiveType::Zip
                 | crate::jobs::assembly::ArchiveType::TarGz
                 | crate::jobs::assembly::ArchiveType::TarBz2
+                | crate::jobs::assembly::ArchiveType::TarXz
                 | crate::jobs::assembly::ArchiveType::Gz
                 | crate::jobs::assembly::ArchiveType::Deflate
                 | crate::jobs::assembly::ArchiveType::Brotli
                 | crate::jobs::assembly::ArchiveType::Zstd
-                | crate::jobs::assembly::ArchiveType::Bzip2 => CleanPar2IntegrityGate::StrongDecode,
+                | crate::jobs::assembly::ArchiveType::Bzip2
+                | crate::jobs::assembly::ArchiveType::Xz => CleanPar2IntegrityGate::StrongDecode,
             };
             gate = Self::fold_integrity_gate(gate, topology_gate);
         }
@@ -5089,11 +5091,13 @@ impl Pipeline {
                 | weaver_model::files::FileRole::TarArchive
                 | weaver_model::files::FileRole::TarGzArchive
                 | weaver_model::files::FileRole::TarBz2Archive
+                | weaver_model::files::FileRole::TarXzArchive
                 | weaver_model::files::FileRole::GzArchive
                 | weaver_model::files::FileRole::DeflateArchive
                 | weaver_model::files::FileRole::BrotliArchive
                 | weaver_model::files::FileRole::ZstdArchive
                 | weaver_model::files::FileRole::Bzip2Archive
+                | weaver_model::files::FileRole::XzArchive
         )
     }
 

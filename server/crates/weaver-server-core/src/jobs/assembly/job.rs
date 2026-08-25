@@ -24,11 +24,13 @@ pub enum ArchiveType {
     Tar,
     TarGz,
     TarBz2,
+    TarXz,
     Gz,
     Deflate,
     Brotli,
     Zstd,
     Bzip2,
+    Xz,
     Split,
 }
 

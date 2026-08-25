@@ -71,11 +71,11 @@ const ko: LocaleDictionary = {
   // Upload page
   "upload.title": "NZB 업로드",
   "upload.dropzone": "NZB 파일을 여기에 드래그하거나 클릭하여 찾아보기",
-  "upload.accepts": "하나 이상의 .nzb 파일을 허용합니다",
+  "upload.accepts": "하나 이상의 .nzb 또는 .nzb.xz 파일을 허용합니다",
   "upload.replaceHint": "클릭하거나 드래그하여 선택 항목 교체",
   "upload.passwordLabel": "비밀번호 (선택사항)",
   "upload.passwordPlaceholder": "필요한 경우 비밀번호 입력",
-  "upload.invalidFiles": ".nzb 파일만 선택해 주세요.",
+  "upload.invalidFiles": ".nzb 또는 .nzb.xz 파일만 선택해 주세요.",
   "upload.noCategory": "카테고리 없음",
   "upload.priorityLabel": "우선순위",
   "upload.priorityLow": "낮음",

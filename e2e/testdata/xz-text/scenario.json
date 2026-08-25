@@ -1,0 +1,10 @@
+{
+  "slug": "xz-text",
+  "title": "E2E.Test.XZ.Text.2026-TESTGRP",
+  "description": "Text file in a standalone XZ stream. Tests basic XZ extraction and suffix removal.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "readme.txt": "988487694904d8df2245cf53d975297f501659972ba19020c6bed58587008d4f"
+  }
+}

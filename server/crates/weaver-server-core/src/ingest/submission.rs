@@ -15,7 +15,10 @@ use crate::{SchedulerError, SchedulerHandle};
 use weaver_nzb::Nzb;
 
 use super::persisted_nzb;
-use crate::ingest::{append_original_title_metadata, derive_release_name, nzb_password_candidates};
+use crate::ingest::{
+    append_original_title_metadata, derive_release_name, nzb_password_candidates,
+    strip_nzb_source_suffix,
+};
 use crate::jobs::{
     CallerScopedIdempotency, DuplicateAction, DuplicateAdmission, DuplicateAdmissionRequest,
     DuplicateBackfillEntry, DuplicateDecision, DuplicateMode, FileSpec, FingerprintEvidence,
@@ -162,12 +165,12 @@ pub fn nzb_to_submission_spec(
 ) -> JobSpec {
     let metadata = append_original_title_metadata(
         metadata,
-        filename.and_then(|value| value.strip_suffix(".nzb")),
+        filename.and_then(|value| strip_nzb_source_suffix(value)),
         nzb.meta.title.as_deref(),
     );
 
     let name = derive_release_name(
-        filename.and_then(|value| value.strip_suffix(".nzb")),
+        filename.and_then(|value| strip_nzb_source_suffix(value)),
         nzb.meta.title.as_deref(),
     );
 

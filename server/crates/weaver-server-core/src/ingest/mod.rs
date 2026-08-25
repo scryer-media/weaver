@@ -3,6 +3,7 @@ pub mod metadata;
 pub mod naming;
 mod persisted_nzb;
 mod submission;
+mod xz;
 
 pub use import::{
     ImportError, import_nzb, normalize_archive_password_candidate, nzb_password_candidates,
@@ -11,7 +12,7 @@ pub use import::{
 pub use metadata::{
     ORIGINAL_TITLE_METADATA_KEY, append_original_title_metadata, original_release_title,
 };
-pub use naming::derive_release_name;
+pub use naming::{derive_release_name, strip_nzb_source_suffix};
 pub use persisted_nzb::{
     PersistedNzbError, compress_nzb_bytes, decode_persisted_nzb_bytes, hash_persisted_nzb_bytes,
     load_persisted_nzb_storage_bytes, parse_persisted_nzb_bytes,
@@ -28,3 +29,5 @@ pub use submission::{
     submit_staged_parsed_nzb_with_options, submit_staged_prepared_nzb_with_options,
     submit_uploaded_nzb_reader, submit_uploaded_nzb_reader_with_options,
 };
+pub use xz::{XZ_DECODER_MEMORY_LIMIT_BYTES, xz_multistream_decoder};
+pub(crate) use xz::{XzFilesystemDecoderKind, xz_filesystem_decoder_kind, xz_parallel_decoder};

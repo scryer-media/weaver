@@ -202,7 +202,9 @@ impl Pipeline {
             | FileRole::DeflateArchive
             | FileRole::BrotliArchive
             | FileRole::ZstdArchive
-            | FileRole::Bzip2Archive => {
+            | FileRole::Bzip2Archive
+            | FileRole::XzArchive
+            | FileRole::TarXzArchive => {
                 self.try_update_7z_topology(job_id, file_id);
             }
             _ => {}

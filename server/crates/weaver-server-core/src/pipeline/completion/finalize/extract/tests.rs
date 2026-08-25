@@ -1,16 +1,20 @@
 use super::*;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Cursor;
-use std::io::Write;
+use std::io::{Cursor, Read, Write};
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
+
+use lzma_rust2::{XzOptions, XzWriter, XzWriterMt};
+
+static XZ_MT_DECODER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn create_test_files(dir: &Path) -> HashMap<String, Vec<u8>> {
     let mut files = HashMap::new();
@@ -187,6 +191,22 @@ fn create_tar_with_entries(archive_path: &Path, entries: &[(&str, &[u8])]) {
     tar.finish().unwrap();
 }
 
+fn xz_compress(bytes: &[u8], block_size: Option<NonZeroU64>) -> Vec<u8> {
+    let mut options = XzOptions::with_preset(0);
+    options.set_block_size(block_size);
+    let mut writer = XzWriter::new(Vec::new(), options).unwrap();
+    writer.write_all(bytes).unwrap();
+    writer.finish().unwrap()
+}
+
+fn xz_compress_multiblock(bytes: &[u8]) -> Vec<u8> {
+    let mut options = XzOptions::with_preset(0);
+    options.set_block_size(NonZeroU64::new(options.lzma_options.dict_size.into()));
+    let mut writer = XzWriterMt::new(Vec::new(), options, 2).unwrap();
+    writer.write_all(bytes).unwrap();
+    writer.finish().unwrap()
+}
+
 fn create_raw_tar_with_entries(archive_path: &Path, entries: &[(&str, &[u8])]) {
     let mut file = fs::File::create(archive_path).unwrap();
     for (name, contents) in entries {
@@ -228,6 +248,41 @@ fn extract_with_weaver_tar_result(
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
     let (root, budget) = test_extraction_security(output_dir);
     extract_tar(
+        archive_path,
+        &root,
+        &budget,
+        &event_tx,
+        JobId(1),
+        archive_path.file_name().unwrap().to_string_lossy().as_ref(),
+        2,
+    )
+}
+
+fn extract_with_weaver_xz_result(
+    archive_path: &Path,
+    output_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let _test_guard = XZ_MT_DECODER_TEST_LOCK.lock().unwrap();
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
+    let (root, budget) = test_extraction_security(output_dir);
+    extract_xz(
+        archive_path,
+        &root,
+        &budget,
+        &event_tx,
+        JobId(1),
+        archive_path.file_name().unwrap().to_string_lossy().as_ref(),
+        2,
+    )
+}
+
+fn extract_with_weaver_tar_xz_result(
+    archive_path: &Path,
+    output_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
+    let (root, budget) = test_extraction_security(output_dir);
+    extract_tar_xz(
         archive_path,
         &root,
         &budget,
@@ -502,6 +557,126 @@ fn tar_rejects_links_and_special_entries_without_touching_targets() {
         assert_eq!(fs::read(&outside).unwrap(), b"unchanged");
         assert!(read_dir_contents(&out_dir).is_empty());
     }
+}
+
+#[test]
+fn xz_extracts_a_single_file_without_its_suffix() {
+    let temp = TempDir::new().unwrap();
+    let archive_path = temp.path().join("payload.txt.xz");
+    let output_dir = temp.path().join("out");
+    fs::create_dir_all(&output_dir).unwrap();
+    fs::write(&archive_path, xz_compress(b"xz payload", None)).unwrap();
+
+    let extracted = extract_with_weaver_xz_result(&archive_path, &output_dir).unwrap();
+
+    assert_eq!(extracted, vec!["payload.txt"]);
+    assert_eq!(
+        fs::read(output_dir.join("payload.txt")).unwrap(),
+        b"xz payload"
+    );
+}
+
+#[test]
+fn tar_xz_uses_the_hardened_tar_member_extractor() {
+    let temp = TempDir::new().unwrap();
+    let tar_path = temp.path().join("payload.tar");
+    let archive_path = temp.path().join("payload.tar.xz");
+    let output_dir = temp.path().join("out");
+    fs::create_dir_all(&output_dir).unwrap();
+    create_tar_with_entries(&tar_path, &[("nested/payload.txt", b"tar xz payload")]);
+    fs::write(
+        &archive_path,
+        xz_compress(&fs::read(&tar_path).unwrap(), None),
+    )
+    .unwrap();
+
+    extract_with_weaver_tar_xz_result(&archive_path, &output_dir).unwrap();
+
+    assert_eq!(
+        fs::read(output_dir.join("nested/payload.txt")).unwrap(),
+        b"tar xz payload"
+    );
+}
+
+#[test]
+fn concatenated_xz_streams_decode_as_one_stream() {
+    let temp = TempDir::new().unwrap();
+    let archive_path = temp.path().join("payload.txt.xz");
+    let output_dir = temp.path().join("out");
+    fs::create_dir_all(&output_dir).unwrap();
+    let mut streams = xz_compress(b"first ", None);
+    streams.extend(xz_compress(b"second", None));
+    fs::write(&archive_path, streams).unwrap();
+
+    extract_with_weaver_xz_result(&archive_path, &output_dir).unwrap();
+
+    assert_eq!(
+        fs::read(output_dir.join("payload.txt")).unwrap(),
+        b"first second"
+    );
+}
+
+#[test]
+fn multi_block_xz_extracts_with_the_filesystem_decoder() {
+    let temp = TempDir::new().unwrap();
+    let archive_path = temp.path().join("payload.bin.xz");
+    let output_dir = temp.path().join("out");
+    fs::create_dir_all(&output_dir).unwrap();
+    let payload: Vec<u8> = (0..(1024 * 1024))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    fs::write(
+        &archive_path,
+        xz_compress(&payload, NonZeroU64::new(64 * 1024)),
+    )
+    .unwrap();
+
+    extract_with_weaver_xz_result(&archive_path, &output_dir).unwrap();
+
+    assert_eq!(fs::read(output_dir.join("payload.bin")).unwrap(), payload);
+}
+
+#[test]
+fn filesystem_xz_decoder_uses_parallel_for_a_multiblock_single_stream() {
+    let _test_guard = XZ_MT_DECODER_TEST_LOCK.lock().unwrap();
+    let temp = TempDir::new().unwrap();
+    let archive_path = temp.path().join("payload.bin.xz");
+    let output_dir = temp.path().join("out");
+    fs::create_dir_all(&output_dir).unwrap();
+    let payload: Vec<u8> = (0..(1024 * 1024))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    fs::write(&archive_path, xz_compress_multiblock(&payload)).unwrap();
+
+    let (_root, budget) = test_extraction_security(&output_dir);
+    let mut decoder = open_filesystem_xz_decoder(&archive_path, &budget, 2).unwrap();
+    assert!(matches!(&decoder, FilesystemXzDecoder::Parallel { .. }));
+
+    let mut output = Vec::new();
+    decoder.read_to_end(&mut output).unwrap();
+    assert_eq!(output, payload);
+}
+
+#[test]
+fn filesystem_xz_decoder_falls_back_to_sequential_when_mt_is_busy() {
+    let _test_guard = XZ_MT_DECODER_TEST_LOCK.lock().unwrap();
+    let temp = TempDir::new().unwrap();
+    let archive_path = temp.path().join("payload.bin.xz");
+    let output_dir = temp.path().join("out");
+    fs::create_dir_all(&output_dir).unwrap();
+    let payload: Vec<u8> = (0..(1024 * 1024))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    fs::write(&archive_path, xz_compress_multiblock(&payload)).unwrap();
+
+    let (_root, budget) = test_extraction_security(&output_dir);
+    let _permit = XZ_MT_DECODER_PERMIT.lock().unwrap();
+    let mut decoder = open_filesystem_xz_decoder(&archive_path, &budget, 2).unwrap();
+    assert!(matches!(&decoder, FilesystemXzDecoder::Sequential(_)));
+
+    let mut output = Vec::new();
+    decoder.read_to_end(&mut output).unwrap();
+    assert_eq!(output, payload);
 }
 
 #[test]
