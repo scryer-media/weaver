@@ -2104,10 +2104,10 @@ fn settings_resolve_env_over_config_over_default() {
     use super::DirectStoreSettings;
     use super::router::HOLDS_SCRATCH_CEILING_BYTES;
 
-    // Nothing configured anywhere: off, at the 512 MiB default ceiling.
+    // Nothing configured anywhere: on, at the 512 MiB default ceiling.
     let defaults = DirectStoreSettings::resolve_parts(None, None, None, None);
     assert_eq!(defaults, DirectStoreSettings::default());
-    assert!(!defaults.gate.is_enabled(), "the default is off");
+    assert!(defaults.gate.is_enabled(), "the default is on");
     assert_eq!(
         defaults.holds_scratch_ceiling_bytes,
         HOLDS_SCRATCH_CEILING_BYTES

@@ -243,7 +243,7 @@ pub(crate) struct DirectStoreSettings {
 impl Default for DirectStoreSettings {
     fn default() -> Self {
         Self {
-            gate: DirectStoreGate::Disabled,
+            gate: DirectStoreGate::Enabled,
             holds_scratch_ceiling_bytes: router::HOLDS_SCRATCH_CEILING_BYTES,
         }
     }
@@ -271,7 +271,7 @@ impl DirectStoreSettings {
         env_enabled: Option<bool>,
         env_ceiling: Option<u64>,
     ) -> Self {
-        let enabled = env_enabled.or(config_enabled).unwrap_or(false);
+        let enabled = env_enabled.or(config_enabled).unwrap_or(true);
         Self {
             gate: if enabled {
                 DirectStoreGate::Enabled
@@ -288,9 +288,8 @@ impl DirectStoreSettings {
 /// Resolved gate value, passed explicitly so callers and tests do not race the
 /// process-wide `OnceLock`.
 ///
-/// **Defaults off.** Flipping the default to on is a release decision — the
-/// feature has to earn it on real fixtures and a Windows validation run — not a
-/// config-default edit.
+/// **Defaults on.** Operators can disable it through configuration or the
+/// environment kill switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectStoreGate {
     Enabled,
