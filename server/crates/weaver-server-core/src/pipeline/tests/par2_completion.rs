@@ -6393,6 +6393,384 @@ fn describe_non_recovery_file(
     file_id
 }
 
+/// Quarantining the damaged source beside repaired canonical bytes must not
+/// force a second read of the whole recovery set.
+#[tokio::test]
+async fn repaired_obfuscated_rar_quarantine_keeps_the_selective_repair_tail() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut repair_events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30347);
+    let mut files = build_multifile_multivolume_rar_set();
+    let source_filename = "ae282dbe64861b7171e041b55057e3dd.40";
+    let canonical_filename = files[1].0.clone();
+    let duplicate_filename = "show.part02.duplicate1.rar";
+    files[1].1.resize(20 * 1024, 0);
+    let repaired_volume = files[1].1.clone();
+    let mut damaged_volume = repaired_volume.clone();
+    damaged_volume[17 * 1024] = 1;
+    let notes_filename = "show.nfo";
+    let notes = b"repair-tail fixture".to_vec();
+    let index_filename = "show.par2";
+    let par2_bytes = build_test_par2_index_for_files(
+        &[
+            (files[0].0.as_str(), files[0].1.as_slice()),
+            (canonical_filename.as_str(), repaired_volume.as_slice()),
+            (notes_filename, notes.as_slice()),
+        ],
+        1024,
+    );
+    let posted_files = vec![
+        files[0].clone(),
+        (source_filename.to_string(), damaged_volume.clone()),
+        files[2].clone(),
+        files[3].clone(),
+        (notes_filename.to_string(), notes.clone()),
+        (index_filename.to_string(), par2_bytes.clone()),
+    ];
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Obfuscated RAR Selective Repair Tail", &posted_files),
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for file_index in [0usize, 2, 3] {
+        write_and_complete_rar_volume(
+            &mut pipeline,
+            job_id,
+            file_index as u32,
+            &posted_files[file_index].0,
+            &posted_files[file_index].1,
+        )
+        .await;
+    }
+    write_and_complete_file(&mut pipeline, job_id, 4, notes_filename, &notes).await;
+    write_and_complete_file(&mut pipeline, job_id, 5, index_filename, &par2_bytes).await;
+    tokio::fs::write(working_dir.join(source_filename), &damaged_volume)
+        .await
+        .unwrap();
+    pipeline.file_prefix_16k.insert(
+        NzbFileId {
+            job_id,
+            file_index: 1,
+        },
+        damaged_volume[..16 * 1024].to_vec(),
+    );
+
+    pipeline.par2_pre_repair_dir_entries.insert(
+        job_id,
+        posted_files
+            .iter()
+            .map(|(filename, _)| filename.clone())
+            .collect(),
+    );
+    let stale_headers = shortened_e01_rar_headers(&files);
+    let rar_key = (job_id, "show".to_string());
+    let generation_before_rebind = pipeline
+        .rar_sets
+        .get(&rar_key)
+        .expect("the partial RAR set should already be registered")
+        .extraction_generation;
+    pipeline
+        .rar_sets
+        .get_mut(&rar_key)
+        .expect("the partial RAR set should already be registered")
+        .cached_headers = Some(stale_headers.clone());
+    pipeline
+        .db
+        .save_archive_headers(job_id, "show", &stale_headers)
+        .unwrap();
+    tokio::fs::write(working_dir.join(&canonical_filename), &repaired_volume)
+        .await
+        .unwrap();
+
+    let par2_set = build_repairable_par2_set_for_files(
+        &[
+            (files[0].0.as_str(), files[0].1.as_slice()),
+            (canonical_filename.as_str(), repaired_volume.as_slice()),
+            (notes_filename, notes.as_slice()),
+        ],
+        1024,
+        1,
+    );
+    let carried_rar_id = par2_set.recovery_file_ids[0];
+    let repaired_rar_id = par2_set.recovery_file_ids[1];
+    let carried_notes_id = par2_set.recovery_file_ids[2];
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        par2_set,
+        &[(5, index_filename, 0, false)],
+    );
+    let par2_set = pipeline.par2_set(job_id).cloned().unwrap();
+
+    let valid_slices = |len: usize| vec![true; len.div_ceil(1024)];
+    let mut damaged_slices = valid_slices(repaired_volume.len());
+    *damaged_slices.last_mut().unwrap() = false;
+    let pre_repair = par2_rs::VerificationResult {
+        files: vec![
+            par2_rs::verify::FileVerification {
+                file_id: carried_rar_id,
+                filename: files[0].0.clone(),
+                status: par2_rs::verify::FileStatus::Complete,
+                valid_slices: valid_slices(files[0].1.len()),
+                missing_slice_count: 0,
+            },
+            par2_rs::verify::FileVerification {
+                file_id: repaired_rar_id,
+                filename: canonical_filename.clone(),
+                status: par2_rs::verify::FileStatus::Damaged(1),
+                valid_slices: damaged_slices,
+                missing_slice_count: 1,
+            },
+            par2_rs::verify::FileVerification {
+                file_id: carried_notes_id,
+                filename: notes_filename.to_string(),
+                status: par2_rs::verify::FileStatus::Complete,
+                valid_slices: valid_slices(notes.len()),
+                missing_slice_count: 0,
+            },
+        ],
+        recovery_blocks_available: 1,
+        total_missing_blocks: 1,
+        repairable: par2_rs::verify::Repairability::Repairable {
+            blocks_needed: 1,
+            blocks_available: 1,
+        },
+    };
+    let outcome = par2_rs::Par2RepairOutcome {
+        status: par2_rs::Par2RepairStatus::Repaired,
+        files_complete: 3,
+        files_renamed: 1,
+        files_damaged: 0,
+        files_missing: 0,
+        available_blocks: 1,
+        missing_blocks: 0,
+        recovery_blocks_available: 1,
+        recovery_blocks_used: 1,
+        bytes_copied: 0,
+        bytes_reconstructed: 1024,
+        packets: par2_rs::PacketDiagnostics::default(),
+        scan: par2_rs::ScanDiagnostics::default(),
+        carry: par2_rs::repairer::CarryDiagnostics::default(),
+        verification: pre_repair.clone(),
+    };
+
+    pipeline
+        .finish_par2_repair(
+            job_id,
+            Arc::clone(&par2_set),
+            working_dir.clone(),
+            &pre_repair,
+            outcome,
+            false,
+        )
+        .await;
+    drain_rar_refreshes(&mut pipeline).await;
+
+    assert_eq!(pipeline.par2_post_repair_read_splits, vec![(2, 1)]);
+    assert_eq!(pipeline.par2_selective_verify_calls, 1);
+    assert_eq!(
+        pipeline.par2_authoritative_verify_calls, 0,
+        "moving the damaged source to a duplicate name did not alter canonical bytes"
+    );
+    assert_eq!(drain_job_repair_complete(&mut repair_events, job_id), 1);
+    assert_eq!(
+        tokio::fs::read(working_dir.join(&canonical_filename))
+            .await
+            .unwrap(),
+        repaired_volume
+    );
+    assert!(
+        !working_dir.join(duplicate_filename).exists(),
+        "the quarantine copy should be swept after the aggregate settles"
+    );
+    let identity = pipeline
+        .file_identity(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(identity.source_filename, source_filename);
+    assert_eq!(identity.current_filename, canonical_filename);
+    assert!(
+        pipeline
+            .rar_sets
+            .get(&rar_key)
+            .unwrap()
+            .extraction_generation
+            > generation_before_rebind,
+        "canonical identity rebinding must invalidate older refresh generations"
+    );
+
+    let volume_paths = pipeline.volume_paths_for_rar_set(job_id, "show");
+    assert_eq!(
+        volume_paths.get(&1),
+        Some(&working_dir.join(&canonical_filename))
+    );
+    let cached_headers = pipeline
+        .load_rar_snapshot(job_id, "show")
+        .expect("canonical reconciliation should rebuild the complete RAR snapshot");
+    let cached_archive =
+        unrar_rs::RarArchive::deserialize_headers_with_password(&cached_headers, None::<String>)
+            .unwrap();
+    let cached_e01 = cached_archive
+        .metadata()
+        .members
+        .into_iter()
+        .find(|member| member.name == "E01.mkv")
+        .unwrap();
+    assert_eq!(cached_e01.volumes.first_volume, 0);
+    assert_eq!(cached_e01.volumes.last_volume, 1);
+    let mut archive = Pipeline::open_rar_archive_from_snapshot_or_disk(
+        crate::pipeline::extraction::RarArchiveSnapshotOpenRequest {
+            set_name: "show",
+            volume_paths: volume_paths.clone(),
+            password_candidates: Vec::new(),
+            cached_headers: Some(cached_headers),
+            shared_kdf_cache: Arc::new(unrar_rs::crypto::KdfCache::new()),
+            open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
+            requested_members: None,
+            already_extracted: None,
+            budget: None,
+        },
+    )
+    .unwrap()
+    .value;
+    let output_dir = working_dir.join("repair-tail-output");
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let member_index = archive.find_member_sanitized("E01.mkv").unwrap();
+    Pipeline::extract_rar_member_to_output(
+        &mut archive,
+        crate::pipeline::extraction::RarExtractionContext::new(
+            &volume_paths,
+            &pipeline.event_tx,
+            job_id,
+            "show",
+            &output_dir,
+            &unrar_rs::ExtractOptions {
+                verify: true,
+                password: None,
+                restore_owners: false,
+            },
+        ),
+        member_index,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(output_dir.join("E01.mkv")).unwrap(),
+        b"episode-a-payload"
+    );
+}
+
+/// A free canonical rename is still only a 16 KiB identity match until the
+/// settled-layout pass proves the full digest.
+#[tokio::test]
+async fn canonical_non_recovery_rename_rejects_corruption_after_the_prefix() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30348);
+    let payload_filename = "silver-horizon.mkv";
+    let posted_notes_filename = "9f2c1a5e.dat";
+    let notes_filename = "silver-horizon.bin";
+    let payload = misplacement_payload(31);
+    let notes: Vec<u8> = (0..20 * 1024).map(|index| (index % 251) as u8).collect();
+    let mut corrupted_notes = notes.clone();
+    corrupted_notes[17 * 1024] ^= 1;
+    let spec = standalone_job_spec(
+        "Canonical Non-Recovery Tail Guard",
+        &[
+            (payload_filename.to_string(), payload.len() as u32),
+            (
+                posted_notes_filename.to_string(),
+                corrupted_notes.len() as u32,
+            ),
+        ],
+    );
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    tokio::fs::write(working_dir.join(payload_filename), &payload)
+        .await
+        .unwrap();
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        1,
+        posted_notes_filename,
+        &corrupted_notes,
+    )
+    .await;
+
+    let mut par2_set = build_repairable_par2_set_for_files(&[(payload_filename, &payload)], 64, 1);
+    describe_non_recovery_file(&mut par2_set, notes_filename, &notes);
+    let payload_id = par2_set.recovery_file_ids[0];
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+    let par2_set = pipeline.par2_set(job_id).cloned().unwrap();
+    let pre_repair = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: payload_id,
+            filename: payload_filename.to_string(),
+            status: par2_rs::verify::FileStatus::Damaged(1),
+            valid_slices: vec![true, false],
+            missing_slice_count: 1,
+        }],
+        recovery_blocks_available: 1,
+        total_missing_blocks: 1,
+        repairable: par2_rs::verify::Repairability::Repairable {
+            blocks_needed: 1,
+            blocks_available: 1,
+        },
+    };
+    let outcome = par2_rs::Par2RepairOutcome {
+        status: par2_rs::Par2RepairStatus::Repaired,
+        files_complete: 1,
+        files_renamed: 0,
+        files_damaged: 0,
+        files_missing: 0,
+        available_blocks: 1,
+        missing_blocks: 0,
+        recovery_blocks_available: 1,
+        recovery_blocks_used: 1,
+        bytes_copied: 0,
+        bytes_reconstructed: 64,
+        packets: par2_rs::PacketDiagnostics::default(),
+        scan: par2_rs::ScanDiagnostics::default(),
+        carry: par2_rs::repairer::CarryDiagnostics::default(),
+        verification: pre_repair.clone(),
+    };
+
+    pipeline
+        .finish_par2_repair(
+            job_id,
+            Arc::clone(&par2_set),
+            working_dir.clone(),
+            &pre_repair,
+            outcome,
+            false,
+        )
+        .await;
+
+    assert_eq!(pipeline.par2_authoritative_verify_calls, 1);
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "the strict canonical pass must reject a tail that the 16 KiB identity prefix cannot see"
+    );
+    assert_eq!(
+        tokio::fs::read(working_dir.join(notes_filename))
+            .await
+            .unwrap(),
+        corrupted_notes,
+        "the failure is proof, not another rename or a destructive cleanup"
+    );
+}
+
 /// The repair's own leftovers must not fail the repair that produced them.
 ///
 /// par2-rs installs a file at the name its description gives it and moves
@@ -6402,8 +6780,9 @@ fn describe_non_recovery_file(
 /// finds two files for one description and calls the pair a conflict. The
 /// settled-layout pass used to be that scan, and it refused accepted repairs
 /// over artefacts the repair had just written. It asks the narrower question
-/// now: is every described file intact at its canonical name. A leftover cannot
-/// answer that one, and it is swept with the rest once the aggregate settles.
+/// now: are the recovery files and newly canonicalized descriptions intact at
+/// their canonical names. A leftover cannot answer that one, and it is swept
+/// with the rest once the aggregate settles.
 #[tokio::test]
 async fn repair_leftovers_do_not_fail_the_pass_that_verifies_the_settled_layout() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -6508,6 +6887,11 @@ async fn repair_leftovers_do_not_fail_the_pass_that_verifies_the_settled_layout(
         1,
     );
     describe_non_recovery_file(&mut par2_set, notes_filename, &notes);
+    describe_non_recovery_file(
+        &mut par2_set,
+        "silver-horizon-missing.sfv",
+        b"described but never posted",
+    );
     let alpha_id = par2_set.recovery_file_ids[0];
     let beta_id = par2_set.recovery_file_ids[1];
     let gamma_id = par2_set.recovery_file_ids[2];
@@ -6614,6 +6998,11 @@ async fn repair_leftovers_do_not_fail_the_pass_that_verifies_the_settled_layout(
         drain_job_repair_complete(&mut repair_events, job_id),
         1,
         "a repair whose set is intact where it now sits is a repair that held"
+    );
+    assert_eq!(
+        pipeline.par2_authoritative_verify_calls, 1,
+        "the non-recovery file moved into its free canonical name from 16 KiB \
+         identity evidence, so the settled layout still needs strict proof"
     );
     let mut remaining: Vec<String> = std::fs::read_dir(&working_dir)
         .unwrap()

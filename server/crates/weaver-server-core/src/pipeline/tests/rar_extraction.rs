@@ -1264,6 +1264,212 @@ async fn stale_post_extraction_refresh_does_not_replace_live_rar_plan() {
 }
 
 #[tokio::test]
+async fn identity_rebind_rejects_an_older_rar_refresh_snapshot() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40138);
+    let files = build_multifile_multivolume_rar_set();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("RAR Identity Rebind Refresh Race", &files),
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let key = (job_id, "show".to_string());
+    let stale_plan = pipeline
+        .rar_sets
+        .get(&key)
+        .and_then(|state| state.plan.as_ref())
+        .cloned()
+        .expect("RAR plan should exist before identity rebinding");
+    let stale_headers = pipeline
+        .load_rar_snapshot(job_id, "show")
+        .expect("RAR snapshot should exist before identity rebinding");
+    let stale_generation = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("RAR set should exist")
+        .extraction_generation;
+    let canonical_facts = pipeline.rar_sets.get(&key).unwrap().facts.clone();
+    let request = RarRefreshRequest {
+        target_completed_volume: 3,
+        reason: RefreshReason::PostExtraction,
+    };
+    let identity_rebuild = RarRefreshRequest {
+        target_completed_volume: 3,
+        reason: RefreshReason::IdentityRebind,
+    };
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: Some(request),
+            queued: Some(identity_rebuild),
+            latest_completed_volume: 3,
+            refreshed_volumes: BTreeSet::from([0, 1, 2, 3]),
+            structure_dirty: true,
+            last_error: None,
+        },
+    );
+
+    let touched_filenames = files.iter().map(|(filename, _)| filename.clone()).collect();
+    pipeline.invalidate_archive_set_for_identity_rebind(job_id, "show", &touched_filenames);
+    pipeline.purge_empty_rar_set_if_idle(job_id, "show");
+    for (volume, (filename, _)) in files.iter().enumerate() {
+        pipeline
+            .persist_rar_volume_facts(
+                job_id,
+                "show",
+                filename,
+                Some(volume as u32),
+                canonical_facts[&(volume as u32)].clone(),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        pipeline
+            .rar_sets
+            .get(&key)
+            .expect("RAR set should survive identity rebinding")
+            .extraction_generation,
+        stale_generation.saturating_add(1)
+    );
+    assert!(pipeline.load_rar_snapshot(job_id, "show").is_none());
+
+    pipeline
+        .handle_rar_refresh_done(RarRefreshDone {
+            job_id,
+            set_name: "show".to_string(),
+            request,
+            extraction_generation: stale_generation,
+            result: Ok(ComputedRarSetState {
+                plan: stale_plan,
+                headers: stale_headers,
+                rebuild_source:
+                    crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+            }),
+        })
+        .await;
+
+    let set_state = pipeline.rar_sets.get(&key).expect("RAR set should remain");
+    assert_eq!(
+        set_state.extraction_generation,
+        stale_generation.saturating_add(1)
+    );
+    assert!(
+        set_state.plan.is_none(),
+        "the stale plan must stay discarded"
+    );
+    assert!(
+        pipeline.load_rar_snapshot(job_id, "show").is_none(),
+        "the stale refresh must not reinstall its header snapshot"
+    );
+
+    drain_rar_refreshes(&mut pipeline).await;
+    let rebuilt_headers = pipeline
+        .load_rar_snapshot(job_id, "show")
+        .expect("the queued identity rebuild should install fresh headers");
+    let rebuilt_archive =
+        unrar_rs::RarArchive::deserialize_headers_with_password(&rebuilt_headers, None::<String>)
+            .unwrap();
+    let e01 = rebuilt_archive
+        .metadata()
+        .members
+        .into_iter()
+        .find(|member| member.name == "E01.mkv")
+        .unwrap();
+    assert_eq!(e01.volumes.first_volume, 0);
+    assert_eq!(e01.volumes.last_volume, 1);
+}
+
+#[tokio::test]
+async fn source_retry_discards_an_in_flight_refresh_without_resurrecting_its_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40139);
+    let files = build_multifile_multivolume_rar_set();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("RAR Source Retry Refresh Retirement", &files),
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let key = (job_id, "show".to_string());
+    let stale_plan = pipeline
+        .rar_sets
+        .get(&key)
+        .and_then(|state| state.plan.clone())
+        .unwrap();
+    let stale_headers = pipeline.load_rar_snapshot(job_id, "show").unwrap();
+    let stale_generation = pipeline.rar_sets[&key].extraction_generation;
+    let request = RarRefreshRequest {
+        target_completed_volume: 3,
+        reason: RefreshReason::PostExtraction,
+    };
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: Some(request),
+            ..Default::default()
+        },
+    );
+
+    pipeline.clear_archive_set_for_source_retry(job_id, "show");
+    let tombstone = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("an in-flight refresh needs a generation tombstone");
+    assert_eq!(
+        tombstone.extraction_generation,
+        stale_generation.saturating_add(1)
+    );
+    assert!(tombstone.facts.is_empty());
+    assert!(tombstone.volume_files.is_empty());
+    assert!(tombstone.plan.is_none());
+    assert!(pipeline.load_rar_snapshot(job_id, "show").is_none());
+
+    pipeline
+        .handle_rar_refresh_done(RarRefreshDone {
+            job_id,
+            set_name: "show".to_string(),
+            request,
+            extraction_generation: stale_generation,
+            result: Ok(ComputedRarSetState {
+                plan: stale_plan,
+                headers: stale_headers,
+                rebuild_source:
+                    crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+            }),
+        })
+        .await;
+
+    assert!(!pipeline.rar_sets.contains_key(&key));
+    assert!(!pipeline.rar_refresh_state.contains_key(&key));
+    assert!(pipeline.load_rar_snapshot(job_id, "show").is_none());
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .assembly
+            .archive_topology_for("show")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn active_sibling_extraction_does_not_launch_post_refresh_or_reselect_finished_member() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -4416,6 +4622,18 @@ async fn rar_identity_rebind_preserves_in_flight_workers() {
         .expect("set state should exist");
     assert_eq!(set_state.active_workers, 2);
     assert_eq!(set_state.in_flight_members, expected_in_flight);
+    let generation_before_rebind = set_state.extraction_generation;
+
+    let stale_headers = shortened_e01_rar_headers(&files);
+    pipeline.rar_sets.get_mut(&set_key).unwrap().cached_headers = Some(stale_headers.clone());
+    pipeline
+        .db
+        .save_archive_headers(job_id, "show", &stale_headers)
+        .unwrap();
+    assert!(
+        pipeline.load_rar_snapshot(job_id, "show").is_some(),
+        "the shortened topology should be cached in memory and the database"
+    );
 
     let touched_filenames = [files[0].0.clone()].into_iter().collect();
     pipeline.invalidate_archive_set_for_identity_rebind(job_id, "show", &touched_filenames);
@@ -4427,6 +4645,14 @@ async fn rar_identity_rebind_preserves_in_flight_workers() {
     assert_eq!(set_state.active_workers, 2);
     assert_eq!(set_state.in_flight_members, expected_in_flight);
     assert!(set_state.plan.is_none());
+    assert_eq!(
+        set_state.extraction_generation,
+        generation_before_rebind.saturating_add(1)
+    );
+    assert!(
+        pipeline.load_rar_snapshot(job_id, "show").is_none(),
+        "identity rebinding must clear both the in-memory and persisted header snapshot"
+    );
 
     pipeline.try_rar_extraction(job_id).await;
     let set_state = pipeline

@@ -235,7 +235,13 @@ async fn conflicting_cross_set_rename_targets_are_dropped() {
     install_two_parsed_sets(&mut pipeline, job_id, served, other);
     write_and_complete_file(&mut pipeline, job_id, 0, posted_name, &payload).await;
 
-    assert_eq!(pipeline.try_deobfuscate_files_with_par2(job_id).await, 0);
+    assert_eq!(
+        pipeline
+            .try_deobfuscate_files_with_par2(job_id)
+            .await
+            .renamed,
+        0
+    );
     assert!(working_dir.join(posted_name).exists());
     assert!(!working_dir.join(correct_name).exists());
 }
@@ -266,7 +272,13 @@ async fn a_unique_non_served_set_rename_lands() {
     install_two_parsed_sets(&mut pipeline, job_id, served, other);
     write_and_complete_file(&mut pipeline, job_id, 0, posted_name, &payload).await;
 
-    assert_eq!(pipeline.try_deobfuscate_files_with_par2(job_id).await, 1);
+    assert_eq!(
+        pipeline
+            .try_deobfuscate_files_with_par2(job_id)
+            .await
+            .renamed,
+        1
+    );
     assert!(!working_dir.join(posted_name).exists());
     assert_eq!(
         std::fs::read(working_dir.join(correct_name)).unwrap(),
@@ -353,7 +365,8 @@ async fn a_single_set_keeps_its_binding_grid_and_rename_behavior() {
     assert_eq!(
         rename_pipeline
             .try_deobfuscate_files_with_par2(rename_job_id)
-            .await,
+            .await
+            .renamed,
         1
     );
     assert!(!rename_dir.join(posted_name).exists());

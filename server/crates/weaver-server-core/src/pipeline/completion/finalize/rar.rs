@@ -8,6 +8,13 @@ use std::collections::BTreeMap;
 impl Pipeline {
     pub(crate) fn purge_empty_rar_set_if_idle(&mut self, job_id: JobId, set_name: &str) {
         let set_key = (job_id, set_name.to_string());
+        if self
+            .rar_refresh_state
+            .get(&set_key)
+            .is_some_and(|refresh| refresh.in_flight.is_some())
+        {
+            return;
+        }
         let should_remove = self.rar_sets.get(&set_key).is_some_and(|state| {
             state.volume_files.is_empty()
                 && state.active_workers == 0
@@ -45,6 +52,10 @@ impl Pipeline {
             .unwrap_or_default();
 
         let mut persisted_suspect_volumes = None;
+        let refresh_in_flight = self
+            .rar_refresh_state
+            .get(&set_key)
+            .is_some_and(|refresh| refresh.in_flight.is_some());
 
         let remove_empty_set = if let Some(state) = self.rar_sets.get_mut(&set_key) {
             state
@@ -58,9 +69,11 @@ impl Pipeline {
             }
             persisted_suspect_volumes = Some(state.verified_suspect_volumes.clone());
             state.plan = None;
+            state.extraction_generation = state.extraction_generation.saturating_add(1);
             state.volume_files.is_empty()
                 && state.active_workers == 0
                 && state.in_flight_members.is_empty()
+                && !refresh_in_flight
         } else {
             false
         };
@@ -81,9 +94,7 @@ impl Pipeline {
             self.persist_verified_suspect_volumes(job_id, set_name, &suspect_volumes);
         }
 
-        if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.assembly.archive_topologies_mut().remove(set_name);
-        }
+        self.clear_rar_snapshot(job_id, set_name);
         self.mark_rar_unlock_priorities_dirty(job_id);
 
         if let Err(error) = self.db.clear_extraction_chunks_for_set(job_id, set_name) {
@@ -130,6 +141,14 @@ impl Pipeline {
 
     pub(crate) fn clear_archive_set_for_source_retry(&mut self, job_id: JobId, set_name: &str) {
         let set_key = (job_id, set_name.to_string());
+        let refresh_in_flight = self
+            .rar_refresh_state
+            .get(&set_key)
+            .is_some_and(|refresh| refresh.in_flight.is_some());
+        let retired_generation = self
+            .rar_sets
+            .get(&set_key)
+            .map_or(1, |state| state.extraction_generation.saturating_add(1));
         let retry_filenames: HashSet<String> = {
             let mut filenames = HashSet::new();
             if let Some(state) = self.jobs.get(&job_id)
@@ -157,8 +176,23 @@ impl Pipeline {
         }
 
         self.clear_rar_snapshot(job_id, set_name);
-        self.rar_sets.remove(&set_key);
-        self.rar_refresh_state.remove(&set_key);
+        if refresh_in_flight {
+            let tombstone = RarSetState {
+                extraction_generation: retired_generation,
+                ..Default::default()
+            };
+            self.rar_sets.insert(set_key.clone(), tombstone);
+            if let Some(refresh) = self.rar_refresh_state.get_mut(&set_key) {
+                let in_flight = refresh.in_flight;
+                *refresh = RarRefreshState {
+                    in_flight,
+                    ..Default::default()
+                };
+            }
+        } else {
+            self.rar_sets.remove(&set_key);
+            self.rar_refresh_state.remove(&set_key);
+        }
 
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.assembly.archive_topologies_mut().remove(set_name);

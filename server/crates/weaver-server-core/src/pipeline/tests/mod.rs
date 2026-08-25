@@ -862,6 +862,27 @@ fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
+fn shortened_e01_rar_headers(files: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut archive = unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+    for (volume, (_, bytes)) in files.iter().enumerate().skip(1) {
+        archive
+            .add_volume(volume, Box::new(std::io::Cursor::new(bytes.clone())))
+            .unwrap();
+    }
+    let mut cached = serde_json::to_value(archive.export_headers()).unwrap();
+    let e01 = cached["members"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|member| member["name"] == "E01.mkv")
+        .unwrap();
+    let first_segment = e01["segments"].as_array().unwrap()[0].clone();
+    e01["segments"] = serde_json::json!([first_segment]);
+    e01["split_after"] = serde_json::json!(false);
+    rmp_serde::to_vec(&serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap())
+        .unwrap()
+}
+
 fn dummy_rar_volume_facts(volume_number: u32) -> unrar_rs::RarVolumeFacts {
     unrar_rs::RarVolumeFacts {
         format: 5,

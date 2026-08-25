@@ -1521,8 +1521,12 @@ impl Pipeline {
                 let mut request = state
                     .queued
                     .take()
+                    .filter(|_| !live_fact_volumes.is_empty())
                     .filter(|queued| queued.reason != RefreshReason::PostExtraction);
-                if request.is_none() && done.request.reason != RefreshReason::PostExtraction {
+                if request.is_none()
+                    && !live_fact_volumes.is_empty()
+                    && done.request.reason != RefreshReason::PostExtraction
+                {
                     request = Some(RarRefreshRequest {
                         target_completed_volume: state
                             .latest_completed_volume
@@ -1531,7 +1535,7 @@ impl Pipeline {
                         reason: done.request.reason,
                     });
                 }
-                if request.is_none() && state.structure_dirty {
+                if request.is_none() && !live_fact_volumes.is_empty() && state.structure_dirty {
                     request = Some(RarRefreshRequest {
                         target_completed_volume: state
                             .latest_completed_volume
@@ -1606,6 +1610,11 @@ impl Pipeline {
                     state.structure_dirty = false;
                 }
             }
+        }
+
+        if stale_refresh && live_fact_volumes.is_empty() {
+            self.purge_empty_rar_set_if_idle(done.job_id, &done.set_name);
+            return;
         }
 
         if let Some(request) = follow_up {

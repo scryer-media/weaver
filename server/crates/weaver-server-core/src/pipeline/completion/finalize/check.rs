@@ -357,6 +357,12 @@ struct CleanPar2Verification {
     retry_message: &'static str,
 }
 
+#[derive(Default)]
+pub(in crate::pipeline) struct Par2DeobfuscationOutcome {
+    pub(in crate::pipeline) renamed: usize,
+    canonical_description_file_ids: HashMap<par2_rs::RecoverySetId, HashSet<par2_rs::FileId>>,
+}
+
 fn log_clean_par2_verification_source(
     job_id: JobId,
     set_id: par2_rs::RecoverySetId,
@@ -636,8 +642,8 @@ enum Par2PassScope {
     /// merge with whatever it is standing in for, and the placement plan it
     /// returns is derived from that merged result rather than scanned.
     Selected(Vec<par2_rs::FileId>),
-    /// Every recovery file, read at the name its description gives it, with no
-    /// directory scan behind it.
+    /// Every recovery file plus the listed descriptions whose canonical paths
+    /// were just populated, read at canonical names with no directory scan.
     ///
     /// The question is "is the whole set intact where it now sits", and that
     /// question needs no scan — a scan answers a different one, which disk file
@@ -648,15 +654,14 @@ enum Par2PassScope {
     /// the same description; the scan reports that as a conflict and refuses.
     /// Reading at canonical names cannot be confused by a leftover, which is
     /// swept with the rest of the repair's artefacts once the aggregate settles.
-    WholeSetAtCanonicalNames,
+    WholeSetAtCanonicalNames(Vec<par2_rs::FileId>),
 }
 
-/// Run the read the scope asks for. `verify_all` is `verify_selected_file_ids`
-/// over the whole recovery set, so the two arms are one pipeline reached with
-/// different file lists — the same per-slice and whole-file rules, the same
-/// verdicts, over fewer files. The selective arm alone opts into the crate's
-/// fast-verify mode; both whole-set shapes stay strict, and differ only in the
-/// placement plan the caller reads them through.
+/// Run the read the scope asks for. All arms share par2-rs's selected-file
+/// verifier. The canonical-name scope also includes non-recovery descriptions:
+/// without IFSC packets the verifier proves those by strict full-file MD5,
+/// which is the identity proof a content rename needs. The selective arm alone
+/// opts into the crate's fast-verify mode.
 ///
 /// # Why the selective arm verifies from slice proof
 ///
@@ -695,8 +700,15 @@ fn verify_in_scope(
     access: &dyn par2_rs::FileAccess,
 ) -> par2_rs::VerificationResult {
     match scope {
-        Par2PassScope::WholeSet | Par2PassScope::WholeSetAtCanonicalNames => {
-            par2_rs::verify_all(par2_set, access)
+        Par2PassScope::WholeSet => par2_rs::verify_all(par2_set, access),
+        Par2PassScope::WholeSetAtCanonicalNames(extras) => {
+            let mut file_ids = par2_set.recovery_file_ids.clone();
+            for file_id in extras {
+                if !file_ids.contains(file_id) {
+                    file_ids.push(*file_id);
+                }
+            }
+            par2_rs::verify_selected_file_ids(par2_set, access, &file_ids)
         }
         Par2PassScope::Selected(file_ids) => par2_rs::verify_selected_file_ids_with_options(
             par2_set,
@@ -1539,9 +1551,9 @@ impl Pipeline {
     pub(in crate::pipeline) async fn try_deobfuscate_files_with_par2(
         &mut self,
         job_id: JobId,
-    ) -> usize {
+    ) -> Par2DeobfuscationOutcome {
         let Some(state) = self.jobs.get(&job_id) else {
-            return 0;
+            return Par2DeobfuscationOutcome::default();
         };
         let rename_dir = state.working_dir.clone();
 
@@ -1550,7 +1562,7 @@ impl Pipeline {
                 job_id = job_id.0,
                 "skipping PAR2 rename inside protected media structure"
             );
-            return 0;
+            return Par2DeobfuscationOutcome::default();
         }
 
         let mut suggestions = Vec::new();
@@ -1558,7 +1570,7 @@ impl Pipeline {
         let mut seen_hashes = HashSet::<[u8; 16]>::new();
         let mut ambiguous_hashes = HashSet::<[u8; 16]>::new();
         let mut descriptions_by_name =
-            HashMap::<String, Vec<(par2_rs::RecoverySetId, u64, [u8; 16])>>::new();
+            HashMap::<String, Vec<(par2_rs::RecoverySetId, par2_rs::FileId, u64, [u8; 16])>>::new();
         let set_ids = self
             .par2_runtime(job_id)
             .map(crate::pipeline::Par2RuntimeState::ordered_set_ids)
@@ -1574,7 +1586,12 @@ impl Pipeline {
                 descriptions_by_name
                     .entry(sanitize_download_filename(&description.filename))
                     .or_default()
-                    .push((set_id, description.length, description.hash_16k));
+                    .push((
+                        set_id,
+                        description.file_id,
+                        description.length,
+                        description.hash_16k,
+                    ));
             }
 
             let set_suggestions = match par2_rs::scan_for_renames(&rename_dir, par2) {
@@ -1621,7 +1638,7 @@ impl Pipeline {
         reserve_directory_filenames(&state.working_dir, &mut occupied_filenames);
         let _ = state;
 
-        let mut renamed = 0usize;
+        let mut outcome = Par2DeobfuscationOutcome::default();
         let mut touched_files = Vec::<NzbFileId>::new();
         let mut touched_rar_files = HashMap::<String, HashSet<String>>::new();
         for (set_id, suggestion) in &suggestions {
@@ -1660,7 +1677,7 @@ impl Pipeline {
                 .is_some_and(|descriptions| {
                     descriptions
                         .iter()
-                        .any(|(described_set_id, length, hash_16k)| {
+                        .any(|(described_set_id, _, length, hash_16k)| {
                             *described_set_id != *set_id
                                 && (*length != description.length
                                     || *hash_16k != description.hash_16k)
@@ -1762,7 +1779,19 @@ impl Pipeline {
 
             let renamed_successfully = match runtime_fs::rename_no_overwrite(old, &new) {
                 Ok(()) => {
-                    renamed += 1;
+                    outcome.renamed += 1;
+                    if correct_name == requested_correct_name
+                        && let Some(descriptions) =
+                            descriptions_by_name.get(&requested_correct_name)
+                    {
+                        for (set_id, file_id, _, _) in descriptions {
+                            outcome
+                                .canonical_description_file_ids
+                                .entry(*set_id)
+                                .or_default()
+                                .insert(*file_id);
+                        }
+                    }
                     reserve_download_filename(&correct_name, &mut occupied_filenames);
                     info!(
                         job_id = job_id.0,
@@ -1806,11 +1835,18 @@ impl Pipeline {
                     });
                 let classification = Self::canonical_archive_identity_from_filename(&correct_name)
                     .or(identity.classification.clone());
-                if let Some(set_name) = old_rar_set_name {
+                let new_rar_set_name = classification.as_ref().and_then(|classification| {
+                    matches!(
+                        classification.kind,
+                        crate::jobs::assembly::DetectedArchiveKind::Rar
+                    )
+                    .then(|| classification.set_name.clone())
+                });
+                for set_name in [old_rar_set_name, new_rar_set_name].into_iter().flatten() {
                     touched_rar_files
                         .entry(set_name)
                         .or_default()
-                        .insert(old_current_filename);
+                        .insert(old_current_filename.clone());
                 }
                 let mut rebound_identity = identity;
                 rebound_identity.current_filename = correct_name.clone();
@@ -1839,14 +1875,18 @@ impl Pipeline {
                 .await;
         }
 
-        if renamed > 0 {
+        if outcome.renamed > 0 {
             // Identity changed, not the bytes owned by this NzbFileId. The
             // binding resolver revalidates names live; raw grid evidence stays
             // available for every recovery set.
-            info!(job_id = job_id.0, renamed, "PAR2 deobfuscation complete");
+            info!(
+                job_id = job_id.0,
+                renamed = outcome.renamed,
+                "PAR2 deobfuscation complete"
+            );
         }
 
-        renamed
+        outcome
     }
 
     async fn run_par2_repairer(
@@ -2184,10 +2224,10 @@ impl Pipeline {
     /// The whole set, read where its files now sit, once something moved them
     /// after the repair.
     ///
-    /// The verdict it returns is final for the set: every described file is read
-    /// at the name its description gives it, strictly, so a file that is not
-    /// there comes back `Missing` and one whose bytes are wrong comes back
-    /// `Damaged`. Nothing is inferred from a directory scan, which is what
+    /// The verdict is final for the recovery files and any additional
+    /// descriptions whose canonical paths were just populated. Each is read at
+    /// its described name, strictly, so absent or wrong bytes cannot pass.
+    /// Nothing is inferred from a directory scan, which is what
     /// [`Par2PassScope::WholeSetAtCanonicalNames`] exists to avoid — the
     /// repairer's own leftovers are indistinguishable from the files they were
     /// displaced by, and a scan can only call that a conflict.
@@ -2196,13 +2236,14 @@ impl Pipeline {
         job_id: JobId,
         par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
+        extra_file_ids: Vec<par2_rs::FileId>,
     ) -> Result<par2_rs::VerificationResult, String> {
         let (mut verification, _) = self
             .run_par2_placement_pass(
                 job_id,
                 par2_set,
                 working_dir,
-                Par2PassScope::WholeSetAtCanonicalNames,
+                Par2PassScope::WholeSetAtCanonicalNames(extra_file_ids),
             )
             .await?;
         self.settle_par2_pass_result(job_id, &mut verification, false);
@@ -2376,7 +2417,7 @@ impl Pipeline {
                         }
                         plan
                     }
-                    Par2PassScope::Selected(_) | Par2PassScope::WholeSetAtCanonicalNames => {
+                    Par2PassScope::Selected(_) | Par2PassScope::WholeSetAtCanonicalNames(_) => {
                         par2_rs::PlacementPlan {
                             exact: Vec::new(),
                             swaps: Vec::new(),
@@ -4244,8 +4285,14 @@ impl Pipeline {
 
         // Rename obfuscated files using PAR2 metadata (16KB hash matching).
         // Must happen after repair and before extraction retry/finalize.
-        let deobfuscated = self.try_deobfuscate_files_with_par2(job_id).await;
+        let deobfuscation = self.try_deobfuscate_files_with_par2(job_id).await;
         stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.deobfuscate", stage_start);
+        let deobfuscation_canonical_file_ids = deobfuscation
+            .canonical_description_file_ids
+            .get(&par2_set.recovery_set_id)
+            .map(|file_ids| file_ids.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let deobfuscation_moved_current_canonical = !deobfuscation_canonical_file_ids.is_empty();
         let placement_moves_paths = !post_repair_placement_plan.swaps.is_empty()
             || !post_repair_placement_plan.renames.is_empty();
         if let Err(error) = self
@@ -4261,18 +4308,16 @@ impl Pipeline {
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.apply_placement", stage_start);
 
-        // The pass above described the directory as the repairer left it. The
-        // two steps in between then renamed files — deobfuscation by content,
-        // placement by the plan — so that description no longer describes the
-        // disk. A verdict is only worth announcing about the layout the job
-        // will actually deliver, so when either step moved a path the whole set
-        // is read once more, at the names the descriptions give it — the final
-        // places, if the repair and the two steps did their job — and that
-        // answer replaces the earlier one everywhere below.
+        // A content rename invalidates this set's verdict only when it populated
+        // one of this set's canonical description paths. Moving a damaged source
+        // aside as `.duplicateN` leaves the selectively verified canonical bytes
+        // untouched, while a rename into a free canonical path was identified
+        // from its 16 KiB prefix and still needs strict whole-file proof.
         //
-        // When nothing moved, the earlier answer still describes the disk
-        // exactly, and re-reading would throw away the whole point of the
-        // selective post-repair pass: it reads only what the repair rewrote.
+        // When no canonical description path moved, the earlier answer still
+        // describes the disk exactly, and re-reading would throw away the whole
+        // point of the selective post-repair pass: it reads only what the repair
+        // rewrote.
         // `misplaced_before_placement` closes the gap the other two conditions
         // leave: a file can verify as `Renamed` and still produce no plan entry
         // (a rename whose path has no file name lands in `unresolved`), and
@@ -4282,10 +4327,14 @@ impl Pipeline {
             .files
             .iter()
             .any(|file| !matches!(file.status, par2_rs::verify::FileStatus::Complete));
-        if deobfuscated > 0 || placement_moves_paths || misplaced_before_placement {
+        if deobfuscation_moved_current_canonical
+            || placement_moves_paths
+            || misplaced_before_placement
+        {
             info!(
                 job_id = job_id.0,
-                deobfuscated,
+                deobfuscated = deobfuscation.renamed,
+                deobfuscation_moved_current_canonical,
                 placement_moves_paths,
                 misplaced_before_placement,
                 "paths moved after repair — verifying the whole set where it now sits"
@@ -4295,6 +4344,7 @@ impl Pipeline {
                     job_id,
                     Arc::clone(&par2_set),
                     working_dir.clone(),
+                    deobfuscation_canonical_file_ids,
                 )
                 .await
             {
