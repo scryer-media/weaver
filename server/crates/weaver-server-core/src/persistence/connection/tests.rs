@@ -2038,6 +2038,7 @@ async fn postgres_runtime_smoke_when_configured() {
             connections: 12,
             active: true,
             supports_pipelining: true,
+            tls_name_mismatch_certificate_der: None,
             priority: 2,
             backfill: false,
             retention_days: 0,

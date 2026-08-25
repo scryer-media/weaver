@@ -357,6 +357,7 @@ fn parse_servers(vars: &HashMap<String, String>) -> Result<Vec<ServerConfig>, En
             max_download_speed: partial.max_download_speed.unwrap_or(0),
             download_quota,
             tls_ca_cert: partial.tls_ca_cert,
+            tls_name_mismatch_certificate_der: None,
         };
         server.validate_download_limits().map_err(|error| {
             EnvSeedError::new(format!("WEAVER_SERVER_{index} download limits: {error}"))
@@ -772,6 +773,7 @@ mod tests {
                 connections: 5,
                 active: true,
                 supports_pipelining: false,
+                tls_name_mismatch_certificate_der: None,
                 priority: 0,
                 backfill: false,
                 retention_days: 0,

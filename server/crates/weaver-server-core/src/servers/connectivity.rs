@@ -6,6 +6,7 @@ pub struct ServerConnectivityResult {
     pub message: String,
     pub latency_ms: Option<u64>,
     pub supports_pipelining: bool,
+    pub adoptable_tls_name_mismatch_certificate_der: Option<Vec<u8>>,
 }
 
 pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivityResult {
@@ -16,6 +17,7 @@ pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivit
         username: config.username.clone(),
         password: config.password.clone(),
         tls_ca_cert: config.tls_ca_cert.clone(),
+        tls_name_mismatch_certificate_der: config.tls_name_mismatch_certificate_der.clone(),
         pipelining: weaver_nntp::PipeliningCapability::Probe,
         ..Default::default()
     };
@@ -30,13 +32,29 @@ pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivit
                 message: "Connected successfully".to_string(),
                 latency_ms: Some(latency),
                 supports_pipelining: pipelining,
+                adoptable_tls_name_mismatch_certificate_der: None,
             }
         }
-        Err(error) => ServerConnectivityResult {
-            success: false,
-            message: format!("{error}"),
-            latency_ms: None,
-            supports_pipelining: false,
-        },
+        Err(error) => {
+            let adoptable_tls_name_mismatch_certificate_der = if config.tls {
+                weaver_nntp::tls::inspect_tls_name_mismatch_certificate(
+                    &config.host,
+                    config.port,
+                    config.tls_ca_cert.as_deref(),
+                )
+                .await
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            ServerConnectivityResult {
+                success: false,
+                message: format!("{error}"),
+                latency_ms: None,
+                supports_pipelining: false,
+                adoptable_tls_name_mismatch_certificate_der,
+            }
+        }
     }
 }

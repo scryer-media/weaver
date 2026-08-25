@@ -40,6 +40,7 @@ fn sample_config() -> Config {
             connections: 20,
             active: true,
             supports_pipelining: true,
+            tls_name_mismatch_certificate_der: Some(vec![0x30, 0x82, 0x01, 0x0a]),
             priority: 0,
             backfill: false,
             retention_days: 0,
@@ -223,6 +224,10 @@ async fn export_and_import_stable_state_roundtrip() {
     assert_eq!(restored.data_dir, "/old/data");
     assert_eq!(restored.servers.len(), 1);
     assert_eq!(restored.servers[0].max_download_speed, 2_000_000);
+    assert_eq!(
+        restored.servers[0].tls_name_mismatch_certificate_der,
+        Some(vec![0x30, 0x82, 0x01, 0x0a])
+    );
     assert!(restored.servers[0].download_quota.enabled);
     assert_eq!(restored.servers[0].download_quota.limit_bytes, 10_000_000);
     let restored_usage = dest.server_download_usage(1).unwrap().unwrap();
@@ -370,6 +375,7 @@ async fn import_stable_state_defaults_limits_missing_from_old_archive_schema() {
         "download_quota_reset_time_minutes_local",
         "download_quota_weekly_reset_weekday",
         "download_quota_monthly_reset_day",
+        "tls_name_mismatch_certificate_der",
     ] {
         let statement = format!("ALTER TABLE servers DROP COLUMN {column}");
         sqlx::raw_sql(sqlx::AssertSqlSafe(statement.as_str()))
@@ -386,6 +392,7 @@ async fn import_stable_state_defaults_limits_missing_from_old_archive_schema() {
     assert_eq!(restored.servers.len(), 1);
     assert_eq!(restored.servers[0].host, "news.example.com");
     assert_eq!(restored.servers[0].max_download_speed, 0);
+    assert_eq!(restored.servers[0].tls_name_mismatch_certificate_der, None);
     assert_eq!(
         restored.servers[0].download_quota,
         crate::servers::ServerDownloadQuotaConfig::default()

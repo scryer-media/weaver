@@ -343,6 +343,23 @@ file = "migrations/0042_post_processing_scripts/postgres.sql"
 engine = "postgres"
 scope = "all"
 
+[[migration]]
+version = 43
+description = "persist adopted TLS hostname-mismatch certificates"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0043_server_name_mismatch_certificate/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0043_server_name_mismatch_certificate/postgres.sql"
+engine = "postgres"
+scope = "all"
+
 [[baseline]]
 through_version = 21
 file = "migrations/0021_legacy_schema_parity/fresh.sql"

@@ -60,6 +60,9 @@ pub async fn rebuild_nntp_from_config(
                     username: server.username.clone(),
                     password: server.password.clone(),
                     tls_ca_cert: server.tls_ca_cert.clone(),
+                    tls_name_mismatch_certificate_der: server
+                        .tls_name_mismatch_certificate_der
+                        .clone(),
                     pipelining: weaver_nntp::PipeliningCapability::Known(
                         server.supports_pipelining,
                     ),
@@ -166,6 +169,7 @@ mod tests {
             connections: 2,
             active: true,
             supports_pipelining: true,
+            tls_name_mismatch_certificate_der: None,
             priority: 0,
             backfill: false,
             retention_days: 0,

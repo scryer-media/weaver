@@ -881,6 +881,18 @@ impl Database {
                                 } else {
                                     "NULL"
                                 };
+                            let src_server_tls_name_mismatch_certificate_der = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "servers",
+                                "tls_name_mismatch_certificate_der",
+                            )
+                            .await?
+                            {
+                                "tls_name_mismatch_certificate_der"
+                            } else {
+                                "NULL"
+                            };
                             let src_has_server_download_usage = table_has_column(
                                 &mut conn,
                                 "src",
@@ -919,14 +931,16 @@ impl Database {
                                       download_quota_limit_bytes, download_quota_period,
                                       download_quota_reset_time_minutes_local,
                                       download_quota_weekly_reset_weekday,
-                                      download_quota_monthly_reset_day, tls_ca_cert)
+                                      download_quota_monthly_reset_day, tls_ca_cert,
+                                      tls_name_mismatch_certificate_der)
                                      SELECT id, host, port, tls, username, password, connections, active,
                                             supports_pipelining, priority, {src_server_backfill},
                                             {src_server_retention_days}, {src_server_max_download_speed},
                                             {src_server_quota_enabled}, {src_server_quota_limit},
                                             {src_server_quota_period}, {src_server_quota_reset_time},
                                             {src_server_quota_weekday}, {src_server_quota_month_day},
-                                            {src_server_tls_ca_cert}
+                                            {src_server_tls_ca_cert},
+                                            {src_server_tls_name_mismatch_certificate_der}
                                        FROM src.servers;
                                  {import_server_download_usage}
                                  INSERT INTO categories (id, name, dest_dir, aliases)

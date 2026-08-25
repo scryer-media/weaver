@@ -30,6 +30,7 @@ fn server_crud() {
         connections: 10,
         active: true,
         supports_pipelining: false,
+        tls_name_mismatch_certificate_der: Some(vec![0x30, 0x82, 0x01, 0x0a]),
         priority: 0,
         backfill: false,
         retention_days: 0,
@@ -52,14 +53,20 @@ fn server_crud() {
     assert_eq!(servers[0].port, 443);
     assert_eq!(servers[0].max_download_speed, 2_500_000);
     assert_eq!(servers[0].download_quota, server.download_quota);
+    assert_eq!(
+        servers[0].tls_name_mismatch_certificate_der,
+        server.tls_name_mismatch_certificate_der
+    );
 
     let mut updated = server.clone();
     updated.connections = 20;
     updated.max_download_speed = 5_000_000;
+    updated.tls_name_mismatch_certificate_der = None;
     db.update_server(&updated).unwrap();
     let servers = db.list_servers().unwrap();
     assert_eq!(servers[0].connections, 20);
     assert_eq!(servers[0].max_download_speed, 5_000_000);
+    assert_eq!(servers[0].tls_name_mismatch_certificate_der, None);
 
     assert!(db.delete_server(1).unwrap());
     assert!(!db.delete_server(1).unwrap());
@@ -92,6 +99,7 @@ fn config_roundtrip() {
             connections: 5,
             active: true,
             supports_pipelining: true,
+            tls_name_mismatch_certificate_der: None,
             priority: 0,
             backfill: false,
             retention_days: 0,

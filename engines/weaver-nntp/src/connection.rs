@@ -268,6 +268,9 @@ pub struct ServerConfig {
     /// Optional path to a PEM-encoded CA certificate to trust in addition
     /// to the system/Mozilla roots (e.g. self-signed or internal CAs).
     pub tls_ca_cert: Option<std::path::PathBuf>,
+    /// One explicitly adopted leaf certificate allowed only when normal TLS
+    /// verification fails because this server's hostname does not match.
+    pub tls_name_mismatch_certificate_der: Option<Vec<u8>>,
     /// Source of the PIPELINING capability for this connection.
     pub pipelining: PipeliningCapability,
 }
@@ -285,6 +288,7 @@ impl Default for ServerConfig {
             command_timeout: Duration::from_mins(1),
             buffer_profile: NntpBufferProfile::default(),
             tls_ca_cert: None,
+            tls_name_mismatch_certificate_der: None,
             pipelining: PipeliningCapability::Probe,
         }
     }
@@ -316,6 +320,8 @@ pub struct NntpConnection {
     credentials: Option<(String, String)>,
     /// Optional custom CA certificate path, kept for STARTTLS upgrades.
     tls_ca_cert: Option<std::path::PathBuf>,
+    /// Optional adopted leaf certificate, kept for STARTTLS upgrades.
+    tls_name_mismatch_certificate_der: Option<Vec<u8>>,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
     /// Immutable geometry the next decoded article's CRC pass checkpoints at.
@@ -368,6 +374,7 @@ impl NntpConnection {
                 &config.host,
                 config.port,
                 config.tls_ca_cert.as_deref(),
+                config.tls_name_mismatch_certificate_der.as_deref(),
                 excluded_ips,
                 address_offset,
             )
@@ -404,6 +411,7 @@ impl NntpConnection {
             current_group: None,
             credentials: None,
             tls_ca_cert: config.tls_ca_cert.clone(),
+            tls_name_mismatch_certificate_der: config.tls_name_mismatch_certificate_der.clone(),
             transfer_control: None,
             body_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
@@ -459,8 +467,13 @@ impl NntpConnection {
 
         // Take ownership of the transport, upgrade it, and put it back.
         let old_transport = self.transport.take().expect("transport must be present");
-        match crate::tls::upgrade_starttls(old_transport, &self.host, self.tls_ca_cert.as_deref())
-            .await
+        match crate::tls::upgrade_starttls(
+            old_transport,
+            &self.host,
+            self.tls_ca_cert.as_deref(),
+            self.tls_name_mismatch_certificate_der.as_deref(),
+        )
+        .await
         {
             Ok(upgraded) => {
                 self.transport = Some(upgraded);
@@ -1843,6 +1856,7 @@ mod tests {
             current_group: None,
             credentials: None,
             tls_ca_cert: None,
+            tls_name_mismatch_certificate_der: None,
             transfer_control: None,
             body_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,

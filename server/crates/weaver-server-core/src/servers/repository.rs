@@ -185,6 +185,7 @@ mod tests {
             connections: 4,
             active: true,
             supports_pipelining: false,
+            tls_name_mismatch_certificate_der: None,
             priority: 0,
             backfill: false,
             retention_days: 0,

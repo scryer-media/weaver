@@ -1,5 +1,7 @@
 use async_graphql::{Enum, InputObject, SimpleObject};
+use base64::Engine;
 use chrono::Local;
+use sha2::{Digest, Sha256};
 
 use weaver_server_core::bandwidth::IspBandwidthCapWeekday;
 use weaver_server_core::servers::{
@@ -182,6 +184,7 @@ pub struct Server {
     pub max_download_speed: u64,
     pub download_quota: ServerDownloadQuota,
     pub tls_ca_cert: Option<String>,
+    pub tls_name_mismatch_certificate_fingerprint: Option<String>,
 }
 
 impl Server {
@@ -203,6 +206,9 @@ impl Server {
             max_download_speed: s.max_download_speed,
             download_quota: ServerDownloadQuota::from_config(&s.download_quota, snapshot),
             tls_ca_cert: s.tls_ca_cert.as_ref().map(|p| p.display().to_string()),
+            tls_name_mismatch_certificate_fingerprint: certificate_fingerprint(
+                s.tls_name_mismatch_certificate_der.as_deref(),
+            ),
         }
     }
 }
@@ -229,6 +235,8 @@ pub struct ServerDetails {
     pub max_download_speed: u64,
     pub download_quota: ServerDownloadQuota,
     pub tls_ca_cert: Option<String>,
+    pub tls_name_mismatch_certificate_der_base64: Option<String>,
+    pub tls_name_mismatch_certificate_fingerprint: Option<String>,
 }
 
 impl ServerDetails {
@@ -251,6 +259,13 @@ impl ServerDetails {
             max_download_speed: s.max_download_speed,
             download_quota: ServerDownloadQuota::from_config(&s.download_quota, snapshot),
             tls_ca_cert: s.tls_ca_cert.as_ref().map(|p| p.display().to_string()),
+            tls_name_mismatch_certificate_der_base64: s
+                .tls_name_mismatch_certificate_der
+                .as_ref()
+                .map(|der| base64::engine::general_purpose::STANDARD.encode(der)),
+            tls_name_mismatch_certificate_fingerprint: certificate_fingerprint(
+                s.tls_name_mismatch_certificate_der.as_deref(),
+            ),
         }
     }
 }
@@ -284,6 +299,15 @@ pub struct ServerInput {
     /// Hard BODY-byte quota. Omitted updates preserve the current policy.
     pub download_quota: Option<ServerDownloadQuotaInput>,
     pub tls_ca_cert: Option<String>,
+    /// Base64 DER for one explicitly adopted certificate used only after a
+    /// normal hostname-verification failure.
+    pub tls_name_mismatch_certificate_der_base64: Option<String>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct AdoptableTlsNameMismatchCertificate {
+    pub der_base64: String,
+    pub sha256_fingerprint: String,
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -292,6 +316,7 @@ pub struct TestConnectionResult {
     pub message: String,
     pub latency_ms: Option<u64>,
     pub supports_pipelining: bool,
+    pub adoptable_tls_name_mismatch_certificate: Option<AdoptableTlsNameMismatchCertificate>,
 }
 
 impl From<weaver_server_core::servers::ServerConnectivityResult> for TestConnectionResult {
@@ -301,6 +326,24 @@ impl From<weaver_server_core::servers::ServerConnectivityResult> for TestConnect
             message: result.message,
             latency_ms: result.latency_ms,
             supports_pipelining: result.supports_pipelining,
+            adoptable_tls_name_mismatch_certificate: result
+                .adoptable_tls_name_mismatch_certificate_der
+                .map(|der| AdoptableTlsNameMismatchCertificate {
+                    sha256_fingerprint: certificate_fingerprint(Some(&der))
+                        .expect("certificate fingerprint exists for DER"),
+                    der_base64: base64::engine::general_purpose::STANDARD.encode(der),
+                }),
         }
     }
+}
+
+fn certificate_fingerprint(der: Option<&[u8]>) -> Option<String> {
+    der.map(|der| {
+        let digest = Sha256::digest(der);
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    })
 }

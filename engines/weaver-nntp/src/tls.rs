@@ -1,13 +1,13 @@
 use std::io::{self, Cursor, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(not(windows))]
 use bytes::BufMut;
 use bytes::BytesMut;
-use rustls_pki_types::{CertificateDer, pem::PemObject};
+use rustls_pki_types::{CertificateDer, UnixTime, pem::PemObject};
 #[cfg(not(windows))]
 use s2n_tls::{config::Config as S2nConfig, security};
 #[cfg(not(windows))]
@@ -16,10 +16,99 @@ use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, lookup_host};
 use tokio_rustls::client::TlsStream as RustlsTlsStream;
+use tokio_rustls::rustls::client::{
+    WebPkiServerVerifier,
+    danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+};
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, ClientConnection, RootCertStore};
+use tokio_rustls::rustls::{
+    CertificateError, ClientConfig, ClientConnection, DigitallySignedStruct, Error as RustlsError,
+    RootCertStore, SignatureScheme,
+};
 
 use crate::error::NntpError;
+
+/// Keeps normal WebPKI verification intact while allowing one explicitly
+/// adopted leaf certificate to bypass only a hostname mismatch.
+#[derive(Debug)]
+enum NameMismatchCertificatePolicy {
+    Adopted(Vec<u8>),
+    Capture(Arc<Mutex<Option<Vec<u8>>>>),
+}
+
+#[derive(Debug)]
+struct AdoptedNameMismatchCertificateVerifier {
+    inner: Arc<WebPkiServerVerifier>,
+    policy: NameMismatchCertificatePolicy,
+}
+
+impl ServerCertVerifier for AdoptedNameMismatchCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(verified) => Ok(verified),
+            Err(error) if is_name_mismatch(&error) => match &self.policy {
+                NameMismatchCertificatePolicy::Adopted(adopted_leaf_der)
+                    if end_entity.as_ref() == adopted_leaf_der.as_slice() =>
+                {
+                    Ok(ServerCertVerified::assertion())
+                }
+                NameMismatchCertificatePolicy::Capture(captured_leaf_der) => {
+                    let mut captured = captured_leaf_der
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *captured = Some(end_entity.as_ref().to_vec());
+                    Err(error)
+                }
+                NameMismatchCertificatePolicy::Adopted(_) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+fn is_name_mismatch(error: &RustlsError) -> bool {
+    matches!(
+        error,
+        RustlsError::InvalidCertificate(
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. }
+        )
+    )
+}
 
 /// Stream type behind the `S2nTls` variant. On Windows, where s2n-tls cannot
 /// compile, this aliases an uninhabited placeholder: the variant still
@@ -740,6 +829,36 @@ impl AsyncWrite for NntpTransport {
 /// Build a `rustls` `ClientConfig` using Mozilla root certificates,
 /// optionally augmented with a custom CA certificate from a PEM file.
 pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>, NntpError> {
+    build_tls_config_with_name_mismatch_policy(ca_cert_path, None)
+}
+
+/// Build a TLS config that may accept one explicitly adopted leaf certificate
+/// when, and only when, normal verification reached a hostname mismatch.
+pub fn build_tls_config_with_name_mismatch_certificate(
+    ca_cert_path: Option<&Path>,
+    adopted_name_mismatch_certificate_der: Option<&[u8]>,
+) -> Result<Arc<ClientConfig>, NntpError> {
+    build_tls_config_with_name_mismatch_policy(
+        ca_cert_path,
+        adopted_name_mismatch_certificate_der
+            .map(|der| NameMismatchCertificatePolicy::Adopted(der.to_vec())),
+    )
+}
+
+fn build_tls_config_with_name_mismatch_capture(
+    ca_cert_path: Option<&Path>,
+    captured_leaf_der: Arc<Mutex<Option<Vec<u8>>>>,
+) -> Result<Arc<ClientConfig>, NntpError> {
+    build_tls_config_with_name_mismatch_policy(
+        ca_cert_path,
+        Some(NameMismatchCertificatePolicy::Capture(captured_leaf_der)),
+    )
+}
+
+fn build_tls_config_with_name_mismatch_policy(
+    ca_cert_path: Option<&Path>,
+    policy: Option<NameMismatchCertificatePolicy>,
+) -> Result<Arc<ClientConfig>, NntpError> {
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -764,12 +883,34 @@ pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>
         }
     }
 
-    let provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
-    let config = ClientConfig::builder_with_provider(Arc::new(provider))
+    let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+    let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+        .expect("aws-lc-rs supports Rustls safe default protocol versions");
+    let config = match policy {
+        Some(policy) => {
+            let verifier =
+                WebPkiServerVerifier::builder_with_provider(Arc::new(root_store), provider)
+                    .build()
+                    .map_err(|error| {
+                        NntpError::MalformedResponse(format!(
+                            "failed to build TLS certificate verifier: {error}"
+                        ))
+                    })?;
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(
+                    AdoptedNameMismatchCertificateVerifier {
+                        inner: verifier,
+                        policy,
+                    },
+                ))
+                .with_no_client_auth()
+        }
+        None => builder
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    };
 
     Ok(Arc::new(config))
 }
@@ -1007,6 +1148,29 @@ async fn connect_tcp_from_resolved(
     })))
 }
 
+/// Inspect a certificate that failed only normal hostname validation.
+///
+/// This performs a TLS handshake only: it never reads the NNTP greeting or
+/// sends `MODE READER`, authentication, or any other NNTP command.
+pub async fn inspect_tls_name_mismatch_certificate(
+    host: &str,
+    port: u16,
+    ca_cert_path: Option<&Path>,
+) -> Result<Option<Vec<u8>>, NntpError> {
+    let captured_leaf_der = Arc::new(Mutex::new(None));
+    let tls_config =
+        build_tls_config_with_name_mismatch_capture(ca_cert_path, captured_leaf_der.clone())?;
+    let server_name = make_server_name(host)?;
+    let addrs = resolve_connect_addrs(host, port, &[], 0).await?;
+    let (tcp, _) = connect_tcp_from_resolved(&addrs).await?;
+
+    let _ = ManualTlsStream::connect(tcp, tls_config, server_name).await;
+    Ok(captured_leaf_der
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take())
+}
+
 /// Connect to a host with implicit TLS (e.g. port 563).
 ///
 /// Performs TCP connect followed by an immediate TLS handshake.
@@ -1017,21 +1181,30 @@ pub async fn connect_tls(
     port: u16,
     ca_cert_path: Option<&Path>,
 ) -> Result<NntpTransport, NntpError> {
-    connect_tls_with_ip_policy(host, port, ca_cert_path, &[], 0).await
+    connect_tls_with_ip_policy(host, port, ca_cert_path, None, &[], 0).await
 }
 
 pub async fn connect_tls_with_ip_policy(
     host: &str,
     port: u16,
     ca_cert_path: Option<&Path>,
+    adopted_name_mismatch_certificate_der: Option<&[u8]>,
     excluded_ips: &[IpAddr],
     address_offset: usize,
 ) -> Result<NntpTransport, NntpError> {
     let addrs = resolve_connect_addrs(host, port, excluded_ips, address_offset).await?;
     let (tcp, remote_addr) = connect_tcp_from_resolved(&addrs).await?;
-    match selected_tls_backend()? {
+    let backend = if adopted_name_mismatch_certificate_der.is_some() {
+        NntpTlsBackend::ManualRustls
+    } else {
+        selected_tls_backend()?
+    };
+    match backend {
         NntpTlsBackend::ManualRustls => {
-            let tls_config = build_tls_config(ca_cert_path)?;
+            let tls_config = build_tls_config_with_name_mismatch_certificate(
+                ca_cert_path,
+                adopted_name_mismatch_certificate_der,
+            )?;
             let server_name = make_server_name(host)?;
             let manual_tls = ManualTlsStream::connect(tcp, tls_config, server_name).await?;
             Ok(NntpTransport::ManualTls {
@@ -1078,6 +1251,7 @@ pub async fn upgrade_starttls(
     transport: NntpTransport,
     host: &str,
     ca_cert_path: Option<&Path>,
+    adopted_name_mismatch_certificate_der: Option<&[u8]>,
 ) -> Result<NntpTransport, NntpError> {
     let (tcp, remote_addr) = match transport {
         NntpTransport::Plain { inner, remote_addr } => (inner, remote_addr),
@@ -1090,9 +1264,17 @@ pub async fn upgrade_starttls(
         }
     };
 
-    match selected_tls_backend()? {
+    let backend = if adopted_name_mismatch_certificate_der.is_some() {
+        NntpTlsBackend::ManualRustls
+    } else {
+        selected_tls_backend()?
+    };
+    match backend {
         NntpTlsBackend::ManualRustls => {
-            let tls_config = build_tls_config(ca_cert_path)?;
+            let tls_config = build_tls_config_with_name_mismatch_certificate(
+                ca_cert_path,
+                adopted_name_mismatch_certificate_der,
+            )?;
             let server_name = make_server_name(host)?;
             let manual_tls = ManualTlsStream::connect(tcp, tls_config, server_name).await?;
             Ok(NntpTransport::ManualTls {
@@ -1137,6 +1319,92 @@ mod tests {
     const TLS_DRAIN_PAYLOAD_BYTES: usize = TLS_DRAIN_RECORD_BYTES * TLS_DRAIN_RECORDS;
     #[cfg(not(windows))]
     const TLS_TEST_BUFFER_BYTES: usize = 256 * 1024;
+
+    fn test_verifier(certs: &[CertificateDer<'static>]) -> Arc<WebPkiServerVerifier> {
+        let mut roots = RootCertStore::empty();
+        for cert in certs {
+            roots.add(cert.clone()).expect("test root");
+        }
+        let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+            .build()
+            .expect("test verifier")
+    }
+
+    #[test]
+    fn adopted_certificate_only_falls_back_for_its_exact_hostname_mismatch() {
+        let adopted = rcgen::generate_simple_self_signed(vec!["dangerous.example".to_string()])
+            .expect("adopted certificate");
+        let safe = rcgen::generate_simple_self_signed(vec!["configured.example".to_string()])
+            .expect("safe certificate");
+        let adopted_der = adopted.cert.der().clone();
+        let safe_der = safe.cert.der().clone();
+        let verifier = AdoptedNameMismatchCertificateVerifier {
+            inner: test_verifier(&[adopted_der.clone(), safe_der.clone()]),
+            policy: NameMismatchCertificatePolicy::Adopted(adopted_der.as_ref().to_vec()),
+        };
+        let configured_name = ServerName::try_from("configured.example").expect("server name");
+        let now = UnixTime::since_unix_epoch(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after unix epoch"),
+        );
+
+        let adopted_result =
+            verifier.verify_server_cert(&adopted_der, &[], &configured_name, &[], now);
+        assert!(adopted_result.is_ok(), "{adopted_result:?}");
+        assert!(
+            verifier
+                .verify_server_cert(&safe_der, &[], &configured_name, &[], now)
+                .is_ok()
+        );
+        assert!(
+            verifier
+                .verify_server_cert(
+                    &safe_der,
+                    &[],
+                    &ServerName::try_from("other.example").unwrap(),
+                    &[],
+                    now
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn capture_policy_records_only_a_trusted_hostname_mismatch() {
+        let certificate = rcgen::generate_simple_self_signed(vec!["dangerous.example".to_string()])
+            .expect("certificate");
+        let certificate_der = certificate.cert.der().clone();
+        let captured = Arc::new(Mutex::new(None));
+        let verifier = AdoptedNameMismatchCertificateVerifier {
+            inner: test_verifier(std::slice::from_ref(&certificate_der)),
+            policy: NameMismatchCertificatePolicy::Capture(captured.clone()),
+        };
+        let now = UnixTime::since_unix_epoch(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after unix epoch"),
+        );
+
+        assert!(
+            verifier
+                .verify_server_cert(
+                    &certificate_der,
+                    &[],
+                    &ServerName::try_from("configured.example").unwrap(),
+                    &[],
+                    now,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            *captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Some(certificate_der.as_ref().to_vec())
+        );
+    }
 
     fn rustls_test_configs() -> (Arc<ClientConfig>, Arc<RustlsServerConfig>) {
         let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])

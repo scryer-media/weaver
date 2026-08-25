@@ -278,6 +278,9 @@ pub enum BodyLaneMode {
 }
 
 fn supports_blocking_tls_body_lane(config: &ServerConfig) -> bool {
+    if config.tls_name_mismatch_certificate_der.is_some() {
+        return blocking_tls_lane_eligible(config, crate::tls::NntpTlsBackend::ManualRustls);
+    }
     match crate::tls::selected_blocking_tls_backend() {
         Ok(backend) => blocking_tls_lane_eligible(config, backend),
         Err(_) => false,
@@ -5793,6 +5796,14 @@ mod tests {
             &lane_config(true, false, true),
             NntpTlsBackend::ManualRustls
         ));
+    }
+
+    #[test]
+    fn adopted_name_mismatch_certificate_forces_the_rustls_body_lane() {
+        let mut config = lane_config(true, false, false);
+        config.tls_name_mismatch_certificate_der = Some(vec![0x30, 0x82, 0x01, 0x0a]);
+
+        assert!(supports_blocking_tls_body_lane(&config));
     }
 
     #[cfg(not(windows))]

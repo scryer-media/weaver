@@ -33,8 +33,9 @@ use crate::fused_yenc::{
 use crate::pool::{BlockingConnectionPermit, ServerId};
 use crate::response::parse_response;
 use crate::tls::{
-    NntpTlsBackend, RustlsSession, TLS_READ_BUFFER, TransportReadStats, build_tls_config,
-    make_server_name, selected_blocking_tls_backend,
+    NntpTlsBackend, RustlsSession, TLS_READ_BUFFER, TransportReadStats,
+    build_tls_config_with_name_mismatch_certificate, make_server_name,
+    selected_blocking_tls_backend,
 };
 use crate::transfer::{
     ActiveTransferBudget, BodyTransferAccounting, ServerTransferControl, StableServerId,
@@ -606,9 +607,13 @@ impl BlockingNntpConnection {
         backend_override: Option<NntpTlsBackend>,
     ) -> Result<Self> {
         let transport = if config.tls {
-            let backend = match backend_override {
-                Some(backend) => backend,
-                None => selected_blocking_tls_backend()?,
+            let backend = if config.tls_name_mismatch_certificate_der.is_some() {
+                NntpTlsBackend::ManualRustls
+            } else {
+                match backend_override {
+                    Some(backend) => backend,
+                    None => selected_blocking_tls_backend()?,
+                }
             };
             match backend {
                 NntpTlsBackend::ManualRustls => {
@@ -616,6 +621,7 @@ impl BlockingNntpConnection {
                         tcp,
                         &config.host,
                         config.tls_ca_cert.as_deref(),
+                        config.tls_name_mismatch_certificate_der.as_deref(),
                         config.command_timeout.max(MIN_TIMEOUT),
                     )?))
                 }
@@ -1376,6 +1382,7 @@ impl BlockingManualTlsStream {
         tcp: TcpStream,
         host: &str,
         ca_cert_path: Option<&std::path::Path>,
+        adopted_name_mismatch_certificate_der: Option<&[u8]>,
         timeout: Duration,
     ) -> Result<Self> {
         tcp.set_read_timeout(Some(timeout)).map_err(NntpError::Io)?;
@@ -1383,7 +1390,10 @@ impl BlockingManualTlsStream {
             .map_err(NntpError::Io)?;
         tcp.set_nonblocking(false).map_err(NntpError::Io)?;
 
-        let config = build_tls_config(ca_cert_path)?;
+        let config = build_tls_config_with_name_mismatch_certificate(
+            ca_cert_path,
+            adopted_name_mismatch_certificate_der,
+        )?;
         let server_name = make_server_name(host)?;
         let session = RustlsSession::new(config, server_name)?;
         let mut stream = Self {
@@ -2281,6 +2291,7 @@ mod tests {
             command_timeout: Duration::from_secs(5),
             buffer_profile: NntpBufferProfile::default(),
             tls_ca_cert: Some(ca_path.clone()),
+            tls_name_mismatch_certificate_der: None,
             pipelining: crate::connection::PipeliningCapability::Probe,
         };
         (config, handle, ca_path)
@@ -3036,6 +3047,7 @@ mod tests {
             tcp,
             "localhost",
             Some(&ca_path),
+            None,
             Duration::from_secs(5),
         )
         .expect("blocking rustls connect");

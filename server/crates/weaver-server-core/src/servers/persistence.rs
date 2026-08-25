@@ -16,8 +16,8 @@ impl Database {
             SqlRuntime::execute(
                 datastore.read_exec(),
                 "INSERT INTO servers
-                    (id, host, port, tls, username, password, connections, active, supports_pipelining, priority, backfill, retention_days, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday, download_quota_monthly_reset_day, tls_ca_cert)
-                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    (id, host, port, tls, username, password, connections, active, supports_pipelining, priority, backfill, retention_days, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday, download_quota_monthly_reset_day, tls_ca_cert, tls_name_mismatch_certificate_der)
+                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                 &args,
             )
             .await?;
@@ -45,7 +45,8 @@ impl Database {
                         download_quota_enabled = {}, download_quota_limit_bytes = {},
                         download_quota_period = {}, download_quota_reset_time_minutes_local = {},
                         download_quota_weekly_reset_weekday = {},
-                        download_quota_monthly_reset_day = {}, tls_ca_cert = {}
+                        download_quota_monthly_reset_day = {}, tls_ca_cert = {},
+                        tls_name_mismatch_certificate_der = {}
                   WHERE id = {}",
                 &args,
             )
@@ -103,5 +104,6 @@ pub(crate) fn server_args(
         ),
         SqlArg::I64(i64::from(record.download_quota_monthly_reset_day)),
         SqlArg::OptText(record.tls_ca_cert),
+        SqlArg::OptBytes(record.tls_name_mismatch_certificate_der),
     ])
 }

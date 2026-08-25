@@ -179,6 +179,7 @@ const SERVER_FIELDS = `
     backfill
     retentionDays
     maxDownloadSpeed
+    tlsNameMismatchCertificateFingerprint
     downloadQuota {
       enabled
       period
@@ -211,6 +212,8 @@ const SERVER_DETAILS_FIELDS = `
     backfill
     retentionDays
     maxDownloadSpeed
+    tlsNameMismatchCertificateDerBase64
+    tlsNameMismatchCertificateFingerprint
     downloadQuota {
       enabled
       period
@@ -1074,6 +1077,10 @@ export const TEST_CONNECTION_MUTATION = gql`
       message
       latencyMs
       supportsPipelining
+      adoptableTlsNameMismatchCertificate {
+        derBase64
+        sha256Fingerprint
+      }
     }
   }
 `;
