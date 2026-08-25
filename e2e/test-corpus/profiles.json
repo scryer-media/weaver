@@ -27,6 +27,7 @@
         "testdata/nested-5deep/**",
         "testdata/nested-obfuscated-split-7z/**",
         "testdata/nested-rar/**",
+        "testdata/nested-xz-rar/**",
         "testdata/obfuscated-rar-retry-7z/**",
         "testdata/obfuscated-rar-split-topology/**",
         "testdata/obfuscated-rar-unknown-numeric/**",
@@ -100,6 +101,7 @@
         "testdata/split-7z/**",
         "testdata/split-plain-mkv/**",
         "testdata/split-plain-par2/**",
+        "testdata/split-xz/**",
         "testdata/tar-archive/**",
         "testdata/tar-bzip2-archive/**",
         "testdata/tar-corrupted/**",
@@ -116,6 +118,8 @@
         "testdata/zip-corrupted/**",
         "testdata/zip-encrypted/**",
         "testdata/zip-unencrypted/**",
+        "testdata/xz-text/**",
+        "testdata/xz-video/**",
         "testdata/zstd-single/**"
       ],
       "exclude": [
@@ -193,6 +197,7 @@
         "testdata/nested-5deep/**",
         "testdata/nested-obfuscated-split-7z/**",
         "testdata/nested-rar/**",
+        "testdata/nested-xz-rar/**",
         "testdata/obfuscated-rar-retry-7z/**",
         "testdata/obfuscated-rar-split-topology/**",
         "testdata/obfuscated-rar-unknown-numeric/**",
@@ -266,6 +271,7 @@
         "testdata/split-7z/**",
         "testdata/split-plain-mkv/**",
         "testdata/split-plain-par2/**",
+        "testdata/split-xz/**",
         "testdata/stat-health-probe/**",
         "testdata/tar-archive/**",
         "testdata/tar-bzip2-archive/**",
@@ -283,6 +289,8 @@
         "testdata/zip-corrupted/**",
         "testdata/zip-encrypted/**",
         "testdata/zip-unencrypted/**",
+        "testdata/xz-text/**",
+        "testdata/xz-video/**",
         "testdata/zstd-single/**"
       ],
       "exclude": [

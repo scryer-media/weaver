@@ -47,11 +47,13 @@ pub(crate) enum SimpleArchiveKind {
     Tar,
     TarGz,
     TarBz2,
+    TarXz,
     Gz,
     Deflate,
     Brotli,
     Zstd,
     Bzip2,
+    Xz,
     Split,
 }
 

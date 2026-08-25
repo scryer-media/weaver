@@ -592,6 +592,13 @@ jobs:
             export CC_x86_64_unknown_linux_musl="sccache musl-gcc"
           fi
           mold -run cargo build -p weaver --release --locked --target x86_64-unknown-linux-musl
+      - name: Verify liblzma is statically bundled
+        run: |
+          BINARY="target/x86_64-unknown-linux-musl/release/weaver"
+          if readelf -d "$BINARY" | grep -q 'liblzma'; then
+            echo "release binary dynamically links liblzma" >&2
+            exit 1
+          fi
       - name: Package tarball
         run: |
           mkdir -p dist/package
@@ -663,6 +670,13 @@ jobs:
             export CC_x86_64_unknown_linux_musl="sccache musl-gcc"
           fi
           mold -run cargo build -p weaver --release --locked --target x86_64-unknown-linux-musl
+      - name: Verify liblzma is statically bundled
+        run: |
+          BINARY="target/x86_64-unknown-linux-musl/release/weaver"
+          if readelf -d "$BINARY" | grep -q 'liblzma'; then
+            echo "release binary dynamically links liblzma" >&2
+            exit 1
+          fi
       - name: Package tarball
         run: |
           mkdir -p dist/package
@@ -734,6 +748,13 @@ jobs:
             export CC_aarch64_unknown_linux_musl="sccache musl-gcc"
           fi
           mold -run cargo build -p weaver --release --locked --target aarch64-unknown-linux-musl
+      - name: Verify liblzma is statically bundled
+        run: |
+          BINARY="target/aarch64-unknown-linux-musl/release/weaver"
+          if readelf -d "$BINARY" | grep -q 'liblzma'; then
+            echo "release binary dynamically links liblzma" >&2
+            exit 1
+          fi
       - name: Package tarball
         run: |
           mkdir -p dist/package
@@ -805,6 +826,13 @@ jobs:
             export CC_aarch64_unknown_linux_musl="sccache musl-gcc"
           fi
           mold -run cargo build -p weaver --release --locked --target aarch64-unknown-linux-musl
+      - name: Verify liblzma is statically bundled
+        run: |
+          BINARY="target/aarch64-unknown-linux-musl/release/weaver"
+          if readelf -d "$BINARY" | grep -q 'liblzma'; then
+            echo "release binary dynamically links liblzma" >&2
+            exit 1
+          fi
       - name: Package tarball
         run: |
           mkdir -p dist/package
@@ -877,6 +905,13 @@ jobs:
             export CMAKE_CXX_COMPILER_LAUNCHER="sccache"
           fi
           cargo build -p weaver --release --locked --target x86_64-apple-darwin
+      - name: Verify liblzma is statically bundled
+        run: |
+          BINARY="target/x86_64-apple-darwin/release/weaver"
+          if otool -L "$BINARY" | grep -q 'liblzma'; then
+            echo "release binary dynamically links liblzma" >&2
+            exit 1
+          fi
       - name: Codesign binary
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         env:
@@ -966,6 +1001,13 @@ jobs:
             export CMAKE_CXX_COMPILER_LAUNCHER="sccache"
           fi
           cargo build -p weaver --release --locked --target aarch64-apple-darwin
+      - name: Verify liblzma is statically bundled
+        run: |
+          BINARY="target/aarch64-apple-darwin/release/weaver"
+          if otool -L "$BINARY" | grep -q 'liblzma'; then
+            echo "release binary dynamically links liblzma" >&2
+            exit 1
+          fi
       - name: Codesign binary
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         env:
@@ -1055,6 +1097,13 @@ jobs:
             export CMAKE_CXX_COMPILER_LAUNCHER="sccache"
           fi
           cargo build -p weaver --release --locked --target aarch64-apple-darwin
+      - name: Verify liblzma is statically bundled
+        run: |
+          BINARY="target/aarch64-apple-darwin/release/weaver"
+          if otool -L "$BINARY" | grep -q 'liblzma'; then
+            echo "release binary dynamically links liblzma" >&2
+            exit 1
+          fi
       - name: Codesign binary
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         env:
@@ -1195,6 +1244,18 @@ jobs:
           cargo build -p weaver --bins --release --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath weaver-windows-x86_64-build.log
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
+          }
+      - name: Verify liblzma is statically bundled
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target\x86_64-pc-windows-msvc\release\weaver.exe"
+          $dependencies = & dumpbin.exe /dependents $exe
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if ($dependencies -match '(?i)liblzma') {
+            throw "release binary dynamically links liblzma"
           }
       - name: Verify embedded Windows manifest
         shell: pwsh

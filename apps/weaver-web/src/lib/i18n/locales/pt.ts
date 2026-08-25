@@ -71,11 +71,11 @@ const pt: LocaleDictionary = {
   // Upload page
   "upload.title": "Enviar NZB",
   "upload.dropzone": "Arraste arquivos NZB aqui ou clique para procurar",
-  "upload.accepts": "Aceita um ou mais arquivos .nzb",
+  "upload.accepts": "Aceita um ou mais arquivos .nzb ou .nzb.xz",
   "upload.replaceHint": "Clique ou arraste para substituir a seleção",
   "upload.passwordLabel": "Senha (opcional)",
   "upload.passwordPlaceholder": "Digite a senha se necessário",
-  "upload.invalidFiles": "Por favor, selecione apenas arquivos .nzb.",
+  "upload.invalidFiles": "Por favor, selecione apenas arquivos .nzb ou .nzb.xz.",
   "upload.noCategory": "Sem categoria",
   "upload.priorityLabel": "Prioridade",
   "upload.priorityLow": "Baixa",

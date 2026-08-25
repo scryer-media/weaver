@@ -2278,11 +2278,13 @@ impl Pipeline {
             | weaver_model::files::FileRole::TarArchive
             | weaver_model::files::FileRole::TarGzArchive
             | weaver_model::files::FileRole::TarBz2Archive
+            | weaver_model::files::FileRole::TarXzArchive
             | weaver_model::files::FileRole::GzArchive
             | weaver_model::files::FileRole::DeflateArchive
             | weaver_model::files::FileRole::BrotliArchive
             | weaver_model::files::FileRole::ZstdArchive
-            | weaver_model::files::FileRole::Bzip2Archive => {
+            | weaver_model::files::FileRole::Bzip2Archive
+            | weaver_model::files::FileRole::XzArchive => {
                 if state.assembly.archive_topology_for(&set_name).is_some() {
                     let state = self.jobs.get_mut(&job_id).unwrap();
                     state.assembly.mark_volume_complete(&set_name, 0);
@@ -2299,11 +2301,13 @@ impl Pipeline {
                     weaver_model::files::FileRole::TarArchive => ArchiveType::Tar,
                     weaver_model::files::FileRole::TarGzArchive => ArchiveType::TarGz,
                     weaver_model::files::FileRole::TarBz2Archive => ArchiveType::TarBz2,
+                    weaver_model::files::FileRole::TarXzArchive => ArchiveType::TarXz,
                     weaver_model::files::FileRole::GzArchive => ArchiveType::Gz,
                     weaver_model::files::FileRole::DeflateArchive => ArchiveType::Deflate,
                     weaver_model::files::FileRole::BrotliArchive => ArchiveType::Brotli,
                     weaver_model::files::FileRole::ZstdArchive => ArchiveType::Zstd,
                     weaver_model::files::FileRole::Bzip2Archive => ArchiveType::Bzip2,
+                    weaver_model::files::FileRole::XzArchive => ArchiveType::Xz,
                     _ => unreachable!(),
                 };
 

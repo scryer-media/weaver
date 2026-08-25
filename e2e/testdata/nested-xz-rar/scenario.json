@@ -1,0 +1,10 @@
+{
+  "slug": "nested-xz-rar",
+  "title": "E2E.Test.Nested.XZ.RAR.2026.1080p-TESTGRP",
+  "description": "RAR5 containing a standalone XZ stream. Tests nested XZ discovery after outer archive extraction.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "test-media.mkv": "f236021bb17d43643c483b805f5af9b086e90dbce3f5710392bc69bdddd4f8de"
+  }
+}

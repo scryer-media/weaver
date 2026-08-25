@@ -1,0 +1,10 @@
+{
+  "slug": "split-xz",
+  "title": "E2E.Test.Split.XZ.2026.1080p-TESTGRP",
+  "description": "Split standalone XZ stream. Tests joining numbered XZ parts before extraction.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "test-media.mkv": "f236021bb17d43643c483b805f5af9b086e90dbce3f5710392bc69bdddd4f8de"
+  }
+}

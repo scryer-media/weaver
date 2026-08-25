@@ -9,8 +9,9 @@ use weaver_nzb::Nzb;
 use crate::auth::CallerIdentity;
 use weaver_server_core::auth::generate_api_key;
 use weaver_server_core::ingest::{
-    StagedSubmissionPreparation, SubmitNzbError, hash_persisted_nzb_bytes, nzb_to_submission_spec,
-    parse_persisted_nzb_bytes, persist_decoded_nzb_reader_to_zstd,
+    StagedSubmissionPreparation, SubmitNzbError, XZ_DECODER_MEMORY_LIMIT_BYTES,
+    hash_persisted_nzb_bytes, nzb_to_submission_spec, parse_persisted_nzb_bytes,
+    persist_decoded_nzb_reader_to_zstd, xz_multistream_decoder,
 };
 use weaver_server_core::jobs::FingerprintEvidence;
 use weaver_server_core::security::RuntimeSecurityConfig;
@@ -277,6 +278,7 @@ enum UploadEncoding {
     Gzip,
     Brotli,
     Deflate,
+    Xz,
 }
 
 fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
@@ -292,6 +294,9 @@ fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
     }
     if filename.ends_with(".deflate") {
         return UploadEncoding::Deflate;
+    }
+    if filename.ends_with(".xz") {
+        return UploadEncoding::Xz;
     }
 
     let Some(content_type) = upload.content_type.as_deref() else {
@@ -311,6 +316,7 @@ fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
         "application/deflate" | "application/x-deflate" | "application/octet-stream+deflate" => {
             UploadEncoding::Deflate
         }
+        "application/x-xz" | "application/xz" | "application/octet-stream+xz" => UploadEncoding::Xz,
         _ => UploadEncoding::Plain,
     }
 }
@@ -374,6 +380,10 @@ pub(crate) fn normalize_uploaded_nzb_reader(
         UploadEncoding::Gzip => Box::new(flate2::read::GzDecoder::new(source)),
         UploadEncoding::Brotli => Box::new(brotli::Decompressor::new(source, 64 * 1024)),
         UploadEncoding::Deflate => Box::new(flate2::read::DeflateDecoder::new(source)),
+        UploadEncoding::Xz => Box::new(
+            xz_multistream_decoder(source, XZ_DECODER_MEMORY_LIMIT_BYTES)
+                .map_err(SubmitNzbError::Upload)?,
+        ),
     };
 
     Ok(Box::new(LimitedReader::new(
@@ -386,6 +396,9 @@ pub(crate) fn normalize_uploaded_nzb_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    use lzma_rust2::{XzOptions, XzWriter};
 
     fn minimal_nzb(name: &str) -> String {
         format!(
@@ -404,6 +417,16 @@ mod tests {
             filename: format!("{name}.nzb"),
             content_type: Some("application/x-nzb".to_string()),
             content: minimal_nzb(name).into_bytes().into(),
+        }
+    }
+
+    fn make_xz_upload(filename: &str, content_type: &str, name: &str) -> UploadValue {
+        let mut writer = XzWriter::new(Vec::new(), XzOptions::with_preset(0)).unwrap();
+        writer.write_all(minimal_nzb(name).as_bytes()).unwrap();
+        UploadValue {
+            filename: filename.to_string(),
+            content_type: Some(content_type.to_string()),
+            content: writer.finish().unwrap().into(),
         }
     }
 
@@ -431,6 +454,29 @@ mod tests {
             manager.take_for_submit(&owner_b, std::slice::from_ref(&staged.staged_upload_id));
         assert!(found.is_empty());
         assert_eq!(missing, vec![staged.staged_upload_id]);
+    }
+
+    #[tokio::test]
+    async fn stages_xz_uploads_by_filename_or_mime_type() {
+        let manager =
+            StagedUploadManager::with_timing(Duration::from_secs(60), Duration::from_secs(60));
+        let owner = CallerIdentity::Local([4; 32]);
+
+        for (filename, content_type) in [
+            ("filename.nzb.xz", "application/octet-stream"),
+            ("mime.nzb", "application/x-xz"),
+        ] {
+            let staged = manager
+                .stage_upload(
+                    owner.clone(),
+                    make_xz_upload(filename, content_type, "xz-upload"),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(staged.filename, filename);
+            assert_eq!(staged.total_files, 1);
+        }
     }
 
     #[tokio::test]

@@ -71,11 +71,11 @@ const zh: LocaleDictionary = {
   // Upload page
   "upload.title": "上传 NZB",
   "upload.dropzone": "拖放 NZB 文件到此处，或点击浏览",
-  "upload.accepts": "支持一个或多个 .nzb 文件",
+  "upload.accepts": "支持一个或多个 .nzb 或 .nzb.xz 文件",
   "upload.replaceHint": "点击或拖放以替换当前选择",
   "upload.passwordLabel": "密码（可选）",
   "upload.passwordPlaceholder": "如需密码请在此输入",
-  "upload.invalidFiles": "请仅选择 .nzb 文件。",
+  "upload.invalidFiles": "请仅选择 .nzb 或 .nzb.xz 文件。",
   "upload.noCategory": "无分类",
   "upload.priorityLabel": "优先级",
   "upload.priorityLow": "低",

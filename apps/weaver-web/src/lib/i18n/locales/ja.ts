@@ -71,11 +71,11 @@ const ja: LocaleDictionary = {
   // Upload page
   "upload.title": "NZB アップロード",
   "upload.dropzone": "NZB ファイルをここにドロップするか、クリックして選択",
-  "upload.accepts": ".nzb ファイルを1つ以上選択できます",
+  "upload.accepts": ".nzb または .nzb.xz ファイルを1つ以上選択できます",
   "upload.replaceHint": "クリックまたはドラッグで選択を変更",
   "upload.passwordLabel": "パスワード（任意）",
   "upload.passwordPlaceholder": "必要な場合はパスワードを入力",
-  "upload.invalidFiles": ".nzb ファイルのみ選択してください。",
+  "upload.invalidFiles": ".nzb または .nzb.xz ファイルのみ選択してください。",
   "upload.noCategory": "カテゴリなし",
   "upload.priorityLabel": "優先度",
   "upload.priorityLow": "低",

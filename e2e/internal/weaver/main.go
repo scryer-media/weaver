@@ -1077,6 +1077,7 @@ var canonicalFixtureSlugs = []string{
 	"nested-5deep",
 	"nested-obfuscated-split-7z",
 	"nested-rar",
+	"nested-xz-rar",
 	"obfuscated-rar",
 	"obfuscated-rar-retry-7z",
 	"obfuscated-rar-split-topology",
@@ -1153,6 +1154,7 @@ var canonicalFixtureSlugs = []string{
 	"split-7z",
 	"split-7z-corrupted",
 	"split-7z-encrypted",
+	"split-xz",
 	"tar-archive",
 	"tar-bzip2-archive",
 	"tar-corrupted",
@@ -1172,6 +1174,8 @@ var canonicalFixtureSlugs = []string{
 	"zip-corrupted",
 	"zip-encrypted",
 	"zip-unencrypted",
+	"xz-text",
+	"xz-video",
 	"zstd-single",
 }
 

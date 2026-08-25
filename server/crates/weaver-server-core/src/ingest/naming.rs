@@ -19,6 +19,20 @@ pub fn derive_release_name(primary: Option<&str>, secondary: Option<&str>) -> St
     "Untitled".to_string()
 }
 
+/// Removes the source-container suffix from an uploaded NZB filename.
+pub fn strip_nzb_source_suffix(value: &str) -> Option<&str> {
+    for suffix in [".nzb.xz", ".nzb"] {
+        let suffix_start = value.len().saturating_sub(suffix.len());
+        if value
+            .get(suffix_start..)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(suffix))
+        {
+            return value.get(..suffix_start);
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy)]
 struct EpisodeSuffix {
     season: Option<u32>,
@@ -162,10 +176,8 @@ pub(crate) fn basic_release_name(raw: &str) -> String {
 }
 
 fn strip_nzb_suffix(raw: &str) -> &str {
-    raw.trim()
-        .trim_end_matches(".nzb")
-        .trim_end_matches(".NZB")
-        .trim()
+    let raw = raw.trim();
+    strip_nzb_source_suffix(raw).unwrap_or(raw).trim()
 }
 
 fn is_generic_season_token(token: &str) -> bool {

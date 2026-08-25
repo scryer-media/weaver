@@ -134,6 +134,8 @@ func (env *Env) RARList(ctx context.Context, toolchainID, relative, password str
 // SevenZipSpec is a 7-Zip invocation. 7z is an open format, so the only
 // constraint here is that the official console binary writes it.
 type SevenZipSpec struct {
+	// Format selects the 7-Zip archive type. The default is 7z.
+	Format string
 	// Archive is the output name relative to the output directory.
 	Archive string
 	// Members are stage-relative paths.
@@ -158,7 +160,14 @@ func (env *Env) SevenZip(ctx context.Context, spec SevenZipSpec) error {
 		return err
 	}
 	env.usedToolchain(SevenZipToolchain)
-	args := []string{"a", "-t7z", "-bso0", "-bsp0", "-ms=off", "-y"}
+	format := spec.Format
+	if format == "" {
+		format = "7z"
+	}
+	args := []string{"a", "-t" + format, "-bso0", "-bsp0", "-y"}
+	if format == "7z" {
+		args = append(args, "-ms=off")
+	}
 	if spec.Store {
 		args = append(args, "-m0=Copy", "-mx0")
 	} else {

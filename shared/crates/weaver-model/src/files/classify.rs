@@ -27,6 +27,8 @@ pub enum FileRole {
     TarGzArchive,
     /// Bzip2-compressed tar archive (`.tar.bz2`, `.tbz`, `.tbz2`, `.tar.bzip2`).
     TarBz2Archive,
+    /// XZ-compressed tar archive (`.tar.xz`, `.txz`).
+    TarXzArchive,
     /// Gzipped single file (`.gz`, but not `.tar.gz`).
     GzArchive,
     /// DEFLATE-compressed single file (`.deflate`).
@@ -37,6 +39,8 @@ pub enum FileRole {
     ZstdArchive,
     /// Bzip2-compressed single file (`.bz2`).
     Bzip2Archive,
+    /// XZ-compressed single file (`.xz`).
+    XzArchive,
     /// Plain split file (`.001`, `.002`, etc.). 0-indexed: `.001` = number 0.
     SplitFile { number: u32 },
     /// Standalone file (not part of an archive).
@@ -88,6 +92,10 @@ impl FileRole {
             return FileRole::TarBz2Archive;
         }
 
+        if lower.ends_with(".tar.xz") || lower.ends_with(".txz") {
+            return FileRole::TarXzArchive;
+        }
+
         if lower.ends_with(".tar") {
             return FileRole::TarArchive;
         }
@@ -112,6 +120,10 @@ impl FileRole {
             return FileRole::Bzip2Archive;
         }
 
+        if lower.ends_with(".xz") {
+            return FileRole::XzArchive;
+        }
+
         if let Some(role) = parse_split_file(&lower) {
             return role;
         }
@@ -133,11 +145,13 @@ impl FileRole {
             FileRole::TarArchive => 3,
             FileRole::TarGzArchive => 3,
             FileRole::TarBz2Archive => 3,
+            FileRole::TarXzArchive => 3,
             FileRole::GzArchive => 3,
             FileRole::DeflateArchive => 3,
             FileRole::BrotliArchive => 3,
             FileRole::ZstdArchive => 3,
             FileRole::Bzip2Archive => 3,
+            FileRole::XzArchive => 3,
             FileRole::Standalone => 5,
             FileRole::RarVolume { volume_number } => 10 + *volume_number,
             FileRole::SevenZipSplit { number } => 10 + *number,
