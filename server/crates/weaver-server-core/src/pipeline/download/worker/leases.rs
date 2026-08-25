@@ -247,7 +247,6 @@ impl Pipeline {
         let lane_mode = self.choose_download_lane_mode(job_id, first.is_recovery, pressure);
         let compatibility = DownloadBatchCompatibility::from_work(&first);
         Ok(Some(self.finish_download_batch_lease(
-            job_id,
             lane_mode,
             compatibility,
             first,
@@ -325,7 +324,6 @@ impl Pipeline {
         };
 
         Ok(Some(self.finish_download_batch_lease(
-            job_id,
             lane_mode,
             compatibility,
             first,
@@ -432,7 +430,6 @@ impl Pipeline {
 
     pub(in crate::pipeline::download::worker) fn finish_download_batch_lease(
         &mut self,
-        job_id: JobId,
         lane_mode: DownloadLaneMode,
         compatibility: DownloadBatchCompatibility,
         first: DownloadWork,
@@ -440,6 +437,7 @@ impl Pipeline {
         refill: bool,
         par2_metadata_bootstrap_files: Option<&[u32]>,
     ) -> DownloadBatchLease {
+        let job_id = first.segment_id.file_id.job_id;
         // Rate reservations are activated after the lease is finalized. Keep
         // limited leases single-work so every subsequent BODY refill observes
         // the updated token balance instead of pre-leasing past the limit.
