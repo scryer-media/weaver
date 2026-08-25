@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import type { Page } from "@playwright/test";
 import { expect, test } from "./helpers";
-import { registerRssProbeRelease } from "./support/external-control/newznab";
 
 async function ensureDownloadsPaused(page: Page): Promise<void> {
   const toggle = page.getByRole("button", { name: /^(Pause All|Resume All)$/ });
@@ -93,21 +92,9 @@ test("watch-folder injection reports queued/error marker renames without pipelin
   await expect(page.getByLabel("Poll Interval (seconds)")).toHaveValue("45");
 });
 
-test("RSS payload injection, seen deduplication, and seen controls are visible behavior", async ({ cleanPage: page, request }) => {
+test("RSS payload ingestion, seen deduplication, and seen controls are visible behavior", async ({ cleanPage: page }) => {
   const feedName = "E2E Controlled Feed";
   const releaseTitle = "Weaver E2E RSS Behavior Probe";
-  const releaseGuid = "weaver-e2e-rss-behavior-probe";
-  await registerRssProbeRelease(request, {
-    guid: releaseGuid,
-    title: releaseTitle,
-    nzbXml: `<?xml version="1.0" encoding="UTF-8"?>
-      <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
-        <file poster="weaver-e2e" date="1700000000" subject="rss-behavior.bin">
-          <groups><group>alt.binaries.test</group></groups>
-          <segments><segment bytes="1" number="1">rss-behavior@e2e.invalid</segment></segments>
-        </file>
-      </nzb>`,
-  });
 
   await page.goto("/");
   await ensureDownloadsPaused(page);
@@ -118,7 +105,7 @@ test("RSS payload injection, seen deduplication, and seen controls are visible b
   await feedForm.getByTestId("rss-feed-name").fill(feedName);
   await feedForm
     .getByTestId("rss-feed-url")
-    .fill("http://newznab:8088/api?t=search&apikey=test-e2e-key");
+    .fill("http://rss-fixture:8089/feed.xml");
   await feedForm.getByRole("button", { name: "Add Feed", exact: true }).click();
 
   const feedCard = page.getByRole("region", { name: new RegExp(feedName) });

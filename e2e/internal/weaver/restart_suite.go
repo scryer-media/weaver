@@ -477,7 +477,7 @@ func ensureRestartInfrastructure() {
 	if err := ensureNyuuImageBuilt(); err != nil {
 		log.Fatalf("build nyuu image for restart suite: %v", err)
 	}
-	services := []string{"nntp", "newznab", "nyuu"}
+	services := []string{"nntp", "nyuu"}
 	if weaverUsesPostgresDatastore() {
 		services = append(services, "weaver-postgres")
 	}
@@ -491,7 +491,6 @@ func ensureRestartInfrastructure() {
 		log.Fatalf("refresh runtime ports after starting restart-suite infrastructure: %v", err)
 	}
 	waitForTCP(nntpHost()+":"+nntpPort(), 30*time.Second)
-	waitForHTTP(newznabURL()+"/admin/health", 30*time.Second)
 	if weaverUsesPostgresDatastore() {
 		if err := waitForWeaverPostgresReady(30 * time.Second); err != nil {
 			log.Fatalf("wait for Weaver Postgres: %v", err)
@@ -509,7 +508,6 @@ func (ctx *restartCaseContext) startWeaverWithConnections(failpoint string, conn
 
 func (ctx *restartCaseContext) startWeaverWithOptions(failpoint string, connections int, extraEnv ...string) error {
 	waitForTCP(nntpHost()+":"+nntpPort(), 30*time.Second)
-	waitForHTTP(newznabURL()+"/admin/health", 30*time.Second)
 	if err := ensureNntpChaosOff(); err != nil {
 		return err
 	}

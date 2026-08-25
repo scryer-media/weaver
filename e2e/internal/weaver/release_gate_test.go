@@ -135,6 +135,14 @@ func TestWeaverIngressPrivateNetworkOverrideIsFlowScoped(t *testing.T) {
 	}
 }
 
+func TestWeaverIngressFlowUsesOnlyTheRSSFixture(t *testing.T) {
+	spec := ingressReleaseFlow()
+	want := []string{"nntp", "nntp2", "weaver", "rss-fixture"}
+	if !slices.Equal(spec.Services, want) {
+		t.Fatalf("ingress services = %v, want %v", spec.Services, want)
+	}
+}
+
 func TestWeaverReleaseConsoleReopensLatestRun(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("E2E_WEAVER_RELEASE_GATE_ROOT", root)

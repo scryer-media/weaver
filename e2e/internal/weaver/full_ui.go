@@ -227,7 +227,6 @@ type fullDashboard struct {
 	title       string
 	start       time.Time
 	seed        dashboardBar
-	cache       dashboardBar
 	phases      map[string]*dashboardBar
 	order       []string
 	// Sub-bars for phases that fan out into named flows — the release gate runs
@@ -235,9 +234,6 @@ type fullDashboard struct {
 	flows       map[string]map[string]*dashboardBar
 	flowOrder   map[string][]string
 	seedByPhase map[string]int
-	cacheByKey  map[string]int
-	cacheTotals map[string]int
-	cacheWarn   map[string]bool
 	dirty       bool
 	lastFrame   string
 	stopCh      chan struct{}
@@ -281,19 +277,11 @@ func newFullDashboard(title string, phaseNames []string, seedTotal int) *fullDas
 			Status: "running",
 			Detail: "isolated stacks",
 		},
-		cache: dashboardBar{
-			Label:  "NNTP Cache",
-			Status: "waiting",
-			Detail: "checking fingerprints",
-		},
 		phases:      make(map[string]*dashboardBar, len(phaseNames)),
 		order:       append([]string(nil), phaseNames...),
 		flows:       make(map[string]map[string]*dashboardBar, len(phaseNames)),
 		flowOrder:   make(map[string][]string, len(phaseNames)),
 		seedByPhase: make(map[string]int, len(phaseNames)),
-		cacheByKey:  make(map[string]int),
-		cacheTotals: make(map[string]int),
-		cacheWarn:   make(map[string]bool),
 		dirty:       true,
 	}
 	for _, name := range phaseNames {
@@ -398,49 +386,6 @@ func (d *fullDashboard) setSeedDetail(status, detail string) {
 	}
 	if strings.TrimSpace(detail) != "" {
 		d.seed.Detail = detail
-	}
-	d.scheduleRenderLocked()
-}
-
-func (d *fullDashboard) noteNntpCacheHit(profile string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.cache.Total == 0 && d.cache.Status != "warning" {
-		d.cache.Status = "pass"
-		d.cache.Detail = profile + ": current"
-		d.scheduleRenderLocked()
-	}
-}
-
-func (d *fullDashboard) updateNntpCache(key, profile string, current, total int, status, detail string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if total > 0 {
-		d.cacheTotals[key] = total
-		d.cacheByKey[key] = current
-	}
-	if status == "warning" {
-		d.cacheWarn[key] = true
-	}
-
-	d.cache.Current = 0
-	d.cache.Total = 0
-	for cacheKey, cacheTotal := range d.cacheTotals {
-		d.cache.Total += cacheTotal
-		d.cache.Current += d.cacheByKey[cacheKey]
-	}
-	switch {
-	case len(d.cacheWarn) > 0:
-		d.cache.Status = "warning"
-	case d.cache.Total > 0 && d.cache.Current >= d.cache.Total:
-		d.cache.Status = "pass"
-	case d.cache.Total > 0:
-		d.cache.Status = "running"
-	case strings.TrimSpace(status) != "":
-		d.cache.Status = status
-	}
-	if strings.TrimSpace(detail) != "" {
-		d.cache.Detail = profile + ": " + detail
 	}
 	d.scheduleRenderLocked()
 }
@@ -596,8 +541,6 @@ func (d *fullDashboard) buildFrameLocked() string {
 	b.WriteString(fmt.Sprintf("%s   %s\n\n", title, elapsedText))
 	b.WriteString(renderDashboardBar(d.seed, d.interactive, layout))
 	b.WriteString("\n")
-	b.WriteString(renderDashboardBar(d.cache, d.interactive, layout))
-	b.WriteString("\n")
 	for _, name := range d.order {
 		b.WriteString(renderDashboardBar(*d.phases[name], d.interactive, layout))
 		b.WriteString("\n")
@@ -612,9 +555,6 @@ func (d *fullDashboard) buildFrameLocked() string {
 func (d *fullDashboard) dashboardLayoutLocked() dashboardLayout {
 	labelWidth := dashboardMinLabelWidth
 	if width := len(d.seed.Label); width > labelWidth {
-		labelWidth = width
-	}
-	if width := len(d.cache.Label); width > labelWidth {
 		labelWidth = width
 	}
 	for _, name := range d.order {
@@ -854,7 +794,7 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	// below seeds from the tree it produces.
 	ensureFixtureProfiles(fullPhaseFixtureProfiles(phases)...)
 
-	seedableCount, err := countSeedableFixtures(phases)
+	seedableCount, err := countPreseedableFixtures(phases)
 	if err != nil {
 		log.Fatalf("count seedable fixtures: %v", err)
 	}
@@ -877,7 +817,7 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	if err := ensureNyuuImageBuilt(); err != nil {
 		log.Fatalf("prepare nyuu image for full suite: %v", err)
 	}
-	dashboard.setSeedDetail("running", "seeding while weaver e2e build runs")
+	dashboard.setSeedDetail("running", "preparing pre-seeded runtimes while the Weaver e2e build runs")
 	go func() {
 		if _, err := ensureE2EWeaverBinary(); err != nil {
 			log.Printf("warning: background weaver e2e build failed: %v", err)
@@ -885,11 +825,21 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	}()
 	awaitWeaverImage := prepareFullSuiteWeaverImage(phases)
 
+	if err := prepareFullPreseededRuntimes(ctx, tempRoot, phases, dashboard); err != nil {
+		cleanupErrors := cleanupFullPhaseContexts(phases, false)
+		printFullSummary(options.summaryLabel, phases, nil, cleanupErrors, tempRoot, nil, true, true)
+		log.Fatalf("prepare pre-seeded full-suite runtimes: %v", err)
+	}
+	if err := writeFullRunManifest(manifestPath, tempRoot, phases); err != nil {
+		cleanupErrors := cleanupFullPhaseContexts(phases, false)
+		printFullSummary(options.summaryLabel, phases, nil, cleanupErrors, tempRoot, nil, true, true)
+		log.Fatalf("update full-suite manifest after pre-seeding: %v", err)
+	}
+
 	keepStacks := envBool("E2E_KEEP_STACKS", false)
 	var cleanupErrors []error
-	cacheWarmer := newNntpSeedCacheWarmer(ctx, tempRoot, dashboard)
 
-	seedResults, phaseResults := runFullPipeline(ctx, phases, dashboard, keepStacks, awaitWeaverImage, cacheWarmer)
+	seedResults, phaseResults := runFullPipeline(ctx, phases, dashboard, keepStacks, awaitWeaverImage)
 	seedFailed := false
 	for _, result := range seedResults {
 		if result.Err != nil {
@@ -1006,15 +956,144 @@ func newFullPhaseContextsFor(tempRoot string, includePhase func(fullPhaseDefinit
 	return contexts, nil
 }
 
-func countSeedableFixtures(phases []*fullPhaseContext) (int, error) {
-	total := 0
+// countPreseedableFixtures counts the corpus once per profile. A full run may
+// exercise that profile in several storage modes, but the pre-seeded NNTP
+// article store is shared by all of them.
+func countPreseedableFixtures(phases []*fullPhaseContext) (int, error) {
+	profiles := make(map[string]struct{})
 	for _, phase := range phases {
-		if phase.SkipSeed {
+		if phase == nil || phase.SkipSeed || strings.TrimSpace(phase.SeedProfile) == "" {
 			continue
 		}
-		total += len(fixtureSlugsForSeedProfile(phase.SeedProfile))
+		profiles[phase.SeedProfile] = struct{}{}
+	}
+
+	total := 0
+	for profile := range profiles {
+		total += len(fixtureSlugsForSeedProfile(profile))
 	}
 	return total, nil
+}
+
+// prepareFullPreseededRuntimes turns each selected fixture profile into one
+// immutable NNTP runtime before phases are started. On a cache hit we only copy
+// the already-generated NZBs once; no phase posts articles.
+func prepareFullPreseededRuntimes(
+	ctx context.Context,
+	tempRoot string,
+	phases []*fullPhaseContext,
+	dashboard *fullDashboard,
+) error {
+	if !nntpSeedImageCacheEnabled() {
+		return nil
+	}
+
+	byProfile := make(map[string][]*fullPhaseContext)
+	for _, phase := range phases {
+		if phase == nil || phase.SkipSeed || strings.TrimSpace(phase.SeedProfile) == "" {
+			continue
+		}
+		byProfile[phase.SeedProfile] = append(byProfile[phase.SeedProfile], phase)
+	}
+
+	profiles := make([]string, 0, len(byProfile))
+	for profile := range byProfile {
+		profiles = append(profiles, profile)
+	}
+	for _, profile := range uniqueSorted(profiles) {
+		profilePhases := byProfile[profile]
+		slugs := fixtureSlugsForSeedProfile(profile)
+		set, err := nntpSeedImageSetForProfile(profile, slugs)
+		if err != nil {
+			return fmt.Errorf("prepare cache image identity for %s: %w", profile, err)
+		}
+
+		fixturesRoot := filepath.Join(tempRoot, "preseeded", profile, "fixtures")
+		if set.ready() {
+			if err := restoreSeededNZBBundle(set.Primary, fixturesRoot); err != nil {
+				return fmt.Errorf("restore pre-seeded NZBs for %s: %w", profile, err)
+			}
+			dashboard.updateSeed("pre-seeded "+profile, progressEvent{
+				Kind:    "seed_done",
+				Current: len(slugs),
+				Total:   len(slugs),
+				Status:  "pass",
+				Detail:  "pre-seeded runtime ready",
+			})
+		} else {
+			bootstrap, err := newFullPreseedBootstrap(tempRoot, profile, profilePhases[0], fixturesRoot)
+			if err != nil {
+				return err
+			}
+
+			seedResult := runSelfWithEnv(ctx, bootstrap, "seed-all", func(event progressEvent) {
+				dashboard.updateSeed("pre-seed "+profile, event)
+			})
+			if seedResult.Err != nil {
+				_ = cleanupFullPhaseContext(bootstrap)
+				return fmt.Errorf("seed pre-seeded runtime for %s: %w", profile, seedResult.Err)
+			}
+			dashboard.setSeedDetail("running", "pre-seed "+profile+": baking NNTP images")
+			if err := captureSeedImageCache(ctx, set, slugs, nntpSeedCacheCaptureConfig{
+				Project:          bootstrap.Project,
+				FixturesDir:      fixturesRoot,
+				StageRoot:        tempRoot,
+				LockRoot:         os.TempDir(),
+				OwnerPID:         os.Getpid(),
+				CommitContainers: true,
+				Progress: func(_ int, _ int, detail string) {
+					dashboard.setSeedDetail("running", "pre-seed "+profile+": "+detail)
+				},
+			}); err != nil {
+				_ = cleanupFullPhaseContext(bootstrap)
+				dashboard.setSeedDetail("fail", "pre-seed "+profile+": "+err.Error())
+				return fmt.Errorf("capture NNTP images for %s: %w", profile, err)
+			}
+			if err := cleanupFullPhaseContext(bootstrap); err != nil {
+				return fmt.Errorf("clean up pre-seed runtime for %s: %w", profile, err)
+			}
+			dashboard.setSeedDetail("", "pre-seed "+profile+": ready")
+		}
+
+		for _, phase := range profilePhases {
+			phase.FixturesDir = fixturesRoot
+			phase.SkipSeed = true
+		}
+	}
+	return nil
+}
+
+func newFullPreseedBootstrap(tempRoot, profile string, source *fullPhaseContext, fixturesRoot string) (*fullPhaseContext, error) {
+	if source == nil {
+		return nil, fmt.Errorf("prepare pre-seed bootstrap for %s: no source phase", profile)
+	}
+	rootDir := filepath.Join(tempRoot, "preseeded", profile)
+	runDir := filepath.Join(rootDir, "run")
+	if err := os.MkdirAll(fixturesRoot, 0o755); err != nil {
+		return nil, fmt.Errorf("create pre-seed fixtures directory for %s: %w", profile, err)
+	}
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create pre-seed run directory for %s: %w", profile, err)
+	}
+
+	bootstrap := &fullPhaseContext{
+		Name:             "Pre-seed " + profile,
+		SeedProfile:      profile,
+		Slug:             "preseed-" + profile,
+		Datastore:        source.Datastore,
+		Project:          sanitizeProjectName(source.Project + "-preseed"),
+		RootDir:          rootDir,
+		FixturesDir:      fixturesRoot,
+		RunDir:           runDir,
+		RuntimePortsFile: filepath.Join(rootDir, "runtime-ports.json"),
+		RuntimePorts:     source.RuntimePorts,
+		LogTail:          &lineTail{limit: 120},
+		ExtraEnv:         source.ExtraEnv,
+	}
+	if err := saveRuntimePortState(bootstrap.RuntimePortsFile, bootstrap.RuntimePorts); err != nil {
+		return nil, fmt.Errorf("write pre-seed runtime ports for %s: %w", profile, err)
+	}
+	return bootstrap, nil
 }
 
 func runFullPipeline(
@@ -1023,7 +1102,6 @@ func runFullPipeline(
 	dashboard *fullDashboard,
 	keepStacks bool,
 	awaitWeaverImage func() error,
-	cacheWarmer *nntpSeedCacheWarmer,
 ) ([]childRunResult, []childRunResult) {
 	seedResults := make(chan childRunResult, len(phases))
 	phaseResults := make(chan childRunResult, len(phases))
@@ -1033,14 +1111,7 @@ func runFullPipeline(
 		wg.Add(1)
 		go func(phase *fullPhaseContext) {
 			defer wg.Done()
-			var cacheJob *nntpSeedCacheWarmJob
-			ownsCacheWarm := false
 			defer func() {
-				if ownsCacheWarm {
-					if err := cacheJob.wait(); err != nil {
-						phase.LogTail.Add("NNTP cache warning: " + err.Error())
-					}
-				}
 				if !keepStacks {
 					if err := cleanupFullPhaseContext(phase); err != nil {
 						phase.LogTail.Add("cleanup error: " + err.Error())
@@ -1057,7 +1128,6 @@ func runFullPipeline(
 					dashboard.markPhaseResult(phase.Name, "fail")
 					return
 				}
-				cacheJob, ownsCacheWarm = cacheWarmer.start(phase)
 			}
 
 			setupStarted := time.Now()

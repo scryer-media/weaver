@@ -1,10 +1,9 @@
 # Weaver end-to-end harness
 
 The integration and release-gate suite for [Weaver](../README.md). It posts
-real yEnc articles to fake NNTP servers with Nyuu, registers them in a fake
-Newznab indexer, drives Weaver through its GraphQL API and its browser UI, and
-asserts on the product's own state — completed files, metrics, database rows,
-what the UI shows.
+real yEnc articles to fake NNTP servers with Nyuu, drives Weaver through its
+GraphQL API and its browser UI, and asserts on the product's own state —
+completed files, metrics, database rows, what the UI shows.
 
 It is a self-contained Go module (`github.com/scryer-media/weaver/e2e`) with
 its own Compose stack, fixture corpus and Playwright project, so a release gate
@@ -35,7 +34,7 @@ suite is the criterion, not the workaround.
 | --- | --- |
 | Go 1.26+ | the harness, the corpus tool and the fixture generator (`go run ./cmd/…`) |
 | [Task](https://taskfile.dev) | the `task` targets below; every one maps to a `weaver-e2e` subcommand, which is the real interface |
-| Docker with Compose v2 | the stack: two NNTP servers, Newznab, Nyuu, Toxiproxy, SABnzbd, NZBGet, PostgreSQL, Playwright, and Weaver itself |
+| Docker with Compose v2 | the stack: two NNTP servers, Nyuu, Toxiproxy, SABnzbd, NZBGet, PostgreSQL, Playwright, a fixed RSS fixture, and Weaver itself |
 | Rust (the toolchain in `../rust-toolchain.toml`) | building the Weaver binary for managed-local phases and the local Weaver image; the harness asks `rustup which cargo` so a stray older toolchain on `PATH` cannot be picked up |
 | Node.js with npm | only to develop the Playwright project locally (`playwright-weaver/`); the tests themselves run in a container. Use npm and the committed `package-lock.json`, never pnpm |
 | Disk | the full fixture corpus is ~6.2 GiB; the `functional` profile alone ~5.9 GiB |
@@ -77,8 +76,8 @@ subcommands.
 | `cmd/weaver-e2e` | The CLI |
 | `internal/weaver` | The harness: flows, seeding, assertions, the release gate |
 | `internal/composeutil` | Compose network and subnet helpers |
-| `docker-compose.yml` | The 10-service stack: `weaver`, `weaver-postgres`, `weaver-playwright`, `nntp`, `nntp2`, `newznab`, `nyuu`, `toxiproxy`, `sabnzbd`, `nzbget` |
-| `services/` | Config and build contexts for the stack services (`services/newznab` is the fake indexer, its own Go module) |
+| `docker-compose.yml` | The 10-service stack: `weaver`, `weaver-postgres`, `weaver-playwright`, `rss-fixture`, `nntp`, `nntp2`, `nyuu`, `toxiproxy`, `sabnzbd`, `nzbget` |
+| `services/` | Config and build contexts for the stack services |
 | `playwright-weaver/` | The Playwright project (image `weaver-e2e-playwright:local`); `tests/` is live-mounted into the container |
 | `testdata/<slug>/` | One directory per scenario: `scenario.json` is tracked, the payload bytes are hydrated; `testdata/shared/` holds the source clips the generators encode from |
 | `test-corpus/` | The corpus ledger, profiles, toolchain lock and published-manifest lock |
@@ -135,10 +134,10 @@ covers the recipes and how to add a scenario.
 
 | Command | What it does |
 | --- | --- |
-| `weaver-e2e seed <fixture-dir>` | Post one fixture with Nyuu and register its NZB in Newznab |
+| `weaver-e2e seed <fixture-dir>` | Post one fixture with Nyuu and generate its NZB |
 | `weaver-e2e seed-all` | Seed every scenario in `testdata/` |
-| `weaver-e2e verify` | Verify article availability and indexer registration |
-| `weaver-e2e status` | Check NNTP, Newznab and Weaver health |
+| `weaver-e2e verify` | Verify article availability |
+| `weaver-e2e status` | Check NNTP and Weaver health |
 | `weaver-e2e scenarios` | List scenarios and their expected outcomes |
 | `weaver-e2e submit <slug>` | Submit one seeded NZB directly to Weaver |
 | `weaver-e2e test <slug>…` / `test-all` | Run selected scenarios, or the whole baseline suite, through Weaver |
@@ -248,7 +247,7 @@ mirrors): `E2E_NNTP_USERNAME` / `E2E_NNTP_PASSWORD` (default `e2e-user` /
 `E2E_WEAVER_RELEASE_GATE_MAX_MINUTES`, `E2E_WEAVER_PLAYWRIGHT_IMAGE`,
 `E2E_WEAVER_PLAYWRIGHT_ARTIFACTS_DIR`, `E2E_WEAVER_MODE`,
 `E2E_WEAVER_BASE_URL`, `E2E_WEAVER_PORT`, `E2E_LOCAL_WEAVER_PORT`,
-`E2E_NEWZNAB_PORT`, `E2E_NYUU_BACKUP_HOST` / `_PORT`, `E2E_TOXIPROXY_API_PORT` /
+`E2E_NYUU_BACKUP_HOST` / `_PORT`, `E2E_TOXIPROXY_API_PORT` /
 `TOXIPROXY_URL`, `E2E_TLS_SCENARIOS`, `E2E_WEAVER_PGO_OUTPUT_DIR`,
 `DOWNLOAD_BENCH_NNTP_PORT`, `ADAPTIVE_DISPATCH_SAMPLE_MS` / `_TIMEOUT_SEC` /
 `_SEED_RETRIES` / `_MESSAGE_PREFIX`, and `WEAVER_RAR_DIRECT_STORE` (passed

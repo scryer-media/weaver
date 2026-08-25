@@ -32,6 +32,73 @@ func TestFullSeedJobsOverrideRespectsExplicitParentSetting(t *testing.T) {
 	}
 }
 
+func TestCountPreseedableFixturesDeduplicatesProfiles(t *testing.T) {
+	phases := []*fullPhaseContext{
+		{SeedProfile: "functional"},
+		{SeedProfile: "functional"},
+		{SeedProfile: "restart"},
+		{SeedProfile: "chaos", SkipSeed: true},
+	}
+
+	got, err := countPreseedableFixtures(phases)
+	if err != nil {
+		t.Fatalf("count preseedable fixtures: %v", err)
+	}
+	want := len(fixtureSlugsForSeedProfile("functional")) + len(fixtureSlugsForSeedProfile("restart"))
+	if got != want {
+		t.Fatalf("preseedable fixture count = %d, want %d", got, want)
+	}
+}
+
+func TestNewFullPreseedBootstrapUsesDedicatedStackAndSharedFixtures(t *testing.T) {
+	tempRoot := t.TempDir()
+	fixturesRoot := filepath.Join(tempRoot, "preseeded", "functional", "fixtures")
+	source := &fullPhaseContext{
+		Datastore: "sqlite",
+		Project:   "e2e-functional-sqlite",
+		RuntimePorts: runtimePortState{
+			NNTPPort:           1119,
+			NNTPTLSPort:        1563,
+			NNTP2Port:          2119,
+			ToxiproxyAPIPort:   8474,
+			ToxiproxyNNTP1Port: 3119,
+			ToxiproxyNNTP2Port: 4119,
+			WeaverPort:         9090,
+			PostgresPort:       5432,
+			NzbgetPort:         6789,
+			SabnzbdPort:        8085,
+			LocalWeaverPort:    19090,
+		},
+	}
+
+	bootstrap, err := newFullPreseedBootstrap(tempRoot, "functional", source, fixturesRoot)
+	if err != nil {
+		t.Fatalf("create pre-seed bootstrap: %v", err)
+	}
+	if bootstrap.Project == source.Project {
+		t.Fatalf("bootstrap reused source project %q", source.Project)
+	}
+	if bootstrap.FixturesDir != fixturesRoot {
+		t.Fatalf("bootstrap fixtures = %q, want %q", bootstrap.FixturesDir, fixturesRoot)
+	}
+	if bootstrap.RuntimePorts != source.RuntimePorts {
+		t.Fatalf("bootstrap runtime ports = %#v, want %#v", bootstrap.RuntimePorts, source.RuntimePorts)
+	}
+	if _, err := os.Stat(bootstrap.RunDir); err != nil {
+		t.Fatalf("bootstrap run directory: %v", err)
+	}
+	if _, err := os.Stat(bootstrap.FixturesDir); err != nil {
+		t.Fatalf("bootstrap fixture directory: %v", err)
+	}
+	stored, err := loadRuntimePortState(bootstrap.RuntimePortsFile)
+	if err != nil {
+		t.Fatalf("read bootstrap runtime ports: %v", err)
+	}
+	if stored != source.RuntimePorts {
+		t.Fatalf("stored bootstrap runtime ports = %#v, want %#v", stored, source.RuntimePorts)
+	}
+}
+
 func TestFullPhaseEnvKeepsRestartSeedRetries(t *testing.T) {
 	t.Setenv("E2E_SEED_JOBS", "")
 	t.Setenv("E2E_RESTART_PROFILE", "")
@@ -487,7 +554,6 @@ func TestFullDashboardAlignsProgressBarsForDatastorePhaseNames(t *testing.T) {
 			Status:  "pass",
 			Detail:  "Functional Postgres: zstd-single",
 		},
-		cache:  dashboardBar{Label: "NNTP Cache", Status: "waiting", Detail: "checking fingerprints"},
 		phases: make(map[string]*dashboardBar, len(phaseNames)),
 		order:  append([]string(nil), phaseNames...),
 	}
@@ -517,8 +583,8 @@ func TestFullDashboardAlignsProgressBarsForDatastorePhaseNames(t *testing.T) {
 		}
 		checked++
 	}
-	if checked != len(phaseNames)+2 {
-		t.Fatalf("expected %d dashboard bars, checked %d in frame:\n%s", len(phaseNames)+2, checked, frame)
+	if checked != len(phaseNames)+1 {
+		t.Fatalf("expected %d dashboard bars, checked %d in frame:\n%s", len(phaseNames)+1, checked, frame)
 	}
 }
 
@@ -589,15 +655,15 @@ func TestFullDashboardRendersOneBarPerReleaseGateFlow(t *testing.T) {
 		}
 		bars++
 	}
-	// seed + cache + phase + three flows
-	if bars != 6 {
-		t.Fatalf("expected 6 bars, got %d in frame:\n%s", bars, frame)
+	// seed + phase + three flows
+	if bars != 5 {
+		t.Fatalf("expected 5 bars, got %d in frame:\n%s", bars, frame)
 	}
 }
 
-// Each seeding phase owns its NNTP corpus. Keeping the assertion on the phase
-// table prevents a future optimization from coupling phase lifetime or ports.
-func TestFullPhasesSeedTheirOwnNNTP(t *testing.T) {
+// The pre-seed bootstrap reuses each phase's reserved ports before the real
+// phases start, so phase port isolation must still be explicit in the plan.
+func TestFullPhasesHaveIsolatedPortsAndProfiles(t *testing.T) {
 	tempRoot := t.TempDir()
 	phases, err := newFullPhaseContexts(tempRoot)
 	if err != nil {
@@ -622,7 +688,7 @@ func TestFullPhasesSeedTheirOwnNNTP(t *testing.T) {
 			t.Fatalf("missing %s phase", slug)
 		}
 		if phase.SkipSeed {
-			t.Fatalf("%s must seed its own NNTP articles", phase.Name)
+			t.Fatalf("%s unexpectedly skips pre-seeding", phase.Name)
 		}
 		if phase.SeedProfile != profile {
 			t.Fatalf("%s seed profile = %q, want %q", phase.Name, phase.SeedProfile, profile)

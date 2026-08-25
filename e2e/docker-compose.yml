@@ -82,18 +82,19 @@ services:
       timeout: 3s
       retries: 5
 
-  # Lightweight Newznab-compatible indexer (Go)
-  newznab:
-    image: ${E2E_NEWZNAB_IMAGE:-weaver-e2e-newznab:local}
+  # Fixed RSS/NZB source for the RSS-ingress release-gate flow. It intentionally
+  # exercises feed parsing and NZB retrieval, not an indexer implementation.
+  rss-fixture:
+    image: ${E2E_WEAVER_PLAYWRIGHT_IMAGE:-weaver-e2e-playwright:local}
     pull_policy: never
-    build: ./services/newznab
-    ports:
-      - "${E2E_NEWZNAB_PORT:-8088}:8088"
-    environment:
-      API_KEY: test-e2e-key
-      LISTEN_ADDR: "0.0.0.0:8088"
+    build:
+      context: ./playwright-weaver
+      dockerfile: Dockerfile
+    command: ["node", "tests/support/rss-fixture-server.mjs"]
+    volumes:
+      - ./playwright-weaver/tests:/work/tests:ro
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8088/admin/health"]
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8089/feed.xml').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""]
       interval: 2s
       timeout: 2s
       retries: 5

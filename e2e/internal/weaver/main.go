@@ -1,13 +1,12 @@
 // weaver-e2e is the CLI tool for the Weaver end-to-end test environment.
 //
-// It orchestrates Nyuu (real usenet poster) for article posting and NZB generation,
-// and talks to the newznab indexer to register releases.
+// It orchestrates Nyuu (real usenet poster) for article posting and NZB generation.
 //
 // Subcommands:
 //
-//	seed <fixture-dir>   Post fixture via Nyuu, register NZB with indexer
+//	seed <fixture-dir>   Post fixture via Nyuu and generate its NZB
 //	seed-all             Seed all fixtures from testdata/
-//	verify               STAT articles in NNTP, search releases in indexer
+//	verify               STAT articles in NNTP
 //	status               Show health of all services
 //	scenarios            List all available test scenarios
 package weaver
@@ -42,7 +41,6 @@ import (
 type Scenario struct {
 	Slug                               string                     `json:"slug"`
 	Title                              string                     `json:"title"`
-	IndexerTitle                       string                     `json:"indexerTitle,omitempty"`
 	Description                        string                     `json:"description"`
 	Category                           string                     `json:"category"`
 	ExpectedOutcome                    string                     `json:"expected_outcome"`
@@ -70,7 +68,6 @@ type Scenario struct {
 	MaxJobEventCounts                  map[string]int             `json:"maxJobEventCounts,omitempty"`
 	ExpectedOutputBLAKE3               map[string]string          `json:"expectedOutputBLAKE3,omitempty"`
 	ForbiddenOutputPaths               []string                   `json:"forbiddenOutputPaths,omitempty"`
-	NewznabAttributes                  map[string]string          `json:"newznabAttributes,omitempty"`
 	RuntimeAssertions                  *ScenarioRuntimeAssertions `json:"runtimeAssertions,omitempty"`
 }
 
@@ -112,7 +109,6 @@ type runtimePortState struct {
 	ToxiproxyAPIPort   int `json:"toxiproxy_api_port"`
 	ToxiproxyNNTP1Port int `json:"toxiproxy_nntp1_port"`
 	ToxiproxyNNTP2Port int `json:"toxiproxy_nntp2_port"`
-	NewznabPort        int `json:"newznab_port"`
 	WeaverPort         int `json:"weaver_port"`
 	PostgresPort       int `json:"postgres_port"`
 	NzbgetPort         int `json:"nzbget_port"`
@@ -264,8 +260,6 @@ Environment:
   E2E_FORCE_REBUILD_NYUU_IMAGE    Force rebuilding the Nyuu image for e2e/full seeding
   NNTP_HOST            NNTP server host (default: localhost)
   NNTP_PORT            NNTP server port (default: runtime-assigned open port)
-  NEWZNAB_URL          Newznab indexer URL (default: runtime-assigned open port)
-  NEWZNAB_API_KEY      Newznab API key (default: test-e2e-key)
   WEAVER_URL           Weaver GraphQL base URL (default: runtime-assigned open port)
   E2E_NZBGET_PORT      Host port for NZBGet (default: runtime-assigned open port)
   E2E_SABNZBD_PORT     Host port for SABnzbd (default: runtime-assigned open port)
@@ -415,7 +409,6 @@ func runtimePortEnvKeys() []string {
 		"E2E_TOXIPROXY_API_PORT",
 		"E2E_TOXIPROXY_NNTP1_PORT",
 		"E2E_TOXIPROXY_NNTP2_PORT",
-		"E2E_NEWZNAB_PORT",
 		"E2E_WEAVER_PORT",
 		"E2E_WEAVER_POSTGRES_PORT",
 		"E2E_NZBGET_PORT",
@@ -542,7 +535,6 @@ func validateRuntimePortState(state runtimePortState) error {
 		state.ToxiproxyAPIPort,
 		state.ToxiproxyNNTP1Port,
 		state.ToxiproxyNNTP2Port,
-		state.NewznabPort,
 		state.WeaverPort,
 		state.PostgresPort,
 		state.NzbgetPort,
@@ -603,7 +595,6 @@ func runtimePortAssignments(state *runtimePortState) []runtimePortAssignment {
 		{value: &state.ToxiproxyAPIPort, name: "toxiproxy API"},
 		{value: &state.ToxiproxyNNTP1Port, name: "toxiproxy NNTP1"},
 		{value: &state.ToxiproxyNNTP2Port, name: "toxiproxy NNTP2"},
-		{value: &state.NewznabPort, name: "newznab"},
 		{value: &state.WeaverPort, name: "docker weaver"},
 		{value: &state.PostgresPort, name: "postgres"},
 		{value: &state.NzbgetPort, name: "nzbget"},
@@ -638,10 +629,6 @@ func discoverRuntimePortState() (runtimePortState, error) {
 		return state, err
 	}
 	state.NNTPTLSPort, err = inspectDockerHostPort("nntp", "563/tcp")
-	if err != nil {
-		return state, err
-	}
-	state.NewznabPort, err = inspectDockerHostPort("newznab", "8088/tcp")
 	if err != nil {
 		return state, err
 	}
@@ -806,7 +793,6 @@ func runtimePortEnvValues(state runtimePortState) map[string]string {
 		"E2E_TOXIPROXY_API_PORT":   strconv.Itoa(state.ToxiproxyAPIPort),
 		"E2E_TOXIPROXY_NNTP1_PORT": strconv.Itoa(state.ToxiproxyNNTP1Port),
 		"E2E_TOXIPROXY_NNTP2_PORT": strconv.Itoa(state.ToxiproxyNNTP2Port),
-		"E2E_NEWZNAB_PORT":         strconv.Itoa(state.NewznabPort),
 		"E2E_WEAVER_PORT":          strconv.Itoa(state.WeaverPort),
 		"E2E_WEAVER_POSTGRES_PORT": strconv.Itoa(state.PostgresPort),
 		"E2E_NZBGET_PORT":          strconv.Itoa(state.NzbgetPort),
@@ -817,7 +803,6 @@ func runtimePortEnvValues(state runtimePortState) map[string]string {
 		"NNTP_BACKUP_PORT":         strconv.Itoa(state.NNTP2Port),
 		"TOXIPROXY_NNTP1_PORT":     strconv.Itoa(state.ToxiproxyNNTP1Port),
 		"TOXIPROXY_NNTP2_PORT":     strconv.Itoa(state.ToxiproxyNNTP2Port),
-		"NEWZNAB_URL":              fmt.Sprintf("http://localhost:%d", state.NewznabPort),
 		"WEAVER_URL":               fmt.Sprintf("http://localhost:%d", state.WeaverPort),
 		"NZBGET_URL":               fmt.Sprintf("http://localhost:%d", state.NzbgetPort),
 		"SABNZBD_URL":              fmt.Sprintf("http://localhost:%d", state.SabnzbdPort),
@@ -852,7 +837,6 @@ func runtimeStackRunning() bool {
 	for _, name := range []string{
 		"nntp",
 		"nntp2",
-		"newznab",
 		"weaver",
 		"nzbget",
 		"sabnzbd",
@@ -1305,15 +1289,6 @@ func toxiproxyNntp2Port() string {
 	return os.Getenv("E2E_TOXIPROXY_NNTP2_PORT")
 }
 
-func newznabURL() string {
-	if value := strings.TrimSpace(os.Getenv("NEWZNAB_URL")); value != "" {
-		return value
-	}
-	ensureRuntimePortEnv()
-	return fmt.Sprintf("http://localhost:%s", os.Getenv("E2E_NEWZNAB_PORT"))
-}
-
-func newznabAPIKey() string  { return env("NEWZNAB_API_KEY", "test-e2e-key") }
 func nyuuImage() string      { return env("NYUU_IMAGE", "e2e-nyuu") }
 func nyuuBackupHost() string { return env("E2E_NYUU_BACKUP_HOST", "nntp2") }
 func nyuuBackupPort() string { return env("E2E_NYUU_BACKUP_PORT", "119") }
@@ -1633,14 +1608,13 @@ func ensureSeedingInfrastructureErr() error {
 	if err := ensureNyuuImageBuilt(); err != nil {
 		return fmt.Errorf("build nyuu image: %w", err)
 	}
-	if err := dockerComposeUp("nntp", "newznab", "nyuu"); err != nil {
+	if err := dockerComposeUp("nntp", "nyuu"); err != nil {
 		return fmt.Errorf("start seeding infrastructure: %w", err)
 	}
 	if err := refreshRuntimePortEnvFromRunningStack(); err != nil {
 		return fmt.Errorf("refresh runtime ports after starting seeding infrastructure: %w", err)
 	}
 	waitForTCP(nntpHost()+":"+nntpPort(), 30*time.Second)
-	waitForHTTP(newznabURL()+"/admin/health", 30*time.Second)
 	if err := ensureNntpChaosOff(); err != nil {
 		return fmt.Errorf("reset NNTP chaos before seeding: %w", err)
 	}
@@ -1651,7 +1625,7 @@ func ensureStandardDockerInfrastructure() {
 	if err := applyNntpSeedImageCacheForProfile(os.Getenv("E2E_SEED_PROFILE")); err != nil {
 		log.Fatalf("prepare pre-seeded NNTP images: %v", err)
 	}
-	services := []string{"nntp", "newznab", "nntp2"}
+	services := []string{"nntp", "nntp2"}
 	if weaverUsesPostgresDatastore() {
 		services = append(services, "weaver-postgres")
 	}
@@ -1662,7 +1636,6 @@ func ensureStandardDockerInfrastructure() {
 		log.Fatalf("refresh runtime ports after starting standard infrastructure: %v", err)
 	}
 	waitForTCP(nntpHost()+":"+nntpPort(), 30*time.Second)
-	waitForHTTP(newznabURL()+"/admin/health", 30*time.Second)
 	waitForTCP("localhost:"+backupNntpPort(), 30*time.Second)
 	if weaverUsesPostgresDatastore() {
 		if err := waitForWeaverPostgresReady(30 * time.Second); err != nil {
@@ -1959,13 +1932,7 @@ func seedScenarioRelease(absDir string, scenario *Scenario) error {
 
 	logSeed("NZB generated: %d bytes", len(nzbData))
 
-	// Compute total size from data files
-	// Register release with indexer
-	if err := registerRelease(scenario, nzbData, totalBytes); err != nil {
-		return fmt.Errorf("register release for %s: %w", scenario.Slug, err)
-	}
-
-	logSeed("done: guid=e2e-%s", scenario.Slug)
+	logSeed("done")
 	return nil
 }
 
@@ -2182,66 +2149,6 @@ func runNyuuPost(
 	return runExternalCommand(cmd, "nyuu post")
 }
 
-func registerRelease(s *Scenario, nzbXML []byte, sizeBytes int64) error {
-	attributes := map[string]string{
-		"category": s.Category,
-		"size":     fmt.Sprintf("%d", sizeBytes),
-	}
-	for key, value := range s.NewznabAttributes {
-		attributes[key] = value
-	}
-	if s.Password != "" {
-		attributes["password"] = s.Password
-	}
-
-	payload := map[string]interface{}{
-		"guid":       fmt.Sprintf("e2e-%s", s.Slug),
-		"title":      scenarioIndexerTitle(s),
-		"nzb_xml":    nzbXML, // Go json.Marshal base64-encodes []byte
-		"size_bytes": sizeBytes,
-		"attributes": attributes,
-	}
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-
-	waitForHTTP(newznabURL()+"/admin/health", 30*time.Second)
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	var lastErr error
-	for attempt := 0; attempt < 10; attempt++ {
-		resp, err := client.Post(newznabURL()+"/admin/releases", "application/json", bytes.NewReader(body))
-		if err != nil {
-			lastErr = err
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		if resp.StatusCode == http.StatusCreated {
-			resp.Body.Close()
-			return nil
-		}
-
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		lastErr = fmt.Errorf("indexer returned %d: %s", resp.StatusCode, respBody)
-		time.Sleep(1 * time.Second)
-	}
-	return lastErr
-}
-
-func scenarioIndexerTitle(s *Scenario) string {
-	if s == nil {
-		return ""
-	}
-	if title := strings.TrimSpace(s.IndexerTitle); title != "" {
-		return title
-	}
-	return strings.TrimSpace(s.Title)
-}
-
 // --- seed-all ---
 
 func seedAllForProfile(profile string) {
@@ -2265,21 +2172,20 @@ func seedAllForProfile(profile string) {
 			log.Fatalf("fingerprint pre-seeded NNTP images for profile %s: %v", profile, err)
 		}
 		if seedImages.ready() {
-			emitProgressEvent(progressEvent{Kind: "seed_total", Total: len(dirs), Detail: "fixtures (pre-seeded NNTP images)"})
-			if err := restoreSeedImageCache(seedImages, slugs); err != nil {
-				emitProgressEvent(progressEvent{Kind: "seed_done", Current: len(dirs), Total: len(dirs), Status: "fail"})
+			emitProgressEvent(progressEvent{Kind: "seed_total", Total: 1, Detail: "pre-seeded runtime"})
+			// The article stores are in the image, but the test commands submit
+			// host-side NZB files. Restore the complete profile in one copy rather
+			// than replaying one copy per fixture.
+			if err := restoreSeededNZBBundle(seedImages.Primary, fixturesDir()); err != nil {
+				emitProgressEvent(progressEvent{Kind: "seed_done", Current: 1, Total: 1, Status: "fail"})
+				log.Fatalf("restore pre-seeded NZBs for profile %s: %v", profile, err)
+			}
+			if err := restoreSeedImageCache(seedImages); err != nil {
+				emitProgressEvent(progressEvent{Kind: "seed_done", Current: 1, Total: 1, Status: "fail"})
 				log.Fatalf("restore pre-seeded NNTP images for profile %s: %v", profile, err)
 			}
-			for index, slug := range slugs {
-				emitProgressEvent(progressEvent{
-					Kind:    "seed_progress",
-					Current: index + 1,
-					Total:   len(dirs),
-					Status:  "pass",
-					Detail:  slug + " (pre-seeded image)",
-				})
-			}
-			emitProgressEvent(progressEvent{Kind: "seed_done", Current: len(dirs), Total: len(dirs), Status: "pass"})
+			emitProgressEvent(progressEvent{Kind: "seed_progress", Current: 1, Total: 1, Status: "pass", Detail: "pre-seeded runtime ready"})
+			emitProgressEvent(progressEvent{Kind: "seed_done", Current: 1, Total: 1, Status: "pass"})
 			return
 		}
 	}
@@ -2538,29 +2444,6 @@ func cmdVerify() {
 			log.Printf("  %s: %d/%d articles missing", slug, missing, len(msgIDs))
 		} else {
 			log.Printf("  %s: OK (%d articles)", slug, len(msgIDs))
-		}
-	}
-
-	// Verify releases in indexer
-	log.Printf("verifying releases in indexer at %s...", newznabURL())
-	for _, slug := range canonicalFixtureSlugs {
-		s, err := loadScenario(filepath.Join(testdataDir(), slug))
-		if err != nil {
-			log.Fatalf("load canonical scenario %q: %v", slug, err)
-		}
-
-		guid := fmt.Sprintf("e2e-%s", s.Slug)
-		url := fmt.Sprintf("%s/api?t=search&q=%s&apikey=%s", newznabURL(), s.Title, newznabAPIKey())
-		resp, err := http.Get(url)
-		if err != nil {
-			log.Printf("  %s: search error: %v", guid, err)
-			continue
-		}
-		resp.Body.Close()
-		if resp.StatusCode == 200 {
-			log.Printf("  %s: indexer OK", guid)
-		} else {
-			log.Printf("  %s: indexer returned %d", guid, resp.StatusCode)
 		}
 	}
 
@@ -4404,7 +4287,6 @@ func downloadBenchOutputDir() string {
 
 func startManagedDownloadBenchWeaver(outputDir string) (*managedWeaverSession, error) {
 	waitForTCP(nntpHost()+":"+nntpPort(), 30*time.Second)
-	waitForHTTP(newznabURL()+"/admin/health", 30*time.Second)
 
 	weaverBin := env("WEAVER_BIN", findWeaverBin())
 	weaverPort := localWeaverPort()
@@ -4983,7 +4865,6 @@ func cmdScenarios() {
 func cmdStatus() {
 	fmt.Println("Service status:")
 	checkTCP("NNTP", nntpHost()+":"+nntpPort())
-	checkHTTP("Newznab", newznabURL()+"/admin/health")
 	checkHTTP("Weaver", graphqlURL(defaultWeaverURL()))
 }
 
@@ -5531,7 +5412,6 @@ func listJobsGraphQL(weaverURL string) ([]struct {
 
 func prepareStandardTestRun(weaverURL string, clearHistory bool) {
 	waitForTCP(nntpHost()+":"+nntpPort(), 30*time.Second)
-	waitForHTTP(newznabURL()+"/admin/health", 30*time.Second)
 	waitForGraphQL(graphqlURL(weaverURL), 30*time.Second)
 
 	if err := ensureNntpChaosOff(); err != nil {
@@ -5965,7 +5845,7 @@ func cmdContainerRestartTest() {
 	}
 
 	emitProgressEvent(progressEvent{Kind: "phase_total", Total: 2, Detail: "Docker boot and restart"})
-	if err := dockerComposeUp("nntp", "nntp2", "newznab", "weaver"); err != nil {
+	if err := dockerComposeUp("nntp", "nntp2", "weaver"); err != nil {
 		log.Fatalf("start Docker Weaver restart stack: %v", err)
 	}
 	if err := refreshRuntimePortEnvFromRunningStack(); err != nil {
@@ -6309,7 +6189,6 @@ func restartStandardManagedWeaverPreservingState() error {
 
 func startStandardManagedWeaver(preserveState bool) error {
 	waitForTCP(nntpHost()+":"+nntpPort(), 30*time.Second)
-	waitForHTTP(newznabURL()+"/admin/health", 30*time.Second)
 	waitForTCP("localhost:"+backupNntpPort(), 30*time.Second)
 	if weaverUsesPostgresDatastore() {
 		if err := waitForWeaverPostgresReady(30 * time.Second); err != nil {
@@ -7327,11 +7206,10 @@ func cmdTcpChaosTest() {
 
 	// Ensure toxiproxy and the clean backup NNTP server are running.
 	log.Println("starting toxiproxy and backup NNTP containers...")
-	if err := dockerComposeUp("nntp", "newznab", "nntp2", "toxiproxy"); err != nil {
+	if err := dockerComposeUp("nntp", "nntp2", "toxiproxy"); err != nil {
 		log.Fatalf("failed to start tcp-chaos infrastructure: %v", err)
 	}
 	waitForTCP(nntpHost()+":"+nntpPort(), 30*time.Second)
-	waitForHTTP(newznabURL()+"/admin/health", 30*time.Second)
 	waitForTCP("localhost:"+backupNntpPort(), 15*time.Second)
 	waitForHTTP(toxiproxyURL()+"/version", 15*time.Second)
 	if err := ensureNntpChaosOff(); err != nil {
@@ -7729,7 +7607,6 @@ func cmdAdaptiveDispatchTest() {
 		log.Fatalf("refresh runtime ports after starting adaptive-dispatch infrastructure: %v", err)
 	}
 	waitForTCP(nntpHost()+":"+nntpPort(), 30*time.Second)
-	waitForHTTP(newznabURL()+"/admin/health", 30*time.Second)
 	waitForTCP("localhost:"+backupNntpPort(), 30*time.Second)
 	waitForHTTP(toxiproxyURL()+"/version", 15*time.Second)
 	if err := ensureNntpChaosOff(); err != nil {

@@ -128,6 +128,12 @@ const defaultForm: ServerFormValues = {
   quotaMonthlyResetDay: 1,
 };
 
+function normalizeServerHost(host: string): string {
+  const trimmed = host.trim();
+  const match = /^(?:https?|nntps?):\/\/(.*)$/i.exec(trimmed);
+  return match ? match[1].replace(/\/+$/, "") : trimmed;
+}
+
 const MIB = 1024 * 1024;
 const GIB = 1024 * 1024 * 1024;
 const TIB = 1024 * 1024 * 1024 * 1024;
@@ -290,7 +296,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   const handleSave = async (values: ServerFormValues) => {
     setSaveError(null);
     const input = {
-      host: values.host.trim(),
+      host: normalizeServerHost(values.host),
       port: values.port,
       tls: values.tls,
       username: values.username.trim() || null,
@@ -378,7 +384,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
     setTestResult(null);
     const result = await testConnection({
       input: {
-        host: values.host.trim(),
+        host: normalizeServerHost(values.host),
         port: values.port,
         tls: values.tls,
         username: values.username.trim() || null,
@@ -740,6 +746,9 @@ function ServerFormCard({
               value={values.host}
               placeholder="news.example.com"
               onChange={(event) => setValues((current) => ({ ...current, host: event.target.value }))}
+              onBlur={() =>
+                setValues((current) => ({ ...current, host: normalizeServerHost(current.host) }))
+              }
             />
           </Field>
           <Field label={t("servers.port")} htmlFor="server-port">

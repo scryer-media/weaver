@@ -334,7 +334,7 @@ impl NormalizedServerInput {
         input: ServerInput,
         fallback: Option<&weaver_server_core::servers::ServerConfig>,
     ) -> std::result::Result<Self, String> {
-        let host = input.host.trim().to_string();
+        let host = normalize_server_host(&input.host).to_string();
         if host.is_empty() {
             return Err("server host must not be empty".to_string());
         }
@@ -422,6 +422,20 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
     })
 }
 
+fn normalize_server_host(host: &str) -> &str {
+    let host = host.trim();
+    match host.split_once("://") {
+        Some((scheme, remainder))
+            if ["http", "https", "nntp", "nntps"]
+                .iter()
+                .any(|candidate| scheme.eq_ignore_ascii_case(candidate)) =>
+        {
+            remainder.trim_end_matches('/')
+        }
+        _ => host,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -471,6 +485,23 @@ mod tests {
             max_download_speed: None,
             download_quota: None,
             tls_ca_cert: None,
+        }
+    }
+
+    #[test]
+    fn normalization_accepts_common_server_scheme_prefixes() {
+        for (host, expected) in [
+            ("https://news.example.com", "news.example.com"),
+            ("HTTP://news.example.com/", "news.example.com"),
+            ("nntp://news.example.com", "news.example.com"),
+            ("NNTPS://news.example.com/", "news.example.com"),
+            (" news.example.com ", "news.example.com"),
+            ("ftp://news.example.com/", "ftp://news.example.com/"),
+        ] {
+            let mut input = inactive_server_input();
+            input.host = host.to_string();
+            let normalized = NormalizedServerInput::from_input(input, None).unwrap();
+            assert_eq!(normalized.host, expected, "input host {host}");
         }
     }
 

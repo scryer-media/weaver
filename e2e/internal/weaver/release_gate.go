@@ -147,7 +147,7 @@ func behaviorReleaseFlow(name string, timeout time.Duration) weaverReleaseFlowSp
 
 func ingressReleaseFlow() weaverReleaseFlowSpec {
 	spec := browserReleaseFlow("ui-ingress-automation", 10*time.Minute)
-	spec.Services = append(spec.Services, "newznab")
+	spec.Services = append(spec.Services, "rss-fixture")
 	spec.Env = map[string]string{"WEAVER_RSS_ALLOW_PRIVATE_NETWORK": "true"}
 	return spec
 }
@@ -1166,6 +1166,11 @@ func startWeaverReleaseStack(spec weaverReleaseFlowSpec, datastore weaverDatasto
 	}
 	if err := dockerComposeUp(spec.Services...); err != nil {
 		return err
+	}
+	if slices.Contains(spec.Services, "rss-fixture") {
+		if err := waitForDockerServiceReady("rss-fixture", 30*time.Second); err != nil {
+			return err
+		}
 	}
 	if err := waitForDockerServiceReady("weaver", 90*time.Second); err != nil {
 		return err

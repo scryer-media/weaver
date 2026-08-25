@@ -137,12 +137,12 @@ func applyNntpSeedImageCacheForProfile(profile string) error {
 	return nil
 }
 
-// restoreSeedImageCache starts fresh volumes. Docker populates an empty named
-// volume from the image at its mount point before the NNTP process starts, so
-// no phase shares either a container or a writable volume with another phase.
-func restoreSeedImageCache(set nntpSeedImageSet, slugs []string) error {
+// restoreSeedImageCache starts an isolated stack from the pre-seeded NNTP
+// images. The article stores and generated NZBs are already baked into those
+// images, so this path deliberately does no per-fixture reposting.
+func restoreSeedImageCache(set nntpSeedImageSet) error {
 	set.apply()
-	if err := dockerComposeUp("nntp", "nntp2", "newznab"); err != nil {
+	if err := dockerComposeUp("nntp", "nntp2"); err != nil {
 		return fmt.Errorf("start pre-seeded NNTP images: %w", err)
 	}
 	if err := refreshRuntimePortEnvFromRunningStack(); err != nil {
@@ -150,57 +150,33 @@ func restoreSeedImageCache(set nntpSeedImageSet, slugs []string) error {
 	}
 	waitForTCP(nntpHost()+":"+nntpPort(), 30*time.Second)
 	waitForTCP("localhost:"+backupNntpPort(), 30*time.Second)
-	waitForHTTP(newznabURL()+"/admin/health", 30*time.Second)
 
-	primaryID, err := dockerComposeServiceContainerID("nntp")
+	log.Printf("started pre-seeded runtime for profile=%s (corpus=%s)", set.Profile, set.Fingerprint[:12])
+	return nil
+}
+
+// restoreSeededNZBBundle copies the complete generated-NZB tree from an image
+// once into the requested fixture root. Full-suite phases then only read it.
+func restoreSeededNZBBundle(image, destination string) error {
+	if err := os.MkdirAll(destination, 0o755); err != nil {
+		return fmt.Errorf("create shared NZB fixture directory: %w", err)
+	}
+	create := exec.Command("docker", "create", image)
+	create.Dir = e2eDir()
+	containerID, err := create.Output()
 	if err != nil {
-		return fmt.Errorf("resolve pre-seeded primary NNTP container: %w", err)
+		return fmt.Errorf("create pre-seeded NNTP fixture container: %w", err)
 	}
-	if err := restoreSeededNZBs(primaryID, slugs); err != nil {
-		return err
-	}
-	if err := registerSeededImageReleases(slugs); err != nil {
-		return err
-	}
-
-	log.Printf("reused pre-seeded NNTP images for profile=%s (corpus=%s)", set.Profile, set.Fingerprint[:12])
-	return nil
-}
-
-func restoreSeededNZBs(primaryID string, slugs []string) error {
-	for _, slug := range slugs {
-		destDir := filepath.Join(fixturesDir(), slug)
-		if err := os.MkdirAll(destDir, 0o755); err != nil {
-			return fmt.Errorf("create restored NZB directory for %s: %w", slug, err)
-		}
-		source := fmt.Sprintf("%s:%s/%s/%s.nzb", primaryID, nntpSeedFixtureRoot, slug, slug)
-		cmd := exec.Command("docker", "cp", source, destDir)
-		cmd.Dir = e2eDir()
-		if err := runExternalCommand(cmd, "restore pre-seeded NZB"); err != nil {
-			return fmt.Errorf("restore generated NZB for %s: %w", slug, err)
-		}
-	}
-	return nil
-}
-
-func registerSeededImageReleases(slugs []string) error {
-	for _, slug := range slugs {
-		absDir := filepath.Join(testdataDir(), slug)
-		scenario, err := loadScenario(absDir)
-		if err != nil {
-			return fmt.Errorf("load scenario %s for pre-seeded image: %w", slug, err)
-		}
-		nzbData, err := os.ReadFile(filepath.Join(fixturesDir(), slug, slug+".nzb"))
-		if err != nil {
-			return fmt.Errorf("read restored NZB for %s: %w", slug, err)
-		}
-		sizeBytes, err := seedPayloadBytes(absDir, scenario)
-		if err != nil {
-			return fmt.Errorf("calculate release size for %s: %w", slug, err)
-		}
-		if err := registerRelease(scenario, nzbData, sizeBytes); err != nil {
-			return fmt.Errorf("register restored release for %s: %w", slug, err)
-		}
+	id := strings.TrimSpace(string(containerID))
+	defer func() {
+		remove := exec.Command("docker", "rm", "-f", id)
+		remove.Dir = e2eDir()
+		_ = runExternalCommand(remove, "remove pre-seeded NNTP fixture container")
+	}()
+	copy := exec.Command("docker", "cp", id+":"+nntpSeedFixtureRoot+"/.", destination)
+	copy.Dir = e2eDir()
+	if err := runExternalCommand(copy, "restore pre-seeded NZB bundle"); err != nil {
+		return fmt.Errorf("restore pre-seeded NZB bundle: %w", err)
 	}
 	return nil
 }
