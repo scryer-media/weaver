@@ -600,8 +600,8 @@
     },
     {
       "path": "testdata/nested-xz-rar/archive.rar",
-      "size": 5232961,
-      "blake3": "727255bdd3d641b37f83f3705ee21d4ddb563380e7d7c9a38ae6198b4061b0a7",
+      "size": 5232595,
+      "blake3": "dd77498c54c590f4925698dbff95750a5049812fdf9c98ca6116939660a18834",
       "format": "rar5",
       "source": {
         "kind": "generated",

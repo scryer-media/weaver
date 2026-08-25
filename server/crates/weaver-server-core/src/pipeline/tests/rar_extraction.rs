@@ -2148,6 +2148,62 @@ async fn nested_rar_five_deep_stops_at_depth_limit() {
 }
 
 #[tokio::test]
+async fn nested_single_stream_preserves_non_archive_sibling() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(100_710);
+    let staging_dir = temp_dir.path().join("nested-xz-with-sibling");
+    tokio::fs::create_dir_all(&staging_dir).await.unwrap();
+
+    let media = b"ordinary outer archive member";
+    let notes = b"nested xz sidecar";
+    tokio::fs::write(staging_dir.join("sample.mkv"), media)
+        .await
+        .unwrap();
+    let mut xz =
+        lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(0)).unwrap();
+    std::io::Write::write_all(&mut xz, notes).unwrap();
+    tokio::fs::write(staging_dir.join("release.nfo.xz"), xz.finish().unwrap())
+        .await
+        .unwrap();
+
+    let mut state = minimal_job_state(job_id, "Nested XZ With Sibling", temp_dir.path().join("wd"));
+    state.staging_dir = Some(staging_dir.clone());
+    pipeline.jobs.insert(job_id, state);
+    pipeline.job_order.push(job_id);
+
+    assert!(matches!(
+        pipeline
+            .maybe_start_nested_extraction(job_id)
+            .await
+            .unwrap(),
+        crate::pipeline::completion::NestedExtractionDecision::Started
+    ));
+    assert_eq!(
+        tokio::fs::read(staging_dir.join("sample.mkv"))
+            .await
+            .unwrap(),
+        media,
+        "starting a selective nested pass must preserve ordinary siblings"
+    );
+
+    drive_extractions_to_terminal(&mut pipeline, job_id, 2).await;
+
+    let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
+        "Nested XZ With Sibling",
+    ));
+    assert_eq!(
+        tokio::fs::read(dest.join("sample.mkv")).await.unwrap(),
+        media
+    );
+    assert_eq!(
+        tokio::fs::read(dest.join("release.nfo")).await.unwrap(),
+        notes
+    );
+    assert!(!dest.join("release.nfo.xz").exists());
+}
+
+#[tokio::test]
 async fn nested_scan_detects_obfuscated_rar_archives_from_staging() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;

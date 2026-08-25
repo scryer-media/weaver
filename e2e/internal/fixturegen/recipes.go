@@ -569,22 +569,45 @@ func Recipes() []Recipe {
 	})
 	add(Recipe{
 		Slug: "nested-xz-rar", Family: "nested",
-		Notes:  "A RAR5 containing an XZ-compressed preview clip, so the nested pass must classify and unpack the extracted .xz file.",
+		Notes:  "A RAR5 containing an ordinary MKV beside an XZ-compressed NFO, so the nested pass must unpack only the sidecar and preserve its sibling.",
 		Inputs: []string{previewPayloadPath},
-		Build: sequence(
-			xzCodec("test-media.mkv.xz", "clip-preview", "test-media.mkv"),
-			func(ctx context.Context, env *Env) error {
-				if err := CopyFile(env.OutputPath("test-media.mkv.xz"), env.StagePath("test-media.mkv.xz")); err != nil {
-					return err
-				}
-				return env.RAR(ctx, RARSpec{
-					Toolchain: RAR5Writer, Format: RAR5, Archive: "archive.rar",
-					Method: "-m1", Dictionary: "-md32m", Members: []string{"test-media.mkv.xz"},
-				})
-			},
-			dropOutput("test-media.mkv.xz"),
-		),
-		ExpectedOutputs: previewClipExpectedOutput("test-media.mkv"),
+		Build: func(ctx context.Context, env *Env) error {
+			clip, err := env.ArtifactPath(ctx, "clip-preview")
+			if err != nil {
+				return err
+			}
+			if err := CopyFile(clip, env.StagePath("test-media.mkv")); err != nil {
+				return err
+			}
+			if err := WriteText(env.StagePath("release.nfo"), "Nested XZ sidecar beside ordinary media.", 96); err != nil {
+				return err
+			}
+			if err := env.SevenZip(ctx, SevenZipSpec{
+				Format: "xz", Archive: "release.nfo.xz", Members: []string{"release.nfo"}, Level: "-mx1",
+			}); err != nil {
+				return err
+			}
+			if err := CopyFile(env.OutputPath("release.nfo.xz"), env.StagePath("release.nfo.xz")); err != nil {
+				return err
+			}
+			if err := env.RAR(ctx, RARSpec{
+				Toolchain: RAR5Writer, Format: RAR5, Archive: "archive.rar",
+				Method: "-m1", Dictionary: "-md32m", Members: []string{"test-media.mkv", "release.nfo.xz"},
+			}); err != nil {
+				return err
+			}
+			return removeOutput(env, "release.nfo.xz")
+		},
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			clip, err := env.ArtifactPath(ctx, "clip-preview")
+			if err != nil {
+				return nil, err
+			}
+			return map[string]string{
+				"test-media.mkv": clip,
+				"release.nfo":    env.StagePath("release.nfo"),
+			}, nil
+		},
 	})
 	add(Recipe{
 		Slug: "nested-3deep", Family: "nested",

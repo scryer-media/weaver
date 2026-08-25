@@ -278,44 +278,6 @@ impl Pipeline {
         Ok(files)
     }
 
-    fn clear_empty_dirs(root: &Path) -> Result<(), String> {
-        fn prune(root: &Path, current: &Path) -> Result<bool, String> {
-            let mut has_entries = false;
-            let entries = std::fs::read_dir(current)
-                .map_err(|error| format!("failed to read {}: {error}", current.display()))?;
-            for entry in entries {
-                let entry = entry.map_err(|error| {
-                    format!("failed to read entry in {}: {error}", current.display())
-                })?;
-                let path = entry.path();
-                let file_type = entry
-                    .file_type()
-                    .map_err(|error| format!("failed to stat {}: {error}", path.display()))?;
-                if file_type.is_dir() {
-                    if prune(root, &path)? {
-                        has_entries = true;
-                    }
-                } else {
-                    has_entries = true;
-                }
-            }
-
-            if current != root && !has_entries {
-                std::fs::remove_dir(current).map_err(|error| {
-                    format!("failed to remove empty dir {}: {error}", current.display())
-                })?;
-                return Ok(false);
-            }
-
-            Ok(has_entries)
-        }
-
-        if root.exists() {
-            let _ = prune(root, root)?;
-        }
-        Ok(())
-    }
-
     pub(super) async fn clear_persisted_extracted_members(&self, job_id: JobId) {
         if let Err(error) = self
             .db_blocking(move |db| db.clear_extracted_members(job_id))
@@ -558,24 +520,6 @@ impl Pipeline {
             );
             return Ok(NestedExtractionDecision::PreserveOutputsAtDepthLimit);
         }
-
-        for file in &scanned_files {
-            if Self::archive_type_for_role(&file.effective_role()).is_some() {
-                continue;
-            }
-            let path = scan_root.join(&file.relative_path);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "failed to remove intermediate extracted file {}: {error}",
-                        path.display()
-                    ));
-                }
-            }
-        }
-        Self::clear_empty_dirs(&scan_root)?;
 
         self.clear_job_extraction_runtime(job_id);
         self.clear_job_rar_runtime(job_id);
