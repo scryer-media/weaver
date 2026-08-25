@@ -168,10 +168,29 @@ struct ServeArgs {
     clean: bool,
     #[arg(
         long,
-        help = "Build and run the backend with the optimized release profile"
+        conflicts_with = "production_build",
+        help = "Build and run the backend with the optimized E2E profile"
     )]
     release: bool,
+    #[arg(
+        long,
+        conflicts_with = "release",
+        help = "Build and run the backend with the full production release profile"
+    )]
+    production_build: bool,
     target: Option<String>,
+}
+
+impl ServeArgs {
+    fn cargo_profile(&self) -> Option<&'static str> {
+        if self.production_build {
+            Some("release")
+        } else if self.release {
+            Some("e2e")
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Args)]
@@ -2773,11 +2792,11 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     let state_key_file = state_dir.join("encryption.key");
     let local_agent_key_file = local_agent_api_key_path(&state_dir);
     let rust_log = build_rust_log(args.target.as_deref());
-    let backend_binary = if args.release {
-        ctx.path("target/release/weaver")
-    } else {
-        ctx.path("target/debug/weaver")
-    };
+    let cargo_profile = args.cargo_profile();
+    let backend_relative_path = cargo_profile
+        .map(|profile| format!("target/{profile}/weaver"))
+        .unwrap_or_else(|| "target/debug/weaver".to_string());
+    let backend_binary = ctx.path(&backend_relative_path);
     let backend_url = format!("http://127.0.0.1:{backend_port}");
     let frontend_url = format!("http://127.0.0.1:{frontend_port}");
     let vite_use_polling =
@@ -2826,18 +2845,17 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
 
     let encryption_key = ensure_state_encryption_key(&state_key_file, &db_path)?;
     step("Building Weaver backend");
-    let profile_arg = args.release.then_some("--release");
-    println!(
-        "   Rust build: cargo build --locked -p weaver{}",
-        if args.release { " --release" } else { "" }
-    );
+    let profile_display = cargo_profile
+        .map(|profile| format!(" --profile {profile}"))
+        .unwrap_or_default();
+    println!("   Rust build: cargo build --locked -p weaver{profile_display}");
     let mut build = ctx.command_in("cargo", &ctx.repo_root);
     build
         .env("WEAVER_ENABLE_DIAGNOSTICS", &diagnostics_enabled)
         .env("RUSTFLAGS", &local_rustflags);
     build.args(["build", "--locked", "-p", "weaver"]);
-    if let Some(profile_arg) = profile_arg {
-        build.arg(profile_arg);
+    if let Some(profile) = cargo_profile {
+        build.args(["--profile", profile]);
     }
     run_checked(&mut build)?;
 
@@ -3110,6 +3128,32 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_serve_args(args: &[&str]) -> ServeArgs {
+        let cli = Cli::try_parse_from(std::iter::once("cargo xtask").chain(args.iter().copied()))
+            .unwrap();
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        args
+    }
+
+    #[test]
+    fn serve_build_profiles_are_explicit_and_mutually_exclusive() {
+        assert_eq!(parse_serve_args(&["serve"]).cargo_profile(), None);
+        assert_eq!(
+            parse_serve_args(&["serve", "--release"]).cargo_profile(),
+            Some("e2e")
+        );
+        assert_eq!(
+            parse_serve_args(&["serve", "--production-build"]).cargo_profile(),
+            Some("release")
+        );
+        assert!(
+            Cli::try_parse_from(["cargo xtask", "serve", "--release", "--production-build"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn local_agent_key_strips_only_trailing_line_endings() {
