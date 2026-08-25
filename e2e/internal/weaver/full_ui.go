@@ -806,10 +806,20 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 
 	dashboard := newFullDashboard(options.dashboardTitle, phaseNames, seedableCount)
 	defer dashboard.Close()
-	dashboard.setSeedDetail("running", "preparing images")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Start both Weaver artifacts before touching NNTP. A corpus cache miss must
+	// still rebuild the immutable images, but that work should overlap the
+	// optimized native and container builds instead of preceding them.
+	go func() {
+		if _, err := ensureE2EWeaverBinary(); err != nil {
+			log.Printf("warning: background weaver e2e build failed: %v", err)
+		}
+	}()
+	awaitWeaverImage := prepareFullSuiteWeaverImage(phases)
+	dashboard.setSeedDetail("running", "checking NNTP cache while Weaver builds")
 
 	if err := ensureLocalWeaverNNTPImage(); err != nil {
 		log.Fatalf("prepare NNTP fixture image for full suite: %v", err)
@@ -817,13 +827,6 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	if err := ensureNyuuImageBuilt(); err != nil {
 		log.Fatalf("prepare nyuu image for full suite: %v", err)
 	}
-	dashboard.setSeedDetail("running", "preparing pre-seeded runtimes while the Weaver e2e build runs")
-	go func() {
-		if _, err := ensureE2EWeaverBinary(); err != nil {
-			log.Printf("warning: background weaver e2e build failed: %v", err)
-		}
-	}()
-	awaitWeaverImage := prepareFullSuiteWeaverImage(phases)
 
 	if err := prepareFullPreseededRuntimes(ctx, tempRoot, phases, dashboard); err != nil {
 		cleanupErrors := cleanupFullPhaseContexts(phases, false)
