@@ -231,6 +231,21 @@ async fn migration_table_exists(pool: &PgPool) -> Result<bool, StateError> {
     .map_err(db_err)
 }
 
+/// PostgreSQL twin of [`crate::schema_migrations::max_recorded_migration_version`],
+/// with the same contract: `None` when no ledger exists yet, otherwise the
+/// highest version any row records regardless of success.
+pub(crate) async fn max_recorded_migration_version(
+    pool: &PgPool,
+) -> Result<Option<i64>, StateError> {
+    if !migration_table_exists(pool).await? {
+        return Ok(None);
+    }
+    sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)
+}
+
 async fn load_applied_migrations(pool: &PgPool) -> Result<Vec<MigrationLedgerRow>, StateError> {
     if !migration_table_exists(pool).await? {
         return Ok(Vec::new());

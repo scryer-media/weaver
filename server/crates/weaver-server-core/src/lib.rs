@@ -20,6 +20,8 @@ pub mod schema_migrations;
 pub mod security;
 pub mod servers;
 pub mod settings;
+/// Transitional, removed in 0.9.1. See the module docs.
+pub mod upgrade_compat;
 pub mod watch_folder;
 
 pub use auth::{ApiKeyRow, AuthCredentials};

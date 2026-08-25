@@ -310,6 +310,39 @@ async fn load_applied_migrations(pool: &SqlitePool) -> Result<Vec<MigrationLedge
         .collect()
 }
 
+/// Highest migration version recorded in the ledger, or `None` when no ledger
+/// exists yet.
+///
+/// Read *before* a migration run, this answers "which release last wrote to
+/// this database": no ledger means nothing has ever migrated it (a database
+/// this process is about to create), while a recorded maximum names the newest
+/// migration the previous binary shipped. That is the only reliable way to tell
+/// a fresh install from an upgrade of a specific older line, because the data a
+/// database holds says nothing about which version wrote it.
+///
+/// Deliberately not filtered by `success`: a recorded-but-failed row still
+/// proves the binary that wrote it reached that version, and counting it can
+/// only make a database look newer than it is, never older.
+pub async fn max_recorded_migration_version(pool: &SqlitePool) -> Result<Option<i64>, StateError> {
+    if !migration_ledger_exists(pool).await? {
+        return Ok(None);
+    }
+    sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)
+}
+
+async fn migration_ledger_exists(pool: &SqlitePool) -> Result<bool, StateError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(count > 0)
+}
+
 fn list_pending_migrations_from_applied(
     applied: &[MigrationLedgerRow],
     catalog: &CompiledMigrationCatalog,
@@ -1143,6 +1176,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stamped, 1);
+    }
+
+    #[tokio::test]
+    async fn max_recorded_migration_version_reports_the_pre_run_ledger() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Nothing has ever migrated this database, so there is no ledger to read.
+        assert_eq!(max_recorded_migration_version(&pool).await.unwrap(), None);
+
+        // A ledger with no rows still records nothing.
+        ensure_migration_ledger_shape(&pool).await.unwrap();
+        assert_eq!(max_recorded_migration_version(&pool).await.unwrap(), None);
+
+        // A directory an older release line left behind reports that line's
+        // last migration, which is what identifies it as an upgrade.
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(39), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            max_recorded_migration_version(&pool).await.unwrap(),
+            Some(39)
+        );
+
+        run_embedded_migrations(&pool, MigrationMode::Apply)
+            .await
+            .unwrap();
+        assert_eq!(
+            max_recorded_migration_version(&pool).await.unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
     }
 
     #[tokio::test]

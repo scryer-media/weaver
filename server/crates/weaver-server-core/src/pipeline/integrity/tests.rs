@@ -1362,6 +1362,94 @@ fn short_final_block_verdict_requires_length_congruence() {
 }
 
 #[test]
+fn conflicting_file_length_invalidates_retained_grid_evidence() {
+    let block_size = block(1024);
+    let file_id = file(99);
+    let original = random_bytes(0x9e8, 1536);
+    let mut extended = original.clone();
+    extended.extend_from_slice(&random_bytes(0x9e9, 64));
+    let (original_set, original_id) = set_for_bytes(&original, block_size.get());
+    let (extended_set, extended_id) = set_for_bytes(&extended, block_size.get());
+    let mut collector = BlockCrcCollector::new();
+
+    decode_articles_into(
+        &mut collector,
+        file_id,
+        &original,
+        512,
+        block_size,
+        &|_, _| {},
+    );
+    let original_verdicts = collector.verdicts_against(file_id, &original_set, original_id);
+    assert_eq!(original_verdicts.len(), 2);
+    assert!(
+        original_verdicts
+            .values()
+            .all(|verdict| matches!(verdict, BlockVerdict::Intact { .. }))
+    );
+
+    let derived = collector.derived_blocks(file_id).collect::<Vec<_>>();
+    let counts = collector.entry_counts_for_job(file_id.job_id);
+    collector.note_file_len(file_id, original.len() as u64);
+    assert_eq!(
+        collector.derived_blocks(file_id).collect::<Vec<_>>(),
+        derived
+    );
+    assert_eq!(collector.entry_counts_for_job(file_id.job_id), counts);
+
+    collector.note_file_len(file_id, extended.len() as u64);
+    assert!(collector.derived_blocks(file_id).next().is_none());
+    assert_eq!(
+        collector.entry_counts_for_job(file_id.job_id),
+        EntryCounts::default()
+    );
+    assert!(
+        collector
+            .verdicts_against(file_id, &original_set, original_id)
+            .is_empty()
+    );
+    assert!(
+        collector
+            .verdicts_against(file_id, &extended_set, extended_id)
+            .is_empty()
+    );
+
+    decode_articles_into(
+        &mut collector,
+        file_id,
+        &extended,
+        512,
+        block_size,
+        &|_, _| {},
+    );
+    let rebuilt = collector.verdicts_against(file_id, &extended_set, extended_id);
+    assert_eq!(rebuilt.len(), 2);
+    assert!(
+        rebuilt
+            .values()
+            .all(|verdict| matches!(verdict, BlockVerdict::Intact { .. }))
+    );
+}
+
+#[test]
+fn zero_file_length_invalidates_retained_grid_evidence() {
+    let block_size = block(1024);
+    let file_id = file(100);
+    let data = random_bytes(0x9ea, 1536);
+    let mut collector = BlockCrcCollector::new();
+    decode_articles_into(&mut collector, file_id, &data, 512, block_size, &|_, _| {});
+    assert!(collector.derived_blocks(file_id).next().is_some());
+
+    collector.note_file_len(file_id, 0);
+
+    assert!(collector.derived_blocks(file_id).next().is_none());
+    assert_eq!(
+        collector.entry_counts_for_job(file_id.job_id),
+        EntryCounts::default()
+    );
+}
+
+#[test]
 fn conflicting_replay_invalidates_and_rederives_from_the_rewrite() {
     let block_size = block(1024);
     let file_id = file(93);

@@ -761,18 +761,21 @@ impl BlockCrcCollector {
     }
 
     /// Declare the file's final length, which is what lets the short final block
-    /// close. Idempotent.
+    /// close. Repeating the same length is idempotent; a conflicting extent
+    /// invalidates the file's retained evidence so the read paths can decide.
     pub(crate) fn note_file_len(&mut self, file_id: NzbFileId, file_len: u64) {
-        if file_len == 0 {
+        let known_len = self.files.get(&file_id).and_then(|entry| entry.file_len);
+        if file_len == 0 || known_len.is_some_and(|known| known != file_len) {
+            self.forget_file(file_id);
+            return;
+        }
+        if known_len == Some(file_len) {
             return;
         }
         let (files, job_entries) = (&mut self.files, &mut self.job_entries);
         let Some(entry) = files.get_mut(&file_id) else {
             return;
         };
-        if entry.file_len == Some(file_len) {
-            return;
-        }
         entry.file_len = Some(file_len);
         let Some(job) = job_entries.get_mut(&file_id.job_id) else {
             return;

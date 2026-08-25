@@ -21,6 +21,23 @@ pub(crate) async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let started_at = std::time::Instant::now();
     let mut security = RuntimeSecurityConfig::from_env()?;
+    // Transitional, removed in 0.9.1: an install upgraded from a pre-0.9 data
+    // directory stored no bind address because it never had to — the default
+    // was network-wide. Writing that address down here, before the settlement
+    // below reads it, is what keeps such an install reachable on this very
+    // boot instead of narrowing it to loopback without a word. Delete this
+    // block, `weaver_server_core::upgrade_compat`, and its `mod` line together.
+    if let Err(error) = weaver_server_core::upgrade_compat::apply_pre_0_9_bind_compat_shim(
+        &db,
+        db.pre_migration_schema_version(),
+        std::env::var(weaver_server_core::security::ENV_HTTP_BIND_ADDRESS)
+            .ok()
+            .as_deref(),
+    ) {
+        // A compatibility default is not worth the process: an install that
+        // cannot record it still starts, on loopback, with the reason logged.
+        warn!(%error, "could not preserve the pre-0.9 network-wide bind address");
+    }
     // The environment answers first, but a desktop or service install has no
     // convenient environment to edit, so the stored settings are what the UI
     // (and the first-run wizard) write. Settled here because this is the first

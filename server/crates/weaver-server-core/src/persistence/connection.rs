@@ -945,6 +945,16 @@ impl Database {
         self.datastore().engine().as_str()
     }
 
+    /// Highest migration version this database's ledger held when this handle
+    /// opened it, before the migrations that open ran. `None` means nothing had
+    /// ever migrated it — a database this process created.
+    ///
+    /// This is how startup tells a fresh install from an upgrade, and from
+    /// which release line it is upgrading.
+    pub fn pre_migration_schema_version(&self) -> Option<i64> {
+        self.sql_services.pre_migration_schema_version()
+    }
+
     pub(crate) fn database_target(&self) -> &DatabaseTarget {
         &self.target
     }

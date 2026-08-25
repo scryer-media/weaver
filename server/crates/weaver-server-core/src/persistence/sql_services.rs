@@ -62,6 +62,13 @@ impl DatabaseServices {
             Self::Postgres(services) => services.datastore(),
         }
     }
+
+    pub(crate) fn pre_migration_schema_version(&self) -> Option<i64> {
+        match self {
+            Self::Sqlite(services) => services.pre_migration_schema_version,
+            Self::Postgres(services) => services.pre_migration_schema_version,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -69,6 +76,10 @@ pub(crate) struct SqliteServices {
     pool: sqlx::SqlitePool,
     encryption_key: Arc<RwLock<Option<crate::persistence::encryption::EncryptionKey>>>,
     writer_gate: SqliteWriterGate,
+    /// Migration ledger maximum as it stood when this handle opened the
+    /// database, captured before the migration run below could move it.
+    /// `None` for a database nothing had ever migrated.
+    pre_migration_schema_version: Option<i64>,
 }
 
 impl SqliteServices {
@@ -129,12 +140,16 @@ impl SqliteServices {
                 StateError::Database(format!("cannot open SQLite database {db_url}: {error}"))
             })?;
 
+        // Read before the run, because the run is what changes the answer.
+        let pre_migration_schema_version =
+            crate::schema_migrations::max_recorded_migration_version(&pool).await?;
         crate::schema_migrations::run_embedded_migrations(&pool, migration_mode).await?;
 
         Ok(Self {
             pool,
             encryption_key: Arc::new(RwLock::new(None)),
             writer_gate: new_writer_gate(),
+            pre_migration_schema_version,
         })
     }
 
@@ -188,6 +203,8 @@ impl SqliteServices {
 pub(crate) struct PostgresServices {
     pool: sqlx::PgPool,
     encryption_key: Arc<RwLock<Option<crate::persistence::encryption::EncryptionKey>>>,
+    /// See [`SqliteServices::pre_migration_schema_version`].
+    pre_migration_schema_version: Option<i64>,
 }
 
 impl PostgresServices {
@@ -237,11 +254,15 @@ impl PostgresServices {
                 StateError::Database(format!("cannot open PostgreSQL database: {error}"))
             })?;
 
+        // Read before the run, because the run is what changes the answer.
+        let pre_migration_schema_version =
+            postgres_migrations::max_recorded_migration_version(&pool).await?;
         postgres_migrations::run_migrations(&pool, migration_mode).await?;
 
         Ok(Self {
             pool,
             encryption_key: Arc::new(RwLock::new(None)),
+            pre_migration_schema_version,
         })
     }
 
