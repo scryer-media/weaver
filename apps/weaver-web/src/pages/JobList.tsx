@@ -185,9 +185,9 @@ const DEFAULT_QUEUE_PREFERENCES: QueueTablePreferences = {
   statuses: [],
   priorities: [],
   categories: [],
-  sorting: [{ id: "progress", desc: true }],
+  sorting: [],
 };
-const QUEUE_TABLE_PREFERENCES_KEY = "weaver.queue.table.preferences.v4";
+const QUEUE_TABLE_PREFERENCES_KEY = "weaver.queue.table.preferences.v5";
 const QUEUE_STATUS_OPTIONS: QueueStatusFilter[] = [
   "QUEUED",
   "DOWNLOADING",
@@ -217,8 +217,11 @@ function queueStatusToGraphql(status: QueueStatusFilter): string {
 
 function queueSortingToGraphql(sorting: SortingState) {
   const current = sorting[0];
+  if (!current) {
+    return {};
+  }
   const sortField = (() => {
-    switch (current?.id) {
+    switch (current.id) {
       case "name":
         return "NAME";
       case "status":
@@ -235,7 +238,7 @@ function queueSortingToGraphql(sorting: SortingState) {
   })();
   return {
     sortField,
-    sortDirection: current?.desc === false ? "ASC" : "DESC",
+    sortDirection: current.desc === false ? "ASC" : "DESC",
   };
 }
 
@@ -837,7 +840,9 @@ export function JobList() {
     if (event.kind === "ITEM_REMOVED" && event.itemId != null) {
       hideQueueJobs([event.itemId]);
     }
-    if (event.item && queuePageItems.some((item) => item.id === event.item?.id)) {
+    const eventItemIsVisible =
+      event.item !== null && queuePageItems.some((item) => item.id === event.item!.id);
+    if (event.item && eventItemIsVisible) {
       setEventItems((current) => {
         const currentOverlay = current[event.item!.id];
         if (currentOverlay && currentOverlay.cursor >= eventCursor) {
@@ -846,12 +851,16 @@ export function JobList() {
         return { ...current, [event.item!.id]: { item: event.item!, cursor: eventCursor } };
       });
     }
+    if (event.item && !eventItemIsVisible) {
+      refreshQueuePageNow();
+      return;
+    }
     if (event.kind === "ITEM_PROGRESS") {
       if (!event.item) {
         scheduleQueuePageRefresh();
         return;
       }
-      if (queuePreferences.sorting[0]?.id !== "progress") {
+      if (queuePreferences.sorting.length > 0 && queuePreferences.sorting[0]?.id !== "progress") {
         return;
       }
     }

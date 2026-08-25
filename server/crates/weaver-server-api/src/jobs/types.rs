@@ -359,8 +359,9 @@ pub struct QueuePageInput {
     pub states: Option<Vec<QueueItemState>>,
     pub priorities: Option<Vec<QueuePriority>>,
     pub categories: Option<Vec<String>>,
-    pub sort_field: QueueSortField,
-    pub sort_direction: QueueSortDirection,
+    /// Omit both fields to retain the scheduler's hot-download order.
+    pub sort_field: Option<QueueSortField>,
+    pub sort_direction: Option<QueueSortDirection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]

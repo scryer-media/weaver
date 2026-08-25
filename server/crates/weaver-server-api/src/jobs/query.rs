@@ -114,7 +114,10 @@ fn queue_page_job_order(
     right: &weaver_server_core::JobInfo,
     input: &QueuePageInput,
 ) -> Ordering {
-    let order = match input.sort_field {
+    let Some(sort_field) = input.sort_field else {
+        return Ordering::Equal;
+    };
+    let order = match sort_field {
         QueueSortField::Name => {
             queue_page_job_display_name(left).cmp(&queue_page_job_display_name(right))
         }
@@ -133,7 +136,7 @@ fn queue_page_job_order(
         }
         QueueSortField::Size => left.total_bytes.cmp(&right.total_bytes),
     };
-    let order = match input.sort_direction {
+    let order = match input.sort_direction.unwrap_or(QueueSortDirection::Desc) {
         QueueSortDirection::Asc => order,
         QueueSortDirection::Desc => order.reverse(),
     };
@@ -245,11 +248,18 @@ impl JobsQuery {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let summary = queue_page_summary(&all_jobs, &handle.get_metrics());
+        let metrics = handle.get_metrics();
+        let summary = queue_page_summary(&all_jobs, &metrics);
+        let hot_dispatch_job_id = handle.get_live_metrics().hot_dispatch_job_id;
         let page_size = (input.page_size as usize).clamp(1, MAX_QUEUE_PAGE_SIZE);
         let offset = (input.page_index as usize).saturating_mul(page_size);
         all_jobs.retain(|job| queue_page_job_matches(job, &input));
-        all_jobs.sort_by(|left, right| queue_page_job_order(left, right, &input));
+        if input.sort_field.is_some() {
+            all_jobs.sort_by(|left, right| queue_page_job_order(left, right, &input));
+        } else if hot_dispatch_job_id != 0 {
+            let hot_job_id = hot_dispatch_job_id;
+            all_jobs.sort_by_key(|job| job.job_id.0 != hot_job_id);
+        }
         let total_count = u32::try_from(all_jobs.len()).unwrap_or(u32::MAX);
         let mut items = all_jobs
             .into_iter()
