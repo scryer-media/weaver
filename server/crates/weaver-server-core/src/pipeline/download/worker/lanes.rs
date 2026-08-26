@@ -170,6 +170,11 @@ impl Pipeline {
 
     pub(in crate::pipeline) fn book_failed_segment(&mut self, seg_id: SegmentId) {
         let job_id = seg_id.file_id.job_id;
+        // A segment can become a PAR2 metadata probe after an earlier ordinary
+        // attempt already exhausted it. Health bytes stay idempotent below,
+        // but discovery must still learn that its newly queued probe cannot
+        // produce metadata or it will wait forever in `work_is_queued`.
+        self.mark_promoted_recovery_segment_unavailable(seg_id);
         let failed_bytes = self.health_counted_segment_bytes(seg_id);
         if !self.terminal_segment_failures.insert(seg_id) {
             return;
@@ -177,7 +182,6 @@ impl Pipeline {
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = state.failed_bytes.saturating_add(failed_bytes);
         }
-        self.mark_promoted_recovery_segment_unavailable(seg_id);
         self.skip_failed_uu_segment(seg_id);
         self.check_health(job_id);
     }

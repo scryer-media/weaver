@@ -12045,6 +12045,45 @@ async fn exhausted_metadata_candidates_stop_promising_metadata() {
     );
 }
 
+/// A metadata probe may reuse an article that ordinary bootstrap already
+/// exhausted. The second terminal result must still settle discovery without
+/// counting the missing bytes twice.
+#[tokio::test]
+async fn metadata_probe_observes_a_previously_booked_terminal_failure() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30946);
+    let (_, first_segment, second_segment) =
+        metadata_promotion_job(&mut pipeline, job_id, "Repeated Metadata Failure").await;
+
+    pipeline.book_failed_segment(first_segment);
+    let failed_bytes = pipeline.jobs[&job_id].failed_bytes;
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+    assert_eq!(
+        drain_promoted_segments(&mut pipeline, job_id),
+        vec![first_segment]
+    );
+    pipeline.book_failed_segment(first_segment);
+
+    assert_eq!(
+        pipeline.jobs[&job_id].failed_bytes, failed_bytes,
+        "health accounting remains idempotent"
+    );
+    assert!(
+        pipeline.promoted_recovery_file_has_unavailable_segment(job_id, 1),
+        "the later metadata role must still observe terminal unavailability"
+    );
+    assert!(
+        pipeline.promote_par2_metadata(job_id),
+        "discovery must advance to the next carrier instead of waiting forever"
+    );
+    assert_eq!(
+        drain_promoted_segments(&mut pipeline, job_id),
+        vec![second_segment]
+    );
+}
+
 #[tokio::test]
 async fn a_failed_full_carrier_scan_preserves_prefix_discovery_and_restart_reopens_it() {
     let temp_dir = tempfile::tempdir().unwrap();
