@@ -2164,8 +2164,19 @@ fn settings_resolve_reads_the_config_table() {
     }
 
     // An absent table is "every default", which is what an existing install's
-    // config file looks like.
-    assert!(!DirectStoreSettings::resolve(&config).gate.is_enabled());
+    // config file looks like — and the default is ON: direct store is the
+    // shipping posture, with the config table and the environment kill switch
+    // as the ways out.
+    assert!(DirectStoreSettings::resolve(&config).gate.is_enabled());
+
+    config.direct_store = Some(DirectStoreOverrides {
+        enabled: Some(false),
+        holds_scratch_ceiling_bytes: Some(64 * 1024 * 1024),
+    });
+    assert!(
+        !DirectStoreSettings::resolve(&config).gate.is_enabled(),
+        "an explicit config off overrides the default-on"
+    );
 
     config.direct_store = Some(DirectStoreOverrides {
         enabled: Some(true),

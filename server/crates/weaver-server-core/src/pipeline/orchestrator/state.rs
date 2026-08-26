@@ -46,10 +46,25 @@ impl Pipeline {
             .values()
             .flat_map(|topology| topology.volume_map.keys().cloned())
             .collect::<HashSet<_>>();
+        // A direct set's source volumes never enter the archive topology —
+        // that is the point of the route — but they are archive input all the
+        // same, and their members land in the staging tree this budget is
+        // about to snapshot. Leaving them out collapses the ratio base to its
+        // floor and then counts the set's own finalized output as a
+        // violation of it.
+        let direct_source_files: HashSet<u32> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .flat_map(|set| set.plan().files.keys().copied())
+            .collect();
         let declared_archive_bytes = state
             .assembly
             .files()
-            .filter(|file| archive_sources.contains(&self.current_filename_for_file(job_id, file)))
+            .filter(|file| {
+                archive_sources.contains(&self.current_filename_for_file(job_id, file))
+                    || direct_source_files.contains(&file.file_id().file_index)
+            })
             .map(|file| file.total_bytes())
             .sum::<u64>()
             .max(1);

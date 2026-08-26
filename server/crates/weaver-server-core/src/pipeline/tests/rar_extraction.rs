@@ -3029,6 +3029,9 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
 
     let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
     restored
+        .direct_store
+        .set_gate(crate::pipeline::direct_store::DirectStoreGate::Disabled);
+    restored
         .restore_job(RestoreJobRequest {
             job_id,
             job_hash: [0; 32],

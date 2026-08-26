@@ -913,9 +913,13 @@ impl Pipeline {
             // already leased, deterministically, every run. Heads are
             // ordinary file bytes; nothing is wasted if the job turns out to
             // be nothing special.
-            let head_segment = matches!(file_spec.role, weaver_model::files::FileRole::Unknown)
-                .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
-                .flatten();
+            let head_segment = matches!(
+                file_spec.role,
+                weaver_model::files::FileRole::Unknown
+                    | weaver_model::files::FileRole::SplitFile { .. }
+            )
+            .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
+            .flatten();
 
             for seg in &file_spec.segments {
                 let segment_id = SegmentId {

@@ -940,6 +940,13 @@ fn streaming_hash_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) ->
 async fn replayed_article_mid_download_condemns_the_streamed_hash_but_completes_cleanly() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    // The fixture is a RAR volume so the STREAMING hash arm sees it — but a
+    // routed article never feeds that arm at all, and with the gate at its
+    // default-on the set would route. This test is about the conventional
+    // streaming hash, so the gate is pinned off.
+    pipeline
+        .direct_store
+        .set_gate(crate::pipeline::direct_store::DirectStoreGate::Disabled);
     let job_id = JobId(20007);
     let filename = "replayed-hash.part01.rar";
     let payload = b"aaaabbbbcccc";
@@ -1142,6 +1149,12 @@ async fn late_metadata_conflicting_duplicate_cannot_quick_verify_against_stale_b
 async fn mismatched_out_of_order_offset_is_rejected_before_hash_state_changes() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    // Pinned off for the same reason as the replayed-article test above: the
+    // RAR-volume fixture exists to reach the streaming hash arm, which a
+    // routed article bypasses by design.
+    pipeline
+        .direct_store
+        .set_gate(crate::pipeline::direct_store::DirectStoreGate::Disabled);
     let job_id = JobId(20008);
     let filename = "out-of-order-hash.part01.rar";
     let payload = b"aaaabbbbcccc";

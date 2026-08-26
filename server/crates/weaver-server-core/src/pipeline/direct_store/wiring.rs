@@ -1227,6 +1227,13 @@ impl Pipeline {
             let bound = {
                 let set = self.direct_store.set_mut(job_id, set_index)?;
                 if set.is_demoted() || set.is_finalized() {
+                    info!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        file_index,
+                        volume_index,
+                        "identity match arrived after its set left the direct path"
+                    );
                     if let Some(admission) = self.direct_store.identity.get_mut(&job_id) {
                         admission.rosters.remove(&set_name);
                     }
@@ -1360,8 +1367,11 @@ impl Pipeline {
             let admission = self.direct_store.identity.get(&job_id);
             for (file_index, file) in state.spec.files.iter().enumerate() {
                 let file_index = file_index as u32;
-                if !matches!(file.role, weaver_model::files::FileRole::Unknown)
-                    || carrier_files.contains(&file_index)
+                if !matches!(
+                    file.role,
+                    weaver_model::files::FileRole::Unknown
+                        | weaver_model::files::FileRole::SplitFile { .. }
+                ) || carrier_files.contains(&file_index)
                     || admission.is_some_and(|admission| {
                         admission.leaked.contains(&file_index)
                             || admission.no_match.contains(&file_index)
@@ -1504,7 +1514,16 @@ impl Pipeline {
                 .is_some_and(|file| file.received_bytes() > 0);
             (role, leaked)
         };
-        if !matches!(role, weaver_model::files::FileRole::Unknown) {
+        // Unknown, and numeric-extension "split" names too: `.NNN` is a
+        // classic obfuscation shape and collides with genuine split payloads,
+        // so the name proves nothing either way — the byte sniff below is the
+        // gate, exactly as it is for the hex names. A real split payload
+        // sniffs as not-RAR and settles as an ordinary conventional file.
+        if !matches!(
+            role,
+            weaver_model::files::FileRole::Unknown
+                | weaver_model::files::FileRole::SplitFile { .. }
+        ) {
             return None;
         }
         let sniff = super::sniff::sniff_rar_prefix(self.file_prefix_16k.get(&file_id)?);
