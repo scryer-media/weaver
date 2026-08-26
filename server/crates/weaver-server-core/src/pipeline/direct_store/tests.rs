@@ -2153,6 +2153,7 @@ fn settings_resolve_reads_the_config_table() {
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: crate::jobs::DuplicatePolicy::default(),
         direct_store: None,
+        delivery_naming: None,
         metrics: Default::default(),
         config_path: None,
     };

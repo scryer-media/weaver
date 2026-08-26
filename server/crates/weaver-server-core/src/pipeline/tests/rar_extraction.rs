@@ -2096,6 +2096,58 @@ async fn nested_rar_two_deep_extracts_final_media() {
     assert!(!dest.join("inner.rar").exists());
 }
 
+/// The delivery-naming pass, through the real completion path rather than the
+/// move function alone: the pipeline resolves the plan from config and the
+/// member reaches the complete directory already renamed.
+///
+/// `sample.mkv` is exactly the shape the pass exists for — a single lowercase
+/// word carrying none of the signals a human-written release name carries, on
+/// the one file large enough to be the payload.
+#[tokio::test]
+async fn an_obfuscated_extracted_member_reaches_the_complete_dir_under_the_job_name() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.config.write().await.delivery_naming =
+        Some(crate::settings::DeliveryNamingOverrides {
+            deobfuscate_delivered_members: Some(true),
+            enable_srrdb_lookup: None,
+        });
+    let job_id = JobId(10070);
+    let fixture_name = "rar5_nested_2deep.rar";
+    let fixture_bytes = rar5_fixture_bytes(fixture_name);
+    let spec = rar_job_spec(
+        "Silver Horizon S01E07",
+        &[(fixture_name.to_string(), fixture_bytes.clone())],
+    );
+    let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, fixture_name, &fixture_bytes).await;
+
+    pipeline.check_job_completion(job_id).await;
+    for _ in 0..4 {
+        settle_inflight_moves(&mut pipeline).await;
+    }
+    drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
+
+    let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
+        "Silver Horizon S01E07",
+    ));
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    ));
+    assert!(
+        dest.join("Silver Horizon S01E07.mkv").exists(),
+        "dest entries: {:?}",
+        std::fs::read_dir(&dest)
+            .map(|entries| entries
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+    assert!(!dest.join("sample.mkv").exists());
+}
+
 #[tokio::test]
 async fn nested_rar_three_deep_extracts_through_inner_7z() {
     let temp_dir = tempfile::tempdir().unwrap();

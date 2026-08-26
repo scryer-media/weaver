@@ -55,6 +55,10 @@ pub struct Config {
     /// RAR direct-store routing. Absent means "every default".
     #[serde(default)]
     pub direct_store: Option<DirectStoreOverrides>,
+    /// Naming policy for the files a finished job delivers. Absent means
+    /// "every default".
+    #[serde(default)]
+    pub delivery_naming: Option<DeliveryNamingOverrides>,
     /// Prometheus exposition knobs.
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -84,6 +88,34 @@ impl Config {
     /// Defaults to `true` when not explicitly configured.
     pub fn cleanup_after_extract(&self) -> bool {
         self.cleanup_after_extract.unwrap_or(true)
+    }
+
+    /// Whether a finished job may rename a delivered member that still wears an
+    /// obfuscated name. Defaults to `true`: an obfuscated member is unusable to
+    /// every downstream tool, and the pass refuses itself whenever the job's own
+    /// name is no better.
+    pub fn deobfuscate_delivered_members(&self) -> bool {
+        self.delivery_naming
+            .as_ref()
+            .and_then(|naming| naming.deobfuscate_delivered_members)
+            .unwrap_or(true)
+    }
+
+    /// Whether an obfuscated member may be looked up by CRC32 in the public
+    /// srrdb release index before falling back to the job's own name.
+    ///
+    /// Defaults to `false`. This is the only part of completion that leaves the
+    /// operator's network, so it stays an explicit opt-in even though the
+    /// request carries nothing but a checksum.
+    ///
+    /// **The `WEAVER_SRRDB_LOOKUP` environment switch overrides this in both
+    /// directions and is how the rung is turned on today** — this row is the
+    /// durable home the settings UI will eventually own.
+    pub fn enable_srrdb_lookup(&self) -> bool {
+        self.delivery_naming
+            .as_ref()
+            .and_then(|naming| naming.enable_srrdb_lookup)
+            .unwrap_or(false)
     }
 
     pub fn ip_replacement_trial_extra_connections(&self) -> u8 {
@@ -198,6 +230,24 @@ pub struct DirectStoreOverrides {
     pub holds_scratch_ceiling_bytes: Option<u64>,
 }
 
+/// Operator-facing switches for how a finished job names what it delivers
+/// (`[delivery_naming]`).
+///
+/// Every field is optional so an absent table, a partially filled one and an
+/// older config file all mean "use the defaults".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeliveryNamingOverrides {
+    /// Rename a delivered member that still wears an obfuscated name to the
+    /// job's own name. **Defaults to on.**
+    pub deobfuscate_delivered_members: Option<bool>,
+    /// Before falling back to the job name, ask the public srrdb release index
+    /// what release the member's CRC32 belongs to.
+    ///
+    /// **Defaults to off.** Completion is otherwise entirely local, so anything
+    /// that reaches outside the operator's network is opt-in.
+    pub enable_srrdb_lookup: Option<bool>,
+}
+
 /// Prometheus exposition knobs (`[metrics]`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetricsConfig {
@@ -307,6 +357,7 @@ mod tests {
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: DuplicatePolicy::default(),
             direct_store: None,
+            delivery_naming: None,
             metrics: Default::default(),
             config_path: None,
         }

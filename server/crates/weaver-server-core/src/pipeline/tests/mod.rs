@@ -102,6 +102,15 @@ impl TestHarness {
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
+            // Pinned off rather than left at the shipped default, so an
+            // extraction fixture whose member happens to be called
+            // `sample.mkv` keeps asserting extraction instead of asserting the
+            // delivery-naming policy. Tests that mean to exercise the pass turn
+            // it on for themselves.
+            delivery_naming: Some(crate::settings::DeliveryNamingOverrides {
+                deobfuscate_delivered_members: Some(false),
+                enable_srrdb_lookup: None,
+            }),
             metrics: Default::default(),
             config_path: None,
         }));
@@ -391,6 +400,12 @@ async fn new_direct_pipeline_at_roots(
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store,
+        // Pinned off for the same reason as the harness above: an extraction
+        // fixture must not start asserting the delivery-naming policy.
+        delivery_naming: Some(crate::settings::DeliveryNamingOverrides {
+            deobfuscate_delivered_members: Some(false),
+            enable_srrdb_lookup: None,
+        }),
         metrics: Default::default(),
         config_path: None,
     }));

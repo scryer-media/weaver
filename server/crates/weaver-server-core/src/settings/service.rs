@@ -4,8 +4,8 @@ use crate::jobs::{DuplicateAction, DuplicatePolicy};
 use crate::persistence::Database;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
-    BufferPoolOverrides, Config, DirectStoreOverrides, MetricsConfig, PerJobSeries, RetryOverrides,
-    TunerOverrides,
+    BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides, MetricsConfig,
+    PerJobSeries, RetryOverrides, TunerOverrides,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
@@ -187,6 +187,23 @@ impl Database {
             }
         };
 
+        let delivery_naming = {
+            let deobfuscate_delivered_members = settings
+                .get("delivery_naming.deobfuscate_delivered_members")
+                .and_then(|v| v.parse().ok());
+            let enable_srrdb_lookup = settings
+                .get("delivery_naming.enable_srrdb_lookup")
+                .and_then(|v| v.parse().ok());
+            if deobfuscate_delivered_members.is_some() || enable_srrdb_lookup.is_some() {
+                Some(DeliveryNamingOverrides {
+                    deobfuscate_delivered_members,
+                    enable_srrdb_lookup,
+                })
+            } else {
+                None
+            }
+        };
+
         let default_duplicate_policy = DuplicatePolicy::default();
         let duplicate_policy = DuplicatePolicy {
             strict_active_or_success: setting_duplicate_action(
@@ -241,6 +258,7 @@ impl Database {
             watch_folder,
             duplicate_policy,
             direct_store,
+            delivery_naming,
             metrics,
             config_path: None,
         })
@@ -363,6 +381,18 @@ impl Database {
                     "direct_store.holds_scratch_ceiling_bytes",
                     &bytes.to_string(),
                 )?;
+            }
+        }
+
+        if let Some(ref delivery_naming) = config.delivery_naming {
+            if let Some(enabled) = delivery_naming.deobfuscate_delivered_members {
+                self.set_setting(
+                    "delivery_naming.deobfuscate_delivered_members",
+                    &enabled.to_string(),
+                )?;
+            }
+            if let Some(enabled) = delivery_naming.enable_srrdb_lookup {
+                self.set_setting("delivery_naming.enable_srrdb_lookup", &enabled.to_string())?;
             }
         }
 

@@ -1577,6 +1577,8 @@ pub(super) enum ExtractionDone {
 
 pub(super) struct MoveToCompleteResult {
     pub(super) moved_entries: u32,
+    /// Delivered files the deobfuscation pass renamed on the way out.
+    pub(super) renamed_members: u32,
 }
 
 pub(super) struct MoveToCompleteDone {

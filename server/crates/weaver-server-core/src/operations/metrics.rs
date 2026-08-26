@@ -403,6 +403,8 @@ pub struct PipelineMetrics {
     pub direct_sets_demoted: AtomicU64,
     pub direct_sets_finalized_direct: AtomicU64,
     pub direct_sets_repaired_while_direct: AtomicU64,
+    /// Delivered files renamed out of an obfuscated in-archive member name.
+    pub deobfuscated_members_renamed: AtomicU64,
     pub decode_pressure_soft_limit_bytes: AtomicU64,
     pub decode_pressure_hard_limit_bytes: AtomicU64,
     pub write_pressure_soft_limit_bytes: AtomicU64,
@@ -562,6 +564,7 @@ impl PipelineMetrics {
             direct_sets_demoted: AtomicU64::new(0),
             direct_sets_finalized_direct: AtomicU64::new(0),
             direct_sets_repaired_while_direct: AtomicU64::new(0),
+            deobfuscated_members_renamed: AtomicU64::new(0),
             decode_pressure_soft_limit_bytes: AtomicU64::new(0),
             decode_pressure_hard_limit_bytes: AtomicU64::new(0),
             write_pressure_soft_limit_bytes: AtomicU64::new(0),
@@ -816,6 +819,7 @@ impl PipelineMetrics {
             direct_sets_repaired_while_direct: self
                 .direct_sets_repaired_while_direct
                 .load(Ordering::Relaxed),
+            deobfuscated_members_renamed: self.deobfuscated_members_renamed.load(Ordering::Relaxed),
             decode_pressure_soft_limit_bytes: self
                 .decode_pressure_soft_limit_bytes
                 .load(Ordering::Relaxed),
@@ -1140,6 +1144,7 @@ pub struct MetricsSnapshot {
     pub direct_sets_demoted: u64,
     pub direct_sets_finalized_direct: u64,
     pub direct_sets_repaired_while_direct: u64,
+    pub deobfuscated_members_renamed: u64,
     pub decode_pressure_soft_limit_bytes: u64,
     pub decode_pressure_hard_limit_bytes: u64,
     pub write_pressure_soft_limit_bytes: u64,

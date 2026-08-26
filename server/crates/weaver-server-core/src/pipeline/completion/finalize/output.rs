@@ -1,8 +1,30 @@
 use super::*;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
+use super::deobfuscate::{self, DeliveryNamingPlan, SrrdbInputs};
 use crate::jobs::working_dir::{WORKING_DIR_MARKER, mark_weaver_owned_output_dir};
 use crate::runtime::{file_cache, fs as runtime_fs};
+
+/// Folds one volume's member headers into the checksum map. A member spanning
+/// volumes states its checksum on the header that ends it, so later volumes
+/// overwrite earlier `None`s naturally by only writing what they know.
+fn record_member_crc32(by_name: &mut HashMap<String, u32>, facts: &unrar_rs::RarVolumeFacts) {
+    for member in &facts.members {
+        if member.is_directory {
+            continue;
+        }
+        let Some(crc32) = member.data_crc32 else {
+            continue;
+        };
+        let name = member
+            .name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&member.name);
+        by_name.insert(name.to_ascii_lowercase(), crc32);
+    }
+}
 
 fn move_path_with_copy_fallback(
     src: &std::path::Path,
@@ -167,6 +189,7 @@ async fn run_move_to_complete(
     staging_dir: Option<PathBuf>,
     dest: PathBuf,
     phase_counters: Arc<PhaseCounters>,
+    naming: Option<DeliveryNamingPlan>,
 ) -> Result<MoveToCompleteResult, String> {
     // Every cached disk write handle under either of the job's roots must be
     // closed before its files are renamed or moved. The staging root is not
@@ -319,6 +342,16 @@ async fn run_move_to_complete(
         ));
     }
 
+    // Both delivery routes have landed in `dest` and nothing else will be added
+    // to it, so this is the first and only moment the delivered set exists as
+    // one directory. Renaming here is still a same-directory rename, and it
+    // finishes before the move reports done — everything downstream of the
+    // move sees only the final names.
+    let renamed_members = match naming {
+        Some(naming) => deobfuscate::rename_obfuscated_members(job_id, &dest, &naming).await,
+        None => 0,
+    };
+
     let output_dir = dest.clone();
     match tokio::task::spawn_blocking(move || mark_weaver_owned_output_dir(&output_dir)).await {
         Ok(Ok(())) => {}
@@ -373,6 +406,7 @@ async fn run_move_to_complete(
 
     Ok(MoveToCompleteResult {
         moved_entries: moved,
+        renamed_members,
     })
 }
 
@@ -515,6 +549,96 @@ impl Pipeline {
         }
     }
 
+    /// Resolves everything the delivery rename pass needs, on this task, before
+    /// the move worker is spawned.
+    ///
+    /// `None` disables the pass. The worker gets an owned plan rather than a
+    /// handle to pipeline state so the pass cannot reach back into the
+    /// orchestrator, and so the outbound lookup — the one step that can take
+    /// seconds — never runs on the orchestrator's own task.
+    async fn delivery_naming_plan(
+        &self,
+        job_id: JobId,
+        job_name: &str,
+    ) -> Option<DeliveryNamingPlan> {
+        let (enabled, srrdb_from_config) = {
+            let cfg = self.config.read().await;
+            (
+                cfg.deobfuscate_delivered_members(),
+                cfg.enable_srrdb_lookup(),
+            )
+        };
+        if !enabled {
+            return None;
+        }
+        // The environment has the last word on the outbound rung — see
+        // [`deobfuscate::SRRDB_LOOKUP_ENV`] for why consent lives there until
+        // the settings UI can ask for it in words.
+        let srrdb_enabled = deobfuscate::srrdb_lookup_enabled_now(srrdb_from_config);
+
+        // The checksum map is only ever read by the lookup, so an operator who
+        // never opted in never pays for gathering it.
+        let srrdb = srrdb_enabled.then(|| SrrdbInputs {
+            base_url: deobfuscate::SRRDB_API_BASE.to_string(),
+            crc32_by_member_name: HashMap::new(),
+        });
+        let srrdb = match srrdb {
+            Some(mut inputs) => {
+                inputs.crc32_by_member_name = self.member_crc32_by_name(job_id).await;
+                Some(inputs)
+            }
+            None => None,
+        };
+
+        Some(DeliveryNamingPlan {
+            job_display_name: job_name.to_string(),
+            srrdb,
+        })
+    }
+
+    /// The CRC32 each archive header stated for its member, keyed by the
+    /// member's filename lowercased.
+    ///
+    /// Read from two places because the two delivery routes keep the same facts
+    /// in different homes: extraction keeps a set's parsed headers in memory
+    /// until the job leaves the pipeline, while direct-store only ever writes
+    /// them to the durable facts table. Reading both makes the map route-blind.
+    /// A member the headers never stated a checksum for is simply absent, and
+    /// the lookup falls back to the job name for it.
+    async fn member_crc32_by_name(&self, job_id: JobId) -> HashMap<String, u32> {
+        let mut by_name = HashMap::new();
+        for ((set_job_id, _), state) in &self.rar_sets {
+            if *set_job_id != job_id {
+                continue;
+            }
+            for facts in state.facts.values() {
+                record_member_crc32(&mut by_name, facts);
+            }
+        }
+
+        let persisted = self
+            .db_blocking(move |db| db.load_all_rar_volume_facts(job_id))
+            .await;
+        match persisted {
+            Ok(sets) => {
+                for (_, volumes) in sets {
+                    for (_, blob) in volumes {
+                        if let Ok(facts) = rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob)
+                        {
+                            record_member_crc32(&mut by_name, &facts);
+                        }
+                    }
+                }
+            }
+            Err(error) => debug!(
+                job_id = job_id.0,
+                error = %error,
+                "could not read persisted volume facts for the release-index lookup"
+            ),
+        }
+        by_name
+    }
+
     /// Move extracted/completed files from the intermediate working directory
     /// to the complete directory, organized by category.
     ///
@@ -567,6 +691,8 @@ impl Pipeline {
             .send(PipelineEvent::MoveToCompleteStarted { job_id });
         self.publish_snapshot();
 
+        let naming = self.delivery_naming_plan(job_id, &job_name).await;
+
         let move_done_tx = self.move_done_tx.clone();
         info!(
             job_id = job_id.0,
@@ -581,6 +707,7 @@ impl Pipeline {
                 staging_dir,
                 dest.clone(),
                 phase_counters,
+                naming,
             )
             .await;
             match &result {
@@ -622,6 +749,11 @@ impl Pipeline {
 
         match result {
             Ok(outcome) => {
+                if outcome.renamed_members > 0 {
+                    self.metrics
+                        .deobfuscated_members_renamed
+                        .fetch_add(u64::from(outcome.renamed_members), Ordering::Relaxed);
+                }
                 let Some(state) = self.jobs.get_mut(&job_id) else {
                     warn!(
                         job_id = job_id.0,

@@ -138,6 +138,10 @@ fn config_roundtrip() {
             enabled: Some(true),
             holds_scratch_ceiling_bytes: Some(128 * 1024 * 1024),
         }),
+        delivery_naming: Some(crate::settings::DeliveryNamingOverrides {
+            deobfuscate_delivered_members: Some(false),
+            enable_srrdb_lookup: Some(true),
+        }),
         metrics: Default::default(),
         config_path: None,
     };
@@ -185,6 +189,25 @@ fn config_roundtrip() {
         direct_store.holds_scratch_ceiling_bytes,
         Some(128 * 1024 * 1024)
     );
+    let delivery_naming = loaded
+        .delivery_naming
+        .expect("the delivery-naming table must survive the round trip");
+    assert_eq!(delivery_naming.deobfuscate_delivered_members, Some(false));
+    assert_eq!(delivery_naming.enable_srrdb_lookup, Some(true));
+}
+
+/// An install that never touched delivery naming loads no table at all, so the
+/// accessors answer with the shipped defaults: rename on, srrdb off.
+#[test]
+fn an_unconfigured_delivery_naming_table_loads_as_absent_defaults() {
+    let db = Database::open_in_memory().unwrap();
+    db.set_setting("data_dir", "/tmp/weaver").unwrap();
+
+    let loaded = db.load_config().unwrap();
+
+    assert!(loaded.delivery_naming.is_none());
+    assert!(loaded.deobfuscate_delivered_members());
+    assert!(!loaded.enable_srrdb_lookup());
 }
 
 /// An install that never touched direct-store loads no table at all, which is

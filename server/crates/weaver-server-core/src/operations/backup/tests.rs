@@ -73,6 +73,7 @@ fn sample_config() -> Config {
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
+        delivery_naming: None,
         metrics: Default::default(),
         config_path: None,
     }

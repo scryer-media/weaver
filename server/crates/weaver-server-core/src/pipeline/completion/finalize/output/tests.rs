@@ -211,6 +211,7 @@ async fn final_move_does_not_overwrite_existing_destination_file() {
         Some(staging),
         dest,
         Arc::new(PhaseCounters::default()),
+        None,
     )
     .await
     {
@@ -311,6 +312,7 @@ async fn final_move_preserves_symlink_entries() {
         Some(staging),
         dest.clone(),
         Arc::new(PhaseCounters::default()),
+        None,
     )
     .await
     .unwrap();
@@ -324,4 +326,70 @@ async fn final_move_preserves_symlink_entries() {
             .is_symlink()
     );
     assert_eq!(std::fs::read_link(placed).unwrap(), target);
+}
+
+/// The seam the rename pass runs at has to see both delivery routes as one set.
+/// Extraction writes members into the working root and direct-store commits
+/// them into staging; only after this move do they share a directory, and the
+/// dominance test that picks the payload is meaningless before then.
+#[tokio::test]
+async fn the_rename_pass_sees_staging_and_working_output_as_one_delivery() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let staging = temp.path().join("staging");
+    let dest = temp.path().join("complete");
+    std::fs::create_dir_all(&working).unwrap();
+    std::fs::create_dir_all(&staging).unwrap();
+
+    // The payload arrives by the direct-store route...
+    let payload = std::fs::File::create(staging.join("Yb5drZSkNi20UCMkb.mkv")).unwrap();
+    payload.set_len(64 * 1024 * 1024).unwrap();
+    // ...and its subtitle by the extraction route.
+    std::fs::write(working.join("Yb5drZSkNi20UCMkb.eng.srt"), b"1\n").unwrap();
+
+    let result = run_move_to_complete(
+        JobId(1),
+        working,
+        Some(staging),
+        dest.clone(),
+        Arc::new(PhaseCounters::default()),
+        Some(DeliveryNamingPlan {
+            job_display_name: "Silver Horizon 2024".to_string(),
+            srrdb: None,
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.moved_entries, 2);
+    assert_eq!(result.renamed_members, 2);
+    assert!(dest.join("Silver Horizon 2024.mkv").is_file());
+    assert!(dest.join("Silver Horizon 2024.eng.srt").is_file());
+    assert!(!dest.join("Yb5drZSkNi20UCMkb.mkv").exists());
+}
+
+/// The pass is a policy, not a stage: with it off the move places exactly what
+/// it was given.
+#[tokio::test]
+async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let dest = temp.path().join("complete");
+    std::fs::create_dir_all(&working).unwrap();
+    let payload = std::fs::File::create(working.join("Yb5drZSkNi20UCMkb.mkv")).unwrap();
+    payload.set_len(64 * 1024 * 1024).unwrap();
+
+    let result = run_move_to_complete(
+        JobId(1),
+        working,
+        None,
+        dest.clone(),
+        Arc::new(PhaseCounters::default()),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.renamed_members, 0);
+    assert!(dest.join("Yb5drZSkNi20UCMkb.mkv").is_file());
 }

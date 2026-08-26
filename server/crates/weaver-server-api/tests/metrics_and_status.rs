@@ -31,6 +31,7 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         direct_sets_demoted: 0,
         direct_sets_finalized_direct: 0,
         direct_sets_repaired_while_direct: 0,
+        deobfuscated_members_renamed: 0,
         decode_pressure_soft_limit_bytes: 0,
         decode_pressure_hard_limit_bytes: 0,
         write_pressure_soft_limit_bytes: 0,

@@ -219,7 +219,7 @@ fn env_scratch_ceiling() -> Option<u64> {
 /// typo'd override must not silently disable a feature the operator turned on
 /// in config, and the direction that surprises least is the one where the
 /// variable simply does not apply.
-fn parse_enabled(raw: Option<&str>) -> Option<bool> {
+pub(in crate::pipeline) fn parse_enabled(raw: Option<&str>) -> Option<bool> {
     let value = raw?.trim().to_ascii_lowercase();
     match value.as_str() {
         "1" | "true" | "on" | "yes" => Some(true),

@@ -769,6 +769,12 @@ fn render_stalls_and_workers(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         out.sample(&f::DIRECT_STORE_SETS, &[("event", event)], value);
     }
 
+    out.sample(
+        &f::DEOBFUSCATED_MEMBERS,
+        &[],
+        snapshot.deobfuscated_members_renamed,
+    );
+
     out.sample(&f::VERIFY_ACTIVE, &[], snapshot.verify_active);
     out.sample(&f::REPAIR_ACTIVE, &[], snapshot.repair_active);
     out.sample(&f::EXTRACT_ACTIVE, &[], snapshot.extract_active);

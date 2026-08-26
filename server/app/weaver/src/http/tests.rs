@@ -167,6 +167,7 @@ fn test_config() -> SharedConfig {
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
+        delivery_naming: None,
         metrics: Default::default(),
         config_path: None,
     }))
@@ -4276,6 +4277,7 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         direct_sets_demoted: 0,
         direct_sets_finalized_direct: 0,
         direct_sets_repaired_while_direct: 0,
+        deobfuscated_members_renamed: 0,
         decode_pressure_soft_limit_bytes: 100,
         decode_pressure_hard_limit_bytes: 200,
         write_pressure_soft_limit_bytes: 300,
@@ -4721,6 +4723,7 @@ fn renders_prometheus_download_observed_limiter_states() {
         direct_sets_demoted: 0,
         direct_sets_finalized_direct: 0,
         direct_sets_repaired_while_direct: 0,
+        deobfuscated_members_renamed: 0,
         decode_pressure_soft_limit_bytes: 100,
         decode_pressure_hard_limit_bytes: 200,
         write_pressure_soft_limit_bytes: 100,
