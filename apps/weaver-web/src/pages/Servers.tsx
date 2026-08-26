@@ -307,6 +307,29 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
     setShowForm(false);
   };
 
+  async function showConnectionTestResult(values: ServerFormValues) {
+    setTesting(true);
+    setSaveError(null);
+    setTestResult(null);
+    const result = await testConnection({
+      input: {
+        host: normalizeServerHost(values.host),
+        port: values.port,
+        tls: values.tls,
+        username: values.username.trim() || null,
+        password: values.password.trim() || null,
+        connections: values.connections,
+        active: values.active,
+        priority: values.priority,
+        backfill: values.backfill,
+        retentionDays: values.retentionDays,
+        tlsNameMismatchCertificateDerBase64: values.tlsNameMismatchCertificateDerBase64,
+      },
+    });
+    setTestResult(result.data?.testConnection ?? null);
+    setTesting(false);
+  }
+
   const handleSave = async (values: ServerFormValues) => {
     setSaveError(null);
     const input = {
@@ -336,11 +359,14 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
         closeForm();
         return;
       }
-      setSaveError(
-        result.error?.graphQLErrors[0]?.message
-          ?? result.error?.message
-          ?? "Unable to save server settings. Fix the connection details and try again.",
-      );
+      const message = result.error?.graphQLErrors[0]?.message
+        ?? result.error?.message
+        ?? "Unable to save server settings. Fix the connection details and try again.";
+      if (values.tls && message.includes("certificate belongs to a different hostname")) {
+        await showConnectionTestResult(values);
+        return;
+      }
+      setSaveError(message);
       return;
     } else {
       const result = await addServer({ input });
@@ -354,11 +380,14 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
         closeForm();
         return;
       }
-      setSaveError(
-        result.error?.graphQLErrors[0]?.message
-          ?? result.error?.message
-          ?? "Unable to save server settings. Fix the connection details and try again.",
-      );
+      const message = result.error?.graphQLErrors[0]?.message
+        ?? result.error?.message
+        ?? "Unable to save server settings. Fix the connection details and try again.";
+      if (values.tls && message.includes("certificate belongs to a different hostname")) {
+        await showConnectionTestResult(values);
+        return;
+      }
+      setSaveError(message);
       return;
     }
   };
@@ -394,26 +423,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   };
 
   const handleTest = async (values: ServerFormValues) => {
-    setTesting(true);
-    setSaveError(null);
-    setTestResult(null);
-    const result = await testConnection({
-      input: {
-        host: normalizeServerHost(values.host),
-        port: values.port,
-        tls: values.tls,
-        username: values.username.trim() || null,
-        password: values.password.trim() || null,
-        connections: values.connections,
-        active: values.active,
-        priority: values.priority,
-        backfill: values.backfill,
-        retentionDays: values.retentionDays,
-        tlsNameMismatchCertificateDerBase64: values.tlsNameMismatchCertificateDerBase64,
-      },
-    });
-    setTestResult(result.data?.testConnection ?? null);
-    setTesting(false);
+    await showConnectionTestResult(values);
   };
 
   const editingServer = useMemo(
