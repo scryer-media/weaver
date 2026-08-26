@@ -1906,6 +1906,115 @@ fn single_member_rar4_store_set_numbered(
         .collect()
 }
 
+#[tokio::test]
+async fn a_restored_job_with_a_conventional_floor_is_never_readmitted() {
+    // The restart tear: restore rebuilds a conventional floor and commits the
+    // skipped segments into the assembly, so the file on disk owns the
+    // volume's prefix. Admitting the set at the next decoded segment would
+    // route every remaining article into an envelope instead — the two
+    // halves would never meet, and extraction would walk real headers into
+    // a hole. The set must stay on the path that owns its bytes.
+    let member_name = "Silver.Horizon.S01E20.mkv";
+    let payload: Vec<u8> = (0..120_000u32).map(|index| (index % 157) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 1);
+    let (volume_name, volume_bytes) = &volumes[0];
+    // The spec's own first-article boundary, so the restored floor covers
+    // exactly segment 0 and the run owes exactly segment 1.
+    let (_, split_at) = article_extent(volume_bytes.len(), 0, 2);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let job_id = JobId(41102);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = temp_dir.path().join("restored-floor");
+    tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    // The prefix the previous run wrote conventionally, exactly as the
+    // restart sweep would find it. The restore floor counts the spec's
+    // yEnc-encoded segment sizes and clamps to the on-disk length, so the
+    // file is extended to the encoded floor — the extension sits in the
+    // segment-1 region, which the restored run rewrites below.
+    let encoded_floor = u64::from(yenc_declared_bytes(split_at as u32));
+    tokio::fs::write(working_dir.join(volume_name), &volume_bytes[..split_at])
+        .await
+        .unwrap();
+    let partial = tokio::fs::File::options()
+        .write(true)
+        .open(working_dir.join(volume_name))
+        .await
+        .unwrap();
+    partial.set_len(encoded_floor).await.unwrap();
+    drop(partial);
+
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            file_progress: HashMap::from([(0u32, encoded_floor)]),
+            complete_files: HashSet::new(),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: working_dir.clone(),
+        })
+        .await
+        .unwrap();
+
+    // The remaining article decodes on the restored run.
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        1,
+        split_at as u64,
+        &volume_bytes[split_at..],
+        volume_name,
+        None,
+    )
+    .await;
+
+    assert!(
+        pipeline.direct_store.sets_for(job_id).is_empty(),
+        "a set whose volume already has conventional bytes must not admit, got {:?}",
+        pipeline.direct_store.sets_for(job_id)
+    );
+    // A restored file's reorder cursor starts at zero with its skipped
+    // segments never arriving, so the tail segment sits buffered until the
+    // quiescent flusher (or backlog pressure) writes it at its own offset —
+    // the same drain a real restored run relies on. The harness supplied the
+    // article directly, so the queued copy is cleared first, exactly as the
+    // other whole-job gates model an exhausted dispatcher.
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+        state.recovery_queue = crate::DownloadQueue::new();
+    }
+    pipeline.flush_quiescent_write_backlog().await;
+    let on_disk = std::fs::read(working_dir.join(volume_name)).unwrap();
+    let first_diff = on_disk
+        .iter()
+        .zip(volume_bytes.iter())
+        .position(|(a, b)| a != b);
+    assert!(
+        on_disk == *volume_bytes,
+        "the restored file must receive the remaining bytes and stay whole          (on_disk_len={} expected_len={} first_diff={:?} split_at={split_at})",
+        on_disk.len(),
+        volume_bytes.len(),
+        first_diff,
+    );
+}
+
 /// Runs one whole **par2-less obfuscated** job gate: hex names, no index
 /// anywhere, so the only admissible evidence is the volumes' own RAR5
 /// headers.

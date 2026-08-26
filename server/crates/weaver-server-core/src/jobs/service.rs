@@ -1476,7 +1476,12 @@ impl Pipeline {
         // because the assembly is what turns a skipped segment into work the
         // job does not queue.
         let direct_restore = self
-            .restore_direct_store_coverage(job_id, &spec, &working_dir)
+            .restore_direct_store_coverage(
+                job_id,
+                &spec,
+                &working_dir,
+                &restore_skip_plan.file_progress,
+            )
             .await;
         restore_skip_plan.skip.extend(direct_restore.skip.iter());
         for (file_index, floor) in &direct_restore.file_progress {

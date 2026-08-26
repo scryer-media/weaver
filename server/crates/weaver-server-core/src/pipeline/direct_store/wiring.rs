@@ -781,6 +781,45 @@ impl Pipeline {
                 "direct-store did not admit an archive set"
             );
         }
+        // The one invariant every admission path shares: a volume binds only
+        // while none of its bytes live in a conventional file. Admission is
+        // lazy — the first decoded segment — and for a freshly submitted job
+        // nothing has committed by then. A RESTORED job is the case this
+        // refuses: restore rebuilds the conventional floor and commits the
+        // skipped segments into the assembly, so admitting such a set would
+        // route every remaining article away from the file that already owns
+        // the prefix, and the two halves would never meet — a volume torn
+        // between an envelope and a file, unreadable from either. (A restored
+        // *direct* set never reaches this seam: `install_restored` marks the
+        // job examined with its coverage re-validated.)
+        let admitted: Vec<DirectSetPlan> = admitted
+            .into_iter()
+            .filter(|plan| {
+                let prior_bytes = plan.files.keys().any(|file_index| {
+                    state
+                        .assembly
+                        .file(NzbFileId {
+                            job_id,
+                            file_index: *file_index,
+                        })
+                        .is_some_and(|file| file.received_bytes() > 0)
+                });
+                if prior_bytes {
+                    crate::runtime::perf_probe::record(
+                        "direct_store.refused.prior_conventional_bytes",
+                        std::time::Duration::from_nanos(1),
+                    );
+                    info!(
+                        job_id = job_id.0,
+                        set_name = %plan.set_name,
+                        "direct-store did not admit an archive set: a volume already \
+                         has conventional bytes, so the set stays on the path that \
+                         owns them"
+                    );
+                }
+                !prior_bytes
+            })
+            .collect();
         if admitted.is_empty() {
             return;
         }

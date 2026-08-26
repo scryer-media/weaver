@@ -606,6 +606,7 @@ impl Pipeline {
         job_id: JobId,
         spec: &JobSpec,
         working_dir: &Path,
+        conventional_floors: &HashMap<u32, u64>,
     ) -> DirectRestore {
         let gate = self.direct_store.gate();
         // Deterministic, and it has to be: this runs before the job state
@@ -783,6 +784,36 @@ impl Pipeline {
             let mut set = match (accepted.as_ref(), restored.remove(&plan.set_name)) {
                 (Some(_), Some(set)) => set,
                 _ => {
+                    // The invariant every admission path shares: a volume
+                    // binds only while none of its bytes live in a
+                    // conventional file. A set starting FRESH here has no
+                    // validated coverage, and if the legacy restore rebuilt a
+                    // conventional floor for any of its volumes, that file
+                    // already owns the prefix — installing a set would route
+                    // every remaining article into an envelope the file never
+                    // meets, and extraction would walk real headers into a
+                    // hole. The set stays conventional; the sweep below
+                    // reclaims whatever direct artifacts the previous run
+                    // left.
+                    let prior_bytes = plan.files.keys().any(|file_index| {
+                        conventional_floors
+                            .get(file_index)
+                            .copied()
+                            .unwrap_or_default()
+                            > 0
+                    });
+                    if prior_bytes {
+                        crate::runtime::perf_probe::record(
+                            "direct_store.refused.prior_conventional_bytes",
+                            std::time::Duration::from_nanos(1),
+                        );
+                        tracing::info!(
+                            job_id = job_id.0,
+                            set_name = %plan.set_name,
+                            "direct-store set not readmitted at restore: a volume                              already has conventional bytes, so the set stays on                              the path that owns them"
+                        );
+                        continue;
+                    }
                     let mut set = DirectSet::new(job_id, plan.clone());
                     self.direct_store.apply_ceilings(&mut set);
                     set.router.set_password(spec.password.as_deref());
