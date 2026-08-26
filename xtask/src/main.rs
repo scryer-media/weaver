@@ -2700,6 +2700,16 @@ fn ensure_frontend_dependencies(ctx: &TaskContext, web_dir: &Path) -> Result<()>
     Ok(())
 }
 
+fn build_frontend_assets(ctx: &TaskContext, web_dir: &Path) -> Result<()> {
+    step("Building frontend assets for the embedded UI");
+    let mut build = ctx.command_in("npm", web_dir);
+    build.args(["run", "build"]);
+    run_status(&mut build)
+        .with_context(|| format!("failed to build frontend assets in {}", web_dir.display()))?;
+    ok("Frontend assets are up to date");
+    Ok(())
+}
+
 fn seed_runtime_dirs(db_path: &Path, data_dir: &Path) -> Result<()> {
     let intermediate_dir = data_dir.join("intermediate");
     let complete_dir = data_dir.join("complete");
@@ -2773,6 +2783,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     require_command("sqlite3")?;
     let web_dir = ctx.path("apps/weaver-web");
     ensure_frontend_dependencies(ctx, &web_dir)?;
+    build_frontend_assets(ctx, &web_dir)?;
     let backend_port = std::env::var("WEAVER_DEV_BACKEND_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
