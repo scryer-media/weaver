@@ -96,6 +96,7 @@ import {
   type GraphqlJobData,
   type JobData,
 } from "@/lib/job-types";
+import { orderQueueByLiveActivity } from "@/lib/queue-live-order";
 import { cn } from "@/lib/utils";
 
 type QueueStatusFilter =
@@ -591,14 +592,6 @@ export function JobList() {
   );
   const queuePageVariables = useMemo(() => ({ input: queuePageInput }), [queuePageInput]);
   const queueQueryKey = useMemo(() => JSON.stringify(queuePageInput), [queuePageInput]);
-  const queueTableVirtualization = useMemo(
-    () => ({
-      estimatedRowHeight: 56,
-      overscan: 8,
-      resetKey: queueQueryKey,
-    }),
-    [queueQueryKey],
-  );
   const queueRowClassName = useCallback(() => "text-xs", []);
   const [{ data: queuePageData, error: queuePageError }, reexecuteQueuePage] =
     useQuery<QueuePageResponse>({
@@ -706,10 +699,14 @@ export function JobList() {
   const serverConfigurationPending = serversResult.data === undefined && !serversResult.error;
   const isQueueBootstrapPending =
     !hasBootstrappedQueue && (queueInitialFetchPending || serverConfigurationPending);
-  const jobs = useMemo(
-    () => queuePageItems.map((job) => normalizeJobData(eventItems[job.id]?.item ?? job)),
-    [eventItems, queuePageItems],
-  );
+  const jobs = useMemo(() => {
+    const normalized = queuePageItems.map((job) =>
+      normalizeJobData(eventItems[job.id]?.item ?? job),
+    );
+    return queuePreferences.sorting.length === 0
+      ? orderQueueByLiveActivity(normalized)
+      : normalized;
+  }, [eventItems, queuePageItems, queuePreferences.sorting]);
   const policyBlockedJobs = jobs.filter((job) => isBlockedByDownloadPolicy(job, downloadBlock)).length;
   const capResetAt = formatResetAt(downloadBlock.windowEndsAtEpochMs);
 
@@ -2042,7 +2039,6 @@ export function JobList() {
                 table={queueTable}
                 wrapperClassName="max-h-[70vh]"
                 rowClassName={queueRowClassName}
-                virtualization={queueTableVirtualization}
                 emptyState={
                   <div className="space-y-3 py-12 text-center">
                     <div className="text-sm text-muted-foreground">{t("queue.noMatches")}</div>

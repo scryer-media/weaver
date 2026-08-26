@@ -62,13 +62,10 @@ async fn jobs_returns_submitted() {
 }
 
 #[tokio::test]
-async fn queue_page_default_order_promotes_the_hot_dispatch_job() {
+async fn queue_page_default_order_preserves_scheduler_order_for_cold_jobs() {
     let h = TestHarness::new().await;
-    h.submit_test_nzb("cold-download").await;
-    let hot_job_id = h.submit_test_nzb("hot-download").await;
-    h.metrics
-        .hot_dispatch_job_id
-        .store(hot_job_id, std::sync::atomic::Ordering::Relaxed);
+    let first_job_id = h.submit_test_nzb("first-download").await;
+    h.submit_test_nzb("second-download").await;
 
     let response = h
         .execute(
@@ -83,7 +80,7 @@ async fn queue_page_default_order_promotes_the_hot_dispatch_job() {
     let data = response_data(&response);
     assert_eq!(
         data["queuePage"]["items"][0]["id"].as_u64(),
-        Some(hot_job_id),
+        Some(first_job_id),
     );
 }
 

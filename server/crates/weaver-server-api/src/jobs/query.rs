@@ -109,6 +109,21 @@ fn queue_page_job_progress(info: &weaver_server_core::JobInfo) -> f64 {
     progress.max(processed_bytes as f64 / info.total_bytes as f64)
 }
 
+fn queue_page_job_live_rate(info: &weaver_server_core::JobInfo) -> u64 {
+    info.phase_progress
+        .iter()
+        .filter_map(|phase| phase.rate_bps)
+        .max()
+        .unwrap_or_default()
+}
+
+fn queue_page_default_order(
+    left: &weaver_server_core::JobInfo,
+    right: &weaver_server_core::JobInfo,
+) -> Ordering {
+    queue_page_job_live_rate(right).cmp(&queue_page_job_live_rate(left))
+}
+
 fn queue_page_job_order(
     left: &weaver_server_core::JobInfo,
     right: &weaver_server_core::JobInfo,
@@ -250,15 +265,13 @@ impl JobsQuery {
             .collect();
         let metrics = handle.get_metrics();
         let summary = queue_page_summary(&all_jobs, &metrics);
-        let hot_dispatch_job_id = handle.get_live_metrics().hot_dispatch_job_id;
         let page_size = (input.page_size as usize).clamp(1, MAX_QUEUE_PAGE_SIZE);
         let offset = (input.page_index as usize).saturating_mul(page_size);
         all_jobs.retain(|job| queue_page_job_matches(job, &input));
         if input.sort_field.is_some() {
             all_jobs.sort_by(|left, right| queue_page_job_order(left, right, &input));
-        } else if hot_dispatch_job_id != 0 {
-            let hot_job_id = hot_dispatch_job_id;
-            all_jobs.sort_by_key(|job| job.job_id.0 != hot_job_id);
+        } else {
+            all_jobs.sort_by(queue_page_default_order);
         }
         let total_count = u32::try_from(all_jobs.len()).unwrap_or(u32::MAX);
         let mut items = all_jobs
