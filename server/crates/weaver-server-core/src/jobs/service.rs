@@ -902,10 +902,30 @@ impl Pipeline {
                 &mut download_queue
             };
 
+            // An unclassifiable file's head segment jumps the data queue: the
+            // offset-zero article carries the archive signature and the whole
+            // identity-fingerprint window, so on an obfuscated post the head
+            // wave is what lets every file bind to a direct set within the
+            // first round trips. Planned here, into the initial order, rather
+            // than re-prioritized when identity evidence arrives — a
+            // reprioritization only reaches work still in the queue, and the
+            // heads it misses are exactly the early files whose payload is
+            // already leased, deterministically, every run. Heads are
+            // ordinary file bytes; nothing is wasted if the job turns out to
+            // be nothing special.
+            let head_segment = matches!(file_spec.role, weaver_model::files::FileRole::Unknown)
+                .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
+                .flatten();
+
             for seg in &file_spec.segments {
                 let segment_id = SegmentId {
                     file_id,
                     segment_number: seg.ordinal,
+                };
+                let priority = if head_segment == Some(seg.ordinal) {
+                    2
+                } else {
+                    priority
                 };
                 if skip.contains(&segment_id) {
                     let _ = file_assembly.commit_segment(seg.ordinal, seg.bytes);
