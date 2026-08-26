@@ -9,8 +9,8 @@ use weaver_nzb::Nzb;
 use crate::auth::CallerIdentity;
 use weaver_server_core::auth::generate_api_key;
 use weaver_server_core::ingest::{
-    StagedSubmissionPreparation, SubmitNzbError, XZ_DECODER_MEMORY_LIMIT_BYTES,
-    hash_persisted_nzb_bytes, nzb_to_submission_spec, parse_persisted_nzb_bytes,
+    PreparedPersistedNzb, StagedSubmissionPreparation, SubmitNzbError,
+    XZ_DECODER_MEMORY_LIMIT_BYTES, nzb_to_submission_spec, parse_and_hash_persisted_nzb_bytes,
     persist_decoded_nzb_reader_to_zstd, xz_multistream_decoder,
 };
 use weaver_server_core::jobs::FingerprintEvidence;
@@ -45,8 +45,8 @@ impl StagedUploadEntry {
         let filename = self.filename.clone();
         let nzb_zstd = self.nzb_zstd.clone();
         let preparation = tokio::task::spawn_blocking(move || {
-            let nzb = match parse_persisted_nzb_bytes(&nzb_zstd) {
-                Ok(nzb) => nzb,
+            let (nzb, raw_job_hash) = match parse_and_hash_persisted_nzb_bytes(&nzb_zstd) {
+                Ok(parsed) => parsed,
                 Err(weaver_server_core::ingest::PersistedNzbError::Io(error)) => {
                     return Err(SubmitNzbError::Save(error));
                 }
@@ -57,8 +57,7 @@ impl StagedUploadEntry {
             if nzb.files.is_empty() {
                 return Err(SubmitNzbError::Empty);
             }
-            let job_hash = hash_persisted_nzb_bytes(&nzb_zstd);
-            Ok(staged_preparation_from_nzb(&nzb, &filename, job_hash))
+            Ok(staged_preparation_from_nzb(&nzb, &filename, raw_job_hash))
         })
         .await
         .map_err(|error| {
@@ -135,7 +134,7 @@ impl StagedUploadManager {
         })
         .await
         .map_err(|error| SubmitNzbError::Upload(std::io::Error::other(error.to_string())))?;
-        let (nzb_zstd, nzb) = match persist_result {
+        let prepared = match persist_result {
             Ok(values) => values,
             Err(weaver_server_core::ingest::PersistedNzbError::Io(error)) => {
                 return Err(SubmitNzbError::Save(error));
@@ -144,14 +143,18 @@ impl StagedUploadManager {
                 return Err(SubmitNzbError::Parse(error));
             }
         };
-        if nzb.files.is_empty() {
+        if prepared.nzb.files.is_empty() {
             return Err(SubmitNzbError::Empty);
         }
 
+        let PreparedPersistedNzb {
+            nzb_zstd,
+            nzb,
+            raw_job_hash,
+        } = prepared;
         let filename_for_preparation = filename.clone();
-        let job_hash = hash_persisted_nzb_bytes(&nzb_zstd);
         let preparation = tokio::task::spawn_blocking(move || {
-            staged_preparation_from_nzb(&nzb, &filename_for_preparation, job_hash)
+            staged_preparation_from_nzb(&nzb, &filename_for_preparation, raw_job_hash)
         })
         .await
         .map_err(|error| {
@@ -396,6 +399,7 @@ pub(crate) fn normalize_uploaded_nzb_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::io::Write;
 
     use lzma_rust2::{XzOptions, XzWriter};
@@ -417,6 +421,24 @@ mod tests {
             filename: format!("{name}.nzb"),
             content_type: Some("application/x-nzb".to_string()),
             content: minimal_nzb(name).into_bytes().into(),
+        }
+    }
+
+    fn make_large_single_file_upload(segment_count: usize) -> UploadValue {
+        let mut xml = String::with_capacity(segment_count * 65);
+        xml.push_str(r#"<nzb><file poster="p" date="0" subject="large"><segments>"#);
+        for number in 1..=segment_count {
+            write!(
+                xml,
+                r#"<segment bytes="1" number="{number}">{number}@test</segment>"#
+            )
+            .unwrap();
+        }
+        xml.push_str("</segments></file></nzb>");
+        UploadValue {
+            filename: "large.nzb".to_string(),
+            content_type: Some("application/x-nzb".to_string()),
+            content: xml.into_bytes().into(),
         }
     }
 
@@ -477,6 +499,31 @@ mod tests {
             assert_eq!(staged.filename, filename);
             assert_eq!(staged.total_files, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn stages_a_file_above_the_former_per_file_segment_cap() {
+        const SEGMENTS: usize = 100_001;
+        let manager =
+            StagedUploadManager::with_timing(Duration::from_secs(60), Duration::from_secs(60));
+        let owner = CallerIdentity::Local([5; 32]);
+
+        let staged = manager
+            .stage_upload(owner, make_large_single_file_upload(SEGMENTS), None)
+            .await
+            .unwrap();
+
+        assert_eq!(staged.total_files, 1);
+        assert_eq!(staged.total_bytes, SEGMENTS as u64);
+        let entries = manager
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let preparation = entries[&staged.staged_upload_id]
+            .preparation
+            .as_ref()
+            .unwrap();
+        assert_eq!(preparation.spec.files[0].segments.len(), SEGMENTS);
     }
 
     #[tokio::test]

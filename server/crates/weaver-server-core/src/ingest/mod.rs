@@ -14,9 +14,9 @@ pub use metadata::{
 };
 pub use naming::{derive_release_name, strip_nzb_source_suffix};
 pub use persisted_nzb::{
-    PersistedNzbError, compress_nzb_bytes, decode_persisted_nzb_bytes, hash_persisted_nzb_bytes,
-    load_persisted_nzb_storage_bytes, parse_persisted_nzb_bytes,
-    persist_decoded_nzb_reader_to_zstd,
+    PersistedNzbError, PreparedPersistedNzb, compress_nzb_bytes, decode_persisted_nzb_bytes,
+    hash_persisted_nzb_bytes, load_persisted_nzb_storage_bytes, parse_and_hash_persisted_nzb_bytes,
+    parse_persisted_nzb_bytes, persist_decoded_nzb_reader_to_zstd,
 };
 pub use submission::{
     DuplicateBackfillReport, StagedSubmissionPreparation, SubmissionDuplicateOutcome,

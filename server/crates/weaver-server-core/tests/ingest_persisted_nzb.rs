@@ -1,5 +1,8 @@
+use std::io::{self, Cursor, Read};
+
 use weaver_server_core::ingest::{
-    hash_persisted_nzb_bytes, load_persisted_nzb_storage_bytes, parse_persisted_nzb_bytes,
+    hash_persisted_nzb_bytes, load_persisted_nzb_storage_bytes, parse_and_hash_persisted_nzb_bytes,
+    parse_persisted_nzb_bytes, persist_decoded_nzb_reader_to_zstd,
 };
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -30,9 +33,10 @@ fn parse_persisted_zstd_nzb_bytes() {
     let xml = minimal_nzb("persisted-zstd");
     let compressed = zstd::bulk::compress(xml.as_bytes(), 3).unwrap();
 
-    let nzb = parse_persisted_nzb_bytes(&compressed).unwrap();
+    let (nzb, raw_hash) = parse_and_hash_persisted_nzb_bytes(&compressed).unwrap();
 
     assert_eq!(nzb.files.len(), 1);
+    assert_eq!(raw_hash, finalize_blake3(xml.as_bytes()));
     assert_eq!(
         nzb.files[0].subject,
         "persisted-zstd - \"file.rar\" yEnc (1/1)"
@@ -43,9 +47,10 @@ fn parse_persisted_zstd_nzb_bytes() {
 fn parse_persisted_plain_nzb_bytes() {
     let xml = minimal_nzb("persisted-plain");
 
-    let nzb = parse_persisted_nzb_bytes(xml.as_bytes()).unwrap();
+    let (nzb, raw_hash) = parse_and_hash_persisted_nzb_bytes(xml.as_bytes()).unwrap();
 
     assert_eq!(nzb.files.len(), 1);
+    assert_eq!(raw_hash, finalize_blake3(xml.as_bytes()));
     assert_eq!(
         nzb.files[0].subject,
         "persisted-plain - \"file.rar\" yEnc (1/1)"
@@ -85,4 +90,57 @@ fn hash_persisted_nzb_bytes_matches_plain_and_zstd_storage() {
 
     assert_eq!(hash_persisted_nzb_bytes(xml.as_bytes()), expected);
     assert_eq!(hash_persisted_nzb_bytes(&compressed), expected);
+}
+
+struct ChunkedReader {
+    source: Cursor<Vec<u8>>,
+    chunk_size: usize,
+    bytes_read: usize,
+}
+
+impl Read for ChunkedReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let limit = buffer.len().min(self.chunk_size);
+        let read = self.source.read(&mut buffer[..limit])?;
+        self.bytes_read += read;
+        Ok(read)
+    }
+}
+
+#[test]
+fn decoded_reader_is_parsed_persisted_and_hashed_in_one_pass() {
+    let xml = minimal_nzb("one-pass").into_bytes();
+    let mut source = ChunkedReader {
+        source: Cursor::new(xml.clone()),
+        chunk_size: 7,
+        bytes_read: 0,
+    };
+
+    let prepared = persist_decoded_nzb_reader_to_zstd(&mut source).unwrap();
+
+    assert_eq!(source.bytes_read, xml.len());
+    assert_eq!(
+        zstd::stream::decode_all(Cursor::new(&prepared.nzb_zstd)).unwrap(),
+        xml
+    );
+    assert_eq!(prepared.nzb.files.len(), 1);
+    assert_eq!(prepared.raw_job_hash, finalize_blake3(&xml));
+}
+
+#[test]
+fn decoded_reader_preserves_source_io_errors() {
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("source failed"))
+        }
+    }
+
+    let result = persist_decoded_nzb_reader_to_zstd(&mut FailingReader);
+    assert!(matches!(
+        result,
+        Err(weaver_server_core::ingest::PersistedNzbError::Io(error))
+            if error.to_string() == "source failed"
+    ));
 }
