@@ -1740,6 +1740,26 @@ func maxBodyFetchCount(metrics restartNntpMetrics) int {
 	return max
 }
 
+// Articles the news server served again AFTER the restart point, and the extra
+// BODY commands that took.
+//
+// This is the measurement the durable-file restart cases actually want. A
+// whole-case fetch count also carries whatever the run did BEFORE the crash —
+// a direct-store set that demotes before it learns a layout refetches the
+// articles it had already consumed — and that says nothing about whether the
+// restart reused what was durable. Comparing the two snapshots isolates the
+// restart, which is the only thing these cases claim.
+func bodyFetchesSinceRestartPoint(before, after restartNntpMetrics) (ids int, extra int) {
+	for id, count := range after.BodyCounts {
+		grew := count - before.BodyCounts[id]
+		if grew > 0 {
+			ids++
+			extra += grew
+		}
+	}
+	return ids, extra
+}
+
 func repeatedBodyFetchStats(metrics restartNntpMetrics) (ids int, extra int) {
 	for _, count := range metrics.BodyCounts {
 		if count <= 1 {
@@ -2286,7 +2306,7 @@ func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCase
 	if err := ctx.waitForCrash(10 * time.Minute); err != nil {
 		return restartCaseResult{}, err
 	}
-	_, preFS, _, err := ctx.captureEvidence("pre_crash", "")
+	_, preFS, preMetrics, err := ctx.captureEvidence("pre_crash", "")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
@@ -2309,16 +2329,16 @@ func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCase
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	maxFetch := maxBodyFetchCount(metrics)
+	refetchedIDs, refetchedBodies := bodyFetchesSinceRestartPoint(preMetrics, metrics)
 	memberPresent := completeSnapshotContainsMember(postFS, memberName)
-	pass := statuses[jobID] == "COMPLETE" && memberPresent && maxFetch <= 1
+	pass := statuses[jobID] == "COMPLETE" && memberPresent && refetchedIDs == 0
 	return classifyRestartResult(
 		ctx.Profile,
 		pass,
-		fmt.Sprintf("lossy extraction restart retried from durable archive files and completed %s (partial=%s size=%d max BODY fetch count %d)", memberName, partialPath, partialSize, maxFetch),
+		fmt.Sprintf("lossy extraction restart retried from durable archive files and completed %s (partial=%s size=%d refetched articles %d bodies %d)", memberName, partialPath, partialSize, refetchedIDs, refetchedBodies),
 		false,
 		"",
-		fmt.Sprintf("lossy extraction restart failed (member=%s present=%v max BODY fetch count %d final=%s)", memberName, memberPresent, maxFetch, statuses[jobID]),
+		fmt.Sprintf("lossy extraction restart failed (member=%s present=%v refetched articles %d bodies %d final=%s)", memberName, memberPresent, refetchedIDs, refetchedBodies, statuses[jobID]),
 	), nil
 }
 
@@ -2333,7 +2353,7 @@ func runRarFinalizeReconcilesAfterRename(ctx *restartCaseContext) (restartCaseRe
 	if err := ctx.waitForCrash(12 * time.Minute); err != nil {
 		return restartCaseResult{}, err
 	}
-	_, preFS, _, err := ctx.captureEvidence("pre_crash", "")
+	_, preFS, preMetrics, err := ctx.captureEvidence("pre_crash", "")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
@@ -2356,16 +2376,16 @@ func runRarFinalizeReconcilesAfterRename(ctx *restartCaseContext) (restartCaseRe
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	maxFetch := maxBodyFetchCount(metrics)
+	refetchedIDs, refetchedBodies := bodyFetchesSinceRestartPoint(preMetrics, metrics)
 	memberPresent := completeSnapshotContainsMember(postFS, memberName)
-	pass := statuses[jobID] == "COMPLETE" && memberPresent && maxFetch <= 1
+	pass := statuses[jobID] == "COMPLETE" && memberPresent && refetchedIDs == 0
 	return classifyRestartResult(
 		ctx.Profile,
 		pass,
-		fmt.Sprintf("finalize-after-rename restart rediscovered durable archive files and completed %s (staged=%s size=%d max BODY fetch count %d)", memberName, stagedPath, stagedSize, maxFetch),
+		fmt.Sprintf("finalize-after-rename restart rediscovered durable archive files and completed %s (staged=%s size=%d refetched articles %d bodies %d)", memberName, stagedPath, stagedSize, refetchedIDs, refetchedBodies),
 		false,
 		"",
-		fmt.Sprintf("finalize-after-rename restart failed (member=%s present=%v max BODY fetch count %d final=%s)", memberName, memberPresent, maxFetch, statuses[jobID]),
+		fmt.Sprintf("finalize-after-rename restart failed (member=%s present=%v refetched articles %d bodies %d final=%s)", memberName, memberPresent, refetchedIDs, refetchedBodies, statuses[jobID]),
 	), nil
 }
 
@@ -2425,7 +2445,8 @@ func runStaleActiveExtractedRowsClearAfterRestart(ctx *restartCaseContext) (rest
 	if insertedCount == 0 {
 		return restartCaseResult{}, fmt.Errorf("expected stale active_extracted row before restart")
 	}
-	if _, _, _, err := ctx.captureEvidence("pre_crash", ""); err != nil {
+	_, _, preMetrics, err := ctx.captureEvidence("pre_crash", "")
+	if err != nil {
 		return restartCaseResult{}, err
 	}
 
@@ -2481,22 +2502,23 @@ func runStaleActiveExtractedRowsClearAfterRestart(ctx *restartCaseContext) (rest
 		return restartCaseResult{}, err
 	}
 
-	maxFetch := maxBodyFetchCount(metrics)
+	refetchedIDs, refetchedBodies := bodyFetchesSinceRestartPoint(preMetrics, metrics)
 	memberPresent := completeSnapshotContainsMember(postFS, staleMember.MemberName)
-	pass := statuses[jobID] == "COMPLETE" && postCount == 0 && memberPresent && maxFetch <= 1
+	pass := statuses[jobID] == "COMPLETE" && postCount == 0 && memberPresent && refetchedIDs == 0
 	return classifyRestartResult(
 		ctx.Profile,
 		pass,
 		fmt.Sprintf(
-			"stale extracted-member marker for %s was ignored until output validation succeeded (cleared_while_active=%v recovered_while_active=%v max BODY fetch count %d)",
+			"stale extracted-member marker for %s was ignored until output validation succeeded (cleared_while_active=%v recovered_while_active=%v refetched articles %d bodies %d)",
 			staleMember.MemberName,
 			clearedWhileActive,
 			recoveredWhileActive,
-			maxFetch,
+			refetchedIDs,
+			refetchedBodies,
 		),
 		false,
 		"",
-		fmt.Sprintf("stale active_extracted validation failed (member=%s present=%v post_count=%d max BODY fetch count %d final=%s cleared_while_active=%v recovered_while_active=%v)", staleMember.MemberName, memberPresent, postCount, maxFetch, statuses[jobID], clearedWhileActive, recoveredWhileActive),
+		fmt.Sprintf("stale active_extracted validation failed (member=%s present=%v post_count=%d refetched articles %d bodies %d final=%s cleared_while_active=%v recovered_while_active=%v)", staleMember.MemberName, memberPresent, postCount, refetchedIDs, refetchedBodies, statuses[jobID], clearedWhileActive, recoveredWhileActive),
 	), nil
 }
 
