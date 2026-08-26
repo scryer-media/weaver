@@ -108,11 +108,29 @@ using System.Runtime.InteropServices;
 public static class WeaverNativeWindow {
   [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
   public static extern IntPtr FindWindow(string className, string windowName);
+
+  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern IntPtr FindWindowEx(
+    IntPtr parent,
+    IntPtr childAfter,
+    string className,
+    string windowName
+  );
 }
 '@
   }
 
-  return [WeaverNativeWindow]::FindWindow("Shell_TrayWnd", $null) -ne [IntPtr]::Zero
+  $taskbar = [WeaverNativeWindow]::FindWindow("Shell_TrayWnd", $null)
+  if ($taskbar -eq [IntPtr]::Zero) {
+    return $false
+  }
+
+  return [WeaverNativeWindow]::FindWindowEx(
+    $taskbar,
+    [IntPtr]::Zero,
+    "TrayNotifyWnd",
+    $null
+  ) -ne [IntPtr]::Zero
 }
 
 function Get-MpCmdRun {
@@ -583,7 +601,7 @@ if (Test-InteractiveDesktop) {
     Restore-EnvVar -Name "WEAVER_ENCRYPTION_KEY" -Value $oldTrayEncryptionKey
   }
 } else {
-  Write-Log $msiLog "Skipping GUI tray startup smoke: no interactive desktop exists for this process session."
+  Write-Log $msiLog "Skipping GUI tray startup smoke: this process session has no usable notification area."
 }
 
 $msiExitCode = Invoke-MsiExec -Arguments @("/fa", $msiCopy, "/qn", "/norestart", "/l*v", $msiLog)
