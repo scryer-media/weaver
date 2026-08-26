@@ -568,7 +568,7 @@ mod tests {
         let error = NormalizedServerInput::from_input(input, None)
             .err()
             .expect("malformed certificate bytes must be rejected");
-        assert!(error.contains("valid base64 DER"));
+        assert!(error.contains("base64-encoded DER"));
     }
 
     #[test]
