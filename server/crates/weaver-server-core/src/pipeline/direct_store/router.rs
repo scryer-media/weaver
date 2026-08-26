@@ -639,6 +639,15 @@ enum StagedChunk {
     Scratch { offset: u64, len: u64 },
 }
 
+/// One region of the holds scratch that is still read from, and the staging
+/// slot whose offset has to follow it when the scratch is compacted.
+struct LiveScratchExtent {
+    scratch_offset: u64,
+    len: u64,
+    volume_index: u32,
+    chunk_offset: u64,
+}
+
 impl StagedChunk {
     fn len(&self) -> u64 {
         match self {
@@ -794,6 +803,51 @@ impl HoldsScratch {
         let offset = self.len;
         self.len = end;
         Ok(offset)
+    }
+
+    /// Rewrites the file so it holds only `live`, and returns each extent's new
+    /// offset.
+    ///
+    /// `live` must be disjoint and sorted ascending, which is what the router's
+    /// staging maps naturally yield: every append claims a fresh region and
+    /// trimming only ever narrows one.
+    ///
+    /// The rewrite is in place and strictly forward. The write cursor
+    /// accumulates live lengths only, while the extents it reads from also step
+    /// over the dead ones, so an extent's destination is never past its own
+    /// source and never lands on a source that has not been read yet. Copying
+    /// each extent front to back keeps that true inside an extent too.
+    ///
+    /// `None` means the file is now in an unknown state: the caller must
+    /// demote rather than trust any offset, including the ones it already had.
+    pub(super) fn compact(&mut self, live: &[(u64, u64)]) -> Option<Vec<u64>> {
+        const COPY_SLICE_BYTES: u64 = 1024 * 1024;
+
+        let file = std::sync::Arc::clone(self.file.as_ref()?);
+        let mut new_offsets = Vec::with_capacity(live.len());
+        let mut cursor = 0u64;
+        for (offset, len) in live.iter().copied() {
+            if cursor > offset {
+                // The caller handed extents that are not disjoint or not
+                // sorted. Refusing is the only safe answer.
+                return None;
+            }
+            if cursor < offset {
+                let mut copied = 0u64;
+                while copied < len {
+                    let take = COPY_SLICE_BYTES.min(len - copied);
+                    let mut buffer = vec![0u8; take as usize];
+                    read_at(&file, offset.saturating_add(copied), &mut buffer).ok()?;
+                    write_at(&file, cursor.saturating_add(copied), &buffer).ok()?;
+                    copied += take;
+                }
+            }
+            new_offsets.push(cursor);
+            cursor = cursor.checked_add(len)?;
+        }
+        file.set_len(cursor).ok()?;
+        self.len = cursor;
+        Some(new_offsets)
     }
 
     pub(super) fn read(&self, offset: u64, len: u64) -> Option<Vec<u8>> {
@@ -2022,7 +2076,19 @@ impl DirectSetRouter {
                 Some(StagedChunk::Memory(bytes)) => std::sync::Arc::clone(bytes),
                 _ => continue,
             };
-            let scratch_offset = self.scratch.append(&bytes)?;
+            let scratch_offset = match self.scratch.append(&bytes) {
+                Ok(offset) => offset,
+                // A ceiling breach is not automatically a full scratch: reclaim
+                // what placed holds left behind and try the append once more.
+                // Only a scratch that is genuinely full demotes the set.
+                Err(DemotionReason::HoldsScratchCeiling) => {
+                    if !self.compact_scratch()? {
+                        return Err(DemotionReason::HoldsScratchCeiling);
+                    }
+                    self.scratch.append(&bytes)?
+                }
+                Err(reason) => return Err(reason),
+            };
             if let Some(staging) = self.staging.get_mut(&volume_index) {
                 staging.chunks.insert(
                     offset,
@@ -2047,6 +2113,74 @@ impl DirectSetRouter {
         self.staging.values().fold(0u64, |total, staging| {
             total.saturating_add(staging.resident_bytes())
         })
+    }
+
+    /// Every scratch extent the set still reads from, ascending by scratch
+    /// offset, tagged with the staging slot that points at it.
+    fn live_scratch_extents(&self) -> Vec<LiveScratchExtent> {
+        let mut extents: Vec<LiveScratchExtent> = self
+            .staging
+            .iter()
+            .flat_map(|(volume_index, staging)| {
+                staging
+                    .chunks
+                    .iter()
+                    .filter_map(move |(chunk_offset, chunk)| match chunk {
+                        StagedChunk::Scratch { offset, len } => Some(LiveScratchExtent {
+                            scratch_offset: *offset,
+                            len: *len,
+                            volume_index: *volume_index,
+                            chunk_offset: *chunk_offset,
+                        }),
+                        StagedChunk::Memory(_) => None,
+                    })
+            })
+            .collect();
+        extents.sort_unstable_by_key(|extent| extent.scratch_offset);
+        extents
+    }
+
+    /// Reclaims the scratch space that placed holds left behind.
+    ///
+    /// The scratch is an append-only log. A paged chunk that later gets routed
+    /// and placed drops out of `staging`, but the region it occupied stays
+    /// inside the file's extent and keeps counting against the ceiling. A set
+    /// that pages, places, and pages again therefore reaches the ceiling while
+    /// holding far less than the ceiling — and demoting there means
+    /// materializing and possibly refetching a set that had room all along.
+    ///
+    /// `Ok(false)` means there was nothing to reclaim, so the breach is real.
+    /// `Err` means the rewrite failed partway and no offset can be trusted.
+    fn compact_scratch(&mut self) -> Result<bool, DemotionReason> {
+        let extents = self.live_scratch_extents();
+        let live_bytes = extents
+            .iter()
+            .fold(0u64, |total, extent| total.saturating_add(extent.len));
+        if live_bytes >= self.scratch.bytes() {
+            return Ok(false);
+        }
+
+        let ranges: Vec<(u64, u64)> = extents
+            .iter()
+            .map(|extent| (extent.scratch_offset, extent.len))
+            .collect();
+        let new_offsets = self
+            .scratch
+            .compact(&ranges)
+            .ok_or(DemotionReason::HoldsScratchFailed)?;
+
+        for (extent, scratch_offset) in extents.into_iter().zip(new_offsets) {
+            if let Some(staging) = self.staging.get_mut(&extent.volume_index) {
+                staging.chunks.insert(
+                    extent.chunk_offset,
+                    StagedChunk::Scratch {
+                        offset: scratch_offset,
+                        len: extent.len,
+                    },
+                );
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn plan(&self) -> &DirectSetPlan {

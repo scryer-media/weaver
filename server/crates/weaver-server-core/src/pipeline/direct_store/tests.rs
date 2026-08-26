@@ -4525,6 +4525,74 @@ fn holds_scratch_refuses_an_append_past_its_ceiling() {
 }
 
 #[test]
+fn holds_scratch_compaction_reclaims_what_placed_holds_left_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".weaver-holds.silver.horizon.f0");
+    let mut scratch = HoldsScratch::new(path, 64);
+
+    let first = scratch.append(b"aaaa").unwrap();
+    let _placed = scratch.append(b"bbbbbb").unwrap();
+    let third = scratch.append(b"cccc").unwrap();
+    assert_eq!(scratch.bytes(), 14);
+
+    // The middle run was routed and placed, so nothing points at it any more.
+    let new_offsets = scratch.compact(&[(first, 4), (third, 4)]).unwrap();
+
+    assert_eq!(
+        new_offsets,
+        vec![0, 4],
+        "the survivors are packed to the front in the order they were given"
+    );
+    assert_eq!(
+        scratch.bytes(),
+        8,
+        "and the append cursor drops to what is actually live, which is the whole point"
+    );
+    assert_eq!(scratch.read(0, 4).as_deref(), Some(&b"aaaa"[..]));
+    assert_eq!(
+        scratch.read(4, 4).as_deref(),
+        Some(&b"cccc"[..]),
+        "a moved run reads back byte-identically at its new offset"
+    );
+}
+
+#[test]
+fn holds_scratch_compaction_moves_runs_larger_than_one_copy_slice() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".weaver-holds.silver.horizon.f0");
+    let live: Vec<u8> = (0..3_000_000u32).map(|index| (index % 251) as u8).collect();
+    let mut scratch = HoldsScratch::new(path, 8 * 1024 * 1024);
+
+    scratch.append(b"dead").unwrap();
+    let survivor = scratch.append(&live).unwrap();
+
+    let new_offsets = scratch.compact(&[(survivor, live.len() as u64)]).unwrap();
+
+    assert_eq!(new_offsets, vec![0]);
+    assert_eq!(scratch.bytes(), live.len() as u64);
+    assert_eq!(
+        scratch.read(0, live.len() as u64).as_deref(),
+        Some(live.as_slice()),
+        "a run that crosses several copy slices survives the move intact, and the copy \
+         runs front to back so the overlapping source is never clobbered"
+    );
+}
+
+#[test]
+fn holds_scratch_compaction_refuses_extents_it_cannot_pack_safely() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".weaver-holds.silver.horizon.f0");
+    let mut scratch = HoldsScratch::new(path, 64);
+    scratch.append(b"aaaabbbb").unwrap();
+
+    assert_eq!(
+        scratch.compact(&[(4, 4), (0, 4)]),
+        None,
+        "out-of-order extents would have the pack overwrite a source it has not read"
+    );
+}
+
+#[test]
 fn a_scratch_that_never_appended_a_byte_leaves_nothing_behind() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(".weaver-holds.silver.horizon.f0");

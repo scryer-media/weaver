@@ -3017,6 +3017,60 @@ async fn a_set_that_paged_its_holds_still_one_passes_byte_identically() {
     );
 }
 
+/// A ceiling breach is not the same thing as a full scratch.
+///
+/// The scratch is an append-only log, so a hold that gets placed leaves its
+/// region behind: a set that pages, places, and pages again walks the cursor up
+/// to the ceiling while holding almost nothing. Reclaiming that space is what
+/// keeps such a set from demoting — and demotion here is expensive, because it
+/// materializes the volumes and can refetch them.
+#[tokio::test]
+async fn a_reclaimable_scratch_breach_spills_instead_of_demoting() {
+    let member_name = "Silver.Horizon.S01E15.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 149) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    // Each volume's payload before its own header, so every volume pages its
+    // hold and then has it placed before the next one arrives.
+    let arrivals = [(0u32, 1u32), (0, 0), (1, 1), (1, 0), (2, 1), (2, 0)];
+
+    // Room for one volume's held payload but not two in sequence: the second
+    // page only fits once the first volume's placed region is reclaimed.
+    let direct = run_direct_store_gate_with_ceilings(
+        DirectStoreGate::Enabled,
+        Some(64),
+        Some(600),
+        JobId(41055),
+        member_name,
+        &volumes,
+        &arrivals,
+    )
+    .await;
+    let conventional = run_direct_store_gate_with_budget(
+        DirectStoreGate::Disabled,
+        None,
+        JobId(41056),
+        member_name,
+        &volumes,
+        &arrivals,
+    )
+    .await;
+
+    assert!(
+        !direct.volume_file_seen,
+        "the set must have stayed direct: a demotion materializes the volumes"
+    );
+    assert_eq!(
+        (direct.member, direct.member_location, direct.status),
+        (
+            conventional.member,
+            conventional.member_location,
+            conventional.status
+        ),
+        "and a set that reclaimed its scratch must still match the conventional extractor \
+         exactly"
+    );
+}
+
 /// The scratch ceiling is the last lever: past it there is nowhere left to put
 /// the holds, and the set demotes with its own reason rather than the RAM one.
 #[tokio::test]
