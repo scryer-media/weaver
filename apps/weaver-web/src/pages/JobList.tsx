@@ -84,6 +84,10 @@ import {
   useLiveSpeed,
 } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
+import {
+  extractionPresentationStatus,
+  useExtractionVisibility,
+} from "@/lib/hooks/use-extraction-visibility";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
@@ -102,6 +106,8 @@ import { cn } from "@/lib/utils";
 type QueueStatusFilter =
   | "QUEUED"
   | "DOWNLOADING"
+  | "FETCHING_REPAIR_DATA"
+  | "FINALIZING_DOWNLOAD"
   | "PAUSED"
   | "VERIFYING"
   | "REPAIRING"
@@ -192,6 +198,8 @@ const QUEUE_TABLE_PREFERENCES_KEY = "weaver.queue.table.preferences.v5";
 const QUEUE_STATUS_OPTIONS: QueueStatusFilter[] = [
   "QUEUED",
   "DOWNLOADING",
+  "FETCHING_REPAIR_DATA",
+  "FINALIZING_DOWNLOAD",
   "PAUSED",
   "VERIFYING",
   "REPAIRING",
@@ -200,14 +208,7 @@ const QUEUE_STATUS_OPTIONS: QueueStatusFilter[] = [
   "MOVING",
 ];
 const QUEUE_PRIORITY_OPTIONS: QueuePriorityFilter[] = ["HIGH", "NORMAL", "LOW"];
-const QUEUE_ACTIVE_STATUSES: QueueStatusFilter[] = [
-  "DOWNLOADING",
-  "VERIFYING",
-  "REPAIRING",
-  "EXTRACTING",
-  "POST_PROCESSING",
-  "MOVING",
-];
+const QUEUE_ACTIVE_STATUSES = QUEUE_STATUS_OPTIONS.filter(isActiveStatus);
 const NO_CATEGORY_SELECT_VALUE = "__no_category__";
 
 type QueueLayout = "table" | "compact";
@@ -414,16 +415,28 @@ const QueueNameCell = memo(function QueueNameCell({
 
 const QueueStatusCell = memo(function QueueStatusCell({
   status,
+  phaseProgress,
   blockedByIspCap,
   bandwidthCapLabel,
 }: {
   status: JobData["status"];
+  phaseProgress: JobData["phaseProgress"];
   blockedByIspCap: boolean;
   bandwidthCapLabel: string;
 }) {
+  const extractionVisible = useExtractionVisibility(phaseProgress);
+  const visibleStatus = extractionPresentationStatus(
+    status,
+    phaseProgress,
+    extractionVisible,
+  );
   return (
     <div className="flex flex-col items-center gap-1 text-center">
-      <JobStatusBadgeGroup statuses={getJobStages({ status })} compact className="justify-center" />
+      <JobStatusBadgeGroup
+        statuses={getJobStages({ status: visibleStatus })}
+        compact
+        className="justify-center"
+      />
       {blockedByIspCap ? (
         <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-status-paused">
           {bandwidthCapLabel}
@@ -433,15 +446,54 @@ const QueueStatusCell = memo(function QueueStatusCell({
   );
 });
 
+const QueueCompactStatusDots = memo(function QueueCompactStatusDots({
+  job,
+}: {
+  job: QueueRowData;
+}) {
+  const extractionVisible = useExtractionVisibility(job.phaseProgress);
+  const visibleStatus = extractionPresentationStatus(
+    job.status,
+    job.phaseProgress,
+    extractionVisible,
+  );
+  const stages = getJobStages({ status: visibleStatus });
+
+  return (
+    <span className="flex shrink-0 items-center gap-0.5">
+      {stages.map((stage, index) => (
+        <span
+          key={`${stage}-${index}`}
+          title={index === 0 ? job.statusLabel : undefined}
+          className={cn(
+            "size-2 rounded-pill",
+            STATUS_BG_CLASS[statusToken(stage)],
+            isActiveStatus(stage) && "animate-status-pulse",
+          )}
+        />
+      ))}
+    </span>
+  );
+});
+
 const QueueProgressCell = memo(function QueueProgressCell({
   phaseProgress,
+  status,
+  progress,
 }: {
   phaseProgress: JobData["phaseProgress"];
+  status: JobData["status"];
+  progress: JobData["progress"];
 }) {
   return (
     <div className="flex justify-center">
       <div className="w-full max-w-[176px]">
-        <JobPhaseProgressBars phaseProgress={phaseProgress} compact />
+        <JobPhaseProgressBars
+          phaseProgress={phaseProgress}
+          status={status}
+          progress={progress}
+          compact
+        />
       </div>
     </div>
   );
@@ -548,6 +600,10 @@ function queueStatusLabel(status: QueueStatusFilter, t: ReturnType<typeof useTra
       return t("status.queued");
     case "DOWNLOADING":
       return t("status.downloading");
+    case "FETCHING_REPAIR_DATA":
+      return t("status.fetchingRepairData");
+    case "FINALIZING_DOWNLOAD":
+      return t("timeline.finalizingDownload");
     case "PAUSED":
       return t("status.paused");
     case "VERIFYING":
@@ -1244,6 +1300,7 @@ export function JobList() {
         cell: ({ row }) => (
           <QueueStatusCell
             status={row.original.status}
+            phaseProgress={row.original.phaseProgress}
             blockedByIspCap={row.original.blockedByIspCap}
             bandwidthCapLabel={t("jobs.bandwidthCapShort")}
           />
@@ -1322,7 +1379,11 @@ export function JobList() {
           />
         ),
         cell: ({ row }) => (
-          <QueueProgressCell phaseProgress={row.original.phaseProgress} />
+          <QueueProgressCell
+            phaseProgress={row.original.phaseProgress}
+            status={row.original.status}
+            progress={row.original.progress}
+          />
         ),
         meta: {
           headerClassName: "h-7 w-[188px] px-2 text-center",
@@ -2063,7 +2124,6 @@ export function JobList() {
               <div className="max-h-[70vh] overflow-y-auto border-t border-border">
                 {queueTable.getRowModel().rows.map((row) => {
                   const job = row.original;
-                  const stages = getJobStages({ status: job.status });
                   return (
                     <div
                       key={row.id}
@@ -2076,19 +2136,7 @@ export function JobList() {
                           onCheckedChange={(value) => row.toggleSelected(value === true)}
                         />
                       </div>
-                      <span className="flex shrink-0 items-center gap-0.5">
-                        {stages.map((stage, index) => (
-                          <span
-                            key={`${stage}-${index}`}
-                            title={index === 0 ? job.statusLabel : undefined}
-                            className={cn(
-                              "size-2 rounded-pill",
-                              STATUS_BG_CLASS[statusToken(stage)],
-                              isActiveStatus(stage) && "animate-status-pulse",
-                            )}
-                          />
-                        ))}
-                      </span>
+                      <QueueCompactStatusDots job={job} />
                       <div className="min-w-0 flex-[1.6]">
                         <Link
                           to={`/jobs/${job.id}`}
@@ -2099,7 +2147,12 @@ export function JobList() {
                         </Link>
                       </div>
                       <div className="hidden min-w-[130px] flex-1 sm:block">
-                        <JobPhaseProgressBars compact phaseProgress={job.phaseProgress} />
+                        <JobPhaseProgressBars
+                          compact
+                          phaseProgress={job.phaseProgress}
+                          progress={job.progress}
+                          status={job.status}
+                        />
                       </div>
                       <span className="hidden w-16 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground md:block">
                         {job.etaDisplay}

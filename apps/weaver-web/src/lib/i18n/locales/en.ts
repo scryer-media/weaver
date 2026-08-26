@@ -49,6 +49,7 @@ const en: LocaleDictionary = {
   // Status labels
   "status.queued": "Queued",
   "status.downloading": "Downloading",
+  "status.fetchingRepairData": "Fetching repair data",
   "status.verifying": "Verifying",
   "status.repairing": "Repairing",
   "status.extracting": "Extracting",

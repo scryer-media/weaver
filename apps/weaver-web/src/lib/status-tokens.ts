@@ -27,6 +27,8 @@ const STATUS_TO_TOKEN: Record<string, StatusToken> = {
   QUEUED_REPAIR: "queued",
   QUEUED_EXTRACT: "queued",
   DOWNLOADING: "downloading",
+  FETCHING_REPAIR_DATA: "repairing",
+  FINALIZING_DOWNLOAD: "downloading",
   PAUSED: "paused",
   CHECKING: "verifying",
   VERIFYING: "verifying",
@@ -48,6 +50,8 @@ const STATUS_TO_I18N_KEY: Record<string, string> = {
   QUEUED_REPAIR: "status.queued",
   QUEUED_EXTRACT: "status.queued",
   DOWNLOADING: "status.downloading",
+  FETCHING_REPAIR_DATA: "status.fetchingRepairData",
+  FINALIZING_DOWNLOAD: "timeline.finalizingDownload",
   PAUSED: "status.paused",
   CHECKING: "status.verifying",
   VERIFYING: "status.verifying",
@@ -65,6 +69,8 @@ const STATUS_TO_I18N_KEY: Record<string, string> = {
 
 const ACTIVE_STATUSES = new Set([
   "DOWNLOADING",
+  "FETCHING_REPAIR_DATA",
+  "FINALIZING_DOWNLOAD",
   "CHECKING",
   "VERIFYING",
   "REPAIRING",
@@ -76,6 +82,7 @@ const ACTIVE_STATUSES = new Set([
 
 const INDETERMINATE_STATUSES = new Set([
   "CHECKING",
+  "FETCHING_REPAIR_DATA",
   "VERIFYING",
   "REPAIRING",
   "QUEUED_REPAIR",

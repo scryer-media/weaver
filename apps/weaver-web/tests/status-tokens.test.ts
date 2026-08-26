@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { statusI18nKey, statusToken } from "../src/lib/status-tokens.ts";
+import { isActiveStatus, statusI18nKey, statusToken } from "../src/lib/status-tokens.ts";
 
 test("every queue API state has an explicit first-party presentation", () => {
   const cases = [
     ["QUEUED", "queued", "status.queued"],
     ["DOWNLOADING", "downloading", "status.downloading"],
+    ["FETCHING_REPAIR_DATA", "repairing", "status.fetchingRepairData"],
+    ["FINALIZING_DOWNLOAD", "downloading", "timeline.finalizingDownload"],
     ["CHECKING", "verifying", "status.verifying"],
     ["VERIFYING", "verifying", "status.verifying"],
     ["REPAIRING", "repairing", "status.repairing"],
@@ -21,4 +23,9 @@ test("every queue API state has an explicit first-party presentation", () => {
     assert.equal(statusToken(status), token);
     assert.equal(statusI18nKey(status), key);
   }
+});
+
+test("synthetic download stages remain part of the active queue filter", () => {
+  assert.equal(isActiveStatus("FETCHING_REPAIR_DATA"), true);
+  assert.equal(isActiveStatus("FINALIZING_DOWNLOAD"), true);
 });

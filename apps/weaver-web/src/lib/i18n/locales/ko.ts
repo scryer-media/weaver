@@ -13,6 +13,7 @@ const ko: LocaleDictionary = {
   // Status labels
   "status.queued": "대기 중",
   "status.downloading": "다운로드 중",
+  "status.fetchingRepairData": "복구 데이터 가져오는 중",
   "status.verifying": "검증 중",
   "status.repairing": "복구 중",
   "status.extracting": "추출 중",

@@ -13,6 +13,7 @@ const es: LocaleDictionary = {
   // Status labels
   "status.queued": "En cola",
   "status.downloading": "Descargando",
+  "status.fetchingRepairData": "Obteniendo datos de reparación",
   "status.verifying": "Verificando",
   "status.repairing": "Reparando",
   "status.extracting": "Extrayendo",

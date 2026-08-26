@@ -13,6 +13,7 @@ const it: LocaleDictionary = {
   // Status labels
   "status.queued": "In coda",
   "status.downloading": "Download in corso",
+  "status.fetchingRepairData": "Recupero dei dati di riparazione",
   "status.verifying": "Verifica in corso",
   "status.repairing": "Riparazione in corso",
   "status.extracting": "Estrazione in corso",
