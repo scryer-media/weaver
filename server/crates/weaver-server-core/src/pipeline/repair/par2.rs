@@ -1981,6 +1981,11 @@ impl Pipeline {
         }
         self.refresh_par2_md5_substitution_bindings(job_id);
 
+        // The descriptions just parsed are the only place an obfuscated post's
+        // real volume names exist, so this is the moment direct-store can arm
+        // admission for the sets the spec's filenames could not name.
+        self.arm_direct_identity_admission(job_id).await;
+
         let _ = self
             .event_tx
             .send(PipelineEvent::Par2MetadataLoaded { job_id });

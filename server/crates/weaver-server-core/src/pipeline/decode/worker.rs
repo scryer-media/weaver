@@ -1659,11 +1659,39 @@ impl Pipeline {
             // [`Self::handle_decode_success`] before this seam is reached, so
             // by the time control arrives here the set is already demoted and
             // its volumes are back on the conventional path.
-            let direct_target = if encoding.is_uu() {
+            let mut direct_target = if encoding.is_uu() {
                 None
             } else {
                 self.direct_route_target(file_id)
             };
+            // The identity half of the seam: a job whose spec named no
+            // candidate sets may still have armed rosters from its PAR2
+            // descriptions, and an offset-zero article is the one moment a
+            // file can prove which described volume it is — with the decoded
+            // bytes in hand, before any of them are written anywhere.
+            if direct_target.is_none() && !encoding.is_uu() {
+                direct_target = self
+                    .direct_identity_route_target(file_id, file_offset)
+                    .await;
+                if let Some(DirectFileTarget::Route {
+                    set_index,
+                    volume_index,
+                }) = direct_target
+                {
+                    // A fresh binding may find this file's later articles
+                    // already parked in the reorder stage — decode order
+                    // within a file is not arrival order. They belong to the
+                    // routed volume now, and reclaiming them here is what
+                    // lets a file bind at its offset-zero article no matter
+                    // how many of its neighbours decoded first.
+                    self.reclaim_parked_segments_for_identity_bind(
+                        file_id,
+                        set_index,
+                        volume_index,
+                    )
+                    .await;
+                }
+            }
 
             // A successfully routed source article leaves the conventional
             // path here, before the write reorder buffer and its legacy file
@@ -2142,6 +2170,11 @@ impl Pipeline {
             self.remove_empty_write_buffer(file_id);
             return Ok(());
         }
+        // Bytes are leaving the reorder stage for a conventional file. THIS is
+        // the moment the file stops being bindable to an identity set — not
+        // the routing decision above, which parks out-of-order segments in
+        // memory where a later offset-zero binding can still reclaim them.
+        self.note_identity_conventional_segment(file_id).await;
         let _profile_scope = crate::runtime::perf_probe::scope("download.persist_ready_segments");
 
         let Some((_job_id, filename, _working_dir, file_path)) =
@@ -2283,6 +2316,10 @@ impl Pipeline {
             self.remove_empty_write_buffer(file_id);
             return Ok(());
         }
+        // The pressure escape writes parked bytes to disk out of order, which
+        // is exactly as final as the sequential drain: the file can no longer
+        // be reclaimed into an identity binding.
+        self.note_identity_conventional_segment(file_id).await;
 
         for _ in 0..segments.len() {
             crate::runtime::perf_probe::record(

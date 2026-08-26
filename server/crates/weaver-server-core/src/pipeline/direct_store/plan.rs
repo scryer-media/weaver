@@ -52,6 +52,43 @@ impl AdmissionRefusal {
     }
 }
 
+/// The facts an **identity-admitted** plan carries instead of a complete
+/// volume map.
+///
+/// A set admitted from the NZB's filenames knows its whole volume-to-file
+/// mapping before a byte lands, so `volumes` is dense from the start and its
+/// length doubles as the set's volume count. A set admitted from PAR2
+/// *descriptions* — an obfuscated post, whose real names live only inside the
+/// recovery set — knows the opposite halves: the roster (how many volumes, and
+/// each one's content fingerprint) is complete up front, while the mapping to
+/// NZB files can only be learned file by file, as each file's first decoded
+/// bytes are matched against the roster. These two fields keep the questions
+/// "how many volumes does this set have" and "which files have been mapped"
+/// answerable separately while the mapping grows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IdentityPlanFacts {
+    /// Total volumes the set has, once that is knowable. `volumes` is
+    /// complete — and the set may finalize — only once it reaches this
+    /// length.
+    ///
+    /// `Some` from admission for a PAR2-described set: the recovery set
+    /// enumerates every volume up front. `None` for a set admitted from the
+    /// volumes' own RAR5 headers: nothing in the format states the count
+    /// until the final volume's end-of-archive record is parsed, and only
+    /// [`Self::close`] — fed from exactly that parse — supplies it. An open
+    /// set can bind and route but never finalize.
+    pub(crate) expected_volumes: Option<u32>,
+    /// The set's per-job path discriminator, pinned at admission.
+    ///
+    /// The name-admitted derivation — the lowest mapped NZB file index — is
+    /// unusable here: the mapping grows, so its minimum can *decrease* after
+    /// envelopes and partials have already been created under a larger one,
+    /// splitting one set's working files across two suffixes. The first bound
+    /// file's index is stable by construction, so it is captured once and
+    /// carried.
+    pub(crate) discriminator: u32,
+}
+
 /// One admitted archive set: its identity, its volume-to-file mapping, and the
 /// **two** roots its derived paths hang off.
 ///
@@ -83,10 +120,14 @@ impl AdmissionRefusal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirectSetPlan {
     pub(crate) set_name: String,
-    /// Volume index to NZB file index. Dense from zero.
+    /// Volume index to NZB file index. Dense from zero for a name-admitted
+    /// set; for an identity-admitted set it grows toward
+    /// [`IdentityPlanFacts::expected_volumes`] as files are matched.
     pub(crate) volumes: BTreeMap<u32, u32>,
     /// NZB file index to volume index — the direction the decode seam asks in.
     pub(crate) files: HashMap<u32, u32>,
+    /// `Some` for a set admitted from PAR2 descriptions rather than filenames.
+    pub(crate) identity: Option<IdentityPlanFacts>,
     /// The job's intermediate directory: envelopes, holds scratch, repair
     /// scratch, and the volume files a demotion reconstructs.
     pub(crate) working_dir: PathBuf,
@@ -160,6 +201,7 @@ impl DirectSetPlan {
                 set_name,
                 volumes,
                 files,
+                identity: None,
                 working_dir: working_dir.to_path_buf(),
                 destination_dir: destination_dir.to_path_buf(),
             });
@@ -213,7 +255,87 @@ impl DirectSetPlan {
     /// gates pass over its own buffers — silent mixed bytes on a PAR2-less set,
     /// which is exactly the set direct-store exists for.
     fn set_discriminator(&self) -> u32 {
+        // Identity-admitted sets pin theirs at admission — see
+        // [`IdentityPlanFacts::discriminator`] for why the derived minimum
+        // cannot be used while the mapping is still growing.
+        if let Some(identity) = &self.identity {
+            return identity.discriminator;
+        }
         self.volumes.values().min().copied().unwrap_or_default()
+    }
+
+    /// How many volumes the set has, whether or not they are all mapped yet —
+    /// `None` while an identity set is still open (its count not yet
+    /// learnable; see [`IdentityPlanFacts::expected_volumes`]).
+    ///
+    /// Every "is the set whole" comparison must use this rather than
+    /// `volumes.len()`: for an identity-admitted set the mapping trails the
+    /// full set, and counting mapped volumes would let two bound volumes of
+    /// an 83-volume set read as a complete archive. `None` compares whole to
+    /// nothing, which is exactly right for an open set.
+    pub(crate) fn expected_volume_count(&self) -> Option<usize> {
+        match self.identity {
+            Some(identity) => identity.expected_volumes.map(|count| count as usize),
+            None => Some(self.volumes.len()),
+        }
+    }
+
+    /// Closes an open identity set at `expected` volumes, learned from the
+    /// final volume's own end-of-archive record.
+    ///
+    /// `false` when the count contradicts what is already bound — a mapped
+    /// volume at or past the claimed end — or restates a different count than
+    /// an earlier close. The caller treats that as the headers and the
+    /// bindings describing different archives, which demotes.
+    pub(crate) fn close_identity_roster(&mut self, expected: u32) -> bool {
+        let Some(identity) = self.identity.as_mut() else {
+            return false;
+        };
+        match identity.expected_volumes {
+            Some(existing) => existing == expected,
+            None => {
+                if self
+                    .volumes
+                    .keys()
+                    .next_back()
+                    .is_some_and(|highest| *highest >= expected)
+                {
+                    return false;
+                }
+                identity.expected_volumes = Some(expected);
+                true
+            }
+        }
+    }
+
+    /// Records one file-to-volume binding an identity match established.
+    ///
+    /// Refused when either side is already taken with a different partner —
+    /// the caller treats that as evidence the identity view and the routed
+    /// bytes disagree, which demotes the set rather than reconciling.
+    pub(crate) fn bind_identity_volume(&mut self, volume_index: u32, file_index: u32) -> bool {
+        if self.identity.is_none() {
+            return false;
+        }
+        // A closed set's end is a fact: a binding at or past it means the
+        // evidence that placed this file and the evidence that closed the set
+        // cannot both be true.
+        if self
+            .identity
+            .and_then(|identity| identity.expected_volumes)
+            .is_some_and(|expected| volume_index >= expected)
+        {
+            return false;
+        }
+        match (self.volumes.get(&volume_index), self.files.get(&file_index)) {
+            (None, None) => {
+                self.volumes.insert(volume_index, file_index);
+                self.files.insert(file_index, volume_index);
+                true
+            }
+            (Some(existing_file), _) if *existing_file == file_index => true,
+            _ => false,
+        }
     }
 
     pub(crate) fn envelope_relative_path(&self, volume_index: u32) -> String {

@@ -348,6 +348,30 @@ pub(crate) enum DemotionReason {
     /// good; the filesystem refused the rename, so the set is rebuilt the
     /// ordinary way rather than left half-committed.
     FinalizationFailed,
+    /// An identity-admitted set's remaining roster volumes can no longer be
+    /// claimed by any file.
+    ///
+    /// The roster is complete at admission — the recovery set describes every
+    /// volume — but the file mapping is only established as each file's first
+    /// decoded bytes match a described fingerprint. A file whose bytes took the
+    /// conventional path before it could be matched, or whose matching window
+    /// never arrived intact, leaves its volume unclaimable forever, and an
+    /// identity set with an unclaimable volume is exactly a starved set: it
+    /// never finalizes, never demotes on its own, and keeps suppressing the
+    /// archive probe. Demoting hands the bound volumes back through the
+    /// ordinary materialization and lets the conventional path — which is
+    /// already writing the unclaimed files — own the whole set.
+    IdentityRosterUnfillable,
+    /// An identity-bound volume's own headers declare a different volume
+    /// number than the binding assigned.
+    ///
+    /// The binding evidence is a content fingerprint, so a disagreement means
+    /// the fingerprint and the headers describe different files — a hostile
+    /// post, or identity metadata that lies about its own set. Either way the
+    /// layout must not adopt members from the claimed position; demoting
+    /// hands everything to the conventional path, whose extractor orders
+    /// volumes by reading them.
+    IdentityVolumeMismatch,
 }
 
 /// The ineligibility reasons this module distinguishes in metrics. The
@@ -423,6 +447,8 @@ impl DemotionReason {
             Self::DestinationWriteFailed => "destination_write_failed",
             Self::SparseMarkFailed => "sparse_mark_failed",
             Self::FinalizationFailed => "finalization_failed",
+            Self::IdentityRosterUnfillable => "identity_roster_unfillable",
+            Self::IdentityVolumeMismatch => "identity_volume_mismatch",
         }
     }
 }
@@ -2027,6 +2053,14 @@ impl DirectSetRouter {
         &self.plan
     }
 
+    /// Records one identity binding on the plan. The router keeps no per-volume
+    /// state ahead of a volume's first bytes — every internal map is guarded by
+    /// `plan.volumes.contains_key` and fills lazily — so growing the mapping
+    /// here needs no cache invalidation.
+    pub(crate) fn bind_identity_volume(&mut self, volume_index: u32, file_index: u32) -> bool {
+        self.plan.bind_identity_volume(volume_index, file_index)
+    }
+
     /// Lowers the holds ceiling so a test can breach it without staging tens of
     /// megabytes.
     #[cfg(test)]
@@ -2901,6 +2935,48 @@ impl DirectSetRouter {
         // is craftable. Nothing may enter the layout on that evidence.
         self.refuse_quick_open_derived_facts(volume_index, &facts, source)?;
 
+        // For an identity-admitted set only: the volume's own headers get a
+        // vote on the binding. A fingerprint match placed this file at
+        // `volume_index`; a RAR5 volume states its number in its main header
+        // and a numbered RAR4 set states it in its end record, and a *declared*
+        // number that disagrees means the identity evidence and the archive
+        // disagree about what this file is. Nothing can reconcile that — one
+        // of them is describing a different file — so the set demotes before
+        // the layout adopts a member from the wrong position. An absent number
+        // parses as zero and stays silent (every unnumbered RAR4 volume would
+        // otherwise demote), with one exception the format guarantees: a RAR5
+        // *set member* always declares a nonzero number past the first volume,
+        // so zero under a nonzero binding is itself a disagreement.
+        if self.plan.identity.is_some() {
+            let declared_disagrees =
+                facts.volume_number != volume_index && facts.volume_number != 0;
+            let rar5_missing_number = facts.archive_format() == ArchiveFormat::Rar5
+                && facts.is_volume
+                && facts.volume_number == 0
+                && volume_index != 0;
+            if declared_disagrees || rar5_missing_number {
+                return Err(self.fail(DemotionReason::IdentityVolumeMismatch));
+            }
+            // A RAR5 parse that reached the end-of-archive record and found
+            // no "more volumes follow" has read the set's own statement of
+            // its size: this volume is the last, so the set has
+            // `volume_index + 1` volumes. For a header-admitted set that is
+            // the one place the count exists and what closes the open plan;
+            // for a PAR2-described set it is a free cross-check against the
+            // roster's count. A close that contradicts the bindings — or a
+            // roster that counted differently — is the same evidence
+            // disagreement the number check above refuses. RAR5 only: the
+            // record is mandatory there, while a RAR4 volume may simply lack
+            // one, and its absence parses exactly like "last volume".
+            if facts.archive_format() == ArchiveFormat::Rar5
+                && reached_end
+                && !facts.more_volumes
+                && !self.plan.close_identity_roster(volume_index + 1)
+            {
+                return Err(self.fail(DemotionReason::IdentityVolumeMismatch));
+            }
+        }
+
         if self.layout.is_none() {
             let format = facts.archive_format();
             if !matches!(format, ArchiveFormat::Rar4 | ArchiveFormat::Rar5) {
@@ -3672,7 +3748,9 @@ impl DirectSetRouter {
     /// Whether every planned volume has been parsed and every member's chain has
     /// closed, so the archive's packed total can no longer grow.
     fn archive_totals_final(&self) -> bool {
-        self.volume_facts.len() == self.plan.volumes.len()
+        self.plan
+            .expected_volume_count()
+            .is_some_and(|expected| self.volume_facts.len() == expected)
             && self
                 .layout_members()
                 .iter()

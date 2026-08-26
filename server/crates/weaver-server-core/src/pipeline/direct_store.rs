@@ -168,6 +168,7 @@ pub(crate) mod restart;
 pub(crate) mod router;
 pub(crate) mod set;
 pub(crate) mod snapshot;
+pub(crate) mod sniff;
 pub(crate) mod sparse;
 pub(crate) mod wiring;
 

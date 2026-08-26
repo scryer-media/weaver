@@ -69,7 +69,13 @@ pub(crate) struct DirectSet {
     /// member destinations and there is nothing to claim before then.
     barrier: Option<CoverageBarrier>,
     registered_members: HashSet<u32>,
-    registered_volumes: bool,
+    /// How many of the plan's volumes have been registered on the barrier. A
+    /// count rather than a latch because an identity-admitted plan's volume
+    /// map grows after the barrier exists, and each newly bound volume still
+    /// has to be registered before a write can be recorded against its
+    /// envelope. Registration is idempotent, so re-running the loop when the
+    /// counts disagree is safe.
+    registered_volumes: usize,
     /// The router's [`DirectSetRouter::member_facts_revision`] the barrier's plan
     /// digest was computed at, so a set that adopts nothing new re-hashes
     /// nothing. `None` until the first push, which is how a freshly built or
@@ -178,7 +184,7 @@ impl DirectSet {
             router: DirectSetRouter::new(plan),
             barrier: None,
             registered_members: HashSet::new(),
-            registered_volumes: false,
+            registered_volumes: 0,
             digest_revision: None,
             complete_volumes: BTreeMap::new(),
             volume_crcs: BTreeMap::new(),
@@ -366,6 +372,12 @@ impl DirectSet {
 
     pub(crate) fn plan(&self) -> &DirectSetPlan {
         self.router.plan()
+    }
+
+    /// Records one identity binding on the plan. See
+    /// [`DirectSetPlan::bind_identity_volume`] for the refusal semantics.
+    pub(crate) fn bind_identity_volume(&mut self, volume_index: u32, file_index: u32) -> bool {
+        self.router.bind_identity_volume(volume_index, file_index)
     }
 
     pub(crate) fn set_name(&self) -> &str {
@@ -607,7 +619,15 @@ impl DirectSet {
     /// at that layer. Callers that must not confuse "not here yet" with
     /// "corrupt" ask this first.
     pub(crate) fn all_volumes_complete(&self) -> bool {
-        self.complete_volumes.len() == self.router.plan().volumes.len()
+        // The expected count, not the mapped count: an identity-admitted set's
+        // mapping trails its full set, and comparing against `volumes.len()`
+        // would finalize an archive most of whose volumes have not even been
+        // matched to files yet. An open set — its count not yet learnable —
+        // is never complete.
+        self.router
+            .plan()
+            .expected_volume_count()
+            .is_some_and(|expected| self.complete_volumes.len() == expected)
     }
 
     /// Marks a source volume complete and returns whatever the confirming parse
@@ -688,7 +708,7 @@ impl DirectSet {
                 _ => CoverageBarrier::new(self.job_id, self.set_name().to_string(), digest),
             };
             self.barrier = Some(barrier);
-            self.registered_volumes = false;
+            self.registered_volumes = 0;
             self.registered_members.clear();
             self.digest_revision = Some(self.router.member_facts_revision());
         }
@@ -710,7 +730,7 @@ impl DirectSet {
         let Some(barrier) = self.barrier.as_mut() else {
             return;
         };
-        if !self.registered_volumes {
+        if self.registered_volumes != self.router.plan().volumes.len() {
             for (volume_index, file_index) in &self.router.plan().volumes {
                 barrier.register_volume(*volume_index, *file_index);
             }
@@ -721,7 +741,7 @@ impl DirectSet {
             for (volume_index, decoded_len) in &self.complete_volumes {
                 barrier.note_volume_complete(*volume_index, *decoded_len);
             }
-            self.registered_volumes = true;
+            self.registered_volumes = self.router.plan().volumes.len();
         }
         for (member_id, partial) in members {
             if self.registered_members.insert(member_id) {
@@ -950,7 +970,7 @@ impl DirectSet {
                 .map_err(BarrierError::Persist)?;
         }
         self.registered_members.clear();
-        self.registered_volumes = false;
+        self.registered_volumes = 0;
         // A retired controller is unregistered in every sense, the digest
         // included: the next registration re-derives it rather than trusting a
         // revision recorded for a controller that no longer holds anything.

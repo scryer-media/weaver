@@ -2329,6 +2329,7 @@ fn envelope_plan() -> DirectSetPlan {
         set_name: "Silver.Horizon.S01E05".to_string(),
         volumes: [(0u32, 0u32), (1, 1)].into_iter().collect(),
         files: [(0u32, 0u32), (1, 1)].into_iter().collect(),
+        identity: None,
         working_dir: std::path::PathBuf::from("/tmp/silver-horizon"),
         destination_dir: std::path::PathBuf::from("/tmp/complete/.weaver-staging/1"),
     }
@@ -2453,6 +2454,7 @@ fn two_sets_of_one_job_never_share_a_derived_path() {
         set_name: "Silver.Horizon/S01E05".to_string(),
         volumes: [(0u32, 2u32), (1, 3)].into_iter().collect(),
         files: [(0u32, 2u32), (1, 3)].into_iter().collect(),
+        identity: None,
         working_dir: first.working_dir.clone(),
         destination_dir: first.destination_dir.clone(),
     };
@@ -2662,6 +2664,7 @@ fn destination_names_stay_inside_the_filename_ceiling_with_their_suffix() {
         set_name: long.clone(),
         volumes: [(0u32, 0u32), (7, 7)].into_iter().collect(),
         files: [(0u32, 0u32), (7, 7)].into_iter().collect(),
+        identity: None,
         working_dir: std::path::PathBuf::from("/tmp/silver-horizon"),
         destination_dir: std::path::PathBuf::from("/tmp/complete/.weaver-staging/1"),
     };
@@ -4345,6 +4348,7 @@ fn rearm_router() -> DirectSetRouter {
         set_name: SET.to_string(),
         volumes: [(0u32, 0u32), (1u32, 1u32)].into_iter().collect(),
         files: [(0u32, 0u32), (1u32, 1u32)].into_iter().collect(),
+        identity: None,
         working_dir: std::path::PathBuf::from("/nonexistent"),
         destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
     };
@@ -4848,6 +4852,7 @@ fn straddle_router(member: &[u8], header_bytes: u64) -> (DirectSetRouter, u32) {
         set_name: SET.to_string(),
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
+        identity: None,
         working_dir: std::path::PathBuf::from("/nonexistent"),
         destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
     };
@@ -5317,6 +5322,7 @@ fn encrypted_crypt_router_partial(
         set_name: SET.to_string(),
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
+        identity: None,
         working_dir: std::path::PathBuf::from("/nonexistent"),
         destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
     };

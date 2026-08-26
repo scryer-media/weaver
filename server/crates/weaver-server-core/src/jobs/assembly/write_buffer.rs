@@ -231,6 +231,34 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
     }
 
     /// Take every queued duplicate arrival, releasing its in-memory accounting.
+    /// Take every buffered segment out of the reorder stage at once,
+    /// duplicates included, leaving the cursor where it stands.
+    ///
+    /// For the identity seam's reclaim: a file whose offset-zero article just
+    /// bound to a direct set may already have later articles parked here, and
+    /// every one of them belongs to the routed volume rather than to a
+    /// sequential file write. Only meaningful while nothing has been
+    /// persisted — the caller refuses to bind a file with flushed bytes — so
+    /// `Persisted` markers are not expected and are left in place if a caller
+    /// ever violates that.
+    pub fn take_all_buffered(&mut self) -> Vec<(u64, T)> {
+        let mut taken = self.take_redundant();
+        let offsets: Vec<u64> = self
+            .pending
+            .iter()
+            .filter_map(|(offset, entry)| {
+                matches!(entry, PendingChunk::Buffered(_)).then_some(*offset)
+            })
+            .collect();
+        for offset in offsets {
+            if let Some(PendingChunk::Buffered(buf)) = self.pending.remove(&offset) {
+                self.forget_buffered(buf.len_bytes());
+                taken.push((offset, buf));
+            }
+        }
+        taken
+    }
+
     fn take_redundant(&mut self) -> Vec<(u64, T)> {
         let taken = std::mem::take(&mut self.redundant);
         for (_, chunk) in &taken {

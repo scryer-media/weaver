@@ -1410,6 +1410,807 @@ async fn a_par2_bearing_direct_job_completes_byte_identically_and_never_writes_a
     );
 }
 
+/// The same volume bytes under hex names that classify to nothing — the shape
+/// of a fully obfuscated posting. The real names survive only inside the PAR2
+/// descriptions the caller builds from the un-obfuscated list.
+fn obfuscate_volumes(volumes: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
+    volumes
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            (
+                format!("{:032x}", 0xd1c7_0000_u128 + index as u128),
+                bytes.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Runs one whole **obfuscated** par2-bearing job gate.
+///
+/// The spec's filenames are hex, so `DirectSetPlan::discover` finds nothing
+/// and any admission must come from the PAR2 descriptions, which carry the
+/// real names. `par2_first` decides whether the index arrives before any
+/// volume article — the identity window — or after them all, which is too
+/// late by construction: every volume's bytes have already landed
+/// conventionally.
+async fn run_obfuscated_par2_gate(
+    gate: DirectStoreGate,
+    job_id: JobId,
+    member_name: &str,
+    volumes: &[(String, Vec<u8>)],
+    par2_first: bool,
+    arrivals: &[(u32, u32)],
+) -> Par2GateOutcome {
+    let par2_bytes = par2_index_over_volumes(volumes);
+    let obfuscated = obfuscate_volumes(volumes);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(gate);
+
+    let (mut spec, index_file_index) =
+        par2_bearing_job_spec("Silver Horizon", &obfuscated, &par2_bytes);
+    spec.password = None;
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    if par2_first {
+        deliver_par2_index(&mut pipeline, job_id, index_file_index, &par2_bytes).await;
+    }
+    let mut volume_file_seen = false;
+    for (file_index, segment_number) in arrivals {
+        submit_volume_article(
+            &mut pipeline,
+            job_id,
+            &obfuscated,
+            *file_index,
+            *segment_number,
+        )
+        .await;
+        for (filename, _) in &obfuscated {
+            if working_dir.join(filename).exists() {
+                volume_file_seen = true;
+            }
+        }
+    }
+    let admitted = !pipeline.direct_store.sets_for(job_id).is_empty();
+    if !par2_first {
+        deliver_par2_index(&mut pipeline, job_id, index_file_index, &par2_bytes).await;
+    }
+
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+        state.recovery_queue = crate::DownloadQueue::new();
+    }
+    pipeline.check_job_completion(job_id).await;
+    let sets_after_verification = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    // Both name populations: a conventional volume is born under its hex name
+    // and renamed to its described name once identity settles, and either
+    // sighting is a volume file this gate produced.
+    let volume_file_at_end = obfuscated
+        .iter()
+        .chain(volumes.iter())
+        .any(|(filename, _)| working_dir.join(filename).exists());
+    let volume_file_seen = volume_file_seen || volume_file_at_end;
+
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    let completed = std::fs::read(output_root.join(member_name)).ok();
+    let staged = staging_member(&complete_dir, member_name);
+    let left_behind = std::fs::read(working_dir.join(member_name)).ok();
+    let (member, member_location) = match (completed, staged, left_behind) {
+        (Some(bytes), _, _) => (Some(bytes), Some("complete")),
+        (None, Some(bytes), _) => (Some(bytes), Some("staging")),
+        (None, None, Some(bytes)) => (Some(bytes), Some("working")),
+        (None, None, None) => (None, None),
+    };
+    Par2GateOutcome {
+        member,
+        member_location,
+        status: job_status_for_assert(&pipeline, job_id),
+        volume_file_seen,
+        admitted,
+        authoritative_verify_calls: pipeline.par2_authoritative_verify_calls,
+        demotions: sets_after_verification,
+    }
+}
+
+#[tokio::test]
+async fn an_obfuscated_rar_set_admits_from_par2_identity_and_never_writes_a_volume() {
+    // The defect this states the fix for: a job whose files are all hex names
+    // carries no `RarVolume` role, so spec discovery admits nothing and the
+    // examined latch used to settle that forever. With the index parsed before
+    // the first data article — the promoted-metadata shape — the descriptions
+    // supply the roster and every volume binds by its own first bytes.
+    let member_name = "Silver.Horizon.S01E08.mkv";
+    let payload: Vec<u8> = (0..120_000u32).map(|index| (index % 199) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let arrivals = in_order_arrivals(volumes.len());
+
+    let conventional = run_obfuscated_par2_gate(
+        DirectStoreGate::Disabled,
+        JobId(41090),
+        member_name,
+        &volumes,
+        true,
+        &arrivals,
+    )
+    .await;
+    let direct = run_obfuscated_par2_gate(
+        DirectStoreGate::Enabled,
+        JobId(41091),
+        member_name,
+        &volumes,
+        true,
+        &arrivals,
+    )
+    .await;
+
+    assert!(
+        direct.admitted,
+        "an obfuscated set must admit from PAR2 identity, got sets {}",
+        direct.demotions
+    );
+    assert!(
+        conventional.volume_file_seen,
+        "the conventional gate should have written source volumes"
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "an identity-admitted job must never create a source volume file, got {}",
+        direct.demotions
+    );
+    assert_eq!(
+        conventional.member.as_deref(),
+        Some(payload.as_slice()),
+        "the conventional gate should reproduce the member payload"
+    );
+    assert_eq!(
+        (
+            direct.member.as_deref(),
+            direct.member_location,
+            &direct.status
+        ),
+        (
+            conventional.member.as_deref(),
+            conventional.member_location,
+            &conventional.status
+        ),
+        "the identity-admitted job must produce the conventional gate's output; sets = {}",
+        direct.demotions
+    );
+    assert!(
+        matches!(direct.status, Some(JobStatus::Complete)),
+        "the job should have completed, got {:?} with sets {}",
+        direct.status,
+        direct.demotions
+    );
+    assert!(
+        direct.demotions.contains("Finalized"),
+        "the set should have finalized once verification cleared it, got {}",
+        direct.demotions
+    );
+}
+
+#[tokio::test]
+async fn identity_admission_refuses_once_volume_bytes_landed_conventionally() {
+    // The index arriving after the data is the boundary of the roster rung:
+    // every volume already has conventional bytes on disk, so no binding may
+    // be made — the envelope model owns all of a routed volume's bytes or
+    // none of them. RAR4 volumes, deliberately: a RAR5 set would be admitted
+    // by the header rung before the index ever mattered, which is the better
+    // outcome but not the boundary under test. The job must simply complete
+    // the way it does today, with no admission and no wedge.
+    let member_name = "Silver.Horizon.S01E09.mkv";
+    let payload: Vec<u8> = (0..120_000u32).map(|index| (index % 197) as u8).collect();
+    let volumes = single_member_rar4_store_set_numbered(member_name, &payload, 3);
+    let arrivals = in_order_arrivals(volumes.len());
+
+    let outcome = run_obfuscated_par2_gate(
+        DirectStoreGate::Enabled,
+        JobId(41092),
+        member_name,
+        &volumes,
+        false,
+        &arrivals,
+    )
+    .await;
+
+    assert!(
+        !outcome.admitted,
+        "identity admission must refuse once volume bytes landed, got {}",
+        outcome.demotions
+    );
+    assert!(
+        outcome.volume_file_seen,
+        "the volumes should have been written conventionally"
+    );
+    assert_eq!(
+        outcome.member.as_deref(),
+        Some(payload.as_slice()),
+        "the conventional fallback must still produce the member; status {:?}",
+        outcome.status
+    );
+    assert!(
+        matches!(outcome.status, Some(JobStatus::Complete)),
+        "the job should have completed conventionally, got {:?}",
+        outcome.status
+    );
+}
+
+#[tokio::test]
+async fn an_out_of_order_payload_article_no_longer_poisons_the_binding() {
+    // The production shape that killed the first cut of this seam: on a wide
+    // connection pool a file's later article routinely decodes before its
+    // offset-zero article. The conventional path parks it in the write
+    // reorder buffer — in memory, unwritten — so when the offset-zero
+    // article then establishes the binding, the parked article is reclaimed
+    // into the routed volume and the set streams whole. Nothing leaks, and
+    // nothing demotes.
+    let member_name = "Silver.Horizon.S01E10.mkv";
+    let payload: Vec<u8> = (0..120_000u32).map(|index| (index % 193) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    // Volume 1's payload article arrives before its offset-zero article, and
+    // volume 0's pair is inverted too, so both the admitting binding and a
+    // later one exercise the reclaim.
+    let arrivals = [(0, 1), (0, 0), (1, 1), (1, 0), (2, 0), (2, 1)];
+
+    let outcome = run_obfuscated_par2_gate(
+        DirectStoreGate::Enabled,
+        JobId(41093),
+        member_name,
+        &volumes,
+        true,
+        &arrivals,
+    )
+    .await;
+
+    assert!(
+        outcome.admitted,
+        "the set must admit despite out-of-order arrivals, got {}",
+        outcome.demotions
+    );
+    assert!(
+        !outcome.volume_file_seen,
+        "reclaimed articles must route, never materialize a volume, got {}",
+        outcome.demotions
+    );
+    assert!(
+        outcome.demotions.contains("Finalized"),
+        "the set should have finalized, got {}",
+        outcome.demotions
+    );
+    assert_eq!(
+        outcome.member.as_deref(),
+        Some(payload.as_slice()),
+        "the reclaimed set must reproduce the member payload; status {:?}",
+        outcome.status
+    );
+    assert!(
+        matches!(outcome.status, Some(JobStatus::Complete)),
+        "the job should have completed, got {:?}",
+        outcome.status
+    );
+}
+
+#[tokio::test]
+async fn an_unmatched_obfuscated_extra_stays_conventional_beside_an_identity_set() {
+    // A junk extra — the nfo, the sample — matches no description. Its
+    // offset-zero evaluation settles it as a non-member, it streams
+    // conventionally, and the identity set is unaffected.
+    let member_name = "Silver.Horizon.S01E11.mkv";
+    let payload: Vec<u8> = (0..120_000u32).map(|index| (index % 191) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let par2_bytes = par2_index_over_volumes(&volumes);
+    let obfuscated = obfuscate_volumes(&volumes);
+    let junk: Vec<u8> = (0..20_000u32).map(|index| (index % 251) as u8).collect();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41094);
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+
+    let (mut spec, index_file_index) =
+        par2_bearing_job_spec("Silver Horizon", &obfuscated, &par2_bytes);
+    let junk_index = spec.files.len() as u32;
+    let junk_name = format!("{:032x}", 0xd1c7_ffff_u128);
+    spec.total_bytes += u64::from(yenc_declared_bytes(junk.len() as u32));
+    spec.files.push(FileSpec {
+        role: FileRole::from_filename(&junk_name),
+        filename: junk_name.clone(),
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: yenc_declared_bytes(junk.len() as u32),
+            message_id: "obfuscated-junk@example.com".to_string(),
+        }],
+    });
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    deliver_par2_index(&mut pipeline, job_id, index_file_index, &par2_bytes).await;
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: junk_index,
+        },
+        0,
+        0,
+        &junk,
+        &junk_name,
+        None,
+    )
+    .await;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(
+            &mut pipeline,
+            job_id,
+            &obfuscated,
+            file_index,
+            segment_number,
+        )
+        .await;
+    }
+    assert!(
+        !pipeline.direct_store.sets_for(job_id).is_empty(),
+        "the identity set must admit despite the unmatched extra"
+    );
+
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+        state.recovery_queue = crate::DownloadQueue::new();
+    }
+    pipeline.check_job_completion(job_id).await;
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    assert!(
+        sets.contains("Finalized"),
+        "the set should have finalized with the extra beside it, got {sets}"
+    );
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    let member = std::fs::read(output_root.join(member_name))
+        .ok()
+        .or_else(|| staging_member(&complete_dir, member_name));
+    assert_eq!(
+        member.as_deref(),
+        Some(payload.as_slice()),
+        "the identity set must produce the member beside the extra"
+    );
+    assert!(
+        !obfuscated
+            .iter()
+            .chain(volumes.iter())
+            .any(|(filename, _)| working_dir.join(filename).exists()),
+        "no source volume file may exist for the finalized identity set"
+    );
+}
+
+/// [`single_member_rar4_store_set`] with **numbered** end-of-archive records
+/// — the shape WinRAR's new-numbering era actually writes. The unnumbered
+/// variant is kept for the paths that must tolerate it; a renamed
+/// conventional set needs the numbers, because every unnumbered volume's
+/// parsed facts claim position zero and the fact-driven topology collides.
+fn single_member_rar4_store_set_numbered(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+) -> Vec<(String, Vec<u8>)> {
+    let member_crc = checksum::crc32(payload);
+    let chunk = payload.len().div_ceil(volume_count);
+    (0..volume_count)
+        .map(|volume| {
+            let start = (volume * chunk).min(payload.len());
+            let end = ((volume + 1) * chunk).min(payload.len());
+            let part = &payload[start..end];
+            let is_first = volume == 0;
+            let is_last = volume + 1 == volume_count;
+            let mut split_flags = 0u16;
+            if !is_first {
+                split_flags |= 0x0001;
+            }
+            if !is_last {
+                split_flags |= 0x0002;
+            }
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&TEST_RAR4_SIG);
+            bytes.extend_from_slice(&build_test_rar4_main_header(is_first));
+            bytes.extend_from_slice(&build_test_rar4_file_header(
+                member_name,
+                split_flags,
+                part.len() as u32,
+                payload.len() as u32,
+                if is_last {
+                    member_crc
+                } else {
+                    checksum::crc32(part)
+                },
+            ));
+            bytes.extend_from_slice(part);
+            bytes.extend_from_slice(&build_test_rar4_end_header_numbered(
+                !is_last,
+                volume as u16,
+            ));
+            (format!("silver.horizon.part{:02}.rar", volume + 1), bytes)
+        })
+        .collect()
+}
+
+/// Runs one whole **par2-less obfuscated** job gate: hex names, no index
+/// anywhere, so the only admissible evidence is the volumes' own RAR5
+/// headers.
+async fn run_obfuscated_headers_gate(
+    job_id: JobId,
+    member_name: &str,
+    obfuscated: &[(String, Vec<u8>)],
+    arrivals: &[(u32, u32)],
+) -> Par2GateOutcome {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+
+    let spec = direct_store_job_spec("Silver Horizon", obfuscated);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let mut volume_file_seen = false;
+    for (file_index, segment_number) in arrivals {
+        submit_volume_article(
+            &mut pipeline,
+            job_id,
+            obfuscated,
+            *file_index,
+            *segment_number,
+        )
+        .await;
+        for (filename, _) in obfuscated {
+            if working_dir.join(filename).exists() {
+                volume_file_seen = true;
+            }
+        }
+    }
+    let admitted = !pipeline.direct_store.sets_for(job_id).is_empty();
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    let volume_file_seen = volume_file_seen
+        || obfuscated
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists());
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    let completed = std::fs::read(output_root.join(member_name)).ok();
+    let staged = staging_member(&complete_dir, member_name);
+    let left_behind = std::fs::read(working_dir.join(member_name)).ok();
+    let (member, member_location) = match (completed, staged, left_behind) {
+        (Some(bytes), _, _) => (Some(bytes), Some("complete")),
+        (None, Some(bytes), _) => (Some(bytes), Some("staging")),
+        (None, None, Some(bytes)) => (Some(bytes), Some("working")),
+        (None, None, None) => (None, None),
+    };
+    Par2GateOutcome {
+        member,
+        member_location,
+        status: job_status_for_assert(&pipeline, job_id),
+        volume_file_seen,
+        admitted,
+        authoritative_verify_calls: pipeline.par2_authoritative_verify_calls,
+        demotions: sets,
+    }
+}
+
+#[tokio::test]
+async fn an_obfuscated_rar4_set_admits_from_par2_identity() {
+    // The fingerprint rung is format-blind: the descriptions carry the real
+    // RAR4 names, name classification orders them, and the per-volume
+    // fingerprint places each file — none of which needs a volume number in
+    // the headers. This is exactly the set shape header-based ordering can
+    // never place (RAR4 interior volumes are indistinguishable), so the
+    // PAR2-identity route is the only streaming admission it will ever have.
+    let member_name = "Silver.Horizon.S01E12.mkv";
+    let payload: Vec<u8> = (0..120_000u32).map(|index| (index % 189) as u8).collect();
+    let volumes = single_member_rar4_store_set(member_name, &payload, 3);
+    let arrivals = in_order_arrivals(volumes.len());
+
+    let direct = run_obfuscated_par2_gate(
+        DirectStoreGate::Enabled,
+        JobId(41095),
+        member_name,
+        &volumes,
+        true,
+        &arrivals,
+    )
+    .await;
+
+    assert!(
+        direct.admitted,
+        "an obfuscated RAR4 set must admit from PAR2 identity, got {}",
+        direct.demotions
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "an identity-admitted RAR4 job must never create a source volume file, got {}",
+        direct.demotions
+    );
+    assert!(
+        direct.demotions.contains("Finalized"),
+        "the RAR4 set should have finalized, got {}",
+        direct.demotions
+    );
+    assert_eq!(
+        direct.member.as_deref(),
+        Some(payload.as_slice()),
+        "the RAR4 identity job must reproduce the member payload; status {:?}",
+        direct.status
+    );
+    assert!(
+        matches!(direct.status, Some(JobStatus::Complete)),
+        "the job should have completed, got {:?}",
+        direct.status
+    );
+}
+
+#[tokio::test]
+async fn an_identity_binding_contradicted_by_the_volumes_own_number_demotes() {
+    // The hardening: the fingerprint placed this file at volume 1, but the
+    // volume's own main header declares position 2. One of the two is
+    // describing a different archive, so the set demotes before the layout
+    // adopts a member from the wrong position — and the fingerprints still
+    // match, because they hash the bytes as posted, tampered header and all.
+    let member_name = "Silver.Horizon.S01E13.mkv";
+    let payload: Vec<u8> = (0..120_000u32).map(|index| (index % 187) as u8).collect();
+    let mut volumes = single_member_store_set(member_name, &payload, 3);
+    {
+        let chunk = payload.len().div_ceil(3);
+        let part = &payload[chunk..2 * chunk];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&TEST_RAR5_SIG);
+        // Volume 1's head, rebuilt to lie: it claims position 2.
+        bytes.extend_from_slice(&build_test_rar_main_header(0x0001 | 0x0002, Some(2)));
+        bytes.extend_from_slice(&build_test_rar_file_header(
+            member_name,
+            0x0008 | 0x0010,
+            part.len() as u64,
+            payload.len() as u64,
+            Some(checksum::crc32(part)),
+        ));
+        bytes.extend_from_slice(part);
+        bytes.extend_from_slice(&build_test_rar_end_header(true));
+        volumes[1].1 = bytes;
+    }
+    // Inline rather than through the gate harness: the demotion hands the
+    // job to the conventional path, which can complete and prune the
+    // direct-store runtime before an end-of-run snapshot would look, so the
+    // verdict has to be read mid-run — right after the lying volume's first
+    // article.
+    let par2_bytes = par2_index_over_volumes(&volumes);
+    let obfuscated = obfuscate_volumes(&volumes);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41096);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let (spec, index_file_index) =
+        par2_bearing_job_spec("Silver Horizon", &obfuscated, &par2_bytes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    deliver_par2_index(&mut pipeline, job_id, index_file_index, &par2_bytes).await;
+
+    submit_volume_article(&mut pipeline, job_id, &obfuscated, 0, 0).await;
+    assert!(
+        !pipeline.direct_store.sets_for(job_id).is_empty(),
+        "the set should admit on the honest first volume"
+    );
+    submit_volume_article(&mut pipeline, job_id, &obfuscated, 1, 0).await;
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        sets.contains("Demoted(IdentityVolumeMismatch)"),
+        "the declared number must contradict the binding and demote, got {sets}"
+    );
+    let _ = working_dir;
+}
+
+#[tokio::test]
+async fn a_par2_less_obfuscated_rar5_set_admits_from_its_own_headers() {
+    // The header rung: no PAR2 anywhere, hex names carrying nothing — the
+    // only structure left is what each volume's own RAR5 main header states,
+    // and that is a position. The set opens on the first volume, grows a
+    // binding per file, closes when the final volume's end record declares
+    // itself last, and finalizes like any other set.
+    let member_name = "Silver.Horizon.S01E14.mkv";
+    let payload: Vec<u8> = (0..120_000u32).map(|index| (index % 181) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let obfuscated = obfuscate_volumes(&volumes);
+    // The very first decoded article is a payload article, not an
+    // offset-zero one — the production arrival shape — so the admitting
+    // binding itself runs the reorder-stage reclaim.
+    let arrivals = [(0, 1), (0, 0), (1, 0), (1, 1), (2, 0), (2, 1)];
+
+    let outcome =
+        run_obfuscated_headers_gate(JobId(41097), member_name, &obfuscated, &arrivals).await;
+
+    assert!(
+        outcome.admitted,
+        "a par2-less obfuscated RAR5 set must admit from its own headers, got {}",
+        outcome.demotions
+    );
+    assert!(
+        !outcome.volume_file_seen,
+        "a header-admitted set must never create a source volume file, got {}",
+        outcome.demotions
+    );
+    assert!(
+        outcome.demotions.contains("Finalized"),
+        "the header set should have closed and finalized, got {}",
+        outcome.demotions
+    );
+    assert_eq!(
+        outcome.member.as_deref(),
+        Some(payload.as_slice()),
+        "the header-admitted set must reproduce the member payload; status {:?}",
+        outcome.status
+    );
+}
+
+#[tokio::test]
+async fn a_par2_less_obfuscated_standalone_rar5_admits_as_a_set_of_one() {
+    // A single archive with no volume flag: a set of one, closed at
+    // admission. The common single-rar obfuscated post.
+    let member_name = "Silver.Horizon.S01E15.mkv";
+    let payload: Vec<u8> = (0..60_000u32).map(|index| (index % 177) as u8).collect();
+    let member_crc = checksum::crc32(&payload);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&TEST_RAR5_SIG);
+    bytes.extend_from_slice(&build_test_rar_main_header(0, None));
+    bytes.extend_from_slice(&build_test_rar_file_header(
+        member_name,
+        0,
+        payload.len() as u64,
+        payload.len() as u64,
+        Some(member_crc),
+    ));
+    bytes.extend_from_slice(&payload);
+    bytes.extend_from_slice(&build_test_rar_end_header(false));
+    let obfuscated = vec![(format!("{:032x}", 0xd1c7_0100_u128), bytes)];
+
+    let outcome =
+        run_obfuscated_headers_gate(JobId(41098), member_name, &obfuscated, &[(0, 0), (0, 1)])
+            .await;
+
+    assert!(
+        outcome.admitted,
+        "a standalone obfuscated RAR5 must admit from its own head, got {}",
+        outcome.demotions
+    );
+    assert!(
+        !outcome.volume_file_seen,
+        "the standalone archive must never materialize, got {}",
+        outcome.demotions
+    );
+    assert_eq!(
+        outcome.member.as_deref(),
+        Some(payload.as_slice()),
+        "the standalone archive must extract in-stream; status {:?}, sets {}",
+        outcome.status,
+        outcome.demotions
+    );
+}
+
+#[tokio::test]
+async fn a_par2_less_obfuscated_rar4_set_stays_conventional() {
+    // The measured boundary, kept deliberately: RAR4 headers carry no volume
+    // number and the interior volumes of a stored set are identical in every
+    // field that could place one, so with no descriptions to consult there
+    // is nothing to bind on. The header rung declines rather than guesses.
+    let member_name = "Silver.Horizon.S01E16.mkv";
+    let payload: Vec<u8> = (0..60_000u32).map(|index| (index % 173) as u8).collect();
+    let volumes = single_member_rar4_store_set(member_name, &payload, 3);
+    let obfuscated = obfuscate_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41099);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = direct_store_job_spec("Silver Horizon", &obfuscated);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in in_order_arrivals(obfuscated.len()) {
+        submit_volume_article(
+            &mut pipeline,
+            job_id,
+            &obfuscated,
+            file_index,
+            segment_number,
+        )
+        .await;
+    }
+
+    assert!(
+        pipeline.direct_store.sets_for(job_id).is_empty(),
+        "obfuscated RAR4 without descriptions must not admit"
+    );
+    assert!(
+        obfuscated
+            .iter()
+            .all(|(filename, _)| working_dir.join(filename).exists()),
+        "every volume must have streamed conventionally to disk"
+    );
+}
+
+#[tokio::test]
+async fn interleaved_obfuscated_header_sets_are_refused_not_guessed() {
+    // Two obfuscated RAR5 sets in one job both open with a volume claiming
+    // position zero. The bytes carry positions but no set identity, so the
+    // second claimant is indistinguishable interleaving: the one header set
+    // demotes, the rung is poisoned against forming another, and everything
+    // streams conventionally.
+    let first = single_member_store_set(
+        "Silver.Horizon.S01E18.mkv",
+        &(0..60_000u32)
+            .map(|index| (index % 171) as u8)
+            .collect::<Vec<u8>>(),
+        2,
+    );
+    let second = single_member_store_set(
+        "Amber.Sky.S01E18.mkv",
+        &(0..60_000u32)
+            .map(|index| (index % 167) as u8)
+            .collect::<Vec<u8>>(),
+        2,
+    );
+    let mut volumes = first.clone();
+    volumes.extend(second);
+    let obfuscated = obfuscate_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41100);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = direct_store_job_spec("Silver Horizon", &obfuscated);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    // First set's volume 0 admits; the second set's volume 0 (file index 2)
+    // claims the same position and condemns the rung.
+    for (file_index, segment_number) in [
+        (0, 0),
+        (2, 0),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+        (2, 1),
+        (3, 0),
+        (3, 1),
+    ] {
+        submit_volume_article(
+            &mut pipeline,
+            job_id,
+            &obfuscated,
+            file_index,
+            segment_number,
+        )
+        .await;
+    }
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        sets.contains("Demoted(IdentityRosterUnfillable)"),
+        "the ambiguous header set must demote, got {sets}"
+    );
+    assert_eq!(
+        pipeline.direct_store.sets_for(job_id).len(),
+        1,
+        "poisoning must prevent a second header set from forming, got {sets}"
+    );
+    assert!(
+        obfuscated
+            .iter()
+            .all(|(filename, _)| working_dir.join(filename).exists()),
+        "every volume must end up conventional after the refusal"
+    );
+}
+
 /// Corrupts one byte of a volume's **recovery-record data area** — envelope
 /// bytes that belong to no member and to no header.
 ///
