@@ -870,7 +870,7 @@ impl Pipeline {
         // got us here was downloaded and parsed — and they are never source
         // volumes, so they are excluded from both the leak scan and the
         // candidate pool the viability arm counts.
-        let carrier_files: HashSet<u32> = runtime.files.keys().copied().collect();
+        let carrier_files = self.identity_par2_carrier_files(job_id);
         let set_ids = runtime.ordered_set_ids();
         let mut candidates: BTreeMap<String, Vec<(u32, IdentityRosterVolume)>> = BTreeMap::new();
         let mut described_by: HashMap<String, HashSet<par2_rs::RecoverySetId>> = HashMap::new();
@@ -1138,15 +1138,12 @@ impl Pipeline {
             }
             // A recovery carrier is never a described source volume, and its
             // conventional bytes say nothing about the rosters — evaluating
-            // it would only burn hashes and pollute the evidence sets.
+            // it would only burn hashes and pollute the evidence sets. The
+            // predicate is evidence-based, never mere discovery presence:
+            // see [`Self::identity_par2_carrier_files`].
             if self
-                .jobs
-                .get(&job_id)
-                .and_then(|state| state.spec.files.get(file_index as usize))
-                .is_some_and(|file| matches!(file.role, weaver_model::files::FileRole::Par2 { .. }))
-                || self
-                    .par2_runtime(job_id)
-                    .is_some_and(|runtime| runtime.files.contains_key(&file_index))
+                .identity_par2_carrier_files(job_id)
+                .contains(&file_index)
             {
                 return None;
             }
@@ -1304,6 +1301,42 @@ impl Pipeline {
         })
     }
 
+    /// The job's files that really are PAR2 material — declared by role, or
+    /// carriers by the discovery machinery's own evidence. Deliberately NOT
+    /// "every file the discovery has touched": obfuscated par2 discovery
+    /// prefix-probes ordinary data files too, and an entry whose probe found
+    /// nothing (or has not run) is a data file, not a carrier. Treating mere
+    /// presence as carrierhood silently withheld a dozen volumes from binding
+    /// on the first production sets.
+    fn identity_par2_carrier_files(&self, job_id: JobId) -> HashSet<u32> {
+        let mut carriers: HashSet<u32> = self
+            .par2_runtime(job_id)
+            .map(|runtime| {
+                runtime
+                    .files
+                    .iter()
+                    .filter(|(_, file)| {
+                        !matches!(
+                            file.discovery,
+                            crate::pipeline::Par2DiscoveryState::Unseen
+                                | crate::pipeline::Par2DiscoveryState::PrefixProbeQueued
+                                | crate::pipeline::Par2DiscoveryState::ProbeInconclusive
+                        )
+                    })
+                    .map(|(file_index, _)| *file_index)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(state) = self.jobs.get(&job_id) {
+            for (file_index, file) in state.spec.files.iter().enumerate() {
+                if matches!(file.role, weaver_model::files::FileRole::Par2 { .. }) {
+                    carriers.insert(file_index as u32);
+                }
+            }
+        }
+        carriers
+    }
+
     /// Reorders the job's download queue so every identity candidate's first
     /// article arrives before any candidate's payload — the probe wave.
     ///
@@ -1323,10 +1356,7 @@ impl Pipeline {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
-            let carrier_files: HashSet<u32> = self
-                .par2_runtime(job_id)
-                .map(|runtime| runtime.files.keys().copied().collect())
-                .unwrap_or_default();
+            let carrier_files = self.identity_par2_carrier_files(job_id);
             let admission = self.direct_store.identity.get(&job_id);
             for (file_index, file) in state.spec.files.iter().enumerate() {
                 let file_index = file_index as u32;
@@ -1917,10 +1947,7 @@ impl Pipeline {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
-            let carrier_files: HashSet<u32> = self
-                .par2_runtime(job_id)
-                .map(|runtime| runtime.files.keys().copied().collect())
-                .unwrap_or_default();
+            let carrier_files = self.identity_par2_carrier_files(job_id);
             let bound_files: HashSet<u32> = admission
                 .rosters
                 .values()
