@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { toast } from "sonner";
 import { useMutation, useQuery } from "urql";
 import { FolderPathInput } from "@/components/FolderPathInput";
 import { formatSpeed } from "@/components/SpeedDisplay";
@@ -94,17 +95,10 @@ export function GeneralSettingsPage() {
   const [cleanup, setCleanup] = useState(true);
   const [maxRetries, setMaxRetries] = useState(3);
   const [ipReplacementBurst, setIpReplacementBurst] = useState(false);
-  const [speedSaved, setSpeedSaved] = useState(false);
-  const [ipReplacementBurstSaved, setIpReplacementBurstSaved] = useState(false);
   const [duplicatePolicySaveStatus, setDuplicatePolicySaveStatus] = useState<
     "idle" | "saved" | "error"
   >("idle");
-  const [storageSaveStatus, setStorageSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
-  const [storageSaveError, setStorageSaveError] = useState<string | null>(null);
-  const speedSavedTimerRef = useRef<number | null>(null);
-  const ipReplacementBurstSavedTimerRef = useRef<number | null>(null);
   const storageSaveTimerRef = useRef<number | null>(null);
-  const storageSavedTimerRef = useRef<number | null>(null);
   const pendingStorageSaveRef = useRef<StorageBehaviorDraft | null>(null);
   const storageSaveInFlightRef = useRef(false);
 
@@ -129,15 +123,6 @@ export function GeneralSettingsPage() {
       if (storageSaveTimerRef.current !== null) {
         window.clearTimeout(storageSaveTimerRef.current);
       }
-      if (speedSavedTimerRef.current !== null) {
-        window.clearTimeout(speedSavedTimerRef.current);
-      }
-      if (ipReplacementBurstSavedTimerRef.current !== null) {
-        window.clearTimeout(ipReplacementBurstSavedTimerRef.current);
-      }
-      if (storageSavedTimerRef.current !== null) {
-        window.clearTimeout(storageSavedTimerRef.current);
-      }
     };
   }, []);
 
@@ -148,25 +133,6 @@ export function GeneralSettingsPage() {
     setSettings(normalizeGeneralSettings(nextSettings));
     reexecuteQuery({ requestPolicy: "network-only" });
   }, [reexecuteQuery]);
-
-  const pulseSpeedSaved = useCallback(() => {
-    if (speedSavedTimerRef.current !== null) {
-      window.clearTimeout(speedSavedTimerRef.current);
-    }
-    setSpeedSaved(true);
-    speedSavedTimerRef.current = window.setTimeout(() => setSpeedSaved(false), 2000);
-  }, []);
-
-  const pulseIpReplacementBurstSaved = useCallback(() => {
-    if (ipReplacementBurstSavedTimerRef.current !== null) {
-      window.clearTimeout(ipReplacementBurstSavedTimerRef.current);
-    }
-    setIpReplacementBurstSaved(true);
-    ipReplacementBurstSavedTimerRef.current = window.setTimeout(
-      () => setIpReplacementBurstSaved(false),
-      2000,
-    );
-  }, []);
 
   const currentStorageDraft = useMemo(
     () => normalizeStorageBehaviorDraft({
@@ -183,16 +149,6 @@ export function GeneralSettingsPage() {
     [settings],
   );
 
-  const setStorageSavedState = useCallback(() => {
-    if (storageSavedTimerRef.current !== null) {
-      window.clearTimeout(storageSavedTimerRef.current);
-    }
-    setStorageSaveStatus("saved");
-    storageSavedTimerRef.current = window.setTimeout(() => {
-      setStorageSaveStatus("idle");
-    }, 2000);
-  }, []);
-
   const flushPendingStorageSave = useCallback(async () => {
     if (storageSaveInFlightRef.current || pendingStorageSaveRef.current == null) {
       return;
@@ -204,12 +160,6 @@ export function GeneralSettingsPage() {
       const nextDraft = pendingStorageSaveRef.current;
       pendingStorageSaveRef.current = null;
 
-      if (storageSavedTimerRef.current !== null) {
-        window.clearTimeout(storageSavedTimerRef.current);
-      }
-      setStorageSaveStatus("saving");
-      setStorageSaveError(null);
-
       const result = await updateSettings({
         input: {
           intermediateDir: nextDraft.intermediateDir || null,
@@ -220,17 +170,18 @@ export function GeneralSettingsPage() {
       });
 
       if (result.error) {
-        setStorageSaveStatus("error");
-        setStorageSaveError(result.error.message ?? "Unable to save settings.");
+        toast.error(result.error.message ?? "Unable to save settings.", {
+          id: "general-settings-save",
+        });
         break;
       }
 
       applyUpdatedSettings(result.data?.updateSettings);
-      setStorageSavedState();
+      toast.success(t("settings.saved"), { id: "general-settings-save" });
     }
 
     storageSaveInFlightRef.current = false;
-  }, [applyUpdatedSettings, setStorageSavedState, updateSettings]);
+  }, [applyUpdatedSettings, t, updateSettings]);
 
   useEffect(() => {
     if (!settings) {
@@ -266,7 +217,11 @@ export function GeneralSettingsPage() {
 
     if (result.data?.updateSettings) {
       applyUpdatedSettings(result.data.updateSettings);
-      pulseSpeedSaved();
+      toast.success(t("settings.saved"), { id: "general-settings-save" });
+    } else if (result.error) {
+      toast.error(result.error.message ?? "Unable to save settings.", {
+        id: "general-settings-save",
+      });
     }
   };
 
@@ -280,7 +235,11 @@ export function GeneralSettingsPage() {
 
     if (result.data?.updateSettings) {
       applyUpdatedSettings(result.data.updateSettings);
-      pulseIpReplacementBurstSaved();
+      toast.success(t("settings.saved"), { id: "general-settings-save" });
+    } else if (result.error) {
+      toast.error(result.error.message ?? "Unable to save settings.", {
+        id: "general-settings-save",
+      });
     }
   };
 
@@ -364,11 +323,6 @@ export function GeneralSettingsPage() {
             <Button variant="outline" onClick={() => setSpeedValue(0)}>
               {t("settings.resetSpeedLimit")}
             </Button>
-            {speedSaved ? (
-              <span className="text-sm text-status-completed">
-                {t("settings.saved")}
-              </span>
-            ) : null}
           </div>
         </div>
       </SectionCard>
@@ -474,11 +428,6 @@ export function GeneralSettingsPage() {
                     aria-label={t("settings.ipReplacementTrialExtraConnections")}
                     disabled={updateState.fetching}
                   />
-                  {ipReplacementBurstSaved ? (
-                    <span className="text-sm text-status-completed">
-                      {t("settings.saved")}
-                    </span>
-                  ) : null}
                 </div>
               </SettingField>
             </div>
@@ -493,20 +442,6 @@ export function GeneralSettingsPage() {
                 </div>
               </div>
               <Switch checked={cleanup} onCheckedChange={setCleanup} />
-            </div>
-
-            <div className="flex flex-wrap items-center gap-3">
-              {storageSaveStatus === "saving" ? (
-                <span className="text-sm text-muted-foreground">{t("settings.saving")}</span>
-              ) : null}
-              {storageSaveStatus === "saved" ? (
-                <span className="text-sm text-status-completed">
-                  {t("settings.saved")}
-                </span>
-              ) : null}
-              {storageSaveStatus === "error" && storageSaveError ? (
-                <span className="text-sm text-destructive">{storageSaveError}</span>
-              ) : null}
             </div>
 
           </div>
