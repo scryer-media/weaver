@@ -1109,11 +1109,43 @@ impl Pipeline {
         let mut evaluated_all = true;
         {
             let admission = self.direct_store.identity.get(&job_id)?;
-            if admission.no_match.contains(&file_index)
-                || admission
-                    .rosters
-                    .values()
-                    .any(|roster| roster.bound.contains_key(&file_index))
+            if admission.no_match.contains(&file_index) {
+                return None;
+            }
+            if let Some(set_index) = admission.rosters.values().find_map(|roster| {
+                roster
+                    .bound
+                    .contains_key(&file_index)
+                    .then_some(roster.set_index)
+                    .flatten()
+            }) {
+                // A bound file's articles route through its plan mapping, so
+                // reaching this rung means the routing seam declined the set —
+                // it is finalized or demoted. A finalized set's late duplicate
+                // has nowhere to go and is dropped, exactly as the routing
+                // seam drops it for name-admitted sets; a demoted set's file
+                // belongs to the conventional path now and must be let
+                // through, never discarded.
+                let finalized = self
+                    .direct_store
+                    .set(job_id, set_index)
+                    .is_some_and(|set| set.is_finalized());
+                if finalized {
+                    return Some(DirectFileTarget::Discard);
+                }
+                return None;
+            }
+            // A recovery carrier is never a described source volume, and its
+            // conventional bytes say nothing about the rosters — evaluating
+            // it would only burn hashes and pollute the evidence sets.
+            if self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.spec.files.get(file_index as usize))
+                .is_some_and(|file| matches!(file.role, weaver_model::files::FileRole::Par2 { .. }))
+                || self
+                    .par2_runtime(job_id)
+                    .is_some_and(|runtime| runtime.files.contains_key(&file_index))
             {
                 return None;
             }
@@ -1140,6 +1172,19 @@ impl Pipeline {
             }
         }
         if matches.is_empty() {
+            if !evaluated_all {
+                let prefix_len = self
+                    .file_prefix_16k
+                    .get(&file_id)
+                    .map(|prefix| prefix.len())
+                    .unwrap_or(0);
+                info!(
+                    job_id = job_id.0,
+                    file_index,
+                    prefix_len,
+                    "identity seam could not evaluate a file against every unclaimed volume"
+                );
+            }
             // Only a fully evaluated miss is a settled fact about the file.
             // A window the article did not cover proves nothing, and the file
             // simply proceeds conventionally — the leak mark and the
@@ -1660,6 +1705,13 @@ impl Pipeline {
         crate::runtime::perf_probe::record(
             "direct_store.identity.bound",
             std::time::Duration::from_nanos(1),
+        );
+        info!(
+            job_id = job_id.0,
+            set_name = %set_name,
+            file_index,
+            volume_index,
+            "identity binding established"
         );
         let Some(admission) = self.direct_store.identity.get_mut(&job_id) else {
             return;
