@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -88,6 +88,7 @@ pub struct DuplicateBackfillReport {
 
 struct PreparedSubmission {
     nzb_zstd: Vec<u8>,
+    raw_job_hash: [u8; 32],
     filename: Option<String>,
     password: Option<String>,
     category: Option<String>,
@@ -273,6 +274,7 @@ async fn submit_prepared_nzb(
 ) -> Result<SubmittedJob, SubmitNzbError> {
     let PreparedSubmission {
         nzb_zstd,
+        raw_job_hash: job_hash,
         filename,
         password,
         category,
@@ -280,7 +282,6 @@ async fn submit_prepared_nzb(
         submit_started,
     } = prepared;
 
-    let job_hash = persisted_nzb::hash_persisted_nzb_bytes(&nzb_zstd);
     let (spec, evidence) = if let Some(mut preparation) = staged_preparation {
         preparation.spec.category =
             resolve_submission_category(config, category.as_deref()).await?;
@@ -832,15 +833,24 @@ pub async fn submit_nzb_bytes_with_options(
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
     let submit_started = Instant::now();
-    let nzb = weaver_nzb::parse_nzb(nzb_bytes)?;
-    let nzb_zstd = persisted_nzb::compress_nzb_bytes(nzb_bytes).map_err(SubmitNzbError::Save)?;
+    let mut source = Cursor::new(nzb_bytes);
+    let prepared = match persisted_nzb::persist_decoded_nzb_reader_to_zstd(&mut source) {
+        Ok(prepared) => prepared,
+        Err(persisted_nzb::PersistedNzbError::Io(error)) => {
+            return Err(SubmitNzbError::Save(error));
+        }
+        Err(persisted_nzb::PersistedNzbError::Parse(error)) => {
+            return Err(SubmitNzbError::Parse(error));
+        }
+    };
     submit_prepared_nzb(
         db,
         handle,
         config,
-        Some(&nzb),
+        Some(&prepared.nzb),
         PreparedSubmission {
-            nzb_zstd,
+            nzb_zstd: prepared.nzb_zstd,
+            raw_job_hash: prepared.raw_job_hash,
             filename,
             password,
             category,
@@ -1017,7 +1027,7 @@ where
     })
     .await
     .map_err(|error| SubmitNzbError::Upload(std::io::Error::other(error.to_string())))?;
-    let (nzb_zstd, nzb) = match persist_result {
+    let prepared = match persist_result {
         Ok(values) => values,
         Err(super::persisted_nzb::PersistedNzbError::Io(error)) => {
             return Err(SubmitNzbError::Save(error));
@@ -1030,9 +1040,10 @@ where
         db,
         handle,
         config,
-        Some(&nzb),
+        Some(&prepared.nzb),
         PreparedSubmission {
-            nzb_zstd,
+            nzb_zstd: prepared.nzb_zstd,
+            raw_job_hash: prepared.raw_job_hash,
             filename,
             password,
             category,
@@ -1082,8 +1093,8 @@ pub async fn submit_staged_nzb_zstd_with_options(
     metadata: Vec<(String, String)>,
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
-    let nzb = match persisted_nzb::parse_persisted_nzb_bytes(&nzb_zstd) {
-        Ok(nzb) => nzb,
+    let (nzb, raw_job_hash) = match persisted_nzb::parse_and_hash_persisted_nzb_bytes(&nzb_zstd) {
+        Ok(parsed) => parsed,
         Err(persisted_nzb::PersistedNzbError::Io(error)) => {
             return Err(SubmitNzbError::Save(error));
         }
@@ -1091,8 +1102,18 @@ pub async fn submit_staged_nzb_zstd_with_options(
             return Err(SubmitNzbError::Parse(error));
         }
     };
-    submit_staged_parsed_nzb_with_options(
-        db, handle, config, &nzb, nzb_zstd, filename, password, category, metadata, options,
+    submit_staged_parsed_nzb_with_hash(
+        db,
+        handle,
+        config,
+        &nzb,
+        nzb_zstd,
+        raw_job_hash,
+        filename,
+        password,
+        category,
+        metadata,
+        options,
     )
     .await
 }
@@ -1110,6 +1131,37 @@ pub async fn submit_staged_parsed_nzb_with_options(
     metadata: Vec<(String, String)>,
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
+    let raw_job_hash = persisted_nzb::hash_persisted_nzb_bytes(&nzb_zstd);
+    submit_staged_parsed_nzb_with_hash(
+        db,
+        handle,
+        config,
+        nzb,
+        nzb_zstd,
+        raw_job_hash,
+        filename,
+        password,
+        category,
+        metadata,
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_staged_parsed_nzb_with_hash(
+    db: &Database,
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+    nzb: &Nzb,
+    nzb_zstd: Vec<u8>,
+    raw_job_hash: [u8; 32],
+    filename: Option<String>,
+    password: Option<String>,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+    options: SubmissionOptions,
+) -> Result<SubmittedJob, SubmitNzbError> {
     submit_prepared_nzb(
         db,
         handle,
@@ -1117,6 +1169,7 @@ pub async fn submit_staged_parsed_nzb_with_options(
         Some(nzb),
         PreparedSubmission {
             nzb_zstd,
+            raw_job_hash,
             filename,
             password,
             category,
@@ -1140,6 +1193,7 @@ pub async fn submit_staged_prepared_nzb_with_options(
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
     let category = preparation.spec.category.clone();
+    let raw_job_hash = preparation.evidence.raw_job_hash;
     submit_prepared_nzb(
         db,
         handle,
@@ -1147,6 +1201,7 @@ pub async fn submit_staged_prepared_nzb_with_options(
         None,
         PreparedSubmission {
             nzb_zstd,
+            raw_job_hash,
             filename,
             password: None,
             category,

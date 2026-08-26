@@ -1,4 +1,4 @@
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, BufReader, Cursor, Read, Write};
 use std::path::Path;
 
 use weaver_nzb::{Nzb, NzbError};
@@ -22,6 +22,59 @@ impl std::fmt::Display for PersistedNzbError {
 
 impl std::error::Error for PersistedNzbError {}
 
+pub struct PreparedPersistedNzb {
+    pub nzb_zstd: Vec<u8>,
+    pub nzb: Nzb,
+    pub raw_job_hash: [u8; 32],
+}
+
+struct ObservedReader<R, W> {
+    source: R,
+    copy: W,
+    hasher: blake3::Hasher,
+    error: Option<io::Error>,
+}
+
+impl<R: Read, W: Write> Read for ObservedReader<R, W> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = match self.source.read(buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                self.error = Some(io::Error::new(error.kind(), error.to_string()));
+                return Err(error);
+            }
+        };
+        if read != 0 {
+            if let Err(error) = self.copy.write_all(&buffer[..read]) {
+                self.error = Some(io::Error::new(error.kind(), error.to_string()));
+                return Err(error);
+            }
+            self.hasher.update(&buffer[..read]);
+        }
+        Ok(read)
+    }
+}
+
+fn parse_decoded_nzb_reader<R: Read, W: Write>(
+    source: R,
+    copy: W,
+) -> Result<(Nzb, W, [u8; 32]), PersistedNzbError> {
+    let observed = ObservedReader {
+        source,
+        copy,
+        hasher: blake3::Hasher::new(),
+        error: None,
+    };
+    let mut reader = BufReader::new(observed);
+    let parsed = weaver_nzb::parse_nzb_reader(&mut reader);
+    let observed = reader.into_inner();
+    if let Some(error) = observed.error {
+        return Err(PersistedNzbError::Io(error));
+    }
+    let nzb = parsed.map_err(PersistedNzbError::Parse)?;
+    Ok((nzb, observed.copy, finalize_blake3(observed.hasher)))
+}
+
 pub fn decode_persisted_nzb_bytes(bytes: &[u8]) -> io::Result<Vec<u8>> {
     if bytes.starts_with(&ZSTD_MAGIC) {
         zstd::stream::decode_all(Cursor::new(bytes))
@@ -31,8 +84,20 @@ pub fn decode_persisted_nzb_bytes(bytes: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 pub fn parse_persisted_nzb_bytes(bytes: &[u8]) -> Result<Nzb, PersistedNzbError> {
-    let decoded = decode_persisted_nzb_bytes(bytes).map_err(PersistedNzbError::Io)?;
-    weaver_nzb::parse_nzb(&decoded).map_err(PersistedNzbError::Parse)
+    parse_and_hash_persisted_nzb_bytes(bytes).map(|(nzb, _)| nzb)
+}
+
+pub fn parse_and_hash_persisted_nzb_bytes(
+    bytes: &[u8],
+) -> Result<(Nzb, [u8; 32]), PersistedNzbError> {
+    let (nzb, _, raw_hash) = if bytes.starts_with(&ZSTD_MAGIC) {
+        let decoder =
+            zstd::stream::read::Decoder::new(Cursor::new(bytes)).map_err(PersistedNzbError::Io)?;
+        parse_decoded_nzb_reader(decoder, io::sink())?
+    } else {
+        parse_decoded_nzb_reader(Cursor::new(bytes), io::sink())?
+    };
+    Ok((nzb, raw_hash))
 }
 
 pub fn compress_nzb_bytes(nzb_bytes: &[u8]) -> io::Result<Vec<u8>> {
@@ -53,18 +118,42 @@ pub fn load_persisted_nzb_storage_bytes(path: &Path) -> io::Result<Vec<u8>> {
 
 pub fn persist_decoded_nzb_reader_to_zstd<R: Read>(
     source: &mut R,
-) -> Result<(Vec<u8>, Nzb), PersistedNzbError> {
-    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).map_err(PersistedNzbError::Io)?;
-    io::copy(source, &mut encoder).map_err(PersistedNzbError::Io)?;
+) -> Result<PreparedPersistedNzb, PersistedNzbError> {
+    let encoder = zstd::stream::Encoder::new(Vec::new(), 3).map_err(PersistedNzbError::Io)?;
+    let (nzb, encoder, raw_hash) = parse_decoded_nzb_reader(source, encoder)?;
     let bytes = encoder.finish().map_err(PersistedNzbError::Io)?;
-    let nzb = parse_persisted_nzb_bytes(&bytes)?;
-    Ok((bytes, nzb))
+    Ok(PreparedPersistedNzb {
+        nzb_zstd: bytes,
+        nzb,
+        raw_job_hash: raw_hash,
+    })
 }
 
 pub fn hash_persisted_nzb_bytes(bytes: &[u8]) -> [u8; 32] {
-    let decoded = decode_persisted_nzb_bytes(bytes).unwrap_or_else(|_| bytes.to_vec());
+    let result = if bytes.starts_with(&ZSTD_MAGIC) {
+        zstd::stream::read::Decoder::new(Cursor::new(bytes))
+            .and_then(|mut decoder| hash_reader(&mut decoder))
+    } else {
+        hash_reader(&mut Cursor::new(bytes))
+    };
+    result.unwrap_or_else(|_| hash_bytes(bytes))
+}
+
+fn hash_reader(reader: &mut impl Read) -> io::Result<[u8; 32]> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&decoded);
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(finalize_blake3(hasher));
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
+fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(bytes);
     finalize_blake3(hasher)
 }
 
