@@ -28,7 +28,7 @@
     "ExtractionFailed"
   ],
   "expectedOutputBLAKE3": {
-    "work/sample.mkv": "8139650c53be5684ab9cf20e34996fcfb510f118ee652ad7b949c32e8cb8b08a"
+    "work/E2E Test PAR2 Obfuscated RAR Repair.mkv": "8139650c53be5684ab9cf20e34996fcfb510f118ee652ad7b949c32e8cb8b08a"
   },
   "runtimeAssertions": {
     "fileIdentityRewrite": {
