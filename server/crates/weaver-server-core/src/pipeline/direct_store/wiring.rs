@@ -1014,7 +1014,7 @@ impl Pipeline {
                             "direct_store.identity.refused.identity_late",
                             std::time::Duration::from_nanos(1),
                         );
-                        debug!(
+                        warn!(
                             job_id = job_id.0,
                             set_name = %set_name,
                             file_index,
@@ -1030,7 +1030,7 @@ impl Pipeline {
                         "direct_store.identity.refused.identity_late",
                         std::time::Duration::from_nanos(1),
                     );
-                    debug!(
+                    warn!(
                         job_id = job_id.0,
                         set_name = %set_name,
                         file_index,
@@ -1148,6 +1148,12 @@ impl Pipeline {
                 if let Some(admission) = self.direct_store.identity.get_mut(&job_id) {
                     admission.no_match.insert(file_index);
                 }
+                info!(
+                    job_id = job_id.0,
+                    file_index,
+                    leaked,
+                    "identity seam settled a file as matching no described volume"
+                );
                 self.identity_viability_sweep(job_id).await;
             }
             return None;
@@ -1693,6 +1699,11 @@ impl Pipeline {
             .get_mut(&job_id)
             .is_some_and(|admission| admission.leaked.insert(file_id.file_index));
         if newly_leaked {
+            info!(
+                job_id = job_id.0,
+                file_index = file_id.file_index,
+                "conventional bytes flushed for a file while identity admission is engaged"
+            );
             self.identity_viability_sweep(job_id).await;
         }
     }
@@ -1726,7 +1737,7 @@ impl Pipeline {
                     "direct_store.identity.dropped.roster_unfillable",
                     std::time::Duration::from_nanos(1),
                 );
-                debug!(
+                warn!(
                     job_id = job_id.0,
                     set_name = %set_name,
                     "identity roster dropped before admission"
@@ -1779,12 +1790,24 @@ impl Pipeline {
                         )
                 })
                 .count();
-            let condemned = admission
+            let condemned: Vec<String> = admission
                 .rosters
                 .iter()
                 .filter(|(_, roster)| roster.volumes.len() - roster.bound.len() > viable)
                 .map(|(set_name, _)| set_name.clone())
                 .collect();
+            for set_name in &condemned {
+                let roster = &admission.rosters[set_name];
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    unbound = roster.volumes.len() - roster.bound.len(),
+                    viable,
+                    leaked = admission.leaked.len(),
+                    no_match = admission.no_match.len(),
+                    "identity roster can no longer be filled"
+                );
+            }
             // A header set is judged only once its plan closed — an open one
             // has no size to fall short of, and its own arms (a leaked file
             // proving to be a set volume, a duplicate position claim) retire
