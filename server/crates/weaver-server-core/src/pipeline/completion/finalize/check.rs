@@ -941,6 +941,19 @@ pub(in crate::pipeline) fn selective_pass_verify_options() -> par2_rs::VerifyOpt
 /// What is left carried is therefore exactly the files that were already intact
 /// at their canonical names before the repair ran, which is the only set whose
 /// pre-repair verdict still describes the disk afterwards.
+/// What [`Pipeline::register_verified_par2_rar_outputs`] adopted.
+///
+/// The set names travel with the count because adopting a rebuilt volume
+/// invalidates its set's derived plan: the plan was computed from the headers of
+/// the volumes that were present, and this is a volume that was not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Par2RarOutputRegistration {
+    /// Volumes whose facts this call newly persisted or changed.
+    pub(crate) registered: usize,
+    /// The RAR sets those volumes belong to.
+    pub(crate) set_names: BTreeSet<String>,
+}
+
 fn par2_repair_write_set(verification: &par2_rs::VerificationResult) -> Vec<par2_rs::FileId> {
     verification
         .files
@@ -3615,15 +3628,21 @@ impl Pipeline {
         // it a repaired interior volume sits on disk under a name the assembly
         // has never heard of, extraction goes on waiting for it, and the repair
         // that just succeeded changes nothing.
-        if let Err(error) = self
+        let registration = match self
             .register_verified_par2_rar_outputs(job_id, &verification)
             .await
         {
-            self.finish_par2_set_failure(job_id, set_id, error).await;
-            return;
-        }
-        self.refresh_verified_complete_archive_topologies(job_id, &verification)
+            Ok(registration) => registration,
+            Err(error) => {
+                self.finish_par2_set_failure(job_id, set_id, error).await;
+                return;
+            }
+        };
+        // No repair ran on this arm, so nothing was rewritten; a rebuilt volume
+        // the NZB never carried still invalidates its set's plan.
+        self.refresh_verified_complete_archive_topologies(job_id, &verification, &HashSet::new())
             .await;
+        self.invalidate_rar_plans_for_repaired_sets(job_id, registration.set_names);
         if let Err(error) = self
             .reconcile_and_classify_par2_verification(
                 job_id,
@@ -4670,16 +4689,28 @@ impl Pipeline {
         }
         self.retry_par2_authoritative_identity(job_id).await;
         stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.identity", stage_start);
-        if let Err(error) = self
+        let registration = match self
             .register_verified_par2_rar_outputs(job_id, &post_repair_verification)
             .await
         {
-            return self.fail_par2_repair(job_id, error);
-        }
+            Ok(registration) => registration,
+            Err(error) => return self.fail_par2_repair(job_id, error),
+        };
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.register_outputs", stage_start);
-        self.refresh_verified_complete_archive_topologies(job_id, &post_repair_verification)
-            .await;
+        // The descriptions the repair wrote, taken from the pre-repair verdict
+        // the repairer itself acted on rather than re-derived from names here.
+        let rewritten: HashSet<par2_rs::FileId> =
+            par2_repair_write_set(pre_repair).into_iter().collect();
+        self.refresh_verified_complete_archive_topologies(
+            job_id,
+            &post_repair_verification,
+            &rewritten,
+        )
+        .await;
+        // Outputs the NZB never carried have no file id to travel through the
+        // refresh set, so their sets are invalidated from the registration.
+        self.invalidate_rar_plans_for_repaired_sets(job_id, registration.set_names);
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.refresh_topologies", stage_start);
         if let Err(error) = self
@@ -5087,13 +5118,18 @@ impl Pipeline {
         .map_err(|error| format!("failed to refresh post-repair verified hashes: {error}"))
     }
 
-    async fn refresh_verified_complete_archive_topologies(
+    /// `rewritten` is the repair's write set, empty on a pass that repaired
+    /// nothing. See
+    /// [`Self::verified_complete_archive_file_ids_needing_refresh`].
+    pub(in crate::pipeline) async fn refresh_verified_complete_archive_topologies(
         &mut self,
         job_id: JobId,
         verification: &par2_rs::VerificationResult,
+        rewritten: &HashSet<par2_rs::FileId>,
     ) -> usize {
-        let file_ids =
-            self.verified_complete_archive_file_ids_needing_refresh(job_id, verification);
+        let targets =
+            self.verified_complete_archive_refresh_targets(job_id, verification, rewritten);
+        let file_ids: Vec<NzbFileId> = targets.iter().map(|(file_id, _)| *file_id).collect();
         if !file_ids.is_empty() {
             info!(
                 job_id = job_id.0,
@@ -5101,15 +5137,89 @@ impl Pipeline {
                 "refreshing archive topology from verified PAR2 outputs"
             );
         }
+        // Only the files the repair actually rewrote invalidate a plan. A
+        // renamed file, or one whose set is being given its first topology, is
+        // ordinary progress and the refresh walk below is the whole of it.
+        let rewritten_file_ids: Vec<NzbFileId> = targets
+            .iter()
+            .filter_map(|(file_id, was_rewritten)| was_rewritten.then_some(*file_id))
+            .collect();
+        let rewritten_set_names = self.rar_set_names_for_files(job_id, &rewritten_file_ids);
         for file_id in &file_ids {
             self.refresh_archive_state_for_completed_file(job_id, *file_id, false)
                 .await;
         }
+        self.invalidate_rar_plans_for_repaired_sets(job_id, rewritten_set_names);
         // Every arm that accepts a verdict passes through here on its way to
         // reconciliation, so a set the verdict has already joined is retired in
         // one place rather than at each of them.
         self.retire_par2_joined_split_topologies(job_id, verification);
         file_ids.len()
+    }
+
+    /// The RAR set names owning a list of the job's files, deduplicated.
+    pub(in crate::pipeline) fn rar_set_names_for_files(
+        &self,
+        job_id: JobId,
+        file_ids: &[NzbFileId],
+    ) -> BTreeSet<String> {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return BTreeSet::new();
+        };
+        file_ids
+            .iter()
+            .filter_map(|file_id| {
+                let file = state.assembly.file(*file_id)?;
+                if !matches!(
+                    self.classified_role_for_file(job_id, file),
+                    weaver_model::files::FileRole::RarVolume { .. }
+                ) {
+                    return None;
+                }
+                self.classified_archive_set_name_for_file(job_id, file)
+            })
+            .collect()
+    }
+
+    /// Force a header-level plan rebuild for every set a repair touched, and
+    /// hold extraction until it lands.
+    ///
+    /// Registering the repaired volume's facts is not enough on its own. The
+    /// derived plan — the member chain, and with it the volume range extraction
+    /// opens — was computed while those volumes were missing, and nothing about
+    /// installing new facts retires it. Re-deriving from the facts alone would
+    /// not do either: the member chain comes from the volumes' *headers*, which
+    /// is exactly what the repair rewrote.
+    ///
+    /// [`RefreshReason::IdentityRebind`] is the existing reason for "the bytes
+    /// behind this set are not what the plan was built from". It marks the
+    /// refresh state `structure_dirty`, which is what makes
+    /// `rar_member_refresh_request` demand a rebuild before a member may start,
+    /// and it leaves the request `in_flight`, which is what
+    /// `job_has_pending_rar_refresh_for_current_sets` reports and the
+    /// `pending_rar_refresh` arm of the completion gate already defers on. No
+    /// new gate: the repaired set becomes pending in the one the extraction path
+    /// has always honoured.
+    fn invalidate_rar_plans_for_repaired_sets(
+        &mut self,
+        job_id: JobId,
+        set_names: BTreeSet<String>,
+    ) {
+        for set_name in set_names {
+            let target = self.latest_completed_rar_volume(job_id, &set_name);
+            info!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                target_completed_volume = target,
+                "rebuilding a repaired RAR set's plan from its repaired headers"
+            );
+            self.enqueue_rar_set_refresh(
+                job_id,
+                &set_name,
+                target,
+                crate::pipeline::RefreshReason::IdentityRebind,
+            );
+        }
     }
 
     /// Retire the split topologies a verdict has already produced the output of.
@@ -5290,7 +5400,7 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         verification: &par2_rs::VerificationResult,
-    ) -> Result<usize, String> {
+    ) -> Result<Par2RarOutputRegistration, String> {
         let registered_filenames = self
             .jobs
             .get(&job_id)
@@ -5303,7 +5413,7 @@ impl Pipeline {
             })
             .unwrap_or_default();
 
-        let mut registered = 0;
+        let mut registration = Par2RarOutputRegistration::default();
         for file in &verification.files {
             if !matches!(file.status, par2_rs::verify::FileStatus::Complete)
                 || registered_filenames.contains(&file.filename)
@@ -5363,24 +5473,76 @@ impl Pipeline {
                 Some(volume_number),
                 facts,
             )? {
-                registered += 1;
+                registration.registered += 1;
+                // A registered output is a volume the plan was built without.
+                // Its set's member chain is therefore derived from a strictly
+                // smaller set of headers than the one now on disk, whether or
+                // not any NZB file of that set was itself rewritten.
+                registration.set_names.insert(set_name);
             }
         }
 
-        if registered > 0 {
+        if registration.registered > 0 {
             info!(
                 job_id = job_id.0,
-                registered, "registered PAR2-verified RAR outputs absent from the NZB"
+                registered = registration.registered,
+                "registered PAR2-verified RAR outputs absent from the NZB"
             );
         }
-        Ok(registered)
+        Ok(registration)
     }
 
+    /// The archive files whose topology must be rebuilt from what a verdict
+    /// proved about the disk.
+    ///
+    /// `rewritten` names the descriptions a repair just wrote — the write set of
+    /// [`par2_repair_write_set`], empty on every pass that repaired nothing.
+    /// Those files are included **unconditionally**, and that is the whole
+    /// reason the parameter exists.
+    ///
+    /// A repaired volume re-verifies as `Complete`, not `Renamed`, and its set
+    /// already carries a plan — one derived from cached headers back while the
+    /// volume was still missing. So neither of the two conditions that admit a
+    /// file here holds for precisely the files whose bytes just changed, and the
+    /// refresh walks past them: the plan a repair exists to correct is the one
+    /// left standing. A member chain that ended at the repaired volume keeps
+    /// ending there, extraction opens the truncated volume range, and the packed
+    /// data fails its CRC against bytes that are in fact perfect.
+    ///
+    /// `needs_refresh` asks whether a set has a plan *at all*, which is a
+    /// question about existence where this needs one about staleness. Repair is
+    /// the one place staleness is known rather than inferred — the repairer says
+    /// which descriptions it wrote — so the answer is threaded in rather than
+    /// re-derived from names here.
+    /// The refresh set without the rewritten flags — the shape the tests assert
+    /// against. Production reads
+    /// [`Self::verified_complete_archive_refresh_targets`], which keeps them.
+    #[cfg(test)]
     pub(crate) fn verified_complete_archive_file_ids_needing_refresh(
         &self,
         job_id: JobId,
         verification: &par2_rs::VerificationResult,
+        rewritten: &HashSet<par2_rs::FileId>,
     ) -> Vec<NzbFileId> {
+        self.verified_complete_archive_refresh_targets(job_id, verification, rewritten)
+            .into_iter()
+            .map(|(file_id, _)| file_id)
+            .collect()
+    }
+
+    /// The refresh set, each entry flagged with whether the repair rewrote it.
+    ///
+    /// The flag is what separates "rebuild this file's topology" from "this
+    /// file's set was built from bytes that no longer exist". Only the latter
+    /// may invalidate a set's plan: a rename or a first-time topology build is
+    /// ordinary progress, and forcing a header-level rebuild for those would
+    /// re-derive a plan from the same headers it already holds.
+    fn verified_complete_archive_refresh_targets(
+        &self,
+        job_id: JobId,
+        verification: &par2_rs::VerificationResult,
+        rewritten: &HashSet<par2_rs::FileId>,
+    ) -> Vec<(NzbFileId, bool)> {
         let Some(state) = self.jobs.get(&job_id) else {
             return Vec::new();
         };
@@ -5427,7 +5589,7 @@ impl Pipeline {
             }
         }
 
-        let mut matched = HashSet::new();
+        let mut matched = HashMap::<NzbFileId, bool>::new();
         for file_verification in &verification.files {
             let renamed = matches!(
                 file_verification.status,
@@ -5440,20 +5602,25 @@ impl Pipeline {
                 continue;
             }
 
+            // Additive: the two original conditions are untouched, and a file
+            // the repair rewrote joins them regardless of what either says.
+            let was_rewritten = rewritten.contains(&file_verification.file_id);
             for candidate_name in Self::par2_verification_candidate_names(file_verification) {
                 let Some((file_id, needs_refresh)) = by_name.get(&candidate_name).copied() else {
                     continue;
                 };
-                if renamed || needs_refresh {
-                    matched.insert(file_id);
+                if renamed || needs_refresh || was_rewritten {
+                    // A file can match more than one description name; it is
+                    // rewritten if any of them says so.
+                    *matched.entry(file_id).or_insert(false) |= was_rewritten;
                 }
                 break;
             }
         }
 
-        let mut file_ids = matched.into_iter().collect::<Vec<_>>();
-        file_ids.sort_by_key(|file_id| file_id.file_index);
-        file_ids
+        let mut targets = matched.into_iter().collect::<Vec<_>>();
+        targets.sort_by_key(|(file_id, _)| file_id.file_index);
+        targets
     }
 
     fn role_refreshes_archive_topology(role: &weaver_model::files::FileRole) -> bool {
@@ -6745,8 +6912,13 @@ impl Pipeline {
                         }
 
                         self.retry_par2_authoritative_identity(job_id).await;
-                        self.refresh_verified_complete_archive_topologies(job_id, verification)
-                            .await;
+                        // A clean verdict repaired nothing.
+                        self.refresh_verified_complete_archive_topologies(
+                            job_id,
+                            verification,
+                            &HashSet::new(),
+                        )
+                        .await;
                         if let Err(error) = self
                             .reconcile_and_classify_par2_verification(
                                 job_id,
@@ -7135,8 +7307,13 @@ impl Pipeline {
                         return;
                     }
                     self.retry_par2_authoritative_identity(job_id).await;
-                    self.refresh_verified_complete_archive_topologies(job_id, &verification)
-                        .await;
+                    // A clean verdict repaired nothing.
+                    self.refresh_verified_complete_archive_topologies(
+                        job_id,
+                        &verification,
+                        &HashSet::new(),
+                    )
+                    .await;
                     if let Err(error) = self
                         .reconcile_and_classify_par2_verification(
                             job_id,

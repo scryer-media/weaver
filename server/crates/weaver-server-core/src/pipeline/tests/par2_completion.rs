@@ -1732,7 +1732,11 @@ async fn par2_verified_complete_archive_refreshes_missing_existing_topology_only
     };
 
     assert_eq!(
-        pipeline.verified_complete_archive_file_ids_needing_refresh(job_id, &verification),
+        pipeline.verified_complete_archive_file_ids_needing_refresh(
+            job_id,
+            &verification,
+            &HashSet::new(),
+        ),
         vec![file_id],
         "already-complete PAR2-verified archives without topology must be refreshed"
     );
@@ -1756,9 +1760,30 @@ async fn par2_verified_complete_archive_refreshes_missing_existing_topology_only
 
     assert!(
         pipeline
-            .verified_complete_archive_file_ids_needing_refresh(job_id, &verification)
+            .verified_complete_archive_file_ids_needing_refresh(
+                job_id,
+                &verification,
+                &HashSet::new(),
+            )
             .is_empty(),
         "existing topology should avoid a redundant refresh for unchanged complete files"
+    );
+
+    // The same unchanged file, named by the repair as one it rewrote, is
+    // refreshed anyway: the plan that existed is the one the repair invalidated.
+    let rewritten: HashSet<par2_rs::FileId> = verification
+        .files
+        .iter()
+        .map(|file| file.file_id)
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        pipeline.verified_complete_archive_file_ids_needing_refresh(
+            job_id,
+            &verification,
+            &rewritten,
+        ),
+        vec![file_id],
+        "a file the repair rewrote must refresh even though its set already has a topology"
     );
 }
 

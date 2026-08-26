@@ -6418,7 +6418,8 @@ async fn verified_par2_output_registers_missing_rar_volume_for_retry() {
         pipeline
             .register_verified_par2_rar_outputs(job_id, &verification)
             .await
-            .unwrap(),
+            .unwrap()
+            .registered,
         1
     );
     pipeline
@@ -6530,7 +6531,8 @@ async fn reconciled_obfuscated_rar_keeps_the_verified_canonical_volume() {
         pipeline
             .register_verified_par2_rar_outputs(job_id, &verification)
             .await
-            .unwrap(),
+            .unwrap()
+            .registered,
         1
     );
     let report = pipeline
@@ -9340,4 +9342,208 @@ async fn purge_idle_rar_set_drops_shared_kdf_cache() {
 
     assert!(!pipeline.rar_sets.contains_key(&(job_id, set_name.clone())));
     assert!(weak_cache.upgrade().is_none());
+}
+
+/// A job whose four-volume RAR set is fully downloaded, complete, and already
+/// carries a derived plan — the state every post-repair refresh finds.
+async fn complete_rar_set_with_plan(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    files: &[(String, Vec<u8>)],
+    name: &str,
+) {
+    insert_active_job(pipeline, job_id, rar_job_spec(name, files)).await;
+    pause_job_for_rar_fixture_setup(pipeline, job_id);
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+    assert!(
+        pipeline
+            .rar_sets
+            .get(&(job_id, "show".to_string()))
+            .and_then(|state| state.plan.as_ref())
+            .is_some(),
+        "the fixture must reproduce the post-repair precondition: a plan already exists"
+    );
+}
+
+/// Every file `Complete` at its canonical name, which is what a repaired volume
+/// re-verifies as — never `Renamed`.
+fn all_complete_verification(files: &[(String, Vec<u8>)]) -> par2_rs::VerificationResult {
+    par2_rs::VerificationResult {
+        files: files
+            .iter()
+            .enumerate()
+            .map(|(index, (filename, _))| par2_rs::verify::FileVerification {
+                file_id: par2_rs::FileId::from_bytes([index as u8; 16]),
+                filename: filename.clone(),
+                status: par2_rs::verify::FileStatus::Complete,
+                valid_slices: Vec::new(),
+                missing_slice_count: 0,
+            })
+            .collect(),
+        recovery_blocks_available: 0,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    }
+}
+
+#[tokio::test]
+async fn repaired_middle_volume_refreshes_topology_despite_an_existing_plan() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30240);
+    let files = build_multifile_multivolume_rar_set();
+    complete_rar_set_with_plan(&mut pipeline, job_id, &files, "Repaired Middle Volume").await;
+
+    let verification = all_complete_verification(&files);
+
+    // The trap this fix exists for: the plan exists, so nothing is judged to
+    // need a refresh, and no file here is `Renamed`.
+    assert!(
+        pipeline
+            .verified_complete_archive_file_ids_needing_refresh(
+                job_id,
+                &verification,
+                &HashSet::new(),
+            )
+            .is_empty(),
+        "an existing plan suppresses every refresh when the repair is not named"
+    );
+
+    // Volume 1 is interior: the member E01.mkv starts at volume 0 and continues
+    // past it, so a chain rebuilt without volume 1's repaired header truncates
+    // the member and extraction opens a short volume range.
+    let rewritten: HashSet<par2_rs::FileId> = [verification.files[1].file_id].into_iter().collect();
+    assert_eq!(
+        pipeline.verified_complete_archive_file_ids_needing_refresh(
+            job_id,
+            &verification,
+            &rewritten,
+        ),
+        vec![NzbFileId {
+            job_id,
+            file_index: 1
+        }],
+        "the volume the repair rewrote must refresh even though its set has a plan"
+    );
+}
+
+#[tokio::test]
+async fn repaired_final_volume_refreshes_topology_despite_an_existing_plan() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30241);
+    let files = build_multifile_multivolume_rar_set();
+    complete_rar_set_with_plan(&mut pipeline, job_id, &files, "Repaired Final Volume").await;
+
+    let verification = all_complete_verification(&files);
+    // The boundary case: a stale chain that stops at the last volume is
+    // accidentally the right length, so nothing downstream would notice the
+    // missed refresh. It must still happen — the repaired header is what proves
+    // the member ends there rather than merely appearing to.
+    let last = files.len() - 1;
+    let rewritten: HashSet<par2_rs::FileId> =
+        [verification.files[last].file_id].into_iter().collect();
+    assert_eq!(
+        pipeline.verified_complete_archive_file_ids_needing_refresh(
+            job_id,
+            &verification,
+            &rewritten,
+        ),
+        vec![NzbFileId {
+            job_id,
+            file_index: last as u32
+        }],
+        "a repaired final volume must refresh like any other"
+    );
+}
+
+#[tokio::test]
+async fn repaired_rar_set_holds_extraction_until_its_plan_is_rebuilt() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30242);
+    let files = build_multifile_multivolume_rar_set();
+    complete_rar_set_with_plan(
+        &mut pipeline,
+        job_id,
+        &files,
+        "Repaired Set Extraction Hold",
+    )
+    .await;
+
+    let key = (job_id, "show".to_string());
+    let verification = all_complete_verification(&files);
+    let rewritten: HashSet<par2_rs::FileId> = [verification.files[1].file_id].into_iter().collect();
+
+    pipeline
+        .refresh_verified_complete_archive_topologies(job_id, &verification, &rewritten)
+        .await;
+
+    assert!(
+        pipeline.job_has_pending_rar_refresh_for_current_sets(job_id),
+        "the repaired set must be pending in the gate the completion path already defers on"
+    );
+    assert!(
+        pipeline
+            .rar_refresh_state
+            .get(&key)
+            .is_some_and(|state| state.structure_dirty),
+        "a repaired set's plan must be marked stale so a member cannot start on it"
+    );
+}
+
+#[tokio::test]
+async fn a_clean_verdict_leaves_a_complete_rar_set_plan_alone() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30243);
+    let files = build_multifile_multivolume_rar_set();
+    complete_rar_set_with_plan(&mut pipeline, job_id, &files, "Clean Verdict Plan Kept").await;
+
+    let key = (job_id, "show".to_string());
+    let verification = all_complete_verification(&files);
+
+    // Nothing was repaired, so nothing is stale: the additive inclusion must not
+    // turn every clean verdict into a header-level rebuild.
+    pipeline
+        .refresh_verified_complete_archive_topologies(job_id, &verification, &HashSet::new())
+        .await;
+
+    assert!(
+        !pipeline
+            .rar_refresh_state
+            .get(&key)
+            .is_some_and(|state| state.structure_dirty),
+        "a clean verdict must not mark an intact set's plan stale"
+    );
+}
+
+#[tokio::test]
+async fn renamed_verified_files_still_refresh_without_a_repair_write_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30244);
+    let files = build_multifile_multivolume_rar_set();
+    complete_rar_set_with_plan(&mut pipeline, job_id, &files, "Renamed Arm Unchanged").await;
+
+    let mut verification = all_complete_verification(&files);
+    verification.files[2].status =
+        par2_rs::verify::FileStatus::Renamed(std::path::PathBuf::from(&files[2].0));
+
+    // The pre-existing arm, unchanged: a rename refreshes on its own, with no
+    // repair write set involved.
+    assert_eq!(
+        pipeline.verified_complete_archive_file_ids_needing_refresh(
+            job_id,
+            &verification,
+            &HashSet::new(),
+        ),
+        vec![NzbFileId {
+            job_id,
+            file_index: 2
+        }],
+        "the renamed arm must keep refreshing exactly as before"
+    );
 }
