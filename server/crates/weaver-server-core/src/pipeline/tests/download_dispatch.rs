@@ -346,7 +346,10 @@ async fn par2_metadata_bootstrap_claims_every_explicit_index_in_one_primary_batc
     assert_eq!(lease.works.len(), 2);
     assert!(
         lease.works.iter().all(|work| {
-            work.segment_id.file_id.file_index < 2 && !work.is_recovery && work.priority == priority
+            work.segment_id.file_id.file_index < 2
+                && !work.is_recovery
+                && !work.completion_critical
+                && work.priority == priority
         }),
         "the bootstrap lease must contain only primary explicit-index work"
     );
@@ -395,6 +398,15 @@ async fn par2_metadata_bootstrap_claims_every_explicit_index_in_one_primary_batc
         pipeline.par2_discovery_state_for_candidate(job_id, 1),
         Par2DiscoveryState::MetadataCarrierQueued { .. }
     ));
+    assert!(
+        !pipeline
+            .list_jobs()
+            .into_iter()
+            .find(|job| job.job_id == job_id)
+            .expect("bootstrapping job remains visible")
+            .fetching_repair_data,
+        "ordinary explicit-index bootstrap must not surface as completion-critical recovery fetch"
+    );
 
     let second_index = lease
         .works
@@ -853,6 +865,7 @@ async fn recovery_async_handoff_resets_owned_lane_caches() {
         byte_estimate: 1024,
         retry_count: 0,
         is_recovery: true,
+        completion_critical: false,
         exclude_servers: Vec::new(),
         avoid_server: None,
     };
@@ -1603,6 +1616,7 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
                     byte_estimate: 128,
                     retry_count: MAX_SEGMENT_RETRIES,
                     is_recovery: false,
+                    completion_critical: false,
                     exclude_servers: vec![0],
                     avoid_server: None,
                 },
@@ -3145,6 +3159,7 @@ async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
             byte_estimate: 128,
             retry_count: 0,
             is_recovery: true,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -3437,6 +3452,7 @@ async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_
         byte_estimate: segment_bytes,
         retry_count: 0,
         is_recovery: false,
+        completion_critical: false,
         exclude_servers: vec![],
         avoid_server: None,
     };
@@ -3787,6 +3803,7 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
         byte_estimate: file_bytes,
         retry_count: 0,
         is_recovery: false,
+        completion_critical: false,
         exclude_servers: vec![],
         avoid_server: None,
     };
@@ -4289,6 +4306,207 @@ async fn dispatch_downloads_bounded_same_band_shares_capacity() {
 }
 
 #[tokio::test]
+async fn completion_critical_recovery_gets_bounded_lanes_ahead_of_higher_priority_primary() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        8,
+    )
+    .await;
+    pipeline.connection_ramp = 8;
+
+    let hot_job_id = JobId(21420);
+    let critical_job_id = JobId(21421);
+    insert_active_job(
+        &mut pipeline,
+        hot_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Completion Critical Hot",
+                &many_standalone_files("completion-critical-hot", 500),
+            ),
+            "HIGH",
+        ),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        critical_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Completion Critical Recovery",
+                &many_standalone_files("completion-critical-recovery", 500),
+            ),
+            "LOW",
+        ),
+    )
+    .await;
+    {
+        let state = pipeline.jobs.get_mut(&critical_job_id).unwrap();
+        let work = state.download_queue.drain_all();
+        for mut work in work {
+            work.is_recovery = true;
+            work.completion_critical = true;
+            state.download_queue.push(work);
+        }
+    }
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.hot_dispatch_job, Some(hot_job_id));
+    assert_eq!(pipeline.active_download_connections, 8);
+    assert_eq!(
+        pipeline.active_download_connections_by_job.get(&hot_job_id),
+        Some(&6)
+    );
+    assert_eq!(
+        pipeline
+            .active_download_connections_by_job
+            .get(&critical_job_id),
+        Some(&2)
+    );
+    assert_eq!(
+        pipeline
+            .hot_dispatch_spillover_loans
+            .bounded_lent_connections(),
+        0,
+        "completion-required PAR2 is reserved work, not measured spillover"
+    );
+}
+
+#[tokio::test]
+async fn completion_critical_recovery_wins_the_only_connection() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        1,
+    )
+    .await;
+    pipeline.connection_ramp = 1;
+
+    let hot_job_id = JobId(21422);
+    let critical_job_id = JobId(21423);
+    insert_active_job(
+        &mut pipeline,
+        hot_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Single Lane Hot",
+                &many_standalone_files("single-lane-hot", 10),
+            ),
+            "HIGH",
+        ),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        critical_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Single Lane Critical",
+                &many_standalone_files("single-lane-critical", 10),
+            ),
+            "LOW",
+        ),
+    )
+    .await;
+    {
+        let state = pipeline.jobs.get_mut(&critical_job_id).unwrap();
+        let work = state.download_queue.drain_all();
+        for mut work in work {
+            work.is_recovery = true;
+            work.completion_critical = true;
+            state.download_queue.push(work);
+        }
+    }
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_download_connections, 1);
+    assert_eq!(
+        pipeline
+            .active_download_connections_by_job
+            .get(&critical_job_id),
+        Some(&1)
+    );
+    assert!(
+        !pipeline
+            .active_download_connections_by_job
+            .contains_key(&hot_job_id)
+    );
+}
+
+#[tokio::test]
+async fn completion_critical_share_caps_mixed_hot_job_by_lane_class() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        8,
+    )
+    .await;
+    pipeline.connection_ramp = 8;
+
+    let job_id = JobId(21424);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        with_priority(
+            standalone_job_spec(
+                "Mixed Completion Critical Hot",
+                &many_standalone_files("mixed-completion-critical-hot", 500),
+            ),
+            "HIGH",
+        ),
+    )
+    .await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let work = state.download_queue.drain_all();
+        for (index, mut work) in work.into_iter().enumerate() {
+            if index < 100 {
+                work.is_recovery = true;
+                work.completion_critical = true;
+            }
+            state.download_queue.push(work);
+        }
+    }
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.hot_dispatch_job, Some(job_id));
+    assert_eq!(pipeline.active_download_connections, 8);
+    assert_eq!(
+        pipeline.active_download_connections_by_job.get(&job_id),
+        Some(&8)
+    );
+    assert_eq!(pipeline.active_completion_critical_connections, 2);
+    assert_eq!(
+        pipeline
+            .active_completion_critical_connections_by_job
+            .get(&job_id),
+        Some(&2)
+    );
+    let queued = &pipeline.jobs.get(&job_id).unwrap().download_queue;
+    assert!(queued.has_completion_critical_work());
+    assert!(queued.has_noncritical_work());
+}
+
+#[tokio::test]
 async fn dispatch_downloads_bounded_same_band_skips_blocked_peer_and_tries_next() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
@@ -4642,6 +4860,7 @@ async fn hot_share_yield_signal_clears_when_refill_gates_disable_bounded_share()
         compatibility: DownloadBatchCompatibility {
             priority: FileRole::Standalone.download_priority(),
             is_recovery: false,
+            completion_critical: false,
             groups: vec!["alt.binaries.test".to_string()],
             exclude_servers: Vec::new(),
             avoid_server: None,
@@ -4945,6 +5164,95 @@ async fn hot_lane_refill_yields_when_bounded_share_unmet() {
     let response = response_rx.await.unwrap();
     assert!(response.lease.is_none());
     assert_eq!(response.park_reason, LaneParkReason::HotShareYield);
+    assert!(pipeline.hot_share_yield_signal.is_requested_for(hot_job_id));
+}
+
+#[tokio::test]
+async fn hot_lane_refill_yields_to_higher_priority_completion_critical_work_without_hot_thrashing()
+{
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        8,
+    )
+    .await;
+    pipeline.connection_ramp = 8;
+
+    let hot_job_id = JobId(21442);
+    let critical_job_id = JobId(21443);
+    insert_active_job(
+        &mut pipeline,
+        hot_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Critical Yield Hot",
+                &many_standalone_files("critical-yield-hot", 600),
+            ),
+            "LOW",
+        ),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        critical_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Critical Yield Peer",
+                &many_standalone_files("critical-yield-peer", 600),
+            ),
+            "HIGH",
+        ),
+    )
+    .await;
+    {
+        let state = pipeline.jobs.get_mut(&critical_job_id).unwrap();
+        for mut work in state.download_queue.drain_all() {
+            work.is_recovery = true;
+            work.completion_critical = true;
+            state.download_queue.push(work);
+        }
+    }
+
+    pipeline.hot_dispatch_job = Some(hot_job_id);
+    pipeline.hot_dispatch_started_at = Some(Instant::now() - Duration::from_secs(5));
+    pipeline.active_download_connections = 8;
+    pipeline
+        .active_download_connections_by_job
+        .insert(hot_job_id, 8);
+    pipeline.active_downloads_by_job.insert(
+        hot_job_id,
+        8 * TEST_HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT,
+    );
+
+    let refill_compatibility = {
+        let state = pipeline.jobs.get_mut(&hot_job_id).unwrap();
+        let sample = state.download_queue.pop().unwrap();
+        let compatibility = DownloadBatchCompatibility::from_work(&sample);
+        state.download_queue.push(sample);
+        compatibility
+    };
+    let (response_tx, response_rx) = oneshot::channel();
+    pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        runtime_generation: 0,
+        job_id: hot_job_id,
+        server_idx: 0,
+        remote_ip: "127.0.0.1".parse().unwrap(),
+        supports_pipelining: false,
+        current_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: None,
+        compatibility: refill_compatibility,
+        response_tx,
+    });
+
+    let response = response_rx.await.unwrap();
+    assert!(response.lease.is_none());
+    assert_eq!(response.park_reason, LaneParkReason::HotShareYield);
+    assert_eq!(pipeline.hot_dispatch_job, Some(hot_job_id));
     assert!(pipeline.hot_share_yield_signal.is_requested_for(hot_job_id));
 }
 
@@ -5336,6 +5644,7 @@ async fn lane_refill_reclaims_spillover_after_measured_speed_harm() {
         job_id: spillover_job_id,
         mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: Some(SpilloverLoanKind::MeasuredUnderfill),
+        completion_critical: false,
         reason: LaneParkReason::SpilloverSpeedHarm,
         release_connection_slot: true,
         release_ip_replacement_burst: false,
@@ -5855,6 +6164,7 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
         job_id,
         mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: None,
+        completion_critical: false,
         reason: LaneParkReason::ServerQuota,
         release_connection_slot: false,
         release_ip_replacement_burst: true,
@@ -6041,6 +6351,7 @@ async fn retired_ip_replacement_lane_parks_at_refill_boundary() {
         compatibility: DownloadBatchCompatibility {
             priority: 3,
             is_recovery: false,
+            completion_critical: false,
             groups: vec!["alt.binaries.test".to_string()],
             exclude_servers: Vec::new(),
             avoid_server: None,

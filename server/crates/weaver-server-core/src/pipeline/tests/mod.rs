@@ -269,6 +269,8 @@ fn finished_job_info(job_id: JobId) -> JobInfo {
         download_retry_at_epoch_ms: None,
         status: JobStatus::Complete,
         download_state: crate::jobs::model::DownloadState::Complete,
+        finalizing_download: false,
+        fetching_repair_data: false,
         post_state: crate::jobs::model::PostState::Idle,
         run_state: crate::jobs::model::RunState::Active,
         progress: 1.0,
@@ -2588,6 +2590,7 @@ fn rar_unlock_work(job_id: JobId, file_index: u32, priority: u32) -> DownloadWor
         byte_estimate: 1024,
         retry_count: 0,
         is_recovery: false,
+        completion_critical: false,
         exclude_servers: Vec::new(),
         avoid_server: None,
     }

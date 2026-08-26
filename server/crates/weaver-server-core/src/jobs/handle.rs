@@ -611,6 +611,12 @@ pub struct JobInfo {
     pub name: String,
     pub status: JobStatus,
     pub download_state: crate::jobs::model::DownloadState,
+    /// Network download is complete, but decode/write or PAR2 discovery work remains.
+    #[serde(default)]
+    pub finalizing_download: bool,
+    /// Weaver is fetching the minimum PAR2 metadata or recovery data needed to finish.
+    #[serde(default)]
+    pub fetching_repair_data: bool,
     pub post_state: crate::jobs::model::PostState,
     pub run_state: crate::jobs::model::RunState,
     pub progress: f64,

@@ -17,6 +17,7 @@ fn make_work(job_id: u64, file_index: u32, seg: u32, priority: u32) -> DownloadW
         byte_estimate: 768_000,
         retry_count: 0,
         is_recovery: false,
+        completion_critical: false,
         exclude_servers: vec![],
         avoid_server: None,
     }
@@ -97,6 +98,68 @@ fn priority_ordering() {
     assert_eq!(third.priority, 100);
 
     assert!(q.pop().is_none());
+}
+
+#[test]
+fn completion_critical_work_precedes_ordinary_priority() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 0, 0, 0));
+    let mut critical = make_work(1, 1, 0, 1000);
+    critical.is_recovery = true;
+    critical.completion_critical = true;
+    q.push(critical);
+
+    let first = q.pop().unwrap();
+    assert!(first.completion_critical);
+    assert_eq!(first.priority, 1000);
+    assert!(!q.pop().unwrap().completion_critical);
+}
+
+#[test]
+fn compatibility_does_not_mix_critical_and_optional_recovery() {
+    let mut q = DownloadQueue::new();
+    let mut critical = make_work(1, 1, 0, 1000);
+    critical.is_recovery = true;
+    critical.completion_critical = true;
+    let mut optional = make_work(1, 1, 1, 1000);
+    optional.is_recovery = true;
+    q.push(optional);
+    q.push(critical);
+
+    let first = q.pop().unwrap();
+    assert!(first.completion_critical);
+    assert!(q.pop_next_pipelining_compatible_with(&first).is_none());
+    assert_eq!(q.len(), 1);
+}
+
+#[test]
+fn class_constrained_pop_preserves_constant_time_queue_class_counts() {
+    let mut q = DownloadQueue::new();
+    let ordinary = make_work(1, 0, 0, 0);
+    let mut critical = make_work(1, 1, 0, 1000);
+    critical.is_recovery = true;
+    critical.completion_critical = true;
+    q.push(ordinary);
+    q.push(critical);
+
+    assert!(q.has_completion_critical_work());
+    assert!(q.has_noncritical_work());
+    let selected = q
+        .pop_first_matching(|work| !work.completion_critical)
+        .expect("ordinary work must be selectable behind the critical heap head");
+    assert!(!selected.completion_critical);
+    assert!(q.has_completion_critical_work());
+    assert!(!q.has_noncritical_work());
+
+    q.push(make_work(1, 2, 0, 0));
+    let extracted = q.extract_matching(|work| work.completion_critical);
+    assert_eq!(extracted.len(), 1);
+    assert!(!q.has_completion_critical_work());
+    assert!(q.has_noncritical_work());
+
+    q.drain_all();
+    assert!(!q.has_completion_critical_work());
+    assert!(!q.has_noncritical_work());
 }
 
 #[test]

@@ -27,12 +27,45 @@ enum DispatchAttempt {
     StopAll,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadWorkSelection {
+    Any,
+    CompletionCritical,
+    NonCritical,
+}
+
+impl DownloadWorkSelection {
+    fn matches(self, work: &DownloadWork) -> bool {
+        match self {
+            Self::Any => true,
+            Self::CompletionCritical => work.completion_critical,
+            Self::NonCritical => !work.completion_critical,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DownloadBatchClass {
+    is_recovery: bool,
+    completion_critical: bool,
+}
+
+impl From<&DownloadBatchCompatibility> for DownloadBatchClass {
+    fn from(compatibility: &DownloadBatchCompatibility) -> Self {
+        Self {
+            is_recovery: compatibility.is_recovery,
+            completion_critical: compatibility.completion_critical,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BoundedSameBandSharePlan {
     hot_job_id: JobId,
     hot_target: usize,
     share_target: usize,
     peer_jobs: Vec<JobId>,
+    completion_critical: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -95,6 +128,7 @@ impl Pipeline {
         job_id: JobId,
         pressure: DownloadPressure,
         spillover_loan_kind: Option<SpilloverLoanKind>,
+        selection: DownloadWorkSelection,
     ) -> DispatchAttempt {
         // Too young to fetch: its articles are still propagating, and asking for
         // them now produces not-founds that are indistinguishable from missing
@@ -125,7 +159,7 @@ impl Pipeline {
                 .remove(&job_id);
         }
         self.apply_rar_unlock_priorities_if_dirty(job_id);
-        let mut lease = match self.try_lease_initial_download_batch(job_id, pressure) {
+        let mut lease = match self.try_lease_initial_download_batch(job_id, pressure, selection) {
             Ok(Some(lease)) => lease,
             Ok(None) => return DispatchAttempt::NoWork,
             Err(attempt) => return attempt,
@@ -198,6 +232,60 @@ impl Pipeline {
         }
     }
 
+    fn dispatch_completion_critical_share(
+        &mut self,
+        plan: &BoundedSameBandSharePlan,
+        pressure: DownloadPressure,
+        max_connections: usize,
+        dispatch_budget: &mut usize,
+    ) -> bool {
+        let mut slots = plan
+            .share_target
+            .saturating_sub(self.active_completion_critical_connections)
+            .min(max_connections.saturating_sub(self.active_download_connections))
+            .min(*dispatch_budget);
+        let mut skipped = Vec::new();
+        while slots > 0
+            && self.active_download_connections < max_connections
+            && !self.rate_limiter.should_wait()
+            && *dispatch_budget > 0
+        {
+            let Some(job_id) = plan
+                .peer_jobs
+                .iter()
+                .enumerate()
+                .filter(|(_, job_id)| self.job_has_completion_critical_work(**job_id))
+                .filter(|(_, job_id)| !skipped.contains(*job_id))
+                .min_by_key(|(index, job_id)| {
+                    (
+                        self.active_completion_critical_connections_by_job
+                            .get(job_id)
+                            .copied()
+                            .unwrap_or(0),
+                        *index,
+                    )
+                })
+                .map(|(_, job_id)| *job_id)
+            else {
+                break;
+            };
+            match self.try_dispatch_download_for_job(
+                job_id,
+                pressure,
+                None,
+                DownloadWorkSelection::CompletionCritical,
+            ) {
+                DispatchAttempt::Dispatched => {
+                    *dispatch_budget = dispatch_budget.saturating_sub(1);
+                    slots = slots.saturating_sub(1);
+                }
+                DispatchAttempt::NoWork => skipped.push(job_id),
+                DispatchAttempt::StopAll => return true,
+            }
+        }
+        false
+    }
+
     pub(crate) fn dispatch_downloads(&mut self) {
         let now = Instant::now();
         if self.global_paused || self.rate_limiter.should_wait() {
@@ -255,7 +343,6 @@ impl Pipeline {
                 .download_pressure_soft_dispatch_after
                 .is_some_and(|ready_at| ready_at > now)
             {
-                self.hot_share_yield_signal.clear();
                 self.update_queue_metrics();
                 if self.active_downloads == 0 {
                     debug!(
@@ -391,37 +478,52 @@ impl Pipeline {
         }
 
         let eligible_count = eligible.len();
-        let Some((hot_priority, hot_job_id)) = self.select_hot_dispatch_job(&eligible, now) else {
-            self.clear_hot_dispatch_period();
+        let Some((_hot_priority, hot_job_id, bounded_share_plan)) =
+            self.select_hot_dispatch_plan(&eligible, now, max, pressure, bandwidth_cap_tight)
+        else {
             self.update_queue_metrics();
             return;
         };
-        let bounded_share_plan = self.bounded_same_band_share_plan(
-            &eligible,
-            hot_priority,
-            hot_job_id,
-            max,
-            pressure,
-            bandwidth_cap_tight,
-        );
         self.update_hot_share_yield_signal(bounded_share_plan.as_ref());
 
         let active_connections_before_dispatch = self.active_download_connections;
+        if let Some(plan) = bounded_share_plan
+            .as_ref()
+            .filter(|plan| plan.completion_critical)
+            && self.dispatch_completion_critical_share(plan, pressure, max, &mut dispatch_budget)
+        {
+            self.publish_hot_dispatch_metrics(now);
+            return;
+        }
         let hot_target = bounded_share_plan
             .as_ref()
             .map(|plan| plan.hot_target)
             .unwrap_or(max);
+        let hot_selection = if bounded_share_plan
+            .as_ref()
+            .is_some_and(|plan| plan.completion_critical)
+        {
+            DownloadWorkSelection::NonCritical
+        } else {
+            DownloadWorkSelection::Any
+        };
         while self.active_download_connections < max
             && self
                 .active_download_connections_by_job
                 .get(&hot_job_id)
                 .copied()
                 .unwrap_or(0)
+                .saturating_sub(
+                    self.active_completion_critical_connections_by_job
+                        .get(&hot_job_id)
+                        .copied()
+                        .unwrap_or(0),
+                )
                 < hot_target
             && !self.rate_limiter.should_wait()
             && dispatch_budget > 0
         {
-            match self.try_dispatch_download_for_job(hot_job_id, pressure, None) {
+            match self.try_dispatch_download_for_job(hot_job_id, pressure, None, hot_selection) {
                 DispatchAttempt::Dispatched => dispatch_budget = dispatch_budget.saturating_sub(1),
                 DispatchAttempt::NoWork => break,
                 DispatchAttempt::StopAll => {
@@ -432,70 +534,81 @@ impl Pipeline {
         }
 
         if let Some(plan) = bounded_share_plan.as_ref() {
-            let mut bounded_slots = plan
-                .share_target
-                .saturating_sub(self.hot_dispatch_spillover_loans.bounded_lent_connections())
-                .min(max.saturating_sub(self.active_download_connections))
-                .min(dispatch_budget);
-            let mut skipped_peer_jobs = Vec::new();
-            while bounded_slots > 0
-                && self.active_download_connections < max
-                && !self.rate_limiter.should_wait()
-                && dispatch_budget > 0
-            {
-                let Some(peer_job_id) = plan
-                    .peer_jobs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, job_id)| self.job_has_primary_download_work(**job_id))
-                    .filter(|(_, job_id)| !skipped_peer_jobs.contains(*job_id))
-                    .min_by_key(|(index, job_id)| {
-                        (
-                            self.active_download_connections_by_job
-                                .get(job_id)
-                                .copied()
-                                .unwrap_or(0),
-                            *index,
-                        )
-                    })
-                    .map(|(_, job_id)| *job_id)
-                else {
-                    break;
-                };
+            if !plan.completion_critical {
+                let mut bounded_slots = plan
+                    .share_target
+                    .saturating_sub(self.hot_dispatch_spillover_loans.bounded_lent_connections())
+                    .min(max.saturating_sub(self.active_download_connections))
+                    .min(dispatch_budget);
+                let mut skipped_peer_jobs = Vec::new();
+                while bounded_slots > 0
+                    && self.active_download_connections < max
+                    && !self.rate_limiter.should_wait()
+                    && dispatch_budget > 0
+                {
+                    let Some(peer_job_id) = plan
+                        .peer_jobs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, job_id)| self.job_has_primary_download_work(**job_id))
+                        .filter(|(_, job_id)| !skipped_peer_jobs.contains(*job_id))
+                        .min_by_key(|(index, job_id)| {
+                            (
+                                self.active_download_connections_by_job
+                                    .get(job_id)
+                                    .copied()
+                                    .unwrap_or(0),
+                                *index,
+                            )
+                        })
+                        .map(|(_, job_id)| *job_id)
+                    else {
+                        break;
+                    };
 
-                match self.try_dispatch_download_for_job(
-                    peer_job_id,
-                    pressure,
-                    Some(SpilloverLoanKind::BoundedSameBand),
-                ) {
-                    DispatchAttempt::Dispatched => {
-                        self.hot_dispatch_mode = DispatchShareMode::Shared;
-                        let hot_speed_bps = self.hot_dispatch_speed_bps(now);
-                        self.start_spillover_loan(
-                            peer_job_id,
-                            now,
-                            hot_speed_bps,
-                            SpilloverLoanKind::BoundedSameBand,
-                        );
-                        self.record_spillover_decision(SpilloverDecision::AllowedBoundedSameBand);
-                        dispatch_budget = dispatch_budget.saturating_sub(1);
-                        bounded_slots = bounded_slots.saturating_sub(1);
-                    }
-                    DispatchAttempt::NoWork => {
-                        skipped_peer_jobs.push(peer_job_id);
-                    }
-                    DispatchAttempt::StopAll => {
-                        self.publish_hot_dispatch_metrics(now);
-                        return;
+                    match self.try_dispatch_download_for_job(
+                        peer_job_id,
+                        pressure,
+                        Some(SpilloverLoanKind::BoundedSameBand),
+                        DownloadWorkSelection::Any,
+                    ) {
+                        DispatchAttempt::Dispatched => {
+                            self.hot_dispatch_mode = DispatchShareMode::Shared;
+                            let hot_speed_bps = self.hot_dispatch_speed_bps(now);
+                            self.start_spillover_loan(
+                                peer_job_id,
+                                now,
+                                hot_speed_bps,
+                                SpilloverLoanKind::BoundedSameBand,
+                            );
+                            self.record_spillover_decision(
+                                SpilloverDecision::AllowedBoundedSameBand,
+                            );
+                            dispatch_budget = dispatch_budget.saturating_sub(1);
+                            bounded_slots = bounded_slots.saturating_sub(1);
+                        }
+                        DispatchAttempt::NoWork => {
+                            skipped_peer_jobs.push(peer_job_id);
+                        }
+                        DispatchAttempt::StopAll => {
+                            self.publish_hot_dispatch_metrics(now);
+                            return;
+                        }
                     }
                 }
             }
 
-            while self.active_download_connections < max
+            while !plan.completion_critical
+                && self.active_download_connections < max
                 && !self.rate_limiter.should_wait()
                 && dispatch_budget > 0
             {
-                match self.try_dispatch_download_for_job(hot_job_id, pressure, None) {
+                match self.try_dispatch_download_for_job(
+                    hot_job_id,
+                    pressure,
+                    None,
+                    DownloadWorkSelection::Any,
+                ) {
                     DispatchAttempt::Dispatched => {
                         dispatch_budget = dispatch_budget.saturating_sub(1)
                     }
@@ -523,14 +636,21 @@ impl Pipeline {
         let best_mode_block_reason =
             self.hot_best_mode_block_reason(hot_job_id, max, pressure, recent_expansion_helped);
 
+        let completion_critical_share_active = bounded_share_plan
+            .as_ref()
+            .is_some_and(|plan| plan.completion_critical);
         let spillover_allowed = if suppress_spillover {
-            self.hot_share_yield_signal.clear();
+            if !completion_critical_share_active {
+                self.hot_share_yield_signal.clear();
+            }
             self.hot_dispatch_underfill_since = None;
             self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
             self.block_or_reclaim_spillover(SpilloverDecision::BlockedPressure);
             false
         } else if bandwidth_cap_tight {
-            self.hot_share_yield_signal.clear();
+            if !completion_critical_share_active {
+                self.hot_share_yield_signal.clear();
+            }
             self.hot_dispatch_underfill_since = None;
             self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
             self.block_or_reclaim_spillover(SpilloverDecision::BlockedNearCap);
@@ -600,6 +720,7 @@ impl Pipeline {
                         job_id,
                         pressure,
                         Some(SpilloverLoanKind::MeasuredUnderfill),
+                        DownloadWorkSelection::Any,
                     ) {
                         DispatchAttempt::Dispatched => {
                             self.start_spillover_loan(

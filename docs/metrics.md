@@ -452,6 +452,7 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_pipeline_download_pressure_current_stall_seconds` | gauge | — | Duration of the hard pressure stall in progress; zero when not stalled. |
 | `weaver_pipeline_direct_write_evictions_total` | counter | — | Direct write evictions. |
 | `weaver_direct_store_sets_total` | counter | `event` | RAR direct-store set lifecycle events. |
+| `weaver_deobfuscated_members_renamed_total` | counter | — | Delivered files renamed out of an obfuscated in-archive member name. |
 | `weaver_pipeline_verify_active` | gauge | — | Active verification workers. |
 | `weaver_pipeline_repair_active` | gauge | — | Active repair workers. |
 | `weaver_pipeline_extract_active` | gauge | — | Active extraction workers. |

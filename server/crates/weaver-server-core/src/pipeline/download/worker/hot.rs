@@ -43,16 +43,47 @@ impl Pipeline {
         })
     }
 
+    pub(in crate::pipeline::download::worker) fn job_has_noncritical_download_work(
+        &self,
+        job_id: JobId,
+    ) -> bool {
+        self.jobs.get(&job_id).is_some_and(|state| {
+            state.download_queue.has_noncritical_work()
+                && Self::status_allows_download_dispatch(&state.status)
+        })
+    }
+
+    pub(in crate::pipeline::download::worker) fn job_has_completion_critical_work(
+        &self,
+        job_id: JobId,
+    ) -> bool {
+        self.jobs.get(&job_id).is_some_and(|state| {
+            state.download_queue.has_completion_critical_work()
+                && Self::status_allows_download_dispatch(&state.status)
+        })
+    }
+
     pub(in crate::pipeline::download::worker) fn hot_share_yield_unmet(
         &self,
         plan: &BoundedSameBandSharePlan,
     ) -> bool {
-        self.active_download_connections_by_job
+        let active_hot_connections = self
+            .active_download_connections_by_job
             .get(&plan.hot_job_id)
             .copied()
-            .unwrap_or(0)
-            > plan.hot_target
-            && self.hot_dispatch_spillover_loans.bounded_lent_connections() < plan.share_target
+            .unwrap_or(0);
+        if plan.completion_critical {
+            let active_hot_critical = self
+                .active_completion_critical_connections_by_job
+                .get(&plan.hot_job_id)
+                .copied()
+                .unwrap_or(0);
+            active_hot_connections.saturating_sub(active_hot_critical) > plan.hot_target
+                && self.active_completion_critical_connections < plan.share_target
+        } else {
+            active_hot_connections > plan.hot_target
+                && self.hot_dispatch_spillover_loans.bounded_lent_connections() < plan.share_target
+        }
     }
 
     pub(in crate::pipeline::download::worker) fn update_hot_share_yield_signal(
@@ -453,6 +484,36 @@ impl Pipeline {
             hot_target: max_connections.saturating_sub(share_target),
             share_target,
             peer_jobs,
+            completion_critical: false,
+        })
+    }
+
+    pub(in crate::pipeline::download::worker) fn bounded_completion_critical_share_plan(
+        &self,
+        eligible: &[(u8, usize, JobId)],
+        hot_job_id: JobId,
+        max_connections: usize,
+    ) -> Option<BoundedSameBandSharePlan> {
+        if max_connections == 0 || !self.job_has_noncritical_download_work(hot_job_id) {
+            return None;
+        }
+        let peer_jobs = eligible
+            .iter()
+            .filter_map(|(_, _, job_id)| {
+                self.job_has_completion_critical_work(*job_id)
+                    .then_some(*job_id)
+            })
+            .collect::<Vec<_>>();
+        if peer_jobs.is_empty() {
+            return None;
+        }
+        let share_target = (max_connections / 4).clamp(1, HOT_DISPATCH_BOUNDED_SHARE_MAX_LANES);
+        Some(BoundedSameBandSharePlan {
+            hot_job_id,
+            hot_target: max_connections.saturating_sub(share_target),
+            share_target,
+            peer_jobs,
+            completion_critical: true,
         })
     }
 
@@ -543,6 +604,59 @@ impl Pipeline {
         let (priority, _, job_id) = eligible.first().copied()?;
         self.start_hot_dispatch_period(job_id, now);
         Some((priority, job_id))
+    }
+
+    pub(in crate::pipeline::download::worker) fn select_hot_dispatch_plan(
+        &mut self,
+        eligible: &[(u8, usize, JobId)],
+        now: Instant,
+        max_connections: usize,
+        pressure: DownloadPressure,
+        bandwidth_cap_tight: bool,
+    ) -> Option<(u8, JobId, Option<BoundedSameBandSharePlan>)> {
+        let has_completion_critical_work = eligible
+            .iter()
+            .any(|(_, _, job_id)| self.job_has_completion_critical_work(*job_id));
+        let completion_critical_hot_candidates = has_completion_critical_work
+            .then(|| {
+                eligible
+                    .iter()
+                    .copied()
+                    .filter(|(_, _, job_id)| self.job_has_noncritical_download_work(*job_id))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|candidates| !candidates.is_empty());
+        if completion_critical_hot_candidates.is_some()
+            && self
+                .hot_dispatch_job
+                .is_some_and(|job_id| !self.job_has_noncritical_download_work(job_id))
+        {
+            self.clear_hot_dispatch_period();
+        }
+        let hot_candidates = completion_critical_hot_candidates
+            .as_deref()
+            .unwrap_or(eligible);
+        let Some((hot_priority, hot_job_id)) = self.select_hot_dispatch_job(hot_candidates, now)
+        else {
+            self.clear_hot_dispatch_period();
+            return None;
+        };
+        let bounded_share_plan = completion_critical_hot_candidates
+            .as_ref()
+            .and_then(|_| {
+                self.bounded_completion_critical_share_plan(eligible, hot_job_id, max_connections)
+            })
+            .or_else(|| {
+                self.bounded_same_band_share_plan(
+                    eligible,
+                    hot_priority,
+                    hot_job_id,
+                    max_connections,
+                    pressure,
+                    bandwidth_cap_tight,
+                )
+            });
+        Some((hot_priority, hot_job_id, bounded_share_plan))
     }
 
     pub(in crate::pipeline::download::worker) fn start_spillover_loan(

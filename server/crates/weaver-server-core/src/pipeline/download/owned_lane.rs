@@ -242,6 +242,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         .as_mut()
         .expect("owned lane cache populated before run")
         .lane;
+    let mut parked_completion_critical: bool;
     let (park_reason, parked_job_id, parked_mode, parked_spillover_loan_kind, keep_cached_lane) = loop {
         let stats_before = lane.stats();
         let DownloadBatchLease {
@@ -255,6 +256,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             checkpoint_plan,
             works,
         } = lease;
+        parked_completion_critical = compatibility.completion_critical;
         let server_idx = lane.server_id().0;
         let supports_pipelining = lane.supports_pipelining();
         let actual_mode = Pipeline::actual_download_lane_mode(
@@ -589,6 +591,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         job_id: parked_job_id,
         mode: parked_mode,
         spillover_loan_kind: parked_spillover_loan_kind,
+        completion_critical: parked_completion_critical,
         reason: park_reason,
         release_connection_slot: true,
         release_ip_replacement_burst: false,
@@ -693,6 +696,7 @@ fn result_from_trace(
 ) -> DownloadResult {
     let segment_id = work.segment_id;
     let retry_count = work.retry_count;
+    let completion_critical = work.completion_critical;
     let (data, attempts, source_server_idx) =
         Pipeline::download_data_from_decoded_trace(segment_id, trace);
     let policy_outcome = matches!(
@@ -714,7 +718,7 @@ fn result_from_trace(
         attempts,
         lane_observation: Some(observation),
         source_server_idx,
-        origin: DownloadResultOrigin::from_recovery(is_recovery),
+        origin: DownloadResultOrigin::from_work(is_recovery, completion_critical),
         retry_count,
         exclude_servers: exclude_servers.to_vec(),
         release_connection_slot: false,
@@ -735,6 +739,7 @@ fn unresolved_result(
     exclude_servers: &[usize],
     message: &'static str,
 ) -> DownloadResult {
+    let completion_critical = work.completion_critical;
     DownloadResult {
         segment_id: work.segment_id,
         runtime_generation,
@@ -755,7 +760,7 @@ fn unresolved_result(
             connection_discarded: true,
         }),
         source_server_idx: None,
-        origin: DownloadResultOrigin::from_recovery(is_recovery),
+        origin: DownloadResultOrigin::from_work(is_recovery, completion_critical),
         retry_count: work.retry_count,
         exclude_servers: exclude_servers.to_vec(),
         release_connection_slot: false,
@@ -783,6 +788,7 @@ mod tests {
             byte_estimate: 1024,
             retry_count,
             is_recovery: false,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         }

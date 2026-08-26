@@ -533,6 +533,8 @@ fn history_query_plan(
                 QueueItemState::Paused => statuses.push("paused".to_string()),
                 QueueItemState::Queued
                 | QueueItemState::Downloading
+                | QueueItemState::FetchingRepairData
+                | QueueItemState::FinalizingDownload
                 | QueueItemState::Checking
                 | QueueItemState::Verifying
                 | QueueItemState::Repairing
@@ -709,6 +711,8 @@ fn history_state_key(state: QueueItemState) -> &'static str {
         QueueItemState::Paused => "paused",
         QueueItemState::Queued => "queued",
         QueueItemState::Downloading => "downloading",
+        QueueItemState::FetchingRepairData => "fetching_repair_data",
+        QueueItemState::FinalizingDownload => "downloading",
         QueueItemState::Checking => "checking",
         QueueItemState::Verifying => "verifying",
         QueueItemState::Repairing => "repairing",
@@ -749,6 +753,8 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         name: row.name.clone(),
         status,
         download_state,
+        finalizing_download: false,
+        fetching_repair_data: false,
         post_state,
         run_state,
         progress,

@@ -532,6 +532,8 @@ mod tests {
             download_retry_at_epoch_ms: None,
             status: JobStatus::Moving,
             download_state: DownloadState::Complete,
+            finalizing_download: false,
+            fetching_repair_data: false,
             post_state: PostState::Finalizing,
             run_state: RunState::Active,
             progress: 100.0,

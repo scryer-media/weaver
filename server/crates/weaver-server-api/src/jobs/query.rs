@@ -41,6 +41,8 @@ fn queue_display_state(state: QueueItemState) -> &'static str {
     match state {
         QueueItemState::Queued => "QUEUED",
         QueueItemState::Downloading => "DOWNLOADING",
+        QueueItemState::FetchingRepairData => "FETCHING_REPAIR_DATA",
+        QueueItemState::FinalizingDownload => "FINALIZING_DOWNLOAD",
         QueueItemState::Checking | QueueItemState::Verifying => "VERIFYING",
         QueueItemState::Repairing => "REPAIRING",
         QueueItemState::Extracting => "EXTRACTING",
@@ -194,6 +196,8 @@ fn queue_page_summary(
                 summary.extracting_items += 1;
             }
             QueueItemState::Downloading
+            | QueueItemState::FetchingRepairData
+            | QueueItemState::FinalizingDownload
             | QueueItemState::Finalizing
             | QueueItemState::PostProcessing => summary.active_items += 1,
             QueueItemState::Completed => {}

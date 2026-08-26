@@ -59,6 +59,8 @@ pub struct AttributeInput {
 pub enum QueueItemState {
     Queued,
     Downloading,
+    FetchingRepairData,
+    FinalizingDownload,
     Checking,
     Verifying,
     Repairing,
@@ -1365,6 +1367,8 @@ pub fn queue_summary(items: &[QueueItem], metrics: &MetricsSnapshot) -> QueueSum
                 summary.extracting_items += 1;
             }
             QueueItemState::Downloading
+            | QueueItemState::FetchingRepairData
+            | QueueItemState::FinalizingDownload
             | QueueItemState::Finalizing
             | QueueItemState::PostProcessing => {
                 summary.active_items += 1;
@@ -1498,7 +1502,31 @@ fn wait_reason_for_post_state(
 /// status. The first-party UI needs the actual active stage, not the synthetic
 /// download lane used for compatibility accounting.
 pub fn queue_item_state_from_job_info(info: &weaver_server_core::JobInfo) -> QueueItemState {
-    QueueItemState::from(&info.status)
+    match &info.status {
+        weaver_server_core::JobStatus::Paused
+        | weaver_server_core::JobStatus::Failed { .. }
+        | weaver_server_core::JobStatus::Complete
+        | weaver_server_core::JobStatus::Moving
+        | weaver_server_core::JobStatus::QueuedRepair
+        | weaver_server_core::JobStatus::Repairing
+        | weaver_server_core::JobStatus::QueuedExtract
+        | weaver_server_core::JobStatus::Extracting
+        | weaver_server_core::JobStatus::QueuedPostProcessing
+        | weaver_server_core::JobStatus::PostProcessing => {
+            return QueueItemState::from(&info.status);
+        }
+        weaver_server_core::JobStatus::Queued
+        | weaver_server_core::JobStatus::Downloading
+        | weaver_server_core::JobStatus::Checking
+        | weaver_server_core::JobStatus::Verifying => {}
+    }
+    if info.fetching_repair_data {
+        QueueItemState::FetchingRepairData
+    } else if info.finalizing_download {
+        QueueItemState::FinalizingDownload
+    } else {
+        QueueItemState::from(&info.status)
+    }
 }
 
 /// Resolve the queue state for compatibility counters that must treat a live

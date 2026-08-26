@@ -483,6 +483,8 @@ fn job_info_from_spec(job_id: JobId, spec: JobSpec) -> JobInfo {
         name: spec.name,
         status: JobStatus::Queued,
         download_state: weaver_server_core::DownloadState::Queued,
+        finalizing_download: false,
+        fetching_repair_data: false,
         post_state: weaver_server_core::PostState::Idle,
         run_state: weaver_server_core::RunState::Active,
         progress: 0.0,
@@ -553,6 +555,8 @@ fn nzbget_test_job(
         name: "Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR".into(),
         status,
         download_state,
+        finalizing_download: false,
+        fetching_repair_data: false,
         post_state: weaver_server_core::PostState::Idle,
         run_state: weaver_server_core::RunState::Active,
         progress: if total_bytes == 0 {
@@ -1213,6 +1217,7 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
             max_download_speed: 0,
             download_quota: Default::default(),
             tls_ca_cert: None,
+            tls_name_mismatch_certificate_der: None,
         });
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
@@ -2907,6 +2912,7 @@ async fn nzbget_servervolumes_report_quota_window_usage() {
         max_download_speed: 0,
         download_quota: Default::default(),
         tls_ca_cert: None,
+        tls_name_mismatch_certificate_der: None,
     })
     .unwrap();
     db.upsert_server_download_usage(&weaver_server_core::servers::ServerDownloadUsage {
@@ -4400,6 +4406,8 @@ fn sample_job(job_id: u64, name: &str, status: JobStatus) -> JobInfo {
         name: name.into(),
         status,
         download_state: weaver_server_core::DownloadState::Downloading,
+        finalizing_download: false,
+        fetching_repair_data: false,
         post_state: weaver_server_core::PostState::Idle,
         run_state: weaver_server_core::RunState::Active,
         progress: 0.5,

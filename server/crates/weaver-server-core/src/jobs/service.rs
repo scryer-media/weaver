@@ -942,6 +942,7 @@ impl Pipeline {
                         byte_estimate: seg.bytes,
                         retry_count: 0,
                         is_recovery,
+                        completion_critical: false,
                         exclude_servers: vec![],
                         avoid_server: None,
                     });

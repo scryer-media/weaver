@@ -2605,6 +2605,7 @@ async fn complete_payload_does_not_finalize_while_promoted_recovery_is_pending()
             byte_estimate: 128,
             retry_count: 0,
             is_recovery: true,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -2666,6 +2667,7 @@ async fn complete_payload_finalizes_while_optional_recovery_is_parked() {
             byte_estimate: 64,
             retry_count: 0,
             is_recovery: true,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -2786,6 +2788,7 @@ async fn complete_direct_payload_with_loaded_par2_does_not_finalize_with_parked_
             byte_estimate: 64,
             retry_count: 0,
             is_recovery: true,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -2909,6 +2912,7 @@ async fn archive_payload_does_not_extract_while_promoted_recovery_is_pending() {
             byte_estimate: 64,
             retry_count: 0,
             is_recovery: true,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -2984,6 +2988,7 @@ async fn cancel_job_clears_promoted_recovery_runtime_state() {
             byte_estimate: 64,
             retry_count: 0,
             is_recovery: true,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -2998,6 +3003,7 @@ async fn cancel_job_clears_promoted_recovery_runtime_state() {
             byte_estimate: 64,
             retry_count: 0,
             is_recovery: true,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -3156,6 +3162,7 @@ async fn promoted_recovery_wait_does_not_reverify_until_recovery_finishes() {
             byte_estimate: 64,
             retry_count: 0,
             is_recovery: true,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -3303,6 +3310,7 @@ async fn promoted_recovery_retry_reenters_dispatchable_queue() {
         byte_estimate: 64,
         retry_count: 1,
         is_recovery: true,
+        completion_critical: false,
         exclude_servers: Vec::new(),
         avoid_server: None,
     });
@@ -3321,6 +3329,7 @@ async fn promoted_recovery_retry_reenters_dispatchable_queue() {
         .expect("promoted recovery retry should be dispatchable");
     assert_eq!(queued.segment_id, segment_id);
     assert_eq!(queued.priority, super::repair::PROMOTED_RECOVERY_PRIORITY);
+    assert!(queued.completion_critical);
 }
 
 #[tokio::test]
@@ -3438,6 +3447,7 @@ async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() 
             byte_estimate: 32,
             retry_count: 0,
             is_recovery: true,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -3449,6 +3459,7 @@ async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() 
             byte_estimate: 64,
             retry_count: 0,
             is_recovery: true,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -8473,6 +8484,7 @@ async fn a_promoted_volume_whose_segments_are_parked_is_not_read_back() {
             byte_estimate: PARTIAL_VOLUME_SLICE_SIZE as u32,
             retry_count: 0,
             is_recovery: true,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -11934,6 +11946,13 @@ async fn queued_prefix_probe_rearms_only_its_selected_recovery_ordinal_once() {
             "the existing selected probe ordinal is rearmed"
         );
         assert_eq!(
+            state.download_queue.count_matching(|work| {
+                work.segment_id == selected_segment && work.completion_critical
+            }),
+            1,
+            "the rearmed probe must keep completion priority"
+        );
+        assert_eq!(
             state
                 .download_queue
                 .count_matching(|work| work.segment_id == unselected_segment),
@@ -12373,6 +12392,7 @@ async fn a_second_index_still_on_the_wire_is_not_an_ignorable_residual() {
             byte_estimate: 64,
             retry_count: 0,
             is_recovery: true,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });

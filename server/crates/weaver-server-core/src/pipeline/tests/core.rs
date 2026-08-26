@@ -1061,6 +1061,7 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
         byte_estimate: 128,
         retry_count: 1,
         is_recovery: false,
+        completion_critical: false,
         exclude_servers: vec![0],
         avoid_server: None,
     };

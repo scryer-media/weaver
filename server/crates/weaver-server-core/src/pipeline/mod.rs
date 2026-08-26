@@ -262,6 +262,7 @@ impl Pipeline {
 pub(super) struct DownloadBatchCompatibility {
     pub(super) priority: u32,
     pub(super) is_recovery: bool,
+    pub(super) completion_critical: bool,
     pub(super) groups: Vec<String>,
     pub(super) exclude_servers: Vec<usize>,
     /// Transport-rotation hint carried from [`DownloadWork::avoid_server`].
@@ -275,6 +276,7 @@ impl DownloadBatchCompatibility {
         Self {
             priority: work.priority,
             is_recovery: work.is_recovery,
+            completion_critical: work.completion_critical,
             groups: work.groups.clone(),
             exclude_servers: work.exclude_servers.clone(),
             avoid_server: work.avoid_server,
@@ -284,6 +286,7 @@ impl DownloadBatchCompatibility {
     fn matches(&self, work: &DownloadWork) -> bool {
         work.priority == self.priority
             && work.is_recovery == self.is_recovery
+            && work.completion_critical == self.completion_critical
             && work.groups == self.groups
             && work.exclude_servers == self.exclude_servers
             && work.avoid_server == self.avoid_server
@@ -831,6 +834,7 @@ pub(super) struct DownloadLaneParked {
     pub(super) job_id: JobId,
     pub(super) mode: DownloadLaneMode,
     pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
+    pub(super) completion_critical: bool,
     pub(super) reason: LaneParkReason,
     pub(super) release_connection_slot: bool,
     pub(super) release_ip_replacement_burst: bool,
@@ -853,20 +857,30 @@ pub(super) enum OwnedDownloadLaneEvent {
 pub(super) enum DownloadResultOrigin {
     NormalPrimary,
     Recovery,
+    CompletionCriticalPrimary,
+    CompletionCriticalRecovery,
     IpReplacementTrial,
 }
 
 impl DownloadResultOrigin {
-    pub(super) fn from_recovery(is_recovery: bool) -> Self {
-        if is_recovery {
-            Self::Recovery
-        } else {
-            Self::NormalPrimary
+    pub(super) fn from_work(is_recovery: bool, completion_critical: bool) -> Self {
+        match (is_recovery, completion_critical) {
+            (false, false) => Self::NormalPrimary,
+            (true, false) => Self::Recovery,
+            (false, true) => Self::CompletionCriticalPrimary,
+            (true, true) => Self::CompletionCriticalRecovery,
         }
     }
 
     pub(super) fn is_recovery(self) -> bool {
-        matches!(self, Self::Recovery)
+        matches!(self, Self::Recovery | Self::CompletionCriticalRecovery)
+    }
+
+    pub(super) fn is_completion_critical(self) -> bool {
+        matches!(
+            self,
+            Self::CompletionCriticalPrimary | Self::CompletionCriticalRecovery
+        )
     }
 
     pub(super) fn counts_for_hot_primary(self) -> bool {
@@ -1389,6 +1403,10 @@ pub(super) struct Par2FileRuntime {
     pub(super) recovery_set_packets_read: bool,
     /// Explicit progress through index/indexless metadata discovery.
     pub(super) discovery: Par2DiscoveryState,
+    /// `MetadataCarrierQueued` is also used by the ordinary explicit-index
+    /// bootstrap. Keep its provenance separate so only completion-driven
+    /// metadata work receives completion-critical scheduling and UI state.
+    pub(super) metadata_carrier_completion_critical: bool,
     /// Set-specific full-file metadata attempts. This prevents a completed
     /// carrier from being selected repeatedly when it contains valid packets
     /// but not enough critical metadata to construct that set.
@@ -2152,6 +2170,8 @@ pub struct Pipeline {
     pub(super) active_downloads: usize,
     /// Number of NNTP connection tasks currently fetching articles.
     pub(super) active_download_connections: usize,
+    /// Active connection lanes carrying completion-critical PAR2 work.
+    pub(super) active_completion_critical_connections: usize,
     /// Number of in-flight recovery downloads (subset of active_downloads).
     pub(super) active_recovery: usize,
     /// Current hot job receiving exclusive article-dispatch preference.
@@ -2207,6 +2227,9 @@ pub struct Pipeline {
     pub(super) active_downloads_by_job: HashMap<JobId, usize>,
     /// In-flight NNTP connection task count per job.
     pub(super) active_download_connections_by_job: HashMap<JobId, usize>,
+    /// Completion-critical connection lanes per job. Kept separately from
+    /// article counts because pipelined lanes can carry several articles.
+    pub(super) active_completion_critical_connections_by_job: HashMap<JobId, usize>,
     /// In-flight article download count per file.
     pub(super) active_downloads_by_file: HashMap<NzbFileId, usize>,
     /// In-flight decode task count per job.

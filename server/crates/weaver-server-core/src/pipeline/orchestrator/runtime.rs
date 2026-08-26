@@ -145,6 +145,7 @@ impl Pipeline {
             job_order: Vec::new(),
             active_downloads: 0,
             active_download_connections: 0,
+            active_completion_critical_connections: 0,
             active_recovery: 0,
             hot_dispatch_job: None,
             hot_dispatch_started_at: None,
@@ -172,6 +173,7 @@ impl Pipeline {
             pending_released_download_result_bytes_by_job: HashMap::new(),
             active_downloads_by_job: HashMap::new(),
             active_download_connections_by_job: HashMap::new(),
+            active_completion_critical_connections_by_job: HashMap::new(),
             active_downloads_by_file: HashMap::new(),
             active_decodes_by_job: HashMap::new(),
             active_decodes_by_file: HashMap::new(),
@@ -733,10 +735,17 @@ impl Pipeline {
             .active_download_connections_by_job
             .remove(&job_id)
             .unwrap_or(0);
+        let completion_critical_connections = self
+            .active_completion_critical_connections_by_job
+            .remove(&job_id)
+            .unwrap_or(0);
         self.active_downloads = self.active_downloads.saturating_sub(in_flight);
         self.active_download_connections = self
             .active_download_connections
             .saturating_sub(in_flight_connections);
+        self.active_completion_critical_connections = self
+            .active_completion_critical_connections
+            .saturating_sub(completion_critical_connections);
         self.active_downloads_by_file
             .retain(|file_id, _| file_id.job_id != job_id);
 
@@ -1274,14 +1283,16 @@ impl Pipeline {
         {
             return;
         }
-        let promoted_recovery = work.is_recovery
-            && self.is_promoted_recovery_file(job_id, segment_id.file_id.file_index);
+        let completion_critical =
+            work.completion_critical || self.segment_is_completion_critical(segment_id);
+        let promoted_recovery = work.is_recovery && completion_critical;
         let mark_rar_unlock_dirty =
             !promoted_recovery && self.rar_unlock_requeued_work_is_relevant(&work);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             if promoted_recovery {
                 let mut work = work;
                 work.priority = crate::pipeline::repair::PROMOTED_RECOVERY_PRIORITY;
+                work.completion_critical = true;
                 state.download_queue.push(work);
             } else if work.is_recovery {
                 state.recovery_queue.push(work);

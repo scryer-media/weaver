@@ -2640,6 +2640,7 @@ impl Pipeline {
                                     byte_estimate: segment.bytes,
                                     retry_count: 0,
                                     is_recovery: false,
+                                    completion_critical: false,
                                     exclude_servers: vec![],
                                     avoid_server: None,
                                 },
@@ -6650,6 +6651,7 @@ impl Pipeline {
                         byte_estimate: segment.bytes,
                         retry_count: 0,
                         is_recovery: false,
+                        completion_critical: false,
                         exclude_servers: vec![],
                         avoid_server: None,
                     });
@@ -6742,6 +6744,7 @@ impl Pipeline {
                         byte_estimate: segment.bytes,
                         retry_count: 0,
                         is_recovery: false,
+                        completion_critical: false,
                         exclude_servers: vec![],
                         avoid_server: None,
                     });

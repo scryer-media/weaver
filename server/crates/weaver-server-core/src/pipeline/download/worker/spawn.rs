@@ -395,6 +395,7 @@ impl Pipeline {
             let mut lease = initial_lease;
             let mut recorded_mode = lease.lane_mode;
             let mut current_spillover_loan_kind: Option<SpilloverLoanKind>;
+            let mut current_completion_critical: bool;
             let mut current_job_id: JobId;
             let park_reason: LaneParkReason;
 
@@ -436,6 +437,7 @@ impl Pipeline {
                 let failure = DownloadFailure::from_lane_acquire_failure(acquire_error.as_ref());
                 let policy_blocked = failure.kind == DownloadFailureKind::ServerQuota;
                 let is_recovery = lease.compatibility.is_recovery;
+                let completion_critical = lease.compatibility.completion_critical;
                 let exclude_servers = lease.compatibility.exclude_servers.clone();
                 let mode = lease.lane_mode;
                 let spillover_loan_kind = lease.spillover_loan_kind;
@@ -465,7 +467,10 @@ impl Pipeline {
                                 connection_discarded: false,
                             }),
                             source_server_idx: None,
-                            origin: DownloadResultOrigin::from_recovery(is_recovery),
+                            origin: DownloadResultOrigin::from_work(
+                                is_recovery,
+                                work.completion_critical,
+                            ),
                             retry_count: work.retry_count,
                             exclude_servers: exclude_servers.clone(),
                             release_connection_slot: false,
@@ -477,6 +482,7 @@ impl Pipeline {
                         job_id,
                         mode,
                         spillover_loan_kind,
+                        completion_critical,
                         reason: if policy_blocked {
                             LaneParkReason::ServerQuota
                         } else {
@@ -504,6 +510,7 @@ impl Pipeline {
                 } = lease;
                 current_job_id = job_id;
                 current_spillover_loan_kind = spillover_loan_kind;
+                current_completion_critical = compatibility.completion_critical;
                 let server_idx = lane.server_id().0;
                 let supports_pipelining = lane.supports_pipelining();
                 let actual_mode = Self::actual_download_lane_mode(
@@ -593,7 +600,10 @@ impl Pipeline {
                                         attempts,
                                         lane_observation: Some(observation),
                                         source_server_idx,
-                                        origin: DownloadResultOrigin::from_recovery(is_recovery),
+                                        origin: DownloadResultOrigin::from_work(
+                                            is_recovery,
+                                            work.completion_critical,
+                                        ),
                                         retry_count,
                                         exclude_servers: exclude_servers.clone(),
                                         release_connection_slot: false,
@@ -661,8 +671,9 @@ impl Pipeline {
                                                     attempts,
                                                     lane_observation: Some(observation),
                                                     source_server_idx,
-                                                    origin: DownloadResultOrigin::from_recovery(
+                                                    origin: DownloadResultOrigin::from_work(
                                                         is_recovery,
+                                                        work.completion_critical,
                                                     ),
                                                     retry_count,
                                                     exclude_servers,
@@ -719,8 +730,9 @@ impl Pipeline {
                                                     attempts,
                                                     lane_observation: Some(observation),
                                                     source_server_idx,
-                                                    origin: DownloadResultOrigin::from_recovery(
+                                                    origin: DownloadResultOrigin::from_work(
                                                         is_recovery,
+                                                        work.completion_critical,
                                                     ),
                                                     retry_count,
                                                     exclude_servers,
@@ -766,7 +778,10 @@ impl Pipeline {
                                     connection_discarded: true,
                                 }),
                                 source_server_idx: None,
-                                origin: DownloadResultOrigin::from_recovery(is_recovery),
+                                origin: DownloadResultOrigin::from_work(
+                                    is_recovery,
+                                    work.completion_critical,
+                                ),
                                 retry_count: work.retry_count,
                                 exclude_servers: exclude_servers.clone(),
                                 release_connection_slot: false,
@@ -804,7 +819,10 @@ impl Pipeline {
                                     connection_discarded: !policy_only,
                                 }),
                                 source_server_idx: None,
-                                origin: DownloadResultOrigin::from_recovery(is_recovery),
+                                origin: DownloadResultOrigin::from_work(
+                                    is_recovery,
+                                    work.completion_critical,
+                                ),
                                 retry_count: work.retry_count,
                                 exclude_servers: exclude_servers.clone(),
                                 release_connection_slot: false,
@@ -869,6 +887,7 @@ impl Pipeline {
                     job_id: current_job_id,
                     mode: recorded_mode,
                     spillover_loan_kind: current_spillover_loan_kind,
+                    completion_critical: current_completion_critical,
                     reason: park_reason,
                     release_connection_slot: true,
                     release_ip_replacement_burst: false,

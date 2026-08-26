@@ -118,6 +118,8 @@ fn job(status: JobStatus) -> JobInfo {
         name: "job".into(),
         status,
         download_state,
+        finalizing_download: false,
+        fetching_repair_data: false,
         post_state,
         run_state,
         progress: 0.0,

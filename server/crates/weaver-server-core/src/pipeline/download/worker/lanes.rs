@@ -581,6 +581,7 @@ impl Pipeline {
                         job_id,
                         lane_mode,
                         spillover_loan_kind,
+                        compatibility,
                         works,
                         ..
                     } = lease;
@@ -601,6 +602,7 @@ impl Pipeline {
                         job_id,
                         mode: lane_mode,
                         spillover_loan_kind,
+                        completion_critical: compatibility.completion_critical,
                         reason: LaneParkReason::Capacity,
                         release_connection_slot: true,
                         release_ip_replacement_burst: false,
@@ -710,7 +712,7 @@ impl Pipeline {
         if let Some(state) = self.jobs.get_mut(&job_id)
             && !is_terminal_status(&state.status)
         {
-            if work.is_recovery {
+            if work.is_recovery && !work.completion_critical {
                 state.recovery_queue.push(work);
             } else {
                 state.download_queue.push(work);
@@ -737,6 +739,21 @@ impl Pipeline {
                 if *in_flight == 0 {
                     self.active_download_connections_by_job
                         .remove(&parked.job_id);
+                }
+            }
+            if parked.completion_critical {
+                self.active_completion_critical_connections = self
+                    .active_completion_critical_connections
+                    .saturating_sub(1);
+                if let Some(in_flight) = self
+                    .active_completion_critical_connections_by_job
+                    .get_mut(&parked.job_id)
+                {
+                    *in_flight = in_flight.saturating_sub(1);
+                    if *in_flight == 0 {
+                        self.active_completion_critical_connections_by_job
+                            .remove(&parked.job_id);
+                    }
                 }
             }
             self.clear_spillover_loan_if_idle();

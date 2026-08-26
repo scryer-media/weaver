@@ -879,6 +879,8 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             download_retry_at_epoch_ms: None,
             status: state.status.clone(),
             download_state: state.download_state,
+            finalizing_download: false,
+            fetching_repair_data: false,
             post_state: state.post_state,
             run_state: state.run_state,
             progress: state.assembly.progress(),

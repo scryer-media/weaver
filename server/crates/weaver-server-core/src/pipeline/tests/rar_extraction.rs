@@ -6766,6 +6766,7 @@ async fn missing_middle_rar_volume_enters_authoritative_par2_repair() {
             // Optional PAR2 volumes enter the parked recovery queue before the
             // authoritative analyzer classifies and promotes them.
             is_recovery: false,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -8169,6 +8170,7 @@ async fn incomplete_download_with_active_extraction_defers_instead_of_failing() 
             byte_estimate: 128,
             retry_count: 0,
             is_recovery: false,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -8802,6 +8804,7 @@ async fn rar_unlock_dirty_priorities_apply_before_lane_refill() {
         compatibility: DownloadBatchCompatibility {
             priority: 3,
             is_recovery: false,
+            completion_critical: false,
             groups: vec!["alt.binaries.test".to_string()],
             exclude_servers: Vec::new(),
             avoid_server: None,
@@ -8865,6 +8868,7 @@ async fn rar_unlock_retry_requeue_marks_rar_volume_dirty_only() {
         byte_estimate: 1024,
         retry_count: 1,
         is_recovery: false,
+        completion_critical: false,
         exclude_servers: Vec::new(),
         avoid_server: None,
     });

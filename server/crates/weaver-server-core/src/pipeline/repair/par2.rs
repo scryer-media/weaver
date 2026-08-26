@@ -2858,6 +2858,25 @@ impl Pipeline {
             .is_some_and(|file| file.promoted)
     }
 
+    pub(crate) fn segment_is_completion_critical(&self, segment_id: SegmentId) -> bool {
+        self.par2_runtime(segment_id.file_id.job_id)
+            .and_then(|runtime| runtime.files.get(&segment_id.file_id.file_index))
+            .is_some_and(|file| {
+                file.promoted
+                    || match &file.discovery {
+                        Par2DiscoveryState::PrefixProbeQueued => file
+                            .discovery_probe_ordinals
+                            .iter()
+                            .max()
+                            .is_some_and(|ordinal| *ordinal == segment_id.segment_number),
+                        Par2DiscoveryState::MetadataCarrierQueued { .. } => {
+                            file.metadata_carrier_completion_critical
+                        }
+                        _ => false,
+                    }
+            })
+    }
+
     fn promoted_recovery_file_is_complete(&self, job_id: JobId, file_index: u32) -> bool {
         let Some(state) = self.jobs.get(&job_id) else {
             return false;
@@ -2936,6 +2955,58 @@ impl Pipeline {
             || pending_decode
             || active_decode
             || write_buffered
+    }
+
+    fn file_is_completion_critical(&self, file_id: NzbFileId) -> bool {
+        self.par2_runtime(file_id.job_id)
+            .and_then(|runtime| runtime.files.get(&file_id.file_index))
+            .is_some_and(|file| {
+                file.promoted
+                    || matches!(file.discovery, Par2DiscoveryState::PrefixProbeQueued)
+                    || matches!(
+                        file.discovery,
+                        Par2DiscoveryState::MetadataCarrierQueued { .. }
+                    ) && file.metadata_carrier_completion_critical
+            })
+    }
+
+    fn jobs_fetching_repair_data(&self) -> HashSet<JobId> {
+        let mut fetching = self
+            .jobs
+            .iter()
+            .filter_map(|(job_id, state)| {
+                state
+                    .download_queue
+                    .has_completion_critical_work()
+                    .then_some(*job_id)
+            })
+            .collect::<HashSet<_>>();
+        for segment_id in self.pending_retries_by_segment.keys() {
+            if self.segment_is_completion_critical(*segment_id) {
+                fetching.insert(segment_id.file_id.job_id);
+            }
+        }
+        for work in &self.pending_decode {
+            if self.segment_is_completion_critical(work.segment_id) {
+                fetching.insert(work.segment_id.file_id.job_id);
+            }
+        }
+        for file_id in self.active_downloads_by_file.keys() {
+            if self.file_is_completion_critical(*file_id) {
+                fetching.insert(file_id.job_id);
+            }
+        }
+        for file_id in self.active_decodes_by_file.keys() {
+            if self.file_is_completion_critical(*file_id) {
+                fetching.insert(file_id.job_id);
+            }
+        }
+        for (file_id, buffer) in &self.write_buffers {
+            if buffer.buffered_len() > 0 && self.file_is_completion_critical(*file_id) {
+                fetching.insert(file_id.job_id);
+            }
+        }
+        fetching
     }
 
     fn loaded_recovery_file_indices(&self, job_id: JobId) -> HashSet<u32> {
@@ -3380,6 +3451,7 @@ impl Pipeline {
                     byte_estimate: segment.bytes,
                     retry_count: 0,
                     is_recovery,
+                    completion_critical: true,
                     exclude_servers: Vec::new(),
                     avoid_server: None,
                 })
@@ -3405,9 +3477,11 @@ impl Pipeline {
             if let Some(ordinal) = probe_ordinal {
                 file.discovery_probe_ordinals.insert(ordinal);
             }
+            file.metadata_carrier_completion_critical = false;
             file.discovery = Par2DiscoveryState::PrefixProbeQueued;
         } else {
             file.promoted = true;
+            file.metadata_carrier_completion_critical = true;
             let set_ids = file.discovery.observed_set_ids().to_vec();
             file.discovery = Par2DiscoveryState::MetadataCarrierQueued {
                 target_set_id,
@@ -3485,12 +3559,13 @@ impl Pipeline {
         let mut queued = state
             .recovery_queue
             .extract_matching(|work| work.segment_id == segment_id);
-        let Some(work) = queued.pop() else {
+        let Some(mut work) = queued.pop() else {
             return false;
         };
         for duplicate in queued {
             state.recovery_queue.push(duplicate);
         }
+        work.completion_critical = true;
         state.download_queue.push(work);
         self.update_queue_metrics();
         true
@@ -3659,6 +3734,7 @@ impl Pipeline {
                 if selected.contains(&file_index) {
                     for mut work in works.drain(..) {
                         work.priority = PROMOTED_RECOVERY_PRIORITY;
+                        work.completion_critical = true;
                         state.download_queue.push(work);
                         promoted_segments += 1;
                     }
@@ -3762,6 +3838,7 @@ impl Pipeline {
             let file_index = work.segment_id.file_id.file_index;
             if promoted.contains(&file_index) {
                 work.priority = PROMOTED_RECOVERY_PRIORITY;
+                work.completion_critical = true;
                 state.download_queue.push(work);
                 moved_segments += 1;
                 moved_files.insert(file_index);
@@ -3787,6 +3864,7 @@ impl Pipeline {
     pub(crate) fn list_jobs(&self) -> Vec<JobInfo> {
         let mut list = Vec::with_capacity(self.jobs.len() + self.finished_jobs.len());
         let mut seen = HashSet::with_capacity(self.jobs.len());
+        let jobs_fetching_repair_data = self.jobs_fetching_repair_data();
 
         let mut push_state = |state: &JobState| {
             let total = state.spec.total_bytes;
@@ -3827,6 +3905,8 @@ impl Pipeline {
                 download_retry_at_epoch_ms: download_wait.and_then(|wait| wait.retry_at_epoch_ms),
                 status: state.status.clone(),
                 download_state,
+                finalizing_download: self.jobs_finalizing_download.contains(&state.job_id),
+                fetching_repair_data: jobs_fetching_repair_data.contains(&state.job_id),
                 post_state,
                 run_state,
                 progress: Self::effective_progress(state),

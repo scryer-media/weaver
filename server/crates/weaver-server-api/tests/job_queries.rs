@@ -64,8 +64,13 @@ async fn jobs_returns_submitted() {
 #[tokio::test]
 async fn queue_page_default_order_preserves_scheduler_order_for_cold_jobs() {
     let h = TestHarness::new().await;
-    let first_job_id = h.submit_test_nzb("first-download").await;
+    h.submit_test_nzb("first-download").await;
     h.submit_test_nzb("second-download").await;
+
+    let scheduler_response = h.execute("{ jobs { id } }").await;
+    assert_no_errors(&scheduler_response);
+    let scheduler_data = response_data(&scheduler_response);
+    let scheduler_first_id = scheduler_data["jobs"][0]["id"].as_u64();
 
     let response = h
         .execute(
@@ -80,7 +85,7 @@ async fn queue_page_default_order_preserves_scheduler_order_for_cold_jobs() {
     let data = response_data(&response);
     assert_eq!(
         data["queuePage"]["items"][0]["id"].as_u64(),
-        Some(first_job_id),
+        scheduler_first_id,
     );
 }
 

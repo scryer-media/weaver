@@ -81,6 +81,7 @@ impl Pipeline {
     ) -> bool {
         let job_id = segment_id.file_id.job_id;
         let file_idx = segment_id.file_id.file_index as usize;
+        let completion_critical = self.segment_is_completion_critical(segment_id);
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return false;
         };
@@ -102,12 +103,13 @@ impl Pipeline {
             byte_estimate: seg_spec.bytes,
             retry_count,
             is_recovery: file_spec.role.is_recovery(),
+            completion_critical,
             exclude_servers,
             // Park/restore drops any rotation hint: it is advisory, and the
             // next transport failure recomputes it.
             avoid_server: None,
         };
-        if work.is_recovery {
+        if work.is_recovery && !work.completion_critical {
             state.recovery_queue.push(work);
         } else {
             state.download_queue.push(work);
@@ -130,6 +132,7 @@ impl Pipeline {
     ) -> Option<DownloadWork> {
         let job_id = segment_id.file_id.job_id;
         let file_idx = segment_id.file_id.file_index as usize;
+        let completion_critical = self.segment_is_completion_critical(segment_id);
         let state = self.jobs.get(&job_id)?;
         let file_spec = state.spec.files.get(file_idx)?;
         let seg_spec = file_spec
@@ -144,6 +147,7 @@ impl Pipeline {
             byte_estimate: seg_spec.bytes,
             retry_count,
             is_recovery: file_spec.role.is_recovery(),
+            completion_critical,
             exclude_servers,
             avoid_server: None,
         })
@@ -302,6 +306,21 @@ impl Pipeline {
                 *in_flight = in_flight.saturating_sub(1);
                 if *in_flight == 0 {
                     self.active_download_connections_by_job.remove(&job_id);
+                }
+            }
+            if result.origin.is_completion_critical() {
+                self.active_completion_critical_connections = self
+                    .active_completion_critical_connections
+                    .saturating_sub(1);
+                if let Some(in_flight) = self
+                    .active_completion_critical_connections_by_job
+                    .get_mut(&job_id)
+                {
+                    *in_flight = in_flight.saturating_sub(1);
+                    if *in_flight == 0 {
+                        self.active_completion_critical_connections_by_job
+                            .remove(&job_id);
+                    }
                 }
             }
             self.clear_spillover_loan_if_idle();
@@ -1004,6 +1023,7 @@ impl Pipeline {
                     self.book_failed_segment(result.segment_id);
                 } else {
                     let seg_id = result.segment_id;
+                    let completion_critical = self.segment_is_completion_critical(seg_id);
                     let preserves_retry_budget = failure.kind.preserves_article_retry_budget();
                     let infrastructure_retry = failure.kind.infrastructure_wait_reason().is_some();
                     let next_retry = if preserves_retry_budget || source_not_found {
@@ -1043,6 +1063,7 @@ impl Pipeline {
                                 byte_estimate: seg_spec.bytes,
                                 retry_count: next_retry,
                                 is_recovery: file_spec.role.is_recovery(),
+                                completion_critical,
                                 exclude_servers: retry_exclude_servers.clone(),
                                 avoid_server,
                             };

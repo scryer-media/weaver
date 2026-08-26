@@ -880,6 +880,7 @@ impl Pipeline {
                     // A CRC recovery candidate is mandatory even when the source
                     // file is normally optional recovery material.
                     is_recovery: false,
+                    completion_critical: false,
                     exclude_servers,
                     avoid_server: None,
                 },
@@ -1212,6 +1213,7 @@ impl Pipeline {
                     byte_estimate: seg_spec.bytes,
                     retry_count: 0,
                     is_recovery: file_spec.role.is_recovery(),
+                    completion_critical: false,
                     exclude_servers: exclude.clone(),
                     avoid_server: None,
                 };
@@ -2032,6 +2034,7 @@ impl Pipeline {
         }
 
         let job_id = segment_id.file_id.job_id;
+        let completion_critical = self.segment_is_completion_critical(segment_id);
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return false;
         };
@@ -2055,6 +2058,7 @@ impl Pipeline {
             byte_estimate: seg_spec.bytes,
             retry_count: 0,
             is_recovery: file_spec.role.is_recovery(),
+            completion_critical,
             exclude_servers: Vec::new(),
             avoid_server: None,
         };

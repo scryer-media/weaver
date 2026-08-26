@@ -769,6 +769,8 @@ fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
         name: row.name,
         status: status.clone(),
         download_state,
+        finalizing_download: false,
+        fetching_repair_data: false,
         post_state,
         run_state,
         progress: 1.0,

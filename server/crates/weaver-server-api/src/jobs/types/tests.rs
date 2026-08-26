@@ -95,6 +95,8 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
         name: "Facade.Test.Release".to_string(),
         status,
         download_state,
+        finalizing_download: false,
+        fetching_repair_data: false,
         post_state,
         run_state,
         progress: 0.5,
@@ -203,6 +205,55 @@ fn queue_item_shows_verifying_while_download_pipeline_still_drains() {
         queue_item_state_from_job_info_for_download_accounting(&job),
         QueueItemState::Downloading
     );
+}
+
+#[test]
+fn queue_item_shows_finalizing_download_while_the_download_pipeline_drains() {
+    let mut job = base_job(JobStatus::Downloading);
+    job.finalizing_download = true;
+
+    let item = queue_item_from_job(&job);
+
+    assert_eq!(item.state, QueueItemState::FinalizingDownload);
+    assert_eq!(item.download_state, QueueDownloadState::Downloading);
+    assert_eq!(item.post_state, QueuePostState::Idle);
+}
+
+#[test]
+fn queue_item_shows_completion_critical_repair_fetch_ahead_of_generic_finalizing() {
+    let mut job = base_job(JobStatus::Downloading);
+    job.finalizing_download = true;
+    job.fetching_repair_data = true;
+
+    let item = queue_item_from_job(&job);
+
+    assert_eq!(item.state, QueueItemState::FetchingRepairData);
+    assert_eq!(item.download_state, QueueDownloadState::Downloading);
+    assert_eq!(item.post_state, QueuePostState::Idle);
+}
+
+#[test]
+fn synthetic_download_flags_never_override_terminal_or_post_processing_states() {
+    for (status, expected) in [
+        (JobStatus::Paused, QueueItemState::Paused),
+        (
+            JobStatus::Failed {
+                error: "failed".to_string(),
+            },
+            QueueItemState::Failed,
+        ),
+        (JobStatus::Complete, QueueItemState::Completed),
+        (JobStatus::Repairing, QueueItemState::Repairing),
+        (JobStatus::Extracting, QueueItemState::Extracting),
+        (JobStatus::Moving, QueueItemState::Finalizing),
+        (JobStatus::PostProcessing, QueueItemState::PostProcessing),
+    ] {
+        let mut job = base_job(status);
+        job.finalizing_download = true;
+        job.fetching_repair_data = true;
+
+        assert_eq!(queue_item_from_job(&job).state, expected);
+    }
 }
 
 #[test]

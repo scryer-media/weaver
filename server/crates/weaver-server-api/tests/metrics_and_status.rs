@@ -153,6 +153,8 @@ fn history_job(job_id: u64, status: JobStatus) -> JobInfo {
         name: format!("job-{job_id}"),
         status,
         download_state: DownloadState::Queued,
+        finalizing_download: false,
+        fetching_repair_data: false,
         post_state: PostState::Idle,
         run_state: RunState::Active,
         progress: 0.0,

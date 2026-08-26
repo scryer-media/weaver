@@ -3297,17 +3297,26 @@ fn nzbget_priority(attributes: &[Attribute]) -> i64 {
 }
 
 fn active_downloads(item: &QueueItem) -> u32 {
-    if item.state == QueueItemState::Downloading {
+    if nzbget_has_active_download(item.state) {
         1
     } else {
         0
     }
 }
 
+fn nzbget_has_active_download(state: QueueItemState) -> bool {
+    matches!(
+        state,
+        QueueItemState::Downloading | QueueItemState::FetchingRepairData
+    )
+}
+
 fn nzbget_queue_status(state: QueueItemState) -> &'static str {
     match state {
         QueueItemState::Queued => "QUEUED",
-        QueueItemState::Downloading => "DOWNLOADING",
+        QueueItemState::Downloading
+        | QueueItemState::FetchingRepairData
+        | QueueItemState::FinalizingDownload => "DOWNLOADING",
         QueueItemState::Checking | QueueItemState::Verifying => "VERIFYING_SOURCES",
         QueueItemState::Repairing => "REPAIRING",
         QueueItemState::Extracting => "UNPACKING",
@@ -3375,4 +3384,19 @@ fn category_dest_dir(complete_dir: &str, name: &str) -> String {
         .join(name)
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod active_download_state_tests {
+    use super::*;
+
+    #[test]
+    fn repair_fetch_counts_as_network_active_but_finalization_does_not() {
+        assert!(nzbget_has_active_download(
+            QueueItemState::FetchingRepairData
+        ));
+        assert!(!nzbget_has_active_download(
+            QueueItemState::FinalizingDownload
+        ));
+    }
 }

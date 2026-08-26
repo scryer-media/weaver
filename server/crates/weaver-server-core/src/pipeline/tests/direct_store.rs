@@ -8800,6 +8800,19 @@ async fn damage_needing_undownloaded_recovery_waits_instead_of_demoting() {
         "and the wait must have asked for something — the recovery volume that \
          covers the damage is now promoted"
     );
+    assert!(pipeline.jobs.get(&job_id).is_some_and(|state| {
+        state.download_queue.count_matching(|work| {
+            work.segment_id.file_id.file_index == recovery_file_index && work.completion_critical
+        }) > 0
+    }));
+    assert!(
+        pipeline
+            .list_jobs()
+            .into_iter()
+            .find(|job| job.job_id == job_id)
+            .is_some_and(|job| job.fetching_repair_data),
+        "the public job snapshot must expose the completion-critical repair fetch"
+    );
     assert!(
         pipeline.job_has_promoted_recovery_pipeline_work(job_id, "test"),
         "with its work on the wire, which is what makes the wait bounded"

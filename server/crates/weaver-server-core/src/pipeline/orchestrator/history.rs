@@ -210,6 +210,8 @@ impl Pipeline {
         self.jobs_finalizing_download.remove(&job_id);
         self.active_downloads_by_job.remove(&job_id);
         self.active_download_connections_by_job.remove(&job_id);
+        self.active_completion_critical_connections_by_job
+            .remove(&job_id);
         self.job_last_download_activity.remove(&job_id);
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
@@ -322,6 +324,8 @@ impl Pipeline {
                 download_retry_at_epoch_ms: None,
                 status: state.status.clone(),
                 download_state,
+                finalizing_download: false,
+                fetching_repair_data: false,
                 post_state,
                 run_state,
                 progress: Self::effective_progress(state),

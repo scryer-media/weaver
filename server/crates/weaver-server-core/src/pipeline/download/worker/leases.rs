@@ -195,6 +195,7 @@ impl Pipeline {
             .entry(file_index)
             .or_default();
         file.filename = filename;
+        file.metadata_carrier_completion_critical = false;
         file.discovery = Par2DiscoveryState::MetadataCarrierQueued {
             target_set_id: None,
             set_ids: Vec::new(),
@@ -206,15 +207,27 @@ impl Pipeline {
         job_id: JobId,
         bootstrap_files: Option<&[u32]>,
         compatibility: Option<&DownloadBatchCompatibility>,
+        selection: DownloadWorkSelection,
     ) -> Option<DownloadWork> {
-        let Some(bootstrap_files) = bootstrap_files else {
+        if bootstrap_files.is_none() && selection == DownloadWorkSelection::Any {
             return self.pop_download_work_for_batch(job_id, compatibility);
-        };
+        }
         self.jobs.get_mut(&job_id).and_then(|state| {
-            state.download_queue.pop_next_matching(|work| {
-                bootstrap_files.contains(&work.segment_id.file_id.file_index)
+            let matches = |work: &DownloadWork| {
+                bootstrap_files
+                    .is_none_or(|files| files.contains(&work.segment_id.file_id.file_index))
                     && compatibility.is_none_or(|compatibility| compatibility.matches(work))
-            })
+                    && selection.matches(work)
+            };
+            match selection {
+                DownloadWorkSelection::Any => state.download_queue.pop_first_matching(matches),
+                DownloadWorkSelection::CompletionCritical => state
+                    .download_queue
+                    .pop_first_matching_in_class(true, matches),
+                DownloadWorkSelection::NonCritical => state
+                    .download_queue
+                    .pop_first_matching_in_class(false, matches),
+            }
         })
     }
 
@@ -222,12 +235,14 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         pressure: DownloadPressure,
+        selection: DownloadWorkSelection,
     ) -> Result<Option<DownloadBatchLease>, DispatchAttempt> {
         let par2_metadata_bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
         let Some(first) = self.pop_download_work_for_par2_bootstrap(
             job_id,
             par2_metadata_bootstrap_files.as_deref(),
             None,
+            selection,
         ) else {
             return Ok(None);
         };
@@ -262,7 +277,7 @@ impl Pipeline {
         job_id: JobId,
         pressure: DownloadPressure,
     ) -> Option<DownloadBatchLease> {
-        match self.try_lease_initial_download_batch(job_id, pressure) {
+        match self.try_lease_initial_download_batch(job_id, pressure, DownloadWorkSelection::Any) {
             Ok(lease) => lease,
             Err(_) => panic!("test lease must not hit a dispatch policy stop"),
         }
@@ -309,10 +324,16 @@ impl Pipeline {
             compatibility.is_recovery,
             Self::refill_mode_pressure(pressure),
         );
+        let selection = if compatibility.completion_critical {
+            DownloadWorkSelection::CompletionCritical
+        } else {
+            DownloadWorkSelection::NonCritical
+        };
         let Some(first) = self.pop_download_work_for_par2_bootstrap(
             job_id,
             par2_metadata_bootstrap_files.as_deref(),
             Some(&compatibility),
+            selection,
         ) else {
             return Ok(None);
         };
@@ -343,6 +364,7 @@ impl Pipeline {
             job_id,
             par2_metadata_bootstrap_files.as_deref(),
             None,
+            DownloadWorkSelection::NonCritical,
         ) else {
             return Ok(None);
         };
@@ -390,6 +412,7 @@ impl Pipeline {
                 job_id,
                 par2_metadata_bootstrap_files.as_deref(),
                 Some(&compatibility),
+                DownloadWorkSelection::NonCritical,
             ) else {
                 break;
             };
@@ -459,11 +482,17 @@ impl Pipeline {
             first.byte_estimate as u64
         };
         let mut works = vec![first];
+        let selection = if compatibility.completion_critical {
+            DownloadWorkSelection::CompletionCritical
+        } else {
+            DownloadWorkSelection::NonCritical
+        };
         while works.len() < work_limit {
             let Some(next) = self.pop_download_work_for_par2_bootstrap(
                 job_id,
                 par2_metadata_bootstrap_files,
                 Some(&compatibility),
+                selection,
             ) else {
                 break;
             };
@@ -620,7 +649,7 @@ impl Pipeline {
     ) {
         self.activate_download_batch(
             lease.job_id,
-            lease.compatibility.is_recovery,
+            DownloadBatchClass::from(&lease.compatibility),
             lease.lane_mode,
             lease.works.len(),
             activation_items,
@@ -631,7 +660,7 @@ impl Pipeline {
     pub(in crate::pipeline::download::worker) fn activate_download_batch(
         &mut self,
         job_id: JobId,
-        is_recovery: bool,
+        batch_class: DownloadBatchClass,
         lane_mode: DownloadLaneMode,
         work_count: usize,
         activation_items: &[(SegmentId, NzbFileId, u64)],
@@ -658,8 +687,15 @@ impl Pipeline {
                 .active_download_connections_by_job
                 .entry(job_id)
                 .or_default() += 1;
+            if batch_class.completion_critical {
+                self.active_completion_critical_connections += 1;
+                *self
+                    .active_completion_critical_connections_by_job
+                    .entry(job_id)
+                    .or_default() += 1;
+            }
         }
-        if is_recovery {
+        if batch_class.is_recovery {
             self.active_recovery += work_count;
         }
         *self.active_downloads_by_job.entry(job_id).or_default() += work_count;

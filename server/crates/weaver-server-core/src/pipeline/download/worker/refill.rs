@@ -35,6 +35,7 @@ impl Pipeline {
             compatibility,
             response_tx,
         } = request;
+        let batch_class = DownloadBatchClass::from(&compatibility);
         if runtime_generation != self.pool_generation {
             let _ = response_tx.send(DownloadLaneRefillResponse {
                 lease: None,
@@ -126,20 +127,35 @@ impl Pipeline {
             let bandwidth_cap_tight = self.bandwidth_cap.cap_enabled()
                 && self.bandwidth_cap.remaining_bytes()
                     <= self.bandwidth_cap.limit_bytes() * 15 / 100;
-            let selected_hot = self.select_hot_dispatch_job(&eligible, now);
-            let bounded_share_plan = selected_hot.and_then(|(hot_priority, hot_job_id)| {
-                self.bounded_same_band_share_plan(
-                    &eligible,
-                    hot_priority,
-                    hot_job_id,
-                    effective_capacity,
-                    pressure,
-                    bandwidth_cap_tight,
-                )
-            });
-            self.update_hot_share_yield_signal(bounded_share_plan.as_ref());
+            let selected_hot = self.select_hot_dispatch_plan(
+                &eligible,
+                now,
+                effective_capacity,
+                pressure,
+                bandwidth_cap_tight,
+            );
+            self.update_hot_share_yield_signal(
+                selected_hot.as_ref().and_then(|(_, _, plan)| plan.as_ref()),
+            );
             match selected_hot {
-                Some((_hot_priority, hot_job_id)) if hot_job_id == job_id => {
+                Some((_hot_priority, _hot_job_id, bounded_share_plan))
+                    if batch_class.completion_critical =>
+                {
+                    let has_noncritical_work = eligible
+                        .iter()
+                        .any(|(_, _, job_id)| self.job_has_noncritical_download_work(*job_id));
+                    let can_keep_critical_lane = !has_noncritical_work
+                        || bounded_share_plan.as_ref().is_some_and(|plan| {
+                            plan.completion_critical
+                                && plan.peer_jobs.contains(&job_id)
+                                && self.active_completion_critical_connections <= plan.share_target
+                        });
+                    if !can_keep_critical_lane {
+                        allow_refill = false;
+                        park_reason = LaneParkReason::HotShareYield;
+                    }
+                }
+                Some((_hot_priority, hot_job_id, bounded_share_plan)) if hot_job_id == job_id => {
                     if bounded_share_plan
                         .as_ref()
                         .is_some_and(|plan| self.hot_share_yield_unmet(plan))
@@ -148,7 +164,7 @@ impl Pipeline {
                         park_reason = LaneParkReason::HotShareYield;
                     }
                 }
-                Some((hot_priority, hot_job_id)) => {
+                Some((hot_priority, hot_job_id, bounded_share_plan)) => {
                     let hot_speed_bps = self.hot_dispatch_speed_bps(now);
                     self.hot_dispatch_expansion_window
                         .refresh(now, hot_speed_bps);
@@ -166,7 +182,8 @@ impl Pipeline {
                         == Some(SpilloverLoanKind::BoundedSameBand)
                         && requested_priority == Some(hot_priority)
                         && bounded_share_plan.as_ref().is_some_and(|plan| {
-                            plan.peer_jobs.contains(&job_id)
+                            !plan.completion_critical
+                                && plan.peer_jobs.contains(&job_id)
                                 && self.hot_dispatch_spillover_loans.bounded_lent_connections()
                                     <= plan.share_target
                         });
@@ -272,7 +289,6 @@ impl Pipeline {
             server_idx,
             supports_pipelining,
         );
-        let is_recovery = lease.compatibility.is_recovery;
         let work_count = lease.works.len();
         match response_tx.send(DownloadLaneRefillResponse {
             lease: Some(lease),
@@ -284,7 +300,7 @@ impl Pipeline {
                     .fetch_add(1, Ordering::Relaxed);
                 self.activate_download_batch(
                     job_id,
-                    is_recovery,
+                    batch_class,
                     next_mode,
                     work_count,
                     &activation_items,
