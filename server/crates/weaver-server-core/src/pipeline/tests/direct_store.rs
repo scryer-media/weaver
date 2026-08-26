@@ -1642,6 +1642,70 @@ async fn identity_admission_refuses_once_volume_bytes_landed_conventionally() {
 }
 
 #[tokio::test]
+async fn arming_schedules_a_probe_wave_ahead_of_candidate_payload() {
+    // The dispatch half of identity admission: an obfuscated post's NZB order
+    // scrambles the volume order, and streaming payload in that order piles
+    // unplaceable member bytes into holds until the scratch ceiling demotes
+    // the set. Arming therefore pulls every candidate's first article to the
+    // front of the queue — binding every file within a few round trips — and
+    // each binding then re-ranks its file to the name path's own
+    // `10 + volume` priority, restoring in-order volume streaming.
+    let member_name = "Silver.Horizon.S01E19.mkv";
+    let payload: Vec<u8> = (0..120_000u32).map(|index| (index % 163) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let par2_bytes = par2_index_over_volumes(&volumes);
+    let obfuscated = obfuscate_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41101);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let (spec, index_file_index) =
+        par2_bearing_job_spec("Silver Horizon", &obfuscated, &par2_bytes);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    deliver_par2_index(&mut pipeline, job_id, index_file_index, &par2_bytes).await;
+
+    // The probe wave: after the PAR2 index (priority 0, still queued — the
+    // harness delivered its bytes directly), the next three dispatches are
+    // the three candidates' first articles, in file order, ahead of every
+    // payload article.
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let index_work = state.download_queue.pop().expect("queued index work");
+    assert_eq!(
+        index_work.segment_id.file_id.file_index, index_file_index,
+        "the declared index leads the queue"
+    );
+    for expected_file in 0..3u32 {
+        let work = state.download_queue.pop().expect("queued work");
+        assert_eq!(
+            (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number
+            ),
+            (expected_file, 0),
+            "the probe wave must lead the queue"
+        );
+    }
+
+    // A binding re-ranks its file to the name path's volume priority.
+    submit_volume_article(&mut pipeline, job_id, &obfuscated, 0, 0).await;
+    assert!(
+        !pipeline.direct_store.sets_for(job_id).is_empty(),
+        "the probe article should have admitted the set"
+    );
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let repriced = state
+        .download_queue
+        .peek_next_matching(|work| work.segment_id.file_id.file_index == 0)
+        .map(|work| work.priority);
+    assert_eq!(
+        repriced,
+        Some(10),
+        "the bound file's payload must carry its volume's name-path priority"
+    );
+}
+
+#[tokio::test]
 async fn an_out_of_order_payload_article_no_longer_poisons_the_binding() {
     // The production shape that killed the first cut of this seam: on a wide
     // connection pool a file's later article routinely decodes before its

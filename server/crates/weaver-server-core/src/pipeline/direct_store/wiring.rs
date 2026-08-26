@@ -1064,6 +1064,7 @@ impl Pipeline {
             );
             admission.rosters.insert(set_name, roster);
         }
+        self.boost_identity_probe_segments(job_id);
         self.identity_viability_sweep(job_id).await;
     }
 
@@ -1303,6 +1304,100 @@ impl Pipeline {
         })
     }
 
+    /// Reorders the job's download queue so every identity candidate's first
+    /// article arrives before any candidate's payload — the probe wave.
+    ///
+    /// Why dispatch order is a correctness lever here: an obfuscated post's
+    /// NZB order routinely scrambles the volume order, and a mid-set volume's
+    /// member payload cannot be *placed* until every earlier volume's headers
+    /// have stated their part sizes. Streamed in NZB order, such a set piles
+    /// its payload into holds until the scratch ceiling demotes it — the
+    /// ceiling is direct-store's own disk promise and must not move. Pulling
+    /// each candidate's first article forward binds every file within a few
+    /// round trips (and carries exactly the headers the layout needs), after
+    /// which [`Self::reprioritize_bound_identity_file`] streams the volumes
+    /// in order, precisely as a name-classified job always has.
+    fn boost_identity_probe_segments(&mut self, job_id: JobId) {
+        let mut first_segments: HashMap<u32, u32> = HashMap::new();
+        {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return;
+            };
+            let carrier_files: HashSet<u32> = self
+                .par2_runtime(job_id)
+                .map(|runtime| runtime.files.keys().copied().collect())
+                .unwrap_or_default();
+            let admission = self.direct_store.identity.get(&job_id);
+            for (file_index, file) in state.spec.files.iter().enumerate() {
+                let file_index = file_index as u32;
+                if !matches!(file.role, weaver_model::files::FileRole::Unknown)
+                    || carrier_files.contains(&file_index)
+                    || admission.is_some_and(|admission| {
+                        admission.leaked.contains(&file_index)
+                            || admission.no_match.contains(&file_index)
+                            || admission
+                                .rosters
+                                .values()
+                                .any(|roster| roster.bound.contains_key(&file_index))
+                            || admission
+                                .header_sets
+                                .iter()
+                                .any(|header_set| header_set.bound.contains_key(&file_index))
+                    })
+                {
+                    continue;
+                }
+                let Some(first) = file.segments.iter().map(|segment| segment.ordinal).min() else {
+                    continue;
+                };
+                first_segments.insert(file_index, first);
+            }
+        }
+        if first_segments.is_empty() {
+            return;
+        }
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let boosted = state
+            .download_queue
+            .reprioritize_matching_with_rank(|work| {
+                let file_index = work.segment_id.file_id.file_index;
+                first_segments
+                    .get(&file_index)
+                    .and_then(|first| (work.segment_id.segment_number == *first).then_some(()))
+                    // Right behind the PAR2 index (0) and a named first
+                    // volume (1); ranked by file index only for determinism.
+                    .map(|()| (2, Some(file_index)))
+            });
+        if boosted > 0 {
+            info!(
+                job_id = job_id.0,
+                boosted, "identity probe wave scheduled ahead of candidate payload"
+            );
+        }
+    }
+
+    /// Re-ranks one bound file's queued articles to the priority a
+    /// name-classified volume of the same position always had: `10 + volume`.
+    /// This is what turns the probe wave's scattered bindings back into
+    /// in-order volume streaming, which keeps the holds footprint at the
+    /// out-of-order jitter of the connection pool rather than the whole set.
+    fn reprioritize_bound_identity_file(
+        &mut self,
+        job_id: JobId,
+        file_index: u32,
+        volume_index: u32,
+    ) {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        state.download_queue.reprioritize_matching(|work| {
+            (work.segment_id.file_id.file_index == file_index)
+                .then_some(10u32.saturating_add(volume_index))
+        });
+    }
+
     /// Pushes one identity-admitted set into the job's set vector with the
     /// ceilings and password every admission path applies, and returns its
     /// stable index.
@@ -1502,6 +1597,11 @@ impl Pipeline {
                 "direct_store.identity.bound",
                 std::time::Duration::from_nanos(1),
             );
+            self.reprioritize_bound_identity_file(job_id, file_index, volume_number);
+            // The job just proved itself an obfuscated RAR5 set: every other
+            // unclassified file's first article is now worth having early,
+            // for exactly the reasons the roster rung's probe wave states.
+            self.boost_identity_probe_segments(job_id);
             return Some(DirectFileTarget::Route {
                 set_index,
                 volume_index: volume_number,
@@ -1637,6 +1737,7 @@ impl Pipeline {
             "direct_store.identity.bound",
             std::time::Duration::from_nanos(1),
         );
+        self.reprioritize_bound_identity_file(job_id, file_index, volume_number);
         let expected = self
             .direct_store
             .set(job_id, set_index)
@@ -1713,6 +1814,7 @@ impl Pipeline {
             volume_index,
             "identity binding established"
         );
+        self.reprioritize_bound_identity_file(job_id, file_index, volume_index);
         let Some(admission) = self.direct_store.identity.get_mut(&job_id) else {
             return;
         };
