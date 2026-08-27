@@ -405,7 +405,6 @@ impl Pipeline {
                 job_id,
                 runtime_generation: self.pool_generation,
                 lane_mode: DownloadLaneMode::Sequential,
-                spillover_loan_kind: None,
                 server_modes: Vec::new(),
                 compatibility,
                 effective_exclude_servers,
@@ -446,7 +445,6 @@ impl Pipeline {
             job_id,
             runtime_generation: self.pool_generation,
             lane_mode: DownloadLaneMode::Sequential,
-            spillover_loan_kind: None,
             server_modes: Vec::new(),
             compatibility,
             effective_exclude_servers,
@@ -548,7 +546,6 @@ impl Pipeline {
             job_id,
             runtime_generation: self.pool_generation,
             lane_mode,
-            spillover_loan_kind: None,
             server_modes,
             compatibility,
             effective_exclude_servers,
@@ -685,12 +682,6 @@ impl Pipeline {
             .download_lane_lease_items_total
             .fetch_add(work_count as u64, Ordering::Relaxed);
         if starts_connection {
-            if self.hot_dispatch_job == Some(job_id) {
-                let now = Instant::now();
-                let speed = self.hot_dispatch_speed_bps(now);
-                self.hot_dispatch_expansion_window
-                    .record(now, HotExpansionKind::LaneStart, speed);
-            }
             self.active_download_connections += 1;
             self.note_download_lane_started(lane_mode);
             *self

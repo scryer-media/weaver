@@ -520,16 +520,6 @@ impl Pipeline {
             return;
         }
 
-        if next.max_depth() > previous.max_depth() {
-            let now = Instant::now();
-            let speed = self.hot_dispatch_speed_bps(now);
-            self.hot_dispatch_expansion_window.record(
-                now,
-                HotExpansionKind::PipelinePromotion,
-                speed,
-            );
-        }
-
         match previous {
             DownloadLaneMode::Sequential => self
                 .metrics
@@ -584,7 +574,6 @@ impl Pipeline {
                     let DownloadBatchLease {
                         job_id,
                         lane_mode,
-                        spillover_loan_kind,
                         compatibility,
                         works,
                         ..
@@ -605,7 +594,6 @@ impl Pipeline {
                     self.handle_download_lane_parked(DownloadLaneParked {
                         job_id,
                         mode: lane_mode,
-                        spillover_loan_kind,
                         completion_critical: compatibility.completion_critical,
                         reason: LaneParkReason::Capacity,
                         release_connection_slot: true,
@@ -731,10 +719,6 @@ impl Pipeline {
         if parked.release_connection_slot {
             self.note_download_lane_released(parked.mode, parked.reason);
             self.active_download_connections = self.active_download_connections.saturating_sub(1);
-            if let Some(kind) = parked.spillover_loan_kind {
-                self.hot_dispatch_spillover_loans
-                    .release_one(parked.job_id, kind);
-            }
             if let Some(in_flight) = self
                 .active_download_connections_by_job
                 .get_mut(&parked.job_id)
@@ -760,7 +744,6 @@ impl Pipeline {
                     }
                 }
             }
-            self.clear_spillover_loan_if_idle();
         }
         if parked.release_ip_replacement_burst {
             self.ip_replacement_burst_active = false;

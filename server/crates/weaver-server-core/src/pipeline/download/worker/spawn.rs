@@ -360,7 +360,6 @@ impl Pipeline {
                 self.owned_download_lane_event_tx.clone(),
                 self.download_refill_tx.clone(),
                 self.download_lane_parked_tx.clone(),
-                Arc::clone(&self.hot_share_yield_signal),
                 initial_lease,
             ) {
                 warn!("owned blocking lane pool stopped; falling back to async download lane");
@@ -394,7 +393,6 @@ impl Pipeline {
             let fetch_started = Instant::now();
             let mut lease = initial_lease;
             let mut recorded_mode = lease.lane_mode;
-            let mut current_spillover_loan_kind: Option<SpilloverLoanKind>;
             let mut current_completion_critical: bool;
             let mut current_job_id: JobId;
             let park_reason: LaneParkReason;
@@ -440,7 +438,6 @@ impl Pipeline {
                 let completion_critical = lease.compatibility.completion_critical;
                 let exclude_servers = lease.compatibility.exclude_servers.clone();
                 let mode = lease.lane_mode;
-                let spillover_loan_kind = lease.spillover_loan_kind;
                 let job_id = lease.job_id;
                 let runtime_generation = lease.runtime_generation;
                 for (work_index, work) in lease.works.into_iter().enumerate() {
@@ -481,7 +478,6 @@ impl Pipeline {
                     .send(DownloadLaneParked {
                         job_id,
                         mode,
-                        spillover_loan_kind,
                         completion_critical,
                         reason: if policy_blocked {
                             LaneParkReason::ServerQuota
@@ -501,7 +497,6 @@ impl Pipeline {
                     job_id,
                     runtime_generation,
                     lane_mode,
-                    spillover_loan_kind,
                     server_modes,
                     compatibility,
                     effective_exclude_servers: _,
@@ -509,7 +504,6 @@ impl Pipeline {
                     works,
                 } = lease;
                 current_job_id = job_id;
-                current_spillover_loan_kind = spillover_loan_kind;
                 current_completion_critical = compatibility.completion_critical;
                 let server_idx = lane.server_id().0;
                 let supports_pipelining = lane.supports_pipelining();
@@ -846,7 +840,6 @@ impl Pipeline {
                         remote_ip: lane.remote_ip(),
                         supports_pipelining,
                         current_mode: recorded_mode,
-                        spillover_loan_kind,
                         compatibility,
                         response_tx,
                     })
@@ -886,7 +879,6 @@ impl Pipeline {
                 .send(DownloadLaneParked {
                     job_id: current_job_id,
                     mode: recorded_mode,
-                    spillover_loan_kind: current_spillover_loan_kind,
                     completion_critical: current_completion_critical,
                     reason: park_reason,
                     release_connection_slot: true,

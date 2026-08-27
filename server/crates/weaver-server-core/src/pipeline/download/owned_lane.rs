@@ -7,8 +7,6 @@ use std::time::Instant;
 
 use tokio::sync::{mpsc, oneshot};
 
-const HOT_SHARE_YIELD_CHECK_ARTICLES: usize = 4;
-
 pub(crate) struct OwnedDownloadLanePool {
     senders: Vec<std_mpsc::Sender<OwnedLanePoolCommand>>,
     next: AtomicUsize,
@@ -21,7 +19,6 @@ struct OwnedLaneRun {
     event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
     refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
     parked_tx: mpsc::Sender<DownloadLaneParked>,
-    hot_share_yield_signal: Arc<HotShareYieldSignal>,
     initial_lease: DownloadBatchLease,
 }
 
@@ -85,7 +82,6 @@ impl OwnedDownloadLanePool {
         event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
         refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
         parked_tx: mpsc::Sender<DownloadLaneParked>,
-        hot_share_yield_signal: Arc<HotShareYieldSignal>,
         initial_lease: DownloadBatchLease,
     ) -> Result<(), DownloadBatchLease> {
         if self.senders.is_empty() {
@@ -96,7 +92,6 @@ impl OwnedDownloadLanePool {
             event_tx,
             refill_tx,
             parked_tx,
-            hot_share_yield_signal,
             initial_lease,
         }));
         let sender_index = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
@@ -194,7 +189,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         event_tx,
         refill_tx,
         parked_tx,
-        hot_share_yield_signal,
         initial_lease,
     } = run;
     let mut lease = initial_lease;
@@ -243,13 +237,12 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         .expect("owned lane cache populated before run")
         .lane;
     let mut parked_completion_critical: bool;
-    let (park_reason, parked_job_id, parked_mode, parked_spillover_loan_kind, keep_cached_lane) = loop {
+    let (park_reason, parked_job_id, parked_mode, keep_cached_lane) = loop {
         let stats_before = lane.stats();
         let DownloadBatchLease {
             job_id,
             runtime_generation,
             lane_mode,
-            spillover_loan_kind,
             server_modes,
             compatibility,
             effective_exclude_servers: _,
@@ -286,7 +279,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                     remote_ip: lane.remote_ip(),
                     supports_pipelining,
                     current_mode: actual_mode,
-                    spillover_loan_kind,
                     compatibility: compatibility.clone(),
                     response_tx,
                 })
@@ -301,9 +293,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         let mut pending_works: VecDeque<DownloadWork> = works.into_iter().collect();
         let mut results = Vec::with_capacity(pending_works.len());
         let mut unrequested_works = Vec::new();
-        let mut completed_since_yield_check = 0usize;
-        let mut yielded_for_hot_share = false;
-
         while let Some(first_work) = pending_works.pop_front() {
             let batch_depth = actual_mode.max_depth();
             let mut batch_works = Vec::with_capacity(batch_depth);
@@ -451,45 +440,23 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             if !batch_clean_for_refill || policy_blocked_for_refill {
                 break;
             }
-
-            completed_since_yield_check = completed_since_yield_check.saturating_add(completed);
-            if completed_since_yield_check >= HOT_SHARE_YIELD_CHECK_ARTICLES {
-                completed_since_yield_check = 0;
-                if hot_share_yield_signal.is_requested_for(job_id) {
-                    yielded_for_hot_share = true;
-                    break;
-                }
-            }
         }
 
         unrequested_works.extend(take_unrequested_tail(
             &mut pending_works,
             batch_clean_for_refill,
-            yielded_for_hot_share,
             policy_blocked_for_refill,
         ));
 
         let stats = stats_delta(lane.stats(), stats_before);
         if send_owned_batch(&event_tx, results, unrequested_works, stats).is_err() {
             drain_pending_refill(pending_refill.take(), &event_tx);
-            break (
-                LaneParkReason::Error,
-                job_id,
-                actual_mode,
-                spillover_loan_kind,
-                false,
-            );
+            break (LaneParkReason::Error, job_id, actual_mode, false);
         }
 
         if !batch_clean_for_refill {
             drain_pending_refill(pending_refill.take(), &event_tx);
-            break (
-                LaneParkReason::Error,
-                job_id,
-                actual_mode,
-                spillover_loan_kind,
-                false,
-            );
+            break (LaneParkReason::Error, job_id, actual_mode, false);
         }
         if policy_blocked_for_refill {
             drain_pending_refill(pending_refill.take(), &event_tx);
@@ -497,29 +464,12 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 LaneParkReason::ServerQuota,
                 job_id,
                 actual_mode,
-                spillover_loan_kind,
                 keep_cached_lane_after_park(LaneParkReason::ServerQuota),
-            );
-        }
-        if yielded_for_hot_share {
-            drain_pending_refill(pending_refill.take(), &event_tx);
-            break (
-                LaneParkReason::HotShareYield,
-                job_id,
-                actual_mode,
-                spillover_loan_kind,
-                false,
             );
         }
 
         let Some(response_rx) = pending_refill.take() else {
-            break (
-                LaneParkReason::Error,
-                job_id,
-                actual_mode,
-                spillover_loan_kind,
-                false,
-            );
+            break (LaneParkReason::Error, job_id, actual_mode, false);
         };
 
         match response_rx.blocking_recv() {
@@ -544,7 +494,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                         remote_ip: lane.remote_ip(),
                         supports_pipelining,
                         current_mode: actual_mode,
-                        spillover_loan_kind,
                         compatibility: compatibility.clone(),
                         response_tx: retry_tx,
                     })
@@ -560,7 +509,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                         retry.park_reason,
                         job_id,
                         actual_mode,
-                        spillover_loan_kind,
                         keep_cached_lane_after_park(retry.park_reason),
                     );
                 }
@@ -568,18 +516,11 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                     response.park_reason,
                     job_id,
                     actual_mode,
-                    spillover_loan_kind,
                     keep_cached_lane_after_park(response.park_reason),
                 );
             }
             Err(_) => {
-                break (
-                    LaneParkReason::ProbeYield,
-                    job_id,
-                    actual_mode,
-                    spillover_loan_kind,
-                    false,
-                );
+                break (LaneParkReason::ProbeYield, job_id, actual_mode, false);
             }
         }
     };
@@ -590,7 +531,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     let _ = parked_tx.blocking_send(DownloadLaneParked {
         job_id: parked_job_id,
         mode: parked_mode,
-        spillover_loan_kind: parked_spillover_loan_kind,
         completion_critical: parked_completion_critical,
         reason: park_reason,
         release_connection_slot: true,
@@ -626,10 +566,9 @@ fn drain_pending_refill(
 fn take_unrequested_tail(
     pending_works: &mut VecDeque<DownloadWork>,
     batch_clean_for_refill: bool,
-    yielded_for_hot_share: bool,
     policy_blocked_for_refill: bool,
 ) -> Vec<DownloadWork> {
-    if batch_clean_for_refill && !yielded_for_hot_share && !policy_blocked_for_refill {
+    if batch_clean_for_refill && !policy_blocked_for_refill {
         return Vec::new();
     }
     pending_works.drain(..).collect()
@@ -798,7 +737,7 @@ mod tests {
     fn owned_hot_lane_yield_returns_unrequested_tail_without_retry() {
         let mut pending_works = VecDeque::from([tail_work(2, 4), tail_work(3, 7)]);
 
-        let tail = take_unrequested_tail(&mut pending_works, true, true, false);
+        let tail = take_unrequested_tail(&mut pending_works, true, true);
 
         assert!(pending_works.is_empty());
         assert_eq!(tail.len(), 2);
@@ -812,7 +751,7 @@ mod tests {
     fn owned_quota_park_returns_unrequested_tail_without_dirtying_batch() {
         let mut pending_works = VecDeque::from([tail_work(4, 2), tail_work(5, 2)]);
 
-        let tail = take_unrequested_tail(&mut pending_works, true, false, true);
+        let tail = take_unrequested_tail(&mut pending_works, true, false);
 
         assert!(pending_works.is_empty());
         assert_eq!(tail.len(), 2);
