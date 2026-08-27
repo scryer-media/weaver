@@ -1857,7 +1857,7 @@ func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCa
 		return restartCaseResult{}, err
 	}
 
-	preDB, _, _, err := func() (restartDBSnapshot, restartFilesystemSnapshot, restartNntpMetrics, error) {
+	preDB, _, preMetrics, err := func() (restartDBSnapshot, restartFilesystemSnapshot, restartNntpMetrics, error) {
 		_, err := ctx.waitForDB(3*time.Minute, func(snapshot restartDBSnapshot) bool {
 			status := jobStatusFromDB(snapshot, jobID)
 			metrics := snapshot.JobMetrics[jobID]
@@ -1893,16 +1893,16 @@ func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCa
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	maxFetch := maxBodyFetchCount(metrics)
+	refetchedIDs, refetchedBodies := bodyFetchesSinceRestartPoint(preMetrics, metrics)
 
-	pass := preCompletedFiles > 0 && statuses[jobID] == "COMPLETE" && maxFetch <= 1
+	pass := preCompletedFiles > 0 && statuses[jobID] == "COMPLETE" && refetchedIDs == 0
 	return classifyRestartResult(
 		ctx.Profile,
 		pass,
-		fmt.Sprintf("restored %d completed file(s) without redownloading archive articles (post=%d max BODY fetch count %d)", preCompletedFiles, postFacade.DownloadedBytes, maxFetch),
+		fmt.Sprintf("restored %d completed file(s) without redownloading archive articles (post=%d refetched articles %d bodies %d)", preCompletedFiles, postFacade.DownloadedBytes, refetchedIDs, refetchedBodies),
 		false,
 		"",
-		fmt.Sprintf("completed file restart redownloaded or failed (files=%d post=%d max BODY fetch count %d final=%s)", preCompletedFiles, postFacade.DownloadedBytes, maxFetch, statuses[jobID]),
+		fmt.Sprintf("completed file restart redownloaded or failed (files=%d post=%d refetched articles %d bodies %d final=%s)", preCompletedFiles, postFacade.DownloadedBytes, refetchedIDs, refetchedBodies, statuses[jobID]),
 	), nil
 }
 

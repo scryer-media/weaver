@@ -163,6 +163,58 @@ fn class_constrained_pop_preserves_constant_time_queue_class_counts() {
 }
 
 #[test]
+fn class_constrained_head_pop_does_not_scan_past_incompatible_work() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 0, 0, 10));
+    q.push(make_work(1, 0, 1, 20));
+
+    assert!(
+        q.pop_next_matching_in_class(false, |work| work.segment_id.segment_number == 1)
+            .is_none(),
+        "ordinary dispatch must remain a heap-head operation"
+    );
+    assert_eq!(q.pop().unwrap().segment_id.segment_number, 0);
+    assert_eq!(q.pop().unwrap().segment_id.segment_number, 1);
+}
+
+#[test]
+fn recovery_presence_tracks_pop_extract_remove_and_drain() {
+    let mut q = DownloadQueue::new();
+    let primary = make_work(1, 0, 0, 10);
+    let mut recovery = make_work(1, 1, 0, 20);
+    recovery.is_recovery = true;
+    let mut other_recovery = make_work(2, 0, 0, 30);
+    other_recovery.is_recovery = true;
+
+    q.push(primary);
+    q.push(recovery);
+    q.push(other_recovery);
+    assert!(q.has_primary_work());
+    assert!(q.has_recovery_work());
+
+    let extracted = q.extract_matching(|work| work.segment_id.file_id.job_id == JobId(2));
+    assert_eq!(extracted.len(), 1);
+    assert!(q.has_recovery_work());
+
+    q.remove_job(JobId(1));
+    assert!(!q.has_primary_work());
+    assert!(!q.has_recovery_work());
+
+    let mut recovery = make_work(3, 0, 0, 10);
+    recovery.is_recovery = true;
+    q.push(recovery);
+    assert!(q.has_recovery_work());
+    assert!(q.pop().unwrap().is_recovery);
+    assert!(!q.has_recovery_work());
+
+    q.push(make_work(4, 0, 0, 10));
+    assert!(q.has_primary_work());
+    q.drain_all();
+    assert!(!q.has_primary_work());
+    assert!(!q.has_recovery_work());
+}
+
+#[test]
 fn reprioritize_job() {
     let mut q = DownloadQueue::new();
     // Job 1 segments at priority 1000 (PAR2 recovery, normally low priority).

@@ -3001,11 +3001,6 @@ impl Pipeline {
                 fetching.insert(file_id.job_id);
             }
         }
-        for (file_id, buffer) in &self.write_buffers {
-            if buffer.buffered_len() > 0 && self.file_is_completion_critical(*file_id) {
-                fetching.insert(file_id.job_id);
-            }
-        }
         fetching
     }
 

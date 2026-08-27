@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { Progress } from "@/components/ui/progress";
+import { useDebouncedStatus } from "@/lib/hooks/use-debounced-status";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { progressDisplayKind, statusBgClass } from "@/lib/status-tokens";
 import { cn } from "@/lib/utils";
@@ -24,16 +25,17 @@ export function JobProgress({
   /** Override the derived label (e.g. "Extracting 42%"). */
   label?: ReactNode;
 }) {
+  const visibleStatus = useDebouncedStatus(status ?? "");
   const fraction = getDisplayedJobProgress({
     progress,
-    status,
+    status: visibleStatus,
     totalBytes,
     downloadedBytes,
     failedBytes,
   });
-  const kind = progressDisplayKind(status, fraction);
+  const kind = progressDisplayKind(visibleStatus, fraction);
   const pct = fraction * 100;
-  const barColor = statusBgClass(status);
+  const barColor = statusBgClass(visibleStatus);
   const height = compact ? "h-1.5" : "h-2";
   const derivedLabel =
     kind === "empty" ? "—" : kind === "indeterminate" ? "…" : `${pct.toFixed(compact ? 0 : 1)}%`;

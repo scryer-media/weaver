@@ -45,6 +45,11 @@ fn main() {
         std::process::exit(1);
     }
 
+    // GUI launchers on macOS commonly hand children a 256-descriptor soft
+    // limit despite a much higher hard limit. A large PAR2 set plus ordinary
+    // NNTP and direct-store handles can exceed that without leaking anything.
+    let _ = weaver_server_core::runtime::resource_limits::raise_open_file_limit();
+
     // Rayon's global pool runs the archive engines' data-parallel loops. Give
     // its workers the same 8 MiB the tokio threads get below: under this
     // binary's fat-LTO profile the optimizer inlines a `par_iter` closure into

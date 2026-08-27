@@ -1498,49 +1498,43 @@ fn wait_reason_for_post_state(
     }
 }
 
-/// Resolve the user-facing queue state from the job's authoritative lifecycle
-/// status. The first-party UI needs the actual active stage, not the synthetic
-/// download lane used for compatibility accounting.
+/// Resolve the user-facing queue state from the authoritative runtime lanes.
+/// Active download work is always primary; post-processing and completion-tail
+/// overlays become primary only after that lane finishes.
 pub fn queue_item_state_from_job_info(info: &weaver_server_core::JobInfo) -> QueueItemState {
-    match &info.status {
-        weaver_server_core::JobStatus::Paused
-        | weaver_server_core::JobStatus::Failed { .. }
-        | weaver_server_core::JobStatus::Complete
-        | weaver_server_core::JobStatus::Moving
-        | weaver_server_core::JobStatus::QueuedRepair
-        | weaver_server_core::JobStatus::Repairing
-        | weaver_server_core::JobStatus::QueuedExtract
-        | weaver_server_core::JobStatus::Extracting
-        | weaver_server_core::JobStatus::QueuedPostProcessing
-        | weaver_server_core::JobStatus::PostProcessing => {
-            return QueueItemState::from(&info.status);
-        }
-        weaver_server_core::JobStatus::Queued
-        | weaver_server_core::JobStatus::Downloading
-        | weaver_server_core::JobStatus::Checking
-        | weaver_server_core::JobStatus::Verifying => {}
-    }
-    if info.fetching_repair_data {
-        QueueItemState::FetchingRepairData
-    } else if info.finalizing_download {
-        QueueItemState::FinalizingDownload
-    } else {
-        QueueItemState::from(&info.status)
-    }
+    resolve_queue_item_state(info, true)
 }
 
-/// Resolve the queue state for compatibility counters that must treat a live
-/// download lane as active, even while post-processing overlaps it.
-pub fn queue_item_state_from_job_info_for_download_accounting(
+fn terminal_queue_item_state(info: &weaver_server_core::JobInfo) -> Option<QueueItemState> {
+    if matches!(info.run_state, weaver_server_core::RunState::Paused) {
+        return Some(QueueItemState::Paused);
+    }
+
+    if matches!(
+        info.download_state,
+        weaver_server_core::DownloadState::Failed
+    ) || matches!(info.post_state, weaver_server_core::PostState::Failed)
+    {
+        return Some(QueueItemState::Failed);
+    }
+
+    if matches!(
+        info.download_state,
+        weaver_server_core::DownloadState::Complete
+    ) && matches!(info.post_state, weaver_server_core::PostState::Completed)
+    {
+        return Some(QueueItemState::Completed);
+    }
+
+    None
+}
+
+fn resolve_queue_item_state(
     info: &weaver_server_core::JobInfo,
+    include_finalization_states: bool,
 ) -> QueueItemState {
-    match &info.status {
-        weaver_server_core::JobStatus::Paused => return QueueItemState::Paused,
-        weaver_server_core::JobStatus::Failed { .. } => return QueueItemState::Failed,
-        weaver_server_core::JobStatus::Complete => return QueueItemState::Completed,
-        weaver_server_core::JobStatus::Moving => return QueueItemState::Finalizing,
-        weaver_server_core::JobStatus::PostProcessing => return QueueItemState::PostProcessing,
-        _ => {}
+    if let Some(state) = terminal_queue_item_state(info) {
+        return state;
     }
 
     match info.download_state {
@@ -1549,6 +1543,22 @@ pub fn queue_item_state_from_job_info_for_download_accounting(
         weaver_server_core::DownloadState::Queued => return QueueItemState::Queued,
         weaver_server_core::DownloadState::Failed => return QueueItemState::Failed,
         weaver_server_core::DownloadState::Complete => {}
+    }
+
+    if include_finalization_states
+        && info.finalizing_download
+        && matches!(
+            info.post_state,
+            weaver_server_core::PostState::Idle
+                | weaver_server_core::PostState::WaitingForVolumes
+                | weaver_server_core::PostState::AwaitingRepair
+        )
+    {
+        return if info.fetching_repair_data {
+            QueueItemState::FetchingRepairData
+        } else {
+            QueueItemState::FinalizingDownload
+        };
     }
 
     match info.post_state {
@@ -1567,6 +1577,14 @@ pub fn queue_item_state_from_job_info_for_download_accounting(
             QueueItemState::from(&info.status)
         }
     }
+}
+
+/// Resolve the queue state for compatibility counters that must treat a live
+/// download lane as active, even while post-processing overlaps it.
+pub fn queue_item_state_from_job_info_for_download_accounting(
+    info: &weaver_server_core::JobInfo,
+) -> QueueItemState {
+    resolve_queue_item_state(info, false)
 }
 
 fn attention_for_live_job(

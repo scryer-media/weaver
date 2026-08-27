@@ -83,6 +83,9 @@ pub struct DownloadQueue {
     /// need a backfill lane. Maintained on push/pop; recounted on the rare
     /// bulk-removal paths.
     excluded_work: usize,
+    /// Queued recovery items. Kept explicitly so scheduler admission checks
+    /// stay O(1) even for jobs with very large article queues.
+    recovery_work: usize,
 }
 
 impl DownloadQueue {
@@ -92,6 +95,7 @@ impl DownloadQueue {
             ordinary_heap: BinaryHeap::new(),
             next_sequence: 0,
             excluded_work: 0,
+            recovery_work: 0,
         }
     }
 
@@ -101,6 +105,9 @@ impl DownloadQueue {
         self.next_sequence += 1;
         if !work.exclude_servers.is_empty() {
             self.excluded_work += 1;
+        }
+        if work.is_recovery {
+            self.recovery_work += 1;
         }
         let completion_critical = work.completion_critical;
         let item = Reverse(PrioritizedWork {
@@ -132,10 +139,8 @@ impl DownloadQueue {
             self.ordinary_heap.pop()
         }
         .map(|Reverse(pw)| pw.work);
-        if let Some(work) = &work
-            && !work.exclude_servers.is_empty()
-        {
-            self.excluded_work = self.excluded_work.saturating_sub(1);
+        if let Some(work) = &work {
+            self.note_removed(work);
         }
         work
     }
@@ -163,11 +168,12 @@ impl DownloadQueue {
         self.excluded_work = 0;
     }
 
-    fn recount_excluded_work(&mut self) {
+    fn recount_derived_counts(&mut self) {
         self.excluded_work = self
             .iter()
             .filter(|item| !item.0.work.exclude_servers.is_empty())
             .count();
+        self.recovery_work = self.iter().filter(|item| item.0.work.is_recovery).count();
     }
 
     fn iter(&self) -> impl Iterator<Item = &Reverse<PrioritizedWork>> {
@@ -200,7 +206,7 @@ impl DownloadQueue {
             .then(|| self.pop_from_class(completion_critical))?
     }
 
-    fn pop_next_matching_in_class(
+    pub fn pop_next_matching_in_class(
         &mut self,
         completion_critical: bool,
         mut matches: impl FnMut(&DownloadWork) -> bool,
@@ -265,6 +271,9 @@ impl DownloadQueue {
         if !work.exclude_servers.is_empty() {
             self.excluded_work = self.excluded_work.saturating_sub(1);
         }
+        if work.is_recovery {
+            self.recovery_work = self.recovery_work.saturating_sub(1);
+        }
     }
 
     fn heap_for_class(&self, completion_critical: bool) -> &BinaryHeap<Reverse<PrioritizedWork>> {
@@ -305,7 +314,7 @@ impl DownloadQueue {
     }
 
     pub fn has_recovery_work(&self) -> bool {
-        self.iter().any(|item| item.0.work.is_recovery)
+        self.recovery_work > 0
     }
 
     pub fn count_matching(&self, mut predicate: impl FnMut(&DownloadWork) -> bool) -> usize {
@@ -330,7 +339,7 @@ impl DownloadQueue {
             }
         }
         if !extracted.is_empty() {
-            self.recount_excluded_work();
+            self.recount_derived_counts();
         }
         extracted
     }
@@ -345,7 +354,7 @@ impl DownloadQueue {
     }
 
     pub fn has_primary_work(&self) -> bool {
-        self.iter().any(|item| !item.0.work.is_recovery)
+        self.len() > self.recovery_work
     }
 
     pub fn has_completion_critical_work(&self) -> bool {
@@ -359,6 +368,7 @@ impl DownloadQueue {
     /// Remove and return all queued segments.
     pub fn drain_all(&mut self) -> Vec<DownloadWork> {
         self.excluded_work = 0;
+        self.recovery_work = 0;
         self.completion_critical_heap
             .drain()
             .chain(self.ordinary_heap.drain())
@@ -376,7 +386,7 @@ impl DownloadQueue {
                 }
             }
         }
-        self.recount_excluded_work();
+        self.recount_derived_counts();
     }
 
     /// Remove and return all queued segments for a given job.
@@ -392,7 +402,7 @@ impl DownloadQueue {
                 }
             }
         }
-        self.recount_excluded_work();
+        self.recount_derived_counts();
         drained
     }
 

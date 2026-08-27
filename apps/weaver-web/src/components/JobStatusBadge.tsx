@@ -1,6 +1,10 @@
 import { cn } from "@/lib/utils";
 import { useTranslate } from "@/lib/context/translate-context";
 import {
+  useDebouncedStatus,
+  useDebouncedStatuses,
+} from "@/lib/hooks/use-debounced-status";
+import {
   STATUS_SOFT_CLASS,
   STATUS_TEXT_CLASS,
   statusI18nKey,
@@ -12,12 +16,20 @@ interface JobStatusBadgeProps {
   label?: string;
   compact?: boolean;
   className?: string;
+  debounce?: boolean;
 }
 
 /** A single pipeline-status chip: colored text on a soft tint of the same token. */
-export function JobStatusBadge({ status, label, compact = false, className }: JobStatusBadgeProps) {
+export function JobStatusBadge({
+  status,
+  label,
+  compact = false,
+  className,
+  debounce = true,
+}: JobStatusBadgeProps) {
   const t = useTranslate();
-  const token = statusToken(status);
+  const visibleStatus = useDebouncedStatus(status, debounce);
+  const token = statusToken(visibleStatus);
   return (
     <span
       className={cn(
@@ -28,7 +40,7 @@ export function JobStatusBadge({ status, label, compact = false, className }: Jo
         className,
       )}
     >
-      {label ?? t(statusI18nKey(status))}
+      {label ?? t(statusI18nKey(visibleStatus))}
     </span>
   );
 }
@@ -47,10 +59,17 @@ export function JobStatusBadgeGroup({
   compact?: boolean;
   className?: string;
 }) {
+  const visibleStatuses = useDebouncedStatuses(statuses);
+
   return (
     <div className={cn("flex flex-wrap items-center gap-1.5", className)}>
-      {statuses.map((status, index) => (
-        <JobStatusBadge key={`${status}-${index}`} status={status} compact={compact} />
+      {visibleStatuses.map((status, index) => (
+        <JobStatusBadge
+          key={`${status}-${index}`}
+          status={status}
+          compact={compact}
+          debounce={false}
+        />
       ))}
     </div>
   );

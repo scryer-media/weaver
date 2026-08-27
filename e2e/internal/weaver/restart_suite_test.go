@@ -107,6 +107,23 @@ func TestRestartSuiteEncryptionKeyIsStableForRun(t *testing.T) {
 	}
 }
 
+func TestBodyFetchesSinceRestartPointIgnoresEarlierRefetches(t *testing.T) {
+	before := restartNntpMetrics{BodyCounts: map[string]int{"already-repeated": 2, "stable": 1}}
+	after := restartNntpMetrics{BodyCounts: map[string]int{"already-repeated": 2, "stable": 1}}
+
+	ids, extra := bodyFetchesSinceRestartPoint(before, after)
+	if ids != 0 || extra != 0 {
+		t.Fatalf("unchanged restart-point metrics reported refetches: ids=%d extra=%d", ids, extra)
+	}
+
+	after.BodyCounts["stable"] = 2
+	after.BodyCounts["new-after-restart"] = 1
+	ids, extra = bodyFetchesSinceRestartPoint(before, after)
+	if ids != 2 || extra != 2 {
+		t.Fatalf("post-restart refetches were not counted: ids=%d extra=%d", ids, extra)
+	}
+}
+
 func TestPreseededRestartSkipsFixturePosting(t *testing.T) {
 	t.Setenv(nntpSeedImageActiveEnv, "1")
 	if err := ensureRestartFixturesSeeded([]string{"fixture-that-does-not-exist"}); err != nil {

@@ -3,7 +3,7 @@ use super::*;
 #[derive(Default)]
 pub(crate) struct SystemSubscription;
 
-const METRICS_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const METRICS_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[Subscription]
 impl SystemSubscription {

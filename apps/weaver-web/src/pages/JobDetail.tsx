@@ -57,7 +57,7 @@ import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-
 import { cn } from "@/lib/utils";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
-import { normalizeJobData, type GraphqlJobData } from "@/lib/job-types";
+import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 import {
   readDownloadErrorMessage,
   saveResponseAsDownload,
@@ -92,7 +92,6 @@ export function JobDetail() {
   const { id } = useParams();
   const jobId = Number(id);
   const navigate = useNavigate();
-  const speed = useLiveSpeed();
   const connection = useLiveConnection();
   const graphqlConnection = useGraphqlConnectionState();
   const queryVariables = useMemo(() => ({ id: jobId }), [jobId]);
@@ -131,7 +130,6 @@ export function JobDetail() {
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [deleteAcceptError, setDeleteAcceptError] = useState<string | null>(null);
   const [polledData, setPolledData] = useState<JobDetailQueryData | undefined>();
-  const [subscriptionSnapshot, setSubscriptionSnapshot] = useState<JobDetailSnapshotData>();
   const [isDownloadingNzb, setIsDownloadingNzb] = useState(false);
   const [nzbDownloadError, setNzbDownloadError] = useState<string | null>(null);
   const [duplicateAction, setDuplicateAction] = useState<DuplicateAction | null>(null);
@@ -140,7 +138,9 @@ export function JobDetail() {
   const lastConnectionAtRef = useRef<number | null | undefined>(undefined);
   const jobQueryData =
     polledData?.jobDetailSnapshot
-    ?? subscriptionSnapshot
+    ?? (connection.status === "connected" && !subscriptionError
+      ? subscriptionData?.jobDetailUpdates
+      : undefined)
     ?? data?.jobDetailSnapshot
     ?? null;
   const queryJob = useMemo(() => {
@@ -163,24 +163,14 @@ export function JobDetail() {
 
   useEffect(() => {
     setPolledData(undefined);
-    setSubscriptionSnapshot(undefined);
     setNzbDownloadError(null);
   }, [jobId]);
 
   useEffect(() => {
-    if (connection.isDisconnected) {
-      setSubscriptionSnapshot(undefined);
-    } else {
+    if (!connection.isDisconnected) {
       setPolledData(undefined);
     }
   }, [connection.isDisconnected]);
-
-  useEffect(() => {
-    if (connection.status === "connected" && subscriptionData?.jobDetailUpdates) {
-      setSubscriptionSnapshot(subscriptionData.jobDetailUpdates);
-      setPolledData(undefined);
-    }
-  }, [connection.status, subscriptionData]);
 
   useEffect(() => {
     if (graphqlConnection.status !== "connected" || graphqlConnection.lastConnectedAt === null) {
@@ -194,7 +184,6 @@ export function JobDetail() {
       return;
     }
     lastConnectionAtRef.current = graphqlConnection.lastConnectedAt;
-    setSubscriptionSnapshot(undefined);
     void reexecuteJobQuery({ requestPolicy: "network-only" });
     void reexecuteDuplicateSnapshot({ requestPolicy: "network-only" });
   }, [
@@ -214,7 +203,6 @@ export function JobDetail() {
       return;
     }
     lastSubscriptionErrorRef.current = errorKey;
-    setSubscriptionSnapshot(undefined);
     void reexecuteJobQuery({ requestPolicy: "network-only" });
     void reexecuteDuplicateSnapshot({ requestPolicy: "network-only" });
   }, [reexecuteDuplicateSnapshot, reexecuteJobQuery, subscriptionError]);
@@ -231,13 +219,6 @@ export function JobDetail() {
 
   const job = queryJob;
   const timeline = jobQueryData?.jobTimeline ?? null;
-  const etaSpeed = useStableEtaSpeed(job ? [job] : [], speed);
-  const eta = job
-    ? formatEtaFromRemainingBytes(
-        Math.max(job.totalBytes - job.downloadedBytes, 0),
-        etaSpeed,
-      )
-    : "\u2014";
   const showEta = job?.status === "DOWNLOADING" || job?.status === "QUEUED";
 
   if (fetching && !job) {
@@ -481,16 +462,7 @@ export function JobDetail() {
                 <span className="text-xs text-status-paused">{t("job.passwordProtected")}</span>
               ) : null}
             </div>
-            {showEta ? (
-              <div className="min-w-[7.5rem] shrink-0 text-right tabular-nums sm:min-w-[8.5rem]">
-                <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-                  {t("table.eta")}
-                </div>
-                <div className="mt-1 text-2xl font-semibold tracking-tight text-foreground tabular-nums sm:text-3xl">
-                  {eta}
-                </div>
-              </div>
-            ) : null}
+            {showEta ? <JobDetailEta job={job} /> : null}
           </div>
         </CardHeader>
         <CardContent className="space-y-5">
@@ -705,6 +677,27 @@ export function JobDetail() {
           <p className="text-sm text-destructive">{deleteAcceptError}</p>
         ) : null}
       </ConfirmDialog>
+    </div>
+  );
+}
+
+function JobDetailEta({ job }: { job: JobData }) {
+  const t = useTranslate();
+  const speed = useLiveSpeed();
+  const etaSpeed = useStableEtaSpeed([job], speed);
+  const eta = formatEtaFromRemainingBytes(
+    Math.max(job.totalBytes - job.downloadedBytes, 0),
+    etaSpeed,
+  );
+
+  return (
+    <div className="min-w-[7.5rem] shrink-0 text-right tabular-nums sm:min-w-[8.5rem]">
+      <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+        {t("table.eta")}
+      </div>
+      <div className="mt-1 text-2xl font-semibold tracking-tight text-foreground tabular-nums sm:text-3xl">
+        {eta}
+      </div>
     </div>
   );
 }

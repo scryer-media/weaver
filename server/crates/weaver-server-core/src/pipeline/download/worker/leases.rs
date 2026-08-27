@@ -209,8 +209,18 @@ impl Pipeline {
         compatibility: Option<&DownloadBatchCompatibility>,
         selection: DownloadWorkSelection,
     ) -> Option<DownloadWork> {
-        if bootstrap_files.is_none() && selection == DownloadWorkSelection::Any {
-            return self.pop_download_work_for_batch(job_id, compatibility);
+        if bootstrap_files.is_none() {
+            if selection == DownloadWorkSelection::Any {
+                return self.pop_download_work_for_batch(job_id, compatibility);
+            }
+            let completion_critical = selection == DownloadWorkSelection::CompletionCritical;
+            return self.jobs.get_mut(&job_id).and_then(|state| {
+                state
+                    .download_queue
+                    .pop_next_matching_in_class(completion_critical, |work| {
+                        compatibility.is_none_or(|compatibility| compatibility.matches(work))
+                    })
+            });
         }
         self.jobs.get_mut(&job_id).and_then(|state| {
             let matches = |work: &DownloadWork| {

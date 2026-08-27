@@ -16,14 +16,17 @@ import {
   X,
 } from "lucide-react";
 import {
+  createContext,
   memo,
   useCallback,
+  useContext,
   useDeferredValue,
   useEffect,
   useMemo,
   useRef,
   useState,
   type KeyboardEvent,
+  type ReactNode,
 } from "react";
 import { Link } from "react-router";
 import { useClient, useMutation, useQuery, useSubscription } from "urql";
@@ -57,13 +60,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
   CATEGORIES_QUERY,
   CANCEL_JOB_MUTATION,
   HAS_CONFIGURED_SERVERS_QUERY,
@@ -88,11 +84,17 @@ import {
   extractionPresentationStatus,
   useExtractionVisibility,
 } from "@/lib/hooks/use-extraction-visibility";
+import { useDebouncedStatuses } from "@/lib/hooks/use-debounced-status";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { getJobStages } from "@/lib/job-stages";
-import { isActiveStatus, STATUS_BG_CLASS, statusToken } from "@/lib/status-tokens";
+import {
+  isActiveStatus,
+  STATUS_BG_CLASS,
+  statusI18nKey,
+  statusToken,
+} from "@/lib/status-tokens";
 import { useStableQueueEta } from "@/lib/hooks/use-stable-queue-eta";
 import {
   formatJobReleaseName,
@@ -143,7 +145,7 @@ type QueueRowData = JobData & {
   categoryLabel: string;
   blockedByGlobalPause: boolean;
   blockedByIspCap: boolean;
-  etaDisplay: string;
+  etaOverride: string | null;
 };
 
 type QueuePageSummary = {
@@ -280,6 +282,39 @@ function sameStatusSet(current: readonly string[], preset: readonly string[]): b
   return current.length === preset.length && preset.every((value) => current.includes(value));
 }
 
+const EMPTY_QUEUE_ETA_BY_ID: ReadonlyMap<number, string> = new Map();
+const QueueEtaContext = createContext<ReadonlyMap<number, string>>(EMPTY_QUEUE_ETA_BY_ID);
+
+function QueueEtaProvider({ jobs, children }: { jobs: JobData[]; children: ReactNode }) {
+  const speed = useLiveSpeed();
+  const etaById = useStableQueueEta(jobs, speed);
+
+  return <QueueEtaContext.Provider value={etaById}>{children}</QueueEtaContext.Provider>;
+}
+
+const QueueEtaCell = memo(function QueueEtaCell({
+  jobId,
+  override,
+  className,
+}: {
+  jobId: number;
+  override: string | null;
+  className?: string;
+}) {
+  const etaById = useContext(QueueEtaContext);
+
+  return (
+    <span className={cn("tabular-nums text-muted-foreground", className)}>
+      {override ?? etaById.get(jobId) ?? "\u2014"}
+    </span>
+  );
+});
+
+function QueueSpeedValue() {
+  const speed = useLiveSpeed();
+  return formatSpeed(speed);
+}
+
 type QueueActionButtonsProps = {
   jobId: number;
   status: JobData["status"];
@@ -360,36 +395,24 @@ const QueueCellSelect = memo(function QueueCellSelect({
   onValueChange: (jobId: number, value: string) => void;
   className?: string;
 }) {
-  const handleValueChange = useCallback((nextValue: string) => {
-    onValueChange(jobId, nextValue);
-  }, [jobId, onValueChange]);
-
   return (
     <div className="flex justify-center" data-row-click-ignore="true">
-      <Select
-        value={value}
-        onValueChange={handleValueChange}
-        disabled={disabled}
-      >
-        <SelectTrigger
-          size="sm"
+      <div className={cn("relative", className)}>
+        <select
+          value={value}
+          disabled={disabled}
+          onChange={(event) => onValueChange(jobId, event.currentTarget.value)}
           aria-label={ariaLabel}
-          className={cn(
-            "h-8 min-w-0 border-0 bg-transparent px-2 text-[11px] shadow-none transition-none hover:bg-accent/40 focus-visible:ring-2",
-            "justify-center gap-1.5 text-center",
-            className,
-          )}
+          className="h-8 w-full appearance-none rounded-md border-0 bg-transparent px-2 pr-7 text-center text-[11px] text-foreground outline-none transition-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring/60 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          <SelectValue className="truncate" />
-        </SelectTrigger>
-        <SelectContent>
           {options.map((option) => (
-            <SelectItem key={option.value} value={option.value}>
+            <option key={option.value} value={option.value}>
               {option.label}
-            </SelectItem>
+            </option>
           ))}
-        </SelectContent>
-      </Select>
+        </select>
+        <ChevronDown className="pointer-events-none absolute right-2 top-1/2 size-3 -translate-y-1/2 text-muted-foreground" />
+      </div>
     </div>
   );
 });
@@ -451,20 +474,21 @@ const QueueCompactStatusDots = memo(function QueueCompactStatusDots({
 }: {
   job: QueueRowData;
 }) {
+  const t = useTranslate();
   const extractionVisible = useExtractionVisibility(job.phaseProgress);
   const visibleStatus = extractionPresentationStatus(
     job.status,
     job.phaseProgress,
     extractionVisible,
   );
-  const stages = getJobStages({ status: visibleStatus });
+  const stages = useDebouncedStatuses(getJobStages({ status: visibleStatus }));
 
   return (
     <span className="flex shrink-0 items-center gap-0.5">
       {stages.map((stage, index) => (
         <span
           key={`${stage}-${index}`}
-          title={index === 0 ? job.statusLabel : undefined}
+          title={index === 0 ? t(statusI18nKey(stage)) : undefined}
           className={cn(
             "size-2 rounded-pill",
             STATUS_BG_CLASS[statusToken(stage)],
@@ -638,7 +662,6 @@ export function JobList() {
   const [savingQueueFields, setSavingQueueFields] = useState<Record<string, boolean>>({});
   const [queueLayout, setQueueLayout] = useState<QueueLayout>("table");
 
-  const speed = useLiveSpeed();
   const isPaused = useLivePaused();
   const downloadBlock = useLiveDownloadBlock();
   const deferredSearch = useDeferredValue(queuePreferences.search.trim());
@@ -1090,7 +1113,6 @@ export function JobList() {
     });
   }, [jobs]);
 
-  const queueEtaById = useStableQueueEta(jobs, speed);
   const queueTableRows = useMemo<QueueRowData[]>(
     () =>
       jobs.map((job) => {
@@ -1110,16 +1132,16 @@ export function JobList() {
           categoryLabel: categoryValue ?? "\u2014",
           blockedByGlobalPause,
           blockedByIspCap,
-          etaDisplay: blockedByIspCap
+          etaOverride: blockedByIspCap
             ? downloadBlock.kind === "SERVER_QUOTA"
               ? t("jobs.serverQuotaEta")
               : t("jobs.bandwidthCapEta", { resetAt: capResetAt })
             : blockedByGlobalPause
               ? t("status.paused")
-              : (queueEtaById.get(job.id) ?? "\u2014"),
+              : null,
         };
       }),
-    [capResetAt, downloadBlock, isPaused, jobs, pendingJobUpdates, queueEtaById, t],
+    [capResetAt, downloadBlock, isPaused, jobs, pendingJobUpdates, t],
   );
   const totalCount = Math.max(
     0,
@@ -1395,7 +1417,7 @@ export function JobList() {
         enableSorting: false,
         header: () => <div className="text-center">{t("table.eta")}</div>,
         cell: ({ row }) => (
-          <span className="tabular-nums text-muted-foreground">{row.original.etaDisplay}</span>
+          <QueueEtaCell jobId={row.original.id} override={row.original.etaOverride} />
         ),
         meta: {
           headerClassName: "h-7 w-[96px] px-2 text-center",
@@ -1661,7 +1683,7 @@ export function JobList() {
                   {t("label.downloadSpeed")}
                 </div>
                 <div className="mt-0.5 font-space-grotesk text-lg font-bold text-foreground">
-                  {formatSpeed(speed)}
+                  <QueueSpeedValue />
                 </div>
                 {isPaused ? (
                   <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-status-paused">
@@ -2095,7 +2117,8 @@ export function JobList() {
               </DataTableToolbar>
             </div>
 
-            {queueLayout === "table" ? (
+            <QueueEtaProvider jobs={jobs}>
+              {queueLayout === "table" ? (
               <DataTable
                 table={queueTable}
                 wrapperClassName="max-h-[70vh]"
@@ -2154,9 +2177,11 @@ export function JobList() {
                           status={job.status}
                         />
                       </div>
-                      <span className="hidden w-16 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground md:block">
-                        {job.etaDisplay}
-                      </span>
+                      <QueueEtaCell
+                        jobId={job.id}
+                        override={job.etaOverride}
+                        className="hidden w-16 shrink-0 text-right text-[12px] md:block"
+                      />
                       <span className="w-16 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground">
                         {formatBytes(job.totalBytes)}
                       </span>
@@ -2202,7 +2227,8 @@ export function JobList() {
                   );
                 })}
               </div>
-            )}
+              )}
+            </QueueEtaProvider>
             <DataTablePagination
               table={queueTable}
               totalCount={totalCount}

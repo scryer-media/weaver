@@ -175,7 +175,6 @@ export function Layout() {
   const [uploadOpen, setUploadOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [polledMetrics, setPolledMetrics] = useState<LiveMetricsSnapshot | undefined>();
-  const [subscriptionMetrics, setSubscriptionMetrics] = useState<LiveMetricsSnapshot>();
   const lastMetricsSubscriptionErrorRef = useRef<string | null>(null);
   const lastMetricsConnectionAtRef = useRef<number | null | undefined>(undefined);
   const connectionState = useGraphqlConnectionState();
@@ -202,14 +201,12 @@ export function Layout() {
 
   useEffect(() => {
     if (connectionState.status === "connected" && metricsSubscriptionData?.systemMetricsUpdates) {
-      setSubscriptionMetrics(metricsSubscriptionData.systemMetricsUpdates);
       setPolledMetrics(undefined);
     }
   }, [connectionState.status, metricsSubscriptionData]);
 
   useEffect(() => {
     if (connectionState.status !== "connected") {
-      setSubscriptionMetrics(undefined);
       return;
     }
     if (connectionState.lastConnectedAt === null) {
@@ -223,7 +220,6 @@ export function Layout() {
       return;
     }
     lastMetricsConnectionAtRef.current = connectionState.lastConnectedAt;
-    setSubscriptionMetrics(undefined);
     void reexecuteMetricsQuery({ requestPolicy: "network-only" });
   }, [
     connectionState.lastConnectedAt,
@@ -241,31 +237,66 @@ export function Layout() {
       return;
     }
     lastMetricsSubscriptionErrorRef.current = errorKey;
-    setSubscriptionMetrics(undefined);
     void reexecuteMetricsQuery({ requestPolicy: "network-only" });
   }, [metricsSubscriptionError, reexecuteMetricsQuery]);
 
   const metricsSnapshot =
-    polledMetrics ?? subscriptionMetrics ?? metricsQueryData;
+    polledMetrics
+    ?? (connectionState.status === "connected" && !metricsSubscriptionError
+      ? metricsSubscriptionData?.systemMetricsUpdates
+      : undefined)
+    ?? metricsQueryData;
   const currentGlobalState = metricsSnapshot?.globalState ?? DEFAULT_GLOBAL_STATE;
   const isPolling = reconnectMetricsPolling.isPolling;
+  const currentDownloadBlock = currentGlobalState.downloadBlock;
+  const liveDownloadBlock = useMemo(
+    () => ({
+      capEnabled: currentDownloadBlock.capEnabled,
+      kind: currentDownloadBlock.kind,
+      limitBytes: currentDownloadBlock.limitBytes,
+      period: currentDownloadBlock.period,
+      remainingBytes: currentDownloadBlock.remainingBytes,
+      reservedBytes: currentDownloadBlock.reservedBytes,
+      scheduledSpeedLimit: currentDownloadBlock.scheduledSpeedLimit,
+      timezoneName: currentDownloadBlock.timezoneName,
+      usedBytes: currentDownloadBlock.usedBytes,
+      windowEndsAtEpochMs: currentDownloadBlock.windowEndsAtEpochMs,
+      windowStartsAtEpochMs: currentDownloadBlock.windowStartsAtEpochMs,
+    }),
+    [
+      currentDownloadBlock.capEnabled,
+      currentDownloadBlock.kind,
+      currentDownloadBlock.limitBytes,
+      currentDownloadBlock.period,
+      currentDownloadBlock.remainingBytes,
+      currentDownloadBlock.reservedBytes,
+      currentDownloadBlock.scheduledSpeedLimit,
+      currentDownloadBlock.timezoneName,
+      currentDownloadBlock.usedBytes,
+      currentDownloadBlock.windowEndsAtEpochMs,
+      currentDownloadBlock.windowStartsAtEpochMs,
+    ],
+  );
+  const liveConnection = useMemo(
+    () => ({
+      status: connectionState.status,
+      isDisconnected: connectionState.status === "disconnected",
+      isPolling,
+    }),
+    [connectionState.status, isPolling],
+  );
   const liveData = useMemo(
     () => ({
       jobs: EMPTY_JOBS,
       speed: metricsSnapshot?.metrics?.currentDownloadSpeed ?? 0,
       isPaused: currentGlobalState.isPaused,
-      downloadBlock: currentGlobalState.downloadBlock,
-      connection: {
-        status: connectionState.status,
-        isDisconnected: connectionState.status === "disconnected",
-        isPolling,
-      },
+      downloadBlock: liveDownloadBlock,
+      connection: liveConnection,
     }),
     [
-      connectionState.status,
-      currentGlobalState.downloadBlock,
       currentGlobalState.isPaused,
-      isPolling,
+      liveConnection,
+      liveDownloadBlock,
       metricsSnapshot?.metrics?.currentDownloadSpeed,
     ],
   );

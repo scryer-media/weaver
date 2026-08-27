@@ -880,7 +880,7 @@ impl Pipeline {
                     // A CRC recovery candidate is mandatory even when the source
                     // file is normally optional recovery material.
                     is_recovery: false,
-                    completion_critical: false,
+                    completion_critical: self.segment_is_completion_critical(segment_id),
                     exclude_servers,
                     avoid_server: None,
                 },
@@ -1213,7 +1213,7 @@ impl Pipeline {
                     byte_estimate: seg_spec.bytes,
                     retry_count: 0,
                     is_recovery: file_spec.role.is_recovery(),
-                    completion_critical: false,
+                    completion_critical: self.segment_is_completion_critical(segment_id),
                     exclude_servers: exclude.clone(),
                     avoid_server: None,
                 };

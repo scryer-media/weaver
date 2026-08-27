@@ -2,7 +2,130 @@ use super::*;
 
 use crate::pipeline::completion::finalize::check::{
     CleanPar2VerificationMode, Par2SetSettlementReason, QuickPar2Evidence,
+    bounded_repair_evidence_covers_assessment, error_chain_has_file_descriptor_exhaustion,
+    run_file_descriptor_bounded_par2_repair,
 };
+
+#[cfg(any(unix, windows))]
+#[test]
+fn par2_session_io_errors_preserve_file_descriptor_exhaustion() {
+    #[cfg(unix)]
+    let raw_os_error = libc::EMFILE;
+    #[cfg(windows)]
+    let raw_os_error = 4;
+
+    let exhausted = par2_rs::Par2SessionError::Par2(par2_rs::Par2Error::Io(
+        std::io::Error::from_raw_os_error(raw_os_error),
+    ));
+    assert!(error_chain_has_file_descriptor_exhaustion(&exhausted));
+
+    let ordinary = par2_rs::Par2SessionError::Par2(par2_rs::Par2Error::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "missing source",
+    )));
+    assert!(!error_chain_has_file_descriptor_exhaustion(&ordinary));
+}
+
+#[test]
+fn descriptor_bounded_repair_handles_a_large_multifile_set() {
+    const FILE_COUNT: usize = 128;
+    const SLICE_SIZE: u64 = 2;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let files = (0..FILE_COUNT)
+        .map(|index| {
+            (
+                format!("volume-{index:03}.rar"),
+                vec![index as u8, index.wrapping_add(1) as u8],
+            )
+        })
+        .collect::<Vec<_>>();
+    let file_refs = files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect::<Vec<_>>();
+    let par2_set = build_repairable_par2_set_for_files(&file_refs, SLICE_SIZE, 1);
+    let damaged_name = &files[FILE_COUNT - 1].0;
+    let expected_repaired = files[FILE_COUNT - 1].1.clone();
+
+    for (name, bytes) in &files {
+        let contents = if name == damaged_name {
+            vec![0, 0]
+        } else {
+            bytes.clone()
+        };
+        std::fs::write(temp_dir.path().join(name), contents).unwrap();
+    }
+
+    let evidence = par2_set
+        .files
+        .iter()
+        .filter(|(_, description)| &description.filename != damaged_name)
+        .map(|(file_id, description)| {
+            let proof =
+                par2_rs::InStreamCrc32Proof::try_new(description.length, true, true, true).unwrap();
+            par2_rs::SliceEvidence::from_in_stream_crc32(
+                par2_set.recovery_set_id,
+                *file_id,
+                0,
+                true,
+                proof,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let verification = par2_rs::VerificationResult {
+        files: par2_set
+            .recovery_file_ids
+            .iter()
+            .map(|file_id| {
+                let damaged = par2_set.files[file_id].filename == *damaged_name;
+                par2_rs::FileVerification {
+                    file_id: *file_id,
+                    filename: par2_set.files[file_id].filename.clone(),
+                    status: if damaged {
+                        par2_rs::FileStatus::Damaged(1)
+                    } else {
+                        par2_rs::FileStatus::Complete
+                    },
+                    valid_slices: vec![!damaged],
+                    missing_slice_count: u32::from(damaged),
+                }
+            })
+            .collect(),
+        recovery_blocks_available: 1,
+        total_missing_blocks: 1,
+        repairable: par2_rs::Repairability::Repairable {
+            blocks_needed: 1,
+            blocks_available: 1,
+        },
+    };
+    assert!(bounded_repair_evidence_covers_assessment(
+        &verification,
+        &evidence
+    ));
+    assert!(!bounded_repair_evidence_covers_assessment(
+        &verification,
+        &evidence[..evidence.len() - 1]
+    ));
+
+    let outcome = run_file_descriptor_bounded_par2_repair(
+        temp_dir.path().to_path_buf(),
+        par2_set,
+        HashMap::new(),
+        evidence,
+        64 * 1024 * 1024,
+        par2_rs::CancellationToken::new(),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(outcome.status, par2_rs::Par2RepairStatus::Repaired);
+    assert_eq!(
+        std::fs::read(temp_dir.path().join(damaged_name)).unwrap(),
+        expected_repaired
+    );
+}
 
 #[tokio::test]
 async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
@@ -11518,6 +11641,35 @@ async fn metadata_promotion_job(
     (working_dir, first_segment, second_segment)
 }
 
+#[tokio::test]
+async fn promoted_recovery_decode_retry_remains_completion_critical() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30948);
+    let (_, _, recovery_segment) =
+        metadata_promotion_job(&mut pipeline, job_id, "Promoted Recovery Decode Retry").await;
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .files
+        .entry(recovery_segment.file_id.file_index)
+        .or_default()
+        .promoted = true;
+
+    pipeline.handle_decode_failure(recovery_segment, "bad recovery article", &[], Some(0));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let retry = pipeline
+        .retry_rx
+        .try_recv()
+        .expect("decode failure should schedule a retry");
+
+    assert_eq!(retry.work.segment_id, recovery_segment);
+    assert!(retry.work.is_recovery);
+    assert!(
+        retry.work.completion_critical,
+        "decode retry must retain completion-critical recovery provenance"
+    );
+}
+
 fn drain_promoted_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<SegmentId> {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     state
@@ -11526,6 +11678,49 @@ fn drain_promoted_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<Segmen
         .into_iter()
         .map(|work| work.segment_id)
         .collect()
+}
+
+#[tokio::test]
+async fn retained_promoted_recovery_buffer_does_not_report_active_fetch() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30947);
+    let (_, recovery_segment, _) =
+        metadata_promotion_job(&mut pipeline, job_id, "Retained Recovery Buffer").await;
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .files
+        .entry(recovery_segment.file_id.file_index)
+        .or_default()
+        .promoted = true;
+
+    let bytes = vec![7u8; 64];
+    let buffered = BufferedDecodedSegment {
+        encoding: SegmentEncoding::Yenc,
+        segment_id: recovery_segment,
+        decoded_size: bytes.len() as u32,
+        data: DecodedChunk::from(bytes.clone()),
+        part_crc: par2_rs::checksum::crc32(&bytes),
+        part_crc_verified: true,
+        yenc_name: "silver-horizon.par2".to_string(),
+        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+        segments: Vec::new(),
+    };
+    pipeline
+        .write_buffers
+        .entry(recovery_segment.file_id)
+        .or_insert_with(|| WriteReorderBuffer::new(1))
+        .insert(64, buffered);
+
+    let job = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|job| job.job_id == job_id)
+        .expect("job remains visible");
+    assert!(
+        !job.fetching_repair_data,
+        "retained decoded recovery bytes are not an active network fetch"
+    );
 }
 
 /// A metadata candidate that arrived without yielding a set is finished.

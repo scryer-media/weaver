@@ -42,7 +42,66 @@ struct Par2SessionEvidenceCandidate {
 }
 
 type RetainedPar2SessionOutcome = (par2_rs::Par2RepairOutcome, Vec<NzbFileId>, bool);
-type RetainedPar2SessionResult = Result<RetainedPar2SessionOutcome, String>;
+
+#[derive(Debug)]
+struct RetainedPar2SessionFailure {
+    message: String,
+    file_descriptor_exhausted: bool,
+}
+
+impl RetainedPar2SessionFailure {
+    fn other(message: String) -> Self {
+        Self {
+            message,
+            file_descriptor_exhausted: false,
+        }
+    }
+
+    fn from_session_error(error: par2_rs::Par2SessionError) -> Self {
+        let file_descriptor_exhausted = error_chain_has_file_descriptor_exhaustion(&error);
+        Self {
+            message: format!("retained PAR2 session failed: {error}"),
+            file_descriptor_exhausted,
+        }
+    }
+}
+
+type RetainedPar2SessionResult = Result<RetainedPar2SessionOutcome, RetainedPar2SessionFailure>;
+
+pub(in crate::pipeline) fn error_chain_has_file_descriptor_exhaustion(
+    error: &(dyn std::error::Error + 'static),
+) -> bool {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        if let Some(error) = source.downcast_ref::<std::io::Error>()
+            && io_error_is_file_descriptor_exhaustion(error)
+        {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
+fn io_error_is_file_descriptor_exhaustion(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EMFILE) | Some(libc::ENFILE)
+        )
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_TOO_MANY_OPEN_FILES
+        error.raw_os_error() == Some(4)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
+}
 
 fn committed_evidence_from_candidate(
     candidate: &Par2SessionEvidenceCandidate,
@@ -148,7 +207,9 @@ fn run_retained_par2_session(
             Err(error) => {
                 return (
                     session,
-                    Err(format!("failed to add retained PAR2 evidence: {error}")),
+                    Err(RetainedPar2SessionFailure::other(format!(
+                        "failed to add retained PAR2 evidence: {error}"
+                    ))),
                 );
             }
         }
@@ -179,7 +240,7 @@ fn run_retained_par2_session(
         session,
         result
             .map(|outcome| (outcome, admitted_file_ids, retried_source_change))
-            .map_err(|error| format!("retained PAR2 session failed: {error}")),
+            .map_err(RetainedPar2SessionFailure::from_session_error),
     )
 }
 
@@ -262,6 +323,70 @@ fn ensure_par2_repair_completed(
             ))
         }
     }
+}
+
+pub(in crate::pipeline) fn bounded_repair_evidence_covers_assessment(
+    verification: &par2_rs::VerificationResult,
+    slice_evidence: &[par2_rs::SliceEvidence],
+) -> bool {
+    let available = slice_evidence
+        .iter()
+        .filter(|evidence| evidence.is_valid())
+        .map(|evidence| (evidence.file_id(), evidence.slice_index()))
+        .collect::<HashSet<_>>();
+    verification.files.iter().all(|file| {
+        file.valid_slices
+            .iter()
+            .enumerate()
+            .all(|(slice_index, valid)| {
+                !*valid
+                    || u32::try_from(slice_index)
+                        .ok()
+                        .is_some_and(|slice_index| available.contains(&(file.file_id, slice_index)))
+            })
+    })
+}
+
+pub(in crate::pipeline) fn run_file_descriptor_bounded_par2_repair(
+    working_dir: std::path::PathBuf,
+    par2_set: par2_rs::Par2FileSet,
+    placement_overrides: HashMap<par2_rs::FileId, String>,
+    slice_evidence: Vec<par2_rs::SliceEvidence>,
+    memory_limit: usize,
+    cancellation: par2_rs::CancellationToken,
+    progress: Option<par2_rs::ProgressCallback>,
+) -> Result<par2_rs::Par2RepairOutcome, String> {
+    // The path-backed repairer keeps every source file open for the repair
+    // lifetime. Large RAR sets can exhaust a process's descriptor budget even
+    // though only a few slices are damaged. The access-backed session does not
+    // scan paths, so its caller must first prove the in-stream grid names every
+    // intact input slice the authoritative assessment will use.
+    let source_access = std::sync::Arc::new(par2_rs::PlacementFileAccess::new(
+        working_dir.clone(),
+        &par2_set,
+        placement_overrides,
+    ));
+    let mut options =
+        par2_rs::Par2RepairSessionOptions::from_set(working_dir, par2_set, source_access);
+    options.memory_limit = Some(memory_limit);
+    options.cancel = Some(cancellation);
+    options.progress = progress;
+
+    let mut session = par2_rs::Par2RepairSession::open(options)
+        .map_err(|error| format!("bounded filesystem PAR2 fallback failed to open: {error}"))?;
+    for evidence in slice_evidence {
+        session
+            .add_slice_evidence_for_file(evidence)
+            .map_err(|error| format!("bounded filesystem PAR2 evidence was rejected: {error}"))?;
+    }
+    session
+        .analyze()
+        .map_err(|error| format!("bounded filesystem PAR2 analysis failed: {error}"))?;
+    let outcome = session
+        .repair()
+        .map_err(|error| format!("bounded filesystem PAR2 repair failed: {error}"))?;
+    ensure_par2_repair_completed(&outcome, true)?;
+    Ok(outcome)
 }
 
 fn default_par2_repair_memory_limit_bytes() -> usize {
@@ -1622,6 +1747,30 @@ impl Pipeline {
             .map_err(|error| format!("failed to load completed-file hashes: {error}"))
     }
 
+    fn par2_filesystem_placement_overrides(
+        &self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+        working_dir: &Path,
+    ) -> HashMap<par2_rs::FileId, String> {
+        let file_ids: Vec<NzbFileId> = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.assembly.files().map(|file| file.file_id()).collect())
+            .unwrap_or_default();
+        file_ids
+            .into_iter()
+            .filter_map(|file_id| {
+                let binding = self.resolve_par2_file_binding_in_set(file_id, set_id)?;
+                let relative = binding.path.strip_prefix(working_dir).ok()?;
+                Some((
+                    binding.par2_file_id,
+                    relative.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect()
+    }
+
     async fn par2_session_evidence_candidates(
         &self,
         job_id: JobId,
@@ -2110,6 +2259,15 @@ impl Pipeline {
             }
         }
 
+        // Repair retires the live grid below, because its verdicts describe
+        // the pre-repair file generation. Keep one local snapshot solely for
+        // the descriptor-bounded retry: that retry validates every source
+        // slice as it reads it and never returns the evidence to runtime state.
+        let repair_slice_evidence =
+            repair.then(|| self.in_stream_slice_evidence_paths_for_set(job_id, set_id));
+        let repair_placement_overrides =
+            repair.then(|| self.par2_filesystem_placement_overrides(job_id, set_id, &working_dir));
+
         if repair {
             // Retire only files the repairing set can write. Other parsed
             // sets may still have byte-exact evidence for their own files.
@@ -2156,7 +2314,7 @@ impl Pipeline {
                 set_id,
                 working_dir.clone(),
                 memory_limit,
-                session_progress,
+                session_progress.clone(),
                 // By this point the repairer reads and writes real files: any
                 // set still routing here materialized before it arrived.
                 None,
@@ -2190,10 +2348,18 @@ impl Pipeline {
                     return Err(error);
                 }
             };
-            // Built here rather than at session-open time so it can never
-            // outlive the block-CRC retirement above: a repairing set forgets
-            // its files' verdicts first, and this reads whatever survived that.
-            let slice_evidence = self.in_stream_slice_evidence_paths_for_set(job_id, set_id);
+            // Analysis reads the live grid here. Repair uses the local
+            // pre-retirement snapshot captured above; it never puts those
+            // verdicts back after the file generation changes.
+            let slice_evidence = repair_slice_evidence
+                .unwrap_or_else(|| self.in_stream_slice_evidence_paths_for_set(job_id, set_id));
+            let bounded_repair = repair.then(|| {
+                let evidence = slice_evidence
+                    .iter()
+                    .flat_map(|(_, evidence)| evidence.iter().copied())
+                    .collect::<Vec<_>>();
+                (repair_placement_overrides.unwrap_or_default(), evidence)
+            });
             let mut repair_task = tokio::task::spawn_blocking(move || {
                 if repair {
                     crate::e2e_failpoint::maybe_delay("repair.task_start");
@@ -2212,10 +2378,7 @@ impl Pipeline {
             } else {
                 repair_task.await
             };
-            if repair {
-                self.phase_end(job_id, JobPhase::Repairing);
-            }
-            return match repair_result {
+            let retained_outcome = match repair_result {
                 Ok((session, Ok((outcome, admitted_file_ids, retried_source_change)))) => {
                     self.restore_par2_repair_session(job_id, set_id, session);
                     let set_runtime = self
@@ -2232,15 +2395,86 @@ impl Pipeline {
                             .session_evidence_file_ids
                             .extend(admitted_file_ids);
                     }
-                    ensure_par2_repair_completed(&outcome, repair)?;
-                    Ok(outcome)
+                    ensure_par2_repair_completed(&outcome, repair).map(|()| outcome)
+                }
+                Ok((session, Err(error))) if repair && error.file_descriptor_exhausted => {
+                    let assessment = session
+                        .assessment()
+                        .ok()
+                        .map(|outcome| outcome.verification.clone());
+                    // The failed constructor drops every handle it opened.
+                    // Do not retain this path-backed session: the retry reads
+                    // through PlacementFileAccess and its assessment belongs
+                    // to a different source kind.
+                    drop(session);
+                    let set_runtime = self
+                        .ensure_par2_runtime(job_id)
+                        .set_runtime_mut(set_id)
+                        .expect("PAR2 fallback belongs to the active recovery set");
+                    set_runtime.session = None;
+                    set_runtime.session_last_used = None;
+                    set_runtime.session_evidence_file_ids.clear();
+
+                    let (placement_overrides, evidence) = bounded_repair
+                        .expect("a repairing retained session has bounded retry inputs");
+                    if !assessment.as_ref().is_some_and(|verification| {
+                        bounded_repair_evidence_covers_assessment(verification, &evidence)
+                    }) {
+                        warn!(
+                            job_id = job_id.0,
+                            error = %error.message,
+                            evidence_slices = evidence.len(),
+                            "filesystem PAR2 repair exhausted file descriptors; the bounded retry lacks a complete source map"
+                        );
+                        self.phase_end(job_id, JobPhase::Repairing);
+                        return Err(error.message);
+                    }
+                    warn!(
+                        job_id = job_id.0,
+                        error = %error.message,
+                        evidence_slices = evidence.len(),
+                        "filesystem PAR2 repair exhausted file descriptors; retrying with bounded source access"
+                    );
+                    let cancellation = self.par2_cancellation_token(job_id);
+                    let fallback_working_dir = working_dir.clone();
+                    let fallback_set = (*par2_set).clone();
+                    let fallback_progress = session_progress.clone();
+                    let mut fallback_task = tokio::task::spawn_blocking(move || {
+                        run_file_descriptor_bounded_par2_repair(
+                            fallback_working_dir,
+                            fallback_set,
+                            placement_overrides,
+                            evidence,
+                            memory_limit,
+                            cancellation,
+                            fallback_progress,
+                        )
+                    });
+                    let fallback_result = loop {
+                        tokio::select! {
+                            result = &mut fallback_task => break result,
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                                self.sample_phase_progress();
+                            }
+                        }
+                    };
+                    match fallback_result {
+                        Ok(result) => result,
+                        Err(error) => Err(format!(
+                            "bounded filesystem PAR2 fallback task panicked: {error}"
+                        )),
+                    }
                 }
                 Ok((session, Err(error))) => {
                     self.restore_par2_repair_session(job_id, set_id, session);
-                    Err(error)
+                    Err(error.message)
                 }
                 Err(error) => Err(format!("retained PAR2 session task panicked: {error}")),
             };
+            if repair {
+                self.phase_end(job_id, JobPhase::Repairing);
+            }
+            return retained_outcome;
         }
 
         let cancellation = self.par2_cancellation_token(job_id);
