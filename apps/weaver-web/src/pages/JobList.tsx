@@ -787,7 +787,18 @@ export function JobList() {
       : normalized;
   }, [eventItems, queuePageItems, queuePreferences.sorting]);
   const policyBlockedJobs = jobs.filter((job) => isBlockedByDownloadPolicy(job, downloadBlock)).length;
-  const capResetAt = formatResetAt(downloadBlock.windowEndsAtEpochMs);
+  const capResetAt = useMemo(
+    () => formatResetAt(downloadBlock.windowEndsAtEpochMs),
+    [downloadBlock.windowEndsAtEpochMs],
+  );
+  const queueTableVirtualization = useMemo(
+    () => ({
+      estimatedRowHeight: 40,
+      overscan: 8,
+      resetKey: queueQueryKey,
+    }),
+    [queueQueryKey],
+  );
 
   useEffect(() => {
     setRowSelection({});
@@ -936,9 +947,10 @@ export function JobList() {
         scheduleQueuePageRefresh();
         return;
       }
-      if (queuePreferences.sorting.length > 0 && queuePreferences.sorting[0]?.id !== "progress") {
-        return;
+      if (queuePreferences.sorting[0]?.id === "progress") {
+        scheduleQueuePageRefresh();
       }
+      return;
     }
     scheduleQueuePageRefresh();
   }, [
@@ -2121,8 +2133,10 @@ export function JobList() {
               {queueLayout === "table" ? (
               <DataTable
                 table={queueTable}
+                tableClassName="table-fixed"
                 wrapperClassName="max-h-[70vh]"
                 rowClassName={queueRowClassName}
+                virtualization={queueTableVirtualization}
                 emptyState={
                   <div className="space-y-3 py-12 text-center">
                     <div className="text-sm text-muted-foreground">{t("queue.noMatches")}</div>
