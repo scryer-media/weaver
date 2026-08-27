@@ -6181,6 +6181,14 @@ impl Pipeline {
             return;
         }
         let set_name = set.set_name().to_string();
+        if reason == DemotionReason::HoldsScratchCeiling {
+            debug!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                scratch_bytes = set.router.scratch_bytes(),
+                "direct-store demoting after a holds scratch cap event"
+            );
+        }
         // Every volume of this set is about to become a real file: either
         // reconstruction writes it from the routed bytes, or the refetch pulls
         // it back off the wire article by article — and in both cases the

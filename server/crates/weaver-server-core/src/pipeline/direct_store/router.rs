@@ -797,6 +797,11 @@ impl HoldsScratch {
             file.set_len(0)
                 .map_err(|_| DemotionReason::HoldsScratchFailed)?;
             self.file = Some(std::sync::Arc::new(file));
+            tracing::debug!(
+                scratch_path = %self.path.display(),
+                ceiling_bytes = self.ceiling,
+                "direct-store created on-disk holds scratch"
+            );
         }
         let file = self.file.as_ref().expect("just opened");
         write_at(file, self.len, bytes).map_err(|_| DemotionReason::HoldsScratchFailed)?;
@@ -2076,16 +2081,79 @@ impl DirectSetRouter {
                 Some(StagedChunk::Memory(bytes)) => std::sync::Arc::clone(bytes),
                 _ => continue,
             };
+            let resident_bytes = self.resident_bytes();
+            let scratch_bytes = self.scratch.bytes();
+            let chunk_bytes = bytes.len() as u64;
             let scratch_offset = match self.scratch.append(&bytes) {
                 Ok(offset) => offset,
                 // A ceiling breach is not automatically a full scratch: reclaim
                 // what placed holds left behind and try the append once more.
                 // Only a scratch that is genuinely full demotes the set.
                 Err(DemotionReason::HoldsScratchCeiling) => {
+                    tracing::debug!(
+                        set_name = %self.plan.set_name,
+                        volume_index,
+                        chunk_offset = offset,
+                        chunk_bytes,
+                        resident_bytes,
+                        holds_budget_bytes = self.holds_budget,
+                        scratch_bytes,
+                        scratch_ceiling_bytes = self.scratch.ceiling,
+                        "direct-store holds scratch reached its cap; attempting compaction"
+                    );
                     if !self.compact_scratch()? {
+                        tracing::debug!(
+                            set_name = %self.plan.set_name,
+                            volume_index,
+                            chunk_offset = offset,
+                            chunk_bytes,
+                            resident_bytes,
+                            scratch_bytes,
+                            scratch_ceiling_bytes = self.scratch.ceiling,
+                            "direct-store holds scratch cap has no reclaimable extents"
+                        );
                         return Err(DemotionReason::HoldsScratchCeiling);
                     }
-                    self.scratch.append(&bytes)?
+                    let compacted_scratch_bytes = self.scratch.bytes();
+                    tracing::debug!(
+                        set_name = %self.plan.set_name,
+                        volume_index,
+                        chunk_offset = offset,
+                        chunk_bytes,
+                        scratch_bytes,
+                        compacted_scratch_bytes,
+                        reclaimed_bytes = scratch_bytes.saturating_sub(compacted_scratch_bytes),
+                        scratch_ceiling_bytes = self.scratch.ceiling,
+                        "direct-store compacted holds scratch before retrying the spill"
+                    );
+                    match self.scratch.append(&bytes) {
+                        Ok(retry_scratch_offset) => {
+                            tracing::debug!(
+                                set_name = %self.plan.set_name,
+                                volume_index,
+                                chunk_offset = offset,
+                                scratch_offset = retry_scratch_offset,
+                                chunk_bytes,
+                                scratch_bytes = self.scratch.bytes(),
+                                scratch_ceiling_bytes = self.scratch.ceiling,
+                                "direct-store holds scratch spill succeeded after compaction"
+                            );
+                            retry_scratch_offset
+                        }
+                        Err(DemotionReason::HoldsScratchCeiling) => {
+                            tracing::debug!(
+                                set_name = %self.plan.set_name,
+                                volume_index,
+                                chunk_offset = offset,
+                                chunk_bytes,
+                                scratch_bytes = self.scratch.bytes(),
+                                scratch_ceiling_bytes = self.scratch.ceiling,
+                                "direct-store holds scratch remained at its cap after compaction"
+                            );
+                            return Err(DemotionReason::HoldsScratchCeiling);
+                        }
+                        Err(reason) => return Err(reason),
+                    }
                 }
                 Err(reason) => return Err(reason),
             };
