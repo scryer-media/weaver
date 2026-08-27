@@ -1840,9 +1840,10 @@ impl Pipeline {
         if file_offset >= crate::pipeline::PAR2_HASH_16K_BYTES as u64 {
             return;
         }
-        let prefix_complete = {
+        let (prefix_complete, header_became_available) = {
             let prefix = self.file_prefix_16k.entry(file_id).or_default();
             let captured = prefix.len() as u64;
+            let header_was_incomplete = prefix.len() < par2_rs::packet::header::HEADER_SIZE;
             // A gap the buffer cannot close, or a range already wholly captured.
             if file_offset > captured {
                 return;
@@ -1864,8 +1865,17 @@ impl Pipeline {
                 }
                 prefix.extend_from_slice(&slice[..slice.len().min(room)]);
             });
-            prefix.len() == crate::pipeline::PAR2_HASH_16K_BYTES
+            (
+                prefix.len() == crate::pipeline::PAR2_HASH_16K_BYTES,
+                header_was_incomplete && prefix.len() >= par2_rs::packet::header::HEADER_SIZE,
+            )
         };
+        if header_became_available {
+            self.note_par2_metadata_signature(
+                file_id,
+                self.file_declared_size.get(&file_id).copied(),
+            );
+        }
         if prefix_complete {
             self.refresh_par2_md5_substitution_binding(file_id);
         }

@@ -234,6 +234,102 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
 }
 
 #[tokio::test]
+async fn restored_unknown_par2_is_inspected_on_completion_not_startup() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(30031);
+    let par2_filename = "c71a5f0d";
+    let payload_filename = "5d420be9";
+    let payload = b"restored opaque payload";
+    let par2 = build_test_par2_index("restored.mkv", payload, 8);
+    let spec = JobSpec {
+        name: "Restored Misnamed PAR2".to_string(),
+        password: None,
+        total_bytes: (par2.len() + payload.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: par2_filename.to_string(),
+                role: FileRole::from_filename(par2_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2.len() as u32,
+                    message_id: "restored-opaque-par2@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: payload.len() as u32,
+                    message_id: "restored-opaque-payload@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = {
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec.clone()).await;
+        tokio::fs::write(working_dir.join(par2_filename), &par2)
+            .await
+            .unwrap();
+        tokio::fs::write(working_dir.join(payload_filename), payload)
+            .await
+            .unwrap();
+        working_dir
+    };
+
+    let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
+    restored
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            file_progress: HashMap::new(),
+            complete_files: HashSet::from([
+                NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                NzbFileId {
+                    job_id,
+                    file_index: 1,
+                },
+            ]),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        restored.par2_set(job_id).is_none(),
+        "restoring does not scan arbitrary completed files"
+    );
+    restored.probe_restored_par2_headers(job_id).await;
+    assert!(
+        restored.par2_set(job_id).is_some(),
+        "the normal completion path discovers a valid opaque PAR2 header"
+    );
+}
+
+#[tokio::test]
 async fn par2_metadata_sanitizes_unsafe_canonical_target_before_rename() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -5896,6 +5992,83 @@ async fn a_split_fragment_rename_suggestion_is_dropped_before_target_exists() {
 }
 
 #[tokio::test]
+async fn signature_detected_unknown_par2_authenticates_and_renames_payload() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(303271);
+    let par2_filename = "b7f3c11d";
+    let payload_filename = "8a2e94bc";
+    let canonical_filename = "movie.mkv";
+    let payload: Vec<u8> = (0..49_152u32).map(|value| (value % 233) as u8).collect();
+    let par2 = build_test_par2_index(canonical_filename, &payload, 1024);
+    let spec = JobSpec {
+        name: "Misnamed PAR2 Carrier".to_string(),
+        password: None,
+        total_bytes: (par2.len() + payload.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: par2_filename.to_string(),
+                role: FileRole::from_filename(par2_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2.len() as u32,
+                    message_id: "misnamed-par2@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: payload.len() as u32,
+                    message_id: "misnamed-payload@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 0, par2_filename, &par2).await;
+    write_and_complete_file(&mut pipeline, job_id, 1, payload_filename, &payload).await;
+
+    let par2_file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    pipeline
+        .file_prefix_16k
+        .insert(par2_file_id, par2[..64].to_vec());
+    pipeline
+        .file_declared_size
+        .insert(par2_file_id, par2.len() as u64);
+    pipeline.note_par2_metadata_signature(par2_file_id, Some(par2.len() as u64));
+    assert!(
+        pipeline
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.files.get(&0))
+            .is_some_and(|file| file.signature_candidate),
+        "a structural PAR2 header makes an unknown file eligible for authenticated parsing"
+    );
+
+    load_par2_index(&mut pipeline, job_id, 0).await;
+    assert!(pipeline.par2_set(job_id).is_some());
+    pipeline.try_deobfuscate_files_with_par2(job_id).await;
+
+    assert!(working_dir.join(par2_filename).exists());
+    assert!(!working_dir.join(payload_filename).exists());
+    assert_eq!(
+        std::fs::read(working_dir.join(canonical_filename)).unwrap(),
+        payload,
+        "only authenticated FileDesc metadata may rename the opaque payload"
+    );
+}
+
+#[tokio::test]
 async fn a_unique_same_length_obfuscated_rename_still_lands() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -9350,6 +9523,78 @@ fn served_set_describes(pipeline: &Pipeline, job_id: JobId, filename: &str) -> b
     pipeline
         .par2_set(job_id)
         .is_some_and(|set| set.files.values().any(|desc| desc.filename == filename))
+}
+
+#[tokio::test]
+async fn metadata_discovery_bootstraps_one_indexless_carrier_per_collection() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30799);
+    let first = "release.vol00+01.par2";
+    let second = "release.vol01+01.par2";
+    let spec = JobSpec {
+        name: "Bounded PAR2 Metadata Bootstrap".to_string(),
+        password: None,
+        total_bytes: 192,
+        category: None,
+        metadata: vec![],
+        files: [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(index, filename)| FileSpec {
+                filename: filename.to_string(),
+                role: FileRole::from_filename(filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: if index == 0 { 64 } else { 128 },
+                    message_id: format!("bounded-metadata-{index}@example.com"),
+                }],
+            })
+            .collect(),
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let set = minimal_par2_file_set();
+    let set_id = set.recovery_set_id;
+    observe_recovery_prefix(&mut pipeline, job_id, 0, set_id);
+    assert_eq!(
+        pipeline.next_par2_metadata_action(job_id),
+        Some((0, false, Some(set_id))),
+        "one authenticated prefix selects its own carrier before any sibling"
+    );
+
+    {
+        let file = pipeline
+            .ensure_par2_runtime(job_id)
+            .files
+            .get_mut(&0)
+            .unwrap();
+        file.metadata_targets_attempted.insert(set_id);
+        file.discovery = Par2DiscoveryState::Exhausted {
+            set_ids: vec![set_id],
+        };
+    }
+    assert_eq!(
+        pipeline.next_par2_metadata_action(job_id),
+        Some((1, true, None)),
+        "a sibling is touched only after the selected carrier is exhausted"
+    );
+
+    {
+        let runtime = pipeline.ensure_par2_runtime(job_id);
+        runtime.ensure_set_runtime(set_id).set = Some(Arc::new(set));
+        runtime.files.get_mut(&0).unwrap().discovery = Par2DiscoveryState::Parsed {
+            set_ids: vec![set_id],
+        };
+    }
+    assert_eq!(
+        pipeline.next_par2_metadata_action(job_id),
+        None,
+        "installed metadata closes this collection without downloading recovery siblings"
+    );
+    assert!(pipeline.par2_metadata_discovery_closed(job_id));
 }
 
 #[tokio::test]

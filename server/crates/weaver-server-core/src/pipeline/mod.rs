@@ -1403,6 +1403,10 @@ pub(super) struct Par2FileRuntime {
     pub(super) recovery_set_packets_read: bool,
     /// Explicit progress through index/indexless metadata discovery.
     pub(super) discovery: Par2DiscoveryState,
+    /// This file was admitted as a PAR2 candidate from a structurally valid
+    /// header despite its NZB filename not being PAR2-shaped. Full packet
+    /// parsing remains required before it contributes metadata or recovery.
+    pub(super) signature_candidate: bool,
     /// `MetadataCarrierQueued` is also used by the ordinary explicit-index
     /// bootstrap. Keep its provenance separate so only completion-driven
     /// metadata work receives completion-critical scheduling and UI state.

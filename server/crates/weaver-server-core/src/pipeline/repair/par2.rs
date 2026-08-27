@@ -11,6 +11,8 @@ use weaver_model::files::{
 
 pub(crate) const PROMOTED_RECOVERY_PRIORITY: u32 = 2;
 const PAR2_PACKET_ALIGNMENT: u64 = 4;
+const PAR2_PACKET_HEADER_BYTES: usize = 64;
+const PAR2_MAGIC: &[u8; 8] = b"PAR2\0PKT";
 const PAR2_RECOVERY_PACKET_OVERHEAD: u64 = 68; // 64-byte header + 4-byte exponent
 const PAR2_RETAINED_SESSION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const STATEFUL_PAR2_SESSION_ENV: &str = "WEAVER_STATEFUL_PAR2_SESSION";
@@ -31,6 +33,22 @@ fn par2_prefix_set_ids(prefix: &[u8]) -> Vec<par2_rs::RecoverySetId> {
     }
     set_ids.sort_by_key(|set_id| *set_id.as_bytes());
     set_ids
+}
+
+/// A cheap, non-authoritative admission check for a file whose NZB name did
+/// not identify it as PAR2. Packet hashes remain the authority: this only
+/// decides whether a completed file is worth passing to the authenticated
+/// packet scanner.
+fn par2_header_looks_valid(prefix: &[u8], known_file_len: Option<u64>) -> bool {
+    if prefix.len() < PAR2_PACKET_HEADER_BYTES || &prefix[..8] != PAR2_MAGIC {
+        return false;
+    }
+    let Ok(packet_len) = prefix[8..16].try_into().map(u64::from_le_bytes) else {
+        return false;
+    };
+    packet_len >= PAR2_PACKET_HEADER_BYTES as u64
+        && packet_len.is_multiple_of(PAR2_PACKET_ALIGNMENT)
+        && known_file_len.is_none_or(|file_len| packet_len <= file_len)
 }
 
 /// Whether the retained repair session is in play, from the raw env value.
@@ -685,7 +703,135 @@ impl Pipeline {
                 .files
                 .iter()
                 .any(|file| matches!(file.role, weaver_model::files::FileRole::Par2 { .. }))
+        }) || self
+            .par2_runtime(job_id)
+            .is_some_and(|runtime| runtime.files.values().any(|file| file.signature_candidate))
+    }
+
+    fn is_par2_signature_eligible_role(role: &weaver_model::files::FileRole) -> bool {
+        matches!(
+            role,
+            weaver_model::files::FileRole::Unknown | weaver_model::files::FileRole::Standalone
+        )
+    }
+
+    /// Records a structurally plausible PAR2 header from an obfuscated file.
+    ///
+    /// This is deliberately only admission evidence. A later whole-file packet
+    /// scan must authenticate every packet before metadata, recovery capacity,
+    /// or a canonical name becomes authoritative.
+    pub(crate) fn note_par2_metadata_signature(
+        &mut self,
+        file_id: NzbFileId,
+        known_file_len: Option<u64>,
+    ) {
+        let Some((filename, role, prefix)) = self.jobs.get(&file_id.job_id).and_then(|state| {
+            state.assembly.file(file_id).map(|file| {
+                (
+                    self.current_filename_for_file(file_id.job_id, file),
+                    file.role().clone(),
+                    self.file_prefix_16k.get(&file_id).cloned(),
+                )
+            })
+        }) else {
+            return;
+        };
+        let Some(prefix) = prefix else {
+            return;
+        };
+        if !Self::is_par2_signature_eligible_role(&role)
+            || !par2_header_looks_valid(&prefix, known_file_len)
+        {
+            return;
+        }
+
+        let set_ids = par2_prefix_set_ids(&prefix);
+        if !set_ids.is_empty() {
+            self.note_foreign_recovery_set_sightings(file_id.job_id, file_id.file_index, &set_ids);
+        }
+        let entry = self
+            .ensure_par2_runtime(file_id.job_id)
+            .files
+            .entry(file_id.file_index)
+            .or_default();
+        if entry.signature_candidate {
+            return;
+        }
+        entry.filename = filename;
+        entry.signature_candidate = true;
+        entry.discovery = if set_ids.is_empty() {
+            Par2DiscoveryState::ProbeInconclusive
+        } else {
+            Par2DiscoveryState::PrefixProbed { set_ids }
+        };
+    }
+
+    /// Restored jobs have no in-memory decode prefix. Probe only the fixed
+    /// PAR2 header for their already-complete eligible files, from the normal
+    /// completion path rather than startup recovery.
+    pub(crate) async fn probe_restored_par2_headers(&mut self, job_id: JobId) {
+        let candidates = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                state
+                    .assembly
+                    .files()
+                    .filter(|file| {
+                        file.is_complete()
+                            && Self::is_par2_signature_eligible_role(file.role())
+                            && !self.file_prefix_16k.contains_key(&file.file_id())
+                    })
+                    .map(|file| {
+                        (
+                            file.file_id(),
+                            state
+                                .working_dir
+                                .join(self.current_filename_for_file(job_id, file)),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if candidates.is_empty() {
+            return;
+        }
+
+        let scanned = match tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+
+            candidates
+                .into_iter()
+                .filter_map(|(file_id, path)| {
+                    let mut file = std::fs::File::open(&path).ok()?;
+                    let file_len = file.metadata().ok()?.len();
+                    let mut prefix = vec![0; PAR2_PACKET_HEADER_BYTES];
+                    let read = file.read(&mut prefix).ok()?;
+                    prefix.truncate(read);
+                    Some((file_id, prefix, file_len))
+                })
+                .collect::<Vec<_>>()
         })
+        .await
+        {
+            Ok(scanned) => scanned,
+            Err(error) => {
+                warn!(job_id = job_id.0, %error, "failed to join restored PAR2 header probe");
+                return;
+            }
+        };
+
+        for (file_id, prefix, file_len) in scanned {
+            self.file_prefix_16k.entry(file_id).or_insert(prefix);
+            self.note_par2_metadata_signature(file_id, Some(file_len));
+            if self
+                .par2_runtime(job_id)
+                .and_then(|runtime| runtime.files.get(&file_id.file_index))
+                .is_some_and(|file| file.signature_candidate)
+            {
+                self.try_load_par2_metadata(job_id, file_id).await;
+            }
+        }
     }
 
     /// Every name a file could be described under, sanitized.
@@ -1768,9 +1914,13 @@ impl Pipeline {
             let Some(file_asm) = state.assembly.file(file_id) else {
                 return;
             };
-            if !matches!(file_asm.role(), weaver_model::files::FileRole::Par2 { .. })
-                || !file_asm.is_complete()
-            {
+            let declared_par2 =
+                matches!(file_asm.role(), weaver_model::files::FileRole::Par2 { .. });
+            let signature_candidate = self
+                .par2_runtime(job_id)
+                .and_then(|runtime| runtime.files.get(&file_id.file_index))
+                .is_some_and(|file| file.signature_candidate);
+            if !(declared_par2 || signature_candidate) || !file_asm.is_complete() {
                 return;
             }
             let filename = self.current_filename_for_file(job_id, file_asm);
@@ -3136,21 +3286,44 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return Vec::new();
         };
+        let signature_candidates = self
+            .par2_runtime(job_id)
+            .map(|runtime| {
+                runtime
+                    .files
+                    .iter()
+                    .filter_map(|(&file_index, file)| {
+                        file.signature_candidate.then_some(file_index)
+                    })
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
         state
             .spec
             .files
             .iter()
             .enumerate()
-            .filter_map(|(file_index, file)| match file.role {
-                weaver_model::files::FileRole::Par2 { is_index, .. } => Some((
-                    file_index as u32,
-                    is_index,
-                    file.segments
-                        .iter()
-                        .map(|segment| segment.bytes as u64)
-                        .sum(),
-                )),
-                _ => None,
+            .filter_map(|(file_index, file)| {
+                let file_index = file_index as u32;
+                match file.role {
+                    weaver_model::files::FileRole::Par2 { is_index, .. } => Some((
+                        file_index,
+                        is_index,
+                        file.segments
+                            .iter()
+                            .map(|segment| segment.bytes as u64)
+                            .sum(),
+                    )),
+                    _ if signature_candidates.contains(&file_index) => Some((
+                        file_index,
+                        false,
+                        file.segments
+                            .iter()
+                            .map(|segment| segment.bytes as u64)
+                            .sum(),
+                    )),
+                    _ => None,
+                }
             })
             .collect()
     }
@@ -3303,80 +3476,151 @@ impl Pipeline {
 
     /// Select the next bounded discovery action as
     /// `(file_index, prefix_only, target_set_id)`.
-    fn next_par2_metadata_action(
+    pub(in crate::pipeline) fn next_par2_metadata_action(
         &self,
         job_id: JobId,
     ) -> Option<(u32, bool, Option<par2_rs::RecoverySetId>)> {
         let candidates = self.par2_metadata_candidate_indices(job_id);
         let discovery_for =
             |file_index: u32| self.par2_discovery_state_for_candidate(job_id, file_index);
-
-        // Explicit indexes remain the cheapest and strongest metadata source.
-        if let Some((file_index, _, _)) = candidates.iter().find(|(file_index, is_index, _)| {
-            *is_index && matches!(discovery_for(*file_index), Par2DiscoveryState::Unseen)
-        }) {
-            return Some((*file_index, false, None));
+        let collection_key_for = |file_index: u32| {
+            self.jobs
+                .get(&job_id)
+                .and_then(|state| state.spec.files.get(file_index as usize))
+                .and_then(|file| par2_set_base_name(&file.filename))
+                .map(|base_name| format!("name:{base_name}"))
+                // Obfuscated names do not identify siblings. Keep those
+                // carriers separate until authenticated metadata does.
+                .unwrap_or_else(|| format!("file:{file_index}"))
+        };
+        let mut collections = HashMap::<String, Vec<(u32, bool, u64)>>::new();
+        for candidate in candidates {
+            collections
+                .entry(collection_key_for(candidate.0))
+                .or_default()
+                .push(candidate);
         }
 
-        // Every indexless volume gets a bounded prefix turn. Discovering one
-        // set never prevents a later candidate from revealing another.
-        if let Some((file_index, _, _)) = candidates.iter().find(|(file_index, is_index, _)| {
-            !*is_index && matches!(discovery_for(*file_index), Par2DiscoveryState::Unseen)
-        }) {
-            return Some((*file_index, true, None));
-        }
-
-        // An inconclusive prefix gets at most the retained prefix cap worth of
-        // additional article probes, then escalates to one bounded full-file
-        // metadata attempt.
-        if let Some((file_index, _, _)) = candidates
-            .iter()
-            .filter(|(file_index, is_index, _)| {
-                !*is_index
-                    && matches!(
-                        discovery_for(*file_index),
-                        Par2DiscoveryState::ProbeInconclusive
-                    )
-            })
-            .min_by_key(|(file_index, _, _)| *file_index)
-        {
-            let prefix_len = self
-                .file_prefix_16k
-                .get(&NzbFileId {
-                    job_id,
-                    file_index: *file_index,
-                })
-                .map_or(0, Vec::len);
-            return Some((
-                *file_index,
-                prefix_len < PAR2_METADATA_PREFIX_CAP_BYTES,
-                None,
-            ));
-        }
-
-        let runtime = self.par2_runtime(job_id)?;
-        for set_id in runtime.ordered_set_ids() {
-            if runtime
-                .set_runtime(set_id)
+        let metadata_is_installed = |set_id| {
+            self.par2_runtime(job_id)
+                .and_then(|runtime| runtime.set_runtime(set_id))
                 .is_some_and(|set_runtime| set_runtime.set.is_some())
-            {
+        };
+        let collection_is_resolved = |members: &Vec<(u32, bool, u64)>| {
+            let observed_set_ids = members
+                .iter()
+                .flat_map(|(file_index, _, _)| {
+                    discovery_for(*file_index).observed_set_ids().to_vec()
+                })
+                .collect::<HashSet<_>>();
+            !observed_set_ids.is_empty()
+                && observed_set_ids
+                    .iter()
+                    .all(|set_id| metadata_is_installed(*set_id))
+        };
+
+        let mut actions = Vec::new();
+        for members in collections.values() {
+            if collection_is_resolved(members) {
                 continue;
             }
-            let selected = candidates
+
+            // An explicit index is the cheapest authoritative bootstrap. One
+            // carrier at a time prevents a collection from draining every
+            // sibling before its first result is parsed.
+            if let Some((file_index, _, total_bytes)) = members
                 .iter()
-                .filter(|(file_index, _, _)| {
-                    runtime.files.get(file_index).is_some_and(|file| {
-                        file.discovery.observed_set_ids().contains(&set_id)
-                            && !file.metadata_targets_attempted.contains(&set_id)
-                            && !matches!(file.discovery, Par2DiscoveryState::Exhausted { .. })
-                    })
+                .filter(|(file_index, is_index, _)| {
+                    *is_index && matches!(discovery_for(*file_index), Par2DiscoveryState::Unseen)
                 })
-                .min_by_key(|(file_index, _, total_bytes)| (*total_bytes, *file_index));
-            if let Some((file_index, _, _)) = selected {
-                return Some((*file_index, false, Some(set_id)));
+                .min_by_key(|(file_index, _, total_bytes)| (*total_bytes, *file_index))
+            {
+                actions.push((0_u8, *total_bytes, *file_index, false, None));
+                continue;
+            }
+
+            // A prefix that has authenticated a SetID selects only the
+            // cheapest carrier for that unresolved set. Other recovery
+            // volumes remain cold unless this attempt fails.
+            let metadata_carrier = members
+                .iter()
+                .flat_map(|(file_index, _, total_bytes)| {
+                    let discovery = discovery_for(*file_index);
+                    discovery
+                        .observed_set_ids()
+                        .to_vec()
+                        .into_iter()
+                        .filter_map(move |set_id| {
+                            let attempted = self
+                                .par2_runtime(job_id)
+                                .and_then(|runtime| runtime.files.get(file_index))
+                                .is_some_and(|file| {
+                                    file.metadata_targets_attempted.contains(&set_id)
+                                });
+                            (!metadata_is_installed(set_id) && !attempted).then_some((
+                                *total_bytes,
+                                *file_index,
+                                set_id,
+                            ))
+                        })
+                })
+                .min_by_key(|(total_bytes, file_index, set_id)| {
+                    (*total_bytes, *file_index, *set_id.as_bytes())
+                });
+            if let Some((total_bytes, file_index, set_id)) = metadata_carrier {
+                actions.push((1, total_bytes, file_index, false, Some(set_id)));
+                continue;
+            }
+
+            // A single indexless candidate gets the bounded prefix path.
+            // Only after it is exhausted can a sibling take its place.
+            if let Some((file_index, _, total_bytes)) = members
+                .iter()
+                .filter(|(file_index, is_index, _)| {
+                    !*is_index
+                        && matches!(
+                            discovery_for(*file_index),
+                            Par2DiscoveryState::ProbeInconclusive
+                        )
+                })
+                .min_by_key(|(file_index, _, total_bytes)| (*total_bytes, *file_index))
+            {
+                let prefix_len = self
+                    .file_prefix_16k
+                    .get(&NzbFileId {
+                        job_id,
+                        file_index: *file_index,
+                    })
+                    .map_or(0, Vec::len);
+                actions.push((
+                    2,
+                    *total_bytes,
+                    *file_index,
+                    prefix_len < PAR2_METADATA_PREFIX_CAP_BYTES,
+                    None,
+                ));
+                continue;
+            }
+
+            if let Some((file_index, _, total_bytes)) = members
+                .iter()
+                .filter(|(file_index, is_index, _)| {
+                    !*is_index && matches!(discovery_for(*file_index), Par2DiscoveryState::Unseen)
+                })
+                .min_by_key(|(file_index, _, total_bytes)| (*total_bytes, *file_index))
+            {
+                actions.push((3, *total_bytes, *file_index, true, None));
             }
         }
-        None
+
+        actions
+            .into_iter()
+            .min_by_key(|(stage, total_bytes, file_index, _, _)| {
+                (*stage, *file_index, *total_bytes)
+            })
+            .map(|(_, _, file_index, prefix_only, target_set_id)| {
+                (file_index, prefix_only, target_set_id)
+            })
     }
 
     fn queue_par2_metadata_action(

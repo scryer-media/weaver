@@ -2095,7 +2095,23 @@ impl Pipeline {
                 );
                 continue;
             }
+            if old.strip_prefix(&rename_dir).is_err() {
+                warn!(
+                    job_id = job_id.0,
+                    from = %old.display(),
+                    "refusing PAR2 rename whose source escapes the job directory"
+                );
+                continue;
+            }
             let new = old.parent().unwrap().join(&correct_name);
+            if new.strip_prefix(&rename_dir).is_err() {
+                warn!(
+                    job_id = job_id.0,
+                    to = %new.display(),
+                    "refusing PAR2 rename whose target escapes the job directory"
+                );
+                continue;
+            }
             if old
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
@@ -2990,42 +3006,21 @@ impl Pipeline {
             .unwrap_or_default()
     }
 
-    /// Discovery closes only after every explicit index and every indexless
-    /// candidate has reached a terminal probe state, and every sighted SetID
-    /// has either become servable or exhausted all of its observed carriers.
+    /// Discovery closes when no bounded collection bootstrap remains. Sibling
+    /// recovery volumes stay cold after one carrier has supplied usable
+    /// metadata, instead of being treated as completion-critical work.
     pub(in crate::pipeline) fn par2_metadata_discovery_closed(&self, job_id: JobId) -> bool {
         let candidates = self.par2_metadata_candidate_indices(job_id);
         if candidates.is_empty() {
             return true;
         }
-        let Some(runtime) = self.par2_runtime(job_id) else {
-            return false;
-        };
-        // `try_load_par2_metadata` reaches `Parsed` before the decode worker
-        // drops its bookkeeping. That trailing work cannot change the parsed
-        // packet set, and waiting for it here leaves an already-settled gate
-        // with no completion re-arm to release direct outputs.
         if candidates.iter().any(|(file_index, _, _)| {
-            let discovery = self.par2_discovery_state_for_candidate(job_id, *file_index);
-            !discovery.candidate_probe_is_terminal() || discovery.work_is_queued()
+            self.par2_discovery_state_for_candidate(job_id, *file_index)
+                .work_is_queued()
         }) {
             return false;
         }
-
-        runtime.ordered_set_ids().into_iter().all(|set_id| {
-            if runtime
-                .set_runtime(set_id)
-                .is_some_and(|set_runtime| set_runtime.set.is_some())
-            {
-                return true;
-            }
-            !candidates.iter().any(|(file_index, _, _)| {
-                runtime.files.get(file_index).is_some_and(|file| {
-                    file.discovery.observed_set_ids().contains(&set_id)
-                        && !file.metadata_targets_attempted.contains(&set_id)
-                })
-            })
-        })
+        self.next_par2_metadata_action(job_id).is_none()
     }
 
     /// Whether every servable set has reached a final answer and no later
@@ -6232,6 +6227,10 @@ impl Pipeline {
         }
 
         self.reapply_promoted_recovery_queue(job_id);
+        // Restored jobs retain completed bytes but not the bounded decode
+        // prefix cache. Inspect a single header here, never during startup,
+        // so an obfuscated PAR2 carrier can rejoin normal discovery.
+        self.probe_restored_par2_headers(job_id).await;
 
         let par2_bypassed = self.par2_bypassed.contains(&job_id);
         if !par2_bypassed
