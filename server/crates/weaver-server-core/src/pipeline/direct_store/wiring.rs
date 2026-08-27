@@ -6343,21 +6343,12 @@ impl Pipeline {
             // filling a file with a hole where the rebuilt prefix should be.
             let filename = self.current_filename_for_file(job_id, file_asm);
             let received = file_asm.received_bytes();
-            let mut coverage = set.volume_coverage(*volume_index);
+            let coverage = set.volume_coverage(*volume_index);
             let extents = set.segment_extents(*volume_index);
-            // A committed direct segment is still locally owned even when its
-            // bytes remain in the router's holds. Add only whole committed
-            // articles: their recorded part CRCs can vouch for the exact range
-            // the reconstruction sweep reads back through the virtual provider.
-            for (segment_number, (offset, len)) in &extents {
-                if file_asm.has_segment(*segment_number) {
-                    coverage.insert(*offset, *len);
-                }
-            }
             // A volume that never completed has no authoritative length; its
-            // received bytes are the most that can be on disk. A committed
-            // range above a hole can end later than that aggregate, though, so
-            // the widened coverage is also a lower bound for this sweep.
+            // received bytes are the most that can be on disk. A routed range
+            // above a hole can end later than that aggregate, though, so its
+            // durable coverage is also a lower bound for this sweep.
             let len = set
                 .virtual_volume_len(*volume_index, received)
                 .max(coverage.end());

@@ -51,6 +51,10 @@ test("post-processing settings, the live script list, and real script execution 
   if (!(await executionToggle.isChecked())) {
     await executionToggle.click();
     await expect(page.getByText("Post-processing settings saved.")).toBeVisible();
+    // Enabling execution saves independently and refreshes the settings query.
+    // Start editing only from the settled, persisted page state.
+    await page.reload();
+    await expect(executionToggle).toBeChecked();
   }
   await page.locator("#pp-concurrency").fill("2");
   await page.locator("#pp-grace").fill("5");
