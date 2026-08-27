@@ -159,6 +159,8 @@ impl Pipeline {
         let mut by_job: HashMap<JobId, Vec<JobPhaseProgress>> = HashMap::new();
 
         for (job_id, phase) in keys {
+            let download_active =
+                phase != JobPhase::Downloading || self.job_has_current_download_activity(job_id);
             let derived_download = if phase == JobPhase::Downloading {
                 self.jobs.get(&job_id).map(|state| {
                     (
@@ -179,6 +181,12 @@ impl Pipeline {
                     runtime.counters.total_bytes.load(Ordering::Relaxed),
                 )
             });
+            if phase == JobPhase::Downloading && !download_active {
+                runtime.ema_bps = None;
+                runtime.first_sample_at = None;
+                runtime.last_sample = None;
+                continue;
+            }
             if total_bytes == 0 {
                 runtime.last_sample = Some((now, completed_bytes));
                 continue;

@@ -4112,10 +4112,16 @@ impl Pipeline {
             let health = health_milli(total, state.failed_bytes);
             let (mut download_state, post_state, run_state) =
                 crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
+            let has_current_download_activity =
+                self.job_has_current_download_activity(state.job_id);
             if matches!(download_state, crate::jobs::model::DownloadState::Complete)
-                && self.job_has_pending_download_pipeline_work(state.job_id)
+                && has_current_download_activity
             {
                 download_state = crate::jobs::model::DownloadState::Downloading;
+            } else if matches!(state.status, JobStatus::Downloading)
+                && !has_current_download_activity
+            {
+                download_state = crate::jobs::model::DownloadState::Queued;
             }
             let remaining_par_files = state
                 .assembly

@@ -1378,6 +1378,45 @@ impl Pipeline {
             })
     }
 
+    /// Whether a job currently owns live download-stage work for queue presentation.
+    /// Queued articles and delayed retries deliberately do not count: they are the
+    /// scheduler's backlog, not current transfer activity.
+    pub(crate) fn job_has_current_download_activity(&self, job_id: JobId) -> bool {
+        self.hot_dispatch_job == Some(job_id)
+            || self
+                .active_download_connections_by_job
+                .get(&job_id)
+                .copied()
+                .unwrap_or(0)
+                > 0
+            || self
+                .active_downloads_by_job
+                .get(&job_id)
+                .copied()
+                .unwrap_or(0)
+                > 0
+            || self
+                .active_decodes_by_job
+                .get(&job_id)
+                .copied()
+                .unwrap_or(0)
+                > 0
+            || self
+                .pending_released_download_results_by_job
+                .get(&job_id)
+                .copied()
+                .unwrap_or(0)
+                > 0
+            || self
+                .pending_decode
+                .iter()
+                .any(|work| work.segment_id.file_id.job_id == job_id)
+            || self
+                .write_buffers
+                .iter()
+                .any(|(file_id, buffer)| file_id.job_id == job_id && buffer.buffered_len() > 0)
+    }
+
     pub(crate) fn job_has_pending_download_pipeline_work(&self, job_id: JobId) -> bool {
         let has_queued_work = self
             .jobs

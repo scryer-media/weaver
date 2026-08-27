@@ -5022,7 +5022,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
 }
 
 #[tokio::test]
-async fn list_jobs_projects_downloading_while_extracting_with_remaining_download_work() {
+async fn list_jobs_projects_downloading_while_extracting_with_active_download_work() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -5064,9 +5064,92 @@ async fn list_jobs_projects_downloading_while_extracting_with_remaining_download
     assert_eq!(info.status, JobStatus::Extracting);
     assert_eq!(
         info.download_state,
-        crate::jobs::model::DownloadState::Downloading
+        crate::jobs::model::DownloadState::Complete
     );
     assert_eq!(info.post_state, crate::jobs::model::PostState::Extracting);
+
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    let active_info = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|info| info.job_id == job_id)
+        .expect("job should be listed");
+    assert_eq!(
+        active_info.download_state,
+        crate::jobs::model::DownloadState::Downloading
+    );
+}
+
+#[tokio::test]
+async fn list_jobs_queues_inactive_downloads_and_rewarms_their_phase_rate() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    let job_id = JobId(20009);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Inactive Download", &[("queued.bin".to_string(), 512)]),
+    )
+    .await;
+
+    pipeline.phase_begin(job_id, JobPhase::Downloading, Some(512));
+    assert!(!pipeline.job_has_current_download_activity(job_id));
+
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.sample_phase_progress();
+    {
+        let runtime = pipeline
+            .phase_progress
+            .get_mut(&(job_id, JobPhase::Downloading))
+            .expect("download phase should exist");
+        runtime.ema_bps = Some(1_024.0);
+        runtime.first_sample_at = Some(std::time::Instant::now() - Duration::from_secs(10));
+        runtime.last_sample = Some((std::time::Instant::now() - Duration::from_secs(1), 64));
+    }
+
+    pipeline.active_downloads_by_job.remove(&job_id);
+    pipeline.sample_phase_progress();
+    let inactive_info = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|info| info.job_id == job_id)
+        .expect("job should be listed");
+    assert_eq!(
+        inactive_info.download_state,
+        crate::jobs::model::DownloadState::Queued
+    );
+    assert!(inactive_info.phase_progress.is_empty());
+    let runtime = pipeline
+        .phase_progress
+        .get(&(job_id, JobPhase::Downloading))
+        .expect("download phase should remain registered");
+    assert!(runtime.ema_bps.is_none());
+    assert!(runtime.first_sample_at.is_none());
+    assert!(runtime.last_sample.is_none());
+
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.sample_phase_progress();
+    let active_info = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|info| info.job_id == job_id)
+        .expect("job should be listed");
+    assert_eq!(
+        active_info.download_state,
+        crate::jobs::model::DownloadState::Downloading
+    );
+    assert_eq!(active_info.phase_progress.len(), 1);
+    assert_eq!(active_info.phase_progress[0].phase, JobPhase::Downloading);
+    assert!(active_info.phase_progress[0].rate_bps.is_none());
 }
 
 #[tokio::test]

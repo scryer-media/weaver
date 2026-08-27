@@ -330,6 +330,22 @@ fn download_accounting_uses_control_and_terminal_lanes_over_stale_lifecycle_stat
 }
 
 #[test]
+fn inactive_download_projection_is_queued_in_queue_state_and_summary() {
+    let mut inactive = base_job(JobStatus::Downloading);
+    inactive.download_state = weaver_server_core::DownloadState::Queued;
+    let active = base_job(JobStatus::Downloading);
+    let items = vec![queue_item_from_job(&inactive), queue_item_from_job(&active)];
+
+    assert_eq!(items[0].state, QueueItemState::Queued);
+    assert_eq!(items[1].state, QueueItemState::Downloading);
+
+    let metrics = weaver_server_core::PipelineMetrics::new().snapshot();
+    let summary = queue_summary(&items, &metrics);
+    assert_eq!(summary.queued_items, 1);
+    assert_eq!(summary.active_items, 1);
+}
+
+#[test]
 fn job_status_gql_maps_checking_to_verifying() {
     assert_eq!(
         JobStatusGql::from(&JobStatus::Checking),
