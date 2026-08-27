@@ -2104,7 +2104,7 @@ fn settings_resolve_env_over_config_over_default() {
     use super::DirectStoreSettings;
     use super::router::HOLDS_SCRATCH_CEILING_BYTES;
 
-    // Nothing configured anywhere: on, at the 512 MiB default ceiling.
+    // Nothing configured anywhere: on, at the 1 GiB default ceiling.
     let defaults = DirectStoreSettings::resolve_parts(None, None, None, None);
     assert_eq!(defaults, DirectStoreSettings::default());
     assert!(defaults.gate.is_enabled(), "the default is on");
@@ -2112,6 +2112,7 @@ fn settings_resolve_env_over_config_over_default() {
         defaults.holds_scratch_ceiling_bytes,
         HOLDS_SCRATCH_CEILING_BYTES
     );
+    assert_eq!(HOLDS_SCRATCH_CEILING_BYTES, 1024 * 1024 * 1024);
 
     // Config alone decides when the environment says nothing.
     let configured = DirectStoreSettings::resolve_parts(Some(true), Some(4096), None, None);
@@ -3559,6 +3560,20 @@ fn a_partially_covered_volume_is_rebuilt_and_verified_run_by_run() {
         written[200..300].iter().all(|byte| *byte == 0),
         "the hole is left for the refetch to fill"
     );
+}
+
+#[test]
+fn materialized_segments_above_a_hole_stay_committed_without_advancing_the_floor() {
+    let extents =
+        std::collections::BTreeMap::from([(0, (0, 100)), (1, (100, 100)), (2, (200, 100))]);
+    let mut coverage = ByteRanges::new();
+    coverage.insert(0, 100);
+    coverage.insert(200, 100);
+
+    let (kept, floor) = super::reconstruct::segments_on_disk(&extents, &coverage, 100);
+
+    assert_eq!(kept, vec![0, 2]);
+    assert_eq!(floor, 100, "only the contiguous prefix persists");
 }
 
 #[test]

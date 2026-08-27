@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -49,6 +50,7 @@ type Scenario struct {
 	NZBSegmentNumbers                  []int                      `json:"nzb_segment_numbers,omitempty"`
 	NZBSegmentNumberStart              int                        `json:"nzb_segment_number_start,omitempty"`
 	NZBSegmentNumberStep               int                        `json:"nzb_segment_number_step,omitempty"`
+	NZBSubjectFilenameOverrides        map[string]string          `json:"nzb_subject_filename_overrides,omitempty"`
 	SkipArticlesPct                    int                        `json:"skip_articles_pct,omitempty"`
 	DeleteFirstMessageIDs              int                        `json:"deleteFirstMessageIDs,omitempty"`
 	DeleteFirstProbeSampleHits         int                        `json:"deleteFirstProbeSampleHits,omitempty"`
@@ -74,6 +76,7 @@ type Scenario struct {
 type ScenarioRuntimeAssertions struct {
 	FileIdentityRewrite *ScenarioFileIdentityRewriteAssertion `json:"fileIdentityRewrite,omitempty"`
 	Par2CleanSettlement *ScenarioPar2CleanSettlementAssertion `json:"par2CleanSettlement,omitempty"`
+	DirectStore         *ScenarioDirectStoreAssertion         `json:"directStore,omitempty"`
 }
 
 type ScenarioFileIdentityRewriteAssertion struct {
@@ -88,6 +91,15 @@ type ScenarioPar2CleanSettlementAssertion struct {
 	VerificationReadBytes        uint64              `json:"verificationReadBytes"`
 }
 
+// ScenarioDirectStoreAssertion pins the exceptional direct-store path in a
+// fixture which otherwise has byte-identical conventional output. It is only
+// evaluated in a direct-store phase.
+type ScenarioDirectStoreAssertion struct {
+	ExpectedDemotionReason           string `json:"expectedDemotionReason"`
+	RequireRoutedByteMaterialization bool   `json:"requireRoutedByteMaterialization"`
+	ForbidVolumeRefetch              bool   `json:"forbidVolumeRefetch"`
+}
+
 func (s *Scenario) fileIdentityRewriteAssertion() *ScenarioFileIdentityRewriteAssertion {
 	if s == nil || s.RuntimeAssertions == nil {
 		return nil
@@ -100,6 +112,13 @@ func (s *Scenario) par2CleanSettlementAssertion() *ScenarioPar2CleanSettlementAs
 		return nil
 	}
 	return s.RuntimeAssertions.Par2CleanSettlement
+}
+
+func (s *Scenario) directStoreAssertion() *ScenarioDirectStoreAssertion {
+	if s == nil || s.RuntimeAssertions == nil {
+		return nil
+	}
+	return s.RuntimeAssertions.DirectStore
 }
 
 type runtimePortState struct {
@@ -1069,8 +1088,11 @@ var canonicalFixtureSlugs = []string{
 	"obfuscated-rar-split-topology",
 	"obfuscated-split-7z",
 	"obfuscated-rar-unknown-numeric",
+	"par2-direct-late-malformed-chain-rebind",
+	"par2-opaque-magic-rebind",
 	"par2-obfuscated-rar-repair",
 	"par2-obfuscated-rar-rewrite",
+	"par2-optional-prefix-hole",
 	"par2-rar-placement-normalization",
 	"par2-rar-placement-normalization-multi-swap",
 	"par2-heavy-damage",
@@ -1835,11 +1857,22 @@ func seedScenarioRelease(absDir string, scenario *Scenario) error {
 	if err != nil {
 		return fmt.Errorf("build NZB segment numbers for %s: %w", scenario.Slug, err)
 	}
+	changedNZB := false
 	if len(segmentNumbers) > 0 {
 		nzbData, err = rewriteNZBSegmentNumbers(nzbData, segmentNumbers)
 		if err != nil {
 			return fmt.Errorf("rewrite NZB segment numbers for %s: %w", scenario.Slug, err)
 		}
+		changedNZB = true
+	}
+	if len(scenario.NZBSubjectFilenameOverrides) > 0 {
+		nzbData, err = rewriteNZBSubjectFilenames(nzbData, scenario.NZBSubjectFilenameOverrides)
+		if err != nil {
+			return fmt.Errorf("rewrite NZB subject filenames for %s: %w", scenario.Slug, err)
+		}
+		changedNZB = true
+	}
+	if changedNZB {
 		if err := os.WriteFile(nzbPath, nzbData, 0o644); err != nil {
 			return fmt.Errorf("persist rewritten NZB for %s: %w", scenario.Slug, err)
 		}
@@ -2680,6 +2713,36 @@ func rewriteNZBSegmentNumbers(nzbData []byte, numbers []int) ([]byte, error) {
 		last = match[1]
 	}
 	out = append(out, nzbData[last:]...)
+	return out, nil
+}
+
+// rewriteNZBSubjectFilenames makes the NZB's declared filename differ from
+// the yEnc filename carried by the already-posted article. That distinction is
+// present in real-world obfuscated posts and must survive seeding unchanged.
+func rewriteNZBSubjectFilenames(nzbData []byte, overrides map[string]string) ([]byte, error) {
+	if len(overrides) == 0 {
+		return nzbData, nil
+	}
+
+	keys := make([]string, 0, len(overrides))
+	for from := range overrides {
+		keys = append(keys, from)
+	}
+	sort.Strings(keys)
+
+	out := append([]byte(nil), nzbData...)
+	for _, from := range keys {
+		to := strings.TrimSpace(overrides[from])
+		if strings.TrimSpace(from) == "" || to == "" {
+			return nil, fmt.Errorf("NZB subject filename overrides require non-empty source and destination")
+		}
+		source := []byte("&quot;" + html.EscapeString(from) + "&quot;")
+		replacement := []byte("&quot;" + html.EscapeString(to) + "&quot;")
+		if count := bytes.Count(out, source); count != 1 {
+			return nil, fmt.Errorf("NZB subject filename %q matched %d entries, want 1", from, count)
+		}
+		out = bytes.ReplaceAll(out, source, replacement)
+	}
 	return out, nil
 }
 

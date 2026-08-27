@@ -428,7 +428,6 @@ impl ByteRanges {
     }
 
     /// Highest covered offset, exclusive. Zero when empty.
-    #[allow(dead_code)]
     pub(crate) fn end(&self) -> u64 {
         self.ranges.last().map(|&(_, end)| end).unwrap_or(0)
     }

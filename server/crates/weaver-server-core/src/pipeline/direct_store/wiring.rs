@@ -6343,15 +6343,26 @@ impl Pipeline {
             // filling a file with a hole where the rebuilt prefix should be.
             let filename = self.current_filename_for_file(job_id, file_asm);
             let received = file_asm.received_bytes();
-            let coverage = set.volume_coverage(*volume_index);
+            let mut coverage = set.volume_coverage(*volume_index);
+            let extents = set.segment_extents(*volume_index);
+            // A committed direct segment is still locally owned even when its
+            // bytes remain in the router's holds. Add only whole committed
+            // articles: their recorded part CRCs can vouch for the exact range
+            // the reconstruction sweep reads back through the virtual provider.
+            for (segment_number, (offset, len)) in &extents {
+                if file_asm.has_segment(*segment_number) {
+                    coverage.insert(*offset, *len);
+                }
+            }
             // A volume that never completed has no authoritative length; its
-            // received bytes are the most that can be on disk, which is exactly
-            // what bounds the sweep. A restart-seeded volume's received bytes
-            // are the spec's yEnc-encoded sizes and would overstate it, so the
-            // coverage map answers for those instead.
-            let len = set.virtual_volume_len(*volume_index, received);
+            // received bytes are the most that can be on disk. A committed
+            // range above a hole can end later than that aggregate, though, so
+            // the widened coverage is also a lower bound for this sweep.
+            let len = set
+                .virtual_volume_len(*volume_index, received)
+                .max(coverage.end());
             lengths.insert(*volume_index, len);
-            extents_by_volume.insert(*volume_index, set.segment_extents(*volume_index));
+            extents_by_volume.insert(*volume_index, extents);
             let path = working_dir.join(&filename);
             targets.push((
                 *volume_index,
@@ -6400,6 +6411,7 @@ impl Pipeline {
             let extents = extents_by_volume.remove(volume_index).unwrap_or_default();
             let (on_disk, floor) = crate::pipeline::direct_store::reconstruct::segments_on_disk(
                 &extents,
+                &plan.covered,
                 outcome.contiguous,
             );
             keep.insert(*file_index, on_disk);
@@ -6523,12 +6535,11 @@ impl Pipeline {
     /// articles that are now genuinely on disk.
     ///
     /// Unlike the full-refetch fallback, `keep` names, per NZB file, the
-    /// articles whose decoded extents
-    /// lie wholly below the contiguous prefix the sweep rebuilt. Those stay
-    /// committed in the assembly and are never fetched again. Everything else
-    /// that the direct path had committed comes back exactly as the refetch path
-    /// would have brought it back. The decode seam still owns its current
-    /// article and carries it directly into conventional assembly.
+    /// articles whose decoded extents the sweep rebuilt. Those stay committed
+    /// in the assembly and are never fetched again. Everything else that the
+    /// direct path had committed comes back exactly as the refetch path would
+    /// have brought it back. The decode seam still owns its current article and
+    /// carries it directly into conventional assembly.
     ///
     /// A file with nothing kept takes the full refetch treatment, including
     /// `mark_file_incomplete`: there is no reconstructed state to protect.
@@ -6607,15 +6618,17 @@ impl Pipeline {
                     file_asm.reset();
                 }
                 let mut kept_bytes = 0u64;
+                let mut materialized_extents = Vec::with_capacity(kept.len());
                 let file_extents = extents.get(file_index).cloned().unwrap_or_default();
                 for segment_number in &kept {
-                    let Some((_, len)) = file_extents.get(segment_number).copied() else {
+                    let Some((offset, len)) = file_extents.get(segment_number).copied() else {
                         continue;
                     };
                     if let Some(file_asm) = state.assembly.file_mut(file_id)
                         && file_asm.commit_segment(*segment_number, len as u32).is_ok()
                     {
                         kept_bytes = kept_bytes.saturating_add(len);
+                        materialized_extents.push((offset, len));
                     }
                 }
                 lost_bytes =
@@ -6624,20 +6637,21 @@ impl Pipeline {
                     .assembly
                     .file(file_id)
                     .is_some_and(|file| !file.is_complete());
-                if kept_bytes > 0 && needs_more_bytes {
-                    // Reconstruction made this prefix durable without passing
-                    // through the sequential writer. Seed the same cursor a
-                    // conventional write would have advanced, so the decoded
-                    // article that triggered demotion can land immediately at
-                    // the prefix boundary instead of waiting for offset zero.
+                if !materialized_extents.is_empty() && needs_more_bytes {
+                    // Reconstruction made these article extents durable without
+                    // passing through the conventional writer. Seed its sparse
+                    // markers so a later missing article bridges the cursor;
+                    // only the contiguous floor is persisted across restart.
                     let write_buf = self
                         .write_buffers
                         .entry(file_id)
                         .or_insert_with(|| WriteReorderBuffer::new(write_buf_max_pending));
-                    write_buf.mark_persisted(0, kept_bytes as usize);
+                    for (offset, len) in materialized_extents {
+                        write_buf.mark_persisted(offset, len as usize);
+                    }
                     let (unexpected, contiguous_end) = write_buf.drain_ready_with_contiguous_end();
                     debug_assert!(unexpected.is_empty());
-                    debug_assert_eq!(contiguous_end, kept_bytes);
+                    debug_assert!(contiguous_end <= kept_bytes);
                 }
 
                 for segment in &file.segments {

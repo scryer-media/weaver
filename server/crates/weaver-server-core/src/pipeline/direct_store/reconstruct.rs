@@ -394,8 +394,8 @@ fn reconstruct_volume(
     })
 }
 
-/// The articles of one volume a reconstruction leaves genuinely on disk, and the
-/// segment-aligned floor they add up to.
+/// The articles of one volume a reconstruction materializes, and the
+/// segment-aligned contiguous floor they add up to.
 ///
 /// Both are in the **decoded** space the extents were observed in. The legacy
 /// floor family — `segments_covered_by_floor` and direct-store's own
@@ -405,20 +405,27 @@ fn reconstruct_volume(
 /// volume was missing its last article. Writing the decoded floor is what the
 /// conventional download path does (it publishes its write cursor), and reading
 /// it back through the encoded walk errs in the safe direction: it can only ever
-/// claim fewer whole segments than are really below the floor.
+/// claim fewer whole segments than are really below the floor. Coverage above a
+/// hole is still retained in the live assembly and write buffer, but is not
+/// persisted as a restart floor.
 pub(crate) fn segments_on_disk(
     extents: &BTreeMap<u32, (u64, u64)>,
+    coverage: &ByteRanges,
     contiguous: u64,
 ) -> (Vec<u32>, u64) {
     let mut segments = Vec::new();
     let mut floor = 0u64;
     for (segment_number, (offset, len)) in extents {
-        let end = offset.saturating_add(*len);
-        if end > contiguous {
+        let Some(end) = offset.checked_add(*len) else {
+            continue;
+        };
+        if !coverage.missing(*offset, *len).is_empty() {
             continue;
         }
         segments.push(*segment_number);
-        floor = floor.max(end);
+        if end <= contiguous {
+            floor = floor.max(end);
+        }
     }
     (segments, floor)
 }

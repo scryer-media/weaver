@@ -2430,6 +2430,54 @@ impl Pipeline {
         false
     }
 
+    /// Whether an unread conventional recovery volume is named for a parsed set.
+    ///
+    /// This is a download-selection hint only. Packet evidence remains the sole
+    /// authority for recovery ownership and capacity.
+    fn unread_recovery_file_is_named_for_set(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        set_id: par2_rs::RecoverySetId,
+    ) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let Some(file) = state.spec.files.get(file_index as usize) else {
+            return false;
+        };
+        if !matches!(
+            file.role,
+            weaver_model::files::FileRole::Par2 {
+                is_index: false,
+                ..
+            }
+        ) {
+            return false;
+        }
+        let Some(runtime) = self.par2_runtime(job_id) else {
+            return false;
+        };
+        if runtime.files.get(&file_index).is_some_and(|entry| {
+            entry.recovery_set_packets_read
+                || entry.recovery_set_id.is_some()
+                || !entry.discovery.observed_set_ids().is_empty()
+                || !entry.recovery_blocks_by_set.is_empty()
+        }) {
+            return false;
+        }
+        let Some(summary) = runtime
+            .set_runtime(set_id)
+            .filter(|set| set.summary.describes)
+        else {
+            return false;
+        };
+        let Some(base_name) = summary.summary.base_name.as_deref() else {
+            return false;
+        };
+        par2_set_base_name(&file.filename).as_deref() == Some(base_name)
+    }
+
     /// When a PAR2 recovery volume completes, parse it and merge recovery
     /// slices into the retained Par2FileSet (avoids re-reading at repair time).
     pub(crate) async fn try_merge_par2_recovery(&mut self, job_id: JobId, file_id: NzbFileId) {
@@ -3382,19 +3430,23 @@ impl Pipeline {
                     let set_ids = prefix
                         .map(|prefix| par2_prefix_set_ids(prefix))
                         .unwrap_or_default();
-                    let probe_may_arrive = self
-                        .par2_runtime(job_id)
-                        .and_then(|runtime| runtime.files.get(&file_index))
-                        .is_some_and(|file| {
-                            file.discovery_probe_ordinals.iter().any(|ordinal| {
-                                !self
-                                    .unavailable_promoted_recovery_segments
-                                    .contains(&SegmentId {
-                                        file_id,
-                                        segment_number: *ordinal,
-                                    })
-                            })
-                        });
+                    let assembly = self
+                        .jobs
+                        .get(&job_id)
+                        .and_then(|state| state.assembly.file(file_id));
+                    let probe_may_arrive =
+                        self.par2_runtime(job_id)
+                            .and_then(|runtime| runtime.files.get(&file_index))
+                            .is_some_and(|file| {
+                                file.discovery_probe_ordinals.iter().any(|ordinal| {
+                                    !self.unavailable_promoted_recovery_segments.contains(
+                                        &SegmentId {
+                                            file_id,
+                                            segment_number: *ordinal,
+                                        },
+                                    ) && !assembly.is_some_and(|file| file.has_segment(*ordinal))
+                                })
+                            });
                     if set_ids.is_empty()
                         && prefix.is_none_or(Vec::is_empty)
                         && !self.promoted_recovery_file_is_complete(job_id, file_index)
@@ -3675,7 +3727,18 @@ impl Pipeline {
                 .collect::<Vec<_>>();
             segments.sort_by_key(|segment| segment.ordinal);
             if prefix_only {
+                let assembly = state.assembly.file(NzbFileId { job_id, file_index });
+                // The capture can grow only from byte zero. If filtering left
+                // an article above the lowest missing ordinal, the hole below
+                // it is terminal and this optional carrier is exhausted.
+                let frontier = file
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ordinal)
+                    .filter(|ordinal| assembly.is_none_or(|file| !file.has_segment(*ordinal)))
+                    .min();
                 segments.truncate(1);
+                segments.retain(|segment| Some(segment.ordinal) == frontier);
             }
             let work = segments
                 .into_iter()
@@ -3936,7 +3999,9 @@ impl Pipeline {
             // Fetching another set's volume spends bandwidth on blocks that
             // cannot enter this repair's equation. Its work stays parked below
             // rather than being dropped.
-            if !self.recovery_file_serves_set(job_id, file_index, set_id) {
+            if !self.recovery_file_serves_set(job_id, file_index, set_id)
+                && !self.unread_recovery_file_is_named_for_set(job_id, file_index, set_id)
+            {
                 continue;
             }
             if let Some(candidate) = self.recovery_candidate_for(job_id, file_index, set_id)

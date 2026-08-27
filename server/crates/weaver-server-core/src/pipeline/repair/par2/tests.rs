@@ -35,6 +35,18 @@ fn metadata_prefix_scanning_reports_every_valid_set_id() {
 }
 
 #[test]
+fn metadata_prefix_scanning_waits_for_the_rest_of_a_split_packet() {
+    let index = crate::pipeline::tests::build_test_par2_index("split.bin", b"payload", 4);
+    let split = par2_rs::packet::header::HEADER_SIZE;
+
+    assert!(
+        par2_prefix_set_ids(&index[..split]).is_empty(),
+        "the packet header alone is not authenticated metadata"
+    );
+    assert_eq!(par2_prefix_set_ids(&index).len(), 1);
+}
+
+#[test]
 fn retained_session_recovery_merge_does_not_rescan_sources() {
     let temp = tempfile::tempdir().unwrap();
     let payload_path = temp.path().join("payload.bin");

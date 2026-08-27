@@ -7304,6 +7304,30 @@ impl Pipeline {
                     );
 
                     if total_recovery_capacity < blocks_needed {
+                        let promoted = self.promote_recovery_targeted(
+                            job_id,
+                            par2_set.recovery_set_id,
+                            blocks_needed,
+                        );
+                        let promoted_recovery = self.promoted_recovery_pipeline_state(job_id);
+                        let recovery_still_settling = promoted > 0
+                            || self.job_has_pending_download_pipeline_work(job_id)
+                            || promoted_recovery.has_pending_work();
+                        if recovery_still_settling {
+                            info!(
+                                job_id = job_id.0,
+                                blocks_needed,
+                                total_recovery_capacity,
+                                promoted_blocks = promoted,
+                                "waiting for targeted recovery downloads before repair"
+                            );
+                            self.transition_postprocessing_status(
+                                job_id,
+                                JobStatus::Downloading,
+                                Some("downloading"),
+                            );
+                            return;
+                        }
                         self.finish_par2_set_failure(
                             job_id,
                             set_id,

@@ -81,11 +81,10 @@ pub(crate) const DEFAULT_HOLDS_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 /// set does when another set is using the budget. If the aggregate ever needs
 /// bounding, that is the design, not a smaller constant.
 ///
-/// A `const` for now, deliberately: how direct-store's own switch is exposed
-/// (config vs env) was unsettled when this was written, and adding a second
-/// operator surface before that was decided would have to be undone. Both move
-/// together.
-pub(crate) const HOLDS_SCRATCH_CEILING_BYTES: u64 = 512 * 1024 * 1024;
+/// This is the fallback when no per-set override applies. The environment
+/// override is resolved before a router is constructed, so every set still owns
+/// one fixed ceiling for its lifetime.
+pub(crate) const HOLDS_SCRATCH_CEILING_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The absolute packed ceiling for the bounded small-member tolerance. The
 /// effective ceiling is `min(this, 1% of the archive's packed bytes)`; the

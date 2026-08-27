@@ -10071,6 +10071,49 @@ async fn targeted_promotion_routes_only_to_the_requested_recovery_set() {
 }
 
 #[tokio::test]
+async fn unread_named_multi_set_volume_is_targeted_without_capacity_credit() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30815);
+    let posting = TwoSetPosting::build();
+    posting.install(&mut pipeline, job_id).await;
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    load_par2_index(&mut pipeline, job_id, 4).await;
+    let larger_set_id = TwoSetPosting::recovery_set_id(&posting.larger_index);
+    let smaller_set_id = TwoSetPosting::recovery_set_id(&posting.smaller_index);
+
+    assert_eq!(
+        pipeline.promote_recovery_targeted(job_id, smaller_set_id, 4),
+        4,
+        "the canonical volume is a targeted download candidate"
+    );
+    let runtime = pipeline.par2_runtime(job_id).unwrap();
+    assert!(
+        runtime.files[&5].promoted,
+        "the matching named volume was promoted"
+    );
+    assert!(
+        !runtime.files.get(&2).is_some_and(|file| file.promoted),
+        "the other parsed set's volume remained parked"
+    );
+    assert_eq!(
+        pipeline.total_recovery_block_capacity(job_id, smaller_set_id),
+        0,
+        "an unread filename still contributes no recovery capacity"
+    );
+    assert_eq!(
+        pipeline.recovery_blocks_available_or_targeted(job_id, smaller_set_id),
+        0,
+        "targeting does not credit recovery blocks before packet validation"
+    );
+    assert_eq!(
+        pipeline.total_recovery_block_capacity(job_id, larger_set_id),
+        0,
+        "the selected candidate did not affect the other set"
+    );
+}
+
+#[tokio::test]
 async fn a_volume_completed_before_its_index_is_replayed_into_that_set() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -12131,10 +12174,38 @@ async fn metadata_probe_extracts_a_nonbootstrap_volume_from_its_recovery_queue()
         0,
         "the parked original must not race the promoted probe"
     );
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state
+            .assembly
+            .file_mut(selected_file)
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+    }
+    let authentic_par2 = build_test_par2_index("metadata-queue-payload.bin", b"payload", 4);
+    pipeline
+        .file_prefix_16k
+        .insert(selected_file, authentic_par2[..64].to_vec());
+
+    assert!(
+        pipeline.promote_par2_metadata(job_id),
+        "a contiguous prefix shorter than one complete PAR2 packet advances once"
+    );
+    assert_eq!(
+        drain_promoted_segments(&mut pipeline, job_id),
+        vec![SegmentId {
+            file_id: selected_file,
+            segment_number: 1,
+        }],
+        "the second article is the prefix frontier"
+    );
 }
 
 #[tokio::test]
-async fn committed_carrier_segment_does_not_keep_metadata_discovery_waiting() {
+async fn unavailable_prefix_frontier_does_not_probe_later_carrier_segments() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30938);
@@ -12150,7 +12221,7 @@ async fn committed_carrier_segment_does_not_keep_metadata_discovery_waiting() {
     let spec = JobSpec {
         name: "Committed Metadata Carrier".to_string(),
         password: None,
-        total_bytes: 129,
+        total_bytes: 193,
         category: None,
         metadata: vec![],
         files: vec![
@@ -12181,6 +12252,11 @@ async fn committed_carrier_segment_does_not_keep_metadata_discovery_waiting() {
                         bytes: 64,
                         message_id: "metadata-carrier-1@example.com".to_string(),
                     },
+                    segment_spec! {
+                        number: 2,
+                        bytes: 64,
+                        message_id: "metadata-carrier-2@example.com".to_string(),
+                    },
                 ],
             },
         ],
@@ -12197,17 +12273,18 @@ async fn committed_carrier_segment_does_not_keep_metadata_discovery_waiting() {
             .commit_segment(0, 64)
             .unwrap();
     }
+    pipeline
+        .file_prefix_16k
+        .insert(carrier_file_id, b"short prefix".to_vec());
     {
         let carrier = pipeline
             .ensure_par2_runtime(job_id)
             .files
             .entry(carrier_file_id.file_index)
             .or_default();
-        carrier.promoted = true;
-        carrier.discovery = Par2DiscoveryState::MetadataCarrierQueued {
-            target_set_id: None,
-            set_ids: vec![],
-        };
+        carrier.discovery = Par2DiscoveryState::PrefixProbeQueued;
+        carrier.discovery_probe_ordinals.insert(0);
+        carrier.discovery_probe_ordinals.insert(1);
     }
     pipeline.mark_promoted_recovery_segment_unavailable(missing_segment);
 
@@ -12224,7 +12301,7 @@ async fn committed_carrier_segment_does_not_keep_metadata_discovery_waiting() {
     );
     assert!(
         !pipeline.promote_par2_metadata(job_id),
-        "a committed carrier segment cannot keep metadata discovery waiting"
+        "a missing prefix frontier cannot promote a later carrier segment"
     );
     assert!(matches!(
         pipeline
@@ -12240,6 +12317,126 @@ async fn committed_carrier_segment_does_not_keep_metadata_discovery_waiting() {
         pipeline.par2_metadata_discovery_closed(job_id),
         "the completion gate must observe the exhausted sole carrier"
     );
+    assert!(
+        drain_promoted_segments(&mut pipeline, job_id).is_empty(),
+        "the later carrier segment must not be requested"
+    );
+}
+
+#[tokio::test]
+async fn exhausted_optional_prefix_probe_does_not_block_clean_completion() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30949);
+    let payload_filename = "optional-prefix-payload.bin";
+    let carrier_filename = "optional-prefix.vol00+01.par2";
+    let payload: Vec<u8> = (0..64u8).collect();
+    let carrier_file_id = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    let spec = JobSpec {
+        name: "Optional Prefix Exhaustion".to_string(),
+        password: None,
+        total_bytes: 256,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: payload.len() as u32,
+                    message_id: "optional-prefix-payload@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: carrier_filename.to_string(),
+                role: FileRole::from_filename(carrier_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "optional-prefix-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "optional-prefix-1@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 2,
+                        bytes: 64,
+                        message_id: "optional-prefix-2@example.com".to_string(),
+                    },
+                ],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 0, payload_filename, &payload).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &payload, 64, 0),
+        &[],
+    );
+    pipeline.par2_verified.insert(job_id);
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        let carrier = state.assembly.file_mut(carrier_file_id).unwrap();
+        carrier.record_placement(1, 64, 64);
+        carrier.commit_segment(1, 64).unwrap();
+    }
+    {
+        let carrier = pipeline
+            .ensure_par2_runtime(job_id)
+            .files
+            .entry(carrier_file_id.file_index)
+            .or_default();
+        carrier.discovery = Par2DiscoveryState::PrefixProbeQueued;
+        carrier.discovery_probe_ordinals.insert(0);
+    }
+    pipeline.mark_promoted_recovery_segment_unavailable(SegmentId {
+        file_id: carrier_file_id,
+        segment_number: 0,
+    });
+
+    assert!(
+        !pipeline.promote_par2_metadata(job_id),
+        "the broken optional prefix must settle without promoting later articles"
+    );
+    assert!(matches!(
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .files
+            .get(&carrier_file_id.file_index)
+            .unwrap()
+            .discovery,
+        Par2DiscoveryState::Exhausted { .. }
+    ));
+    assert!(
+        !pipeline.is_promoted_recovery_file(job_id, carrier_file_id.file_index),
+        "exhausting a metadata prefix must not promote the optional volume"
+    );
+
+    settle_job_completion(&mut pipeline, job_id).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "a clean, verified payload must not wait on an optional PAR2 prefix; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert_eq!(pipeline.par2_repairer_execute_calls, 0);
 }
 
 #[tokio::test]

@@ -1148,3 +1148,60 @@ func TestAssertForbiddenOutputPathsReadsTheDeliveredTree(t *testing.T) {
 		t.Fatalf("the failure must list what was delivered, got %v", err)
 	}
 }
+
+func TestAssertDirectStoreScenarioRequiresRoutedMaterializationWithoutRefetch(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assertion := &ScenarioDirectStoreAssertion{
+		ExpectedDemotionReason:           "member_malformed_chain",
+		RequireRoutedByteMaterialization: true,
+		ForbidVolumeRefetch:              true,
+	}
+
+	for _, test := range []struct {
+		name    string
+		lines   []string
+		wantErr string
+	}{
+		{
+			name: "matching job passes",
+			lines: []string{
+				`job_id=81 direct-store set demoted reason="member_malformed_chain"`,
+				`job_id=81 direct-store set materialized from its own routed bytes`,
+				`job_id=82 direct-store reconstruction is not possible; refetching the set's volumes`,
+			},
+		},
+		{
+			name: "refetch fails",
+			lines: []string{
+				`job_id=81 direct-store set demoted reason="member_malformed_chain"`,
+				`job_id=81 direct-store set materialized from its own routed bytes`,
+				`job_id=81 direct-store reconstruction is not possible; refetching the set's volumes`,
+			},
+			wantErr: "refetched volumes",
+		},
+		{
+			name: "missing materialization fails",
+			lines: []string{
+				`job_id=81 direct-store set demoted reason="member_malformed_chain"`,
+			},
+			wantErr: "did not materialize",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err := assertDirectStoreScenario(81, assertion)
+			if test.wantErr == "" && err != nil {
+				t.Fatalf("assertion failed: %v", err)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}

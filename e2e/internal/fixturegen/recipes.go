@@ -103,17 +103,20 @@ type Recipe struct {
 // fixture bytes: they stage another scenario's assets through their
 // scenario.json `fixtureAssets`, or they need no payload at all.
 var ScenarioOnly = map[string]string{
-	"multiserver-backup-par2-repair":       "stages par2-small-repair's archive and sidecars across two servers",
-	"multiserver-primary-corrupt-direct":   "stages single-mkv's payload; the damage is injected by the fake NNTP server",
-	"multiserver-primary-missing-direct":   "stages single-mkv's payload; articles are withheld at post time",
-	"obfuscated-rar-retry-7z":              "stages rar5-corrupted and single-7z under one obfuscated name",
-	"par2-obfuscated-rar-repair":           "stages obfuscated rar5-multivolume beside par2-obfuscated-rar-rewrite's sidecars and withholds an interior tail article",
-	"par2-multi-grid-late-discovery":       "stages one indexed payload and one independent late-set payload from the clean PAR2 corpus",
-	"par2-rar-placement-normalization":     "stages rar5-multivolume under swapped names beside par2-obfuscated-rar-rewrite's sidecars",
-	"par2-rar-placement-stripped-recovery": "the same staging, with the recovery volumes stripped after posting",
-	"rar5-multivolume-missing-tail":        "stages the first two volumes of rar5-multivolume and omits the third",
-	"single-mkv-sparse-nzb":                "stages single-mkv's payload under a sparse NZB numbering",
-	"stat-health-probe":                    "stages single-mkv's payload; articles are deleted by the harness",
+	"multiserver-backup-par2-repair":          "stages par2-small-repair's archive and sidecars across two servers",
+	"multiserver-primary-corrupt-direct":      "stages single-mkv's payload; the damage is injected by the fake NNTP server",
+	"multiserver-primary-missing-direct":      "stages single-mkv's payload; articles are withheld at post time",
+	"obfuscated-rar-retry-7z":                 "stages rar5-corrupted and single-7z under one obfuscated name",
+	"par2-direct-late-malformed-chain-rebind": "stages a PAR2-bound direct RAR set whose swapped tail pair demotes after routed coverage exists",
+	"par2-opaque-magic-rebind":                "stages obfuscated rar5-multivolume beside an extensionless PAR2 index",
+	"par2-obfuscated-rar-repair":              "stages obfuscated rar5-multivolume beside par2-obfuscated-rar-rewrite's sidecars and withholds an interior tail article",
+	"par2-multi-grid-late-discovery":          "stages one indexed payload and one independent late-set payload from the clean PAR2 corpus",
+	"par2-optional-prefix-hole":               "stages a clean payload beside an optional recovery carrier with its leading article withheld",
+	"par2-rar-placement-normalization":        "stages rar5-multivolume under swapped names beside par2-obfuscated-rar-rewrite's sidecars",
+	"par2-rar-placement-stripped-recovery":    "the same staging, with the recovery volumes stripped after posting",
+	"rar5-multivolume-missing-tail":           "stages the first two volumes of rar5-multivolume and omits the third",
+	"single-mkv-sparse-nzb":                   "stages single-mkv's payload under a sparse NZB numbering",
+	"stat-health-probe":                       "stages single-mkv's payload; articles are deleted by the harness",
 }
 
 // Recipes is the corpus, one entry per scenario directory that owns bytes.

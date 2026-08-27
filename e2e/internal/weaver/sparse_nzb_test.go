@@ -58,6 +58,22 @@ func TestRewriteNZBSegmentNumbersRejectsMismatchedCounts(t *testing.T) {
 	}
 }
 
+func TestRewriteNZBSubjectFilenames(t *testing.T) {
+	input := []byte(`<nzb><file subject="&quot;posted.part1.rar&quot; yEnc (1/1)"><segments><segment bytes="1" number="1">one</segment></segments></file></nzb>`)
+	output, err := rewriteNZBSubjectFilenames(input, map[string]string{
+		"posted.part1.rar": "declared.part1.rar",
+	})
+	if err != nil {
+		t.Fatalf("rewrite NZB subjects: %v", err)
+	}
+	if !bytes.Contains(output, []byte(`&quot;declared.part1.rar&quot;`)) || bytes.Contains(output, []byte(`&quot;posted.part1.rar&quot;`)) {
+		t.Fatalf("subject rewrite = %q", output)
+	}
+	if _, err := rewriteNZBSubjectFilenames(input, map[string]string{"missing.rar": "declared.rar"}); err == nil {
+		t.Fatal("expected an unmatched source filename error")
+	}
+}
+
 func TestScenarioNZBSegmentNumbersBuildsGeneratedSequence(t *testing.T) {
 	input := []byte(`<?xml version="1.0" encoding="UTF-8"?>
 <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">

@@ -2,6 +2,7 @@ package weaver
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -630,8 +631,50 @@ func applyTerminalStateCheck(dbPath string, jobID int, slug string, status strin
 				return "PAR2_SETTLEMENT_ERROR", err.Error()
 			}
 		}
+		if err == nil && directStoreEnabledForPhase() && scenario.directStoreAssertion() != nil {
+			if err := assertDirectStoreScenario(jobID, scenario.directStoreAssertion()); err != nil {
+				log.Printf("  %s: direct-store runtime assertion failed after %s: %v", slug, status, err)
+				return "DIRECT_STORE_ASSERTION_ERROR", err.Error()
+			}
+		}
 	}
 	return status, ""
+}
+
+func assertDirectStoreScenario(jobID int, assertion *ScenarioDirectStoreAssertion) error {
+	if assertion == nil {
+		return nil
+	}
+	raw, err := os.ReadFile(localWeaverLogPath())
+	if err != nil {
+		return fmt.Errorf("read weaver log: %w", err)
+	}
+
+	wantJobID := strconv.Itoa(jobID)
+	seenDemotion := false
+	seenMaterialization := false
+	for _, rawLine := range strings.Split(string(raw), "\n") {
+		line := ansiEscape.ReplaceAllString(rawLine, "")
+		if directLogJobID(line) != wantJobID {
+			continue
+		}
+		if strings.Contains(line, "direct-store set demoted") && directDemotionReason(line) == assertion.ExpectedDemotionReason {
+			seenDemotion = true
+		}
+		if strings.Contains(line, "direct-store set materialized from its own routed bytes") {
+			seenMaterialization = true
+		}
+		if assertion.ForbidVolumeRefetch && strings.Contains(line, "direct-store reconstruction is not possible; refetching the set's volumes") {
+			return errors.New("direct-store refetched volumes after demotion")
+		}
+	}
+	if assertion.ExpectedDemotionReason != "" && !seenDemotion {
+		return fmt.Errorf("direct-store did not demote with %q", assertion.ExpectedDemotionReason)
+	}
+	if assertion.RequireRoutedByteMaterialization && !seenMaterialization {
+		return errors.New("direct-store did not materialize the demoted set from routed bytes")
+	}
+	return nil
 }
 
 const cleanPar2SettlementMessage = "PAR2 set settled clean from in-stream grid evidence"
