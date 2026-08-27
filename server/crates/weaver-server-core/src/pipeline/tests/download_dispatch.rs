@@ -4146,6 +4146,102 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
 }
 
 #[tokio::test]
+async fn dispatch_downloads_yields_retained_hot_job_to_high_priority_while_critical_lane_runs() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    pipeline.connection_ramp = 2;
+    let normal_job_id = JobId(20029);
+    let promoted_job_id = JobId(20030);
+
+    insert_active_job(
+        &mut pipeline,
+        normal_job_id,
+        with_priority(
+            standalone_job_spec("Retained Normal", &many_standalone_files("normal", 64)),
+            "NORMAL",
+        ),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        promoted_job_id,
+        with_priority(
+            standalone_job_spec("Promoted High", &[("promoted.bin".to_string(), 512u32)]),
+            "NORMAL",
+        ),
+    )
+    .await;
+
+    pipeline.dispatch_downloads();
+    assert_eq!(pipeline.hot_dispatch_job, Some(normal_job_id));
+    let normal_queued_before_priority_update = pipeline
+        .jobs
+        .get(&normal_job_id)
+        .unwrap()
+        .download_queue
+        .len();
+    assert!(
+        normal_queued_before_priority_update > 0,
+        "the retained Normal job must still have queued ordinary work"
+    );
+
+    // One lane is free while the prior completion-critical body remains active.
+    // Existing work keeps running; the priority update owns only the new lane.
+    pipeline.active_downloads = 1;
+    pipeline.active_download_connections = 1;
+    pipeline.active_downloads_by_job.insert(normal_job_id, 1);
+    pipeline
+        .active_download_connections_by_job
+        .insert(normal_job_id, 1);
+    pipeline.active_downloads_by_file.clear();
+    pipeline
+        .active_completion_critical_connections_by_job
+        .insert(normal_job_id, 1);
+    pipeline
+        .jobs
+        .get_mut(&promoted_job_id)
+        .unwrap()
+        .spec
+        .metadata = vec![("priority".to_string(), "HIGH".to_string())];
+
+    pipeline.dispatch_downloads();
+    assert_eq!(
+        pipeline.hot_dispatch_job,
+        Some(promoted_job_id),
+        "the High update must replace the retained hot selection"
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&normal_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        normal_queued_before_priority_update,
+        "the Normal job's remaining work must not consume the new lane"
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&promoted_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        0,
+        "the High job must receive the newly available lane"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_downloads_prefers_earliest_job_within_priority_band() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(

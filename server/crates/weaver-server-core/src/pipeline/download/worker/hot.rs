@@ -28,19 +28,14 @@ impl Pipeline {
         })
     }
 
-    pub(in crate::pipeline::download::worker) fn job_has_completion_critical_work(
-        &self,
-        job_id: JobId,
-    ) -> bool {
+    /// Whether the job has critical work still waiting for a lane. An active
+    /// critical body continues safely on its own lane, but must not claim the
+    /// next newly available one.
+    fn job_has_queued_completion_critical_work(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|state| {
             state.download_queue.has_completion_critical_work()
                 && Self::status_allows_download_dispatch(&state.status)
-        }) || self
-            .active_completion_critical_connections_by_job
-            .get(&job_id)
-            .copied()
-            .unwrap_or(0)
-            > 0
+        })
     }
 
     pub(in crate::pipeline::download::worker) fn job_has_active_download_work(
@@ -153,9 +148,9 @@ impl Pipeline {
         let critical = eligible
             .iter()
             .copied()
-            .find(|(_, _, job_id)| self.job_has_completion_critical_work(*job_id));
+            .find(|(_, _, job_id)| self.job_has_queued_completion_critical_work(*job_id));
         let current_critical =
-            current.filter(|job_id| self.job_has_completion_critical_work(*job_id));
+            current.filter(|job_id| self.job_has_queued_completion_critical_work(*job_id));
 
         let selected = match (critical, current_critical) {
             (Some((priority, index, candidate)), Some(current)) => {
@@ -169,7 +164,19 @@ impl Pipeline {
                 }
             }
             (Some((_, _, candidate)), None) => candidate,
-            (None, Some(current)) => current,
+            (None, Some(current)) => {
+                let Some((priority, index, candidate)) = eligible.first().copied() else {
+                    return Some(current);
+                };
+                if self
+                    .job_rank(current)
+                    .is_some_and(|current_rank| current_rank <= (priority, index))
+                {
+                    current
+                } else {
+                    candidate
+                }
+            }
             (None, None) => {
                 let Some((priority, index, candidate)) = eligible.first().copied() else {
                     return current;
