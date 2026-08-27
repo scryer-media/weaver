@@ -334,6 +334,39 @@ fn rar_unlock_reprioritize_matching_uses_rank_inside_priority_band() {
 }
 
 #[test]
+fn promoted_identity_probe_leads_other_completion_critical_work() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 0, 0, 0));
+    q.push(make_work(1, 2, 0, 100));
+    q.push(make_work(1, 2, 1, 101));
+    let mut repair = make_work(1, 99, 0, 1000);
+    repair.is_recovery = true;
+    repair.completion_critical = true;
+    q.push(repair);
+
+    let promoted = q.promote_matching_to_completion_critical_with_rank(|work| {
+        if work.priority <= 1 {
+            Some((work.priority, None))
+        } else {
+            (work.segment_id.file_id.file_index == 2 && work.segment_id.segment_number == 0)
+                .then_some((2, Some(2)))
+        }
+    });
+
+    assert_eq!(promoted, 2);
+    let index = q.pop().unwrap();
+    assert_eq!(index.priority, 0);
+    assert!(index.completion_critical);
+    let probe = q.pop().unwrap();
+    assert_eq!(probe.segment_id.file_id.file_index, 2);
+    assert_eq!(probe.segment_id.segment_number, 0);
+    assert_eq!(probe.priority, 2);
+    assert!(probe.completion_critical);
+    assert!(q.pop().unwrap().completion_critical);
+    assert!(!q.pop().unwrap().completion_critical);
+}
+
+#[test]
 fn mixed_priorities() {
     let mut q = DownloadQueue::new();
 

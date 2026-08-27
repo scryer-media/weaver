@@ -1685,6 +1685,10 @@ async fn arming_schedules_a_probe_wave_ahead_of_candidate_payload() {
             (expected_file, 0),
             "the probe wave must lead the queue"
         );
+        assert!(
+            work.completion_critical,
+            "the probe wave must stay ahead of completion-critical PAR2 work"
+        );
     }
 
     // A binding re-ranks its file to the name path's volume priority.

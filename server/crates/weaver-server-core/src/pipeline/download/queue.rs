@@ -13,11 +13,11 @@ pub struct DownloadWork {
     pub retry_count: u32,
     /// Whether this segment belongs to a recovery file (PAR2 repair blocks).
     pub is_recovery: bool,
-    /// Whether completion is explicitly waiting for this PAR2 segment.
+    /// Whether pipeline progress is explicitly waiting for this segment.
     ///
-    /// This is deliberately orthogonal to `is_recovery`: explicit PAR2 indexes
-    /// are primary files, while indexless metadata probes and recovery volumes
-    /// remain recovery work. The flag changes dispatch eligibility only.
+    /// This is deliberately orthogonal to `is_recovery`: PAR2 completion work
+    /// and the bounded direct-store identity probe wave both need to lead the
+    /// ordinary queue. The flag changes dispatch eligibility only.
     pub completion_critical: bool,
     /// Servers to skip for this download (e.g. after decode failure from that server).
     pub exclude_servers: Vec<usize>,
@@ -455,6 +455,36 @@ impl DownloadQueue {
             }
         }
         changed
+    }
+
+    /// Moves selected work into the completion-critical class while applying
+    /// its priority and optional intra-priority rank.
+    pub fn promote_matching_to_completion_critical_with_rank(
+        &mut self,
+        mut priority_for: impl FnMut(&DownloadWork) -> Option<(u32, Option<u32>)>,
+    ) -> usize {
+        let items: Vec<_> = self
+            .completion_critical_heap
+            .drain()
+            .chain(self.ordinary_heap.drain())
+            .collect();
+        let mut promoted = 0;
+        for Reverse(mut pw) in items {
+            if let Some((priority, rank)) = priority_for(&pw.work) {
+                pw.completion_rank = 0;
+                pw.priority = priority;
+                pw.rank = rank;
+                pw.work.priority = priority;
+                pw.work.completion_critical = true;
+                promoted += 1;
+            }
+            if pw.work.completion_critical {
+                self.completion_critical_heap.push(Reverse(pw));
+            } else {
+                self.ordinary_heap.push(Reverse(pw));
+            }
+        }
+        promoted
     }
 }
 

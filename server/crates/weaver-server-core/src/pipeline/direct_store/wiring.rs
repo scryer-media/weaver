@@ -1440,7 +1440,10 @@ impl Pipeline {
         };
         let boosted = state
             .download_queue
-            .reprioritize_matching_with_rank(|work| {
+            .promote_matching_to_completion_critical_with_rank(|work| {
+                if work.priority <= 1 {
+                    return Some((work.priority, None));
+                }
                 let file_index = work.segment_id.file_id.file_index;
                 first_segments
                     .get(&file_index)
