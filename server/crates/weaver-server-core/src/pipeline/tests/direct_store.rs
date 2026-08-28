@@ -5396,7 +5396,6 @@ async fn direct_job_after_verification(
         state.recovery_queue = crate::DownloadQueue::new();
     }
     pipeline.check_job_completion(job_id).await;
-    pump_pipeline_runtime_queues(&mut pipeline).await;
     (pipeline, working_dir)
 }
 
@@ -8401,7 +8400,6 @@ async fn live_damaged_direct_job(
         state.recovery_queue = crate::DownloadQueue::new();
     }
     pipeline.check_job_completion(job_id).await;
-    pump_pipeline_runtime_queues(&mut pipeline).await;
     (pipeline, working_dir)
 }
 
@@ -8537,21 +8535,75 @@ async fn a_second_damage_verdict_after_a_repair_demotes_instead_of_repairing_aga
         .par2_set(job_id)
         .cloned()
         .expect("the index parsed");
+    let mut first_pending_work = None;
     let resolution = loop {
         let resolution = pipeline
-            .resolve_direct_sets_before_par2_repairer(job_id, par2_set.clone(), working_dir.clone())
+            .resolve_direct_sets_before_par2_repairer(
+                job_id,
+                Arc::clone(&par2_set),
+                working_dir.clone(),
+            )
             .await;
         if resolution != crate::pipeline::direct_store::wiring::DirectPar2Resolution::Pending {
             break resolution;
         }
+        if first_pending_work.is_none() {
+            let pending = pipeline
+                .direct_post_repair_in_flight
+                .get(&job_id)
+                .expect("the first check must leave one post-repair ticket in flight");
+            first_pending_work = Some((pending.work_id, pending.recovery_set_id));
+
+            let duplicate = pipeline
+                .resolve_direct_sets_before_par2_repairer(
+                    job_id,
+                    Arc::clone(&par2_set),
+                    working_dir.clone(),
+                )
+                .await;
+            assert_eq!(
+                duplicate,
+                crate::pipeline::direct_store::wiring::DirectPar2Resolution::Pending,
+                "a repeated completion check must reuse the in-flight ticket"
+            );
+            assert_eq!(
+                pipeline
+                    .direct_post_repair_in_flight
+                    .get(&job_id)
+                    .map(|work| (work.work_id, work.recovery_set_id)),
+                first_pending_work,
+                "the repeated check must not replace or duplicate the ticket"
+            );
+            pipeline.remove_pending_completion_check(job_id);
+            pipeline.schedule_job_completion_check_if_download_pipeline_drained(
+                job_id,
+                "post-repair ticket test",
+            );
+            assert!(
+                !pipeline.pending_completion_checks.contains(&job_id),
+                "normal drain ticks must not poll an in-flight post-repair ticket"
+            );
+
+            let (work_id, recovery_set_id) = first_pending_work.unwrap();
+            pipeline.handle_direct_post_repair_done(crate::pipeline::DirectPostRepairWorkDone {
+                job_id,
+                work_id: work_id.wrapping_add(1),
+                recovery_set_id,
+                result: Err("stale verdict".to_string()),
+            });
+            assert!(
+                !pipeline.direct_post_repair_results.contains_key(&job_id),
+                "a stale ticket must not publish a verdict"
+            );
+        }
         let done = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            pipeline.par2_work_done_rx.recv(),
+            pipeline.direct_post_repair_done_rx.recv(),
         )
         .await
-        .expect("the post-repair verification should finish")
-        .expect("the post-repair verification completion channel stays open");
-        pipeline.handle_par2_work_done(done);
+        .expect("the post-repair read-back should finish")
+        .expect("the post-repair completion channel stays open");
+        pipeline.handle_direct_post_repair_done(done);
     };
 
     let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));

@@ -2438,12 +2438,32 @@ fn debug_job_state(pipeline: &Pipeline, job_id: JobId) -> String {
     lines.join("\n")
 }
 
-async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
-    pipeline.pump_decode_queue();
-    while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
-        pipeline.check_job_completion(queued_job).await;
+async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
+    loop {
         pipeline.pump_decode_queue();
+        while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
+            pipeline.check_job_completion(queued_job).await;
+            pipeline.pump_decode_queue();
+        }
+        while let Ok(done) = pipeline.direct_post_repair_done_rx.try_recv() {
+            pipeline.handle_direct_post_repair_done(done);
+        }
+        if pipeline.direct_post_repair_in_flight.is_empty() {
+            return;
+        }
+        let done = tokio::time::timeout(
+            Duration::from_secs(5),
+            pipeline.direct_post_repair_done_rx.recv(),
+        )
+        .await
+        .expect("direct post-repair read-back should finish")
+        .expect("direct post-repair completion channel should stay open");
+        pipeline.handle_direct_post_repair_done(done);
     }
+}
+
+async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
+    settle_direct_post_repair_work(pipeline).await;
 
     settle_inflight_moves(pipeline).await;
 
@@ -2454,6 +2474,7 @@ async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
             pipeline.check_job_completion(queued_job).await;
             pipeline.pump_decode_queue();
         }
+        settle_direct_post_repair_work(pipeline).await;
     }
 
     settle_inflight_moves(pipeline).await;
