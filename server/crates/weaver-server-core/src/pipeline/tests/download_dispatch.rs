@@ -8842,10 +8842,20 @@ async fn a_deferred_job_issues_nothing_until_it_is_eligible() {
     pipeline.propagation_delay_forced = Some(Duration::from_millis(150));
 
     let job_id = JobId(20209);
+    // Dated one minute in the future: the gate saturates a future post to age
+    // zero, so the first dispatch is held no matter how many wall-clock seconds
+    // fixture setup takes on a loaded machine. A post dated exactly `now` flips
+    // to eligible the moment one second ticks before `dispatch_downloads`,
+    // because ages are whole epoch seconds and the delay here is only 150ms.
+    // The second half is unaffected — the first consult caches an
+    // `Instant`-based `ready_at`, and the sleep below outlives it.
     insert_active_job(
         &mut pipeline,
         job_id,
-        posted_job_spec("Silver Horizon Deferred Dispatch", Some(now_epoch_secs())),
+        posted_job_spec(
+            "Silver Horizon Deferred Dispatch",
+            Some(now_epoch_secs() + 60),
+        ),
     )
     .await;
     // `insert_active_job` admits at `Downloading`. A deferred job has never
