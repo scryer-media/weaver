@@ -6318,6 +6318,98 @@ async fn a_placement_only_verdict_is_placed_without_running_the_repairer() {
     );
 }
 
+/// Partial quick evidence is recognized and the set still settles correctly.
+///
+/// Half the set is proven by zero-read digest evidence; the other half is a
+/// swapped pair with no evidence at all. The quick pass now reports Partial
+/// instead of throwing the proof away, and the swap is still seen and fixed —
+/// through the repairer-analysis arm, whose whole-set pass places by 16 KiB
+/// prefix proposal rather than the old full-MD5 directory scan, so the set is
+/// read once there instead of twice. The analysis arm does not yet consume
+/// the partial evidence to narrow its read to the unproven pair — that
+/// consumption exists only at the verification fallback today — which is why
+/// this test pins one authoritative pass, not a selective one.
+#[tokio::test]
+async fn partial_quick_evidence_is_reported_and_the_swap_still_settles() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30346);
+    let job_name = "Silver Horizon Partial Evidence";
+    let described: Vec<(&str, Vec<u8>)> = vec![
+        ("silver-horizon-a.bin", misplacement_payload(11)),
+        ("silver-horizon-b.bin", misplacement_payload(12)),
+        ("silver-horizon-c.bin", misplacement_payload(13)),
+        ("silver-horizon-d.bin", misplacement_payload(14)),
+    ];
+    // a and b sit at their own names; c and d are posted under each other's.
+    let on_disk = vec![
+        described[0].1.clone(),
+        described[1].1.clone(),
+        described[3].1.clone(),
+        described[2].1.clone(),
+    ];
+    let working_dir =
+        misplaced_payload_par2_job(&mut pipeline, job_id, job_name, &described, &on_disk, 1).await;
+
+    // Measured-digest evidence for the first two files: the quick pass's
+    // digest arm proves each without a read. Deliberately NOT grid evidence —
+    // a fully gridded job earns the strong-decode skip and never owes the
+    // authoritative pass this test exists to narrow. The swapped pair carries
+    // no evidence of any kind — unproven, not distrusted.
+    for file_index in 0..2u32 {
+        let file_id = NzbFileId { job_id, file_index };
+        let payload = described[file_index as usize].1.clone();
+        pipeline
+            .ensure_par2_runtime(job_id)
+            .completed_checksums
+            .insert(
+                file_id,
+                crate::pipeline::CompletedFileChecksum {
+                    md5: Some(par2_rs::checksum::md5(&payload)),
+                    crc32: par2_rs::checksum::crc32(&payload),
+                    all_parts_crc_verified: false,
+                },
+            );
+    }
+
+    settle_job_completion(&mut pipeline, job_id).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert_eq!(
+        pipeline.par2_quick_partial_verify_calls, 1,
+        "the quick pass must conclude partially, not inconclusively"
+    );
+    assert_eq!(
+        pipeline.par2_authoritative_verify_calls, 1,
+        "the analysis arm answers with exactly one pass — the scan that used \
+         to double it is gone; analyze={} execute={}",
+        pipeline.par2_repairer_analyze_calls, pipeline.par2_repairer_execute_calls,
+    );
+    assert_eq!(
+        pipeline.par2_repairer_execute_calls, 0,
+        "a swap with nothing damaged writes nothing"
+    );
+    let output_dir = pipeline
+        .complete_dir
+        .join(crate::jobs::working_dir::sanitize_dirname(job_name));
+    for (filename, bytes) in &described {
+        assert_eq!(
+            tokio::fs::read(output_dir.join(filename)).await.unwrap(),
+            *bytes,
+            "{filename} must be delivered intact"
+        );
+    }
+    assert!(
+        !working_dir.exists() || std::fs::read_dir(&working_dir).unwrap().next().is_none(),
+        "and nothing may be left behind in the working directory"
+    );
+}
+
 /// Damage alongside misplacement still runs the repairer, and the files it
 /// placed are read back where it placed them.
 ///
@@ -7156,7 +7248,18 @@ async fn canonical_non_recovery_rename_rejects_corruption_after_the_prefix() {
         )
         .await;
 
-    assert_eq!(pipeline.par2_authoritative_verify_calls, 1);
+    assert_eq!(
+        pipeline.par2_selective_verify_calls, 2,
+        "two selective passes and nothing more: the post-repair read of what \
+         the repair rewrote, then the canonical re-proof of what moved; \
+         authoritative={}",
+        pipeline.par2_authoritative_verify_calls,
+    );
+    assert_eq!(
+        pipeline.par2_authoritative_verify_calls, 0,
+        "and nothing may re-read the files the selective post-repair pass \
+         already proved in place"
+    );
     assert!(
         matches!(
             job_status_for_assert(&pipeline, job_id),
@@ -7402,9 +7505,16 @@ async fn repair_leftovers_do_not_fail_the_pass_that_verifies_the_settled_layout(
         "a repair whose set is intact where it now sits is a repair that held"
     );
     assert_eq!(
-        pipeline.par2_authoritative_verify_calls, 1,
+        pipeline.par2_selective_verify_calls, 2,
         "the non-recovery file moved into its free canonical name from 16 KiB \
-         identity evidence, so the settled layout still needs strict proof"
+         identity evidence, so the settled layout still needs strict proof — \
+         delivered by the selective canonical pass over the moved files, not \
+         a whole-set read; authoritative={}",
+        pipeline.par2_authoritative_verify_calls,
+    );
+    assert_eq!(
+        pipeline.par2_authoritative_verify_calls, 0,
+        "and the files proven in place are carried, never re-read"
     );
     let mut remaining: Vec<String> = std::fs::read_dir(&working_dir)
         .unwrap()

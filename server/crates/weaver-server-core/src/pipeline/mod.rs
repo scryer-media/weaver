@@ -2344,6 +2344,8 @@ pub struct Pipeline {
     /// is what lets a test say the quick pass is what answered instead.
     #[cfg(test)]
     pub(super) par2_quick_verify_calls: usize,
+    #[cfg(test)]
+    pub(super) par2_quick_partial_verify_calls: usize,
     /// Forces the PAR2 ignore-extension list for a test, so the "override
     /// disables it" case can be exercised without mutating a process-global
     /// environment variable while other tests are running.
