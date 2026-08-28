@@ -12,6 +12,7 @@
         "testdata/direct-store-multi-member/**",
         "testdata/direct-store-multivolume/**",
         "testdata/direct-store-par2-repair/**",
+        "testdata/direct-store-post-repair-queue-liveness/**",
         "testdata/direct-store-rar4/**",
         "testdata/direct-store-single/**",
         "testdata/empty-rar/**",

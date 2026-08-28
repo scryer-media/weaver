@@ -5396,6 +5396,7 @@ async fn direct_job_after_verification(
         state.recovery_queue = crate::DownloadQueue::new();
     }
     pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
     (pipeline, working_dir)
 }
 
@@ -8400,6 +8401,7 @@ async fn live_damaged_direct_job(
         state.recovery_queue = crate::DownloadQueue::new();
     }
     pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
     (pipeline, working_dir)
 }
 
@@ -8535,9 +8537,22 @@ async fn a_second_damage_verdict_after_a_repair_demotes_instead_of_repairing_aga
         .par2_set(job_id)
         .cloned()
         .expect("the index parsed");
-    let resolution = pipeline
-        .resolve_direct_sets_before_par2_repairer(job_id, par2_set, working_dir.clone())
-        .await;
+    let resolution = loop {
+        let resolution = pipeline
+            .resolve_direct_sets_before_par2_repairer(job_id, par2_set.clone(), working_dir.clone())
+            .await;
+        if resolution != crate::pipeline::direct_store::wiring::DirectPar2Resolution::Pending {
+            break resolution;
+        }
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pipeline.par2_work_done_rx.recv(),
+        )
+        .await
+        .expect("the post-repair verification should finish")
+        .expect("the post-repair verification completion channel stays open");
+        pipeline.handle_par2_work_done(done);
+    };
 
     let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert_eq!(

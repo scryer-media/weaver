@@ -244,6 +244,32 @@ fn run_retained_par2_session(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_one_shot_par2_repairer(
+    working_dir: std::path::PathBuf,
+    par2_set: Arc<par2_rs::Par2FileSet>,
+    repair: bool,
+    memory_limit: usize,
+    cancellation: par2_rs::CancellationToken,
+    progress: Option<par2_rs::ProgressCallback>,
+) -> Result<par2_rs::Par2RepairOutcome, String> {
+    if repair {
+        crate::e2e_failpoint::maybe_delay("repair.task_start");
+    }
+    let mut options = par2_rs::Par2RepairerOptions::new(working_dir, Vec::new());
+    options.file_set = Some((*par2_set).clone());
+    options.repair = repair;
+    options.memory_limit = Some(memory_limit);
+    options.cancel = Some(cancellation);
+    options.progress = progress;
+    let repairer = par2_rs::Par2Repairer::new(options);
+    let (outcome, _) = repairer
+        .verify_or_repair_carrying()
+        .map_err(|error| format!("PAR2 repairer failed: {error}"))?;
+    ensure_par2_repair_completed(&outcome, repair)?;
+    Ok(outcome)
+}
+
 fn should_retry_par2_source_change<T>(
     result: &Result<T, par2_rs::Par2SessionError>,
     already_retried: bool,
@@ -953,6 +979,16 @@ enum Par2PassScope {
     /// Reading at canonical names cannot be confused by a leftover, which is
     /// swept with the rest of the repair's artefacts once the aggregate settles.
     WholeSetAtCanonicalNames(Vec<par2_rs::FileId>),
+}
+
+impl Par2PassScope {
+    fn work_scope(&self) -> Par2WorkScope {
+        match self {
+            Self::WholeSet => Par2WorkScope::WholeSet,
+            Self::Selected(_) => Par2WorkScope::Selected,
+            Self::WholeSetAtCanonicalNames(_) => Par2WorkScope::WholeSetAtCanonicalNames,
+        }
+    }
 }
 
 /// Run the read the scope asks for. All arms share par2-rs's selected-file
@@ -2287,8 +2323,55 @@ impl Pipeline {
         par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
         repair: bool,
-    ) -> Result<par2_rs::Par2RepairOutcome, String> {
+    ) -> Option<Result<par2_rs::Par2RepairOutcome, String>> {
         let set_id = par2_set.recovery_set_id;
+        let kind = Par2WorkKind::Repairer {
+            recovery_set_id: set_id,
+            repair,
+        };
+        if let Some(result) = self.par2_work_results.remove(&job_id) {
+            self.par2_work_in_flight.remove(&job_id);
+            let Par2WorkResult::Repairer(output) = result else {
+                self.par2_work_results.insert(job_id, result);
+                return None;
+            };
+            if output.clear_session {
+                let set_runtime = self
+                    .ensure_par2_runtime(job_id)
+                    .set_runtime_mut(set_id)
+                    .expect("PAR2 fallback belongs to the active recovery set");
+                set_runtime.session = None;
+                set_runtime.session_last_used = None;
+                set_runtime.session_evidence_file_ids.clear();
+            }
+            if let Some(session) = output.session {
+                self.restore_par2_repair_session(job_id, set_id, session);
+                let set_runtime = self
+                    .ensure_par2_runtime(job_id)
+                    .set_runtime_mut(set_id)
+                    .expect("PAR2 session evidence belongs to the active recovery set");
+                if output.session_newly_opened {
+                    set_runtime.session_evidence_file_ids.clear();
+                }
+                if repair || output.retried_source_change {
+                    set_runtime.session_evidence_file_ids.clear();
+                    if repair && let Some(session) = set_runtime.session.as_mut() {
+                        session.invalidate_all_sources();
+                    }
+                } else {
+                    set_runtime
+                        .session_evidence_file_ids
+                        .extend(output.admitted_file_ids);
+                }
+            }
+            if repair {
+                self.phase_end(job_id, JobPhase::Repairing);
+            }
+            return Some(output.result);
+        }
+        if self.par2_work_in_flight.contains_key(&job_id) {
+            return None;
+        }
         if repair {
             // What the directory held before the repairer touched it, so the
             // artefacts it leaves behind can be named afterwards by difference
@@ -2363,46 +2446,20 @@ impl Pipeline {
             }) as par2_rs::ProgressCallback
         });
 
-        let retained_session = match self
-            .take_or_open_par2_repair_session(
-                job_id,
-                set_id,
-                working_dir.clone(),
-                memory_limit,
-                session_progress.clone(),
-                // By this point the repairer reads and writes real files: any
-                // set still routing here materialized before it arrived.
-                None,
-            )
-            .await
-        {
-            Ok(session) => session,
-            Err(error) => {
-                warn!(job_id = job_id.0, error = %error, "retained PAR2 session unavailable; using one-shot repairer");
-                None
-            }
-        };
-        if let Some((session, newly_opened)) = retained_session {
-            if newly_opened {
-                self.ensure_par2_runtime(job_id)
-                    .set_runtime_mut(set_id)
-                    .expect("PAR2 session evidence belongs to the active recovery set")
-                    .session_evidence_file_ids
-                    .clear();
-            }
-            let candidates = match self
+        let prepared_session = self.prepare_par2_repair_session(
+            job_id,
+            set_id,
+            working_dir.clone(),
+            memory_limit,
+            session_progress.clone(),
+            // By this point the repairer reads and writes real files: any set
+            // still routing here materialized before it arrived.
+            None,
+        );
+        if let Some(prepared_session) = prepared_session {
+            let candidates = self
                 .par2_session_evidence_candidates(job_id, set_id, &par2_set)
-                .await
-            {
-                Ok(candidates) => candidates,
-                Err(error) => {
-                    self.restore_par2_repair_session(job_id, set_id, session);
-                    if repair {
-                        self.phase_end(job_id, JobPhase::Repairing);
-                    }
-                    return Err(error);
-                }
-            };
+                .await;
             // Analysis reads the live grid here. Repair uses the local
             // pre-retirement snapshot captured above; it never puts those
             // verdicts back after the file generation changes.
@@ -2415,180 +2472,200 @@ impl Pipeline {
                     .collect::<Vec<_>>();
                 (repair_placement_overrides.unwrap_or_default(), evidence)
             });
-            let mut repair_task = tokio::task::spawn_blocking(move || {
-                if repair {
-                    crate::e2e_failpoint::maybe_delay("repair.task_start");
-                }
-                run_retained_par2_session(session, candidates, slice_evidence, repair)
-            });
-            let repair_result = if repair {
-                loop {
-                    tokio::select! {
-                        result = &mut repair_task => break result,
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                            self.sample_phase_progress();
-                        }
-                    }
-                }
-            } else {
-                repair_task.await
-            };
-            let retained_outcome = match repair_result {
-                Ok((session, Ok((outcome, admitted_file_ids, retried_source_change)))) => {
-                    self.restore_par2_repair_session(job_id, set_id, session);
-                    let set_runtime = self
-                        .ensure_par2_runtime(job_id)
-                        .set_runtime_mut(set_id)
-                        .expect("PAR2 session evidence belongs to the active recovery set");
-                    if repair || retried_source_change {
-                        set_runtime.session_evidence_file_ids.clear();
-                        if repair && let Some(session) = set_runtime.session.as_mut() {
-                            session.invalidate_all_sources();
-                        }
-                    } else {
-                        set_runtime
-                            .session_evidence_file_ids
-                            .extend(admitted_file_ids);
-                    }
-                    ensure_par2_repair_completed(&outcome, repair).map(|()| outcome)
-                }
-                Ok((session, Err(error))) if repair && error.file_descriptor_exhausted => {
-                    let assessment = session
-                        .assessment()
-                        .ok()
-                        .map(|outcome| outcome.verification.clone());
-                    // The failed constructor drops every handle it opened.
-                    // Do not retain this path-backed session: the retry reads
-                    // through PlacementFileAccess and its assessment belongs
-                    // to a different source kind.
-                    drop(session);
-                    let set_runtime = self
-                        .ensure_par2_runtime(job_id)
-                        .set_runtime_mut(set_id)
-                        .expect("PAR2 fallback belongs to the active recovery set");
-                    set_runtime.session = None;
-                    set_runtime.session_last_used = None;
-                    set_runtime.session_evidence_file_ids.clear();
-
-                    let (placement_overrides, evidence) = bounded_repair
-                        .expect("a repairing retained session has bounded retry inputs");
-                    if !assessment.as_ref().is_some_and(|verification| {
-                        bounded_repair_evidence_covers_assessment(verification, &evidence)
-                    }) {
-                        warn!(
-                            job_id = job_id.0,
-                            error = %error.message,
-                            evidence_slices = evidence.len(),
-                            "filesystem PAR2 repair exhausted file descriptors; the bounded retry lacks a complete source map"
-                        );
-                        self.phase_end(job_id, JobPhase::Repairing);
-                        return Err(error.message);
-                    }
-                    warn!(
-                        job_id = job_id.0,
-                        error = %error.message,
-                        evidence_slices = evidence.len(),
-                        "filesystem PAR2 repair exhausted file descriptors; retrying with bounded source access"
-                    );
-                    let cancellation = self.par2_cancellation_token(job_id);
-                    let fallback_working_dir = working_dir.clone();
-                    let fallback_set = (*par2_set).clone();
-                    let fallback_progress = session_progress.clone();
-                    let mut fallback_task = tokio::task::spawn_blocking(move || {
-                        run_file_descriptor_bounded_par2_repair(
-                            fallback_working_dir,
-                            fallback_set,
-                            placement_overrides,
-                            evidence,
-                            memory_limit,
-                            cancellation,
-                            fallback_progress,
-                        )
-                    });
-                    let fallback_result = loop {
-                        tokio::select! {
-                            result = &mut fallback_task => break result,
-                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                                self.sample_phase_progress();
+            let cancellation = self.par2_cancellation_token(job_id);
+            let pp_pool = self.pp_pool.clone();
+            let done_tx = self.par2_work_done_tx.clone();
+            let fallback_working_dir = working_dir.clone();
+            let fallback_set = (*par2_set).clone();
+            let fallback_progress = session_progress.clone();
+            self.next_par2_work_id = self.next_par2_work_id.wrapping_add(1);
+            let work_id = self.next_par2_work_id;
+            self.par2_work_in_flight
+                .insert(job_id, Par2WorkInFlight { work_id, kind });
+            tokio::spawn(async move {
+                let joined = tokio::task::spawn_blocking(move || {
+                    pp_pool.install(move || {
+                        let (session, newly_opened) = match prepared_session.open() {
+                            Ok(session) => session,
+                            Err(error) => {
+                                warn!(job_id = job_id.0, error = %error, "retained PAR2 session unavailable; using one-shot repairer");
+                                let result = run_one_shot_par2_repairer(
+                                    working_dir,
+                                    par2_set,
+                                    repair,
+                                    memory_limit,
+                                    cancellation,
+                                    session_progress,
+                                );
+                                return Par2RepairerWorkOutput {
+                                    result,
+                                    session: None,
+                                    session_newly_opened: false,
+                                    admitted_file_ids: Vec::new(),
+                                    retried_source_change: false,
+                                    clear_session: false,
+                                };
                             }
+                        };
+                        let candidates = match candidates {
+                            Ok(candidates) => candidates,
+                            Err(error) => {
+                                return Par2RepairerWorkOutput {
+                                    result: Err(error),
+                                    session: Some(session),
+                                    session_newly_opened: newly_opened,
+                                    admitted_file_ids: Vec::new(),
+                                    retried_source_change: false,
+                                    clear_session: false,
+                                };
+                            }
+                        };
+                        if repair {
+                            crate::e2e_failpoint::maybe_delay("repair.task_start");
                         }
-                    };
-                    match fallback_result {
-                        Ok(result) => result,
-                        Err(error) => Err(format!(
-                            "bounded filesystem PAR2 fallback task panicked: {error}"
-                        )),
-                    }
-                }
-                Ok((session, Err(error))) => {
-                    self.restore_par2_repair_session(job_id, set_id, session);
-                    Err(error.message)
-                }
-                Err(error) => Err(format!("retained PAR2 session task panicked: {error}")),
-            };
-            if repair {
-                self.phase_end(job_id, JobPhase::Repairing);
-            }
-            return retained_outcome;
+                        match run_retained_par2_session(
+                            session,
+                            candidates,
+                            slice_evidence,
+                            repair,
+                        ) {
+                            (session, Ok((outcome, admitted_file_ids, retried_source_change))) => {
+                                Par2RepairerWorkOutput {
+                                    result: ensure_par2_repair_completed(&outcome, repair)
+                                        .map(|()| outcome),
+                                    session: Some(session),
+                                    session_newly_opened: newly_opened,
+                                    admitted_file_ids,
+                                    retried_source_change,
+                                    clear_session: false,
+                                }
+                            }
+                            (session, Err(error))
+                                if repair && error.file_descriptor_exhausted =>
+                            {
+                                let assessment = session
+                                    .assessment()
+                                    .ok()
+                                    .map(|outcome| outcome.verification.clone());
+                                drop(session);
+                                let (placement_overrides, evidence) = bounded_repair
+                                    .expect("a repairing retained session has bounded retry inputs");
+                                let result = if !assessment.as_ref().is_some_and(|verification| {
+                                    bounded_repair_evidence_covers_assessment(
+                                        verification,
+                                        &evidence,
+                                    )
+                                }) {
+                                    warn!(
+                                        job_id = job_id.0,
+                                        error = %error.message,
+                                        evidence_slices = evidence.len(),
+                                        "filesystem PAR2 repair exhausted file descriptors; the bounded retry lacks a complete source map"
+                                    );
+                                    Err(error.message)
+                                } else {
+                                    warn!(
+                                        job_id = job_id.0,
+                                        error = %error.message,
+                                        evidence_slices = evidence.len(),
+                                        "filesystem PAR2 repair exhausted file descriptors; retrying with bounded source access"
+                                    );
+                                    run_file_descriptor_bounded_par2_repair(
+                                        fallback_working_dir,
+                                        fallback_set,
+                                        placement_overrides,
+                                        evidence,
+                                        memory_limit,
+                                        cancellation,
+                                        fallback_progress,
+                                    )
+                                };
+                                Par2RepairerWorkOutput {
+                                    result,
+                                    session: None,
+                                    session_newly_opened: false,
+                                    admitted_file_ids: Vec::new(),
+                                    retried_source_change: false,
+                                    clear_session: true,
+                                }
+                            }
+                            (session, Err(error)) => Par2RepairerWorkOutput {
+                                result: Err(error.message),
+                                session: Some(session),
+                                session_newly_opened: newly_opened,
+                                admitted_file_ids: Vec::new(),
+                                retried_source_change: false,
+                                clear_session: false,
+                            },
+                        }
+                    })
+                })
+                .await;
+                let output = match joined {
+                    Ok(output) => output,
+                    Err(error) => Par2RepairerWorkOutput {
+                        result: Err(format!("retained PAR2 session task panicked: {error}")),
+                        session: None,
+                        session_newly_opened: false,
+                        admitted_file_ids: Vec::new(),
+                        retried_source_change: false,
+                        clear_session: false,
+                    },
+                };
+                let _ = done_tx
+                    .send(Par2WorkDone {
+                        job_id,
+                        work_id,
+                        kind,
+                        result: Par2WorkResult::Repairer(output),
+                    })
+                    .await;
+            });
+            return None;
         }
 
         let cancellation = self.par2_cancellation_token(job_id);
-        let mut repair_task = tokio::task::spawn_blocking(move || {
-            if repair {
-                crate::e2e_failpoint::maybe_delay("repair.task_start");
-            }
-            let mut options = par2_rs::Par2RepairerOptions::new(working_dir, Vec::new());
-            options.file_set = Some((*par2_set).clone());
-            options.repair = repair;
-            options.memory_limit = Some(memory_limit);
-            options.cancel = Some(cancellation);
-            if let Some(counters) = phase_counters {
-                options.progress = Some(Arc::new(move |update: par2_rs::ProgressUpdate| {
-                    if !matches!(
-                        update.stage,
-                        par2_rs::ProgressStage::Repairing | par2_rs::ProgressStage::WritingRepaired
-                    ) {
-                        return;
-                    }
-                    counters
-                        .completed_bytes
-                        .fetch_max(update.bytes_processed, Ordering::Relaxed);
-                    if let Some(total_bytes) = update.total_bytes {
-                        counters
-                            .total_bytes
-                            .fetch_max(total_bytes, Ordering::Relaxed);
-                    }
-                }));
-            }
-            let repairer = par2_rs::Par2Repairer::new(options);
-            let (outcome, _) = repairer
-                .verify_or_repair_carrying()
-                .map_err(|e| format!("PAR2 repairer failed: {e}"))?;
-            ensure_par2_repair_completed(&outcome, repair)?;
-            Ok(outcome)
+        let pp_pool = self.pp_pool.clone();
+        let done_tx = self.par2_work_done_tx.clone();
+        self.next_par2_work_id = self.next_par2_work_id.wrapping_add(1);
+        let work_id = self.next_par2_work_id;
+        self.par2_work_in_flight
+            .insert(job_id, Par2WorkInFlight { work_id, kind });
+        tokio::spawn(async move {
+            let joined = tokio::task::spawn_blocking(move || {
+                pp_pool.install(move || {
+                    run_one_shot_par2_repairer(
+                        working_dir,
+                        par2_set,
+                        repair,
+                        memory_limit,
+                        cancellation,
+                        session_progress,
+                    )
+                })
+            })
+            .await;
+            let result = match joined {
+                Ok(result) => result,
+                Err(error) => Err(format!("repair task panicked: {error}")),
+            };
+            let _ = done_tx
+                .send(Par2WorkDone {
+                    job_id,
+                    work_id,
+                    kind,
+                    result: Par2WorkResult::Repairer(Par2RepairerWorkOutput {
+                        result,
+                        session: None,
+                        session_newly_opened: false,
+                        admitted_file_ids: Vec::new(),
+                        retried_source_change: false,
+                        clear_session: false,
+                    }),
+                })
+                .await;
         });
-        let repair_result = if repair {
-            loop {
-                tokio::select! {
-                    result = &mut repair_task => break result,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                        self.sample_phase_progress();
-                    }
-                }
-            }
-        } else {
-            repair_task.await
-        };
-
-        if repair {
-            self.phase_end(job_id, JobPhase::Repairing);
-        }
-
-        match repair_result {
-            Ok(Ok(outcome)) => Ok(outcome),
-            Ok(Err(error)) => Err(error),
-            Err(error) => Err(format!("repair task panicked: {error}")),
-        }
+        None
     }
 
     async fn analyze_par2_with_repairer(
@@ -2597,33 +2674,46 @@ impl Pipeline {
         par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
         preserve_repairing_status: bool,
-    ) -> Result<par2_rs::Par2RepairOutcome, String> {
-        if !preserve_repairing_status {
-            self.transition_postprocessing_status(job_id, JobStatus::Verifying, Some("verifying"));
-        } else {
-            info!(
-                job_id = job_id.0,
-                "rerunning PAR2 analysis while preserving restored repair slot"
-            );
+    ) -> Option<Result<par2_rs::Par2RepairOutcome, String>> {
+        let starting = !self.par2_work_in_flight.contains_key(&job_id)
+            && !self.par2_work_results.contains_key(&job_id);
+        if starting {
+            if !preserve_repairing_status {
+                self.transition_postprocessing_status(
+                    job_id,
+                    JobStatus::Verifying,
+                    Some("verifying"),
+                );
+            } else {
+                info!(
+                    job_id = job_id.0,
+                    "rerunning PAR2 analysis while preserving restored repair slot"
+                );
+            }
+            self.emit_job_verification_started(job_id);
+            let _ = self.event_tx.send(PipelineEvent::VerificationStarted {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+            });
+            self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
+            info!(job_id = job_id.0, "par2 damaged-path analysis started");
         }
-        self.emit_job_verification_started(job_id);
-        let _ = self.event_tx.send(PipelineEvent::VerificationStarted {
-            file_id: NzbFileId {
-                job_id,
-                file_index: 0,
-            },
-        });
 
-        self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
-        info!(job_id = job_id.0, "par2 damaged-path analysis started");
-
-        let outcome_result = self
+        let Some(outcome_result) = self
             .run_par2_repairer(job_id, par2_set, working_dir, false)
-            .await;
+            .await
+        else {
+            return None;
+        };
 
         self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
 
-        let mut outcome = outcome_result?;
+        let mut outcome = match outcome_result {
+            Ok(outcome) => outcome,
+            Err(error) => return Some(Err(error)),
+        };
 
         let (skipped_blocks, retained_suspect_blocks) =
             self.apply_eager_delete_exclusions(job_id, &mut outcome.verification);
@@ -2661,7 +2751,7 @@ impl Pipeline {
             passed: !par2_verification_needs_repair(&outcome.verification),
         });
 
-        Ok(outcome)
+        Some(Ok(outcome))
     }
 
     async fn verify_par2_with_placement(
@@ -2671,8 +2761,10 @@ impl Pipeline {
         working_dir: std::path::PathBuf,
         preserve_repairing_status: bool,
         emit_events: bool,
-    ) -> Result<(par2_rs::VerificationResult, par2_rs::PlacementPlan), String> {
-        if emit_events {
+    ) -> Option<Result<(par2_rs::VerificationResult, par2_rs::PlacementPlan), String>> {
+        let starting = !self.par2_work_in_flight.contains_key(&job_id)
+            && !self.par2_work_results.contains_key(&job_id);
+        if emit_events && starting {
             if !preserve_repairing_status {
                 self.transition_postprocessing_status(
                     job_id,
@@ -2694,12 +2786,16 @@ impl Pipeline {
             });
         }
 
-        let (mut verification, placement_plan) = self
+        let result = self
             .run_par2_placement_pass(job_id, par2_set, working_dir, Par2PassScope::WholeSet)
             .await?;
+        let (mut verification, placement_plan) = match result {
+            Ok(result) => result,
+            Err(error) => return Some(Err(error)),
+        };
         Self::log_placement_plan(job_id, &placement_plan);
         self.settle_par2_pass_result(job_id, &mut verification, emit_events);
-        Ok((verification, placement_plan))
+        Some(Ok((verification, placement_plan)))
     }
 
     /// The whole set, read where its files now sit, once something moved them
@@ -2718,8 +2814,8 @@ impl Pipeline {
         par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
         extra_file_ids: Vec<par2_rs::FileId>,
-    ) -> Result<par2_rs::VerificationResult, String> {
-        let (mut verification, _) = self
+    ) -> Option<Result<par2_rs::VerificationResult, String>> {
+        let result = self
             .run_par2_placement_pass(
                 job_id,
                 par2_set,
@@ -2727,8 +2823,12 @@ impl Pipeline {
                 Par2PassScope::WholeSetAtCanonicalNames(extra_file_ids),
             )
             .await?;
+        let (mut verification, _) = match result {
+            Ok(result) => result,
+            Err(error) => return Some(Err(error)),
+        };
         self.settle_par2_pass_result(job_id, &mut verification, false);
-        Ok(verification)
+        Some(Ok(verification))
     }
 
     /// The post-repair authoritative pass, reading only the files the repair
@@ -2746,23 +2846,27 @@ impl Pipeline {
         par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
         pre_repair: &par2_rs::VerificationResult,
-    ) -> Result<(par2_rs::VerificationResult, par2_rs::PlacementPlan), String> {
+    ) -> Option<Result<(par2_rs::VerificationResult, par2_rs::PlacementPlan), String>> {
         let write_set = par2_repair_write_set(pre_repair);
+        let starting = !self.par2_work_in_flight.contains_key(&job_id)
+            && !self.par2_work_results.contains_key(&job_id);
         #[cfg(test)]
-        {
+        if starting {
             self.par2_post_repair_read_splits.push((
                 pre_repair.files.len().saturating_sub(write_set.len()),
                 write_set.len(),
             ));
         }
-        info!(
-            job_id = job_id.0,
-            carried = pre_repair.files.len().saturating_sub(write_set.len()),
-            rewritten = write_set.len(),
-            "post-repair PAR2 verification reads only what the repair rewrote"
-        );
+        if starting {
+            info!(
+                job_id = job_id.0,
+                carried = pre_repair.files.len().saturating_sub(write_set.len()),
+                rewritten = write_set.len(),
+                "post-repair PAR2 verification reads only what the repair rewrote"
+            );
+        }
 
-        let (fresh, _) = self
+        let result = self
             .run_par2_placement_pass(
                 job_id,
                 Arc::clone(&par2_set),
@@ -2770,6 +2874,10 @@ impl Pipeline {
                 Par2PassScope::Selected(write_set),
             )
             .await?;
+        let (fresh, _) = match result {
+            Ok(result) => result,
+            Err(error) => return Some(Err(error)),
+        };
 
         // The carried entries are the pre-repair pass's, verbatim: same status,
         // same filename, same `valid_slices`. Everything downstream —
@@ -2792,7 +2900,7 @@ impl Pipeline {
         self.settle_par2_pass_result(job_id, &mut verification, false);
         let placement_plan = placement_plan_from_verification(&verification);
         Self::log_placement_plan(job_id, &placement_plan);
-        Ok((verification, placement_plan))
+        Some(Ok((verification, placement_plan)))
     }
 
     /// Everything an authoritative pass does with its raw result before a
@@ -2848,7 +2956,28 @@ impl Pipeline {
         par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
         scope: Par2PassScope,
-    ) -> Result<(par2_rs::VerificationResult, par2_rs::PlacementPlan), String> {
+    ) -> Option<Result<(par2_rs::VerificationResult, par2_rs::PlacementPlan), String>> {
+        let kind = Par2WorkKind::PlacementVerify {
+            recovery_set_id: par2_set.recovery_set_id,
+            scope: scope.work_scope(),
+        };
+        if self
+            .par2_work_in_flight
+            .get(&job_id)
+            .is_some_and(|in_flight| in_flight.kind == kind)
+            && let Some(result) = self.par2_work_results.remove(&job_id)
+        {
+            let Par2WorkResult::PlacementVerification(result) = result else {
+                self.par2_work_results.insert(job_id, result);
+                return None;
+            };
+            self.par2_work_in_flight.remove(&job_id);
+            self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
+            return Some(result);
+        }
+        if self.par2_work_in_flight.contains_key(&job_id) {
+            return None;
+        }
         #[cfg(test)]
         {
             // Counted by what the pass reads, not by how it resolves names: both
@@ -2872,7 +3001,13 @@ impl Pipeline {
         // demoted set's materialized volumes — keeps reading through
         // `PlacementFileAccess` exactly as before.
         let direct = self.direct_par2_overlay(job_id);
-        let verify_result = tokio::task::spawn_blocking(move || {
+        let done_tx = self.par2_work_done_tx.clone();
+        self.next_par2_work_id = self.next_par2_work_id.wrapping_add(1);
+        let work_id = self.next_par2_work_id;
+        self.par2_work_in_flight
+            .insert(job_id, Par2WorkInFlight { work_id, kind });
+        tokio::spawn(async move {
+            let verify_result = tokio::task::spawn_blocking(move || {
             pp_pool.install(move || {
                 // The scanning shape observes placement; the other two assert
                 // it. `scan_placement` is not the cheap half of this pass — it
@@ -2981,16 +3116,23 @@ impl Pipeline {
                 );
                 Ok((verification, plan))
             })
-        })
-        .await;
-
-        self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
-
-        match verify_result {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(message)) => Err(message),
-            Err(error) => Err(format!("verification task panicked: {error}")),
-        }
+            })
+            .await;
+            let result = match verify_result {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(message)) => Err(message),
+                Err(error) => Err(format!("verification task panicked: {error}")),
+            };
+            let _ = done_tx
+                .send(Par2WorkDone {
+                    job_id,
+                    work_id,
+                    kind,
+                    result: Par2WorkResult::PlacementVerification(result),
+                })
+                .await;
+        });
+        None
     }
 
     /// What [`Pipeline::apply_direct_damage_adjustments`] moved, so each caller
@@ -4833,37 +4975,153 @@ impl Pipeline {
         outcome: par2_rs::Par2RepairOutcome,
         has_crc_failures: bool,
     ) {
+        self.drive_par2_repair_finish(
+            job_id,
+            par2_set,
+            working_dir,
+            pre_repair,
+            outcome,
+            has_crc_failures,
+            Par2RepairFinishStage::VerifyRepaired,
+        )
+        .await;
+    }
+
+    async fn resume_par2_repair_finish(&mut self, job_id: JobId) {
+        let Some(context) = self.par2_repair_finish.remove(&job_id) else {
+            return;
+        };
+        let Par2RepairFinishContext {
+            par2_set,
+            working_dir,
+            pre_repair,
+            outcome,
+            has_crc_failures,
+            stage,
+        } = context;
+        self.drive_par2_repair_finish(
+            job_id,
+            par2_set,
+            working_dir,
+            &pre_repair,
+            outcome,
+            has_crc_failures,
+            stage,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_par2_repair_finish(
+        &mut self,
+        job_id: JobId,
+        par2_set: Arc<par2_rs::Par2FileSet>,
+        working_dir: std::path::PathBuf,
+        pre_repair: &par2_rs::VerificationResult,
+        outcome: par2_rs::Par2RepairOutcome,
+        has_crc_failures: bool,
+        stage: Par2RepairFinishStage,
+    ) {
         // Covers the whole tail including every failure exit below, which the
         // per-stage stamps cannot: a repair that is rejected still spent the
         // time it spent.
         let _finish_scope = crate::runtime::perf_probe::scope("par2_repair.finish");
         let mut stage_start = std::time::Instant::now();
         let slices_repaired = par2_repair_slices_repaired(pre_repair);
-        info!(
-            job_id = job_id.0,
-            status = ?outcome.status,
-            slices_repaired,
-            bytes_copied = outcome.bytes_copied,
-            bytes_reconstructed = outcome.bytes_reconstructed,
-            files_complete = outcome.files_complete,
-            files_renamed = outcome.files_renamed,
-            files_damaged = outcome.files_damaged,
-            files_missing = outcome.files_missing,
-            "PAR2 repair wrote its outputs — verifying what was installed"
-        );
+        let starting = !self.par2_work_in_flight.contains_key(&job_id)
+            && !self.par2_work_results.contains_key(&job_id);
+        if starting && matches!(stage, Par2RepairFinishStage::VerifyRepaired) {
+            info!(
+                job_id = job_id.0,
+                status = ?outcome.status,
+                slices_repaired,
+                bytes_copied = outcome.bytes_copied,
+                bytes_reconstructed = outcome.bytes_reconstructed,
+                files_complete = outcome.files_complete,
+                files_renamed = outcome.files_renamed,
+                files_damaged = outcome.files_damaged,
+                files_missing = outcome.files_missing,
+                "PAR2 repair wrote its outputs — verifying what was installed"
+            );
+            self.emit_job_verification_started(job_id);
+        }
 
-        self.emit_job_verification_started(job_id);
-        let (mut post_repair_verification, post_repair_placement_plan) = match self
-            .verify_repaired_par2_files_with_placement(
-                job_id,
-                Arc::clone(&par2_set),
-                working_dir.clone(),
-                pre_repair,
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(message) => return self.fail_par2_repair(job_id, message),
+        let (mut post_repair_verification, post_repair_placement_plan) = match stage {
+            Par2RepairFinishStage::VerifyRepaired => {
+                match self
+                    .verify_repaired_par2_files_with_placement(
+                        job_id,
+                        Arc::clone(&par2_set),
+                        working_dir.clone(),
+                        pre_repair,
+                    )
+                    .await
+                {
+                    Some(Ok(result)) => (result.0, Some(result.1)),
+                    Some(Err(message)) => return self.fail_par2_repair(job_id, message),
+                    None => {
+                        self.par2_repair_finish.insert(
+                            job_id,
+                            Par2RepairFinishContext {
+                                par2_set,
+                                working_dir,
+                                pre_repair: pre_repair.clone(),
+                                outcome,
+                                has_crc_failures,
+                                stage: Par2RepairFinishStage::VerifyRepaired,
+                            },
+                        );
+                        return;
+                    }
+                }
+            }
+            Par2RepairFinishStage::VerifyCanonical {
+                post_repair_verification,
+                extra_file_ids,
+            } => match self
+                .verify_par2_set_at_canonical_names(
+                    job_id,
+                    Arc::clone(&par2_set),
+                    working_dir.clone(),
+                    extra_file_ids.clone(),
+                )
+                .await
+            {
+                Some(Ok(settled)) => {
+                    if par2_verification_needs_repair(&settled) {
+                        let message = format!(
+                            "PAR2 repair completed but verification after deobfuscation and \
+                             placement found {} damaged slices or file placements remaining",
+                            settled.total_missing_blocks
+                        );
+                        return self.fail_par2_repair(job_id, message);
+                    }
+                    stage_start = note_par2_repair_stage(
+                        job_id,
+                        "par2_repair.finish.verify_after_placement",
+                        stage_start,
+                    );
+                    (settled, None)
+                }
+                Some(Err(message)) => return self.fail_par2_repair(job_id, message),
+                None => {
+                    self.par2_repair_finish.insert(
+                        job_id,
+                        Par2RepairFinishContext {
+                            par2_set,
+                            working_dir,
+                            pre_repair: pre_repair.clone(),
+                            outcome,
+                            has_crc_failures,
+                            stage: Par2RepairFinishStage::VerifyCanonical {
+                                post_repair_verification,
+                                extra_file_ids,
+                            },
+                        },
+                    );
+                    return;
+                }
+            },
         };
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.verify_repaired", stage_start);
@@ -4874,6 +5132,7 @@ impl Pipeline {
 
         // Rename obfuscated files using PAR2 metadata (16KB hash matching).
         // Must happen after repair and before extraction retry/finalize.
+        if let Some(post_repair_placement_plan) = post_repair_placement_plan {
         let deobfuscation = self.try_deobfuscate_files_with_par2(job_id).await;
         stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.deobfuscate", stage_start);
         let deobfuscation_canonical_file_ids = deobfuscation
@@ -4933,12 +5192,29 @@ impl Pipeline {
                     job_id,
                     Arc::clone(&par2_set),
                     working_dir.clone(),
-                    deobfuscation_canonical_file_ids,
+                    deobfuscation_canonical_file_ids.clone(),
                 )
                 .await
             {
-                Ok(result) => result,
-                Err(message) => return self.fail_par2_repair(job_id, message),
+                Some(Ok(result)) => result,
+                Some(Err(message)) => return self.fail_par2_repair(job_id, message),
+                None => {
+                    self.par2_repair_finish.insert(
+                        job_id,
+                        Par2RepairFinishContext {
+                            par2_set,
+                            working_dir,
+                            pre_repair: pre_repair.clone(),
+                            outcome,
+                            has_crc_failures,
+                            stage: Par2RepairFinishStage::VerifyCanonical {
+                                post_repair_verification,
+                                extra_file_ids: deobfuscation_canonical_file_ids,
+                            },
+                        },
+                    );
+                    return;
+                }
             };
             if par2_verification_needs_repair(&settled) {
                 let msg = format!(
@@ -4954,6 +5230,7 @@ impl Pipeline {
                 "par2_repair.finish.verify_after_placement",
                 stage_start,
             );
+        }
         }
         self.retry_par2_authoritative_identity(job_id).await;
         stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.identity", stage_start);
@@ -6200,6 +6477,14 @@ impl Pipeline {
     /// CRC failures occur, recovery files are promoted for download and repair
     /// runs from disk using `verify_all` + `plan_repair` + `execute_repair`.
     pub(crate) async fn check_job_completion(&mut self, job_id: JobId) {
+        if self.direct_repair_continuations.contains_key(&job_id) {
+            self.resume_direct_repair(job_id).await;
+            return;
+        }
+        if self.par2_repair_finish.contains_key(&job_id) {
+            self.resume_par2_repair_finish(job_id).await;
+            return;
+        }
         let current_status = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
@@ -6994,6 +7279,12 @@ impl Pipeline {
                             self.schedule_job_completion_check(job_id);
                             return;
                         }
+                        DirectPar2Resolution::Pending => {
+                            // The direct post-repair verification continues on
+                            // the post-processing pool. Its completion event
+                            // re-arms this job without blocking the queue actor.
+                            return;
+                        }
                         DirectPar2Resolution::Clean => run_par2_repairer = false,
                         DirectPar2Resolution::Deferred => {
                             // The same wait the analysis below performs when it
@@ -7041,14 +7332,17 @@ impl Pipeline {
                         )
                         .await
                     {
-                        Ok(outcome) => outcome,
-                        Err(_) if self.shared_state.is_job_cancellation_requested(job_id) => {
+                        Some(Ok(outcome)) => outcome,
+                        Some(Err(_))
+                            if self.shared_state.is_job_cancellation_requested(job_id) =>
+                        {
                             return;
                         }
-                        Err(message) => {
+                        Some(Err(message)) => {
                             self.finish_par2_set_failure(job_id, set_id, message).await;
                             return;
                         }
+                        None => return,
                     };
                     let verification = &repair_analysis.verification;
                     let damaged = verification.total_missing_blocks;
@@ -7122,11 +7416,12 @@ impl Pipeline {
                             )
                             .await
                         {
-                            Ok(result) => result,
-                            Err(message) => {
+                            Some(Ok(result)) => result,
+                            Some(Err(message)) => {
                                 self.finish_par2_set_failure(job_id, set_id, message).await;
                                 return;
                             }
+                            None => return,
                         };
                         // The scan is a second read of a directory the analysis
                         // described a moment ago, and it is the one this arm
@@ -7412,7 +7707,7 @@ impl Pipeline {
                         .run_par2_repairer(job_id, Arc::clone(&par2_set), working_dir.clone(), true)
                         .await
                     {
-                        Ok(outcome) => {
+                        Some(Ok(outcome)) => {
                             self.finish_par2_repair(
                                 job_id,
                                 Arc::clone(&par2_set),
@@ -7424,10 +7719,11 @@ impl Pipeline {
                             .await;
                             return;
                         }
-                        Err(error_msg) => {
+                        Some(Err(error_msg)) => {
                             self.fail_par2_repair(job_id, error_msg);
                             return;
                         }
+                        None => return,
                     }
                 }
 
@@ -7509,11 +7805,12 @@ impl Pipeline {
                     )
                     .await
                 {
-                    Ok(result) => result,
-                    Err(message) => {
+                    Some(Ok(result)) => result,
+                    Some(Err(message)) => {
                         self.finish_par2_set_failure(job_id, set_id, message).await;
                         return;
                     }
+                    None => return,
                 };
                 // Damage on a virtual volume has nothing to repair *into* — the
                 // bytes live in a member's partial and an envelope, and a
@@ -7539,6 +7836,7 @@ impl Pipeline {
                         self.schedule_job_completion_check(job_id);
                         return;
                     }
+                    DirectDamageResolution::Pending => return,
                     DirectDamageResolution::Deferred => {
                         // Damage the merged recovery cannot cover but the
                         // recovery *set* can. The sets keep their outputs and
@@ -7719,11 +8017,12 @@ impl Pipeline {
                         )
                         .await
                     {
-                        Ok(outcome) => outcome,
-                        Err(message) => {
+                        Some(Ok(outcome)) => outcome,
+                        Some(Err(message)) => {
                             self.finish_par2_set_failure(job_id, set_id, message).await;
                             return;
                         }
+                        None => return,
                     };
                     let repairer_damaged = repair_preview.verification.total_missing_blocks;
                     let repairer_recovery_now = repair_preview.recovery_blocks_available;
@@ -7826,7 +8125,7 @@ impl Pipeline {
                         .run_par2_repairer(job_id, Arc::clone(&par2_set), working_dir.clone(), true)
                         .await
                     {
-                        Ok(outcome) => {
+                        Some(Ok(outcome)) => {
                             self.finish_par2_repair(
                                 job_id,
                                 Arc::clone(&par2_set),
@@ -7838,10 +8137,11 @@ impl Pipeline {
                             .await;
                             return;
                         }
-                        Err(error_msg) => {
+                        Some(Err(error_msg)) => {
                             self.fail_par2_repair(job_id, error_msg);
                             return;
                         }
+                        None => return,
                     }
                 }
             } else {

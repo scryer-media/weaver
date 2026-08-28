@@ -94,6 +94,7 @@ impl Pipeline {
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
         let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
             mpsc::channel(32);
+        let (par2_work_done_tx, par2_work_done_rx) = mpsc::channel(32);
         let post_processing_settings = db.post_processing_settings().unwrap_or_else(|error| {
             warn!(error = %error, "failed to load post-processing settings; using disabled defaults");
             crate::post_processing::model::PostProcessingSettings::default()
@@ -309,6 +310,14 @@ impl Pipeline {
             last_no_eligible_server_warn: None,
             last_body_fetch_failure_log_at: None,
             par2_cancellations: HashMap::new(),
+            next_par2_work_id: 0,
+            par2_work_in_flight: HashMap::new(),
+            par2_work_results: HashMap::new(),
+            par2_repair_finish: HashMap::new(),
+            direct_repair_continuations: HashMap::new(),
+            direct_repair_results: HashMap::new(),
+            par2_work_done_tx,
+            par2_work_done_rx,
             inflight_moves: HashSet::new(),
             reserved_complete_destinations: HashMap::new(),
             failed_extractions: HashMap::new(),
@@ -968,6 +977,9 @@ impl Pipeline {
                     }
                     Some(done) = self.move_done_rx.recv() => {
                         self.handle_move_to_complete_done(done).await;
+                    }
+                    Some(done) = self.par2_work_done_rx.recv() => {
+                        self.handle_par2_work_done(done);
                     }
                     Some(event) = self.terminal_post_processing_done_rx.recv() => {
                         match event {

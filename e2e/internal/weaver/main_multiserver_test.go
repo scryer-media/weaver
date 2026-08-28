@@ -63,6 +63,13 @@ func TestScenarioUsesExclusiveNntpState(t *testing.T) {
 	if !scenarioUsesExclusiveNntpState(&Scenario{BackupUnavailableUntilFileComplete: "payload.mkv"}) {
 		t.Fatal("backup availability gate should force exclusive NNTP state")
 	}
+	if !scenarioUsesExclusiveNntpState(&Scenario{
+		RuntimeAssertions: &ScenarioRuntimeAssertions{
+			QueueLiveness: &ScenarioQueueLivenessAssertion{ProbeSlug: "deflate-single"},
+		},
+	}) {
+		t.Fatal("queue-liveness assertion should force exclusive execution")
+	}
 	if scenarioUsesExclusiveNntpState(&Scenario{}) {
 		t.Fatal("plain scenario should not force exclusive NNTP state")
 	}

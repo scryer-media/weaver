@@ -77,6 +77,7 @@ type ScenarioRuntimeAssertions struct {
 	FileIdentityRewrite *ScenarioFileIdentityRewriteAssertion `json:"fileIdentityRewrite,omitempty"`
 	Par2CleanSettlement *ScenarioPar2CleanSettlementAssertion `json:"par2CleanSettlement,omitempty"`
 	DirectStore         *ScenarioDirectStoreAssertion         `json:"directStore,omitempty"`
+	QueueLiveness       *ScenarioQueueLivenessAssertion       `json:"queueLiveness,omitempty"`
 }
 
 type ScenarioFileIdentityRewriteAssertion struct {
@@ -100,6 +101,13 @@ type ScenarioDirectStoreAssertion struct {
 	ForbidVolumeRefetch              bool   `json:"forbidVolumeRefetch"`
 }
 
+// ScenarioQueueLivenessAssertion holds an unrelated fixture which must finish
+// while this scenario's deliberately delayed post-repair PAR2 verification is
+// still running.
+type ScenarioQueueLivenessAssertion struct {
+	ProbeSlug string `json:"probeSlug"`
+}
+
 func (s *Scenario) fileIdentityRewriteAssertion() *ScenarioFileIdentityRewriteAssertion {
 	if s == nil || s.RuntimeAssertions == nil {
 		return nil
@@ -119,6 +127,13 @@ func (s *Scenario) directStoreAssertion() *ScenarioDirectStoreAssertion {
 		return nil
 	}
 	return s.RuntimeAssertions.DirectStore
+}
+
+func (s *Scenario) queueLivenessAssertion() *ScenarioQueueLivenessAssertion {
+	if s == nil || s.RuntimeAssertions == nil {
+		return nil
+	}
+	return s.RuntimeAssertions.QueueLiveness
 }
 
 type runtimePortState struct {
@@ -1070,6 +1085,7 @@ var canonicalFixtureSlugs = []string{
 	"direct-store-multi-member",
 	"direct-store-multivolume",
 	"direct-store-par2-repair",
+	"direct-store-post-repair-queue-liveness",
 	"direct-store-rar4",
 	"direct-store-single",
 	"empty-rar",
@@ -2002,7 +2018,8 @@ func segmentDeleteNeedles(scenario *Scenario) []string {
 
 func scenarioUsesExclusiveNntpState(scenario *Scenario) bool {
 	return scenario != nil && (strings.TrimSpace(scenario.PrimaryChaosConfig) != "" ||
-		strings.TrimSpace(scenario.BackupUnavailableUntilFileComplete) != "")
+		strings.TrimSpace(scenario.BackupUnavailableUntilFileComplete) != "" ||
+		scenario.queueLivenessAssertion() != nil)
 }
 
 func applyBackupFixtureOverridesForSlugs(slugs []string) error {
@@ -3162,6 +3179,48 @@ func functionalRegularBatches(jobs []testJob, batchSize int) [][]int {
 	return batches
 }
 
+func functionalQueueLivenessProbeIndex(jobs []testJob, blockerIndex int) (int, error) {
+	if blockerIndex < 0 || blockerIndex >= len(jobs) {
+		return -1, fmt.Errorf("queue-liveness blocker index %d is out of range", blockerIndex)
+	}
+	if jobs[blockerIndex].scenario == nil {
+		return -1, fmt.Errorf("queue-liveness fixture %q has no scenario", jobs[blockerIndex].slug)
+	}
+	assertion := jobs[blockerIndex].scenario.queueLivenessAssertion()
+	if assertion == nil {
+		return -1, fmt.Errorf("fixture %q has no queue-liveness assertion", jobs[blockerIndex].slug)
+	}
+	probeSlug := strings.TrimSpace(assertion.ProbeSlug)
+	if probeSlug == "" {
+		return -1, fmt.Errorf("fixture %q has an empty queue-liveness probe slug", jobs[blockerIndex].slug)
+	}
+
+	probeIndex := -1
+	for i := range jobs {
+		if jobs[i].slug != probeSlug {
+			continue
+		}
+		if i == blockerIndex {
+			return -1, fmt.Errorf("queue-liveness fixture %q cannot probe itself", probeSlug)
+		}
+		if probeIndex >= 0 {
+			return -1, fmt.Errorf("queue-liveness probe %q appears more than once", probeSlug)
+		}
+		probeIndex = i
+	}
+	if probeIndex < 0 {
+		return -1, fmt.Errorf("queue-liveness probe %q is not in the functional corpus", probeSlug)
+	}
+	if jobs[probeIndex].status != "queued_regular" {
+		return -1, fmt.Errorf(
+			"queue-liveness probe %q must be a regular fixture, got %q",
+			probeSlug,
+			jobs[probeIndex].status,
+		)
+	}
+	return probeIndex, nil
+}
+
 func functionalStatusPollIndexes(jobs []testJob, fastRewritePolling bool, cursor *int) []int {
 	pending := make([]int, 0, len(jobs))
 	for i := range jobs {
@@ -3243,7 +3302,11 @@ func waitForActiveFileComplete(dbPath string, jobID int, filename string, timeou
 	}
 }
 
-func runExclusiveFunctionalJob(weaverURL, dbPath string, job *testJob) {
+func runExclusiveFunctionalJob(
+	weaverURL, dbPath string,
+	job *testJob,
+	queueLivenessProbe *testJob,
+) {
 	config := strings.TrimSpace(job.scenario.PrimaryChaosConfig)
 	backupGateFilename := strings.TrimSpace(job.scenario.BackupUnavailableUntilFileComplete)
 	var releaseBackupGate func() error
@@ -3321,6 +3384,19 @@ func runExclusiveFunctionalJob(weaverURL, dbPath string, job *testJob) {
 		}
 		log.Printf("  %s: backup NNTP released after %s completed", job.slug, backupGateFilename)
 	}
+	if assertion := job.scenario.queueLivenessAssertion(); assertion != nil {
+		if delay, enabled := configuredDirectPostRepairVerificationDelay(); enabled {
+			runDirectPostRepairQueueLiveness(
+				weaverURL,
+				dbPath,
+				job,
+				queueLivenessProbe,
+				assertion,
+				delay,
+			)
+			return
+		}
+	}
 
 	deadline := time.Now().Add(180 * time.Second)
 	firstPoll := true
@@ -3366,6 +3442,128 @@ func runExclusiveFunctionalJob(weaverURL, dbPath string, job *testJob) {
 	job.status = "timeout"
 	job.errMsg = "exclusive scenario timed out after 180s"
 	log.Printf("  %s: TIMEOUT after 180s", job.slug)
+}
+
+const directPostRepairVerificationHook = "direct_store.post_repair_verify"
+
+func configuredDirectPostRepairVerificationDelay() (time.Duration, bool) {
+	raw := strings.TrimSpace(os.Getenv("WEAVER_E2E_DELAY"))
+	name, millis, ok := strings.Cut(raw, "=")
+	if !ok || strings.TrimSpace(name) != directPostRepairVerificationHook {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(strings.TrimSpace(millis), 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0, false
+	}
+	return time.Duration(parsed) * time.Millisecond, true
+}
+
+func waitForJobEvents(dbPath string, jobID int, required []string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		events, err := jobEventKinds(dbPath, jobID)
+		if err == nil && len(missingJobEvents(events, required)) == 0 {
+			return nil
+		}
+		if err != nil && !isTransientSQLiteBusy(err) {
+			return fmt.Errorf("load job events for job %d: %w", jobID, err)
+		}
+		mustSleepWithSuspendDetection(50*time.Millisecond, fmt.Sprintf("job %d event gate", jobID))
+	}
+	return fmt.Errorf("job %d did not emit required event(s) %s within %s", jobID, strings.Join(required, ", "), timeout)
+}
+
+func waitForLocalWeaverDelayHook(hook string, timeout time.Duration) error {
+	needle := fmt.Sprintf("hook=\"%s\"", hook)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if logContains(localWeaverLogPath(), needle) {
+			return nil
+		}
+		mustSleepWithSuspendDetection(50*time.Millisecond, fmt.Sprintf("%s delay hook", hook))
+	}
+	return fmt.Errorf("did not observe %s delay hook within %s", hook, timeout)
+}
+
+func runDirectPostRepairQueueLiveness(
+	weaverURL, dbPath string,
+	blocker *testJob,
+	probe *testJob,
+	assertion *ScenarioQueueLivenessAssertion,
+	verificationDelay time.Duration,
+) {
+	if verificationDelay < 5*time.Second {
+		blocker.status = "setup_error"
+		blocker.errMsg = fmt.Sprintf("%s delay must be at least 5s, got %s", directPostRepairVerificationHook, verificationDelay)
+		return
+	}
+	if err := waitForJobEvents(dbPath, blocker.jobID, []string{"RepairComplete"}, 90*time.Second); err != nil {
+		blocker.status = "timeout"
+		blocker.errMsg = err.Error()
+		return
+	}
+	if err := waitForLocalWeaverDelayHook(directPostRepairVerificationHook, 30*time.Second); err != nil {
+		blocker.status = "timeout"
+		blocker.errMsg = err.Error()
+		return
+	}
+
+	probeSlug := strings.TrimSpace(assertion.ProbeSlug)
+	if probe == nil || probe.slug != probeSlug || probe.scenario == nil {
+		blocker.status = "setup_error"
+		blocker.errMsg = fmt.Sprintf("queue-liveness probe %q is not a canonical queued fixture", probeSlug)
+		return
+	}
+	probe.status = ""
+	probeID, err := submitOneNZB(weaverURL, probe.scenario)
+	if err != nil {
+		probe.status = "submit_error"
+		probe.errMsg = err.Error()
+		blocker.status = "submit_error"
+		blocker.errMsg = fmt.Sprintf("submit queue-liveness probe %q: %v", probeSlug, err)
+		return
+	}
+	probe.jobID = probeID
+	log.Printf("  %s: submitted queue-liveness probe %s as job=%d", blocker.slug, probeSlug, probeID)
+
+	// Leave a little margin for observing the terminal façade update. The
+	// verifier remains blocked for the full configured delay, so a completion
+	// here proves the scheduler actor continued to service another job.
+	probeDeadline := time.Now().Add(verificationDelay - 2*time.Second)
+	for time.Now().Before(probeDeadline) {
+		snapshot, err := fetchFacadeItemSnapshot(weaverURL, probeID)
+		if err == nil && snapshot.Found && facadeTerminalStatus(snapshot.Status) {
+			finalizeTestJobFromSnapshot(probe, dbPath, snapshot, " during queue-liveness polling")
+			if probe.status != "COMPLETE" {
+				blocker.status = probe.status
+				blocker.errMsg = fmt.Sprintf("queue-liveness probe %s ended %s: %s", probeSlug, probe.status, probe.errMsg)
+				return
+			}
+			break
+		}
+		mustSleepWithSuspendDetection(100*time.Millisecond, "queue-liveness probe polling")
+	}
+	if probe.status != "COMPLETE" {
+		probe.status = "timeout"
+		probe.errMsg = fmt.Sprintf("did not complete before %s elapsed", verificationDelay)
+		blocker.status = "timeout"
+		blocker.errMsg = fmt.Sprintf("queue-liveness probe %s did not complete before %s elapsed", probeSlug, verificationDelay)
+		return
+	}
+
+	deadline := time.Now().Add(180 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot, err := fetchFacadeItemSnapshot(weaverURL, blocker.jobID)
+		if err == nil && snapshot.Found && facadeTerminalStatus(snapshot.Status) {
+			finalizeTestJobFromSnapshot(blocker, dbPath, snapshot, " after queue-liveness probe")
+			log.Printf("  %s: %s after queue-liveness probe", blocker.slug, blocker.status)
+			return
+		}
+		mustSleepWithSuspendDetection(250*time.Millisecond, "queue-liveness blocker polling")
+	}
+	blocker.status = "timeout"
+	blocker.errMsg = "blocker did not complete after queue-liveness probe"
 }
 
 func cmdTest(targets []string) {
@@ -3423,6 +3621,30 @@ func runTests(slugs []string) {
 	}
 
 	dbPath := localWeaverDBPath()
+	// The queue-liveness fixture must consume the one-shot delay before normal
+	// functional batches can run. It is otherwise indistinguishable from a
+	// normal direct-store repair fixture, so keep it in the functional corpus
+	// but execute its assertion first and in isolation.
+	for i := range jobs {
+		if jobs[i].status != "queued_exclusive" || jobs[i].scenario.queueLivenessAssertion() == nil {
+			continue
+		}
+		log.Printf("running exclusive queue-liveness scenario %s...", jobs[i].slug)
+		probeIndex, err := functionalQueueLivenessProbeIndex(jobs, i)
+		if err != nil {
+			jobs[i].status = "setup_error"
+			jobs[i].errMsg = err.Error()
+		} else {
+			runExclusiveFunctionalJob(weaverURL, dbPath, &jobs[i], &jobs[probeIndex])
+		}
+		emitProgressEvent(progressEvent{
+			Kind:    "phase_progress",
+			Current: countResolvedTestJobs(jobs),
+			Total:   len(jobs),
+			Status:  strings.ToLower(jobs[i].status),
+			Detail:  jobs[i].slug,
+		})
+	}
 	regularBatches := functionalRegularBatches(jobs, functionalRegularBatchSize)
 	weaverDiedMidRun := false
 	for batchNumber, batchIndexes := range regularBatches {
@@ -3682,7 +3904,7 @@ func runTests(slugs []string) {
 			continue
 		}
 		log.Printf("running exclusive NNTP scenario %s...", jobs[i].slug)
-		runExclusiveFunctionalJob(weaverURL, dbPath, &jobs[i])
+		runExclusiveFunctionalJob(weaverURL, dbPath, &jobs[i], nil)
 		emitProgressEvent(progressEvent{
 			Kind:    "phase_progress",
 			Current: countResolvedTestJobs(jobs),

@@ -2513,15 +2513,27 @@ async fn post_repair_verification_accepts_a_file_corrupted_after_the_pre_repair_
         .await
         .unwrap();
 
-    let (merged, plan) = pipeline
-        .verify_repaired_par2_files_with_placement(
-            job_id,
-            Arc::clone(&par2_set),
-            working_dir.clone(),
-            &pre_repair,
+    let (merged, plan) = loop {
+        if let Some(result) = pipeline
+            .verify_repaired_par2_files_with_placement(
+                job_id,
+                Arc::clone(&par2_set),
+                working_dir.clone(),
+                &pre_repair,
+            )
+            .await
+        {
+            break result.unwrap();
+        }
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pipeline.par2_work_done_rx.recv(),
         )
         .await
-        .unwrap();
+        .expect("the selective post-repair pass should finish")
+        .expect("the PAR2 work channel stays open");
+        pipeline.handle_par2_work_done(done);
+    };
 
     assert_eq!(
         pipeline.par2_post_repair_read_splits,
@@ -2607,15 +2619,27 @@ async fn post_repair_verification_reads_back_a_renamed_file_at_its_canonical_nam
         .await
         .unwrap();
 
-    let (merged, plan) = pipeline
-        .verify_repaired_par2_files_with_placement(
-            job_id,
-            Arc::clone(&par2_set),
-            working_dir.clone(),
-            &pre_repair,
+    let (merged, plan) = loop {
+        if let Some(result) = pipeline
+            .verify_repaired_par2_files_with_placement(
+                job_id,
+                Arc::clone(&par2_set),
+                working_dir.clone(),
+                &pre_repair,
+            )
+            .await
+        {
+            break result.unwrap();
+        }
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pipeline.par2_work_done_rx.recv(),
         )
         .await
-        .unwrap();
+        .expect("the selective post-repair pass should finish")
+        .expect("the PAR2 work channel stays open");
+        pipeline.handle_par2_work_done(done);
+    };
 
     assert_eq!(
         pipeline.par2_post_repair_read_splits,

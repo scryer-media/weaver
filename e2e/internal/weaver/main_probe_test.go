@@ -253,6 +253,78 @@ func TestFunctionalRegularBatchesExcludeExclusiveAndCapAtEight(t *testing.T) {
 	}
 }
 
+func TestQueueLivenessProbeOwnsCanonicalFixtureExecution(t *testing.T) {
+	blocker := &Scenario{
+		RuntimeAssertions: &ScenarioRuntimeAssertions{
+			QueueLiveness: &ScenarioQueueLivenessAssertion{ProbeSlug: "deflate-single"},
+		},
+	}
+	jobs := []testJob{
+		{slug: "queue-liveness", scenario: blocker, status: "queued_exclusive"},
+		{slug: "deflate-single", scenario: &Scenario{Slug: "deflate-single"}, status: "queued_regular"},
+		{slug: "another-fixture", scenario: &Scenario{Slug: "another-fixture"}, status: "queued_regular"},
+	}
+
+	probeIndex, err := functionalQueueLivenessProbeIndex(jobs, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probeIndex != 1 {
+		t.Fatalf("probe index = %d, want 1", probeIndex)
+	}
+
+	// The exclusive flow submitted and completed this canonical fixture. It
+	// must therefore be absent from the later regular batch instead of being
+	// submitted a second time and rejected as a duplicate.
+	jobs[probeIndex].jobID = 10001
+	jobs[probeIndex].status = "COMPLETE"
+	batches := functionalRegularBatches(jobs, functionalRegularBatchSize)
+	if len(batches) != 1 || !sameIntSlices(batches[0], []int{2}) {
+		t.Fatalf("regular batches = %v, want only fixture index 2", batches)
+	}
+	if got := countResolvedTestJobs(jobs); got != 1 {
+		t.Fatalf("resolved fixture count = %d, want the probe counted once", got)
+	}
+}
+
+func TestQueueLivenessProbeMustNameOneRegularCanonicalFixture(t *testing.T) {
+	blocker := &Scenario{
+		RuntimeAssertions: &ScenarioRuntimeAssertions{
+			QueueLiveness: &ScenarioQueueLivenessAssertion{ProbeSlug: "deflate-single"},
+		},
+	}
+	for _, tc := range []struct {
+		name string
+		jobs []testJob
+	}{
+		{
+			name: "missing",
+			jobs: []testJob{{slug: "queue-liveness", scenario: blocker, status: "queued_exclusive"}},
+		},
+		{
+			name: "exclusive probe",
+			jobs: []testJob{
+				{slug: "queue-liveness", scenario: blocker, status: "queued_exclusive"},
+				{slug: "deflate-single", scenario: &Scenario{}, status: "queued_exclusive"},
+			},
+		},
+		{
+			name: "duplicate",
+			jobs: []testJob{
+				{slug: "queue-liveness", scenario: blocker, status: "queued_exclusive"},
+				{slug: "deflate-single", scenario: &Scenario{}, status: "queued_regular"},
+				{slug: "deflate-single", scenario: &Scenario{}, status: "queued_regular"},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := functionalQueueLivenessProbeIndex(tc.jobs, 0); err == nil {
+				t.Fatal("expected invalid probe configuration to fail")
+			}
+		})
+	}
+}
+
 func TestFunctionalBatchActivationIsolatesPollingAndProgress(t *testing.T) {
 	jobs := make([]testJob, 10)
 	for i := range jobs {

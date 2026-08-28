@@ -106,6 +106,7 @@ var ScenarioOnly = map[string]string{
 	"multiserver-backup-par2-repair":          "stages par2-small-repair's archive and sidecars across two servers",
 	"multiserver-primary-corrupt-direct":      "stages single-mkv's payload; the damage is injected by the fake NNTP server",
 	"multiserver-primary-missing-direct":      "stages single-mkv's payload; articles are withheld at post time",
+	"direct-store-post-repair-queue-liveness": "stages the small direct-store PAR2 repair corpus for the queue-liveness flow",
 	"obfuscated-rar-retry-7z":                 "stages rar5-corrupted and single-7z under one obfuscated name",
 	"par2-direct-late-malformed-chain-rebind": "stages a PAR2-bound direct RAR set whose swapped tail pair demotes after routed coverage exists",
 	"par2-opaque-magic-rebind":                "stages obfuscated rar5-multivolume beside an extensionless PAR2 index",

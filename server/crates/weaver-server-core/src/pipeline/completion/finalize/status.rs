@@ -836,6 +836,11 @@ impl Pipeline {
         self.direct_store.clear_pending_materializations(job_id);
         self.par2_runtime.remove(&job_id);
         self.par2_cancellations.remove(&job_id);
+        self.par2_work_in_flight.remove(&job_id);
+        self.par2_work_results.remove(&job_id);
+        self.par2_repair_finish.remove(&job_id);
+        self.direct_repair_continuations.remove(&job_id);
+        self.direct_repair_results.remove(&job_id);
         self.shared_state.clear_job_cancellations(job_id);
         self.par2_verified.remove(&job_id);
         self.par2_joined_split_sets.remove(&job_id);

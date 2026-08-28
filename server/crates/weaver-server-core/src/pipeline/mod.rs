@@ -1164,6 +1164,117 @@ pub(super) struct Par2RuntimeState {
     pub(super) metadata_exhausted_warned: bool,
 }
 
+/// A PAR2 operation that is executing outside the scheduler actor.
+///
+/// The actor owns this state and only mutates a job after it receives the
+/// matching completion. `work_id` prevents a late worker from reviving a job
+/// that was cancelled, restarted, or reprocessed in the meantime.
+pub(super) struct Par2WorkInFlight {
+    pub(super) work_id: u64,
+    pub(super) kind: Par2WorkKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Par2WorkKind {
+    DirectVerify {
+        recovery_set_id: par2_rs::RecoverySetId,
+        post_repair: bool,
+    },
+    Repairer {
+        recovery_set_id: par2_rs::RecoverySetId,
+        repair: bool,
+    },
+    PlacementVerify {
+        recovery_set_id: par2_rs::RecoverySetId,
+        scope: Par2WorkScope,
+    },
+    DirectRepairCompute {
+        set_index: usize,
+    },
+    DirectRepairReadback {
+        set_index: usize,
+        volume_index: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Par2WorkScope {
+    WholeSet,
+    Selected,
+    WholeSetAtCanonicalNames,
+}
+
+pub(super) enum Par2WorkResult {
+    DirectVerification(DirectVerificationWorkOutput),
+    Repairer(Par2RepairerWorkOutput),
+    PlacementVerification(
+        Result<(par2_rs::VerificationResult, par2_rs::PlacementPlan), String>,
+    ),
+    DirectRepairCompute(
+        Result<direct_store::repair::DirectRepairOutcome, direct_store::repair::DirectRepairFailure>,
+    ),
+    DirectRepairReadback(
+        Result<Vec<direct_store::repair::RepairedSpan>, direct_store::repair::DirectRepairFailure>,
+    ),
+}
+
+pub(super) struct DirectVerificationWorkOutput {
+    pub(super) result: Result<par2_rs::VerificationResult, String>,
+    pub(super) session: Option<par2_rs::Par2RepairSession>,
+    pub(super) used_session: bool,
+}
+
+pub(super) struct Par2RepairerWorkOutput {
+    pub(super) result: Result<par2_rs::Par2RepairOutcome, String>,
+    pub(super) session: Option<par2_rs::Par2RepairSession>,
+    pub(super) session_newly_opened: bool,
+    pub(super) admitted_file_ids: Vec<NzbFileId>,
+    pub(super) retried_source_change: bool,
+    pub(super) clear_session: bool,
+}
+
+pub(super) struct Par2RepairFinishContext {
+    pub(super) par2_set: Arc<par2_rs::Par2FileSet>,
+    pub(super) working_dir: PathBuf,
+    pub(super) pre_repair: par2_rs::VerificationResult,
+    pub(super) outcome: par2_rs::Par2RepairOutcome,
+    pub(super) has_crc_failures: bool,
+    pub(super) stage: Par2RepairFinishStage,
+}
+
+pub(super) enum Par2RepairFinishStage {
+    VerifyRepaired,
+    VerifyCanonical {
+        post_repair_verification: par2_rs::VerificationResult,
+        extra_file_ids: Vec<par2_rs::FileId>,
+    },
+}
+
+pub(super) struct DirectRepairContinuation {
+    pub(super) set_index: usize,
+    pub(super) set_name: String,
+    pub(super) set_lengths: BTreeMap<u32, u64>,
+    pub(super) damaged: Vec<direct_store::repair::DamagedDirectVolume>,
+    pub(super) rewrite_bytes: u64,
+    pub(super) cipher_lead_in: bool,
+    pub(super) stage: DirectRepairContinuationStage,
+}
+
+pub(super) enum DirectRepairContinuationStage {
+    Compute,
+    Readback {
+        outcome: direct_store::repair::DirectRepairOutcome,
+        next_volume: usize,
+    },
+}
+
+pub(super) struct Par2WorkDone {
+    pub(super) job_id: JobId,
+    pub(super) work_id: u64,
+    pub(super) kind: Par2WorkKind,
+    pub(super) result: Par2WorkResult,
+}
+
 impl Par2RuntimeState {
     pub(super) fn served_set_id(&self) -> Option<par2_rs::RecoverySetId> {
         self.served
@@ -2055,6 +2166,26 @@ pub struct Pipeline {
         HashMap<JobId, tokio::sync::watch::Sender<bool>>,
     /// Cooperative cancellation tokens for PAR2 verification and repair work.
     pub(super) par2_cancellations: HashMap<JobId, par2_rs::CancellationToken>,
+    /// Monotonic identity for PAR2 tasks detached from the scheduler actor.
+    pub(super) next_par2_work_id: u64,
+    /// At most one heavyweight PAR2 operation runs for a job at a time.
+    pub(super) par2_work_in_flight: HashMap<JobId, Par2WorkInFlight>,
+    /// Completed PAR2 operations waiting for their continuation to consume
+    /// them on the next completion-gate pass.
+    pub(super) par2_work_results: HashMap<JobId, Par2WorkResult>,
+    /// Actor-owned state needed to resume the multi-stage tail after a repair
+    /// without replaying completed placement or identity mutations.
+    pub(super) par2_repair_finish: HashMap<JobId, Par2RepairFinishContext>,
+    /// Direct-store repair computation and one-volume-at-a-time readback state.
+    pub(super) direct_repair_continuations: HashMap<JobId, DirectRepairContinuation>,
+    /// Terminal direct repair answers consumed by the gate that initiated the
+    /// operation so its existing demotion and retry semantics stay unchanged.
+    pub(super) direct_repair_results:
+        HashMap<JobId, Result<(), direct_store::repair::DirectRepairFailure>>,
+    /// Background PAR2 work reports back through the scheduler loop rather
+    /// than being awaited by it.
+    pub(super) par2_work_done_tx: mpsc::Sender<Par2WorkDone>,
+    pub(super) par2_work_done_rx: mpsc::Receiver<Par2WorkDone>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
     /// Whether the active global pause came from a bandwidth schedule rather

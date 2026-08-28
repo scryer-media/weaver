@@ -18,6 +18,25 @@ const PAR2_RETAINED_SESSION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const STATEFUL_PAR2_SESSION_ENV: &str = "WEAVER_STATEFUL_PAR2_SESSION";
 const PAR2_METADATA_PREFIX_CAP_BYTES: usize = PAR2_HASH_16K_BYTES;
 
+pub(crate) struct PreparedPar2RepairSession {
+    session: Option<par2_rs::Par2RepairSession>,
+    options: Option<par2_rs::Par2RepairSessionOptions>,
+}
+
+impl PreparedPar2RepairSession {
+    pub(crate) fn open(self) -> Result<(par2_rs::Par2RepairSession, bool), String> {
+        if let Some(session) = self.session {
+            return Ok((session, false));
+        }
+        let options = self
+            .options
+            .expect("a prepared PAR2 session has an existing session or open options");
+        par2_rs::Par2RepairSession::open(options)
+            .map(|session| (session, true))
+            .map_err(|error| format!("failed to open retained PAR2 session: {error}"))
+    }
+}
+
 fn par2_prefix_set_ids(prefix: &[u8]) -> Vec<par2_rs::RecoverySetId> {
     let budget = par2_rs::PacketScanBudget::new(par2_rs::PacketScanLimits::default());
     let mut set_ids = Vec::new();
@@ -1530,7 +1549,7 @@ impl Pipeline {
         stateful_par2_session_enabled()
     }
 
-    pub(crate) async fn take_or_open_par2_repair_session(
+    pub(crate) fn prepare_par2_repair_session(
         &mut self,
         job_id: JobId,
         set_id: par2_rs::RecoverySetId,
@@ -1538,9 +1557,9 @@ impl Pipeline {
         memory_limit: usize,
         progress: Option<par2_rs::ProgressCallback>,
         source_access: Option<std::sync::Arc<dyn par2_rs::FileAccess + Send + Sync>>,
-    ) -> Result<Option<(par2_rs::Par2RepairSession, bool)>, String> {
+    ) -> Option<PreparedPar2RepairSession> {
         if !self.stateful_par2_session_gate() {
-            return Ok(None);
+            return None;
         }
         if let Some(runtime) = self.par2_runtime.get_mut(&job_id)
             && let Some(set_runtime) = runtime.set_runtime_mut(set_id)
@@ -1558,11 +1577,17 @@ impl Pipeline {
                     (Some(access), true) => {
                         session.set_source_access(std::sync::Arc::clone(access));
                         set_runtime.session_last_used = Some(Instant::now());
-                        return Ok(Some((session, false)));
+                        return Some(PreparedPar2RepairSession {
+                            session: Some(session),
+                            options: None,
+                        });
                     }
                     (None, false) => {
                         set_runtime.session_last_used = Some(Instant::now());
-                        return Ok(Some((session, false)));
+                        return Some(PreparedPar2RepairSession {
+                            session: Some(session),
+                            options: None,
+                        });
                     }
                     _ => {}
                 }
@@ -1575,38 +1600,58 @@ impl Pipeline {
                 .and_then(|set_runtime| set_runtime.set.as_deref())
                 .cloned()
         }) else {
-            return Ok(None);
+            return None;
         };
         let cancellation = self.par2_cancellation_token(job_id);
-
-        let session_result = tokio::task::spawn_blocking(move || {
-            let mut options = match source_access {
-                Some(access) => {
-                    par2_rs::Par2RepairSessionOptions::from_set(working_dir, par2_set, access)
-                }
-                None => {
-                    let mut options =
-                        par2_rs::Par2RepairSessionOptions::new(working_dir, Vec::new());
-                    options.file_set = Some(par2_set);
-                    options
-                }
-            };
-            options.memory_limit = Some(memory_limit);
-            options.cancel = Some(cancellation);
-            options.progress = progress;
-            // The in-stream grid seeds this session with per-slice verdicts, so
-            // the analysis need not re-read what those verdicts already account
-            // for. Every seeded verdict is admitted only on dual-alignment
-            // evidence, and the crate re-stats each path before honouring a
-            // skip, so a file that moved under us is read in full instead.
-            options.trust_seeded_evidence_for_scan = true;
-            par2_rs::Par2RepairSession::open(options)
-                .map_err(|error| format!("failed to open retained PAR2 session: {error}"))
+        let mut options = match source_access {
+            Some(access) => {
+                par2_rs::Par2RepairSessionOptions::from_set(working_dir, par2_set, access)
+            }
+            None => {
+                let mut options = par2_rs::Par2RepairSessionOptions::new(working_dir, Vec::new());
+                options.file_set = Some(par2_set);
+                options
+            }
+        };
+        options.memory_limit = Some(memory_limit);
+        options.cancel = Some(cancellation);
+        options.progress = progress;
+        // The in-stream grid seeds this session with per-slice verdicts, so
+        // the analysis need not re-read what those verdicts already account
+        // for. Every seeded verdict is admitted only on dual-alignment
+        // evidence, and the crate re-stats each path before honouring a skip,
+        // so a file that moved under us is read in full instead.
+        options.trust_seeded_evidence_for_scan = true;
+        Some(PreparedPar2RepairSession {
+            session: None,
+            options: Some(options),
         })
-        .await
-        .map_err(|error| format!("retained PAR2 session task panicked: {error}"))??;
+    }
 
-        Ok(Some((session_result, true)))
+    #[cfg(test)]
+    pub(crate) async fn take_or_open_par2_repair_session(
+        &mut self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+        working_dir: std::path::PathBuf,
+        memory_limit: usize,
+        progress: Option<par2_rs::ProgressCallback>,
+        source_access: Option<std::sync::Arc<dyn par2_rs::FileAccess + Send + Sync>>,
+    ) -> Result<Option<(par2_rs::Par2RepairSession, bool)>, String> {
+        let Some(prepared) = self.prepare_par2_repair_session(
+            job_id,
+            set_id,
+            working_dir,
+            memory_limit,
+            progress,
+            source_access,
+        ) else {
+            return Ok(None);
+        };
+        tokio::task::spawn_blocking(move || prepared.open())
+            .await
+            .map_err(|error| format!("retained PAR2 session task panicked: {error}"))?
+            .map(Some)
     }
 
     pub(crate) fn par2_cancellation_token(&mut self, job_id: JobId) -> par2_rs::CancellationToken {
