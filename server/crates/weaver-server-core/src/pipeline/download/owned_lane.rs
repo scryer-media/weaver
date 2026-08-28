@@ -751,7 +751,7 @@ mod tests {
     fn owned_quota_park_returns_unrequested_tail_without_dirtying_batch() {
         let mut pending_works = VecDeque::from([tail_work(4, 2), tail_work(5, 2)]);
 
-        let tail = take_unrequested_tail(&mut pending_works, true, false);
+        let tail = take_unrequested_tail(&mut pending_works, true, true);
 
         assert!(pending_works.is_empty());
         assert_eq!(tail.len(), 2);

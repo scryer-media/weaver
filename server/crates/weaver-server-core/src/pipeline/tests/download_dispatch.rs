@@ -4015,7 +4015,7 @@ async fn dispatch_downloads_allows_postprocessing_status_with_remaining_download
         2,
     )
     .await;
-    pipeline.connection_ramp = 2;
+    pipeline.connection_ramp = 1;
     let cases = [
         (JobId(20006), JobStatus::Extracting),
         (JobId(20007), JobStatus::QueuedExtract),

@@ -4724,6 +4724,14 @@ async fn a_damaged_job_runs_the_authoritative_analyzer_and_fails() {
     insert_active_job(&mut pipeline, job_id, spec).await;
 
     submit_par2_index(&mut pipeline, job_id, index_filename, &par2_bytes).await;
+    {
+        // Direct decode injection bypasses dispatch. Once index parsing rebuilds
+        // the queue, model the payload work as already leased before injecting
+        // its decoded results so phantom queued work cannot force a second pass.
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
     submit_split_payload(&mut pipeline, job_id, payload_filename, &damaged).await;
     drain_job_to_completion(&mut pipeline, job_id).await;
 
