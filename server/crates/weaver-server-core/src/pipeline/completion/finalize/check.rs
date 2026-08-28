@@ -7400,6 +7400,33 @@ impl Pipeline {
                     }
                 }
                 if run_par2_repairer {
+                    // The filesystem analysis below is a whole-directory
+                    // authoritative read, and it holds the pipeline actor for
+                    // its duration. Running it while this job still has wire
+                    // work in flight buys nothing — a damaged verdict cannot
+                    // repair better than the same verdict after the remaining
+                    // articles land, and an insufficient-recovery verdict
+                    // parks on exactly the drain this gate waits for. Without
+                    // the gate every completing recovery volume re-runs the
+                    // full pass, which starves dispatch for the whole queue.
+                    // The direct-store arm above waits for the same drain in
+                    // `direct_sets_ready_for_authoritative_par2`; this is the
+                    // conventional path's mirror of it. The re-arm is the
+                    // drain itself: the last completing file schedules a
+                    // completion check, and the quiescent flush sweeps a
+                    // parked tail.
+                    if self.job_has_pending_download_pipeline_work(job_id) {
+                        info!(
+                            job_id = job_id.0,
+                            "deferring PAR2 damaged-path analysis until the job's downloads drain"
+                        );
+                        self.transition_postprocessing_status(
+                            job_id,
+                            JobStatus::Downloading,
+                            Some("downloading"),
+                        );
+                        return;
+                    }
                     // The repairer reads and *writes* volume files through
                     // `DiskFileAccess`, which a virtual volume has none of. So
                     // any set still routing here — one whose repair refused, or

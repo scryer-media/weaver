@@ -13933,3 +13933,147 @@ async fn slice_evidence_is_keyed_to_the_name_a_renamed_file_now_carries() {
         "the vacated source name must not be seeded, got {seeded_paths:?}"
     );
 }
+
+#[tokio::test]
+async fn a_damaged_job_defers_repairer_analysis_until_its_downloads_drain() {
+    // The filesystem damaged-path analysis is a whole-directory authoritative
+    // read that holds the pipeline actor. While the job still has wire work in
+    // flight, every completing file would otherwise re-run that pass to
+    // rediscover "still waiting" — the live decay shape: repeated analyses
+    // starving dispatch for the whole queue. The gate parks the pass until the
+    // job's downloads drain; the drain itself is the re-arm.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30188);
+    let payload_filename = "payload.mkv";
+    let index_filename = "repair.par2";
+    let recovery_filename = "repair.vol00+01.par2";
+    let original_payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let mut damaged_payload = original_payload.clone();
+    for byte in &mut damaged_payload[64..128] {
+        *byte = 0;
+    }
+    let par2_bytes = build_test_par2_index(payload_filename, &original_payload, 64);
+    let recovery_bytes = vec![0xAA; 64];
+    let spec = JobSpec {
+        name: "Deferred Damaged Analysis".to_string(),
+        password: None,
+        total_bytes: (original_payload.len() + par2_bytes.len() + recovery_bytes.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "deferred-damaged-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "deferred-damaged-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "deferred-damaged-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: recovery_filename.to_string(),
+                role: FileRole::from_filename(recovery_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: recovery_bytes.len() as u32,
+                    message_id: "deferred-damaged-recovery@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    tokio::fs::write(working_dir.join(payload_filename), &damaged_payload)
+        .await
+        .unwrap();
+    {
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Repairing;
+        state.refresh_runtime_lanes_from_status();
+        state
+            .assembly
+            .file_mut(file_id)
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+        state
+            .assembly
+            .file_mut(file_id)
+            .unwrap()
+            .commit_segment(1, 64)
+            .unwrap();
+    }
+    write_and_complete_file(&mut pipeline, job_id, 1, index_filename, &par2_bytes).await;
+    write_and_complete_file(&mut pipeline, job_id, 2, recovery_filename, &recovery_bytes).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &original_payload, 64, 1),
+        &[
+            (1, index_filename, 0, false),
+            (2, recovery_filename, 1, true),
+        ],
+    );
+
+    // Wire work still in flight for this job: the damaged path must not run.
+    pipeline.active_downloads = 1;
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        pipeline.par2_repairer_analyze_calls, 0,
+        "no authoritative analysis while the job's downloads are in flight"
+    );
+    assert_eq!(pipeline.par2_repairer_execute_calls, 0);
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Downloading),
+        "the job parks as downloading — the drain is what re-arms the pass"
+    );
+
+    // The drain: the same completion check now runs the single analyze/repair
+    // pass and the job settles.
+    pipeline.active_downloads = 0;
+    pipeline.active_downloads_by_job.remove(&job_id);
+
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
+    assert_eq!(pipeline.par2_repairer_execute_calls, 1);
+}
