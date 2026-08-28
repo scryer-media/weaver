@@ -455,7 +455,9 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             completed_since_yield_check = completed_since_yield_check.saturating_add(completed);
             if completed_since_yield_check >= HOT_SHARE_YIELD_CHECK_ARTICLES {
                 completed_since_yield_check = 0;
-                if hot_share_yield_signal.is_requested_for(job_id) {
+                // A completion-critical batch never yields here — it is the
+                // work the signal exists to make room for.
+                if !parked_completion_critical && hot_share_yield_signal.is_requested() {
                     yielded_for_hot_share = true;
                     break;
                 }

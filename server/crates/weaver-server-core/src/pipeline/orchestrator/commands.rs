@@ -573,7 +573,6 @@ impl Pipeline {
                     self.owned_download_lane_pool.reset();
                     self.owned_download_lane_pool
                         .resize(total_connections.max(1));
-                    self.connection_ramp = total_connections.min(5);
                     self.tuner.set_connection_limit(total_connections);
                     tokio::spawn(async move { old_client.shutdown().await });
                     self.dispatch_downloads();

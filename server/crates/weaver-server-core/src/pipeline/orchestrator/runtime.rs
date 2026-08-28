@@ -7,7 +7,6 @@ impl Pipeline {
     /// Bound on how long `drain` waits to join detached fire-and-forget writes.
     const FIRE_AND_FORGET_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const DOWNLOAD_COMPLETION_DRAIN_LIMIT: usize = 128;
-    const INITIAL_CONNECTION_RAMP_LIMIT: usize = 20;
 
     /// Create a new pipeline.
     #[allow(clippy::too_many_arguments)]
@@ -150,7 +149,6 @@ impl Pipeline {
             active_recovery: 0,
             hot_dispatch_job: None,
             hot_dispatch_started_at: None,
-            hot_dispatch_successes: 0,
             hot_dispatch_exclusive_peak_bps: 0,
             hot_dispatch_last_lend_at: None,
             hot_dispatch_mode: DispatchShareMode::Exclusive,
@@ -279,7 +277,6 @@ impl Pipeline {
             rate_limit_reservations: HashMap::new(),
             configured_rate_limit: 0,
             scheduled_rate_limit: None,
-            connection_ramp: total_connections.min(Self::INITIAL_CONNECTION_RAMP_LIMIT),
             rate_limiter: TokenBucket::new(0),
             write_buf_max_pending,
             decode_backlog_budget_bytes,
@@ -1048,7 +1045,6 @@ impl Pipeline {
                             hot_dispatch_mode = snapshot.hot_dispatch_mode.as_str(),
                             hot_dispatch_lent_connections = snapshot.hot_dispatch_lent_connections,
                             hot_dispatch_underfill_ms = snapshot.hot_dispatch_underfill_ms,
-                            hot_dispatch_warmup_complete = snapshot.hot_dispatch_warmup_complete,
                             hot_dispatch_speed_bps = snapshot.hot_dispatch_hot_speed_bps,
                             hot_dispatch_exclusive_peak_bps =
                                 snapshot.hot_dispatch_exclusive_peak_bps,
@@ -1075,12 +1071,6 @@ impl Pipeline {
                             health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                             "pipeline tick"
                         );
-
-                        let max = self.tuner.params().max_concurrent_downloads;
-                        if self.connection_ramp < max {
-                            self.connection_ramp = (self.connection_ramp + 5).min(max);
-                            info!(connection_ramp = self.connection_ramp, "ramping up connections");
-                        }
 
                         if self.tuner.adjust(&snapshot) {
                             info!(

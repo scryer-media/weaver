@@ -776,14 +776,11 @@ type Metrics {
 	hotDispatchMode: String!
 	hotDispatchUnderfillMs: Int!
 	hotDispatchLentConnections: Int!
-	hotDispatchWarmupComplete: Boolean!
 	hotDispatchLastSpilloverDecision: String!
-	hotDispatchSpilloverBlockedWarmupTotal: Int!
 	hotDispatchSpilloverBlockedPressureTotal: Int!
 	hotDispatchSpilloverBlockedNearCapTotal: Int!
 	hotDispatchSpilloverBlockedHotCanUseCapacityTotal: Int!
 	hotDispatchSpilloverBlockedBestModePendingTotal: Int!
-	hotDispatchSpilloverBlockedRecentExpansionHelpedTotal: Int!
 	hotDispatchSpilloverBlockedCapSpeedTotal: Int!
 	hotDispatchSpilloverAllowedUnderfillTotal: Int!
 	hotDispatchSpilloverAllowedMeasuredUnderfillTotal: Int!

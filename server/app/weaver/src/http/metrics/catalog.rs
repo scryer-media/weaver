@@ -169,8 +169,6 @@ metric_families! {
         "Current hot-job unused-capacity underfill window age.");
     HOT_LENT_CONNECTIONS = ("weaver_pipeline_hot_dispatch_lent_connections", Gauge, [],
         "Active NNTP connection tasks lent to spillover jobs.");
-    HOT_WARMUP_COMPLETE = ("weaver_pipeline_hot_dispatch_warmup_complete", Gauge, [],
-        "Whether the current hot-dispatch warmup gate is complete.");
     HOT_LAST_SPILLOVER_DECISION = ("weaver_pipeline_hot_dispatch_last_spillover_decision", Gauge,
         ["decision"], "Last hot-dispatch spillover decision; exactly one decision is 1.");
     HOT_SPILLOVER_DECISIONS = ("weaver_pipeline_hot_dispatch_spillover_decisions_total", Counter,

@@ -613,7 +613,7 @@ impl Pipeline {
             // articles blind — on a slow link those leases take minutes to
             // drain before any runway discipline applies. A quarter batch
             // bounds cold-start refill churn until the window fills.
-            return HOT_LEASE_WARMUP_WORK_LIMIT
+            return HOT_LEASE_COLD_START_WORK_LIMIT
                 .max(lane_mode.max_depth())
                 .min(full);
         }

@@ -1020,7 +1020,7 @@ fn many_standalone_files(prefix: &str, count: usize) -> Vec<(String, u32)> {
 }
 
 const TEST_HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
-const TEST_HOT_LEASE_WARMUP_WORK_LIMIT: usize = 16;
+const TEST_HOT_LEASE_COLD_START_WORK_LIMIT: usize = 16;
 
 fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes: u32) -> JobSpec {
     JobSpec {

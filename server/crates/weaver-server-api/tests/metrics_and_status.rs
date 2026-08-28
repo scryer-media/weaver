@@ -46,18 +46,14 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         hot_dispatch_mode: weaver_server_core::DispatchShareMode::Exclusive,
         hot_dispatch_underfill_ms: 0,
         hot_dispatch_lent_connections: 0,
-        hot_dispatch_warmup_complete: false,
         hot_dispatch_last_spillover_decision: weaver_server_core::SpilloverDecision::None,
-        hot_dispatch_spillover_blocked_warmup_total: 0,
         hot_dispatch_spillover_blocked_pressure_total: 0,
         hot_dispatch_spillover_blocked_near_cap_total: 0,
         hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 0,
         hot_dispatch_spillover_blocked_best_mode_pending_total: 0,
-        hot_dispatch_spillover_blocked_recent_expansion_helped_total: 0,
         hot_dispatch_spillover_blocked_cap_speed_total: 0,
         hot_dispatch_spillover_allowed_underfill_total: 0,
         hot_dispatch_spillover_allowed_measured_underfill_total: 0,
-        hot_dispatch_spillover_allowed_bounded_same_band_total: 0,
         hot_dispatch_spillover_reclaimed_total: 0,
         hot_dispatch_hot_speed_bps: 0,
         hot_dispatch_exclusive_peak_bps: 0,
@@ -297,7 +293,7 @@ async fn metrics_has_expected_fields() {
     let h = TestHarness::new().await;
     let resp = h
         .execute(
-            "{ metrics { bytesDownloaded bytesDecoded bytesCommitted downloadQueueDepth segmentsDownloaded currentDownloadSpeed hotDispatchJobId hotDispatchMode hotDispatchUnderfillMs hotDispatchLentConnections hotDispatchWarmupComplete hotDispatchLastSpilloverDecision hotDispatchSpilloverBlockedWarmupTotal hotDispatchSpilloverAllowedUnderfillTotal downloadLanesActive downloadLanesDepth2Active downloadLanesIssuingActive downloadLanesAwaitingWorkActive downloadLaneParksNoWorkTotal downloadPipelineProofPassTotal downloadPipelineReplayItemsTotal } }",
+            "{ metrics { bytesDownloaded bytesDecoded bytesCommitted downloadQueueDepth segmentsDownloaded currentDownloadSpeed hotDispatchJobId hotDispatchMode hotDispatchUnderfillMs hotDispatchLentConnections hotDispatchLastSpilloverDecision hotDispatchSpilloverBlockedNearCapTotal hotDispatchSpilloverAllowedUnderfillTotal downloadLanesActive downloadLanesDepth2Active downloadLanesIssuingActive downloadLanesAwaitingWorkActive downloadLaneParksNoWorkTotal downloadPipelineProofPassTotal downloadPipelineReplayItemsTotal } }",
         )
         .await;
     assert_no_errors(&resp);
@@ -311,9 +307,8 @@ async fn metrics_has_expected_fields() {
     assert!(m["hotDispatchMode"].is_string());
     assert!(m["hotDispatchUnderfillMs"].is_number());
     assert!(m["hotDispatchLentConnections"].is_number());
-    assert!(m["hotDispatchWarmupComplete"].is_boolean());
     assert!(m["hotDispatchLastSpilloverDecision"].is_string());
-    assert!(m["hotDispatchSpilloverBlockedWarmupTotal"].is_number());
+    assert!(m["hotDispatchSpilloverBlockedNearCapTotal"].is_number());
     assert!(m["hotDispatchSpilloverAllowedUnderfillTotal"].is_number());
     assert!(m["downloadLanesActive"].is_number());
     assert!(m["downloadLanesDepth2Active"].is_number());

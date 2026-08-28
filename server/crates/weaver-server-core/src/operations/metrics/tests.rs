@@ -3,17 +3,10 @@ use std::sync::atomic::Ordering;
 use super::*;
 
 #[test]
-fn spillover_decision_codes_preserve_existing_meanings() {
-    assert_eq!(SpilloverDecision::ReclaimedSpeedHarm.as_code(), 11);
-    assert_eq!(
-        SpilloverDecision::from_code(11),
-        SpilloverDecision::ReclaimedSpeedHarm
-    );
-    assert_eq!(SpilloverDecision::AllowedBoundedSameBand.as_code(), 12);
-    assert_eq!(
-        SpilloverDecision::from_code(12),
-        SpilloverDecision::AllowedBoundedSameBand
-    );
+fn spillover_decision_codes_round_trip() {
+    for decision in SpilloverDecision::ALL {
+        assert_eq!(SpilloverDecision::from_code(decision.as_code()), decision);
+    }
 }
 
 #[test]
@@ -34,7 +27,6 @@ fn metrics_snapshot() {
         .store(DispatchShareMode::Shared.as_code(), Ordering::Relaxed);
     m.hot_dispatch_underfill_ms.store(2500, Ordering::Relaxed);
     m.hot_dispatch_lent_connections.store(2, Ordering::Relaxed);
-    m.hot_dispatch_warmup_complete.store(1, Ordering::Relaxed);
     m.hot_dispatch_last_spillover_decision.store(
         SpilloverDecision::AllowedUnderfill.as_code(),
         Ordering::Relaxed,
@@ -57,7 +49,6 @@ fn metrics_snapshot() {
     assert_eq!(snap.hot_dispatch_mode, DispatchShareMode::Shared);
     assert_eq!(snap.hot_dispatch_underfill_ms, 2500);
     assert_eq!(snap.hot_dispatch_lent_connections, 2);
-    assert!(snap.hot_dispatch_warmup_complete);
     assert_eq!(
         snap.hot_dispatch_last_spillover_decision,
         SpilloverDecision::AllowedUnderfill

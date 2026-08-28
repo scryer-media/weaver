@@ -4298,19 +4298,15 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         hot_dispatch_mode: weaver_server_core::DispatchShareMode::Shared,
         hot_dispatch_underfill_ms: 2500,
         hot_dispatch_lent_connections: 2,
-        hot_dispatch_warmup_complete: true,
         hot_dispatch_last_spillover_decision:
             weaver_server_core::SpilloverDecision::AllowedUnderfill,
-        hot_dispatch_spillover_blocked_warmup_total: 29,
         hot_dispatch_spillover_blocked_pressure_total: 30,
         hot_dispatch_spillover_blocked_near_cap_total: 31,
         hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 32,
         hot_dispatch_spillover_blocked_best_mode_pending_total: 33,
-        hot_dispatch_spillover_blocked_recent_expansion_helped_total: 34,
         hot_dispatch_spillover_blocked_cap_speed_total: 35,
         hot_dispatch_spillover_allowed_underfill_total: 33,
         hot_dispatch_spillover_allowed_measured_underfill_total: 0,
-        hot_dispatch_spillover_allowed_bounded_same_band_total: 0,
         hot_dispatch_spillover_reclaimed_total: 34,
         hot_dispatch_hot_speed_bps: 35,
         hot_dispatch_exclusive_peak_bps: 36,
@@ -4540,7 +4536,6 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(rendered.contains("weaver_pipeline_hot_dispatch_mode{mode=\"shared\"} 1"));
     assert!(rendered.contains("weaver_pipeline_hot_dispatch_underfill_milliseconds 2500"));
     assert!(rendered.contains("weaver_pipeline_hot_dispatch_lent_connections 2"));
-    assert!(rendered.contains("weaver_pipeline_hot_dispatch_warmup_complete 1"));
     assert!(rendered.contains(
         "weaver_pipeline_hot_dispatch_last_spillover_decision{decision=\"allowed_underfill\"} 1"
     ));
@@ -4746,18 +4741,14 @@ fn renders_prometheus_download_observed_limiter_states() {
         hot_dispatch_mode: weaver_server_core::DispatchShareMode::Exclusive,
         hot_dispatch_underfill_ms: 0,
         hot_dispatch_lent_connections: 0,
-        hot_dispatch_warmup_complete: false,
         hot_dispatch_last_spillover_decision: weaver_server_core::SpilloverDecision::None,
-        hot_dispatch_spillover_blocked_warmup_total: 0,
         hot_dispatch_spillover_blocked_pressure_total: 0,
         hot_dispatch_spillover_blocked_near_cap_total: 0,
         hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 0,
         hot_dispatch_spillover_blocked_best_mode_pending_total: 0,
-        hot_dispatch_spillover_blocked_recent_expansion_helped_total: 0,
         hot_dispatch_spillover_blocked_cap_speed_total: 0,
         hot_dispatch_spillover_allowed_underfill_total: 0,
         hot_dispatch_spillover_allowed_measured_underfill_total: 0,
-        hot_dispatch_spillover_allowed_bounded_same_band_total: 0,
         hot_dispatch_spillover_reclaimed_total: 0,
         hot_dispatch_hot_speed_bps: 0,
         hot_dispatch_exclusive_peak_bps: 0,
@@ -5053,7 +5044,7 @@ fn assert_label_set(rendered: &str, family: &str, label: &str, expected: &[&str]
 
 /// The regression that motivated the descriptor rewrite: label sets were
 /// restated by hand next to the enum they mirrored, so `Scheduled`,
-/// `AllowedBoundedSameBand`, `hot_share_yield`, `deferred`,
+/// a spillover-decision variant since removed, `hot_share_yield`, `deferred`,
 /// `queued_post_processing` and `post_processing` were all collected by the
 /// runtime and then dropped on the floor at scrape time.
 #[test]
@@ -5138,7 +5129,7 @@ fn rendered_label_sets_cover_every_enum_variant() {
         "decision",
         &counted_decisions,
     );
-    assert!(counted_decisions.contains(&"allowed_bounded_same_band"));
+    assert!(counted_decisions.contains(&"allowed_measured_underfill"));
 
     assert_label_set(
         &rendered,

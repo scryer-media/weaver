@@ -23,7 +23,7 @@ use orchestrator::{is_terminal_status, write_segment_to_disk, write_segments_to_
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -508,13 +508,11 @@ pub(super) enum SpilloverReclaimReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SpilloverLoanKind {
     MeasuredUnderfill,
-    BoundedSameBand,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SpilloverLoanState {
     pub(super) measured_lent_connections: usize,
-    pub(super) bounded_lent_connections: usize,
     pub(super) measured_post_lend_bps: Option<u64>,
     pub(super) measured_reclaim_reason: Option<SpilloverReclaimReason>,
 }
@@ -542,7 +540,7 @@ impl SpilloverLoanBook {
         hot_speed_bps: u64,
         kind: SpilloverLoanKind,
     ) {
-        if kind == SpilloverLoanKind::MeasuredUnderfill && self.measured_lent_connections() == 0 {
+        if self.measured_lent_connections() == 0 {
             self.aggregate_pre_lend_bps = Some(hot_speed_bps);
             self.aggregate_lent_at = Some(now);
             self.aggregate_post_lend_bps = None;
@@ -553,10 +551,7 @@ impl SpilloverLoanBook {
                 loan.increment(kind);
             })
             .or_insert(SpilloverLoanState {
-                measured_lent_connections: usize::from(
-                    kind == SpilloverLoanKind::MeasuredUnderfill,
-                ),
-                bounded_lent_connections: usize::from(kind == SpilloverLoanKind::BoundedSameBand),
+                measured_lent_connections: 1,
                 measured_post_lend_bps: None,
                 measured_reclaim_reason: None,
             });
@@ -603,13 +598,6 @@ impl SpilloverLoanBook {
             .sum()
     }
 
-    pub(super) fn bounded_lent_connections(&self) -> usize {
-        self.loans
-            .values()
-            .map(|loan| loan.bounded_lent_connections)
-            .sum()
-    }
-
     fn measured_lent_connections(&self) -> usize {
         self.loans
             .values()
@@ -619,6 +607,22 @@ impl SpilloverLoanBook {
 
     pub(super) fn active_loan_count(&self) -> usize {
         self.loans.len()
+    }
+
+    /// Number of distinct jobs currently holding a spillover loan. Same
+    /// value as `active_loan_count` (loans are keyed one-per-job); named for
+    /// the dispatch-side cap check against `HOT_DISPATCH_SPILLOVER_MAX_JOBS`,
+    /// so that call site reads as what it is instead of what it happens to
+    /// share a value with.
+    pub(super) fn distinct_loan_jobs(&self) -> usize {
+        self.active_loan_count()
+    }
+
+    /// Whether `job_id` already holds a spillover loan — used to prefer
+    /// concentrating new lanes onto jobs already spilling to, rather than
+    /// admitting a fresh job while under the distinct-job cap.
+    pub(super) fn holds_loan(&self, job_id: JobId) -> bool {
+        self.loans.contains_key(&job_id)
     }
 
     pub(super) fn speed_snapshot(&self) -> (u64, u64, usize) {
@@ -680,9 +684,6 @@ impl SpilloverLoanState {
             SpilloverLoanKind::MeasuredUnderfill => {
                 self.measured_lent_connections = self.measured_lent_connections.saturating_add(1)
             }
-            SpilloverLoanKind::BoundedSameBand => {
-                self.bounded_lent_connections = self.bounded_lent_connections.saturating_add(1)
-            }
         }
     }
 
@@ -691,34 +692,36 @@ impl SpilloverLoanState {
             SpilloverLoanKind::MeasuredUnderfill => {
                 self.measured_lent_connections = self.measured_lent_connections.saturating_sub(1)
             }
-            SpilloverLoanKind::BoundedSameBand => {
-                self.bounded_lent_connections = self.bounded_lent_connections.saturating_sub(1)
-            }
         }
     }
 
     fn total_lent_connections(&self) -> usize {
         self.measured_lent_connections
-            .saturating_add(self.bounded_lent_connections)
     }
 }
 
+/// Cooperative signal asking every non-critical lane to return its
+/// unrequested tail so the dispatcher can hand the freed connection to
+/// completion-critical work on the next pass. A plain flag rather than a
+/// targeted job id: once completion-critical demand goes unmet, ANY lane
+/// running regular bytes — the hot job's own included — is fair game to
+/// yield, not just one designated job's.
 #[derive(Debug, Default)]
 pub(super) struct HotShareYieldSignal {
-    requested_hot_job_id: AtomicU64,
+    requested: AtomicBool,
 }
 
 impl HotShareYieldSignal {
-    pub(super) fn request(&self, job_id: JobId) {
-        self.requested_hot_job_id.store(job_id.0, Ordering::Relaxed);
+    pub(super) fn request(&self) {
+        self.requested.store(true, Ordering::Relaxed);
     }
 
     pub(super) fn clear(&self) {
-        self.requested_hot_job_id.store(0, Ordering::Relaxed);
+        self.requested.store(false, Ordering::Relaxed);
     }
 
-    pub(super) fn is_requested_for(&self, job_id: JobId) -> bool {
-        self.requested_hot_job_id.load(Ordering::Relaxed) == job_id.0
+    pub(super) fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Relaxed)
     }
 }
 
@@ -727,8 +730,6 @@ pub(super) enum HotBestModeBlockReason {
     None,
     HotHasQueuedPrimary,
     LaneCapacityAvailable,
-    PipelinePromotionPending,
-    RecentExpansionHelped,
 }
 
 impl HotBestModeBlockReason {
@@ -737,8 +738,6 @@ impl HotBestModeBlockReason {
             Self::None => 0,
             Self::HotHasQueuedPrimary => 1,
             Self::LaneCapacityAvailable => 2,
-            Self::PipelinePromotionPending => 3,
-            Self::RecentExpansionHelped => 4,
         }
     }
 }
@@ -746,13 +745,8 @@ impl HotBestModeBlockReason {
 /// Labels for the `hot_dispatch_best_mode_block_reason` snapshot code, in code
 /// order. The metrics snapshot carries the raw integer; exposing the mapping
 /// lets the Prometheus exporter render a state-set rather than an opaque gauge.
-pub const HOT_BEST_MODE_BLOCK_REASON_LABELS: [&str; 5] = [
-    "none",
-    "hot_has_queued_primary",
-    "lane_capacity_available",
-    "pipeline_promotion_pending",
-    "recent_expansion_helped",
-];
+pub const HOT_BEST_MODE_BLOCK_REASON_LABELS: [&str; 3] =
+    ["none", "hot_has_queued_primary", "lane_capacity_available"];
 
 /// Labels for the `hot_dispatch_last_expansion_kind` snapshot code, in code
 /// order. Code 0 means "no expansion has been recorded yet".
@@ -786,8 +780,6 @@ mod hot_dispatch_label_tests {
             HotBestModeBlockReason::None,
             HotBestModeBlockReason::HotHasQueuedPrimary,
             HotBestModeBlockReason::LaneCapacityAvailable,
-            HotBestModeBlockReason::PipelinePromotionPending,
-            HotBestModeBlockReason::RecentExpansionHelped,
         ] {
             assert_ne!(
                 hot_best_mode_block_reason_label(reason.as_code()),
@@ -2229,8 +2221,6 @@ pub struct Pipeline {
     pub(super) hot_dispatch_job: Option<JobId>,
     /// When the current hot-dispatch ownership period began.
     pub(super) hot_dispatch_started_at: Option<Instant>,
-    /// Successful primary BODY responses observed during the current hot period.
-    pub(super) hot_dispatch_successes: u64,
     /// Best observed speed while the current hot job was exclusive.
     pub(super) hot_dispatch_exclusive_peak_bps: u64,
     /// Last time dispatch lent a reclaimable connection to spillover work.
@@ -2532,8 +2522,6 @@ pub struct Pipeline {
     pub(super) scheduled_rate_limit: Option<u64>,
     /// Effective bandwidth rate limiter.
     pub(super) rate_limiter: TokenBucket,
-    /// Gradual connection ramp-up limit (increases each tick).
-    pub(super) connection_ramp: usize,
     /// Max pending segments per write reorder buffer (memory-adaptive).
     pub(super) write_buf_max_pending: usize,
     /// Max in-memory raw article bytes queued or active for decode.

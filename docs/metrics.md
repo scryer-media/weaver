@@ -413,7 +413,6 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_pipeline_hot_dispatch_underfill_milliseconds` | gauge | — | Current hot-job unused-capacity underfill window age in milliseconds. **Deprecated — use `weaver_pipeline_hot_dispatch_underfill_seconds`.** |
 | `weaver_pipeline_hot_dispatch_underfill_seconds` | gauge | — | Current hot-job unused-capacity underfill window age. |
 | `weaver_pipeline_hot_dispatch_lent_connections` | gauge | — | Active NNTP connection tasks lent to spillover jobs. |
-| `weaver_pipeline_hot_dispatch_warmup_complete` | gauge | — | Whether the current hot-dispatch warmup gate is complete. |
 | `weaver_pipeline_hot_dispatch_last_spillover_decision` | gauge | `decision` | Last hot-dispatch spillover decision; exactly one decision is 1. |
 | `weaver_pipeline_hot_dispatch_spillover_decisions_total` | counter | `decision` | Hot-dispatch spillover decisions by reason. |
 | `weaver_pipeline_hot_dispatch_speed_bytes_per_second` | gauge | — | Two-second hot-job BODY throughput. |

@@ -436,9 +436,6 @@ fn spillover_decision_total(
 ) -> Option<u64> {
     match decision {
         SpilloverDecision::None => None,
-        SpilloverDecision::BlockedWarmup => {
-            Some(snapshot.hot_dispatch_spillover_blocked_warmup_total)
-        }
         SpilloverDecision::BlockedPressure => {
             Some(snapshot.hot_dispatch_spillover_blocked_pressure_total)
         }
@@ -455,17 +452,11 @@ fn spillover_decision_total(
         SpilloverDecision::BlockedBestModePending => {
             Some(snapshot.hot_dispatch_spillover_blocked_best_mode_pending_total)
         }
-        SpilloverDecision::BlockedRecentExpansionHelped => {
-            Some(snapshot.hot_dispatch_spillover_blocked_recent_expansion_helped_total)
-        }
         SpilloverDecision::BlockedCapSpeed => {
             Some(snapshot.hot_dispatch_spillover_blocked_cap_speed_total)
         }
         SpilloverDecision::AllowedMeasuredUnderfill => {
             Some(snapshot.hot_dispatch_spillover_allowed_measured_underfill_total)
-        }
-        SpilloverDecision::AllowedBoundedSameBand => {
-            Some(snapshot.hot_dispatch_spillover_allowed_bounded_same_band_total)
         }
         SpilloverDecision::ReclaimedSpeedHarm => {
             Some(snapshot.hot_dispatch_spillover_reclaimed_speed_harm_total)
@@ -496,11 +487,6 @@ fn render_hot_dispatch(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         &f::HOT_LENT_CONNECTIONS,
         &[],
         snapshot.hot_dispatch_lent_connections,
-    );
-    out.sample(
-        &f::HOT_WARMUP_COMPLETE,
-        &[],
-        u8::from(snapshot.hot_dispatch_warmup_complete),
     );
 
     for decision in SpilloverDecision::ALL {
