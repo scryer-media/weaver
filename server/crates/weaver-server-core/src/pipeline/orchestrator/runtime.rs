@@ -326,6 +326,7 @@ impl Pipeline {
             direct_post_repair_results: HashMap::new(),
             direct_post_repair_done_tx,
             direct_post_repair_done_rx,
+            direct_post_repair_carry: HashMap::new(),
             inflight_moves: HashSet::new(),
             reserved_complete_destinations: HashMap::new(),
             failed_extractions: HashMap::new(),

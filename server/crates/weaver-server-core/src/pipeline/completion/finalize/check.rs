@@ -1079,7 +1079,9 @@ pub(crate) struct Par2RarOutputRegistration {
     pub(crate) set_names: BTreeSet<String>,
 }
 
-fn par2_repair_write_set(verification: &par2_rs::VerificationResult) -> Vec<par2_rs::FileId> {
+pub(in crate::pipeline) fn par2_repair_write_set(
+    verification: &par2_rs::VerificationResult,
+) -> Vec<par2_rs::FileId> {
     verification
         .files
         .iter()
@@ -6978,6 +6980,14 @@ impl Pipeline {
                 // in place, and a clean verdict skips the repairer so the
                 // ordinary verify path below can record it.
                 let mut run_par2_repairer = authoritative_par2_verification_needed;
+                // Stashed rather than discarded when the direct gate reaches
+                // `Clean`: the verdict below is the same one the ordinary
+                // whole-set pass would have reached over the same virtual
+                // volumes, and asking that pass to read them again would be
+                // the second whole-set read this gate exists to avoid. See
+                // where `direct_verdict` is consumed, further down, for how it
+                // stands in for `verify_par2_with_placement`.
+                let mut direct_verdict: Option<par2_rs::VerificationResult> = None;
                 if authoritative_par2_verification_needed {
                     match self
                         .resolve_direct_sets_before_par2_repairer(
@@ -6994,7 +7004,10 @@ impl Pipeline {
                             self.schedule_job_completion_check(job_id);
                             return;
                         }
-                        DirectPar2Resolution::Clean => run_par2_repairer = false,
+                        DirectPar2Resolution::Clean(verification) => {
+                            run_par2_repairer = false;
+                            direct_verdict = Some(*verification);
+                        }
                         DirectPar2Resolution::Pending => return,
                         DirectPar2Resolution::Deferred => {
                             // The same wait the analysis below performs when it
@@ -7500,21 +7513,67 @@ impl Pipeline {
                     || !self.par2_verified.contains(&job_id)
                     || authoritative_par2_verification_needed
                     || matches!(current_status, JobStatus::Repairing);
-                let (verification, placement_plan) = match self
-                    .verify_par2_with_placement(
-                        job_id,
-                        Arc::clone(&par2_set),
-                        working_dir.clone(),
-                        matches!(current_status, JobStatus::Repairing),
-                        emit_verification_events,
-                    )
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(message) => {
-                        self.finish_par2_set_failure(job_id, set_id, message).await;
-                        return;
+                let (verification, placement_plan) = match direct_verdict {
+                    Some(mut verification) => {
+                        // The direct gate already read this set — virtually,
+                        // through the overlay — and reached exactly this
+                        // verdict. Asking `verify_par2_with_placement` to read
+                        // it again would be the second whole-set pass this
+                        // gate exists to avoid, so its observable effects are
+                        // replicated here instead of its read: the same status
+                        // transition and verification-started announcement
+                        // `emit_events` would have produced, then the one
+                        // settlement this verdict gets — `verify_direct_sets_quietly`
+                        // adjusts direct damage before returning but never
+                        // settles, so this is the first and only settle call
+                        // this verification instance sees.
+                        if emit_verification_events {
+                            if !matches!(current_status, JobStatus::Repairing) {
+                                self.transition_postprocessing_status(
+                                    job_id,
+                                    JobStatus::Verifying,
+                                    Some("verifying"),
+                                );
+                            } else {
+                                info!(
+                                    job_id = job_id.0,
+                                    "rerunning PAR2 verification while preserving restored \
+                                     repair slot"
+                                );
+                            }
+                            self.emit_job_verification_started(job_id);
+                            let _ = self.event_tx.send(PipelineEvent::VerificationStarted {
+                                file_id: NzbFileId {
+                                    job_id,
+                                    file_index: 0,
+                                },
+                            });
+                        }
+                        self.settle_par2_pass_result(
+                            job_id,
+                            &mut verification,
+                            emit_verification_events,
+                        );
+                        let plan = placement_plan_from_verification(&verification);
+                        Self::log_placement_plan(job_id, &plan);
+                        (verification, plan)
                     }
+                    None => match self
+                        .verify_par2_with_placement(
+                            job_id,
+                            Arc::clone(&par2_set),
+                            working_dir.clone(),
+                            matches!(current_status, JobStatus::Repairing),
+                            emit_verification_events,
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(message) => {
+                            self.finish_par2_set_failure(job_id, set_id, message).await;
+                            return;
+                        }
+                    },
                 };
                 // Damage on a virtual volume has nothing to repair *into* — the
                 // bytes live in a member's partial and an envelope, and a

@@ -1508,6 +1508,11 @@ pub(super) struct Par2Md5SubstitutionBinding {
 pub(super) struct DirectPostRepairWork {
     pub(super) work_id: u64,
     pub(super) recovery_set_id: par2_rs::RecoverySetId,
+    /// When this ticket was handed to the detached task, so the completion
+    /// handler can log how long the read-back actually took. The gap between
+    /// submission and completion is exactly the window that once produced an
+    /// unexplained multi-second stall with nothing in the logs to explain it.
+    pub(super) submitted_at: std::time::Instant,
 }
 
 pub(super) struct DirectPostRepairWorkDone {
@@ -1515,6 +1520,31 @@ pub(super) struct DirectPostRepairWorkDone {
     pub(super) work_id: u64,
     pub(super) recovery_set_id: par2_rs::RecoverySetId,
     pub(super) result: Result<par2_rs::VerificationResult, String>,
+}
+
+/// The pre-repair verdict and the repair's own write set, carried across a
+/// direct-store repair so the post-repair read-back can be selective instead
+/// of re-reading the whole recovery set.
+///
+/// This is the direct-store mirror of what
+/// [`Pipeline::verify_repaired_par2_files_with_placement`] does for a
+/// conventional set: that function is handed `pre_repair` by its caller,
+/// which still has the verification in a local variable a few lines above.
+/// The direct-store gate has no such luxury — the pre-repair verdict is
+/// computed in [`Pipeline::resolve_direct_sets_before_par2_repairer_for_set`],
+/// the repair runs, and the job re-enters the gate on a **later** completion
+/// check to read the result back, by which point the local variable is long
+/// gone. This struct is what stands in for it across that gap.
+///
+/// Keyed by job rather than by recovery set: a job serves one recovery set
+/// through this gate at a time (see [`Pipeline::direct_sets_repaired_in_place`]),
+/// so one carry is all a job ever needs, and `recovery_set_id` is kept
+/// alongside it so a consumer can tell a fresh carry from a stale one instead
+/// of trusting the map key alone.
+pub(super) struct DirectPostRepairCarry {
+    pub(super) recovery_set_id: par2_rs::RecoverySetId,
+    pub(super) pre_repair: par2_rs::VerificationResult,
+    pub(super) write_set: Vec<par2_rs::FileId>,
 }
 
 #[derive(Default)]
@@ -2478,6 +2508,11 @@ pub struct Pipeline {
     /// The bounded lane reports only terminal post-repair verdicts.
     pub(super) direct_post_repair_done_tx: mpsc::Sender<DirectPostRepairWorkDone>,
     pub(super) direct_post_repair_done_rx: mpsc::Receiver<DirectPostRepairWorkDone>,
+    /// The pre-repair verdict a direct-store repair leaves behind for the
+    /// post-repair pass to read selectively instead of re-reading the whole
+    /// recovery set. Cleared once consumed, on demotion, and by
+    /// [`Pipeline::clear_par2_runtime_state`] — see [`DirectPostRepairCarry`].
+    pub(super) direct_post_repair_carry: HashMap<JobId, DirectPostRepairCarry>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
     /// Whether the active global pause came from a bandwidth schedule rather

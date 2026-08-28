@@ -839,6 +839,7 @@ impl Pipeline {
         self.par2_cancellations.remove(&job_id);
         self.direct_post_repair_in_flight.remove(&job_id);
         self.direct_post_repair_results.remove(&job_id);
+        self.direct_post_repair_carry.remove(&job_id);
         self.shared_state.clear_job_cancellations(job_id);
         self.par2_verified.remove(&job_id);
         self.par2_joined_split_sets.remove(&job_id);

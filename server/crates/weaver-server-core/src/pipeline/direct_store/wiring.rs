@@ -59,7 +59,8 @@ use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::pipeline::{
-    BufferedDecodedSegment, DecodedChunk, DirectPostRepairWork, DirectPostRepairWorkDone, Pipeline,
+    BufferedDecodedSegment, DecodedChunk, DirectPostRepairCarry, DirectPostRepairWork,
+    DirectPostRepairWorkDone, Pipeline,
 };
 
 /// Read chunk for the restart gate re-arm. Matches the reconstruction sweep's:
@@ -653,7 +654,7 @@ impl DirectPar2Overlay {
 
 /// What a live direct set turned out to need, just before the completion gate
 /// would have handed the job to `Par2Repairer`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum DirectPar2Resolution {
     /// Damage was found and repaired in place. The job goes round again and
     /// re-verifies over the repaired virtual volumes.
@@ -665,7 +666,12 @@ pub(crate) enum DirectPar2Resolution {
     /// get files it could — for a job whose sets are *fine*. The caller instead
     /// skips the repairer and lets the ordinary verify path, which reads them
     /// virtually, record the same verdict this pass just reached.
-    Clean,
+    ///
+    /// Carries the verdict itself, because the caller now settles it directly
+    /// instead of throwing it away and asking [`Pipeline::verify_par2_with_placement`]
+    /// to read the whole set again to reach the same answer. Boxed to keep this
+    /// enum small on the branches that carry nothing.
+    Clean(Box<par2_rs::VerificationResult>),
     /// Damage was found that the recovery *merged so far* cannot cover, but the
     /// recovery set as a whole can. Targeted recovery has been asked for and the
     /// sets stay direct until it lands. The caller must not run the repairer and
@@ -3060,13 +3066,33 @@ impl Pipeline {
             };
         };
         if !verification.needs_repair() {
-            return DirectPar2Resolution::Clean;
+            return DirectPar2Resolution::Clean(Box::new(verification));
         }
         match self
             .repair_direct_sets_with_par2_damage(job_id, &verification)
             .await
         {
-            DirectRepairAnswer::Acted => DirectPar2Resolution::Repaired,
+            DirectRepairAnswer::Acted => {
+                // The write set this repair actually touched, taken from the
+                // verdict that decided the repair was needed — the same
+                // reading [`par2_repair_write_set`] gives the conventional
+                // selective pass. It is what lets the *next* completion
+                // check's post-repair read stay selective too, instead of
+                // reading every volume this set describes to answer a
+                // question only these few volumes can have a new answer to.
+                let write_set = crate::pipeline::completion::finalize::check::par2_repair_write_set(
+                    &verification,
+                );
+                self.direct_post_repair_carry.insert(
+                    job_id,
+                    DirectPostRepairCarry {
+                        recovery_set_id,
+                        pre_repair: verification,
+                        write_set,
+                    },
+                );
+                DirectPar2Resolution::Repaired
+            }
             DirectRepairAnswer::Deferred => DirectPar2Resolution::Deferred,
             DirectRepairAnswer::Declined => DirectPar2Resolution::Unresolved,
         }
@@ -3093,6 +3119,7 @@ impl Pipeline {
         par2_set: std::sync::Arc<par2_rs::Par2FileSet>,
         access: std::sync::Arc<super::par2_access::DirectVolumeFileAccess>,
         to_read: Vec<par2_rs::FileId>,
+        selective: bool,
     ) -> Option<Result<par2_rs::VerificationResult, String>> {
         let recovery_set_id = par2_set.recovery_set_id;
         if let Some((result_set_id, result)) = self.direct_post_repair_results.remove(&job_id) {
@@ -3103,18 +3130,52 @@ impl Pipeline {
             self.direct_post_repair_results
                 .insert(job_id, (result_set_id, result));
         }
-        if self.direct_post_repair_in_flight.contains_key(&job_id) {
-            return None;
+        if let Some(in_flight) = self.direct_post_repair_in_flight.get(&job_id) {
+            // A ticket for a *different* recovery set is not this call's to
+            // wait on — the set it was reading has been rebound out from
+            // under it (a re-parsed index, a different served set) — and
+            // nothing ever clears it on its own: `handle_direct_post_repair_done`
+            // only ever discards a mismatched *work id* against a `recovery_set_id`
+            // it already agrees with, so a mismatched `recovery_set_id` here
+            // means that done message, whenever it lands, will find no taker
+            // either. Left alone, this was a permanent park: no new ticket
+            // ever starts, so no result ever arrives, so nothing ever re-arms
+            // the job. Dropping the stale entry (and any result parked
+            // beside it under the old set id) frees the slot for a fresh
+            // ticket against the set this call actually cares about; the
+            // work id we are about to hand out fences the old task's done
+            // message if it lands late.
+            if in_flight.recovery_set_id != recovery_set_id {
+                warn!(
+                    job_id = job_id.0,
+                    stale_recovery_set_id = ?in_flight.recovery_set_id,
+                    "dropping a direct post-repair ticket parked against a recovery set this \
+                     job no longer serves"
+                );
+                self.direct_post_repair_in_flight.remove(&job_id);
+                self.direct_post_repair_results.remove(&job_id);
+            } else {
+                return None;
+            }
         }
 
         self.next_direct_post_repair_work_id = self.next_direct_post_repair_work_id.wrapping_add(1);
         let work_id = self.next_direct_post_repair_work_id;
+        let submitted_at = Instant::now();
         self.direct_post_repair_in_flight.insert(
             job_id,
             DirectPostRepairWork {
                 work_id,
                 recovery_set_id,
+                submitted_at,
             },
+        );
+        info!(
+            job_id = job_id.0,
+            work_id,
+            files = to_read.len(),
+            selective,
+            "submitting a direct post-repair verification ticket"
         );
 
         let pp_pool = self.pp_pool.clone();
@@ -3169,6 +3230,20 @@ impl Pipeline {
             );
             return;
         }
+        let elapsed = in_flight.submitted_at.elapsed();
+        let outcome = match &done.result {
+            Ok(verification) if verification.needs_repair() => "damaged",
+            Ok(_) => "clean",
+            Err(_) => "error",
+        };
+        info!(
+            job_id = done.job_id.0,
+            work_id = done.work_id,
+            elapsed_ms = elapsed.as_millis() as u64,
+            outcome,
+            "direct post-repair verification ticket completed"
+        );
+        crate::runtime::perf_probe::record("direct_store.post_repair_verify", elapsed);
         if !self.jobs.contains_key(&done.job_id) {
             self.direct_post_repair_in_flight.remove(&done.job_id);
             return;
@@ -3210,9 +3285,25 @@ impl Pipeline {
     /// else ever re-reads, so if this pass stands on wire evidence, a disk fault
     /// under a repaired set ships in a `Completed` job.
     ///
-    /// So a post-repair pass takes no claims and reads every described file,
-    /// unconditionally and with no knob to turn it off. See
-    /// [`Self::direct_sets_repaired_in_place`] for how the two are told apart.
+    /// So a post-repair pass takes no *wire* claims — the grid and the
+    /// session are both skipped, unconditionally and with no knob to turn
+    /// that off. See [`Self::direct_sets_repaired_in_place`] for how the two
+    /// are told apart.
+    ///
+    /// It does not follow that every described file is read, though. When
+    /// [`Pipeline::resolve_direct_sets_before_par2_repairer_for_set`] left a
+    /// [`DirectPostRepairCarry`] for this recovery set, the files the repair
+    /// did not rewrite carry their entry forward from that *disk* read — the
+    /// pre-repair pass's own, taken minutes ago in this same flow — rather
+    /// than being re-read. That is not wire evidence standing in for a read;
+    /// it is the same trust class [`Pipeline::verify_repaired_par2_files_with_placement`]
+    /// already extends to a conventional set's untouched files, applied here
+    /// for the same reason: the repair could only ever have rewritten the
+    /// files its own pre-repair verdict called not-`Complete`, so re-reading
+    /// the rest answers a question the disk already answered once this pass.
+    /// A carry that is missing or stale for this recovery set gets no such
+    /// shortcut; every described file is read, which is this pass's answer
+    /// whenever it cannot prove a narrower one is enough.
     ///
     /// The reads themselves go to real files — [`super::provider::VirtualVolumeReader`]
     /// holds an open handle on the envelope and on each member `.direct.partial`
@@ -3263,6 +3354,21 @@ impl Pipeline {
         // in on this pass.
         let post_repair = self.direct_sets_repaired_in_place(job_id);
 
+        // The narrower read this pass may take instead: the write set a live
+        // carry names, but only when the carry is actually for the recovery
+        // set this call is resolving. A mismatch means the carry belongs to a
+        // repair against a set this job no longer serves — the set was
+        // rebound by a later PAR2 index, say — and using its write set here
+        // would silently stand in for files a *different* set's pre-repair
+        // pass vouched for. Cloned out from under the borrow up front so the
+        // mutable calls below are free to take the carry for real once the
+        // read they start actually finishes.
+        let selective_write_set: Option<Vec<par2_rs::FileId>> = post_repair
+            .then(|| self.direct_post_repair_carry.get(&job_id))
+            .flatten()
+            .filter(|carry| carry.recovery_set_id == par2_set.recovery_set_id)
+            .map(|carry| carry.write_set.clone());
+
         let session_verification = if post_repair {
             None
         } else {
@@ -3278,6 +3384,57 @@ impl Pipeline {
 
         let mut verification = match session_verification {
             Some(verification) => verification,
+            None if post_repair && selective_write_set.is_some() => {
+                // The selective post-repair read-back: only the volumes the
+                // repair rewrote, standing in for everything else with the
+                // pre-repair pass's own entries. The direct-store mirror of
+                // [`Pipeline::verify_repaired_par2_files_with_placement`] —
+                // see this function's docs for why the carry, not the grid or
+                // the session, is what a post-repair pass may stand on.
+                let to_read = selective_write_set.expect("checked by the match guard");
+                #[cfg(test)]
+                {
+                    self.direct_post_repair_read_splits.push((0, to_read.len()));
+                }
+                info!(
+                    job_id = job_id.0,
+                    rewritten = to_read.len(),
+                    "post-repair direct-store verification reads only what the repair rewrote"
+                );
+                let fresh = match self.take_or_start_direct_post_repair_verification(
+                    job_id,
+                    std::sync::Arc::clone(&par2_set),
+                    std::sync::Arc::clone(&access),
+                    to_read,
+                    true,
+                ) {
+                    Some(Ok(fresh)) => fresh,
+                    Some(Err(error)) => {
+                        warn!(
+                            job_id = job_id.0,
+                            error = %error,
+                            "direct post-repair verification failed"
+                        );
+                        // The carry answered no question this attempt — the
+                        // read that was meant to settle it never landed — so
+                        // it must not survive to describe a future attempt
+                        // against bytes that may have moved again by then.
+                        self.direct_post_repair_carry.remove(&job_id);
+                        return None;
+                    }
+                    None => return None,
+                };
+                // Taken only now that a fresh read actually landed: while the
+                // ticket is still in flight, later laps of this same pass
+                // need the carry's write set again to resubmit or to notice
+                // the ticket is already running, so it stays in the map
+                // until there is a result to fold it into.
+                let carry = self
+                    .direct_post_repair_carry
+                    .remove(&job_id)
+                    .expect("selective_write_set was read from a live carry moments ago");
+                par2_rs::verify::merge_verification_results(&par2_set, &carry.pre_repair, fresh)
+            }
             None => {
                 // Read and verify through the access adapter. A direct set's
                 // source volumes have no files, so the adapter answers every
@@ -3297,15 +3454,15 @@ impl Pipeline {
                 // length, over bytes that were durable before the claim was
                 // made. Anything less is not adjudicated and is read.
                 //
-                // Post-repair, no file is stood in for. The grid is in fact
-                // already empty here — `repair_damaged_volumes`' caller retires
-                // it for the whole job before the rewrite, because a repair
-                // moves bytes the grid claimed — so this is belt to that
-                // braces. It is worth having as its own statement: the emptiness
-                // is a consequence of a decision made for a different reason
-                // several hundred lines away, and the requirement that a
-                // post-repair pass reads everything should not be one refactor
-                // of that decision away from silently lapsing.
+                // Post-repair, no file is stood in for here either — this arm
+                // is reached post-repair only when there is no live carry for
+                // this recovery set (a restart, an evicted job, a set that was
+                // rebound since the repair ran), and the sibling arm above is
+                // what a fresh carry routes to instead. Without one there is
+                // nothing to merge a selective read against, so the fallback
+                // is the same full, unconditional read this pass has always
+                // taken post-repair: every described file, standing in for
+                // none of them.
                 let claimed = if post_repair {
                     Vec::new()
                 } else {
@@ -3359,6 +3516,7 @@ impl Pipeline {
                             std::sync::Arc::clone(&par2_set),
                             std::sync::Arc::clone(&access),
                             to_read,
+                            false,
                         ) {
                             Some(Ok(verification)) => verification,
                             Some(Err(error)) => {
@@ -6292,6 +6450,18 @@ impl Pipeline {
             return;
         }
         let set_name = set.set_name().to_string();
+        // A demoted set's volumes become real files and hand off to the
+        // conventional repairer, which brings its own post-repair pass — so
+        // any post-repair state this job is carrying for the direct gate is
+        // no longer this set's business, and must not outlive the demotion
+        // to describe bytes a different repair path now owns. Cleared for the
+        // whole job rather than filtered to this set: the carry and the
+        // ticket bookkeeping are job-scoped (a job serves one recovery set
+        // through this gate at a time), so a demotion of any of its sets
+        // invalidates whatever the gate was mid-resolving.
+        self.direct_post_repair_carry.remove(&job_id);
+        self.direct_post_repair_in_flight.remove(&job_id);
+        self.direct_post_repair_results.remove(&job_id);
         if reason == DemotionReason::HoldsScratchCeiling {
             debug!(
                 job_id = job_id.0,
