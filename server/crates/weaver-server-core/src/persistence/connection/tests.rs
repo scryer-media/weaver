@@ -1993,6 +1993,16 @@ async fn postgres_runtime_smoke_when_configured() {
     assert_eq!(
         fetch_text(
             &db,
+            "SELECT current_setting('synchronous_commit') AS value",
+            vec![],
+        ),
+        "off",
+        "weaver postgres sessions must run asynchronous commit, matching the \
+         SQLite synchronous=NORMAL durability posture"
+    );
+    assert_eq!(
+        fetch_text(
+            &db,
             "SELECT runtime_version AS value FROM _sqlx_migrations WHERE version = {}",
             vec![SqlArg::I64(current_schema_version())],
         ),
