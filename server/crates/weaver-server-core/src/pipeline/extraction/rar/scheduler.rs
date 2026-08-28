@@ -985,17 +985,21 @@ impl Pipeline {
         let pp_pool = self.pp_pool.clone();
         let lower_bound = tokio::task::spawn_blocking(move || {
             pp_pool.install(move || -> Result<u32, String> {
-                let plan = par2_rs::scan_placement(&working_dir, &par2_set)
-                    .map_err(|e| format!("placement scan failed: {e}"))?;
-                let selected: HashSet<par2_rs::FileId> = file_ids.iter().copied().collect();
-                if plan
-                    .conflicts
-                    .iter()
-                    .any(|file_id| selected.contains(file_id))
-                {
-                    return Err("placement conflicts in suspect files".to_string());
-                }
-
+                // The suspect ids were selected by matching the topology's
+                // on-disk filenames against the descriptions' own filenames
+                // (`suspect_par2_file_ids_for_member`), so every selected file
+                // already sits at exactly its described name and the identity
+                // placement resolves it. A placement scan here would compute
+                // the full-file MD5 of every matching-length file in the
+                // working directory to rediscover that identity — a whole-set
+                // read in service of a few suspects.
+                let plan = par2_rs::PlacementPlan {
+                    exact: file_ids.clone(),
+                    swaps: Vec::new(),
+                    renames: Vec::new(),
+                    unresolved: Vec::new(),
+                    conflicts: Vec::new(),
+                };
                 let access = par2_rs::PlacementFileAccess::from_plan(working_dir, &par2_set, &plan);
                 let verification = par2_rs::verify_selected_file_ids(&par2_set, &access, &file_ids);
                 Ok(verification.total_missing_blocks)
