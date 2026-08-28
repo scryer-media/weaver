@@ -764,6 +764,29 @@ impl Pipeline {
             )
         };
 
+        if volume_paths.is_empty() {
+            // A set whose registered names resolve to nothing on disk and that
+            // no live file identity classifies into is a stale alias topology:
+            // its names predate a PAR2 identity rebind (an obfuscated post
+            // rebinds every file to canonical names, and a direct set
+            // finalizes without ever writing the alias names to disk). Such a
+            // set defends nothing — the real content belongs to the set the
+            // live identities claim — so retire it instead of failing a clean
+            // job over it. A set that live files still classify into keeps the
+            // hard error inside the task below: that one is genuinely missing
+            // volumes.
+            self.clear_archive_set_if_unreferenced_and_idle(job_id, set_name);
+            if !self.rar_sets.contains_key(&(job_id, set_name.to_string())) {
+                info!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    "retired a stale archive set — no on-disk volumes and no live file claims its names"
+                );
+                self.schedule_job_completion_check(job_id);
+                return Ok(0);
+            }
+        }
+
         if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.to_string())) {
             set_state.active_workers = 1;
             set_state.in_flight_members.clear();

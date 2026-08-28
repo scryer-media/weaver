@@ -9771,3 +9771,77 @@ async fn renamed_verified_files_still_refresh_without_a_repair_write_set() {
         "the renamed arm must keep refreshing exactly as before"
     );
 }
+
+#[tokio::test]
+async fn a_stale_alias_set_with_no_live_claimants_retires_instead_of_failing() {
+    // The job-10162 shape: an obfuscated post's PAR2 index rebinds every file
+    // to canonical names early, the canonical set finalizes direct (nothing is
+    // ever written under the alias names), but a topology entry keyed by the
+    // posted alias survives. Extraction of that alias set finds no volumes on
+    // disk and no live identity claims its names — it must retire, not fail a
+    // clean job.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90211);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Silver Horizon Stale Alias",
+            &[("Silver.Horizon.S01E01.mkv".to_string(), 64)],
+        ),
+    )
+    .await;
+
+    let alias = "bWq99zz0testAliasSetName";
+    let mut stale = crate::pipeline::archive::rar_state::RarSetState::default();
+    stale.volume_files.insert(0, format!("{alias}.part001.rar"));
+    stale.volume_files.insert(1, format!("{alias}.part002.rar"));
+    pipeline.rar_sets.insert((job_id, alias.to_string()), stale);
+
+    let extracted = pipeline.extract_rar_set(job_id, alias).await;
+    assert_eq!(extracted, Ok(0), "retirement is not a failure");
+    assert!(
+        !pipeline.rar_sets.contains_key(&(job_id, alias.to_string())),
+        "the alias set no live file claims is retired"
+    );
+
+    // The negative control: a set live files DO classify into keeps its
+    // topology even when its volumes are missing on disk — that shape is
+    // genuinely missing volumes, not a stale alias.
+    let claimed_job = JobId(90212);
+    let claimed_spec = JobSpec {
+        name: "Silver Horizon Claimed Set".to_string(),
+        password: None,
+        total_bytes: 64,
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: "claimed.part001.rar".to_string(),
+            role: FileRole::from_filename("claimed.part001.rar"),
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: vec![segment_spec! {
+                number: 0,
+                bytes: 64,
+                message_id: "claimed-set-volume@example.com".to_string(),
+            }],
+        }],
+    };
+    insert_active_job(&mut pipeline, claimed_job, claimed_spec).await;
+    let mut claimed = crate::pipeline::archive::rar_state::RarSetState::default();
+    claimed
+        .volume_files
+        .insert(0, "claimed.part001.rar".to_string());
+    pipeline
+        .rar_sets
+        .insert((claimed_job, "claimed".to_string()), claimed);
+
+    let _ = pipeline.extract_rar_set(claimed_job, "claimed").await;
+    assert!(
+        pipeline
+            .rar_sets
+            .contains_key(&(claimed_job, "claimed".to_string())),
+        "a set with live claimants is never retired by the missing-volume path"
+    );
+}
