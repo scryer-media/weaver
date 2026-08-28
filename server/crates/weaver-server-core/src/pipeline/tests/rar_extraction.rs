@@ -958,6 +958,152 @@ async fn rar_refresh_follow_up_covers_holey_inflight_snapshot() {
     );
 }
 
+/// A coverage gap the plan CANNOT close must park, not respawn.
+///
+/// The follow-up machinery exists for absorbable facts: a holey snapshot's
+/// next rebuild attaches the present volumes and the gap closes. But a
+/// rebuild can also come back with a plan that has NOT absorbed every
+/// registered fact — a chain the opened headers cannot extend, a volume
+/// binding pointing at bytes no rebuild can attach — and an ungated
+/// follow-up then respawns an identical refresh from every completion, at
+/// actor speed, forever: identical inputs, identical plan, same gap. The
+/// completion fingerprint parks the second identical completion; a real
+/// fact change moves the fingerprint and re-arms the gap.
+#[tokio::test]
+async fn a_refresh_gap_the_plan_cannot_close_parks_instead_of_respawning() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40133);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Unclosable Gap Parks", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+    let key = (job_id, "show".to_string());
+    let extraction_generation = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("RAR set state should exist")
+        .extraction_generation;
+
+    // A computed result whose plan absorbed only volume 0, while the set's
+    // facts hold every volume: the unclosable-gap shape, reduced to its
+    // essence. Rebuilding it twice models a refresh loop whose inputs never
+    // change between rounds.
+    let unclosable_computed = |pipeline: &Pipeline| {
+        let mut topology = pipeline
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.assembly.archive_topology_for("show"))
+            .cloned()
+            .expect("RAR topology should exist after all volumes complete");
+        topology.complete_volumes.retain(|volume| *volume == 0);
+        ComputedRarSetState {
+            plan: crate::pipeline::archive::rar_state::RarDerivedPlan {
+                phase: crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes,
+                is_solid: false,
+                ready_members: Vec::new(),
+                member_names: Vec::new(),
+                member_dependencies: HashMap::new(),
+                waiting_on_volumes: HashSet::from([1]),
+                deletion_eligible: HashSet::new(),
+                delete_decisions: BTreeMap::new(),
+                topology,
+                fallback_reason: None,
+            },
+            headers: Vec::new(),
+            rebuild_source:
+                crate::pipeline::archive::topology::RarTopologyRebuildSource::VolumeZero,
+        }
+    };
+    let request = RarRefreshRequest {
+        target_completed_volume: 2,
+        reason: RefreshReason::CoverageExpansion,
+    };
+    let refresh_done = |pipeline: &Pipeline| RarRefreshDone {
+        job_id,
+        set_name: "show".to_string(),
+        request,
+        extraction_generation,
+        result: Ok(unclosable_computed(pipeline)),
+    };
+
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: Some(request),
+            queued: None,
+            latest_completed_volume: 2,
+            refreshed_volumes: BTreeSet::from([0, 1, 2]),
+            structure_dirty: false,
+            last_error: None,
+            last_completion_fingerprint: None,
+        },
+    );
+
+    // Round one: the gap is new, so a follow-up is the right call — the facts
+    // grew past what this plan absorbed and a rebuild might absorb them.
+    let done = refresh_done(&pipeline);
+    pipeline.handle_rar_refresh_done(done).await;
+    assert!(
+        pipeline
+            .rar_refresh_state
+            .get(&key)
+            .is_some_and(|state| state.in_flight.is_some()),
+        "the first unabsorbed-facts completion must spawn a follow-up refresh"
+    );
+
+    // Round two lands on identical inputs and an identical plan: without the
+    // park this respawns forever, at actor speed.
+    let done = refresh_done(&pipeline);
+    pipeline.handle_rar_refresh_done(done).await;
+    let parked_fingerprint = {
+        let state = pipeline
+            .rar_refresh_state
+            .get(&key)
+            .expect("RAR refresh state should remain present");
+        assert!(
+            state.in_flight.is_none() && state.queued.is_none(),
+            "an identical completion must park the gap instead of respawning"
+        );
+        state
+            .last_completion_fingerprint
+            .expect("a successful completion must record its fingerprint")
+    };
+
+    // A real fact change re-arms the parked gap: the fingerprint moves, so
+    // the next completion follows up again instead of staying parked.
+    pipeline
+        .rar_sets
+        .get_mut(&key)
+        .expect("RAR set state should exist")
+        .facts_generation += 1;
+    pipeline
+        .rar_refresh_state
+        .get_mut(&key)
+        .expect("RAR refresh state should remain present")
+        .in_flight = Some(request);
+    let done = refresh_done(&pipeline);
+    pipeline.handle_rar_refresh_done(done).await;
+    let state = pipeline
+        .rar_refresh_state
+        .get(&key)
+        .expect("RAR refresh state should remain present");
+    assert!(
+        state.in_flight.is_some(),
+        "a changed fact must re-arm the parked coverage gap"
+    );
+    assert_ne!(
+        state.last_completion_fingerprint,
+        Some(parked_fingerprint),
+        "the re-armed completion must move the fingerprint"
+    );
+}
+
 #[tokio::test]
 async fn rar_refresh_follow_up_does_not_starve_covered_ready_members() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -997,6 +1143,7 @@ async fn rar_refresh_follow_up_does_not_starve_covered_ready_members() {
             refreshed_volumes: BTreeSet::from([0, 1]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1129,6 +1276,7 @@ async fn rar_refresh_done_uses_actual_refreshed_frontier() {
             refreshed_volumes: BTreeSet::from([0, 1]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1222,6 +1370,7 @@ async fn stale_post_extraction_refresh_does_not_replace_live_rar_plan() {
             refreshed_volumes: BTreeSet::from([0, 1, 2, 3]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1315,6 +1464,7 @@ async fn identity_rebind_rejects_an_older_rar_refresh_snapshot() {
             refreshed_volumes: BTreeSet::from([0, 1, 2, 3]),
             structure_dirty: true,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1530,6 +1680,7 @@ async fn active_sibling_extraction_does_not_launch_post_refresh_or_reselect_fini
             refreshed_volumes: BTreeSet::from([0, 1, 2, 3]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1752,6 +1903,7 @@ async fn idle_rar_worker_drain_recomputes_and_clears_obsolete_post_refresh() {
             refreshed_volumes: BTreeSet::from([0, 1, 2, 3]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1832,6 +1984,7 @@ async fn idle_rar_worker_drain_keeps_extracting_when_coverage_refresh_launches()
             refreshed_volumes: BTreeSet::from([0, 1, 2, 3]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1891,6 +2044,7 @@ async fn rar_member_refresh_request_retries_after_refresh_error() {
             refreshed_volumes: BTreeSet::from([0, 1]),
             structure_dirty: false,
             last_error: Some(RarRefreshError::Other("refresh failed".to_string())),
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1929,6 +2083,7 @@ async fn rar_refresh_capacity_pressure_requeues_without_validation_escalation() 
             refreshed_volumes: BTreeSet::from([0]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -2048,6 +2203,7 @@ async fn rar_member_refresh_request_ignores_verified_suspects_when_covered() {
             refreshed_volumes: BTreeSet::from([0, 1]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
     pipeline
@@ -6902,6 +7058,7 @@ async fn rar_waiting_for_missing_volumes_without_par2_fails_after_download_compl
             active_workers: 0,
             in_flight_members: HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::WaitingForVolumes,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::WaitingForVolumes,
@@ -6975,6 +7132,7 @@ async fn legacy_reconcile_schedules_waiting_rar_completion_check() {
             active_workers: 0,
             in_flight_members: HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::WaitingForVolumes,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::WaitingForVolumes,
@@ -7054,6 +7212,7 @@ async fn rar_completion_waiting_for_volumes_does_not_requeue_itself() {
             active_workers: 0,
             in_flight_members: HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::Ready,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::Ready,
@@ -7141,6 +7300,7 @@ async fn clean_member_keeps_failed_neighbor_boundary_volume_suspect() {
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::Ready,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::Ready,
@@ -7410,6 +7570,7 @@ async fn ownerless_live_rar_plan_error_requires_named_member_facts() {
             active_workers: 0,
             in_flight_members: HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::WaitingForVolumes,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::WaitingForVolumes,
@@ -7510,6 +7671,7 @@ async fn rar_completion_waits_for_pending_refresh_before_terminal_decision() {
             refreshed_volumes: BTreeSet::from([0, 1, 2]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
     {
@@ -7924,6 +8086,7 @@ async fn eager_delete_retains_volume_with_failed_member_claim() {
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::Ready,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::Ready,
@@ -8915,6 +9078,7 @@ async fn impossible_rar_state_fails_loudly_after_forced_recompute() {
             active_workers: 0,
             in_flight_members: HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::Ready,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::Ready,
@@ -9340,6 +9504,7 @@ async fn reconcile_job_progress_marks_waiting_for_rar_volumes_without_clobbering
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::WaitingForVolumes,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::WaitingForVolumes,

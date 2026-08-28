@@ -77,6 +77,11 @@ pub(crate) struct RarSetState {
     pub(crate) active_workers: usize,
     pub(crate) in_flight_members: HashSet<String>,
     pub(crate) extraction_generation: u64,
+    /// Bumped whenever a volume's persisted facts or filename binding change.
+    /// The refresh loop's progress fingerprint folds this in, so a
+    /// content-level fact change (same volume key, different facts) re-arms a
+    /// parked refresh exactly like a brand-new volume would.
+    pub(crate) facts_generation: u64,
     pub(crate) phase: RarSetPhase,
     pub(crate) plan: Option<RarDerivedPlan>,
 }
@@ -92,6 +97,7 @@ impl Default for RarSetState {
             active_workers: 0,
             in_flight_members: HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: RarSetPhase::WaitingForVolumes,
             plan: None,
         }

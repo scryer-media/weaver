@@ -1194,6 +1194,16 @@ pub(super) struct RarRefreshState {
     pub(super) refreshed_volumes: BTreeSet<u32>,
     pub(super) structure_dirty: bool,
     pub(super) last_error: Option<RarRefreshError>,
+    /// Fingerprint of (facts generation, fact volumes, plan volumes, plan
+    /// waits) at the last successful refresh completion. A coverage gap —
+    /// facts the plan has not absorbed — normally spawns a follow-up refresh,
+    /// but when a completed refresh lands on the same fingerprint as the one
+    /// before it, the follow-up would recompute the identical answer from
+    /// identical inputs: a gap the plan CANNOT close (a missing chain link,
+    /// say) would otherwise respawn itself forever at actor speed. Matching
+    /// fingerprints park the gap instead; any real change — a new fact, a
+    /// changed fact, plan progress — changes the fingerprint and re-arms it.
+    pub(super) last_completion_fingerprint: Option<u64>,
 }
 
 pub(super) struct ComputedRarSetState {

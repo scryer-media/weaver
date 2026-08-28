@@ -734,6 +734,7 @@ impl Pipeline {
         let state = self.rar_sets.entry(state_key).or_default();
         Self::register_rar_volume_file(state, facts.volume_number, filename.to_string());
         state.facts.insert(facts.volume_number, facts);
+        state.facts_generation = state.facts_generation.wrapping_add(1);
 
         Ok(true)
     }
@@ -1508,6 +1509,34 @@ impl Pipeline {
             .get(&key)
             .map(|set_state| set_state.facts.keys().copied().collect())
             .unwrap_or_default();
+        // Everything a follow-up refresh could possibly compute from: the
+        // facts (generation covers content changes under an unchanged key)
+        // and the plan this refresh just installed. Two successive
+        // completions landing on the same fingerprint prove a follow-up
+        // would re-derive the identical plan from identical inputs.
+        let completion_fingerprint = {
+            use std::hash::{DefaultHasher, Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            if let Some(set_state) = self.rar_sets.get(&key) {
+                set_state.facts_generation.hash(&mut hasher);
+                set_state
+                    .facts
+                    .keys()
+                    .for_each(|volume| volume.hash(&mut hasher));
+                u32::MAX.hash(&mut hasher);
+                if let Some(plan) = set_state.plan.as_ref() {
+                    plan.topology
+                        .complete_volumes
+                        .iter()
+                        .for_each(|volume| volume.hash(&mut hasher));
+                    u32::MAX.hash(&mut hasher);
+                    plan.waiting_on_volumes
+                        .iter()
+                        .for_each(|volume| volume.hash(&mut hasher));
+                }
+            }
+            hasher.finish()
+        };
         let latest_live_volume = live_fact_volumes.iter().next_back().copied().unwrap_or(0);
         let active_rar_workers = self.rar_sets.get(&key).is_some_and(|set_state| {
             set_state.active_workers > 0 || !set_state.in_flight_members.is_empty()
@@ -1563,8 +1592,33 @@ impl Pipeline {
                     state.last_error = None;
                 }
 
-                let coverage_gap =
-                    success && !live_fact_volumes.is_subset(&state.refreshed_volumes);
+                // The progress gate. A coverage gap asks for a follow-up
+                // because the facts hold volumes the plan has not absorbed —
+                // but a gap the plan CANNOT close (a chain link whose volume
+                // does not exist yet, say) reproduces itself on every
+                // follow-up, and an ungated respawn here is a full-speed
+                // livelock: refresh → identical plan → same gap → refresh,
+                // at actor cadence, starving every other job. When this
+                // completion lands on the same fingerprint as the previous
+                // one, the follow-up is parked instead; the next real change
+                // — a fact registered, a fact rewritten, plan progress —
+                // moves the fingerprint and re-arms the gap through the
+                // ordinary event-driven enqueues.
+                let no_progress =
+                    success && state.last_completion_fingerprint == Some(completion_fingerprint);
+                if success {
+                    state.last_completion_fingerprint = Some(completion_fingerprint);
+                }
+                let unabsorbed_facts = !live_fact_volumes.is_subset(&state.refreshed_volumes);
+                let coverage_gap = success && !no_progress && unabsorbed_facts;
+                if success && no_progress && unabsorbed_facts {
+                    debug!(
+                        job_id = done.job_id.0,
+                        set_name = %done.set_name,
+                        "RAR refresh made no progress against unchanged facts; parking the \
+                         coverage gap until a new fact or volume arrives"
+                    );
+                }
                 if let Some(mut queued) = state.queued.take() {
                     if coverage_gap || capacity_pressure {
                         queued.target_completed_volume = queued
