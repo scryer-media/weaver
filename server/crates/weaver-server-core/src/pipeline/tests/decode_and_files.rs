@@ -2403,6 +2403,23 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
     assert!(pipeline.job_has_pending_download_pipeline_work(job_id));
     assert!(pipeline.pending_completion_checks.is_empty());
 
+    pipeline.active_downloads = 1;
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.flush_quiescent_write_backlog().await;
+    assert!(pipeline.write_buffered_bytes > 0);
+    assert!(pipeline.pending_completion_checks.is_empty());
+    pipeline.active_downloads_by_job.remove(&job_id);
+
+    let competing_job_id = JobId(20008);
+    insert_active_job(
+        &mut pipeline,
+        competing_job_id,
+        standalone_job_spec("Active Competitor", &[("competitor.bin".to_string(), 64)]),
+    )
+    .await;
+    pipeline.active_downloads = 1;
+    pipeline.active_downloads_by_job.insert(competing_job_id, 1);
+
     pipeline.flush_quiescent_write_backlog().await;
 
     assert_eq!(pipeline.write_buffered_bytes, 0);

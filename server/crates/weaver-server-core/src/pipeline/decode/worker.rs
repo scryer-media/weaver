@@ -1012,18 +1012,36 @@ impl Pipeline {
     }
 
     pub(crate) async fn flush_quiescent_write_backlog(&mut self) {
-        if self.active_downloads > 0
-            || !self.pending_decode.is_empty()
-            || self.metrics.decode_pending.load(Ordering::Relaxed) > 0
-        {
-            return;
-        }
-
         let stalled_jobs: Vec<JobId> = self
             .jobs
             .iter()
             .filter_map(|(job_id, state)| {
                 if is_terminal_status(&state.status) || !state.download_queue.is_empty() {
+                    return None;
+                }
+                let has_active_downloads = self
+                    .active_downloads_by_job
+                    .get(job_id)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0;
+                let has_active_decodes =
+                    self.active_decodes_by_job.get(job_id).copied().unwrap_or(0) > 0;
+                let has_released_download_results = self
+                    .pending_released_download_results_by_job
+                    .get(job_id)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0;
+                let has_pending_decode = self
+                    .pending_decode
+                    .iter()
+                    .any(|work| work.segment_id.file_id.job_id == *job_id);
+                if has_active_downloads
+                    || has_active_decodes
+                    || has_released_download_results
+                    || has_pending_decode
+                {
                     return None;
                 }
                 let has_buffered_segments = self
