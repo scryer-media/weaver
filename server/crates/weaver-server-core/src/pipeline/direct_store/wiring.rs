@@ -3489,6 +3489,54 @@ impl Pipeline {
                         claimed.len() as u64,
                     );
                 }
+                if !post_repair && !to_read.is_empty() {
+                    // Why each read is happening at all: the first failing
+                    // rung of the claim ladder, per unclaimed file, folded
+                    // into a histogram. A healthy 100%-grid-fed job that
+                    // still pays a multi-minute read should say WHY in its
+                    // own log line, not leave a silent gap to reconstruct
+                    // from timestamps.
+                    let to_read_set: HashSet<par2_rs::FileId> = to_read.iter().copied().collect();
+                    let mut shortfalls: BTreeMap<&'static str, u32> = BTreeMap::new();
+                    let mut bound: HashSet<par2_rs::FileId> = HashSet::new();
+                    if let Some(state) = self.jobs.get(&job_id) {
+                        let file_ids: Vec<NzbFileId> =
+                            state.assembly.files().map(|file| file.file_id()).collect();
+                        for file_id in file_ids {
+                            let Some(binding) = self.resolve_par2_file_binding_in_set(
+                                file_id,
+                                par2_set.recovery_set_id,
+                            ) else {
+                                continue;
+                            };
+                            if !to_read_set.contains(&binding.par2_file_id) {
+                                continue;
+                            }
+                            bound.insert(binding.par2_file_id);
+                            if let Some(reason) =
+                                self.in_stream_par2_claim_shortfall(file_id, &par2_set)
+                            {
+                                *shortfalls.entry(reason).or_default() += 1;
+                            }
+                        }
+                    }
+                    let unbound = to_read_set.len().saturating_sub(bound.len());
+                    if unbound > 0 {
+                        *shortfalls.entry("no_bound_pipeline_file").or_default() += unbound as u32;
+                    }
+                    info!(
+                        job_id = job_id.0,
+                        read = to_read.len(),
+                        shortfalls = ?shortfalls,
+                        "direct verify is reading files the grid could not claim"
+                    );
+                    for (reason, count) in &shortfalls {
+                        crate::runtime::perf_probe::record_value_owned(
+                            format!("direct_store.verify.claim_shortfall.{reason}"),
+                            u64::from(*count),
+                        );
+                    }
+                }
                 #[cfg(test)]
                 {
                     self.direct_verify_read_splits

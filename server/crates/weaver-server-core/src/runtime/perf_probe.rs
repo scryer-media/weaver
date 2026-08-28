@@ -70,6 +70,13 @@ pub(crate) fn record_value(label: &'static str, value: u64) {
     profiler().record_value(label.to_string(), value);
 }
 
+pub(crate) fn record_value_owned(label: String, value: u64) {
+    if !enabled() {
+        return;
+    }
+    profiler().record_value(label, value);
+}
+
 pub(crate) fn scope(label: &'static str) -> Scope {
     Scope {
         label,

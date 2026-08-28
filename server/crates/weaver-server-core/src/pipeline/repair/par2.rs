@@ -1344,6 +1344,69 @@ impl Pipeline {
         ))
     }
 
+    /// Why [`Self::in_stream_verified_par2_match`] would refuse this file —
+    /// `None` when it would claim. Diagnostics only: the answer names the
+    /// FIRST failing rung of the same ladder the predicate walks, so a
+    /// production log can say why a healthy-looking job still paid a read
+    /// instead of leaving it a mystery gap in the timeline.
+    pub(crate) fn in_stream_par2_claim_shortfall(
+        &self,
+        file_id: NzbFileId,
+        par2_set: &par2_rs::Par2FileSet,
+    ) -> Option<&'static str> {
+        let Some(binding) =
+            self.resolve_par2_file_binding_in_set(file_id, par2_set.recovery_set_id)
+        else {
+            return Some("no_binding");
+        };
+        let Some(description) = par2_set.file_description(&binding.par2_file_id) else {
+            return Some("no_description");
+        };
+        if description.length == 0 {
+            return Some("zero_length_description");
+        }
+        let Some(file) = self
+            .jobs
+            .get(&file_id.job_id)
+            .and_then(|state| state.assembly.file(file_id))
+        else {
+            return Some("no_assembly_file");
+        };
+        if !binding.is_complete {
+            return Some("binding_incomplete");
+        }
+        if file.received_bytes() != description.length {
+            return Some("length_mismatch");
+        }
+        let verdicts = self
+            .block_crcs
+            .verdicts_against(file_id, par2_set, binding.par2_file_id);
+        let slice_count = par2_set.slice_count_for_file(description.length);
+        let mut unverdicted = false;
+        let mut dependent = false;
+        for slice_index in 0..slice_count {
+            match verdicts.get(&slice_index) {
+                Some(crate::pipeline::integrity::BlockVerdict::Intact {
+                    independently_covered: true,
+                }) => {}
+                Some(crate::pipeline::integrity::BlockVerdict::Intact {
+                    independently_covered: false,
+                }) => dependent = true,
+                Some(crate::pipeline::integrity::BlockVerdict::Damaged) => {
+                    return Some("slices_damaged");
+                }
+                _ => unverdicted = true,
+            }
+        }
+        if unverdicted {
+            return Some("slices_unverdicted");
+        }
+        if dependent {
+            return Some("slices_dependent_coverage");
+        }
+        None
+    }
+
     /// Whether the dual-CRC grid adjudicated **every** described slice of
     /// **every** described file in a job's recovery set.
     ///

@@ -402,6 +402,26 @@ impl Pipeline {
 
         #[cfg(test)]
         self.sfv_verify_read_splits.push((combined_arm, read_arm));
+        // The combined arm is the zero-read path; the read arm re-reads a file
+        // whole because its streamed CRC could not compose (duplicates, gaps,
+        // out-of-order assembly). Counted in production so a job that quietly
+        // re-reads its payload for SFV is visible instead of folklore.
+        crate::runtime::perf_probe::record_value(
+            "completion.sfv.files_verified_from_streamed_crc",
+            combined_arm as u64,
+        );
+        if read_arm > 0 {
+            crate::runtime::perf_probe::record_value(
+                "completion.sfv.files_reread_from_disk",
+                read_arm as u64,
+            );
+            info!(
+                job_id = job_id.0,
+                combined_from_stream = combined_arm,
+                reread_from_disk = read_arm,
+                "SFV verification re-read files whose streamed CRC could not compose"
+            );
+        }
 
         if let Some(cause) = failure {
             warn!(job_id = job_id.0, error = %cause, "SFV verification failed");
