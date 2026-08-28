@@ -47,7 +47,6 @@ import {
 } from "@/graphql/queries";
 
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 
@@ -1114,7 +1113,23 @@ export function History() {
     setPageIndex(0);
   }
 
-  const showEmptyState = !fetching && counts.all === 0 && totalCount === 0 && historyPreferences.search.length === 0 && historyPreferences.status === "all";
+  const hasNoHistory = counts.all === 0 && totalCount === 0 && historyPreferences.search.length === 0 && historyPreferences.status === "all";
+  const historyEmptyState = fetching && !data ? (
+    <div className="py-12 text-center text-muted-foreground">{t("label.loading")}</div>
+  ) : hasNoHistory ? (
+    <div className="py-4">
+      <EmptyState title={t("history.title")} description={t("history.empty")} />
+    </div>
+  ) : (
+    <div className="space-y-3 py-12 text-center">
+      <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
+      <div>
+        <Button variant="outline" onClick={resetHistoryView}>
+          {t("action.clearFilters")}
+        </Button>
+      </div>
+    </div>
+  );
 
   return (
     <div className="space-y-6">
@@ -1141,16 +1156,7 @@ export function History() {
         ) : null}
       </div>
 
-      {fetching && !data ? (
-        <Card className="rounded-card">
-          <CardContent className="py-12 text-center text-muted-foreground">
-            {t("label.loading")}
-          </CardContent>
-        </Card>
-      ) : showEmptyState ? (
-        <EmptyState title={t("history.title")} description={t("history.empty")} />
-      ) : (
-        <div className="space-y-4">
+      <div className="space-y-4">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="relative w-full sm:max-w-[260px]">
               <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -1254,16 +1260,7 @@ export function History() {
               wrapperClassName="max-h-[70vh]"
               rowClassName={historyRowClassName}
               virtualization={historyTableVirtualization}
-              emptyState={
-                <div className="space-y-3 py-12 text-center">
-                  <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
-                  <div>
-                    <Button variant="outline" onClick={resetHistoryView}>
-                      {t("action.clearFilters")}
-                    </Button>
-                  </div>
-                </div>
-              }
+              emptyState={historyEmptyState}
             />
             <DataTablePagination
               table={historyTable}
@@ -1274,8 +1271,7 @@ export function History() {
               nextLabel={t("action.next")}
             />
           </div>
-        </div>
-      )}
+      </div>
 
       <ConfirmDialog
         open={deleteConfirmId != null}

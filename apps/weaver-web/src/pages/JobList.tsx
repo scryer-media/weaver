@@ -1671,6 +1671,30 @@ export function JobList() {
     setPageIndex(0);
   }
 
+  const queueEmptyState: ReactNode = isQueueBootstrapPending ? (
+    <div role="status" className="py-8 text-center text-sm text-muted-foreground">
+      {t("label.loading")}
+    </div>
+  ) : totalCount === 0 && !hasUnfilteredQueueItems ? (
+    <div className="py-4">
+      <EmptyState
+        title={t("jobs.empty")}
+        description={t("jobs.emptyHint")}
+        actionLabel={t("jobs.emptyAction")}
+        onAction={() => setUploadOpen(true)}
+      />
+    </div>
+  ) : (
+    <div className="space-y-3 py-12 text-center">
+      <div className="text-sm text-muted-foreground">{t("queue.noMatches")}</div>
+      <div>
+        <Button variant="outline" onClick={resetQueueView}>
+          {t("action.clearFilters")}
+        </Button>
+      </div>
+    </div>
+  );
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -1774,19 +1798,7 @@ export function JobList() {
         </Card>
       ) : null}
 
-      {isQueueBootstrapPending ? (
-        <div role="status" className="py-8 text-center text-sm text-muted-foreground">
-          {t("label.loading")}
-        </div>
-      ) : totalCount === 0 ? (
-        <EmptyState
-          title={hasUnfilteredQueueItems ? t("queue.noMatches") : t("jobs.empty")}
-          description={hasUnfilteredQueueItems ? undefined : t("jobs.emptyHint")}
-          actionLabel={hasUnfilteredQueueItems ? t("action.clearFilters") : t("jobs.emptyAction")}
-          onAction={hasUnfilteredQueueItems ? resetQueueView : () => setUploadOpen(true)}
-        />
-      ) : (
-        <Card>
+      <Card>
           <CardContent className="space-y-4 px-0 pb-0 pt-6">
             <div className="px-6">
               <DataTableToolbar
@@ -2137,26 +2149,10 @@ export function JobList() {
                 wrapperClassName="max-h-[70vh]"
                 rowClassName={queueRowClassName}
                 virtualization={queueTableVirtualization}
-                emptyState={
-                  <div className="space-y-3 py-12 text-center">
-                    <div className="text-sm text-muted-foreground">{t("queue.noMatches")}</div>
-                    <div>
-                      <Button variant="outline" onClick={resetQueueView}>
-                        {t("action.clearFilters")}
-                      </Button>
-                    </div>
-                  </div>
-                }
+                emptyState={queueEmptyState}
               />
             ) : queueTable.getRowModel().rows.length === 0 ? (
-              <div className="space-y-3 py-12 text-center">
-                <div className="text-sm text-muted-foreground">{t("queue.noMatches")}</div>
-                <div>
-                  <Button variant="outline" onClick={resetQueueView}>
-                    {t("action.clearFilters")}
-                  </Button>
-                </div>
-              </div>
+              queueEmptyState
             ) : (
               <div className="max-h-[70vh] overflow-y-auto border-t border-border">
                 {queueTable.getRowModel().rows.map((row) => {
@@ -2252,8 +2248,7 @@ export function JobList() {
               nextLabel={t("action.next")}
             />
           </CardContent>
-        </Card>
-      )}
+      </Card>
 
       <ConfirmDialog
         open={cancelConfirmId != null}
