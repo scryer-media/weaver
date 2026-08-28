@@ -2781,7 +2781,7 @@ async fn demote_mid_download(
     temp_dir: &TempDir,
     job_id: JobId,
     volumes: &[(String, Vec<u8>)],
-    before_demotion: impl FnOnce(&Pipeline, &std::path::Path),
+    before_demotion: impl FnOnce(&mut Pipeline, &std::path::Path),
 ) -> (Pipeline, std::path::PathBuf, u64) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
@@ -2823,7 +2823,7 @@ async fn demote_mid_download(
         "volume 0's bytes were routed before the demotion"
     );
 
-    before_demotion(&pipeline, &working_dir);
+    before_demotion(&mut pipeline, &working_dir);
     pipeline
         .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded)
         .await;
@@ -2906,6 +2906,95 @@ async fn a_demoted_set_materializes_its_covered_volumes_instead_of_refetching_th
     assert!(
         pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
         "the direct coverage row is retired once the legacy state replaces it"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_chain_demotion_leaves_a_partial_crc_atom_provisional() {
+    let member_name = "Silver.Horizon.S01E11.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41032);
+    let (mut pipeline, working_dir, other_file_bytes) =
+        demote_mid_download(&temp_dir, job_id, &volumes, |pipeline, _| {
+            // The SQLite ordering from the malformed-chain fixture: durable
+            // placement reaches into the next article before the chain
+            // contradiction demotes the set. Its whole-article CRC exists, but
+            // the placed prefix cannot be composed against it exactly.
+            let (start, end) = article_extent(volumes[1].1.len(), 1, 2);
+            let partial_len = (end - start).div_ceil(2);
+            let set = pipeline.direct_store.set_mut(job_id, 0).unwrap();
+            set.note_volume_part_crc(
+                1,
+                start as u64,
+                (end - start) as u64,
+                par2_rs::checksum::crc32(&volumes[1].1[start..end]),
+            );
+            set.record_writes(
+                &[crate::pipeline::direct_store::router::RoutedSpan {
+                    destination:
+                        crate::pipeline::direct_store::router::DirectDestination::Envelope {
+                            volume_index: 1,
+                        },
+                    destination_offset: start as u64,
+                    volume_index: 1,
+                    source_offset: start as u64,
+                    bytes: vec![0xA5; partial_len],
+                }],
+                std::time::Instant::now(),
+            );
+            assert_eq!(
+                set.volume_coverage(1).end(),
+                (start + partial_len) as u64,
+                "the rig must end physical coverage inside the CRC atom"
+            );
+            set.demote(DemotionReason::MemberIneligible(
+                crate::pipeline::direct_store::router::MemberIneligibility::MalformedChain,
+            ));
+        })
+        .await;
+
+    let volume_one_prefix = volumes[1].1.len().div_ceil(2);
+    let materialized_volume_one = std::fs::read(working_dir.join(&volumes[1].0)).unwrap();
+    let provisional_len = (volumes[1].1.len() - volume_one_prefix).div_ceil(2);
+    assert_eq!(
+        std::fs::read(working_dir.join(&volumes[0].0))
+            .ok()
+            .as_deref(),
+        Some(volumes[0].1.as_slice()),
+        "the complete neighbour must survive the malformed tail"
+    );
+    assert_eq!(
+        materialized_volume_one.len(),
+        volume_one_prefix + provisional_len,
+        "physical geometry is retained even where proof coverage stops"
+    );
+    assert_eq!(
+        &materialized_volume_one[..volume_one_prefix],
+        &volumes[1].1[..volume_one_prefix],
+        "the wholly CRC-vouched article must materialize byte for byte"
+    );
+    assert!(
+        materialized_volume_one[volume_one_prefix..]
+            .iter()
+            .all(|byte| *byte == 0),
+        "the partial CRC atom must remain a sparse, unowned hole"
+    );
+    assert_eq!(
+        queued_segments(&mut pipeline, job_id),
+        vec![(1, 1), (2, 0), (2, 1)],
+        "the provisional article is targeted for conventional ownership without refetching its complete neighbours"
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().downloaded_bytes,
+        other_file_bytes + volumes[0].1.len() as u64 + volume_one_prefix as u64,
+        "only materialized article extents remain counted"
+    );
+    assert!(
+        format!("{:?}", pipeline.direct_store.sets_for(job_id)).contains("MalformedChain"),
+        "the regression must retain the malformed-chain demotion reason"
     );
 }
 
@@ -7781,15 +7870,36 @@ async fn a_restored_last_volume_whose_envelope_is_gone_still_demotes_by_name() {
         "a demoted set must hand its volumes to the conventional path, either \
          materialized or refetched (materialized {materialized}, requeued {requeued:?})"
     );
-    for (filename, bytes) in &volumes {
+    assert!(
+        requeued.contains(&(2, 0))
+            && requeued.contains(&(2, 3))
+            && !requeued.contains(&(2, 1))
+            && !requeued.contains(&(2, 2)),
+        "only the restored volume's unmaterialized edge articles should return to conventional ownership, got {requeued:?}"
+    );
+    for (file_index, (filename, bytes)) in volumes.iter().enumerate() {
         let Some(on_disk) = std::fs::read(working_dir.join(filename)).ok() else {
             continue;
         };
-        assert_eq!(
-            on_disk.as_slice(),
-            bytes.as_slice(),
-            "{filename} was materialized, so it must be byte-exact"
+        assert!(
+            on_disk.len() <= bytes.len(),
+            "{filename} must not grow past its canonical geometry"
         );
+        for segment_number in 0..ARTICLES as u32 {
+            if requeued.contains(&(file_index as u32, segment_number)) {
+                continue;
+            }
+            let (start, end) = article_extent(bytes.len(), segment_number, ARTICLES);
+            assert!(
+                end <= on_disk.len(),
+                "{filename} segment {segment_number} stayed materialized, so its full extent must exist"
+            );
+            assert_eq!(
+                &on_disk[start..end],
+                &bytes[start..end],
+                "{filename} segment {segment_number} stayed materialized, so its bytes must be exact"
+            );
+        }
     }
     let complete_dir = temp_dir.path().join("complete");
     let (member, _) = member_after_gate(&complete_dir, &working_dir, member_name);

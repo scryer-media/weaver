@@ -2266,6 +2266,31 @@ fn crc_runs_compose_any_sub_range_that_lands_on_run_boundaries() {
 }
 
 #[test]
+fn crc_runs_promote_only_wholly_covered_atoms_for_reconstruction() {
+    let mut runs = CrcRuns::default();
+    for start in [0u64, 100, 200, 300, 400] {
+        runs.insert(start, 100, start as u32);
+    }
+
+    let mut available = ByteRanges::default();
+    available.insert(0, 250); // trails into the 200..300 atom
+    available.insert(275, 225); // starts inside it, then covers two atoms
+
+    let materializable = runs.materializable_coverage(&available);
+    assert_eq!(
+        materializable.ranges(),
+        &[(0, 200), (300, 500)],
+        "partial leading and trailing atoms stay provisional while adjacent complete atoms coalesce"
+    );
+    for &(start, end) in materializable.ranges() {
+        assert!(
+            runs.compose(start, end - start).is_some(),
+            "every promoted range must remain exactly composable"
+        );
+    }
+}
+
+#[test]
 fn crc_runs_refuse_every_shape_of_overlap() {
     let base = |start: u64, len: u64| {
         let mut runs = CrcRuns::default();

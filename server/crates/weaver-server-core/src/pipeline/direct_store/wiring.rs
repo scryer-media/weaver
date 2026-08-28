@@ -6454,7 +6454,13 @@ impl Pipeline {
             // filling a file with a hole where the rebuilt prefix should be.
             let filename = self.current_filename_for_file(job_id, file_asm);
             let received = file_asm.received_bytes();
-            let coverage = set.volume_coverage(*volume_index);
+            let physical_coverage = set.volume_coverage(*volume_index);
+            let crcs = set.volume_crc_runs(*volume_index);
+            // Routing can demote after durably placing only part of the current
+            // article. Keep that range provisional: the decode handoff owns the
+            // current segment, and the targeted requeue below owns any other
+            // segment that is not wholly backed by an article CRC atom.
+            let coverage = crcs.materializable_coverage(&physical_coverage);
             let extents = set.segment_extents(*volume_index);
             // A volume that never completed has no authoritative length; its
             // received bytes are the most that can be on disk. A routed range
@@ -6462,7 +6468,7 @@ impl Pipeline {
             // durable coverage is also a lower bound for this sweep.
             let len = set
                 .virtual_volume_len(*volume_index, received)
-                .max(coverage.end());
+                .max(physical_coverage.end());
             lengths.insert(*volume_index, len);
             extents_by_volume.insert(*volume_index, extents);
             let path = working_dir.join(&filename);
@@ -6476,7 +6482,7 @@ impl Pipeline {
                     len,
                     assembly_complete: file_asm.is_complete(),
                     covered: coverage,
-                    crcs: set.volume_crc_runs(*volume_index),
+                    crcs,
                 },
             ));
         }

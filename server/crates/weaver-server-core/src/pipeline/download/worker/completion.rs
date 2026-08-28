@@ -323,6 +323,7 @@ impl Pipeline {
                     }
                 }
             }
+            self.clear_spillover_loan_if_idle();
         }
         if result.origin.is_recovery() {
             self.active_recovery = self.active_recovery.saturating_sub(1);
@@ -345,6 +346,12 @@ impl Pipeline {
                 self.active_downloads_by_file
                     .remove(&result.segment_id.file_id);
             }
+        }
+        if result.origin.counts_for_hot_primary()
+            && self.hot_dispatch_job == Some(job_id)
+            && result.data.is_ok()
+        {
+            self.hot_dispatch_successes = self.hot_dispatch_successes.saturating_add(1);
         }
         if result.origin.counts_for_hot_primary()
             && let Ok(DownloadPayload::Decoded(decoded)) = &result.data

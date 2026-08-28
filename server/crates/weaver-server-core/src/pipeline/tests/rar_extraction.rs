@@ -8800,6 +8800,7 @@ async fn rar_unlock_dirty_priorities_apply_before_lane_refill() {
         remote_ip: "127.0.0.1".parse().unwrap(),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: None,
         compatibility: DownloadBatchCompatibility {
             priority: 3,
             is_recovery: false,

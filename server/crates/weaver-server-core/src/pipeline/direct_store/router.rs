@@ -543,6 +543,35 @@ impl CrcRuns {
         self.runs.insert(position, (start, len, crc));
     }
 
+    /// The durable coverage whose complete article-shaped CRC atoms can be
+    /// composed during reconstruction.
+    ///
+    /// Physical placement may stop inside an atom when routing demotes after
+    /// writing only part of the current article. That partial range remains
+    /// provisional: the conventional handoff (or a targeted requeue) owns it.
+    /// Publishing it as reconstructed would either require inventing a
+    /// sub-article reference CRC or weaken [`Self::compose`]'s exactness.
+    pub(crate) fn materializable_coverage(&self, available: &ByteRanges) -> ByteRanges {
+        let ranges = available.ranges();
+        let mut materializable = ByteRanges::default();
+        let mut range_index = 0usize;
+
+        for &(run_start, run_len, _) in &self.runs {
+            let run_end = run_start.saturating_add(run_len);
+            while range_index < ranges.len() && ranges[range_index].1 <= run_start {
+                range_index += 1;
+            }
+            let Some(&(range_start, range_end)) = ranges.get(range_index) else {
+                break;
+            };
+            if range_start <= run_start && run_end <= range_end {
+                materializable.insert(run_start, run_len);
+            }
+        }
+
+        materializable
+    }
+
     /// Replaces every run overlapping `[start, start + len)` with a single run
     /// for the rewritten span, and returns the sub-ranges of the discarded runs
     /// that fall **outside** it — the stale gaps.
