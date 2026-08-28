@@ -2929,6 +2929,47 @@ async fn a_demoted_set_materializes_its_covered_volumes_instead_of_refetching_th
     );
 }
 
+/// A demoted set's volumes must re-enter the conventional completion seam.
+///
+/// While the set was direct, `refresh_archive_state_for_completed_file`
+/// suppressed itself for its files, so none of them ever reached the RAR
+/// facts parser or the archive topology — correctly, because a direct set
+/// never extracts through the topology. Demotion ends that: the volumes are
+/// ordinary files now, and a materialized-complete volume that never gets
+/// its facts registered is invisible to the extraction planner forever —
+/// the plan waits on a volume whose bytes sit finished on disk, and no
+/// event ever arrives to change its mind.
+#[tokio::test]
+async fn a_demoted_sets_materialized_volumes_register_their_rar_facts() {
+    let member_name = "Silver.Horizon.S01E14.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 181) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41033);
+    let (pipeline, _working_dir, _) =
+        demote_mid_download(&temp_dir, job_id, &volumes, |_, _| {}).await;
+
+    let facts_registered = pipeline
+        .rar_sets
+        .iter()
+        .any(|((facts_job_id, _), state)| *facts_job_id == job_id && state.facts.contains_key(&0));
+    assert!(
+        facts_registered,
+        "the materialized first volume must have parsed RAR facts through the \
+         conventional completion replay; rar_sets = {:?}",
+        pipeline
+            .rar_sets
+            .iter()
+            .map(|((jid, name), state)| (
+                jid.0,
+                name.clone(),
+                state.facts.keys().collect::<Vec<_>>()
+            ))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test]
 async fn a_malformed_chain_demotion_leaves_a_partial_crc_atom_provisional() {
     let member_name = "Silver.Horizon.S01E11.mkv";
@@ -8481,9 +8522,26 @@ async fn an_unrepairable_direct_set_still_demotes_whole() {
         direct.repair_scratch_left, 0,
         "a refused repair leaves no scratch behind"
     );
+    // The damage sits entirely in volume 1's RAR recovery record; the member's
+    // own data slices are untouched. Once the demotion hands its materialized
+    // volumes back to the conventional completion seam, extraction reads the
+    // intact data and delivers the member byte for byte — the damaged
+    // recovery record is archive residue the job never needed. This test once
+    // asserted the job must NOT complete, but that pinned an accident: the
+    // demoted volumes never entered the archive topology at all, so
+    // extraction never had the chance to prove the data was fine. Delivering
+    // provably intact content is the outcome the whole pipeline exists for.
+    assert_eq!(
+        direct.member.as_deref(),
+        Some(payload.as_slice()),
+        "the member's data slices are undamaged, so the conventional path must \
+         deliver it byte for byte; sets = {}",
+        direct.sets
+    );
     assert!(
-        !matches!(direct.status, Some(JobStatus::Complete)),
-        "an unrepairable job must not complete, got {:?}",
+        matches!(direct.status, Some(JobStatus::Complete)),
+        "with the member delivered intact, the job completes; the unrepairable \
+         damage lived only in a recovery record nothing needed, got {:?}",
         direct.status
     );
 }

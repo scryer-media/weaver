@@ -6503,8 +6503,8 @@ impl Pipeline {
             self.direct_store
                 .note_materialization_handoff(set_index, segment_id);
         }
-        for file_id in demoted_volume_files {
-            self.block_crcs.forget_file(file_id);
+        for file_id in &demoted_volume_files {
+            self.block_crcs.forget_file(*file_id);
         }
 
         crate::runtime::perf_probe::record_owned(
@@ -6559,6 +6559,25 @@ impl Pipeline {
                 );
                 self.refetch_demoted_set(job_id, set_index).await;
             }
+        }
+        // Re-enter every complete volume into the conventional completion
+        // seam. While the set was direct, `refresh_archive_state_for_completed_file`
+        // suppressed itself for these files at its own entry — a direct set
+        // never enters the archive topology, and its extraction never needs
+        // one. Demotion is the moment that stops being true: the volumes are
+        // ordinary files now, and everything downstream of the conventional
+        // decode-completion hook — classification, RAR volume facts, the
+        // topology entry the extraction planner chains from — has never run
+        // for any of them that completed while direct. Without this replay a
+        // materialized volume is invisible to the topology forever: the plan
+        // waits on a volume whose bytes sit complete on disk, and nothing
+        // ever arrives to change its mind. The replay walks the same door a
+        // conventional completion walks (`allow_probe` included), and the
+        // hook's own guards skip files that are still incomplete — those
+        // complete later through the decode path and get the hook naturally.
+        for file_id in demoted_volume_files {
+            self.refresh_archive_state_for_completed_file(job_id, file_id, true)
+                .await;
         }
         // The other moment a retained image can lose its last possible reader: a
         // demoted set is repaired by the filesystem-bound `Par2Repairer`, which
