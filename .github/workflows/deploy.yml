@@ -2127,11 +2127,10 @@ jobs:
 
   winget-submit:
     name: winget-submit
-    # Gated the same way scryer's submission is: the job only runs once the
-    # WINGET_AUTO_SUBMISSION_ENABLED repository variable is set to 'true'
-    # (and WINGET_TOKEN is provisioned in release-credentials); until then it
-    # is skipped instead of failing the release on the missing token.
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && vars.WINGET_AUTO_SUBMISSION_ENABLED == 'true' }}
+    # Unlike scryer, weaver's winget-pkgs submission is approved and armed:
+    # the org-level WINGET_TOKEN secret authenticates the PR, so this job
+    # runs on every release tag rather than being gated behind a variable.
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
     needs: [github-release, winget-published-install]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
