@@ -102,7 +102,7 @@ import {
   type GraphqlJobData,
   type JobData,
 } from "@/lib/job-types";
-import { orderQueueByLiveActivity } from "@/lib/queue-live-order";
+import { orderQueueByLiveActivity, prioritizeDownloadingJobs } from "@/lib/queue-live-order";
 import { cn } from "@/lib/utils";
 
 type QueueStatusFilter =
@@ -784,7 +784,7 @@ export function JobList() {
     );
     return queuePreferences.sorting.length === 0
       ? orderQueueByLiveActivity(normalized)
-      : normalized;
+      : prioritizeDownloadingJobs(normalized);
   }, [eventItems, queuePageItems, queuePreferences.sorting]);
   const policyBlockedJobs = jobs.filter((job) => isBlockedByDownloadPolicy(job, downloadBlock)).length;
   const capResetAt = useMemo(

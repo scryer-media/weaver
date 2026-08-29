@@ -119,11 +119,28 @@ fn queue_page_job_live_rate(info: &weaver_server_core::JobInfo) -> u64 {
         .unwrap_or_default()
 }
 
+fn queue_page_download_rank(state: QueueItemState) -> u8 {
+    match state {
+        QueueItemState::Downloading | QueueItemState::FetchingRepairData => 1,
+        _ => 0,
+    }
+}
+
+fn queue_page_download_order(
+    left: &weaver_server_core::JobInfo,
+    right: &weaver_server_core::JobInfo,
+) -> Ordering {
+    queue_page_download_rank(queue_item_state_from_job_info(right)).cmp(&queue_page_download_rank(
+        queue_item_state_from_job_info(left),
+    ))
+}
+
 fn queue_page_default_order(
     left: &weaver_server_core::JobInfo,
     right: &weaver_server_core::JobInfo,
 ) -> Ordering {
-    queue_page_job_live_rate(right).cmp(&queue_page_job_live_rate(left))
+    queue_page_download_order(left, right)
+        .then_with(|| queue_page_job_live_rate(right).cmp(&queue_page_job_live_rate(left)))
 }
 
 fn queue_page_job_order(
@@ -157,7 +174,9 @@ fn queue_page_job_order(
         QueueSortDirection::Asc => order,
         QueueSortDirection::Desc => order.reverse(),
     };
-    order.then_with(|| left.job_id.0.cmp(&right.job_id.0))
+    queue_page_download_order(left, right)
+        .then(order)
+        .then_with(|| left.job_id.0.cmp(&right.job_id.0))
 }
 
 fn queue_page_summary(
@@ -624,4 +643,21 @@ fn collect_files_recursive(dir: &std::path::Path, out: &mut Vec<JobOutputFile>) 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downloading_states_rank_above_queued() {
+        assert!(
+            queue_page_download_rank(QueueItemState::Downloading)
+                > queue_page_download_rank(QueueItemState::Queued)
+        );
+        assert!(
+            queue_page_download_rank(QueueItemState::FetchingRepairData)
+                > queue_page_download_rank(QueueItemState::Queued)
+        );
+    }
 }

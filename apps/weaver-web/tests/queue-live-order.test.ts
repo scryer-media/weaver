@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { orderQueueByLiveActivity } from "../src/lib/queue-live-order.ts";
+import {
+  orderQueueByLiveActivity,
+  prioritizeDownloadingJobs,
+} from "../src/lib/queue-live-order.ts";
 
 test("queue live order puts every transferring job ahead of cold jobs", () => {
   const jobs = [
@@ -27,5 +30,18 @@ test("queue live order preserves scheduler order for equal rates", () => {
   assert.deepEqual(
     orderQueueByLiveActivity(jobs).map(({ id }) => id),
     ["first", "second", "third"],
+  );
+});
+
+test("queue column sorts retain downloading jobs above queued jobs", () => {
+  const jobs = [
+    { id: "queued-first", status: "QUEUED", phaseProgress: [] },
+    { id: "downloading", status: "DOWNLOADING", phaseProgress: [{ rateBps: 0 }] },
+    { id: "queued-second", status: "QUEUED", phaseProgress: [] },
+  ];
+
+  assert.deepEqual(
+    prioritizeDownloadingJobs(jobs).map(({ id }) => id),
+    ["downloading", "queued-first", "queued-second"],
   );
 });
