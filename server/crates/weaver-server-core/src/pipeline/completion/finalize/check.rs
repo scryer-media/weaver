@@ -480,7 +480,10 @@ fn parse_par2_ignore_extensions(raw: Option<&str>) -> Vec<String> {
 /// with a hole in it is strictly better for the user than refusing the payload
 /// it describes. Matching is on the file's own extension so a payload that
 /// merely *mentions* one of these names is unaffected.
-fn par2_damage_ignorable(filename: &str, ignore_extensions: &[String]) -> bool {
+pub(in crate::pipeline) fn par2_damage_ignorable(
+    filename: &str,
+    ignore_extensions: &[String],
+) -> bool {
     if ignore_extensions.is_empty() {
         return false;
     }
@@ -5039,7 +5042,7 @@ impl Pipeline {
     /// exactly as the repair memory limit is. The test hook exists so the
     /// "override disables it" case can be exercised without mutating a
     /// process-global environment other tests are reading concurrently.
-    fn par2_ignore_extensions(&self) -> Vec<String> {
+    pub(in crate::pipeline) fn par2_ignore_extensions(&self) -> Vec<String> {
         #[cfg(test)]
         if let Some(extensions) = self.par2_ignore_extensions_override.as_ref() {
             return extensions.clone();
@@ -6054,7 +6057,11 @@ impl Pipeline {
     /// none of the post-verdict incomplete buckets — which matters most for the
     /// *first* part, whose 16 KiB prefix is the joined file's own, so PAR2
     /// content identity answers the joined description with it.
-    fn par2_join_consumed_split_part(&self, job_id: JobId, file_id: NzbFileId) -> bool {
+    pub(in crate::pipeline) fn par2_join_consumed_split_part(
+        &self,
+        job_id: JobId,
+        file_id: NzbFileId,
+    ) -> bool {
         let Some(sets) = self.par2_joined_split_sets.get(&job_id) else {
             return false;
         };

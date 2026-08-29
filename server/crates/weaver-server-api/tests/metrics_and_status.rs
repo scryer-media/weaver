@@ -161,6 +161,7 @@ fn history_job(job_id: u64, status: JobStatus) -> JobInfo {
         phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
+        terminal_discards: Vec::new(),
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,

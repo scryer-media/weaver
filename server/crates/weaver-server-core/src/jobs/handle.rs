@@ -629,7 +629,16 @@ pub struct JobInfo {
     /// Bytes from segments that are permanently lost (430 / max retries).
     pub failed_bytes: u64,
     /// Job health 0-1000 (1000 = perfect). Drops as articles fail.
+    ///
+    /// For a job that reached a terminal status this is the settled figure —
+    /// what the claim census concluded was delivered — not the live wire
+    /// counter, which knows nothing of the repairs and discards that answered
+    /// its misses.
     pub health: u32,
+    /// Files the settlement dropped from the delivery, with the bytes each one
+    /// took out of the accounting. Empty for every job that discarded nothing.
+    #[serde(default)]
+    pub terminal_discards: Vec<crate::jobs::model::TerminalDiscard>,
     /// Total files in the NZB (all roles).
     #[serde(default)]
     pub total_files: u32,

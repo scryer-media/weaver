@@ -4344,6 +4344,7 @@ impl Pipeline {
                     .unwrap_or_default(),
                 failed_bytes: state.failed_bytes,
                 health,
+                terminal_discards: Vec::new(),
                 total_files: state.assembly.total_file_count() as u32,
                 completed_files: state.assembly.complete_file_count() as u32,
                 remaining_par_files,

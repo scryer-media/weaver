@@ -651,6 +651,13 @@ impl Pipeline {
             return Ok(());
         }
 
+        // The last gate at which every settlement fact is still in hand, and
+        // the last at which refusing costs nothing: nothing has moved yet. The
+        // census rebuilds the terminal record from what claimed each payload
+        // file, and refuses the delivery outright when a file was never
+        // delivered and nothing accounts for it.
+        self.reconcile_terminal_delivery(job_id)?;
+
         // Terminal transition: the job is leaving the verification question
         // behind. With no recovery set there was never a verdict to be had, so
         // attribute it rather than leaving the job out of
@@ -865,6 +872,15 @@ impl Pipeline {
         pipeline_outcome: crate::post_processing::model::PipelineOutcome,
         primary_failure: Option<String>,
     ) {
+        // Scripts read health to decide whether the download is worth acting
+        // on, so they must be handed the settled figure — the one the terminal
+        // record will carry — and not the live wire counter the settlement has
+        // already answered.
+        let settled_health = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.spec.total_bytes)
+            .map(|total_bytes| self.terminal_record_figures(job_id, total_bytes).1);
         let Some(state) = self.jobs.get(&job_id) else {
             self.inflight_terminal_post_processing.remove(&job_id);
             return;
@@ -942,7 +958,8 @@ impl Pipeline {
             compatibility: crate::post_processing::runner::CompatibilityFacts {
                 total_bytes: state.spec.total_bytes,
                 downloaded_bytes: state.downloaded_bytes,
-                health_milli: health_milli(state.spec.total_bytes, state.failed_bytes),
+                health_milli: settled_health
+                    .unwrap_or_else(|| health_milli(state.spec.total_bytes, state.failed_bytes)),
                 critical_health_milli: Self::critical_health_milli(
                     state.spec.total_bytes,
                     state.par2_bytes,

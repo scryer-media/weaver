@@ -544,6 +544,7 @@ mod tests {
             phase_progress: Vec::new(),
             failed_bytes: 0,
             health: 1000,
+            terminal_discards: Vec::new(),
             total_files: 1,
             completed_files: 1,
             remaining_par_files: 0,

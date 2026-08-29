@@ -765,6 +765,7 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         phase_progress: Vec::new(),
         failed_bytes: row.failed_bytes,
         health: row.health,
+        terminal_discards: Vec::new(),
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,

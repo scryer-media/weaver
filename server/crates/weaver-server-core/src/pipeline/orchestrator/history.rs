@@ -201,6 +201,7 @@ impl Pipeline {
         self.jobs.remove(&job_id);
         self.job_order.retain(|id| *id != job_id);
         self.clear_terminal_segment_failures(job_id);
+        self.terminal_reconciliations.remove(&job_id);
         self.clear_par2_runtime_state(job_id);
         self.clear_job_extraction_runtime(job_id);
         self.extraction_budgets.remove(&job_id);
@@ -240,6 +241,16 @@ impl Pipeline {
         job_id: JobId,
         terminal_event: Option<PipelineEvent>,
     ) {
+        // Taken before the long immutable borrow below, and before the runtime
+        // that produced them is purged. A completed job carries the claim
+        // census's verdict; a failed one falls through to its own counters,
+        // where the raw numbers are the explanation.
+        let settled = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.spec.total_bytes)
+            .map(|total_bytes| self.terminal_record_figures(job_id, total_bytes));
+
         let state = match self.jobs.get(&job_id) {
             Some(s) => s,
             None => {
@@ -278,7 +289,13 @@ impl Pipeline {
         let total = state.spec.total_bytes;
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
             state.assembly.optional_recovery_bytes();
-        let health = health_milli(total, state.failed_bytes);
+        let (failed_bytes, health, terminal_discards) = settled.unwrap_or_else(|| {
+            (
+                state.failed_bytes,
+                health_milli(total, state.failed_bytes),
+                Vec::new(),
+            )
+        });
 
         let row = crate::JobHistoryRow {
             job_id: job_id.0,
@@ -290,7 +307,7 @@ impl Pipeline {
             downloaded_bytes: Self::effective_downloaded_bytes(state),
             optional_recovery_bytes,
             optional_recovery_downloaded_bytes,
-            failed_bytes: state.failed_bytes,
+            failed_bytes,
             health,
             category: state.spec.category.clone(),
             output_dir: Some(state.working_dir.display().to_string()),
@@ -334,8 +351,9 @@ impl Pipeline {
                 optional_recovery_bytes,
                 optional_recovery_downloaded_bytes,
                 phase_progress: Vec::new(),
-                failed_bytes: state.failed_bytes,
+                failed_bytes,
                 health,
+                terminal_discards,
                 total_files: state.assembly.total_file_count() as u32,
                 completed_files: state.assembly.complete_file_count() as u32,
                 remaining_par_files: 0,

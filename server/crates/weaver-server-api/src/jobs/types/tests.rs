@@ -107,6 +107,7 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
         phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
+        terminal_discards: Vec::new(),
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,

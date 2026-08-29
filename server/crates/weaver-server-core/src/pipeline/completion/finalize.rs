@@ -65,6 +65,7 @@ pub(crate) enum NestedExtractionDecision {
 }
 
 pub(crate) mod check;
+pub(crate) mod claims;
 pub(crate) mod deobfuscate;
 mod extract;
 mod nested;
