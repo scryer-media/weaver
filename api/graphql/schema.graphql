@@ -45,6 +45,11 @@ type AccessPolicyStatus {
 	strictSecurity: Boolean!
 }
 
+type AdoptableTlsNameMismatchCertificate {
+	derBase64: String!
+	sha256Fingerprint: String!
+}
+
 type ApiKey {
 	id: Int!
 	name: String!
@@ -1530,6 +1535,8 @@ extraction begins.
 enum QueueItemState {
 	QUEUED
 	DOWNLOADING
+	FETCHING_REPAIR_DATA
+	FINALIZING_DOWNLOAD
 	CHECKING
 	VERIFYING
 	REPAIRING
@@ -1566,8 +1573,11 @@ input QueuePageInput {
 	states: [QueueItemState!]
 	priorities: [QueuePriority!]
 	categories: [String!]
-	sortField: QueueSortField!
-	sortDirection: QueueSortDirection!
+	"""
+	Omit both fields to retain the scheduler's hot-download order.
+	"""
+	sortField: QueueSortField
+	sortDirection: QueueSortDirection
 }
 
 enum QueuePhase {
@@ -1944,6 +1954,7 @@ type Server {
 	maxDownloadSpeed: Int!
 	downloadQuota: ServerDownloadQuota!
 	tlsCaCert: String
+	tlsNameMismatchCertificateFingerprint: String
 }
 
 type ServerDetails {
@@ -1961,6 +1972,8 @@ type ServerDetails {
 	maxDownloadSpeed: Int!
 	downloadQuota: ServerDownloadQuota!
 	tlsCaCert: String
+	tlsNameMismatchCertificateDerBase64: String
+	tlsNameMismatchCertificateFingerprint: String
 }
 
 type ServerDownloadQuota {
@@ -2087,6 +2100,11 @@ input ServerInput {
 	"""
 	downloadQuota: ServerDownloadQuotaInput
 	tlsCaCert: String
+	"""
+	Base64 DER for one explicitly adopted certificate used only after a
+	normal hostname-verification failure.
+	"""
+	tlsNameMismatchCertificateDerBase64: String
 }
 
 """
@@ -2290,6 +2308,7 @@ type TestConnectionResult {
 	message: String!
 	latencyMs: Int
 	supportsPipelining: Boolean!
+	adoptableTlsNameMismatchCertificate: AdoptableTlsNameMismatchCertificate
 }
 
 enum TimelineSpanState {
