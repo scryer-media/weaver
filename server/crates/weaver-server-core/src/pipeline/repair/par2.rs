@@ -1407,6 +1407,56 @@ impl Pipeline {
         None
     }
 
+    /// Per-slice grid evidence for one bound file, in the shape
+    /// [`par2_rs::VerifyOptions`]'s `proven_slices` takes: one entry per slice
+    /// of the described file, `true` only for a slice the grid proved `Intact`
+    /// with independent (pCRC-verified) article coverage — the same bar
+    /// [`Self::in_stream_verified_par2_match`] demands of every slice, applied
+    /// per slice. The eligibility rungs are the match predicate's own: a
+    /// binding, a non-empty description, a complete binding at exactly the
+    /// described length. `None` when a rung fails or when no slice is proven —
+    /// to the verifier, absent and all-`false` are the same statement.
+    ///
+    /// This is what lets a file the grid could *not* claim whole — one damaged
+    /// or unverdicted slice vetoes the whole-file claim — still hand the
+    /// verify pass everything the grid did prove, so the pass reads only the
+    /// slices in question instead of the whole file.
+    pub(crate) fn in_stream_proven_slices(
+        &self,
+        file_id: NzbFileId,
+        par2_set: &par2_rs::Par2FileSet,
+    ) -> Option<(par2_rs::FileId, Vec<bool>)> {
+        let binding = self.resolve_par2_file_binding_in_set(file_id, par2_set.recovery_set_id)?;
+        let description = par2_set.file_description(&binding.par2_file_id)?;
+        if description.length == 0 {
+            return None;
+        }
+        let state = self.jobs.get(&file_id.job_id)?;
+        let file = state.assembly.file(file_id)?;
+        if !binding.is_complete || file.received_bytes() != description.length {
+            return None;
+        }
+        let verdicts = self
+            .block_crcs
+            .verdicts_against(file_id, par2_set, binding.par2_file_id);
+        let slice_count = par2_set.slice_count_for_file(description.length);
+        let proven: Vec<bool> = (0..slice_count)
+            .map(|slice_index| {
+                matches!(
+                    verdicts.get(&slice_index),
+                    Some(crate::pipeline::integrity::BlockVerdict::Intact {
+                        independently_covered: true
+                    })
+                )
+            })
+            .collect();
+        if proven.iter().any(|slice_proven| *slice_proven) {
+            Some((binding.par2_file_id, proven))
+        } else {
+            None
+        }
+    }
+
     /// Whether the dual-CRC grid adjudicated **every** described slice of
     /// **every** described file in a job's recovery set.
     ///

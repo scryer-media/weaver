@@ -3578,15 +3578,61 @@ impl Pipeline {
                             None => return None,
                         }
                     } else {
+                        // The grid's per-slice proofs for the very files being
+                        // read: a file lands in `to_read` when one slice is
+                        // damaged or unverdicted, but every slice the grid DID
+                        // prove is attested here, so the pass seeks over the
+                        // proven ranges and reads only the slices in
+                        // question. Same bar as the whole-file claim above,
+                        // applied per slice.
+                        let to_read_ids: HashSet<par2_rs::FileId> =
+                            to_read.iter().copied().collect();
+                        let mut proven_slices: std::collections::HashMap<
+                            par2_rs::FileId,
+                            Vec<bool>,
+                        > = std::collections::HashMap::new();
+                        if let Some(state) = self.jobs.get(&job_id) {
+                            let file_ids: Vec<NzbFileId> =
+                                state.assembly.files().map(|file| file.file_id()).collect();
+                            for file_id in file_ids {
+                                let Some((par2_file_id, slices)) =
+                                    self.in_stream_proven_slices(file_id, &par2_set)
+                                else {
+                                    continue;
+                                };
+                                if to_read_ids.contains(&par2_file_id) {
+                                    proven_slices.insert(par2_file_id, slices);
+                                }
+                            }
+                        }
+                        if !proven_slices.is_empty() {
+                            let slices_proven: usize = proven_slices
+                                .values()
+                                .map(|slices| slices.iter().filter(|proven| **proven).count())
+                                .sum();
+                            info!(
+                                job_id = job_id.0,
+                                partially_proven_files = proven_slices.len(),
+                                slices_proven,
+                                "direct verify reads only the slices the grid could not prove"
+                            );
+                            crate::runtime::perf_probe::record_value(
+                                "direct_store.verify.slices_proven_in_stream",
+                                slices_proven as u64,
+                            );
+                        }
                         let pp_pool = self.pp_pool.clone();
                         let read_set = std::sync::Arc::clone(&par2_set);
                         let access = std::sync::Arc::clone(&access);
                         tokio::task::spawn_blocking(move || {
                             pp_pool.install(move || {
-                                par2_rs::verify_selected_file_ids(
+                                let mut options = par2_rs::VerifyOptions::default();
+                                options.proven_slices = proven_slices;
+                                par2_rs::verify_selected_file_ids_with_options(
                                     &read_set,
                                     access.as_ref(),
                                     &to_read,
+                                    &options,
                                 )
                             })
                         })

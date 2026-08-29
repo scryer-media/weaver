@@ -707,3 +707,83 @@ async fn restart_rebuilds_each_direct_overlay_for_its_own_recovery_set() {
         other_overlay.volumes[0].par2_file_id
     );
 }
+
+#[tokio::test]
+async fn partial_grid_coverage_yields_proven_slices_without_a_whole_file_claim() {
+    // One article's dual-CRC evidence covers the first slice only. The
+    // whole-file claim refuses — one unverdicted slice vetoes it — but the
+    // per-slice extraction hands the verify pass exactly the slice the grid
+    // proved, so a read of this file seeks over it and reads only the rest.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(32205);
+    let filename = "ember.partial.bin";
+    let bytes = fixture_bytes(23, (SERVED_SLICE_SIZE * 2) as usize);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Ember Partial Proof",
+            &[(filename.to_string(), bytes.len() as u32)],
+        ),
+    )
+    .await;
+    let first =
+        build_repairable_par2_set_for_files(&[(filename, bytes.as_slice())], SERVED_SLICE_SIZE, 0);
+    let second =
+        build_repairable_par2_set_for_files(&[(filename, bytes.as_slice())], OTHER_SLICE_SIZE, 0);
+    install_two_parsed_sets(&mut pipeline, job_id, first.clone(), second.clone());
+    pipeline.refresh_par2_checkpoint_plan(job_id);
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    write_and_complete_file(&mut pipeline, job_id, 0, filename, &bytes).await;
+    let plan = pipeline.par2_checkpoint_plan(job_id);
+    let article_len = SERVED_SLICE_SIZE as usize;
+    let mut crc = weaver_yenc::SegmentedCrc32::new(0, plan.clone());
+    crc.update(&bytes[..article_len]);
+    let (part_crc, segments) = crc.finish_article();
+    pipeline.note_block_crc_segments_for_plan(
+        file_id,
+        &plan,
+        0,
+        article_len as u64,
+        part_crc,
+        true,
+        false,
+        &segments,
+    );
+    pipeline
+        .block_crcs
+        .note_file_len(file_id, bytes.len() as u64);
+
+    assert!(
+        pipeline
+            .in_stream_verified_par2_match(file_id, &first)
+            .is_none(),
+        "one unverdicted slice must veto the whole-file claim"
+    );
+    let (par2_file_id, proven) = pipeline
+        .in_stream_proven_slices(file_id, &first)
+        .expect("the covered slice is still proven evidence");
+    assert_eq!(
+        first.recovery_file_ids.first().copied(),
+        Some(par2_file_id),
+        "the evidence names the described file"
+    );
+    assert_eq!(
+        proven,
+        vec![true, false],
+        "exactly the article-covered slice is attested, in set slice order"
+    );
+    assert!(
+        pipeline.in_stream_proven_slices(file_id, &second).is_none()
+            || pipeline
+                .in_stream_proven_slices(file_id, &second)
+                .is_some_and(|(_, slices)| slices.iter().any(|proven| *proven)),
+        "a differently-sliced grid answers for itself: either nothing is \
+         proven or only genuinely covered slices are"
+    );
+}
