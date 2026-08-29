@@ -46,24 +46,14 @@ function Assert-PublishedMsiInstallation {
 }
 
 function Install-PublishedMsiWithWinGet {
-  param(
-    [Parameter(Mandatory = $true)]
-    [ValidateSet("install", "upgrade")]
-    [string]$Verb
-  )
-
   for ($attempt = 1; $attempt -le 5; $attempt++) {
-    if ($Verb -eq "install") {
-      & $winget install --manifest $manifestDirectory --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
-    } else {
-      & $winget upgrade --manifest $manifestDirectory --installer-type msi --uninstall-previous --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
-    }
+    & $winget install --manifest $manifestDirectory --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
     if ($LASTEXITCODE -eq 0) {
       return
     }
 
     if ($attempt -eq 5) {
-      throw "winget $Verb of the published MSI failed with exit code $LASTEXITCODE."
+      throw "winget install of the published MSI failed with exit code $LASTEXITCODE."
     }
     Start-Sleep -Seconds 15
   }
@@ -158,7 +148,7 @@ $msiProductCode = Get-ManifestMsiProductCode -ManifestDirectory $manifestDirecto
 
 $directInstallCompleted = $false
 try {
-  Install-PublishedMsiWithWinGet -Verb install
+  Install-PublishedMsiWithWinGet
   $directInstallCompleted = $true
   Assert-PublishedMsiInstallation -Context "winget install"
 } finally {
@@ -175,6 +165,7 @@ $legacyMarker = Join-Path $legacyProfile "winget-transition-marker.txt"
 $legacyLink = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\weaver.exe"
 $portablePackagesRoot = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
 $legacyInstallCompleted = $false
+$portableRemoved = $false
 $transitionCompleted = $false
 try {
   New-Item -ItemType Directory -Force -Path $legacyProfile | Out-Null
@@ -189,24 +180,31 @@ try {
     throw "legacy portable Weaver did not create $legacyLink"
   }
 
-  Install-PublishedMsiWithWinGet -Verb upgrade
+  # winget refuses to upgrade across install technologies ("The install
+  # technology of the newer version specified is different from the current
+  # version installed"), so a portable-to-MSI `winget upgrade` can never
+  # succeed. Validate the transition winget actually prescribes for legacy
+  # portable users: uninstall the portable package, then install the MSI.
+  Remove-WeaverPortablePackage
+  $portableRemoved = $true
+  Install-PublishedMsiWithWinGet
   $transitionCompleted = $true
-  Assert-PublishedMsiInstallation -Context "winget portable-to-MSI upgrade"
+  Assert-PublishedMsiInstallation -Context "winget portable-to-MSI transition"
 
   if (Test-Path $legacyLink) {
-    throw "winget portable-to-MSI upgrade retained the portable command link $legacyLink"
+    throw "winget portable-to-MSI transition retained the portable command link $legacyLink"
   }
   $remainingPortablePackages = Get-ChildItem -LiteralPath $portablePackagesRoot -Directory -Filter "ScryerMedia.Weaver_*" -ErrorAction SilentlyContinue
   if ($remainingPortablePackages) {
-    throw "winget portable-to-MSI upgrade retained portable package files: $($remainingPortablePackages.FullName -join ', ')"
+    throw "winget portable-to-MSI transition retained portable package files: $($remainingPortablePackages.FullName -join ', ')"
   }
   if (-not (Test-Path $legacyMarker)) {
-    throw "winget portable-to-MSI upgrade removed legacy user data at $legacyMarker"
+    throw "winget portable-to-MSI transition removed legacy user data at $legacyMarker"
   }
 } finally {
   if ($transitionCompleted) {
     Remove-WeaverMsi -ProductCode $msiProductCode
-  } elseif ($legacyInstallCompleted) {
+  } elseif ($legacyInstallCompleted -and -not $portableRemoved) {
     Remove-WeaverPortablePackage
   }
   Remove-Item -LiteralPath $legacyProfile -Recurse -Force -ErrorAction SilentlyContinue
