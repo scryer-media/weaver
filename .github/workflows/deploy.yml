@@ -1824,13 +1824,28 @@ jobs:
         with:
           name: weaver-provenance.intoto.jsonl
           path: artifacts
+      # The provenance-inputs artifact preserves its workspace-relative upload
+      # layout (artifacts/, release-inputs/), so its files arrive nested one
+      # level deeper than every later step expects. Hoist the winget manifest
+      # archive and the SBOMs up to the flat artifacts/ root that the
+      # -maxdepth 1 asset census and the release-upload globs operate on.
+      - name: Flatten provenance input artifacts
+        run: |
+          set -euo pipefail
+          mv artifacts/artifacts/weaver-winget-manifests.tar.gz artifacts/
+          mv artifacts/release-inputs/*.spdx.json artifacts/
+          rmdir artifacts/artifacts artifacts/release-inputs
       - name: Verify release provenance and sign checksums
         env:
           IDENTITY: ^https://github.com/${{ github.repository }}/.github/workflows/deploy.yml@refs/tags/weaver-v.*$
         run: |
           set -euo pipefail
           mapfile -t release_assets < <(find artifacts -maxdepth 1 -type f \( -name 'weaver-*.tar.gz' -o -name 'weaver-*.zip' -o -name 'weaver-*.msi' -o -name 'weaver-*.spdx.json' \) -printf '%f\n' | sort)
-          test "${#release_assets[@]}" -eq 16
+          if [ "${#release_assets[@]}" -ne 16 ]; then
+            echo "expected 16 release assets under artifacts/, found ${#release_assets[@]}:" >&2
+            printf '  %s\n' "${release_assets[@]}" >&2
+            exit 1
+          fi
           for asset in "${release_assets[@]}"; do
             slsa-verifier verify-artifact "artifacts/${asset}" \
               --provenance-path artifacts/weaver-provenance.intoto.jsonl \
