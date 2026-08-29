@@ -6,7 +6,7 @@ struct ReadyRarExtraction {
     members: Vec<String>,
     volume_paths_map: std::collections::BTreeMap<u32, PathBuf>,
     cached_headers: Option<Vec<u8>>,
-    shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
+    shared_kdf_cache: std::sync::Arc<unrar_rs::crypto::KdfCache>,
     password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     is_solid: bool,
 }
@@ -19,6 +19,17 @@ enum RarExtractionSettle {
 }
 
 impl Pipeline {
+    fn fail_terminal_extraction_rejection(&mut self, job_id: JobId, error: &str) -> bool {
+        if !JobExtractionBudget::is_rejection(error) {
+            return false;
+        }
+        if let Some(budget) = self.extraction_budgets.get(&job_id) {
+            budget.cancel_with_error(error);
+        }
+        self.fail_job(job_id, error.to_string());
+        true
+    }
+
     fn is_recoverable_full_set_extraction_error(error: &str) -> bool {
         let lower = error.to_ascii_lowercase();
         lower.contains("checksum") || lower.contains("crc mismatch")
@@ -141,12 +152,73 @@ impl Pipeline {
         })
     }
 
+    /// Whether PAR2 can still deliver a verdict on this job's archives.
+    ///
+    /// Keyed on a **loaded** set, not on the NZB declaring one. A job can
+    /// declare a `.par2` whose articles never arrive — routine, since recovery
+    /// volumes often sit on a different retention tier — and keying on the
+    /// declaration would latch a failed member out while waiting for a verdict
+    /// that can never come.
+    ///
+    /// A clean verdict releases it. 0.7.9 drops that clause so a member that
+    /// fails *after* verification stays latched; 0.8 does not need to, because
+    /// it already re-opens the completion gate for that job by another route,
+    /// and holding the latch as well would keep the member out with no verdict
+    /// left to come.
+    pub(crate) fn par2_is_authoritative_for_extraction(&self, job_id: JobId) -> bool {
+        self.par2_set(job_id).is_some() && !self.par2_bypassed.contains(&job_id)
+    }
+
+    /// Whether a RAR extraction has failed for this job and PAR2 has not yet
+    /// had its say about why.
+    ///
+    /// This is the recovery latch. A member that failed to extract will fail
+    /// the same way against the same bytes, so re-scheduling it before PAR2
+    /// has decided whether those bytes can be repaired is a spin: extract,
+    /// fail, re-schedule, extract. The failed-extraction marker is the only
+    /// state involved — it is already recorded, already persisted, and already
+    /// cleared by the paths that resolve a failure
+    /// ([`Self::clear_failed_extraction_member`] after a repair,
+    /// `replace_failed_extraction_members` when the set is retried).
+    ///
+    /// "No worker still running" matters: while one is, the job's inputs can
+    /// still change under it, and the failure is not settled.
+    pub(crate) fn par2_recovery_evaluation_pending(&self, job_id: JobId) -> bool {
+        if !self.par2_is_authoritative_for_extraction(job_id) {
+            return false;
+        }
+        if self
+            .failed_extractions
+            .get(&job_id)
+            .is_none_or(|members| members.is_empty())
+        {
+            return false;
+        }
+        // The broader check, matching what completion asks: a full-set
+        // extraction in flight can still change this job's inputs just as a
+        // per-member worker can.
+        !self.job_has_active_extraction_tasks(job_id)
+    }
+
     pub(crate) fn rar_ready_member_is_startable_for_batch_extraction(
         &self,
         job_id: JobId,
         set_name: &str,
         member_name: &str,
     ) -> bool {
+        // The recovery latch (see `par2_recovery_evaluation_pending`). A member
+        // that already failed does not go round again until PAR2 has decided
+        // whether its bytes can be repaired — otherwise the failure and the
+        // re-schedule chase each other. Checked per member, so the set's other
+        // members are unaffected.
+        if self
+            .failed_extractions
+            .get(&job_id)
+            .is_some_and(|members| members.contains(member_name))
+            && self.par2_is_authoritative_for_extraction(job_id)
+        {
+            return false;
+        }
         if self
             .inflight_extractions
             .get(&job_id)
@@ -424,6 +496,8 @@ impl Pipeline {
             .get(&job_id)
             .cloned()
             .unwrap_or_default();
+        let par2_repair_authoritative =
+            self.par2_set(job_id).is_some() && !self.par2_bypassed.contains(&job_id);
 
         let mut candidate_sets: Vec<(String, Vec<String>, bool)> = self
             .rar_sets
@@ -458,6 +532,14 @@ impl Pipeline {
                         .extracted_members
                         .get(&job_id)
                         .is_some_and(|extracted| extracted.contains(&ready_member.name))
+                    {
+                        continue;
+                    }
+                    if par2_repair_authoritative
+                        && self
+                            .failed_extractions
+                            .get(&job_id)
+                            .is_some_and(|failed| failed.contains(&ready_member.name))
                     {
                         continue;
                     }
@@ -538,7 +620,7 @@ impl Pipeline {
                 .rar_sets
                 .get(&(job_id, set_name.clone()))
                 .map(|state| state.shared_kdf_cache.clone())
-                .unwrap_or_else(|| std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()));
+                .unwrap_or_else(|| std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()));
             ready_sets.push(ReadyRarExtraction {
                 set_name,
                 members: gated_members,
@@ -624,6 +706,27 @@ impl Pipeline {
                 scheduled_slots += 1;
 
                 let output_dir = self.extraction_staging_dir(job_id);
+                let budget = match self.extraction_budget(job_id, &output_dir) {
+                    Ok(budget) => budget,
+                    Err(error) => {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+                };
+                let root = match ExtractionRoot::open(&output_dir) {
+                    Ok(root) => Arc::new(root),
+                    Err(error) => {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+                };
+                let task_permit = match budget.task_permit_for_root(root) {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+                };
                 let event_tx = self.event_tx.clone();
                 let attempted = members_to_extract.clone();
                 let extract_done_tx = self.extract_done_tx.clone();
@@ -643,6 +746,8 @@ impl Pipeline {
                 tokio::task::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         pp_pool.install(move || {
+                            let _task_permit = task_permit;
+                            let root = _task_permit.root();
                             let selection =
                                 Self::open_rar_archive_for_extraction_with_password_candidates(
                                     RarExtractionOpenRequest {
@@ -654,13 +759,16 @@ impl Pipeline {
                                         open_mode: RarArchiveOpenMode::AttachOnly,
                                         requested_members: &members_to_extract,
                                         already_extracted: None,
+                                        budget: Some(Arc::clone(&budget)),
                                     },
                                 )?;
+                            let _memory_permit =
+                                budget.reserve_memory_wait(selection.decoder_memory_bytes)?;
                             let mut archive = selection.archive;
                             let selected_password = selection.password;
                             let archive_password_required = archive.metadata().is_encrypted;
 
-                            let options = weaver_unrar::ExtractOptions {
+                            let options = unrar_rs::ExtractOptions {
                                 verify: true,
                                 password: selected_password.clone(),
                                 restore_owners: false,
@@ -694,6 +802,8 @@ impl Pipeline {
                                         job_id,
                                         set_name: &set_name_for_task,
                                         output_dir: &output_dir,
+                                        root: Some(Arc::clone(&root)),
+                                        budget: Some(Arc::clone(&budget)),
                                         options: &options,
                                         phase_attempt: Some(Arc::new(PhaseAttemptCounters::new(
                                             Arc::clone(&phase_counters),
@@ -788,7 +898,7 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
         member_name: &str,
-    ) -> Vec<weaver_par2::FileId> {
+    ) -> Vec<par2_rs::FileId> {
         let Some(par2_set) = self.par2_set(job_id) else {
             return Vec::new();
         };
@@ -804,7 +914,7 @@ impl Pipeline {
             return Vec::new();
         };
 
-        let filename_to_file_id: HashMap<&str, weaver_par2::FileId> = par2_set
+        let filename_to_file_id: HashMap<&str, par2_rs::FileId> = par2_set
             .recovery_file_ids
             .iter()
             .filter_map(|file_id| {
@@ -865,6 +975,7 @@ impl Pipeline {
             };
             (state.working_dir.clone(), par2_set)
         };
+        let recovery_set_id = par2_set.recovery_set_id;
 
         #[cfg(test)]
         {
@@ -874,21 +985,23 @@ impl Pipeline {
         let pp_pool = self.pp_pool.clone();
         let lower_bound = tokio::task::spawn_blocking(move || {
             pp_pool.install(move || -> Result<u32, String> {
-                let plan = weaver_par2::scan_placement(&working_dir, &par2_set)
-                    .map_err(|e| format!("placement scan failed: {e}"))?;
-                let selected: HashSet<weaver_par2::FileId> = file_ids.iter().copied().collect();
-                if plan
-                    .conflicts
-                    .iter()
-                    .any(|file_id| selected.contains(file_id))
-                {
-                    return Err("placement conflicts in suspect files".to_string());
-                }
-
-                let access =
-                    weaver_par2::PlacementFileAccess::from_plan(working_dir, &par2_set, &plan);
-                let verification =
-                    weaver_par2::verify_selected_file_ids(&par2_set, &access, &file_ids);
+                // The suspect ids were selected by matching the topology's
+                // on-disk filenames against the descriptions' own filenames
+                // (`suspect_par2_file_ids_for_member`), so every selected file
+                // already sits at exactly its described name and the identity
+                // placement resolves it. A placement scan here would compute
+                // the full-file MD5 of every matching-length file in the
+                // working directory to rediscover that identity — a whole-set
+                // read in service of a few suspects.
+                let plan = par2_rs::PlacementPlan {
+                    exact: file_ids.clone(),
+                    swaps: Vec::new(),
+                    renames: Vec::new(),
+                    unresolved: Vec::new(),
+                    conflicts: Vec::new(),
+                };
+                let access = par2_rs::PlacementFileAccess::from_plan(working_dir, &par2_set, &plan);
+                let verification = par2_rs::verify_selected_file_ids(&par2_set, &access, &file_ids);
                 Ok(verification.total_missing_blocks)
             })
         })
@@ -896,7 +1009,8 @@ impl Pipeline {
 
         match lower_bound {
             Ok(Ok(blocks_needed)) if blocks_needed > 0 => {
-                let promoted = self.promote_recovery_targeted(job_id, blocks_needed);
+                let promoted =
+                    self.promote_recovery_targeted(job_id, recovery_set_id, blocks_needed);
                 info!(
                     job_id = job_id.0,
                     set_name = %set_name,
@@ -1059,6 +1173,16 @@ impl Pipeline {
                 let mut capacity_retry = false;
                 match result {
                     Ok(outcome) => {
+                        if let Some(error) = outcome
+                            .failed
+                            .iter()
+                            .map(|(_, error)| error)
+                            .find(|error| JobExtractionBudget::is_rejection(error))
+                            .cloned()
+                            && self.fail_terminal_extraction_rejection(job_id, &error)
+                        {
+                            return;
+                        }
                         if let Err(error) = self
                             .normalize_extraction_output_tree(job_id, &set_name)
                             .await
@@ -1212,6 +1336,9 @@ impl Pipeline {
                         }
                     }
                     Err(error) => {
+                        if self.fail_terminal_extraction_rejection(job_id, &error) {
+                            return;
+                        }
                         let current_failed_members = attempted
                             .iter()
                             .filter(|member| {
@@ -1301,6 +1428,12 @@ impl Pipeline {
                 let all_downloaded = self.jobs.get(&job_id).is_some_and(|state| {
                     state.assembly.complete_data_file_count() >= state.assembly.data_file_count()
                 });
+                let par2_repair_pending = self.par2_set(job_id).is_some()
+                    && !self.par2_bypassed.contains(&job_id)
+                    && self
+                        .failed_extractions
+                        .get(&job_id)
+                        .is_some_and(|failed| !failed.is_empty());
                 if capacity_retry {
                     self.schedule_rar_capacity_retry(
                         job_id,
@@ -1320,7 +1453,18 @@ impl Pipeline {
                         RarExtractionSettle::RefreshLaunched {
                             allows_extraction: false,
                         } => {}
-                        RarExtractionSettle::Idle if all_downloaded => {
+                        RarExtractionSettle::Idle if all_downloaded || par2_repair_pending => {
+                            self.check_job_completion(job_id).await;
+                        }
+                        // The last worker of a failed batch has settled. The
+                        // job goes to completion for a PAR2 verdict, not back
+                        // to extraction: the member that failed is latched out
+                        // of scheduling until that verdict lands, so calling
+                        // `try_rar_extraction` here would either pick nothing
+                        // or pick a member the same failure is about to cover.
+                        RarExtractionSettle::Idle
+                            if self.par2_recovery_evaluation_pending(job_id) =>
+                        {
                             self.check_job_completion(job_id).await;
                         }
                         RarExtractionSettle::Idle => {
@@ -1335,6 +1479,16 @@ impl Pipeline {
                 result,
             } => match result {
                 Ok(outcome) => {
+                    if let Some(error) = outcome
+                        .failed
+                        .iter()
+                        .map(|(_, error)| error)
+                        .find(|error| JobExtractionBudget::is_rejection(error))
+                        .cloned()
+                        && self.fail_terminal_extraction_rejection(job_id, &error)
+                    {
+                        return;
+                    }
                     if let Err(error) = self
                         .normalize_extraction_output_tree(job_id, &set_name)
                         .await
@@ -1471,6 +1625,7 @@ impl Pipeline {
                     let settle_result = self
                         .settle_rar_set_after_extraction_worker(job_id, &set_name)
                         .await;
+                    self.phase_end_extracting_if_idle(job_id);
                     self.reconcile_job_progress(job_id).await;
                     match settle_result {
                         RarExtractionSettle::Idle => {
@@ -1490,6 +1645,9 @@ impl Pipeline {
                     }
                 }
                 Err(e) => {
+                    if self.fail_terminal_extraction_rejection(job_id, &e) {
+                        return;
+                    }
                     warn!(
                         job_id = job_id.0,
                         set_name = %set_name,
@@ -1533,6 +1691,12 @@ impl Pipeline {
                         self.check_job_completion(job_id).await;
                         return;
                     }
+                    // Low-frequency: one observation per job-level extraction, never on a
+                    // per-segment path. Records the metric next to the event that already
+                    // announces the same fact.
+                    self.metrics.job_lifecycle.note_extraction(
+                        crate::operations::instrumentation::StageOutcomeKind::Failed,
+                    );
                     let _ = self.event_tx.send(PipelineEvent::ExtractionFailed {
                         job_id,
                         error: e.clone(),

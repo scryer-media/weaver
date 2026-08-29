@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
 
-fn open_rar_volume_file(path: &Path) -> std::io::Result<Box<dyn weaver_unrar::ReadSeek>> {
+fn open_rar_volume_file(path: &Path) -> std::io::Result<Box<dyn unrar_rs::ReadSeek>> {
     #[cfg(test)]
     {
         rar_refresh_open_tracking::open(path)
@@ -31,8 +31,8 @@ mod tests {
         file_header as build_test_rar_file_header, main_header as build_test_rar_main_header,
     };
     use crate::pipeline::rar_state::RarSetState;
+    use par2_rs::checksum;
     use std::io::Cursor;
-    use weaver_par2::checksum;
 
     fn build_many_volume_rar_set(volume_count: usize) -> Vec<(String, Vec<u8>)> {
         assert!(volume_count >= 2);
@@ -69,13 +69,231 @@ mod tests {
             .collect()
     }
 
+    /// Volumes 0-2 and 5 of a six-volume set, all covered by a matching cached
+    /// snapshot. The gap at 3-4 leaves volume 5 waiting no matter which source
+    /// the plan is rebuilt from, so it must not be read as snapshot staleness.
+    fn holey_cached_rebuild_input(temp_dir: &tempfile::TempDir) -> RarSetComputeInput {
+        let files = build_many_volume_rar_set(6);
+        let present = [0usize, 1, 2, 5];
+
+        let mut cached_archive =
+            unrar_rs::RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+        for volume in present.iter().copied().skip(1) {
+            cached_archive
+                .add_volume(volume, Box::new(Cursor::new(files[volume].1.clone())))
+                .unwrap();
+        }
+
+        let mut volume_map = HashMap::new();
+        let mut volume_paths = BTreeMap::new();
+        let mut facts = BTreeMap::new();
+        for volume in present.iter().copied() {
+            let (filename, bytes) = &files[volume];
+            let path = temp_dir.path().join(filename);
+            std::fs::write(&path, bytes).unwrap();
+            volume_map.insert(filename.clone(), volume as u32);
+            volume_paths.insert(volume as u32, path);
+            facts.insert(
+                volume as u32,
+                unrar_rs::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
+                    .expect("synthetic RAR volume facts should parse"),
+            );
+        }
+
+        RarSetComputeInput {
+            job_id: JobId(98),
+            set_name: "show".to_string(),
+            existing: RarSetState::default(),
+            volume_map,
+            volume_paths,
+            password_candidates: Vec::new(),
+            extracted: HashSet::new(),
+            failed: HashSet::new(),
+            facts,
+            verified_suspect_volumes: HashSet::new(),
+            worker_active: false,
+            cached_headers: Some(cached_archive.serialize_headers()),
+            extraction_generation: 0,
+            reason: RefreshReason::CoverageExpansion,
+        }
+    }
+
+    #[test]
+    fn rar_plan_rebuild_reuses_matching_cached_headers_without_reopening_volume_zero() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let input = holey_cached_rebuild_input(&temp_dir);
+        // Volume 0 is only ever opened by the fallback, so removing it turns any
+        // unnecessary reopen into a hard failure instead of silent extra I/O.
+        std::fs::remove_file(&input.volume_paths[&0]).unwrap();
+
+        let _tracking = rar_refresh_open_tracking::start();
+        let computed = Pipeline::compute_rar_set_state_blocking(input)
+            .expect("matching cached headers should rebuild without volume 0");
+
+        assert_eq!(computed.rebuild_source.as_str(), "cached-headers");
+        // The guard under test only ever fires for waited-on volumes; if the
+        // fixture stops producing this wait the whole test goes vacuous.
+        assert!(
+            computed.plan.waiting_on_volumes.contains(&5),
+            "fixture must leave volume 5 waiting: {:?}",
+            computed.plan.waiting_on_volumes
+        );
+        let opened = rar_refresh_open_tracking::opened();
+        assert!(
+            opened.is_empty(),
+            "cached-header rebuild reopened volumes: {opened:?}"
+        );
+        assert_eq!(
+            computed
+                .plan
+                .topology
+                .complete_volumes
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1, 2, 5])
+        );
+    }
+
+    /// The same six volumes as [`holey_cached_rebuild_input`] — files for 0-2
+    /// and 5, a cached snapshot over those four — except volumes 3 and 4 now
+    /// have facts without files: the shape eager deletion leaves behind, since
+    /// it removes the volume file and keeps the per-volume facts. `volume_paths`
+    /// drops a deleted volume (it is built from paths that still exist) while
+    /// `state.facts` carries it forever, so the header chain stays reachable
+    /// across the hole and the waited-on volume 5 sits *inside* the facts ∪
+    /// paths prefix instead of past a true gap.
+    fn facts_bridged_gap_rebuild_input(temp_dir: &tempfile::TempDir) -> RarSetComputeInput {
+        let mut input = holey_cached_rebuild_input(temp_dir);
+        let files = build_many_volume_rar_set(6);
+        for volume in [3usize, 4] {
+            input.facts.insert(
+                volume as u32,
+                unrar_rs::RarArchive::parse_volume_facts(
+                    Cursor::new(files[volume].1.clone()),
+                    None,
+                )
+                .expect("synthetic RAR volume facts should parse"),
+            );
+        }
+        input
+    }
+
+    #[test]
+    fn rar_plan_rebuild_retries_from_live_volumes_when_facts_bridge_deleted_volume_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let input = facts_bridged_gap_rebuild_input(&temp_dir);
+        let facts = input.facts.clone();
+        let volume_paths = input.volume_paths.clone();
+
+        // Both halves of the predicate the retry turns on: on disk alone the
+        // chain stops at volume 2, so a paths-only reachability test would put
+        // the waited-on volume 5 past a gap and suppress the retry. Facts carry
+        // the chain to the end of the set.
+        assert_eq!(rar_state::contiguous_prefix_end(&volume_paths), Some(2));
+        assert_eq!(rar_state::contiguous_prefix_end(&facts), Some(5));
+
+        // The cached snapshot must survive its own consistency check, otherwise
+        // the volume-0 rebuild asserted below could be that check's doing
+        // rather than the present-waiting guard's.
+        let archive = Pipeline::deserialize_rar_headers_with_password_candidates(
+            "show",
+            input.cached_headers.as_ref().unwrap(),
+            &[],
+            std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
+        )
+        .expect("fixture snapshot should deserialize")
+        .value;
+        assert_eq!(
+            cached_rar_snapshot_alignment_with_volume_facts(&facts, &archive),
+            CachedRarSnapshotAlignment::CompletedGrowthRequiresRefresh
+        );
+
+        let _tracking = rar_refresh_open_tracking::start();
+        let computed = Pipeline::compute_rar_set_state_blocking(input)
+            .expect("facts-bridged gap should still rebuild the plan");
+
+        assert_eq!(computed.rebuild_source.as_str(), "volume-0");
+        assert!(
+            rar_refresh_open_tracking::opened().contains(&volume_paths[&0]),
+            "retry from live volumes should reopen volume 0: {:?}",
+            rar_refresh_open_tracking::opened()
+        );
+        // The wait itself is not the anomaly and survives the live rebuild —
+        // volume 5 is present, waited on, and inside the reachable prefix, which
+        // is exactly the input the guard fires on.
+        assert!(
+            computed.plan.waiting_on_volumes.contains(&5),
+            "fixture must leave volume 5 waiting: {:?}",
+            computed.plan.waiting_on_volumes
+        );
+        assert_eq!(
+            present_waiting_rar_volumes(&computed.plan, &facts, &volume_paths),
+            vec![5]
+        );
+    }
+
+    #[test]
+    fn cached_header_and_volume_zero_rar_plans_agree_across_a_true_gap() {
+        let cached_dir = tempfile::tempdir().unwrap();
+        let cached =
+            Pipeline::compute_rar_set_state_blocking(holey_cached_rebuild_input(&cached_dir))
+                .expect("cached headers should rebuild the plan");
+
+        let live_dir = tempfile::tempdir().unwrap();
+        let mut live_input = holey_cached_rebuild_input(&live_dir);
+        live_input.cached_headers = None;
+        let live = Pipeline::compute_rar_set_state_blocking(live_input)
+            .expect("live volumes should rebuild the plan");
+
+        assert_eq!(cached.rebuild_source.as_str(), "cached-headers");
+        assert_eq!(live.rebuild_source.as_str(), "volume-0");
+
+        // The claim the post-gap carve-out rests on: a volume-0 rebuild reads
+        // the same files and reproduces the same wait, so suppressing the retry
+        // costs nothing.
+        let waiting = |plan: &RarDerivedPlan| {
+            let mut volumes: Vec<u32> = plan.waiting_on_volumes.iter().copied().collect();
+            volumes.sort_unstable();
+            volumes
+        };
+        let ready = |plan: &RarDerivedPlan| {
+            plan.ready_members
+                .iter()
+                .map(|member| member.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !waiting(&cached.plan).is_empty(),
+            "fixture must leave the set waiting or the comparison is vacuous"
+        );
+        assert_eq!(waiting(&cached.plan), waiting(&live.plan));
+        assert_eq!(ready(&cached.plan), ready(&live.plan));
+        assert_eq!(cached.plan.member_names, live.plan.member_names);
+        assert_eq!(cached.plan.phase.as_str(), live.plan.phase.as_str());
+    }
+
+    #[test]
+    fn rar_plan_rebuild_falls_back_to_volume_zero_without_usable_cached_headers() {
+        for cached_headers in [None, Some(b"not-a-cached-header-snapshot".to_vec())] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut input = holey_cached_rebuild_input(&temp_dir);
+            input.cached_headers = cached_headers;
+
+            let computed = Pipeline::compute_rar_set_state_blocking(input)
+                .expect("live volumes should still rebuild the plan");
+
+            assert_eq!(computed.rebuild_source.as_str(), "volume-0");
+        }
+    }
+
     #[test]
     fn rar_refresh_compute_bounds_live_source_readers_for_many_volumes() {
         let temp_dir = tempfile::tempdir().unwrap();
         let volume_count = 260usize;
         let files = build_many_volume_rar_set(volume_count);
 
-        let first_archive = weaver_unrar::RarArchive::open(Cursor::new(files[0].1.clone()))
+        let first_archive = unrar_rs::RarArchive::open(Cursor::new(files[0].1.clone()))
             .expect("volume 0 should parse");
         let cached_headers = first_archive.serialize_headers();
 
@@ -89,7 +307,7 @@ mod tests {
             volume_paths.insert(volume as u32, path);
             facts.insert(
                 volume as u32,
-                weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
+                unrar_rs::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
                     .expect("synthetic RAR volume facts should parse"),
             );
         }
@@ -139,7 +357,7 @@ mod tests {
 
 #[cfg(test)]
 mod rar_refresh_open_tracking {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::io::{Read, Seek};
     use std::path::Path;
 
@@ -147,6 +365,7 @@ mod rar_refresh_open_tracking {
         static ENABLED: Cell<bool> = const { Cell::new(false) };
         static ACTIVE: Cell<usize> = const { Cell::new(0) };
         static PEAK: Cell<usize> = const { Cell::new(0) };
+        static OPENED: RefCell<Vec<std::path::PathBuf>> = const { RefCell::new(Vec::new()) };
     }
 
     pub(super) struct Guard {
@@ -161,6 +380,7 @@ mod rar_refresh_open_tracking {
         });
         ACTIVE.with(|active| active.set(0));
         PEAK.with(|peak| peak.set(0));
+        OPENED.with(|opened| opened.borrow_mut().clear());
         Guard { previous }
     }
 
@@ -168,10 +388,15 @@ mod rar_refresh_open_tracking {
         PEAK.with(Cell::get)
     }
 
-    pub(super) fn open(path: &Path) -> std::io::Result<Box<dyn weaver_unrar::ReadSeek>> {
+    pub(super) fn opened() -> Vec<std::path::PathBuf> {
+        OPENED.with(|opened| opened.borrow().clone())
+    }
+
+    pub(super) fn open(path: &Path) -> std::io::Result<Box<dyn unrar_rs::ReadSeek>> {
         let file = std::fs::File::open(path)?;
         let counted = ENABLED.with(Cell::get);
         if counted {
+            OPENED.with(|opened| opened.borrow_mut().push(path.to_path_buf()));
             ACTIVE.with(|active| {
                 let next = active.get() + 1;
                 active.set(next);
@@ -241,8 +466,8 @@ pub(in crate::pipeline) enum CachedRarSnapshotAlignment {
 }
 
 pub(in crate::pipeline) fn cached_rar_snapshot_alignment_with_volume_facts(
-    facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
-    archive: &weaver_unrar::RarArchive,
+    facts: &BTreeMap<u32, unrar_rs::RarVolumeFacts>,
+    archive: &unrar_rs::RarArchive,
 ) -> CachedRarSnapshotAlignment {
     let metadata = archive.metadata();
     let mut saw_stale_growth = false;
@@ -254,7 +479,7 @@ pub(in crate::pipeline) fn cached_rar_snapshot_alignment_with_volume_facts(
                 continue;
             }
 
-            let name = weaver_unrar::sanitize_path(&member.name);
+            let name = unrar_rs::sanitize_path(&member.name);
             let mut observed_last = first_volume;
             let mut observed_complete = false;
             let mut next_volume = first_volume + 1;
@@ -263,7 +488,7 @@ pub(in crate::pipeline) fn cached_rar_snapshot_alignment_with_volume_facts(
                 let Some(next_member) = next_facts.members.iter().find(|candidate| {
                     !candidate.is_directory
                         && candidate.split_before
-                        && weaver_unrar::sanitize_path(&candidate.name) == name
+                        && unrar_rs::sanitize_path(&candidate.name) == name
                 }) else {
                     break;
                 };
@@ -312,7 +537,7 @@ fn cached_rar_plan_is_incoherent(
     plan: &RarDerivedPlan,
     failed: &HashSet<String>,
     worker_active: bool,
-    facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
+    facts: &BTreeMap<u32, unrar_rs::RarVolumeFacts>,
     volume_paths: &BTreeMap<u32, PathBuf>,
 ) -> bool {
     matches!(plan.phase, RarSetPhase::WaitingForVolumes)
@@ -330,9 +555,25 @@ fn cached_rar_plan_is_incoherent(
         })
 }
 
+/// Volumes whose plan decision claims no owner while `facts` still show a named
+/// member on them.
+///
+/// This only says anything when `plan` and `facts` come from different
+/// generations, which is why its one call site is the live check in
+/// `ownerless_live_rar_plan_error_for_set`: there the plan is whatever was last
+/// applied to the set and the facts are the set's current ones, so a volume
+/// that gained named members after the plan was built shows up as ownerless.
+///
+/// Measured against the same facts a plan was built from it is vacuous by
+/// construction: `rar_state::build_plan` backfills empty `owners` from
+/// `fact_owner_claims`, which accepts a member under exactly the predicate
+/// below — non-directory-or-nonempty and a non-empty sanitized name. Callers on
+/// the compute path would therefore always get an empty vector back. Narrowing
+/// that fallback in `build_plan` is what would make a compute-path check
+/// meaningful again.
 pub(in crate::pipeline) fn ownerless_present_member_volumes(
     plan: &RarDerivedPlan,
-    facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
+    facts: &BTreeMap<u32, unrar_rs::RarVolumeFacts>,
 ) -> Vec<u32> {
     let mut volumes: Vec<u32> = plan
         .delete_decisions
@@ -341,7 +582,7 @@ pub(in crate::pipeline) fn ownerless_present_member_volumes(
             let has_named_member = facts.get(volume).is_some_and(|volume_facts| {
                 volume_facts.members.iter().any(|member| {
                     (!member.is_directory || member.data_size > 0)
-                        && !weaver_unrar::sanitize_path(&member.name).is_empty()
+                        && !unrar_rs::sanitize_path(&member.name).is_empty()
                 })
             });
             (decision.owners.is_empty() && has_named_member).then_some(*volume)
@@ -351,16 +592,31 @@ pub(in crate::pipeline) fn ownerless_present_member_volumes(
     volumes
 }
 
-fn present_waiting_rar_volumes(
+pub(in crate::pipeline) fn present_waiting_rar_volumes(
     plan: &RarDerivedPlan,
-    facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
+    facts: &BTreeMap<u32, unrar_rs::RarVolumeFacts>,
     volume_paths: &BTreeMap<u32, PathBuf>,
 ) -> Vec<u32> {
+    // Waiting on a volume past the first gap in the header chain is the correct
+    // plan, not a stale-snapshot symptom: no rebuild of any kind can link a
+    // continuation header back to its member start across a gap neither view can
+    // see into. The chain stays reachable through cached facts even when the
+    // file itself was eagerly deleted after extraction, so the prefix must be
+    // measured over facts ∪ volume_paths — disk presence alone would suppress
+    // retries that a volume-0 rebuild (which attaches real readers, not the
+    // cached path's empty cursors) could genuinely change.
+    let reachable_end = (0u32..)
+        .take_while(|volume| facts.contains_key(volume) || volume_paths.contains_key(volume))
+        .last();
     let mut volumes: Vec<u32> = plan
         .waiting_on_volumes
         .iter()
         .copied()
-        .filter(|volume| facts.contains_key(volume) && volume_paths.contains_key(volume))
+        .filter(|volume| {
+            facts.contains_key(volume)
+                && volume_paths.contains_key(volume)
+                && reachable_end.is_some_and(|end| *volume <= end)
+        })
         .collect();
     volumes.sort_unstable();
     volumes.dedup();
@@ -382,7 +638,7 @@ struct RarSetComputeInput {
     password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     extracted: HashSet<String>,
     failed: HashSet<String>,
-    facts: BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
+    facts: BTreeMap<u32, unrar_rs::RarVolumeFacts>,
     verified_suspect_volumes: HashSet<u32>,
     worker_active: bool,
     cached_headers: Option<Vec<u8>>,
@@ -394,10 +650,10 @@ pub(in crate::pipeline) fn is_incoherent_rar_waiting_state_error(error: &str) ->
     error.contains(INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER)
 }
 
-pub(in crate::pipeline) fn is_ownerless_rar_plan_error(error: &str) -> bool {
-    error.contains(OWNERLESS_RAR_PLAN_ERROR_MARKER)
-}
-
+/// Formats the error `ownerless_live_rar_plan_error_for_set` fails a job with.
+/// Nothing matches on the marker any more: the compute path cannot produce this
+/// error, and the live path returns it straight to the caller that fails the
+/// job.
 pub(in crate::pipeline) fn ownerless_rar_plan_error(set_name: &str, volumes: &[u32]) -> String {
     format!("RAR set '{set_name}' {OWNERLESS_RAR_PLAN_ERROR_MARKER}: {volumes:?}")
 }
@@ -420,7 +676,7 @@ impl Pipeline {
     pub(crate) async fn parse_rar_volume_facts_from_path(
         path: PathBuf,
         password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
-    ) -> Result<weaver_unrar::RarVolumeFacts, String> {
+    ) -> Result<unrar_rs::RarVolumeFacts, String> {
         tokio::task::spawn_blocking(move || {
             let context = format!("failed to parse RAR volume facts from {}", path.display());
             Self::try_rar_password_candidates(&context, &password_candidates, |password| {
@@ -430,7 +686,7 @@ impl Pipeline {
                         path.display()
                     ))
                 })?;
-                weaver_unrar::RarArchive::parse_volume_facts(file, password)
+                unrar_rs::RarArchive::parse_volume_facts(file, password)
                     .map_err(crate::pipeline::RarPasswordAttemptError::from)
             })
             .map(|selection| selection.value)
@@ -439,13 +695,13 @@ impl Pipeline {
         .map_err(|e| format!("RAR facts parser task panicked: {e}"))?
     }
 
-    pub(in crate::pipeline::archive) fn persist_rar_volume_facts(
+    pub(crate) fn persist_rar_volume_facts(
         &mut self,
         job_id: JobId,
         set_name: &str,
         filename: &str,
         observed_volume: Option<u32>,
-        facts: weaver_unrar::RarVolumeFacts,
+        facts: unrar_rs::RarVolumeFacts,
     ) -> Result<bool, String> {
         if let Some(expected_volume) = observed_volume
             && facts.volume_number != expected_volume
@@ -478,6 +734,7 @@ impl Pipeline {
         let state = self.rar_sets.entry(state_key).or_default();
         Self::register_rar_volume_file(state, facts.volume_number, filename.to_string());
         state.facts.insert(facts.volume_number, facts);
+        state.facts_generation = state.facts_generation.wrapping_add(1);
 
         Ok(true)
     }
@@ -734,7 +991,7 @@ impl Pipeline {
         } = input;
 
         let open_from_volume_zero =
-            || -> Result<crate::pipeline::ArchivePasswordSelection<weaver_unrar::RarArchive>, String> {
+            || -> Result<crate::pipeline::ArchivePasswordSelection<unrar_rs::RarArchive>, String> {
             let first_path = volume_paths.get(&0).ok_or_else(|| {
                 format!(
                     "RAR set '{set_name_owned}' cannot be rebuilt without cached headers or volume 0"
@@ -744,11 +1001,11 @@ impl Pipeline {
                 &set_name_owned,
                 first_path,
                 &password_candidates,
-                std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+                std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             )
         };
 
-        let attach_volumes_and_build_plan = |mut archive: weaver_unrar::RarArchive,
+        let attach_volumes_and_build_plan = |mut archive: unrar_rs::RarArchive,
                                              rebuild_source: RarTopologyRebuildSource,
                                              using_cached_headers: bool,
                                              force_refresh_all_volumes: bool|
@@ -841,7 +1098,7 @@ impl Pipeline {
                     &set_name_owned,
                     &headers,
                     &password_candidates,
-                    std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+                    std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
                 ) {
                     Ok(selection) => selection,
                     Err(error) => {
@@ -937,23 +1194,15 @@ impl Pipeline {
             )?;
         }
 
-        let ownerless_volumes = ownerless_present_member_volumes(&plan, &facts);
-        if used_cached_headers && !ownerless_volumes.is_empty() && volume_paths.contains_key(&0) {
-            warn!(
-                set_name = %set_name_owned,
-                volumes = ?ownerless_volumes,
-                "cached RAR headers produced ownerless present volumes; retrying from live volumes"
-            );
-
-            let selection = open_from_volume_zero()?;
-            (plan, headers, rebuild_source, used_cached_headers) = attach_volumes_and_build_plan(
-                selection.value,
-                RarTopologyRebuildSource::VolumeZero,
-                false,
-                false,
-            )?;
-        }
-
+        // Ownerless present volumes are deliberately not checked on this path,
+        // neither as a retry trigger nor as an error: every plan this function
+        // can hold came out of `rar_state::build_plan` over the same `facts`,
+        // and that builder's fact-derived owner fallback fills `owners` under
+        // exactly the predicate `ownerless_present_member_volumes` tests, so
+        // the check can only ever come back empty here. The live-path call in
+        // `ownerless_live_rar_plan_error_for_set` — where the plan and the
+        // facts it is measured against are different generations — is the real
+        // backstop.
         if used_cached_headers
             && cached_rar_plan_is_incoherent(&plan, &failed, worker_active, &facts, &volume_paths)
             && volume_paths.contains_key(&0)
@@ -970,14 +1219,6 @@ impl Pipeline {
                 false,
                 false,
             )?;
-        }
-
-        let ownerless_volumes = ownerless_present_member_volumes(&plan, &facts);
-        if !ownerless_volumes.is_empty() {
-            return Err(ownerless_rar_plan_error(
-                &set_name_owned,
-                &ownerless_volumes,
-            ));
         }
 
         if cached_rar_plan_is_incoherent(&plan, &failed, worker_active, &facts, &volume_paths) {
@@ -1037,11 +1278,6 @@ impl Pipeline {
         existing: RarSetState,
         error: String,
     ) -> Result<(), String> {
-        if is_ownerless_rar_plan_error(&error) {
-            self.clear_rar_snapshot(job_id, set_name);
-            return Err(error);
-        }
-
         let mut fallback = existing.plan.clone().unwrap_or_else(|| RarDerivedPlan {
             phase: RarSetPhase::FallbackFullSet,
             is_solid: false,
@@ -1273,6 +1509,34 @@ impl Pipeline {
             .get(&key)
             .map(|set_state| set_state.facts.keys().copied().collect())
             .unwrap_or_default();
+        // Everything a follow-up refresh could possibly compute from: the
+        // facts (generation covers content changes under an unchanged key)
+        // and the plan this refresh just installed. Two successive
+        // completions landing on the same fingerprint prove a follow-up
+        // would re-derive the identical plan from identical inputs.
+        let completion_fingerprint = {
+            use std::hash::{DefaultHasher, Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            if let Some(set_state) = self.rar_sets.get(&key) {
+                set_state.facts_generation.hash(&mut hasher);
+                set_state
+                    .facts
+                    .keys()
+                    .for_each(|volume| volume.hash(&mut hasher));
+                u32::MAX.hash(&mut hasher);
+                if let Some(plan) = set_state.plan.as_ref() {
+                    plan.topology
+                        .complete_volumes
+                        .iter()
+                        .for_each(|volume| volume.hash(&mut hasher));
+                    u32::MAX.hash(&mut hasher);
+                    plan.waiting_on_volumes
+                        .iter()
+                        .for_each(|volume| volume.hash(&mut hasher));
+                }
+            }
+            hasher.finish()
+        };
         let latest_live_volume = live_fact_volumes.iter().next_back().copied().unwrap_or(0);
         let active_rar_workers = self.rar_sets.get(&key).is_some_and(|set_state| {
             set_state.active_workers > 0 || !set_state.in_flight_members.is_empty()
@@ -1286,8 +1550,12 @@ impl Pipeline {
                 let mut request = state
                     .queued
                     .take()
+                    .filter(|_| !live_fact_volumes.is_empty())
                     .filter(|queued| queued.reason != RefreshReason::PostExtraction);
-                if request.is_none() && done.request.reason != RefreshReason::PostExtraction {
+                if request.is_none()
+                    && !live_fact_volumes.is_empty()
+                    && done.request.reason != RefreshReason::PostExtraction
+                {
                     request = Some(RarRefreshRequest {
                         target_completed_volume: state
                             .latest_completed_volume
@@ -1296,7 +1564,7 @@ impl Pipeline {
                         reason: done.request.reason,
                     });
                 }
-                if request.is_none() && state.structure_dirty {
+                if request.is_none() && !live_fact_volumes.is_empty() && state.structure_dirty {
                     request = Some(RarRefreshRequest {
                         target_completed_volume: state
                             .latest_completed_volume
@@ -1324,8 +1592,33 @@ impl Pipeline {
                     state.last_error = None;
                 }
 
-                let coverage_gap =
-                    success && !live_fact_volumes.is_subset(&state.refreshed_volumes);
+                // The progress gate. A coverage gap asks for a follow-up
+                // because the facts hold volumes the plan has not absorbed —
+                // but a gap the plan CANNOT close (a chain link whose volume
+                // does not exist yet, say) reproduces itself on every
+                // follow-up, and an ungated respawn here is a full-speed
+                // livelock: refresh → identical plan → same gap → refresh,
+                // at actor cadence, starving every other job. When this
+                // completion lands on the same fingerprint as the previous
+                // one, the follow-up is parked instead; the next real change
+                // — a fact registered, a fact rewritten, plan progress —
+                // moves the fingerprint and re-arms the gap through the
+                // ordinary event-driven enqueues.
+                let no_progress =
+                    success && state.last_completion_fingerprint == Some(completion_fingerprint);
+                if success {
+                    state.last_completion_fingerprint = Some(completion_fingerprint);
+                }
+                let unabsorbed_facts = !live_fact_volumes.is_subset(&state.refreshed_volumes);
+                let coverage_gap = success && !no_progress && unabsorbed_facts;
+                if success && no_progress && unabsorbed_facts {
+                    debug!(
+                        job_id = done.job_id.0,
+                        set_name = %done.set_name,
+                        "RAR refresh made no progress against unchanged facts; parking the \
+                         coverage gap until a new fact or volume arrives"
+                    );
+                }
                 if let Some(mut queued) = state.queued.take() {
                     if coverage_gap || capacity_pressure {
                         queued.target_completed_volume = queued
@@ -1371,6 +1664,11 @@ impl Pipeline {
                     state.structure_dirty = false;
                 }
             }
+        }
+
+        if stale_refresh && live_fact_volumes.is_empty() {
+            self.purge_empty_rar_set_if_idle(done.job_id, &done.set_name);
+            return;
         }
 
         if let Some(request) = follow_up {
@@ -1578,7 +1876,7 @@ impl Pipeline {
                         &set_name,
                         &headers,
                         &password_candidates,
-                        std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+                        std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
                     ) {
                         Ok(_) => {
                             self.rar_sets
@@ -1627,7 +1925,7 @@ impl Pipeline {
             state.facts.clear();
             state.volume_files.clear();
             for (volume_index, blob) in facts_rows {
-                match rmp_serde::from_slice::<weaver_unrar::RarVolumeFacts>(&blob) {
+                match rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob) {
                     Ok(facts) => {
                         if facts.volume_number != volume_index {
                             warn!(
@@ -1890,6 +2188,25 @@ impl Pipeline {
             None => return,
         };
 
+        // A split set whose joined output the recovery data already produced is
+        // retired for the rest of the job. Several paths re-offer its completed
+        // parts here — job restore, and the archive finalization that re-refreshes
+        // every unextracted source file — and rebuilding the topology from one of
+        // them would put the joiner back in front of a verified output.
+        if matches!(role, weaver_model::files::FileRole::SplitFile { .. })
+            && self
+                .par2_joined_split_sets
+                .get(&job_id)
+                .is_some_and(|sets| sets.contains_key(&set_name))
+        {
+            debug!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                "split set already joined by its recovery data — not re-registering it"
+            );
+            return;
+        }
+
         match role {
             weaver_model::files::FileRole::SevenZipArchive => {
                 if state.assembly.archive_topology_for(&set_name).is_some() {
@@ -2015,11 +2332,13 @@ impl Pipeline {
             | weaver_model::files::FileRole::TarArchive
             | weaver_model::files::FileRole::TarGzArchive
             | weaver_model::files::FileRole::TarBz2Archive
+            | weaver_model::files::FileRole::TarXzArchive
             | weaver_model::files::FileRole::GzArchive
             | weaver_model::files::FileRole::DeflateArchive
             | weaver_model::files::FileRole::BrotliArchive
             | weaver_model::files::FileRole::ZstdArchive
-            | weaver_model::files::FileRole::Bzip2Archive => {
+            | weaver_model::files::FileRole::Bzip2Archive
+            | weaver_model::files::FileRole::XzArchive => {
                 if state.assembly.archive_topology_for(&set_name).is_some() {
                     let state = self.jobs.get_mut(&job_id).unwrap();
                     state.assembly.mark_volume_complete(&set_name, 0);
@@ -2036,11 +2355,13 @@ impl Pipeline {
                     weaver_model::files::FileRole::TarArchive => ArchiveType::Tar,
                     weaver_model::files::FileRole::TarGzArchive => ArchiveType::TarGz,
                     weaver_model::files::FileRole::TarBz2Archive => ArchiveType::TarBz2,
+                    weaver_model::files::FileRole::TarXzArchive => ArchiveType::TarXz,
                     weaver_model::files::FileRole::GzArchive => ArchiveType::Gz,
                     weaver_model::files::FileRole::DeflateArchive => ArchiveType::Deflate,
                     weaver_model::files::FileRole::BrotliArchive => ArchiveType::Brotli,
                     weaver_model::files::FileRole::ZstdArchive => ArchiveType::Zstd,
                     weaver_model::files::FileRole::Bzip2Archive => ArchiveType::Bzip2,
+                    weaver_model::files::FileRole::XzArchive => ArchiveType::Xz,
                     _ => unreachable!(),
                 };
 

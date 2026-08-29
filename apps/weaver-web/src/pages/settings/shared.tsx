@@ -81,7 +81,6 @@ type BackupManifest = {
     complete_dir: string;
   };
   encrypted: boolean;
-  managed_packages?: Array<{ digest: string }>;
   notes: string[];
 };
 
@@ -519,9 +518,6 @@ export function BackupRestoreSection({
                   )}
                 </div>
                 <div>
-                  Managed packages: {inspectResult.manifest.managed_packages?.length ?? 0}
-                </div>
-                <div>
                   {t("settings.restoreEncrypted")}:{" "}
                   {inspectResult.manifest.encrypted
                     ? t("settings.restoreYes")
@@ -820,6 +816,7 @@ export function ApiKeysSection() {
           <div className="min-w-52 flex-1">
             <Label className="mb-2">{t("settings.apiKeyName")}</Label>
             <Input
+              data-testid="api-key-name"
               value={newKeyName}
               onChange={(e) => setNewKeyName(e.target.value)}
               placeholder={t("settings.apiKeyNamePlaceholder")}
@@ -827,14 +824,16 @@ export function ApiKeysSection() {
             />
           </div>
           <div>
-            <Label className="mb-2">{t("settings.apiKeyScope")}</Label>
+            <Label className="mb-2" htmlFor="api-key-scope">
+              {t("settings.apiKeyScope")}
+            </Label>
             <Select
               value={newKeyScope}
               onValueChange={(value) =>
                 setNewKeyScope(value as ApiKeyScope)
               }
             >
-              <SelectTrigger className="min-w-44">
+              <SelectTrigger className="min-w-44" id="api-key-scope">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>

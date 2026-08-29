@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
@@ -10,7 +9,7 @@ use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::events::publish::should_record_job_event;
 use weaver_server_core::runtime::buffers::{BufferPool, BufferPoolConfig};
 use weaver_server_core::runtime::system_profile::SystemProfile;
-use weaver_server_core::servers::{ServerConfig, ServerConnectivityResult};
+use weaver_server_core::servers::ServerConfig;
 use weaver_server_core::settings::Config;
 
 pub(crate) struct RuntimeContext {
@@ -19,8 +18,7 @@ pub(crate) struct RuntimeContext {
     pub write_buf_max: usize,
 }
 
-pub(crate) fn build_runtime_context(output_dir: &Path) -> RuntimeContext {
-    let profile = weaver_server_core::runtime::detect_system_profile(output_dir);
+pub(crate) fn build_runtime_context(profile: SystemProfile) -> RuntimeContext {
     info!(
         cores = profile.cpu.physical_cores,
         storage = ?profile.disk.storage_class,
@@ -59,44 +57,6 @@ pub(crate) fn build_runtime_context(output_dir: &Path) -> RuntimeContext {
     }
 }
 
-pub(crate) async fn detect_server_capabilities(config: &mut Config, db: &Database) {
-    for server in config.servers.iter_mut().filter(|server| server.active) {
-        let ServerConnectivityResult {
-            success,
-            message,
-            supports_pipelining,
-            ..
-        } = weaver_server_core::servers::probe_server_connection(server).await;
-        server.supports_pipelining = supports_pipelining;
-        if success {
-            info!(
-                host = %server.host,
-                supports_pipelining,
-                "detected server capabilities"
-            );
-        } else {
-            info!(
-                host = %server.host,
-                error = %message,
-                "capability detection failed, assuming no pipelining"
-            );
-        }
-
-        let persisted = server.clone();
-        let server_id = persisted.id;
-        let db = db.clone();
-        match tokio::task::spawn_blocking(move || db.update_server(&persisted)).await {
-            Ok(Err(error)) => {
-                error!(server_id, error = %error, "failed to persist server capabilities");
-            }
-            Err(join_error) => {
-                error!(server_id, error = %join_error, "failed to persist server capabilities");
-            }
-            Ok(Ok(())) => {}
-        }
-    }
-}
-
 pub(crate) fn build_nntp_client(
     config: &Config,
     profile: &SystemProfile,
@@ -130,6 +90,7 @@ pub(crate) fn build_nntp_client(
                 password: server.password.clone(),
                 tls_ca_cert: server.tls_ca_cert.clone(),
                 buffer_profile,
+                pipelining: weaver_nntp::PipeliningCapability::Known(server.supports_pipelining),
                 ..Default::default()
             },
             max_connections: server.connections as usize,

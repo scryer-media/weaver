@@ -1,0 +1,8 @@
+{
+  "slug": "large-segments",
+  "title": "E2E.Test.LargeSegments.2024.2160p.UHD-TESTGRP",
+  "description": "Many small segments (50KB). Tests multi-segment reassembly",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 50000
+}

@@ -12,6 +12,8 @@ const HOT_SHARE_YIELD_CHECK_ARTICLES: usize = 4;
 pub(crate) struct OwnedDownloadLanePool {
     senders: Vec<std_mpsc::Sender<OwnedLanePoolCommand>>,
     next: AtomicUsize,
+    #[cfg(test)]
+    reset_calls: AtomicUsize,
 }
 
 struct OwnedLaneRun {
@@ -39,6 +41,8 @@ impl OwnedDownloadLanePool {
         let mut pool = Self {
             senders: Vec::new(),
             next: AtomicUsize::new(0),
+            #[cfg(test)]
+            reset_calls: AtomicUsize::new(0),
         };
         pool.resize(worker_count);
         pool
@@ -58,7 +62,14 @@ impl OwnedDownloadLanePool {
         self.senders.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn reset_calls(&self) -> usize {
+        self.reset_calls.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn reset(&self) {
+        #[cfg(test)]
+        self.reset_calls.fetch_add(1, Ordering::Relaxed);
         for sender in &self.senders {
             let _ = sender.send(OwnedLanePoolCommand::Reset);
         }
@@ -216,10 +227,8 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 });
             }
             Err(error) => {
-                let _ = event_tx.blocking_send(OwnedDownloadLaneEvent::AcquireFailed {
-                    lease,
-                    error: error.to_string(),
-                });
+                let _ =
+                    event_tx.blocking_send(OwnedDownloadLaneEvent::AcquireFailed { lease, error });
                 crate::runtime::perf_probe::record(
                     "download.fetch_body.owned",
                     fetch_started.elapsed(),
@@ -233,6 +242,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         .as_mut()
         .expect("owned lane cache populated before run")
         .lane;
+    let mut parked_completion_critical: bool;
     let (park_reason, parked_job_id, parked_mode, parked_spillover_loan_kind, keep_cached_lane) = loop {
         let stats_before = lane.stats();
         let DownloadBatchLease {
@@ -243,8 +253,10 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             server_modes,
             compatibility,
             effective_exclude_servers: _,
+            checkpoint_plan,
             works,
         } = lease;
+        parked_completion_critical = compatibility.completion_critical;
         let server_idx = lane.server_id().0;
         let supports_pipelining = lane.supports_pipelining();
         let actual_mode = Pipeline::actual_download_lane_mode(
@@ -255,6 +267,9 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         );
         let is_recovery = compatibility.is_recovery;
         let exclude_servers = compatibility.exclude_servers.clone();
+        // An owned lane outlives its batch, so the immutable checkpoint plan
+        // is re-applied for every batch, including `None` after pooled reuse.
+        lane.set_checkpoint_plan(checkpoint_plan);
 
         // Prefetch the next lease while this batch downloads. The refill
         // response then overlaps the batch instead of serializing at the
@@ -440,7 +455,9 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             completed_since_yield_check = completed_since_yield_check.saturating_add(completed);
             if completed_since_yield_check >= HOT_SHARE_YIELD_CHECK_ARTICLES {
                 completed_since_yield_check = 0;
-                if hot_share_yield_signal.is_requested_for(job_id) {
+                // A completion-critical batch never yields here — it is the
+                // work the signal exists to make room for.
+                if !parked_completion_critical && hot_share_yield_signal.is_requested() {
                     yielded_for_hot_share = true;
                     break;
                 }
@@ -576,6 +593,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         job_id: parked_job_id,
         mode: parked_mode,
         spillover_loan_kind: parked_spillover_loan_kind,
+        completion_critical: parked_completion_critical,
         reason: park_reason,
         release_connection_slot: true,
         release_ip_replacement_burst: false,
@@ -680,6 +698,7 @@ fn result_from_trace(
 ) -> DownloadResult {
     let segment_id = work.segment_id;
     let retry_count = work.retry_count;
+    let completion_critical = work.completion_critical;
     let (data, attempts, source_server_idx) =
         Pipeline::download_data_from_decoded_trace(segment_id, trace);
     let policy_outcome = matches!(
@@ -701,7 +720,7 @@ fn result_from_trace(
         attempts,
         lane_observation: Some(observation),
         source_server_idx,
-        origin: DownloadResultOrigin::from_recovery(is_recovery),
+        origin: DownloadResultOrigin::from_work(is_recovery, completion_critical),
         retry_count,
         exclude_servers: exclude_servers.to_vec(),
         release_connection_slot: false,
@@ -722,6 +741,7 @@ fn unresolved_result(
     exclude_servers: &[usize],
     message: &'static str,
 ) -> DownloadResult {
+    let completion_critical = work.completion_critical;
     DownloadResult {
         segment_id: work.segment_id,
         runtime_generation,
@@ -742,7 +762,7 @@ fn unresolved_result(
             connection_discarded: true,
         }),
         source_server_idx: None,
-        origin: DownloadResultOrigin::from_recovery(is_recovery),
+        origin: DownloadResultOrigin::from_work(is_recovery, completion_critical),
         retry_count: work.retry_count,
         exclude_servers: exclude_servers.to_vec(),
         release_connection_slot: false,
@@ -770,6 +790,7 @@ mod tests {
             byte_estimate: 1024,
             retry_count,
             is_recovery: false,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         }

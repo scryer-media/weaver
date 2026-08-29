@@ -47,11 +47,13 @@ pub(crate) enum SimpleArchiveKind {
     Tar,
     TarGz,
     TarBz2,
+    TarXz,
     Gz,
     Deflate,
     Brotli,
     Zstd,
     Bzip2,
+    Xz,
     Split,
 }
 
@@ -62,9 +64,12 @@ pub(crate) enum NestedExtractionDecision {
     PreserveOutputsAtDepthLimit,
 }
 
-mod check;
+pub(crate) mod check;
+pub(crate) mod claims;
+pub(crate) mod deobfuscate;
 mod extract;
 mod nested;
 mod output;
 mod rar;
+mod sfv;
 mod status;

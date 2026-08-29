@@ -1,12 +1,13 @@
 use std::io::{self, Cursor, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(not(windows))]
 use bytes::BufMut;
 use bytes::BytesMut;
+use rustls_pki_types::{CertificateDer, UnixTime, pem::PemObject};
 #[cfg(not(windows))]
 use s2n_tls::{config::Config as S2nConfig, security};
 #[cfg(not(windows))]
@@ -15,10 +16,99 @@ use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, lookup_host};
 use tokio_rustls::client::TlsStream as RustlsTlsStream;
+use tokio_rustls::rustls::client::{
+    WebPkiServerVerifier,
+    danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+};
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, ClientConnection, RootCertStore};
+use tokio_rustls::rustls::{
+    CertificateError, ClientConfig, ClientConnection, DigitallySignedStruct, Error as RustlsError,
+    RootCertStore, SignatureScheme,
+};
 
 use crate::error::NntpError;
+
+/// Keeps normal WebPKI verification intact while allowing one explicitly
+/// adopted leaf certificate to bypass only a hostname mismatch.
+#[derive(Debug)]
+enum NameMismatchCertificatePolicy {
+    Adopted(Vec<u8>),
+    Capture(Arc<Mutex<Option<Vec<u8>>>>),
+}
+
+#[derive(Debug)]
+struct AdoptedNameMismatchCertificateVerifier {
+    inner: Arc<WebPkiServerVerifier>,
+    policy: NameMismatchCertificatePolicy,
+}
+
+impl ServerCertVerifier for AdoptedNameMismatchCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(verified) => Ok(verified),
+            Err(error) if is_name_mismatch(&error) => match &self.policy {
+                NameMismatchCertificatePolicy::Adopted(adopted_leaf_der)
+                    if end_entity.as_ref() == adopted_leaf_der.as_slice() =>
+                {
+                    Ok(ServerCertVerified::assertion())
+                }
+                NameMismatchCertificatePolicy::Capture(captured_leaf_der) => {
+                    let mut captured = captured_leaf_der
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *captured = Some(end_entity.as_ref().to_vec());
+                    Err(error)
+                }
+                NameMismatchCertificatePolicy::Adopted(_) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+fn is_name_mismatch(error: &RustlsError) -> bool {
+    matches!(
+        error,
+        RustlsError::InvalidCertificate(
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. }
+        )
+    )
+}
 
 /// Stream type behind the `S2nTls` variant. On Windows, where s2n-tls cannot
 /// compile, this aliases an uninhabited placeholder: the variant still
@@ -87,8 +177,14 @@ pin_project_lite::pin_project! {
 }
 
 pub(crate) const TLS_READ_BUFFER: usize = 256 * 1024;
+pub(crate) const TLS_READ_TURN_LIMIT: usize = 1024 * 1024;
 const TLS_PLAINTEXT_DRAIN_CHUNK: usize = 16 * 1024;
 const TLS_BACKEND_ENV: &str = "WEAVER_NNTP_TLS_BACKEND";
+
+#[inline]
+fn read_turn_exhausted_without_plaintext(ciphertext: usize, plaintext: usize) -> bool {
+    ciphertext >= TLS_READ_TURN_LIMIT && plaintext == 0
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransportReadStats {
@@ -147,7 +243,13 @@ async fn read_s2n_available_into(
     target_read_size: usize,
 ) -> io::Result<TransportRead> {
     let started_len = dst.len();
-    let target_read_size = target_read_size.max(1);
+    // The ceiling mirrors the manual-rustls lane's turn budget. Production
+    // targets are built as `per_connection.min(256 KiB)` (or the 64 KiB
+    // default), so the clamp is the identity on the whole tuned range — it
+    // exists because `dst.reserve(target_read_size - total)` below reserves
+    // the full remaining target, and an unbounded caller-supplied target
+    // would turn that into a capacity-overflow abort.
+    let target_read_size = target_read_size.clamp(1, TLS_READ_TURN_LIMIT);
     let mut stats = TransportReadStats::default();
     let bytes = std::future::poll_fn(|cx| {
         loop {
@@ -407,8 +509,9 @@ impl ManualTlsStream {
         target_read_size: usize,
         mut stats: Option<&mut TransportReadStats>,
     ) -> io::Result<usize> {
-        let started_len = dst.len();
-        let drained = self.session.drain_plaintext(dst, stats.as_deref_mut())?;
+        let drained =
+            self.session
+                .drain_plaintext_up_to(dst, TLS_READ_TURN_LIMIT, stats.as_deref_mut())?;
         if drained > 0 {
             if let Some(stats) = stats.as_deref_mut() {
                 stats.cached_plaintext_returns += 1;
@@ -416,10 +519,12 @@ impl ManualTlsStream {
             return Ok(drained);
         }
 
-        let read_size = target_read_size.max(TLS_READ_BUFFER);
+        let read_size = target_read_size.clamp(TLS_READ_BUFFER, TLS_READ_TURN_LIMIT);
         if self.read_buffer.len() < read_size {
             self.read_buffer.resize(read_size, 0);
         }
+        let mut ciphertext_read_this_turn = 0usize;
+        let mut plaintext_read_this_turn = 0usize;
 
         loop {
             if let Some(stats) = stats.as_deref_mut() {
@@ -427,22 +532,37 @@ impl ManualTlsStream {
             }
             self.tcp.readable().await?;
             let mut saw_eof = false;
-            let len_before_ready = dst.len();
+            let plaintext_before_ready = plaintext_read_this_turn;
 
             loop {
+                let remaining_ciphertext = TLS_READ_TURN_LIMIT - ciphertext_read_this_turn;
+                if remaining_ciphertext == 0 {
+                    if let Some(stats) = stats.as_deref_mut() {
+                        stats.backend_target_full_returns += 1;
+                    }
+                    break;
+                }
                 if let Some(stats) = stats.as_deref_mut() {
                     stats.try_read_calls += 1;
                 }
-                match self.tcp.try_read(&mut self.read_buffer[..read_size]) {
+                let attempt_size = read_size.min(remaining_ciphertext);
+                match self.tcp.try_read(&mut self.read_buffer[..attempt_size]) {
                     Ok(0) => {
                         saw_eof = true;
                         break;
                     }
                     Ok(n) => {
+                        ciphertext_read_this_turn += n;
                         if let Some(stats) = stats.as_deref_mut() {
                             stats.try_read_bytes += n as u64;
                         }
-                        self.feed_ciphertext(n, dst, stats.as_deref_mut())?;
+                        let remaining_plaintext = TLS_READ_TURN_LIMIT - plaintext_read_this_turn;
+                        plaintext_read_this_turn += self.feed_ciphertext_up_to(
+                            n,
+                            dst,
+                            remaining_plaintext,
+                            stats.as_deref_mut(),
+                        )?;
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         if let Some(stats) = stats.as_deref_mut() {
@@ -454,13 +574,22 @@ impl ManualTlsStream {
                 }
             }
 
-            if dst.len() > started_len {
-                return Ok(dst.len() - started_len);
+            if plaintext_read_this_turn > 0 {
+                return Ok(plaintext_read_this_turn);
             }
             if saw_eof {
                 return Ok(0);
             }
-            if dst.len() == len_before_ready
+            if read_turn_exhausted_without_plaintext(
+                ciphertext_read_this_turn,
+                plaintext_read_this_turn,
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "TLS read turn reached its limit without application plaintext",
+                ));
+            }
+            if plaintext_read_this_turn == plaintext_before_ready
                 && let Some(stats) = stats.as_deref_mut()
             {
                 stats.empty_readiness_wakes += 1;
@@ -493,6 +622,21 @@ impl ManualTlsStream {
         self.session
             .feed_ciphertext_slice(&self.read_buffer[..bytes], dst, stats)
     }
+
+    fn feed_ciphertext_up_to(
+        &mut self,
+        bytes: usize,
+        dst: &mut BytesMut,
+        max_plaintext: usize,
+        stats: Option<&mut TransportReadStats>,
+    ) -> io::Result<usize> {
+        self.session.feed_ciphertext_slice_up_to(
+            &self.read_buffer[..bytes],
+            dst,
+            max_plaintext,
+            stats,
+        )
+    }
 }
 
 impl RustlsSession {
@@ -500,10 +644,21 @@ impl RustlsSession {
         &mut self,
         ciphertext: &[u8],
         dst: &mut BytesMut,
+        stats: Option<&mut TransportReadStats>,
+    ) -> io::Result<usize> {
+        self.feed_ciphertext_slice_up_to(ciphertext, dst, usize::MAX, stats)
+    }
+
+    fn feed_ciphertext_slice_up_to(
+        &mut self,
+        ciphertext: &[u8],
+        dst: &mut BytesMut,
+        max_plaintext: usize,
         mut stats: Option<&mut TransportReadStats>,
     ) -> io::Result<usize> {
         let mut cursor = Cursor::new(ciphertext);
         let mut plaintext_bytes = 0usize;
+        let mut remaining_plaintext = max_plaintext;
 
         while (cursor.position() as usize) < ciphertext.len() {
             if let Some(stats) = stats.as_deref_mut() {
@@ -518,14 +673,19 @@ impl RustlsSession {
                     self.tls
                         .process_new_packets()
                         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-                    plaintext_bytes += self.drain_plaintext(dst, stats.as_deref_mut())?;
+                    let drained =
+                        self.drain_plaintext_up_to(dst, remaining_plaintext, stats.as_deref_mut())?;
+                    plaintext_bytes += drained;
+                    remaining_plaintext -= drained;
                 }
                 Err(err) if err.kind() == io::ErrorKind::Other => {
-                    let drained = self.drain_plaintext(dst, stats.as_deref_mut())?;
+                    let drained =
+                        self.drain_plaintext_up_to(dst, remaining_plaintext, stats.as_deref_mut())?;
                     if drained == 0 {
                         return Err(err);
                     }
                     plaintext_bytes += drained;
+                    remaining_plaintext -= drained;
                 }
                 Err(err) => return Err(err),
             }
@@ -537,18 +697,32 @@ impl RustlsSession {
     pub(crate) fn drain_plaintext(
         &mut self,
         dst: &mut BytesMut,
+        stats: Option<&mut TransportReadStats>,
+    ) -> io::Result<usize> {
+        self.drain_plaintext_up_to(dst, usize::MAX, stats)
+    }
+
+    fn drain_plaintext_up_to(
+        &mut self,
+        dst: &mut BytesMut,
+        max_plaintext: usize,
         mut stats: Option<&mut TransportReadStats>,
     ) -> io::Result<usize> {
         if let Some(stats) = stats.as_deref_mut() {
             stats.plaintext_drain_calls += 1;
         }
-        let started_len = dst.len();
+        let mut plaintext_bytes = 0usize;
+        let mut remaining_plaintext = max_plaintext;
 
         loop {
-            dst.reserve(TLS_PLAINTEXT_DRAIN_CHUNK);
+            if remaining_plaintext == 0 {
+                break;
+            }
+            let requested = TLS_PLAINTEXT_DRAIN_CHUNK.min(remaining_plaintext);
+            dst.reserve(requested);
             let old_len = dst.len();
             let spare = dst.spare_capacity_mut();
-            let writable = spare.len().min(TLS_PLAINTEXT_DRAIN_CHUNK);
+            let writable = spare.len().min(requested);
             if writable == 0 {
                 break;
             }
@@ -569,6 +743,8 @@ impl RustlsSession {
                         stats.plaintext_bytes += n as u64;
                     }
                     dst.set_len(old_len + n);
+                    plaintext_bytes += n;
+                    remaining_plaintext -= n;
                 },
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     if let Some(stats) = stats.as_deref_mut() {
@@ -580,7 +756,7 @@ impl RustlsSession {
             }
         }
 
-        Ok(dst.len() - started_len)
+        Ok(plaintext_bytes)
     }
 }
 
@@ -653,6 +829,36 @@ impl AsyncWrite for NntpTransport {
 /// Build a `rustls` `ClientConfig` using Mozilla root certificates,
 /// optionally augmented with a custom CA certificate from a PEM file.
 pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>, NntpError> {
+    build_tls_config_with_name_mismatch_policy(ca_cert_path, None)
+}
+
+/// Build a TLS config that may accept one explicitly adopted leaf certificate
+/// when, and only when, normal verification reached a hostname mismatch.
+pub fn build_tls_config_with_name_mismatch_certificate(
+    ca_cert_path: Option<&Path>,
+    adopted_name_mismatch_certificate_der: Option<&[u8]>,
+) -> Result<Arc<ClientConfig>, NntpError> {
+    build_tls_config_with_name_mismatch_policy(
+        ca_cert_path,
+        adopted_name_mismatch_certificate_der
+            .map(|der| NameMismatchCertificatePolicy::Adopted(der.to_vec())),
+    )
+}
+
+fn build_tls_config_with_name_mismatch_capture(
+    ca_cert_path: Option<&Path>,
+    captured_leaf_der: Arc<Mutex<Option<Vec<u8>>>>,
+) -> Result<Arc<ClientConfig>, NntpError> {
+    build_tls_config_with_name_mismatch_policy(
+        ca_cert_path,
+        Some(NameMismatchCertificatePolicy::Capture(captured_leaf_der)),
+    )
+}
+
+fn build_tls_config_with_name_mismatch_policy(
+    ca_cert_path: Option<&Path>,
+    policy: Option<NameMismatchCertificatePolicy>,
+) -> Result<Arc<ClientConfig>, NntpError> {
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -661,8 +867,7 @@ pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>
         let pem_data = std::fs::read(path).map_err(|e| {
             NntpError::MalformedResponse(format!("failed to read CA cert {}: {e}", path.display()))
         })?;
-        let mut cursor = std::io::Cursor::new(&pem_data);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(&pem_data)
             .filter_map(|r| r.ok())
             .collect();
         if certs.is_empty() {
@@ -678,12 +883,34 @@ pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>
         }
     }
 
-    let provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
-    let config = ClientConfig::builder_with_provider(Arc::new(provider))
+    let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+    let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+        .expect("aws-lc-rs supports Rustls safe default protocol versions");
+    let config = match policy {
+        Some(policy) => {
+            let verifier =
+                WebPkiServerVerifier::builder_with_provider(Arc::new(root_store), provider)
+                    .build()
+                    .map_err(|error| {
+                        NntpError::MalformedResponse(format!(
+                            "failed to build TLS certificate verifier: {error}"
+                        ))
+                    })?;
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(
+                    AdoptedNameMismatchCertificateVerifier {
+                        inner: verifier,
+                        policy,
+                    },
+                ))
+                .with_no_client_auth()
+        }
+        None => builder
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    };
 
     Ok(Arc::new(config))
 }
@@ -693,6 +920,33 @@ pub(crate) enum NntpTlsBackend {
     ManualRustls,
     #[cfg(not(windows))]
     S2n,
+}
+
+impl NntpTlsBackend {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ManualRustls => "rustls",
+            #[cfg(not(windows))]
+            Self::S2n => "s2n",
+        }
+    }
+}
+
+/// Name of the TLS backend that carries article bodies, for `weaver_build_info`.
+///
+/// Reports the **owned blocking BODY lane's** choice, because that is the lane
+/// the bulk of the traffic goes through and the only one whose default differs
+/// by platform: unix defaults to s2n, Windows is always the rustls engine.
+/// `WEAVER_NNTP_TLS_BACKEND` overrides both lanes at once, so whenever an
+/// operator has made a choice this reports exactly that choice.
+///
+/// An unparseable override falls back to the rustls engine rather than
+/// failing: this exists to label a build, and a label must not be able to take
+/// the exporter down. The connection path still rejects the bad value loudly.
+pub fn selected_tls_backend_name() -> &'static str {
+    selected_blocking_tls_backend()
+        .unwrap_or(NntpTlsBackend::ManualRustls)
+        .as_str()
 }
 
 /// Parse an explicit `WEAVER_NNTP_TLS_BACKEND` value.
@@ -894,6 +1148,29 @@ async fn connect_tcp_from_resolved(
     })))
 }
 
+/// Inspect a certificate that failed only normal hostname validation.
+///
+/// This performs a TLS handshake only: it never reads the NNTP greeting or
+/// sends `MODE READER`, authentication, or any other NNTP command.
+pub async fn inspect_tls_name_mismatch_certificate(
+    host: &str,
+    port: u16,
+    ca_cert_path: Option<&Path>,
+) -> Result<Option<Vec<u8>>, NntpError> {
+    let captured_leaf_der = Arc::new(Mutex::new(None));
+    let tls_config =
+        build_tls_config_with_name_mismatch_capture(ca_cert_path, captured_leaf_der.clone())?;
+    let server_name = make_server_name(host)?;
+    let addrs = resolve_connect_addrs(host, port, &[], 0).await?;
+    let (tcp, _) = connect_tcp_from_resolved(&addrs).await?;
+
+    let _ = ManualTlsStream::connect(tcp, tls_config, server_name).await;
+    Ok(captured_leaf_der
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take())
+}
+
 /// Connect to a host with implicit TLS (e.g. port 563).
 ///
 /// Performs TCP connect followed by an immediate TLS handshake.
@@ -904,21 +1181,30 @@ pub async fn connect_tls(
     port: u16,
     ca_cert_path: Option<&Path>,
 ) -> Result<NntpTransport, NntpError> {
-    connect_tls_with_ip_policy(host, port, ca_cert_path, &[], 0).await
+    connect_tls_with_ip_policy(host, port, ca_cert_path, None, &[], 0).await
 }
 
 pub async fn connect_tls_with_ip_policy(
     host: &str,
     port: u16,
     ca_cert_path: Option<&Path>,
+    adopted_name_mismatch_certificate_der: Option<&[u8]>,
     excluded_ips: &[IpAddr],
     address_offset: usize,
 ) -> Result<NntpTransport, NntpError> {
     let addrs = resolve_connect_addrs(host, port, excluded_ips, address_offset).await?;
     let (tcp, remote_addr) = connect_tcp_from_resolved(&addrs).await?;
-    match selected_tls_backend()? {
+    let backend = if adopted_name_mismatch_certificate_der.is_some() {
+        NntpTlsBackend::ManualRustls
+    } else {
+        selected_tls_backend()?
+    };
+    match backend {
         NntpTlsBackend::ManualRustls => {
-            let tls_config = build_tls_config(ca_cert_path)?;
+            let tls_config = build_tls_config_with_name_mismatch_certificate(
+                ca_cert_path,
+                adopted_name_mismatch_certificate_der,
+            )?;
             let server_name = make_server_name(host)?;
             let manual_tls = ManualTlsStream::connect(tcp, tls_config, server_name).await?;
             Ok(NntpTransport::ManualTls {
@@ -965,6 +1251,7 @@ pub async fn upgrade_starttls(
     transport: NntpTransport,
     host: &str,
     ca_cert_path: Option<&Path>,
+    adopted_name_mismatch_certificate_der: Option<&[u8]>,
 ) -> Result<NntpTransport, NntpError> {
     let (tcp, remote_addr) = match transport {
         NntpTransport::Plain { inner, remote_addr } => (inner, remote_addr),
@@ -977,9 +1264,17 @@ pub async fn upgrade_starttls(
         }
     };
 
-    match selected_tls_backend()? {
+    let backend = if adopted_name_mismatch_certificate_der.is_some() {
+        NntpTlsBackend::ManualRustls
+    } else {
+        selected_tls_backend()?
+    };
+    match backend {
         NntpTlsBackend::ManualRustls => {
-            let tls_config = build_tls_config(ca_cert_path)?;
+            let tls_config = build_tls_config_with_name_mismatch_certificate(
+                ca_cert_path,
+                adopted_name_mismatch_certificate_der,
+            )?;
             let server_name = make_server_name(host)?;
             let manual_tls = ManualTlsStream::connect(tcp, tls_config, server_name).await?;
             Ok(NntpTransport::ManualTls {
@@ -1002,7 +1297,6 @@ pub async fn upgrade_starttls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(windows))]
     use std::sync::Arc;
     #[cfg(not(windows))]
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1014,10 +1308,8 @@ mod tests {
     use tokio::sync::oneshot;
     #[cfg(not(windows))]
     use tokio_rustls::TlsAcceptor;
-    #[cfg(not(windows))]
-    use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
-    #[cfg(not(windows))]
     use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio_rustls::rustls::{ServerConfig as RustlsServerConfig, ServerConnection};
 
     #[cfg(not(windows))]
     const TLS_DRAIN_RECORD_BYTES: usize = 16 * 1024;
@@ -1027,6 +1319,265 @@ mod tests {
     const TLS_DRAIN_PAYLOAD_BYTES: usize = TLS_DRAIN_RECORD_BYTES * TLS_DRAIN_RECORDS;
     #[cfg(not(windows))]
     const TLS_TEST_BUFFER_BYTES: usize = 256 * 1024;
+
+    fn test_verifier(certs: &[CertificateDer<'static>]) -> Arc<WebPkiServerVerifier> {
+        let mut roots = RootCertStore::empty();
+        for cert in certs {
+            roots.add(cert.clone()).expect("test root");
+        }
+        let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+            .build()
+            .expect("test verifier")
+    }
+
+    #[test]
+    fn adopted_certificate_only_falls_back_for_its_exact_hostname_mismatch() {
+        let adopted = rcgen::generate_simple_self_signed(vec!["dangerous.example".to_string()])
+            .expect("adopted certificate");
+        let safe = rcgen::generate_simple_self_signed(vec!["configured.example".to_string()])
+            .expect("safe certificate");
+        let adopted_der = adopted.cert.der().clone();
+        let safe_der = safe.cert.der().clone();
+        let verifier = AdoptedNameMismatchCertificateVerifier {
+            inner: test_verifier(&[adopted_der.clone(), safe_der.clone()]),
+            policy: NameMismatchCertificatePolicy::Adopted(adopted_der.as_ref().to_vec()),
+        };
+        let configured_name = ServerName::try_from("configured.example").expect("server name");
+        let now = UnixTime::since_unix_epoch(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after unix epoch"),
+        );
+
+        let adopted_result =
+            verifier.verify_server_cert(&adopted_der, &[], &configured_name, &[], now);
+        assert!(adopted_result.is_ok(), "{adopted_result:?}");
+        assert!(
+            verifier
+                .verify_server_cert(&safe_der, &[], &configured_name, &[], now)
+                .is_ok()
+        );
+        assert!(
+            verifier
+                .verify_server_cert(
+                    &safe_der,
+                    &[],
+                    &ServerName::try_from("other.example").unwrap(),
+                    &[],
+                    now
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn capture_policy_records_only_a_trusted_hostname_mismatch() {
+        let certificate = rcgen::generate_simple_self_signed(vec!["dangerous.example".to_string()])
+            .expect("certificate");
+        let certificate_der = certificate.cert.der().clone();
+        let captured = Arc::new(Mutex::new(None));
+        let verifier = AdoptedNameMismatchCertificateVerifier {
+            inner: test_verifier(std::slice::from_ref(&certificate_der)),
+            policy: NameMismatchCertificatePolicy::Capture(captured.clone()),
+        };
+        let now = UnixTime::since_unix_epoch(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after unix epoch"),
+        );
+
+        assert!(
+            verifier
+                .verify_server_cert(
+                    &certificate_der,
+                    &[],
+                    &ServerName::try_from("configured.example").unwrap(),
+                    &[],
+                    now,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            *captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Some(certificate_der.as_ref().to_vec())
+        );
+    }
+
+    fn rustls_test_configs() -> (Arc<ClientConfig>, Arc<RustlsServerConfig>) {
+        let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate test certificate");
+        let cert_der = certified_key.cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            certified_key.signing_key.serialize_der(),
+        ));
+
+        let server_provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+        let server_config = RustlsServerConfig::builder_with_provider(Arc::new(server_provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).expect("client root store");
+        let client_provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+        let client_config = ClientConfig::builder_with_provider(Arc::new(client_provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        (Arc::new(client_config), Arc::new(server_config))
+    }
+
+    fn transfer_client_to_server(client: &mut ClientConnection, server: &mut ServerConnection) {
+        let mut wire = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut wire).expect("client TLS write");
+        }
+        if wire.is_empty() {
+            return;
+        }
+        let mut cursor = Cursor::new(wire.as_slice());
+        while (cursor.position() as usize) < wire.len() {
+            let read = server.read_tls(&mut cursor).expect("server TLS read");
+            assert_ne!(read, 0, "server stopped before consuming TLS bytes");
+            server
+                .process_new_packets()
+                .expect("server process packets");
+        }
+    }
+
+    fn transfer_server_to_client(
+        server: &mut ServerConnection,
+        client: &mut ClientConnection,
+    ) -> usize {
+        let mut wire = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut wire).expect("server TLS write");
+        }
+        if wire.is_empty() {
+            return 0;
+        }
+        let wire_len = wire.len();
+        let mut cursor = Cursor::new(wire.as_slice());
+        while (cursor.position() as usize) < wire.len() {
+            let read = client.read_tls(&mut cursor).expect("client TLS read");
+            assert_ne!(read, 0, "client stopped before consuming TLS bytes");
+            client
+                .process_new_packets()
+                .expect("client process packets");
+        }
+        wire_len
+    }
+
+    fn handshake_rustls_pair(client: &mut ClientConnection, server: &mut ServerConnection) {
+        for _ in 0..16 {
+            transfer_client_to_server(client, server);
+            let _ = transfer_server_to_client(server, client);
+            if !client.is_handshaking() && !server.is_handshaking() {
+                transfer_client_to_server(client, server);
+                let _ = transfer_server_to_client(server, client);
+                return;
+            }
+        }
+        panic!("in-memory TLS handshake did not complete");
+    }
+
+    #[test]
+    fn cached_plaintext_drain_respects_read_turn_limit() {
+        let (client_config, server_config) = rustls_test_configs();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut client = ClientConnection::new(client_config, server_name).unwrap();
+        let mut server = ServerConnection::new(server_config).unwrap();
+        client.set_buffer_limit(None);
+        server.set_buffer_limit(None);
+        handshake_rustls_pair(&mut client, &mut server);
+
+        let drain_limit = TLS_PLAINTEXT_DRAIN_CHUNK / 2;
+        let payload_len = TLS_PLAINTEXT_DRAIN_CHUNK;
+        let record = vec![0x5Au8; TLS_PLAINTEXT_DRAIN_CHUNK];
+        server
+            .writer()
+            .write_all(&record)
+            .expect("queue server plaintext");
+        let wire_len = transfer_server_to_client(&mut server, &mut client);
+        assert!(
+            wire_len > payload_len,
+            "server emitted no application record"
+        );
+
+        let mut session = RustlsSession { tls: client };
+        let mut dst = BytesMut::new();
+        let first = session
+            .drain_plaintext_up_to(&mut dst, drain_limit, None)
+            .unwrap();
+        assert_eq!(first, drain_limit);
+        assert_eq!(dst.len(), drain_limit);
+
+        let second = session
+            .drain_plaintext_up_to(&mut dst, drain_limit, None)
+            .unwrap();
+        assert_eq!(second, drain_limit);
+        assert_eq!(dst.len(), payload_len);
+        assert_eq!(session.drain_plaintext(&mut dst, None).unwrap(), 0);
+        assert!(dst.iter().all(|byte| *byte == 0x5A));
+    }
+
+    #[test]
+    fn partial_tls_record_is_preserved_across_feeds() {
+        let (client_config, server_config) = rustls_test_configs();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut client = ClientConnection::new(client_config, server_name).unwrap();
+        let mut server = ServerConnection::new(server_config).unwrap();
+        handshake_rustls_pair(&mut client, &mut server);
+
+        let payload = vec![0xA5; TLS_PLAINTEXT_DRAIN_CHUNK / 2];
+        server
+            .writer()
+            .write_all(&payload)
+            .expect("queue server plaintext");
+        let mut wire = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut wire).expect("server TLS write");
+        }
+        assert!(wire.len() > payload.len());
+
+        let split = wire.len() - 1;
+        let mut session = RustlsSession { tls: client };
+        let mut dst = BytesMut::new();
+        let first = session
+            .feed_ciphertext_slice_up_to(&wire[..split], &mut dst, TLS_READ_TURN_LIMIT, None)
+            .unwrap();
+        assert_eq!(first, 0);
+        assert!(dst.is_empty());
+
+        let second = session
+            .feed_ciphertext_slice_up_to(&wire[split..], &mut dst, TLS_READ_TURN_LIMIT, None)
+            .unwrap();
+        assert_eq!(second, payload.len());
+        assert_eq!(dst.as_ref(), payload.as_slice());
+    }
+
+    #[test]
+    fn full_read_turn_without_plaintext_is_rejected() {
+        assert!(!read_turn_exhausted_without_plaintext(
+            TLS_READ_TURN_LIMIT - 1,
+            0
+        ));
+        assert!(!read_turn_exhausted_without_plaintext(
+            TLS_READ_TURN_LIMIT,
+            1
+        ));
+        assert!(read_turn_exhausted_without_plaintext(
+            TLS_READ_TURN_LIMIT,
+            0
+        ));
+    }
 
     #[test]
     fn parse_tls_backend_accepts_rustls_aliases() {

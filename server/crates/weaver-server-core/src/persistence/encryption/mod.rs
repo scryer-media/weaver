@@ -183,6 +183,18 @@ pub fn ensure_encryption_key(data_dir: Option<PathBuf>) -> Result<EncryptionKey,
     ensure_encryption_key_for_state(data_dir, false)
 }
 
+pub fn key_store_description(data_dir: Option<PathBuf>) -> String {
+    let names = keystore::platform_keystores(data_dir)
+        .iter()
+        .map(|store| store.name())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        "no persistent platform keystore".to_string()
+    } else {
+        names.join(" -> ")
+    }
+}
+
 /// Ensure a key is available without ever replacing a missing key when
 /// encrypted credentials already exist. A fresh instance may create a key;
 /// an existing encrypted instance must recover the original key or fail.

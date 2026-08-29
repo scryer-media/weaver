@@ -729,6 +729,7 @@ function FeedFormCard({
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <Field label={t("rss.feedName")}>
             <Input
+              data-testid="rss-feed-name"
               value={values.name}
               placeholder="Nyaa"
               onChange={(event) =>
@@ -739,6 +740,7 @@ function FeedFormCard({
 
           <Field label={t("rss.feedUrl")}>
             <Input
+              data-testid="rss-feed-url"
               value={values.url}
               placeholder="https://example.com/rss.xml"
               onChange={(event) =>
@@ -965,6 +967,7 @@ function RuleFormCard({
 
         <Field label={t("rss.titleRegex")} description={t("rss.titleRegexDesc")}>
           <Input
+            data-testid="rss-rule-title-regex"
             value={values.titleRegex}
             placeholder="Silver Horizon"
             onChange={(event) =>

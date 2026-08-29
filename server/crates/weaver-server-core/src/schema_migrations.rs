@@ -22,7 +22,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 37;
+const CURRENT_SCHEMA_VERSION: i64 = 43;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -308,6 +308,39 @@ async fn load_applied_migrations(pool: &SqlitePool) -> Result<Vec<MigrationLedge
             })
         })
         .collect()
+}
+
+/// Highest migration version recorded in the ledger, or `None` when no ledger
+/// exists yet.
+///
+/// Read *before* a migration run, this answers "which release last wrote to
+/// this database": no ledger means nothing has ever migrated it (a database
+/// this process is about to create), while a recorded maximum names the newest
+/// migration the previous binary shipped. That is the only reliable way to tell
+/// a fresh install from an upgrade of a specific older line, because the data a
+/// database holds says nothing about which version wrote it.
+///
+/// Deliberately not filtered by `success`: a recorded-but-failed row still
+/// proves the binary that wrote it reached that version, and counting it can
+/// only make a database look newer than it is, never older.
+pub async fn max_recorded_migration_version(pool: &SqlitePool) -> Result<Option<i64>, StateError> {
+    if !migration_ledger_exists(pool).await? {
+        return Ok(None);
+    }
+    sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)
+}
+
+async fn migration_ledger_exists(pool: &SqlitePool) -> Result<bool, StateError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(count > 0)
 }
 
 fn list_pending_migrations_from_applied(
@@ -941,6 +974,146 @@ mod tests {
         assert_eq!(CURRENT_SCHEMA_VERSION, catalog.max_version());
     }
 
+    #[tokio::test]
+    async fn migration_39_forgets_only_orphaned_duplicate_identities() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(38), true)
+            .await
+            .unwrap();
+
+        for job_id in [100_i64, 101, 102] {
+            sqlx::query(
+                "INSERT INTO duplicate_job_snapshots
+                    (job_id, lifecycle, normalized_name, admission_action, origin, created_at, updated_at)
+                 VALUES (?, 'succeeded', ?, 'accept', 'api', 1, 1)",
+            )
+            .bind(job_id)
+            .bind(format!("release-{job_id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO active_jobs
+                (job_id, nzb_hash, nzb_path, output_dir, status, error, created_at, category, metadata)
+             VALUES (101, ?, 'active.nzb', 'active-output', 'queued', NULL, 1, NULL, NULL)",
+        )
+        .bind(vec![1_u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO job_history
+                (job_id, name, status, total_bytes, downloaded_bytes,
+                 optional_recovery_bytes, optional_recovery_downloaded_bytes,
+                 failed_bytes, health, created_at, completed_at)
+             VALUES (102, 'history', 'complete', 0, 0, 0, 0, 0, 1000, 1, 2)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO job_fingerprints
+                (job_id, fingerprint_kind, fingerprint_version, fingerprint_digest, created_at)
+             VALUES (100, 'raw_nzb', 1, ?, 1)",
+        )
+        .bind(vec![1_u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO duplicate_admission_claims
+                (fingerprint_kind, fingerprint_version, fingerprint_digest, job_id, claimed_at)
+             VALUES ('raw_nzb', 1, ?, 100, 1)",
+        )
+        .bind(vec![1_u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO submission_idempotency
+                (caller_scope, idempotency_key, request_hash, job_id, created_at)
+             VALUES ('test', 'orphan', ?, 100, 1)",
+        )
+        .bind(vec![2_u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO semantic_duplicate_groups (group_id, normalized_key, created_at, updated_at)
+             VALUES (1, 'orphan', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO semantic_duplicate_candidates
+                (job_id, group_id, score, candidate_state, created_at, updated_at)
+             VALUES (100, 1, 100, 'active', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        apply_version_range(
+            &pool,
+            &catalog,
+            &payload,
+            MigrationInstallKind::Upgrade,
+            39,
+            39,
+        )
+        .await
+        .unwrap();
+
+        let retained: Vec<i64> =
+            sqlx::query_scalar("SELECT job_id FROM duplicate_job_snapshots ORDER BY job_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(retained, vec![101, 102]);
+        let forgotten: Vec<i64> =
+            sqlx::query_scalar("SELECT job_id FROM forgotten_duplicate_identities ORDER BY job_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(forgotten, vec![100]);
+        for table in [
+            "job_fingerprints",
+            "duplicate_admission_claims",
+            "submission_idempotency",
+            "semantic_duplicate_candidates",
+            "semantic_duplicate_groups",
+        ] {
+            let count: i64 = match table {
+                "job_fingerprints" => sqlx::query_scalar("SELECT COUNT(*) FROM job_fingerprints"),
+                "duplicate_admission_claims" => {
+                    sqlx::query_scalar("SELECT COUNT(*) FROM duplicate_admission_claims")
+                }
+                "submission_idempotency" => {
+                    sqlx::query_scalar("SELECT COUNT(*) FROM submission_idempotency")
+                }
+                "semantic_duplicate_candidates" => {
+                    sqlx::query_scalar("SELECT COUNT(*) FROM semantic_duplicate_candidates")
+                }
+                "semantic_duplicate_groups" => {
+                    sqlx::query_scalar("SELECT COUNT(*) FROM semantic_duplicate_groups")
+                }
+                _ => unreachable!("test table allowlist is exhaustive"),
+            }
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "{table} should not retain orphaned data");
+        }
+    }
+
     type PausedActiveJobRow = (
         String,
         String,
@@ -1003,6 +1176,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stamped, 1);
+    }
+
+    #[tokio::test]
+    async fn max_recorded_migration_version_reports_the_pre_run_ledger() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Nothing has ever migrated this database, so there is no ledger to read.
+        assert_eq!(max_recorded_migration_version(&pool).await.unwrap(), None);
+
+        // A ledger with no rows still records nothing.
+        ensure_migration_ledger_shape(&pool).await.unwrap();
+        assert_eq!(max_recorded_migration_version(&pool).await.unwrap(), None);
+
+        // A directory an older release line left behind reports that line's
+        // last migration, which is what identifies it as an upgrade.
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(39), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            max_recorded_migration_version(&pool).await.unwrap(),
+            Some(39)
+        );
+
+        run_embedded_migrations(&pool, MigrationMode::Apply)
+            .await
+            .unwrap();
+        assert_eq!(
+            max_recorded_migration_version(&pool).await.unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,11 @@
+{
+  "slug": "nested-xz-rar",
+  "title": "E2E.Test.Nested.XZ.RAR.2026.1080p-TESTGRP",
+  "description": "RAR5 containing an ordinary MKV beside an XZ-compressed NFO. Tests selective nested extraction without losing sibling output.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "release.nfo": "c2d20ba1a4a41e1ae7f6567528402d01ee9b571bb1f24466cd89a48c4f5897b2",
+    "test-media.mkv": "bd8b3991787e2bc03ae0f47bda585f1b9dbd831448493fe3c4a9118f4f947cf2"
+  }
+}

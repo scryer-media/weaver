@@ -81,6 +81,7 @@ impl Pipeline {
     ) -> bool {
         let job_id = segment_id.file_id.job_id;
         let file_idx = segment_id.file_id.file_index as usize;
+        let completion_critical = self.segment_is_completion_critical(segment_id);
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return false;
         };
@@ -102,12 +103,13 @@ impl Pipeline {
             byte_estimate: seg_spec.bytes,
             retry_count,
             is_recovery: file_spec.role.is_recovery(),
+            completion_critical,
             exclude_servers,
             // Park/restore drops any rotation hint: it is advisory, and the
             // next transport failure recomputes it.
             avoid_server: None,
         };
-        if work.is_recovery {
+        if work.is_recovery && !work.completion_critical {
             state.recovery_queue.push(work);
         } else {
             state.download_queue.push(work);
@@ -130,6 +132,7 @@ impl Pipeline {
     ) -> Option<DownloadWork> {
         let job_id = segment_id.file_id.job_id;
         let file_idx = segment_id.file_id.file_index as usize;
+        let completion_critical = self.segment_is_completion_critical(segment_id);
         let state = self.jobs.get(&job_id)?;
         let file_spec = state.spec.files.get(file_idx)?;
         let seg_spec = file_spec
@@ -144,6 +147,7 @@ impl Pipeline {
             byte_estimate: seg_spec.bytes,
             retry_count,
             is_recovery: file_spec.role.is_recovery(),
+            completion_critical,
             exclude_servers,
             avoid_server: None,
         })
@@ -304,6 +308,21 @@ impl Pipeline {
                     self.active_download_connections_by_job.remove(&job_id);
                 }
             }
+            if result.origin.is_completion_critical() {
+                self.active_completion_critical_connections = self
+                    .active_completion_critical_connections
+                    .saturating_sub(1);
+                if let Some(in_flight) = self
+                    .active_completion_critical_connections_by_job
+                    .get_mut(&job_id)
+                {
+                    *in_flight = in_flight.saturating_sub(1);
+                    if *in_flight == 0 {
+                        self.active_completion_critical_connections_by_job
+                            .remove(&job_id);
+                    }
+                }
+            }
             self.clear_spillover_loan_if_idle();
         }
         if result.origin.is_recovery() {
@@ -327,12 +346,6 @@ impl Pipeline {
                 self.active_downloads_by_file
                     .remove(&result.segment_id.file_id);
             }
-        }
-        if result.origin.counts_for_hot_primary()
-            && self.hot_dispatch_job == Some(job_id)
-            && result.data.is_ok()
-        {
-            self.hot_dispatch_successes = self.hot_dispatch_successes.saturating_add(1);
         }
         if result.origin.counts_for_hot_primary()
             && let Ok(DownloadPayload::Decoded(decoded)) = &result.data
@@ -385,7 +398,7 @@ impl Pipeline {
     pub(crate) fn released_download_result_lead_bytes(result: &DownloadResult) -> u64 {
         match &result.data {
             Ok(DownloadPayload::Raw(bytes)) => bytes.len() as u64,
-            Ok(DownloadPayload::Decoded(decoded)) => decoded.decoded_size as u64,
+            Ok(DownloadPayload::Decoded(decoded)) => decoded.data.len_bytes() as u64,
             Err(_) => 0,
         }
     }
@@ -482,13 +495,59 @@ impl Pipeline {
         let (excluded_servers, source_server_idx) = {
             let _cpu_scope =
                 crate::runtime::perf_probe::cpu_scope("download.process_done.pre_match");
-            let excluded_servers = result.exclude_servers.clone();
+            let excluded_servers = result.exclude_servers;
             let source_server_idx = result.source_server_idx;
             if result.origin != DownloadResultOrigin::IpReplacementTrial {
                 self.observe_ip_rtt_attempts(&result.attempts);
             }
 
+            let is_recovery = result.origin.is_recovery();
+            // Per-server counters are indexed by the runtime `server_idx` of
+            // the generation the result was dispatched under. After a rebuild
+            // the same index may name a different server, so results from a
+            // superseded generation are not attributed at all (an out-of-range
+            // index is caught by the bounds check below either way). One
+            // integer compare; the stale case only exists around a config
+            // reload.
+            let attribute_to_servers = result.runtime_generation == self.pool_generation;
             for (attempt_index, attempt) in result.attempts.iter().enumerate() {
+                // Per-server metric accounting. Hot-path safe: a bounds-checked
+                // index into a lock-free `Vec<Arc<ServerCounters>>` followed by
+                // `Relaxed` `fetch_add`s and a histogram observation over the
+                // `elapsed` this attempt already carries. No allocation, no
+                // lock, no clock read, no map lookup.
+                let metric_outcome = match attempt.outcome {
+                    FetchAttemptOutcome::Success => {
+                        crate::operations::instrumentation::ServerAttemptOutcomeKind::Success
+                    }
+                    FetchAttemptOutcome::NotFound => {
+                        crate::operations::instrumentation::ServerAttemptOutcomeKind::NotFound
+                    }
+                    FetchAttemptOutcome::AuthenticationFailure => {
+                        crate::operations::instrumentation::ServerAttemptOutcomeKind::AuthFailure
+                    }
+                    FetchAttemptOutcome::TransientFailure => {
+                        crate::operations::instrumentation::ServerAttemptOutcomeKind::TransientFailure
+                    }
+                    FetchAttemptOutcome::PermanentFailure => {
+                        crate::operations::instrumentation::ServerAttemptOutcomeKind::PermanentFailure
+                    }
+                    FetchAttemptOutcome::QuotaBlocked | FetchAttemptOutcome::QuotaUnrequested => {
+                        crate::operations::instrumentation::ServerAttemptOutcomeKind::QuotaBlocked
+                    }
+                };
+                if let Some(counters) = attribute_to_servers
+                    .then(|| self.server_counters.get(attempt.server_idx))
+                    .flatten()
+                {
+                    counters.note_attempt(metric_outcome, is_recovery);
+                    // A quota block never reached the wire, so its `elapsed` is
+                    // not a round-trip and would poison the latency histogram.
+                    if metric_outcome.has_round_trip() {
+                        counters.observe_latency(attempt.elapsed);
+                    }
+                }
+
                 let outcome = match attempt.outcome {
                     FetchAttemptOutcome::QuotaBlocked | FetchAttemptOutcome::QuotaUnrequested => {
                         continue;
@@ -517,7 +576,7 @@ impl Pipeline {
                     latency_ms: attempt.elapsed.as_millis().min(u64::MAX as u128) as u64,
                     outcome,
                     error: attempt.error.clone(),
-                    is_recovery: result.origin.is_recovery(),
+                    is_recovery,
                 });
             }
 
@@ -555,16 +614,9 @@ impl Pipeline {
                 });
                 self.pump_decode_queue();
             }
-            Ok(DownloadPayload::Decoded(mut decoded)) => {
-                if !decoded.part_crc_verified {
-                    decoded.unverified_provenance = Some(Box::new(UnverifiedSegmentProvenance {
-                        source_server_idx,
-                        exclude_servers: excluded_servers,
-                    }));
-                }
+            Ok(DownloadPayload::Decoded(decoded)) => {
                 let raw_size_bytes = decoded.raw_size;
                 let raw_size = raw_size_bytes.min(u64::from(u32::MAX)) as u32;
-                let decoded_size = decoded.decoded_size;
                 {
                     let _cpu_scope = crate::runtime::perf_probe::cpu_scope(
                         "download.process_done.decoded_pre_success",
@@ -575,20 +627,20 @@ impl Pipeline {
                     self.metrics
                         .segments_downloaded
                         .fetch_add(1, Ordering::Relaxed);
-                    self.metrics
-                        .bytes_decoded
-                        .fetch_add(decoded_size as u64, Ordering::Relaxed);
-                    self.metrics
-                        .segments_decoded
-                        .fetch_add(1, Ordering::Relaxed);
-
                     let _ = self.event_tx.send(PipelineEvent::ArticleDownloaded {
                         segment_id: result.segment_id,
                         raw_size,
                     });
                 }
 
-                self.handle_decode_success(decoded).await;
+                self.handle_decode_success(
+                    decoded,
+                    SegmentSource {
+                        source_server_idx,
+                        exclude_servers: excluded_servers,
+                    },
+                )
+                .await;
             }
             Err(DownloadError::Decode {
                 raw_size,
@@ -965,6 +1017,7 @@ impl Pipeline {
                     self.book_failed_segment(result.segment_id);
                 } else {
                     let seg_id = result.segment_id;
+                    let completion_critical = self.segment_is_completion_critical(seg_id);
                     let preserves_retry_budget = failure.kind.preserves_article_retry_budget();
                     let infrastructure_retry = failure.kind.infrastructure_wait_reason().is_some();
                     let next_retry = if preserves_retry_budget || source_not_found {
@@ -986,7 +1039,7 @@ impl Pipeline {
                         // Retry exhaustion is as terminal as a missing
                         // article: without this, health stays optimistic and
                         // recovery promotion waits for post-download verify.
-                        self.book_failed_segment(seg_id);
+                        self.book_terminal_segment(seg_id, SegmentTerminalState::RetriesExhausted);
                     } else if let Some(state) = self.jobs.get(&job_id) {
                         let file_idx = seg_id.file_id.file_index as usize;
                         if let Some(file_spec) = state.spec.files.get(file_idx)
@@ -1004,6 +1057,7 @@ impl Pipeline {
                                 byte_estimate: seg_spec.bytes,
                                 retry_count: next_retry,
                                 is_recovery: file_spec.role.is_recovery(),
+                                completion_critical,
                                 exclude_servers: retry_exclude_servers.clone(),
                                 avoid_server,
                             };

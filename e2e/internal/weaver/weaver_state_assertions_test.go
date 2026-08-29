@@ -1,0 +1,1207 @@
+package weaver
+
+import (
+	"database/sql"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+func TestAssertTerminalFixtureStatePassesWhenArchivedJobIsClean(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_history (job_id, status) VALUES (1, 'COMPLETED')`)
+
+	if err := assertTerminalFixtureState(dbPath, 1, "COMPLETE"); err != nil {
+		t.Fatalf("expected clean archived job state to pass, got %v", err)
+	}
+}
+
+func TestAssertTerminalFixtureStateEventuallyWaitsForHistoryVisibility(t *testing.T) {
+	previousTimeout := terminalFixtureStateTimeout
+	previousPollInterval := terminalFixtureStatePollInterval
+	terminalFixtureStateTimeout = 250 * time.Millisecond
+	terminalFixtureStatePollInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		terminalFixtureStateTimeout = previousTimeout
+		terminalFixtureStatePollInterval = previousPollInterval
+	})
+
+	dbPath := newTestWeaverStateDB(t)
+
+	errCh := make(chan error, 1)
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		db, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer db.Close()
+		_, err = db.Exec(`INSERT INTO job_history (job_id, status) VALUES (2, 'COMPLETED')`)
+		errCh <- err
+	}()
+
+	if err := assertTerminalFixtureStateEventually(dbPath, 2, "COMPLETE"); err != nil {
+		t.Fatalf("expected eventual terminal state validation to pass, got %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("insert delayed job history row: %v", err)
+	}
+}
+
+func TestAssertTerminalFixtureStateFailsWhenLingeringFileProgressRemains(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_history (job_id, status) VALUES (7, 'COMPLETED')`)
+	mustExecWeaverStateSQL(t, db, `INSERT INTO active_file_progress (job_id) VALUES (7)`)
+
+	err := assertTerminalFixtureState(dbPath, 7, "COMPLETE")
+	if err == nil {
+		t.Fatal("expected lingering active file progress to fail state validation")
+	}
+	if !strings.Contains(err.Error(), "active_file_progress=1") {
+		t.Fatalf("expected active file progress leak to be reported, got %v", err)
+	}
+}
+
+func TestAssertTerminalFixtureStateFailsWhenLingeringExtractedRowsRemain(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_history (job_id, status) VALUES (8, 'COMPLETED')`)
+	mustExecWeaverStateSQL(t, db, `INSERT INTO active_extracted (job_id, member_name, output_path) VALUES (8, 'episode01.mkv', '/config/intermediate/show/episode01.mkv')`)
+
+	err := assertTerminalFixtureState(dbPath, 8, "COMPLETE")
+	if err == nil {
+		t.Fatal("expected lingering active_extracted rows to fail state validation")
+	}
+	if !strings.Contains(err.Error(), "active_extracted=1") {
+		t.Fatalf("expected active_extracted leak to be reported, got %v", err)
+	}
+}
+
+func TestAssertTerminalFixtureStateFailsWhenLingeringFailedExtractionsRemain(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_history (job_id, status) VALUES (9, 'FAILED')`)
+	mustExecWeaverStateSQL(t, db, `INSERT INTO active_failed_extractions (job_id, member_name) VALUES (9, 'episode01.mkv')`)
+
+	err := assertTerminalFixtureState(dbPath, 9, "FAILED")
+	if err == nil {
+		t.Fatal("expected lingering active_failed_extractions rows to fail state validation")
+	}
+	if !strings.Contains(err.Error(), "active_failed_extractions=1") {
+		t.Fatalf("expected active_failed_extractions leak to be reported, got %v", err)
+	}
+}
+
+func TestAssertRequiredJobEventsFailsWhenExpectedEventIsMissing(t *testing.T) {
+	previousTimeout := requiredJobEventTimeout
+	previousPollInterval := requiredJobEventPollInterval
+	previousStabilityWindow := requiredJobEventStabilityWindow
+	requiredJobEventTimeout = 10 * time.Millisecond
+	requiredJobEventPollInterval = time.Millisecond
+	requiredJobEventStabilityWindow = 0
+	t.Cleanup(func() {
+		requiredJobEventTimeout = previousTimeout
+		requiredJobEventPollInterval = previousPollInterval
+		requiredJobEventStabilityWindow = previousStabilityWindow
+	})
+
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_events (job_id, kind) VALUES (10, 'JobVerificationStarted')`)
+
+	err := assertRequiredJobEvents(dbPath, 10, []string{"RepairComplete"})
+	if err == nil {
+		t.Fatal("expected missing required job event to fail validation")
+	}
+	if !strings.Contains(err.Error(), "RepairComplete") {
+		t.Fatalf("expected missing event to be reported, got %v", err)
+	}
+}
+
+func TestAssertRequiredJobEventsPassesWhenExpectedEventIsPresent(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_events (job_id, kind) VALUES (11, 'RepairComplete')`)
+
+	if err := assertRequiredJobEvents(dbPath, 11, []string{"RepairComplete"}); err != nil {
+		t.Fatalf("expected required event validation to pass: %v", err)
+	}
+}
+
+func TestAssertRequiredJobEventsWaitsForStableSnapshotBeforeFailing(t *testing.T) {
+	previousTimeout := requiredJobEventTimeout
+	previousPollInterval := requiredJobEventPollInterval
+	previousStabilityWindow := requiredJobEventStabilityWindow
+	requiredJobEventTimeout = 150 * time.Millisecond
+	requiredJobEventPollInterval = 5 * time.Millisecond
+	requiredJobEventStabilityWindow = 250 * time.Millisecond
+	t.Cleanup(func() {
+		requiredJobEventTimeout = previousTimeout
+		requiredJobEventPollInterval = previousPollInterval
+		requiredJobEventStabilityWindow = previousStabilityWindow
+	})
+
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+	mustExecWeaverStateSQL(t, db, `PRAGMA journal_mode = WAL`)
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_events (job_id, kind) VALUES (14, 'JobVerificationStarted')`)
+
+	errCh := make(chan error, 1)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		if _, err := db.Exec(`INSERT INTO job_events (job_id, kind) VALUES (14, 'JobVerificationComplete')`); err != nil {
+			errCh <- err
+			return
+		}
+		time.Sleep(170 * time.Millisecond)
+		_, err := db.Exec(`INSERT INTO job_events (job_id, kind) VALUES (14, 'RepairComplete')`)
+		errCh <- err
+	}()
+
+	if err := assertRequiredJobEvents(dbPath, 14, []string{"RepairComplete"}); err != nil {
+		t.Fatalf("expected required event validation to wait for delayed repair event: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("insert delayed job events: %v", err)
+	}
+	if err := assertRequiredJobEvents(dbPath, 14, []string{"RepairComplete"}); err != nil {
+		t.Fatalf("expected delayed repair event to remain visible after persistence: %v", err)
+	}
+}
+
+func TestAssertForbiddenJobEventsFailsWhenForbiddenEventIsPresent(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_events (job_id, kind) VALUES (12, 'JobVerificationStarted')`)
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_events (job_id, kind) VALUES (12, 'ExtractionMemberFailed')`)
+
+	err := assertForbiddenJobEvents(dbPath, 12, []string{"JobVerificationStarted", "JobVerificationComplete"})
+	if err == nil {
+		t.Fatal("expected forbidden job event validation to fail")
+	}
+	if !strings.Contains(err.Error(), "JobVerificationStarted") {
+		t.Fatalf("expected forbidden event to be reported, got %v", err)
+	}
+}
+
+func TestAssertForbiddenJobEventsPassesWhenForbiddenEventIsAbsent(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_events (job_id, kind) VALUES (13, 'ExtractionMemberFailed')`)
+
+	if err := assertForbiddenJobEvents(dbPath, 13, []string{"JobVerificationStarted", "JobVerificationComplete"}); err != nil {
+		t.Fatalf("expected forbidden event validation to pass: %v", err)
+	}
+}
+
+func TestAssertMaxJobEventCountsRejectsRepeatedVerification(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_events (job_id, kind) VALUES (15, 'JobVerificationStarted')`)
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_events (job_id, kind) VALUES (15, 'JobVerificationStarted')`)
+
+	err := assertMaxJobEventCounts(dbPath, 15, map[string]int{"JobVerificationStarted": 1})
+	if err == nil {
+		t.Fatal("expected repeated verification to fail the event-count assertion")
+	}
+	if !strings.Contains(err.Error(), "JobVerificationStarted") {
+		t.Fatalf("expected repeated event to be reported, got %v", err)
+	}
+}
+
+func TestAssertOutputBLAKE3ChecksCompletedOutput(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	outputDir := t.TempDir()
+	relativePath := filepath.Join("work", "payload", "movie.mkv")
+	outputPath := filepath.Join(outputDir, relativePath)
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+		t.Fatalf("create output directory: %v", err)
+	}
+	if err := os.WriteFile(outputPath, []byte("verified output"), 0o644); err != nil {
+		t.Fatalf("write output: %v", err)
+	}
+
+	if _, err := db.Exec(`INSERT INTO job_history (job_id, status, output_dir) VALUES (16, 'COMPLETED', ?)`, outputDir); err != nil {
+		t.Fatalf("insert completed job: %v", err)
+	}
+	if err := assertOutputBLAKE3(dbPath, 16, map[string]string{
+		"work/payload/movie.mkv": "70921b7152a16c7f6f7c6af596235ac7e0bdb6bbe4ae66cfc42146bdb6b7d029",
+	}); err != nil {
+		t.Fatalf("expected matching output digest to pass: %v", err)
+	}
+
+	if err := assertOutputBLAKE3(dbPath, 16, map[string]string{"../outside": ""}); err == nil {
+		t.Fatal("expected non-relative output digest path to fail")
+	}
+}
+
+func TestAssertNoOrphanActiveStatePathFailsForOrphanRows(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO active_file_progress (job_id) VALUES (99)`)
+
+	err := assertNoOrphanActiveStatePath(dbPath)
+	if err == nil {
+		t.Fatal("expected orphan active state to fail validation")
+	}
+	if !strings.Contains(err.Error(), "active_file_progress=1") {
+		t.Fatalf("expected orphaned active_file_progress row to be reported, got %v", err)
+	}
+}
+
+func TestObserveActiveFileIdentityRewritePassesWhenCanonicalRowsObserved(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	insertActiveFileIdentity(t, db, 42, 1, "51273...101", "archive.part1.rar", "par2")
+	insertActiveFileIdentity(t, db, 42, 2, "51273...102", "archive.part2.rar", "par2")
+	insertActiveFileIdentity(t, db, 42, 3, "51273...103", "archive.part3.rar", "par2")
+
+	observation, err := observeActiveFileIdentityRewrite(dbPath, 42, &ScenarioFileIdentityRewriteAssertion{
+		RequiredCurrentFilenames:     []string{"archive.part1.rar", "archive.part2.rar", "archive.part3.rar"},
+		ForbiddenCurrentFilenames:    []string{"51273aad56a8b904e96928935278a627.101"},
+		RequiredClassificationSource: "par2",
+	})
+	if err != nil {
+		t.Fatalf("observe active file identity rewrite: %v", err)
+	}
+	if !observation.Observed {
+		t.Fatalf("expected rewrite observation to pass, got %#v", observation)
+	}
+}
+
+func TestFileIdentityRewriteObserverReusesOpenDatabase(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	insertActiveFileIdentity(t, db, 42, 1, "51273...101", "archive.part1.rar", "par2")
+	insertActiveFileIdentity(t, db, 43, 1, "51273...201", "episode.mkv", "par2")
+
+	observer, err := openFileIdentityRewriteObserver(dbPath)
+	if err != nil {
+		t.Fatalf("open reusable file identity rewrite observer: %v", err)
+	}
+	defer observer.Close()
+
+	for _, tc := range []struct {
+		jobID    int
+		filename string
+	}{
+		{jobID: 42, filename: "archive.part1.rar"},
+		{jobID: 43, filename: "episode.mkv"},
+	} {
+		observation, err := observer.Observe(tc.jobID, &ScenarioFileIdentityRewriteAssertion{
+			RequiredCurrentFilenames:     []string{tc.filename},
+			RequiredClassificationSource: "par2",
+		})
+		if err != nil {
+			t.Fatalf("observe job %d through reusable observer: %v", tc.jobID, err)
+		}
+		if !observation.Observed {
+			t.Fatalf("expected rewrite observation for job %d to pass, got %#v", tc.jobID, observation)
+		}
+	}
+}
+
+func TestObserveActiveFileIdentityRewriteFailsWhenObfuscatedRowsRemain(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	insertActiveFileIdentity(t, db, 7, 1, "51273...101", "archive.part1.rar", "par2")
+	insertActiveFileIdentity(t, db, 7, 2, "51273...102", "archive.part2.rar", "par2")
+	insertActiveFileIdentity(t, db, 7, 3, "51273...103", "archive.part3.rar", "par2")
+	insertActiveFileIdentity(t, db, 7, 4, "51273...104", "51273aad56a8b904e96928935278a627.101", "declared")
+
+	observation, err := observeActiveFileIdentityRewrite(dbPath, 7, &ScenarioFileIdentityRewriteAssertion{
+		RequiredCurrentFilenames:     []string{"archive.part1.rar", "archive.part2.rar", "archive.part3.rar"},
+		ForbiddenCurrentFilenames:    []string{"51273aad56a8b904e96928935278a627.101"},
+		RequiredClassificationSource: "par2",
+	})
+	if err != nil {
+		t.Fatalf("observe active file identity rewrite: %v", err)
+	}
+	if observation.Observed {
+		t.Fatalf("expected rewrite observation to fail when obfuscated names remain, got %#v", observation)
+	}
+	if len(observation.ForbiddenCurrentFilenames) != 1 || observation.ForbiddenCurrentFilenames[0] != "51273aad56a8b904e96928935278a627.101" {
+		t.Fatalf("expected forbidden obfuscated filename to be reported, got %#v", observation)
+	}
+}
+
+func TestObserveActiveFileIdentityRewriteFailsWhenPar2ClassificationIsMissing(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	insertActiveFileIdentity(t, db, 9, 1, "51273...101", "archive.part1.rar", "declared")
+	insertActiveFileIdentity(t, db, 9, 2, "51273...102", "archive.part2.rar", "declared")
+	insertActiveFileIdentity(t, db, 9, 3, "51273...103", "archive.part3.rar", "declared")
+
+	observation, err := observeActiveFileIdentityRewrite(dbPath, 9, &ScenarioFileIdentityRewriteAssertion{
+		RequiredCurrentFilenames:     []string{"archive.part1.rar", "archive.part2.rar", "archive.part3.rar"},
+		RequiredClassificationSource: "par2",
+	})
+	if err != nil {
+		t.Fatalf("observe active file identity rewrite: %v", err)
+	}
+	if observation.Observed {
+		t.Fatalf("expected rewrite observation to fail when classification_source=par2 is missing, got %#v", observation)
+	}
+	if len(observation.WrongClassificationSources) != 3 {
+		t.Fatalf("expected all canonical rows to report source mismatches, got %#v", observation)
+	}
+	if !strings.Contains(observation.WrongClassificationSources[0], "found: declared") {
+		t.Fatalf("expected source mismatch details to include the observed classification source, got %#v", observation)
+	}
+}
+
+func TestObserveActiveFileIdentityRewriteUsesObserverRowsAfterActiveCleanup(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
+		t.Fatalf("install file identity rewrite observer: %v", err)
+	}
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	insertActiveFileIdentity(t, db, 17, 1, "archive.part1.rar", "archive.part1.rar", "par2")
+	insertActiveFileIdentity(t, db, 17, 2, "51273...102", "51273aad56a8b904e96928935278a627.102", "declared")
+	if _, err := db.Exec(
+		`UPDATE active_file_identities
+		 SET current_filename = ?,
+		     canonical_filename = ?,
+		     classification_source = ?
+		 WHERE job_id = ? AND file_index = ?`,
+		"archive.part2.rar",
+		"archive.part2.rar",
+		"par2",
+		17,
+		2,
+	); err != nil {
+		t.Fatalf("update active_file_identities row: %v", err)
+	}
+	deleteActiveFileIdentities(t, db, 17)
+
+	observation, err := observeActiveFileIdentityRewrite(dbPath, 17, &ScenarioFileIdentityRewriteAssertion{
+		RequiredCurrentFilenames:     []string{"archive.part1.rar", "archive.part2.rar"},
+		RequiredClassificationSource: "par2",
+	})
+	if err != nil {
+		t.Fatalf("observe active file identity rewrite: %v", err)
+	}
+	if !observation.Observed {
+		t.Fatalf("expected observer rows to satisfy rewrite assertion after active cleanup, got %#v", observation)
+	}
+
+	assertObservedFileIdentityRewriteRow(t, db, 17, "insert", "archive.part1.rar", "archive.part1.rar", "par2")
+	assertObservedFileIdentityRewriteRow(t, db, 17, "update", "archive.part2.rar", "archive.part2.rar", "par2")
+}
+
+func TestObserveActiveFileIdentityRewriteUsesLatestObserverRowsAfterSupersededObfuscatedRows(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
+		t.Fatalf("install file identity rewrite observer: %v", err)
+	}
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	insertActiveFileIdentity(t, db, 19, 0, "51273...101", "51273aad56a8b904e96928935278a627.101", "declared")
+	insertActiveFileIdentity(t, db, 19, 1, "51273...102", "51273aad56a8b904e96928935278a627.102", "declared")
+	insertActiveFileIdentity(t, db, 19, 2, "51273...103", "51273aad56a8b904e96928935278a627.103", "declared")
+	updateActiveFileIdentity(t, db, 19, 0, "51273aad56a8b904e96928935278a627.101", "51273aad56a8b904e96928935278a627.101", "probe")
+	updateActiveFileIdentity(t, db, 19, 0, "archive.part1.rar", "archive.part1.rar", "par2")
+	updateActiveFileIdentity(t, db, 19, 1, "51273aad56a8b904e96928935278a627.102", "51273aad56a8b904e96928935278a627.102", "probe")
+	updateActiveFileIdentity(t, db, 19, 1, "archive.part2.rar", "archive.part2.rar", "par2")
+	updateActiveFileIdentity(t, db, 19, 2, "51273aad56a8b904e96928935278a627.103", "51273aad56a8b904e96928935278a627.103", "probe")
+	updateActiveFileIdentity(t, db, 19, 2, "archive.part3.rar", "archive.part3.rar", "par2")
+	deleteActiveFileIdentities(t, db, 19)
+
+	observation, err := observeActiveFileIdentityRewrite(dbPath, 19, &ScenarioFileIdentityRewriteAssertion{
+		RequiredCurrentFilenames: []string{
+			"archive.part1.rar",
+			"archive.part2.rar",
+			"archive.part3.rar",
+		},
+		ForbiddenCurrentFilenames: []string{
+			"51273aad56a8b904e96928935278a627.101",
+			"51273aad56a8b904e96928935278a627.102",
+			"51273aad56a8b904e96928935278a627.103",
+		},
+		RequiredClassificationSource: "par2",
+	})
+	if err != nil {
+		t.Fatalf("observe active file identity rewrite: %v", err)
+	}
+	if !observation.Observed {
+		t.Fatalf("expected latest observer rows to satisfy rewrite assertion, got %#v", observation)
+	}
+	for _, observed := range observation.ObservedCurrentFilenames {
+		if strings.Contains(observed, "51273aad56a8b904e96928935278a627") {
+			t.Fatalf("expected effective rows to omit superseded obfuscated filenames, got %#v", observation.ObservedCurrentFilenames)
+		}
+	}
+}
+
+func TestObserveActiveFileIdentityRewriteFailsWhenLatestObserverRowRemainsForbidden(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
+		t.Fatalf("install file identity rewrite observer: %v", err)
+	}
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	insertActiveFileIdentity(t, db, 20, 1, "51273...101", "archive.part1.rar", "par2")
+	updateActiveFileIdentity(t, db, 20, 1, "51273aad56a8b904e96928935278a627.101", "51273aad56a8b904e96928935278a627.101", "declared")
+	deleteActiveFileIdentities(t, db, 20)
+
+	observation, err := observeActiveFileIdentityRewrite(dbPath, 20, &ScenarioFileIdentityRewriteAssertion{
+		RequiredCurrentFilenames:     []string{"archive.part1.rar"},
+		ForbiddenCurrentFilenames:    []string{"51273aad56a8b904e96928935278a627.101"},
+		RequiredClassificationSource: "par2",
+	})
+	if err != nil {
+		t.Fatalf("observe active file identity rewrite: %v", err)
+	}
+	if observation.Observed {
+		t.Fatalf("expected latest forbidden observer row to fail, got %#v", observation)
+	}
+	if len(observation.ForbiddenCurrentFilenames) != 1 || observation.ForbiddenCurrentFilenames[0] != "51273aad56a8b904e96928935278a627.101" {
+		t.Fatalf("expected latest forbidden filename to be reported, got %#v", observation)
+	}
+}
+
+func TestObserveActiveFileIdentityRewriteFailsWhenLatestObserverRowMissesPar2Classification(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
+		t.Fatalf("install file identity rewrite observer: %v", err)
+	}
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	insertActiveFileIdentity(t, db, 21, 1, "51273...101", "archive.part1.rar", "par2")
+	updateActiveFileIdentity(t, db, 21, 1, "archive.part1.rar", "archive.part1.rar", "declared")
+	deleteActiveFileIdentities(t, db, 21)
+
+	observation, err := observeActiveFileIdentityRewrite(dbPath, 21, &ScenarioFileIdentityRewriteAssertion{
+		RequiredCurrentFilenames:     []string{"archive.part1.rar"},
+		RequiredClassificationSource: "par2",
+	})
+	if err != nil {
+		t.Fatalf("observe active file identity rewrite: %v", err)
+	}
+	if observation.Observed {
+		t.Fatalf("expected latest observer row without classification_source=par2 to fail, got %#v", observation)
+	}
+	if len(observation.WrongClassificationSources) != 1 || !strings.Contains(observation.WrongClassificationSources[0], "found: declared") {
+		t.Fatalf("expected latest source mismatch to be reported, got %#v", observation)
+	}
+}
+
+func TestObserveActiveFileIdentityRewriteUsesLiveRowsBeforeObserverHistory(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
+		t.Fatalf("install file identity rewrite observer: %v", err)
+	}
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	insertActiveFileIdentity(t, db, 22, 1, "51273...101", "archive.part1.rar", "par2")
+	deleteActiveFileIdentities(t, db, 22)
+	insertActiveFileIdentity(t, db, 22, 1, "51273...101", "51273aad56a8b904e96928935278a627.101", "declared")
+
+	observation, err := observeActiveFileIdentityRewrite(dbPath, 22, &ScenarioFileIdentityRewriteAssertion{
+		RequiredCurrentFilenames:     []string{"archive.part1.rar"},
+		RequiredClassificationSource: "par2",
+	})
+	if err != nil {
+		t.Fatalf("observe active file identity rewrite: %v", err)
+	}
+	if observation.Observed {
+		t.Fatalf("expected live active rows to override historical observer rows, got %#v", observation)
+	}
+	if len(observation.MissingCurrentFilenames) != 1 || observation.MissingCurrentFilenames[0] != "archive.part1.rar" {
+		t.Fatalf("expected live-row snapshot to report missing canonical filename, got %#v", observation)
+	}
+}
+
+func TestObserveActiveFileIdentityRewriteFailsWhenObserverRowsMissPar2Classification(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
+		t.Fatalf("install file identity rewrite observer: %v", err)
+	}
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	insertActiveFileIdentity(t, db, 18, 1, "51273...101", "archive.part1.rar", "declared")
+	insertActiveFileIdentity(t, db, 18, 2, "51273...102", "archive.part2.rar", "declared")
+	deleteActiveFileIdentities(t, db, 18)
+
+	observation, err := observeActiveFileIdentityRewrite(dbPath, 18, &ScenarioFileIdentityRewriteAssertion{
+		RequiredCurrentFilenames:     []string{"archive.part1.rar", "archive.part2.rar"},
+		RequiredClassificationSource: "par2",
+	})
+	if err != nil {
+		t.Fatalf("observe active file identity rewrite: %v", err)
+	}
+	if observation.Observed {
+		t.Fatalf("expected observer rows without classification_source=par2 to fail, got %#v", observation)
+	}
+	if len(observation.WrongClassificationSources) != 2 {
+		t.Fatalf("expected both observer rows to report source mismatches, got %#v", observation)
+	}
+}
+
+func TestApplyRuntimeFileIdentityRewriteTerminalCheckFailsWhenJobCompletesBeforeObservation(t *testing.T) {
+	status, errMsg, overridden := applyRuntimeFileIdentityRewriteTerminalCheck(
+		"COMPLETE",
+		&ScenarioFileIdentityRewriteAssertion{
+			RequiredCurrentFilenames:     []string{"archive.part1.rar", "archive.part2.rar", "archive.part3.rar"},
+			ForbiddenCurrentFilenames:    []string{"51273aad56a8b904e96928935278a627.101"},
+			RequiredClassificationSource: "par2",
+		},
+		false,
+		fileIdentityRewriteObservation{
+			RequiredClassificationSource: "par2",
+			MissingCurrentFilenames:      []string{"archive.part1.rar", "archive.part2.rar", "archive.part3.rar"},
+			ForbiddenCurrentFilenames:    []string{"51273aad56a8b904e96928935278a627.101"},
+		},
+		"",
+	)
+	if !overridden {
+		t.Fatal("expected runtime file identity rewrite terminal check to override terminal success")
+	}
+	if status != "RUNTIME_ASSERTION_ERROR" {
+		t.Fatalf("expected runtime assertion error status, got %s", status)
+	}
+	if !strings.Contains(errMsg, "job reached COMPLETE before file identity rewrite oracle observed") {
+		t.Fatalf("expected terminal failure message to mention the missed oracle, got %q", errMsg)
+	}
+	if !strings.Contains(errMsg, "archive.part1.rar") || !strings.Contains(errMsg, "51273aad56a8b904e96928935278a627.101") {
+		t.Fatalf("expected terminal failure message to include missing and forbidden filenames, got %q", errMsg)
+	}
+}
+
+func TestAssertPar2CleanSettlementDistinguishesGridAndAuthoritativeSets(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logLines := []string{
+		`job_id=42 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
+		`job_id=42 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
+		`job_id=42 recovery_set_id=late-set slice_size=96 verification_mode=authoritative PAR2 clean set verification source`,
+	}
+	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	assertion := &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64, "late-set": 96},
+		ExpectedSetVerificationModes: map[string][]string{
+			"grid-set": {"grid"},
+			"late-set": {"authoritative"},
+		},
+	}
+	if err := assertPar2CleanSettlement(42, assertion); err != nil {
+		t.Fatalf("expected mixed settlement sources to pass: %v", err)
+	}
+}
+
+func TestAssertPar2CleanSettlementRejectsModeOutsideSingletonPin(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logLines := []string{
+		`job_id=44 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
+		`job_id=44 recovery_set_id=grid-set slice_size=64 verification_mode=quick_digest PAR2 clean set verification source`,
+	}
+	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := assertPar2CleanSettlement(44, &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64},
+		ExpectedSetVerificationModes: map[string][]string{
+			"grid-set": {"grid"},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), `mode "quick_digest", want one of [grid]`) {
+		t.Fatalf("expected singleton grid pin to reject quick_digest, got %v", err)
+	}
+}
+
+func TestAssertPar2CleanSettlementAcceptsAllowedNonGridModes(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logLines := []string{
+		`job_id=43 recovery_set_id=first-set slice_size=64 verification_mode=strong_decode PAR2 clean set verification source`,
+		`job_id=43 recovery_set_id=second-set slice_size=96 verification_mode=authoritative PAR2 clean set verification source`,
+	}
+	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	assertion := &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"first-set": 64, "second-set": 96},
+		ExpectedSetVerificationModes: map[string][]string{
+			"first-set":  {"strong_decode", "authoritative"},
+			"second-set": {"strong_decode", "authoritative"},
+		},
+	}
+	if err := assertPar2CleanSettlement(43, assertion); err != nil {
+		t.Fatalf("expected allowed non-grid settlement modes to pass: %v", err)
+	}
+}
+
+func TestAssertPar2CleanSettlementConditionsGridEvidenceOnObservedMode(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assertion := &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"variable-set": 64},
+		ExpectedSetVerificationModes: map[string][]string{
+			"variable-set": {"grid", "quick_digest"},
+		},
+	}
+
+	for _, test := range []struct {
+		name  string
+		lines []string
+	}{
+		{
+			name: "quick digest needs no grid record",
+			lines: []string{
+				`job_id=45 recovery_set_id=variable-set slice_size=64 verification_mode=quick_digest PAR2 clean set verification source`,
+			},
+		},
+		{
+			name: "grid requires its matching record",
+			lines: []string{
+				`job_id=45 recovery_set_id=variable-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
+				`job_id=45 recovery_set_id=variable-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := assertPar2CleanSettlement(45, assertion); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestAssertPar2CleanSettlementRejectsGridEvidenceForNonGridMode(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logLines := []string{
+		`job_id=46 recovery_set_id=late-set slice_size=96 verification_mode=quick_digest PAR2 clean set verification source`,
+		`job_id=46 recovery_set_id=late-set slice_size=96 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
+	}
+	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := assertPar2CleanSettlement(46, &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"late-set": 96},
+		ExpectedSetVerificationModes: map[string][]string{
+			"late-set": {"grid", "quick_digest", "authoritative"},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), `non-grid mode "quick_digest"`) {
+		t.Fatalf("expected non-grid settlement evidence failure, got %v", err)
+	}
+}
+
+func TestAssertPar2CleanSettlementRejectsMissingGridEvidence(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		localWeaverLogPath(),
+		[]byte(`job_id=47 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	err := assertPar2CleanSettlement(47, &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64},
+		ExpectedSetVerificationModes: map[string][]string{
+			"grid-set": {"grid"},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "did not observe grid set(s): grid-set") {
+		t.Fatalf("expected missing grid settlement failure, got %v", err)
+	}
+}
+
+func TestAssertPar2CleanSettlementRejectsDuplicateAndUnknownRecords(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assertion := &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64},
+		ExpectedSetVerificationModes: map[string][]string{
+			"grid-set": {"grid"},
+		},
+	}
+	for _, test := range []struct {
+		name    string
+		lines   []string
+		message string
+	}{
+		{
+			name: "duplicate source",
+			lines: []string{
+				`job_id=48 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
+				`job_id=48 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
+			},
+			message: "verification source observed set grid-set more than once",
+		},
+		{
+			name: "unknown source",
+			lines: []string{
+				`job_id=48 recovery_set_id=unknown-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
+			},
+			message: "verification source observed unexpected set unknown-set",
+		},
+		{
+			name: "duplicate grid record",
+			lines: []string{
+				`job_id=48 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
+				`job_id=48 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
+				`job_id=48 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
+			},
+			message: "settlement observed set grid-set more than once",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err := assertPar2CleanSettlement(48, assertion)
+			if err == nil || !strings.Contains(err.Error(), test.message) {
+				t.Fatalf("expected %q, got %v", test.message, err)
+			}
+		})
+	}
+}
+
+func TestAssertPar2CleanSettlementRejectsUnknownVerificationMode(t *testing.T) {
+	err := assertPar2CleanSettlement(49, &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes: map[string]uint64{"typed-set": 64},
+		ExpectedSetVerificationModes: map[string][]string{
+			"typed-set": {"mystery"},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), `unknown verification mode "mystery"`) {
+		t.Fatalf("expected unknown verification mode failure, got %v", err)
+	}
+}
+
+func TestWaitForActiveFileCompleteMatchesExactJobAndFilename(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO active_files (job_id, file_index, filename) VALUES (51, 0, 'other.mkv')`)
+	mustExecWeaverStateSQL(t, db, `INSERT INTO active_files (job_id, file_index, filename) VALUES (52, 0, 'payload.mkv')`)
+	if err := waitForActiveFileComplete(dbPath, 51, "payload.mkv", 100*time.Millisecond); err == nil {
+		t.Fatal("wrong-job and wrong-filename rows must not release the gate")
+	}
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO active_files (job_id, file_index, filename) VALUES (51, 1, 'payload.mkv')`)
+	if err := waitForActiveFileComplete(dbPath, 51, "payload.mkv", time.Second); err != nil {
+		t.Fatalf("exact completed file did not release the gate: %v", err)
+	}
+}
+
+func newTestWeaverStateDB(t *testing.T) string {
+	t.Helper()
+
+	dbPath := filepath.Join(t.TempDir(), "weaver-state.sqlite")
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE job_history (job_id INTEGER PRIMARY KEY, status TEXT NOT NULL, output_dir TEXT)`)
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE job_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		job_id INTEGER NOT NULL,
+		kind TEXT NOT NULL
+	)`)
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE active_jobs (job_id INTEGER PRIMARY KEY)`)
+	for _, table := range weaverActiveStateTables[1:] {
+		if table.Name == "active_file_identities" {
+			mustExecWeaverStateSQL(t, db, `CREATE TABLE active_file_identities (
+				job_id INTEGER NOT NULL,
+				file_index INTEGER NOT NULL,
+				source_filename TEXT NOT NULL,
+				current_filename TEXT NOT NULL,
+				canonical_filename TEXT,
+				classification_kind TEXT,
+				classification_set_name TEXT,
+				classification_volume_index INTEGER,
+				classification_source TEXT NOT NULL DEFAULT 'declared',
+				PRIMARY KEY (job_id, file_index)
+			)`)
+			continue
+		}
+		if table.Name == "active_files" {
+			mustExecWeaverStateSQL(t, db, `CREATE TABLE active_files (
+				job_id INTEGER NOT NULL,
+				file_index INTEGER NOT NULL,
+				filename TEXT NOT NULL,
+				PRIMARY KEY (job_id, file_index)
+			)`)
+			continue
+		}
+		if table.Name == "active_extracted" {
+			mustExecWeaverStateSQL(t, db, `CREATE TABLE active_extracted (
+				job_id INTEGER NOT NULL,
+				member_name TEXT NOT NULL,
+				output_path TEXT NOT NULL,
+				PRIMARY KEY (job_id, member_name)
+			)`)
+			continue
+		}
+		if table.Name == "active_failed_extractions" {
+			mustExecWeaverStateSQL(t, db, `CREATE TABLE active_failed_extractions (
+				job_id INTEGER NOT NULL,
+				member_name TEXT NOT NULL,
+				PRIMARY KEY (job_id, member_name)
+			)`)
+			continue
+		}
+		mustExecWeaverStateSQL(t, db, "CREATE TABLE "+table.Name+" (job_id INTEGER NOT NULL)")
+	}
+
+	return dbPath
+}
+
+func openTestWeaverStateDB(t *testing.T, dbPath string) *sql.DB {
+	t.Helper()
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db %s: %v", dbPath, err)
+	}
+	return db
+}
+
+func mustExecWeaverStateSQL(t *testing.T, db *sql.DB, query string) {
+	t.Helper()
+
+	if _, err := db.Exec(query); err != nil {
+		t.Fatalf("exec %q: %v", query, err)
+	}
+}
+
+func insertActiveFileIdentity(
+	t *testing.T,
+	db *sql.DB,
+	jobID int,
+	fileIndex int,
+	sourceFilename string,
+	currentFilename string,
+	classificationSource string,
+) {
+	t.Helper()
+
+	_, err := db.Exec(
+		`INSERT INTO active_file_identities (
+			job_id,
+			file_index,
+			source_filename,
+			current_filename,
+			canonical_filename,
+			classification_kind,
+			classification_set_name,
+			classification_volume_index,
+			classification_source
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		jobID,
+		fileIndex,
+		sourceFilename,
+		currentFilename,
+		currentFilename,
+		"rar",
+		"archive",
+		fileIndex,
+		classificationSource,
+	)
+	if err != nil {
+		t.Fatalf("insert active_file_identities row: %v", err)
+	}
+}
+
+func updateActiveFileIdentity(
+	t *testing.T,
+	db *sql.DB,
+	jobID int,
+	fileIndex int,
+	currentFilename string,
+	canonicalFilename string,
+	classificationSource string,
+) {
+	t.Helper()
+
+	_, err := db.Exec(
+		`UPDATE active_file_identities
+		 SET current_filename = ?,
+		     canonical_filename = ?,
+		     classification_source = ?
+		 WHERE job_id = ? AND file_index = ?`,
+		currentFilename,
+		canonicalFilename,
+		classificationSource,
+		jobID,
+		fileIndex,
+	)
+	if err != nil {
+		t.Fatalf("update active_file_identities row: %v", err)
+	}
+}
+
+func deleteActiveFileIdentities(t *testing.T, db *sql.DB, jobID int) {
+	t.Helper()
+
+	if _, err := db.Exec(`DELETE FROM active_file_identities WHERE job_id = ?`, jobID); err != nil {
+		t.Fatalf("delete active_file_identities rows: %v", err)
+	}
+}
+
+func assertObservedFileIdentityRewriteRow(
+	t *testing.T,
+	db *sql.DB,
+	jobID int,
+	operation string,
+	currentFilename string,
+	canonicalFilename string,
+	classificationSource string,
+) {
+	t.Helper()
+
+	var count int
+	if err := db.QueryRow(
+		`SELECT COUNT(*)
+		 FROM e2e_file_identity_rewrite_observations
+		 WHERE job_id = ?
+		   AND operation = ?
+		   AND current_filename = ?
+		   AND canonical_filename = ?
+		   AND classification_source = ?`,
+		jobID,
+		operation,
+		currentFilename,
+		canonicalFilename,
+		classificationSource,
+	).Scan(&count); err != nil {
+		t.Fatalf("query observed file identity rewrite rows: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf(
+			"expected one %s observer row for %s (%s), got %d",
+			operation,
+			currentFilename,
+			classificationSource,
+			count,
+		)
+	}
+}
+
+func TestMatchForbiddenOutputPathsMatchesNamesGlobsAndPaths(t *testing.T) {
+	delivered := []string{
+		"test-media.mkv",
+		"test-media.mkv.001",
+		"test-media.mkv.002",
+		"Season 01/test-media.mkv.003",
+		"notes.nfo",
+	}
+
+	cases := []struct {
+		name     string
+		patterns []string
+		want     []string
+	}{
+		{
+			name:     "a bare glob reaches a file wherever it landed",
+			patterns: []string{"test-media.mkv.0*"},
+			want:     []string{"Season 01/test-media.mkv.003", "test-media.mkv.001", "test-media.mkv.002"},
+		},
+		{
+			name:     "a literal name is a glob with nothing to expand",
+			patterns: []string{"test-media.mkv.002"},
+			want:     []string{"test-media.mkv.002"},
+		},
+		{
+			name:     "a pattern with a separator is anchored to the relative path",
+			patterns: []string{"Season 01/*.003"},
+			want:     []string{"Season 01/test-media.mkv.003"},
+		},
+		{
+			name:     "the release itself is not claimed by a part glob",
+			patterns: []string{"test-media.mkv.0*"},
+			want:     []string{"Season 01/test-media.mkv.003", "test-media.mkv.001", "test-media.mkv.002"},
+		},
+		{
+			name:     "overlapping patterns report each file once",
+			patterns: []string{"test-media.mkv.001", "test-media.mkv.0*"},
+			want:     []string{"Season 01/test-media.mkv.003", "test-media.mkv.001", "test-media.mkv.002"},
+		},
+		{
+			name:     "nothing forbidden is nothing found",
+			patterns: []string{"*.rar", "  "},
+			want:     nil,
+		},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			found, err := matchForbiddenOutputPaths(test.patterns, delivered)
+			if err != nil {
+				t.Fatalf("match: %v", err)
+			}
+			if strings.Join(found, "|") != strings.Join(test.want, "|") {
+				t.Fatalf("found = %v, want %v", found, test.want)
+			}
+		})
+	}
+
+	if _, err := matchForbiddenOutputPaths([]string{"[bad"}, delivered); err == nil {
+		t.Fatal("a malformed pattern must be an error rather than a silent pass")
+	}
+}
+
+func TestAssertForbiddenOutputPathsReadsTheDeliveredTree(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	outputDir := t.TempDir()
+	writeStageTestFile(t, filepath.Join(outputDir, "test-media.mkv"), []byte("joined"))
+	mustExecWeaverStateSQL(t, db,
+		`INSERT INTO job_history (job_id, status, output_dir) VALUES (1, 'COMPLETED', '`+outputDir+`')`)
+
+	if err := assertForbiddenOutputPaths(dbPath, 1, []string{"test-media.mkv.0*"}); err != nil {
+		t.Fatalf("a delivered tree holding only the release must pass, got %v", err)
+	}
+
+	writeStageTestFile(t, filepath.Join(outputDir, "test-media.mkv.002"), []byte("part"))
+	err := assertForbiddenOutputPaths(dbPath, 1, []string{"test-media.mkv.0*"})
+	if err == nil {
+		t.Fatal("a leftover split part must fail the assertion")
+	}
+	if !strings.Contains(err.Error(), "test-media.mkv.002") {
+		t.Fatalf("the failure must name the leftover, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "delivered: ") {
+		t.Fatalf("the failure must list what was delivered, got %v", err)
+	}
+}
+
+func TestAssertDirectStoreScenarioRequiresRoutedMaterializationWithoutRefetch(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assertion := &ScenarioDirectStoreAssertion{
+		ExpectedDemotionReason:           "member_malformed_chain",
+		RequireRoutedByteMaterialization: true,
+		ForbidVolumeRefetch:              true,
+	}
+
+	for _, test := range []struct {
+		name    string
+		lines   []string
+		wantErr string
+	}{
+		{
+			name: "matching job passes",
+			lines: []string{
+				`job_id=81 direct-store set demoted reason="member_malformed_chain"`,
+				`job_id=81 direct-store set materialized from its own routed bytes`,
+				`job_id=82 direct-store reconstruction is not possible; refetching the set's volumes`,
+			},
+		},
+		{
+			name: "refetch fails",
+			lines: []string{
+				`job_id=81 direct-store set demoted reason="member_malformed_chain"`,
+				`job_id=81 direct-store set materialized from its own routed bytes`,
+				`job_id=81 direct-store reconstruction is not possible; refetching the set's volumes`,
+			},
+			wantErr: "refetched volumes",
+		},
+		{
+			name: "missing materialization fails",
+			lines: []string{
+				`job_id=81 direct-store set demoted reason="member_malformed_chain"`,
+			},
+			wantErr: "did not materialize",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err := assertDirectStoreScenario(81, assertion)
+			if test.wantErr == "" && err != nil {
+				t.Fatalf("assertion failed: %v", err)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}

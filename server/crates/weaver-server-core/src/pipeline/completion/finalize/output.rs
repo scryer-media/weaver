@@ -1,8 +1,30 @@
 use super::*;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
+use super::deobfuscate::{self, DeliveryNamingPlan, SrrdbInputs};
 use crate::jobs::working_dir::{WORKING_DIR_MARKER, mark_weaver_owned_output_dir};
 use crate::runtime::{file_cache, fs as runtime_fs};
+
+/// Folds one volume's member headers into the checksum map. A member spanning
+/// volumes states its checksum on the header that ends it, so later volumes
+/// overwrite earlier `None`s naturally by only writing what they know.
+fn record_member_crc32(by_name: &mut HashMap<String, u32>, facts: &unrar_rs::RarVolumeFacts) {
+    for member in &facts.members {
+        if member.is_directory {
+            continue;
+        }
+        let Some(crc32) = member.data_crc32 else {
+            continue;
+        };
+        let name = member
+            .name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&member.name);
+        by_name.insert(name.to_ascii_lowercase(), crc32);
+    }
+}
 
 fn move_path_with_copy_fallback(
     src: &std::path::Path,
@@ -75,13 +97,55 @@ fn cleanup_copy_destination_if_parent_matches(
     }
 }
 
+fn rename_path_for_publication(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(src)?;
+    if !metadata.is_dir() {
+        return runtime_fs::rename_no_overwrite(src, dst);
+    }
+
+    match std::fs::symlink_metadata(dst) {
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("destination already exists: {}", dst.display()),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::fs::rename(src, dst)
+}
+
 fn move_path_with_safe_rename_or_copy_fallback(
     src: &std::path::Path,
     dst: &std::path::Path,
     phase_counters: Arc<PhaseCounters>,
 ) -> Result<(), (std::io::Error, std::io::Error)> {
+    move_path_with_safe_rename_or_copy_fallback_using(
+        src,
+        dst,
+        phase_counters,
+        rename_path_for_publication,
+        move_path_with_copy_fallback,
+    )
+}
+
+fn move_path_with_safe_rename_or_copy_fallback_using<R, C>(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    phase_counters: Arc<PhaseCounters>,
+    rename: R,
+    copy: C,
+) -> Result<(), (std::io::Error, std::io::Error)>
+where
+    R: FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+    C: FnOnce(&std::path::Path, &std::path::Path, &PhaseCounters) -> std::io::Result<()>,
+{
     let path_bytes = path_regular_file_bytes(src).unwrap_or(0);
-    match runtime_fs::rename_no_overwrite(src, dst) {
+    match rename(src, dst) {
         Ok(()) => {
             if path_bytes > 0 {
                 phase_counters
@@ -90,8 +154,13 @@ fn move_path_with_safe_rename_or_copy_fallback(
             }
             Ok(())
         }
-        Err(rename_err) => move_path_with_copy_fallback(src, dst, &phase_counters)
-            .map_err(|copy_err| (rename_err, copy_err)),
+        Err(rename_err) if rename_err.kind() == std::io::ErrorKind::CrossesDevices => {
+            copy(src, dst, &phase_counters).map_err(|copy_err| (rename_err, copy_err))
+        }
+        Err(rename_err) => Err((
+            rename_err,
+            std::io::Error::other("copy fallback not attempted for a non-cross-device error"),
+        )),
     }
 }
 
@@ -120,10 +189,16 @@ async fn run_move_to_complete(
     staging_dir: Option<PathBuf>,
     dest: PathBuf,
     phase_counters: Arc<PhaseCounters>,
+    naming: Option<DeliveryNamingPlan>,
 ) -> Result<MoveToCompleteResult, String> {
-    // Every cached disk write handle under the working dir must be closed
-    // before its files are renamed or moved.
+    // Every cached disk write handle under either of the job's roots must be
+    // closed before its files are renamed or moved. The staging root is not
+    // only extraction output any more: direct-store writes member payload
+    // straight into it, through the same owner pool.
     crate::pipeline::close_cached_write_handles_under(&working_dir).await;
+    if let Some(staging) = staging_dir.as_deref() {
+        crate::pipeline::close_cached_write_handles_under(staging).await;
+    }
 
     // Verify at least one source directory exists before creating
     // the destination, so a missing source doesn't leave behind an
@@ -267,6 +342,16 @@ async fn run_move_to_complete(
         ));
     }
 
+    // Both delivery routes have landed in `dest` and nothing else will be added
+    // to it, so this is the first and only moment the delivered set exists as
+    // one directory. Renaming here is still a same-directory rename, and it
+    // finishes before the move reports done — everything downstream of the
+    // move sees only the final names.
+    let renamed_members = match naming {
+        Some(naming) => deobfuscate::rename_obfuscated_members(job_id, &dest, &naming).await,
+        None => 0,
+    };
+
     let output_dir = dest.clone();
     match tokio::task::spawn_blocking(move || mark_weaver_owned_output_dir(&output_dir)).await {
         Ok(Ok(())) => {}
@@ -321,6 +406,7 @@ async fn run_move_to_complete(
 
     Ok(MoveToCompleteResult {
         moved_entries: moved,
+        renamed_members,
     })
 }
 
@@ -354,6 +440,65 @@ fn move_sources_regular_file_bytes(
     total
 }
 
+fn complete_parent_for_category(
+    complete_dir: &std::path::Path,
+    categories: &[crate::categories::CategoryConfig],
+    category: Option<&str>,
+) -> Result<PathBuf, String> {
+    crate::categories::completion_parent(complete_dir, categories, category)
+}
+
+#[cfg(test)]
+mod category_destination_tests {
+    use super::*;
+
+    fn category(name: &str, dest_dir: Option<&str>) -> crate::categories::CategoryConfig {
+        crate::categories::CategoryConfig {
+            id: 1,
+            name: name.to_string(),
+            dest_dir: dest_dir.map(str::to_string),
+            aliases: String::new(),
+        }
+    }
+
+    #[test]
+    fn safe_categories_and_collision_suffixes_remain_beneath_complete_dir() {
+        let complete = std::path::Path::new("/downloads/complete");
+        let parent = complete_parent_for_category(complete, &[], Some("tv-hd")).unwrap();
+        assert_eq!(parent, complete.join("tv-hd"));
+
+        let collision = parent.join(weaver_model::files::path_component_with_suffix(
+            "release", ".#42.1",
+        ));
+        assert!(collision.starts_with(complete));
+    }
+
+    #[test]
+    fn configured_destination_override_remains_trusted_admin_input() {
+        let complete = std::path::Path::new("/downloads/complete");
+        let categories = vec![category("custom/name", Some("/mnt/admin-selected"))];
+
+        assert_eq!(
+            complete_parent_for_category(complete, &categories, Some("custom/name")).unwrap(),
+            PathBuf::from("/mnt/admin-selected")
+        );
+    }
+
+    #[test]
+    fn malicious_or_legacy_unsafe_categories_fail_before_a_destination_is_returned() {
+        let complete = std::path::Path::new("/downloads/complete");
+        for unsafe_category in ["/tmp", "../../outside", "nested/path", "C:\\outside"] {
+            assert!(
+                complete_parent_for_category(complete, &[], Some(unsafe_category)).is_err(),
+                "accepted {unsafe_category:?}"
+            );
+        }
+
+        let legacy = vec![category("legacy/unsafe", None)];
+        assert!(complete_parent_for_category(complete, &legacy, Some("legacy/unsafe")).is_err());
+    }
+}
+
 impl Pipeline {
     fn complete_destination_is_reserved(&self, job_id: JobId, candidate: &std::path::Path) -> bool {
         self.reserved_complete_destinations
@@ -368,34 +513,16 @@ impl Pipeline {
         job_id: JobId,
         job_name: &str,
         category: Option<&str>,
-    ) -> PathBuf {
+    ) -> Result<PathBuf, String> {
         let dir_name = crate::jobs::working_dir::sanitize_dirname(job_name);
-        let base_dest = {
+        let parent = {
             let cfg = self.config.read().await;
-            let cat_dest = category.and_then(|cat| {
-                cfg.categories
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(cat))
-                    .and_then(|c| c.dest_dir.as_ref())
-                    .filter(|d| !d.is_empty())
-                    .map(PathBuf::from)
-            });
-
-            if let Some(custom_dest) = cat_dest {
-                custom_dest.join(&dir_name)
-            } else {
-                let mut dest = self.complete_dir.clone();
-                if let Some(cat) = category
-                    && !cat.is_empty()
-                {
-                    dest = dest.join(cat);
-                }
-                dest.join(&dir_name)
-            }
+            complete_parent_for_category(&self.complete_dir, &cfg.categories, category)?
         };
+        let base_dest = parent.join(&dir_name);
 
         if !base_dest.exists() && !self.complete_destination_is_reserved(job_id, &base_dest) {
-            return base_dest;
+            return Ok(base_dest);
         }
 
         let parent = base_dest
@@ -406,7 +533,7 @@ impl Pipeline {
             &format!(".#{}", job_id.0),
         ));
         if !suffixed.exists() && !self.complete_destination_is_reserved(job_id, &suffixed) {
-            return suffixed;
+            return Ok(suffixed);
         }
 
         let mut attempt = 1u32;
@@ -416,10 +543,100 @@ impl Pipeline {
                 &format!(".#{}.{}", job_id.0, attempt),
             ));
             if !candidate.exists() && !self.complete_destination_is_reserved(job_id, &candidate) {
-                return candidate;
+                return Ok(candidate);
             }
             attempt += 1;
         }
+    }
+
+    /// Resolves everything the delivery rename pass needs, on this task, before
+    /// the move worker is spawned.
+    ///
+    /// `None` disables the pass. The worker gets an owned plan rather than a
+    /// handle to pipeline state so the pass cannot reach back into the
+    /// orchestrator, and so the outbound lookup — the one step that can take
+    /// seconds — never runs on the orchestrator's own task.
+    async fn delivery_naming_plan(
+        &self,
+        job_id: JobId,
+        job_name: &str,
+    ) -> Option<DeliveryNamingPlan> {
+        let (enabled, srrdb_from_config) = {
+            let cfg = self.config.read().await;
+            (
+                cfg.deobfuscate_delivered_members(),
+                cfg.enable_srrdb_lookup(),
+            )
+        };
+        if !enabled {
+            return None;
+        }
+        // The environment has the last word on the outbound rung — see
+        // [`deobfuscate::SRRDB_LOOKUP_ENV`] for why consent lives there until
+        // the settings UI can ask for it in words.
+        let srrdb_enabled = deobfuscate::srrdb_lookup_enabled_now(srrdb_from_config);
+
+        // The checksum map is only ever read by the lookup, so an operator who
+        // never opted in never pays for gathering it.
+        let srrdb = srrdb_enabled.then(|| SrrdbInputs {
+            base_url: deobfuscate::SRRDB_API_BASE.to_string(),
+            crc32_by_member_name: HashMap::new(),
+        });
+        let srrdb = match srrdb {
+            Some(mut inputs) => {
+                inputs.crc32_by_member_name = self.member_crc32_by_name(job_id).await;
+                Some(inputs)
+            }
+            None => None,
+        };
+
+        Some(DeliveryNamingPlan {
+            job_display_name: job_name.to_string(),
+            srrdb,
+        })
+    }
+
+    /// The CRC32 each archive header stated for its member, keyed by the
+    /// member's filename lowercased.
+    ///
+    /// Read from two places because the two delivery routes keep the same facts
+    /// in different homes: extraction keeps a set's parsed headers in memory
+    /// until the job leaves the pipeline, while direct-store only ever writes
+    /// them to the durable facts table. Reading both makes the map route-blind.
+    /// A member the headers never stated a checksum for is simply absent, and
+    /// the lookup falls back to the job name for it.
+    async fn member_crc32_by_name(&self, job_id: JobId) -> HashMap<String, u32> {
+        let mut by_name = HashMap::new();
+        for ((set_job_id, _), state) in &self.rar_sets {
+            if *set_job_id != job_id {
+                continue;
+            }
+            for facts in state.facts.values() {
+                record_member_crc32(&mut by_name, facts);
+            }
+        }
+
+        let persisted = self
+            .db_blocking(move |db| db.load_all_rar_volume_facts(job_id))
+            .await;
+        match persisted {
+            Ok(sets) => {
+                for (_, volumes) in sets {
+                    for (_, blob) in volumes {
+                        if let Ok(facts) = rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob)
+                        {
+                            record_member_crc32(&mut by_name, &facts);
+                        }
+                    }
+                }
+            }
+            Err(error) => debug!(
+                job_id = job_id.0,
+                error = %error,
+                "could not read persisted volume facts for the release-index lookup"
+            ),
+        }
+        by_name
     }
 
     /// Move extracted/completed files from the intermediate working directory
@@ -434,32 +651,18 @@ impl Pipeline {
             return Ok(());
         }
 
-        if self
-            .post_processing_repair_return_to_terminal
-            .remove(&job_id)
-        {
-            self.phase_end(job_id, JobPhase::Extracting);
-            self.phase_end(job_id, JobPhase::Repairing);
-            info!(
-                job_id = job_id.0,
-                "requested PAR pass finished; resuming terminal post-processing in final directory"
-            );
-            let plan = self
-                .db_blocking(move |db| {
-                    if !db.post_processing_settings()?.execution_enabled {
-                        return Ok(None);
-                    }
-                    db.frozen_post_processing_plan(job_id.0)
-                })
-                .await
-                .map_err(|error| format!("failed to load frozen post-processing plan: {error}"))?;
-            if let Some(plan) = plan.filter(|plan| !plan.steps().is_empty()) {
-                self.start_terminal_post_processing(job_id, plan);
-            } else {
-                self.complete_job_after_terminal_post_processing(job_id);
-            }
-            return Ok(());
-        }
+        // The last gate at which every settlement fact is still in hand, and
+        // the last at which refusing costs nothing: nothing has moved yet. The
+        // census rebuilds the terminal record from what claimed each payload
+        // file, and refuses the delivery outright when a file was never
+        // delivered and nothing accounts for it.
+        self.reconcile_terminal_delivery(job_id)?;
+
+        // Terminal transition: the job is leaving the verification question
+        // behind. With no recovery set there was never a verdict to be had, so
+        // attribute it rather than leaving the job out of
+        // `weaver_verifications_total` entirely. No-op when a pass ruled.
+        self.note_job_unverifiable_if_no_par2_set(job_id);
 
         let (working_dir, staging_dir, job_name, category) = {
             let Some(state) = self.jobs.get(&job_id) else {
@@ -473,6 +676,11 @@ impl Pipeline {
             )
         };
 
+        if let Some(staging) = staging_dir.as_deref() {
+            let budget = self.extraction_budget(job_id, staging)?;
+            ExtractionRoot::open(staging)?.scan_no_links(&budget)?;
+        }
+
         self.phase_end(job_id, JobPhase::Extracting);
         self.phase_end(job_id, JobPhase::Repairing);
         let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
@@ -480,7 +688,7 @@ impl Pipeline {
 
         let dest = self
             .compute_complete_destination(job_id, &job_name, category.as_deref())
-            .await;
+            .await?;
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());
         self.inflight_moves.insert(job_id);
@@ -489,6 +697,8 @@ impl Pipeline {
             .event_tx
             .send(PipelineEvent::MoveToCompleteStarted { job_id });
         self.publish_snapshot();
+
+        let naming = self.delivery_naming_plan(job_id, &job_name).await;
 
         let move_done_tx = self.move_done_tx.clone();
         info!(
@@ -504,6 +714,7 @@ impl Pipeline {
                 staging_dir,
                 dest.clone(),
                 phase_counters,
+                naming,
             )
             .await;
             match &result {
@@ -545,6 +756,11 @@ impl Pipeline {
 
         match result {
             Ok(outcome) => {
+                if outcome.renamed_members > 0 {
+                    self.metrics
+                        .deobfuscated_members_renamed
+                        .fetch_add(u64::from(outcome.renamed_members), Ordering::Relaxed);
+                }
                 let Some(state) = self.jobs.get_mut(&job_id) else {
                     warn!(
                         job_id = job_id.0,
@@ -565,103 +781,109 @@ impl Pipeline {
                     dest = %dest.display(),
                     "built-in pipeline completed final move"
                 );
-                let plan = self
-                    .db_blocking(move |db| {
-                        if !db.post_processing_settings()?.execution_enabled {
-                            return Ok(None);
-                        }
-                        db.frozen_post_processing_plan(job_id.0)
-                    })
-                    .await;
-                match plan {
-                    Ok(Some(plan)) if !plan.steps().is_empty() => {
-                        self.start_terminal_post_processing(job_id, plan);
-                    }
-                    Ok(_) => self.complete_job_after_terminal_post_processing(job_id),
-                    Err(error) => self.fail_job(
-                        job_id,
-                        format!("failed to load frozen post-processing plan: {error}"),
-                    ),
-                }
+                self.start_terminal_post_processing(job_id);
             }
             Err(error) => self.fail_job(job_id, error),
         }
     }
 
-    fn start_terminal_post_processing(
-        &mut self,
-        job_id: JobId,
-        plan: crate::post_processing::model::FrozenPlan,
-    ) {
+    fn start_terminal_post_processing(&mut self, job_id: JobId) {
         self.start_terminal_post_processing_with_outcome(
             job_id,
-            plan,
             crate::post_processing::model::PipelineOutcome::Succeeded,
-            crate::post_processing::persistence::TerminalIntent::Complete,
             None,
         );
     }
 
+    /// Resolve the job's script list and, when it is non-empty, run it.
+    ///
+    /// Resolution happens here rather than at submission time: the list a job
+    /// runs is the one configured when it finishes, which is what both oracles
+    /// do and what removes the "edited while queued" race entirely.
     pub(crate) fn start_terminal_post_processing_with_outcome(
         &mut self,
         job_id: JobId,
-        plan: crate::post_processing::model::FrozenPlan,
         pipeline_outcome: crate::post_processing::model::PipelineOutcome,
-        terminal_intent: crate::post_processing::persistence::TerminalIntent,
         primary_failure: Option<String>,
     ) {
-        if !self.jobs.contains_key(&job_id) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let category = state.spec.category.clone();
+        let metadata = state.spec.metadata.clone();
+        let admission = match self
+            .terminal_post_processing_executor
+            .admit_job_scripts(category.as_deref(), &metadata)
+        {
+            Ok(Some(admission)) => admission,
+            Ok(None) => {
+                match primary_failure {
+                    Some(failure) => {
+                        self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
+                    }
+                    None => self.complete_job_after_terminal_post_processing(job_id),
+                }
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "could not admit post-processing scripts; skipping scripts"
+                );
+                match primary_failure {
+                    Some(failure) => {
+                        self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
+                    }
+                    None => self.complete_job_after_terminal_post_processing(job_id),
+                }
+                return;
+            }
+        };
+        if !admission.has_enabled_entries() {
+            match primary_failure {
+                Some(failure) => {
+                    self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
+                }
+                None => self.complete_job_after_terminal_post_processing(job_id),
+            }
             return;
         }
         if !self.inflight_terminal_post_processing.insert(job_id) {
             return;
         }
-        let run_id = match self.db.create_post_processing_run(
-            job_id.0,
-            &plan,
-            &pipeline_outcome,
-            terminal_intent,
-            None,
-            chrono::Utc::now().timestamp_millis(),
-        ) {
-            Ok(run_id) => run_id,
-            Err(error) => {
-                self.inflight_terminal_post_processing.remove(&job_id);
-                let error = format!("failed to persist terminal post-processing run: {error}");
-                self.finalize_failed_job_after_terminal_post_processing(
-                    job_id,
-                    primary_failure.unwrap_or(error),
-                );
-                return;
-            }
-        };
-        self.launch_terminal_post_processing_run(job_id, run_id, pipeline_outcome, primary_failure);
+        // Low-frequency: at most one terminal post-processing pass per job.
+        self.note_stage_started(
+            job_id,
+            crate::operations::instrumentation::JobStageKind::PostProcess,
+        );
+        self.launch_terminal_post_processing_run(
+            job_id,
+            admission,
+            pipeline_outcome,
+            primary_failure,
+        );
     }
 
     fn launch_terminal_post_processing_run(
         &mut self,
         job_id: JobId,
-        run_id: crate::post_processing::model::RunId,
+        admission: crate::post_processing::executor::PostProcessingJobAdmission,
         pipeline_outcome: crate::post_processing::model::PipelineOutcome,
         primary_failure: Option<String>,
     ) {
+        // Scripts read health to decide whether the download is worth acting
+        // on, so they must be handed the settled figure — the one the terminal
+        // record will carry — and not the live wire counter the settlement has
+        // already answered.
+        let settled_health = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.spec.total_bytes)
+            .map(|total_bytes| self.terminal_record_figures(job_id, total_bytes).1);
         let Some(state) = self.jobs.get(&job_id) else {
             self.inflight_terminal_post_processing.remove(&job_id);
-            let _ = self.db.finish_post_processing_run(
-                &run_id,
-                crate::post_processing::model::RunStatus::Interrupted,
-                crate::post_processing::model::PostProcessingSummary::Interrupted,
-                chrono::Utc::now().timestamp_millis(),
-            );
             return;
-        };
-        let settings = self.db.post_processing_settings().unwrap_or_default();
-        let interpreters = crate::post_processing::runner::InterpreterConfig {
-            python: settings.python_interpreter.map(std::path::PathBuf::from),
-            powershell: settings
-                .powershell_interpreter
-                .map(std::path::PathBuf::from),
-            batch: settings.batch_interpreter.map(std::path::PathBuf::from),
         };
         let pipeline_failure_stage = match &pipeline_outcome {
             crate::post_processing::model::PipelineOutcome::Failed { stage, .. } => Some(*stage),
@@ -730,13 +952,14 @@ impl Pipeline {
             source_url: None,
             working_directory: state.working_dir.clone(),
             final_directory: state.working_dir.clone(),
-            pipeline_outcome: pipeline_outcome.clone(),
+            pipeline_outcome,
             par_status,
             unpack_status,
             compatibility: crate::post_processing::runner::CompatibilityFacts {
                 total_bytes: state.spec.total_bytes,
                 downloaded_bytes: state.downloaded_bytes,
-                health_milli: health_milli(state.spec.total_bytes, state.failed_bytes),
+                health_milli: settled_health
+                    .unwrap_or_else(|| health_milli(state.spec.total_bytes, state.failed_bytes)),
                 critical_health_milli: Self::critical_health_milli(
                     state.spec.total_bytes,
                     state.par2_bytes,
@@ -756,20 +979,20 @@ impl Pipeline {
         self.transition_postprocessing_status(
             job_id,
             JobStatus::QueuedPostProcessing,
-            Some("queued for extension post-processing"),
+            Some("queued for post-processing scripts"),
         );
         self.publish_snapshot();
         let (cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(false);
         self.terminal_post_processing_cancellations
             .insert(job_id, cancellation_tx);
-        let service = self.terminal_post_processing_service.clone();
+        let executor = self.terminal_post_processing_executor.clone();
         let done_tx = self.terminal_post_processing_done_tx.clone();
         tokio::spawn(async move {
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-            let execution = service.execute_existing_with_started(
-                &run_id,
+            let execution = executor.execute_admitted_job(
+                job_id.0,
+                admission,
                 context,
-                interpreters,
                 Some(cancellation_rx),
                 Some(started_tx),
             );
@@ -798,10 +1021,12 @@ impl Pipeline {
         });
     }
 
-    /// Reconcile the durable post-processing state before the restored job can re-enter the
-    /// built-in completion pipeline. Queued runs are safe to resume because no attempt has
-    /// started; active attempts are marked interrupted during `Pipeline` construction and are
-    /// deliberately never rerun here.
+    /// Finish a job that was restored while it sat in post-processing.
+    ///
+    /// The startup recovery scan already stamped `interrupted` on every such
+    /// job, so nothing is rerun here: a script that was mid-flight when weaver
+    /// stopped has unknown side effects, and running it again is worse than
+    /// reporting that it was interrupted.
     pub(crate) fn recover_restored_terminal_post_processing(&mut self, job_id: JobId) -> bool {
         let is_terminal_post_processing = self.jobs.get(&job_id).is_some_and(|state| {
             matches!(
@@ -813,110 +1038,40 @@ impl Pipeline {
             return false;
         }
         self.remove_pending_completion_check(job_id);
-
-        let run = match self.db.active_job_post_processing_run(job_id.0) {
-            Ok(run) => run,
-            Err(error) => {
-                self.finalize_failed_job_after_terminal_post_processing(
-                    job_id,
-                    format!("failed to recover terminal post-processing state: {error}"),
-                );
-                return true;
-            }
-        };
-        let Some(run) = run else {
-            self.finalize_failed_job_after_terminal_post_processing(
-                job_id,
-                "terminal post-processing state was restored without a durable run".into(),
-            );
-            return true;
-        };
-        let primary_failure = match (&run.terminal_intent, &run.pipeline_outcome) {
-            (
-                crate::post_processing::persistence::TerminalIntent::Fail,
-                crate::post_processing::model::PipelineOutcome::Failed { message, .. },
-            ) => Some(message.clone()),
-            (crate::post_processing::persistence::TerminalIntent::Fail, _) => {
-                Some("built-in pipeline failed before post-processing".into())
-            }
-            _ => None,
-        };
-
-        if matches!(run.status, crate::post_processing::model::RunStatus::Queued) {
-            if self.inflight_terminal_post_processing.insert(job_id) {
-                info!(
-                    job_id = job_id.0,
-                    run_id = %run.run_id.as_str(),
-                    "resuming durable queued post-processing run after restart"
-                );
-                self.launch_terminal_post_processing_run(
-                    job_id,
-                    run.run_id,
-                    run.pipeline_outcome,
-                    primary_failure,
-                );
-            }
-            return true;
-        }
-
-        if matches!(
-            run.status,
-            crate::post_processing::model::RunStatus::Starting
-                | crate::post_processing::model::RunStatus::Running
-        ) {
-            let _ = self.db.finish_post_processing_run(
-                &run.run_id,
-                crate::post_processing::model::RunStatus::Interrupted,
-                crate::post_processing::model::PostProcessingSummary::Interrupted,
-                chrono::Utc::now().timestamp_millis(),
-            );
-        }
-        let effects = self
+        let summary = self
             .db
-            .post_processing_attempts(&run.run_id)
+            .job_post_processing_summary(job_id.0)
             .unwrap_or_default()
-            .into_iter()
-            .map(|attempt| attempt.control_effects())
-            .collect::<Vec<_>>();
-        let repair_requested = effects.iter().any(|effect| effect.repair_requested);
-        let mut restored_working_directory = self
+            .unwrap_or(crate::post_processing::model::PostProcessingSummary::Interrupted);
+        if summary == crate::post_processing::model::PostProcessingSummary::NotRun {
+            // Nothing had started yet, so the job is safe to run from the top —
+            // the same guarantee the durable queue used to provide.
+            info!(
+                job_id = job_id.0,
+                "resuming post-processing for a restored job whose scripts never started"
+            );
+            self.start_terminal_post_processing(job_id);
+            return true;
+        }
+        let results = self
+            .db
+            .job_post_processing_results(job_id.0)
+            .unwrap_or_default();
+        let primary_failure = self
             .jobs
             .get(&job_id)
-            .map(|state| state.working_dir.clone());
-        let mut restored_final_directory = None;
-        for effect in &effects {
-            if let Some(directory) = effect.directory.as_ref() {
-                restored_working_directory = Some(directory.clone());
-            }
-            if let Some(final_directory) = effect.final_directory.as_ref() {
-                restored_final_directory = Some(final_directory.clone());
-            }
-        }
-        let output_directory = restored_final_directory.or(restored_working_directory);
-        let summary = if matches!(
-            run.status,
-            crate::post_processing::model::RunStatus::Starting
-                | crate::post_processing::model::RunStatus::Running
-        ) {
-            crate::post_processing::model::PostProcessingSummary::Interrupted
-        } else {
-            run.summary
-        };
+            .and_then(|state| state.failure_error.clone());
         info!(
             job_id = job_id.0,
-            run_id = %run.run_id.as_str(),
-            summary = ?summary,
-            "finalizing restored terminal post-processing run without rerunning attempts"
+            summary = summary.as_str(),
+            "finalizing restored post-processing without rerunning scripts"
         );
         self.handle_terminal_post_processing_done(TerminalPostProcessingDone {
             job_id,
             primary_failure,
-            result: Ok(crate::post_processing::service::RunExecutionReport {
-                run_id: Some(run.run_id),
+            result: Ok(crate::post_processing::executor::JobPostProcessingReport {
                 summary,
-                effects,
-                repair_requested,
-                output_directory,
+                results,
             }),
         });
         true
@@ -931,7 +1086,7 @@ impl Pipeline {
         self.transition_postprocessing_status(
             job_id,
             JobStatus::PostProcessing,
-            Some("running extension post-processing"),
+            Some("running post-processing scripts"),
         );
         self.publish_snapshot();
     }
@@ -941,8 +1096,19 @@ impl Pipeline {
         done: TerminalPostProcessingDone,
     ) {
         self.inflight_terminal_post_processing.remove(&done.job_id);
+        // Low-frequency: closes the timer armed when the run was launched.
+        self.note_stage_finished(
+            done.job_id,
+            crate::operations::instrumentation::JobStageKind::PostProcess,
+        );
         self.terminal_post_processing_cancellations
             .remove(&done.job_id);
+        // User cancellation archives and removes the runtime state before the
+        // interrupted script reports completion. Its delayed result must not
+        // recreate or overwrite that cancelled job history.
+        if !self.jobs.contains_key(&done.job_id) {
+            return;
+        }
         if let Some(primary_failure) = done.primary_failure {
             match &done.result {
                 Ok(report) => info!(
@@ -956,12 +1122,6 @@ impl Pipeline {
                     "failure post-processing could not complete; preserving primary pipeline failure"
                 ),
             }
-            if let Ok(report) = &done.result
-                && let Some(path) = report.output_directory.as_ref()
-                && let Some(state) = self.jobs.get_mut(&done.job_id)
-            {
-                state.working_dir = path.clone();
-            }
             self.finalize_failed_job_after_terminal_post_processing(done.job_id, primary_failure);
             return;
         }
@@ -974,54 +1134,18 @@ impl Pipeline {
                         | crate::post_processing::model::PostProcessingSummary::NotRun
                 ) =>
             {
-                if let Some(path) = report.output_directory.as_ref()
-                    && let Some(state) = self.jobs.get_mut(&done.job_id)
-                {
-                    state.working_dir = path.clone();
-                }
-                if report.repair_requested {
-                    let already_reentered =
-                        self.post_processing_repair_reentered.contains(&done.job_id);
-                    let recoverable_inputs_remain = self.par2_set(done.job_id).is_some()
-                        && self
-                            .jobs
-                            .get(&done.job_id)
-                            .is_some_and(|state| state.working_dir.is_dir());
-                    if !already_reentered && recoverable_inputs_remain {
-                        self.post_processing_repair_reentered.insert(done.job_id);
-                        self.post_processing_repair_return_to_terminal
-                            .insert(done.job_id);
-                        self.par2_bypassed.remove(&done.job_id);
-                        self.par2_verified.remove(&done.job_id);
-                        info!(
-                            job_id = done.job_id.0,
-                            "extension requested PAR re-entry; returning to authoritative verification"
-                        );
-                        self.transition_postprocessing_status(
-                            done.job_id,
-                            JobStatus::Downloading,
-                            Some("extension requested PAR verification"),
-                        );
-                        self.schedule_job_completion_check(done.job_id);
-                        self.publish_snapshot();
-                        return;
-                    }
-                    warn!(
-                        job_id = done.job_id.0,
-                        already_reentered,
-                        recoverable_inputs_remain,
-                        "ignoring extension PAR request because the one-time safety conditions were not met"
-                    );
-                }
                 self.complete_job_after_terminal_post_processing(done.job_id);
             }
             Ok(report) => self.finalize_failed_job_after_terminal_post_processing(
                 done.job_id,
-                format!("extension post-processing ended with {:?}", report.summary),
+                format!(
+                    "post-processing scripts ended with {}",
+                    report.summary.as_str()
+                ),
             ),
             Err(error) => self.finalize_failed_job_after_terminal_post_processing(
                 done.job_id,
-                format!("extension post-processing failed: {error}"),
+                format!("post-processing scripts failed: {error}"),
             ),
         }
     }

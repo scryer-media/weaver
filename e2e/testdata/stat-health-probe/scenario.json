@@ -1,0 +1,12 @@
+{
+  "slug": "stat-health-probe",
+  "title": "E2E.Test.STAT.HealthProbe.2024.1080p-TESTGRP",
+  "description": "Direct MKV with a small number of missing articles. Exercises health-probe STAT checks without immediately crossing the terminal health threshold.",
+  "category": "2000",
+  "expected_outcome": "health_failure",
+  "segment_size": 65536,
+  "deleteFirstProbeSampleHits": 40,
+  "fixtureAssets": [
+    "single-mkv/test-media.mkv"
+  ]
+}

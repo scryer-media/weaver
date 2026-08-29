@@ -129,12 +129,21 @@ pub struct ServerConfig {
     /// connections to this server (e.g. self-signed or internal CAs).
     #[serde(default)]
     pub tls_ca_cert: Option<std::path::PathBuf>,
+    /// One leaf certificate that may bypass only a hostname mismatch after
+    /// normal certificate chain and expiry validation has succeeded.
+    #[serde(default)]
+    pub tls_name_mismatch_certificate_der: Option<Vec<u8>>,
 }
 
 impl ServerConfig {
     pub fn validate_download_limits(&self) -> Result<(), String> {
         if self.max_download_speed > MAX_PERSISTED_SERVER_DOWNLOAD_BYTES {
             return Err("server max download speed exceeds database range".to_string());
+        }
+        if !self.tls && self.tls_name_mismatch_certificate_der.is_some() {
+            return Err(
+                "a hostname-mismatch TLS certificate requires TLS to be enabled".to_string(),
+            );
         }
         self.download_quota.validate()
     }

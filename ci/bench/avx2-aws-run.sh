@@ -1,20 +1,16 @@
 #!/usr/bin/env bash
 # avx2-aws-run.sh — launch a self-contained, repeatable AVX2 weaver-vs-rapidyenc
 # perf profile on a fresh AWS AMD Zen2/Zen3 (c5a/c6a) instance. One command:
-# bundles THIS working tree (uncommitted WIP included), uploads it to S3, boots
+# bundles the current commit, uploads it to S3, boots
 # an instance that runs ci/bench/avx2-profile.sh unattended via cloud-init,
 # publishes results back to S3, and self-terminates. Re-run = run this again.
 #
 # Prereqs (one-time):
 #   - awscli v2 configured (`aws configure`) with EC2 + S3 + SSM read perms
 #   - an S3 bucket you own                          (export S3_BUCKET=...)
-#   - an EC2 *instance profile* (IAM role) that can read/write that bucket
-#     (so the box can pull the code tarball + push results). Minimal one-time:
-#       aws iam create-role --role-name weaver-avx2 --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-#       aws iam attach-role-policy --role-name weaver-avx2 --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
-#       aws iam create-instance-profile --instance-profile-name weaver-avx2
-#       aws iam add-role-to-instance-profile --instance-profile-name weaver-avx2 --role-name weaver-avx2
-#     then: export INSTANCE_PROFILE=weaver-avx2
+#   - an EC2 instance profile restricted to `s3:GetObject` and `s3:PutObject`
+#     for `arn:aws:s3:::<bucket>/<prefix>/*`. Create and review that role outside
+#     this script, then export INSTANCE_PROFILE=<profile-name>.
 #
 # Usage:
 #   S3_BUCKET=my-bucket INSTANCE_PROFILE=weaver-avx2 ./ci/bench/avx2-aws-run.sh
@@ -25,7 +21,7 @@ set -euo pipefail
 S3_BUCKET="${S3_BUCKET:?set S3_BUCKET to an S3 bucket you own}"
 S3_PREFIX="${S3_PREFIX:-weaver-avx2}"
 INSTANCE_PROFILE="${INSTANCE_PROFILE:?set INSTANCE_PROFILE to an EC2 instance profile that can access the bucket (see header)}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-c5a.2xlarge}"     # AMD Zen 2 = SYLIX uarch, AVX2-native
+INSTANCE_TYPE="${INSTANCE_TYPE:-c5a.2xlarge}"     # AMD Zen 2 = Windows AVX2 target uarch
 AWS_REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo us-east-1)}"
 KEY_NAME="${KEY_NAME:-}"                          # optional, only for SSH debugging
 SECURITY_GROUP_ID="${SECURITY_GROUP_ID:-}"       # optional; default VPC SG if empty
@@ -33,6 +29,7 @@ SUBNET_ID="${SUBNET_ID:-}"                        # optional; default subnet if 
 TERMINATE="${TERMINATE:-1}"
 VOLUME_GB="${VOLUME_GB:-30}"
 DRY_RUN="${DRY_RUN:-0}"
+INCLUDE_TRACKED_CHANGES="${INCLUDE_TRACKED_CHANGES:-0}"
 BENCH_TAG="${BENCH_TAG:-avx2}"       # instance Name suffix + weaver-bench tag (avx2 | avx512)
 
 log(){ printf '\033[1;34m[aws-run]\033[0m %s\n' "$*"; }
@@ -46,21 +43,27 @@ USERDATA="${USERDATA:-$SCRIPT_DIR/avx2-aws-userdata.sh}"
 [ -f "$USERDATA" ] || die "missing user-data template: $USERDATA (set USERDATA=/abs/path)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
-# ── 1. bundle THIS working tree (tracked + uncommitted WIP), via git so
-#      .gitignore (target/, node_modules/, …) is honored portably on any tar. ──
+# ── 1. bundle source ─────────────────────────────────────────────────────────
 TARBALL="/tmp/weaver-src-$STAMP.tar.gz"
-log "bundling working tree at $WEAVER_ROOT (tracked + WIP, git-ignored paths excluded)…"
 command -v git >/dev/null 2>&1 || die "git not found (needed to select the files to bundle)"
 git -C "$WEAVER_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   || die "$WEAVER_ROOT is not a git work tree"
-# tracked + untracked-not-ignored, NUL-delimited; drops stale local bench
-# results via a git pathspec (portable — no GNU-only `grep -z`).
-git -C "$WEAVER_ROOT" ls-files -z --cached --others --exclude-standard -- . \
-    ':(exclude)ci/bench/results/**' \
-    ':(exclude)**/tests/fixtures/**' \
-    ':(exclude)ci/vendor/**' \
-    ':(exclude)apps/weaver-web/public/**' \
-  | tar czf "$TARBALL" -C "$WEAVER_ROOT" --null -T -
+if [ "$INCLUDE_TRACKED_CHANGES" = "1" ]; then
+  log "bundling tracked working-tree files (explicit INCLUDE_TRACKED_CHANGES=1; untracked files excluded)…"
+  git -C "$WEAVER_ROOT" ls-files -z --cached -- . \
+      ':(exclude)ci/bench/results/**' \
+      ':(exclude)**/tests/fixtures/**' \
+      ':(exclude)ci/vendor/**' \
+      ':(exclude)apps/weaver-web/public/**' \
+    | tar czf "$TARBALL" -C "$WEAVER_ROOT" --null -T -
+else
+  log "bundling committed HEAD at $WEAVER_ROOT…"
+  git -C "$WEAVER_ROOT" archive --format=tar.gz --output="$TARBALL" HEAD -- . \
+      ':(exclude)ci/bench/results/**' \
+      ':(exclude)**/tests/fixtures/**' \
+      ':(exclude)ci/vendor/**' \
+      ':(exclude)apps/weaver-web/public/**'
+fi
 log "tarball: $TARBALL ($(du -h "$TARBALL" | cut -f1))"
 
 S3_CODE="s3://$S3_BUCKET/$S3_PREFIX/weaver-src-$STAMP.tar.gz"

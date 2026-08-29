@@ -23,12 +23,24 @@ impl Pipeline {
         }
     }
 
+    /// The failed-byte figure the health policy decides on.
+    ///
+    /// The ledger is derived from per-segment terminal states and is what the
+    /// job reports; a completed probe round contributes a *projection* over its
+    /// sample, which is a health signal and nothing else. Taking the larger of
+    /// the two keeps the early abort on a dead release while leaving the
+    /// reported ledger a sum of facts.
+    pub(crate) fn health_decision_failed_bytes(state: &crate::jobs::model::JobState) -> u64 {
+        state.failed_bytes.max(state.probe_projected_failed_bytes)
+    }
+
     fn next_health_probe_failed_bytes(
         state: &crate::jobs::model::JobState,
         missed: usize,
         inconclusive: bool,
     ) -> u64 {
-        let immediate_rearm = state.failed_bytes.saturating_add(1);
+        let decided = Self::health_decision_failed_bytes(state);
+        let immediate_rearm = decided.saturating_add(1);
         if inconclusive || missed > 0 {
             return immediate_rearm;
         }
@@ -44,8 +56,7 @@ impl Pipeline {
             .saturating_sub(((state.spec.total_bytes as u128 * critical as u128) / 1000) as u64);
         let critical_rearm = critical_failed_bytes.saturating_add(1);
 
-        state
-            .failed_bytes
+        decided
             .saturating_add(rearm_delta)
             .min(critical_rearm)
             .max(immediate_rearm)
@@ -121,7 +132,8 @@ impl Pipeline {
                 return;
             }
 
-            let health = health_milli(total, state.failed_bytes);
+            let failed_bytes = Self::health_decision_failed_bytes(state);
+            let health = health_milli(total, failed_bytes);
 
             let par2_bytes = state.par2_bytes;
 
@@ -130,15 +142,15 @@ impl Pipeline {
             let critical_failed_bytes =
                 total.saturating_sub(((total as u128 * critical as u128) / 1000) as u64);
             let within_critical_probe_fence =
-                state.failed_bytes <= critical_failed_bytes.saturating_add(1);
+                failed_bytes <= critical_failed_bytes.saturating_add(1);
             let needs_probes = health < 980
                 && !state.health_probing
-                && state.failed_bytes >= state.next_health_probe_failed_bytes
+                && failed_bytes >= state.next_health_probe_failed_bytes
                 && (health > critical || within_critical_probe_fence);
             (
                 health,
                 critical,
-                state.failed_bytes,
+                failed_bytes,
                 total,
                 par2_bytes,
                 needs_probes,
@@ -250,11 +262,17 @@ impl Pipeline {
                 if !inconclusive
                     && let Some(projected) =
                         Self::projected_probe_failed_bytes(state, total, missed)
-                    && projected > state.failed_bytes
                 {
-                    state.failed_bytes = projected;
+                    // The projection is a health signal, never a ledger entry:
+                    // it is an extrapolation from a sample and the segments it
+                    // stands for have not reached a terminal state yet. Folding
+                    // it into `failed_bytes` is what let a job book a
+                    // projection and then add the real terminal failures on top
+                    // of it.
+                    state.probe_projected_failed_bytes =
+                        state.probe_projected_failed_bytes.max(projected);
                 }
-                state.last_health_probe_failed_bytes = state.failed_bytes;
+                state.last_health_probe_failed_bytes = Self::health_decision_failed_bytes(state);
                 state.next_health_probe_failed_bytes =
                     Self::next_health_probe_failed_bytes(state, missed, inconclusive);
                 state.health_probing = false;
@@ -279,9 +297,7 @@ impl Pipeline {
                 JobStatus::Downloading,
                 Some("downloading"),
             );
-            if !inconclusive {
-                self.check_health(job_id);
-            }
+            self.check_health(job_id);
             if self.jobs.contains_key(&job_id)
                 && !self.job_has_pending_download_pipeline_work(job_id)
             {
@@ -292,6 +308,9 @@ impl Pipeline {
 
     /// Mark a job as failed and purge its queued segments.
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
+        // Terminal transition: a job dying without a recovery set never had a
+        // PAR2 verdict available to it. No-op when a pass already ruled.
+        self.note_job_unverifiable_if_no_par2_set(job_id);
         let failure_stage = self
             .jobs
             .get(&job_id)
@@ -307,38 +326,31 @@ impl Pipeline {
                 _ => crate::post_processing::model::PipelineFailureStage::Download,
             })
             .unwrap_or(crate::post_processing::model::PipelineFailureStage::Download);
-        let plan = match self.db.post_processing_settings() {
-            Ok(settings) if settings.execution_enabled => {
-                match self.db.frozen_post_processing_plan(job_id.0) {
-                    Ok(Some(plan)) if !plan.steps().is_empty() => Some(plan),
-                    Ok(_) => None,
-                    Err(plan_error) => {
-                        tracing::warn!(
-                            job_id = job_id.0,
-                            error = %plan_error,
-                            "could not load failure post-processing plan; preserving legacy failure finalization"
-                        );
-                        None
-                    }
-                }
-            }
-            Ok(_) => None,
-            Err(settings_error) => {
+        // Scripts run on failure too, so the job's own failure survives them:
+        // the primary failure is carried through and re-applied afterwards.
+        let scripts_may_run = self
+            .terminal_post_processing_executor
+            .execution_enabled()
+            .unwrap_or_else(|settings_error| {
                 tracing::warn!(
                     job_id = job_id.0,
                     error = %settings_error,
                     "could not load post-processing settings; preserving legacy failure finalization"
                 );
-                None
-            }
-        };
-        let should_defer = plan.is_some()
+                false
+            });
+        let extraction_rejected = JobExtractionBudget::is_rejection(&error);
+        if extraction_rejected && let Some(budget) = self.extraction_budgets.get(&job_id) {
+            budget.cancel_with_error(&error);
+        }
+        let should_defer = !extraction_rejected
+            && scripts_may_run
             && self.jobs.contains_key(&job_id)
             && !self.inflight_terminal_post_processing.contains(&job_id);
         let (released_repair, released_extract) =
             self.prepare_failed_job_runtime(job_id, &error, should_defer);
 
-        if let Some(plan) = plan.filter(|_| should_defer) {
+        if should_defer {
             if released_repair {
                 self.promote_queued_repairs();
             }
@@ -347,13 +359,11 @@ impl Pipeline {
             }
             self.start_terminal_post_processing_with_outcome(
                 job_id,
-                plan,
                 crate::post_processing::model::PipelineOutcome::Failed {
                     stage: failure_stage,
                     code: "PIPELINE_FAILURE".to_string(),
                     message: error.clone(),
                 },
-                crate::post_processing::persistence::TerminalIntent::Fail,
                 Some(error),
             );
             return;
@@ -401,6 +411,11 @@ impl Pipeline {
             } else {
                 (None, false, false)
             };
+        let extraction_budget = if preserve_staging {
+            None
+        } else {
+            self.extraction_budgets.remove(&job_id)
+        };
         if released_repair {
             self.metrics.repair_active.fetch_sub(1, Ordering::Relaxed);
         }
@@ -410,6 +425,13 @@ impl Pipeline {
         // Clean up staging directory if it was created.
         if let Some(staging) = staging_dir {
             tokio::spawn(async move {
+                if let Some(budget) = extraction_budget {
+                    let _ = tokio::task::spawn_blocking(move || budget.wait_for_idle()).await;
+                }
+                // Direct-store's member payload is written into the staging root
+                // through the cached-handle pool, so the handles have to go
+                // before the directory does.
+                crate::pipeline::close_cached_write_handles_under(&staging).await;
                 if let Err(e) = tokio::fs::remove_dir_all(&staging).await
                     && e.kind() != std::io::ErrorKind::NotFound
                 {
@@ -431,6 +453,8 @@ impl Pipeline {
             .remove(&job_id);
         self.active_downloads_by_job.remove(&job_id);
         self.active_download_connections_by_job.remove(&job_id);
+        self.active_completion_critical_connections_by_job
+            .remove(&job_id);
         self.active_downloads_by_file
             .retain(|file_id, _| file_id.job_id != job_id);
         self.active_decodes_by_job.remove(&job_id);
@@ -508,8 +532,9 @@ impl Pipeline {
         let total_segs = all_segments.len();
         if total_segs == 0 {
             if let Some(state) = self.jobs.get_mut(&job_id) {
-                state.last_health_probe_failed_bytes = state.failed_bytes;
-                state.next_health_probe_failed_bytes = state.failed_bytes.saturating_add(1);
+                let decided = Self::health_decision_failed_bytes(state);
+                state.last_health_probe_failed_bytes = decided;
+                state.next_health_probe_failed_bytes = decided.saturating_add(1);
                 state.health_probing = false;
                 let held = std::mem::take(&mut state.held_segments);
                 for work in held {

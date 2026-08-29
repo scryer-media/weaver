@@ -1,0 +1,41 @@
+# The Weaver repository root ignores `weaver.toml` (a developer's local server
+# config). This harness ships one deliberately: it is the config the `weaver`
+# compose service bind-mounts, so re-include it here.
+!services/weaver/weaver.toml
+
+# compiled binaries. `go build ./...` inside services/newznab drops the service
+# binary beside its source; the image builds it from scratch, so it is never an input.
+.bin/
+/weaver-e2e
+/services/newznab/newznab
+
+# scratch
+tmp/
+*.log
+__pycache__/
+**/node_modules
+.DS_Store
+.env
+
+# The fixture corpus is hydrated, not committed. `test-corpus/sources.json`
+# describes every one of these files by size and BLAKE3, and
+# `go run ./cmd/corpus hydrate` fetches them from the published, signed corpus.
+# What stays in git is the scenario definitions beside them. Order matters:
+# the directory re-include is what lets git descend far enough to see the
+# scenario files at all.
+testdata/**
+!testdata/**/
+!testdata/**/scenario.json
+
+# seed outputs: `weaver-e2e seed` regenerates every NZB against a live NNTP
+# server from the corpus above, so nothing here is worth tracking.
+fixtures/*
+!fixtures/.gitkeep
+
+# run artifacts
+artifacts/
+/test-results/
+playwright-weaver/test-results/
+playwright-weaver/artifacts/
+docker-compose.ps.txt
+weaver-metrics.prom

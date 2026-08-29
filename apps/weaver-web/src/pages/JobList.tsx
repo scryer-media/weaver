@@ -1,8 +1,5 @@
 import {
   getCoreRowModel,
-  getFilteredRowModel,
-  getPaginationRowModel,
-  getSortedRowModel,
   useReactTable,
   type ColumnDef,
   type RowSelectionState,
@@ -19,17 +16,20 @@ import {
   X,
 } from "lucide-react";
 import {
+  createContext,
   memo,
   useCallback,
+  useContext,
   useDeferredValue,
   useEffect,
   useMemo,
   useRef,
   useState,
   type KeyboardEvent,
+  type ReactNode,
 } from "react";
 import { Link } from "react-router";
-import { useClient, useMutation, useQuery } from "urql";
+import { useClient, useMutation, useQuery, useSubscription } from "urql";
 import { BulkEditModal } from "@/components/BulkEditModal";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { DataTable } from "@/components/data-table/DataTable";
@@ -60,13 +60,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
   CATEGORIES_QUERY,
   CANCEL_JOB_MUTATION,
   HAS_CONFIGURED_SERVERS_QUERY,
@@ -74,32 +67,54 @@ import {
   PAUSE_JOB_MUTATION,
   RESUME_ALL_MUTATION,
   RESUME_JOB_MUTATION,
+  QUEUE_EVENTS_SUBSCRIPTION,
+  QUEUE_PAGE_QUERY,
   SET_SPEED_LIMIT_MUTATION,
   UPDATE_JOBS_MUTATION,
 } from "@/graphql/queries";
 import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";
+import { useGraphqlConnectionState } from "@/graphql/client";
 import {
   useLiveDownloadBlock,
-  useLiveJobs,
   useLivePaused,
   useLiveSpeed,
 } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
+import {
+  extractionPresentationStatus,
+  useExtractionVisibility,
+} from "@/lib/hooks/use-extraction-visibility";
+import { useDebouncedStatuses } from "@/lib/hooks/use-debounced-status";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
+import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { getJobStages } from "@/lib/job-stages";
-import { isActiveStatus, STATUS_BG_CLASS, statusToken } from "@/lib/status-tokens";
+import {
+  isActiveStatus,
+  STATUS_BG_CLASS,
+  statusI18nKey,
+  statusToken,
+} from "@/lib/status-tokens";
 import { useStableQueueEta } from "@/lib/hooks/use-stable-queue-eta";
-import { formatJobReleaseName, type JobData } from "@/lib/job-types";
+import {
+  formatJobReleaseName,
+  normalizeJobData,
+  type GraphqlJobData,
+  type JobData,
+} from "@/lib/job-types";
+import { orderQueueByLiveActivity, prioritizeDownloadingJobs } from "@/lib/queue-live-order";
 import { cn } from "@/lib/utils";
 
 type QueueStatusFilter =
   | "QUEUED"
   | "DOWNLOADING"
+  | "FETCHING_REPAIR_DATA"
+  | "FINALIZING_DOWNLOAD"
   | "PAUSED"
   | "VERIFYING"
   | "REPAIRING"
   | "EXTRACTING"
+  | "POST_PROCESSING"
   | "MOVING";
 
 type QueuePriorityFilter = "LOW" | "NORMAL" | "HIGH";
@@ -111,12 +126,6 @@ type QueueSelectOption = {
   value: string;
   label: string;
 };
-type OpenQueueCellSelect = {
-  field: "priority" | "category";
-  jobId: number;
-} | null;
-type QueueCellSelectField = NonNullable<OpenQueueCellSelect>["field"];
-
 type QueueTablePreferences = {
   pageSize: number;
   search: string;
@@ -136,42 +145,174 @@ type QueueRowData = JobData & {
   categoryLabel: string;
   blockedByGlobalPause: boolean;
   blockedByIspCap: boolean;
-  etaDisplay: string;
+  etaOverride: string | null;
+};
+
+type QueuePageSummary = {
+  totalItems: number;
+  queuedItems: number;
+  activeItems: number;
+  pausedItems: number;
+};
+
+type QueuePageResponse = {
+  queuePage: {
+    items: GraphqlJobData[];
+    totalCount: number;
+    summary: QueuePageSummary;
+    categories: string[];
+    latestCursor: string;
+  };
+};
+
+type QueuePageData = QueuePageResponse["queuePage"];
+
+type QueueEventPayload = {
+  cursor: string;
+  kind: "ITEM_CREATED" | "ITEM_STATE_CHANGED" | "ITEM_PROGRESS" | "ITEM_ATTENTION" | "ITEM_COMPLETED" | "ITEM_REMOVED" | "GLOBAL_STATE_CHANGED";
+  itemId: number | null;
+  item: GraphqlJobData | null;
+};
+
+type QueueItemEventOverlay = {
+  item: GraphqlJobData;
+  cursor: bigint;
+};
+
+type PolledQueuePage = {
+  queryKey: string;
+  page: QueuePageData;
 };
 
 const QUEUE_PAGE_SIZE_OPTIONS = [25, 50, 100, 500] as const;
+const QUEUE_EVENT_REFRESH_INTERVAL_MS = 2_000;
+const EMPTY_QUEUE_PAGE_ITEMS: GraphqlJobData[] = [];
+const EMPTY_QUEUE_CATEGORIES: string[] = [];
 const DEFAULT_QUEUE_PREFERENCES: QueueTablePreferences = {
   pageSize: 50,
   search: "",
   statuses: [],
   priorities: [],
   categories: [],
-  sorting: [{ id: "progress", desc: true }],
+  sorting: [],
 };
-const QUEUE_TABLE_PREFERENCES_KEY = "weaver.queue.table.preferences.v4";
+const QUEUE_TABLE_PREFERENCES_KEY = "weaver.queue.table.preferences.v5";
 const QUEUE_STATUS_OPTIONS: QueueStatusFilter[] = [
   "QUEUED",
   "DOWNLOADING",
+  "FETCHING_REPAIR_DATA",
+  "FINALIZING_DOWNLOAD",
   "PAUSED",
   "VERIFYING",
   "REPAIRING",
   "EXTRACTING",
+  "POST_PROCESSING",
   "MOVING",
 ];
 const QUEUE_PRIORITY_OPTIONS: QueuePriorityFilter[] = ["HIGH", "NORMAL", "LOW"];
-const QUEUE_ACTIVE_STATUSES: QueueStatusFilter[] = [
-  "DOWNLOADING",
-  "VERIFYING",
-  "REPAIRING",
-  "EXTRACTING",
-  "MOVING",
-];
+const QUEUE_ACTIVE_STATUSES = QUEUE_STATUS_OPTIONS.filter(isActiveStatus);
 const NO_CATEGORY_SELECT_VALUE = "__no_category__";
 
 type QueueLayout = "table" | "compact";
 
+function queueStatusToGraphql(status: QueueStatusFilter): string {
+  return status === "MOVING" ? "FINALIZING" : status;
+}
+
+function queueSortingToGraphql(sorting: SortingState) {
+  const current = sorting[0];
+  if (!current) {
+    return {};
+  }
+  const sortField = (() => {
+    switch (current.id) {
+      case "name":
+        return "NAME";
+      case "status":
+        return "STATE";
+      case "priority":
+        return "PRIORITY";
+      case "category":
+        return "CATEGORY";
+      case "size":
+        return "SIZE";
+      default:
+        return "PROGRESS";
+    }
+  })();
+  return {
+    sortField,
+    sortDirection: current.desc === false ? "ASC" : "DESC",
+  };
+}
+
+function buildQueuePageInput(
+  preferences: QueueTablePreferences,
+  search: string,
+  pageIndex: number,
+) {
+  return {
+    pageIndex,
+    pageSize: preferences.pageSize,
+    search: search.length > 0 ? search : undefined,
+    states: preferences.statuses.length > 0
+      ? preferences.statuses.map(queueStatusToGraphql)
+      : undefined,
+    priorities: preferences.priorities.length > 0 ? preferences.priorities : undefined,
+    categories: preferences.categories.length > 0 ? preferences.categories : undefined,
+    ...queueSortingToGraphql(preferences.sorting),
+  };
+}
+
+function decodeQueueEventCursor(cursor: string): bigint | null {
+  try {
+    const base64 = cursor.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = `${base64}${"=".repeat((4 - (base64.length % 4)) % 4)}`;
+    const decoded = atob(padded);
+    if (!decoded.startsWith("evt:")) {
+      return null;
+    }
+    return BigInt(decoded.slice(4));
+  } catch {
+    return null;
+  }
+}
+
 function sameStatusSet(current: readonly string[], preset: readonly string[]): boolean {
   return current.length === preset.length && preset.every((value) => current.includes(value));
+}
+
+const EMPTY_QUEUE_ETA_BY_ID: ReadonlyMap<number, string> = new Map();
+const QueueEtaContext = createContext<ReadonlyMap<number, string>>(EMPTY_QUEUE_ETA_BY_ID);
+
+function QueueEtaProvider({ jobs, children }: { jobs: JobData[]; children: ReactNode }) {
+  const speed = useLiveSpeed();
+  const etaById = useStableQueueEta(jobs, speed);
+
+  return <QueueEtaContext.Provider value={etaById}>{children}</QueueEtaContext.Provider>;
+}
+
+const QueueEtaCell = memo(function QueueEtaCell({
+  jobId,
+  override,
+  className,
+}: {
+  jobId: number;
+  override: string | null;
+  className?: string;
+}) {
+  const etaById = useContext(QueueEtaContext);
+
+  return (
+    <span className={cn("tabular-nums text-muted-foreground", className)}>
+      {override ?? etaById.get(jobId) ?? "\u2014"}
+    </span>
+  );
+});
+
+function QueueSpeedValue() {
+  const speed = useLiveSpeed();
+  return formatSpeed(speed);
 }
 
 type QueueActionButtonsProps = {
@@ -239,63 +380,39 @@ const QueueActionButtons = memo(function QueueActionButtons({
 
 const QueueCellSelect = memo(function QueueCellSelect({
   jobId,
-  field,
   value,
   options,
   ariaLabel,
   disabled,
-  open,
-  onOpenChange,
   onValueChange,
   className,
 }: {
   jobId: number;
-  field: QueueCellSelectField;
   value: string;
   options: QueueSelectOption[];
   ariaLabel: string;
   disabled?: boolean;
-  open?: boolean;
-  onOpenChange?: (jobId: number, field: QueueCellSelectField, open: boolean) => void;
   onValueChange: (jobId: number, value: string) => void;
   className?: string;
 }) {
-  const handleOpenChange = useCallback((nextOpen: boolean) => {
-    onOpenChange?.(jobId, field, nextOpen);
-  }, [field, jobId, onOpenChange]);
-
-  const handleValueChange = useCallback((nextValue: string) => {
-    onValueChange(jobId, nextValue);
-  }, [jobId, onValueChange]);
-
   return (
     <div className="flex justify-center" data-row-click-ignore="true">
-      <Select
-        value={value}
-        open={open}
-        onOpenChange={handleOpenChange}
-        onValueChange={handleValueChange}
-        disabled={disabled}
-      >
-        <SelectTrigger
-          size="sm"
+      <div className={cn("relative", className)}>
+        <select
+          value={value}
+          disabled={disabled}
+          onChange={(event) => onValueChange(jobId, event.currentTarget.value)}
           aria-label={ariaLabel}
-          className={cn(
-            "h-8 min-w-0 border-0 bg-transparent px-2 text-[11px] shadow-none transition-none hover:bg-accent/40 focus-visible:ring-2",
-            "justify-center gap-1.5 text-center",
-            className,
-          )}
+          className="h-8 w-full appearance-none rounded-md border-0 bg-transparent px-2 pr-7 text-center text-[11px] text-foreground outline-none transition-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring/60 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          <SelectValue className="truncate" />
-        </SelectTrigger>
-        <SelectContent>
           {options.map((option) => (
-            <SelectItem key={option.value} value={option.value}>
+            <option key={option.value} value={option.value}>
               {option.label}
-            </SelectItem>
+            </option>
           ))}
-        </SelectContent>
-      </Select>
+        </select>
+        <ChevronDown className="pointer-events-none absolute right-2 top-1/2 size-3 -translate-y-1/2 text-muted-foreground" />
+      </div>
     </div>
   );
 });
@@ -311,7 +428,7 @@ const QueueNameCell = memo(function QueueNameCell({
     <div className="min-w-0">
       <Link
         to={`/jobs/${jobId}`}
-        className="block min-h-6 whitespace-normal break-words text-xs font-medium leading-snug text-foreground"
+        className="block whitespace-normal break-words text-xs font-medium leading-snug text-foreground"
       >
         {displayName}
       </Link>
@@ -321,16 +438,28 @@ const QueueNameCell = memo(function QueueNameCell({
 
 const QueueStatusCell = memo(function QueueStatusCell({
   status,
+  phaseProgress,
   blockedByIspCap,
   bandwidthCapLabel,
 }: {
   status: JobData["status"];
+  phaseProgress: JobData["phaseProgress"];
   blockedByIspCap: boolean;
   bandwidthCapLabel: string;
 }) {
+  const extractionVisible = useExtractionVisibility(phaseProgress);
+  const visibleStatus = extractionPresentationStatus(
+    status,
+    phaseProgress,
+    extractionVisible,
+  );
   return (
     <div className="flex flex-col items-center gap-1 text-center">
-      <JobStatusBadgeGroup statuses={getJobStages({ status })} compact className="justify-center" />
+      <JobStatusBadgeGroup
+        statuses={getJobStages({ status: visibleStatus })}
+        compact
+        className="justify-center"
+      />
       {blockedByIspCap ? (
         <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-status-paused">
           {bandwidthCapLabel}
@@ -340,15 +469,55 @@ const QueueStatusCell = memo(function QueueStatusCell({
   );
 });
 
+const QueueCompactStatusDots = memo(function QueueCompactStatusDots({
+  job,
+}: {
+  job: QueueRowData;
+}) {
+  const t = useTranslate();
+  const extractionVisible = useExtractionVisibility(job.phaseProgress);
+  const visibleStatus = extractionPresentationStatus(
+    job.status,
+    job.phaseProgress,
+    extractionVisible,
+  );
+  const stages = useDebouncedStatuses(getJobStages({ status: visibleStatus }));
+
+  return (
+    <span className="flex shrink-0 items-center gap-0.5">
+      {stages.map((stage, index) => (
+        <span
+          key={`${stage}-${index}`}
+          title={index === 0 ? t(statusI18nKey(stage)) : undefined}
+          className={cn(
+            "size-2 rounded-pill",
+            STATUS_BG_CLASS[statusToken(stage)],
+            isActiveStatus(stage) && "animate-status-pulse",
+          )}
+        />
+      ))}
+    </span>
+  );
+});
+
 const QueueProgressCell = memo(function QueueProgressCell({
   phaseProgress,
+  status,
+  progress,
 }: {
   phaseProgress: JobData["phaseProgress"];
+  status: JobData["status"];
+  progress: JobData["progress"];
 }) {
   return (
     <div className="flex justify-center">
       <div className="w-full max-w-[176px]">
-        <JobPhaseProgressBars phaseProgress={phaseProgress} compact />
+        <JobPhaseProgressBars
+          phaseProgress={phaseProgress}
+          status={status}
+          progress={progress}
+          compact
+        />
       </div>
     </div>
   );
@@ -449,40 +618,16 @@ function formatResetAt(epochMs?: number | null) {
   });
 }
 
-function pruneBooleanRecord<T extends Record<string, boolean>>(
-  current: T,
-  validIds: Set<string>,
-): T {
-  const entries = Object.entries(current);
-  if (entries.length === 0) {
-    return current;
-  }
-
-  let changed = false;
-  const nextEntries: Array<[string, boolean]> = [];
-
-  for (const [id, enabled] of entries) {
-    if (enabled && validIds.has(id)) {
-      nextEntries.push([id, enabled]);
-      continue;
-    }
-
-    changed = true;
-  }
-
-  if (!changed && nextEntries.length === entries.length) {
-    return current;
-  }
-
-  return Object.fromEntries(nextEntries) as T;
-}
-
 function queueStatusLabel(status: QueueStatusFilter, t: ReturnType<typeof useTranslate>) {
   switch (status) {
     case "QUEUED":
       return t("status.queued");
     case "DOWNLOADING":
       return t("status.downloading");
+    case "FETCHING_REPAIR_DATA":
+      return t("status.fetchingRepairData");
+    case "FINALIZING_DOWNLOAD":
+      return t("timeline.finalizingDownload");
     case "PAUSED":
       return t("status.paused");
     case "VERIFYING":
@@ -491,6 +636,8 @@ function queueStatusLabel(status: QueueStatusFilter, t: ReturnType<typeof useTra
       return t("status.repairing");
     case "EXTRACTING":
       return t("status.extracting");
+    case "POST_PROCESSING":
+      return t("status.postProcessing");
     case "MOVING":
       return t("status.moving");
     default:
@@ -498,26 +645,9 @@ function queueStatusLabel(status: QueueStatusFilter, t: ReturnType<typeof useTra
   }
 }
 
-function queueDisplayRank(status: string): number {
-  switch (status) {
-    case "VERIFYING":
-    case "REPAIRING":
-    case "EXTRACTING":
-    case "MOVING":
-      return 0;
-    case "DOWNLOADING":
-      return 1;
-    default:
-      return 2;
-  }
-}
-
-function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-
 export function JobList() {
   const client = useClient();
+  const graphqlConnection = useGraphqlConnectionState();
   const [serversResult] = useQuery({ query: HAS_CONFIGURED_SERVERS_QUERY });
   const [{ data: categoryData }] = useQuery({ query: CATEGORIES_QUERY });
   const hasNoServers = serversResult.data?.hasConfiguredServers === false;
@@ -530,22 +660,320 @@ export function JobList() {
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [pendingJobUpdates, setPendingJobUpdates] = useState<Record<number, PendingQueueJobUpdate>>({});
   const [savingQueueFields, setSavingQueueFields] = useState<Record<string, boolean>>({});
-  const [openQueueCellSelect, setOpenQueueCellSelect] = useState<OpenQueueCellSelect>(null);
   const [queueLayout, setQueueLayout] = useState<QueueLayout>("table");
 
-  const allJobs = useLiveJobs();
-  const speed = useLiveSpeed();
   const isPaused = useLivePaused();
   const downloadBlock = useLiveDownloadBlock();
-  const jobs = allJobs.filter((job) => job.status !== "COMPLETE" && job.status !== "FAILED");
+  const deferredSearch = useDeferredValue(queuePreferences.search.trim());
+  const queuePageInput = useMemo(
+    () => buildQueuePageInput(queuePreferences, deferredSearch, pageIndex),
+    [deferredSearch, pageIndex, queuePreferences],
+  );
+  const queuePageVariables = useMemo(() => ({ input: queuePageInput }), [queuePageInput]);
+  const queueQueryKey = useMemo(() => JSON.stringify(queuePageInput), [queuePageInput]);
+  const queueRowClassName = useCallback(() => "text-xs", []);
+  const [{ data: queuePageData, error: queuePageError }, reexecuteQueuePage] =
+    useQuery<QueuePageResponse>({
+      query: QUEUE_PAGE_QUERY,
+      variables: queuePageVariables,
+    });
+  const [polledQueuePage, setPolledQueuePage] = useState<PolledQueuePage>();
+  useReconnectPolling<QueuePageResponse>({
+    enabled: graphqlConnection.status === "disconnected",
+    query: QUEUE_PAGE_QUERY,
+    variables: queuePageVariables,
+    onData: (data) => setPolledQueuePage({ queryKey: queueQueryKey, page: data.queuePage }),
+  });
+  const queuePage = useMemo(
+    () => {
+      const currentPolledPage =
+        polledQueuePage?.queryKey === queueQueryKey ? polledQueuePage.page : undefined;
+      if (graphqlConnection.status === "disconnected" && currentPolledPage) {
+        return currentPolledPage;
+      }
+      return queuePageData?.queuePage;
+    },
+    [graphqlConnection.status, polledQueuePage, queuePageData?.queuePage, queueQueryKey],
+  );
+  const [{ data: queueEventData, error: queueEventError }] = useSubscription<{
+    queueEvents: QueueEventPayload;
+  }>({
+    query: QUEUE_EVENTS_SUBSCRIPTION,
+    variables: { after: queuePage?.latestCursor },
+    pause: !queuePage?.latestCursor,
+  });
+  const [eventItems, setEventItems] = useState<Record<number, QueueItemEventOverlay>>({});
+  const [optimisticallyRemovedJobIds, setOptimisticallyRemovedJobIds] = useState<Set<number>>(
+    () => new Set(),
+  );
+  const queueRefreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastQueueRefreshAtRef = useRef(0);
+  const lastQueueEventSequenceRef = useRef<bigint | null>(null);
+  const lastQueueEventErrorRef = useRef<string | null>(null);
+  const lastQueueConnectionAtRef = useRef<number | null | undefined>(undefined);
+  const rawQueuePageItems = queuePage?.items ?? EMPTY_QUEUE_PAGE_ITEMS;
+  const queuePageItems = useMemo(
+    () =>
+      optimisticallyRemovedJobIds.size === 0
+        ? rawQueuePageItems
+        : rawQueuePageItems.filter((job) => !optimisticallyRemovedJobIds.has(job.id)),
+    [optimisticallyRemovedJobIds, rawQueuePageItems],
+  );
+  const hideQueueJobs = useCallback((ids: readonly number[]) => {
+    if (ids.length === 0) {
+      return;
+    }
+    const idsToHide = new Set(ids);
+    setOptimisticallyRemovedJobIds((current) => {
+      const next = new Set(current);
+      let changed = false;
+      for (const id of idsToHide) {
+        if (!next.has(id)) {
+          next.add(id);
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+    setEventItems((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const id of idsToHide) {
+        if (id in next) {
+          delete next[id];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+    setRowSelection((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const id of idsToHide) {
+        if (next[id]) {
+          delete next[id];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, []);
+  const restoreQueueJobs = useCallback((ids: readonly number[]) => {
+    if (ids.length === 0) {
+      return;
+    }
+    setOptimisticallyRemovedJobIds((current) => {
+      let changed = false;
+      const next = new Set(current);
+      for (const id of ids) {
+        if (next.delete(id)) {
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, []);
+  const [hasBootstrappedQueue, setHasBootstrappedQueue] = useState(false);
+  const queueInitialFetchPending = queuePage === undefined && !queuePageError;
+  const serverConfigurationPending = serversResult.data === undefined && !serversResult.error;
+  const isQueueBootstrapPending =
+    !hasBootstrappedQueue && (queueInitialFetchPending || serverConfigurationPending);
+  const jobs = useMemo(() => {
+    const normalized = queuePageItems.map((job) =>
+      normalizeJobData(eventItems[job.id]?.item ?? job),
+    );
+    return queuePreferences.sorting.length === 0
+      ? orderQueueByLiveActivity(normalized)
+      : prioritizeDownloadingJobs(normalized);
+  }, [eventItems, queuePageItems, queuePreferences.sorting]);
   const policyBlockedJobs = jobs.filter((job) => isBlockedByDownloadPolicy(job, downloadBlock)).length;
-  const capResetAt = formatResetAt(downloadBlock.windowEndsAtEpochMs);
+  const capResetAt = useMemo(
+    () => formatResetAt(downloadBlock.windowEndsAtEpochMs),
+    [downloadBlock.windowEndsAtEpochMs],
+  );
+  const queueTableVirtualization = useMemo(
+    () => ({
+      estimatedRowHeight: 40,
+      overscan: 8,
+      resetKey: queueQueryKey,
+    }),
+    [queueQueryKey],
+  );
+
+  useEffect(() => {
+    setRowSelection({});
+  }, [queueQueryKey]);
+
+  useEffect(() => {
+    setEventItems({});
+    setPolledQueuePage(undefined);
+    if (queueRefreshTimeoutRef.current) {
+      clearTimeout(queueRefreshTimeoutRef.current);
+      queueRefreshTimeoutRef.current = null;
+    }
+  }, [queueQueryKey]);
+
+  useEffect(() => {
+    const pageCursor = queuePage && decodeQueueEventCursor(queuePage.latestCursor);
+    if (pageCursor === null || pageCursor === undefined) {
+      return;
+    }
+    setEventItems((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const [jobId, overlay] of Object.entries(current)) {
+        if (overlay.cursor <= pageCursor) {
+          delete next[Number(jobId)];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [queuePage]);
+
+  useEffect(() => {
+    setOptimisticallyRemovedJobIds((current) => {
+      if (current.size === 0) {
+        return current;
+      }
+      const visibleJobIds = new Set(rawQueuePageItems.map((job) => job.id));
+      const next = new Set(current);
+      let changed = false;
+      for (const id of current) {
+        if (!visibleJobIds.has(id)) {
+          next.delete(id);
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [rawQueuePageItems]);
+
+  useEffect(() => {
+    if (!isQueueBootstrapPending) {
+      setHasBootstrappedQueue(true);
+    }
+  }, [isQueueBootstrapPending]);
+
+  useEffect(() => {
+    if (graphqlConnection.status === "disconnected") {
+      setEventItems({});
+    }
+  }, [graphqlConnection.status]);
+
+  const refreshQueuePageNow = useCallback(() => {
+    if (queueRefreshTimeoutRef.current) {
+      clearTimeout(queueRefreshTimeoutRef.current);
+      queueRefreshTimeoutRef.current = null;
+    }
+    lastQueueRefreshAtRef.current = Date.now();
+    void reexecuteQueuePage({ requestPolicy: "network-only" });
+  }, [reexecuteQueuePage]);
+
+  const scheduleQueuePageRefresh = useCallback(() => {
+    if (queueRefreshTimeoutRef.current) {
+      return;
+    }
+    const elapsed = Date.now() - lastQueueRefreshAtRef.current;
+    const delay = Math.max(0, QUEUE_EVENT_REFRESH_INTERVAL_MS - elapsed);
+    queueRefreshTimeoutRef.current = setTimeout(() => {
+      queueRefreshTimeoutRef.current = null;
+      lastQueueRefreshAtRef.current = Date.now();
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
+    }, delay);
+  }, [reexecuteQueuePage]);
+
+  useEffect(() => {
+    if (graphqlConnection.status !== "connected" || graphqlConnection.lastConnectedAt === null) {
+      return;
+    }
+    if (lastQueueConnectionAtRef.current === undefined) {
+      lastQueueConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+      return;
+    }
+    if (lastQueueConnectionAtRef.current === graphqlConnection.lastConnectedAt) {
+      return;
+    }
+    lastQueueConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+    lastQueueEventSequenceRef.current = null;
+    setEventItems({});
+    setPolledQueuePage(undefined);
+    refreshQueuePageNow();
+  }, [graphqlConnection.lastConnectedAt, graphqlConnection.status, refreshQueuePageNow]);
+
+  useEffect(() => {
+    if (queueEventError) {
+      const errorKey = queueEventError.message;
+      if (lastQueueEventErrorRef.current !== errorKey) {
+        lastQueueEventErrorRef.current = errorKey;
+        refreshQueuePageNow();
+      }
+    } else {
+      lastQueueEventErrorRef.current = null;
+    }
+    const event = queueEventData?.queueEvents;
+    if (!event) {
+      return;
+    }
+    const eventCursor = decodeQueueEventCursor(event.cursor);
+    if (eventCursor === null) {
+      refreshQueuePageNow();
+      return;
+    }
+    if (lastQueueEventSequenceRef.current !== null && eventCursor <= lastQueueEventSequenceRef.current) {
+      return;
+    }
+    lastQueueEventSequenceRef.current = eventCursor;
+    if (event.kind === "ITEM_REMOVED" && event.itemId != null) {
+      hideQueueJobs([event.itemId]);
+    }
+    const eventItemIsVisible =
+      event.item !== null && queuePageItems.some((item) => item.id === event.item!.id);
+    if (event.item && eventItemIsVisible) {
+      setEventItems((current) => {
+        const currentOverlay = current[event.item!.id];
+        if (currentOverlay && currentOverlay.cursor >= eventCursor) {
+          return current;
+        }
+        return { ...current, [event.item!.id]: { item: event.item!, cursor: eventCursor } };
+      });
+    }
+    if (event.item && !eventItemIsVisible) {
+      refreshQueuePageNow();
+      return;
+    }
+    if (event.kind === "ITEM_PROGRESS") {
+      if (!event.item) {
+        scheduleQueuePageRefresh();
+        return;
+      }
+      if (queuePreferences.sorting[0]?.id === "progress") {
+        scheduleQueuePageRefresh();
+      }
+      return;
+    }
+    scheduleQueuePageRefresh();
+  }, [
+    hideQueueJobs,
+    queueEventData,
+    queueEventError,
+    queuePageItems,
+    queuePreferences.sorting,
+    refreshQueuePageNow,
+    scheduleQueuePageRefresh,
+  ]);
+
+  useEffect(() => () => {
+    if (queueRefreshTimeoutRef.current) {
+      clearTimeout(queueRefreshTimeoutRef.current);
+    }
+  }, []);
 
   const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
   const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
-  const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
+  const [, cancelJob] = useMutation<{ cancelJob: boolean }>(CANCEL_JOB_MUTATION);
   const [, setSpeedLimit] = useMutation(SET_SPEED_LIMIT_MUTATION);
   const [, updateJobs] = useMutation(UPDATE_JOBS_MUTATION);
 
@@ -596,6 +1024,21 @@ export function JobList() {
     setCancelConfirmId(id);
   }, []);
 
+  const handleConfirmCancelJob = useCallback(async () => {
+    const id = cancelConfirmId;
+    setCancelConfirmId(null);
+    if (id == null) {
+      return;
+    }
+
+    hideQueueJobs([id]);
+    const result = await cancelJob({ id });
+    if (result.error || result.data?.cancelJob !== true) {
+      restoreQueueJobs([id]);
+    }
+    void reexecuteQueuePage({ requestPolicy: "network-only" });
+  }, [cancelConfirmId, cancelJob, hideQueueJobs, reexecuteQueuePage, restoreQueueJobs]);
+
   const selectedIds = useMemo(
     () => Object.entries(rowSelection)
       .filter(([, selected]) => selected)
@@ -603,28 +1046,7 @@ export function JobList() {
     [rowSelection],
   );
 
-  const queueCategoriesRef = useRef<string[]>([]);
-  const queueCategories = useMemo(
-    () => {
-      const next = Array.from(
-        new Set(
-          jobs
-            .map((job) => resolveJobCategory(job, pendingJobUpdates[job.id]))
-            .filter((category): category is string => Boolean(category)),
-        ),
-      ).sort((left, right) => left.localeCompare(right));
-
-      if (sameStringArray(queueCategoriesRef.current, next)) {
-        return queueCategoriesRef.current;
-      }
-
-      queueCategoriesRef.current = next;
-      return next;
-    },
-    [jobs, pendingJobUpdates],
-  );
-
-  const editableCategoryOptionsRef = useRef<string[]>([]);
+  const queueCategories = queuePage?.categories ?? EMPTY_QUEUE_CATEGORIES;
   const editableCategoryOptions = useMemo(
     () => {
       const next = Array.from(
@@ -635,12 +1057,6 @@ export function JobList() {
           ...queueCategories,
         ]),
       ).sort((left, right) => left.localeCompare(right));
-
-      if (sameStringArray(editableCategoryOptionsRef.current, next)) {
-        return editableCategoryOptionsRef.current;
-      }
-
-      editableCategoryOptionsRef.current = next;
       return next;
     },
     [categoryData?.categories, queueCategories],
@@ -662,24 +1078,6 @@ export function JobList() {
     ],
     [editableCategoryOptions, t],
   );
-
-  useEffect(() => {
-    const nextCategories = queuePreferences.categories
-      .filter((category) => queueCategories.includes(category));
-    if (nextCategories.length === queuePreferences.categories.length) {
-      return;
-    }
-
-    setQueuePreferences((current) => ({
-      ...current,
-      categories: current.categories.filter((category) => queueCategories.includes(category)),
-    }));
-  }, [queueCategories, queuePreferences.categories, setQueuePreferences]);
-
-  useEffect(() => {
-    const validIds = new Set(jobs.map((job) => String(job.id)));
-    setRowSelection((current) => pruneBooleanRecord(current, validIds));
-  }, [jobs]);
 
   useEffect(() => {
     setPendingJobUpdates((current) => {
@@ -727,33 +1125,9 @@ export function JobList() {
     });
   }, [jobs]);
 
-  const queueRows = useMemo(
-    () =>
-      jobs
-        .filter((job) => {
-          const pending = pendingJobUpdates[job.id];
-          const matchesStatus =
-            queuePreferences.statuses.length === 0
-            || queuePreferences.statuses.includes(job.status as QueueStatusFilter);
-          const priority = resolveJobPriority(job, pending);
-          const matchesPriority =
-            queuePreferences.priorities.length === 0
-            || queuePreferences.priorities.includes(priority);
-          const category = resolveJobCategory(job, pending);
-          const matchesCategory =
-            queuePreferences.categories.length === 0
-            || (category != null && queuePreferences.categories.includes(category));
-          return matchesStatus && matchesPriority && matchesCategory;
-        })
-        .sort((left, right) => queueDisplayRank(left.status) - queueDisplayRank(right.status)),
-    [jobs, pendingJobUpdates, queuePreferences.categories, queuePreferences.priorities, queuePreferences.statuses],
-  );
-
-  const deferredSearch = useDeferredValue(queuePreferences.search.trim().toLowerCase());
-  const queueEtaById = useStableQueueEta(jobs, speed);
   const queueTableRows = useMemo<QueueRowData[]>(
     () =>
-      queueRows.map((job) => {
+      jobs.map((job) => {
         const pending = pendingJobUpdates[job.id];
         const priorityValue = resolveJobPriority(job, pending);
         const categoryValue = resolveJobCategory(job, pending);
@@ -770,28 +1144,24 @@ export function JobList() {
           categoryLabel: categoryValue ?? "\u2014",
           blockedByGlobalPause,
           blockedByIspCap,
-          etaDisplay: blockedByIspCap
+          etaOverride: blockedByIspCap
             ? downloadBlock.kind === "SERVER_QUOTA"
               ? t("jobs.serverQuotaEta")
               : t("jobs.bandwidthCapEta", { resetAt: capResetAt })
             : blockedByGlobalPause
               ? t("status.paused")
-              : (queueEtaById.get(job.id) ?? "\u2014"),
+              : null,
         };
       }),
-    [capResetAt, downloadBlock, isPaused, pendingJobUpdates, queueEtaById, queueRows, t],
+    [capResetAt, downloadBlock, isPaused, jobs, pendingJobUpdates, t],
   );
-  const queueSearchIndex = useMemo(
-    () =>
-      new Map(
-        queueTableRows.map((job) => [
-          String(job.id),
-          job.displayName.toLowerCase(),
-        ]),
-      ),
-    [queueTableRows],
+  const totalCount = Math.max(
+    0,
+    (queuePage?.totalCount ?? 0)
+      - rawQueuePageItems.filter((job) => optimisticallyRemovedJobIds.has(job.id)).length,
   );
-  const pageCount = Math.max(1, Math.ceil(queueTableRows.length / queuePreferences.pageSize));
+  const hasUnfilteredQueueItems = (queuePage?.summary.totalItems ?? 0) > 0;
+  const pageCount = Math.max(1, Math.ceil(totalCount / queuePreferences.pageSize));
 
   useEffect(() => {
     if (pageIndex >= pageCount && pageIndex > 0) {
@@ -850,8 +1220,10 @@ export function JobList() {
           [jobId]: previousUpdate,
         };
       });
+    } else {
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
     }
-  }, [setQueueFieldSaving, updateJobs]);
+  }, [reexecuteQueuePage, setQueueFieldSaving, updateJobs]);
 
   const handleInlineCategoryChange = useCallback(async (jobId: number, value: string) => {
     const nextCategory = value === NO_CATEGORY_SELECT_VALUE ? null : value;
@@ -888,23 +1260,10 @@ export function JobList() {
           [jobId]: previousUpdate,
         };
       });
+    } else {
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
     }
-  }, [setQueueFieldSaving, updateJobs]);
-
-  const handleQueueCellSelectOpenChange = useCallback(
-    (jobId: number, field: NonNullable<OpenQueueCellSelect>["field"], open: boolean) => {
-      setOpenQueueCellSelect((current) => {
-        if (!open) {
-          return current?.jobId === jobId && current.field === field ? null : current;
-        }
-        if (current?.jobId === jobId && current.field === field) {
-          return current;
-        }
-        return { jobId, field };
-      });
-    },
-    [],
-  );
+  }, [reexecuteQueuePage, setQueueFieldSaving, updateJobs]);
 
   const handlePrioritySelectValueChange = useCallback((jobId: number, value: string) => {
     void handleInlinePriorityChange(jobId, value as QueuePriorityFilter);
@@ -947,7 +1306,7 @@ export function JobList() {
         ),
         meta: {
           headerClassName: "h-7 w-[52px] px-2 text-center",
-          cellClassName: "p-0 text-center",
+          cellClassName: "p-0 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -959,7 +1318,7 @@ export function JobList() {
         ),
         meta: {
           headerClassName: "h-7 w-[34%] px-2 text-left",
-          cellClassName: "w-[34%] px-2 py-1.5 text-left",
+          cellClassName: "w-[34%] px-2 py-1.5 text-left align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -975,13 +1334,14 @@ export function JobList() {
         cell: ({ row }) => (
           <QueueStatusCell
             status={row.original.status}
+            phaseProgress={row.original.phaseProgress}
             blockedByIspCap={row.original.blockedByIspCap}
             bandwidthCapLabel={t("jobs.bandwidthCapShort")}
           />
         ),
         meta: {
           headerClassName: "h-7 w-[104px] px-2 text-center",
-          cellClassName: "w-[104px] px-2 py-1.5 text-center",
+          cellClassName: "w-[104px] px-2 py-1.5 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -997,20 +1357,17 @@ export function JobList() {
         cell: ({ row }) => (
           <QueueCellSelect
             jobId={row.original.id}
-            field="priority"
             value={row.original.priorityValue}
             options={prioritySelectOptions}
             ariaLabel={`${t("upload.priorityLabel")} ${row.original.displayName}`}
             disabled={Boolean(savingQueueFields[`${row.original.id}:priority`])}
-            open={openQueueCellSelect?.jobId === row.original.id && openQueueCellSelect.field === "priority"}
-            onOpenChange={handleQueueCellSelectOpenChange}
             onValueChange={handlePrioritySelectValueChange}
             className="w-[108px]"
           />
         ),
         meta: {
           headerClassName: "h-7 w-[124px] px-2 text-center",
-          cellClassName: "w-[124px] px-2 py-1.5 text-center",
+          cellClassName: "w-[124px] px-2 py-1.5 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1025,20 +1382,17 @@ export function JobList() {
         cell: ({ row }) => (
           <QueueCellSelect
             jobId={row.original.id}
-            field="category"
             value={row.original.categoryValue ?? NO_CATEGORY_SELECT_VALUE}
             options={categorySelectOptions}
             ariaLabel={`${t("table.category")} ${row.original.displayName}`}
             disabled={Boolean(savingQueueFields[`${row.original.id}:category`])}
-            open={openQueueCellSelect?.jobId === row.original.id && openQueueCellSelect.field === "category"}
-            onOpenChange={handleQueueCellSelectOpenChange}
             onValueChange={handleCategorySelectValueChange}
             className="w-[136px]"
           />
         ),
         meta: {
           headerClassName: "h-7 w-[152px] px-2 text-center",
-          cellClassName: "w-[152px] px-2 py-1.5 text-center",
+          cellClassName: "w-[152px] px-2 py-1.5 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1059,11 +1413,27 @@ export function JobList() {
           />
         ),
         cell: ({ row }) => (
-          <QueueProgressCell phaseProgress={row.original.phaseProgress} />
+          <QueueProgressCell
+            phaseProgress={row.original.phaseProgress}
+            status={row.original.status}
+            progress={row.original.progress}
+          />
         ),
         meta: {
           headerClassName: "h-7 w-[188px] px-2 text-center",
-          cellClassName: "w-[188px] px-2 py-1.5 text-center",
+          cellClassName: "w-[188px] px-2 py-1.5 text-center align-middle",
+        } satisfies DataTableColumnMeta,
+      },
+      {
+        id: "eta",
+        enableSorting: false,
+        header: () => <div className="text-center">{t("table.eta")}</div>,
+        cell: ({ row }) => (
+          <QueueEtaCell jobId={row.original.id} override={row.original.etaOverride} />
+        ),
+        meta: {
+          headerClassName: "h-7 w-[96px] px-2 text-center",
+          cellClassName: "w-[96px] px-2 py-1.5 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1079,7 +1449,7 @@ export function JobList() {
         cell: ({ row }) => <QueueSizeCell totalBytes={row.original.totalBytes} />,
         meta: {
           headerClassName: "h-7 w-[132px] px-2 text-center",
-          cellClassName: "w-[132px] px-2 py-1.5 text-center",
+          cellClassName: "w-[132px] px-2 py-1.5 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1100,7 +1470,7 @@ export function JobList() {
         ),
         meta: {
           headerClassName: "h-7 w-[116px] px-2 text-right",
-          cellClassName: "w-[116px] p-0 text-right",
+          cellClassName: "w-[116px] p-0 text-right align-middle",
         } satisfies DataTableColumnMeta,
       },
     ],
@@ -1108,11 +1478,9 @@ export function JobList() {
       categorySelectOptions,
       handleCancelJob,
       handleCategorySelectValueChange,
-      handleQueueCellSelectOpenChange,
       handlePauseJob,
       handlePrioritySelectValueChange,
       handleResumeJob,
-      openQueueCellSelect,
       prioritySelectOptions,
       savingQueueFields,
       t,
@@ -1124,18 +1492,11 @@ export function JobList() {
     columns,
     getRowId: (row) => String(row.id),
     enableRowSelection: true,
+    manualPagination: true,
+    manualSorting: true,
+    pageCount,
     getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-    globalFilterFn: (row, _columnId, filterValue) => {
-      if (typeof filterValue !== "string" || filterValue.length === 0) {
-        return true;
-      }
-      return queueSearchIndex.get(row.id)?.includes(filterValue) ?? false;
-    },
     state: {
-      globalFilter: deferredSearch,
       pagination: {
         pageIndex,
         pageSize: queuePreferences.pageSize,
@@ -1198,6 +1559,7 @@ export function JobList() {
     if (!result.error) {
       setRowSelection({});
       setBulkEditOpen(false);
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
     }
   };
 
@@ -1215,6 +1577,7 @@ export function JobList() {
     });
     if (!result.error) {
       setRowSelection({});
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
     }
   };
 
@@ -1232,6 +1595,7 @@ export function JobList() {
     });
     if (!result.error) {
       setRowSelection({});
+      void reexecuteQueuePage({ requestPolicy: "network-only" });
     }
   };
 
@@ -1240,6 +1604,7 @@ export function JobList() {
       return;
     }
 
+    hideQueueJobs(selectedIds);
     const result = await executeAliasedIdMutation<boolean>({
       client,
       ids: selectedIds,
@@ -1247,9 +1612,14 @@ export function JobList() {
       aliasPrefix: "cancelJob",
       fieldName: "cancelJob",
     });
-    if (!result.error) {
-      setRowSelection({});
+    const cancelledIds = selectedIds.filter(
+      (_id, index) => result.data?.[`cancelJob${index}`] === true,
+    );
+    const failedIds = selectedIds.filter((id) => !cancelledIds.includes(id));
+    if (failedIds.length > 0) {
+      restoreQueueJobs(failedIds);
     }
+    void reexecuteQueuePage({ requestPolicy: "network-only" });
     setCancelSelectedConfirm(false);
   };
 
@@ -1268,23 +1638,23 @@ export function JobList() {
     count: number;
     statuses: QueueStatusFilter[];
   }[] = [
-    { key: "all", label: t("history.filterAll"), count: jobs.length, statuses: [] },
+    { key: "all", label: t("history.filterAll"), count: queuePage?.summary.totalItems ?? 0, statuses: [] },
     {
       key: "active",
       label: t("queue.filterActive"),
-      count: jobs.filter((job) => QUEUE_ACTIVE_STATUSES.includes(job.status as QueueStatusFilter)).length,
+      count: queuePage?.summary.activeItems ?? 0,
       statuses: QUEUE_ACTIVE_STATUSES,
     },
     {
       key: "queued",
       label: t("status.queued"),
-      count: jobs.filter((job) => job.status === "QUEUED").length,
+      count: queuePage?.summary.queuedItems ?? 0,
       statuses: ["QUEUED"],
     },
     {
       key: "stalled",
       label: t("queue.filterStalled"),
-      count: jobs.filter((job) => job.status === "PAUSED").length,
+      count: queuePage?.summary.pausedItems ?? 0,
       statuses: ["PAUSED"],
     },
   ];
@@ -1301,19 +1671,55 @@ export function JobList() {
     setPageIndex(0);
   }
 
+  const queueEmptyState: ReactNode = isQueueBootstrapPending ? (
+    <div role="status" className="py-8 text-center text-sm text-muted-foreground">
+      {t("label.loading")}
+    </div>
+  ) : totalCount === 0 && !hasUnfilteredQueueItems ? (
+    <div className="py-4">
+      <EmptyState
+        title={t("jobs.empty")}
+        description={t("jobs.emptyHint")}
+        actionLabel={t("jobs.emptyAction")}
+        onAction={() => setUploadOpen(true)}
+      />
+    </div>
+  ) : (
+    <div className="space-y-3 py-12 text-center">
+      <div className="text-sm text-muted-foreground">{t("queue.noMatches")}</div>
+      <div>
+        <Button variant="outline" onClick={resetQueueView}>
+          {t("action.clearFilters")}
+        </Button>
+      </div>
+    </div>
+  );
+
   return (
     <div className="space-y-6">
       <PageHeader
         title={t("jobs.title")}
         actions={
           <>
+            {hasNoServers ? (
+              <Card className="flex h-[66px] shrink-0 items-center rounded-inner border-destructive/40 bg-destructive/8 shadow-none">
+                <div className="flex h-full w-full items-center gap-2 px-4">
+                  <Badge variant="destructive" className="px-2 py-0.5 text-[10px] uppercase tracking-[0.12em]">
+                    {t("jobs.noServersBadge")}
+                  </Badge>
+                  <Button asChild variant="outline" size="sm" className="h-7 px-2 text-xs">
+                    <Link to="/settings/servers">{t("jobs.noServersAction")}</Link>
+                  </Button>
+                </div>
+              </Card>
+            ) : null}
             <div className="flex overflow-hidden rounded-inner border border-border bg-card">
               <div className="border-r border-border px-4 py-2.5">
                 <div className="text-[9.5px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
                   {t("label.downloadSpeed")}
                 </div>
                 <div className="mt-0.5 font-space-grotesk text-lg font-bold text-foreground">
-                  {formatSpeed(speed)}
+                  <QueueSpeedValue />
                 </div>
                 {isPaused ? (
                   <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-status-paused">
@@ -1392,38 +1798,7 @@ export function JobList() {
         </Card>
       ) : null}
 
-      {hasNoServers ? (
-        <Card className="border-destructive/40 bg-destructive/8">
-          <CardContent className="flex flex-col gap-4 py-5 sm:flex-row sm:items-center sm:justify-between">
-            <div className="space-y-2">
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge variant="destructive">{t("jobs.noServersBadge")}</Badge>
-                <span className="text-sm font-medium text-foreground">
-                  {t("jobs.noServersTitle")}
-                </span>
-              </div>
-              <div className="text-sm text-muted-foreground">
-                {t("jobs.noServersBody")}
-              </div>
-            </div>
-            <div className="flex shrink-0 items-center gap-2">
-              <Button asChild variant="outline">
-                <Link to="/settings/servers">{t("jobs.noServersAction")}</Link>
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      ) : null}
-
-      {jobs.length === 0 ? (
-        <EmptyState
-          title={t("jobs.empty")}
-          description={t("jobs.emptyHint")}
-          actionLabel={t("jobs.emptyAction")}
-          onAction={() => setUploadOpen(true)}
-        />
-      ) : (
-        <Card>
+      <Card>
           <CardContent className="space-y-4 px-0 pb-0 pt-6">
             <div className="px-6">
               <DataTableToolbar
@@ -1437,8 +1812,6 @@ export function JobList() {
                   setPageIndex(0);
                 }}
                 searchPlaceholder={t("jobs.searchPlaceholder")}
-                searchContainerClassName="max-w-[280px]"
-                searchInputClassName="h-10"
                 centerContainerClassName="min-h-10"
                 centerContent={selectedIds.length > 0 ? (
                   <div className="inline-flex h-10 min-w-0 items-center justify-center gap-1.5 rounded-md border border-border/70 bg-muted/20 px-2">
@@ -1768,36 +2141,22 @@ export function JobList() {
               </DataTableToolbar>
             </div>
 
-            {queueLayout === "table" ? (
+            <QueueEtaProvider jobs={jobs}>
+              {queueLayout === "table" ? (
               <DataTable
                 table={queueTable}
+                tableClassName="table-fixed"
                 wrapperClassName="max-h-[70vh]"
-                rowClassName={() => "text-xs"}
-                emptyState={
-                  <div className="space-y-3 py-12 text-center">
-                    <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
-                    <div>
-                      <Button variant="outline" onClick={resetQueueView}>
-                        {t("action.clearFilters")}
-                      </Button>
-                    </div>
-                  </div>
-                }
+                rowClassName={queueRowClassName}
+                virtualization={queueTableVirtualization}
+                emptyState={queueEmptyState}
               />
             ) : queueTable.getRowModel().rows.length === 0 ? (
-              <div className="space-y-3 py-12 text-center">
-                <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
-                <div>
-                  <Button variant="outline" onClick={resetQueueView}>
-                    {t("action.clearFilters")}
-                  </Button>
-                </div>
-              </div>
+              queueEmptyState
             ) : (
               <div className="max-h-[70vh] overflow-y-auto border-t border-border">
                 {queueTable.getRowModel().rows.map((row) => {
                   const job = row.original;
-                  const stages = getJobStages({ status: job.status });
                   return (
                     <div
                       key={row.id}
@@ -1810,19 +2169,7 @@ export function JobList() {
                           onCheckedChange={(value) => row.toggleSelected(value === true)}
                         />
                       </div>
-                      <span className="flex shrink-0 items-center gap-0.5">
-                        {stages.map((stage, index) => (
-                          <span
-                            key={`${stage}-${index}`}
-                            title={index === 0 ? job.statusLabel : undefined}
-                            className={cn(
-                              "size-2 rounded-pill",
-                              STATUS_BG_CLASS[statusToken(stage)],
-                              isActiveStatus(stage) && "animate-status-pulse",
-                            )}
-                          />
-                        ))}
-                      </span>
+                      <QueueCompactStatusDots job={job} />
                       <div className="min-w-0 flex-[1.6]">
                         <Link
                           to={`/jobs/${job.id}`}
@@ -1833,11 +2180,18 @@ export function JobList() {
                         </Link>
                       </div>
                       <div className="hidden min-w-[130px] flex-1 sm:block">
-                        <JobPhaseProgressBars compact phaseProgress={job.phaseProgress} />
+                        <JobPhaseProgressBars
+                          compact
+                          phaseProgress={job.phaseProgress}
+                          progress={job.progress}
+                          status={job.status}
+                        />
                       </div>
-                      <span className="hidden w-16 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground md:block">
-                        {job.etaDisplay}
-                      </span>
+                      <QueueEtaCell
+                        jobId={job.id}
+                        override={job.etaOverride}
+                        className="hidden w-16 shrink-0 text-right text-[12px] md:block"
+                      />
                       <span className="w-16 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground">
                         {formatBytes(job.totalBytes)}
                       </span>
@@ -1883,18 +2237,18 @@ export function JobList() {
                   );
                 })}
               </div>
-            )}
+              )}
+            </QueueEtaProvider>
             <DataTablePagination
               table={queueTable}
-              totalCount={queueTable.getFilteredRowModel().rows.length}
+              totalCount={totalCount}
               pageSizeOptions={[...QUEUE_PAGE_SIZE_OPTIONS]}
               rowsPerPageLabel={t("table.rowsPerPage")}
               previousLabel={t("action.previous")}
               nextLabel={t("action.next")}
             />
           </CardContent>
-        </Card>
-      )}
+      </Card>
 
       <ConfirmDialog
         open={cancelConfirmId != null}
@@ -1902,19 +2256,14 @@ export function JobList() {
         message={t("confirm.cancelJobMessage")}
         confirmLabel={t("confirm.cancelJobConfirm")}
         cancelLabel={t("confirm.cancelJobDismiss")}
-        onConfirm={() => {
-          if (cancelConfirmId != null) {
-            void cancelJob({ id: cancelConfirmId });
-          }
-          setCancelConfirmId(null);
-        }}
+        onConfirm={() => void handleConfirmCancelJob()}
         onCancel={() => setCancelConfirmId(null)}
       />
 
       <ConfirmDialog
         open={cancelSelectedConfirm}
-        title={t("confirm.cancelJobBatch")}
-        message={t("confirm.cancelJobBatchMessage", { count: selectedIds.length })}
+        title={t("confirm.cancelSelected", { count: selectedIds.length })}
+        message={t("confirm.cancelSelectedMessage")}
         confirmLabel={t("confirm.cancelJobConfirm")}
         cancelLabel={t("confirm.cancelJobDismiss")}
         onConfirm={() => void handleBulkCancel()}
@@ -1928,7 +2277,11 @@ export function JobList() {
         onApply={handleBulkEdit}
       />
 
-      <UploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />
+      <UploadModal
+        open={uploadOpen}
+        onClose={() => setUploadOpen(false)}
+        onSubmitted={() => void reexecuteQueuePage({ requestPolicy: "network-only" })}
+      />
 
       <Dialog open={speedLimitOpen} onOpenChange={setSpeedLimitOpen}>
         <DialogContent>

@@ -1,0 +1,10 @@
+{
+  "slug": "rar5-recovery-volume-light",
+  "title": "E2E.Test.RAR5.RecoveryVolume.Light.2026.1080p-TESTGRP",
+  "description": "Four RAR5 volumes posted with one RARLAB recovery volume (archive.part1.rev); the second data volume is absent from the post. The download must reconstruct it from the recovery volume before extraction, so success requires the .rev path, not a lucky partial extract.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "work/payload/E2E Test RAR5 RecoveryVolume Light.mkv": "15849b0fd55c4b653829ae1b6cd3457442591cb158d4b1bdda5e88c1a4676a62"
+  }
+}

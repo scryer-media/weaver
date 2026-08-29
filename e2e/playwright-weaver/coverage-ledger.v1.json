@@ -1,0 +1,509 @@
+{
+  "version": 1,
+  "routes": [
+    {
+      "path": "/",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/jobs/:id",
+      "owner": "ui-post-processing",
+      "oracle": "browser"
+    },
+    {
+      "path": "/upload",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/monitoring",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/history",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/logs",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/system-info",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/servers",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "path": "/categories",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/general",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/bandwidth",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/security",
+      "owner": "ui-security",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/backup",
+      "owner": "ui-backup-restore-sqlite-to-sqlite",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/rss",
+      "owner": "ui-ingress-automation",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/watch-folder",
+      "owner": "ui-ingress-automation",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/post-processing",
+      "owner": "ui-post-processing",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/schedules",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/categories",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/servers",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    }
+  ],
+  "mutations": [
+    {
+      "name": "resetServerDownloadQuotaUsage",
+      "owner": "bandwidth-and-server-quotas",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "cancelJob",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "Sanctioned setup helpers use this legacy alias only to seed history; cancelQueueItem owns the product assertion."
+    },
+    {
+      "name": "cancelQueueItem",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "forgetDuplicateIdentity",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "The release flow exercises duplicate decisions and good/bad replacement, not identity-forgetting administration."
+    },
+    {
+      "name": "markDuplicateBad",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "markDuplicateGood",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "pauseAll",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "pauseJob",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "The release flow owns the canonical pauseQueueItem behavior; this legacy job alias is not called."
+    },
+    {
+      "name": "pauseQueue",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "The release flow owns pauseAll and per-item pause behavior; this compatibility alias is not called."
+    },
+    {
+      "name": "pauseQueueItem",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "promoteDuplicateCandidate",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "The release flow proves automatic replacement through markDuplicateBad, not explicit candidate promotion."
+    },
+    {
+      "name": "reorderQueueItem",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "resumeAll",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "resumeJob",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "The release flow owns the canonical resumeQueueItem behavior; this legacy job alias is not called."
+    },
+    {
+      "name": "resumeQueue",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "The release flow owns resumeAll and per-item resume behavior; this compatibility alias is not called."
+    },
+    {
+      "name": "resumeQueueItem",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "updateJobs",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "The release flow asserts individual queue controls; the bulk compatibility mutation is not called."
+    },
+    {
+      "name": "testConfiguredServerConnection",
+      "owner": "encryption-key-lifecycle",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "testConnection",
+      "owner": "encryption-key-lifecycle",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "discardStagedNzbs",
+      "owner": "existing-download-pipeline",
+      "oracle": "existing-pipeline"
+    },
+    {
+      "name": "redownloadJob",
+      "owner": "existing-download-pipeline",
+      "oracle": "existing-pipeline"
+    },
+    {
+      "name": "redownloadQueueItem",
+      "owner": "existing-download-pipeline",
+      "oracle": "existing-pipeline"
+    },
+    {
+      "name": "stageNzbUpload",
+      "owner": "existing-download-pipeline",
+      "oracle": "existing-pipeline"
+    },
+    {
+      "name": "submitNzb",
+      "owner": "existing-download-pipeline",
+      "oracle": "existing-pipeline"
+    },
+    {
+      "name": "submitStagedNzbs",
+      "owner": "existing-download-pipeline",
+      "oracle": "existing-pipeline"
+    },
+    {
+      "name": "setQueueSpeedLimit",
+      "owner": "rate-limits",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "setSpeedLimit",
+      "owner": "rate-limits",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "addRssFeed",
+      "owner": "ui-ingress-automation",
+      "oracle": "browser"
+    },
+    {
+      "name": "addRssRule",
+      "owner": "ui-ingress-automation",
+      "oracle": "browser"
+    },
+    {
+      "name": "clearRssSeenItems",
+      "owner": "ui-ingress-automation",
+      "oracle": "browser"
+    },
+    {
+      "name": "deleteRssFeed",
+      "owner": "ui-ingress-automation",
+      "oracle": "browser"
+    },
+    {
+      "name": "deleteRssRule",
+      "owner": "ui-ingress-automation",
+      "oracle": "browser"
+    },
+    {
+      "name": "deleteRssSeenItem",
+      "owner": "ui-ingress-automation",
+      "oracle": "browser"
+    },
+    {
+      "name": "runRssSync",
+      "owner": "ui-ingress-automation",
+      "oracle": "browser"
+    },
+    {
+      "name": "scanWatchFolder",
+      "owner": "ui-ingress-automation",
+      "oracle": "browser"
+    },
+    {
+      "name": "updateRssFeed",
+      "owner": "ui-ingress-automation",
+      "oracle": "browser"
+    },
+    {
+      "name": "updateRssRule",
+      "owner": "ui-ingress-automation",
+      "oracle": "browser"
+    },
+    {
+      "name": "cancelJobPostProcessing",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "Cancelling mid-script needs a job that is still executing; the browser flow asserts completed script results instead."
+    },
+    {
+      "name": "reprocessJob",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "The browser flow exercises script reruns through rerunPostProcessing, not download-job reprocessing."
+    },
+    {
+      "name": "reprocessQueueItem",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "The browser flow exercises script-only reruns through rerunPostProcessing, not download-queue reprocessing."
+    },
+    {
+      "name": "rerunPostProcessing",
+      "owner": "ui-post-processing",
+      "oracle": "browser"
+    },
+    {
+      "name": "setJobPassword",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "The post-processing browser flow seeds controlled jobs and does not exercise password-protected archive input."
+    },
+    {
+      "name": "setPostProcessingSettings",
+      "owner": "ui-post-processing",
+      "oracle": "browser"
+    },
+    {
+      "name": "setPostProcessingScriptDirectory",
+      "owner": "ui-post-processing",
+      "oracle": "browser"
+    },
+    {
+      "name": "setScriptLists",
+      "owner": "ui-post-processing",
+      "oracle": "browser"
+    },
+    {
+      "name": "setScriptOptions",
+      "owner": "ui-post-processing",
+      "oracle": "browser"
+    },
+    {
+      "name": "acceptHistoryDelete",
+      "owner": "ui-runtime-observability",
+      "oracle": "unit-only",
+      "rationale": "The runtime browser flow verifies history rendering and pagination without deleting release evidence."
+    },
+    {
+      "name": "deleteAllHistory",
+      "owner": "ui-runtime-observability",
+      "oracle": "unit-only",
+      "rationale": "The runtime browser flow verifies history rendering and pagination without deleting release evidence."
+    },
+    {
+      "name": "deleteHistory",
+      "owner": "ui-runtime-observability",
+      "oracle": "unit-only",
+      "rationale": "The runtime browser flow verifies history rendering and pagination without deleting release evidence."
+    },
+    {
+      "name": "deleteHistoryBatch",
+      "owner": "ui-runtime-observability",
+      "oracle": "unit-only",
+      "rationale": "The runtime browser flow verifies history rendering and pagination without deleting release evidence."
+    },
+    {
+      "name": "removeHistoryItems",
+      "owner": "ui-runtime-observability",
+      "oracle": "unit-only",
+      "rationale": "The runtime browser flow verifies history rendering and pagination without deleting release evidence."
+    },
+    {
+      "name": "changePassword",
+      "owner": "ui-security",
+      "oracle": "browser"
+    },
+    {
+      "name": "createApiKey",
+      "owner": "ui-security",
+      "oracle": "browser"
+    },
+    {
+      "name": "deleteApiKey",
+      "owner": "ui-security",
+      "oracle": "browser"
+    },
+    {
+      "name": "disableLogin",
+      "owner": "ui-security",
+      "oracle": "browser"
+    },
+    {
+      "name": "enableLogin",
+      "owner": "ui-security",
+      "oracle": "browser"
+    },
+    {
+      "name": "setAccessPolicy",
+      "owner": "ui-security",
+      "oracle": "unit-only",
+      "rationale": "Loosening browser admission would sign the running Playwright session out of the very instance under test; the guard, environment-pinned refusal, strict-security refusal and no-login-while-login-enabled refusal are covered by weaver-server-api security_policy tests."
+    },
+    {
+      "name": "setHttpBindAddress",
+      "owner": "ui-security",
+      "oracle": "unit-only",
+      "rationale": "Changing the listen address only takes effect at the next restart, so a browser flow cannot observe its result within a test; the refusal paths (environment-pinned, strict-security without login) and the pending/restart reporting are covered by weaver-server-api security_policy tests and weaver-server-core security unit tests."
+    },
+    {
+      "name": "addCategory",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "name": "addServer",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "name": "createDirectory",
+      "owner": "ui-settings-crud",
+      "oracle": "unit-only",
+      "rationale": "The settings flow selects and persists existing paths; it does not create a directory through the browser."
+    },
+    {
+      "name": "createSchedule",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "name": "deleteSchedule",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "name": "removeCategory",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "name": "removeServer",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "name": "toggleSchedule",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "name": "updateCategory",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "name": "updateSchedule",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "name": "updateServer",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "name": "updateSettings",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    }
+  ],
+  "behaviors": [
+    {
+      "name": "encrypted-backup-restore-matrix",
+      "owner": "ui-backup-restore-sqlite-to-sqlite",
+      "oracle": "browser"
+    },
+    {
+      "name": "isp-and-server-quota-precedence",
+      "owner": "bandwidth-and-server-quotas",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "provider-effective-connection-cap",
+      "owner": "provider-connection-cap",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "encryption-key-fail-closed",
+      "owner": "encryption-key-lifecycle",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "subscription-disconnect-poll-reconnect",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "name": "transport-chaos",
+      "owner": "existing-download-pipeline",
+      "oracle": "existing-pipeline"
+    }
+  ]
+}

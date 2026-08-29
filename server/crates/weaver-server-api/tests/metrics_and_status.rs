@@ -27,6 +27,11 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         write_buffered_bytes: speed * 2,
         write_buffered_segments: 1,
         direct_write_evictions: 0,
+        direct_sets_admitted: 0,
+        direct_sets_demoted: 0,
+        direct_sets_finalized_direct: 0,
+        direct_sets_repaired_while_direct: 0,
+        deobfuscated_members_renamed: 0,
         decode_pressure_soft_limit_bytes: 0,
         decode_pressure_hard_limit_bytes: 0,
         write_pressure_soft_limit_bytes: 0,
@@ -41,18 +46,14 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         hot_dispatch_mode: weaver_server_core::DispatchShareMode::Exclusive,
         hot_dispatch_underfill_ms: 0,
         hot_dispatch_lent_connections: 0,
-        hot_dispatch_warmup_complete: false,
         hot_dispatch_last_spillover_decision: weaver_server_core::SpilloverDecision::None,
-        hot_dispatch_spillover_blocked_warmup_total: 0,
         hot_dispatch_spillover_blocked_pressure_total: 0,
         hot_dispatch_spillover_blocked_near_cap_total: 0,
         hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 0,
         hot_dispatch_spillover_blocked_best_mode_pending_total: 0,
-        hot_dispatch_spillover_blocked_recent_expansion_helped_total: 0,
         hot_dispatch_spillover_blocked_cap_speed_total: 0,
         hot_dispatch_spillover_allowed_underfill_total: 0,
         hot_dispatch_spillover_allowed_measured_underfill_total: 0,
-        hot_dispatch_spillover_allowed_bounded_same_band_total: 0,
         hot_dispatch_spillover_reclaimed_total: 0,
         hot_dispatch_hot_speed_bps: 0,
         hot_dispatch_exclusive_peak_bps: 0,
@@ -86,7 +87,6 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         download_lane_parks_spillover_withdraw_total: 0,
         download_lane_parks_spillover_speed_harm_total: 0,
         download_lane_parks_ip_replacement_retired_total: 0,
-        download_lane_parks_server_tier_changed_total: 0,
         download_lane_parks_proof_failure_total: 0,
         download_lane_parks_error_total: 0,
         download_lane_lease_items_total: 0,
@@ -148,6 +148,8 @@ fn history_job(job_id: u64, status: JobStatus) -> JobInfo {
         name: format!("job-{job_id}"),
         status,
         download_state: DownloadState::Queued,
+        finalizing_download: false,
+        fetching_repair_data: false,
         post_state: PostState::Idle,
         run_state: RunState::Active,
         progress: 0.0,
@@ -158,6 +160,7 @@ fn history_job(job_id: u64, status: JobStatus) -> JobInfo {
         phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
+        terminal_discards: Vec::new(),
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,
@@ -290,7 +293,7 @@ async fn metrics_has_expected_fields() {
     let h = TestHarness::new().await;
     let resp = h
         .execute(
-            "{ metrics { bytesDownloaded bytesDecoded bytesCommitted downloadQueueDepth segmentsDownloaded currentDownloadSpeed hotDispatchJobId hotDispatchMode hotDispatchUnderfillMs hotDispatchLentConnections hotDispatchWarmupComplete hotDispatchLastSpilloverDecision hotDispatchSpilloverBlockedWarmupTotal hotDispatchSpilloverAllowedUnderfillTotal downloadLanesActive downloadLanesDepth2Active downloadLanesIssuingActive downloadLanesAwaitingWorkActive downloadLaneParksNoWorkTotal downloadPipelineProofPassTotal downloadPipelineReplayItemsTotal } }",
+            "{ metrics { bytesDownloaded bytesDecoded bytesCommitted downloadQueueDepth segmentsDownloaded currentDownloadSpeed hotDispatchJobId hotDispatchMode hotDispatchUnderfillMs hotDispatchLentConnections hotDispatchLastSpilloverDecision hotDispatchSpilloverBlockedNearCapTotal hotDispatchSpilloverAllowedUnderfillTotal downloadLanesActive downloadLanesDepth2Active downloadLanesIssuingActive downloadLanesAwaitingWorkActive downloadLaneParksNoWorkTotal downloadPipelineProofPassTotal downloadPipelineReplayItemsTotal } }",
         )
         .await;
     assert_no_errors(&resp);
@@ -304,9 +307,8 @@ async fn metrics_has_expected_fields() {
     assert!(m["hotDispatchMode"].is_string());
     assert!(m["hotDispatchUnderfillMs"].is_number());
     assert!(m["hotDispatchLentConnections"].is_number());
-    assert!(m["hotDispatchWarmupComplete"].is_boolean());
     assert!(m["hotDispatchLastSpilloverDecision"].is_string());
-    assert!(m["hotDispatchSpilloverBlockedWarmupTotal"].is_number());
+    assert!(m["hotDispatchSpilloverBlockedNearCapTotal"].is_number());
     assert!(m["hotDispatchSpilloverAllowedUnderfillTotal"].is_number());
     assert!(m["downloadLanesActive"].is_number());
     assert!(m["downloadLanesDepth2Active"].is_number());

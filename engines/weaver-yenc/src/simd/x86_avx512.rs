@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2")]
+#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2,bmi1,bmi2,popcnt,lzcnt")]
 pub(super) unsafe fn decode_kernel_avx512_vbmi2(
     input: &[u8],
     output: &mut [u8],
@@ -12,37 +12,70 @@ pub(super) unsafe fn decode_kernel_avx512_vbmi2(
 ) -> Result<KernelOutcome, YencError> {
     const WIDTH: usize = 64;
 
-    // Hot path: faithful 512-bit port of rapidyenc `do_decode_avx2<…, VBMI2>`
-    // (raw dot-unstuffing, no end-search). Applies the AVX2 flat-loop port's
-    // register-carried state model at full 512-bit width. Other combos
-    // (search_end, non-raw, or an entry state the head-switch doesn't cover)
-    // keep the general line-aware kernel below.
-    if dot_unstuffing
-        && !search_end
+    let mode = DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    };
+
+    // Head resolution (search_end only): a terminator/control sequence whose
+    // `\r\n` sits in the PREVIOUS chunk is invisible to the flat raw loop, so
+    // resolve those entry shapes with the scalar machine first. Gated on the
+    // same length as the raw path, so short inputs keep today's routing exactly.
+    let mut head_src = 0usize;
+    let mut head_dst = 0usize;
+    if search_end
+        && dot_unstuffing
         && input.len() > WIDTH * 2
+        && x86_search_end_head(input, output, state, mode, &mut head_src, &mut head_dst)?
+    {
+        return Ok(KernelOutcome {
+            consumed: head_src,
+            written: head_dst,
+            end: state.end.into(),
+        });
+    }
+
+    // Hot path: faithful 512-bit port of rapidyenc `do_decode_avx2<…, VBMI2>`
+    // (raw dot-unstuffing), both `searchEnd` instantiations. Applies the AVX2
+    // flat-loop port's register-carried state model at full 512-bit width.
+    // Other combos (non-raw, or an entry state the head resolution doesn't
+    // cover) keep the general line-aware kernel below.
+    if dot_unstuffing
+        && input.len() - head_src > WIDTH * 2
         && matches!(
             state.state,
             DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
         )
     {
-        let mode = DecodeStepMode {
-            dot_unstuffing,
-            preserve_pending,
-            search_end,
+        // `head_src`/`head_dst` are 0 unless the head loop ran, so the
+        // `::<false>` instantiation always sees the untouched full buffers.
+        let outcome = if search_end {
+            unsafe {
+                decode_kernel_avx512_raw::<true>(
+                    &input[head_src..],
+                    &mut output[head_dst..],
+                    state,
+                    mode,
+                )
+            }
+        } else {
+            unsafe { decode_kernel_avx512_raw::<false>(input, output, state, mode) }
         };
-        return unsafe { decode_kernel_avx512_raw(input, output, state, mode) };
+        return x86_fold_head(outcome, head_src, head_dst);
     }
 
-    unsafe {
+    let outcome = unsafe {
         decode_kernel_simd64_vbmi2_line_aware(
-            input,
-            output,
+            &input[head_src..],
+            &mut output[head_dst..],
             state,
             dot_unstuffing,
             preserve_pending,
             search_end,
         )
-    }
+    };
+    x86_fold_head(outcome, head_src, head_dst)
 }
 
 /// Faithful 512-bit port of rapidyenc `do_decode_avx2` instantiated at
@@ -56,9 +89,9 @@ pub(super) unsafe fn decode_kernel_avx512_vbmi2(
 /// `escaped`, `esc_first`, `skip`, entry/exit state) is byte-identical to the
 /// AVX2 port, so both tiers share the same correctness envelope.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2")]
+#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn decode_kernel_avx512_raw(
+unsafe fn decode_kernel_avx512_raw<const SEARCH_END: bool>(
     input: &[u8],
     output: &mut [u8],
     state: &mut KernelState,
@@ -69,6 +102,10 @@ unsafe fn decode_kernel_avx512_raw(
 
     let mut src = 0usize;
     let mut dst = 0usize;
+    // Oracle `lenBuffer` for `isRaw && searchEnd` is `width-1 + 3 + 1`
+    // (decoder_common.h:44-46) == this 67; the widest lookahead is the `+4`
+    // view, ending at `src + WIDTH + 3`, and the loop bound
+    // (`src + WIDTH <= len - tail`) leaves a further WIDTH bytes of slack.
     let tail = WIDTH - 1 + 4;
     let simd_limit = input.len().saturating_sub(tail);
 
@@ -78,6 +115,7 @@ unsafe fn decode_kernel_avx512_raw(
     let eq_needle = _mm512_set1_epi8(b'=' as i8);
     let cr = _mm512_set1_epi8(b'\r' as i8);
     let lf = _mm512_set1_epi8(b'\n' as i8);
+    let y_needle = _mm512_set1_epi8(b'y' as i8);
     // The oracle's 16-byte specials LUT (`. \n \r =` → self, else -1) replicated
     // across all four 128-bit lanes (`_mm512_shuffle_epi8` is per-lane).
     let special_lut = _mm512_set_epi8(
@@ -168,6 +206,11 @@ unsafe fn decode_kernel_avx512_raw(
     };
     let mut min_mask = _mm512_maskz_mov_epi8(!entry_zero, dot);
 
+    // Set when the SEARCH_END probe aborts a window (oracle `len += i; break;`):
+    // the window is left unconsumed and the exit state comes from the
+    // no-backtrack rule instead of the trailing-bytes lookback.
+    let mut broke = false;
+
     if input.len() > WIDTH * 2 {
         while src + WIDTH <= simd_limit {
             let v = _mm512_loadu_si512(input.as_ptr().add(src) as *const _);
@@ -184,16 +227,83 @@ unsafe fn decode_kernel_avx512_raw(
                     // \r\n. dot-stuffing detection (oracle match2CrXDt / m2nldot).
                     let cr_mask: u64 = _mm512_cmpeq_epi8_mask(v, cr);
                     let tmp2 = _mm512_loadu_si512(input.as_ptr().add(src + 2) as *const _);
+                    // `=` at lane+2 (oracle `match2EqMask`, the AVX3 mask arm of
+                    // decoder_avx2_base.h:148-152 at 512-bit width).
+                    let match2_eq: u64 = if SEARCH_END {
+                        _mm512_cmpeq_epi8_mask(eq_needle, tmp2)
+                    } else {
+                        0
+                    };
                     let m2cr_mask: u64 = _mm512_mask_cmpeq_epi8_mask(cr_mask, tmp2, dot);
                     if m2cr_mask != 0 {
                         let tmp1 = _mm512_loadu_si512(input.as_ptr().add(src + 1) as *const _);
                         let m1nl_mask: u64 = _mm512_mask_cmpeq_epi8_mask(cr_mask, tmp1, lf);
                         let m2nldot_mask = m2cr_mask & m1nl_mask;
+
+                        // Terminator probe with a stuffed dot in the window
+                        // (oracle decoder_avx2_base.h:222-327): `\r\n.\r\n`,
+                        // `\r\n.=y` and `\r\n=y`, in k-mask form. Runs BEFORE the
+                        // `mask` merge, so an aborted window reports the pre-merge
+                        // mask to the no-backtrack exit rule.
+                        if SEARCH_END {
+                            let tmp3 = _mm512_loadu_si512(input.as_ptr().add(src + 3) as *const _);
+                            let tmp4 = _mm512_loadu_si512(input.as_ptr().add(src + 4) as *const _);
+                            // "`=y` at lane+2" (oracle match3EqY).
+                            let m3eqy: u64 = _mm512_mask_cmpeq_epi8_mask(match2_eq, tmp3, y_needle);
+                            // "`=y` at lane+3" (oracle match34EqY). Bit-position
+                            // proof: the oracle builds this per parity because a
+                            // vector register cannot address bytes — odd lanes
+                            // from `cmpeq_epi16(tmpData4, "=y") << 8` (u16 lane j
+                            // covers bytes (4+2j, 5+2j) of the window, and the
+                            // `slli` parks the hit at byte 2j+1, i.e. lane
+                            // k = 2j+1 whose k+3 = 4+2j is even), even lanes from
+                            // `match3EqY >> 8` (u16-lane byte 2j+1 -> 2j, i.e.
+                            // lane k = 2j takes match3EqY[k+1], whose "=y at
+                            // (k+1)+2" IS "=y at k+3"). Both halves therefore
+                            // state exactly `data[k+3]=='=' && data[k+4]=='y'`, so
+                            // at bit granularity the whole parity dance collapses
+                            // to `m3eqy >> 1` — with bit 63 (which would need
+                            // match3EqY[64], outside the window) supplied by the
+                            // oracle's u16 lane 31 of the `+4` view, i.e. by bytes
+                            // 66/67. Comparing the `+3`/`+4` views directly gives
+                            // every bit including 63 from those same bytes.
+                            let m34eqy: u64 = _mm512_cmpeq_epi8_mask(tmp3, eq_needle)
+                                & _mm512_cmpeq_epi8_mask(tmp4, y_needle);
+                            debug_assert_eq!(m34eqy & !(1u64 << 63), m3eqy >> 1);
+                            let m4nl: u64 =
+                                _mm512_cmpeq_epi8_mask(tmp3, cr) & _mm512_cmpeq_epi8_mask(tmp4, lf);
+                            // `\r\n.` + (`\r\n` | `=y`) at lane+3, and `\r\n=y`.
+                            let m4end = (m4nl | m34eqy) & m2nldot_mask;
+                            let m3end = m3eqy & m1nl_mask;
+                            if (m4end | m3end) != 0 {
+                                state.state = x86_break_state(input, src, mask, esc_first);
+                                broke = true;
+                                break;
+                            }
+                        }
+
                         mask |= m2nldot_mask << 2;
                         // carry a straddling \r\n. (CR at byte 62/63, dot in the
                         // next window) into the next window's min_mask.
                         min_mask = _mm512_maskz_mov_epi8(!(m2nldot_mask >> 62), dot);
                     } else {
+                        // Terminator probe without a stuffed dot in the window
+                        // (oracle decoder_avx2_base.h:344-421): only `\r\n=y` is
+                        // reachable — any `\r\n.` shape would have set m2cr_mask.
+                        if SEARCH_END {
+                            let tmp3 = _mm512_loadu_si512(input.as_ptr().add(src + 3) as *const _);
+                            let m3eqy: u64 = _mm512_mask_cmpeq_epi8_mask(match2_eq, tmp3, y_needle);
+                            if m3eqy != 0 {
+                                let tmp1 =
+                                    _mm512_loadu_si512(input.as_ptr().add(src + 1) as *const _);
+                                let m1nl_mask: u64 = _mm512_mask_cmpeq_epi8_mask(cr_mask, tmp1, lf);
+                                if (m3eqy & m1nl_mask) != 0 {
+                                    state.state = x86_break_state(input, src, mask, esc_first);
+                                    broke = true;
+                                    break;
+                                }
+                            }
+                        }
                         min_mask = dot;
                     }
                 } else {
@@ -251,7 +361,9 @@ unsafe fn decode_kernel_avx512_raw(
     // < WIDTH), `src` is still 0 and the entry state MUST survive untouched for
     // the scalar epilogue — otherwise a carried Cr/CrLf line-start (with a
     // pending stuffed dot) would be clobbered to None and mis-decoded.
-    if src > 0 {
+    // A SEARCH_END break already set the state from the no-backtrack rule over
+    // the unconsumed window, so the (backtracking) lookback must not run.
+    if !broke && src > 0 {
         let out_next_mask: u16 = if src >= 2 && src + 1 < input.len() {
             if input[src - 2] == b'\r' && input[src - 1] == b'\n' && input[src] == b'.' {
                 1
@@ -289,7 +401,7 @@ unsafe fn decode_kernel_avx512_raw(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2")]
+#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[inline]
 pub(super) unsafe fn try_decode_avx512_vbmi2_block(
     input: &[u8],
@@ -404,7 +516,7 @@ pub(super) unsafe fn try_decode_avx512_vbmi2_block(
 /// kernel structure (`decode_kernel_simd64_ssse3_line_aware`) at 512-bit
 /// width.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2")]
+#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2,bmi1,bmi2,popcnt,lzcnt")]
 pub(super) unsafe fn decode_kernel_simd64_vbmi2_line_aware(
     input: &[u8],
     output: &mut [u8],
@@ -490,7 +602,7 @@ pub(super) unsafe fn decode_kernel_simd64_vbmi2_line_aware(
 /// one 512-bit vector per 64-byte chunk, k-register masks, and full-width
 /// vpcompressb compaction.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2")]
+#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn try_decode_avx512_vbmi2_line(
     input: &[u8],

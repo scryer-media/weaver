@@ -411,19 +411,18 @@ fn build_service(
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
+        direct_store: None,
+        delivery_naming: None,
+        metrics: Default::default(),
         config_path: None,
     }));
     let handle = test_scheduler_handle(submissions);
     crate::ingest::init_job_counter(20_000);
-    RssService::new_with_security(
-        handle,
-        config,
-        db,
-        RuntimeSecurityConfig {
-            rss_allow_private_network: true,
-            ..RuntimeSecurityConfig::default()
-        },
-    )
+    RssService::new_with_security(handle, config, db, {
+        let mut security = RuntimeSecurityConfig::default();
+        security.rss_allow_private_network = true;
+        security
+    })
 }
 
 fn test_scheduler_handle(submissions: Arc<StdMutex<Vec<CapturedSubmission>>>) -> SchedulerHandle {

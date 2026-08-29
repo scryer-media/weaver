@@ -951,7 +951,10 @@ fn append_marker(
 }
 
 fn is_permanent_submit_error(error: &SubmitNzbError) -> bool {
-    matches!(error, SubmitNzbError::Parse(_) | SubmitNzbError::Empty)
+    matches!(
+        error,
+        SubmitNzbError::Parse(_) | SubmitNzbError::Empty | SubmitNzbError::InvalidCategory(_)
+    )
 }
 
 fn display_path(path: &Path) -> String {

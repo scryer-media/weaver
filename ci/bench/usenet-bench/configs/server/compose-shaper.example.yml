@@ -1,0 +1,77 @@
+# Keep the local source-built E2E NNTP server and the benchmark clients on
+# different networks. Clients resolve `nntp` to the transparent shaper; TLS
+# is passed through to `nntp-upstream`, so CA validation remains end-to-end.
+services:
+  nntp:
+    # Build this tag with `nntpbench image build`; it is never pulled or
+    # published by this project.
+    image: ${E2E_NNTP_IMAGE:-e2e-nntp:local}
+    pull_policy: never
+    environment:
+      NNTP_LISTEN_ADDR: "0.0.0.0:119"
+      NNTP_TLS_LISTEN_ADDR: "0.0.0.0:563"
+      NNTP_DATA_DIR: /data/articles
+      NNTP_USERNAME: "${NNTP_BENCH_USERNAME:-fixture-user}"
+      NNTP_PASSWORD_FILE: /run/secrets/nntp-password
+      NNTP_GENERATE_TEST_TLS: "1"
+      NNTP_TLS_DIR: /certs
+      NNTP_TLS_DNS_NAMES: "nntp,nntp-upstream,nntp.bench.test,localhost"
+    secrets:
+      - nntp-password
+    volumes:
+      - nntp-data:/data
+      - nntp-certs:/certs
+    healthcheck:
+      test: ["CMD", "/e2e-nntp", "health", "--addr", "127.0.0.1:119"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    networks:
+      nntp_upstream:
+        aliases: [nntp-upstream]
+
+  nntp-shaper:
+    image: ${NNTP_SHAPER_IMAGE:-weaver-nntp-bench-shaper:dev}
+    build:
+      context: ../..
+      dockerfile: docker/nntp-shaper/Dockerfile
+    environment:
+      UPSTREAM_ADDR: nntp-upstream:119
+      TLS_UPSTREAM_ADDR: nntp-upstream:563
+      CONTROL_LISTEN_ADDR: "0.0.0.0:8080"
+      # Supply an immutable file from `nntpbench server-env`. 0/0 means
+      # unlimited; named profiles are serialized into every run artifact.
+      NNTP_EGRESS_BITS_PER_SECOND: "${NNTP_EGRESS_BITS_PER_SECOND:?run nntpbench server-env first}"
+      NNTP_EGRESS_BURST_BYTES: "${NNTP_EGRESS_BURST_BYTES:?run nntpbench server-env first}"
+    depends_on:
+      nntp:
+        condition: service_healthy
+    # Keep the synthetic service loopback-only by default. Set
+    # NNTP_PUBLIC_BIND_ADDR to the benchmark host's LAN address only when a
+    # native Windows client must reach this shaper remotely.
+    ports:
+      - "${NNTP_PUBLIC_BIND_ADDR:-127.0.0.1}:${NNTP_PUBLIC_PLAINTEXT_PORT:-119}:119"
+      - "${NNTP_PUBLIC_BIND_ADDR:-127.0.0.1}:${NNTP_PUBLIC_TLS_PORT:-563}:563"
+      - "${NNTP_CONTROL_BIND_ADDR:-127.0.0.1}:${NNTP_CONTROL_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "/nntpshaper", "health", "--addr", "127.0.0.1:8080"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    networks:
+      nntp_upstream: {}
+      benchmark:
+        aliases: [nntp]
+
+networks:
+  nntp_upstream:
+    internal: true
+  benchmark: {}
+
+volumes:
+  nntp-data:
+  nntp-certs:
+
+secrets:
+  nntp-password:
+    file: "${NNTP_BENCH_PASSWORD_FILE:?set NNTP_BENCH_PASSWORD_FILE to a local password file}"

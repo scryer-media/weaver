@@ -20,6 +20,8 @@ pub mod schema_migrations;
 pub mod security;
 pub mod servers;
 pub mod settings;
+/// Transitional, removed in 0.9.1. See the module docs.
+pub mod upgrade_compat;
 pub mod watch_folder;
 
 pub use auth::{ApiKeyRow, AuthCredentials};
@@ -46,6 +48,16 @@ pub use jobs::{
     derive_legacy_job_status, epoch_ms_now, job_status_from_persisted_str,
     normalize_semantic_duplicate_key, record_semantic_duplicate_lifecycle_metric,
     runtime_lanes_from_status_snapshot, semantic_duplicate_lifecycle_metrics_snapshot,
+};
+pub use operations::instrumentation::{
+    ARTICLE_LATENCY_BOUNDS, AtomicHistogram, DB_OP_DURATION_BOUNDS, DECODE_TASK_DURATION_BOUNDS,
+    DISK_WRITE_DURATION_BOUNDS, DbRuntimeMetrics, DbRuntimeMetricsSnapshot, DiskSpaceSnapshot,
+    EXTRACT_MEMBER_DURATION_BOUNDS, HISTOGRAM_MAX_BUCKETS, HTTP_REQUEST_DURATION_BOUNDS,
+    HistogramSnapshot, HttpMetricsSnapshot, HttpRequestCount, JOB_DURATION_BOUNDS, JobFinishCount,
+    JobLifecycleMetrics, JobLifecycleMetricsSnapshot, JobResultKind, JobStageKind,
+    JobSubmissionCount, PipelineHistograms, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
+    STAGE_DURATION_BOUNDS, ServerAttemptCount, ServerAttemptOutcomeKind, ServerCounters,
+    ServerMetricsRegistry, ServerMetricsSnapshot, StageOutcomeKind, VerificationOutcomeKind,
 };
 pub use operations::metrics::{
     DispatchShareMode, DownloadPressureReason, DownloadPressureState, MetricsSnapshot,

@@ -9,9 +9,6 @@ const JOB_BODY_WINDOW: usize = 64;
 const LANE_RTT_WINDOW: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct DownloadLaneId(pub(super) u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DownloadLaneMode {
     Sequential,
     PipelineDepth2,
@@ -29,21 +26,6 @@ impl DownloadLaneMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
-pub(crate) enum DownloadLaneState {
-    Idle,
-    AwaitingWork,
-    BindingServer,
-    Acquired,
-    Issuing,
-    Draining,
-    YieldAfterBatch,
-    Parking,
-    Recovering,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub(crate) enum LaneParkReason {
     NoWork,
     Pressure,
@@ -53,8 +35,8 @@ pub(crate) enum LaneParkReason {
     SpilloverWithdraw,
     SpilloverSpeedHarm,
     IpReplacementRetired,
-    ServerTierChanged,
     ProofFailure,
+    Capacity,
     ServerQuota,
     Error,
 }
@@ -368,10 +350,6 @@ impl LaneRttWindow {
 
 #[derive(Debug, Default)]
 pub(crate) struct DownloadLaneRuntimeState {
-    pub(super) next_lane_id: u64,
-    pub(super) active_by_mode: HashMap<DownloadLaneMode, usize>,
-    pub(super) active_by_state: HashMap<DownloadLaneState, usize>,
-    pub(super) park_counts: HashMap<LaneParkReason, u64>,
     pub(super) server_proof: HashMap<usize, ServerPipelineProof>,
     pub(super) server_rtt: HashMap<usize, LaneRttWindow>,
 }

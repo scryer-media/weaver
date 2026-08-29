@@ -118,7 +118,14 @@ mod tests {
     }
 
     #[test]
-    fn generated_key_is_created_once_and_reused() {
+    fn manual_keychain_round_trip_is_opt_in() {
+        // A real Keychain round trip can prompt for the login password when the
+        // test binary's signature changes. Keep automated tests non-interactive;
+        // developers can still exercise this path explicitly when needed.
+        if std::env::var("WEAVER_MANUAL_KEYCHAIN_TEST").ok().as_deref() != Some("1") {
+            return;
+        }
+
         let account = format!("key-test-{}", std::process::id());
         let store = MacOSKeychain::with_identifiers("weaver-test".into(), account);
         let _cleanup = KeychainCleanup(&store);

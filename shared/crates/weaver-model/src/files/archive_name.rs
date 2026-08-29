@@ -40,11 +40,13 @@ pub fn archive_base_name(filename: &str, role: &FileRole) -> Option<String> {
         | FileRole::TarArchive
         | FileRole::TarGzArchive
         | FileRole::TarBz2Archive
+        | FileRole::TarXzArchive
         | FileRole::GzArchive
         | FileRole::DeflateArchive
         | FileRole::BrotliArchive
         | FileRole::ZstdArchive
-        | FileRole::Bzip2Archive => Some(filename.to_string()),
+        | FileRole::Bzip2Archive
+        | FileRole::XzArchive => Some(filename.to_string()),
         FileRole::SplitFile { .. } => {
             if let Some(dot_pos) = filename.rfind('.') {
                 Some(filename[..dot_pos].to_string())

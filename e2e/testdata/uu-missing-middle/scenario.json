@@ -1,0 +1,10 @@
+{
+  "slug": "uu-missing-middle",
+  "title": "Crimson.Vale.S01E06.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A uuencoded multipart whose fourth of eight articles is deleted after posting, with no PAR2 to rebuild it. What is asserted is that the job reaches a terminal state cleanly and is labelled there — not which damage verdict it lands on, which is the product's to define.",
+  "category": "2000",
+  "expected_outcome": "health_failure",
+  "deleteSegmentNumbers": [
+    4
+  ]
+}

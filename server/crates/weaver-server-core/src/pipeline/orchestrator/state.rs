@@ -28,6 +28,80 @@ impl Pipeline {
         staging
     }
 
+    pub(crate) fn extraction_budget(
+        &mut self,
+        job_id: JobId,
+        staging: &std::path::Path,
+    ) -> Result<Arc<JobExtractionBudget>, String> {
+        if let Some(budget) = self.extraction_budgets.get(&job_id) {
+            return Ok(Arc::clone(budget));
+        }
+        let state = self
+            .jobs
+            .get(&job_id)
+            .ok_or_else(|| format!("job {job_id:?} not found"))?;
+        let archive_sources = state
+            .assembly
+            .archive_topologies()
+            .values()
+            .flat_map(|topology| topology.volume_map.keys().cloned())
+            .collect::<HashSet<_>>();
+        // A direct set's source volumes never enter the archive topology —
+        // that is the point of the route — but they are archive input all the
+        // same, and their members land in the staging tree this budget is
+        // about to snapshot. Leaving them out collapses the ratio base to its
+        // floor and then counts the set's own finalized output as a
+        // violation of it.
+        let direct_source_files: HashSet<u32> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .flat_map(|set| set.plan().files.keys().copied())
+            .collect();
+        let declared_archive_bytes = state
+            .assembly
+            .files()
+            .filter(|file| {
+                archive_sources.contains(&self.current_filename_for_file(job_id, file))
+                    || direct_source_files.contains(&file.file_id().file_index)
+            })
+            .map(|file| file.total_bytes())
+            .sum::<u64>()
+            .max(1);
+        let (initial_entries, initial_bytes) = match ExtractionRoot::snapshot_usage(staging) {
+            Ok(usage) => usage,
+            Err(error) => {
+                let budget = JobExtractionBudget::new(
+                    Arc::clone(&self.extraction_limits),
+                    staging.to_path_buf(),
+                    declared_archive_bytes,
+                    0,
+                    0,
+                    Arc::clone(&self.metrics),
+                )?;
+                let rejection = if error.contains("symlink") || error.contains("reparse") {
+                    budget.reject_unsafe_path(error)
+                } else {
+                    budget.reject_unsupported_entry(error)
+                };
+                return Err(rejection);
+            }
+        };
+        let budget = JobExtractionBudget::new(
+            Arc::clone(&self.extraction_limits),
+            staging.to_path_buf(),
+            declared_archive_bytes,
+            initial_entries,
+            initial_bytes,
+            Arc::clone(&self.metrics),
+        )?;
+        self.extraction_budgets.insert(job_id, Arc::clone(&budget));
+        let cancellation_budget = Arc::clone(&budget);
+        self.shared_state
+            .register_job_cancellation(job_id, Arc::new(move || cancellation_budget.cancel()));
+        Ok(budget)
+    }
+
     pub(crate) fn note_write_buffered(&mut self, bytes: usize, segments: usize) {
         self.write_buffered_bytes += bytes;
         self.write_buffered_segments += segments;
@@ -60,9 +134,14 @@ impl Pipeline {
     }
 
     pub(crate) fn clear_job_write_backlog(&mut self, job_id: JobId) {
-        let file_ids: Vec<NzbFileId> = self
+        // Both maps, not just the write buffers: a completed uuencode file
+        // keeps a tombstone entry in `uu_files` after its write buffer is gone
+        // (it is what suppresses the restart checkpoint), and teardown is where
+        // that entry is finally dropped.
+        let file_ids: std::collections::HashSet<NzbFileId> = self
             .write_buffers
             .keys()
+            .chain(self.uu_files.keys())
             .copied()
             .filter(|file_id| file_id.job_id == job_id)
             .collect();
@@ -74,6 +153,17 @@ impl Pipeline {
                 released_bytes += buf.buffered_bytes();
                 released_segments += buf.buffered_len();
             }
+            // Parked uuencode parts are held in memory for want of an offset,
+            // so they have to be released on the same teardown the write buffer
+            // is, or a torn-down job keeps its bytes alive.
+            if let Some(uu) = self.uu_files.remove(&file_id) {
+                released_bytes += uu.parked_bytes();
+                released_segments += uu.parked.len();
+            }
+            self.uu_park_requeues
+                .retain(|segment_id, _| segment_id.file_id != file_id);
+            self.file_prefix_16k.remove(&file_id);
+            self.file_declared_size.remove(&file_id);
         }
 
         if released_bytes > 0 || released_segments > 0 {
@@ -89,6 +179,17 @@ impl Pipeline {
         self.pending_concat.remove(&job_id);
         self.par2_bypassed.remove(&job_id);
         self.par2_verified.remove(&job_id);
+        // The verdict that retired them is gone, so a reprocessed job rebuilds
+        // its split topologies and asks the recovery set again.
+        self.par2_joined_split_sets.remove(&job_id);
+        // The verdict is gone, so the post-verdict re-entry budget goes with it.
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id)
+            && let Some(set_runtime) = runtime.served_mut()
+        {
+            set_runtime.post_verdict_reconcile_attempts = 0;
+        }
+        self.par2_pre_repair_dir_entries.remove(&job_id);
+        self.sfv_checked.remove(&job_id);
     }
 
     pub(crate) fn clear_job_rar_runtime(&mut self, job_id: JobId) {
@@ -141,100 +242,6 @@ impl Pipeline {
                 error = %error,
                 "failed to persist normalization retry state"
             );
-        }
-    }
-
-    pub(crate) fn persist_verified_suspect_volumes(
-        &mut self,
-        job_id: JobId,
-        set_name: &str,
-        volumes: &HashSet<u32>,
-    ) {
-        let key = (job_id, set_name.to_string());
-        let mut launch = None;
-        {
-            let state = self
-                .verified_suspect_persist_state
-                .entry(key.clone())
-                .or_default();
-            state.desired = volumes.clone();
-            if state.in_flight_version.is_some() {
-                state.queued = true;
-            } else {
-                state.next_version = state.next_version.saturating_add(1);
-                let version = state.next_version;
-                state.in_flight_version = Some(version);
-                state.queued = false;
-                launch = Some((version, state.desired.clone()));
-            }
-        }
-
-        if let Some((version, desired)) = launch {
-            self.spawn_verified_suspect_persist(job_id, set_name.to_string(), version, desired);
-        }
-    }
-
-    fn spawn_verified_suspect_persist(
-        &self,
-        job_id: JobId,
-        set_name: String,
-        version: u64,
-        volumes: HashSet<u32>,
-    ) {
-        let done_tx = self.verified_suspect_persist_done_tx.clone();
-        tokio::spawn(async move {
-            let _ = volumes;
-            let result = Ok(());
-
-            let _ = done_tx
-                .send(crate::pipeline::VerifiedSuspectPersistDone {
-                    job_id,
-                    set_name,
-                    version,
-                    result,
-                })
-                .await;
-        });
-    }
-
-    pub(crate) fn handle_verified_suspect_persist_done(
-        &mut self,
-        done: crate::pipeline::VerifiedSuspectPersistDone,
-    ) {
-        if let Err(error) = &done.result {
-            error!(
-                job_id = done.job_id.0,
-                set_name = %done.set_name,
-                error = %error,
-                "verified suspect RAR volume persistence failed"
-            );
-        }
-
-        let key = (done.job_id, done.set_name.clone());
-        let mut relaunch = None;
-        let mut remove_entry = false;
-        if let Some(state) = self.verified_suspect_persist_state.get_mut(&key) {
-            if state.in_flight_version != Some(done.version) {
-                return;
-            }
-            state.in_flight_version = None;
-
-            if state.queued {
-                state.queued = false;
-                state.next_version = state.next_version.saturating_add(1);
-                let version = state.next_version;
-                state.in_flight_version = Some(version);
-                relaunch = Some((version, state.desired.clone()));
-            } else if state.desired.is_empty() {
-                remove_entry = true;
-            }
-        }
-
-        if remove_entry {
-            self.verified_suspect_persist_state.remove(&key);
-        }
-        if let Some((version, desired)) = relaunch {
-            self.spawn_verified_suspect_persist(done.job_id, done.set_name, version, desired);
         }
     }
 

@@ -9,6 +9,8 @@ repository.workspace = true
 [dependencies]
 weaver-server-core = { path = "../weaver-server-core", default-features = false }
 weaver-nntp = { path = "../../../engines/weaver-nntp" }
+weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
+weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false }
 base64 = { workspace = true }
 age = { workspace = true, default-features = false }
 tokio = { workspace = true }
@@ -43,3 +45,4 @@ serde_json = { workspace = true }
 async-graphql = { workspace = true }
 base64 = { workspace = true }
 tempfile = { workspace = true }
+lzma-rust2 = { workspace = true, features = ["encoder"] }

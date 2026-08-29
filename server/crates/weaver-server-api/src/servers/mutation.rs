@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use async_graphql::{Context, Object, Result};
+use base64::Engine;
 use tracing::info;
 
 use crate::auth::AdminGuard;
@@ -113,7 +114,7 @@ impl ServersMutation {
 
         let validated_capabilities = validate_server_before_save(&normalized).await?;
         let mut server = normalized.as_runtime_server_config(id);
-        server.supports_pipelining = validated_capabilities.unwrap_or(false);
+        server.supports_pipelining = validated_capabilities.unwrap_or(existing.supports_pipelining);
 
         {
             let db = db.clone();
@@ -276,6 +277,7 @@ impl ServersMutation {
                     message,
                     latency_ms: None,
                     supports_pipelining: false,
+                    adoptable_tls_name_mismatch_certificate: None,
                 });
             }
         };
@@ -327,6 +329,7 @@ struct NormalizedServerInput {
     max_download_speed: u64,
     download_quota: weaver_server_core::servers::ServerDownloadQuotaConfig,
     tls_ca_cert: Option<PathBuf>,
+    tls_name_mismatch_certificate_der: Option<Vec<u8>>,
 }
 
 impl NormalizedServerInput {
@@ -334,7 +337,7 @@ impl NormalizedServerInput {
         input: ServerInput,
         fallback: Option<&weaver_server_core::servers::ServerConfig>,
     ) -> std::result::Result<Self, String> {
-        let host = input.host.trim().to_string();
+        let host = normalize_server_host(&input.host).to_string();
         if host.is_empty() {
             return Err("server host must not be empty".to_string());
         }
@@ -354,6 +357,13 @@ impl NormalizedServerInput {
             .transpose()?
             .or_else(|| fallback.map(|server| server.download_quota.clone()))
             .unwrap_or_default();
+        let tls_name_mismatch_certificate_der =
+            decode_name_mismatch_certificate(input.tls_name_mismatch_certificate_der_base64)?;
+        if !input.tls && tls_name_mismatch_certificate_der.is_some() {
+            return Err(
+                "a hostname-mismatch TLS certificate requires TLS to be enabled".to_string(),
+            );
+        }
 
         Ok(Self {
             host,
@@ -369,6 +379,7 @@ impl NormalizedServerInput {
             max_download_speed,
             download_quota,
             tls_ca_cert: normalize_optional_string(input.tls_ca_cert).map(PathBuf::from),
+            tls_name_mismatch_certificate_der,
         })
     }
 
@@ -389,6 +400,7 @@ impl NormalizedServerInput {
             max_download_speed: self.max_download_speed,
             download_quota: self.download_quota.clone(),
             tls_ca_cert: self.tls_ca_cert.clone(),
+            tls_name_mismatch_certificate_der: self.tls_name_mismatch_certificate_der.clone(),
         }
     }
 }
@@ -422,6 +434,39 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
     })
 }
 
+fn decode_name_mismatch_certificate(
+    value: Option<String>,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| "adopted TLS certificate must be base64-encoded DER".to_string())?;
+    if der.is_empty() || der.len() > 64 * 1024 {
+        return Err("adopted TLS certificate must be between 1 and 65536 bytes".to_string());
+    }
+    Ok(Some(der))
+}
+
+fn normalize_server_host(host: &str) -> &str {
+    let host = host.trim();
+    match host.split_once("://") {
+        Some((scheme, remainder))
+            if ["http", "https", "nntp", "nntps"]
+                .iter()
+                .any(|candidate| scheme.eq_ignore_ascii_case(candidate)) =>
+        {
+            remainder.trim_end_matches('/')
+        }
+        _ => host,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -450,6 +495,9 @@ mod tests {
             ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
+            direct_store: None,
+            delivery_naming: None,
+            metrics: Default::default(),
             config_path: None,
         }))
     }
@@ -469,7 +517,58 @@ mod tests {
             max_download_speed: None,
             download_quota: None,
             tls_ca_cert: None,
+            tls_name_mismatch_certificate_der_base64: None,
         }
+    }
+
+    #[test]
+    fn normalization_accepts_common_server_scheme_prefixes() {
+        for (host, expected) in [
+            ("https://news.example.com", "news.example.com"),
+            ("HTTP://news.example.com/", "news.example.com"),
+            ("nntp://news.example.com", "news.example.com"),
+            ("NNTPS://news.example.com/", "news.example.com"),
+            (" news.example.com ", "news.example.com"),
+            ("ftp://news.example.com/", "ftp://news.example.com/"),
+        ] {
+            let mut input = inactive_server_input();
+            input.host = host.to_string();
+            let normalized = NormalizedServerInput::from_input(input, None).unwrap();
+            assert_eq!(normalized.host, expected, "input host {host}");
+        }
+    }
+
+    #[test]
+    fn normalization_requires_tls_for_an_adopted_name_mismatch_certificate() {
+        let mut input = inactive_server_input();
+        input.tls_name_mismatch_certificate_der_base64 = Some("AQID".to_string());
+
+        let error = NormalizedServerInput::from_input(input, None)
+            .err()
+            .expect("a certificate exception without TLS must be rejected");
+        assert!(error.contains("requires TLS"));
+
+        let mut input = inactive_server_input();
+        input.tls = true;
+        input.tls_name_mismatch_certificate_der_base64 = Some("AQID".to_string());
+        let normalized = NormalizedServerInput::from_input(input, None)
+            .expect("a TLS server may carry an adopted certificate");
+        assert_eq!(
+            normalized.tls_name_mismatch_certificate_der,
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn normalization_rejects_malformed_adopted_name_mismatch_certificate() {
+        let mut input = inactive_server_input();
+        input.tls = true;
+        input.tls_name_mismatch_certificate_der_base64 = Some("not base64".to_string());
+
+        let error = NormalizedServerInput::from_input(input, None)
+            .err()
+            .expect("malformed certificate bytes must be rejected");
+        assert!(error.contains("base64-encoded DER"));
     }
 
     #[test]
@@ -530,6 +629,7 @@ mod tests {
                             download_quota:
                                 weaver_server_core::servers::ServerDownloadQuotaConfig::default(),
                             tls_ca_cert: None,
+                            tls_name_mismatch_certificate_der: None,
                         });
                     },
                 )

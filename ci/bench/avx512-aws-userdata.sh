@@ -2,8 +2,7 @@
 # avx512-aws-userdata.sh — EC2 cloud-init user-data. Runs on boot as root on a
 # fresh Ubuntu 24.04 Intel AVX-512 (c6i/c7i) or AMD Zen4 (c7a) instance and drives
 # the whole VBMI2 weaver-vs-rapidyenc validation end to end, unattended:
-#   1. fetch the weaver working tree (S3 tarball — includes uncommitted WIP, i.e.
-#      the new decode_kernel_avx512_raw — or a git clone as fallback)
+#   1. fetch the Weaver source archive from S3, or clone a Git ref as fallback
 #   2. run ci/bench/avx512-profile.sh (installs deps, builds weaver + rapidyenc,
 #      runs cargo test on real AVX-512, then the same-run VBMI2 ratio)
 #   3. push the results tarball to S3 AND echo summary to the serial console
@@ -58,7 +57,8 @@ sudo -u "$RUN_USER" -H bash -lc "cd '$WEAVER_DIR' && chmod +x ci/bench/avx512-pr
   || echo "WARN: avx512-profile.sh returned non-zero (results may still be partial)"
 
 # ── 3. collect + publish results ─────────────────────────────────────────────
-RES_DIR="$(ls -1dt "$WEAVER_DIR"/ci/bench/results/avx512-* 2>/dev/null | head -1)"
+RES_DIR="$(find "$WEAVER_DIR/ci/bench/results" -mindepth 1 -maxdepth 1 \
+  -type d -name 'avx512-*' -print 2>/dev/null | sort -r | head -1)"
 if [ -n "$RES_DIR" ] && [ -d "$RES_DIR" ]; then
   TARBALL="/tmp/avx512-results-$(basename "$RES_DIR").tar.gz"
   tar czf "$TARBALL" -C "$(dirname "$RES_DIR")" "$(basename "$RES_DIR")"

@@ -53,7 +53,7 @@ impl Database {
         // no-op instead of resurrecting the deleted row from a stale read.
         let observed_generation = self.job_history_cache_generation();
         let datastore = self.datastore();
-        let row = self.run_sql_blocking(async move {
+        let row = self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 &format!("{JOB_HISTORY_SELECT} WHERE job_id = {{}} LIMIT 1"),
@@ -75,7 +75,7 @@ impl Database {
     ) -> Result<Vec<JobHistoryRow>, StateError> {
         let datastore = self.datastore();
         let filter = filter.clone();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let mut sql = String::from(JOB_HISTORY_SELECT_ALIASED);
             let mut args = Vec::new();
 
@@ -94,7 +94,7 @@ impl Database {
     pub fn count_job_history(&self, filter: &HistoryFilter) -> Result<u32, StateError> {
         let datastore = self.datastore();
         let filter = filter.clone();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let mut sql = String::from("SELECT COUNT(*) AS count FROM ");
             let mut args = Vec::new();
 
@@ -118,7 +118,7 @@ impl Database {
         limit: Option<u32>,
     ) -> Result<Vec<IntegrationEventRow>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let mut sql = String::from(
                 "SELECT id, timestamp, kind, item_id, payload_json
                    FROM integration_events
@@ -160,7 +160,7 @@ impl Database {
 
     pub fn latest_integration_event_id(&self) -> Result<Option<i64>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT MAX(id) AS id FROM integration_events",
@@ -175,7 +175,7 @@ impl Database {
 
     pub fn max_job_id(&self) -> Result<u64, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let max = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT MAX(job_id) AS job_id FROM job_history",
@@ -195,7 +195,7 @@ impl Database {
         job_id: u64,
     ) -> Result<Option<PersistedNzbRecord>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT nzb_path, nzb_zstd

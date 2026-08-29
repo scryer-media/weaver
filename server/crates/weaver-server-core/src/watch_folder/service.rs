@@ -382,6 +382,9 @@ mod tests {
             ip_replacement_trial_extra_connections: None,
             watch_folder,
             duplicate_policy: Default::default(),
+            direct_store: None,
+            delivery_naming: None,
+            metrics: Default::default(),
             config_path: None,
         }))
     }

@@ -1,9 +1,11 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use weaver_yenc::{
     RapidyencDecodeEnd, RapidyencDecodeState, decode_rapidyenc_ex, decode_rapidyenc_incremental,
@@ -120,11 +122,157 @@ struct Observation {
     end: RapidyencDecodeEnd,
 }
 
+/// The compiled oracle image, shared by every test in this process.
+///
+/// Each test drives its own oracle *process* -- they run concurrently and each
+/// owns a private stdin/stdout stream -- but they all exec one image, compiled
+/// once.
+///
+/// Building once is what makes this harness deterministic. Each test used to
+/// build privately into `<tmp>/weaver-yenc-rapidyenc-oracle-<pid>-<nanos>`, and
+/// because the tests all start together, two of them could read the same value
+/// from the clock and derive the *same* directory. `create_dir_all` succeeds on
+/// an existing directory, so the collision was silent, and the colliding tests
+/// then compiled to one `oracle` path and exec'd it while another was still
+/// writing it. Whichever test lost that race failed before checking a single
+/// case, in one of three ways:
+///
+/// * `ETXTBSY` ("Text file busy") -- exec'ing an image a linker still holds
+///   open for writing. This is the ~1-run-in-100 flake seen on Linux.
+/// * `ENOENT` -- a colliding test finished first and its cleanup removed the
+///   shared directory out from under a test that had not spawned yet.
+/// * "rapidyenc oracle exited before responding" -- a half-linked image ran.
+///
+/// The clock's granularity sets the rate: 25ns under Linux, but 1000ns under
+/// macOS, where collisions are correspondingly commoner. Nothing about the
+/// failure is specific to the test that reports it -- it is whichever one loses.
+struct OracleBinary {
+    binary: PathBuf,
+    temp_dir: PathBuf,
+}
+
+impl Drop for OracleBinary {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
+/// Weak, so the build is dropped -- and its temp dir removed -- as soon as the
+/// last [`Oracle`] using it goes away, exactly as the per-test cleanup did.
+static ORACLE_BINARY: LazyLock<Mutex<Weak<OracleBinary>>> =
+    LazyLock::new(|| Mutex::new(Weak::new()));
+
+/// Compile the oracle once per process, and hand every caller the same image.
+fn shared_oracle_binary(root: &Path) -> Result<Arc<OracleBinary>, Box<dyn Error>> {
+    // Deliberately held across the compile: the tests that lose this race wait
+    // for the winner's binary rather than linking one of their own, so no exec
+    // can overlap a link.
+    let mut slot = ORACLE_BINARY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = slot.upgrade() {
+        return Ok(existing);
+    }
+    let built = Arc::new(build_oracle_binary(root)?);
+    *slot = Arc::downgrade(&built);
+    Ok(built)
+}
+
+fn build_oracle_binary(root: &Path) -> Result<OracleBinary, Box<dyn Error>> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "weaver-yenc-rapidyenc-oracle-{}-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    // The counter above is what actually guarantees uniqueness: the clock alone
+    // did not, and `create_dir_all` accepts an existing directory, which is what
+    // kept the old collision silent. `create_dir` fails on one instead, so if a
+    // name is ever reused again this reports it rather than sharing the path.
+    std::fs::create_dir(&temp_dir)?;
+
+    let source = temp_dir.join("oracle.cc");
+    let binary = temp_dir.join("oracle");
+    // Link under a scratch name and rename into place, so the path we exec is
+    // only ever published whole and is never itself the file being written.
+    let linked = temp_dir.join("oracle.linked");
+    std::fs::write(&source, ORACLE_SOURCE)?;
+
+    let cxx = std::env::var_os("CXX").unwrap_or_else(|| OsString::from("c++"));
+    let output = Command::new(cxx)
+        .arg("-std=c++17")
+        .arg("-O2")
+        .arg("-DRAPIDYENC_DISABLE_ENCODE")
+        .arg("-DRAPIDYENC_DISABLE_CRC")
+        .arg("-I")
+        .arg(root)
+        .arg(&source)
+        .arg(root.join("rapidyenc.cc"))
+        .arg(root.join("src/decoder.cc"))
+        .arg("-o")
+        .arg(&linked)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "failed to build rapidyenc oracle\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::rename(&linked, &binary)?;
+
+    Ok(OracleBinary { binary, temp_dir })
+}
+
+/// Start an oracle process, waiting out any writer still holding the image.
+///
+/// `execve` reports `ETXTBSY` ("Text file busy") while any process holds the
+/// binary open for writing. [`OracleBinary`] describes how a shared output path
+/// used to produce that here, and building once removes it: no linker is alive
+/// by the time any test reaches this function.
+///
+/// The retry stays as a backstop, because `execve` can also see a writer this
+/// process does not control -- `fork` copies every descriptor and `O_CLOEXEC`
+/// only clears them at `exec`, so an unrelated child can briefly hold a
+/// writable duplicate. That window is transient by construction, which is what
+/// makes waiting the right response rather than failing the run.
+fn spawn_oracle(binary: &Path) -> Result<Child, Box<dyn Error>> {
+    const ATTEMPTS: usize = 100;
+    const BACKOFF: Duration = Duration::from_millis(10);
+
+    for attempt in 1..=ATTEMPTS {
+        match Command::new(binary)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < ATTEMPTS =>
+            {
+                std::thread::sleep(BACKOFF);
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to spawn rapidyenc oracle {} after {attempt} attempt(s): {err}",
+                    binary.display()
+                )
+                .into());
+            }
+        }
+    }
+    unreachable!("the final attempt returns rather than retrying")
+}
+
 struct Oracle {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    temp_dir: PathBuf,
+    /// Keeps the shared image alive; its temp dir is removed once the last
+    /// oracle in the process lets go.
+    _binary: Arc<OracleBinary>,
 }
 
 impl Oracle {
@@ -133,42 +281,8 @@ impl Oracle {
             return Ok(None);
         };
 
-        let temp_dir = std::env::temp_dir().join(format!(
-            "weaver-yenc-rapidyenc-oracle-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
-        std::fs::create_dir_all(&temp_dir)?;
-        let source = temp_dir.join("oracle.cc");
-        let binary = temp_dir.join("oracle");
-        std::fs::write(&source, ORACLE_SOURCE)?;
-
-        let cxx = std::env::var_os("CXX").unwrap_or_else(|| OsString::from("c++"));
-        let output = Command::new(cxx)
-            .arg("-std=c++17")
-            .arg("-O2")
-            .arg("-DRAPIDYENC_DISABLE_ENCODE")
-            .arg("-DRAPIDYENC_DISABLE_CRC")
-            .arg("-I")
-            .arg(&root)
-            .arg(&source)
-            .arg(root.join("rapidyenc.cc"))
-            .arg(root.join("src/decoder.cc"))
-            .arg("-o")
-            .arg(&binary)
-            .output()?;
-        assert!(
-            output.status.success(),
-            "failed to build rapidyenc oracle\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let mut child = Command::new(&binary)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
+        let binary = shared_oracle_binary(&root)?;
+        let mut child = spawn_oracle(&binary.binary)?;
         let stdin = child.stdin.take().expect("oracle stdin");
         let stdout = BufReader::new(child.stdout.take().expect("oracle stdout"));
 
@@ -176,7 +290,7 @@ impl Oracle {
             child,
             stdin,
             stdout,
-            temp_dir,
+            _binary: binary,
         }))
     }
 
@@ -225,9 +339,10 @@ impl Oracle {
 
 impl Drop for Oracle {
     fn drop(&mut self) {
+        // Reap the child first; the shared image's temp dir is then removed by
+        // `OracleBinary::drop` when this is the last oracle holding it.
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.temp_dir);
     }
 }
 
@@ -238,6 +353,10 @@ fn rapidyenc_decode_ex_matches_local_oracle() -> Result<(), Box<dyn Error>> {
     };
     let mut cases = fixed_cases();
     cases.extend(random_cases(0xdec0_de0d, 160));
+    // Long enough for the flat SIMD kernels to engage (everything above stays
+    // under the 128-byte gate, so the C oracle never saw a SIMD window).
+    cases.extend(simd_fixed_cases());
+    cases.extend(simd_random_cases(0x51d0_0d1e_5eed_1234, 200));
 
     let mut checked = 0usize;
     for case in &cases {
@@ -268,6 +387,10 @@ fn rapidyenc_incremental_matches_local_oracle() -> Result<(), Box<dyn Error>> {
     };
     let mut cases = fixed_cases();
     cases.extend(random_cases(0x1ced_cafe, 160));
+    // Same SIMD-reaching corpus, but through the end-detecting entry point:
+    // this family pins `consumed` exactly, not just the decoded bytes.
+    cases.extend(simd_fixed_cases());
+    cases.extend(simd_random_cases(0x0ff1_ce5e_c0de_7777, 200));
 
     let mut checked = 0usize;
     for case in &cases {
@@ -342,6 +465,79 @@ fn rapidyenc_chunk_boundaries_match_local_oracle() -> Result<(), Box<dyn Error>>
     }
 
     eprintln!("rapidyenc chunk-boundary differential cases: {checked}");
+    assert!(checked > 0);
+    Ok(())
+}
+
+/// The SIMD-reaching corpus across chunk splits.
+///
+/// Chunk splits are where the per-chunk `consumed` contract lives, and these
+/// inputs are the first in this harness long enough for the flat SIMD kernels
+/// to run at all. The split sweep is exhaustive for one ~600-byte case (plus a
+/// byte-at-a-time pass, the strictest form of the contract) and sampled for the
+/// longer cases — every 61st and 64th offset, which walks the split through all
+/// residues of the 64-byte window, plus the first and last eight offsets —
+/// which keeps the oracle round-trips bounded.
+#[test]
+fn rapidyenc_simd_chunk_boundaries_match_local_oracle() -> Result<(), Box<dyn Error>> {
+    let Some(mut oracle) = Oracle::new()? else {
+        return Ok(());
+    };
+
+    let sweep_case = simd_chunk_sweep_case();
+    let mut plans: Vec<(Vec<u8>, Vec<usize>)> =
+        vec![(sweep_case.clone(), (0..=sweep_case.len()).collect())];
+    for case in simd_fixed_cases() {
+        let splits = sparse_split_offsets(case.len());
+        plans.push((case, splits));
+    }
+
+    let mut checked = 0usize;
+    for (case, splits) in &plans {
+        for &split in splits {
+            let chunks = [&case[..split], &case[split..]];
+            for &is_raw in &[false, true] {
+                for &state in states() {
+                    let expected = oracle_decode_ex_chunks(&mut oracle, is_raw, state, &chunks)?;
+                    let actual = weaver_decode_ex_chunks(is_raw, state, &chunks)?;
+                    assert_eq!(
+                        actual,
+                        expected,
+                        "simd decode_ex chunk mismatch raw={is_raw} state={state:?} split={split} input={}",
+                        hex_encode(case)
+                    );
+                    checked += 1;
+                }
+            }
+
+            for &state in states() {
+                let expected = oracle_incremental_chunks(&mut oracle, state, &chunks)?;
+                let actual = weaver_incremental_chunks(state, &chunks)?;
+                assert_eq!(
+                    actual,
+                    expected,
+                    "simd incremental chunk mismatch state={state:?} split={split} input={}",
+                    hex_encode(case)
+                );
+                checked += 1;
+            }
+        }
+    }
+
+    let chunks: Vec<&[u8]> = sweep_case.chunks(1).collect();
+    for &state in states() {
+        let expected = oracle_incremental_chunks(&mut oracle, state, &chunks)?;
+        let actual = weaver_incremental_chunks(state, &chunks)?;
+        assert_eq!(
+            actual,
+            expected,
+            "simd incremental bytewise mismatch state={state:?} input={}",
+            hex_encode(&sweep_case)
+        );
+        checked += 1;
+    }
+
+    eprintln!("rapidyenc SIMD chunk-boundary differential cases: {checked}");
     assert!(checked > 0);
     Ok(())
 }
@@ -547,6 +743,156 @@ fn random_cases(mut seed: u64, count: usize) -> Vec<Vec<u8>> {
 
 fn lcg(seed: u64) -> u64 {
     seed.wrapping_mul(6364136223846793005).wrapping_add(1)
+}
+
+/// Special-free, line-structured body: `columns` data bytes per line separated
+/// by `\r\n`, containing no `=`, `.`, CR or LF outside those breaks — so the
+/// only escape or terminator in a case is the one the case splices in.
+fn line_structured_body(len: usize, columns: usize) -> Vec<u8> {
+    const DATA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-*";
+    let mut body = Vec::with_capacity(len + 2);
+    let mut col = 0usize;
+    let mut idx = 0usize;
+    while body.len() < len {
+        if col == columns {
+            body.extend_from_slice(b"\r\n");
+            col = 0;
+            continue;
+        }
+        body.push(DATA[idx % DATA.len()]);
+        col += 1;
+        idx += 1;
+    }
+    body.truncate(len);
+    body
+}
+
+fn splice_at(body: &[u8], at: usize, seq: &[u8]) -> Vec<u8> {
+    assert!(at + seq.len() <= body.len(), "splice past end of body");
+    let mut out = body.to_vec();
+    out[at..at + seq.len()].copy_from_slice(seq);
+    out
+}
+
+/// The ~600-byte clean article body reserved for the exhaustive chunk-split
+/// sweep: several 64-byte windows of 128-column data closed by a real trailer.
+fn simd_chunk_sweep_case() -> Vec<u8> {
+    let mut case = line_structured_body(560, 128);
+    case.extend_from_slice(b"\r\n=yend size=560 part=1 pcrc32=1a2b3c4d");
+    case
+}
+
+/// Fixed cases past the 128-byte flat-kernel gate: every one spans several
+/// 64-byte SIMD windows, so these are the first inputs in this harness that
+/// make the C oracle validate a weaver SIMD loop at all.
+///
+/// The window-edge families sweep the spliced sequence across absolute offsets
+/// 254..=258 — bytes 62, 63, 64, 65 and 66 of the window that starts at 192 —
+/// so the sequence starts inside one window, exactly on the edge, and inside
+/// the next.
+fn simd_fixed_cases() -> Vec<Vec<u8>> {
+    /// Absolute offsets placing a spliced sequence at bytes 62..=66 relative to
+    /// the 64-byte window starting at 192.
+    const WINDOW_EDGE: [usize; 5] = [254, 255, 256, 257, 258];
+    let base = line_structured_body(512, 128);
+    let mut cases: Vec<Vec<u8>> = Vec::new();
+
+    // (a) Clean multi-line body closed by a well-formed `=yend` trailer.
+    let mut case = line_structured_body(384, 128);
+    case.extend_from_slice(b"\r\n=yend size=384 part=2 pcrc32=deadbeef");
+    cases.push(case);
+
+    // (b) `\r\n=y` control terminator, (c) `\r\n.\r\n` article end and
+    // (d) the dot-stuffed `\r\n.=y` control form, each swept across the edge.
+    for seq in [b"\r\n=y".as_slice(), b"\r\n.\r\n", b"\r\n.=y"] {
+        for at in WINDOW_EDGE {
+            cases.push(splice_at(&base, at, seq));
+        }
+    }
+
+    // (e) `=y` INSIDE a data line is an escaped `y`, never a boundary: the two
+    // leading data bytes keep the `=` off a line start whatever surrounds it.
+    for at in WINDOW_EDGE {
+        cases.push(splice_at(&base, at, b"QQ=yQQ"));
+    }
+
+    // (f) Escape as the last byte of a window with the terminator opening the
+    // next one, so the carried `escFirst` decides how the `\r` is read.
+    for seq in [b"\r\n=y".as_slice(), b"\r\n.\r\n", b"\r\n.=y"] {
+        for boundary in [256usize, 320] {
+            let mut case = splice_at(&base, boundary, seq);
+            case[boundary - 1] = b'=';
+            cases.push(case);
+        }
+    }
+
+    // (g) Dot-stuffed line starts mid-body, on and off the window edge.
+    for at in [128usize, 190, 254, 255, 256, 257] {
+        cases.push(splice_at(&base, at, b"\r\n..x"));
+    }
+
+    // (h) Dense escape runs straddling the window edge.
+    for at in [250usize, 254, 255, 256] {
+        cases.push(splice_at(&base, at, b"========"));
+    }
+    cases.push(splice_at(&base, 60, b"=========================="));
+
+    // (i) A ~4 KiB realistic 128-column body with a trailer.
+    let mut case = line_structured_body(4096, 128);
+    case.extend_from_slice(b"\r\n=yend size=4096 part=3 pcrc32=0badc0de");
+    cases.push(case);
+
+    cases
+}
+
+/// Deterministic random cases sized for the SIMD loops: lengths 129..=4096,
+/// three in four biased to within ±4 of a 64-byte window boundary (including
+/// the 129-byte gate edge), with the same byte-class mix as [`random_cases`] —
+/// mostly yEnc-significant bytes, one in five an arbitrary byte that can be NUL.
+fn simd_random_cases(mut seed: u64, count: usize) -> Vec<Vec<u8>> {
+    const YENCISH: &[u8] = b"\r\n.=yABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut cases = Vec::with_capacity(count);
+    for _ in 0..count {
+        seed = lcg(seed);
+        let windows = 2 + ((seed >> 32) as usize % 63);
+        seed = lcg(seed);
+        let delta = ((seed >> 32) as i64 % 9) - 4;
+        seed = lcg(seed);
+        let len = if (seed >> 40).is_multiple_of(4) {
+            129 + ((seed >> 32) as usize % 3968)
+        } else {
+            ((windows * 64) as i64 + delta).clamp(129, 4096) as usize
+        };
+        let mut bytes = Vec::with_capacity(len);
+        for _ in 0..len {
+            seed = lcg(seed);
+            let pick = (seed >> 56) as usize;
+            let byte = if pick.is_multiple_of(5) {
+                (seed >> 24) as u8
+            } else {
+                YENCISH[pick % YENCISH.len()]
+            };
+            bytes.push(byte);
+        }
+        cases.push(bytes);
+    }
+    cases
+}
+
+/// Split offsets for the long chunk-boundary cases: every 61st and 64th offset
+/// (co-prime strides that walk the split through every residue of the 64-byte
+/// window) plus the first and last eight offsets, where the pending-state
+/// carries live.
+fn sparse_split_offsets(len: usize) -> Vec<usize> {
+    let mut offsets: Vec<usize> = (0..=len).step_by(61).collect();
+    offsets.extend((0..=len).step_by(64));
+    for back in 0..=8usize {
+        offsets.push(back.min(len));
+        offsets.push(len.saturating_sub(back));
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
 }
 
 fn states() -> &'static [RapidyencDecodeState] {

@@ -1,0 +1,8 @@
+{
+  "slug": "split-7z-encrypted",
+  "title": "E2E.Test.Split.7z.Encrypted.2024.1080p-TESTGRP",
+  "description": "Password-protected split 7z (3 volumes) with header encryption",
+  "category": "2000",
+  "expected_outcome": "success",
+  "password": "e2e-test-password"
+}

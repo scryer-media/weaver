@@ -10,6 +10,10 @@ tmp
 apps/weaver-web/node_modules
 apps/weaver-web/dist
 
+# The release image is built from this context but never consumes the E2E
+# harness. Keeping it out lets harness-only changes reuse the existing image.
+e2e
+
 crates/*/tests
 crates/*/examples
 

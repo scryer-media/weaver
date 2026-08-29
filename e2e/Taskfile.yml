@@ -1,0 +1,312 @@
+version: "3"
+
+vars:
+  E2E_BIN: ./.bin/weaver-e2e
+
+tasks:
+  default:
+    cmds:
+      - task help
+    silent: true
+
+  help:
+    desc: Show available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Build the weaver-e2e CLI
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - mkdir -p ./.bin
+      - go build -o {{.E2E_BIN}} ./cmd/weaver-e2e
+
+  hydrate:
+    desc: "Make one fixture-corpus profile present: reuse, then fetch from the published corpus, then generate what is still missing"
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - go run ./cmd/corpus ensure --profile {{.PROFILE | default "functional"}} {{.CLI_ARGS}}
+
+  fetch:
+    desc: Fetch one fixture-corpus profile from the published corpus only (no local generation)
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - go run ./cmd/corpus hydrate --profile {{.PROFILE | default "functional"}}
+
+  corpus:verify:
+    desc: Check the fixture corpus against its ledger, lock and signature
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - go run ./cmd/corpus verify {{.CLI_ARGS}}
+
+  scenarios:
+    desc: List the available Weaver scenarios
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} scenarios {{.CLI_ARGS}}"
+
+  seed:
+    desc: Seed one Weaver scenario
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} seed {{.CLI_ARGS}}"
+
+  seed-all:
+    desc: Seed all Weaver scenarios
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} seed-all {{.CLI_ARGS}}"
+
+  verify:
+    desc: Verify seeded Weaver fixtures
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} verify {{.CLI_ARGS}}"
+
+  status:
+    desc: Check Weaver-side stack health
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} status {{.CLI_ARGS}}"
+
+  submit:
+    desc: Submit one seeded NZB to Weaver
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} submit {{.CLI_ARGS}}"
+
+  test:
+    desc: Run selected Weaver scenarios
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} test {{.CLI_ARGS}}"
+
+  test-all:
+    desc: Run the full Weaver baseline suite
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} test-all {{.CLI_ARGS}}"
+
+  functional:
+    desc: Run Weaver functional full-suite phases with the dashboard
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} functional"
+
+  chaos-test:
+    desc: Run the Weaver NNTP chaos suite
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} chaos-test {{.CLI_ARGS}}"
+
+  tcp-chaos:
+    desc: Run the Weaver TCP chaos suite
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} tcp-chaos {{.CLI_ARGS}}"
+
+  tls-test:
+    desc: Run the Weaver TLS NNTP suite
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} tls-test {{.CLI_ARGS}}"
+
+  adaptive-dispatch:
+    desc: Run the Weaver adaptive dispatch multi-server suite
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} adaptive-dispatch {{.CLI_ARGS}}"
+
+  container-restart:
+    desc: Restart Docker Weaver and verify encryption key persistence
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} container-restart {{.CLI_ARGS}}"
+
+  restart-test:
+    desc: Run selected Weaver restart cases
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} restart-test {{.CLI_ARGS}}"
+
+  restart-all:
+    desc: Run the full Weaver restart suite
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} restart-all {{.CLI_ARGS}}"
+
+  full:
+    desc: Run the full Weaver end-to-end gate
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} full {{.CLI_ARGS}}"
+
+  release-gate:
+    desc: Run the Weaver product-behavior release gate
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} release-gate {{.CLI_ARGS}}"
+
+  release-console:
+    desc: Serve a Weaver release-gate artifact directory
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} release-console {{.CLI_ARGS}}"
+
+  pgo:
+    desc: Run representative managed-Weaver flows and collect LLVM raw profiles
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} pgo {{.CLI_ARGS}}"
+
+  stack:up:
+    desc: Start the Weaver e2e Docker stack
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - docker compose up -d {{.CLI_ARGS}}
+
+  stack:down:
+    desc: Stop the Weaver e2e Docker stack
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - docker compose down {{.CLI_ARGS}}
+
+  stack:ps:
+    desc: Show e2e Docker service status
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - docker compose ps {{.CLI_ARGS}}
+
+  stack:logs:
+    desc: Tail e2e Docker service logs
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - docker compose logs {{.CLI_ARGS}}
+
+  bench:download:
+    desc: Run the download hotpath benchmark
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - |
+        bash -lc '
+          set -euo pipefail
+          E2E_DIR="$(pwd)"
+          E2E_BIN="${E2E_BIN:-$E2E_DIR/.bin/weaver-e2e}"
+          OUT_DIR="${DOWNLOAD_BENCH_OUTPUT_DIR:-/tmp/e2e-download-hotpaths-$(date +%Y%m%d-%H%M%S)}"
+
+          mkdir -p "$OUT_DIR"
+
+          export DOWNLOAD_BENCH_LOCAL_WEAVER="${DOWNLOAD_BENCH_LOCAL_WEAVER:-1}"
+          export DOWNLOAD_BENCH_OUTPUT_DIR="$OUT_DIR"
+          export DOWNLOAD_BENCH_ITERATIONS="${DOWNLOAD_BENCH_ITERATIONS:-3}"
+          export DOWNLOAD_BENCH_SAMPLE_MS="${DOWNLOAD_BENCH_SAMPLE_MS:-250}"
+          export DOWNLOAD_BENCH_TIMEOUT_SEC="${DOWNLOAD_BENCH_TIMEOUT_SEC:-300}"
+
+          CMD=("$E2E_BIN" download-bench "$@")
+
+          echo "Download hotpath benchmark output: $OUT_DIR"
+          echo "Command: ${CMD[*]}"
+          "${CMD[@]}"
+          echo "Artifacts written to $OUT_DIR"
+        ' -- {{.CLI_ARGS}}
+
+  bench:perf-stat:
+    desc: Run the download hotpath benchmark under perf stat
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - |
+        bash -lc '
+          set -euo pipefail
+          E2E_DIR="$(pwd)"
+          E2E_BIN="${E2E_BIN:-$E2E_DIR/.bin/weaver-e2e}"
+          OUT_DIR="${DOWNLOAD_BENCH_OUTPUT_DIR:-/tmp/e2e-download-hotpaths-$(date +%Y%m%d-%H%M%S)}"
+
+          if ! command -v perf >/dev/null 2>&1; then
+            echo "perf not found but perf-stat was requested" >&2
+            exit 1
+          fi
+
+          mkdir -p "$OUT_DIR"
+
+          export DOWNLOAD_BENCH_LOCAL_WEAVER="${DOWNLOAD_BENCH_LOCAL_WEAVER:-1}"
+          export DOWNLOAD_BENCH_OUTPUT_DIR="$OUT_DIR"
+          export DOWNLOAD_BENCH_ITERATIONS="${DOWNLOAD_BENCH_ITERATIONS:-3}"
+          export DOWNLOAD_BENCH_SAMPLE_MS="${DOWNLOAD_BENCH_SAMPLE_MS:-250}"
+          export DOWNLOAD_BENCH_TIMEOUT_SEC="${DOWNLOAD_BENCH_TIMEOUT_SEC:-300}"
+
+          CMD=("$E2E_BIN" download-bench "$@")
+
+          echo "Download hotpath benchmark output: $OUT_DIR"
+          echo "Command: ${CMD[*]}"
+          perf stat -d -o "$OUT_DIR/perf-stat.txt" -- "${CMD[@]}"
+          echo "Artifacts written to $OUT_DIR"
+        ' -- {{.CLI_ARGS}}
+
+  bench:perf-record:
+    desc: Run the download hotpath benchmark under perf record
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - |
+        bash -lc '
+          set -euo pipefail
+          E2E_DIR="$(pwd)"
+          E2E_BIN="${E2E_BIN:-$E2E_DIR/.bin/weaver-e2e}"
+          OUT_DIR="${DOWNLOAD_BENCH_OUTPUT_DIR:-/tmp/e2e-download-hotpaths-$(date +%Y%m%d-%H%M%S)}"
+
+          if ! command -v perf >/dev/null 2>&1; then
+            echo "perf not found but perf-record was requested" >&2
+            exit 1
+          fi
+
+          mkdir -p "$OUT_DIR"
+
+          export DOWNLOAD_BENCH_LOCAL_WEAVER="${DOWNLOAD_BENCH_LOCAL_WEAVER:-1}"
+          export DOWNLOAD_BENCH_OUTPUT_DIR="$OUT_DIR"
+          export DOWNLOAD_BENCH_ITERATIONS="${DOWNLOAD_BENCH_ITERATIONS:-3}"
+          export DOWNLOAD_BENCH_SAMPLE_MS="${DOWNLOAD_BENCH_SAMPLE_MS:-250}"
+          export DOWNLOAD_BENCH_TIMEOUT_SEC="${DOWNLOAD_BENCH_TIMEOUT_SEC:-300}"
+
+          CMD=("$E2E_BIN" download-bench "$@")
+
+          echo "Download hotpath benchmark output: $OUT_DIR"
+          echo "Command: ${CMD[*]}"
+          perf record -F "${PERF_FREQ:-999}" -g -o "$OUT_DIR/perf.data" -- "${CMD[@]}"
+          perf report --stdio -i "$OUT_DIR/perf.data" > "$OUT_DIR/perf-report.txt" || true
+          echo "Artifacts written to $OUT_DIR"
+        ' -- {{.CLI_ARGS}}
+
+  playwright:install:
+    desc: Install the Weaver Playwright project's dependencies
+    dir: "{{.TASKFILE_DIR}}/playwright-weaver"
+    cmds:
+      - npm ci
+
+  playwright:audit:
+    desc: Run the Weaver Playwright spec audits (self-containment, selectors, boundary)
+    dir: "{{.TASKFILE_DIR}}/playwright-weaver"
+    cmds:
+      - npm run audit

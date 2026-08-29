@@ -1,0 +1,31 @@
+{
+  "name": "weaver-e2e-playwright",
+  "private": true,
+  "scripts": {
+    "test": "playwright test",
+    "typecheck": "tsc --noEmit",
+    "test:ui-settings-crud": "playwright test tests/ui-settings-crud.spec.ts",
+    "test:ui-security": "playwright test tests/ui-security.spec.ts",
+    "test:ui-ingress-automation": "playwright test tests/ui-ingress-automation.spec.ts",
+    "test:ui-post-processing": "playwright test tests/ui-post-processing.spec.ts",
+    "test:ui-runtime-observability": "playwright test tests/ui-runtime-observability.spec.ts",
+    "test:ui-backup-restore": "playwright test tests/ui-backup-restore.spec.ts",
+    "test:rate-limits": "playwright test tests/rate-limits.spec.ts",
+    "test:bandwidth-and-server-quotas": "playwright test tests/bandwidth-and-server-quotas.spec.ts",
+    "test:provider-connection-cap": "playwright test tests/provider-connection-cap.spec.ts",
+    "test:encryption-key-lifecycle": "playwright test tests/encryption-key-lifecycle.spec.ts",
+    "test:duplicate-and-queue-policy": "playwright test tests/duplicate-and-queue-policy.spec.ts",
+    "audit": "npm run audit:self-containment && npm run audit:browser-boundary && npm run audit:selector-quality",
+    "audit:self-containment": "node scripts/audit-self-containment.mjs",
+    "audit:browser-boundary": "node scripts/audit-browser-boundary.mjs",
+    "audit:selector-quality": "node scripts/audit-selector-quality.mjs",
+    "test:audit-browser-boundary": "node --test scripts/browser-boundary.test.mjs",
+    "test:audit-selector-quality": "node --test scripts/selector-quality.test.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.58.2",
+    "@types/node": "24.13.3",
+    "playwright": "1.58.2",
+    "typescript": "5.9.3"
+  }
+}

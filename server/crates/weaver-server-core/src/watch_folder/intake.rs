@@ -44,20 +44,33 @@ impl IntakeOutput {
         Ok(output)
     }
 
-    fn push_nzb(&mut self, nzb: ExtractedNzb, per_member_limit: u64) -> Result<(), String> {
+    /// Why a member of `len` bytes could not be accepted, if it could not.
+    ///
+    /// The same arithmetic [`Self::push_nzb`] enforces, asked before the bytes
+    /// exist so a member that cannot fit is never materialised into memory
+    /// just to be rejected. `push_nzb` stays the authority — this is an
+    /// optimisation in front of it, never a replacement for it.
+    fn rejection_for(&self, len: u64, per_member_limit: u64) -> Option<String> {
         if self.nzbs.len() >= MAX_NZB_MEMBERS_PER_INPUT {
-            return Err(format!(
+            return Some(format!(
                 "input contains more than {MAX_NZB_MEMBERS_PER_INPUT} NZB members"
             ));
         }
-        let next_total = self.total_nzb_bytes.saturating_add(nzb.bytes.len() as u64);
         let total_limit = total_nzb_bytes_limit(per_member_limit);
-        if next_total > total_limit {
-            return Err(format!(
+        if self.total_nzb_bytes.saturating_add(len) > total_limit {
+            return Some(format!(
                 "extracted NZB members exceed {total_limit} total bytes"
             ));
         }
-        self.total_nzb_bytes = next_total;
+        None
+    }
+
+    fn push_nzb(&mut self, nzb: ExtractedNzb, per_member_limit: u64) -> Result<(), String> {
+        let len = nzb.bytes.len() as u64;
+        if let Some(rejection) = self.rejection_for(len, per_member_limit) {
+            return Err(rejection);
+        }
+        self.total_nzb_bytes = self.total_nzb_bytes.saturating_add(len);
         self.nzbs.push(nzb);
         Ok(())
     }
@@ -89,11 +102,13 @@ pub(super) fn is_supported_candidate(path: &Path) -> bool {
                 | FileRole::TarArchive
                 | FileRole::TarGzArchive
                 | FileRole::TarBz2Archive
+                | FileRole::TarXzArchive
                 | FileRole::GzArchive
                 | FileRole::DeflateArchive
                 | FileRole::BrotliArchive
                 | FileRole::ZstdArchive
                 | FileRole::Bzip2Archive
+                | FileRole::XzArchive
                 | FileRole::SplitFile { number: 0 }
         )
 }
@@ -154,6 +169,17 @@ pub(super) fn read_nzbs_from_path_with_name(
             let reader = bzip2::read::BzDecoder::new(file);
             extract_tar_nzbs(reader, limit)
         }
+        FileRole::TarXzArchive => {
+            let file = File::open(path).map_err(transient_io)?;
+            let reader = crate::ingest::xz_multistream_decoder(
+                file,
+                crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES,
+            )
+            .map_err(|error| {
+                IntakeError::Permanent(format!("failed to open xz decoder: {error}"))
+            })?;
+            extract_tar_nzbs(reader, limit)
+        }
         FileRole::GzArchive => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = flate2::read::GzDecoder::new(file);
@@ -185,6 +211,17 @@ pub(super) fn read_nzbs_from_path_with_name(
             let file = File::open(path).map_err(transient_io)?;
             let reader = bzip2::read::BzDecoder::new(file);
             IntakeOutput::one_checked(single_stream_nzb(name, &[".bz2"], reader, limit)?, limit)
+        }
+        FileRole::XzArchive => {
+            let file = File::open(path).map_err(transient_io)?;
+            let reader = crate::ingest::xz_multistream_decoder(
+                file,
+                crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES,
+            )
+            .map_err(|error| {
+                IntakeError::Permanent(format!("failed to open xz decoder: {error}"))
+            })?;
+            IntakeOutput::one_checked(single_stream_nzb(name, &[".xz"], reader, limit)?, limit)
         }
         FileRole::SevenZipArchive | FileRole::SevenZipSplit { number: 0 } => {
             extract_7z_nzbs(path, name, limit)
@@ -461,7 +498,7 @@ fn extract_7z_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput, 
 
 fn extract_rar_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput, IntakeError> {
     let first = File::open(path).map_err(transient_io)?;
-    let mut archive = weaver_unrar::RarArchive::open(first)
+    let mut archive = unrar_rs::RarArchive::open(first)
         .map_err(|error| IntakeError::Permanent(format!("failed to read RAR archive: {error}")))?;
     archive.set_limits(rar_limits(limit));
 
@@ -484,7 +521,7 @@ fn extract_rar_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput,
     }
 
     let mut output = IntakeOutput::default();
-    let options = weaver_unrar::ExtractOptions::default();
+    let options = unrar_rs::ExtractOptions::default();
     let metadata = archive.metadata();
     for (idx, member) in metadata.members.iter().enumerate() {
         if member.is_directory || !member.name.to_ascii_lowercase().ends_with(".nzb") {
@@ -510,6 +547,17 @@ fn extract_rar_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput,
                 }
             },
         };
+        // Ask the aggregate caps before materialising. `extracted.len()` is
+        // free on both `ExtractedMember` variants, so a member that cannot fit
+        // in the remaining budget is rejected without ever being pulled into
+        // memory — otherwise a crafted archive can charge us one full member
+        // of RAM per rejection, up to the member cap. Same rejection and same
+        // stop-processing behaviour as `push_nzb` below, because it is the
+        // same arithmetic.
+        if let Some(rejection) = output.rejection_for(extracted.len() as u64, limit) {
+            output.permanent_errors.push(rejection);
+            break;
+        }
         let bytes = match extracted.into_bytes() {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -548,11 +596,11 @@ fn total_nzb_bytes_limit(per_member_limit: u64) -> u64 {
         .min(MAX_TOTAL_NZB_BYTES_PER_INPUT)
 }
 
-fn rar_limits(per_member_limit: u64) -> weaver_unrar::Limits {
-    weaver_unrar::Limits {
+fn rar_limits(per_member_limit: u64) -> unrar_rs::Limits {
+    unrar_rs::Limits {
         max_data_segment: per_member_limit,
         max_unpacked_size: per_member_limit,
-        ..weaver_unrar::Limits::default()
+        ..unrar_rs::Limits::default()
     }
 }
 
@@ -618,10 +666,10 @@ fn archive_volume_number(role: &FileRole) -> u32 {
     }
 }
 
-fn rar_member_error(error: weaver_unrar::RarError) -> IntakeError {
+fn rar_member_error(error: unrar_rs::RarError) -> IntakeError {
     match error {
-        weaver_unrar::RarError::MissingVolume { .. } => IntakeError::Transient(error.to_string()),
-        weaver_unrar::RarError::Io(error)
+        unrar_rs::RarError::MissingVolume { .. } => IntakeError::Transient(error.to_string()),
+        unrar_rs::RarError::Io(error)
             if matches!(
                 error.kind(),
                 io::ErrorKind::NotFound
@@ -742,6 +790,8 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    use lzma_rust2::{XzOptions, XzWriter};
+
     fn minimal_nzb(name: &str) -> Vec<u8> {
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -755,11 +805,126 @@ mod tests {
         .into_bytes()
     }
 
+    fn xz_compress(bytes: &[u8]) -> Vec<u8> {
+        let mut writer = XzWriter::new(Vec::new(), XzOptions::with_preset(0)).unwrap();
+        writer.write_all(bytes).unwrap();
+        writer.finish().unwrap()
+    }
+
+    #[test]
+    fn aggregate_rejection_matches_push_nzb_so_nothing_is_materialised_needlessly() {
+        // The pre-check runs before a member's bytes exist, so it has to reject
+        // exactly when `push_nzb` would: disagreeing either materialises a
+        // member that cannot fit, or drops one that could.
+        let limit = 1024;
+        let total_limit = total_nzb_bytes_limit(limit);
+        let mut output = IntakeOutput::default();
+
+        // Fill the budget exactly — that must still be accepted.
+        assert!(output.rejection_for(total_limit, limit).is_none());
+        output
+            .push_nzb(
+                ExtractedNzb {
+                    filename: "first.nzb".to_string(),
+                    bytes: vec![0u8; total_limit as usize],
+                },
+                limit,
+            )
+            .unwrap();
+
+        // One more byte cannot fit. The pre-check says so, with the message
+        // `push_nzb` produces for the same member.
+        let predicted = output.rejection_for(1, limit).expect("budget is exhausted");
+        let enforced = output
+            .push_nzb(
+                ExtractedNzb {
+                    filename: "second.nzb".to_string(),
+                    bytes: vec![0u8; 1],
+                },
+                limit,
+            )
+            .unwrap_err();
+        assert_eq!(predicted, enforced);
+        assert!(predicted.contains("total bytes"), "{predicted}");
+        assert_eq!(output.nzbs.len(), 1, "a rejected member is never recorded");
+    }
+
+    #[test]
+    fn member_cap_is_answerable_without_a_size() {
+        // At the member cap the pre-check refuses a zero-byte member, which is
+        // what lets the RAR loop stop before extracting anything further.
+        let limit = 1024 * 1024;
+        let mut output = IntakeOutput::default();
+        for index in 0..MAX_NZB_MEMBERS_PER_INPUT {
+            output
+                .push_nzb(
+                    ExtractedNzb {
+                        filename: format!("{index}.nzb"),
+                        bytes: vec![0u8; 1],
+                    },
+                    limit,
+                )
+                .unwrap();
+        }
+
+        let predicted = output.rejection_for(0, limit).expect("member cap reached");
+        let enforced = output
+            .push_nzb(
+                ExtractedNzb {
+                    filename: "overflow.nzb".to_string(),
+                    bytes: Vec::new(),
+                },
+                limit,
+            )
+            .unwrap_err();
+        assert_eq!(predicted, enforced);
+        assert!(predicted.contains("NZB members"), "{predicted}");
+    }
+
     #[test]
     fn reads_raw_nzb() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("release.nzb");
         fs::write(&path, minimal_nzb("raw")).unwrap();
+
+        let output = read_nzbs_from_path(&path).unwrap();
+
+        assert_eq!(output.nzbs.len(), 1);
+        assert_eq!(output.nzbs[0].filename, "release.nzb");
+    }
+
+    #[test]
+    fn reads_xz_nzb() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("release.nzb.xz");
+        fs::write(&path, xz_compress(&minimal_nzb("xz"))).unwrap();
+
+        let output = read_nzbs_from_path(&path).unwrap();
+
+        assert_eq!(output.nzbs.len(), 1);
+        assert_eq!(output.nzbs[0].filename, "release.nzb");
+    }
+
+    #[test]
+    fn reads_tar_xz_nzb_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let tar_path = temp.path().join("release.tar");
+        let path = temp.path().join("release.tar.xz");
+        let file = File::create(&tar_path).unwrap();
+        let mut tar = tar::Builder::new(file);
+        let bytes = minimal_nzb("tar-xz");
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(
+            &mut header,
+            "folder/release.nzb",
+            std::io::Cursor::new(bytes),
+        )
+        .unwrap();
+        tar.finish().unwrap();
+        fs::write(&path, xz_compress(&fs::read(&tar_path).unwrap())).unwrap();
 
         let output = read_nzbs_from_path(&path).unwrap();
 
@@ -890,14 +1055,14 @@ mod tests {
 
     #[test]
     fn rar_member_error_classifies_typed_missing_volume_as_transient() {
-        let error = weaver_unrar::RarError::MissingVolume {
+        let error = unrar_rs::RarError::MissingVolume {
             volume: 2,
             member: "release.nzb".to_string(),
         };
 
         assert!(matches!(rar_member_error(error), IntakeError::Transient(_)));
         assert!(matches!(
-            rar_member_error(weaver_unrar::RarError::ResourceLimit {
+            rar_member_error(unrar_rs::RarError::ResourceLimit {
                 detail: "too large".to_string()
             }),
             IntakeError::Permanent(_)

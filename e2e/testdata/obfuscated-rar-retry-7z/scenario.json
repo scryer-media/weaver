@@ -1,0 +1,14 @@
+{
+  "slug": "obfuscated-rar-retry-7z",
+  "title": "E2E.Test.Obfuscated.Retry.Reprobe.2024.1080p-TESTGRP",
+  "description": "Primary serves a corrupted obfuscated RAR with no PAR2 while backup serves a clean obfuscated 7z. Under conservative primary-first retries, file-level corruption no longer proves the primary server is bad, so the job is expected to fail instead of switching to backup automatically.",
+  "category": "2000",
+  "expected_outcome": "health_failure",
+  "segment_size": 16777216,
+  "fixtureAssets": [
+    "rar5-corrupted/archive.rar::51273aad56a8b904e96928935278a627"
+  ],
+  "backupFixtureAssets": [
+    "single-7z/archive.7z::51273aad56a8b904e96928935278a627"
+  ]
+}

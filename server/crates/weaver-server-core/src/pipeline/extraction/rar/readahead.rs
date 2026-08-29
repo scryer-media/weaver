@@ -105,20 +105,21 @@ fn spawn_prefetch(path: PathBuf) -> JoinHandle<std::io::Result<File>> {
     })
 }
 
-impl weaver_unrar::VolumeProvider for ReadaheadVolumeProvider {
+impl unrar_rs::VolumeProvider for ReadaheadVolumeProvider {
     fn get_volume(
         &self,
         index: usize,
-    ) -> Result<Box<dyn weaver_unrar::ReadSeek>, weaver_unrar::VolumeProviderError> {
-        let path = self.paths.get(&index).ok_or_else(|| {
-            weaver_unrar::VolumeProviderError::Unavailable {
-                volume: index,
-                reason: "not registered".into(),
-            }
-        })?;
+    ) -> Result<Box<dyn unrar_rs::ReadSeek>, unrar_rs::VolumeProviderError> {
+        let path =
+            self.paths
+                .get(&index)
+                .ok_or_else(|| unrar_rs::VolumeProviderError::Unavailable {
+                    volume: index,
+                    reason: "not registered".into(),
+                })?;
         let file = match self.take_prefetched(index) {
             Some(file) => file,
-            None => File::open(path).map_err(weaver_unrar::VolumeProviderError::Io)?,
+            None => File::open(path).map_err(unrar_rs::VolumeProviderError::Io)?,
         };
         self.schedule(index + 1);
         Ok(Box::new(file))
@@ -128,7 +129,7 @@ impl weaver_unrar::VolumeProvider for ReadaheadVolumeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaver_unrar::VolumeProvider;
+    use unrar_rs::VolumeProvider;
 
     fn write_volumes(temp: &tempfile::TempDir, contents: &[&[u8]]) -> HashMap<usize, PathBuf> {
         contents
@@ -200,7 +201,7 @@ mod tests {
         };
         assert!(matches!(
             error,
-            weaver_unrar::VolumeProviderError::Unavailable { volume: 1, .. }
+            unrar_rs::VolumeProviderError::Unavailable { volume: 1, .. }
         ));
     }
 
@@ -215,7 +216,7 @@ mod tests {
         let Err(error) = provider.get_volume(1) else {
             panic!("expected missing volume file to fail the open");
         };
-        assert!(matches!(error, weaver_unrar::VolumeProviderError::Io(_)));
+        assert!(matches!(error, unrar_rs::VolumeProviderError::Io(_)));
         assert_eq!(provider.prefetch_hits(), 0);
     }
 }

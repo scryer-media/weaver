@@ -1,0 +1,25 @@
+{
+  "slug": "par2-rar-placement-normalization-multi-swap",
+  "title": "E2E.Test.PAR2.RAR.Placement.Normalization.Multi.Swap.2024.1080p-TESTGRP",
+  "description": "Clean 6-volume RAR5 payload with two physical volume pairs staged under swapped filenames plus canonical PAR2 sidecars. Tests clean PAR2 placement normalization across multiple touched volumes while preserving incremental extraction.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 65536,
+  "forbiddenJobEvents": [
+    "RepairStarted",
+    "RepairComplete"
+  ],
+  "runtimeAssertions": {
+    "fileIdentityRewrite": {
+      "requiredCurrentFilenames": [
+        "fixture_rar5_lz_plain.part1.rar",
+        "fixture_rar5_lz_plain.part2.rar",
+        "fixture_rar5_lz_plain.part3.rar",
+        "fixture_rar5_lz_plain.part4.rar",
+        "fixture_rar5_lz_plain.part5.rar",
+        "fixture_rar5_lz_plain.part6.rar"
+      ],
+      "requiredClassificationSource": "par2"
+    }
+  }
+}

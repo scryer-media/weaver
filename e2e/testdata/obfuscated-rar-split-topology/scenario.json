@@ -1,0 +1,7 @@
+{
+  "slug": "obfuscated-rar-split-topology",
+  "title": "E2E.Test.RAR5.Obfuscated.Split.Topology.2024.1080p-TESTGRP",
+  "description": "Obfuscated RAR5 multi-volume set renamed to .100/.101/.102. Exercises recovery before the no-complete-volumes blocked failure path.",
+  "category": "2000",
+  "expected_outcome": "success"
+}

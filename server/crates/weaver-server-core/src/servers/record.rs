@@ -23,6 +23,7 @@ pub(crate) struct ServerRecord {
     pub download_quota_weekly_reset_weekday: IspBandwidthCapWeekday,
     pub download_quota_monthly_reset_day: u8,
     pub tls_ca_cert: Option<String>,
+    pub tls_name_mismatch_certificate_der: Option<Vec<u8>>,
 }
 
 impl ServerRecord {
@@ -50,6 +51,7 @@ impl ServerRecord {
                 monthly_reset_day: self.download_quota_monthly_reset_day,
             },
             tls_ca_cert: self.tls_ca_cert.map(std::path::PathBuf::from),
+            tls_name_mismatch_certificate_der: self.tls_name_mismatch_certificate_der,
         }
     }
 
@@ -78,6 +80,7 @@ impl ServerRecord {
                 .tls_ca_cert
                 .as_ref()
                 .map(|path| path.display().to_string()),
+            tls_name_mismatch_certificate_der: server.tls_name_mismatch_certificate_der.clone(),
         }
     }
 }

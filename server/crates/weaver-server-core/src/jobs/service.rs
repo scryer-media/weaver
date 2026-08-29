@@ -30,6 +30,45 @@ struct RestoreSkipPlan {
     stats: RestoreSkipStats,
 }
 
+/// Whole segments that a contiguous byte floor covers, and the floor those
+/// segments actually account for.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct FloorCoveredSegments {
+    pub(crate) segments: Vec<SegmentId>,
+    /// Never a partial segment: the end offset of the last segment lying
+    /// entirely below the requested floor.
+    pub(crate) floor: u64,
+}
+
+/// Walks `segments` in NZB order and returns every segment lying entirely below
+/// `floor`, together with the contiguous byte floor those whole segments
+/// account for.
+///
+/// Clamping belongs to the caller. `build_restore_skip_plan` clamps its floor
+/// to the declared file size and the partial file's on-disk length before
+/// calling. Direct-store coverage floors deliberately do not: for a direct set
+/// the source volume has no file at all, and file length never implies coverage.
+pub(crate) fn segments_covered_by_floor(
+    file_id: NzbFileId,
+    segments: &[crate::jobs::model::SegmentSpec],
+    floor: u64,
+) -> FloorCoveredSegments {
+    let mut covered = FloorCoveredSegments::default();
+    let mut segment_end = 0u64;
+    for segment in segments {
+        segment_end = segment_end.saturating_add(segment.bytes as u64);
+        if segment_end > floor {
+            break;
+        }
+        covered.segments.push(SegmentId {
+            file_id,
+            segment_number: segment.ordinal,
+        });
+        covered.floor = segment_end;
+    }
+    covered
+}
+
 impl Pipeline {
     async fn restore_has_open_download_finalization(&self, job_id: JobId) -> bool {
         let events = match self
@@ -378,16 +417,6 @@ impl Pipeline {
         self.clear_job_write_backlog(job_id);
         self.replace_failed_extraction_members(job_id, HashSet::new());
         self.set_normalization_retried_state(job_id, false);
-        if let Err(error) = self
-            .db_blocking(move |db| db.clear_verified_suspect_volumes(job_id))
-            .await
-        {
-            error!(
-                job_id = job_id.0,
-                error = %error,
-                "failed to clear persisted verified suspect RAR volumes during failed-job restart"
-            );
-        }
     }
 
     fn declared_archive_identity(
@@ -533,23 +562,13 @@ impl Pipeline {
                 stats.clamped_checkpoint_files += 1;
             }
 
-            let mut segment_end = 0u64;
-            let mut checkpoint_floor = 0u64;
-            for segment in &file_spec.segments {
-                segment_end = segment_end.saturating_add(segment.bytes as u64);
-                if segment_end > clamped_floor {
-                    break;
-                }
-
-                let segment_id = SegmentId {
-                    file_id,
-                    segment_number: segment.ordinal,
-                };
+            let covered = segments_covered_by_floor(file_id, &file_spec.segments, clamped_floor);
+            for segment_id in covered.segments {
                 if skip.insert(segment_id) {
                     stats.checkpoint_segments += 1;
                 }
-                checkpoint_floor = segment_end;
             }
+            let checkpoint_floor = covered.floor;
 
             stats.checkpoint_floor_bytes = stats
                 .checkpoint_floor_bytes
@@ -759,6 +778,13 @@ impl Pipeline {
             total_bytes: spec.total_bytes,
         });
 
+        // Resolve the category's shared decoded-byte counter once, here, so the
+        // per-segment accounting site does a single `Relaxed` `fetch_add`
+        // through an already-resolved pointer instead of a map lookup.
+        let category_bytes = self
+            .metrics
+            .job_lifecycle
+            .category_bytes_counter(spec.category.as_deref());
         let par2_bytes = spec.par2_bytes();
         let mut state = JobState {
             job_id,
@@ -786,6 +812,7 @@ impl Pipeline {
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,
             failed_bytes: 0,
+            probe_projected_failed_bytes: 0,
             par2_bytes,
             health_probing: false,
             health_probe_round: 0,
@@ -797,6 +824,7 @@ impl Pipeline {
             download_queue,
             recovery_queue,
             staging_dir: None,
+            category_bytes: Some(category_bytes),
         };
         state.refresh_runtime_lanes_from_status();
         self.jobs.insert(job_id, state);
@@ -865,10 +893,34 @@ impl Pipeline {
                 &mut download_queue
             };
 
+            // An unclassifiable file's head segment jumps the data queue: the
+            // offset-zero article carries the archive signature and the whole
+            // identity-fingerprint window, so on an obfuscated post the head
+            // wave is what lets every file bind to a direct set within the
+            // first round trips. Planned here, into the initial order, rather
+            // than re-prioritized when identity evidence arrives — a
+            // reprioritization only reaches work still in the queue, and the
+            // heads it misses are exactly the early files whose payload is
+            // already leased, deterministically, every run. Heads are
+            // ordinary file bytes; nothing is wasted if the job turns out to
+            // be nothing special.
+            let head_segment = matches!(
+                file_spec.role,
+                weaver_model::files::FileRole::Unknown
+                    | weaver_model::files::FileRole::SplitFile { .. }
+            )
+            .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
+            .flatten();
+
             for seg in &file_spec.segments {
                 let segment_id = SegmentId {
                     file_id,
                     segment_number: seg.ordinal,
+                };
+                let priority = if head_segment == Some(seg.ordinal) {
+                    2
+                } else {
+                    priority
                 };
                 if skip.contains(&segment_id) {
                     let _ = file_assembly.commit_segment(seg.ordinal, seg.bytes);
@@ -881,6 +933,7 @@ impl Pipeline {
                         byte_estimate: seg.bytes,
                         retry_count: 0,
                         is_recovery,
+                        completion_critical: false,
                         exclude_servers: vec![],
                         avoid_server: None,
                     });
@@ -1024,6 +1077,13 @@ impl Pipeline {
                 Self::build_job_assembly(job_id, &spec, &all_segments);
             let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
 
+            // Resolve the category's shared decoded-byte counter once, here, so the
+            // per-segment accounting site does a single `Relaxed` `fetch_add`
+            // through an already-resolved pointer instead of a map lookup.
+            let category_bytes = self
+                .metrics
+                .job_lifecycle
+                .category_bytes_counter(spec.category.as_deref());
             let par2_bytes = spec.par2_bytes();
             let mut state = JobState {
                 job_id,
@@ -1047,6 +1107,7 @@ impl Pipeline {
                 downloaded_bytes,
                 restored_download_floor_bytes: 0,
                 failed_bytes: 0,
+                probe_projected_failed_bytes: 0,
                 par2_bytes,
                 health_probing: false,
                 health_probe_round: 0,
@@ -1058,6 +1119,7 @@ impl Pipeline {
                 download_queue,
                 recovery_queue,
                 staging_dir: None,
+                category_bytes: Some(category_bytes),
             };
             state.refresh_runtime_lanes_from_status();
             self.jobs.insert(job_id, state);
@@ -1261,7 +1323,7 @@ impl Pipeline {
         Ok(())
     }
 
-    async fn restore_par2_state_from_disk(&mut self, job_id: JobId) {
+    pub(crate) async fn restore_par2_state_from_disk(&mut self, job_id: JobId) {
         let files: Vec<(NzbFileId, weaver_model::files::FileRole)> = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
@@ -1292,11 +1354,7 @@ impl Pipeline {
                     ..
                 }
             ) {
-                if self.par2_set(job_id).is_some() {
-                    self.try_merge_par2_recovery(job_id, *file_id).await;
-                } else {
-                    self.try_load_par2_metadata(job_id, *file_id).await;
-                }
+                self.try_merge_par2_recovery(job_id, *file_id).await;
             }
         }
 
@@ -1395,7 +1453,7 @@ impl Pipeline {
         };
         let (stale_rar_sets, refreshed_rar_files) =
             Self::scrub_restored_par2_file_identities(&mut file_identities);
-        let restore_skip_plan = Self::build_restore_skip_plan(
+        let mut restore_skip_plan = Self::build_restore_skip_plan(
             job_id,
             &spec,
             &complete_files,
@@ -1404,6 +1462,28 @@ impl Pipeline {
             &working_dir,
         )
         .await;
+        // A direct set's source volumes have no legacy floor and no
+        // completed-file row by construction, so everything above comes back
+        // empty for them; their coverage lives in the direct checkpoint and
+        // feeds exactly the same skip set. Merged before the assembly is built,
+        // because the assembly is what turns a skipped segment into work the
+        // job does not queue.
+        let direct_restore = self
+            .restore_direct_store_coverage(
+                job_id,
+                &spec,
+                &working_dir,
+                &restore_skip_plan.file_progress,
+            )
+            .await;
+        restore_skip_plan.skip.extend(direct_restore.skip.iter());
+        for (file_index, floor) in &direct_restore.file_progress {
+            let slot = restore_skip_plan
+                .file_progress
+                .entry(*file_index)
+                .or_insert(*floor);
+            *slot = (*slot).max(*floor);
+        }
         let (assembly, download_queue, recovery_queue) =
             Self::build_job_assembly(job_id, &spec, &restore_skip_plan.skip);
         let status = Self::normalize_restored_status(status, &download_queue, &recovery_queue);
@@ -1473,6 +1553,13 @@ impl Pipeline {
             total_bytes: spec.total_bytes,
         });
 
+        // Resolve the category's shared decoded-byte counter once, here, so the
+        // per-segment accounting site does a single `Relaxed` `fetch_add`
+        // through an already-resolved pointer instead of a map lookup.
+        let category_bytes = self
+            .metrics
+            .job_lifecycle
+            .category_bytes_counter(spec.category.as_deref());
         let par2_bytes = spec.par2_bytes();
         let mut state = JobState {
             job_id,
@@ -1551,6 +1638,7 @@ impl Pipeline {
             downloaded_bytes,
             restored_download_floor_bytes,
             failed_bytes: 0,
+            probe_projected_failed_bytes: 0,
             par2_bytes,
             health_probing: false,
             health_probe_round: 0,
@@ -1562,9 +1650,20 @@ impl Pipeline {
             download_queue,
             recovery_queue,
             staging_dir: restored_staging_dir,
+            category_bytes: Some(category_bytes),
         };
         state.refresh_runtime_lanes_from_status();
         self.jobs.insert(job_id, state);
+        // After the job state exists, and before anything can decode a segment
+        // for it: `install_restored` marks the job examined, so the lazy
+        // admission seam does not rediscover the same sets from the spec and
+        // discard the coverage this restore just validated.
+        let direct_sets = direct_restore.sets;
+        let direct_accepted = direct_restore.accepted;
+        let direct_rejected = direct_restore.rejected;
+        let direct_ignored = direct_restore.ignored;
+        let direct_swept = direct_restore.swept;
+        self.direct_store.install_restored(job_id, direct_sets);
         self.restore_download_finalization_runtime(job_id).await;
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
@@ -1656,6 +1755,10 @@ impl Pipeline {
             checkpoint_floor_bytes = restore_skip_plan.stats.checkpoint_floor_bytes,
             clamped_checkpoint_files = restore_skip_plan.stats.clamped_checkpoint_files,
             missing_checkpoint_files = restore_skip_plan.stats.missing_checkpoint_files,
+            direct_accepted,
+            direct_rejected,
+            direct_ignored,
+            direct_swept,
             "job restored from journal"
         );
         if !restored_terminal_post_processing

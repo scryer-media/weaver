@@ -415,6 +415,24 @@ pub fn is_protected_media_structure(path: &std::path::Path) -> bool {
         || s.contains("\\BDMV\\")
 }
 
+/// Returns `true` if any component of `relative_path` names a disc-structure
+/// directory.
+///
+/// [`is_protected_media_structure`] answers the same question for an absolute
+/// path, where the directory name is always flanked by separators. A delivery
+/// is enumerated relative to its own root, so its first component has no
+/// leading separator and a one-file `BDMV/index.bdmv` delivery would slip past
+/// the substring form.
+pub fn contains_protected_media_structure(relative_path: &str) -> bool {
+    relative_path.split(['/', '\\']).any(|component| {
+        PROTECTED_STRUCTURE_DIRS
+            .iter()
+            .any(|dir| component.eq_ignore_ascii_case(dir))
+    })
+}
+
+const PROTECTED_STRUCTURE_DIRS: &[&str] = &["VIDEO_TS", "AUDIO_TS", "BDMV"];
+
 /// Strip known archive extensions to get the filename stem for obfuscation checks.
 fn strip_archive_extension(filename: &str) -> &str {
     let lower = filename.to_ascii_lowercase();

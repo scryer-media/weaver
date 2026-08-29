@@ -16,6 +16,11 @@
       "matchPackageNames": ["slsa-framework/slsa-github-generator"],
       "enabled": false,
       "description": "Update only after verifying SLSA generator and verifier compatibility."
+    },
+    {
+      "matchPackageNames": ["lucide-react"],
+      "allowedVersions": "<1.0.0",
+      "description": "Keep Lucide React on the pre-1.0 API line."
     }
   ],
   "lockFileMaintenance": {

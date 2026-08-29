@@ -1,0 +1,31 @@
+{
+  "slug": "par2-rar-placement-stripped-recovery",
+  "title": "E2E.Test.PAR2.RAR.Placement.Stripped.Recovery.2024.1080p-TESTGRP",
+  "description": "Clean RAR5 multivolume payload with canonical PAR2 sidecars where the recovery volumes are stripped from NNTP after posting while the PAR2 index remains available. Verifies optional recovery loss does not trigger a health abort and PAR2 placement normalization still succeeds.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 65536,
+  "fixtureAssets": [
+    "rar5-multivolume/archive.part1.rar",
+    "rar5-multivolume/archive.part3.rar::archive.part2.rar",
+    "rar5-multivolume/archive.part2.rar::archive.part3.rar",
+    "par2-obfuscated-rar-rewrite/archive.rar.par2",
+    "par2-obfuscated-rar-rewrite/archive.rar.vol00+1.par2",
+    "par2-obfuscated-rar-rewrite/archive.rar.vol01+2.par2",
+    "par2-obfuscated-rar-rewrite/archive.rar.vol03+4.par2",
+    "par2-obfuscated-rar-rewrite/archive.rar.vol07+8.par2"
+  ],
+  "deleteSubjectContains": [
+    ".vol"
+  ],
+  "runtimeAssertions": {
+    "fileIdentityRewrite": {
+      "requiredCurrentFilenames": [
+        "archive.part1.rar",
+        "archive.part2.rar",
+        "archive.part3.rar"
+      ],
+      "requiredClassificationSource": "par2"
+    }
+  }
+}

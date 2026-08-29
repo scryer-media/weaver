@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use super::keystore::KeyStore;
 use keyring::{Entry, Error};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED_0, WAIT_OBJECT_0};
@@ -5,15 +7,19 @@ use windows_sys::Win32::System::Threading::{
     CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject,
 };
 
-const SERVICE: &str = "weaver";
+const LEGACY_SERVICE: &str = "weaver";
 const ACCOUNT: &str = "encryption-master-key";
-const CREATE_MUTEX_NAME: &str = "Local\\ScryerMedia.Weaver.EncryptionKey";
+const LEGACY_CREATE_MUTEX_NAME: &str = "Local\\ScryerMedia.Weaver.EncryptionKey";
+const DESKTOP_SERVICE: &str = "ScryerMedia.Weaver.Desktop.v1";
+const DESKTOP_CREATE_MUTEX_NAME: &str = "Local\\ScryerMedia.Weaver.Desktop.v1.EncryptionKey";
+const LEGACY_STORE_NAME: &str = "Windows Credential Manager (weaver)";
+const DESKTOP_STORE_NAME: &str = "Windows Credential Manager (ScryerMedia.Weaver.Desktop.v1)";
 
 struct CredentialCreateGuard(HANDLE);
 
 impl CredentialCreateGuard {
-    fn acquire() -> Result<Self, String> {
-        let name: Vec<u16> = CREATE_MUTEX_NAME.encode_utf16().chain(Some(0)).collect();
+    fn acquire(mutex_name: &str) -> Result<Self, String> {
+        let name: Vec<u16> = mutex_name.encode_utf16().chain(Some(0)).collect();
         // SAFETY: The security attributes pointer is null, and `name` is a live,
         // nul-terminated UTF-16 buffer for the duration of the call.
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
@@ -51,19 +57,41 @@ impl Drop for CredentialCreateGuard {
 pub struct WindowsCredentialManager {
     service: String,
     account: String,
+    mutex_name: &'static str,
+    store_name: &'static str,
 }
 
 impl WindowsCredentialManager {
     pub fn new() -> Self {
         Self {
-            service: SERVICE.to_string(),
+            service: LEGACY_SERVICE.to_string(),
             account: ACCOUNT.to_string(),
+            mutex_name: LEGACY_CREATE_MUTEX_NAME,
+            store_name: LEGACY_STORE_NAME,
+        }
+    }
+
+    pub fn for_data_dir(data_dir: Option<&Path>) -> Self {
+        if is_desktop_profile(data_dir) {
+            Self {
+                service: DESKTOP_SERVICE.to_string(),
+                account: ACCOUNT.to_string(),
+                mutex_name: DESKTOP_CREATE_MUTEX_NAME,
+                store_name: DESKTOP_STORE_NAME,
+            }
+        } else {
+            Self::new()
         }
     }
 
     #[cfg(test)]
     fn with_identifiers(service: String, account: String) -> Self {
-        Self { service, account }
+        Self {
+            service,
+            account,
+            mutex_name: LEGACY_CREATE_MUTEX_NAME,
+            store_name: LEGACY_STORE_NAME,
+        }
     }
 
     fn entry(&self) -> Result<Entry, String> {
@@ -90,7 +118,7 @@ impl KeyStore for WindowsCredentialManager {
     }
 
     fn create_key_if_absent(&self, key: &str) -> Result<Option<String>, String> {
-        let _guard = CredentialCreateGuard::acquire()?;
+        let _guard = CredentialCreateGuard::acquire(self.mutex_name)?;
         let entry = self.entry()?;
         match entry.get_password() {
             Ok(existing) => {
@@ -114,7 +142,7 @@ impl KeyStore for WindowsCredentialManager {
     }
 
     fn replace_key(&self, key: &str) -> Result<bool, String> {
-        let _guard = CredentialCreateGuard::acquire()?;
+        let _guard = CredentialCreateGuard::acquire(self.mutex_name)?;
         self.entry()?
             .set_password(key)
             .map(|()| true)
@@ -139,8 +167,25 @@ impl KeyStore for WindowsCredentialManager {
     }
 
     fn name(&self) -> &'static str {
-        "Windows Credential Manager"
+        self.store_name
     }
+}
+
+fn is_desktop_profile(data_dir: Option<&Path>) -> bool {
+    let Some(data_dir) = data_dir else {
+        return false;
+    };
+    let Some(name) = data_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(parent) = data_dir.parent() else {
+        return false;
+    };
+    let Some(parent_name) = parent.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    name.eq_ignore_ascii_case("Weaver") && parent_name.eq_ignore_ascii_case("ScryerMedia")
 }
 
 #[cfg(test)]
@@ -204,5 +249,24 @@ mod tests {
 
         assert!(error.contains("is empty"));
         assert_eq!(store.entry().unwrap().get_password().unwrap(), "   ");
+    }
+
+    #[test]
+    fn desktop_profile_uses_isolated_credential_namespace() {
+        let store = WindowsCredentialManager::for_data_dir(Some(Path::new(
+            r"C:\\Users\\example\\AppData\\Local\\ScryerMedia\\Weaver",
+        )));
+
+        assert_eq!(store.service, DESKTOP_SERVICE);
+        assert_eq!(store.mutex_name, DESKTOP_CREATE_MUTEX_NAME);
+        assert_eq!(store.name(), DESKTOP_STORE_NAME);
+    }
+
+    #[test]
+    fn non_desktop_paths_keep_the_legacy_credential_namespace() {
+        let store = WindowsCredentialManager::for_data_dir(Some(Path::new(r"C:\\work\\weaver")));
+
+        assert_eq!(store.service, LEGACY_SERVICE);
+        assert_eq!(store.mutex_name, LEGACY_CREATE_MUTEX_NAME);
     }
 }

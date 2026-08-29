@@ -92,6 +92,178 @@ impl AuthMutation {
             })
             .collect())
     }
+    /// Set the address Weaver listens on, applied at the next restart.
+    ///
+    /// Refused when `WEAVER_HTTP_BIND_ADDRESS` is set, rather than stored and
+    /// silently ignored: an operator who pinned the address in their
+    /// deployment should be told their edit would not take effect, not left to
+    /// discover it after a restart. An empty value clears the setting back to
+    /// the loopback default.
+    #[graphql(guard = "AdminGuard")]
+    async fn set_http_bind_address(&self, ctx: &Context<'_>, address: String) -> Result<bool> {
+        use weaver_server_core::security::{
+            BindAddressSource, RuntimeSecurityConfig, SETTING_HTTP_BIND_ADDRESS, ip_is_loopback,
+            resolve_bind_address,
+        };
+
+        let security = ctx.data::<RuntimeSecurityConfig>()?;
+        if matches!(security.bind_address_source, BindAddressSource::Environment) {
+            return Err(async_graphql::Error::new(
+                "WEAVER_HTTP_BIND_ADDRESS is set in this deployment's environment, \
+                 which takes precedence; change it there instead",
+            ));
+        }
+
+        let trimmed = address.trim().to_string();
+        // Syntactic validation through the same resolver startup uses. Note
+        // what this does NOT promise: bindability. A syntactically valid
+        // address this host cannot bind (a moved DHCP lease, a downed VPN
+        // interface) is only discoverable by binding — which is why startup
+        // falls back to loopback with a banner instead of refusing to start,
+        // and why this mutation may accept a value the next boot cannot use.
+        let (parsed, _) = resolve_bind_address(None, Some(trimmed.as_str()))
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+
+        // Refuse a combination strict security will refuse at the next boot,
+        // rather than storing a time bomb: under WEAVER_STRICT_SECURITY=1 a
+        // non-loopback bind without login makes startup fail.
+        if security.strict_security && !trimmed.is_empty() && !ip_is_loopback(parsed) {
+            let login_enabled = ctx
+                .data::<crate::auth::LoginAuthCache>()?
+                .snapshot()
+                .is_some();
+            if !login_enabled {
+                return Err(async_graphql::Error::new(
+                    "WEAVER_STRICT_SECURITY=1 refuses a non-loopback bind address while \
+                     login is disabled; enable login first",
+                ));
+            }
+        }
+
+        let db = ctx.data::<weaver_server_core::Database>()?.clone();
+        let stored = trimmed.clone();
+        tokio::task::spawn_blocking(move || {
+            if stored.is_empty() {
+                db.delete_setting(SETTING_HTTP_BIND_ADDRESS)
+            } else {
+                db.set_setting(SETTING_HTTP_BIND_ADDRESS, &stored)
+            }
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        // The one mutation whose effect is invisible until a restart is the
+        // one that most needs a log line when someone later asks why the
+        // instance started listening somewhere new.
+        if trimmed.is_empty() {
+            info!("http bind address setting cleared; next restart binds loopback");
+        } else {
+            info!(address = %trimmed, "http bind address setting changed; applies at next restart");
+        }
+
+        Ok(true)
+    }
+
+    /// Change the browser-admission policy: mode plus trusted networks.
+    /// Applies immediately — trust is live state, unlike the bind address.
+    #[graphql(guard = "AdminGuard")]
+    async fn set_access_policy(
+        &self,
+        ctx: &Context<'_>,
+        mode: String,
+        trusted_networks: Option<Vec<String>>,
+    ) -> Result<bool> {
+        use weaver_server_core::security::{
+            AccessMode, LOCAL_NETWORK_PRESETS, LOOPBACK_NETWORKS, RuntimeSecurityConfig,
+            SETTING_ACCESS_MODE, SETTING_TRUSTED_NETWORKS,
+        };
+
+        let security = ctx.data::<RuntimeSecurityConfig>()?;
+        if security.trust_env_pinned {
+            return Err(async_graphql::Error::new(
+                "WEAVER_TRUSTED_CIDRS is set in this deployment's environment, which takes \
+                 precedence; change it there instead",
+            ));
+        }
+        let Some(parsed_mode) = AccessMode::parse_setting_value(&mode) else {
+            return Err(async_graphql::Error::new("unknown access mode"));
+        };
+        if security.strict_security && !matches!(parsed_mode, AccessMode::LoginRequired) {
+            return Err(async_graphql::Error::new(
+                "WEAVER_STRICT_SECURITY=1 refuses trusting access modes",
+            ));
+        }
+        // No-login means no credentials; switching to it while a login exists
+        // would strand a stored password that silently stops mattering. Force
+        // the explicit order: disable login first, then loosen the policy.
+        let login_enabled = ctx
+            .data::<crate::auth::LoginAuthCache>()?
+            .snapshot()
+            .is_some();
+        if matches!(parsed_mode, AccessMode::NoLogin) && login_enabled {
+            return Err(async_graphql::Error::new(
+                "disable login before switching to no-login mode",
+            ));
+        }
+
+        let networks: Vec<String> = match (parsed_mode, trusted_networks) {
+            (AccessMode::LoginExceptLocal, Some(entries)) => {
+                if entries.iter().all(|entry| entry.trim().is_empty()) {
+                    return Err(async_graphql::Error::new(
+                        "trusted networks must not be empty for this access mode",
+                    ));
+                }
+                entries
+                    .iter()
+                    .map(|entry| entry.trim().to_string())
+                    .filter(|entry| !entry.is_empty())
+                    .collect()
+            }
+            (AccessMode::LoginExceptLocal, None) => LOCAL_NETWORK_PRESETS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            (AccessMode::NoLogin, _) => LOOPBACK_NETWORKS.iter().map(|s| s.to_string()).collect(),
+            (AccessMode::LoginRequired, _) => Vec::new(),
+        };
+
+        // Validate through the exact parser startup settles with — one JSON
+        // round-trip, all-or-nothing, no second grammar to drift.
+        let networks_json = serde_json::to_string(&networks)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let parsed_networks =
+            weaver_server_core::security::parse_trusted_networks_json(&networks_json)
+                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+
+        let db = ctx.data::<weaver_server_core::Database>()?.clone();
+        let mode_value = parsed_mode.as_setting_value().to_string();
+        let json_for_store = networks_json.clone();
+        let store_networks = matches!(parsed_mode, AccessMode::LoginExceptLocal);
+        tokio::task::spawn_blocking(move || {
+            db.set_setting(SETTING_ACCESS_MODE, &mode_value)?;
+            if store_networks {
+                db.set_setting(SETTING_TRUSTED_NETWORKS, &json_for_store)?;
+            }
+            Ok::<_, weaver_server_core::StateError>(())
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        security.set_trusted_cidrs(parsed_networks);
+        // The stored mode is now a decision, not a default: an operator who
+        // picks no-login here must not have the first-run wizard served back to
+        // every browser outside the machine on the next page load.
+        security.mark_security_configured();
+        info!(
+            mode = parsed_mode.as_setting_value(),
+            networks = ?networks,
+            "access policy changed; effective immediately"
+        );
+        Ok(true)
+    }
+
     /// Enable login protection with a username and password.
     #[graphql(guard = "AdminGuard")]
     async fn enable_login(

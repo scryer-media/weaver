@@ -1,0 +1,16 @@
+{
+  "slug": "split-plain-par2",
+  "title": "Ivory.Meadow.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "Plain split-file parts named test-media.mkv.001/.002/.003 with a PAR2 set computed over the joined file rather than over the parts, and three blocks zeroed inside the middle part. The recovery set names a file the posting never carries, so the parts have to be read as one file, repaired and joined exactly once: the delivered output is the joined MKV byte for byte, and the parts are not part of the release.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenOutputPaths": [
+    "test-media.mkv.0*"
+  ],
+  "expectedOutputBLAKE3": {
+    "test-media.mkv": "bd8b3991787e2bc03ae0f47bda585f1b9dbd831448493fe3c4a9118f4f947cf2"
+  }
+}

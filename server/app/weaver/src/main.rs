@@ -2,18 +2,25 @@ mod args;
 mod bootstrap;
 mod commands;
 mod http;
+mod logging;
+mod restart;
 mod shutdown;
+#[cfg(windows)]
+mod tray_ipc;
 mod wiring;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use tracing::error;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 use crate::args::{Cli, Command};
+use crate::logging::{LogColor, LogFormat};
 
 const LOG_FILE_ENV: &str = "WEAVER_LOG_FILE";
 const DOTENV_FILE: &str = ".env";
@@ -38,6 +45,24 @@ fn main() {
         std::process::exit(1);
     }
 
+    // GUI launchers on macOS commonly hand children a 256-descriptor soft
+    // limit despite a much higher hard limit. A large PAR2 set plus ordinary
+    // NNTP and direct-store handles can exceed that without leaking anything.
+    let _ = weaver_server_core::runtime::resource_limits::raise_open_file_limit();
+
+    // Rayon's global pool runs the archive engines' data-parallel loops. Give
+    // its workers the same 8 MiB the tokio threads get below: under this
+    // binary's fat-LTO profile the optimizer inlines a `par_iter` closure into
+    // rayon's recursive splitting helper, so a closure with a few tens of KiB
+    // of locals is multiplied by the recursion depth — a RAR3 recovery-volume
+    // restore aborted the whole server that way on a default 2 MiB worker.
+    // The stack is reserved, not committed, so this costs nothing at rest.
+    // Ignoring the error is deliberate: it only says a pool already exists.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .stack_size(8 * 1024 * 1024)
+        .thread_name(|index| format!("weaver-rayon-{index}"))
+        .build_global();
+
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all().thread_stack_size(8 * 1024 * 1024); // 8 MB - pipeline futures are large
     weaver_server_core::runtime::affinity::install_tokio_worker_affinity(&mut builder);
@@ -52,9 +77,19 @@ async fn async_main() {
     let config_path = cli.resolved_config_path();
     let Cli {
         log_file: log_file_override,
+        log_format: log_format_override,
         command,
         ..
     } = cli;
+    let log_format = LogFormat::resolve(
+        log_format_override.as_deref(),
+        std::env::var_os(logging::LOG_FORMAT_ENV).as_ref(),
+    );
+    let log_color = LogColor::resolve(std::env::var_os(logging::LOG_COLOR_ENV).as_ref());
+    let stdout_ansi = log_color.should_colour(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").is_some(),
+    );
     let command = command.unwrap_or_else(Command::default_serve);
 
     let log_ring_buffer =
@@ -62,7 +97,6 @@ async fn async_main() {
     let buffer_layer = tracing_subscriber::fmt::layer()
         .with_writer(LogBufferWriter(log_ring_buffer.clone()))
         .with_ansi(false);
-    let stdout_layer = tracing_subscriber::fmt::layer();
     let env_log_file = std::env::var_os(LOG_FILE_ENV).map(PathBuf::from);
     let log_file_config = resolve_log_file_config(
         log_file_override.as_deref(),
@@ -91,16 +125,37 @@ async fn async_main() {
         }
         None => None,
     };
-    let log_file_layer = log_file_writer.map(|writer| {
-        tracing_subscriber::fmt::layer()
-            .with_writer(LogFileMakeWriter(writer))
-            .with_ansi(false)
+    // The in-memory ring buffer always keeps the human-readable line format:
+    // the web log viewer parses it, so a JSON stdout must not reformat it.
+    let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![Box::new(buffer_layer)];
+    layers.push(match log_format {
+        LogFormat::Json => Box::new(tracing_subscriber::fmt::layer().json()),
+        LogFormat::Text => Box::new(tracing_subscriber::fmt::layer().with_ansi(stdout_ansi)),
     });
+    if let Some(writer) = log_file_writer {
+        layers.push(match log_format {
+            LogFormat::Json => Box::new(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(LogFileMakeWriter(writer)),
+            ),
+            LogFormat::Text => Box::new(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(LogFileMakeWriter(writer))
+                    .with_ansi(false),
+            ),
+        });
+    }
     tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
-        .with(stdout_layer)
-        .with(buffer_layer)
-        .with(log_file_layer)
+        .with(layers)
+        // `from_default_env()` alone resolves to ERROR-only when RUST_LOG is
+        // unset, which left a default install with effectively no operational
+        // logging. INFO is the floor now; RUST_LOG still overrides it wholesale.
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
         .init();
     install_panic_hook();
 
@@ -140,7 +195,6 @@ async fn async_main() {
     let (mut db, mut config) = if let Some(outcome) = restore_outcome {
         tracing::info!(
             restore_id = %outcome.restore_id,
-            managed_packages = outcome.managed_packages_restored,
             "applied staged backup restore"
         );
         let config = match db.load_config() {
@@ -201,14 +255,42 @@ async fn async_main() {
         error!("{error}");
         std::process::exit(1);
     }
+    let canonical_data_dir = match std::fs::canonicalize(&data_dir) {
+        Ok(path) => path,
+        Err(error) => {
+            error!("failed to canonicalize data directory: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = db.initialize_post_processing_script_directory(
+        &canonical_data_dir,
+        env_seed
+            .core
+            .scripts_dir
+            .as_deref()
+            .map(std::path::Path::new),
+    ) {
+        error!("failed to initialize post-processing scripts directory: {error}");
+        std::process::exit(1);
+    }
 
     match command {
-        Command::Download { nzb, output, force } => {
+        Command::Download {
+            nzb,
+            output,
+            password,
+            report,
+            report_ack,
+            force,
+        } => {
             if let Err(error) = commands::download::run(
                 &mut config,
                 &db,
                 &nzb,
                 output.as_deref(),
+                password.as_deref(),
+                report.as_deref(),
+                report_ack.as_deref(),
                 force,
                 &data_dir,
                 &intermediate_dir,

@@ -201,22 +201,24 @@ impl Pipeline {
         self.jobs.remove(&job_id);
         self.job_order.retain(|id| *id != job_id);
         self.clear_terminal_segment_failures(job_id);
+        self.terminal_reconciliations.remove(&job_id);
         self.clear_par2_runtime_state(job_id);
         self.clear_job_extraction_runtime(job_id);
-        self.post_processing_repair_reentered.remove(&job_id);
-        self.post_processing_repair_return_to_terminal
-            .remove(&job_id);
+        self.extraction_budgets.remove(&job_id);
         self.inflight_moves.remove(&job_id);
         self.reserved_complete_destinations.remove(&job_id);
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);
         self.active_downloads_by_job.remove(&job_id);
         self.active_download_connections_by_job.remove(&job_id);
+        self.active_completion_critical_connections_by_job
+            .remove(&job_id);
         self.job_last_download_activity.remove(&job_id);
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
         self.clear_job_progress_floor_runtime(job_id);
         self.clear_job_phase_progress_runtime(job_id);
+        self.discard_stage_timers(job_id);
         self.clear_job_retention_excludes(job_id);
         self.decode_retries
             .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
@@ -239,6 +241,16 @@ impl Pipeline {
         job_id: JobId,
         terminal_event: Option<PipelineEvent>,
     ) {
+        // Taken before the long immutable borrow below, and before the runtime
+        // that produced them is purged. A completed job carries the claim
+        // census's verdict; a failed one falls through to its own counters,
+        // where the raw numbers are the explanation.
+        let settled = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.spec.total_bytes)
+            .map(|total_bytes| self.terminal_record_figures(job_id, total_bytes));
+
         let state = match self.jobs.get(&job_id) {
             Some(s) => s,
             None => {
@@ -257,13 +269,33 @@ impl Pipeline {
         };
         let completed = matches!(state.status, JobStatus::Complete);
 
+        // Low-frequency: one observation per job reaching a terminal status.
+        // `created_at` is an `Instant` the job state already carries, so the
+        // duration costs one clock read at the end of a whole job — no
+        // `SystemTime::now()` and nothing on an article path.
+        self.metrics.job_lifecycle.note_finished(
+            if completed {
+                crate::operations::instrumentation::JobResultKind::Complete
+            } else {
+                crate::operations::instrumentation::JobResultKind::Failed
+            },
+            state.spec.category.as_deref().unwrap_or(""),
+            Some(state.created_at.elapsed()),
+        );
+
         let now = timestamp_secs() as i64;
         let elapsed_secs = state.created_at.elapsed().as_secs() as i64;
         let created_at = now - elapsed_secs;
         let total = state.spec.total_bytes;
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
             state.assembly.optional_recovery_bytes();
-        let health = health_milli(total, state.failed_bytes);
+        let (failed_bytes, health, terminal_discards) = settled.unwrap_or_else(|| {
+            (
+                state.failed_bytes,
+                health_milli(total, state.failed_bytes),
+                Vec::new(),
+            )
+        });
 
         let row = crate::JobHistoryRow {
             job_id: job_id.0,
@@ -275,7 +307,7 @@ impl Pipeline {
             downloaded_bytes: Self::effective_downloaded_bytes(state),
             optional_recovery_bytes,
             optional_recovery_downloaded_bytes,
-            failed_bytes: state.failed_bytes,
+            failed_bytes,
             health,
             category: state.spec.category.clone(),
             output_dir: Some(state.working_dir.display().to_string()),
@@ -309,6 +341,8 @@ impl Pipeline {
                 download_retry_at_epoch_ms: None,
                 status: state.status.clone(),
                 download_state,
+                finalizing_download: false,
+                fetching_repair_data: false,
                 post_state,
                 run_state,
                 progress: Self::effective_progress(state),
@@ -317,8 +351,9 @@ impl Pipeline {
                 optional_recovery_bytes,
                 optional_recovery_downloaded_bytes,
                 phase_progress: Vec::new(),
-                failed_bytes: state.failed_bytes,
+                failed_bytes,
                 health,
+                terminal_discards,
                 total_files: state.assembly.total_file_count() as u32,
                 completed_files: state.assembly.complete_file_count() as u32,
                 remaining_par_files: 0,

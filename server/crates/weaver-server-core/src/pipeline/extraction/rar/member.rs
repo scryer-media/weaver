@@ -13,8 +13,40 @@ pub(crate) struct RarExtractionContext<'a> {
     pub(crate) job_id: JobId,
     pub(crate) set_name: &'a str,
     pub(crate) output_dir: &'a std::path::Path,
-    pub(crate) options: &'a weaver_unrar::ExtractOptions,
+    pub(crate) root: Option<Arc<ExtractionRoot>>,
+    pub(crate) budget: Option<Arc<JobExtractionBudget>>,
+    pub(crate) options: &'a unrar_rs::ExtractOptions,
     pub(crate) phase_attempt: Option<Arc<PhaseAttemptCounters>>,
+}
+
+/// Times one archive-member extraction end to end, closing on whichever path
+/// the extraction leaves by — including the early guardrail rejections.
+///
+/// A member is thousands of articles' worth of work, so unlike the decode task
+/// this wall clock is nowhere near a per-segment path: it is the same class of
+/// low-frequency event as a verification or a repair. `cpu_scope` above still
+/// reports thread CPU time for the profiler; this reports the wall time the
+/// operator's `weaver_pipeline_extract_member_duration_seconds` needs.
+struct MemberExtractionTimer {
+    metrics: Arc<PipelineMetrics>,
+    started: std::time::Instant,
+}
+
+impl MemberExtractionTimer {
+    fn start(metrics: Arc<PipelineMetrics>) -> Self {
+        Self {
+            metrics,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for MemberExtractionTimer {
+    fn drop(&mut self) {
+        self.metrics
+            .pipeline_histograms
+            .observe_extract_member(self.started.elapsed());
+    }
 }
 
 struct PhaseAttemptRollbackGuard {
@@ -33,13 +65,6 @@ impl PhaseAttemptRollbackGuard {
     fn reserve_total(&self, bytes: u64) {
         if let Some(attempt) = &self.attempt {
             attempt.reserve_total(bytes);
-        }
-    }
-
-    fn record_and_commit(mut self, bytes: u64) {
-        if let Some(attempt) = self.attempt.take() {
-            attempt.record_completed(bytes);
-            attempt.commit();
         }
     }
 
@@ -91,12 +116,29 @@ fn configured_rar_max_dict_bytes() -> u64 {
 }
 
 /// Apply the server's decode limits to a freshly opened archive.
-fn apply_server_rar_limits(archive: &mut weaver_unrar::RarArchive) {
-    let limits = weaver_unrar::Limits {
-        max_dict_size: configured_rar_max_dict_bytes(),
+pub(crate) fn apply_server_rar_limits(archive: &mut unrar_rs::RarArchive) {
+    apply_server_rar_limits_with_memory_limit(archive, u64::MAX);
+}
+
+fn apply_server_rar_limits_with_memory_limit(
+    archive: &mut unrar_rs::RarArchive,
+    extraction_memory_limit: u64,
+) {
+    let limits = unrar_rs::Limits {
+        max_dict_size: configured_rar_max_dict_bytes().min(extraction_memory_limit),
         ..Default::default()
     };
     archive.set_limits(limits);
+}
+
+fn rar_decoder_memory_bytes(archive: &unrar_rs::RarArchive) -> u64 {
+    archive
+        .metadata()
+        .members
+        .iter()
+        .map(|member| member.compression.dict_size)
+        .max()
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,10 +152,11 @@ pub(crate) struct RarExtractionOpenRequest<'a> {
     pub(crate) volume_paths: std::collections::BTreeMap<u32, PathBuf>,
     pub(crate) password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     pub(crate) cached_headers: Option<Vec<u8>>,
-    pub(crate) shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
+    pub(crate) shared_kdf_cache: std::sync::Arc<unrar_rs::crypto::KdfCache>,
     pub(crate) open_mode: RarArchiveOpenMode,
     pub(crate) requested_members: &'a [String],
     pub(crate) already_extracted: Option<&'a std::collections::HashSet<String>>,
+    pub(crate) budget: Option<Arc<JobExtractionBudget>>,
 }
 
 pub(crate) struct RarArchiveSnapshotOpenRequest<'a> {
@@ -121,29 +164,60 @@ pub(crate) struct RarArchiveSnapshotOpenRequest<'a> {
     pub(crate) volume_paths: std::collections::BTreeMap<u32, PathBuf>,
     pub(crate) password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     pub(crate) cached_headers: Option<Vec<u8>>,
-    pub(crate) shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
+    pub(crate) shared_kdf_cache: std::sync::Arc<unrar_rs::crypto::KdfCache>,
     pub(crate) open_mode: RarArchiveOpenMode,
     pub(crate) requested_members: Option<&'a [String]>,
     pub(crate) already_extracted: Option<&'a std::collections::HashSet<String>>,
+    pub(crate) budget: Option<Arc<JobExtractionBudget>>,
 }
 
 struct RarArchiveOpenInputs<'a> {
     set_name: &'a str,
     volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
     cached_headers: Option<&'a [u8]>,
-    shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
+    shared_kdf_cache: std::sync::Arc<unrar_rs::crypto::KdfCache>,
     open_mode: RarArchiveOpenMode,
     requested_members: Option<&'a [String]>,
     already_extracted: Option<&'a std::collections::HashSet<String>>,
+    budget: Option<Arc<JobExtractionBudget>>,
+}
+
+struct BudgetedRarVolumeProvider<'a, P> {
+    inner: &'a P,
+    budget: Arc<JobExtractionBudget>,
+}
+
+impl<'a, P> BudgetedRarVolumeProvider<'a, P> {
+    fn new(inner: &'a P, budget: Arc<JobExtractionBudget>) -> Self {
+        Self { inner, budget }
+    }
+}
+
+impl<P: unrar_rs::VolumeProvider> unrar_rs::VolumeProvider for BudgetedRarVolumeProvider<'_, P> {
+    fn get_volume(
+        &self,
+        index: usize,
+    ) -> Result<Box<dyn unrar_rs::ReadSeek>, unrar_rs::VolumeProviderError> {
+        let reader = self.inner.get_volume(index)?;
+        Ok(Box::new(BudgetedReader::new(
+            reader,
+            Arc::clone(&self.budget),
+        )))
+    }
 }
 
 pub(crate) struct RarExtractionOpenSelection {
-    pub(crate) archive: weaver_unrar::RarArchive,
+    pub(crate) archive: unrar_rs::RarArchive,
     pub(crate) password: Option<String>,
     pub(crate) validated_password: Option<String>,
+    pub(crate) decoder_memory_bytes: u64,
 }
 
-fn validate_sanitized_rar_member_path(member_name: &str) -> Result<PathBuf, String> {
+/// Rejects any path that would escape the directory it is joined onto: absolute
+/// paths, `..`, root and prefix components, Windows drive letters, embedded NUL,
+/// and the empty path. Shared with the direct-store coverage snapshot through
+/// `pipeline::extraction`'s re-export — one validator, one stance.
+pub(crate) fn validate_sanitized_rar_member_path(member_name: &str) -> Result<PathBuf, String> {
     if member_name.contains('\0') {
         return Err(format!("unsafe RAR member path: {member_name}"));
     }
@@ -195,13 +269,13 @@ fn current_umask() -> u32 {
 }
 
 #[cfg(unix)]
-fn rar_member_unix_output_mode(member: &weaver_unrar::MemberInfo) -> Option<u32> {
+fn rar_member_unix_output_mode(member: &unrar_rs::MemberInfo) -> Option<u32> {
     match member.host_os {
-        weaver_unrar::HostOs::Unix | weaver_unrar::HostOs::Darwin => {
+        unrar_rs::HostOs::Unix | unrar_rs::HostOs::Darwin => {
             let mode = member.attributes.unix_mode() & 0o7777;
             (mode != 0).then_some(mode)
         }
-        weaver_unrar::HostOs::Windows => {
+        unrar_rs::HostOs::Windows => {
             let mode = if member.is_directory || member.attributes.is_directory_attr() {
                 0o777
             } else if member.attributes.is_readonly() {
@@ -211,7 +285,7 @@ fn rar_member_unix_output_mode(member: &weaver_unrar::MemberInfo) -> Option<u32>
             };
             Some(mode & !current_umask())
         }
-        weaver_unrar::HostOs::Unknown(_) => {
+        unrar_rs::HostOs::Unknown(_) => {
             let mode = if member.is_directory { 0o777 } else { 0o666 };
             Some(mode & !current_umask())
         }
@@ -219,7 +293,7 @@ fn rar_member_unix_output_mode(member: &weaver_unrar::MemberInfo) -> Option<u32>
 }
 
 fn apply_rar_member_filesystem_metadata(
-    member: &weaver_unrar::MemberInfo,
+    member: &unrar_rs::MemberInfo,
     out_path: &Path,
 ) -> Result<(), String> {
     match (member.mtime, member.atime) {
@@ -286,12 +360,10 @@ fn apply_rar_member_filesystem_metadata(
     Ok(())
 }
 
-fn ensure_unique_sanitized_rar_member_paths(
-    archive: &weaver_unrar::RarArchive,
-) -> Result<(), String> {
+fn ensure_unique_sanitized_rar_member_paths(archive: &unrar_rs::RarArchive) -> Result<(), String> {
     let mut occupied = std::collections::HashSet::<String>::new();
     for raw_name in archive.started_member_names() {
-        let member_name = weaver_unrar::sanitize_path(raw_name);
+        let member_name = unrar_rs::sanitize_path(raw_name);
         let safe_path = validate_sanitized_rar_member_path(&member_name)?;
         let collision_key = safe_path
             .to_string_lossy()
@@ -313,7 +385,7 @@ impl<'a> RarExtractionContext<'a> {
         job_id: JobId,
         set_name: &'a str,
         output_dir: &'a std::path::Path,
-        options: &'a weaver_unrar::ExtractOptions,
+        options: &'a unrar_rs::ExtractOptions,
     ) -> Self {
         Self {
             volume_paths,
@@ -321,6 +393,8 @@ impl<'a> RarExtractionContext<'a> {
             job_id,
             set_name,
             output_dir,
+            root: None,
+            budget: None,
             options,
             phase_attempt: None,
         }
@@ -330,11 +404,21 @@ impl<'a> RarExtractionContext<'a> {
         self.phase_attempt = attempt;
         self
     }
+
+    pub(crate) fn with_security(
+        mut self,
+        root: Arc<ExtractionRoot>,
+        budget: Arc<JobExtractionBudget>,
+    ) -> Self {
+        self.root = Some(root);
+        self.budget = Some(budget);
+        self
+    }
 }
 
 impl Pipeline {
     pub(crate) fn extract_rar_member_to_output(
-        archive: &mut weaver_unrar::RarArchive,
+        archive: &mut unrar_rs::RarArchive,
         ctx: RarExtractionContext<'_>,
         idx: usize,
     ) -> Result<(String, u64, u64), String> {
@@ -345,16 +429,45 @@ impl Pipeline {
             job_id,
             set_name,
             output_dir,
+            root,
+            budget,
             options,
             phase_attempt,
         } = ctx;
+        let root = match root {
+            Some(root) => root,
+            None => Arc::new(ExtractionRoot::open(output_dir)?),
+        };
+        let budget = match budget {
+            Some(budget) => budget,
+            None => {
+                let limits = Arc::new(ExtractionLimits::from_env(output_dir)?);
+                let (initial_entries, initial_bytes) = ExtractionRoot::snapshot_usage(output_dir)?;
+                JobExtractionBudget::new(
+                    limits,
+                    output_dir.to_path_buf(),
+                    archive
+                        .metadata()
+                        .members
+                        .iter()
+                        .map(|member| member.compressed_size)
+                        .sum(),
+                    initial_entries,
+                    initial_bytes,
+                    PipelineMetrics::new(),
+                )?
+            }
+        };
+        let _member_timer = MemberExtractionTimer::start(Arc::clone(budget.metrics()));
         let phase_guard = PhaseAttemptRollbackGuard::new(phase_attempt);
         let member = archive
             .member_info(idx)
             .ok_or_else(|| format!("member index {idx} missing from archive metadata"))?;
         let member_name = member.name.clone();
-        let safe_member_path = validate_sanitized_rar_member_path(&member_name)?;
+        let safe_member_path = validate_sanitized_rar_member_path(&member_name)
+            .map_err(|error| budget.reject_unsafe_path(error))?;
         let unpacked_size = member.unpacked_size.unwrap_or(0);
+        budget.check_member_metadata(&member_name, unpacked_size)?;
         let is_directory = member.is_directory;
         let first_volume = member.volumes.first_volume as u32;
         let last_volume = member.volumes.last_volume as u32;
@@ -362,10 +475,15 @@ impl Pipeline {
 
         if is_directory {
             let dir_path = output_dir.join(&safe_member_path);
-            std::fs::create_dir_all(&dir_path)
-                .map_err(|e| format!("failed to create dir {}: {e}", member_name))?;
+            root.create_dir(&safe_member_path, &budget)?;
             apply_rar_member_filesystem_metadata(&member, &dir_path)?;
             return Ok((member_name, 0, unpacked_size));
+        }
+
+        if member.is_symlink || member.is_hardlink || member.is_file_copy {
+            return Err(budget.reject_unsupported_entry(format!(
+                "RAR member '{member_name}' is a link or file-copy entry"
+            )));
         }
 
         // Reserve this member's share of the Extracting total here, at open
@@ -380,10 +498,6 @@ impl Pipeline {
 
         let safe_member_name = safe_member_path.to_string_lossy().replace('\\', "/");
         let (out_path, partial_path) = Self::member_output_paths(output_dir, &safe_member_name);
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create parent dir: {e}"))?;
-        }
 
         let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
             job_id,
@@ -393,26 +507,6 @@ impl Pipeline {
         crate::e2e_failpoint::maybe_delay("extract.member_start");
 
         let chunk_dir = Self::member_chunk_dir(output_dir, set_name, &member_name);
-
-        if member.is_symlink || member.is_hardlink || member.is_file_copy {
-            if partial_path.exists() || chunk_dir.exists() {
-                Self::clear_member_extraction_artifacts(&partial_path, &chunk_dir)?;
-            }
-            let bytes_written = archive
-                .extract_member_to_file(idx, options, None, &out_path)
-                .map_err(|error| format!("failed to extract {member_name}: {error}"))?;
-            phase_guard.record_and_commit(bytes_written);
-            info!(
-                job_id = job_id.0,
-                set_name,
-                member = %member_name,
-                bytes_written,
-                unpacked_size,
-                out_path = %out_path.display(),
-                "RAR link member extraction finalized"
-            );
-            return Ok((member_name, bytes_written, unpacked_size));
-        }
 
         let partial_size = std::fs::metadata(&partial_path).ok().map(|meta| meta.len());
         let out_size = std::fs::metadata(&out_path).ok().map(|meta| meta.len());
@@ -436,15 +530,21 @@ impl Pipeline {
             Self::clear_member_extraction_artifacts(&partial_path, &chunk_dir)?;
         }
 
-        let mut partial_file_options = std::fs::OpenOptions::new();
-        partial_file_options.create(true).write(true).truncate(true);
-        let partial_file = partial_file_options.open(&partial_path).map_err(|e| {
-            format!(
-                "failed to create partial output {}: {e}",
-                partial_path.display()
-            )
+        let partial_relative = partial_path.strip_prefix(output_dir).map_err(|error| {
+            budget.reject_unsafe_path(format!("RAR partial output escaped staging root: {error}"))
         })?;
-        weaver_unrar::RarArchive::preallocate_output_file(&partial_file, unpacked_size);
+        let partial_file = root.create_file(partial_relative, &budget)?;
+        // Reserve the extent up front so a large member does not stream into a
+        // fragmented file. This borrows the capability handle as a plain `File`
+        // view rather than taking ownership of it, and it changes allocation
+        // only — every byte still goes through the budgeted writer.
+        {
+            use cap_std::io_lifetimes::AsFilelike;
+            unrar_rs::RarArchive::preallocate_output_file(
+                &partial_file.get_ref().as_filelike_view::<std::fs::File>(),
+                unpacked_size,
+            );
+        }
         let shared = Rc::new(RefCell::new(SharedOutputFile {
             inner: std::io::BufWriter::with_capacity(8 * 1024 * 1024, partial_file),
         }));
@@ -458,13 +558,13 @@ impl Pipeline {
             error: Mutex::new(None),
         });
 
-        let chunk_records: Result<Vec<(u32, u64)>, weaver_unrar::RarError> = if is_solid {
+        let chunk_records: Result<Vec<(u32, u64)>, unrar_rs::RarError> = if is_solid {
             let shared_ref = Rc::clone(&shared);
             let checkpoint_ref = Arc::clone(&checkpoint);
             archive
                 .extract_member_solid_chunked(idx, options, |absolute_volume| {
                     let absolute_volume = u32::try_from(absolute_volume).map_err(|_| {
-                        weaver_unrar::RarError::CorruptArchive {
+                        unrar_rs::RarError::CorruptArchive {
                             detail: format!(
                                 "solid chunk volume {absolute_volume} does not fit into u32"
                             ),
@@ -483,7 +583,7 @@ impl Pipeline {
                         .into_iter()
                         .map(|(absolute_volume, bytes_written)| {
                             let absolute_volume = u32::try_from(absolute_volume).map_err(|_| {
-                                weaver_unrar::RarError::CorruptArchive {
+                                unrar_rs::RarError::CorruptArchive {
                                     detail: format!(
                                         "solid chunk volume {absolute_volume} does not fit into u32"
                                     ),
@@ -494,6 +594,9 @@ impl Pipeline {
                         .collect::<Result<Vec<_>, _>>()
                 })
         } else {
+            // Keyed by the set's own volume indices, which is the numbering
+            // `extract_member_streaming_chunked` asks the provider for and
+            // reports its chunks against.
             let mut provider_paths = std::collections::HashMap::new();
             for absolute_volume in first_volume..=last_volume {
                 let Some(path) = volume_paths.get(&absolute_volume) else {
@@ -501,14 +604,19 @@ impl Pipeline {
                         "missing local RAR volume {absolute_volume} for member {member_name}"
                     ));
                 };
-                provider_paths.insert((absolute_volume - first_volume) as usize, path.clone());
+                provider_paths.insert(absolute_volume as usize, path.clone());
             }
             let provider = ReadaheadVolumeProvider::new(provider_paths);
+            let provider = BudgetedRarVolumeProvider::new(&provider, Arc::clone(&budget));
             let shared_ref = Rc::clone(&shared);
             let checkpoint_ref = Arc::clone(&checkpoint);
             archive
-                .extract_member_streaming_chunked(idx, options, &provider, |local_volume| {
-                    let volume_index = first_volume + local_volume as u32;
+                .extract_member_streaming_chunked(idx, options, &provider, |absolute_volume| {
+                    let volume_index = u32::try_from(absolute_volume).map_err(|_| {
+                        unrar_rs::RarError::CorruptArchive {
+                            detail: format!("chunk volume {absolute_volume} does not fit into u32"),
+                        }
+                    })?;
                     Ok(Box::new(DirectOutputWriter {
                         shared: Some(Rc::clone(&shared_ref)),
                         bytes_written: 0,
@@ -520,10 +628,17 @@ impl Pipeline {
                 .and_then(|records| {
                     records
                         .into_iter()
-                        .map(|(local_volume, bytes_written)| {
-                            Ok((first_volume + local_volume as u32, bytes_written))
+                        .map(|(absolute_volume, bytes_written)| {
+                            let absolute_volume = u32::try_from(absolute_volume).map_err(|_| {
+                                unrar_rs::RarError::CorruptArchive {
+                                    detail: format!(
+                                        "chunk volume {absolute_volume} does not fit into u32"
+                                    ),
+                                }
+                            })?;
+                            Ok((absolute_volume, bytes_written))
                         })
-                        .collect::<Result<Vec<_>, weaver_unrar::RarError>>()
+                        .collect::<Result<Vec<_>, unrar_rs::RarError>>()
                 })
         };
         let chunk_records = chunk_records.map_err(|error| {
@@ -613,7 +728,7 @@ impl Pipeline {
 
     pub(crate) fn open_rar_archive_from_snapshot_or_disk(
         request: RarArchiveSnapshotOpenRequest<'_>,
-    ) -> Result<crate::pipeline::ArchivePasswordSelection<weaver_unrar::RarArchive>, String> {
+    ) -> Result<crate::pipeline::ArchivePasswordSelection<unrar_rs::RarArchive>, String> {
         let RarArchiveSnapshotOpenRequest {
             set_name,
             volume_paths,
@@ -623,6 +738,7 @@ impl Pipeline {
             open_mode,
             requested_members,
             already_extracted,
+            budget,
         } = request;
         let context = format!("failed to open RAR archive for set '{set_name}'");
         let inputs = RarArchiveOpenInputs {
@@ -633,6 +749,7 @@ impl Pipeline {
             open_mode,
             requested_members,
             already_extracted,
+            budget,
         };
         Self::try_rar_password_candidates(&context, &password_candidates, |password| {
             Self::open_rar_archive_from_snapshot_or_disk_with_password(&inputs, password)
@@ -655,6 +772,7 @@ impl Pipeline {
             open_mode,
             requested_members,
             already_extracted,
+            budget,
         } = request;
 
         if password_candidates.len() <= 1 {
@@ -668,11 +786,14 @@ impl Pipeline {
                     open_mode,
                     requested_members: Some(requested_members),
                     already_extracted,
+                    budget,
                 })?;
+            let decoder_memory_bytes = rar_decoder_memory_bytes(&selection.value);
             return Ok(RarExtractionOpenSelection {
                 archive: selection.value,
                 password: selection.selected_password,
                 validated_password: None,
+                decoder_memory_bytes,
             });
         }
 
@@ -685,11 +806,22 @@ impl Pipeline {
             open_mode,
             requested_members: Some(requested_members),
             already_extracted,
+            budget: budget.clone(),
         };
         let selection =
             Self::try_rar_password_candidates(&context, &password_candidates, |password| {
                 let mut probe_archive =
                     Self::open_rar_archive_from_snapshot_or_disk_with_password(&inputs, password)?;
+                let _memory_permit = if let Some(budget) = inputs.budget.as_ref() {
+                    let required = rar_decoder_memory_bytes(&probe_archive);
+                    Some(
+                        budget
+                            .reserve_memory_wait(required)
+                            .map_err(crate::pipeline::RarPasswordAttemptError::Fatal)?,
+                    )
+                } else {
+                    None
+                };
                 let probe = Self::select_rar_password_probe_member(
                     &probe_archive,
                     requested_members,
@@ -701,6 +833,7 @@ impl Pipeline {
                         &volume_paths,
                         idx,
                         password,
+                        inputs.budget.as_ref(),
                     )?;
                     requires_password
                 } else {
@@ -712,17 +845,19 @@ impl Pipeline {
             })?;
         let (archive, password_validated) = selection.value;
         ensure_unique_sanitized_rar_member_paths(&archive)?;
+        let decoder_memory_bytes = rar_decoder_memory_bytes(&archive);
         let password = selection.selected_password;
         let validated_password = password_validated.then(|| password.clone()).flatten();
         Ok(RarExtractionOpenSelection {
             archive,
             password,
             validated_password,
+            decoder_memory_bytes,
         })
     }
 
     fn archive_needs_attached_source_readers(
-        archive: &weaver_unrar::RarArchive,
+        archive: &unrar_rs::RarArchive,
         requested_members: Option<&[String]>,
         already_extracted: Option<&std::collections::HashSet<String>>,
     ) -> bool {
@@ -730,9 +865,8 @@ impl Pipeline {
             return true;
         }
 
-        let member_needs_attached_reader = |info: weaver_unrar::MemberInfo| {
-            info.is_symlink || info.is_hardlink || info.is_file_copy
-        };
+        let member_needs_attached_reader =
+            |info: unrar_rs::MemberInfo| info.is_symlink || info.is_hardlink || info.is_file_copy;
 
         requested_members.is_some_and(|members| {
             if members.is_empty() {
@@ -754,13 +888,18 @@ impl Pipeline {
     fn open_rar_archive_from_snapshot_or_disk_with_password(
         inputs: &RarArchiveOpenInputs<'_>,
         password: Option<&str>,
-    ) -> Result<weaver_unrar::RarArchive, crate::pipeline::RarPasswordAttemptError> {
+    ) -> Result<unrar_rs::RarArchive, crate::pipeline::RarPasswordAttemptError> {
         let set_name = inputs.set_name;
         let volume_paths = inputs.volume_paths;
         let cached_headers = inputs.cached_headers;
         let open_mode = inputs.open_mode;
         let requested_members = inputs.requested_members;
         let already_extracted = inputs.already_extracted;
+        if let Some(budget) = inputs.budget.as_ref() {
+            budget.check_active_io().map_err(|error| {
+                crate::pipeline::RarPasswordAttemptError::Fatal(error.to_string())
+            })?;
+        }
         let has_cached_headers = cached_headers.is_some();
         let refresh_provided_volumes =
             matches!(open_mode, RarArchiveOpenMode::RefreshProvidedVolumes);
@@ -772,9 +911,10 @@ impl Pipeline {
                         first_path,
                         password,
                         inputs.shared_kdf_cache.clone(),
+                        inputs.budget.as_ref(),
                     )?;
                 }
-                weaver_unrar::RarArchive::deserialize_headers_with_password_and_shared_kdf_cache(
+                unrar_rs::RarArchive::deserialize_headers_with_password_and_shared_kdf_cache(
                     headers,
                     password.map(str::to_string),
                     inputs.shared_kdf_cache.clone(),
@@ -795,10 +935,18 @@ impl Pipeline {
                     first_path,
                     password,
                     inputs.shared_kdf_cache.clone(),
+                    inputs.budget.as_ref(),
                 )?
             }
         };
-        apply_server_rar_limits(&mut archive);
+        apply_server_rar_limits_with_memory_limit(
+            &mut archive,
+            inputs
+                .budget
+                .as_ref()
+                .map(|budget| budget.max_memory_bytes())
+                .unwrap_or(u64::MAX),
+        );
 
         let full_set_open = requested_members.is_some_and(|members| members.is_empty());
         let metadata_may_expand =
@@ -822,10 +970,20 @@ impl Pipeline {
             {
                 archive.attach_volume_reader(
                     *volume_number as usize,
-                    bounded_sources
-                        .as_ref()
-                        .expect("bounded source pool should exist")
-                        .reader(path.clone()),
+                    if let Some(budget) = inputs.budget.as_ref() {
+                        Box::new(BudgetedReader::new(
+                            bounded_sources
+                                .as_ref()
+                                .expect("bounded source pool should exist")
+                                .reader(path.clone()),
+                            Arc::clone(budget),
+                        ))
+                    } else {
+                        bounded_sources
+                            .as_ref()
+                            .expect("bounded source pool should exist")
+                            .reader(path.clone())
+                    },
                 );
                 continue;
             }
@@ -856,31 +1014,46 @@ impl Pipeline {
                     ));
                 }
             };
+            let file: Box<dyn unrar_rs::ReadSeek> = if let Some(budget) = inputs.budget.as_ref() {
+                Box::new(BudgetedReader::new(file, Arc::clone(budget)))
+            } else {
+                Box::new(file)
+            };
             if has_cached_headers
                 && refresh_provided_volumes
                 && archive.has_volume(*volume_number as usize)
             {
                 archive
-                    .refresh_volume(*volume_number as usize, Box::new(file))
+                    .refresh_volume(*volume_number as usize, file)
                     .map_err(|error| {
                         crate::pipeline::RarPasswordAttemptError::Fatal(format!(
                             "failed to refresh RAR volume {volume_number} for set '{set_name}': {error}"
                         ))
                     })?;
             } else if archive.has_volume(*volume_number as usize) {
-                archive.attach_volume_reader(*volume_number as usize, Box::new(file));
+                archive.attach_volume_reader(*volume_number as usize, file);
             } else {
                 archive
-                    .add_volume(*volume_number as usize, Box::new(file))
+                    .add_volume(*volume_number as usize, file)
                     .map_err(crate::pipeline::RarPasswordAttemptError::from)?;
             }
             if retain_attached_readers {
                 archive.attach_volume_reader(
                     *volume_number as usize,
-                    bounded_sources
-                        .as_ref()
-                        .expect("bounded source pool should exist")
-                        .reader(path.clone()),
+                    if let Some(budget) = inputs.budget.as_ref() {
+                        Box::new(BudgetedReader::new(
+                            bounded_sources
+                                .as_ref()
+                                .expect("bounded source pool should exist")
+                                .reader(path.clone()),
+                            Arc::clone(budget),
+                        ))
+                    } else {
+                        bounded_sources
+                            .as_ref()
+                            .expect("bounded source pool should exist")
+                            .reader(path.clone())
+                    },
                 );
             } else {
                 archive.attach_volume_reader(
@@ -896,8 +1069,9 @@ impl Pipeline {
     fn open_rar_volume_zero_with_password(
         first_path: &PathBuf,
         password: Option<&str>,
-        shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
-    ) -> Result<weaver_unrar::RarArchive, crate::pipeline::RarPasswordAttemptError> {
+        shared_kdf_cache: std::sync::Arc<unrar_rs::crypto::KdfCache>,
+        budget: Option<&Arc<JobExtractionBudget>>,
+    ) -> Result<unrar_rs::RarArchive, crate::pipeline::RarPasswordAttemptError> {
         let first_file = std::fs::File::open(first_path).map_err(|e| {
             crate::pipeline::RarPasswordAttemptError::Fatal(
                 crate::pipeline::capacity::format_fd_capacity_error(
@@ -906,21 +1080,24 @@ impl Pipeline {
                 ),
             )
         })?;
+        let first_file: Box<dyn unrar_rs::ReadSeek> = if let Some(budget) = budget {
+            Box::new(BudgetedReader::new(first_file, Arc::clone(budget)))
+        } else {
+            Box::new(first_file)
+        };
         match password {
-            Some(password) => weaver_unrar::RarArchive::open_with_password_and_shared_kdf_cache(
+            Some(password) => unrar_rs::RarArchive::open_with_password_and_shared_kdf_cache(
                 first_file,
                 password,
                 shared_kdf_cache,
             ),
-            None => {
-                weaver_unrar::RarArchive::open_with_shared_kdf_cache(first_file, shared_kdf_cache)
-            }
+            None => unrar_rs::RarArchive::open_with_shared_kdf_cache(first_file, shared_kdf_cache),
         }
         .map_err(crate::pipeline::RarPasswordAttemptError::from)
     }
 
     fn select_rar_password_probe_member(
-        archive: &weaver_unrar::RarArchive,
+        archive: &unrar_rs::RarArchive,
         requested_members: &[String],
         already_extracted: Option<&std::collections::HashSet<String>>,
     ) -> Option<(usize, bool)> {
@@ -957,10 +1134,11 @@ impl Pipeline {
     }
 
     fn probe_rar_member_password(
-        archive: &mut weaver_unrar::RarArchive,
+        archive: &mut unrar_rs::RarArchive,
         volume_paths: &std::collections::BTreeMap<u32, PathBuf>,
         idx: usize,
         password: Option<&str>,
+        budget: Option<&Arc<JobExtractionBudget>>,
     ) -> Result<(), crate::pipeline::RarPasswordAttemptError> {
         let member = archive.member_info(idx).ok_or_else(|| {
             crate::pipeline::RarPasswordAttemptError::Fatal(format!(
@@ -970,17 +1148,23 @@ impl Pipeline {
         if member.is_directory {
             return Ok(());
         }
-        let options = weaver_unrar::ExtractOptions {
+        let options = unrar_rs::ExtractOptions {
             verify: true,
             password: password.map(str::to_string),
             restore_owners: false,
         };
 
         if archive.is_solid() {
+            // The probe wants the decode, not the bytes: a wrong password is
+            // detected by verification failing, so the output goes nowhere.
+            // `skip_member_solid` is that exact operation, and it verifies
+            // slightly more than the chunked sink this replaced — it adds the
+            // legacy RAR1.4 stored-member data-hash check on top of the CRC32
+            // and BLAKE2sp both paths run under `verify`. Strictly more
+            // checking on a path whose whole purpose is to reject bad
+            // passwords.
             archive
-                .extract_member_solid_chunked(idx, &options, |_| {
-                    Ok(Box::new(std::io::sink()) as Box<dyn Write>)
-                })
+                .skip_member_solid(idx, &options)
                 .map(|_| ())
                 .map_err(crate::pipeline::RarPasswordAttemptError::from)?;
             return Ok(());
@@ -988,6 +1172,8 @@ impl Pipeline {
 
         let first_volume = member.volumes.first_volume as u32;
         let last_volume = member.volumes.last_volume as u32;
+        // Keyed by the set's own volume indices: `extract_member_streaming`
+        // asks for the volumes the member's segments name.
         let mut provider_paths = std::collections::HashMap::new();
         for absolute_volume in first_volume..=last_volume {
             let Some(path) = volume_paths.get(&absolute_volume) else {
@@ -996,12 +1182,22 @@ impl Pipeline {
                     member.name
                 )));
             };
-            provider_paths.insert((absolute_volume - first_volume) as usize, path.clone());
+            provider_paths.insert(absolute_volume as usize, path.clone());
         }
         let provider = ReadaheadVolumeProvider::new(provider_paths);
+        let budgeted_provider =
+            budget.map(|budget| BudgetedRarVolumeProvider::new(&provider, Arc::clone(budget)));
         let mut sink = std::io::sink();
         archive
-            .extract_member_streaming(idx, &options, &provider, &mut sink)
+            .extract_member_streaming(
+                idx,
+                &options,
+                budgeted_provider
+                    .as_ref()
+                    .map(|provider| provider as &dyn unrar_rs::VolumeProvider)
+                    .unwrap_or(&provider),
+                &mut sink,
+            )
             .map(|_| ())
             .map_err(crate::pipeline::RarPasswordAttemptError::from)
     }
@@ -1052,11 +1248,11 @@ impl Pipeline {
         set_name: &str,
         headers: &[u8],
         candidates: &[crate::jobs::ArchivePasswordCandidate],
-        shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
-    ) -> Result<crate::pipeline::ArchivePasswordSelection<weaver_unrar::RarArchive>, String> {
+        shared_kdf_cache: std::sync::Arc<unrar_rs::crypto::KdfCache>,
+    ) -> Result<crate::pipeline::ArchivePasswordSelection<unrar_rs::RarArchive>, String> {
         let selected = candidates.first();
         let password = selected.map(|candidate| candidate.value().to_string());
-        weaver_unrar::RarArchive::deserialize_headers_with_password_and_shared_kdf_cache(
+        unrar_rs::RarArchive::deserialize_headers_with_password_and_shared_kdf_cache(
             headers,
             password,
             shared_kdf_cache,
@@ -1076,21 +1272,26 @@ impl Pipeline {
         set_name: &str,
         first_path: &PathBuf,
         candidates: &[crate::jobs::ArchivePasswordCandidate],
-        shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
-    ) -> Result<crate::pipeline::ArchivePasswordSelection<weaver_unrar::RarArchive>, String> {
+        shared_kdf_cache: std::sync::Arc<unrar_rs::crypto::KdfCache>,
+    ) -> Result<crate::pipeline::ArchivePasswordSelection<unrar_rs::RarArchive>, String> {
         let context = format!("failed to parse RAR volume 0 for set '{set_name}'");
         Self::try_rar_password_candidates(&context, candidates, |password| {
-            Self::open_rar_volume_zero_with_password(first_path, password, shared_kdf_cache.clone())
+            Self::open_rar_volume_zero_with_password(
+                first_path,
+                password,
+                shared_kdf_cache.clone(),
+                None,
+            )
         })
     }
 
-    pub(crate) fn rar_error_is_password_related(error: &weaver_unrar::RarError) -> bool {
+    pub(crate) fn rar_error_is_password_related(error: &unrar_rs::RarError) -> bool {
         matches!(
             error,
-            weaver_unrar::RarError::EncryptedArchive
-                | weaver_unrar::RarError::EncryptedMember { .. }
-                | weaver_unrar::RarError::InvalidPassword
-                | weaver_unrar::RarError::WrongPassword { .. }
+            unrar_rs::RarError::EncryptedArchive
+                | unrar_rs::RarError::EncryptedMember { .. }
+                | unrar_rs::RarError::InvalidPassword
+                | unrar_rs::RarError::WrongPassword { .. }
         )
     }
 
@@ -1110,14 +1311,54 @@ mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
 
+    /// The solid branch of the password probe, over a real solid archive.
+    ///
+    /// That branch swapped a hand-rolled `extract_member_solid_chunked` sink
+    /// factory for `skip_member_solid`, and had no coverage before: every
+    /// password fixture in this crate is a non-solid `store` archive, so the
+    /// existing probe tests exercise the streaming branch instead. This pins
+    /// that a legitimate solid member decodes and verifies clean through the
+    /// new call.
+    ///
+    /// Not covered, for want of a fixture: wrong-password rejection on a
+    /// *solid encrypted* archive. `tests/fixtures/rar5` has solid archives and
+    /// encrypted archives, but none that is both, and one would have to be
+    /// produced with real RAR tooling rather than synthesised.
+    #[test]
+    fn solid_password_probe_accepts_a_verifying_member() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rar5/rar5_solid.rar");
+        let mut archive =
+            unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        assert!(
+            archive.is_solid(),
+            "fixture must be solid or this exercises the wrong branch"
+        );
+
+        let index = (0..archive.member_names().len())
+            .find(|index| {
+                archive
+                    .member_info(*index)
+                    .is_some_and(|member| !member.is_directory)
+            })
+            .expect("fixture has a file member");
+
+        let volume_paths = std::collections::BTreeMap::from([(0u32, fixture.clone())]);
+        if let Err(error) =
+            Pipeline::probe_rar_member_password(&mut archive, &volume_paths, index, None, None)
+        {
+            panic!("an unencrypted solid member should verify clean: {error}");
+        }
+    }
+
     fn metadata_test_member(
         name: &str,
-        host_os: weaver_unrar::HostOs,
+        host_os: unrar_rs::HostOs,
         attributes: u64,
         is_directory: bool,
         mtime_secs: Option<u64>,
-    ) -> weaver_unrar::MemberInfo {
-        weaver_unrar::MemberInfo {
+    ) -> unrar_rs::MemberInfo {
+        unrar_rs::MemberInfo {
             name: name.to_string(),
             raw_name: name.to_string(),
             raw_name_bytes: Some(name.as_bytes().to_vec()),
@@ -1130,18 +1371,18 @@ mod tests {
             atime: None,
             version: None,
             host_os,
-            compression: weaver_unrar::CompressionInfo {
-                format: weaver_unrar::ArchiveFormat::Rar5,
+            compression: unrar_rs::CompressionInfo {
+                format: unrar_rs::ArchiveFormat::Rar5,
                 version: 0,
-                method: weaver_unrar::CompressionMethod::Store,
+                method: unrar_rs::CompressionMethod::Store,
                 solid: false,
                 dict_size: 0,
             },
             is_encrypted: false,
             hash: None,
-            attributes: weaver_unrar::types::FileAttributes(attributes),
+            attributes: unrar_rs::types::FileAttributes(attributes),
             owner: None,
-            volumes: weaver_unrar::VolumeSpan {
+            volumes: unrar_rs::VolumeSpan {
                 first_volume: 0,
                 last_volume: 0,
             },
@@ -1180,7 +1421,7 @@ mod tests {
         std::fs::write(&path, b"payload").unwrap();
         let member = metadata_test_member(
             "movie.mkv",
-            weaver_unrar::HostOs::Unix,
+            unrar_rs::HostOs::Unix,
             0o640,
             false,
             Some(1_700_000_123),
@@ -1203,32 +1444,26 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rar_member_mode_translation_matches_unrar_attribute_rules() {
-        let readonly_file = metadata_test_member(
-            "readonly.txt",
-            weaver_unrar::HostOs::Windows,
-            0x1,
-            false,
-            None,
-        );
+        let readonly_file =
+            metadata_test_member("readonly.txt", unrar_rs::HostOs::Windows, 0x1, false, None);
         assert_eq!(
             rar_member_unix_output_mode(&readonly_file),
             Some(0o444 & !current_umask())
         );
 
-        let windows_dir =
-            metadata_test_member("dir", weaver_unrar::HostOs::Windows, 0x10, true, None);
+        let windows_dir = metadata_test_member("dir", unrar_rs::HostOs::Windows, 0x10, true, None);
         assert_eq!(
             rar_member_unix_output_mode(&windows_dir),
             Some(0o777 & !current_umask())
         );
 
         let unix_without_mode =
-            metadata_test_member("empty-mode", weaver_unrar::HostOs::Unix, 0, false, None);
+            metadata_test_member("empty-mode", unrar_rs::HostOs::Unix, 0, false, None);
         assert_eq!(rar_member_unix_output_mode(&unix_without_mode), None);
 
         let darwin_mode = metadata_test_member(
             "darwin-mode",
-            weaver_unrar::HostOs::Darwin,
+            unrar_rs::HostOs::Darwin,
             0o100640,
             false,
             None,
@@ -1238,11 +1473,11 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn rar_server_extraction_delegates_symlink_entries_to_unrar_crate() {
+    fn rar_server_extraction_rejects_symlink_entries() {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar5/rar5_symlink.rar");
         let file = std::fs::File::open(&fixture).unwrap();
-        let mut archive = weaver_unrar::RarArchive::open(file).unwrap();
+        let mut archive = unrar_rs::RarArchive::open(file).unwrap();
         let symlink_idx = archive
             .metadata()
             .members
@@ -1251,17 +1486,12 @@ mod tests {
             .expect("fixture should contain a symlink member");
         let member = archive.member_info(symlink_idx).unwrap();
         let member_name = member.name.clone();
-        let expected_target = member
-            .link_target
-            .clone()
-            .expect("symlink member should expose target");
-
         let output_dir = tempfile::tempdir().unwrap();
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
         let volume_paths = std::collections::BTreeMap::new();
-        let options = weaver_unrar::ExtractOptions::default();
+        let options = unrar_rs::ExtractOptions::default();
 
-        let (name, written, total) = Pipeline::extract_rar_member_to_output(
+        let error = Pipeline::extract_rar_member_to_output(
             &mut archive,
             RarExtractionContext {
                 volume_paths: &volume_paths,
@@ -1269,27 +1499,17 @@ mod tests {
                 job_id: JobId(42),
                 set_name: "rar5-symlink",
                 output_dir: output_dir.path(),
+                root: None,
+                budget: None,
                 options: &options,
                 phase_attempt: None,
             },
             symlink_idx,
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(name, member_name);
-        assert_eq!(written, 0);
-        assert_eq!(total, 0);
-
-        let out_path = output_dir.path().join(member_name);
-        let metadata = std::fs::symlink_metadata(&out_path).unwrap();
-        assert!(
-            metadata.file_type().is_symlink(),
-            "server extraction should create a symlink instead of an empty regular file"
-        );
-        assert_eq!(
-            std::fs::read_link(out_path).unwrap(),
-            PathBuf::from(expected_target)
-        );
+        assert!(error.contains("unsupported_entry"));
+        assert!(!output_dir.path().join(member_name).exists());
     }
 
     #[test]
@@ -1298,7 +1518,7 @@ mod tests {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar5/rar5_symlink.rar");
         let file = std::fs::File::open(&fixture).unwrap();
-        let archive = weaver_unrar::RarArchive::open(file).unwrap();
+        let archive = unrar_rs::RarArchive::open(file).unwrap();
         let symlink_name = archive
             .metadata()
             .members
@@ -1363,7 +1583,7 @@ mod tests {
         let header_size = body.len() as u64;
         let header_size_bytes = encode_test_rar_vint(header_size);
         let crc =
-            weaver_par2::checksum::crc32(&[header_size_bytes.as_slice(), body.as_slice()].concat());
+            par2_rs::checksum::crc32(&[header_size_bytes.as_slice(), body.as_slice()].concat());
         let mut result = Vec::new();
         result.extend_from_slice(&crc.to_le_bytes());
         result.extend_from_slice(&header_size_bytes);
@@ -1415,7 +1635,7 @@ mod tests {
         let header_size = body.len() as u64;
         let header_size_bytes = encode_test_rar_vint(header_size);
         let crc =
-            weaver_par2::checksum::crc32(&[header_size_bytes.as_slice(), body.as_slice()].concat());
+            par2_rs::checksum::crc32(&[header_size_bytes.as_slice(), body.as_slice()].concat());
         let mut result = Vec::new();
         result.extend_from_slice(&crc.to_le_bytes());
         result.extend_from_slice(&header_size_bytes);
@@ -1429,7 +1649,7 @@ mod tests {
         let payload = (0..volume_count)
             .map(|index| b'a' + (index % 26) as u8)
             .collect::<Vec<_>>();
-        let payload_crc = weaver_par2::checksum::crc32(&payload);
+        let payload_crc = par2_rs::checksum::crc32(&payload);
         let solid_store_compression = 1u64 << 6;
 
         (0..volume_count)
@@ -1470,7 +1690,7 @@ mod tests {
         let volume_count = 260usize;
         let files = build_solid_store_multivolume_rar_set(volume_count);
         let first_archive =
-            weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+            unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
         assert!(first_archive.is_solid());
         let cached_headers = first_archive.serialize_headers();
 
@@ -1491,10 +1711,11 @@ mod tests {
                 volume_paths: volume_paths.clone(),
                 password_candidates: Vec::new(),
                 cached_headers: Some(cached_headers),
-                shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+                shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
                 open_mode: RarArchiveOpenMode::AttachOnly,
                 requested_members: Some(&requested),
                 already_extracted: None,
+                budget: None,
             })
             .unwrap()
             .value;
@@ -1503,7 +1724,7 @@ mod tests {
         let output_dir = temp.path().join("out");
         std::fs::create_dir_all(&output_dir).unwrap();
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
-        let options = weaver_unrar::ExtractOptions {
+        let options = unrar_rs::ExtractOptions {
             verify: true,
             password: None,
             restore_owners: false,

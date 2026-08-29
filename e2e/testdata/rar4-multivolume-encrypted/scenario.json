@@ -1,0 +1,8 @@
+{
+  "slug": "rar4-multivolume-encrypted",
+  "title": "E2E.Test.RAR4.MultiVol.Encrypted.2024.1080p-TESTGRP",
+  "description": "3-volume RAR4 with member encryption. Tests legacy multivolume + encryption.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "password": "e2e-test-password"
+}

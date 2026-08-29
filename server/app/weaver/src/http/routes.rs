@@ -2,15 +2,66 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Extension, Request};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use weaver_server_core::auth::generate_api_key;
+use weaver_server_core::security::{HttpAuthority, RuntimeSecurityConfig};
 
 pub(super) const NZBGET_RPC_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostRejection {
+    BadRequest,
+}
+
+fn request_authority(req: &Request) -> Result<HttpAuthority, HostRejection> {
+    let uri_authority = req
+        .uri()
+        .authority()
+        .map(|authority| HttpAuthority::parse(authority.as_str()))
+        .transpose()
+        .map_err(|_| HostRejection::BadRequest)?;
+
+    let mut host_values = req.headers().get_all(header::HOST).iter();
+    let host_authority = host_values
+        .next()
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| HostRejection::BadRequest)
+                .and_then(|value| {
+                    HttpAuthority::parse(value).map_err(|_| HostRejection::BadRequest)
+                })
+        })
+        .transpose()?;
+    if host_values.next().is_some() {
+        return Err(HostRejection::BadRequest);
+    }
+
+    match (uri_authority, host_authority) {
+        (Some(uri), Some(host)) if !uri.matches(&host) => Err(HostRejection::BadRequest),
+        (Some(authority), _) | (_, Some(authority)) => Ok(authority),
+        (None, None) => Err(HostRejection::BadRequest),
+    }
+}
+
+async fn enforce_http_host(security: &RuntimeSecurityConfig, req: Request, next: Next) -> Response {
+    match request_authority(&req) {
+        Ok(authority) if security.is_http_authority_allowed(&authority) => next.run(req).await,
+        Ok(_) => (
+            StatusCode::MISDIRECTED_REQUEST,
+            "request Host is not allowed",
+        )
+            .into_response(),
+        Err(HostRejection::BadRequest) => {
+            (StatusCode::BAD_REQUEST, "invalid Host header").into_response()
+        }
+    }
+}
 
 pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     let super::ServerRuntime {
@@ -27,9 +78,13 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         config,
         base_url,
         security,
+        disk_space,
+        http_metrics,
+        restart,
     } = runtime;
     let base_url_ext = super::assets::BaseUrl(Arc::new(base_url.clone()));
     let session_token = super::SessionToken(Arc::new(generate_api_key()));
+    let request_security = Arc::new(security.clone());
     let login_limiter = super::auth::LoginRateLimiter::default();
     let backup_upload_limit =
         usize::try_from(security.backup_upload_limit_bytes).unwrap_or(usize::MAX);
@@ -40,6 +95,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         auth_cache: auth_cache.clone(),
         api_key_cache: api_key_cache.clone(),
         session_token: session_token.clone(),
+        security: Arc::clone(&request_security),
     };
     let nzbget_context = super::nzbget::NzbgetFacadeContext::new(
         db.clone(),
@@ -48,6 +104,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         auth_cache.clone(),
         api_key_cache.clone(),
         session_token.clone(),
+        security.clone(),
         rss,
         watch_folder,
         scheduled_resume,
@@ -61,6 +118,10 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
 
     let inner = Router::new()
         .route("/metrics", get(super::metrics::metrics_handler))
+        // Probes live on the same router as everything else, so they inherit
+        // the Host allowlist rather than opening an unguarded side door.
+        .route("/healthz", get(super::health::healthz_handler))
+        .route("/readyz", get(super::health::readyz_handler))
         .merge(nzbget_rpc_routes)
         .route("/graphql", post(super::graphql::graphql_handler))
         .route("/graphql/ws", get(super::graphql::ws_handler))
@@ -81,6 +142,8 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             post(super::backup::backup_export_handler),
         )
         .nest("/api/backup", backup_upload_routes)
+        .route("/api/system/restart", post(super::system::restart_handler))
+        .route("/api/auth/setup", post(super::auth::setup_handler))
         .route("/api/login", post(super::auth::login_handler))
         .route("/api/logout", post(super::auth::logout_handler))
         .route("/api/auth/status", get(super::auth::auth_status_handler))
@@ -95,9 +158,21 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .layer(Extension(api_key_cache))
         .layer(Extension(request_auth))
         .layer(Extension(metrics_exporter))
+        // `build_router` consumes the `ServerRuntime`, so the two scrape-time
+        // collectors are re-published as extensions; that is how the metrics
+        // handler reaches them.
+        .layer(Extension(disk_space))
+        .layer(Extension(http_metrics.clone()))
         .layer(Extension(base_url_ext))
         .layer(Extension(security))
-        .layer(Extension(session_token));
+        .layer(Extension(session_token))
+        .layer(Extension(restart))
+        // Outermost of the inner router's layers, so the recorded duration
+        // covers the handler and everything wrapped around it.
+        .layer(middleware::from_fn(move |req, next| {
+            let http_metrics = http_metrics.clone();
+            async move { super::request_metrics::track_requests(http_metrics, req, next).await }
+        }));
 
     if base_url.is_empty() {
         inner
@@ -113,6 +188,14 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             )
             .nest(&base_url, inner)
     }
+}
+
+pub(super) fn with_http_host_validation(router: Router, security: RuntimeSecurityConfig) -> Router {
+    let host_security = Arc::new(security);
+    router.layer(middleware::from_fn(move |req, next| {
+        let security = Arc::clone(&host_security);
+        async move { enforce_http_host(&security, req, next).await }
+    }))
 }
 
 pub(super) fn build_nzbget_rpc_routes(
@@ -156,4 +239,159 @@ pub(super) fn build_nzbget_rpc_routes(
             }
         }))
         .layer(Extension(nzbget_context))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn guarded_router(security: RuntimeSecurityConfig, hits: Arc<AtomicUsize>) -> Router {
+        let router = Router::new().fallback(move || {
+            let hits = Arc::clone(&hits);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut response = StatusCode::OK.into_response();
+                response.headers_mut().insert(
+                    header::SET_COOKIE,
+                    "weaver_session=local-admin"
+                        .parse()
+                        .expect("valid test cookie"),
+                );
+                response
+            }
+        });
+        with_http_host_validation(router, security)
+    }
+
+    #[tokio::test]
+    async fn disallowed_host_is_rejected_before_every_route_surface() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = guarded_router(RuntimeSecurityConfig::default(), Arc::clone(&hits));
+
+        for (method, path) in [
+            (Method::GET, "/"),
+            (Method::GET, "/weaver/"),
+            (Method::POST, "/graphql"),
+            (Method::GET, "/graphql/ws"),
+            (Method::POST, "/jsonrpc"),
+            (Method::POST, "/api/backup/restore"),
+            (Method::GET, "/metrics"),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::HOST, "attacker.example.test")
+                .body(Body::from(vec![0u8; 16 * 1024]))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST, "{path}");
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "{path}"
+            );
+        }
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn host_guard_accepts_local_and_configured_authorities() {
+        let security = {
+            let mut security = RuntimeSecurityConfig::default();
+            security.http_allowed_hosts =
+                vec![HttpAuthority::parse("weaver.internal:8443").unwrap()];
+            security
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = guarded_router(security, Arc::clone(&hits));
+
+        for host in [
+            "localhost:9090",
+            "127.0.0.1:9090",
+            "[::1]:9090",
+            "WEAVER.INTERNAL.:8443",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(header::HOST, host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{host}");
+        }
+
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn host_guard_rejects_missing_duplicate_malformed_and_conflicting_authorities() {
+        let app = guarded_router(
+            RuntimeSecurityConfig::default(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let missing = Request::builder().uri("/").body(Body::empty()).unwrap();
+        assert_eq!(
+            app.clone().oneshot(missing).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let malformed = Request::builder()
+            .uri("/")
+            .header(header::HOST, "https://localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(malformed).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut duplicate = Request::builder()
+            .uri("/")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        duplicate
+            .headers_mut()
+            .append(header::HOST, "localhost".parse().unwrap());
+        assert_eq!(
+            app.clone().oneshot(duplicate).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let conflicting = Request::builder()
+            .uri("http://localhost/")
+            .header(header::HOST, "127.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(conflicting).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let forwarded_host = Request::builder()
+            .uri("/")
+            .header(header::HOST, "attacker.example.test")
+            .header("x-forwarded-host", "localhost")
+            .header("forwarded", "host=localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(forwarded_host).await.unwrap().status(),
+            StatusCode::MISDIRECTED_REQUEST
+        );
+    }
 }

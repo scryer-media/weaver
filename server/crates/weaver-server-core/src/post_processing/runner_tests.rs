@@ -1,84 +1,40 @@
-use std::fs;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::Router;
-use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
-use hmac::{Hmac, Mac, digest::KeyInit};
-use sha2::Sha256;
-
-use super::discovery::{DiscoveryOptions, discover_extensions};
-use super::manifest::parse_native_manifest;
 use super::model::{
-    ExtensionAdapter, ExtensionDigest, NzbgetCompatibilityName, OptionName, PipelineFailureStage,
-    PipelineOutcome, ResolvedOption, ResolvedOptionValue, SecretOptionValue, TimeoutPolicy,
-    VerifiedExtensionDigest,
+    NzbgetCompatibilityName, OptionName, OptionValue, PipelineFailureStage, PipelineOutcome,
+    ResolvedOption, ScriptAdapter, ScriptManifest, SecretOptionValue,
 };
-use super::persistence::LogStream;
 use super::runner::{
-    CapturedOutputLine, ControlEffects, ExecutionDisposition, ExtensionExecutionRequest,
-    ExtensionExecutionResult, InterpreterConfig, JobExecutionContext, NzbgetScriptStatus,
-    RunnerError, adapter_contract_for_test, bounded_output_for_test, control_effects_for_test,
-    execute_extension, redact_bytes_for_test, redact_execution_result_for_test,
-    webhook_url_for_test,
+    CompatibilityFacts, ExecutionDisposition, InterpreterConfig, JobExecutionContext,
+    MAX_SCRIPT_OUTPUT_BYTES, NzbgetScriptStatus, ScriptExecutionRequest, adapter_contract_for_test,
+    adapter_disposition_for_test, bounded_output_for_test, cancellation_grace_for_test,
+    redact_bytes_for_test,
 };
 
-type CapturedWebhookRequests = Arc<Mutex<Vec<(HeaderMap, Vec<u8>)>>>;
-
-#[derive(Clone, Default)]
-struct WebhookCapture {
-    attempts: Arc<AtomicUsize>,
-    requests: CapturedWebhookRequests,
-}
-
-async fn webhook_handler(
-    State(capture): State<WebhookCapture>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> (StatusCode, &'static str) {
-    capture
-        .requests
-        .lock()
-        .unwrap()
-        .push((headers, body.to_vec()));
-    if capture.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-        (StatusCode::INTERNAL_SERVER_ERROR, "retry")
-    } else {
-        (StatusCode::OK, "top-secret")
-    }
-}
-
-fn native_manifest() -> super::model::ExtensionManifest {
-    parse_native_manifest(
-        r#"{
-            "schema_version": 1,
-            "kind": "native",
-            "id": "example.runner",
-            "name": "Runner",
-            "version": "1",
-            "entrypoint": "run.sh",
-            "commands": [],
-            "options": []
-        }"#,
-        VerifiedExtensionDigest::from_verified_package_digest(
-            ExtensionDigest::new(format!("blake3:{}", "b".repeat(64))).unwrap(),
-        ),
+fn manifest(adapter: ScriptAdapter) -> ScriptManifest {
+    let compatibility_name = match adapter {
+        ScriptAdapter::Nzbget => Some(NzbgetCompatibilityName::new("email").unwrap()),
+        ScriptAdapter::Sabnzbd => None,
+    };
+    ScriptManifest::new(
+        adapter,
+        compatibility_name,
+        "Runner".into(),
+        Some("1.0.0".into()),
+        "run.sh".into(),
+        vec![],
+        vec![],
     )
     .unwrap()
 }
 
-fn request(manifest: super::model::ExtensionManifest) -> ExtensionExecutionRequest {
-    ExtensionExecutionRequest {
-        attempt_id: "attempt-test".into(),
-        manifest,
-        managed_path: PathBuf::from("/managed"),
+fn request(adapter: ScriptAdapter) -> ScriptExecutionRequest {
+    ScriptExecutionRequest {
+        manifest: manifest(adapter),
+        root: PathBuf::from("/scripts"),
         options: vec![],
-        approved_roots: vec![],
         context: JobExecutionContext {
             job_id: 42,
             name: "Example Job".into(),
@@ -95,359 +51,279 @@ fn request(manifest: super::model::ExtensionManifest) -> ExtensionExecutionReque
             },
             par_status: 2,
             unpack_status: 2,
-            compatibility: super::runner::CompatibilityFacts::default(),
+            compatibility: CompatibilityFacts::default(),
         },
-        timeout_policy: TimeoutPolicy::Default24Hours,
+        timeout: Some(Duration::from_secs(60)),
         termination_grace: Duration::from_secs(10),
         interpreters: InterpreterConfig::default(),
-        control_token: None,
-        diagnostic_command: None,
         supervisor_executable: None,
     }
 }
 
-#[test]
-fn sab_adapter_supplies_the_documented_eight_arguments() {
-    let native = native_manifest();
-    let sab = super::model::ExtensionManifest::new(
-        ExtensionAdapter::Sabnzbd,
-        None,
-        "SAB script".into(),
-        native.revision().clone(),
-        "run.sh".into(),
-        vec![],
-        vec![],
-        vec![],
-    )
-    .unwrap();
-    let mut request = request(sab);
-    request.context.compatibility.total_bytes = 1_000;
-    request.context.compatibility.downloaded_bytes = 900;
-    request.context.compatibility.password = Some("job-password".into());
-    request.context.compatibility.failure_message = Some("unpack failed".into());
-    let (args, env) = adapter_contract_for_test(&request).unwrap();
-    assert_eq!(args.len(), 8);
-    assert_eq!(args[0], "/work/job");
-    assert_eq!(args[6], "2");
-    assert_eq!(args[7], "");
-    assert_eq!(env["SAB_NZO_ID"], "42");
-    assert_eq!(env["SAB_COMPLETE_DIR"], args[0]);
-    assert_eq!(env["SAB_PP_STATUS"], args[6]);
-    assert_eq!(env["SAB_FAIL_MSG"], "unpack failed");
-    assert_eq!(env["SAB_URL"], "https://example.invalid/failure");
-    assert_eq!(env["SAB_FAILURE_URL"], "");
-    assert_eq!(env["SAB_BYTES"], "1000");
-    assert_eq!(env["SAB_BYTES_DOWNLOADED"], "900");
-    assert_eq!(env["SAB_PASSWORD"], "job-password");
-    assert!(!env.contains_key("SAB_API_KEY"));
+fn contract(request: &ScriptExecutionRequest) -> (Vec<String>, BTreeMap<String, String>) {
+    adapter_contract_for_test(request).unwrap()
+}
 
-    for (stage, expected) in [
-        (PipelineFailureStage::Download, "-1"),
-        (PipelineFailureStage::Verify, "1"),
-        (PipelineFailureStage::Repair, "1"),
-        (PipelineFailureStage::Move, "2"),
+#[test]
+fn sab_adapter_supplies_the_documented_eight_arguments_and_sab_variables() {
+    let mut request = request(ScriptAdapter::Sabnzbd);
+    request.options = vec![ResolvedOption::new(
+        OptionName::new("ApiKey").unwrap(),
+        OptionValue::String("value".into()),
+    )];
+    let (args, env) = contract(&request);
+
+    assert_eq!(
+        args,
+        vec![
+            "/complete/job".to_string(),
+            "example.nzb".to_string(),
+            "Example Job".to_string(),
+            String::new(),
+            "movies".to_string(),
+            "alt.binaries.test".to_string(),
+            // Extract failure is SABnzbd's status 2.
+            "2".to_string(),
+            String::new(),
+        ]
+    );
+    assert_eq!(env.get("SAB_NZO_ID").unwrap(), "42");
+    assert_eq!(env.get("SAB_FINAL_NAME").unwrap(), "Example Job");
+    assert_eq!(env.get("SAB_FILENAME").unwrap(), "example.nzb");
+    assert_eq!(env.get("SAB_CAT").unwrap(), "movies");
+    assert_eq!(env.get("SAB_GROUP").unwrap(), "alt.binaries.test");
+    assert_eq!(env.get("SAB_COMPLETE_DIR").unwrap(), "/complete/job");
+    assert_eq!(env.get("SAB_STATUS").unwrap(), "Running");
+    assert_eq!(env.get("SAB_PP_STATUS").unwrap(), "2");
+    assert_eq!(
+        env.get("SAB_URL").unwrap(),
+        "https://example.invalid/failure"
+    );
+    assert_eq!(env.get("SAB_REPAIR").unwrap(), "1");
+    assert_eq!(env.get("SAB_UNPACK").unwrap(), "1");
+    assert_eq!(env.get("SAB_SCRIPT").unwrap(), "run.sh");
+    assert_eq!(env.get("SAB_OPTION_APIKEY").unwrap(), "value");
+    // Fields weaver has no equivalent for are still present and empty, because
+    // SABnzbd scripts read them unconditionally.
+    for empty in [
+        "SAB_CORRECT_PASSWORD",
+        "SAB_DUPLICATE",
+        "SAB_DUPLICATE_KEY",
+        "SAB_ENCRYPTED",
+        "SAB_OVERSIZED",
+        "SAB_PP",
+        "SAB_PRIORITY",
+        "SAB_UNWANTED_EXT",
+        "SAB_FAILURE_URL",
     ] {
-        request.context.pipeline_outcome = PipelineOutcome::Failed {
-            stage,
-            code: "failed".into(),
-            message: "failed".into(),
-        };
-        assert_eq!(adapter_contract_for_test(&request).unwrap().0[6], expected);
+        assert_eq!(env.get(empty).map(String::as_str), Some(""), "{empty}");
     }
 }
 
 #[test]
-fn nzbget_adapter_supplies_status_options_and_control_commands() {
-    let native = native_manifest();
-    let nzbget = super::model::ExtensionManifest::new(
-        ExtensionAdapter::Nzbget,
-        Some(NzbgetCompatibilityName::new("Example").unwrap()),
-        "NZBGet script".into(),
-        native.revision().clone(),
-        "run.sh".into(),
-        vec![],
-        vec![],
-        vec![],
-    )
-    .unwrap();
-    let mut request = request(nzbget);
-    request.options.push(ResolvedOption::new(
-        super::model::OptionName::new("Api.Token").unwrap(),
-        ResolvedOptionValue::Secret(SecretOptionValue::for_execution("secret-value")),
-    ));
-    request.context.compatibility.health_milli = 952;
-    request.context.compatibility.critical_health_milli = 900;
-    request.context.compatibility.previous_script_status = NzbgetScriptStatus::Failure;
-    request.context.compatibility.data_dir = Some(PathBuf::from("/data"));
-    request.context.compatibility.intermediate_dir = Some(PathBuf::from("/intermediate"));
-    request.context.compatibility.complete_dir = Some(PathBuf::from("/complete"));
-    request.context.compatibility.temp_dir = Some(PathBuf::from("/tmp"));
-    request.context.compatibility.app_dir = Some(PathBuf::from("/app"));
-    let (args, env) = adapter_contract_for_test(&request).unwrap();
-    assert!(args.is_empty());
-    assert_eq!(env["NZBPP_STATUS"], "FAILURE/UNPACK");
-    assert_eq!(env["NZBPP_TOTALSTATUS"], "FAILURE");
-    assert_eq!(env["NZBPP_PARSTATUS"], "2");
-    assert_eq!(env["NZBPP_SCRIPTSTATUS"], "FAILURE");
-    assert_eq!(env["NZBPP_HEALTH"], "952");
-    assert_eq!(env["NZBPO_Api.Token"], "secret-value");
-    assert_eq!(env["NZBPO_API_TOKEN"], "secret-value");
-    assert_eq!(env["NZBOP_MAINDIR"], "/data");
-    assert_eq!(env["NZBOP_INTERDIR"], "/intermediate");
-    assert_eq!(env["NZBOP_DESTDIR"], "/complete");
-
+fn sab_pipeline_status_follows_the_failing_stage() {
+    let mut request = request(ScriptAdapter::Sabnzbd);
+    for (stage, expected) in [
+        (PipelineFailureStage::Verify, "1"),
+        (PipelineFailureStage::Repair, "1"),
+        (PipelineFailureStage::Extract, "2"),
+        (PipelineFailureStage::Move, "2"),
+        (PipelineFailureStage::Download, "-1"),
+    ] {
+        request.context.pipeline_outcome = PipelineOutcome::Failed {
+            stage,
+            code: "x".into(),
+            message: "y".into(),
+        };
+        let (_, env) = contract(&request);
+        assert_eq!(env.get("SAB_PP_STATUS").map(String::as_str), Some(expected));
+    }
     request.context.pipeline_outcome = PipelineOutcome::Succeeded;
+    let (_, env) = contract(&request);
+    assert_eq!(env.get("SAB_PP_STATUS").map(String::as_str), Some("0"));
+}
+
+#[test]
+fn nzbget_adapter_supplies_nzbpp_nzbpo_and_nzbop_variables_with_no_positional_args() {
+    let mut request = request(ScriptAdapter::Nzbget);
+    request.options = vec![ResolvedOption::new(
+        OptionName::new("Server.Timeout").unwrap(),
+        OptionValue::Integer(30),
+    )];
+    request.context.compatibility = CompatibilityFacts {
+        health_milli: 900,
+        critical_health_milli: 800,
+        data_dir: Some(PathBuf::from("/data")),
+        intermediate_dir: Some(PathBuf::from("/data/intermediate")),
+        complete_dir: Some(PathBuf::from("/data/complete")),
+        temp_dir: Some(PathBuf::from("/tmp")),
+        app_dir: Some(PathBuf::from("/opt/weaver")),
+        previous_script_status: NzbgetScriptStatus::Success,
+        ..CompatibilityFacts::default()
+    };
+    let (args, env) = contract(&request);
+
+    assert!(args.is_empty(), "NZBGet scripts read the environment only");
+    assert_eq!(env.get("NZBPP_NZBID").unwrap(), "42");
+    assert_eq!(env.get("NZBPP_NZBNAME").unwrap(), "Example Job");
+    assert_eq!(env.get("NZBPP_DIRECTORY").unwrap(), "/complete/job");
+    assert_eq!(env.get("NZBPP_NZBFILENAME").unwrap(), "example.nzb");
+    assert_eq!(env.get("NZBPP_QUEUEDFILE").unwrap(), "example.nzb");
+    assert_eq!(env.get("NZBPP_FINALDIR").unwrap(), "/complete/job");
+    assert_eq!(env.get("NZBPP_CATEGORY").unwrap(), "movies");
+    assert_eq!(env.get("NZBPP_STATUS").unwrap(), "FAILURE/UNPACK");
+    assert_eq!(env.get("NZBPP_TOTALSTATUS").unwrap(), "FAILURE");
+    assert_eq!(env.get("NZBPP_SCRIPTSTATUS").unwrap(), "SUCCESS");
+    assert_eq!(env.get("NZBPP_PARSTATUS").unwrap(), "2");
+    assert_eq!(env.get("NZBPP_UNPACKSTATUS").unwrap(), "2");
+    assert_eq!(env.get("NZBPP_HEALTH").unwrap(), "900");
+    assert_eq!(env.get("NZBPP_CRITICALHEALTH").unwrap(), "800");
+    // Options keep their documented name and also gain the normalized alias,
+    // because legacy scripts read whichever the manifest declared.
+    assert_eq!(env.get("NZBPO_Server.Timeout").unwrap(), "30");
+    assert_eq!(env.get("NZBPO_SERVER_TIMEOUT").unwrap(), "30");
+    assert_eq!(env.get("NZBOP_MainDir").unwrap(), "/data");
+    assert_eq!(env.get("NZBOP_MAINDIR").unwrap(), "/data");
+    assert_eq!(env.get("NZBOP_InterDir").unwrap(), "/data/intermediate");
+    assert_eq!(env.get("NZBOP_DestDir").unwrap(), "/data/complete");
+    assert_eq!(env.get("NZBOP_TempDir").unwrap(), "/tmp");
+    assert_eq!(env.get("NZBOP_AppDir").unwrap(), "/opt/weaver");
+    assert!(env.contains_key("NZBOP_Version"));
+}
+
+#[test]
+fn nzbget_pipeline_status_follows_the_failing_stage_and_success_detail() {
+    let mut request = request(ScriptAdapter::Nzbget);
+    for (stage, expected) in [
+        (PipelineFailureStage::Download, "FAILURE/HEALTH"),
+        (PipelineFailureStage::Verify, "FAILURE/PAR"),
+        (PipelineFailureStage::Repair, "FAILURE/PAR"),
+        (PipelineFailureStage::Extract, "FAILURE/UNPACK"),
+        (PipelineFailureStage::Move, "FAILURE/MOVE"),
+    ] {
+        request.context.pipeline_outcome = PipelineOutcome::Failed {
+            stage,
+            code: "x".into(),
+            message: "y".into(),
+        };
+        let (_, env) = contract(&request);
+        assert_eq!(env.get("NZBPP_STATUS").map(String::as_str), Some(expected));
+    }
+    request.context.pipeline_outcome = PipelineOutcome::Succeeded;
+    let (_, env) = contract(&request);
+    assert_eq!(env.get("NZBPP_STATUS").unwrap(), "SUCCESS/ALL");
     request.context.par_status = 0;
     request.context.unpack_status = 0;
-    assert_eq!(
-        adapter_contract_for_test(&request).unwrap().1["NZBPP_STATUS"],
-        "SUCCESS/HEALTH"
-    );
-    request.context.par_status = 2;
-    assert_eq!(
-        adapter_contract_for_test(&request).unwrap().1["NZBPP_STATUS"],
-        "SUCCESS/ALL"
-    );
-
-    let lines = vec![
-        CapturedOutputLine {
-            sequence: 0,
-            stream: LogStream::Stdout,
-            bytes: b"[NZB] DIRECTORY=/work/job/new\n".to_vec(),
-        },
-        CapturedOutputLine {
-            sequence: 1,
-            stream: LogStream::Stdout,
-            bytes: b"[NZB] NZBPR_RESULT=ok\n".to_vec(),
-        },
-        CapturedOutputLine {
-            sequence: 2,
-            stream: LogStream::Stdout,
-            bytes: b"[NZB] MARK=BAD\n".to_vec(),
-        },
-    ];
-    let effects = control_effects_for_test(ExtensionAdapter::Nzbget, &lines).unwrap();
-    assert_eq!(effects.directory, Some(PathBuf::from("/work/job/new")));
-    assert_eq!(effects.parameters["RESULT"], "ok");
-    assert!(effects.mark_bad);
+    let (_, env) = contract(&request);
+    assert_eq!(env.get("NZBPP_STATUS").unwrap(), "SUCCESS/HEALTH");
 }
 
 #[test]
-fn control_output_survives_display_truncation_and_enforces_its_own_limit() {
-    let mut lines = vec![b"display header\n".to_vec()];
-    lines.push(b"[WEAVER] {\"type\":\"directory\",\"path\":\"/work/next\"}\n".to_vec());
-    lines.extend((0..80).map(|_| vec![b'x'; 64 * 1024]));
-    let (display, effects, truncated) =
-        bounded_output_for_test(ExtensionAdapter::Native, lines).unwrap();
-    assert!(truncated);
-    assert_eq!(effects.directory, Some(PathBuf::from("/work/next")));
-    assert!(
-        display
-            .iter()
-            .all(|line| !line.bytes.starts_with(b"[WEAVER] "))
-    );
-
-    let oversized_control = (0..65)
-        .map(|_| {
-            let mut line = b"[NZB] NZBPR_VALUE=".to_vec();
-            line.extend(std::iter::repeat_n(b'x', 65_500));
-            line.push(b'\n');
-            line
-        })
-        .collect();
-    assert!(matches!(
-        bounded_output_for_test(ExtensionAdapter::Nzbget, oversized_control),
-        Err(RunnerError::SupervisorProtocol(_))
-    ));
-}
-
-#[test]
-fn nzbget_diagnostic_uses_command_context_without_job_context() {
-    let native = native_manifest();
-    let nzbget = super::model::ExtensionManifest::new(
-        ExtensionAdapter::Nzbget,
-        Some(NzbgetCompatibilityName::new("Example").unwrap()),
-        "NZBGet script".into(),
-        native.revision().clone(),
-        "run.sh".into(),
-        vec![],
-        vec![],
-        vec![],
-    )
-    .unwrap();
-    let mut request = request(nzbget);
-    request.diagnostic_command = Some("ConnectionTest".into());
-    request.options.push(ResolvedOption::new(
-        super::model::OptionName::new("Api.Token").unwrap(),
-        ResolvedOptionValue::Secret(SecretOptionValue::for_execution("secret-value")),
-    ));
-
-    let (args, env) = adapter_contract_for_test(&request).unwrap();
-
-    assert!(args.is_empty());
-    assert_eq!(env["NZBCP_COMMAND"], "ConnectionTest");
-    assert_eq!(env["NZBPO_API_TOKEN"], "secret-value");
-    assert!(!env.contains_key("NZBPP_NZBID"));
-}
-
-#[test]
-fn secret_values_are_redacted_even_when_embedded_in_hostile_output() {
-    let redacted = redact_bytes_for_test(
-        b"prefix secret-value suffix secret-value",
-        &[b"secret-value".to_vec()],
-    );
-    assert_eq!(
-        String::from_utf8(redacted).unwrap(),
-        "prefix [REDACTED] suffix [REDACTED]"
-    );
-}
-
-#[test]
-fn redaction_covers_chunk_boundaries_keys_errors_and_rejects_sensitive_paths() {
-    let secrets = [b"top-secret".to_vec()];
-    let mut result = ExtensionExecutionResult {
-        disposition: ExecutionDisposition::Failed,
-        exit_code: Some(1),
-        output: vec![
-            CapturedOutputLine {
-                sequence: 0,
-                stream: LogStream::Stdout,
-                bytes: b"prefix top-".to_vec(),
-            },
-            CapturedOutputLine {
-                sequence: 1,
-                stream: LogStream::Stdout,
-                bytes: b"secret suffix".to_vec(),
-            },
-        ],
-        output_truncated: false,
-        effects: ControlEffects {
-            parameters: [("top-secret-key".into(), "top-secret-value".into())]
-                .into_iter()
-                .collect(),
-            metadata: [(
-                "top-secret-metadata".into(),
-                serde_json::json!({"top-secret-json-key": "top-secret-json-value"}),
-            )]
-            .into_iter()
-            .collect(),
-            ..ControlEffects::default()
-        },
-        error_message: Some("failed with top-secret".into()),
-    };
-    redact_execution_result_for_test(&mut result, &secrets).unwrap();
-    let serialized = format!("{result:?}");
-    assert!(!serialized.contains("top-secret"));
-    assert!(serialized.contains("[REDACTED]"));
-
-    result.effects.directory = Some(PathBuf::from("/tmp/top-secret"));
-    assert!(matches!(
-        redact_execution_result_for_test(&mut result, &secrets),
-        Err(RunnerError::SensitiveControlEffect)
-    ));
-}
-
-#[test]
-fn webhook_urls_reject_embedded_user_information() {
-    let mut request = request(native_manifest());
-    request.options = vec![ResolvedOption::new(
-        OptionName::new("webhook_url").unwrap(),
-        ResolvedOptionValue::String("https://user:password@example.test/hook".into()),
-    )];
-    assert!(matches!(
-        webhook_url_for_test(&request),
-        Err(RunnerError::InvalidWebhookConfiguration(_))
-    ));
-}
-
-#[tokio::test]
-async fn webhook_retries_with_stable_idempotency_and_hmac_and_redacts_credentials() {
-    let capture = WebhookCapture::default();
-    let app = Router::new()
-        .route("/hook", post(webhook_handler))
-        .with_state(capture.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let data = tempfile::tempdir().unwrap();
-    let package = data.path().join("scripts").join("webhook");
-    fs::create_dir_all(&package).unwrap();
-    fs::write(
-        package.join("weaver-extension.json"),
-        r#"{
-            "schema_version": 1,
-            "kind": "webhook",
-            "id": "example.webhook",
-            "name": "Webhook",
-            "version": "1",
-            "entrypoint": "webhook",
-            "commands": [],
-            "options": []
-        }"#,
-    )
-    .unwrap();
-    let manifest = discover_extensions(
-        data.path(),
-        DiscoveryOptions {
-            enabled: true,
-            bare_script_adapter: None,
-        },
-    )
-    .unwrap()
-    .remove(0)
-    .manifest;
-    let mut request = request(manifest);
-    request.managed_path = package;
-    request.timeout_policy =
-        TimeoutPolicy::Finite(super::model::NonZeroTimeoutSeconds::new(10).unwrap());
+fn boolean_options_use_the_yes_no_spelling_both_ecosystems_expect() {
+    let mut request = request(ScriptAdapter::Nzbget);
     request.options = vec![
         ResolvedOption::new(
-            OptionName::new("webhook_url").unwrap(),
-            ResolvedOptionValue::String(format!("http://{address}/hook")),
+            OptionName::new("Enabled").unwrap(),
+            OptionValue::Boolean(true),
         ),
         ResolvedOption::new(
-            OptionName::new("webhook_retries").unwrap(),
-            ResolvedOptionValue::Integer(1),
-        ),
-        ResolvedOption::new(
-            OptionName::new("webhook_hmac_secret").unwrap(),
-            ResolvedOptionValue::Secret(SecretOptionValue::for_execution("hmac-secret")),
-        ),
-        ResolvedOption::new(
-            OptionName::new("webhook_bearer_token").unwrap(),
-            ResolvedOptionValue::Secret(SecretOptionValue::for_execution("top-secret")),
+            OptionName::new("Disabled").unwrap(),
+            OptionValue::Boolean(false),
         ),
     ];
+    let (_, env) = contract(&request);
+    assert_eq!(env.get("NZBPO_Enabled").unwrap(), "yes");
+    assert_eq!(env.get("NZBPO_Disabled").unwrap(), "no");
+}
 
-    let result = execute_extension(request, None).await.unwrap();
-    server.abort();
+#[test]
+fn secret_options_reach_the_script_verbatim() {
+    let mut request = request(ScriptAdapter::Nzbget);
+    request.options = vec![ResolvedOption::new(
+        OptionName::new("Token").unwrap(),
+        OptionValue::Secret(SecretOptionValue::from_admin_input("hunter2")),
+    )];
+    let (_, env) = contract(&request);
+    assert_eq!(env.get("NZBPO_Token").unwrap(), "hunter2");
+}
 
-    assert_eq!(result.disposition, ExecutionDisposition::Succeeded);
-    assert_eq!(capture.attempts.load(Ordering::SeqCst), 2);
-    let requests = capture.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].1, requests[1].1);
+#[test]
+fn exit_codes_map_onto_each_ecosystem_contract() {
+    use ExecutionDisposition::{Failed, Skipped, Succeeded, Warned};
+    // SABnzbd: zero succeeds, anything else is a warning on the job.
     assert_eq!(
-        requests[0].0["idempotency-key"],
-        requests[1].0["idempotency-key"]
+        adapter_disposition_for_test(ScriptAdapter::Sabnzbd, Some(0)),
+        Succeeded
     );
-    assert_eq!(requests[0].0["authorization"], "Bearer top-secret");
-    let payload: serde_json::Value = serde_json::from_slice(&requests[0].1).unwrap();
-    assert_eq!(payload["options"], serde_json::json!({}));
-    let mut mac = Hmac::<Sha256>::new_from_slice(b"hmac-secret").unwrap();
-    mac.update(&requests[0].1);
-    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
     assert_eq!(
-        requests[0].0["x-weaver-signature"].to_str().unwrap(),
-        expected
+        adapter_disposition_for_test(ScriptAdapter::Sabnzbd, Some(1)),
+        Warned
     );
-    let output = result
-        .output
-        .iter()
-        .flat_map(|line| line.bytes.iter().copied())
-        .collect::<Vec<_>>();
-    let output = String::from_utf8(output).unwrap();
-    assert!(!output.contains("top-secret"));
-    assert!(output.contains("[REDACTED]"));
+    assert_eq!(
+        adapter_disposition_for_test(ScriptAdapter::Sabnzbd, None),
+        Warned
+    );
+    // NZBGet: 92 par-check request is acknowledged, 93 success, 94 error, 95 none.
+    assert_eq!(
+        adapter_disposition_for_test(ScriptAdapter::Nzbget, Some(92)),
+        Succeeded
+    );
+    assert_eq!(
+        adapter_disposition_for_test(ScriptAdapter::Nzbget, Some(93)),
+        Succeeded
+    );
+    assert_eq!(
+        adapter_disposition_for_test(ScriptAdapter::Nzbget, Some(94)),
+        Failed
+    );
+    assert_eq!(
+        adapter_disposition_for_test(ScriptAdapter::Nzbget, Some(95)),
+        Skipped
+    );
+    assert_eq!(
+        adapter_disposition_for_test(ScriptAdapter::Nzbget, Some(0)),
+        Failed
+    );
+    assert_eq!(
+        adapter_disposition_for_test(ScriptAdapter::Nzbget, None),
+        Failed
+    );
+}
+
+#[test]
+fn user_cancellation_grace_is_capped_at_five_seconds() {
+    assert_eq!(
+        cancellation_grace_for_test(Duration::from_secs(10)),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        cancellation_grace_for_test(Duration::from_secs(3)),
+        Duration::from_secs(3)
+    );
+}
+
+#[test]
+fn captured_output_keeps_the_tail_within_the_persisted_cap() {
+    let line = vec![b'x'; 1024];
+    let count = (MAX_SCRIPT_OUTPUT_BYTES as usize / line.len()) + 8;
+    let (output, truncated) = bounded_output_for_test(vec![line.clone(); count]);
+    assert!(truncated, "an over-cap script must report truncation");
+    assert!(output.len() as u64 <= MAX_SCRIPT_OUTPUT_BYTES);
+
+    let (output, truncated) = bounded_output_for_test(vec![b"short\n".to_vec()]);
+    assert!(!truncated);
+    assert_eq!(output, b"short\n");
+}
+
+#[test]
+fn secrets_are_removed_from_captured_output() {
+    let secrets = vec![b"hunter2".to_vec()];
+    let redacted = redact_bytes_for_test(b"token=hunter2 and hunter2 again", &secrets);
+    assert_eq!(
+        String::from_utf8(redacted).unwrap(),
+        "token=[REDACTED] and [REDACTED] again"
+    );
+    // An empty secret must not turn every byte boundary into a redaction.
+    let untouched = redact_bytes_for_test(b"plain", &[Vec::new()]);
+    assert_eq!(untouched, b"plain");
 }

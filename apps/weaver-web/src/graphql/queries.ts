@@ -36,6 +36,39 @@ const FACADE_QUEUE_ITEM_FIELDS = `
   }
 `;
 
+const QUEUE_TABLE_ITEM_FIELDS = `
+  fragment QueueTableItemFields on QueueItem {
+    id
+    name
+    displayTitle
+    originalTitle
+    status: state
+    progressPercent
+    totalBytes
+    downloadedBytes
+    optionalRecoveryBytes
+    optionalRecoveryDownloadedBytes
+    phaseProgress {
+      phase
+      completedBytes
+      totalBytes
+      progressPercent
+      rateBps
+      estimatedRemainingMs
+      startedAtEpochMs
+      updatedAtEpochMs
+    }
+    failedBytes
+    health
+    hasPassword
+    category
+    metadata: attributes {
+      key
+      value
+    }
+  }
+`;
+
 export const FACADE_HISTORY_ITEM_FIELDS = `
   fragment FacadeHistoryItemFields on HistoryItem {
     id
@@ -146,6 +179,7 @@ const SERVER_FIELDS = `
     backfill
     retentionDays
     maxDownloadSpeed
+    tlsNameMismatchCertificateFingerprint
     downloadQuota {
       enabled
       period
@@ -178,6 +212,8 @@ const SERVER_DETAILS_FIELDS = `
     backfill
     retentionDays
     maxDownloadSpeed
+    tlsNameMismatchCertificateDerBase64
+    tlsNameMismatchCertificateFingerprint
     downloadQuota {
       enabled
       period
@@ -479,6 +515,26 @@ export const JOBS_PAGE_QUERY = gql`
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
+export const QUEUE_PAGE_QUERY = gql`
+  query QueuePage($input: QueuePageInput!) {
+    queuePage(input: $input) {
+      items {
+        ...QueueTableItemFields
+      }
+      totalCount
+      summary {
+        totalItems
+        queuedItems
+        activeItems
+        pausedItems
+      }
+      categories
+      latestCursor
+    }
+  }
+  ${QUEUE_TABLE_ITEM_FIELDS}
+`;
+
 export const JOB_QUERY = gql`
   query Job($id: Int!) {
     jobDetailSnapshot(jobId: $id) {
@@ -631,14 +687,43 @@ export const LIVE_METRICS_QUERY = gql`
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
-export const DISK_USAGE_QUERY = gql`
-  query DiskUsage {
-    diskUsage {
-      label
-      path
-      totalBytes
-      usedBytes
-      freeBytes
+export const SYSTEM_INFO_QUERY = gql`
+  query SystemInfo {
+    systemInfo {
+      version
+      uptimeSeconds
+      deployment
+      operatingSystem
+      architecture
+      databaseEngine
+      compute {
+        physicalCores
+        logicalCores
+        cgroupLimit
+        decoderTier
+        simdFeatures
+      }
+      memory {
+        totalBytes
+        availableAtStartupBytes
+        cgroupLimitBytes
+        effectiveLimitBytes
+      }
+      primaryStorage {
+        storageClass
+        filesystem
+        startupRandomReadIops
+      }
+      configuredStorage {
+        labels
+        path
+        error
+        capacity {
+          totalBytes
+          usedBytes
+          freeBytes
+        }
+      }
     }
   }
 `;
@@ -786,28 +871,6 @@ export const EVENTS_SUBSCRIPTION = gql`
       message
     }
   }
-`;
-
-export const JOB_UPDATES_SUBSCRIPTION = gql`
-  subscription JobUpdates {
-    queueSnapshots {
-      items {
-        ...FacadeQueueItemFields
-      }
-      summary {
-        currentDownloadSpeed
-      }
-      globalState {
-        isPaused
-        downloadBlock {
-          ...DownloadBlockFields
-        }
-      }
-    }
-  }
-  ${PARSED_RELEASE_FIELDS}
-  ${FACADE_QUEUE_ITEM_FIELDS}
-  ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
 export const QUEUE_EVENTS_SUBSCRIPTION = gql`
@@ -1014,6 +1077,10 @@ export const TEST_CONNECTION_MUTATION = gql`
       message
       latencyMs
       supportsPipelining
+      adoptableTlsNameMismatchCertificate {
+        derBase64
+        sha256Fingerprint
+      }
     }
   }
 `;
@@ -1123,6 +1190,70 @@ export const LOGIN_STATUS_QUERY = gql`
     adminLoginStatus {
       enabled
       username
+    }
+  }
+`;
+
+export const HTTP_BIND_ADDRESS_QUERY = gql`
+  query HttpBindAddress {
+    httpBindAddress {
+      address
+      storedAddress
+      source
+      editable
+      exposedWithoutLogin
+      restartRequired
+      bindFallback
+    }
+  }
+`;
+
+export const SET_HTTP_BIND_ADDRESS_MUTATION = gql`
+  mutation SetHttpBindAddress($address: String!) {
+    setHttpBindAddress(address: $address)
+  }
+`;
+
+export const ACCESS_POLICY_QUERY = gql`
+  query AccessPolicy {
+    accessPolicy {
+      mode
+      trustedNetworks
+      editable
+      envPinned
+    }
+  }
+`;
+
+export const SET_ACCESS_POLICY_MUTATION = gql`
+  mutation SetAccessPolicy($mode: String!, $trustedNetworks: [String!]) {
+    setAccessPolicy(mode: $mode, trustedNetworks: $trustedNetworks)
+  }
+`;
+
+// One probe for the upgrade wizard: whether an access mode was ever stored,
+// whether this deployment allows changing it, and what the bind question
+// should default to. Combined so an already-configured install pays a single
+// round trip before the app renders.
+export const SECURITY_SETUP_STATE_QUERY = gql`
+  query SecuritySetupState {
+    adminLoginStatus {
+      enabled
+    }
+    accessPolicy {
+      editable
+      configured
+      strictSecurity
+    }
+    httpBindAddress {
+      address
+      storedAddress
+      editable
+    }
+    serverRestart {
+      supported
+      reason
+      deployment
     }
   }
 `;
@@ -1364,260 +1495,145 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
   }
 `;
 
+const POST_PROCESSING_SETTINGS_FIELDS = gql`
+  fragment PostProcessingSettingsFields on PostProcessingSettingsGql {
+    scriptDirectory
+    executionEnabled
+    concurrency
+    terminationGraceSeconds
+    pythonInterpreter
+    powershellInterpreter
+    batchInterpreter
+    strictSecurityRefusesExecution
+    lists {
+      global {
+        script
+        enabled
+        timeoutSeconds
+      }
+      categories {
+        category
+        entries {
+          script
+          enabled
+          timeoutSeconds
+        }
+      }
+    }
+  }
+`;
+
 export const POST_PROCESSING_SETTINGS_QUERY = gql`
   query PostProcessingSettings {
     postProcessingSettings {
-      discoveryEnabled
-      executionEnabled
-      concurrency
-      terminationGraceSeconds
-      pythonInterpreter
-      powershellInterpreter
-      batchInterpreter
-      webhooksEnabled
-      allowedRoots
+      ...PostProcessingSettingsFields
     }
-    postProcessingRevisions {
-      extensionId
-      revisionId
-      declaredVersion
-      digest
-      adapter
-      displayName
-      trustState
-      managed
-      sourcePath
-      discoveredAtEpochMs
-      approvedAtEpochMs
-      manifest
+    scripts {
+      scripts {
+        name
+        displayName
+        adapter
+        version
+        options {
+          name
+          section
+          optionType
+          displayName
+          description
+          select
+          required
+          defaultValue
+          value
+        }
+      }
+      problems {
+        name
+        message
+      }
     }
-    postProcessingProfiles {
-      profileId
+    categories {
+      id
       name
-      enabled
-      createdAtEpochMs
-      updatedAtEpochMs
-      definition
+    }
+  }
+  ${POST_PROCESSING_SETTINGS_FIELDS}
+`;
+
+export const SET_POST_PROCESSING_SETTINGS_MUTATION = gql`
+  mutation SetPostProcessingSettings($input: PostProcessingSettingsInput!) {
+    setPostProcessingSettings(input: $input) {
+      ...PostProcessingSettingsFields
+    }
+  }
+  ${POST_PROCESSING_SETTINGS_FIELDS}
+`;
+
+export const SET_POST_PROCESSING_SCRIPT_DIRECTORY_MUTATION = gql`
+  mutation SetPostProcessingScriptDirectory($directory: String!) {
+    setPostProcessingScriptDirectory(directory: $directory) {
+      ...PostProcessingSettingsFields
+    }
+  }
+  ${POST_PROCESSING_SETTINGS_FIELDS}
+`;
+
+export const SET_SCRIPT_LISTS_MUTATION = gql`
+  mutation SetScriptLists($input: ScriptListsInput!) {
+    setScriptLists(input: $input) {
+      global {
+        script
+        enabled
+        timeoutSeconds
+      }
+      categories {
+        category
+        entries {
+          script
+          enabled
+          timeoutSeconds
+        }
+      }
     }
   }
 `;
 
-export const UPDATE_POST_PROCESSING_SETTINGS_MUTATION = gql`
-  mutation UpdatePostProcessingSettings($input: PostProcessingSettingsInput!) {
-    updatePostProcessingSettings(input: $input) {
-      discoveryEnabled
-      executionEnabled
-      concurrency
-      terminationGraceSeconds
-      pythonInterpreter
-      powershellInterpreter
-      batchInterpreter
-      allowedRoots
-    }
-  }
-`;
-
-export const DISCOVER_POST_PROCESSING_EXTENSIONS_MUTATION = gql`
-  mutation DiscoverPostProcessingExtensions {
-    discoverPostProcessingExtensions {
-      extensionId
-      revisionId
-      declaredVersion
-      digest
-      adapter
-      displayName
-      trustState
-      managed
-      sourcePath
-      discoveredAtEpochMs
-      approvedAtEpochMs
-      manifest
-    }
-  }
-`;
-
-export const APPROVE_POST_PROCESSING_REVISION_MUTATION = gql`
-  mutation ApprovePostProcessingRevision($extensionId: String!, $revisionId: String!) {
-    approvePostProcessingRevision(extensionId: $extensionId, revisionId: $revisionId) {
-      extensionId
-      revisionId
-      trustState
-      managed
-    }
-  }
-`;
-
-export const DISABLE_POST_PROCESSING_REVISION_MUTATION = gql`
-  mutation DisablePostProcessingRevision($extensionId: String!, $revisionId: String!) {
-    disablePostProcessingRevision(extensionId: $extensionId, revisionId: $revisionId)
-  }
-`;
-
-export const REVOKE_POST_PROCESSING_REVISION_MUTATION = gql`
-  mutation RevokePostProcessingRevision($extensionId: String!, $revisionId: String!) {
-    revokePostProcessingRevision(extensionId: $extensionId, revisionId: $revisionId)
-  }
-`;
-
-export const SAVE_POST_PROCESSING_PROFILE_MUTATION = gql`
-  mutation SavePostProcessingProfile($input: PostProcessingProfileInput!) {
-    savePostProcessingProfile(input: $input) {
-      profileId
+export const SET_SCRIPT_OPTIONS_MUTATION = gql`
+  mutation SetScriptOptions($script: String!, $options: [ScriptOptionInput!]!) {
+    setScriptOptions(script: $script, options: $options) {
       name
-      enabled
-      updatedAtEpochMs
-      definition
+      options {
+        name
+        optionType
+        value
+      }
     }
   }
 `;
 
-export const DELETE_POST_PROCESSING_PROFILE_MUTATION = gql`
-  mutation DeletePostProcessingProfile($profileId: String!) {
-    deletePostProcessingProfile(profileId: $profileId)
-  }
-`;
-
-export const ASSIGN_GLOBAL_POST_PROCESSING_PROFILE_MUTATION = gql`
-  mutation AssignGlobalPostProcessingProfile($profileId: String) {
-    assignGlobalPostProcessingProfile(profileId: $profileId)
-  }
-`;
-
-export const ASSIGN_CATEGORY_POST_PROCESSING_PROFILE_MUTATION = gql`
-  mutation AssignCategoryPostProcessingProfile($category: String!, $profileId: String) {
-    assignCategoryPostProcessingProfile(category: $category, profileId: $profileId)
-  }
-`;
-
-const POST_PROCESSING_RUN_FIELDS = gql`
-  fragment PostProcessingRunFields on PostProcessingRun {
-    runId
-    jobId
-    status
-    pipelineOutcome
-    summary
-    terminalIntent
-    plan
-    rerunOfRunId
-    queuedAtEpochMs
-    queuePosition
-    startedAtEpochMs
-    finishedAtEpochMs
-  }
-`;
-
-export const POST_PROCESSING_QUEUE_QUERY = gql`
-  query PostProcessingQueue {
-    postProcessingQueue {
-      ...PostProcessingRunFields
-    }
-  }
-  ${POST_PROCESSING_RUN_FIELDS}
-`;
-
-export const POST_PROCESSING_JOB_QUERY = gql`
-  query PostProcessingJob($jobId: Int!) {
-    postProcessingJobPlan(jobId: $jobId) {
-      jobId
-      definition
-    }
-    postProcessingRuns(jobId: $jobId, limit: 100) {
-      ...PostProcessingRunFields
-    }
-  }
-  ${POST_PROCESSING_RUN_FIELDS}
-`;
-
-export const POST_PROCESSING_ATTEMPTS_QUERY = gql`
-  query PostProcessingAttempts($runId: String!) {
-    postProcessingAttempts(runId: $runId) {
-      attemptId
-      runId
-      stepIndex
+export const POST_PROCESSING_RESULTS_QUERY = gql`
+  query PostProcessingResults($jobId: Int!) {
+    postProcessingResults(jobId: $jobId) {
+      script
+      adapter
       status
-      extensionId
-      revisionId
-      adapter
-      workingDirectory
       exitCode
-      errorMessage
-      progress
+      durationMs
+      outputTail
       outputTruncated
-      queuedAtEpochMs
-      startedAtEpochMs
+      errorMessage
       finishedAtEpochMs
     }
   }
 `;
 
-export const POST_PROCESSING_ARTIFACTS_QUERY = gql`
-  query PostProcessingArtifacts($runId: String!) {
-    postProcessingArtifacts(runId: $runId) {
-      attemptId
-      stepIndex
-      path
-      exists
-      isFile
-      isDirectory
-      isSymlink
-      sizeBytes
-    }
-  }
-`;
-
-export const POST_PROCESSING_LOGS_QUERY = gql`
-  query PostProcessingLogs($attemptId: String!, $cursor: Int, $limit: Int!) {
-    postProcessingLogs(attemptId: $attemptId, cursor: $cursor, limit: $limit) {
-      chunks {
-        sequence
-        stream
-        text
-        createdAtEpochMs
-      }
-      nextCursor
-      truncated
-    }
-  }
-`;
-
-export const PAUSE_POST_PROCESSING_QUEUE_MUTATION = gql`
-  mutation PausePostProcessingQueue {
-    pausePostProcessingQueue
-  }
-`;
-
-export const RESUME_POST_PROCESSING_QUEUE_MUTATION = gql`
-  mutation ResumePostProcessingQueue {
-    resumePostProcessingQueue
-  }
-`;
-
-export const REORDER_POST_PROCESSING_QUEUE_MUTATION = gql`
-  mutation ReorderPostProcessingQueue($runIds: [String!]!) {
-    reorderPostProcessingQueue(runIds: $runIds)
+export const RERUN_POST_PROCESSING_MUTATION = gql`
+  mutation RerunPostProcessing($jobId: Int!) {
+    rerunPostProcessing(jobId: $jobId)
   }
 `;
 
 export const CANCEL_JOB_POST_PROCESSING_MUTATION = gql`
   mutation CancelJobPostProcessing($jobId: Int!) {
     cancelJobPostProcessing(jobId: $jobId)
-  }
-`;
-
-export const RERUN_POST_PROCESSING_MUTATION = gql`
-  mutation RerunPostProcessing($input: PostProcessingRerunInput!) {
-    rerunPostProcessing(input: $input) {
-      ...PostProcessingRunFields
-    }
-  }
-  ${POST_PROCESSING_RUN_FIELDS}
-`;
-
-export const SET_JOB_POST_PROCESSING_SELECTION_MUTATION = gql`
-  mutation SetJobPostProcessingSelection($jobId: Int!, $selection: PostProcessingSelectionInput!) {
-    setJobPostProcessingSelection(jobId: $jobId, selection: $selection) {
-      jobId
-      definition
-    }
   }
 `;

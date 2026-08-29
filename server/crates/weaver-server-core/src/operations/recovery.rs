@@ -66,6 +66,7 @@ pub async fn recover_server_state(
                 active_detected_archives = counts.active_detected_archives,
                 active_volume_status = counts.active_volume_status,
                 active_rar_verified_suspect = counts.active_rar_verified_suspect,
+                active_direct_coverage = counts.active_direct_coverage,
                 "removed orphaned active-state rows before recovery"
             );
         }
@@ -116,6 +117,8 @@ pub async fn recover_server_state(
                 download_retry_at_epoch_ms: None,
                 status,
                 download_state,
+                finalizing_download: false,
+                fetching_repair_data: false,
                 post_state,
                 run_state,
                 progress: 1.0,
@@ -126,6 +129,7 @@ pub async fn recover_server_state(
                 phase_progress: Vec::new(),
                 failed_bytes: 0,
                 health: 1000,
+                terminal_discards: Vec::new(),
                 total_files: 0,
                 completed_files: 0,
                 remaining_par_files: 0,
@@ -271,6 +275,8 @@ pub async fn recover_server_state(
                     download_retry_at_epoch_ms: None,
                     status,
                     download_state,
+                    finalizing_download: false,
+                    fetching_repair_data: false,
                     post_state,
                     run_state,
                     progress: 1.0,
@@ -281,6 +287,7 @@ pub async fn recover_server_state(
                     phase_progress: Vec::new(),
                     failed_bytes: row.failed_bytes,
                     health: row.health,
+                    terminal_discards: Vec::new(),
                     total_files: 0,
                     completed_files: 0,
                     remaining_par_files: 0,
@@ -430,7 +437,7 @@ mod tests {
     fn count_rows(db: &Database, table: &str, job_id: u64) -> i64 {
         let datastore = db.datastore();
         let sql = format!("SELECT COUNT(*) FROM {table} WHERE job_id = {{}}");
-        db.run_sql_blocking(async move {
+        db.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 &sql,

@@ -232,7 +232,7 @@ async fn final_volume_refresh_heals_encrypted_multivolume_member_span_before_sch
         .load_rar_snapshot(job_id, set_name)
         .expect("partial encrypted snapshot should exist after four volumes");
     let mut cached = serde_json::to_value(
-        rmp_serde::from_slice::<weaver_unrar::CachedArchiveHeaders>(&cached_headers).unwrap(),
+        rmp_serde::from_slice::<unrar_rs::CachedArchiveHeaders>(&cached_headers).unwrap(),
     )
     .unwrap();
     let members = cached["members"].as_array_mut().unwrap();
@@ -249,7 +249,7 @@ async fn final_volume_refresh_heals_encrypted_multivolume_member_span_before_sch
     clip["split_after"] = serde_json::json!(false);
 
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
 
@@ -282,38 +282,6 @@ async fn final_volume_refresh_heals_encrypted_multivolume_member_span_before_sch
     assert_eq!(
         selected.keys().copied().collect::<Vec<_>>(),
         vec![0, 1, 2, 3, 4]
-    );
-}
-
-#[tokio::test]
-async fn verified_suspect_persist_serializes_latest_value_per_set() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(40123);
-    let files = build_multifile_multivolume_rar_set();
-    let spec = rar_job_spec("RAR Suspect Persist Queue", &files);
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    pipeline.persist_verified_suspect_volumes(job_id, "show", &HashSet::from([1u32]));
-    pipeline.persist_verified_suspect_volumes(job_id, "show", &HashSet::from([2u32, 3u32]));
-
-    let key = (job_id, "show".to_string());
-    let persist_state = pipeline
-        .verified_suspect_persist_state
-        .get(&key)
-        .expect("verified suspect persistence state should exist");
-    assert!(persist_state.in_flight_version.is_some());
-    assert!(persist_state.queued);
-    assert_eq!(persist_state.desired, HashSet::from([2u32, 3u32]));
-
-    drain_verified_suspect_persists(&mut pipeline).await;
-
-    assert!(
-        pipeline
-            .db
-            .load_verified_suspect_volumes(job_id)
-            .unwrap()
-            .is_empty()
     );
 }
 
@@ -1061,6 +1029,7 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
         byte_estimate: 128,
         retry_count: 1,
         is_recovery: false,
+        completion_critical: false,
         exclude_servers: vec![0],
         avoid_server: None,
     };
@@ -1213,116 +1182,7 @@ async fn completion_reconciliation_clears_missing_extracted_outputs() {
 }
 
 #[tokio::test]
-async fn nzbget_repair_request_reenters_par_once_when_inputs_remain() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(31235);
-    let working_dir = temp_dir.path().join("post-processing-repair");
-    std::fs::create_dir_all(&working_dir).unwrap();
-    pipeline.jobs.insert(
-        job_id,
-        minimal_job_state(job_id, "post-processing-repair", working_dir),
-    );
-    install_test_par2_runtime(
-        &mut pipeline,
-        job_id,
-        minimal_par2_file_set(),
-        &[(0, "post-processing-repair.par2", 0, false)],
-    );
-    pipeline.par2_bypassed.insert(job_id);
-
-    pipeline.handle_terminal_post_processing_done(TerminalPostProcessingDone {
-        job_id,
-        primary_failure: None,
-        result: Ok(crate::post_processing::service::RunExecutionReport {
-            run_id: None,
-            summary: crate::post_processing::model::PostProcessingSummary::Succeeded,
-            effects: vec![],
-            repair_requested: true,
-            output_directory: None,
-        }),
-    });
-
-    assert!(pipeline.post_processing_repair_reentered.contains(&job_id));
-    assert!(
-        pipeline
-            .post_processing_repair_return_to_terminal
-            .contains(&job_id)
-    );
-    assert!(!pipeline.par2_bypassed.contains(&job_id));
-    assert_eq!(
-        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
-        Some(JobStatus::Downloading)
-    );
-    assert!(pipeline.pending_completion_checks.contains(&job_id));
-}
-
-#[tokio::test]
-async fn restored_queued_post_processing_resumes_the_durable_run_only() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(31236);
-    let spec = JobSpec {
-        name: "queued-post-processing".to_string(),
-        password: None,
-        files: vec![],
-        total_bytes: 0,
-        category: None,
-        metadata: vec![],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-    pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::QueuedPostProcessing;
-    let plan = crate::post_processing::model::FrozenPlan::new(
-        crate::post_processing::model::FrozenPlanProvenance::Empty,
-        vec![],
-    )
-    .unwrap();
-    let run_id = pipeline
-        .db
-        .create_post_processing_run(
-            job_id.0,
-            &plan,
-            &crate::post_processing::model::PipelineOutcome::Succeeded,
-            crate::post_processing::persistence::TerminalIntent::Complete,
-            None,
-            100,
-        )
-        .unwrap();
-    pipeline.terminal_post_processing_service.pause();
-    pipeline.schedule_job_completion_check(job_id);
-
-    assert!(pipeline.recover_restored_terminal_post_processing(job_id));
-    for _ in 0..20 {
-        if pipeline
-            .terminal_post_processing_service
-            .queued_run_ids()
-            .iter()
-            .any(|queued| queued == run_id.as_str())
-        {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-
-    assert!(!pipeline.pending_completion_checks.contains(&job_id));
-    assert!(pipeline.inflight_terminal_post_processing.contains(&job_id));
-    assert_eq!(
-        pipeline
-            .db
-            .post_processing_run(&run_id)
-            .unwrap()
-            .unwrap()
-            .status,
-        crate::post_processing::model::RunStatus::Queued
-    );
-    assert_eq!(
-        pipeline.terminal_post_processing_service.queued_run_ids(),
-        vec![run_id.as_str().to_string()]
-    );
-}
-
-#[tokio::test]
-async fn restored_active_post_processing_is_interrupted_without_rerun() {
+async fn restored_post_processing_is_interrupted_without_rerunning_scripts() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(31237);
@@ -1336,32 +1196,17 @@ async fn restored_active_post_processing_is_interrupted_without_rerun() {
     };
     insert_active_job(&mut pipeline, job_id, spec).await;
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::PostProcessing;
-    let plan = crate::post_processing::model::FrozenPlan::new(
-        crate::post_processing::model::FrozenPlanProvenance::Empty,
-        vec![],
-    )
-    .unwrap();
-    let run_id = pipeline
-        .db
-        .create_post_processing_run(
-            job_id.0,
-            &plan,
-            &crate::post_processing::model::PipelineOutcome::Succeeded,
-            crate::post_processing::persistence::TerminalIntent::Complete,
-            None,
-            100,
-        )
-        .unwrap();
-    assert!(
-        pipeline
-            .db
-            .mark_post_processing_run_running(&run_id, 101)
-            .unwrap()
-    );
+    // The executor stamps this marker before the first script runs.
     pipeline
         .db
-        .recover_interrupted_post_processing(102)
+        .mark_job_post_processing_running(job_id.0)
         .unwrap();
+    // The startup scan is the whole recovery: a `running` marker can only have
+    // been left behind by a process that died mid-pass.
+    assert_eq!(
+        pipeline.db.recover_interrupted_post_processing().unwrap(),
+        1
+    );
     pipeline.schedule_job_completion_check(job_id);
 
     assert!(pipeline.recover_restored_terminal_post_processing(job_id));
@@ -1376,26 +1221,10 @@ async fn restored_active_post_processing_is_interrupted_without_rerun() {
             .map(|job| &job.status),
         Some(JobStatus::Failed { .. })
     ));
-    assert!(
-        pipeline
-            .db
-            .post_processing_attempts(&run_id)
-            .unwrap()
-            .is_empty()
-    );
-    let run = pipeline.db.post_processing_run(&run_id).unwrap().unwrap();
-    assert_eq!(
-        run.status,
-        crate::post_processing::model::RunStatus::Interrupted
-    );
-    assert_eq!(
-        run.summary,
-        crate::post_processing::model::PostProcessingSummary::Interrupted
-    );
 }
 
 #[tokio::test]
-async fn restored_terminal_run_archives_without_rerunning_completed_work() {
+async fn restored_post_processing_that_already_finished_archives_as_complete() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(31238);
@@ -1409,38 +1238,18 @@ async fn restored_terminal_run_archives_without_rerunning_completed_work() {
     };
     insert_active_job(&mut pipeline, job_id, spec).await;
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::PostProcessing;
-    let plan = crate::post_processing::model::FrozenPlan::new(
-        crate::post_processing::model::FrozenPlanProvenance::Empty,
-        vec![],
-    )
-    .unwrap();
-    let run_id = pipeline
+    pipeline
         .db
-        .create_post_processing_run(
+        .save_job_post_processing_results(
             job_id.0,
-            &plan,
-            &crate::post_processing::model::PipelineOutcome::Succeeded,
-            crate::post_processing::persistence::TerminalIntent::Complete,
-            None,
-            100,
+            crate::post_processing::model::PostProcessingSummary::Succeeded,
+            &[],
         )
         .unwrap();
-    assert!(
-        pipeline
-            .db
-            .mark_post_processing_run_running(&run_id, 101)
-            .unwrap()
-    );
-    assert!(
-        pipeline
-            .db
-            .finish_post_processing_run(
-                &run_id,
-                crate::post_processing::model::RunStatus::Succeeded,
-                crate::post_processing::model::PostProcessingSummary::Succeeded,
-                102,
-            )
-            .unwrap()
+    // A job whose summary is already terminal is not swept by the scan.
+    assert_eq!(
+        pipeline.db.recover_interrupted_post_processing().unwrap(),
+        0
     );
     pipeline.schedule_job_completion_check(job_id);
 
@@ -1456,11 +1265,4 @@ async fn restored_terminal_run_archives_without_rerunning_completed_work() {
             .map(|job| &job.status),
         Some(JobStatus::Complete)
     ));
-    assert!(
-        pipeline
-            .db
-            .post_processing_attempts(&run_id)
-            .unwrap()
-            .is_empty()
-    );
 }

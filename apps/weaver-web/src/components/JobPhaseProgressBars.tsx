@@ -1,12 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import { Progress } from "@/components/ui/progress";
 import { formatSpeed } from "@/components/SpeedDisplay";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { JobPhase, JobPhaseProgressData } from "@/lib/job-types";
+import { useExtractionVisibility } from "@/lib/hooks/use-extraction-visibility";
 import { cn } from "@/lib/utils";
-
-const REVEAL_AFTER_MS = 5_000;
-const MIN_REMAINING_MS = 5_000;
 
 const PHASE_PRIORITY: Record<JobPhase, number> = {
   MOVING: 0,
@@ -44,55 +42,44 @@ function phaseLabelKey(phase: JobPhase): string {
 
 export function JobPhaseProgressBars({
   phaseProgress,
+  status,
+  progress,
   compact = false,
 }: {
   phaseProgress?: JobPhaseProgressData[] | null;
+  status?: string | null;
+  /** Normalized job progress in the 0–1 range. */
+  progress?: number | null;
   compact?: boolean;
 }) {
   const t = useTranslate();
   const phases = useMemo(() => phaseProgress ?? [], [phaseProgress]);
-  const [now, setNow] = useState(() => Date.now());
-  const [revealed, setRevealed] = useState<Set<JobPhase>>(() => new Set());
-  const phaseKey = phases.map((phase) => phase.phase).sort().join("|");
-
-  useEffect(() => {
-    if (phases.length === 0) {
-      return;
-    }
-    const id = window.setInterval(() => setNow(Date.now()), 1_000);
-    return () => window.clearInterval(id);
-  }, [phases.length]);
-
-  useEffect(() => {
-    const live = new Set(phases.map((phase) => phase.phase));
-    setRevealed((previous) => {
-      const next = new Set<JobPhase>();
-      for (const phase of previous) {
-        if (live.has(phase)) {
-          next.add(phase);
-        }
-      }
-      for (const phase of phases) {
-        const remaining = phase.estimatedRemainingMs ?? 0;
-        if (
-          phase.totalBytes > 0 &&
-          now - phase.startedAtEpochMs >= REVEAL_AFTER_MS &&
-          remaining >= MIN_REMAINING_MS
-        ) {
-          next.add(phase.phase);
-        }
-      }
-      return next;
-    });
-  }, [now, phaseKey, phases]);
+  const extractionVisible = useExtractionVisibility(phases);
 
   const visible = phases
-    .filter((phase) => revealed.has(phase.phase) && phase.totalBytes > 0)
+    .filter(
+      (phase) =>
+        phase.totalBytes > 0 &&
+        (phase.phase !== "EXTRACTING" || extractionVisible),
+    )
     .sort((left, right) => PHASE_PRIORITY[left.phase] - PHASE_PRIORITY[right.phase])
     .slice(0, 2);
+  const progressClassName = cn("rounded-pill bg-secondary", compact ? "h-1.5" : "h-2");
 
   if (visible.length === 0) {
-    return null;
+    if (status === "FINALIZING_DOWNLOAD") {
+      const pct = clampPercent((progress ?? 0) * 100);
+      return (
+        <div className={cn("space-y-1.5", compact && "space-y-1")}>
+          <div className="flex items-center justify-between gap-2 text-[10px] font-medium text-muted-foreground">
+            <span className="truncate">{t("timeline.finalizingDownload")}</span>
+            <span className="shrink-0 tabular-nums">{pct.toFixed(0)}%</span>
+          </div>
+          <Progress value={pct} className={progressClassName} />
+        </div>
+      );
+    }
+    return <Progress value={0} className={progressClassName} />;
   }
 
   return (
@@ -109,7 +96,7 @@ export function JobPhaseProgressBars({
             </div>
             <Progress
               value={pct}
-              className={cn("rounded-pill bg-secondary", compact ? "h-1.5" : "h-2")}
+              className={progressClassName}
               indicatorClassName={cn("rounded-pill", PHASE_COLOR[phase.phase])}
             />
           </div>

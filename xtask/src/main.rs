@@ -11,7 +11,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::{
+    fs::{OpenOptionsExt, PermissionsExt},
+    process::CommandExt,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Output, Stdio};
 #[cfg(unix)]
@@ -36,6 +39,9 @@ const TCP_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_millis(200);
 const RELEASE_DRY_RUN_CACHE_FILE: &str = "tmp/xtask-release-dry-run.json";
 const RELEASE_DRY_RUN_CACHE_DIR: &str = "tmp/xtask-release-dry-run-cache";
 const BACKEND_SHUTDOWN_GRACE_PERIOD: StdDuration = StdDuration::from_secs(5);
+const LOCAL_AGENT_API_KEY_NAME: &str = "xtask-local-agent";
+const LOCAL_AGENT_API_KEY_SCOPE: &str = "admin";
+const LOCAL_AGENT_API_KEY_FILENAME: &str = "local-agent-api-key";
 const RELEASE_ALLOWED_CARGO_AUDIT_IDS: &[ReleaseAuditAllow] = &[
     ReleaseAuditAllow {
         id: "RUSTSEC-2023-0071",
@@ -66,10 +72,9 @@ const GRAPHQL_SCHEMA_EXPORT_DIR: &str = "target/xtask-release/graphql";
 const WINGET_PACKAGE_IDENTIFIER: &str = "ScryerMedia.Weaver";
 const WINGET_PACKAGE_NAME: &str = "Weaver";
 const WINGET_MONIKER: &str = "weaver-usenet";
-const WINGET_PORTABLE_COMMAND_ALIAS: &str = "weaver";
-const WINGET_MANIFEST_VERSION: &str = "1.12.0";
-const WINGET_WINDOWS_X64_ASSET: &str = "weaver-windows-x86_64.zip";
-const WINGET_WINDOWS_ARM64_ASSET: &str = "weaver-windows-arm64.zip";
+const WINGET_MANIFEST_VERSION: &str = "1.10.0";
+const WINGET_WINDOWS_X64_ASSET: &str = "weaver-windows-x86_64.msi";
+const WINGET_WINDOWS_ARM64_ASSET: &str = "weaver-windows-arm64.msi";
 
 struct ReleaseAuditAllow {
     id: &'static str,
@@ -163,10 +168,29 @@ struct ServeArgs {
     clean: bool,
     #[arg(
         long,
-        help = "Build and run the backend with the optimized release profile"
+        conflicts_with = "production_build",
+        help = "Build and run the backend with the optimized E2E profile"
     )]
     release: bool,
+    #[arg(
+        long,
+        conflicts_with = "release",
+        help = "Build and run the backend with the full production release profile"
+    )]
+    production_build: bool,
     target: Option<String>,
+}
+
+impl ServeArgs {
+    fn cargo_profile(&self) -> Option<&'static str> {
+        if self.production_build {
+            Some("release")
+        } else if self.release {
+            Some("e2e")
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Args)]
@@ -1266,7 +1290,7 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
     );
     let linux_linker_env = format!("{}=musl-gcc", cargo_target_env_key(&linux_target, "LINKER"));
     let linux_clippy_script = format!(
-        "set -euo pipefail; export PATH=\"/usr/local/cargo/bin:$PATH\"; apt-get update >/dev/null; apt-get install -y --no-install-recommends musl-tools >/dev/null; /usr/local/cargo/bin/rustup component add clippy; /usr/local/cargo/bin/rustup target add {linux_target}; cargo clippy --workspace --lib --bins --tests --examples --target {linux_target} -- -D warnings"
+        "set -euo pipefail; export PATH=\"/usr/local/cargo/bin:$PATH\"; apt-get update >/dev/null; apt-get install -y --no-install-recommends musl-tools >/dev/null; /usr/local/cargo/bin/rustup component add clippy; /usr/local/cargo/bin/rustup target add {linux_target}; cargo clippy --workspace --lib --bins --tests --examples --benches --target {linux_target} -- -D warnings"
     );
 
     if !args.linux_only {
@@ -1279,6 +1303,7 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
             "--bins",
             "--tests",
             "--examples",
+            "--benches",
             "--",
             "-D",
             "warnings",
@@ -1333,6 +1358,7 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
                 "--bins",
                 "--tests",
                 "--examples",
+                "--benches",
                 "--target",
                 &linux_target,
                 "--",
@@ -1391,6 +1417,12 @@ struct WingetArtifact {
     architecture: &'static str,
     installer_url: String,
     installer_sha256: String,
+    product_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WingetMsiMetadata {
+    product_code: String,
 }
 
 fn normalize_winget_version(raw: &str) -> Result<Version> {
@@ -1431,9 +1463,21 @@ fn collect_winget_artifacts(
     .into_iter()
     .map(|(architecture, asset_name)| {
         let path = artifacts_dir.join(asset_name);
-        validate_winget_portable_zip(&path)?;
         let bytes =
             fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let metadata_path = artifacts_dir.join(format!("{asset_name}.json"));
+        let metadata: WingetMsiMetadata = serde_json::from_slice(
+            &fs::read(&metadata_path)
+                .with_context(|| format!("failed to read {}", metadata_path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", metadata_path.display()))?;
+        if !is_windows_product_code(&metadata.product_code) {
+            bail!(
+                "{} contains an invalid MSI ProductCode: {}",
+                metadata_path.display(),
+                metadata.product_code
+            );
+        }
         let installer_sha256 = sha256_hex(&bytes).to_ascii_uppercase();
         let installer_url =
             format!("https://github.com/{repository}/releases/download/{tag_name}/{asset_name}");
@@ -1441,92 +1485,25 @@ fn collect_winget_artifacts(
             architecture,
             installer_url,
             installer_sha256,
+            product_code: metadata.product_code,
         })
     })
     .collect()
 }
 
-fn validate_winget_portable_zip(path: &Path) -> Result<()> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let entries = zip_central_directory_entries(&bytes)
-        .with_context(|| format!("failed to inspect {}", path.display()))?;
-    if entries.iter().any(|entry| entry == "weaver.exe") {
-        Ok(())
-    } else {
-        bail!(
-            "{} must contain weaver.exe at the zip root for WinGet portable install",
-            path.display()
-        )
-    }
-}
-
-fn zip_central_directory_entries(bytes: &[u8]) -> Result<Vec<String>> {
-    const EOCD_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
-    const CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0201_4b50;
-
-    if bytes.len() < 22 {
-        bail!("zip is too short to contain an end-of-central-directory record");
-    }
-
-    let search_start = bytes.len().saturating_sub(22 + u16::MAX as usize);
-    let eocd_offset = (search_start..=bytes.len() - 22)
-        .rev()
-        .find(|offset| bytes.get(*offset..*offset + 4) == Some(EOCD_SIGNATURE.as_slice()))
-        .context("missing zip end-of-central-directory record")?;
-    let central_directory_size = read_le_u32(bytes, eocd_offset + 12)? as usize;
-    let central_directory_offset = read_le_u32(bytes, eocd_offset + 16)? as usize;
-    let central_directory_end = central_directory_offset
-        .checked_add(central_directory_size)
-        .context("zip central directory overflows usize")?;
-    if central_directory_end > bytes.len() {
-        bail!("zip central directory points beyond file length");
-    }
-
-    let mut offset = central_directory_offset;
-    let mut entries = Vec::new();
-    while offset < central_directory_end {
-        let signature = read_le_u32(bytes, offset)?;
-        if signature != CENTRAL_DIRECTORY_SIGNATURE {
-            bail!("invalid zip central directory header at byte {offset}");
-        }
-        let file_name_len = read_le_u16(bytes, offset + 28)? as usize;
-        let extra_len = read_le_u16(bytes, offset + 30)? as usize;
-        let comment_len = read_le_u16(bytes, offset + 32)? as usize;
-        let name_start = offset + 46;
-        let name_end = name_start
-            .checked_add(file_name_len)
-            .context("zip file name length overflows usize")?;
-        let record_end = name_end
-            .checked_add(extra_len)
-            .and_then(|end| end.checked_add(comment_len))
-            .context("zip central directory record length overflows usize")?;
-        if record_end > central_directory_end {
-            bail!("zip central directory record extends beyond declared directory");
-        }
-        let name = std::str::from_utf8(&bytes[name_start..name_end])
-            .context("zip entry name is not utf-8")?;
-        entries.push(name.to_string());
-        offset = record_end;
-    }
-    Ok(entries)
-}
-
-fn read_le_u16(bytes: &[u8], offset: usize) -> Result<u16> {
-    let raw = bytes
-        .get(offset..offset + 2)
-        .ok_or_else(|| anyhow!("unexpected end of zip while reading u16 at byte {offset}"))?;
-    Ok(u16::from_le_bytes(
-        raw.try_into().expect("slice length checked"),
-    ))
-}
-
-fn read_le_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    let raw = bytes
-        .get(offset..offset + 4)
-        .ok_or_else(|| anyhow!("unexpected end of zip while reading u32 at byte {offset}"))?;
-    Ok(u32::from_le_bytes(
-        raw.try_into().expect("slice length checked"),
-    ))
+fn is_windows_product_code(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 38
+        && bytes[0] == b'{'
+        && bytes[37] == b'}'
+        && [9, 14, 19, 24]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !matches!(index, 0 | 9 | 14 | 19 | 24 | 37))
+            .all(|(_, byte)| byte.is_ascii_hexdigit())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1629,8 +1606,13 @@ fn winget_installer_manifest(
         .iter()
         .map(|artifact| {
             format!(
-                "- Architecture: {}\n  InstallerUrl: {}\n  InstallerSha256: {}",
-                artifact.architecture, artifact.installer_url, artifact.installer_sha256
+                // The braces must be single-quoted: unquoted, YAML parses
+                // {GUID} as a flow mapping and winget rejects the manifest.
+                "- Architecture: {}\n  InstallerUrl: {}\n  InstallerSha256: {}\n  ProductCode: '{}'",
+                artifact.architecture,
+                artifact.installer_url,
+                artifact.installer_sha256,
+                artifact.product_code,
             )
         })
         .collect::<Vec<_>>()
@@ -1639,13 +1621,10 @@ fn winget_installer_manifest(
         "# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.{WINGET_MANIFEST_VERSION}.schema.json\n\n\
 PackageIdentifier: {WINGET_PACKAGE_IDENTIFIER}\n\
 PackageVersion: {version}\n\
-InstallerType: zip\n\
-NestedInstallerType: portable\n\
-NestedInstallerFiles:\n\
-- RelativeFilePath: weaver.exe\n  PortableCommandAlias: {WINGET_PORTABLE_COMMAND_ALIAS}\n\
+InstallerType: msi\n\
 InstallModes:\n\
 - silent\n\
-UpgradeBehavior: install\n\
+UpgradeBehavior: uninstallPrevious\n\
 ReleaseDate: {release_date}\n\
 Installers:\n\
 {installers}\n\
@@ -1926,9 +1905,22 @@ fn sync_release_workspace_lockfile(ctx: &TaskContext) -> Result<()> {
 }
 
 fn run_weaver_release_prep(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    run_weaver_release_container_contract_validation(ctx, prefix)?;
     run_weaver_rust_prep_validation(ctx, prefix)?;
     run_weaver_web_validation(ctx, prefix)?;
     run_weaver_release_hygiene_validation(ctx, prefix)
+}
+
+fn run_weaver_release_container_contract_validation(
+    ctx: &TaskContext,
+    prefix: &'static str,
+) -> Result<()> {
+    prefixed_step(prefix, "Checking Docker release publish contract");
+    let mut command = ctx.command_in("sh", &ctx.repo_root);
+    command.arg("docker/validate-release-build-config.sh");
+    run_checked(&mut command)?;
+    prefixed_ok(prefix, "Docker release publish contract passed");
+    Ok(())
 }
 
 fn run_weaver_release_hygiene_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
@@ -2540,6 +2532,141 @@ fn ensure_state_encryption_key(key_path: &Path, db_path: &Path) -> Result<String
     Ok(key)
 }
 
+fn local_agent_api_key_path(state_dir: &Path) -> PathBuf {
+    std::env::var_os("WEAVER_DEV_AGENT_API_KEY_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join(LOCAL_AGENT_API_KEY_FILENAME))
+}
+
+fn strip_trailing_line_endings(value: String) -> String {
+    value.trim_end_matches(['\r', '\n']).to_string()
+}
+
+fn load_local_agent_api_key(path: &Path) -> Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect local agent API key file {}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "local agent API key path {} must be a regular file",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "failed to restrict local agent API key file permissions for {}",
+            path.display()
+        )
+    })?;
+
+    let key =
+        strip_trailing_line_endings(fs::read_to_string(path).with_context(|| {
+            format!("failed to read local agent API key file {}", path.display())
+        })?);
+    if key.is_empty() {
+        bail!("local agent API key file {} is empty", path.display());
+    }
+
+    Ok(Some(key))
+}
+
+fn generate_local_agent_api_key() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).context("failed to generate local agent API key")?;
+    Ok(format!("wvr_{}", hex::encode(bytes)))
+}
+
+fn write_local_agent_api_key(path: &Path, key: &str) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create local agent API key directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).with_context(|| {
+        format!(
+            "failed to create local agent API key file {}",
+            path.display()
+        )
+    })?;
+    writeln!(file, "{key}").with_context(|| {
+        format!(
+            "failed to write local agent API key file {}",
+            path.display()
+        )
+    })?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync local agent API key file {}", path.display()))?;
+    Ok(())
+}
+
+fn ensure_local_agent_api_key(path: &Path) -> Result<String> {
+    if let Some(key) = load_local_agent_api_key(path)? {
+        return Ok(key);
+    }
+
+    let key = generate_local_agent_api_key()?;
+    write_local_agent_api_key(path, &key)?;
+    Ok(key)
+}
+
+fn hash_local_agent_api_key(key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn provision_local_agent_api_key(db_path: &Path, key: &str) -> Result<()> {
+    let key_hash = hash_local_agent_api_key(key);
+    let mut existing = Command::new("sqlite3");
+    existing.args([
+        "-noheader",
+        db_path
+            .to_str()
+            .ok_or_else(|| anyhow!("database path is not UTF-8"))?,
+        &format!("SELECT name FROM api_keys WHERE key_hash = X'{key_hash}';"),
+    ]);
+    let existing_name = run_capture(&mut existing)?.trim().to_string();
+    if !existing_name.is_empty() && existing_name != LOCAL_AGENT_API_KEY_NAME {
+        bail!(
+            "local agent API key file maps to an existing non-local API key; \
+             choose a different WEAVER_DEV_AGENT_API_KEY_FILE or replace the file"
+        );
+    }
+
+    let now = Utc::now().timestamp_millis();
+    let sql = format!(
+        "BEGIN IMMEDIATE; \
+         DELETE FROM api_keys WHERE name = '{LOCAL_AGENT_API_KEY_NAME}' AND key_hash != X'{key_hash}'; \
+         INSERT INTO api_keys (name, key_hash, scope, created_at) \
+         VALUES ('{LOCAL_AGENT_API_KEY_NAME}', X'{key_hash}', '{LOCAL_AGENT_API_KEY_SCOPE}', {now}) \
+         ON CONFLICT(key_hash) DO UPDATE SET scope = excluded.scope; \
+         COMMIT;"
+    );
+    let mut provision = Command::new("sqlite3");
+    provision.arg(db_path).arg(sql);
+    run_checked(&mut provision)
+}
+
 fn reset_serve_database(db_path: &Path) -> Result<()> {
     let cleanup_targets = [
         db_path.to_path_buf(),
@@ -2572,6 +2699,16 @@ fn ensure_frontend_dependencies(ctx: &TaskContext, web_dir: &Path) -> Result<()>
         )
     })?;
     ok("Frontend dependencies are up to date");
+    Ok(())
+}
+
+fn build_frontend_assets(ctx: &TaskContext, web_dir: &Path) -> Result<()> {
+    step("Building frontend assets for the embedded UI");
+    let mut build = ctx.command_in("npm", web_dir);
+    build.args(["run", "build"]);
+    run_status(&mut build)
+        .with_context(|| format!("failed to build frontend assets in {}", web_dir.display()))?;
+    ok("Frontend assets are up to date");
     Ok(())
 }
 
@@ -2648,6 +2785,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     require_command("sqlite3")?;
     let web_dir = ctx.path("apps/weaver-web");
     ensure_frontend_dependencies(ctx, &web_dir)?;
+    build_frontend_assets(ctx, &web_dir)?;
     let backend_port = std::env::var("WEAVER_DEV_BACKEND_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
@@ -2665,12 +2803,13 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
             .unwrap_or_else(|_| ctx.path("tmp/dev-instance").display().to_string()),
     );
     let state_key_file = state_dir.join("encryption.key");
+    let local_agent_key_file = local_agent_api_key_path(&state_dir);
     let rust_log = build_rust_log(args.target.as_deref());
-    let backend_binary = if args.release {
-        ctx.path("target/release/weaver")
-    } else {
-        ctx.path("target/debug/weaver")
-    };
+    let cargo_profile = args.cargo_profile();
+    let backend_relative_path = cargo_profile
+        .map(|profile| format!("target/{profile}/weaver"))
+        .unwrap_or_else(|| "target/debug/weaver".to_string());
+    let backend_binary = ctx.path(&backend_relative_path);
     let backend_url = format!("http://127.0.0.1:{backend_port}");
     let frontend_url = format!("http://127.0.0.1:{frontend_port}");
     let vite_use_polling =
@@ -2719,18 +2858,17 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
 
     let encryption_key = ensure_state_encryption_key(&state_key_file, &db_path)?;
     step("Building Weaver backend");
-    let profile_arg = args.release.then_some("--release");
-    println!(
-        "   Rust build: cargo build --locked -p weaver{}",
-        if args.release { " --release" } else { "" }
-    );
+    let profile_display = cargo_profile
+        .map(|profile| format!(" --profile {profile}"))
+        .unwrap_or_default();
+    println!("   Rust build: cargo build --locked -p weaver{profile_display}");
     let mut build = ctx.command_in("cargo", &ctx.repo_root);
     build
         .env("WEAVER_ENABLE_DIAGNOSTICS", &diagnostics_enabled)
         .env("RUSTFLAGS", &local_rustflags);
     build.args(["build", "--locked", "-p", "weaver"]);
-    if let Some(profile_arg) = profile_arg {
-        build.arg(profile_arg);
+    if let Some(profile) = cargo_profile {
+        build.args(["--profile", profile]);
     }
     run_checked(&mut build)?;
 
@@ -2742,6 +2880,8 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         &backend_log,
         Some(encryption_key.as_str()),
     )?;
+    let local_agent_api_key = ensure_local_agent_api_key(&local_agent_key_file)?;
+    provision_local_agent_api_key(&db_path, &local_agent_api_key)?;
     seed_runtime_dirs(&db_path, &data_dir)?;
 
     step(format!(
@@ -2790,6 +2930,14 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     println!("    State:    {}", state_dir.display());
     println!("    Data:     {}", data_dir.display());
     println!("    Log:      tail -f {}", backend_log.display());
+    println!(
+        "    Local agent API key (Admin): {}",
+        local_agent_key_file.display()
+    );
+    println!(
+        "    Agent setup: export WEAVER_API_KEY_FILE={}",
+        local_agent_key_file.display()
+    );
     println!();
     println!("==> Starting Vite dev server with live updates...");
 
@@ -2994,6 +3142,79 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn parse_serve_args(args: &[&str]) -> ServeArgs {
+        let cli = Cli::try_parse_from(std::iter::once("cargo xtask").chain(args.iter().copied()))
+            .unwrap();
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        args
+    }
+
+    #[test]
+    fn serve_build_profiles_are_explicit_and_mutually_exclusive() {
+        assert_eq!(parse_serve_args(&["serve"]).cargo_profile(), None);
+        assert_eq!(
+            parse_serve_args(&["serve", "--release"]).cargo_profile(),
+            Some("e2e")
+        );
+        assert_eq!(
+            parse_serve_args(&["serve", "--production-build"]).cargo_profile(),
+            Some("release")
+        );
+        assert!(
+            Cli::try_parse_from(["cargo xtask", "serve", "--release", "--production-build"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn local_agent_key_strips_only_trailing_line_endings() {
+        assert_eq!(
+            strip_trailing_line_endings("  key with spaces  \r\n".to_string()),
+            "  key with spaces  "
+        );
+        assert_eq!(strip_trailing_line_endings("\r\n".to_string()), "");
+    }
+
+    #[test]
+    fn local_agent_key_generation_uses_weaver_key_shape() {
+        let key = generate_local_agent_api_key().unwrap();
+        assert!(key.starts_with("wvr_"));
+        assert_eq!(key.len(), 36);
+    }
+
+    #[test]
+    fn local_agent_key_provisioning_is_admin_and_rotates_the_previous_dev_key() {
+        let state = tempfile::tempdir().unwrap();
+        let db_path = state.path().join("weaver.db");
+        let mut schema = Command::new("sqlite3");
+        schema.arg(&db_path).arg(
+            "CREATE TABLE api_keys (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                name TEXT NOT NULL, \
+                key_hash BLOB NOT NULL UNIQUE, \
+                scope TEXT NOT NULL, \
+                created_at INTEGER NOT NULL, \
+                last_used_at INTEGER\
+            );",
+        );
+        run_checked(&mut schema).unwrap();
+
+        provision_local_agent_api_key(&db_path, "wvr_local-agent-one").unwrap();
+        provision_local_agent_api_key(&db_path, "wvr_local-agent-two").unwrap();
+
+        let mut query = Command::new("sqlite3");
+        query
+            .arg("-noheader")
+            .arg(&db_path)
+            .arg("SELECT name || '|' || scope || '|' || length(key_hash) FROM api_keys;");
+        assert_eq!(
+            run_capture(&mut query).unwrap().trim(),
+            "xtask-local-agent|admin|32"
+        );
+    }
+
     #[test]
     fn graphql_baseline_bootstrap_applies_only_before_the_baseline_release() {
         let baseline = graphql_api_baseline_version();
@@ -3050,6 +3271,7 @@ mod tests {
                     "https://github.com/scryer-media/weaver/releases/download/weaver-v0.6.6/{WINGET_WINDOWS_X64_ASSET}"
                 ),
                 installer_sha256: "A".repeat(64),
+                product_code: "{694CA1CE-CB74-486A-BB1A-005D1D2051A2}".to_string(),
             },
             WingetArtifact {
                 architecture: "arm64",
@@ -3057,22 +3279,23 @@ mod tests {
                     "https://github.com/scryer-media/weaver/releases/download/weaver-v0.6.6/{WINGET_WINDOWS_ARM64_ASSET}"
                 ),
                 installer_sha256: "B".repeat(64),
+                product_code: "{AD8E9924-5148-4052-9A91-E4B7B47C9CD7}".to_string(),
             },
         ]
     }
 
     #[test]
-    fn winget_installer_manifest_uses_weaver_portable_zip_contract() {
+    fn winget_installer_manifest_uses_weaver_msi_contract() {
         let version = Version::parse("0.6.6").unwrap();
         let manifest =
             winget_installer_manifest(&version, "2026-06-24", &sample_winget_artifacts());
 
         assert!(manifest.contains("PackageIdentifier: ScryerMedia.Weaver"));
         assert!(manifest.contains("PackageVersion: 0.6.6"));
-        assert!(manifest.contains("InstallerType: zip"));
-        assert!(manifest.contains("NestedInstallerType: portable"));
-        assert!(manifest.contains("RelativeFilePath: weaver.exe"));
-        assert!(manifest.contains("  PortableCommandAlias: weaver"));
+        assert!(manifest.contains("InstallerType: msi"));
+        assert!(manifest.contains("UpgradeBehavior: uninstallPrevious"));
+        assert!(manifest.contains("ProductCode: '{694CA1CE-CB74-486A-BB1A-005D1D2051A2}'"));
+        assert!(manifest.contains("ProductCode: '{AD8E9924-5148-4052-9A91-E4B7B47C9CD7}'"));
         assert!(manifest.contains("Architecture: x64"));
         assert!(manifest.contains("Architecture: arm64"));
         assert!(manifest.contains(WINGET_WINDOWS_X64_ASSET));
@@ -3123,6 +3346,15 @@ mod tests {
                 .join("ScryerMedia.Weaver.locale.en-US.yaml")
                 .is_file()
         );
+        for manifest in [
+            "ScryerMedia.Weaver.yaml",
+            "ScryerMedia.Weaver.installer.yaml",
+            "ScryerMedia.Weaver.locale.en-US.yaml",
+        ] {
+            let content = fs::read_to_string(manifest_dir.join(manifest)).unwrap();
+            assert!(content.contains("$schema=https://aka.ms/winget-manifest."));
+            assert!(content.contains(".1.10.0.schema.json"));
+        }
     }
 
     #[test]

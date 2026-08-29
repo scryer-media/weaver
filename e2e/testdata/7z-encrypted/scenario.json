@@ -1,0 +1,8 @@
+{
+  "slug": "7z-encrypted",
+  "title": "E2E.Test.7z.Encrypted.2024.1080p-TESTGRP",
+  "description": "Password-protected 7z archive with header encryption",
+  "category": "2000",
+  "expected_outcome": "success",
+  "password": "e2e-test-password"
+}

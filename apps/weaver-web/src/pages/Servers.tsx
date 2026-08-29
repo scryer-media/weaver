@@ -70,10 +70,12 @@ type Server = {
   retentionDays: number;
   maxDownloadSpeed: number;
   downloadQuota: ServerDownloadQuota;
+  tlsNameMismatchCertificateFingerprint?: string | null;
 };
 
 type ServerDetails = Server & {
   username: string | null;
+  tlsNameMismatchCertificateDerBase64: string | null;
 };
 
 type ServerFormValues = {
@@ -100,6 +102,8 @@ type ServerFormValues = {
   quotaResetTime: string;
   quotaWeeklyResetWeekday: ServerDownloadQuotaWeekday;
   quotaMonthlyResetDay: number;
+  tlsNameMismatchCertificateDerBase64: string | null;
+  tlsNameMismatchCertificateFingerprint: string | null;
 };
 
 const defaultForm: ServerFormValues = {
@@ -126,7 +130,15 @@ const defaultForm: ServerFormValues = {
   quotaResetTime: "00:00",
   quotaWeeklyResetWeekday: "MON",
   quotaMonthlyResetDay: 1,
+  tlsNameMismatchCertificateDerBase64: null,
+  tlsNameMismatchCertificateFingerprint: null,
 };
+
+function normalizeServerHost(host: string): string {
+  const trimmed = host.trim();
+  const match = /^(?:https?|nntps?):\/\/(.*)$/i.exec(trimmed);
+  return match ? match[1].replace(/\/+$/, "") : trimmed;
+}
 
 const MIB = 1024 * 1024;
 const GIB = 1024 * 1024 * 1024;
@@ -182,6 +194,10 @@ function serverToFormValues(server: ServerDetails | Server): ServerFormValues {
     quotaResetTime: minutesToTimeInput(server.downloadQuota.resetTimeMinutesLocal),
     quotaWeeklyResetWeekday: server.downloadQuota.weeklyResetWeekday,
     quotaMonthlyResetDay: server.downloadQuota.monthlyResetDay,
+    tlsNameMismatchCertificateDerBase64: "tlsNameMismatchCertificateDerBase64" in server
+      ? server.tlsNameMismatchCertificateDerBase64
+      : null,
+    tlsNameMismatchCertificateFingerprint: server.tlsNameMismatchCertificateFingerprint ?? null,
   };
 }
 
@@ -239,6 +255,10 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
     message: string;
     latencyMs?: number;
     supportsPipelining?: boolean;
+    adoptableTlsNameMismatchCertificate?: {
+      derBase64: string;
+      sha256Fingerprint: string;
+    } | null;
   } | null>(null);
 
   useEffect(() => {
@@ -287,10 +307,33 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
     setShowForm(false);
   };
 
+  async function showConnectionTestResult(values: ServerFormValues) {
+    setTesting(true);
+    setSaveError(null);
+    setTestResult(null);
+    const result = await testConnection({
+      input: {
+        host: normalizeServerHost(values.host),
+        port: values.port,
+        tls: values.tls,
+        username: values.username.trim() || null,
+        password: values.password.trim() || null,
+        connections: values.connections,
+        active: values.active,
+        priority: values.priority,
+        backfill: values.backfill,
+        retentionDays: values.retentionDays,
+        tlsNameMismatchCertificateDerBase64: values.tlsNameMismatchCertificateDerBase64,
+      },
+    });
+    setTestResult(result.data?.testConnection ?? null);
+    setTesting(false);
+  }
+
   const handleSave = async (values: ServerFormValues) => {
     setSaveError(null);
     const input = {
-      host: values.host.trim(),
+      host: normalizeServerHost(values.host),
       port: values.port,
       tls: values.tls,
       username: values.username.trim() || null,
@@ -300,6 +343,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       priority: values.priority,
       backfill: values.backfill,
       retentionDays: values.retentionDays,
+      tlsNameMismatchCertificateDerBase64: values.tlsNameMismatchCertificateDerBase64,
       ...downloadLimitsInput(values),
     };
 
@@ -315,11 +359,14 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
         closeForm();
         return;
       }
-      setSaveError(
-        result.error?.graphQLErrors[0]?.message
-          ?? result.error?.message
-          ?? "Unable to save server settings. Fix the connection details and try again.",
-      );
+      const message = result.error?.graphQLErrors[0]?.message
+        ?? result.error?.message
+        ?? "Unable to save server settings. Fix the connection details and try again.";
+      if (values.tls && message.includes("certificate belongs to a different hostname")) {
+        await showConnectionTestResult(values);
+        return;
+      }
+      setSaveError(message);
       return;
     } else {
       const result = await addServer({ input });
@@ -333,11 +380,14 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
         closeForm();
         return;
       }
-      setSaveError(
-        result.error?.graphQLErrors[0]?.message
-          ?? result.error?.message
-          ?? "Unable to save server settings. Fix the connection details and try again.",
-      );
+      const message = result.error?.graphQLErrors[0]?.message
+        ?? result.error?.message
+        ?? "Unable to save server settings. Fix the connection details and try again.";
+      if (values.tls && message.includes("certificate belongs to a different hostname")) {
+        await showConnectionTestResult(values);
+        return;
+      }
+      setSaveError(message);
       return;
     }
   };
@@ -373,25 +423,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   };
 
   const handleTest = async (values: ServerFormValues) => {
-    setTesting(true);
-    setSaveError(null);
-    setTestResult(null);
-    const result = await testConnection({
-      input: {
-        host: values.host.trim(),
-        port: values.port,
-        tls: values.tls,
-        username: values.username.trim() || null,
-        password: values.password.trim() || null,
-        connections: values.connections,
-        active: values.active,
-        priority: values.priority,
-        backfill: values.backfill,
-        retentionDays: values.retentionDays,
-      },
-    });
-    setTestResult(result.data?.testConnection ?? null);
-    setTesting(false);
+    await showConnectionTestResult(values);
   };
 
   const editingServer = useMemo(
@@ -655,6 +687,10 @@ function ServerFormCard({
     message: string;
     latencyMs?: number;
     supportsPipelining?: boolean;
+    adoptableTlsNameMismatchCertificate?: {
+      derBase64: string;
+      sha256Fingerprint: string;
+    } | null;
   } | null;
   onSave: (values: ServerFormValues) => Promise<void>;
   onTest: (values: ServerFormValues) => Promise<void>;
@@ -664,6 +700,10 @@ function ServerFormCard({
   const t = useTranslate();
   const [values, setValues] = useState(initialValues);
   const [showTlsWarning, setShowTlsWarning] = useState(false);
+  const [pendingCertificateAdoption, setPendingCertificateAdoption] = useState<{
+    derBase64: string;
+    sha256Fingerprint: string;
+  } | null>(null);
   const speedLimitValue = Number(values.maxDownloadSpeedMib);
   const quotaLimitValue = Number(values.quotaLimit);
   const enteredSpeedBytes = Math.round(speedLimitValue * MIB);
@@ -723,6 +763,8 @@ function ServerFormCard({
       ...current,
       tls: false,
       port: (current.port === 443 || current.port === 563) ? 119 : current.port,
+      tlsNameMismatchCertificateDerBase64: null,
+      tlsNameMismatchCertificateFingerprint: null,
     }));
     setShowTlsWarning(false);
   };
@@ -740,6 +782,9 @@ function ServerFormCard({
               value={values.host}
               placeholder="news.example.com"
               onChange={(event) => setValues((current) => ({ ...current, host: event.target.value }))}
+              onBlur={() =>
+                setValues((current) => ({ ...current, host: normalizeServerHost(current.host) }))
+              }
             />
           </Field>
           <Field label={t("servers.port")} htmlFor="server-port">
@@ -1101,6 +1146,28 @@ function ServerFormCard({
           onCancel={() => setShowTlsWarning(false)}
         />
 
+        <ConfirmDialog
+          open={pendingCertificateAdoption != null}
+          title="Adopt hostname-mismatched certificate?"
+          message="This is dangerous. Normal TLS verification remains required first; this certificate is accepted only when hostname validation fails. A different hostname-mismatched certificate will be rejected."
+          confirmLabel="Adopt certificate"
+          onConfirm={() => {
+            if (!pendingCertificateAdoption) return;
+            setValues((current) => ({
+              ...current,
+              tlsNameMismatchCertificateDerBase64: pendingCertificateAdoption.derBase64,
+              tlsNameMismatchCertificateFingerprint: pendingCertificateAdoption.sha256Fingerprint,
+            }));
+            setPendingCertificateAdoption(null);
+          }}
+          onCancel={() => setPendingCertificateAdoption(null)}
+          testId="adopt-tls-name-mismatch-certificate"
+        >
+          <code className="block break-all rounded bg-background/70 p-3 text-xs text-foreground">
+            {pendingCertificateAdoption?.sha256Fingerprint}
+          </code>
+        </ConfirmDialog>
+
         {testResult ? (
           <div
             className={cn(
@@ -1113,6 +1180,40 @@ function ServerFormCard({
             {testResult.success
               ? `${t("servers.testSuccess")} (${testResult.latencyMs}ms${testResult.supportsPipelining ? ", pipelining supported" : ""})`
               : `${t("servers.testFailed")}: ${testResult.message}`}
+            {!testResult.success && testResult.adoptableTlsNameMismatchCertificate ? (
+              <div className="mt-3 flex flex-wrap items-center gap-3">
+                <code className="break-all text-xs text-foreground">
+                  {testResult.adoptableTlsNameMismatchCertificate.sha256Fingerprint}
+                </code>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setPendingCertificateAdoption(testResult.adoptableTlsNameMismatchCertificate!)}
+                >
+                  Adopt presented certificate
+                </Button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
+        {values.tlsNameMismatchCertificateDerBase64 ? (
+          <div className="flex flex-wrap items-center gap-3 rounded-inner border border-amber-500/30 bg-amber-500/10 p-3 text-sm">
+            <span>Adopted hostname-mismatched certificate:</span>
+            <code className="break-all text-xs">{values.tlsNameMismatchCertificateFingerprint}</code>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setValues((current) => ({
+                ...current,
+                tlsNameMismatchCertificateDerBase64: null,
+                tlsNameMismatchCertificateFingerprint: null,
+              }))}
+            >
+              Forget adopted certificate
+            </Button>
           </div>
         ) : null}
 

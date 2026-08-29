@@ -1,0 +1,7 @@
+{
+  "slug": "single-mkv",
+  "title": "E2E.Test.Single.MKV.2024.1080p.WEB-DL.H264-TESTGRP",
+  "description": "Plain MKV file, no archive wrapping. Tests direct file import.",
+  "category": "2000",
+  "expected_outcome": "success"
+}

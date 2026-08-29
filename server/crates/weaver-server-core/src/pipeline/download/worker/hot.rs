@@ -33,39 +33,24 @@ impl Pipeline {
         })
     }
 
-    pub(in crate::pipeline::download::worker) fn job_has_primary_download_work(
+    pub(in crate::pipeline::download::worker) fn job_has_completion_critical_work(
         &self,
         job_id: JobId,
     ) -> bool {
         self.jobs.get(&job_id).is_some_and(|state| {
-            state.download_queue.has_primary_work()
+            state.download_queue.has_completion_critical_work()
                 && Self::status_allows_download_dispatch(&state.status)
         })
     }
 
-    pub(in crate::pipeline::download::worker) fn hot_share_yield_unmet(
+    pub(in crate::pipeline::download::worker) fn job_has_noncritical_download_work(
         &self,
-        plan: &BoundedSameBandSharePlan,
+        job_id: JobId,
     ) -> bool {
-        self.active_download_connections_by_job
-            .get(&plan.hot_job_id)
-            .copied()
-            .unwrap_or(0)
-            > plan.hot_target
-            && self.hot_dispatch_spillover_loans.bounded_lent_connections() < plan.share_target
-    }
-
-    pub(in crate::pipeline::download::worker) fn update_hot_share_yield_signal(
-        &self,
-        plan: Option<&BoundedSameBandSharePlan>,
-    ) {
-        if let Some(plan) = plan
-            && self.hot_share_yield_unmet(plan)
-        {
-            self.hot_share_yield_signal.request(plan.hot_job_id);
-            return;
-        }
-        self.hot_share_yield_signal.clear();
+        self.jobs.get(&job_id).is_some_and(|state| {
+            state.download_queue.has_noncritical_work()
+                && Self::status_allows_download_dispatch(&state.status)
+        })
     }
 
     pub(in crate::pipeline::download::worker) fn set_hot_best_mode_block_reason(
@@ -115,7 +100,6 @@ impl Pipeline {
 
         self.hot_dispatch_job = Some(job_id);
         self.hot_dispatch_started_at = Some(now);
-        self.hot_dispatch_successes = 0;
         self.hot_dispatch_exclusive_peak_bps = 0;
         self.hot_dispatch_last_lend_at = None;
         self.hot_dispatch_mode = DispatchShareMode::Exclusive;
@@ -132,7 +116,6 @@ impl Pipeline {
     pub(in crate::pipeline::download::worker) fn clear_hot_dispatch_period(&mut self) {
         self.hot_dispatch_job = None;
         self.hot_dispatch_started_at = None;
-        self.hot_dispatch_successes = 0;
         self.hot_dispatch_exclusive_peak_bps = 0;
         self.hot_dispatch_last_lend_at = None;
         self.hot_dispatch_mode = DispatchShareMode::Exclusive;
@@ -145,19 +128,6 @@ impl Pipeline {
         self.hot_share_yield_signal.clear();
         self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
         self.publish_hot_dispatch_metrics(Instant::now());
-    }
-
-    pub(in crate::pipeline::download::worker) fn hot_dispatch_warmup_complete(
-        &self,
-        now: Instant,
-    ) -> bool {
-        let Some(started_at) = self.hot_dispatch_started_at else {
-            return false;
-        };
-        let elapsed = now.saturating_duration_since(started_at);
-        elapsed >= HOT_DISPATCH_WARMUP_MIN_DURATION
-            && (self.hot_dispatch_successes >= HOT_DISPATCH_MIN_SUCCESSFUL_PRIMARY_BODIES
-                || elapsed >= HOT_DISPATCH_FORCE_UNDERFILL_AFTER)
     }
 
     pub(in crate::pipeline::download::worker) fn active_spillover_connections(&self) -> usize {
@@ -228,7 +198,6 @@ impl Pipeline {
                     .min(u128::from(u64::MAX)) as u64
             })
             .unwrap_or(0);
-        let warmup_complete = self.hot_dispatch_warmup_complete(now);
         let hot_speed_bps = self.hot_dispatch_speed_bps(now);
         self.hot_dispatch_expansion_window
             .refresh(now, hot_speed_bps);
@@ -255,9 +224,6 @@ impl Pipeline {
         self.metrics
             .hot_dispatch_lent_connections
             .store(active_lent_connections, Ordering::Relaxed);
-        self.metrics
-            .hot_dispatch_warmup_complete
-            .store(usize::from(warmup_complete), Ordering::Relaxed);
         self.metrics.hot_dispatch_last_spillover_decision.store(
             self.hot_dispatch_last_spillover_decision.as_code(),
             Ordering::Relaxed,
@@ -316,11 +282,6 @@ impl Pipeline {
             .store(decision.as_code(), Ordering::Relaxed);
         match decision {
             SpilloverDecision::None => {}
-            SpilloverDecision::BlockedWarmup => {
-                self.metrics
-                    .hot_dispatch_spillover_blocked_warmup_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
             SpilloverDecision::BlockedPressure => {
                 self.metrics
                     .hot_dispatch_spillover_blocked_pressure_total
@@ -346,11 +307,6 @@ impl Pipeline {
                     .hot_dispatch_spillover_allowed_measured_underfill_total
                     .fetch_add(1, Ordering::Relaxed);
             }
-            SpilloverDecision::AllowedBoundedSameBand => {
-                self.metrics
-                    .hot_dispatch_spillover_allowed_bounded_same_band_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
             SpilloverDecision::Reclaimed => {
                 self.metrics
                     .hot_dispatch_spillover_reclaimed_total
@@ -364,11 +320,6 @@ impl Pipeline {
             SpilloverDecision::BlockedBestModePending => {
                 self.metrics
                     .hot_dispatch_spillover_blocked_best_mode_pending_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            SpilloverDecision::BlockedRecentExpansionHelped => {
-                self.metrics
-                    .hot_dispatch_spillover_blocked_recent_expansion_helped_total
                     .fetch_add(1, Ordering::Relaxed);
             }
             SpilloverDecision::BlockedCapSpeed => {
@@ -413,113 +364,24 @@ impl Pipeline {
             .unwrap_or(1)
     }
 
-    pub(in crate::pipeline::download::worker) fn bounded_same_band_share_plan(
-        &self,
-        eligible: &[(u8, usize, JobId)],
-        hot_priority: u8,
-        hot_job_id: JobId,
-        max_connections: usize,
-        pressure: DownloadPressure,
-        bandwidth_cap_tight: bool,
-    ) -> Option<BoundedSameBandSharePlan> {
-        if pressure.state != DownloadPressureState::Clear
-            || bandwidth_cap_tight
-            || max_connections < HOT_DISPATCH_BOUNDED_SHARE_MIN_CONNECTIONS
-            || !self.job_has_primary_download_work(hot_job_id)
-        {
-            return None;
-        }
-
-        let peer_jobs = eligible
-            .iter()
-            .filter_map(|(priority, _, job_id)| {
-                (*job_id != hot_job_id
-                    && *priority == hot_priority
-                    && self.job_has_primary_download_work(*job_id))
-                .then_some(*job_id)
-            })
-            .collect::<Vec<_>>();
-        if peer_jobs.is_empty() {
-            return None;
-        }
-
-        let share_target = (max_connections / 4).min(HOT_DISPATCH_BOUNDED_SHARE_MAX_LANES);
-        if share_target == 0 {
-            return None;
-        }
-
-        Some(BoundedSameBandSharePlan {
-            hot_job_id,
-            hot_target: max_connections.saturating_sub(share_target),
-            share_target,
-            peer_jobs,
-        })
-    }
-
-    pub(in crate::pipeline::download::worker) fn hot_job_has_pending_pipeline_promotion(
-        &mut self,
-        job_id: JobId,
-        pressure: DownloadPressure,
-    ) -> bool {
-        if pressure.state != DownloadPressureState::Clear {
-            return false;
-        }
-        let Some(profile) = self.ensure_job_transport_profile(job_id) else {
-            return false;
-        };
-        let job_class = profile.class();
-        let median_body_bytes = profile.median_body_bytes();
-        let now = Instant::now();
-        let server_count = self.nntp.pool().server_count();
-        (0..server_count).any(|server_idx| {
-            let default_proof;
-            let proof =
-                if let Some(proof) = self.download_lane_runtime.server_proof.get(&server_idx) {
-                    proof
-                } else {
-                    default_proof = ServerPipelineProof::default();
-                    &default_proof
-                };
-            let current = proof.state(now);
-            let mode = self.choose_download_lane_mode_for_server(
-                now,
-                server_idx,
-                proof,
-                job_class,
-                median_body_bytes,
-                true,
-            );
-            matches!(
-                (current, mode),
-                (
-                    ServerPipelineState::Unknown | ServerPipelineState::SequentialOnly,
-                    DownloadLaneMode::PipelineDepth2
-                ) | (
-                    ServerPipelineState::PipelineProvenDepth2,
-                    DownloadLaneMode::PipelineDepth4
-                )
-            )
-        })
-    }
-
+    /// Whether the hot job can still use more capacity: either it has queued
+    /// dispatchable work and connections remain to give it (`LaneCapacityAvailable`,
+    /// meaning dispatch just hasn't caught up yet), or it has queued work and
+    /// capacity is already full of it (`HotHasQueuedPrimary`). Either way, the
+    /// hot job is not "slow" — spillover only ever engages once this returns
+    /// `None`. Per-server pipeline-depth proving (`choose_download_lane_mode_for_server`)
+    /// still runs on its own schedule elsewhere; it is protocol capability
+    /// detection, not a reason to withhold spillover, so it plays no part here.
     pub(in crate::pipeline::download::worker) fn hot_best_mode_block_reason(
-        &mut self,
+        &self,
         hot_job_id: JobId,
         max_connections: usize,
-        pressure: DownloadPressure,
-        recent_expansion_helped: bool,
     ) -> HotBestModeBlockReason {
         if self.job_has_dispatchable_work(hot_job_id) {
             if self.active_download_connections < max_connections {
                 return HotBestModeBlockReason::LaneCapacityAvailable;
             }
             return HotBestModeBlockReason::HotHasQueuedPrimary;
-        }
-        if self.hot_job_has_pending_pipeline_promotion(hot_job_id, pressure) {
-            return HotBestModeBlockReason::PipelinePromotionPending;
-        }
-        if recent_expansion_helped {
-            return HotBestModeBlockReason::RecentExpansionHelped;
         }
         HotBestModeBlockReason::None
     }
@@ -529,7 +391,36 @@ impl Pipeline {
         eligible: &[(u8, usize, JobId)],
         now: Instant,
     ) -> Option<(u8, JobId)> {
-        let top_eligible_priority = eligible.first().map(|(priority, _, _)| *priority);
+        // A job whose only queued work is completion-critical has nothing
+        // left for the fill phase once phase 1 drains it — critical demand
+        // is unconditional now, so it drains regardless of who is "hot".
+        // Preferring candidates that still have regular work avoids handing
+        // hot status to such a job only to relinquish it again next pass,
+        // which would otherwise reset hot-dispatch state (throughput window,
+        // spillover loans) on every toggle. Fall back to the full eligible
+        // set when nothing has regular work — there is nothing to prefer.
+        let has_completion_critical_work = eligible
+            .iter()
+            .any(|(_, _, job_id)| self.job_has_completion_critical_work(*job_id));
+        let noncritical_candidates = has_completion_critical_work
+            .then(|| {
+                eligible
+                    .iter()
+                    .copied()
+                    .filter(|(_, _, job_id)| self.job_has_noncritical_download_work(*job_id))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|candidates| !candidates.is_empty());
+        if noncritical_candidates.is_some()
+            && self
+                .hot_dispatch_job
+                .is_some_and(|job_id| !self.job_has_noncritical_download_work(job_id))
+        {
+            self.clear_hot_dispatch_period();
+        }
+        let candidates = noncritical_candidates.as_deref().unwrap_or(eligible);
+
+        let top_eligible_priority = candidates.first().map(|(priority, _, _)| *priority);
 
         if let Some(current_job_id) = self.hot_dispatch_job
             && self.job_can_remain_hot(current_job_id)
@@ -540,7 +431,7 @@ impl Pipeline {
             return Some((current_priority, current_job_id));
         }
 
-        let (priority, _, job_id) = eligible.first().copied()?;
+        let (priority, _, job_id) = candidates.first().copied()?;
         self.start_hot_dispatch_period(job_id, now);
         Some((priority, job_id))
     }

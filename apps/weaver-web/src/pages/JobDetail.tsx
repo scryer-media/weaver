@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import { ChevronRight, Download } from "lucide-react";
 import { useMutation, useQuery, useSubscription } from "urql";
@@ -40,12 +40,16 @@ import {
   PROMOTE_DUPLICATE_CANDIDATE_MUTATION,
   REDOWNLOAD_JOB_MUTATION,
   REPROCESS_JOB_MUTATION,
+  RERUN_POST_PROCESSING_MUTATION,
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
-import { authHeaders, requestGraphqlClientRestart } from "@/graphql/client";
+import {
+  authHeaders,
+  requestGraphqlClientRestart,
+  useGraphqlConnectionState,
+} from "@/graphql/client";
 import {
   useLiveConnection,
-  useLiveJob,
   useLiveSpeed,
 } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -88,9 +92,8 @@ export function JobDetail() {
   const { id } = useParams();
   const jobId = Number(id);
   const navigate = useNavigate();
-  const liveJob = useLiveJob(jobId);
-  const speed = useLiveSpeed();
   const connection = useLiveConnection();
+  const graphqlConnection = useGraphqlConnectionState();
   const queryVariables = useMemo(() => ({ id: jobId }), [jobId]);
 
   const [{ data, fetching }, reexecuteJobQuery] = useQuery<JobDetailQueryData>({
@@ -102,7 +105,7 @@ export function JobDetail() {
     variables: queryVariables,
     pause: !Number.isFinite(jobId),
   });
-  const [{ data: subscriptionData }] = useSubscription<{
+  const [{ data: subscriptionData, error: subscriptionError }] = useSubscription<{
     jobDetailUpdates: JobDetailSnapshotData;
   }>({
     query: JOB_DETAIL_UPDATES_SUBSCRIPTION,
@@ -113,6 +116,7 @@ export function JobDetail() {
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
+  const [rerunScriptsState, rerunPostProcessing] = useMutation(RERUN_POST_PROCESSING_MUTATION);
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
   const [acceptDeleteState, acceptHistoryDelete] = useMutation(ACCEPT_HISTORY_DELETE_MUTATION);
   const [markDuplicateGoodState, markDuplicateGood] = useMutation(MARK_DUPLICATE_GOOD_MUTATION);
@@ -125,15 +129,18 @@ export function JobDetail() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [deleteAcceptError, setDeleteAcceptError] = useState<string | null>(null);
-  const [lastLiveJob, setLastLiveJob] = useState<JobData | null>(null);
   const [polledData, setPolledData] = useState<JobDetailQueryData | undefined>();
   const [isDownloadingNzb, setIsDownloadingNzb] = useState(false);
   const [nzbDownloadError, setNzbDownloadError] = useState<string | null>(null);
   const [duplicateAction, setDuplicateAction] = useState<DuplicateAction | null>(null);
   const [duplicateActionError, setDuplicateActionError] = useState<string | null>(null);
+  const lastSubscriptionErrorRef = useRef<string | null>(null);
+  const lastConnectionAtRef = useRef<number | null | undefined>(undefined);
   const jobQueryData =
     polledData?.jobDetailSnapshot
-    ?? subscriptionData?.jobDetailUpdates
+    ?? (connection.status === "connected" && !subscriptionError
+      ? subscriptionData?.jobDetailUpdates
+      : undefined)
     ?? data?.jobDetailSnapshot
     ?? null;
   const queryJob = useMemo(() => {
@@ -155,7 +162,6 @@ export function JobDetail() {
   );
 
   useEffect(() => {
-    setLastLiveJob(null);
     setPolledData(undefined);
     setNzbDownloadError(null);
   }, [jobId]);
@@ -167,16 +173,39 @@ export function JobDetail() {
   }, [connection.isDisconnected]);
 
   useEffect(() => {
-    if (connection.status === "connected" && subscriptionData?.jobDetailUpdates) {
-      setPolledData(undefined);
+    if (graphqlConnection.status !== "connected" || graphqlConnection.lastConnectedAt === null) {
+      return;
     }
-  }, [connection.status, subscriptionData]);
+    if (lastConnectionAtRef.current === undefined) {
+      lastConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+      return;
+    }
+    if (lastConnectionAtRef.current === graphqlConnection.lastConnectedAt) {
+      return;
+    }
+    lastConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+    void reexecuteJobQuery({ requestPolicy: "network-only" });
+    void reexecuteDuplicateSnapshot({ requestPolicy: "network-only" });
+  }, [
+    graphqlConnection.lastConnectedAt,
+    graphqlConnection.status,
+    reexecuteDuplicateSnapshot,
+    reexecuteJobQuery,
+  ]);
 
   useEffect(() => {
-    if (liveJob) {
-      setLastLiveJob(liveJob);
+    if (!subscriptionError) {
+      lastSubscriptionErrorRef.current = null;
+      return;
     }
-  }, [liveJob]);
+    const errorKey = subscriptionError.message;
+    if (lastSubscriptionErrorRef.current === errorKey) {
+      return;
+    }
+    lastSubscriptionErrorRef.current = errorKey;
+    void reexecuteJobQuery({ requestPolicy: "network-only" });
+    void reexecuteDuplicateSnapshot({ requestPolicy: "network-only" });
+  }, [reexecuteDuplicateSnapshot, reexecuteJobQuery, subscriptionError]);
 
   useReconnectPolling<JobDetailQueryData>({
     enabled: connection.isDisconnected && Number.isFinite(jobId),
@@ -188,16 +217,8 @@ export function JobDetail() {
     },
   });
 
-  const queryJobIsTerminal = queryJob?.status === "COMPLETE" || queryJob?.status === "FAILED";
-  const job = liveJob ?? (queryJobIsTerminal ? queryJob : lastLiveJob ?? queryJob);
+  const job = queryJob;
   const timeline = jobQueryData?.jobTimeline ?? null;
-  const etaSpeed = useStableEtaSpeed(job ? [job] : [], speed);
-  const eta = job
-    ? formatEtaFromRemainingBytes(
-        Math.max(job.totalBytes - job.downloadedBytes, 0),
-        etaSpeed,
-      )
-    : "\u2014";
   const showEta = job?.status === "DOWNLOADING" || job?.status === "QUEUED";
 
   if (fetching && !job) {
@@ -388,6 +409,19 @@ export function JobDetail() {
                 <Button variant="outline" onClick={() => setShowRedownloadConfirm(true)}>
                   {t("action.redownload")}
                 </Button>
+                {/* Scripts only: the download is untouched, so this is safe to
+                    offer beside the heavier reprocess and redownload actions. */}
+                <Button
+                  variant="outline"
+                  disabled={rerunScriptsState.fetching}
+                  onClick={() => {
+                    void rerunPostProcessing({ jobId: job.id }).then(() => {
+                      void reexecuteJobQuery({ requestPolicy: "network-only" });
+                    });
+                  }}
+                >
+                  {t("action.rerunPostProcessing")}
+                </Button>
               </>
             ) : null}
             {job.status !== "COMPLETE" && job.status !== "FAILED" ? (
@@ -428,16 +462,7 @@ export function JobDetail() {
                 <span className="text-xs text-status-paused">{t("job.passwordProtected")}</span>
               ) : null}
             </div>
-            {showEta ? (
-              <div className="min-w-[7.5rem] shrink-0 text-right tabular-nums sm:min-w-[8.5rem]">
-                <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-                  {t("table.eta")}
-                </div>
-                <div className="mt-1 text-2xl font-semibold tracking-tight text-foreground tabular-nums sm:text-3xl">
-                  {eta}
-                </div>
-              </div>
-            ) : null}
+            {showEta ? <JobDetailEta job={job} /> : null}
           </div>
         </CardHeader>
         <CardContent className="space-y-5">
@@ -607,6 +632,7 @@ export function JobDetail() {
 
       <ConfirmDialog
         open={showDeleteConfirm}
+        testId="job-history-delete-confirm"
         title={t("confirm.deleteHistory")}
         message={t("confirm.deleteHistoryMessage")}
         confirmLabel={t("confirm.deleteHistoryConfirm")}
@@ -651,6 +677,27 @@ export function JobDetail() {
           <p className="text-sm text-destructive">{deleteAcceptError}</p>
         ) : null}
       </ConfirmDialog>
+    </div>
+  );
+}
+
+function JobDetailEta({ job }: { job: JobData }) {
+  const t = useTranslate();
+  const speed = useLiveSpeed();
+  const etaSpeed = useStableEtaSpeed([job], speed);
+  const eta = formatEtaFromRemainingBytes(
+    Math.max(job.totalBytes - job.downloadedBytes, 0),
+    etaSpeed,
+  );
+
+  return (
+    <div className="min-w-[7.5rem] shrink-0 text-right tabular-nums sm:min-w-[8.5rem]">
+      <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+        {t("table.eta")}
+      </div>
+      <div className="mt-1 text-2xl font-semibold tracking-tight text-foreground tabular-nums sm:text-3xl">
+        {eta}
+      </div>
     </div>
   );
 }
@@ -740,6 +787,8 @@ function formatMetadataKey(key: string): string {
 type OutputFile = { name: string; path: string; sizeBytes: number };
 type OutputResult = { outputDir: string; files: OutputFile[]; totalBytes: number };
 
+const OUTPUT_DIR_MARKER = ".weaver-output-dir";
+
 function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }) {
   const t = useTranslate();
   const isTerminal = status === "COMPLETE" || status === "FAILED";
@@ -759,6 +808,8 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
   if (!isTerminal) return null;
 
   const result = data?.jobOutputFiles;
+  const files = result?.files.filter((file) => file.name !== OUTPUT_DIR_MARKER) ?? [];
+  const visibleTotalBytes = files.reduce((total, file) => total + file.sizeBytes, 0);
   const outputFileDownloadHref = new URL(`api/jobs/${jobId}/output-file`, document.baseURI).href;
 
   if (fetching) {
@@ -774,7 +825,7 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
     );
   }
 
-  if (!result || result.files.length === 0) {
+  if (!result || files.length === 0) {
     return (
       <Card>
         <CardHeader>
@@ -802,9 +853,9 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
     }, 1000);
   }
 
-  const filesOpen = filesOpenOverride ?? (result.files.length <= 10);
+  const filesOpen = filesOpenOverride ?? (files.length <= 10);
   const outputFilesRegionId = `job-${jobId}-output-files`;
-  const outputFileCountLabel = `${result.files.length} file${result.files.length !== 1 ? "s" : ""}`;
+  const outputFileCountLabel = `${files.length} file${files.length !== 1 ? "s" : ""}`;
 
   return (
     <Card>
@@ -827,7 +878,7 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
             <CardTitle>Output Files</CardTitle>
           </div>
           <span className="text-xs text-muted-foreground">
-            {outputFileCountLabel} &middot; {formatBytes(result.totalBytes)}
+            {outputFileCountLabel} &middot; {formatBytes(visibleTotalBytes)}
           </span>
         </button>
         <div className="font-mono text-xs text-muted-foreground">{result.outputDir}</div>
@@ -844,7 +895,7 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
               </TableRow>
             </TableHeader>
             <TableBody>
-              {result.files.map((file) => (
+              {files.map((file) => (
                 <TableRow key={file.path}>
                   <TableCell className="font-mono text-xs">{file.name}</TableCell>
                   <TableCell className="text-right text-xs text-muted-foreground">

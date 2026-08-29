@@ -2,6 +2,7 @@ import { FileText, RotateCcw, UploadCloud, X } from "lucide-react";
 import type { Ref } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useUploadNzb, type UploadNzbEntry } from "@/features/upload/hooks/use-upload-nzb";
+import { NZB_UPLOAD_ACCEPT } from "@/features/upload/upload-file-types";
 import {
   semanticStateI18nKey,
   submissionOutcomeI18nKey,
@@ -160,7 +161,7 @@ export function UploadNzbForm({
             <input
               ref={fileInputRef}
               type="file"
-              accept=".nzb"
+              accept={NZB_UPLOAD_ACCEPT}
               multiple
               className="hidden"
               onChange={onFileInputChange}
@@ -235,7 +236,7 @@ export function UploadNzbForm({
                         ) : null}
                       </div>
                     </div>
-                    <div className="flex shrink-0 items-start gap-2">
+                    <div className="flex shrink-0 self-center items-center gap-2">
                       <div
                         className={cn(
                           "rounded-chip border px-2 py-1 text-[10.5px] font-semibold uppercase tracking-[0.13em]",
@@ -244,7 +245,7 @@ export function UploadNzbForm({
                       >
                         {statusLabel(entry, t)}
                       </div>
-                      <div className="pt-1 text-xs text-muted-foreground">
+                      <div className="text-xs text-muted-foreground">
                         {(entry.file.size / 1024).toFixed(1)} KB
                       </div>
                       <Button
@@ -310,7 +311,13 @@ export function UploadNzbForm({
               </Label>
               <Input
                 id={`upload-password-${layout}`}
-                type="text"
+                type="password"
+                autoComplete="off"
+                data-1p-ignore="true"
+                data-bwignore="true"
+                data-lpignore="true"
+                data-protonpass-ignore="true"
+                data-form-type="other"
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
                 placeholder={t("upload.passwordPlaceholder")}

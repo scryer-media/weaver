@@ -51,14 +51,6 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("job_history", Export, RequireEmpty),
     table!("job_history_attributes", Export, RequireEmpty),
     table!("job_events", Export, RequireEmpty),
-    table!("post_processing_extension_revisions", Export, RequireEmpty),
-    table!("post_processing_profiles", Export, RequireEmpty),
-    table!("post_processing_profile_steps", Export, RequireEmpty),
-    table!("post_processing_profile_assignments", Export, RequireEmpty),
-    table!("post_processing_job_plans", Export, RequireEmpty),
-    table!("post_processing_runs", Export, RequireEmpty),
-    table!("post_processing_attempts", Export, RequireEmpty),
-    table!("post_processing_log_chunks", Export, RequireEmpty),
     table!("duplicate_job_snapshots", Export, RequireEmpty),
     table!("job_fingerprints", Export, RequireEmpty),
     table!("duplicate_admission_claims", Export, RequireEmpty),
@@ -81,6 +73,11 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("active_file_identities", ResetOnRestore, RequireEmpty),
     table!("active_volume_status", ResetOnRestore, RequireEmpty),
     table!("active_rar_verified_suspect", ResetOnRestore, RequireEmpty),
+    // Direct-store coverage is claimed against working-directory destination
+    // files that a database restore does not restore, so the claim must be
+    // discarded with every other `active_*` table. `Export`
+    // would be actively wrong here.
+    table!("active_direct_coverage", ResetOnRestore, RequireEmpty),
     table!("integration_events", ResetOnRestore, Replace),
     table!("metrics_history_chunks", ResetOnRestore, Replace),
     table!("async_operations", ResetOnRestore, Replace),
@@ -99,10 +96,6 @@ pub(crate) fn catalog_tables(classifications: &[BackupTableClassification]) -> B
         .collect()
 }
 
-const TERMINAL_RUN_IDS: &str = "SELECT run_id FROM post_processing_runs
- WHERE job_id IN (SELECT job_id FROM job_history)
-   AND status IN ('succeeded', 'failed', 'skipped', 'cancelled', 'interrupted')";
-
 pub(crate) fn export_query(table: &str, columns: &[String]) -> String {
     let quoted = quote_identifier(table);
     let projection = columns
@@ -112,30 +105,7 @@ pub(crate) fn export_query(table: &str, columns: &[String]) -> String {
         .join(", ");
     let predicate = match table {
         "settings" => "key <> 'nzbget.scheduled_resume_at'",
-        "job_history_attributes" | "job_events" | "post_processing_job_plans" => {
-            "job_id IN (SELECT job_id FROM job_history)"
-        }
-        "post_processing_runs" => {
-            "job_id IN (SELECT job_id FROM job_history)
-             AND status IN ('succeeded', 'failed', 'skipped', 'cancelled', 'interrupted')"
-        }
-        "post_processing_attempts" => {
-            "run_id IN (
-                SELECT run_id FROM post_processing_runs
-                 WHERE job_id IN (SELECT job_id FROM job_history)
-                   AND status IN ('succeeded', 'failed', 'skipped', 'cancelled', 'interrupted')
-             )"
-        }
-        "post_processing_log_chunks" => {
-            "attempt_id IN (
-                SELECT attempt_id FROM post_processing_attempts
-                 WHERE run_id IN (
-                    SELECT run_id FROM post_processing_runs
-                     WHERE job_id IN (SELECT job_id FROM job_history)
-                       AND status IN ('succeeded', 'failed', 'skipped', 'cancelled', 'interrupted')
-                 )
-             )"
-        }
+        "job_history_attributes" | "job_events" => "job_id IN (SELECT job_id FROM job_history)",
         "duplicate_job_snapshots" => "lifecycle IN ('succeeded', 'failed', 'cancelled')",
         "job_fingerprints" | "duplicate_admission_claims" | "submission_idempotency" => {
             "job_id IN (
@@ -168,25 +138,10 @@ pub(crate) fn export_query(table: &str, columns: &[String]) -> String {
 fn export_column(table: &str, column: &str) -> String {
     let quoted = quote_identifier(column);
     match (table, column) {
-        ("job_history", "post_processing_run_id") => format!(
-            "CASE WHEN {quoted} IN ({TERMINAL_RUN_IDS})
-                  THEN {quoted} ELSE NULL END AS {quoted}"
-        ),
-        ("job_history", "post_processing_summary") => format!(
-            "CASE WHEN post_processing_run_id IN ({TERMINAL_RUN_IDS})
-                  THEN {quoted} ELSE 'not_run' END AS {quoted}"
-        ),
-        ("post_processing_runs", "rerun_of_run_id") => format!(
-            "CASE WHEN {quoted} IN ({TERMINAL_RUN_IDS})
-                  THEN {quoted} ELSE NULL END AS {quoted}"
-        ),
         ("rss_seen_items", "job_id") => format!(
             "CASE WHEN {quoted} IN (SELECT job_id FROM job_history)
                   THEN {quoted} ELSE NULL END AS {quoted}"
         ),
-        ("post_processing_extension_revisions", "discovered_source_path") => {
-            format!("CAST(NULL AS TEXT) AS {quoted}")
-        }
         _ => quoted,
     }
 }

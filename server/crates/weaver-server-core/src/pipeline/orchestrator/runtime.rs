@@ -7,7 +7,6 @@ impl Pipeline {
     /// Bound on how long `drain` waits to join detached fire-and-forget writes.
     const FIRE_AND_FORGET_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const DOWNLOAD_COMPLETION_DRAIN_LIMIT: usize = 128;
-    const INITIAL_CONNECTION_RAMP_LIMIT: usize = 20;
 
     /// Create a new pipeline.
     #[allow(clippy::too_many_arguments)]
@@ -34,11 +33,23 @@ impl Pipeline {
         let decode_backlog_budget_bytes =
             compute_decode_backlog_budget_bytes(&profile, &buffers, write_backlog_budget_bytes);
         let tuner = RuntimeTuner::with_connection_limit(profile, total_connections);
-        let (initial_bandwidth_policy, ip_replacement_trial_extra_connections) = {
+        let (
+            initial_bandwidth_policy,
+            ip_replacement_trial_extra_connections,
+            direct_store_settings,
+        ) = {
             let cfg = config.read().await;
             (
                 cfg.isp_bandwidth_cap.clone(),
                 cfg.ip_replacement_trial_extra_connections(),
+                // Config, with `WEAVER_RAR_DIRECT_STORE`
+                // overriding it. Resolved once here and held for the life of
+                // the pipeline — a set admitted under an enabled gate must not
+                // find it disabled at finalization, and the kill switch's
+                // contract is that turning it off at *startup* sweeps and
+                // redownloads mid-flight direct work, not that it takes effect
+                // mid-job.
+                crate::pipeline::direct_store::DirectStoreSettings::resolve(&cfg),
             )
         };
         metrics.set_ip_replacement_trial_extra_connections(ip_replacement_trial_extra_connections);
@@ -49,10 +60,21 @@ impl Pipeline {
             total_connections,
             "pipeline tuner initialized"
         );
+        if direct_store_settings.gate.is_enabled() {
+            // Logged only when on: the default is off, and an operator reading
+            // a startup log wants to see the non-default. The ceiling goes with
+            // it because the two are configured together and a demotion for
+            // `holds_scratch_ceiling` is otherwise unattributable.
+            info!(
+                holds_scratch_ceiling_bytes = direct_store_settings.holds_scratch_ceiling_bytes,
+                "RAR direct-store routing enabled"
+            );
+        }
 
         tokio::fs::create_dir_all(&data_dir).await?;
         tokio::fs::create_dir_all(&intermediate_dir).await?;
         tokio::fs::create_dir_all(&complete_dir).await?;
+        let extraction_limits = Arc::new(ExtractionLimits::from_env(&complete_dir)?);
 
         let (download_done_tx, download_done_rx) = mpsc::channel(256);
         let (download_refill_tx, download_refill_rx) = mpsc::channel(256);
@@ -66,23 +88,31 @@ impl Pipeline {
         let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
         let (rar_refresh_done_tx, rar_refresh_done_rx) = mpsc::channel(32);
         let (rar_capacity_retry_tx, rar_capacity_retry_rx) = mpsc::channel(32);
-        let (verified_suspect_persist_done_tx, verified_suspect_persist_done_rx) =
-            mpsc::channel(32);
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
         let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
             mpsc::channel(32);
+        let (direct_post_repair_done_tx, direct_post_repair_done_rx) = mpsc::channel(32);
         let post_processing_settings = db.post_processing_settings().unwrap_or_else(|error| {
             warn!(error = %error, "failed to load post-processing settings; using disabled defaults");
             crate::post_processing::model::PostProcessingSettings::default()
         });
-        let terminal_post_processing_service =
-            crate::post_processing::service::PostProcessingService::new_with_termination_grace(
+        let scripts_directory = db
+            .initialize_post_processing_script_directory(
+                &std::path::PathBuf::from(&data_dir),
+                None,
+            )
+            .unwrap_or_else(|error| {
+                warn!(error = %error, "failed to initialize post-processing scripts directory; using default");
+                std::path::PathBuf::from(&data_dir).join("scripts")
+            });
+        let terminal_post_processing_executor =
+            crate::post_processing::executor::PostProcessingExecutor::new(
                 db.clone(),
+                scripts_directory,
                 usize::from(post_processing_settings.concurrency),
-                Duration::from_secs(post_processing_settings.termination_grace_seconds),
             );
-        if let Err(error) = terminal_post_processing_service.recover_interrupted() {
-            warn!(error = %error, "failed to recover interrupted post-processing attempts");
+        if let Err(error) = terminal_post_processing_executor.recover_interrupted() {
+            warn!(error = %error, "failed to mark interrupted post-processing jobs");
         }
         let nntp = Arc::new(nntp);
         shared_state.set_nntp_runtime_activation(NntpRuntimeActivation {
@@ -90,6 +120,7 @@ impl Pipeline {
             configured_connections: total_connections,
             effective_connections: nntp.pool().effective_connection_capacity(),
         });
+        let server_counters = Self::activate_server_counters(&metrics, &nntp);
         let owned_download_lane_pool =
             download::owned_lane::OwnedDownloadLanePool::new(total_connections.max(1));
         shared_state.set_paused(initial_global_paused);
@@ -112,10 +143,10 @@ impl Pipeline {
             job_order: Vec::new(),
             active_downloads: 0,
             active_download_connections: 0,
+            active_completion_critical_connections: 0,
             active_recovery: 0,
             hot_dispatch_job: None,
             hot_dispatch_started_at: None,
-            hot_dispatch_successes: 0,
             hot_dispatch_exclusive_peak_bps: 0,
             hot_dispatch_last_lend_at: None,
             hot_dispatch_mode: DispatchShareMode::Exclusive,
@@ -139,6 +170,7 @@ impl Pipeline {
             pending_released_download_result_bytes_by_job: HashMap::new(),
             active_downloads_by_job: HashMap::new(),
             active_download_connections_by_job: HashMap::new(),
+            active_completion_critical_connections_by_job: HashMap::new(),
             active_downloads_by_file: HashMap::new(),
             active_decodes_by_job: HashMap::new(),
             active_decodes_by_file: HashMap::new(),
@@ -146,7 +178,12 @@ impl Pipeline {
             pending_retries_by_job: HashMap::new(),
             pending_retries_by_segment: HashMap::new(),
             download_wait_by_job: HashMap::new(),
-            terminal_segment_failures: HashSet::new(),
+            segment_terminal_states: HashMap::new(),
+            foreign_layout_watches: HashMap::new(),
+            #[cfg(test)]
+            foreign_layout_breaker_override: None,
+            terminal_reconciliations: HashMap::new(),
+            files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),
             intermediate_dir,
             complete_dir,
@@ -166,9 +203,43 @@ impl Pipeline {
             #[cfg(test)]
             par2_authoritative_verify_calls: 0,
             #[cfg(test)]
+            par2_selective_verify_calls: 0,
+            #[cfg(test)]
+            par2_quick_verify_calls: 0,
+            #[cfg(test)]
+            par2_quick_partial_verify_calls: 0,
+            #[cfg(test)]
+            par2_scan_carry_seeded_calls: 0,
+            #[cfg(test)]
+            par2_scan_carry_stashed_calls: 0,
+            #[cfg(test)]
+            par2_host_carry_builds: 0,
+            #[cfg(test)]
+            par2_ignore_extensions_override: None,
+            #[cfg(test)]
+            par2_recovery_salvage_scans: 0,
+            #[cfg(test)]
+            par2_unserved_set_warnings: 0,
+            #[cfg(test)]
             par2_repairer_analyze_calls: 0,
             #[cfg(test)]
+            par2_authoritative_bytes_read: Vec::new(),
+            #[cfg(test)]
             par2_repairer_execute_calls: 0,
+            #[cfg(test)]
+            stateful_par2_session_forced: None,
+            #[cfg(test)]
+            direct_session_pass_calls: 0,
+            #[cfg(test)]
+            direct_verify_read_splits: Vec::new(),
+            #[cfg(test)]
+            par2_post_repair_read_splits: Vec::new(),
+            #[cfg(test)]
+            sfv_verify_read_splits: Vec::new(),
+            #[cfg(test)]
+            direct_post_repair_read_splits: Vec::new(),
+            #[cfg(test)]
+            last_direct_verdict: None,
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
             download_done_tx,
@@ -188,6 +259,8 @@ impl Pipeline {
             retry_rx,
             infrastructure_retries: infrastructure_retry::InfrastructureRetryQueue::default(),
             pool_generation: 0,
+            server_counters,
+            job_stage_started_at: HashMap::new(),
             capacity_probe_result_tx,
             capacity_probe_result_rx,
             probe_result_tx,
@@ -198,13 +271,11 @@ impl Pipeline {
             rar_refresh_done_rx,
             rar_capacity_retry_tx,
             rar_capacity_retry_rx,
-            verified_suspect_persist_done_tx,
-            verified_suspect_persist_done_rx,
             move_done_tx,
             move_done_rx,
             terminal_post_processing_done_tx,
             terminal_post_processing_done_rx,
-            terminal_post_processing_service,
+            terminal_post_processing_executor,
             inflight_terminal_post_processing: HashSet::new(),
             terminal_post_processing_cancellations: HashMap::new(),
             global_paused: initial_global_paused,
@@ -214,7 +285,6 @@ impl Pipeline {
             rate_limit_reservations: HashMap::new(),
             configured_rate_limit: 0,
             scheduled_rate_limit: None,
-            connection_ramp: total_connections.min(Self::INITIAL_CONNECTION_RAMP_LIMIT),
             rate_limiter: TokenBucket::new(0),
             write_buf_max_pending,
             decode_backlog_budget_bytes,
@@ -223,12 +293,28 @@ impl Pipeline {
             download_write_hard_pressure_latched: false,
             download_pressure_hard_stall_started_at: None,
             download_pressure_soft_dispatch_after: None,
+            snapshot_published_at: None,
+            snapshot_publish_pending: false,
             download_restart_durable_lead_retry_after: HashMap::new(),
+            propagation_ready_at: HashMap::new(),
+            propagation_delay_forced: None,
             last_download_dispatch_stall_log_at: None,
             write_buffered_bytes: 0,
             write_buffered_segments: 0,
             write_buffers: HashMap::new(),
+            file_prefix_16k: HashMap::new(),
+            file_declared_size: HashMap::new(),
+            uu_files: HashMap::new(),
+            uu_park_requeues: HashMap::new(),
             par2_runtime: HashMap::new(),
+            #[cfg(test)]
+            par2_binding_resolver_calls: std::sync::atomic::AtomicU64::new(0),
+            block_crcs: crate::pipeline::integrity::BlockCrcCollector::new(),
+            direct_store: crate::pipeline::direct_store::wiring::DirectStoreRuntime::with_settings(
+                direct_store_settings,
+            ),
+            extraction_limits,
+            extraction_budgets: HashMap::new(),
             extracted_members: HashMap::new(),
             extracted_archives: HashMap::new(),
             decode_retries: HashMap::new(),
@@ -241,6 +327,13 @@ impl Pipeline {
             job_retention_exclude_cache: HashMap::new(),
             last_no_eligible_server_warn: None,
             last_body_fetch_failure_log_at: None,
+            par2_cancellations: HashMap::new(),
+            next_direct_post_repair_work_id: 0,
+            direct_post_repair_in_flight: HashMap::new(),
+            direct_post_repair_results: HashMap::new(),
+            direct_post_repair_done_tx,
+            direct_post_repair_done_rx,
+            direct_post_repair_carry: HashMap::new(),
             inflight_moves: HashSet::new(),
             reserved_complete_destinations: HashMap::new(),
             failed_extractions: HashMap::new(),
@@ -250,14 +343,15 @@ impl Pipeline {
             rar_unlock_priority_dirty_jobs: HashSet::new(),
             rar_unlock_boosted_files: HashMap::new(),
             pending_rar_capacity_retries: HashSet::new(),
-            verified_suspect_persist_state: HashMap::new(),
             rar_waiting_members: HashMap::new(),
             normalization_retried: HashSet::new(),
             pending_concat: HashMap::new(),
             par2_bypassed: HashSet::new(),
             par2_verified: HashSet::new(),
-            post_processing_repair_reentered: HashSet::new(),
-            post_processing_repair_return_to_terminal: HashSet::new(),
+            par2_joined_split_sets: HashMap::new(),
+            par2_pre_repair_dir_entries: HashMap::new(),
+            sfv_checked: HashSet::new(),
+            jobs_with_verification_outcome: HashSet::new(),
             unavailable_promoted_recovery_segments: HashSet::new(),
             finished_jobs: initial_history,
             shared_state,
@@ -349,6 +443,31 @@ impl Pipeline {
         self.nntp.pool().clone()
     }
 
+    /// Point the per-server metric counters at the servers of `nntp`.
+    ///
+    /// Called only when an NNTP runtime generation is activated (startup and
+    /// every `RebuildNntp`), never on an article path. The registry re-uses the
+    /// counters of any stable server id it has already seen, so a server that
+    /// survives a config reload keeps its lifetime totals even though its
+    /// runtime index may have moved.
+    pub(in crate::pipeline) fn activate_server_counters(
+        metrics: &PipelineMetrics,
+        nntp: &NntpClient,
+    ) -> Vec<Arc<crate::operations::instrumentation::ServerCounters>> {
+        let pool = nntp.pool();
+        let stable_ids = (0..pool.server_count())
+            .map(|index| {
+                pool.stable_server_id(weaver_nntp::pool::ServerId(index))
+                    .map(|stable| stable.0)
+                    // A pool entry with no durable identity can only come from a
+                    // synthetic config; index it by position so its counters are
+                    // still addressable rather than dropping the server.
+                    .unwrap_or(index as u32)
+            })
+            .collect::<Vec<_>>();
+        metrics.server_metrics.activate(&stable_ids)
+    }
+
     pub(in crate::pipeline) fn drive_capacity_probes_at(&self, now: tokio::time::Instant) {
         let pool = self.nntp_pool();
         for change in pool.take_capacity_changes() {
@@ -436,10 +555,10 @@ impl Pipeline {
         }
     }
 
-    pub fn post_processing_service(
+    pub fn post_processing_executor(
         &self,
-    ) -> crate::post_processing::service::PostProcessingService {
-        self.terminal_post_processing_service.clone()
+    ) -> crate::post_processing::executor::PostProcessingExecutor {
+        self.terminal_post_processing_executor.clone()
     }
 
     pub(crate) fn effective_downloaded_bytes(state: &JobState) -> u64 {
@@ -464,6 +583,37 @@ impl Pipeline {
         contiguous_bytes_written: u64,
         force_flush: bool,
     ) {
+        // A direct set's source volume has no file, so its legacy
+        // floor stays at zero — an older binary then sees no coverage and
+        // redownloads instead of trusting bytes that were never written there.
+        // The routing seam already returns before this is reached; the guard is
+        // here so any *other* caller inherits the same rule.
+        if self.is_direct_source_file(file_id) {
+            return;
+        }
+        // A uuencode file has no resumable checkpoint, so it must never write
+        // one. The floor is a count of DECODED bytes, and the restart path that
+        // reads it back (`segments_covered_by_floor`) walks the NZB's DECLARED
+        // segment sizes to decide which ordinals those bytes cover. Declared
+        // sizes are ENCODED: yEnc runs ~1.03x its decoded bytes, so the walk
+        // stops a little early and a yEnc file merely re-fetches a segment or
+        // two. uuencode runs ~1.38x, so the walk marks a prefix of ordinals
+        // received whose decoded end nobody can compute — and a uuencode part's
+        // offset is precisely the decoded length of its whole prefix. The
+        // resumed cursor would start at ordinal 0 with every arriving part
+        // parked forever behind ordinals that were never queued.
+        //
+        // Suppressing the checkpoint costs a partial uuencode file its resume
+        // and nothing else: with no floor recorded, the restart finds nothing to
+        // skip and the file downloads from ordinal 0 with a cursor that agrees.
+        // That is the honest price of sequential assembly — an offset is only
+        // knowable from the whole prefix, so a prefix nobody measured cannot be
+        // resumed from. The tombstone left by `finish_uu_file` keeps this
+        // holding for the file's final write too, which lands after the
+        // completion branch has run.
+        if self.uu_files.contains_key(&file_id) {
+            return;
+        }
         let current = self
             .pending_file_progress
             .get(&file_id)
@@ -555,6 +705,12 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
+        self.propagation_ready_at.remove(&job_id);
+        // The direct-store runtime is per-job state like every map
+        // above it. Left behind, its sets keep a removed job "active" and the
+        // barrier poll keeps demanding checkpoints for a working directory that
+        // is being deleted.
+        self.direct_store.clear_job(job_id);
     }
 
     pub(crate) fn note_download_activity(&mut self, job_id: JobId) {
@@ -592,10 +748,17 @@ impl Pipeline {
             .active_download_connections_by_job
             .remove(&job_id)
             .unwrap_or(0);
+        let completion_critical_connections = self
+            .active_completion_critical_connections_by_job
+            .remove(&job_id)
+            .unwrap_or(0);
         self.active_downloads = self.active_downloads.saturating_sub(in_flight);
         self.active_download_connections = self
             .active_download_connections
             .saturating_sub(in_flight_connections);
+        self.active_completion_critical_connections = self
+            .active_completion_critical_connections
+            .saturating_sub(completion_critical_connections);
         self.active_downloads_by_file
             .retain(|file_id, _| file_id.job_id != job_id);
 
@@ -714,12 +877,23 @@ impl Pipeline {
             }
 
             self.dispatch_downloads();
+            // The byte and age triggers are polled on the loop's
+            // existing periodic seam rather than on a timer of their own, so an
+            // idle set still checkpoints and a busy one is never checked more
+            // often than the pipeline turns.
+            self.poll_direct_store_barriers().await;
 
             let rate_delay = self.rate_limiter.time_until_ready();
             let rate_sleep = tokio::time::sleep(rate_delay);
             let durable_lead_retry_delay = self.next_restart_durable_lead_retry_delay();
             let durable_lead_retry_sleep = tokio::time::sleep(
                 durable_lead_retry_delay.unwrap_or_else(|| std::time::Duration::from_secs(3600)),
+            );
+            // A deferred job wakes the loop exactly when its post is old
+            // enough, rather than being rediscovered by polling.
+            let propagation_delay = self.next_propagation_delay();
+            let propagation_sleep = tokio::time::sleep(
+                propagation_delay.unwrap_or_else(|| std::time::Duration::from_secs(3600)),
             );
             let infrastructure_retry_deadline = self.infrastructure_retries.next_deadline();
             let infrastructure_retry_sleep =
@@ -731,9 +905,18 @@ impl Pipeline {
                 match self.cmd_rx.try_recv() {
                     Ok(SchedulerCommand::Shutdown) => {
                         info!("pipeline shutting down");
+                        self.demand_direct_store_barriers_for_all_jobs(
+                            crate::pipeline::direct_store::barrier::BarrierDemand::Shutdown,
+                        )
+                        .await;
                         break 'run_loop;
                     }
-                    Ok(cmd) => self.handle_command(cmd).await,
+                    Ok(cmd) => {
+                        if let Some(scope) = Self::pause_barrier_scope(&cmd) {
+                            self.demand_direct_store_barriers_for_pause(scope).await;
+                        }
+                        self.handle_command(cmd).await
+                    }
                     Err(_) => break,
                 }
             }
@@ -750,7 +933,12 @@ impl Pipeline {
                                 info!("pipeline shutting down");
                                 break;
                             }
-                            Some(cmd) => self.handle_command(cmd).await,
+                            Some(cmd) => {
+                                if let Some(scope) = Self::pause_barrier_scope(&cmd) {
+                                    self.demand_direct_store_barriers_for_pause(scope).await;
+                                }
+                                self.handle_command(cmd).await
+                            }
                         }
                     }
                     Some(result) = self.download_done_rx.recv() => {
@@ -799,11 +987,11 @@ impl Pipeline {
                     Some(retry) = self.rar_capacity_retry_rx.recv() => {
                         self.handle_rar_capacity_retry(retry).await;
                     }
-                    Some(done) = self.verified_suspect_persist_done_rx.recv() => {
-                        self.handle_verified_suspect_persist_done(done);
-                    }
                     Some(done) = self.move_done_rx.recv() => {
                         self.handle_move_to_complete_done(done).await;
+                    }
+                    Some(done) = self.direct_post_repair_done_rx.recv() => {
+                        self.handle_direct_post_repair_done(done);
                     }
                     Some(event) = self.terminal_post_processing_done_rx.recv() => {
                         match event {
@@ -824,12 +1012,14 @@ impl Pipeline {
                     _ = metrics_snapshot_interval.tick() => {
                         self.sample_phase_progress();
                         self.shared_state.refresh_metrics_snapshot();
+                        self.flush_pending_snapshot();
                         // Fallback wake for refills held under hard pressure, in
                         // case the backlog drained without a download event.
                         self.maybe_service_deferred_lane_refills();
                     }
                     _ = rate_sleep, if !rate_delay.is_zero() => {}
                     _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {}
+                    _ = propagation_sleep, if propagation_delay.is_some() => {}
                     _ = infrastructure_retry_sleep, if infrastructure_retry_deadline.is_some() => {
                         self.requeue_due_infrastructure_retries();
                     }
@@ -862,7 +1052,6 @@ impl Pipeline {
                             hot_dispatch_mode = snapshot.hot_dispatch_mode.as_str(),
                             hot_dispatch_lent_connections = snapshot.hot_dispatch_lent_connections,
                             hot_dispatch_underfill_ms = snapshot.hot_dispatch_underfill_ms,
-                            hot_dispatch_warmup_complete = snapshot.hot_dispatch_warmup_complete,
                             hot_dispatch_speed_bps = snapshot.hot_dispatch_hot_speed_bps,
                             hot_dispatch_exclusive_peak_bps =
                                 snapshot.hot_dispatch_exclusive_peak_bps,
@@ -890,12 +1079,6 @@ impl Pipeline {
                             "pipeline tick"
                         );
 
-                        let max = self.tuner.params().max_concurrent_downloads;
-                        if self.connection_ramp < max {
-                            self.connection_ramp = (self.connection_ramp + 5).min(max);
-                            info!(connection_ramp = self.connection_ramp, "ramping up connections");
-                        }
-
                         if self.tuner.adjust(&snapshot) {
                             info!(
                                 max_downloads = self.tuner.params().max_concurrent_downloads,
@@ -919,11 +1102,40 @@ impl Pipeline {
             }
 
             self.pump_decode_queue();
-            self.publish_snapshot();
+            self.publish_snapshot_debounced();
         }
 
         self.drain().await;
         info!("pipeline stopped");
+    }
+
+    /// The pause demand, at the command seam.
+    ///
+    /// A paused job stops feeding the byte trigger and its sets go quiet, so
+    /// without this the last interval's coverage would sit uncheckpointed for
+    /// however long the pause lasts — and a pause is a common thing to do
+    /// *before* stopping the process. Demanded here rather than inside
+    /// `pause_job_runtime`, which is synchronous and is also the transition every
+    /// other pause path funnels through after the fact; the command is the point
+    /// where the intent is known and the job has not stopped yet.
+    /// Classified synchronously and by value: a `&SchedulerCommand` held across
+    /// the await below would make the whole pipeline future non-`Send`, because
+    /// the command carries reply channels whose payloads are `Send` but not
+    /// `Sync`.
+    pub(crate) fn pause_barrier_scope(command: &SchedulerCommand) -> Option<Option<JobId>> {
+        match command {
+            SchedulerCommand::PauseJob { job_id, .. } => Some(Some(*job_id)),
+            SchedulerCommand::PauseAll { .. } => Some(None),
+            _ => None,
+        }
+    }
+
+    pub(crate) async fn demand_direct_store_barriers_for_pause(&mut self, scope: Option<JobId>) {
+        let demand = crate::pipeline::direct_store::barrier::BarrierDemand::Pause;
+        match scope {
+            Some(job_id) => self.demand_direct_store_barriers(job_id, demand).await,
+            None => self.demand_direct_store_barriers_for_all_jobs(demand).await,
+        }
     }
 
     pub(crate) fn next_restart_durable_lead_retry_delay(&self) -> Option<std::time::Duration> {
@@ -936,8 +1148,44 @@ impl Pipeline {
     }
 
     pub(crate) fn publish_snapshot(&mut self) {
+        self.snapshot_published_at = Some(Instant::now());
+        self.snapshot_publish_pending = false;
         let _ = self.refresh_bandwidth_cap_window();
         self.shared_state.publish_jobs(self.list_jobs());
+    }
+
+    /// Publish the job snapshot unless one was already published inside the
+    /// debounce window; a suppressed publish is owed and caught up by the
+    /// metrics tick.
+    ///
+    /// The run loop turns once per pipeline event — every download result,
+    /// decode completion, and lane refill — and `list_jobs` rebuilds the whole
+    /// snapshot (per-job clones plus per-file walks) on each call, so an
+    /// unconditional per-turn publish scaled the orchestrator's overhead with
+    /// article rate. Bumping the revision also wakes every quota-parked retry
+    /// task, each of which re-reads its job from the published list; the same
+    /// window bounds that herd. Explicit callers — command handlers, status
+    /// transitions — keep the immediate `publish_snapshot` so user-visible
+    /// changes never wait on the window.
+    pub(crate) fn publish_snapshot_debounced(&mut self) {
+        const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(100);
+        if self
+            .snapshot_published_at
+            .is_some_and(|at| at.elapsed() < SNAPSHOT_DEBOUNCE)
+        {
+            self.snapshot_publish_pending = true;
+            return;
+        }
+        self.publish_snapshot();
+    }
+
+    /// The trailing edge of the debounce: publish a suppressed snapshot once
+    /// the periodic tick comes around, so the last event before a quiet spell
+    /// still reaches the UI.
+    pub(crate) fn flush_pending_snapshot(&mut self) {
+        if self.snapshot_publish_pending {
+            self.publish_snapshot();
+        }
     }
 
     fn update_parked_infrastructure_metric(&self) {
@@ -1078,14 +1326,16 @@ impl Pipeline {
         {
             return;
         }
-        let promoted_recovery = work.is_recovery
-            && self.is_promoted_recovery_file(job_id, segment_id.file_id.file_index);
+        let completion_critical =
+            work.completion_critical || self.segment_is_completion_critical(segment_id);
+        let promoted_recovery = work.is_recovery && completion_critical;
         let mark_rar_unlock_dirty =
             !promoted_recovery && self.rar_unlock_requeued_work_is_relevant(&work);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             if promoted_recovery {
                 let mut work = work;
                 work.priority = crate::pipeline::repair::PROMOTED_RECOVERY_PRIORITY;
+                work.completion_critical = true;
                 state.download_queue.push(work);
             } else if work.is_recovery {
                 state.recovery_queue.push(work);
@@ -1270,6 +1520,23 @@ enum DiskWriteCommand {
             Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError>,
         >,
     },
+    /// One direct-store destination's share of a routed article.
+    ///
+    /// Raw bytes rather than a `BufferedDecodedSegment`, because a routed run is
+    /// a *fragment* of an article: one decoded span is split across a member
+    /// partial and the set's envelope, and neither piece is a segment.
+    RawBatch {
+        path: std::path::PathBuf,
+        writes: Vec<(u64, Vec<u8>)>,
+        queued_at: Instant,
+        response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    },
+    /// Durably syncs one destination, on the thread that owns its handle so the
+    /// sync is ordered behind every batch queued before it.
+    SyncPath {
+        path: std::path::PathBuf,
+        response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    },
     CloseHandles {
         scope: CloseHandleScope,
         ack: Option<tokio::sync::oneshot::Sender<()>>,
@@ -1353,6 +1620,56 @@ impl DiskWriteOwnerPool {
                 unwritten: Vec::new(),
             })
         })
+    }
+
+    /// Queues one destination's sub-batch and hands back its completion. Split
+    /// from awaiting so a multi-path article submits every sub-batch first and
+    /// only then joins them — otherwise the fan-out would be a sequence.
+    fn submit_raw_batch(
+        &self,
+        path: std::path::PathBuf,
+        writes: Vec<(u64, Vec<u8>)>,
+    ) -> tokio::sync::oneshot::Receiver<std::io::Result<()>> {
+        let (response, response_rx) = tokio::sync::oneshot::channel();
+        let sender_index = self.owner_index_for_path(&path);
+        let command = DiskWriteCommand::RawBatch {
+            path,
+            writes,
+            queued_at: Instant::now(),
+            response,
+        };
+        if let Err(error) = self.senders[sender_index].send(command) {
+            let DiskWriteCommand::RawBatch { response, .. } = error.0 else {
+                unreachable!("raw batch send returned a different command");
+            };
+            let _ = response.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "disk write owner thread stopped",
+            )));
+        }
+        response_rx
+    }
+
+    /// Queues one sync without waiting for it, so a caller with several
+    /// destinations can have them all in flight before it awaits any.
+    fn submit_sync_path(
+        &self,
+        path: std::path::PathBuf,
+    ) -> tokio::sync::oneshot::Receiver<std::io::Result<()>> {
+        let (response, response_rx) = tokio::sync::oneshot::channel();
+        let sender_index = self.owner_index_for_path(&path);
+        if let Err(error) =
+            self.senders[sender_index].send(DiskWriteCommand::SyncPath { path, response })
+        {
+            let DiskWriteCommand::SyncPath { response, .. } = error.0 else {
+                unreachable!("sync path send returned a different command");
+            };
+            let _ = response.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "disk write owner thread stopped",
+            )));
+        }
+        response_rx
     }
 
     fn release_handle(&self, path: &std::path::Path) {
@@ -1498,6 +1815,24 @@ fn run_disk_write_owner(rx: std::sync::mpsc::Receiver<DiskWriteCommand>) {
                     write_segments_to_disk_blocking(&mut handles, path, segments, queued_at);
                 let _ = response.send(result);
             }
+            Ok(DiskWriteCommand::RawBatch {
+                path,
+                writes,
+                queued_at,
+                response,
+            }) => {
+                let result = write_raw_batch_blocking(&mut handles, path, writes, queued_at);
+                let _ = response.send(result);
+            }
+            Ok(DiskWriteCommand::SyncPath { path, response }) => {
+                let result = handles
+                    .open_or_reuse(&path)
+                    .and_then(|file| file.sync_data());
+                if result.is_err() {
+                    handles.discard(&path);
+                }
+                let _ = response.send(result);
+            }
             Ok(DiskWriteCommand::CloseHandles { scope, ack }) => {
                 handles.close_matching(&scope);
                 if let Some(ack) = ack {
@@ -1586,6 +1921,103 @@ fn write_segments_into_file(
     }
 
     Ok(written)
+}
+
+fn write_raw_batch_blocking(
+    handles: &mut DiskWriteHandleCache,
+    path: std::path::PathBuf,
+    writes: Vec<(u64, Vec<u8>)>,
+    queued_at: Instant,
+) -> std::io::Result<()> {
+    use std::io::{Seek, Write};
+
+    crate::runtime::perf_probe::record(
+        "download.disk_write.owner.queue_wait",
+        Instant::now().duration_since(queued_at),
+    );
+    let file = handles.open_or_reuse(&path)?;
+    let mut next_offset = None;
+    for (offset, bytes) in &writes {
+        if next_offset != Some(*offset)
+            && let Err(source) = file.seek(std::io::SeekFrom::Start(*offset))
+        {
+            handles.discard(&path);
+            return Err(source);
+        }
+        if let Err(source) = file.write_all(bytes) {
+            handles.discard(&path);
+            return Err(source);
+        }
+        next_offset = Some(offset + bytes.len() as u64);
+    }
+    Ok(())
+}
+
+/// One routed article's fragments, grouped into one sub-batch per destination
+/// file: `(destination path, [(offset, bytes)])`.
+pub(crate) type DirectWriteBatches = Vec<(std::path::PathBuf, Vec<(u64, Vec<u8>)>)>;
+
+/// Writes one routed article's fragments to **every** destination it touches,
+/// fanning the per-path sub-batches out to their owner threads and joining them
+/// all.
+///
+/// The article counts as placed only when every destination write returned;
+/// a partial failure is reported as an error and leaves orphan bytes, which is
+/// safe because the coverage map — not the bytes — is the truth.
+pub(crate) async fn write_direct_batches(batches: DirectWriteBatches) -> std::io::Result<()> {
+    if batches.is_empty() {
+        return Ok(());
+    }
+    let pool = disk_write_owner_pool();
+    // Every sub-batch is queued before any of them is awaited, so the owner
+    // threads run in parallel; joining them all is what makes the article
+    // "placed only when every destination write returned".
+    let mut pending = Vec::with_capacity(batches.len());
+    for (path, writes) in batches {
+        pending.push(pool.submit_raw_batch(path, writes));
+    }
+    let mut first_error = None;
+    for response in pending {
+        let result = response
+            .await
+            .unwrap_or_else(|error| Err(std::io::Error::other(error)));
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Durably syncs every destination one coverage barrier touched, in parallel.
+///
+/// Same shape as [`write_direct_batches`], and for the same reason: every sync
+/// is queued to its owner thread before any of them is awaited. Envelope v2
+/// turned a barrier's sync set from two destinations into `members + volumes`,
+/// so awaiting them one at a time serialized `n` independent fsyncs behind each
+/// other on the pipeline task. The ordering guarantee is unchanged — the barrier
+/// still sees every sync's outcome before it persists anything.
+pub(crate) async fn sync_direct_destinations(
+    paths: Vec<std::path::PathBuf>,
+) -> Vec<std::io::Result<()>> {
+    let pool = disk_write_owner_pool();
+    let pending: Vec<_> = paths
+        .into_iter()
+        .map(|path| pool.submit_sync_path(path))
+        .collect();
+    let mut results = Vec::with_capacity(pending.len());
+    for response in pending {
+        results.push(
+            response
+                .await
+                .unwrap_or_else(|error| Err(std::io::Error::other(error))),
+        );
+    }
+    results
 }
 
 pub(crate) async fn write_segments_to_disk(
@@ -1703,6 +2135,7 @@ mod disk_write_handle_cache_tests {
 
     fn segment(bytes: &[u8]) -> BufferedDecodedSegment {
         BufferedDecodedSegment {
+            encoding: SegmentEncoding::Yenc,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id: JobId(1),
@@ -1715,6 +2148,8 @@ mod disk_write_handle_cache_tests {
             part_crc: 0,
             part_crc_verified: false,
             yenc_name: String::new(),
+            checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+            segments: Vec::new(),
         }
     }
 

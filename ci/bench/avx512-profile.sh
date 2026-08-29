@@ -50,11 +50,16 @@ die(){ printf '\033[1;31m[avx512-prof:FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 assert_vbmi2_box() {
   [ -r /proc/cpuinfo ] || die "no /proc/cpuinfo"
   local flags; flags="$(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2-)"
+  # Linux spells LZCNT as 'abm' in /proc/cpuinfo; normalize so the loop below
+  # can name the same nine features the dispatcher's vbmi2_tier_available()
+  # gates on. Omitting the BMI family here made this gate looser than the
+  # dispatcher: a box could pass it and still be demoted to the AVX2 tier.
+  case " $flags " in *" abm "*) flags="$flags lzcnt" ;; esac
   local f
-  for f in avx2 avx512f avx512vl avx512bw; do
+  for f in avx2 avx512f avx512vl avx512bw bmi1 bmi2 popcnt lzcnt; do
     case " $flags " in
       *" $f "*) : ;;
-      *) die "CPU missing '$f' — not an AVX-512 box." ;;
+      *) die "CPU missing '$f' — weaver would NOT dispatch the VBMI2 tier." ;;
     esac
   done
   # Linux /proc/cpuinfo spells VBMI2 as 'avx512_vbmi2' (underscore) on modern
@@ -84,7 +89,20 @@ install_deps() {
       build-essential cmake nasm git curl ca-certificates pkg-config linux-tools-generic
   if ! command -v cargo >/dev/null 2>&1; then
     log "installing rustup toolchain…"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    local rustup_init
+    rustup_init="$(mktemp)"
+    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+      --output "$rustup_init" \
+      https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init
+    if ! printf '%s  %s\n' \
+      ead833fc004f6930a3f67a3762701e87dc10f77c89e52493b51b96c30f4b5319 \
+      "$rustup_init" | sha256sum --check --status; then
+      rm -f "$rustup_init"
+      die "rustup-init checksum verification failed"
+    fi
+    chmod +x "$rustup_init"
+    "$rustup_init" -y --profile minimal
+    rm -f "$rustup_init"
     # shellcheck disable=SC1091
     . "$HOME/.cargo/env"; export PATH="$HOME/.cargo/bin:$PATH"
   fi

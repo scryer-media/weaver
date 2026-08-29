@@ -1,0 +1,11 @@
+{
+  "slug": "uu-preamble-tail",
+  "title": "Violet.Cascade.S01E05.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "Two decoder-tolerance probes in one release. The media file carries the encoder's own prose block ahead of the data in every article, continuations included, so a decoder has to skip non-uu lines rather than assume the body starts with the encoding. The sidecar's final group is left unpadded, the way a class of broken encoder posted it. Both must come back byte-identical.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "violet.cascade.s01e05.mkv": "1b3ce8824abd781df8013d8b32f1192329da264938d8ed8b6781c6dccefa42e3",
+    "violet.cascade.s01e05.nfo": "449b8c838263b755daa13b6c607f0f2ea37bb001078b82f6f4684d40e3440f4f"
+  }
+}

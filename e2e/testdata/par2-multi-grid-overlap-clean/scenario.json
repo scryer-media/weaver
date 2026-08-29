@@ -1,0 +1,28 @@
+{
+  "slug": "par2-multi-grid-overlap-clean",
+  "title": "Lattice.Harbor.PAR2.MultiGrid.Overlap.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "One clean payload described by independent 64 KiB and 96 KiB PAR2 sets. Both indexes lead the payload, so one decode pass must close both recovery grids without read-back verification.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "forbiddenJobEvents": [
+    "RepairStarted",
+    "RepairComplete",
+    "RepairFailed"
+  ],
+  "runtimeAssertions": {
+    "par2CleanSettlement": {
+      "expectedSetSliceSizes": {
+        "6a197aef97785caa4d20e5ed8628be6f": 65536,
+        "617ae7848ecc6d3878e8b1567b7e19f0": 98304
+      },
+      "expectedSetVerificationModes": {
+        "6a197aef97785caa4d20e5ed8628be6f": ["grid"],
+        "617ae7848ecc6d3878e8b1567b7e19f0": ["grid"]
+      },
+      "verificationReadBytes": 0
+    }
+  },
+  "expectedOutputBLAKE3": {
+    "payload.mkv": "bd8b3991787e2bc03ae0f47bda585f1b9dbd831448493fe3c4a9118f4f947cf2"
+  }
+}

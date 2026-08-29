@@ -17,6 +17,7 @@ use bytes::BytesMut;
 use s2n_tls_sys as s2n;
 use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
+use weaver_yenc::CheckpointPlan;
 
 use crate::client::{
     BodyLaneMode, BodyLaneTraceMeta, DecodedBody, DecodedBodyCpu, DecodedBodyError, DecodedBodyIo,
@@ -32,8 +33,9 @@ use crate::fused_yenc::{
 use crate::pool::{BlockingConnectionPermit, ServerId};
 use crate::response::parse_response;
 use crate::tls::{
-    NntpTlsBackend, RustlsSession, TLS_READ_BUFFER, TransportReadStats, build_tls_config,
-    make_server_name, selected_blocking_tls_backend,
+    NntpTlsBackend, RustlsSession, TLS_READ_BUFFER, TransportReadStats,
+    build_tls_config_with_name_mismatch_certificate, make_server_name,
+    selected_blocking_tls_backend,
 };
 use crate::transfer::{
     ActiveTransferBudget, BodyTransferAccounting, ServerTransferControl, StableServerId,
@@ -113,6 +115,7 @@ struct RawS2nConnection {
 
 pub struct BlockingBodyLane {
     conn: BlockingNntpConnection,
+    checkpoint_plan: CheckpointPlan,
     server_id: ServerId,
     stable_server_id: StableServerId,
     remote_ip: IpAddr,
@@ -137,9 +140,18 @@ pub struct BlockingNntpConnection {
     poisoned: bool,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
+    /// Immutable geometry the next decoded article's CRC pass checkpoints at.
+    /// Set per fetch by the lane; never inherited from a prior job.
+    checkpoint_plan: CheckpointPlan,
 }
 
 impl BlockingBodyLane {
+    /// Apply the batch's immutable geometry before every decoded response, so
+    /// a lane reused by another job cannot carry previous checkpoint state.
+    pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
+        self.checkpoint_plan = checkpoint_plan;
+    }
+
     // These are independent lane identity, transfer policy, address-selection,
     // group, and ownership inputs at the engine boundary.
     #[allow(clippy::too_many_arguments)]
@@ -171,6 +183,7 @@ impl BlockingBodyLane {
                     let remote_ip = conn.remote_ip();
                     return Ok(Self {
                         conn,
+                        checkpoint_plan: CheckpointPlan::None,
                         server_id,
                         stable_server_id,
                         remote_ip,
@@ -190,6 +203,7 @@ impl BlockingBodyLane {
             let remote_ip = conn.remote_ip();
             Ok(Self {
                 conn,
+                checkpoint_plan: CheckpointPlan::None,
                 server_id,
                 stable_server_id,
                 remote_ip,
@@ -427,6 +441,7 @@ impl BlockingBodyLane {
         estimated_body_bytes: u64,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
         let mut budget = ActiveTransferBudget::new(self.soft_timeout);
+        self.conn.set_checkpoint_plan(self.checkpoint_plan.clone());
         match self.conn.stream_yenc_article_with_active_budget(
             message_id,
             estimated_body_bytes,
@@ -442,6 +457,7 @@ impl BlockingBodyLane {
 
     fn read_next_decoded_body(&mut self) -> std::result::Result<DecodedBody, DecodedBodyError> {
         let mut budget = ActiveTransferBudget::new(self.soft_timeout);
+        self.conn.set_checkpoint_plan(self.checkpoint_plan.clone());
         match self
             .conn
             .stream_next_yenc_article_with_active_budget(&mut budget)
@@ -534,6 +550,11 @@ impl BlockingBodyLane {
 }
 
 impl BlockingNntpConnection {
+    /// Declare immutable checkpoint geometry for subsequent decoded articles.
+    pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
+        self.checkpoint_plan = checkpoint_plan;
+    }
+
     pub fn connect_with_ip_policy(
         config: &ServerConfig,
         excluded_ips: &[IpAddr],
@@ -586,9 +607,13 @@ impl BlockingNntpConnection {
         backend_override: Option<NntpTlsBackend>,
     ) -> Result<Self> {
         let transport = if config.tls {
-            let backend = match backend_override {
-                Some(backend) => backend,
-                None => selected_blocking_tls_backend()?,
+            let backend = if config.tls_name_mismatch_certificate_der.is_some() {
+                NntpTlsBackend::ManualRustls
+            } else {
+                match backend_override {
+                    Some(backend) => backend,
+                    None => selected_blocking_tls_backend()?,
+                }
             };
             match backend {
                 NntpTlsBackend::ManualRustls => {
@@ -596,6 +621,7 @@ impl BlockingNntpConnection {
                         tcp,
                         &config.host,
                         config.tls_ca_cert.as_deref(),
+                        config.tls_name_mismatch_certificate_der.as_deref(),
                         config.command_timeout.max(MIN_TIMEOUT),
                     )?))
                 }
@@ -618,7 +644,12 @@ impl BlockingNntpConnection {
             read_buf: BytesMut::with_capacity(read_buf_capacity),
             read_scratch: vec![0; config.buffer_profile.socket_read_size.max(64 * 1024)],
             buffer_profile: config.buffer_profile,
-            capabilities: Capabilities::default(),
+            capabilities: match config.pipelining {
+                crate::connection::PipeliningCapability::Probe => Capabilities::default(),
+                crate::connection::PipeliningCapability::Known(supports) => {
+                    Capabilities::from_pipelining(supports)
+                }
+            },
             remote_addr,
             command_timeout: config.command_timeout.max(MIN_TIMEOUT),
             current_group: None,
@@ -626,6 +657,7 @@ impl BlockingNntpConnection {
             poisoned: false,
             transfer_control: None,
             body_accounting: VecDeque::new(),
+            checkpoint_plan: CheckpointPlan::None,
         };
 
         let greeting = conn.read_response()?;
@@ -637,18 +669,20 @@ impl BlockingNntpConnection {
             _ => return Err(NntpError::unexpected(greeting.code, &greeting.message)),
         }
 
-        conn.fetch_capabilities()?;
-        if conn.capabilities.mode_reader_required() {
-            let resp = conn.send_command(&Command::ModeReader)?;
-            if resp.code.is_error() && resp.code.raw() != 500 {
-                warn!(code = resp.code.raw(), "blocking MODE READER failed");
-            }
+        let resp = conn.send_command(&Command::ModeReader)?;
+        if resp.code.is_error() && resp.code.raw() != 500 {
+            warn!(code = resp.code.raw(), "blocking MODE READER failed");
         }
         if let (Some(user), Some(pass)) = (&config.username, &config.password) {
             let user = user.clone();
             let pass = pass.clone();
             conn.authenticate(&user, &pass)?;
             conn.credentials = Some((user, pass));
+        }
+        if matches!(
+            config.pipelining,
+            crate::connection::PipeliningCapability::Probe
+        ) {
             conn.fetch_capabilities()?;
         }
 
@@ -966,12 +1000,31 @@ impl BlockingNntpConnection {
         self.stream_yenc_article_with_estimate(message_id, 0)
     }
 
+    /// [`Self::stream_yenc_article`], calling `on_chunk` with each decoded
+    /// batch as it is produced rather than only once the article is complete.
+    ///
+    /// The batches handed to `on_chunk` are exactly the ones that end up in
+    /// [`FusedYencArticle::chunks`], in the same order, so a caller can hash or
+    /// write incrementally and still fall back to the buffered article.
+    pub fn stream_yenc_article_with_chunks<F>(
+        &mut self,
+        message_id: &str,
+        on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        self.stream_yenc_article_with_estimate_inner(message_id, 0, None, on_chunk)
+    }
+
     pub fn stream_yenc_article_with_estimate(
         &mut self,
         message_id: &str,
         estimated_body_bytes: u64,
     ) -> std::result::Result<FusedYencArticle, FusedYencError> {
-        self.stream_yenc_article_with_estimate_inner(message_id, estimated_body_bytes, None)
+        self.stream_yenc_article_with_estimate_inner(message_id, estimated_body_bytes, None, |_| {
+            Ok(())
+        })
     }
 
     fn stream_yenc_article_with_active_budget(
@@ -980,15 +1033,24 @@ impl BlockingNntpConnection {
         estimated_body_bytes: u64,
         budget: &mut ActiveTransferBudget,
     ) -> std::result::Result<FusedYencArticle, FusedYencError> {
-        self.stream_yenc_article_with_estimate_inner(message_id, estimated_body_bytes, Some(budget))
+        self.stream_yenc_article_with_estimate_inner(
+            message_id,
+            estimated_body_bytes,
+            Some(budget),
+            |_| Ok(()),
+        )
     }
 
-    fn stream_yenc_article_with_estimate_inner(
+    fn stream_yenc_article_with_estimate_inner<F>(
         &mut self,
         message_id: &str,
         estimated_body_bytes: u64,
         budget: Option<&mut ActiveTransferBudget>,
-    ) -> std::result::Result<FusedYencArticle, FusedYencError> {
+        on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
         self.reserve_body(estimated_body_bytes)?;
         let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
         let initial = match self.send_command_with_active_budget(&cmd, budget.as_deref()) {
@@ -1024,26 +1086,42 @@ impl BlockingNntpConnection {
         } else {
             initial
         };
-        self.stream_yenc_article_response(initial, budget)
+        self.stream_yenc_article_response(initial, budget, on_chunk)
     }
 
     pub fn stream_next_yenc_article(
         &mut self,
     ) -> std::result::Result<FusedYencArticle, FusedYencError> {
-        self.stream_next_yenc_article_inner(None)
+        self.stream_next_yenc_article_inner(None, |_| Ok(()))
+    }
+
+    /// [`Self::stream_next_yenc_article`] with per-batch delivery; see
+    /// [`Self::stream_yenc_article_with_chunks`].
+    pub fn stream_next_yenc_article_with_chunks<F>(
+        &mut self,
+        on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        self.stream_next_yenc_article_inner(None, on_chunk)
     }
 
     fn stream_next_yenc_article_with_active_budget(
         &mut self,
         budget: &mut ActiveTransferBudget,
     ) -> std::result::Result<FusedYencArticle, FusedYencError> {
-        self.stream_next_yenc_article_inner(Some(budget))
+        self.stream_next_yenc_article_inner(Some(budget), |_| Ok(()))
     }
 
-    fn stream_next_yenc_article_inner(
+    fn stream_next_yenc_article_inner<F>(
         &mut self,
         budget: Option<&mut ActiveTransferBudget>,
-    ) -> std::result::Result<FusedYencArticle, FusedYencError> {
+        on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
         let initial = match self.read_response_with_active_budget(budget.as_deref()) {
             Ok(initial) => initial,
             Err(error) => {
@@ -1055,14 +1133,18 @@ impl BlockingNntpConnection {
             self.fail_body_pipeline();
             return Err(NntpError::AuthenticationRequired.into());
         }
-        self.stream_yenc_article_response(initial, budget)
+        self.stream_yenc_article_response(initial, budget, on_chunk)
     }
 
-    fn stream_yenc_article_response(
+    fn stream_yenc_article_response<F>(
         &mut self,
         initial: Response,
         mut budget: Option<&mut ActiveTransferBudget>,
-    ) -> std::result::Result<FusedYencArticle, FusedYencError> {
+        mut on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
         let mut decoder = match FusedYencArticleDecoder::from_body_response(initial) {
             Ok(decoder) => decoder,
             Err(error) => {
@@ -1081,12 +1163,15 @@ impl BlockingNntpConnection {
                 return Err(error);
             }
         };
-        decoder.set_profile_cpu(profile_cpu_timings_enabled());
+        let profile_cpu = profile_cpu_timings_enabled();
+        decoder.set_profile_cpu(profile_cpu);
+        decoder.set_checkpoint_plan(self.checkpoint_plan.clone());
         let mut read_calls = 0u64;
         let mut read_bytes = 0u64;
         let mut transport_read = TransportReadStats::default();
         let mut article_chunks = Vec::new();
         let mut throttle_wait = Duration::ZERO;
+        let mut output_callback_cpu = Duration::ZERO;
 
         loop {
             let payload_before = decoder.body_payload_bytes_consumed();
@@ -1121,13 +1206,23 @@ impl BlockingNntpConnection {
                 }
                 Ok(Some(mut article)) => {
                     let chunks = std::mem::take(&mut article.chunks);
-                    article_chunks.extend(chunks);
+                    if let Err(error) = crate::connection::deliver_fused_output_chunks(
+                        chunks,
+                        &mut article_chunks,
+                        &mut on_chunk,
+                        &mut output_callback_cpu,
+                        profile_cpu,
+                    ) {
+                        self.fail_body_pipeline();
+                        return Err(error);
+                    }
                     article.stats.read_calls = read_calls;
                     article.stats.read_bytes = read_bytes;
                     article.stats.transport_read = transport_read;
                     article.stats.throttle_wait = throttle_wait;
                     article.stats.leftover_bytes_after_terminator = self.read_buf.len() as u64;
                     article.stats.output_batches = article_chunks.len() as u64;
+                    article.stats.output_callback_cpu = output_callback_cpu;
                     article.chunks = article_chunks;
                     if let Some(lane_stats) = self.transport.lane_stats_mut() {
                         lane_stats.body_responses += 1;
@@ -1137,7 +1232,16 @@ impl BlockingNntpConnection {
                     return Ok(article);
                 }
                 Ok(None) => {
-                    article_chunks.extend(decoder.drain_output_chunks());
+                    if let Err(error) = crate::connection::deliver_fused_output_chunks(
+                        decoder.drain_output_chunks(),
+                        &mut article_chunks,
+                        &mut on_chunk,
+                        &mut output_callback_cpu,
+                        profile_cpu,
+                    ) {
+                        self.fail_body_pipeline();
+                        return Err(error);
+                    }
                 }
             }
 
@@ -1278,6 +1382,7 @@ impl BlockingManualTlsStream {
         tcp: TcpStream,
         host: &str,
         ca_cert_path: Option<&std::path::Path>,
+        adopted_name_mismatch_certificate_der: Option<&[u8]>,
         timeout: Duration,
     ) -> Result<Self> {
         tcp.set_read_timeout(Some(timeout)).map_err(NntpError::Io)?;
@@ -1285,7 +1390,10 @@ impl BlockingManualTlsStream {
             .map_err(NntpError::Io)?;
         tcp.set_nonblocking(false).map_err(NntpError::Io)?;
 
-        let config = build_tls_config(ca_cert_path)?;
+        let config = build_tls_config_with_name_mismatch_certificate(
+            ca_cert_path,
+            adopted_name_mismatch_certificate_der,
+        )?;
         let server_name = make_server_name(host)?;
         let session = RustlsSession::new(config, server_name)?;
         let mut stream = Self {
@@ -1648,8 +1756,21 @@ impl RawS2nConfig {
         check_s2n_status("load CA PEM", unsafe {
             s2n::s2n_config_add_pem_to_trust_store(config.as_ptr(), pem.as_ptr())
         })?;
+        // Pinned OFF, deliberately and permanently: the read loop
+        // (`read_buffered_pull_direct`) already IS the multi-record
+        // optimization — it drains one record per `s2n_recv` into advancing
+        // offsets of the destination until the target fills or s2n is dry,
+        // so every record is copied exactly once and the per-call cost being
+        // amortized is a bare FFI call. s2n's internal multi-record mode
+        // reaches the same call shape by assembling through its own buffered
+        // plaintext first — extra copy work per byte to economize calls that
+        // cost nothing here. It measured worse for exactly that reason. An
+        // env switch used to offer this as a "try it" knob; it was a trap —
+        // the name promises batching wins the loop above already delivers.
+        // Pinned rather than left to the library default so an upstream
+        // default change cannot silently reintroduce the copies.
         check_s2n_status("configure multi-record receive", unsafe {
-            s2n::s2n_config_set_recv_multi_record(config.as_ptr(), multi_record_receive_enabled())
+            s2n::s2n_config_set_recv_multi_record(config.as_ptr(), false)
         })?;
         Ok(config)
     }
@@ -1657,20 +1778,6 @@ impl RawS2nConfig {
     fn as_ptr(&self) -> *mut s2n::s2n_config {
         self.ptr.as_ptr()
     }
-}
-
-/// Multi-record receive decrypts every full record already buffered before
-/// returning, trading larger reads for extra buffered-copy work. Off by
-/// default (single-record reads measured better under the previous allocator
-/// economics); env-gated so the trade can be re-measured without a rebuild.
-#[cfg(not(windows))]
-fn multi_record_receive_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("WEAVER_NNTP_S2N_MULTI_RECORD")
-            .map(|value| matches!(value.trim(), "1" | "true" | "on"))
-            .unwrap_or(false)
-    })
 }
 
 #[cfg(not(windows))]
@@ -1810,7 +1917,7 @@ fn decoded_body_from_article(article: FusedYencArticle) -> DecodedBody {
         cpu: decoded_cpu_from_fused_stats(&article.stats),
         io: decoded_io_from_fused_stats(&article.stats),
         decoded: article.chunks,
-        result: article.result,
+        body: article.body,
     }
 }
 
@@ -1943,6 +2050,8 @@ fn is_connection_error(err: &NntpError) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::io::BufRead;
+    use std::net::TcpListener;
     use std::sync::Arc;
     #[cfg(not(windows))]
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -2182,8 +2291,63 @@ mod tests {
             command_timeout: Duration::from_secs(5),
             buffer_profile: NntpBufferProfile::default(),
             tls_ca_cert: Some(ca_path.clone()),
+            tls_name_mismatch_certificate_der: None,
+            pipelining: crate::connection::PipeliningCapability::Probe,
         };
         (config, handle, ca_path)
+    }
+
+    #[cfg(not(windows))]
+    fn spawn_partial_tls_record_proxy(
+        upstream_port: u16,
+        stall: Duration,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut downstream, _) = listener.accept().unwrap();
+            let mut upstream = TcpStream::connect(("127.0.0.1", upstream_port)).unwrap();
+            let mut request_reader = downstream.try_clone().unwrap();
+            let mut request_writer = upstream.try_clone().unwrap();
+            let request_forwarder = std::thread::spawn(move || {
+                let _ = io::copy(&mut request_reader, &mut request_writer);
+            });
+
+            let mut fragmented = false;
+            loop {
+                let mut header = [0u8; 5];
+                if upstream.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let record_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+                let mut payload = vec![0u8; record_len];
+                if upstream.read_exact(&mut payload).is_err() {
+                    break;
+                }
+
+                if header[0] == 0x17 && record_len >= 8 * 1024 {
+                    downstream.write_all(&header).unwrap();
+                    downstream.write_all(&payload[..record_len / 2]).unwrap();
+                    downstream.flush().unwrap();
+                    fragmented = true;
+                    std::thread::sleep(stall);
+                    break;
+                }
+
+                downstream.write_all(&header).unwrap();
+                downstream.write_all(&payload).unwrap();
+                downstream.flush().unwrap();
+            }
+
+            let _ = downstream.shutdown(std::net::Shutdown::Both);
+            let _ = upstream.shutdown(std::net::Shutdown::Both);
+            let _ = request_forwarder.join();
+            assert!(
+                fragmented,
+                "proxy never observed a large TLS application record"
+            );
+        });
+        (port, handle)
     }
 
     fn test_transfer_control(
@@ -2227,13 +2391,76 @@ mod tests {
         let _ = std::fs::remove_file(ca_path);
     }
 
-    fn tls_lane_reads_pipelined_body_responses(backend: NntpTlsBackend) {
-        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
-            ("<one@test>", TestArticle::Body(b"first article".to_vec())),
-            ("<two@test>", TestArticle::Body(b"second article".to_vec())),
-        ]);
+    /// E12: the blocking article reader had no chunk callback at all, so every
+    /// caller buffered the whole article and `output_callback_cpu` was
+    /// permanently zero. Decoded batches must now reach the callback as they
+    /// are produced, in order, and concatenate to the buffered article.
+    fn tls_lane_delivers_decoded_batches_to_chunk_callback(backend: NntpTlsBackend) {
+        // Two full 512 KiB batches plus a remainder.
+        let original: Vec<u8> = (0..(2 * 512 * 1024 + 123))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<batched@test>",
+            TestArticle::Body(original.clone()),
+        )]);
         let mut conn = connect_with_backend(&config, backend);
         conn.select_group("alt.test").unwrap();
+
+        let mut delivered: Vec<Vec<u8>> = Vec::new();
+        let article = conn
+            .stream_yenc_article_with_chunks("<batched@test>", |chunk| {
+                delivered.push(chunk.to_vec());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(delivered.len(), 3, "batch lengths {:?}", {
+            delivered.iter().map(Vec::len).collect::<Vec<_>>()
+        });
+        assert_eq!(delivered[0].len(), 512 * 1024);
+        assert_eq!(delivered[1].len(), 512 * 1024);
+        assert_eq!(delivered[2].len(), 123);
+
+        let streamed: Vec<u8> = delivered.concat();
+        assert_eq!(streamed, original);
+        assert_eq!(streamed, article.to_data());
+        assert_eq!(article.stats.output_batches as usize, delivered.len());
+
+        conn.quit().unwrap();
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
+    fn tls_lane_reads_pipelined_body_responses(backend: NntpTlsBackend) {
+        let sequential_data = vec![0x11; 512];
+        let first_data = vec![0x22; 512];
+        let second_data = vec![0x33; 512];
+        let reset_data = vec![0x44; 512];
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
+            (
+                "<sequential@test>",
+                TestArticle::Body(sequential_data.clone()),
+            ),
+            ("<one@test>", TestArticle::Body(first_data.clone())),
+            ("<two@test>", TestArticle::Body(second_data.clone())),
+            ("<reset@test>", TestArticle::Body(reset_data.clone())),
+        ]);
+        let checkpoint_plan = CheckpointPlan::from_sizes([
+            std::num::NonZeroU64::new(64).unwrap(),
+            std::num::NonZeroU64::new(96).unwrap(),
+        ])
+        .plan;
+        let mut conn = connect_with_backend(&config, backend);
+        conn.select_group("alt.test").unwrap();
+        conn.set_checkpoint_plan(checkpoint_plan.clone());
+
+        let sequential = conn.stream_yenc_article("<sequential@test>").unwrap();
+        let sequential_result = sequential.body.yenc().unwrap();
+        assert_eq!(sequential_result.checkpoint_plan, checkpoint_plan);
+        assert!(sequential_result.segments.len() > 1);
+        assert_eq!(sequential.into_data(), sequential_data);
+
         conn.write_body_request("<one@test>").unwrap();
         conn.write_body_request("<two@test>").unwrap();
         conn.flush_commands().unwrap();
@@ -2241,8 +2468,24 @@ mod tests {
         let first = conn.stream_next_yenc_article().unwrap();
         let second = conn.stream_next_yenc_article().unwrap();
 
-        assert_eq!(first.into_data(), b"first article");
-        assert_eq!(second.into_data(), b"second article");
+        let first_result = first.body.yenc().unwrap();
+        assert_eq!(first_result.checkpoint_plan, checkpoint_plan);
+        assert!(first_result.segments.len() > 1);
+        assert_eq!(first.into_data(), first_data);
+        let second_result = second.body.yenc().unwrap();
+        assert_eq!(second_result.checkpoint_plan, checkpoint_plan);
+        assert!(second_result.segments.len() > 1);
+        assert_eq!(second.into_data(), second_data);
+
+        conn.set_checkpoint_plan(CheckpointPlan::None);
+        conn.write_body_request("<reset@test>").unwrap();
+        conn.flush_commands().unwrap();
+        let reset = conn.stream_next_yenc_article().unwrap();
+        let reset_result = reset.body.yenc().unwrap();
+        assert_eq!(reset_result.checkpoint_plan, CheckpointPlan::None);
+        assert_eq!(reset_result.segments.len(), 1);
+        assert_eq!(reset.into_data(), reset_data);
+
         assert!(conn.stats().tls_recv_calls > 0);
         assert!(conn.stats().tls_send_calls > 0);
         conn.quit().unwrap();
@@ -2357,6 +2600,67 @@ mod tests {
         let _ = std::fs::remove_file(ca_path);
     }
 
+    fn assert_blocking_known_pipelining_skips_capabilities_probe(supports_pipelining: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.write_all(b"200 ready\r\n").unwrap();
+            socket.flush().unwrap();
+
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut mode_reader = String::new();
+            reader.read_line(&mut mode_reader).unwrap();
+            assert!(mode_reader.starts_with("MODE READER"));
+            socket
+                .write_all(b"500 MODE READER unsupported\r\n")
+                .unwrap();
+            socket.flush().unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
+            let mut trailing = String::new();
+            match reader.read_line(&mut trailing) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                Ok(0) => {}
+                Ok(_) => panic!("known capability mode sent an unexpected command: {trailing:?}"),
+                Err(error) => panic!("unexpected read error: {error}"),
+            }
+        });
+
+        let config = ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            connect_timeout: Duration::from_secs(1),
+            command_timeout: Duration::from_secs(1),
+            pipelining: crate::connection::PipeliningCapability::Known(supports_pipelining),
+            ..Default::default()
+        };
+        let conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+        assert_eq!(
+            conn.capabilities().supports_pipelining(),
+            supports_pipelining
+        );
+        drop(conn);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn blocking_known_pipelining_skips_capabilities_probe() {
+        assert_blocking_known_pipelining_skips_capabilities_probe(true);
+    }
+
+    #[test]
+    fn blocking_known_non_pipelining_skips_capabilities_probe() {
+        assert_blocking_known_pipelining_skips_capabilities_probe(false);
+    }
+
     #[test]
     fn blocking_rustls_reads_single_body_response() {
         tls_lane_reads_single_body_response(NntpTlsBackend::ManualRustls);
@@ -2365,6 +2669,11 @@ mod tests {
     #[test]
     fn blocking_rustls_reads_pipelined_body_responses() {
         tls_lane_reads_pipelined_body_responses(NntpTlsBackend::ManualRustls);
+    }
+
+    #[test]
+    fn blocking_rustls_delivers_decoded_batches_to_chunk_callback() {
+        tls_lane_delivers_decoded_batches_to_chunk_callback(NntpTlsBackend::ManualRustls);
     }
 
     #[test]
@@ -2438,9 +2747,12 @@ mod tests {
 
     #[test]
     fn blocking_rustls_rate_wait_is_excluded_from_active_budget() {
+        const BODY_LEN: usize = 2_000;
+        const ACTIVE_BUDGET: Duration = Duration::from_millis(500);
+
         let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
             "<rate-wait@test>",
-            TestArticle::Body(vec![b'A'; 1_200]),
+            TestArticle::Body(vec![b'A'; BODY_LEN]),
         )]);
         let mut conn = connect_with_backend(&config, NntpTlsBackend::ManualRustls);
         let control = crate::transfer::ServerTransferRegistry::new().configure(
@@ -2452,15 +2764,18 @@ mod tests {
         );
         conn.set_transfer_control(Some(control));
         conn.select_group("alt.test").unwrap();
-        let mut budget = ActiveTransferBudget::new(Duration::from_millis(50));
+        let mut budget = ActiveTransferBudget::new(ACTIVE_BUDGET);
 
-        let started = Instant::now();
         let article = conn
             .stream_yenc_article_with_active_budget("<rate-wait@test>", 0, &mut budget)
             .expect("deliberate rate wait must not exhaust the active budget");
 
-        assert!(started.elapsed() >= Duration::from_millis(100));
-        assert_eq!(article.into_data(), vec![b'A'; 1_200]);
+        assert!(
+            article.stats.throttle_wait > ACTIVE_BUDGET,
+            "test must force a throttle wait longer than the active budget: {:?}",
+            article.stats.throttle_wait
+        );
+        assert_eq!(article.into_data(), vec![b'A'; BODY_LEN]);
         conn.quit().unwrap();
         handle.join().unwrap();
         let _ = std::fs::remove_file(ca_path);
@@ -2495,7 +2810,7 @@ mod tests {
         let mut budget = ActiveTransferBudget::new(Duration::ZERO);
 
         let error = conn
-            .stream_yenc_article_response(initial, Some(&mut budget))
+            .stream_yenc_article_response(initial, Some(&mut budget), |_| Ok(()))
             .unwrap_err();
 
         assert!(matches!(
@@ -2528,6 +2843,13 @@ mod tests {
     fn blocking_s2n_fd_reads_pipelined_body_responses() {
         let _guard = s2n_test_guard();
         tls_lane_reads_pipelined_body_responses(NntpTlsBackend::S2n);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_s2n_delivers_decoded_batches_to_chunk_callback() {
+        let _guard = s2n_test_guard();
+        tls_lane_delivers_decoded_batches_to_chunk_callback(NntpTlsBackend::S2n);
     }
 
     #[cfg(not(windows))]
@@ -2637,6 +2959,42 @@ mod tests {
         let _ = std::fs::remove_file(ca_path);
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_s2n_partial_tls_record_respects_active_budget() {
+        let _guard = s2n_test_guard();
+        let (mut config, server_handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<partial-record@test>",
+            TestArticle::Body(vec![b'A'; 256 * 1024]),
+        )]);
+        let (proxy_port, proxy_handle) =
+            spawn_partial_tls_record_proxy(config.port, Duration::from_secs(2));
+        config.port = proxy_port;
+
+        let mut conn = connect_with_backend(&config, NntpTlsBackend::S2n);
+        conn.select_group("alt.test").unwrap();
+        let mut budget = ActiveTransferBudget::new(Duration::from_millis(150));
+        let started = Instant::now();
+        let result =
+            conn.stream_yenc_article_with_active_budget("<partial-record@test>", 0, &mut budget);
+        let elapsed = started.elapsed();
+
+        drop(conn);
+        proxy_handle.join().unwrap();
+        let _ = server_handle.join();
+        let _ = std::fs::remove_file(ca_path);
+
+        let error = result.expect_err("an incomplete TLS record must not produce an article");
+        assert!(matches!(
+            error,
+            FusedYencError::Nntp(NntpError::SoftTimeout(_))
+        ));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "partial TLS record ignored active budget for {elapsed:?}"
+        );
+    }
+
     const TLS_DRAIN_RECORD_BYTES: usize = 16 * 1024;
     const TLS_DRAIN_RECORDS: usize = 8;
 
@@ -2695,6 +3053,7 @@ mod tests {
             tcp,
             "localhost",
             Some(&ca_path),
+            None,
             Duration::from_secs(5),
         )
         .expect("blocking rustls connect");

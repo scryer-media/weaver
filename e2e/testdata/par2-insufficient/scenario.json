@@ -1,0 +1,7 @@
+{
+  "slug": "par2-insufficient",
+  "title": "E2E.Test.PAR2.Insufficient.2024.1080p-TESTGRP",
+  "description": "RAR5 with 25MB corrupted (16 damaged blocks). Only 1 recovery block available. Tests graceful repair failure.",
+  "category": "2000",
+  "expected_outcome": "repair_failure"
+}

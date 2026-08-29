@@ -122,18 +122,35 @@ fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         .find_map(|cookie| cookie.strip_prefix(&prefix).map(|value| value.to_string()))
 }
 
-fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
+fn explicit_api_key(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
+    let bearer = match headers.get(header::AUTHORIZATION) {
+        Some(value) => {
+            let value = value.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+            let value = value
+                .strip_prefix("Bearer ")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or(StatusCode::UNAUTHORIZED)?;
+            Some(value.to_owned())
+        }
+        None => None,
+    };
+    let api_key = match headers.get("x-api-key") {
+        Some(value) => {
+            let value = value.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+            (!value.is_empty())
+                .then(|| value.to_owned())
+                .ok_or(StatusCode::UNAUTHORIZED)
+                .map(Some)?
+        }
+        None => None,
+    };
 
-/// Check if login auth is enabled and return the cached JWT secret if so.
-pub(super) fn jwt_secret_if_auth_enabled(auth_cache: &LoginAuthCache) -> Option<[u8; 32]> {
-    auth_cache.snapshot().map(|auth| auth.jwt_secret)
+    match (bearer, api_key) {
+        (Some(bearer), Some(api_key)) if bearer != api_key => Err(StatusCode::UNAUTHORIZED),
+        (Some(key), _) | (_, Some(key)) => Ok(Some(key)),
+        (None, None) => Ok(None),
+    }
 }
 
 pub(super) fn caller_scope_from_api_key_scope(scope: &str) -> CallerScope {
@@ -218,29 +235,29 @@ pub(super) struct ResolvedCaller {
     pub(super) identity: CallerIdentity,
 }
 
-/// Resolve the caller scope and stable request identity from API key header, JWT cookie, or session token.
+/// Browser session cookies are accepted only on browser-facing routes whose
+/// immediate socket peer has been explicitly trusted by the operator.
+#[derive(Clone, Copy)]
+pub(super) enum BrowserSessionPolicy {
+    TrustedPeer(Option<SocketAddr>),
+    Denied,
+}
+
+/// Resolve the caller scope and stable request identity from persistent API
+/// key headers, a login JWT cookie, or a trusted-peer browser session cookie.
 pub(super) async fn resolve_caller(
     db: &Database,
     auth_cache: &LoginAuthCache,
     api_key_cache: &ApiKeyCache,
     session_token: &str,
+    security: &RuntimeSecurityConfig,
+    browser_session: BrowserSessionPolicy,
     headers: &HeaderMap,
 ) -> Result<ResolvedCaller, StatusCode> {
-    let api_key_header = headers.get("x-api-key");
-    let bearer_token = extract_bearer_token(headers);
-    let presented_token = bearer_token
-        .as_deref()
-        .or_else(|| api_key_header.and_then(|value| value.to_str().ok()));
-
-    // 1. Bearer token or API key header (session token or stored key).
-    if let Some(raw_key) = presented_token {
-        if raw_key == session_token {
-            return Ok(ResolvedCaller {
-                scope: CallerScope::Local,
-                identity: CallerIdentity::Local(hash_api_key(raw_key)),
-            });
-        }
-        let key_hash = hash_api_key(raw_key);
+    // An explicit machine credential must be a persistent API key. In
+    // particular, never fall back to browser cookies after an invalid header.
+    if let Some(raw_key) = explicit_api_key(headers)? {
+        let key_hash = hash_api_key(&raw_key);
         if let Some(row) = lookup_api_key_auth(db, api_key_cache, key_hash).await? {
             queue_touch_api_key_last_used(db, row.id);
             return Ok(ResolvedCaller {
@@ -248,6 +265,7 @@ pub(super) async fn resolve_caller(
                 identity: CallerIdentity::ApiKey(row.key_hash),
             });
         }
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     // 2. JWT cookie (when login auth is enabled).
@@ -262,9 +280,11 @@ pub(super) async fn resolve_caller(
         });
     }
 
-    // 3. No login auth enabled: accept the browser-only session cookie issued
-    // by the SPA index response.
-    if cached_auth.is_none()
+    // A browser cookie is process-bound *and* peer-bound. Once login is
+    // enabled, credentials always take precedence over trusted-network access.
+    if let BrowserSessionPolicy::TrustedPeer(peer) = browser_session
+        && cached_auth.is_none()
+        && security.is_trusted_peer(peer)
         && let Some(cookie) = extract_session_cookie(headers)
         && cookie == session_token
     {
@@ -277,19 +297,27 @@ pub(super) async fn resolve_caller(
     Err(StatusCode::UNAUTHORIZED)
 }
 
-/// Resolve the caller scope from API key header, JWT cookie, or session token.
+/// Resolve the caller scope with an explicit browser-session policy.
 pub(super) async fn resolve_scope(
     db: &Database,
     auth_cache: &LoginAuthCache,
     api_key_cache: &ApiKeyCache,
     session_token: &str,
+    security: &RuntimeSecurityConfig,
+    browser_session: BrowserSessionPolicy,
     headers: &HeaderMap,
 ) -> Result<CallerScope, StatusCode> {
-    Ok(
-        resolve_caller(db, auth_cache, api_key_cache, session_token, headers)
-            .await?
-            .scope,
+    Ok(resolve_caller(
+        db,
+        auth_cache,
+        api_key_cache,
+        session_token,
+        security,
+        browser_session,
+        headers,
     )
+    .await?
+    .scope)
 }
 
 #[derive(Deserialize)]
@@ -350,6 +378,284 @@ pub(super) async fn login_handler(
         Json(serde_json::json!({ "ok": true })),
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SetupRequest {
+    mode: String,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    bind_address: Option<String>,
+    #[serde(default)]
+    trusted_networks: Option<Vec<String>>,
+}
+
+/// Complete first-run setup from the browser: pick an access mode, optionally
+/// create the login, optionally widen the binding.
+///
+/// This is the wizard's endpoint, and its whole reason to exist is that every
+/// peer product does setup in the browser while Weaver used to demand
+/// environment variables. It is callable exactly once — while no credentials
+/// are stored — and only from loopback or an already-trusted peer, which is
+/// the same trust argument the loopback bind default rests on: the first
+/// browser to reach a fresh instance from the machine itself is the operator.
+pub(super) async fn setup_handler(
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Extension(db): Extension<Database>,
+    Extension(auth_cache): Extension<LoginAuthCache>,
+    Extension(security): Extension<RuntimeSecurityConfig>,
+    Extension(session_token): Extension<super::SessionToken>,
+    Json(body): Json<SetupRequest>,
+) -> Response {
+    use weaver_server_core::security::{
+        AccessMode, LOCAL_NETWORK_PRESETS, LOOPBACK_NETWORKS, SETTING_ACCESS_MODE,
+        SETTING_HTTP_BIND_ADDRESS, SETTING_TRUSTED_NETWORKS, ip_is_loopback, resolve_bind_address,
+    };
+
+    if auth_cache.snapshot().is_some() {
+        return super::error_response(StatusCode::CONFLICT, "setup is already complete");
+    }
+    // Canonical loopback: on a dual-stack listener the machine's own browser
+    // arrives as `::ffff:127.0.0.1`, which must not be refused as remote.
+    if !ip_is_loopback(peer_addr.ip()) && !security.is_trusted_peer(Some(peer_addr)) {
+        return super::error_response(
+            StatusCode::FORBIDDEN,
+            "setup must be completed from the machine Weaver runs on",
+        );
+    }
+
+    let Some(mode) = AccessMode::parse_setting_value(&body.mode) else {
+        return super::error_response(StatusCode::BAD_REQUEST, "unknown access mode");
+    };
+    // With the trust list pinned by the environment, the wizard's only real
+    // effect is creating credentials. No-login creates none and stores
+    // nothing, which would complete setup as a total no-op and leave this
+    // browser exactly where it started — refuse it instead of pretending.
+    if security.trust_env_pinned && matches!(mode, AccessMode::NoLogin) {
+        return super::error_response(
+            StatusCode::BAD_REQUEST,
+            "WEAVER_TRUSTED_CIDRS pins the browser-access policy in this deployment's \
+             environment; choose a login mode",
+        );
+    }
+
+    // Credentials: required for the two login modes, refused for no-login so a
+    // password can never be silently collected and ignored.
+    let credentials = match mode {
+        AccessMode::LoginRequired | AccessMode::LoginExceptLocal => {
+            let username = body.username.as_deref().unwrap_or("").trim().to_string();
+            let password = body.password.clone().unwrap_or_default();
+            if username.is_empty() || password.is_empty() {
+                return super::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "username and password are required for this access mode",
+                );
+            }
+            Some((username, password))
+        }
+        AccessMode::NoLogin => {
+            if body.username.is_some() || body.password.is_some() {
+                return super::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "no-login mode does not take credentials",
+                );
+            }
+            None
+        }
+    };
+
+    // Trusted networks: only meaningful for except-local; the preset when the
+    // wizard sends nothing. Validated all-or-nothing through the same parser
+    // startup settles with.
+    let trusted_networks: Vec<String> = match (&mode, &body.trusted_networks) {
+        (AccessMode::LoginExceptLocal, Some(entries)) => {
+            let cleaned: Vec<String> = entries
+                .iter()
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect();
+            if cleaned.is_empty() {
+                return super::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "trusted networks must not be empty for this access mode",
+                );
+            }
+            cleaned
+        }
+        (AccessMode::LoginExceptLocal, None) => LOCAL_NETWORK_PRESETS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        (AccessMode::NoLogin, _) => LOOPBACK_NETWORKS.iter().map(|s| s.to_string()).collect(),
+        (AccessMode::LoginRequired, _) => Vec::new(),
+    };
+    let networks_json = serde_json::to_string(&trusted_networks).unwrap_or_else(|_| "[]".into());
+    let parsed_networks =
+        match weaver_server_core::security::parse_trusted_networks_json(&networks_json) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return super::error_response(StatusCode::BAD_REQUEST, &error.to_string());
+            }
+        };
+
+    // Bind address: validated exactly as startup resolves it; ignored with a
+    // note when the environment pins it, because storing a value the process
+    // will never read is a lie waiting to be discovered.
+    let bind_pinned_by_env = !security.bind_address_source.is_editable();
+    let bind_to_store = match body
+        .bind_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None => None,
+        Some(_) if bind_pinned_by_env => None,
+        Some(value) => match resolve_bind_address(None, Some(value)) {
+            Ok(_) => Some(value.to_string()),
+            Err(error) => {
+                return super::error_response(StatusCode::BAD_REQUEST, &error.to_string());
+            }
+        },
+    };
+
+    // Persist everything, then apply the live effects.
+    let hashed = match credentials.clone() {
+        Some((username, password)) => {
+            let hash_result =
+                tokio::task::spawn_blocking(move || jwt::hash_password(&password)).await;
+            match hash_result {
+                Ok(Ok(hash)) => Some((username, hash)),
+                Ok(Err(error)) => {
+                    return super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &error);
+                }
+                Err(error) => {
+                    return super::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &error.to_string(),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+
+    // The environment pins the browser-access policy exactly as it pins the
+    // bind address: the wizard's answer is neither stored nor applied live,
+    // so a running env-managed instance can never have its trust list swapped
+    // out from under the deployment by a loopback browser. Credentials are
+    // still created — they are the half the environment did not answer.
+    let trust_pinned_by_env = security.trust_env_pinned;
+    let db_for_write = db.clone();
+    let mode_value = mode.as_setting_value().to_string();
+    let networks_json = networks_json.clone();
+    let bind_for_write = bind_to_store.clone();
+    let hashed_for_write = hashed.clone();
+    let store_trusted = matches!(mode, AccessMode::LoginExceptLocal) && !trust_pinned_by_env;
+    let write_result = tokio::task::spawn_blocking(move || {
+        if !trust_pinned_by_env {
+            db_for_write.set_setting(SETTING_ACCESS_MODE, &mode_value)?;
+        }
+        if store_trusted {
+            db_for_write.set_setting(SETTING_TRUSTED_NETWORKS, &networks_json)?;
+        }
+        if let Some(address) = bind_for_write.as_deref() {
+            db_for_write.set_setting(SETTING_HTTP_BIND_ADDRESS, address)?;
+        }
+        let jwt_secret = match hashed_for_write {
+            Some((username, hash)) => {
+                db_for_write.set_auth_credentials(&username, &hash)?;
+                Some(db_for_write.rotate_jwt_signing_secret()?)
+            }
+            None => None,
+        };
+        Ok::<_, weaver_server_core::StateError>(jwt_secret)
+    })
+    .await;
+    let jwt_secret = match write_result {
+        Ok(Ok(secret)) => secret,
+        Ok(Err(error)) => {
+            return super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+        Err(error) => {
+            return super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+    };
+
+    // Live effects: trust applies immediately (the shared list every clone
+    // reads), credentials swap into the cache, and the wizard's own browser is
+    // signed in so completing setup lands in the app rather than at a login
+    // form. Only the bind address waits for a restart.
+    if !trust_pinned_by_env {
+        security.set_trusted_cidrs(parsed_networks);
+        // The policy is settled from this instant, which is what stops a
+        // no-login install re-offering this wizard to every browser it does
+        // not trust. (An env-pinned deployment was settled at startup.)
+        security.mark_security_configured();
+    }
+
+    let mut response_headers: Vec<(header::HeaderName, String)> = Vec::new();
+    // A no-login install that now trusts this browser's own machine gets the
+    // browser session cookie the next page load would hand it anyway. The
+    // wizard's remaining calls are made from THIS page, which never reloads
+    // when the operator restarts Weaver from it.
+    if credentials.is_none() && security.is_trusted_peer(Some(peer_addr)) {
+        response_headers.push((
+            header::SET_COOKIE,
+            session_cookie_value(session_token.0.as_str(), &security),
+        ));
+    }
+    if let (Some((username, hash)), Some(secret)) = (hashed, jwt_secret) {
+        let cached = weaver_server_core::auth::CachedLoginAuth::new(username, hash, secret);
+        let token = jwt::create_jwt(&cached.username, &cached.jwt_secret, JWT_TTL_SECS);
+        auth_cache.replace(Some(cached));
+        response_headers.push((
+            header::SET_COOKIE,
+            format!(
+                "{JWT_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={JWT_TTL_SECS}{}",
+                secure_cookie_suffix(&security)
+            ),
+        ));
+    }
+
+    let restart_required_for_bind = bind_to_store.is_some();
+    tracing::info!(
+        mode = mode.as_setting_value(),
+        login_created = credentials.is_some(),
+        bind_stored = restart_required_for_bind,
+        bind_ignored_env_pinned = bind_pinned_by_env
+            && body
+                .bind_address
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty()),
+        "first-run setup completed from the wizard"
+    );
+
+    // Whether the browser may offer to do the restart itself, answered from the
+    // same rule the restart endpoint enforces.
+    let restart_capability = weaver_server_core::runtime::restart::current_restart_capability();
+    let mut response = (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "restartRequiredForBind": restart_required_for_bind,
+            "bindIgnoredBecauseEnvPinned": bind_pinned_by_env
+                && body.bind_address.as_deref().is_some_and(|v| !v.trim().is_empty()),
+            "accessPolicyIgnoredBecauseEnvPinned": trust_pinned_by_env,
+            "restartSupported": restart_capability.supported,
+            "restartUnsupportedReason": restart_capability.reason,
+        })),
+    )
+        .into_response();
+    for (name, value) in response_headers {
+        if let Ok(value) = value.parse() {
+            response.headers_mut().append(name, value);
+        }
+    }
+    response
 }
 
 pub(super) async fn logout_handler(
@@ -475,21 +781,49 @@ mod tests {
 
 pub(super) async fn auth_status_handler(
     Extension(auth_cache): Extension<LoginAuthCache>,
+    Extension(security): Extension<RuntimeSecurityConfig>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> Json<serde_json::Value> {
     let creds = auth_cache.snapshot();
-    let authenticated = if let Some(creds) = creds.as_ref() {
+    let login_authenticated = if let Some(creds) = creds.as_ref() {
         if let Some(token) = extract_jwt_cookie(&headers) {
             jwt::verify_jwt(&token, &creds.jwt_secret).is_ok()
         } else {
             false
         }
     } else {
-        true // auth not enabled -> everyone is "authenticated"
+        false
     };
+    let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
+    let trusted_peer = security.is_trusted_peer(peer);
+    // Setup is offered to exactly the browsers that could complete it:
+    // `setup_handler` admits loopback-or-trusted, and a trusted peer skips
+    // the wizard entirely (it is already admitted), which leaves loopback.
+    // The loopback term is what stops the two permanent loops — a CONFIGURED
+    // no-login instance looks like "no credentials, not trusted" to every
+    // outside browser, and inside a container NO outside browser is ever
+    // loopback — while still reopening the wizard for the machine's own
+    // browser after WEAVER_RESET_LOGIN clears the credentials on an
+    // already-configured install.
+    let setup_required = creds.is_none()
+        && !trusted_peer
+        && peer.is_some_and(|peer| weaver_server_core::security::ip_is_loopback(peer.ip()));
 
-    Json(serde_json::json!({
+    let mut status = serde_json::json!({
         "enabled": creds.is_some(),
-        "authenticated": authenticated,
-    }))
+        "authenticated": login_authenticated || trusted_peer,
+        "setupRequired": setup_required,
+    });
+    // Only a browser about to run the first-run wizard is told how this
+    // deployment is packaged. This endpoint is unauthenticated, so a
+    // configured install must not describe itself to anyone who asks.
+    if setup_required {
+        let environment = weaver_server_core::runtime::environment::detect_runtime_environment();
+        status["setup"] = serde_json::json!({
+            "bindEditable": security.bind_address_source.is_editable(),
+            "deployment": environment.deployment.as_str(),
+        });
+    }
+    Json(status)
 }

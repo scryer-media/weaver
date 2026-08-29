@@ -1,10 +1,10 @@
 use std::future::Future;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::Database;
 use crate::jobs::JobSpec;
@@ -15,7 +15,10 @@ use crate::{SchedulerError, SchedulerHandle};
 use weaver_nzb::Nzb;
 
 use super::persisted_nzb;
-use crate::ingest::{append_original_title_metadata, derive_release_name, nzb_password_candidates};
+use crate::ingest::{
+    append_original_title_metadata, derive_release_name, nzb_password_candidates,
+    strip_nzb_source_suffix,
+};
 use crate::jobs::{
     CallerScopedIdempotency, DuplicateAction, DuplicateAdmission, DuplicateAdmissionRequest,
     DuplicateBackfillEntry, DuplicateDecision, DuplicateMode, FileSpec, FingerprintEvidence,
@@ -32,9 +35,34 @@ const MAX_FETCH_REDIRECTS: usize = 10;
 pub struct SubmittedJob {
     pub job_id: JobId,
     pub job_hash: [u8; 32],
-    pub spec: JobSpec,
+    pub summary: SubmittedJobSummary,
     pub created_at_epoch_ms: f64,
     pub duplicate_outcome: SubmissionDuplicateOutcome,
+}
+
+#[derive(Clone)]
+pub struct SubmittedJobSummary {
+    pub name: String,
+    pub password: Option<String>,
+    pub category: Option<String>,
+    pub metadata: Vec<(String, String)>,
+    pub total_bytes: u64,
+    pub file_count: u32,
+    pub remaining_par_count: u32,
+}
+
+impl SubmittedJobSummary {
+    fn from_spec(spec: &JobSpec) -> Self {
+        Self {
+            name: spec.name.clone(),
+            password: spec.password.clone(),
+            category: spec.category.clone(),
+            metadata: spec.metadata.clone(),
+            total_bytes: spec.total_bytes,
+            file_count: spec.files.len() as u32,
+            remaining_par_count: spec.par2_volume_count() as u32,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +88,7 @@ pub struct DuplicateBackfillReport {
 
 struct PreparedSubmission {
     nzb_zstd: Vec<u8>,
+    raw_job_hash: [u8; 32],
     filename: Option<String>,
     password: Option<String>,
     category: Option<String>,
@@ -67,33 +96,29 @@ struct PreparedSubmission {
     submit_started: Instant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CategoryResolutionMode {
-    ResolveConfigured,
-    PreserveSubmitted,
+#[derive(Clone)]
+pub struct StagedSubmissionPreparation {
+    pub spec: JobSpec,
+    pub evidence: FingerprintEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionOptions {
-    pub category_resolution: CategoryResolutionMode,
     pub add_paused: bool,
     pub duplicate_mode: DuplicateMode,
     pub semantic_duplicate: Option<SemanticDuplicate>,
     pub origin: SubmissionOrigin,
     pub idempotency: Option<CallerScopedIdempotency>,
-    pub frozen_post_processing_plan: Option<crate::post_processing::model::FrozenPlan>,
 }
 
 impl Default for SubmissionOptions {
     fn default() -> Self {
         Self {
-            category_resolution: CategoryResolutionMode::ResolveConfigured,
             add_paused: false,
             duplicate_mode: DuplicateMode::Enforce,
             semantic_duplicate: None,
             origin: SubmissionOrigin::Api,
             idempotency: None,
-            frozen_post_processing_plan: None,
         }
     }
 }
@@ -116,6 +141,8 @@ pub enum SubmitNzbError {
     Fetch(String),
     #[error("NZB response was not valid XML")]
     NotXml,
+    #[error("invalid category: {0}")]
+    InvalidCategory(#[from] crate::categories::CategoryValidationError),
     #[error("duplicate submission blocked")]
     DuplicateBlocked { decision: DuplicateDecision },
     #[error("idempotency key is already bound to job {job_id}")]
@@ -139,12 +166,12 @@ pub fn nzb_to_submission_spec(
 ) -> JobSpec {
     let metadata = append_original_title_metadata(
         metadata,
-        filename.and_then(|value| value.strip_suffix(".nzb")),
+        filename.and_then(|value| strip_nzb_source_suffix(value)),
         nzb.meta.title.as_deref(),
     );
 
     let name = derive_release_name(
-        filename.and_then(|value| value.strip_suffix(".nzb")),
+        filename.and_then(|value| strip_nzb_source_suffix(value)),
         nzb.meta.title.as_deref(),
     );
 
@@ -214,78 +241,20 @@ pub fn nzb_to_submission_spec(
 pub async fn resolve_submission_category(
     config: &SharedConfig,
     category: Option<&str>,
-) -> Option<String> {
-    resolve_submission_category_with_mode(
-        config,
-        category,
-        CategoryResolutionMode::ResolveConfigured,
-    )
-    .await
-}
-
-pub async fn resolve_submission_category_with_mode(
-    config: &SharedConfig,
-    category: Option<&str>,
-    mode: CategoryResolutionMode,
-) -> Option<String> {
-    let category = category?;
-    if matches!(mode, CategoryResolutionMode::PreserveSubmitted) {
-        return Some(category.to_string());
-    }
-
+) -> Result<Option<String>, crate::categories::CategoryValidationError> {
     let cfg = config.read().await;
-    if cfg.categories.is_empty() {
-        return Some(category.to_string());
-    }
-
-    match crate::categories::resolve_category(&cfg.categories, category) {
-        Some(canonical) => Some(canonical),
-        None => {
-            warn!(category = %category, "unknown category, submitting without category");
-            None
-        }
-    }
-}
-
-async fn persist_submission_plan(
-    db: &Database,
-    job_id: JobId,
-    category: Option<String>,
-    explicit_plan: Option<crate::post_processing::model::FrozenPlan>,
-) -> Result<(), SubmitNzbError> {
-    let db = db.clone();
-    tokio::task::spawn_blocking(move || {
-        let plan = explicit_plan
-            .map(Ok)
-            .unwrap_or_else(|| db.resolve_post_processing_plan(None, category.as_deref()))?;
-        db.save_frozen_post_processing_plan(job_id.0, &plan, chrono::Utc::now().timestamp_millis())
-    })
-    .await
-    .map_err(|error| {
-        SubmitNzbError::State(crate::StateError::Database(format!(
-            "post-processing plan worker panicked: {error}"
-        )))
-    })??;
-    Ok(())
+    crate::categories::resolve_submission_category(&cfg.categories, category)
 }
 
 async fn rollback_accepted_submission(
     db: &Database,
     job_id: JobId,
     superseded_job_id: Option<JobId>,
-    delete_plan: bool,
 ) {
     if let Some(superseded_job_id) = superseded_job_id {
         let rollback_db = db.clone();
         let _ = tokio::task::spawn_blocking(move || {
             rollback_db.rollback_semantic_supersession(job_id, superseded_job_id)
-        })
-        .await;
-    }
-    if delete_plan {
-        let plan_db = db.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            plan_db.delete_frozen_post_processing_plan(job_id.0)
         })
         .await;
     }
@@ -298,16 +267,14 @@ async fn submit_prepared_nzb(
     db: &Database,
     handle: &SchedulerHandle,
     config: &SharedConfig,
-    nzb: Nzb,
+    nzb: Option<&Nzb>,
     prepared: PreparedSubmission,
-    mut options: SubmissionOptions,
+    options: SubmissionOptions,
+    staged_preparation: Option<StagedSubmissionPreparation>,
 ) -> Result<SubmittedJob, SubmitNzbError> {
-    if nzb.files.is_empty() {
-        return Err(SubmitNzbError::Empty);
-    }
-
     let PreparedSubmission {
         nzb_zstd,
+        raw_job_hash: job_hash,
         filename,
         password,
         category,
@@ -315,35 +282,42 @@ async fn submit_prepared_nzb(
         submit_started,
     } = prepared;
 
-    let resolved_category = resolve_submission_category_with_mode(
-        config,
-        category.as_deref(),
-        options.category_resolution,
-    )
-    .await;
-    let job_hash = persisted_nzb::hash_persisted_nzb_bytes(&nzb_zstd);
-    let spec = nzb_to_submission_spec(
-        &nzb,
-        filename.as_deref(),
-        password,
-        resolved_category,
-        metadata,
-    );
-    // Fingerprints are CPU-heavy canonical encodings of the validated parser
-    // result. Keep them off HTTP/RSS/watch-folder async workers and the
-    // scheduler loop.
-    let evidence = {
-        let spec = spec.clone();
-        tokio::task::spawn_blocking(move || {
-            FingerprintEvidence::from_validated_spec(&spec, job_hash)
-        })
-        .await
-        .map_err(|error| {
-            SubmitNzbError::State(crate::StateError::Database(format!(
-                "fingerprint worker panicked: {error}"
-            )))
-        })?
+    let (spec, evidence) = if let Some(mut preparation) = staged_preparation {
+        preparation.spec.category =
+            resolve_submission_category(config, category.as_deref()).await?;
+        (preparation.spec, preparation.evidence)
+    } else {
+        let nzb = nzb.expect("non-staged submissions provide a parsed NZB");
+        if nzb.files.is_empty() {
+            return Err(SubmitNzbError::Empty);
+        }
+
+        let resolved_category = resolve_submission_category(config, category.as_deref()).await?;
+        let spec = nzb_to_submission_spec(
+            nzb,
+            filename.as_deref(),
+            password,
+            resolved_category,
+            metadata,
+        );
+        // Fingerprints are CPU-heavy canonical encodings of the validated parser
+        // result. Keep them off HTTP/RSS/watch-folder async workers and the
+        // scheduler loop.
+        let evidence = {
+            let spec = spec.clone();
+            tokio::task::spawn_blocking(move || {
+                FingerprintEvidence::from_validated_spec(&spec, job_hash)
+            })
+            .await
+            .map_err(|error| {
+                SubmitNzbError::State(crate::StateError::Database(format!(
+                    "fingerprint worker panicked: {error}"
+                )))
+            })?
+        };
+        (spec, evidence)
     };
+    let submitted_summary = SubmittedJobSummary::from_spec(&spec);
     let duplicate_policy = {
         let cfg = config.read().await;
         cfg.duplicate_policy
@@ -432,21 +406,10 @@ async fn submit_prepared_nzb(
             semantic,
         } => {
             record_duplicate_admission_metric(&options.origin, "parked");
-            if let Err(error) = persist_submission_plan(
-                db,
-                job_id,
-                spec.category.clone(),
-                options.frozen_post_processing_plan.take(),
-            )
-            .await
-            {
-                rollback_accepted_submission(db, job_id, None, true).await;
-                return Err(error);
-            }
             return Ok(SubmittedJob {
                 job_id,
                 job_hash,
-                spec,
+                summary: submitted_summary,
                 created_at_epoch_ms: created_at as f64 * 1000.0,
                 duplicate_outcome: SubmissionDuplicateOutcome::Parked { decision, semantic },
             });
@@ -456,7 +419,7 @@ async fn submit_prepared_nzb(
             return Ok(SubmittedJob {
                 job_id,
                 job_hash,
-                spec,
+                summary: submitted_summary,
                 created_at_epoch_ms: created_at as f64 * 1000.0,
                 duplicate_outcome: SubmissionDuplicateOutcome::IdempotentReplay,
             });
@@ -470,28 +433,17 @@ async fn submit_prepared_nzb(
             return Err(SubmitNzbError::DuplicateBlocked { decision });
         }
     };
-    if let Err(error) = persist_submission_plan(
-        db,
-        job_id,
-        spec.category.clone(),
-        options.frozen_post_processing_plan.take(),
-    )
-    .await
-    {
-        rollback_accepted_submission(db, job_id, superseded_job_id, true).await;
-        return Err(error);
-    }
     if let Some(superseded_job_id) = superseded_job_id {
         match handle.cancel_semantic_superseded(superseded_job_id).await {
             Ok(()) | Err(crate::SchedulerError::JobNotFound(_)) => {}
             Err(crate::SchedulerError::Conflict(error)) => {
-                rollback_accepted_submission(db, job_id, Some(superseded_job_id), true).await;
+                rollback_accepted_submission(db, job_id, Some(superseded_job_id)).await;
                 return Err(SubmitNzbError::Scheduler(crate::SchedulerError::Conflict(
                     error,
                 )));
             }
             Err(error) => {
-                rollback_accepted_submission(db, job_id, Some(superseded_job_id), true).await;
+                rollback_accepted_submission(db, job_id, Some(superseded_job_id)).await;
                 return Err(error.into());
             }
         }
@@ -501,11 +453,14 @@ async fn submit_prepared_nzb(
             .clone()
             .unwrap_or_else(|| format!("job-{}.nzb", job_id.0)),
     );
+    // Captured before `spec` moves into the scheduler; the submission origin is
+    // only knowable here, so this is where the submitted counter is recorded.
+    let submitted_category = spec.category.clone();
 
     if let Err(error) = handle
         .add_job_with_options(
             job_id,
-            spec.clone(),
+            spec,
             nzb_path.clone(),
             nzb_zstd,
             crate::jobs::AddJobOptions {
@@ -527,7 +482,7 @@ async fn submit_prepared_nzb(
             return Ok(SubmittedJob {
                 job_id,
                 job_hash,
-                spec,
+                summary: submitted_summary,
                 created_at_epoch_ms,
                 duplicate_outcome: SubmissionDuplicateOutcome::Parked {
                     decision: materialization_decision,
@@ -535,16 +490,18 @@ async fn submit_prepared_nzb(
                 },
             });
         }
-        rollback_accepted_submission(db, job_id, superseded_job_id, true).await;
+        rollback_accepted_submission(db, job_id, superseded_job_id).await;
         return Err(error.into());
     }
 
+    handle.note_job_submitted(options.origin, submitted_category.as_deref());
+
     info!(
         job_id = job_id.0,
-        name = %spec.name,
-        category = spec.category,
-        metadata_len = spec.metadata.len(),
-        has_password = spec.password.is_some(),
+        name = %submitted_summary.name,
+        category = ?submitted_summary.category,
+        metadata_len = submitted_summary.metadata.len(),
+        has_password = submitted_summary.password.is_some(),
         elapsed_ms = submit_started.elapsed().as_millis() as u64,
         "submitted NZB job"
     );
@@ -552,7 +509,7 @@ async fn submit_prepared_nzb(
     Ok(SubmittedJob {
         job_id,
         job_hash,
-        spec,
+        summary: submitted_summary,
         created_at_epoch_ms,
         duplicate_outcome,
     })
@@ -628,6 +585,9 @@ pub async fn materialize_semantic_promotion(
         return Err(SubmitNzbError::Empty);
     }
 
+    // Captured before the source's fields move into the spec; the promoted job
+    // needs the same `(origin, category)` labels an ordinary submission gets.
+    let promoted_category = source.category.clone();
     let spec = nzb_to_submission_spec(
         &nzb,
         source.filename.as_deref(),
@@ -663,6 +623,21 @@ pub async fn materialize_semantic_promotion(
         .await;
         return Err(error.into());
     }
+
+    // A promotion puts a job in the queue that `submit_nzb` never counted: the
+    // candidate was parked at admission time, before it had a queue entry. The
+    // claim carries no intake origin of its own — the durable snapshot's
+    // `origin` column is free-form text that also holds non-submission values
+    // like the fingerprint backfill marker, so it cannot be read back as a
+    // `SubmissionOrigin` — and this *is* an internal requeue of content whose
+    // first attempt did not finish, which is what `internal-redownload` names.
+    // Recorded after the scheduler accepted the job, exactly as the ordinary
+    // submission path does.
+    handle.note_job_submitted(
+        crate::jobs::SubmissionOrigin::InternalRedownload,
+        promoted_category.as_deref(),
+    );
+
     let db = db.clone();
     let completed = tokio::task::spawn_blocking(move || {
         db.complete_semantic_promotion_claim(job_id, generation)
@@ -858,15 +833,24 @@ pub async fn submit_nzb_bytes_with_options(
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
     let submit_started = Instant::now();
-    let nzb = weaver_nzb::parse_nzb(nzb_bytes)?;
-    let nzb_zstd = persisted_nzb::compress_nzb_bytes(nzb_bytes).map_err(SubmitNzbError::Save)?;
+    let mut source = Cursor::new(nzb_bytes);
+    let prepared = match persisted_nzb::persist_decoded_nzb_reader_to_zstd(&mut source) {
+        Ok(prepared) => prepared,
+        Err(persisted_nzb::PersistedNzbError::Io(error)) => {
+            return Err(SubmitNzbError::Save(error));
+        }
+        Err(persisted_nzb::PersistedNzbError::Parse(error)) => {
+            return Err(SubmitNzbError::Parse(error));
+        }
+    };
     submit_prepared_nzb(
         db,
         handle,
         config,
-        nzb,
+        Some(&prepared.nzb),
         PreparedSubmission {
-            nzb_zstd,
+            nzb_zstd: prepared.nzb_zstd,
+            raw_job_hash: prepared.raw_job_hash,
             filename,
             password,
             category,
@@ -874,6 +858,7 @@ pub async fn submit_nzb_bytes_with_options(
             submit_started,
         },
         options,
+        None,
     )
     .await
 }
@@ -1042,7 +1027,7 @@ where
     })
     .await
     .map_err(|error| SubmitNzbError::Upload(std::io::Error::other(error.to_string())))?;
-    let (nzb_zstd, nzb) = match persist_result {
+    let prepared = match persist_result {
         Ok(values) => values,
         Err(super::persisted_nzb::PersistedNzbError::Io(error)) => {
             return Err(SubmitNzbError::Save(error));
@@ -1055,9 +1040,10 @@ where
         db,
         handle,
         config,
-        nzb,
+        Some(&prepared.nzb),
         PreparedSubmission {
-            nzb_zstd,
+            nzb_zstd: prepared.nzb_zstd,
+            raw_job_hash: prepared.raw_job_hash,
             filename,
             password,
             category,
@@ -1065,6 +1051,7 @@ where
             submit_started,
         },
         options,
+        None,
     )
     .await
 }
@@ -1106,9 +1093,8 @@ pub async fn submit_staged_nzb_zstd_with_options(
     metadata: Vec<(String, String)>,
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
-    let submit_started = Instant::now();
-    let nzb = match persisted_nzb::parse_persisted_nzb_bytes(&nzb_zstd) {
-        Ok(nzb) => nzb,
+    let (nzb, raw_job_hash) = match persisted_nzb::parse_and_hash_persisted_nzb_bytes(&nzb_zstd) {
+        Ok(parsed) => parsed,
         Err(persisted_nzb::PersistedNzbError::Io(error)) => {
             return Err(SubmitNzbError::Save(error));
         }
@@ -1116,20 +1102,114 @@ pub async fn submit_staged_nzb_zstd_with_options(
             return Err(SubmitNzbError::Parse(error));
         }
     };
-    submit_prepared_nzb(
+    submit_staged_parsed_nzb_with_hash(
+        db,
+        handle,
+        config,
+        &nzb,
+        nzb_zstd,
+        raw_job_hash,
+        filename,
+        password,
+        category,
+        metadata,
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_staged_parsed_nzb_with_options(
+    db: &Database,
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+    nzb: &Nzb,
+    nzb_zstd: Vec<u8>,
+    filename: Option<String>,
+    password: Option<String>,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+    options: SubmissionOptions,
+) -> Result<SubmittedJob, SubmitNzbError> {
+    let raw_job_hash = persisted_nzb::hash_persisted_nzb_bytes(&nzb_zstd);
+    submit_staged_parsed_nzb_with_hash(
         db,
         handle,
         config,
         nzb,
+        nzb_zstd,
+        raw_job_hash,
+        filename,
+        password,
+        category,
+        metadata,
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_staged_parsed_nzb_with_hash(
+    db: &Database,
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+    nzb: &Nzb,
+    nzb_zstd: Vec<u8>,
+    raw_job_hash: [u8; 32],
+    filename: Option<String>,
+    password: Option<String>,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+    options: SubmissionOptions,
+) -> Result<SubmittedJob, SubmitNzbError> {
+    submit_prepared_nzb(
+        db,
+        handle,
+        config,
+        Some(nzb),
         PreparedSubmission {
             nzb_zstd,
+            raw_job_hash,
             filename,
             password,
             category,
             metadata,
-            submit_started,
+            submit_started: Instant::now(),
         },
         options,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_staged_prepared_nzb_with_options(
+    db: &Database,
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+    preparation: StagedSubmissionPreparation,
+    nzb_zstd: Vec<u8>,
+    filename: Option<String>,
+    options: SubmissionOptions,
+) -> Result<SubmittedJob, SubmitNzbError> {
+    let category = preparation.spec.category.clone();
+    let raw_job_hash = preparation.evidence.raw_job_hash;
+    submit_prepared_nzb(
+        db,
+        handle,
+        config,
+        None,
+        PreparedSubmission {
+            nzb_zstd,
+            raw_job_hash,
+            filename,
+            password: None,
+            category,
+            metadata: Vec::new(),
+            submit_started: Instant::now(),
+        },
+        options,
+        Some(preparation),
     )
     .await
 }

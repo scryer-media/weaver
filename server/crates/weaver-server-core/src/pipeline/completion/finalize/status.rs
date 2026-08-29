@@ -194,6 +194,7 @@ impl Pipeline {
             return;
         }
         if self.job_has_pending_download_pipeline_work(job_id)
+            || self.direct_post_repair_in_flight.contains_key(&job_id)
             || self.pending_completion_checks.contains(&job_id)
         {
             return;
@@ -832,8 +833,21 @@ impl Pipeline {
     }
 
     pub(crate) fn clear_par2_runtime_state(&mut self, job_id: JobId) {
+        self.block_crcs.forget_job(job_id);
+        self.direct_store.clear_pending_materializations(job_id);
         self.par2_runtime.remove(&job_id);
+        self.par2_cancellations.remove(&job_id);
+        self.direct_post_repair_in_flight.remove(&job_id);
+        self.direct_post_repair_results.remove(&job_id);
+        self.direct_post_repair_carry.remove(&job_id);
+        self.shared_state.clear_job_cancellations(job_id);
         self.par2_verified.remove(&job_id);
+        self.par2_joined_split_sets.remove(&job_id);
+        self.par2_pre_repair_dir_entries.remove(&job_id);
+        // A reprocessed job runs its verification again, so it must be able to
+        // record a fresh outcome.
+        self.sfv_checked.remove(&job_id);
+        self.jobs_with_verification_outcome.remove(&job_id);
         self.unavailable_promoted_recovery_segments
             .retain(|segment_id| segment_id.file_id.job_id != job_id);
     }

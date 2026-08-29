@@ -104,15 +104,28 @@ pub fn bootstrap_encryption(
     config: &mut Config,
 ) -> Result<(), String> {
     if db.encryption_key().is_none() {
+        let key_store =
+            crate::persistence::encryption::key_store_description(Some(data_dir.to_path_buf()));
         let encrypted_credentials_exist = db
             .has_encrypted_credentials()
             .map_err(|error| format!("inspect encrypted credential state: {error}"))?;
         let key = crate::persistence::encryption::ensure_encryption_key_for_state(
             Some(data_dir.to_path_buf()),
             encrypted_credentials_exist,
-        )?;
+        )
+        .map_err(|error| {
+            format!(
+                "{error}; data directory: {}; key store: {key_store}",
+                data_dir.display()
+            )
+        })?;
         db.validate_encrypted_credentials(&key)
-            .map_err(|error| format!("validate encryption key against persisted state: {error}"))?;
+            .map_err(|error| {
+                format!(
+                    "validate encryption key against persisted state in data directory {} using {key_store}: {error}",
+                    data_dir.display()
+                )
+            })?;
         db.set_encryption_key(key);
     }
     db.migrate_plaintext_credentials()

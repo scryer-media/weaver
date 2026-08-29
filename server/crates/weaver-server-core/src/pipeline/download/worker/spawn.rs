@@ -14,6 +14,40 @@ pub(in crate::pipeline) fn lane_acquire_failure_for_work(
     }
 }
 
+/// Closes one decode task's wall-clock measurement, on whichever path the task
+/// leaves by.
+///
+/// This is the single, deliberate exception to "no clock reads on a
+/// per-segment path". `perf_probe::scope` already pays an unconditional
+/// `Instant::now()` when the task starts; this guard adds the matching read at
+/// the end and feeds the *same* `Duration` to both the profile bucket and the
+/// histogram, so profiling on or off the cost is one extra clock read per
+/// decode task — one per decoded article, roughly one per 750 KB of work, not
+/// one per byte. Everything else on this path stays `Relaxed`-atomic only.
+struct DecodeTaskTimer {
+    scope: Option<crate::runtime::perf_probe::Scope>,
+    metrics: Arc<crate::operations::metrics::PipelineMetrics>,
+}
+
+impl DecodeTaskTimer {
+    fn start(metrics: Arc<crate::operations::metrics::PipelineMetrics>) -> Self {
+        Self {
+            scope: Some(crate::runtime::perf_probe::scope("download.decode.task")),
+            metrics,
+        }
+    }
+}
+
+impl Drop for DecodeTaskTimer {
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope.take() {
+            self.metrics
+                .pipeline_histograms
+                .observe_decode_task(scope.finish());
+        }
+    }
+}
+
 fn send_blocking_decode_failure(
     tx: &mpsc::Sender<DecodeDone>,
     segment_id: SegmentId,
@@ -39,6 +73,18 @@ fn send_blocking_decode_failure(
 }
 
 impl Pipeline {
+    /// Decode an article that arrived as an undecoded buffer.
+    ///
+    /// This is the buffer-decode path, reached only from
+    /// [`DownloadPayload::Raw`]. Production never takes it: the download lanes
+    /// decode inline and hand back [`DownloadPayload::Decoded`], so `Raw` is
+    /// constructed only by tests.
+    ///
+    /// It is therefore yEnc-only. The uuencode sniffer lives in the fused
+    /// streaming decoder, which this path does not use, so a uuencode article
+    /// routed through here would fail its decode exactly as it did before
+    /// uuencode support existed. If `Raw` is ever made production-reachable
+    /// again, this path needs the same sniffer the fused decoder has.
     pub(in crate::pipeline::download::worker) fn spawn_decode_task(
         &self,
         work: PendingDecodeWork,
@@ -71,7 +117,7 @@ impl Pipeline {
                 "download.decode.task.enter",
                 Duration::from_nanos(1),
             );
-            let _profile_scope = crate::runtime::perf_probe::scope("download.decode.task");
+            let _decode_task_timer = DecodeTaskTimer::start(Arc::clone(&metrics));
             let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.task");
             crate::runtime::affinity::pin_current_thread_for_hot_download_path();
 
@@ -98,16 +144,13 @@ impl Pipeline {
                 match decode_result {
                     Ok(decode_result) => {
                         output.set_len(decode_result.bytes_written);
-                        metrics
-                            .bytes_decoded
-                            .fetch_add(decode_result.bytes_written as u64, Ordering::Relaxed);
-                        metrics.segments_decoded.fetch_add(1, Ordering::Relaxed);
-
-                        let file_offset = decode_result
-                            .metadata
-                            .begin
-                            .map(|b| b.saturating_sub(1))
-                            .unwrap_or(0);
+                        let yenc_layout = YencLayoutAssertions {
+                            file_size: decode_result.metadata.size,
+                            part: decode_result.metadata.part,
+                            total: decode_result.metadata.total,
+                            begin: decode_result.metadata.begin,
+                            end: decode_result.metadata.end,
+                        };
 
                         let decoded = {
                             let _cpu_scope = crate::runtime::perf_probe::cpu_scope(
@@ -121,27 +164,32 @@ impl Pipeline {
                         let _cpu_scope =
                             crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
                         let send_started = Instant::now();
+                        let crc_valid =
+                            crate::pipeline::crc_not_mismatched(decode_result.crc_status);
                         let part_crc_verified =
-                            decode_result.expected_part_crc.is_some() && decode_result.crc_valid;
-                        let unverified_provenance = (!part_crc_verified).then(|| {
-                            Box::new(UnverifiedSegmentProvenance {
+                            decode_result.expected_part_crc.is_some() && crc_valid;
+                        let _ = tx.blocking_send(DecodeDone::Success {
+                            result: DecodeResult {
+                                segment_id,
+                                raw_size,
+                                // This buffer-decode path is yEnc-only; see the note at
+                                // its call site.
+                                encoding: SegmentEncoding::Yenc,
+                                yenc_layout,
+                                crc_valid,
+                                part_crc_verified,
+                                part_crc: decode_result.part_crc,
+                                expected_file_crc: decode_result.expected_file_crc,
+                                data: decoded,
+                                yenc_name: decode_result.metadata.name,
+                                checkpoint_plan: decode_result.checkpoint_plan,
+                                segments: decode_result.segments,
+                            },
+                            source: SegmentSource {
                                 source_server_idx,
                                 exclude_servers,
-                            })
+                            },
                         });
-                        let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
-                            segment_id,
-                            raw_size,
-                            unverified_provenance,
-                            file_offset,
-                            decoded_size: decode_result.bytes_written as u32,
-                            crc_valid: decode_result.crc_valid,
-                            part_crc_verified,
-                            part_crc: decode_result.part_crc,
-                            expected_file_crc: decode_result.expected_file_crc,
-                            data: decoded,
-                            yenc_name: decode_result.metadata.name,
-                        }));
                         crate::runtime::perf_probe::record(
                             "download.decode.done_channel.blocking_send",
                             send_started.elapsed(),
@@ -176,43 +224,45 @@ impl Pipeline {
                 };
                 match decode_result {
                     Ok(decode_result) => {
-                        metrics
-                            .bytes_decoded
-                            .fetch_add(decode_result.bytes_written as u64, Ordering::Relaxed);
-                        metrics.segments_decoded.fetch_add(1, Ordering::Relaxed);
-
-                        let file_offset = decode_result
-                            .metadata
-                            .begin
-                            .map(|b| b.saturating_sub(1))
-                            .unwrap_or(0);
+                        let yenc_layout = YencLayoutAssertions {
+                            file_size: decode_result.metadata.size,
+                            part: decode_result.metadata.part,
+                            total: decode_result.metadata.total,
+                            begin: decode_result.metadata.begin,
+                            end: decode_result.metadata.end,
+                        };
 
                         let _profile_scope =
                             crate::runtime::perf_probe::scope("download.decode.send_success");
                         let _cpu_scope =
                             crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
                         let send_started = Instant::now();
+                        let crc_valid =
+                            crate::pipeline::crc_not_mismatched(decode_result.crc_status);
                         let part_crc_verified =
-                            decode_result.expected_part_crc.is_some() && decode_result.crc_valid;
-                        let unverified_provenance = (!part_crc_verified).then(|| {
-                            Box::new(UnverifiedSegmentProvenance {
+                            decode_result.expected_part_crc.is_some() && crc_valid;
+                        let _ = tx.blocking_send(DecodeDone::Success {
+                            result: DecodeResult {
+                                segment_id,
+                                raw_size,
+                                // This buffer-decode path is yEnc-only; see the note at
+                                // its call site.
+                                encoding: SegmentEncoding::Yenc,
+                                yenc_layout,
+                                crc_valid,
+                                part_crc_verified,
+                                part_crc: decode_result.part_crc,
+                                expected_file_crc: decode_result.expected_file_crc,
+                                data: DecodedChunk::from(output),
+                                yenc_name: decode_result.metadata.name,
+                                checkpoint_plan: decode_result.checkpoint_plan,
+                                segments: decode_result.segments,
+                            },
+                            source: SegmentSource {
                                 source_server_idx,
                                 exclude_servers,
-                            })
+                            },
                         });
-                        let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
-                            segment_id,
-                            raw_size,
-                            unverified_provenance,
-                            file_offset,
-                            decoded_size: decode_result.bytes_written as u32,
-                            crc_valid: decode_result.crc_valid,
-                            part_crc_verified,
-                            part_crc: decode_result.part_crc,
-                            expected_file_crc: decode_result.expected_file_crc,
-                            data: DecodedChunk::from(output),
-                            yenc_name: decode_result.metadata.name,
-                        }));
                         crate::runtime::perf_probe::record(
                             "download.decode.done_channel.blocking_send",
                             send_started.elapsed(),
@@ -330,6 +380,11 @@ impl Pipeline {
             return;
         }
 
+        // Owned and async lanes share the same provider permits. Idle owned
+        // workers retain their connections for reuse, so release those caches
+        // before an async-only lease (notably PAR2 recovery) tries to acquire.
+        self.owned_download_lane_pool.reset();
+
         let nntp = Arc::clone(&self.nntp);
         let tx = self.download_done_tx.clone();
         let refill_tx = self.download_refill_tx.clone();
@@ -340,6 +395,7 @@ impl Pipeline {
             let mut lease = initial_lease;
             let mut recorded_mode = lease.lane_mode;
             let mut current_spillover_loan_kind: Option<SpilloverLoanKind>;
+            let mut current_completion_critical: bool;
             let mut current_job_id: JobId;
             let park_reason: LaneParkReason;
 
@@ -381,6 +437,7 @@ impl Pipeline {
                 let failure = DownloadFailure::from_lane_acquire_failure(acquire_error.as_ref());
                 let policy_blocked = failure.kind == DownloadFailureKind::ServerQuota;
                 let is_recovery = lease.compatibility.is_recovery;
+                let completion_critical = lease.compatibility.completion_critical;
                 let exclude_servers = lease.compatibility.exclude_servers.clone();
                 let mode = lease.lane_mode;
                 let spillover_loan_kind = lease.spillover_loan_kind;
@@ -410,7 +467,10 @@ impl Pipeline {
                                 connection_discarded: false,
                             }),
                             source_server_idx: None,
-                            origin: DownloadResultOrigin::from_recovery(is_recovery),
+                            origin: DownloadResultOrigin::from_work(
+                                is_recovery,
+                                work.completion_critical,
+                            ),
                             retry_count: work.retry_count,
                             exclude_servers: exclude_servers.clone(),
                             release_connection_slot: false,
@@ -422,6 +482,7 @@ impl Pipeline {
                         job_id,
                         mode,
                         spillover_loan_kind,
+                        completion_critical,
                         reason: if policy_blocked {
                             LaneParkReason::ServerQuota
                         } else {
@@ -444,10 +505,12 @@ impl Pipeline {
                     server_modes,
                     compatibility,
                     effective_exclude_servers: _,
+                    checkpoint_plan,
                     works,
                 } = lease;
                 current_job_id = job_id;
                 current_spillover_loan_kind = spillover_loan_kind;
+                current_completion_critical = compatibility.completion_critical;
                 let server_idx = lane.server_id().0;
                 let supports_pipelining = lane.supports_pipelining();
                 let actual_mode = Self::actual_download_lane_mode(
@@ -458,6 +521,9 @@ impl Pipeline {
                 );
                 let is_recovery = compatibility.is_recovery;
                 let exclude_servers = compatibility.exclude_servers.clone();
+                // Every lease reapplies its immutable plan, including `None`,
+                // so pooled responses cannot retain a prior job's geometry.
+                lane.set_checkpoint_plan(checkpoint_plan);
                 let mut batch_clean_for_refill = true;
                 let mut policy_blocked_for_refill = false;
                 let mut pending_works: std::collections::VecDeque<DownloadWork> =
@@ -534,7 +600,10 @@ impl Pipeline {
                                         attempts,
                                         lane_observation: Some(observation),
                                         source_server_idx,
-                                        origin: DownloadResultOrigin::from_recovery(is_recovery),
+                                        origin: DownloadResultOrigin::from_work(
+                                            is_recovery,
+                                            work.completion_critical,
+                                        ),
                                         retry_count,
                                         exclude_servers: exclude_servers.clone(),
                                         release_connection_slot: false,
@@ -602,8 +671,9 @@ impl Pipeline {
                                                     attempts,
                                                     lane_observation: Some(observation),
                                                     source_server_idx,
-                                                    origin: DownloadResultOrigin::from_recovery(
+                                                    origin: DownloadResultOrigin::from_work(
                                                         is_recovery,
+                                                        work.completion_critical,
                                                     ),
                                                     retry_count,
                                                     exclude_servers,
@@ -660,8 +730,9 @@ impl Pipeline {
                                                     attempts,
                                                     lane_observation: Some(observation),
                                                     source_server_idx,
-                                                    origin: DownloadResultOrigin::from_recovery(
+                                                    origin: DownloadResultOrigin::from_work(
                                                         is_recovery,
+                                                        work.completion_critical,
                                                     ),
                                                     retry_count,
                                                     exclude_servers,
@@ -707,7 +778,10 @@ impl Pipeline {
                                     connection_discarded: true,
                                 }),
                                 source_server_idx: None,
-                                origin: DownloadResultOrigin::from_recovery(is_recovery),
+                                origin: DownloadResultOrigin::from_work(
+                                    is_recovery,
+                                    work.completion_critical,
+                                ),
                                 retry_count: work.retry_count,
                                 exclude_servers: exclude_servers.clone(),
                                 release_connection_slot: false,
@@ -745,7 +819,10 @@ impl Pipeline {
                                     connection_discarded: !policy_only,
                                 }),
                                 source_server_idx: None,
-                                origin: DownloadResultOrigin::from_recovery(is_recovery),
+                                origin: DownloadResultOrigin::from_work(
+                                    is_recovery,
+                                    work.completion_critical,
+                                ),
                                 retry_count: work.retry_count,
                                 exclude_servers: exclude_servers.clone(),
                                 release_connection_slot: false,
@@ -810,6 +887,7 @@ impl Pipeline {
                     job_id: current_job_id,
                     mode: recorded_mode,
                     spillover_loan_kind: current_spillover_loan_kind,
+                    completion_critical: current_completion_critical,
                     reason: park_reason,
                     release_connection_slot: true,
                     release_ip_replacement_burst: false,

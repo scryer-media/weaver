@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "docker_base": "debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818",
+  "rar_writers": [
+    {
+      "id": "rarlab-3.93",
+      "image": "weaver-e2e-rarlab:3.93",
+      "platform": "linux/amd64",
+      "url": "https://www.rarlab.com/rar/rarlinux-3.9.3.tar.gz",
+      "sha256": "55122286a2a72ccc2b866c5a0e415c05638dfe99cebb5f2ef036784387a8eff8",
+      "binary": "rar_static",
+      "dockerfile": "internal/fixturegen/docker/rarlab/Dockerfile"
+    },
+    {
+      "id": "rarlab-4.20",
+      "image": "weaver-e2e-rarlab:4.20",
+      "platform": "linux/amd64",
+      "url": "https://www.rarlab.com/rar/rarlinux-4.2.0.tar.gz",
+      "sha256": "6826646bc9620055689f465e61f7d4a86e6ccc66940178d24f48d01734968eb5",
+      "binary": "rar_static",
+      "dockerfile": "internal/fixturegen/docker/rarlab/Dockerfile"
+    },
+    {
+      "id": "rarlab-5.00",
+      "image": "weaver-e2e-rarlab:5.00",
+      "platform": "linux/amd64",
+      "url": "https://www.rarlab.com/rar/rarlinux-5.0.0.tar.gz",
+      "sha256": "4f942d79bb16dc1981ccb52893e4a24dbee908089d783d766ac45cd4f2c78610",
+      "binary": "rar_static",
+      "dockerfile": "internal/fixturegen/docker/rarlab/Dockerfile"
+    },
+    {
+      "id": "rarlab-6.24",
+      "utf8_locale": true,
+      "image": "weaver-e2e-rarlab:6.24",
+      "platform": "linux/amd64",
+      "url": "https://www.rarlab.com/rar/rarlinux-x64-624.tar.gz",
+      "sha256": "88e22a8e84125c947637bbf28c746e338a0a63279d80f9f9d7373603875db1eb",
+      "binary": "rar",
+      "dockerfile": "internal/fixturegen/docker/rarlab/Dockerfile"
+    },
+    {
+      "id": "rarlab-7.23",
+      "utf8_locale": true,
+      "image": "weaver-e2e-rarlab:7.23",
+      "platform": "linux/amd64",
+      "url": "https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz",
+      "sha256": "759b4b6aa0d9f77131882162951193f3a0e54bf60e1d8dc4255aa308accab588",
+      "binary": "rar",
+      "dockerfile": "internal/fixturegen/docker/rarlab/Dockerfile"
+    }
+  ],
+  "video_encoder": {
+    "id": "ffmpeg-7.1-ubuntu2404",
+    "image": "jrottenberg/ffmpeg@sha256:292a972c60356abd651d9a4f9c808c13e7473f65ad400b7eb99215f4e571931d",
+    "platform": "linux/amd64"
+  },
+  "par2_generator": {
+    "id": "par2cmdline-turbo-1.4.0",
+    "image": "weaver-e2e-par2-turbo:1.4.0",
+    "platform": "linux/amd64",
+    "url": "https://github.com/animetosho/par2cmdline-turbo/archive/refs/tags/v1.4.0.tar.gz",
+    "sha256": "6f2cb042f23d9b0c93f14cc0e16de5bd6e98bf36d8be1f8f2e886fa85ad1b972",
+    "dockerfile": "internal/fixturegen/docker/par2/Dockerfile"
+  },
+  "uu_codec": {
+    "id": "uudeview-0.5.20",
+    "image": "weaver-e2e-uudeview:0.5.20",
+    "platform": "linux/amd64",
+    "url": "https://deb.debian.org/debian/pool/main/u/uudeview/uudeview_0.5.20.orig.tar.gz",
+    "sha256": "a2a44fa543976775429bc65620bcca3c9b795dbfaec8183607a45f132270a414",
+    "dockerfile": "internal/fixturegen/docker/uudeview/Dockerfile",
+    "notes": "Frank Pilhofer's UUDeview 0.5pl20, pristine upstream source as redistributed by Debian. Ships both halves: uuenview writes the uuencoding and splits it into multi-part postings, uudeview reads it back as the generator's round-trip oracle."
+  },
+  "archivers": [
+    {
+      "id": "sevenzip-26.02",
+      "utf8_locale": true,
+      "image": "weaver-e2e-7zip:26.02",
+      "platform": "linux/amd64",
+      "url": "https://www.7-zip.org/a/7z2602-linux-x64.tar.xz",
+      "sha256": "41aaba7b1235304ab5aa0624530c67ae829496cd29e875925271efdccc28c03e",
+      "binary": "7zz",
+      "dockerfile": "internal/fixturegen/docker/sevenzip/Dockerfile",
+      "notes": "The official 7-Zip console binary from 7-zip.org, never a distribution p7zip fork."
+    }
+  ],
+  "go_writers": [
+    {
+      "id": "go-fixture-bytes",
+      "go": "1.26.2",
+      "module": "std",
+      "writes": "deterministic payload streams and format-agnostic byte edits: split, concatenate, truncate, zero or overwrite a range, rename"
+    },
+    {
+      "id": "go-archive-zip",
+      "go": "1.26.2",
+      "module": "std",
+      "package": "archive/zip",
+      "writes": "zip containers, including the legacy PKWARE ZipCrypto member cipher"
+    },
+    {
+      "id": "go-archive-tar",
+      "go": "1.26.2",
+      "module": "std",
+      "package": "archive/tar",
+      "writes": "ustar/GNU tar containers"
+    },
+    {
+      "id": "go-compress-gzip",
+      "go": "1.26.2",
+      "module": "std",
+      "package": "compress/gzip",
+      "writes": "gzip streams"
+    },
+    {
+      "id": "go-compress-flate",
+      "go": "1.26.2",
+      "module": "std",
+      "package": "compress/flate",
+      "writes": "raw DEFLATE streams"
+    },
+    {
+      "id": "go-klauspost-zstd@v1.19.2",
+      "go": "1.26.2",
+      "module": "github.com/klauspost/compress",
+      "version": "v1.19.2",
+      "package": "zstd",
+      "writes": "zstd streams"
+    },
+    {
+      "id": "go-dsnet-bzip2@v0.0.1",
+      "go": "1.26.2",
+      "module": "github.com/dsnet/compress",
+      "version": "v0.0.1",
+      "package": "bzip2",
+      "writes": "bzip2 streams"
+    },
+    {
+      "id": "go-andybalholm-brotli@v1.2.2",
+      "go": "1.26.2",
+      "module": "github.com/andybalholm/brotli",
+      "version": "v1.2.2",
+      "writes": "brotli streams"
+    }
+  ]
+}

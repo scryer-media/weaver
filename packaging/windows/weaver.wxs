@@ -1,0 +1,90 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Weaver"
+      Manufacturer="Scryer Media"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="$(var.UpgradeCode)"
+      Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Weaver is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="WeaverIcon" SourceFile="$(var.StageDir)\weaver.ico" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="ScryerMediaFolder" Name="Scryer Media">
+        <Directory Id="INSTALLFOLDER" Name="Weaver">
+          <Component Id="ApplicationFiles" Guid="$(var.ApplicationFilesComponentGuid)" Bitness="always64">
+            <File Id="WeaverExe" Source="$(var.StageDir)\weaver.exe" KeyPath="yes" />
+            <File Id="WeaverTrayExe" Source="$(var.StageDir)\weaver-tray.exe" />
+            <File Id="LicenseFile" Source="$(var.StageDir)\LICENSE" />
+            <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="WeaverStartMenuFolder" Name="Weaver">
+        <Component Id="StartMenuShortcuts" Guid="$(var.StartMenuShortcutsComponentGuid)" Bitness="always64">
+          <Shortcut
+              Id="WeaverTrayShortcut"
+              Name="Weaver"
+              Description="Open Weaver"
+              Target="[#WeaverTrayExe]"
+              Icon="WeaverIcon"
+              IconIndex="0"
+              WorkingDirectory="INSTALLFOLDER" />
+          <RemoveFolder Id="RemoveWeaverStartMenuFolder" On="uninstall" />
+          <RegistryValue
+              Root="HKLM"
+              Key="Software\Scryer Media\Weaver"
+              Name="StartMenuShortcut"
+              Type="integer"
+              Value="1"
+              KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Weaver" Level="1">
+      <ComponentRef Id="ApplicationFiles" />
+      <ComponentRef Id="StartMenuShortcuts" />
+    </Feature>
+
+    <!-- Interactive installs start the user-session tray. Silent MSI and WinGet installs
+         have UILevel < 4, so they never launch a process or a browser. -->
+    <CustomAction
+        Id="LaunchTrayAfterInteractiveInstall"
+        FileRef="WeaverTrayExe"
+        ExeCommand=""
+        Execute="immediate"
+        Return="asyncNoWait"
+        Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="LaunchTrayAfterInteractiveInstall"
+              After="InstallFinalize"
+              Condition="NOT Installed AND UILevel &gt;= 4" />
+    </InstallExecuteSequence>
+
+    <!-- These commands affect only the installing user's HKCU Run entry and the tray
+         process it owns. Application data and Credential Manager entries are not MSI
+         resources and are intentionally retained on uninstall. -->
+    <CustomAction
+        Id="StopTrayBeforeRemoval"
+        FileRef="WeaverTrayExe"
+        ExeCommand="--shutdown"
+        Execute="immediate"
+        Return="check"
+        Impersonate="yes" />
+    <CustomAction
+        Id="RemoveTrayStartupBeforeRemoval"
+        FileRef="WeaverTrayExe"
+        ExeCommand="--unregister-startup"
+        Execute="immediate"
+        Return="ignore"
+        Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="StopTrayBeforeRemoval" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RemoveTrayStartupBeforeRemoval" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

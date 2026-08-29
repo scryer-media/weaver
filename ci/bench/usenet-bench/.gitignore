@@ -1,0 +1,4 @@
+# Fixture artifacts are intentionally generated locally.  They can be several
+# gigabytes and are described by the checked-in fixture matrix and manifests.
+/generated/
+/runs/

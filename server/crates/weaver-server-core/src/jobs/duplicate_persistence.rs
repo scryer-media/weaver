@@ -333,7 +333,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<Option<DuplicateJobSnapshot>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT job_id, lifecycle, normalized_name, created_at, updated_at, reservation_expires_at
@@ -351,7 +351,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<Option<SemanticCandidateSnapshot>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT c.job_id, c.group_id, g.normalized_key, c.score, c.candidate_state,
@@ -438,7 +438,7 @@ impl Database {
              ORDER BY s.job_id ASC, f.fingerprint_kind ASC, f.fingerprint_version ASC"
         );
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(datastore.read_exec(), &query, &args).await?;
             let mut summaries = BTreeMap::new();
             for row in rows {
@@ -738,7 +738,7 @@ impl Database {
         let limit = limit.clamp(1, 256) as i64;
         let now = epoch_seconds();
         let (active_claims, stale_claims, pending_triggers) =
-            self.run_sql_blocking(async move {
+            self.run_sql_blocking_read(async move {
                 let active_claims = SqlRuntime::fetch_all(
                     datastore.read_exec(),
                     "SELECT c.job_id, c.promotion_generation FROM semantic_duplicate_candidates AS c
@@ -994,7 +994,7 @@ impl Database {
 
     pub fn duplicate_backfill_state(&self) -> Result<Option<DuplicateBackfillState>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT cursor_job_id, completed_at FROM duplicate_backfill_state WHERE backfill_key = {}",
@@ -1049,7 +1049,7 @@ impl Database {
         let datastore = self.datastore();
         let after = cursor_job_id.map_or(0, |job_id| job_id.0.min(i64::MAX as u64) as i64);
         let limit = limit.clamp(1, 256) as i64;
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT job_id, raw_job_hash, nzb_zstd, lifecycle, created_at FROM (
@@ -2080,6 +2080,22 @@ async fn forget_duplicate_identity_tx(tx: &mut SqlTx<'_>, job_id: JobId) -> Resu
     )
     .await?;
     Ok(())
+}
+
+/// Records a permanent user-requested deletion before removing the durable
+/// identity, so duplicate backfill cannot recreate it from stale source data.
+pub(crate) async fn forget_duplicate_identity_for_history_delete_tx(
+    tx: &mut SqlTx<'_>,
+    job_id: JobId,
+) -> Result<(), StateError> {
+    tx.execute(
+        "INSERT INTO forgotten_duplicate_identities (job_id, forgotten_at)
+         VALUES ({}, {})
+         ON CONFLICT(job_id) DO UPDATE SET forgotten_at = excluded.forgotten_at",
+        &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(epoch_seconds())],
+    )
+    .await?;
+    forget_duplicate_identity_tx(tx, job_id).await
 }
 
 fn snapshot_from_row(

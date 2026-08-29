@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.7.8"
+version = "0.9.3"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -23,10 +23,11 @@ serde = { version = "1.0", default-features = false, features = ["derive", "rc",
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = { version = "2.0", default-features = false, features = ["std"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json"] }
 bytes = { version = "1", default-features = false, features = ["std"] }
+http = { version = "1", default-features = false }
 async-graphql = { version = "7.2", default-features = false, features = ["chrono"] }
-crc32fast = { version = "1.5", default-features = false, features = ["std"] }
+crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 md-5 = { version = "0.11", default-features = false, features = ["alloc"] }
 blake3 = { version = "1.8", default-features = false, features = ["std"] }
 blake2s_simd = { version = "1.0", default-features = false, features = ["std"] }
@@ -45,7 +46,7 @@ hex = { version = "0.4", default-features = false, features = ["std"] }
 rayon = { version = "1.12", default-features = false }
 libc = { version = "0.2", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
-rustls-pemfile = { version = "2", default-features = false, features = ["std"] }
+rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
 webpki-roots = { version = "1", default-features = false }
 tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
 pin-project-lite = { version = "0.2", default-features = false }
@@ -77,12 +78,17 @@ sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "zstd"] }
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
 regex = { version = "1.13", default-features = false, features = ["std", "perf", "unicode"] }
+ipnet = { version = "2.11", default-features = false, features = ["std"] }
 unicode-normalization = { version = "0.1.25", default-features = false }
 tar = { version = "0.4", default-features = false }
+cap-std = { version = "4", default-features = false }
+cap-fs-ext = { version = "4", default-features = false, features = ["std"] }
 zip = { version = "8", default-features = false, features = ["aes-crypto", "deflate64", "deflate-flate2-zlib-rs", "bzip2", "time"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 brotli = { version = "8", default-features = false, features = ["std"] }
 bzip2 = "0.6"
+lzma-rust2 = { version = "0.18.1", default-features = false, features = ["std", "xz"] }
+liblzma = { version = "0.4.8", default-features = false, features = ["static", "parallel"] }
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 age = { version = "0.12", default-features = false }
 security-framework = { version = "3", default-features = false }
@@ -90,8 +96,27 @@ security-framework-sys = { version = "2", default-features = false }
 keyring = { version = "4", default-features = false, features = ["v1"] }
 keyring-core = { version = "1", default-features = false }
 windows-sys = { version = "0.61", default-features = false }
-weaver-par2 = { version = "0.2.4", default-features = false, features = ["metal", "native-crypto"] }
-weaver-unrar = { version = "0.3.1", default-features = false, features = ["crypto-aws-lc"] }
+# `metal` is deliberately NOT enabled, and must not be re-added without an
+# explicit decision. This one feature is the ONLY path by which GPU code reaches
+# a weaver build: `par2-rs/metal` -> `reedsolomon-rs/metal` -> `objc2` +
+# `objc2-foundation` + `objc2-metal`, all target-gated to macOS aarch64, so the
+# Apple-silicon build was the only one that ever compiled it.
+#
+# In par2-rs it gates the GPU arm of both PAR2 creation (which weaver
+# never calls) and PAR2 *repair* (which weaver does call). With the feature off
+# the GPU arm is compiled out entirely — `GpuSession` does not exist, every hook
+# is a no-op, and the CPU streaming path is the only path — and creation's
+# `CreationBackend::{Auto, Metal}` both resolve to the CPU backend. Nothing in
+# weaver needs to change to take the CPU path; it is the only one built.
+#
+# Re-enabling means shipping a GPU repair lane again: decide it deliberately,
+# and re-verify with `cargo tree -e features --workspace | grep metal`.
+par2-rs = { version = "0.8", default-features = false, features = ["native-crypto"] }
+# Floor is 0.5.5, not 0.5: 0.5.1 through 0.5.4 decode some RAR5 members with
+# filters to the wrong bytes. Extraction here always runs with `verify: true`,
+# so those versions fail loudly rather than silently — but a resolver must not
+# be free to pick one.
+unrar-rs = { version = "0.5.5", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.12.0", default-features = false }
 
 [profile.release]
@@ -99,3 +124,20 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[profile.e2e]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+debug-assertions = true
+
+[profile.test]
+debug = 0
+split-debuginfo = "off"
+incremental = false
+
+# `par2-rs`, `unrar-rs` and `reedsolomon-rs` are ordinary crates.io
+# dependencies. Do not add a `[patch.crates-io]` block that points outside this
+# repository: the e2e harness's Weaver image build refuses such a manifest, and
+# any build without that exact checkout cannot compile the workspace. When a
+# rarpar change is needed, publish it and bump the requirement here instead.

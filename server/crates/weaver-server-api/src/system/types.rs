@@ -119,6 +119,20 @@ pub struct Metrics {
     pub write_buffered_bytes: u64,
     pub write_buffered_segments: u32,
     pub direct_write_evictions: u64,
+    /// Lifetime count of archive sets direct-store admitted. Together with
+    /// the two below this is the external answer to "did direct routing carry
+    /// this work, or quietly fall back?" — output bytes are identical either
+    /// way.
+    pub direct_sets_admitted: u64,
+    /// Lifetime count of sets that left direct routing (demoted); per-reason
+    /// detail is in the server logs.
+    pub direct_sets_demoted: u64,
+    /// Lifetime count of sets that completed without ever writing a source
+    /// volume to disk — direct-store's success case.
+    pub direct_sets_finalized_direct: u64,
+    /// Lifetime count of sets repaired in place without leaving direct
+    /// routing.
+    pub direct_sets_repaired_while_direct: u64,
     pub decode_pressure_soft_limit_bytes: u64,
     pub decode_pressure_hard_limit_bytes: u64,
     pub write_pressure_soft_limit_bytes: u64,
@@ -132,14 +146,11 @@ pub struct Metrics {
     pub hot_dispatch_mode: String,
     pub hot_dispatch_underfill_ms: u64,
     pub hot_dispatch_lent_connections: u32,
-    pub hot_dispatch_warmup_complete: bool,
     pub hot_dispatch_last_spillover_decision: String,
-    pub hot_dispatch_spillover_blocked_warmup_total: u64,
     pub hot_dispatch_spillover_blocked_pressure_total: u64,
     pub hot_dispatch_spillover_blocked_near_cap_total: u64,
     pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: u64,
     pub hot_dispatch_spillover_blocked_best_mode_pending_total: u64,
-    pub hot_dispatch_spillover_blocked_recent_expansion_helped_total: u64,
     pub hot_dispatch_spillover_blocked_cap_speed_total: u64,
     pub hot_dispatch_spillover_allowed_underfill_total: u64,
     pub hot_dispatch_spillover_allowed_measured_underfill_total: u64,
@@ -269,6 +280,10 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             write_buffered_bytes: m.write_buffered_bytes,
             write_buffered_segments: m.write_buffered_segments as u32,
             direct_write_evictions: m.direct_write_evictions,
+            direct_sets_admitted: m.direct_sets_admitted,
+            direct_sets_demoted: m.direct_sets_demoted,
+            direct_sets_finalized_direct: m.direct_sets_finalized_direct,
+            direct_sets_repaired_while_direct: m.direct_sets_repaired_while_direct,
             decode_pressure_soft_limit_bytes: m.decode_pressure_soft_limit_bytes,
             decode_pressure_hard_limit_bytes: m.decode_pressure_hard_limit_bytes,
             write_pressure_soft_limit_bytes: m.write_pressure_soft_limit_bytes,
@@ -282,13 +297,10 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             hot_dispatch_mode: m.hot_dispatch_mode.as_str().to_string(),
             hot_dispatch_underfill_ms: m.hot_dispatch_underfill_ms,
             hot_dispatch_lent_connections: m.hot_dispatch_lent_connections as u32,
-            hot_dispatch_warmup_complete: m.hot_dispatch_warmup_complete,
             hot_dispatch_last_spillover_decision: m
                 .hot_dispatch_last_spillover_decision
                 .as_str()
                 .to_string(),
-            hot_dispatch_spillover_blocked_warmup_total: m
-                .hot_dispatch_spillover_blocked_warmup_total,
             hot_dispatch_spillover_blocked_pressure_total: m
                 .hot_dispatch_spillover_blocked_pressure_total,
             hot_dispatch_spillover_blocked_near_cap_total: m
@@ -297,8 +309,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
                 .hot_dispatch_spillover_blocked_hot_can_use_capacity_total,
             hot_dispatch_spillover_blocked_best_mode_pending_total: m
                 .hot_dispatch_spillover_blocked_best_mode_pending_total,
-            hot_dispatch_spillover_blocked_recent_expansion_helped_total: m
-                .hot_dispatch_spillover_blocked_recent_expansion_helped_total,
             hot_dispatch_spillover_blocked_cap_speed_total: m
                 .hot_dispatch_spillover_blocked_cap_speed_total,
             hot_dispatch_spillover_allowed_underfill_total: m
@@ -810,6 +820,108 @@ pub struct SystemStatus {
     pub version: String,
     pub global_state: GlobalQueueState,
     pub summary: QueueSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum DeploymentEnvironmentGql {
+    Native,
+    Docker,
+    Container,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum OperatingSystemGql {
+    Linux,
+    Macos,
+    Windows,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum DatabaseEngineGql {
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum DecoderTierGql {
+    Avx512Vbmi2,
+    Avx2,
+    Avx,
+    Sse41,
+    Ssse3,
+    Sse2,
+    Neon,
+    Scalar,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct SystemComputeInfo {
+    pub physical_cores: u32,
+    pub logical_cores: u32,
+    pub cgroup_limit: Option<f64>,
+    pub decoder_tier: DecoderTierGql,
+    pub simd_features: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct SystemMemoryInfo {
+    pub total_bytes: u64,
+    pub available_at_startup_bytes: u64,
+    pub cgroup_limit_bytes: Option<u64>,
+    pub effective_limit_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct SystemStorageProfile {
+    pub storage_class: String,
+    pub filesystem: String,
+    pub startup_random_read_iops: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct DiskCapacity {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct ConfiguredStorage {
+    pub labels: Vec<String>,
+    pub path: String,
+    pub capacity: Option<DiskCapacity>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct SystemInfo {
+    pub version: String,
+    pub uptime_seconds: f64,
+    pub deployment: DeploymentEnvironmentGql,
+    pub operating_system: OperatingSystemGql,
+    pub architecture: String,
+    pub database_engine: DatabaseEngineGql,
+    pub compute: SystemComputeInfo,
+    pub memory: SystemMemoryInfo,
+    pub primary_storage: SystemStorageProfile,
+    pub configured_storage: Vec<ConfiguredStorage>,
+}
+
+/// Whether this deployment can restart Weaver from the browser.
+///
+/// A container must not be exited from the UI — without a restart policy the
+/// operator would be left with nothing — so the deployment, not the operator,
+/// answers this.
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct ServerRestartCapability {
+    pub supported: bool,
+    /// Set only when unsupported: what to do instead.
+    pub reason: Option<String>,
+    /// The packaging that decided this answer. The security wizard reads it
+    /// here rather than from `systemInfo`, whose resolver probes storage —
+    /// this field must stay cheap enough to ask on every app load.
+    pub deployment: DeploymentEnvironmentGql,
 }
 
 /// Filesystem capacity for a configured storage directory (data / intermediate / complete).

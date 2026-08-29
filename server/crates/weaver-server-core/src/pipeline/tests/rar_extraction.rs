@@ -17,14 +17,13 @@ async fn extraction_reserves_member_totals_at_open() {
             (volume as u32, path)
         })
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     for (volume, (_, bytes)) in files.iter().enumerate().skip(1) {
         archive
             .add_volume(volume, Box::new(std::io::Cursor::new(bytes.clone())))
             .unwrap();
     }
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -89,6 +88,96 @@ async fn extraction_reserves_member_totals_at_open() {
     );
 }
 
+/// `weaver_pipeline_extract_member_duration_seconds` stays absent until a
+/// member has actually been extracted, then reports one observation per
+/// member. Extraction is rare next to an article, so the wall clock this needs
+/// is nowhere near a per-segment path.
+#[tokio::test]
+async fn extracting_members_records_one_wall_duration_each() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20021);
+
+    let files = build_multifile_multivolume_rar_set();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Silver Horizon Archive", &files),
+    )
+    .await;
+
+    let volume_paths = files
+        .iter()
+        .enumerate()
+        .map(|(volume, (filename, bytes))| {
+            let path = temp_dir.path().join(filename);
+            std::fs::write(&path, bytes).unwrap();
+            (volume as u32, path)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut archive = unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+    for (volume, (_, bytes)) in files.iter().enumerate().skip(1) {
+        archive
+            .add_volume(volume, Box::new(std::io::Cursor::new(bytes.clone())))
+            .unwrap();
+    }
+    let options = unrar_rs::ExtractOptions {
+        verify: true,
+        password: None,
+        restore_owners: false,
+    };
+    let output_dir = temp_dir.path().join("out");
+    std::fs::create_dir_all(&output_dir).unwrap();
+
+    // The budget is what carries the job's metrics handle into the extractor,
+    // so build it exactly as the extraction task does.
+    let budget = pipeline.extraction_budget(job_id, &output_dir).unwrap();
+    let root = std::sync::Arc::new(
+        crate::pipeline::extraction::ExtractionRoot::open(&output_dir).unwrap(),
+    );
+
+    assert!(
+        pipeline
+            .metrics
+            .pipeline_histograms
+            .snapshot()
+            .extract_member_duration
+            .is_none(),
+        "the histogram must be absent, not an all-zero series, before the first member"
+    );
+
+    for (member, expected_count) in [("E01.mkv", 1u64), ("E02.mkv", 2u64)] {
+        let idx = archive.find_member_sanitized(member).unwrap();
+        Pipeline::extract_rar_member_to_output(
+            &mut archive,
+            crate::pipeline::extraction::RarExtractionContext::new(
+                &volume_paths,
+                &pipeline.event_tx,
+                job_id,
+                "show",
+                &output_dir,
+                &options,
+            )
+            .with_security(std::sync::Arc::clone(&root), std::sync::Arc::clone(&budget)),
+            idx,
+        )
+        .unwrap();
+
+        let histogram = pipeline
+            .metrics
+            .pipeline_histograms
+            .snapshot()
+            .extract_member_duration
+            .expect("an extracted member turns the histogram on");
+        assert_eq!(histogram.count, expected_count);
+        assert_eq!(
+            histogram.cumulative_counts().last().copied(),
+            Some(expected_count),
+            "every observation must land in a bucket"
+        );
+    }
+}
+
 #[tokio::test]
 async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -96,7 +185,7 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
     let files = build_multifile_multivolume_rar_set();
 
     let mut good_archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -117,7 +206,7 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
         segment["volume_index"] = serde_json::json!(0);
     }
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
 
@@ -131,7 +220,7 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
         })
         .collect::<std::collections::BTreeMap<_, _>>();
 
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -145,10 +234,11 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
             volume_paths: volume_paths.clone(),
             password_candidates: Vec::new(),
             cached_headers: Some(stale_headers.clone()),
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: None,
             already_extracted: None,
+            budget: None,
         },
     )
     .unwrap()
@@ -185,10 +275,11 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
             volume_paths: volume_paths.clone(),
             password_candidates: Vec::new(),
             cached_headers: Some(stale_headers),
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::RefreshProvidedVolumes,
             requested_members: None,
             already_extracted: None,
+            budget: None,
         },
     )
     .unwrap()
@@ -232,7 +323,7 @@ async fn recompute_rar_set_state_refreshes_cached_span_when_facts_contradict_sna
     }
 
     let mut good_archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -258,7 +349,7 @@ async fn recompute_rar_set_state_refreshes_cached_span_when_facts_contradict_sna
     e01["split_after"] = serde_json::json!(false);
 
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
 
@@ -294,11 +385,9 @@ async fn recompute_rar_set_state_refreshes_cached_span_when_facts_contradict_sna
     let healed_headers = pipeline
         .load_rar_snapshot(job_id, "show")
         .expect("recompute should persist a healed snapshot");
-    let healed_archive = weaver_unrar::RarArchive::deserialize_headers_with_password(
-        &healed_headers,
-        None::<String>,
-    )
-    .unwrap();
+    let healed_archive =
+        unrar_rs::RarArchive::deserialize_headers_with_password(&healed_headers, None::<String>)
+            .unwrap();
     let healed_e01 = healed_archive
         .metadata()
         .members
@@ -314,7 +403,7 @@ fn cached_rar_snapshot_alignment_treats_incomplete_tail_growth_as_staleness() {
     let files = build_multifile_multivolume_rar_set();
 
     let mut cached_archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     cached_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -325,7 +414,7 @@ fn cached_rar_snapshot_alignment_treats_incomplete_tail_growth_as_staleness() {
     let mut facts = BTreeMap::new();
     for (volume, (_, bytes)) in files.iter().enumerate() {
         let mut parsed =
-            weaver_unrar::RarArchive::parse_volume_facts(std::io::Cursor::new(bytes.clone()), None)
+            unrar_rs::RarArchive::parse_volume_facts(std::io::Cursor::new(bytes.clone()), None)
                 .unwrap();
         if volume == 3 {
             parsed.more_volumes = true;
@@ -364,7 +453,7 @@ async fn recompute_rar_set_state_rebuilds_from_live_volumes_when_cached_headers_
     }
 
     let mut good_archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -378,7 +467,7 @@ async fn recompute_rar_set_state_rebuilds_from_live_volumes_when_cached_headers_
     let mut cached = serde_json::to_value(good_archive.export_headers()).unwrap();
     cached["members"] = serde_json::json!([]);
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
 
@@ -420,11 +509,9 @@ async fn recompute_rar_set_state_rebuilds_from_live_volumes_when_cached_headers_
     let healed_headers = pipeline
         .load_rar_snapshot(job_id, "show")
         .expect("recompute should persist healed headers");
-    let healed_archive = weaver_unrar::RarArchive::deserialize_headers_with_password(
-        &healed_headers,
-        None::<String>,
-    )
-    .unwrap();
+    let healed_archive =
+        unrar_rs::RarArchive::deserialize_headers_with_password(&healed_headers, None::<String>)
+            .unwrap();
     assert!(
         !healed_archive.metadata().members.is_empty(),
         "healed headers should no longer carry the incoherent empty-member snapshot",
@@ -477,10 +564,11 @@ async fn rar_password_fallback_from_nzb_meta_is_validated_before_remembering_cac
             volume_paths,
             password_candidates: restart_candidates.clone(),
             cached_headers: Some(cached_headers),
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: &[],
             already_extracted: None,
+            budget: None,
         },
     )
     .expect("cached headers should validate extraction with the fallback winner");
@@ -547,10 +635,11 @@ async fn rar_password_member_encrypted_fallback_from_nzb_meta_is_validated_by_pr
             volume_paths: volume_paths.clone(),
             password_candidates: candidates.clone(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: &requested_members,
             already_extracted: None,
+            budget: None,
         },
     )
     .expect("member extraction probe should fall back to the NZB meta password");
@@ -570,7 +659,7 @@ async fn rar_password_member_encrypted_fallback_from_nzb_meta_is_validated_by_pr
 
     let output_dir = temp_dir.path().join("member-password-fallback");
     std::fs::create_dir_all(&output_dir).unwrap();
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: selection.password.clone(),
         restore_owners: false,
@@ -646,10 +735,11 @@ async fn rar_password_member_encrypted_cached_headers_probe_after_restart() {
             volume_paths,
             password_candidates: candidates.clone(),
             cached_headers: Some(cached_headers),
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: &requested_members,
             already_extracted: None,
+            budget: None,
         },
     )
     .expect("cached headers should still probe extraction before selecting a member password");
@@ -720,7 +810,7 @@ fn rar_password_candidate_helper_redacts_exhausted_candidates() {
         |_password| {
             attempts += 1;
             Err(RarPasswordAttemptError::Rar(
-                weaver_unrar::RarError::InvalidPassword,
+                unrar_rs::RarError::InvalidPassword,
             ))
         },
     ) {
@@ -868,6 +958,152 @@ async fn rar_refresh_follow_up_covers_holey_inflight_snapshot() {
     );
 }
 
+/// A coverage gap the plan CANNOT close must park, not respawn.
+///
+/// The follow-up machinery exists for absorbable facts: a holey snapshot's
+/// next rebuild attaches the present volumes and the gap closes. But a
+/// rebuild can also come back with a plan that has NOT absorbed every
+/// registered fact — a chain the opened headers cannot extend, a volume
+/// binding pointing at bytes no rebuild can attach — and an ungated
+/// follow-up then respawns an identical refresh from every completion, at
+/// actor speed, forever: identical inputs, identical plan, same gap. The
+/// completion fingerprint parks the second identical completion; a real
+/// fact change moves the fingerprint and re-arms the gap.
+#[tokio::test]
+async fn a_refresh_gap_the_plan_cannot_close_parks_instead_of_respawning() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40133);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Unclosable Gap Parks", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+    let key = (job_id, "show".to_string());
+    let extraction_generation = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("RAR set state should exist")
+        .extraction_generation;
+
+    // A computed result whose plan absorbed only volume 0, while the set's
+    // facts hold every volume: the unclosable-gap shape, reduced to its
+    // essence. Rebuilding it twice models a refresh loop whose inputs never
+    // change between rounds.
+    let unclosable_computed = |pipeline: &Pipeline| {
+        let mut topology = pipeline
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.assembly.archive_topology_for("show"))
+            .cloned()
+            .expect("RAR topology should exist after all volumes complete");
+        topology.complete_volumes.retain(|volume| *volume == 0);
+        ComputedRarSetState {
+            plan: crate::pipeline::archive::rar_state::RarDerivedPlan {
+                phase: crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes,
+                is_solid: false,
+                ready_members: Vec::new(),
+                member_names: Vec::new(),
+                member_dependencies: HashMap::new(),
+                waiting_on_volumes: HashSet::from([1]),
+                deletion_eligible: HashSet::new(),
+                delete_decisions: BTreeMap::new(),
+                topology,
+                fallback_reason: None,
+            },
+            headers: Vec::new(),
+            rebuild_source:
+                crate::pipeline::archive::topology::RarTopologyRebuildSource::VolumeZero,
+        }
+    };
+    let request = RarRefreshRequest {
+        target_completed_volume: 2,
+        reason: RefreshReason::CoverageExpansion,
+    };
+    let refresh_done = |pipeline: &Pipeline| RarRefreshDone {
+        job_id,
+        set_name: "show".to_string(),
+        request,
+        extraction_generation,
+        result: Ok(unclosable_computed(pipeline)),
+    };
+
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: Some(request),
+            queued: None,
+            latest_completed_volume: 2,
+            refreshed_volumes: BTreeSet::from([0, 1, 2]),
+            structure_dirty: false,
+            last_error: None,
+            last_completion_fingerprint: None,
+        },
+    );
+
+    // Round one: the gap is new, so a follow-up is the right call — the facts
+    // grew past what this plan absorbed and a rebuild might absorb them.
+    let done = refresh_done(&pipeline);
+    pipeline.handle_rar_refresh_done(done).await;
+    assert!(
+        pipeline
+            .rar_refresh_state
+            .get(&key)
+            .is_some_and(|state| state.in_flight.is_some()),
+        "the first unabsorbed-facts completion must spawn a follow-up refresh"
+    );
+
+    // Round two lands on identical inputs and an identical plan: without the
+    // park this respawns forever, at actor speed.
+    let done = refresh_done(&pipeline);
+    pipeline.handle_rar_refresh_done(done).await;
+    let parked_fingerprint = {
+        let state = pipeline
+            .rar_refresh_state
+            .get(&key)
+            .expect("RAR refresh state should remain present");
+        assert!(
+            state.in_flight.is_none() && state.queued.is_none(),
+            "an identical completion must park the gap instead of respawning"
+        );
+        state
+            .last_completion_fingerprint
+            .expect("a successful completion must record its fingerprint")
+    };
+
+    // A real fact change re-arms the parked gap: the fingerprint moves, so
+    // the next completion follows up again instead of staying parked.
+    pipeline
+        .rar_sets
+        .get_mut(&key)
+        .expect("RAR set state should exist")
+        .facts_generation += 1;
+    pipeline
+        .rar_refresh_state
+        .get_mut(&key)
+        .expect("RAR refresh state should remain present")
+        .in_flight = Some(request);
+    let done = refresh_done(&pipeline);
+    pipeline.handle_rar_refresh_done(done).await;
+    let state = pipeline
+        .rar_refresh_state
+        .get(&key)
+        .expect("RAR refresh state should remain present");
+    assert!(
+        state.in_flight.is_some(),
+        "a changed fact must re-arm the parked coverage gap"
+    );
+    assert_ne!(
+        state.last_completion_fingerprint,
+        Some(parked_fingerprint),
+        "the re-armed completion must move the fingerprint"
+    );
+}
+
 #[tokio::test]
 async fn rar_refresh_follow_up_does_not_starve_covered_ready_members() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -907,6 +1143,7 @@ async fn rar_refresh_follow_up_does_not_starve_covered_ready_members() {
             refreshed_volumes: BTreeSet::from([0, 1]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1039,6 +1276,7 @@ async fn rar_refresh_done_uses_actual_refreshed_frontier() {
             refreshed_volumes: BTreeSet::from([0, 1]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1132,6 +1370,7 @@ async fn stale_post_extraction_refresh_does_not_replace_live_rar_plan() {
             refreshed_volumes: BTreeSet::from([0, 1, 2, 3]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1171,6 +1410,219 @@ async fn stale_post_extraction_refresh_does_not_replace_live_rar_plan() {
         .expect("refresh state should remain");
     assert!(refresh.in_flight.is_none());
     assert!(refresh.queued.is_none());
+}
+
+#[tokio::test]
+async fn identity_rebind_rejects_an_older_rar_refresh_snapshot() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40138);
+    let files = build_multifile_multivolume_rar_set();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("RAR Identity Rebind Refresh Race", &files),
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let key = (job_id, "show".to_string());
+    let stale_plan = pipeline
+        .rar_sets
+        .get(&key)
+        .and_then(|state| state.plan.as_ref())
+        .cloned()
+        .expect("RAR plan should exist before identity rebinding");
+    let stale_headers = pipeline
+        .load_rar_snapshot(job_id, "show")
+        .expect("RAR snapshot should exist before identity rebinding");
+    let stale_generation = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("RAR set should exist")
+        .extraction_generation;
+    let canonical_facts = pipeline.rar_sets.get(&key).unwrap().facts.clone();
+    let request = RarRefreshRequest {
+        target_completed_volume: 3,
+        reason: RefreshReason::PostExtraction,
+    };
+    let identity_rebuild = RarRefreshRequest {
+        target_completed_volume: 3,
+        reason: RefreshReason::IdentityRebind,
+    };
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: Some(request),
+            queued: Some(identity_rebuild),
+            latest_completed_volume: 3,
+            refreshed_volumes: BTreeSet::from([0, 1, 2, 3]),
+            structure_dirty: true,
+            last_error: None,
+            last_completion_fingerprint: None,
+        },
+    );
+
+    let touched_filenames = files.iter().map(|(filename, _)| filename.clone()).collect();
+    pipeline.invalidate_archive_set_for_identity_rebind(job_id, "show", &touched_filenames);
+    pipeline.purge_empty_rar_set_if_idle(job_id, "show");
+    for (volume, (filename, _)) in files.iter().enumerate() {
+        pipeline
+            .persist_rar_volume_facts(
+                job_id,
+                "show",
+                filename,
+                Some(volume as u32),
+                canonical_facts[&(volume as u32)].clone(),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        pipeline
+            .rar_sets
+            .get(&key)
+            .expect("RAR set should survive identity rebinding")
+            .extraction_generation,
+        stale_generation.saturating_add(1)
+    );
+    assert_eq!(
+        pipeline.load_rar_snapshot(job_id, "show").as_deref(),
+        Some(stale_headers.as_slice()),
+        "identity rebinding retains the snapshot only as a base for rebuilding sets whose \
+         volume zero may already be gone"
+    );
+
+    pipeline
+        .handle_rar_refresh_done(RarRefreshDone {
+            job_id,
+            set_name: "show".to_string(),
+            request,
+            extraction_generation: stale_generation,
+            result: Ok(ComputedRarSetState {
+                plan: stale_plan,
+                headers: stale_headers.clone(),
+                rebuild_source:
+                    crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+            }),
+        })
+        .await;
+
+    let set_state = pipeline.rar_sets.get(&key).expect("RAR set should remain");
+    assert_eq!(
+        set_state.extraction_generation,
+        stale_generation.saturating_add(1)
+    );
+    assert!(
+        set_state.plan.is_none(),
+        "the stale plan must stay discarded"
+    );
+    assert_eq!(
+        pipeline.load_rar_snapshot(job_id, "show").as_deref(),
+        Some(stale_headers.as_slice()),
+        "the older refresh must not alter the retained rebuild base"
+    );
+
+    drain_rar_refreshes(&mut pipeline).await;
+    let rebuilt_headers = pipeline
+        .load_rar_snapshot(job_id, "show")
+        .expect("the queued identity rebuild should install fresh headers");
+    let rebuilt_archive =
+        unrar_rs::RarArchive::deserialize_headers_with_password(&rebuilt_headers, None::<String>)
+            .unwrap();
+    let e01 = rebuilt_archive
+        .metadata()
+        .members
+        .into_iter()
+        .find(|member| member.name == "E01.mkv")
+        .unwrap();
+    assert_eq!(e01.volumes.first_volume, 0);
+    assert_eq!(e01.volumes.last_volume, 1);
+}
+
+#[tokio::test]
+async fn source_retry_discards_an_in_flight_refresh_without_resurrecting_its_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40139);
+    let files = build_multifile_multivolume_rar_set();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("RAR Source Retry Refresh Retirement", &files),
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let key = (job_id, "show".to_string());
+    let stale_plan = pipeline
+        .rar_sets
+        .get(&key)
+        .and_then(|state| state.plan.clone())
+        .unwrap();
+    let stale_headers = pipeline.load_rar_snapshot(job_id, "show").unwrap();
+    let stale_generation = pipeline.rar_sets[&key].extraction_generation;
+    let request = RarRefreshRequest {
+        target_completed_volume: 3,
+        reason: RefreshReason::PostExtraction,
+    };
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: Some(request),
+            ..Default::default()
+        },
+    );
+
+    pipeline.clear_archive_set_for_source_retry(job_id, "show");
+    let tombstone = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("an in-flight refresh needs a generation tombstone");
+    assert_eq!(
+        tombstone.extraction_generation,
+        stale_generation.saturating_add(1)
+    );
+    assert!(tombstone.facts.is_empty());
+    assert!(tombstone.volume_files.is_empty());
+    assert!(tombstone.plan.is_none());
+    assert!(pipeline.load_rar_snapshot(job_id, "show").is_none());
+
+    pipeline
+        .handle_rar_refresh_done(RarRefreshDone {
+            job_id,
+            set_name: "show".to_string(),
+            request,
+            extraction_generation: stale_generation,
+            result: Ok(ComputedRarSetState {
+                plan: stale_plan,
+                headers: stale_headers,
+                rebuild_source:
+                    crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+            }),
+        })
+        .await;
+
+    assert!(!pipeline.rar_sets.contains_key(&key));
+    assert!(!pipeline.rar_refresh_state.contains_key(&key));
+    assert!(pipeline.load_rar_snapshot(job_id, "show").is_none());
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .assembly
+            .archive_topology_for("show")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1228,6 +1680,7 @@ async fn active_sibling_extraction_does_not_launch_post_refresh_or_reselect_fini
             refreshed_volumes: BTreeSet::from([0, 1, 2, 3]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1450,6 +1903,7 @@ async fn idle_rar_worker_drain_recomputes_and_clears_obsolete_post_refresh() {
             refreshed_volumes: BTreeSet::from([0, 1, 2, 3]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1530,6 +1984,7 @@ async fn idle_rar_worker_drain_keeps_extracting_when_coverage_refresh_launches()
             refreshed_volumes: BTreeSet::from([0, 1, 2, 3]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1589,6 +2044,7 @@ async fn rar_member_refresh_request_retries_after_refresh_error() {
             refreshed_volumes: BTreeSet::from([0, 1]),
             structure_dirty: false,
             last_error: Some(RarRefreshError::Other("refresh failed".to_string())),
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1627,6 +2083,7 @@ async fn rar_refresh_capacity_pressure_requeues_without_validation_escalation() 
             refreshed_volumes: BTreeSet::from([0]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
 
@@ -1746,6 +2203,7 @@ async fn rar_member_refresh_request_ignores_verified_suspects_when_covered() {
             refreshed_volumes: BTreeSet::from([0, 1]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
     pipeline
@@ -1792,6 +2250,58 @@ async fn nested_rar_two_deep_extracts_final_media() {
     ));
     assert!(dest.join("sample.mkv").exists());
     assert!(!dest.join("inner.rar").exists());
+}
+
+/// The delivery-naming pass, through the real completion path rather than the
+/// move function alone: the pipeline resolves the plan from config and the
+/// member reaches the complete directory already renamed.
+///
+/// `sample.mkv` is exactly the shape the pass exists for — a single lowercase
+/// word carrying none of the signals a human-written release name carries, on
+/// the one file large enough to be the payload.
+#[tokio::test]
+async fn an_obfuscated_extracted_member_reaches_the_complete_dir_under_the_job_name() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.config.write().await.delivery_naming =
+        Some(crate::settings::DeliveryNamingOverrides {
+            deobfuscate_delivered_members: Some(true),
+            enable_srrdb_lookup: None,
+        });
+    let job_id = JobId(10070);
+    let fixture_name = "rar5_nested_2deep.rar";
+    let fixture_bytes = rar5_fixture_bytes(fixture_name);
+    let spec = rar_job_spec(
+        "Silver Horizon S01E07",
+        &[(fixture_name.to_string(), fixture_bytes.clone())],
+    );
+    let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, fixture_name, &fixture_bytes).await;
+
+    pipeline.check_job_completion(job_id).await;
+    for _ in 0..4 {
+        settle_inflight_moves(&mut pipeline).await;
+    }
+    drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
+
+    let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
+        "Silver Horizon S01E07",
+    ));
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    ));
+    assert!(
+        dest.join("Silver Horizon S01E07.mkv").exists(),
+        "dest entries: {:?}",
+        std::fs::read_dir(&dest)
+            .map(|entries| entries
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+    assert!(!dest.join("sample.mkv").exists());
 }
 
 #[tokio::test]
@@ -1849,6 +2359,62 @@ async fn nested_rar_five_deep_stops_at_depth_limit() {
     ));
     assert!(dest.join("level2.rar").exists());
     assert!(!dest.join("sample.mkv").exists());
+}
+
+#[tokio::test]
+async fn nested_single_stream_preserves_non_archive_sibling() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(100_710);
+    let staging_dir = temp_dir.path().join("nested-xz-with-sibling");
+    tokio::fs::create_dir_all(&staging_dir).await.unwrap();
+
+    let media = b"ordinary outer archive member";
+    let notes = b"nested xz sidecar";
+    tokio::fs::write(staging_dir.join("sample.mkv"), media)
+        .await
+        .unwrap();
+    let mut xz =
+        lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(0)).unwrap();
+    std::io::Write::write_all(&mut xz, notes).unwrap();
+    tokio::fs::write(staging_dir.join("release.nfo.xz"), xz.finish().unwrap())
+        .await
+        .unwrap();
+
+    let mut state = minimal_job_state(job_id, "Nested XZ With Sibling", temp_dir.path().join("wd"));
+    state.staging_dir = Some(staging_dir.clone());
+    pipeline.jobs.insert(job_id, state);
+    pipeline.job_order.push(job_id);
+
+    assert!(matches!(
+        pipeline
+            .maybe_start_nested_extraction(job_id)
+            .await
+            .unwrap(),
+        crate::pipeline::completion::NestedExtractionDecision::Started
+    ));
+    assert_eq!(
+        tokio::fs::read(staging_dir.join("sample.mkv"))
+            .await
+            .unwrap(),
+        media,
+        "starting a selective nested pass must preserve ordinary siblings"
+    );
+
+    drive_extractions_to_terminal(&mut pipeline, job_id, 2).await;
+
+    let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
+        "Nested XZ With Sibling",
+    ));
+    assert_eq!(
+        tokio::fs::read(dest.join("sample.mkv")).await.unwrap(),
+        media
+    );
+    assert_eq!(
+        tokio::fs::read(dest.join("release.nfo")).await.unwrap(),
+        notes
+    );
+    assert!(!dest.join("release.nfo.xz").exists());
 }
 
 #[tokio::test]
@@ -2288,32 +2854,39 @@ async fn list_jobs_keeps_legacy_idle_post_state_for_waiting_rar_phase() {
     assert_eq!(info.status, JobStatus::Downloading);
     assert_eq!(
         info.download_state,
-        crate::jobs::model::DownloadState::Downloading
+        crate::jobs::model::DownloadState::Queued
     );
     assert_eq!(info.post_state, crate::jobs::model::PostState::Idle);
 }
 
+/// Regression for the removed PAR2 expected-hash substitution: a completed
+/// RAR volume whose yEnc aggregate CRC matches must NOT have the recovery
+/// set's EXPECTED MD5 persisted as though it had been calculated. The yEnc
+/// header is the poster's own declaration; a same-length different byte
+/// sequence with internally consistent yEnc CRCs used to sail through here
+/// and later self-certify quick verification against the very hash it was
+/// copied from, overriding a `Damaged` IFSC verdict.
 #[tokio::test]
-async fn completed_rar_with_par2_metadata_and_verified_yenc_crc_uses_expected_hash() {
+async fn completed_rar_with_par2_metadata_never_persists_the_expected_hash() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20020);
     let filename = "show.part01.rar";
     let payload = b"verified rar volume";
     let expected_hash = [0xAB; 16];
-    assert_ne!(expected_hash, weaver_par2::checksum::md5(payload));
+    assert_ne!(expected_hash, par2_rs::checksum::md5(payload));
     let spec = rar_job_spec(
         "RAR Expected Hash Fast Path",
         &[(filename.to_string(), payload.to_vec())],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
 
-    let par2_file_id = weaver_par2::FileId::from_bytes([0x42; 16]);
+    let par2_file_id = par2_rs::FileId::from_bytes([0x42; 16]);
     let mut par2_set = minimal_par2_file_set();
     par2_set.recovery_file_ids.push(par2_file_id);
     par2_set.files.insert(
         par2_file_id,
-        weaver_par2::FileDescription {
+        par2_rs::FileDescription {
             file_id: par2_file_id,
             hash_full: expected_hash,
             hash_16k: [0xCD; 16],
@@ -2335,35 +2908,47 @@ async fn completed_rar_with_par2_metadata_and_verified_yenc_crc_uses_expected_ha
         0,
         payload,
         filename,
-        Some(weaver_par2::checksum::crc32(payload)),
+        Some(par2_rs::checksum::crc32(payload)),
     )
     .await;
 
-    let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
-    assert_eq!(hashes.get(&0).copied(), Some(expected_hash));
+    // Neither loader may hold the PAR2 expectation. A digest, when one is
+    // persisted at all, must be the one calculated from the downloaded
+    // bytes — never the recovery set's declared value.
+    let actual_hash = par2_rs::checksum::md5(payload);
+    let trusted = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_ne!(trusted.get(&0).copied(), Some(expected_hash));
+    if let Some(stored) = trusted.get(&0) {
+        assert_eq!(*stored, actual_hash);
+    }
+    let any = pipeline.db.load_complete_file_hashes_any(job_id).unwrap();
+    assert_ne!(any.get(&0).copied(), Some(expected_hash));
 }
 
+/// Twin of the test above for the no-whole-file-CRC arm the substitution also
+/// served: with only part CRCs verified, completion must still not mint the
+/// PAR2 expectation as a persisted digest.
 #[tokio::test]
-async fn completed_rar_without_whole_file_crc_uses_expected_hash_when_parts_verified() {
+async fn completed_rar_without_whole_file_crc_never_persists_the_expected_hash() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20021);
     let filename = "show.part02.rar";
     let payload = b"verified rar volume without whole crc";
     let expected_hash = [0xBC; 16];
-    assert_ne!(expected_hash, weaver_par2::checksum::md5(payload));
+    assert_ne!(expected_hash, par2_rs::checksum::md5(payload));
     let spec = rar_job_spec(
         "RAR Expected Hash Missing CRC Fast Path",
         &[(filename.to_string(), payload.to_vec())],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
 
-    let par2_file_id = weaver_par2::FileId::from_bytes([0x43; 16]);
+    let par2_file_id = par2_rs::FileId::from_bytes([0x43; 16]);
     let mut par2_set = minimal_par2_file_set();
     par2_set.recovery_file_ids.push(par2_file_id);
     par2_set.files.insert(
         par2_file_id,
-        weaver_par2::FileDescription {
+        par2_rs::FileDescription {
             file_id: par2_file_id,
             hash_full: expected_hash,
             hash_16k: [0xDE; 16],
@@ -2380,8 +2965,14 @@ async fn completed_rar_without_whole_file_crc_uses_expected_hash_when_parts_veri
 
     submit_decoded_segment(&mut pipeline, file_id, 0, 0, payload, filename, None).await;
 
-    let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
-    assert_eq!(hashes.get(&0).copied(), Some(expected_hash));
+    let actual_hash = par2_rs::checksum::md5(payload);
+    let trusted = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_ne!(trusted.get(&0).copied(), Some(expected_hash));
+    if let Some(stored) = trusted.get(&0) {
+        assert_eq!(*stored, actual_hash);
+    }
+    let any = pipeline.db.load_complete_file_hashes_any(job_id).unwrap();
+    assert_ne!(any.get(&0).copied(), Some(expected_hash));
 }
 
 #[tokio::test]
@@ -2392,7 +2983,7 @@ async fn completed_rar_without_verified_part_crc_falls_back_to_actual_hash() {
     let filename = "show.part03.rar";
     let payload = b"rar volume without verified part crc";
     let expected_hash = [0xBD; 16];
-    let actual_hash = weaver_par2::checksum::md5(payload);
+    let actual_hash = par2_rs::checksum::md5(payload);
     assert_ne!(expected_hash, actual_hash);
     let spec = rar_job_spec(
         "RAR Expected Hash Missing Part CRC Fallback",
@@ -2400,12 +2991,12 @@ async fn completed_rar_without_verified_part_crc_falls_back_to_actual_hash() {
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
 
-    let par2_file_id = weaver_par2::FileId::from_bytes([0x44; 16]);
+    let par2_file_id = par2_rs::FileId::from_bytes([0x44; 16]);
     let mut par2_set = minimal_par2_file_set();
     par2_set.recovery_file_ids.push(par2_file_id);
     par2_set.files.insert(
         par2_file_id,
-        weaver_par2::FileDescription {
+        par2_rs::FileDescription {
             file_id: par2_file_id,
             hash_full: expected_hash,
             hash_16k: [0xEF; 16],
@@ -2594,8 +3185,8 @@ async fn eager_delete_waits_for_par2_verification_before_removing_rar_sources() 
     );
 
     let par2_set = placement_par2_file_set(&files);
-    let access = weaver_par2::DiskFileAccess::new(working_dir.clone(), &par2_set);
-    let verification = weaver_par2::verify_all(&par2_set, &access);
+    let access = par2_rs::DiskFileAccess::new(working_dir.clone(), &par2_set);
+    let verification = par2_rs::verify_all(&par2_set, &access);
     pipeline.recompute_volume_safety_from_verification(job_id, &verification);
     pipeline.par2_verified.insert(job_id);
     pipeline.try_delete_volumes(job_id, "show");
@@ -2645,6 +3236,9 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
     };
 
     let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
+    restored
+        .direct_store
+        .set_gate(crate::pipeline::direct_store::DirectStoreGate::Disabled);
     restored
         .restore_job(RestoreJobRequest {
             job_id,
@@ -3600,14 +4194,6 @@ async fn restore_job_does_not_rehydrate_lossy_extraction_attempt_state() {
             .db
             .set_active_job_normalization_retried(job_id, true)
             .unwrap();
-        pipeline
-            .db
-            .replace_verified_suspect_volumes(
-                job_id,
-                "show",
-                &std::collections::HashSet::from([1u32, 2u32]),
-            )
-            .unwrap();
         working_dir
     };
 
@@ -4301,6 +4887,18 @@ async fn rar_identity_rebind_preserves_in_flight_workers() {
         .expect("set state should exist");
     assert_eq!(set_state.active_workers, 2);
     assert_eq!(set_state.in_flight_members, expected_in_flight);
+    let generation_before_rebind = set_state.extraction_generation;
+
+    let stale_headers = shortened_e01_rar_headers(&files);
+    pipeline.rar_sets.get_mut(&set_key).unwrap().cached_headers = Some(stale_headers.clone());
+    pipeline
+        .db
+        .save_archive_headers(job_id, "show", &stale_headers)
+        .unwrap();
+    assert!(
+        pipeline.load_rar_snapshot(job_id, "show").is_some(),
+        "the shortened topology should be cached in memory and the database"
+    );
 
     let touched_filenames = [files[0].0.clone()].into_iter().collect();
     pipeline.invalidate_archive_set_for_identity_rebind(job_id, "show", &touched_filenames);
@@ -4312,6 +4910,15 @@ async fn rar_identity_rebind_preserves_in_flight_workers() {
     assert_eq!(set_state.active_workers, 2);
     assert_eq!(set_state.in_flight_members, expected_in_flight);
     assert!(set_state.plan.is_none());
+    assert_eq!(
+        set_state.extraction_generation,
+        generation_before_rebind.saturating_add(1)
+    );
+    assert_eq!(
+        pipeline.load_rar_snapshot(job_id, "show").as_deref(),
+        Some(stale_headers.as_slice()),
+        "identity rebinding retains the snapshot as a rebuild base without retaining its plan"
+    );
 
     pipeline.try_rar_extraction(job_id).await;
     let set_state = pipeline
@@ -4832,8 +5439,7 @@ async fn solid_rar_keeps_later_members_ready_after_earlier_failure() {
     let fixture_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar5/rar5_solid.rar");
     let fixture_bytes = tokio::fs::read(&fixture_path).await.unwrap();
-    let archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture_path).unwrap()).unwrap();
+    let archive = unrar_rs::RarArchive::open(std::fs::File::open(&fixture_path).unwrap()).unwrap();
     let member_names = archive.member_names();
     assert!(member_names.len() >= 3);
 
@@ -4965,9 +5571,7 @@ async fn check_job_completion_retains_par2_until_rar_extraction_finishes() {
     }
 
     let par2_filename = &files[4].0;
-    tokio::fs::write(working_dir.join(par2_filename), &files[4].1)
-        .await
-        .unwrap();
+    write_and_complete_file(&mut pipeline, job_id, 4, par2_filename, &files[4].1).await;
     install_test_par2_runtime(
         &mut pipeline,
         job_id,
@@ -4984,6 +5588,7 @@ async fn check_job_completion_retains_par2_until_rar_extraction_finishes() {
     if let Some(plan) = set_state.plan.as_mut() {
         plan.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
     }
+    pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Extracting;
 
     pipeline.check_job_completion(job_id).await;
 
@@ -5219,26 +5824,26 @@ async fn eager_delete_exclusions_do_not_hide_suspect_deleted_rar_damage() {
         .await
         .unwrap();
 
-    let mut verification = weaver_par2::VerificationResult {
+    let mut verification = par2_rs::VerificationResult {
         files: vec![
-            weaver_par2::verify::FileVerification {
-                file_id: weaver_par2::FileId::from_bytes([1; 16]),
+            par2_rs::verify::FileVerification {
+                file_id: par2_rs::FileId::from_bytes([1; 16]),
                 filename: "show.part02.rar".to_string(),
-                status: weaver_par2::verify::FileStatus::Missing,
+                status: par2_rs::verify::FileStatus::Missing,
                 valid_slices: vec![false; 3],
                 missing_slice_count: 3,
             },
-            weaver_par2::verify::FileVerification {
-                file_id: weaver_par2::FileId::from_bytes([2; 16]),
+            par2_rs::verify::FileVerification {
+                file_id: par2_rs::FileId::from_bytes([2; 16]),
                 filename: "show.part04.rar".to_string(),
-                status: weaver_par2::verify::FileStatus::Missing,
+                status: par2_rs::verify::FileStatus::Missing,
                 valid_slices: vec![false; 2],
                 missing_slice_count: 2,
             },
         ],
         recovery_blocks_available: 3,
         total_missing_blocks: 5,
-        repairable: weaver_par2::verify::Repairability::Insufficient {
+        repairable: par2_rs::verify::Repairability::Insufficient {
             blocks_needed: 5,
             blocks_available: 3,
             deficit: 2,
@@ -5253,17 +5858,17 @@ async fn eager_delete_exclusions_do_not_hide_suspect_deleted_rar_damage() {
     assert_eq!(verification.total_missing_blocks, 3);
     assert!(matches!(
         verification.files[0].status,
-        weaver_par2::verify::FileStatus::Missing
+        par2_rs::verify::FileStatus::Missing
     ));
     assert_eq!(verification.files[0].missing_slice_count, 3);
     assert!(matches!(
         verification.files[1].status,
-        weaver_par2::verify::FileStatus::Complete
+        par2_rs::verify::FileStatus::Complete
     ));
     assert_eq!(verification.files[1].missing_slice_count, 0);
     assert!(matches!(
         verification.repairable,
-        weaver_par2::verify::Repairability::Repairable {
+        par2_rs::verify::Repairability::Repairable {
             blocks_needed: 3,
             blocks_available: 3
         }
@@ -5976,6 +6581,427 @@ async fn exhausted_rar_failed_member_skips_lower_bound_recovery_preflight() {
 }
 
 #[tokio::test]
+async fn verified_par2_output_registers_missing_rar_volume_for_retry() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30191);
+    let files = build_multifile_multivolume_rar_set();
+    let present_files = vec![files[0].clone(), files[1].clone(), files[3].clone()];
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("RAR Missing Volume PAR2 Registration", &present_files),
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in present_files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let (missing_filename, missing_bytes) = &files[2];
+    tokio::fs::write(working_dir.join(missing_filename), missing_bytes)
+        .await
+        .unwrap();
+    let verification = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: par2_rs::FileId::from_bytes([0; 16]),
+            filename: missing_filename.clone(),
+            status: par2_rs::verify::FileStatus::Complete,
+            valid_slices: Vec::new(),
+            missing_slice_count: 0,
+        }],
+        recovery_blocks_available: 0,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+
+    assert_eq!(
+        pipeline
+            .register_verified_par2_rar_outputs(job_id, &verification)
+            .await
+            .unwrap()
+            .registered,
+        1
+    );
+    pipeline
+        .recompute_rar_set_state(job_id, "show")
+        .await
+        .unwrap();
+
+    let rar_set = pipeline
+        .rar_sets
+        .get(&(job_id, "show".to_string()))
+        .expect("RAR set should be registered");
+    assert!(rar_set.facts.contains_key(&2));
+    assert!(
+        rar_set
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.waiting_on_volumes.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn reconciled_obfuscated_rar_keeps_the_verified_canonical_volume() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30195);
+    let files = build_multifile_multivolume_rar_set();
+    let source_filename = "ae282dbe64861b7171e041b55057e3dd.40";
+    let canonical_filename = files[1].0.as_str();
+    let duplicate_filename = "show.part02.duplicate1.rar";
+    let posted_files = vec![
+        files[0].clone(),
+        (source_filename.to_string(), files[1].1.clone()),
+        files[2].clone(),
+        files[3].clone(),
+    ];
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Obfuscated RAR Repair Reconciliation", &posted_files),
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for file_index in [0usize, 2, 3] {
+        write_and_complete_rar_volume(
+            &mut pipeline,
+            job_id,
+            file_index as u32,
+            &posted_files[file_index].0,
+            &posted_files[file_index].1,
+        )
+        .await;
+    }
+    tokio::fs::write(working_dir.join(canonical_filename), &files[1].1)
+        .await
+        .unwrap();
+    let mut damaged_duplicate = files[1].1.clone();
+    let payload_offset = damaged_duplicate
+        .windows(b"a-payload".len())
+        .position(|window| window == b"a-payload")
+        .unwrap();
+    damaged_duplicate[payload_offset] ^= 1;
+    tokio::fs::write(working_dir.join(duplicate_filename), damaged_duplicate)
+        .await
+        .unwrap();
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    pipeline
+        .set_file_identity(
+            job_id,
+            crate::jobs::record::ActiveFileIdentity {
+                file_index: file_id.file_index,
+                source_filename: source_filename.to_string(),
+                current_filename: duplicate_filename.to_string(),
+                canonical_filename: Some(duplicate_filename.to_string()),
+                classification: Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                    kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
+                    set_name: "show".to_string(),
+                    volume_index: Some(1),
+                }),
+                classification_source: FileIdentitySource::Par2,
+            },
+        )
+        .unwrap();
+    pipeline.file_prefix_16k.insert(
+        file_id,
+        files[1].1[..files[1].1.len().min(16 * 1024)].to_vec(),
+    );
+
+    let par2_set = placement_par2_file_set(&files);
+    let verification = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: par2_set.recovery_file_ids[1],
+            filename: canonical_filename.to_string(),
+            status: par2_rs::verify::FileStatus::Complete,
+            valid_slices: vec![true],
+            missing_slice_count: 0,
+        }],
+        recovery_blocks_available: 1,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+
+    assert_eq!(
+        pipeline
+            .register_verified_par2_rar_outputs(job_id, &verification)
+            .await
+            .unwrap()
+            .registered,
+        1
+    );
+    let report = pipeline
+        .reconcile_verified_par2_files(job_id, &verification)
+        .await
+        .unwrap();
+    assert_eq!(report.completed, 1);
+    pipeline
+        .recompute_rar_set_state(job_id, "show")
+        .await
+        .unwrap();
+
+    let identity = pipeline.file_identity(job_id, file_id).unwrap();
+    assert_eq!(identity.source_filename, source_filename);
+    assert_eq!(identity.current_filename, canonical_filename);
+    assert_eq!(
+        identity.canonical_filename.as_deref(),
+        Some(canonical_filename)
+    );
+    let volume_paths = pipeline.volume_paths_for_rar_set(job_id, "show");
+    assert_eq!(
+        volume_paths.get(&1),
+        Some(&working_dir.join(canonical_filename))
+    );
+
+    let mut archive =
+        unrar_rs::RarArchive::open(std::fs::File::open(volume_paths.get(&0).unwrap()).unwrap())
+            .unwrap();
+    for volume in 1..files.len() {
+        archive
+            .add_volume(
+                volume,
+                Box::new(std::fs::File::open(volume_paths.get(&(volume as u32)).unwrap()).unwrap()),
+            )
+            .unwrap();
+    }
+    let output_dir = working_dir.join("regression-output");
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let member_index = archive.find_member_sanitized("E01.mkv").unwrap();
+    Pipeline::extract_rar_member_to_output(
+        &mut archive,
+        crate::pipeline::extraction::RarExtractionContext::new(
+            &volume_paths,
+            &pipeline.event_tx,
+            job_id,
+            "show",
+            &output_dir,
+            &unrar_rs::ExtractOptions {
+                verify: true,
+                password: None,
+                restore_owners: false,
+            },
+        ),
+        member_index,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(output_dir.join("E01.mkv")).unwrap(),
+        b"episode-a-payload"
+    );
+}
+
+#[tokio::test]
+async fn failed_rar_member_with_par2_is_not_incrementally_retried() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30192);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR PAR2 Retry Latch", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+    install_test_par2_runtime(&mut pipeline, job_id, placement_par2_file_set(&files), &[]);
+
+    let set_key = (job_id, "show".to_string());
+    let failed_member = "E01.mkv".to_string();
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&set_key)
+            .expect("RAR set should exist after all volumes complete");
+        let plan = set_state
+            .plan
+            .as_mut()
+            .expect("RAR set should have an extraction plan");
+        plan.ready_members = vec![crate::pipeline::rar_state::RarReadyMember {
+            name: failed_member.clone(),
+        }];
+    }
+    pipeline
+        .failed_extractions
+        .insert(job_id, HashSet::from([failed_member]));
+    pipeline.par2_verified.insert(job_id);
+
+    resume_job_downloading_for_test(&mut pipeline, job_id);
+    pipeline.try_rar_extraction(job_id).await;
+
+    let set_state = pipeline
+        .rar_sets
+        .get(&set_key)
+        .expect("RAR set should remain available");
+    assert_eq!(set_state.active_workers, 0);
+    assert!(set_state.in_flight_members.is_empty());
+}
+
+#[tokio::test]
+async fn missing_middle_rar_volume_enters_authoritative_par2_repair() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30193);
+    let missing_filename = "archive.part3.rar";
+    let index_filename = "archive.par2";
+    let recovery_filename = "archive.vol00+01.par2";
+    let missing_bytes: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let index_bytes = build_test_par2_index(missing_filename, &missing_bytes, 64);
+    let files = vec![
+        ("archive.part1.rar".to_string(), vec![0x11; 64]),
+        ("archive.part2.rar".to_string(), vec![0x22; 64]),
+        (missing_filename.to_string(), missing_bytes.clone()),
+        ("archive.part4.rar".to_string(), vec![0x44; 64]),
+        (index_filename.to_string(), index_bytes.clone()),
+        (recovery_filename.to_string(), vec![0xAA; 64]),
+    ];
+    let spec = rar_job_spec("RAR Missing Middle PAR2 Recovery", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for file_index in [0u32, 1, 3] {
+        let (filename, bytes) = &files[file_index as usize];
+        write_and_complete_file(&mut pipeline, job_id, file_index, filename, bytes).await;
+    }
+    write_and_complete_file(&mut pipeline, job_id, 4, index_filename, &index_bytes).await;
+
+    let archive_topology = crate::jobs::assembly::ArchiveTopology {
+        archive_type: crate::jobs::assembly::ArchiveType::Rar,
+        volume_map: HashMap::from([
+            ("archive.part1.rar".to_string(), 0),
+            ("archive.part2.rar".to_string(), 1),
+            ("archive.part4.rar".to_string(), 3),
+        ]),
+        complete_volumes: [0u32, 1, 3].into_iter().collect(),
+        expected_volume_count: Some(4),
+        members: vec![crate::jobs::assembly::ArchiveMember {
+            name: "movie.mkv".to_string(),
+            first_volume: 0,
+            last_volume: 3,
+            unpacked_size: 0,
+        }],
+        unresolved_spans: vec![crate::jobs::assembly::ArchivePendingSpan {
+            first_volume: 2,
+            last_volume: 2,
+        }],
+    };
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.recovery_queue.push(DownloadWork {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 5,
+                },
+                segment_number: 0,
+            },
+            message_id: MessageId::new("missing-middle-recovery@example.com"),
+            groups: vec!["alt.binaries.test".to_string()],
+            priority: 1000,
+            byte_estimate: 64,
+            retry_count: 0,
+            // Optional PAR2 volumes enter the parked recovery queue before the
+            // authoritative analyzer classifies and promotes them.
+            is_recovery: false,
+            completion_critical: false,
+            exclude_servers: Vec::new(),
+            avoid_server: None,
+        });
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+        state
+            .assembly
+            .set_archive_topology("archive".to_string(), archive_topology.clone());
+    }
+    pipeline.rar_sets.insert(
+        (job_id, "archive".to_string()),
+        crate::pipeline::archive::rar_state::RarSetState {
+            plan: Some(crate::pipeline::archive::rar_state::RarDerivedPlan {
+                phase: crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes,
+                is_solid: true,
+                ready_members: Vec::new(),
+                member_names: vec!["movie.mkv".to_string()],
+                member_dependencies: HashMap::new(),
+                waiting_on_volumes: HashSet::from([2u32]),
+                deletion_eligible: HashSet::new(),
+                delete_decisions: std::collections::BTreeMap::new(),
+                topology: archive_topology,
+                fallback_reason: None,
+            }),
+            ..Default::default()
+        },
+    );
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(missing_filename, &missing_bytes, 64, 0),
+        &[
+            (4, index_filename, 0, false),
+            (5, recovery_filename, 2, false),
+        ],
+    );
+    assert!(pipeline.par2_set(job_id).is_some());
+    assert!(!pipeline.par2_bypassed.contains(&job_id));
+    pipeline.par2_verified.insert(job_id);
+    assert!(pipeline.par2_verified.contains(&job_id));
+    assert!(!pipeline.job_has_active_extraction_tasks(job_id));
+    assert!(pipeline.job_has_live_rar_waiting_for_missing_volumes(job_id));
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| !state.recovery_queue.is_empty())
+    );
+
+    while events.try_recv().is_ok() {}
+    pipeline.par2_repairer_analyze_calls = 0;
+    pipeline.check_job_completion(job_id).await;
+
+    let status = pipeline.jobs.get(&job_id).map(|state| state.status.clone());
+    assert_eq!(
+        pipeline.par2_repairer_analyze_calls,
+        1,
+        "missing RAR volume must force authoritative PAR2 verification; status={status:?}, failed={:?}, verified={}",
+        pipeline.failed_extractions.get(&job_id),
+        pipeline.par2_verified.contains(&job_id),
+    );
+    assert_eq!(drain_job_verification_started(&mut events, job_id), 1);
+    assert_eq!(status, Some(JobStatus::Downloading));
+    assert!(pipeline.jobs.get(&job_id).is_some_and(|state| {
+        state
+            .download_queue
+            .count_matching(|work| work.segment_id.file_id.file_index == 5)
+            > 0
+    }));
+    assert_eq!(
+        pipeline.recovery_blocks_available_or_targeted(
+            job_id,
+            pipeline.par2_served_set_id(job_id).unwrap()
+        ),
+        2
+    );
+
+    // Optional PAR2 files preserve the NZB's original classification, so they
+    // are not necessarily marked `is_recovery`. A completion check triggered
+    // by one recovered file must wait for every promoted file, not rescan.
+    pipeline.check_job_completion(job_id).await;
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
+    assert_eq!(drain_job_verification_started(&mut events, job_id), 0);
+    assert!(!pipeline.failed_extractions.contains_key(&job_id));
+}
+
+#[tokio::test]
 async fn rar_waiting_for_missing_volumes_without_par2_fails_after_download_completion() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
@@ -6019,11 +7045,12 @@ async fn rar_waiting_for_missing_volumes_without_par2_fails_after_download_compl
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::WaitingForVolumes,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::WaitingForVolumes,
@@ -6092,11 +7119,12 @@ async fn legacy_reconcile_schedules_waiting_rar_completion_check() {
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::WaitingForVolumes,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::WaitingForVolumes,
@@ -6171,11 +7199,12 @@ async fn rar_completion_waiting_for_volumes_does_not_requeue_itself() {
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::Ready,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::Ready,
@@ -6258,11 +7287,12 @@ async fn clean_member_keeps_failed_neighbor_boundary_volume_suspect() {
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: std::collections::HashSet::from([1u32]),
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::Ready,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::Ready,
@@ -6527,11 +7557,12 @@ async fn ownerless_live_rar_plan_error_requires_named_member_facts() {
             facts: BTreeMap::from([(0u32, stale_named_facts)]),
             volume_files: BTreeMap::from([(0u32, "show.part01.rar".to_string())]),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::WaitingForVolumes,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::WaitingForVolumes,
@@ -6632,6 +7663,7 @@ async fn rar_completion_waits_for_pending_refresh_before_terminal_decision() {
             refreshed_volumes: BTreeSet::from([0, 1, 2]),
             structure_dirty: false,
             last_error: None,
+            last_completion_fingerprint: None,
         },
     );
     {
@@ -6677,7 +7709,7 @@ async fn incoherent_rar_waiting_state_heals_before_reverification() {
     }
 
     let mut good_archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -6691,7 +7723,7 @@ async fn incoherent_rar_waiting_state_heals_before_reverification() {
     let mut cached = serde_json::to_value(good_archive.export_headers()).unwrap();
     cached["members"] = serde_json::json!([]);
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
     let topology = pipeline
@@ -6799,7 +7831,7 @@ async fn retry_archive_extraction_after_verify_or_repair_heals_incoherent_rar_st
         );
 
     let mut good_archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -6813,7 +7845,7 @@ async fn retry_archive_extraction_after_verify_or_repair_heals_incoherent_rar_st
     let mut cached = serde_json::to_value(good_archive.export_headers()).unwrap();
     cached["members"] = serde_json::json!([]);
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
     let topology = pipeline
@@ -7041,11 +8073,12 @@ async fn eager_delete_retains_volume_with_failed_member_claim() {
             facts: std::collections::BTreeMap::from([(1u32, dummy_rar_volume_facts(1))]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: std::collections::HashSet::new(),
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::Ready,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::Ready,
@@ -7292,6 +8325,7 @@ async fn incomplete_download_with_active_extraction_defers_instead_of_failing() 
             byte_estimate: 128,
             retry_count: 0,
             is_recovery: false,
+            completion_critical: false,
             exclude_servers: Vec::new(),
             avoid_server: None,
         });
@@ -7925,6 +8959,7 @@ async fn rar_unlock_dirty_priorities_apply_before_lane_refill() {
         compatibility: DownloadBatchCompatibility {
             priority: 3,
             is_recovery: false,
+            completion_critical: false,
             groups: vec!["alt.binaries.test".to_string()],
             exclude_servers: Vec::new(),
             avoid_server: None,
@@ -7988,6 +9023,7 @@ async fn rar_unlock_retry_requeue_marks_rar_volume_dirty_only() {
         byte_estimate: 1024,
         retry_count: 1,
         is_recovery: false,
+        completion_critical: false,
         exclude_servers: Vec::new(),
         avoid_server: None,
     });
@@ -8029,11 +9065,12 @@ async fn impossible_rar_state_fails_loudly_after_forced_recompute() {
             facts: std::collections::BTreeMap::from([(0u32, dummy_rar_volume_facts(0))]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::Ready,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::Ready,
@@ -8454,11 +9491,12 @@ async fn reconcile_job_progress_marks_waiting_for_rar_volumes_without_clobbering
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: std::collections::HashSet::new(),
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: rar_state::RarSetPhase::WaitingForVolumes,
             plan: Some(rar_state::RarDerivedPlan {
                 phase: rar_state::RarSetPhase::WaitingForVolumes,
@@ -8505,7 +9543,7 @@ async fn purge_idle_rar_set_drops_shared_kdf_cache() {
         minimal_job_state(job_id, "purge-job", temp_dir.path().join("purge-job")),
     );
 
-    let shared_kdf_cache = std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new());
+    let shared_kdf_cache = std::sync::Arc::new(unrar_rs::crypto::KdfCache::new());
     let weak_cache = std::sync::Arc::downgrade(&shared_kdf_cache);
 
     pipeline.rar_sets.insert(
@@ -8520,4 +9558,282 @@ async fn purge_idle_rar_set_drops_shared_kdf_cache() {
 
     assert!(!pipeline.rar_sets.contains_key(&(job_id, set_name.clone())));
     assert!(weak_cache.upgrade().is_none());
+}
+
+/// A job whose four-volume RAR set is fully downloaded, complete, and already
+/// carries a derived plan — the state every post-repair refresh finds.
+async fn complete_rar_set_with_plan(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    files: &[(String, Vec<u8>)],
+    name: &str,
+) {
+    insert_active_job(pipeline, job_id, rar_job_spec(name, files)).await;
+    pause_job_for_rar_fixture_setup(pipeline, job_id);
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+    assert!(
+        pipeline
+            .rar_sets
+            .get(&(job_id, "show".to_string()))
+            .and_then(|state| state.plan.as_ref())
+            .is_some(),
+        "the fixture must reproduce the post-repair precondition: a plan already exists"
+    );
+}
+
+/// Every file `Complete` at its canonical name, which is what a repaired volume
+/// re-verifies as — never `Renamed`.
+fn all_complete_verification(files: &[(String, Vec<u8>)]) -> par2_rs::VerificationResult {
+    par2_rs::VerificationResult {
+        files: files
+            .iter()
+            .enumerate()
+            .map(|(index, (filename, _))| par2_rs::verify::FileVerification {
+                file_id: par2_rs::FileId::from_bytes([index as u8; 16]),
+                filename: filename.clone(),
+                status: par2_rs::verify::FileStatus::Complete,
+                valid_slices: Vec::new(),
+                missing_slice_count: 0,
+            })
+            .collect(),
+        recovery_blocks_available: 0,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    }
+}
+
+#[tokio::test]
+async fn repaired_middle_volume_refreshes_topology_despite_an_existing_plan() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30240);
+    let files = build_multifile_multivolume_rar_set();
+    complete_rar_set_with_plan(&mut pipeline, job_id, &files, "Repaired Middle Volume").await;
+
+    let verification = all_complete_verification(&files);
+
+    // The trap this fix exists for: the plan exists, so nothing is judged to
+    // need a refresh, and no file here is `Renamed`.
+    assert!(
+        pipeline
+            .verified_complete_archive_file_ids_needing_refresh(
+                job_id,
+                &verification,
+                &HashSet::new(),
+            )
+            .is_empty(),
+        "an existing plan suppresses every refresh when the repair is not named"
+    );
+
+    // Volume 1 is interior: the member E01.mkv starts at volume 0 and continues
+    // past it, so a chain rebuilt without volume 1's repaired header truncates
+    // the member and extraction opens a short volume range.
+    let rewritten: HashSet<par2_rs::FileId> = [verification.files[1].file_id].into_iter().collect();
+    assert_eq!(
+        pipeline.verified_complete_archive_file_ids_needing_refresh(
+            job_id,
+            &verification,
+            &rewritten,
+        ),
+        vec![NzbFileId {
+            job_id,
+            file_index: 1
+        }],
+        "the volume the repair rewrote must refresh even though its set has a plan"
+    );
+}
+
+#[tokio::test]
+async fn repaired_final_volume_refreshes_topology_despite_an_existing_plan() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30241);
+    let files = build_multifile_multivolume_rar_set();
+    complete_rar_set_with_plan(&mut pipeline, job_id, &files, "Repaired Final Volume").await;
+
+    let verification = all_complete_verification(&files);
+    // The boundary case: a stale chain that stops at the last volume is
+    // accidentally the right length, so nothing downstream would notice the
+    // missed refresh. It must still happen — the repaired header is what proves
+    // the member ends there rather than merely appearing to.
+    let last = files.len() - 1;
+    let rewritten: HashSet<par2_rs::FileId> =
+        [verification.files[last].file_id].into_iter().collect();
+    assert_eq!(
+        pipeline.verified_complete_archive_file_ids_needing_refresh(
+            job_id,
+            &verification,
+            &rewritten,
+        ),
+        vec![NzbFileId {
+            job_id,
+            file_index: last as u32
+        }],
+        "a repaired final volume must refresh like any other"
+    );
+}
+
+#[tokio::test]
+async fn repaired_rar_set_holds_extraction_until_its_plan_is_rebuilt() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30242);
+    let files = build_multifile_multivolume_rar_set();
+    complete_rar_set_with_plan(
+        &mut pipeline,
+        job_id,
+        &files,
+        "Repaired Set Extraction Hold",
+    )
+    .await;
+
+    let key = (job_id, "show".to_string());
+    let verification = all_complete_verification(&files);
+    let rewritten: HashSet<par2_rs::FileId> = [verification.files[1].file_id].into_iter().collect();
+
+    pipeline
+        .refresh_verified_complete_archive_topologies(job_id, &verification, &rewritten)
+        .await;
+
+    assert!(
+        pipeline.job_has_pending_rar_refresh_for_current_sets(job_id),
+        "the repaired set must be pending in the gate the completion path already defers on"
+    );
+    assert!(
+        pipeline
+            .rar_refresh_state
+            .get(&key)
+            .is_some_and(|state| state.structure_dirty),
+        "a repaired set's plan must be marked stale so a member cannot start on it"
+    );
+}
+
+#[tokio::test]
+async fn a_clean_verdict_leaves_a_complete_rar_set_plan_alone() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30243);
+    let files = build_multifile_multivolume_rar_set();
+    complete_rar_set_with_plan(&mut pipeline, job_id, &files, "Clean Verdict Plan Kept").await;
+
+    let key = (job_id, "show".to_string());
+    let verification = all_complete_verification(&files);
+
+    // Nothing was repaired, so nothing is stale: the additive inclusion must not
+    // turn every clean verdict into a header-level rebuild.
+    pipeline
+        .refresh_verified_complete_archive_topologies(job_id, &verification, &HashSet::new())
+        .await;
+
+    assert!(
+        !pipeline
+            .rar_refresh_state
+            .get(&key)
+            .is_some_and(|state| state.structure_dirty),
+        "a clean verdict must not mark an intact set's plan stale"
+    );
+}
+
+#[tokio::test]
+async fn renamed_verified_files_still_refresh_without_a_repair_write_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30244);
+    let files = build_multifile_multivolume_rar_set();
+    complete_rar_set_with_plan(&mut pipeline, job_id, &files, "Renamed Arm Unchanged").await;
+
+    let mut verification = all_complete_verification(&files);
+    verification.files[2].status =
+        par2_rs::verify::FileStatus::Renamed(std::path::PathBuf::from(&files[2].0));
+
+    // The pre-existing arm, unchanged: a rename refreshes on its own, with no
+    // repair write set involved.
+    assert_eq!(
+        pipeline.verified_complete_archive_file_ids_needing_refresh(
+            job_id,
+            &verification,
+            &HashSet::new(),
+        ),
+        vec![NzbFileId {
+            job_id,
+            file_index: 2
+        }],
+        "the renamed arm must keep refreshing exactly as before"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_alias_set_with_no_live_claimants_retires_instead_of_failing() {
+    // The job-10162 shape: an obfuscated post's PAR2 index rebinds every file
+    // to canonical names early, the canonical set finalizes direct (nothing is
+    // ever written under the alias names), but a topology entry keyed by the
+    // posted alias survives. Extraction of that alias set finds no volumes on
+    // disk and no live identity claims its names — it must retire, not fail a
+    // clean job.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90211);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Silver Horizon Stale Alias",
+            &[("Silver.Horizon.S01E01.mkv".to_string(), 64)],
+        ),
+    )
+    .await;
+
+    let alias = "bWq99zz0testAliasSetName";
+    let mut stale = crate::pipeline::archive::rar_state::RarSetState::default();
+    stale.volume_files.insert(0, format!("{alias}.part001.rar"));
+    stale.volume_files.insert(1, format!("{alias}.part002.rar"));
+    pipeline.rar_sets.insert((job_id, alias.to_string()), stale);
+
+    let extracted = pipeline.extract_rar_set(job_id, alias).await;
+    assert_eq!(extracted, Ok(0), "retirement is not a failure");
+    assert!(
+        !pipeline.rar_sets.contains_key(&(job_id, alias.to_string())),
+        "the alias set no live file claims is retired"
+    );
+
+    // The negative control: a set live files DO classify into keeps its
+    // topology even when its volumes are missing on disk — that shape is
+    // genuinely missing volumes, not a stale alias.
+    let claimed_job = JobId(90212);
+    let claimed_spec = JobSpec {
+        name: "Silver Horizon Claimed Set".to_string(),
+        password: None,
+        total_bytes: 64,
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: "claimed.part001.rar".to_string(),
+            role: FileRole::from_filename("claimed.part001.rar"),
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: vec![segment_spec! {
+                number: 0,
+                bytes: 64,
+                message_id: "claimed-set-volume@example.com".to_string(),
+            }],
+        }],
+    };
+    insert_active_job(&mut pipeline, claimed_job, claimed_spec).await;
+    let mut claimed = crate::pipeline::archive::rar_state::RarSetState::default();
+    claimed
+        .volume_files
+        .insert(0, "claimed.part001.rar".to_string());
+    pipeline
+        .rar_sets
+        .insert((claimed_job, "claimed".to_string()), claimed);
+
+    let _ = pipeline.extract_rar_set(claimed_job, "claimed").await;
+    assert!(
+        pipeline
+            .rar_sets
+            .contains_key(&(claimed_job, "claimed".to_string())),
+        "a set with live claimants is never retired by the missing-volume path"
+    );
 }

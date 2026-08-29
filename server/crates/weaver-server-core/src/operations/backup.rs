@@ -34,8 +34,7 @@ pub use self::logical::TablePartMetadata;
 pub(crate) use self::manifest::{BACKUP_SCOPE, required_category_remaps};
 pub use self::manifest::{
     BackupArtifact, BackupInspectResult, BackupManifest, BackupServiceError, BackupSourcePaths,
-    BackupStatus, CategoryRemapInput, CategoryRemapRequirement, ManagedPackageInventory,
-    RestoreOptions, RestoreReport,
+    BackupStatus, CategoryRemapInput, CategoryRemapRequirement, RestoreOptions, RestoreReport,
 };
 pub use self::service::BackupService;
 pub use pending::{PendingRestoreOutcome, apply_pending_restore};
@@ -58,14 +57,6 @@ const LEGACY_V1_STABLE_TABLES: &[&str] = &[
     "job_history_attributes",
     "job_events",
     "bandwidth_usage_minute_buckets",
-    "post_processing_extension_revisions",
-    "post_processing_profiles",
-    "post_processing_profile_steps",
-    "post_processing_profile_assignments",
-    "post_processing_job_plans",
-    "post_processing_runs",
-    "post_processing_attempts",
-    "post_processing_log_chunks",
     "rss_feeds",
     "rss_rules",
     "rss_seen_items",
@@ -73,14 +64,6 @@ const LEGACY_V1_STABLE_TABLES: &[&str] = &[
 
 const LEGACY_V1_CLEAR_IMPORT_TABLES: &[&str] = &[
     "metrics_history_chunks",
-    "post_processing_log_chunks",
-    "post_processing_attempts",
-    "post_processing_runs",
-    "post_processing_job_plans",
-    "post_processing_profile_assignments",
-    "post_processing_profile_steps",
-    "post_processing_profiles",
-    "post_processing_extension_revisions",
     "rss_seen_items",
     "rss_rules",
     "rss_feeds",
@@ -392,15 +375,7 @@ async fn postgres_columns(
         .collect()
 }
 
-fn is_post_processing_table(table: &str) -> bool {
-    table.starts_with("post_processing_")
-}
-
-async fn import_stable_state_to_postgres(
-    pool: PgPool,
-    src: PathBuf,
-    include_post_processing: bool,
-) -> Result<(), StateError> {
+async fn import_stable_state_to_postgres(pool: PgPool, src: PathBuf) -> Result<(), StateError> {
     let mut source = SqliteConnectOptions::new()
         .filename(src)
         .connect()
@@ -413,13 +388,6 @@ async fn import_stable_state_to_postgres(
     rebuild_job_history_attributes(&mut source).await?;
     let mut tx = pool.begin().await.map_err(db_err)?;
 
-    sqlx::raw_sql(
-        "UPDATE job_history SET post_processing_run_id = NULL;
-         UPDATE post_processing_runs SET rerun_of_run_id = NULL;",
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(db_err)?;
     for table in LEGACY_V1_CLEAR_IMPORT_TABLES {
         let sql = format!("DELETE FROM {table}");
         sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
@@ -428,12 +396,8 @@ async fn import_stable_state_to_postgres(
             .map_err(db_err)?;
     }
 
-    let mut history_run_links = Vec::<(i64, String)>::new();
-    let mut rerun_links = Vec::<(String, String)>::new();
     for table in LEGACY_V1_STABLE_TABLES {
-        if *table == "schema_version"
-            || (!include_post_processing && is_post_processing_table(table))
-        {
+        if *table == "schema_version" {
             continue;
         }
 
@@ -461,35 +425,10 @@ async fn import_stable_state_to_postgres(
             {
                 let mut values = builder.separated(", ");
                 for column in &columns {
-                    if *table == "job_history"
-                        && column.name == "post_processing_summary"
-                        && !include_post_processing
-                    {
+                    // Legacy v1 bundles predate the script model, so a restored
+                    // history row carries no script results and no summary.
+                    if *table == "job_history" && column.name == "post_processing_summary" {
                         values.push_bind(Some("not_run".to_string()));
-                        continue;
-                    }
-                    if *table == "job_history" && column.name == "post_processing_run_id" {
-                        if include_post_processing {
-                            let job_id: i64 = row.try_get("job_id").map_err(db_err)?;
-                            if let Some(run_id) = row
-                                .try_get::<Option<String>, _>(column.name.as_str())
-                                .map_err(db_err)?
-                            {
-                                history_run_links.push((job_id, run_id));
-                            }
-                        }
-                        values.push_bind(Option::<String>::None);
-                        continue;
-                    }
-                    if *table == "post_processing_runs" && column.name == "rerun_of_run_id" {
-                        let run_id: String = row.try_get("run_id").map_err(db_err)?;
-                        if let Some(rerun_of) = row
-                            .try_get::<Option<String>, _>(column.name.as_str())
-                            .map_err(db_err)?
-                        {
-                            rerun_links.push((run_id, rerun_of));
-                        }
-                        values.push_bind(Option::<String>::None);
                         continue;
                     }
 
@@ -569,31 +508,6 @@ async fn import_stable_state_to_postgres(
             builder.push(")");
             builder.build().execute(&mut *tx).await.map_err(db_err)?;
         }
-    }
-
-    for (run_id, rerun_of) in rerun_links {
-        sqlx::query(
-            "UPDATE post_processing_runs
-                SET rerun_of_run_id = $1
-              WHERE run_id = $2",
-        )
-        .bind(rerun_of)
-        .bind(run_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-    }
-    for (job_id, run_id) in history_run_links {
-        sqlx::query(
-            "UPDATE job_history
-                SET post_processing_run_id = $1
-              WHERE job_id = $2",
-        )
-        .bind(run_id)
-        .bind(job_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
     }
 
     for (table, column) in [
@@ -700,7 +614,7 @@ async fn rebuild_job_history_attributes_tx(
 impl Database {
     pub fn schema_version(&self) -> Result<i64, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT version FROM schema_version LIMIT 1",
@@ -714,7 +628,7 @@ impl Database {
 
     pub fn restore_target_is_pristine(&self) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             for entry in catalog::BACKUP_TABLE_CATALOG {
                 let query = match entry.restore_target_policy {
                     catalog::RestoreTargetPolicy::Replace => continue,
@@ -780,7 +694,7 @@ impl Database {
             }
             StoreDatastore::Postgres { pool } => {
                 let dest = dest.to_path_buf();
-                self.run_sql_blocking(copy_postgres_stable_tables_to_backup(pool, dest))?;
+                self.run_sql_blocking_read(copy_postgres_stable_tables_to_backup(pool, dest))?;
             }
         }
 
@@ -795,23 +709,11 @@ impl Database {
     }
 
     pub fn import_stable_state(&self, src: &Path) -> Result<(), StateError> {
-        self.import_stable_state_with_post_processing(src, true)
-    }
-
-    pub(crate) fn import_stable_state_with_post_processing(
-        &self,
-        src: &Path,
-        include_post_processing: bool,
-    ) -> Result<(), StateError> {
         let src_path = src.to_string_lossy().to_string();
         let datastore = self.datastore();
         if let StoreDatastore::Postgres { pool } = datastore {
             let src = src.to_path_buf();
-            return self.run_sql_blocking(import_stable_state_to_postgres(
-                pool,
-                src,
-                include_post_processing,
-            ));
+            return self.run_sql_blocking_read(import_stable_state_to_postgres(pool, src));
         }
         let datastore = self.datastore();
         self.run_sql_blocking_local(move || async move {
@@ -864,44 +766,9 @@ impl Database {
                             } else {
                                 "NULL"
                             };
-                            let src_pipeline_outcome = if table_has_column(
-                                &mut conn,
-                                "src",
-                                "job_history",
-                                "pipeline_outcome_json",
-                            )
-                            .await?
-                            {
-                                "pipeline_outcome_json"
-                            } else {
-                                "NULL"
-                            };
-                            let src_post_processing_summary = if include_post_processing
-                                && table_has_column(
-                                    &mut conn,
-                                    "src",
-                                    "job_history",
-                                    "post_processing_summary",
-                                )
-                                .await?
-                            {
-                                "post_processing_summary"
-                            } else {
-                                "'not_run'"
-                            };
-                            let src_post_processing_run_id = if include_post_processing
-                                && table_has_column(
-                                    &mut conn,
-                                    "src",
-                                    "job_history",
-                                    "post_processing_run_id",
-                                )
-                                .await?
-                            {
-                                "post_processing_run_id"
-                            } else {
-                                "NULL"
-                            };
+                            // Legacy v1 bundles predate the script model, so a
+                            // restored history row starts with no summary.
+                            let src_post_processing_summary = "'not_run'";
                             let src_server_backfill =
                                 if table_has_column(&mut conn, "src", "servers", "backfill")
                                     .await?
@@ -1014,6 +881,18 @@ impl Database {
                                 } else {
                                     "NULL"
                                 };
+                            let src_server_tls_name_mismatch_certificate_der = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "servers",
+                                "tls_name_mismatch_certificate_der",
+                            )
+                            .await?
+                            {
+                                "tls_name_mismatch_certificate_der"
+                            } else {
+                                "NULL"
+                            };
                             let src_has_server_download_usage = table_has_column(
                                 &mut conn,
                                 "src",
@@ -1033,69 +912,6 @@ impl Database {
                             } else {
                                 ""
                             };
-                            let import_post_processing = if include_post_processing {
-                                "INSERT INTO post_processing_extension_revisions
-                                     (extension_id, revision_id, declared_version, digest, adapter,
-                                      display_name, compatibility_name, entrypoint, manifest_json,
-                                      managed_path, discovered_source_path, trust_state,
-                                      discovered_at_epoch_ms, approved_at_epoch_ms)
-                                     SELECT extension_id, revision_id, declared_version, digest, adapter,
-                                            display_name, compatibility_name, entrypoint, manifest_json,
-                                            managed_path, discovered_source_path, trust_state,
-                                            discovered_at_epoch_ms, approved_at_epoch_ms
-                                       FROM src.post_processing_extension_revisions;
-                                 INSERT INTO post_processing_profiles
-                                     (profile_id, name, enabled, created_at_epoch_ms, updated_at_epoch_ms)
-                                     SELECT profile_id, name, enabled, created_at_epoch_ms, updated_at_epoch_ms
-                                       FROM src.post_processing_profiles;
-                                 INSERT INTO post_processing_profile_steps
-                                     (profile_id, step_index, selection_json, policy_json,
-                                      options_json, secret_options_json)
-                                     SELECT profile_id, step_index, selection_json, policy_json,
-                                            options_json, secret_options_json
-                                       FROM src.post_processing_profile_steps;
-                                 INSERT INTO post_processing_profile_assignments
-                                     (scope_kind, scope_key, profile_id)
-                                     SELECT scope_kind, scope_key, profile_id
-                                       FROM src.post_processing_profile_assignments;
-                                 INSERT INTO post_processing_job_plans
-                                     (job_id, provenance_json, plan_json, secret_options_json,
-                                      created_at_epoch_ms)
-                                     SELECT job_id, provenance_json, plan_json, secret_options_json,
-                                            created_at_epoch_ms
-                                       FROM src.post_processing_job_plans;
-                                 INSERT INTO post_processing_runs
-                                     (run_id, job_id, status, pipeline_outcome_json, summary,
-                                      terminal_intent, plan_json, secret_options_json,
-                                      rerun_of_run_id, queued_at_epoch_ms, queue_position,
-                                      started_at_epoch_ms, finished_at_epoch_ms)
-                                     SELECT run_id, job_id, status, pipeline_outcome_json, summary,
-                                            terminal_intent, plan_json, secret_options_json,
-                                            rerun_of_run_id, queued_at_epoch_ms, queue_position,
-                                            started_at_epoch_ms, finished_at_epoch_ms
-                                       FROM src.post_processing_runs;
-                                 INSERT INTO post_processing_attempts
-                                     (attempt_id, run_id, step_index, status, extension_id,
-                                      revision_id, adapter, command_json, working_directory,
-                                      exit_code, error_message, progress_json, control_token_hash,
-                                      output_truncated, queued_at_epoch_ms, started_at_epoch_ms,
-                                      finished_at_epoch_ms)
-                                     SELECT attempt_id, run_id, step_index, status, extension_id,
-                                            revision_id, adapter, command_json, working_directory,
-                                            exit_code, error_message, progress_json, control_token_hash,
-                                            output_truncated, queued_at_epoch_ms, started_at_epoch_ms,
-                                            finished_at_epoch_ms
-                                       FROM src.post_processing_attempts;
-                                 INSERT INTO post_processing_log_chunks
-                                     (attempt_id, sequence, stream, payload, byte_count,
-                                      created_at_epoch_ms)
-                                     SELECT attempt_id, sequence, stream, payload, byte_count,
-                                            created_at_epoch_ms
-                                       FROM src.post_processing_log_chunks;"
-                            } else {
-                                ""
-                            };
-
                             let mut tx = conn.begin().await.map_err(db_err)?;
                             for table in LEGACY_V1_CLEAR_IMPORT_TABLES {
                                 let sql = format!("DELETE FROM {table}");
@@ -1115,14 +931,16 @@ impl Database {
                                       download_quota_limit_bytes, download_quota_period,
                                       download_quota_reset_time_minutes_local,
                                       download_quota_weekly_reset_weekday,
-                                      download_quota_monthly_reset_day, tls_ca_cert)
+                                      download_quota_monthly_reset_day, tls_ca_cert,
+                                      tls_name_mismatch_certificate_der)
                                      SELECT id, host, port, tls, username, password, connections, active,
                                             supports_pipelining, priority, {src_server_backfill},
                                             {src_server_retention_days}, {src_server_max_download_speed},
                                             {src_server_quota_enabled}, {src_server_quota_limit},
                                             {src_server_quota_period}, {src_server_quota_reset_time},
                                             {src_server_quota_weekday}, {src_server_quota_month_day},
-                                            {src_server_tls_ca_cert}
+                                            {src_server_tls_ca_cert},
+                                            {src_server_tls_name_mismatch_certificate_der}
                                        FROM src.servers;
                                  {import_server_download_usage}
                                  INSERT INTO categories (id, name, dest_dir, aliases)
@@ -1133,8 +951,7 @@ impl Database {
                                      (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                                       optional_recovery_bytes, optional_recovery_downloaded_bytes,
                                       failed_bytes, health, category, output_dir, nzb_path, created_at,
-                                      completed_at, metadata, pipeline_outcome_json,
-                                      post_processing_summary, post_processing_run_id)
+                                      completed_at, metadata, post_processing_summary)
                                      SELECT job_id, {src_job_hash}, name, status, error_message, total_bytes, downloaded_bytes,
                                             {src_optional_recovery_bytes}, {src_optional_recovery_downloaded_bytes},
                                             failed_bytes, health, category, output_dir, nzb_path, created_at, completed_at,
@@ -1149,12 +966,10 @@ impl Database {
                                                      )
                                                 )
                                             END AS metadata,
-                                            {src_pipeline_outcome}, {src_post_processing_summary},
-                                            {src_post_processing_run_id}
+                                            {src_post_processing_summary}
                                      FROM src.job_history;
                                  INSERT INTO job_events (id, job_id, timestamp, kind, message, file_id)
                                      SELECT id, job_id, timestamp, kind, message, file_id FROM src.job_events;
-                                 {import_post_processing}
                                  INSERT INTO bandwidth_usage_minute_buckets (bucket_epoch_minute, payload_bytes)
                                      SELECT bucket_epoch_minute, payload_bytes FROM src.bandwidth_usage_minute_buckets;
                                  INSERT INTO rss_feeds

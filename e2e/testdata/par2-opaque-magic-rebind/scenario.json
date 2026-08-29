@@ -1,0 +1,39 @@
+{
+  "slug": "par2-opaque-magic-rebind",
+  "title": "E2E.Test.PAR2.Opaque.Magic.Rebind.2026.1080p-TESTGRP",
+  "description": "Clean three-volume RAR5 data posted under obfuscated numeric names beside an extensionless PAR2 index. PAR2 magic discovery must authenticate the index, rebind the volumes to canonical names, and extract the member.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 65536,
+  "fixtureAssets": [
+    "rar5-multivolume/archive.part1.rar::51273aad56a8b904e96928935278a627.101",
+    "rar5-multivolume/archive.part2.rar::51273aad56a8b904e96928935278a627.102",
+    "rar5-multivolume/archive.part3.rar::51273aad56a8b904e96928935278a627.103",
+    "par2-obfuscated-rar-rewrite/archive.rar.par2::zz-opaque-par2"
+  ],
+  "forbiddenJobEvents": [
+    "RepairStarted",
+    "RepairComplete",
+    "RepairFailed",
+    "ExtractionMemberFailed",
+    "ExtractionFailed"
+  ],
+  "expectedOutputBLAKE3": {
+    "work/E2E Test PAR2 Opaque Magic Rebind.mkv": "8139650c53be5684ab9cf20e34996fcfb510f118ee652ad7b949c32e8cb8b08a"
+  },
+  "runtimeAssertions": {
+    "fileIdentityRewrite": {
+      "requiredCurrentFilenames": [
+        "archive.part1.rar",
+        "archive.part2.rar",
+        "archive.part3.rar"
+      ],
+      "forbiddenCurrentFilenames": [
+        "51273aad56a8b904e96928935278a627.101",
+        "51273aad56a8b904e96928935278a627.102",
+        "51273aad56a8b904e96928935278a627.103"
+      ],
+      "requiredClassificationSource": "par2"
+    }
+  }
+}

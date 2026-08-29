@@ -30,6 +30,17 @@ const MIN_POSTGRES_MAX_CONNECTIONS: u32 = 2;
 /// long — long enough that a proxy or idle-timeout may have dropped it. Hot
 /// connections skip the round-trip.
 const POSTGRES_PING_IDLE_THRESHOLD: Duration = Duration::from_secs(30);
+/// Default `synchronous_commit` for every weaver Postgres session.
+///
+/// `off` matches the durability posture the SQLite side has always run
+/// (`PRAGMA synchronous = NORMAL` under WAL): a host crash can lose the last
+/// instant of commits but never corrupts or reorders state, and everything in
+/// active state is re-derived on restart by design. Leaving Postgres at its
+/// server default meant every commit paid a full WAL flush that the SQLite
+/// side does not — the single largest per-write latency gap between the two
+/// engines. Asynchronous commit is still fully ordered and atomic; only
+/// durability of the tail is relaxed.
+const DEFAULT_POSTGRES_SYNCHRONOUS_COMMIT: &str = "off";
 const SLOW_STATEMENT_WARN_MS: u64 = 1000;
 
 #[derive(Clone)]
@@ -62,6 +73,13 @@ impl DatabaseServices {
             Self::Postgres(services) => services.datastore(),
         }
     }
+
+    pub(crate) fn pre_migration_schema_version(&self) -> Option<i64> {
+        match self {
+            Self::Sqlite(services) => services.pre_migration_schema_version,
+            Self::Postgres(services) => services.pre_migration_schema_version,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -69,6 +87,10 @@ pub(crate) struct SqliteServices {
     pool: sqlx::SqlitePool,
     encryption_key: Arc<RwLock<Option<crate::persistence::encryption::EncryptionKey>>>,
     writer_gate: SqliteWriterGate,
+    /// Migration ledger maximum as it stood when this handle opened the
+    /// database, captured before the migration run below could move it.
+    /// `None` for a database nothing had ever migrated.
+    pre_migration_schema_version: Option<i64>,
 }
 
 impl SqliteServices {
@@ -129,12 +151,16 @@ impl SqliteServices {
                 StateError::Database(format!("cannot open SQLite database {db_url}: {error}"))
             })?;
 
+        // Read before the run, because the run is what changes the answer.
+        let pre_migration_schema_version =
+            crate::schema_migrations::max_recorded_migration_version(&pool).await?;
         crate::schema_migrations::run_embedded_migrations(&pool, migration_mode).await?;
 
         Ok(Self {
             pool,
             encryption_key: Arc::new(RwLock::new(None)),
             writer_gate: new_writer_gate(),
+            pre_migration_schema_version,
         })
     }
 
@@ -188,6 +214,8 @@ impl SqliteServices {
 pub(crate) struct PostgresServices {
     pool: sqlx::PgPool,
     encryption_key: Arc<RwLock<Option<crate::persistence::encryption::EncryptionKey>>>,
+    /// See [`SqliteServices::pre_migration_schema_version`].
+    pre_migration_schema_version: Option<i64>,
 }
 
 impl PostgresServices {
@@ -208,6 +236,15 @@ impl PostgresServices {
                 LevelFilter::Warn,
                 Duration::from_millis(SLOW_STATEMENT_WARN_MS),
             );
+        // `on` sends nothing: the server default is already `on`, and skipping
+        // the startup option keeps weaver usable behind poolers that reject
+        // `options` (PgBouncer in transaction mode), making the env var a full
+        // escape hatch.
+        let synchronous_commit = postgres_synchronous_commit_from_env();
+        if synchronous_commit != "on" {
+            connect_options =
+                connect_options.options([("synchronous_commit", synchronous_commit.as_str())]);
+        }
 
         let max_connections = postgres_max_connections_from_env();
         let pool = PgPoolOptions::new()
@@ -237,11 +274,15 @@ impl PostgresServices {
                 StateError::Database(format!("cannot open PostgreSQL database: {error}"))
             })?;
 
+        // Read before the run, because the run is what changes the answer.
+        let pre_migration_schema_version =
+            postgres_migrations::max_recorded_migration_version(&pool).await?;
         postgres_migrations::run_migrations(&pool, migration_mode).await?;
 
         Ok(Self {
             pool,
             encryption_key: Arc::new(RwLock::new(None)),
+            pre_migration_schema_version,
         })
     }
 
@@ -314,7 +355,7 @@ pub(crate) fn sqlite_url_with_create(path: &str) -> String {
     format!("sqlite://{path}?mode=rwc")
 }
 
-fn sqlite_max_connections_from_env() -> u32 {
+pub(crate) fn sqlite_max_connections_from_env() -> u32 {
     std::env::var("WEAVER_SQLITE_MAX_CONNECTIONS")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
@@ -330,6 +371,38 @@ pub(crate) fn postgres_max_connections_from_env() -> u32 {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_POSTGRES_MAX_CONNECTIONS)
         .clamp(MIN_POSTGRES_MAX_CONNECTIONS, MAX_POSTGRES_CONNECTIONS_CAP)
+}
+
+/// Resolves the per-session `synchronous_commit` setting, defaulting to
+/// [`DEFAULT_POSTGRES_SYNCHRONOUS_COMMIT`]. Values outside PostgreSQL's own
+/// vocabulary for the setting are rejected (with a warning) rather than passed
+/// through, because the value lands in the connection's startup options.
+pub(crate) fn postgres_synchronous_commit_from_env() -> String {
+    parse_postgres_synchronous_commit(
+        std::env::var("WEAVER_POSTGRES_SYNCHRONOUS_COMMIT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_postgres_synchronous_commit(value: Option<&str>) -> String {
+    const ALLOWED: [&str; 5] = ["on", "off", "local", "remote_write", "remote_apply"];
+    match value {
+        Some(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            if ALLOWED.contains(&value.as_str()) {
+                value
+            } else {
+                tracing::warn!(
+                    value = %value,
+                    default = DEFAULT_POSTGRES_SYNCHRONOUS_COMMIT,
+                    "ignoring invalid WEAVER_POSTGRES_SYNCHRONOUS_COMMIT; expected one of on/off/local/remote_write/remote_apply"
+                );
+                DEFAULT_POSTGRES_SYNCHRONOUS_COMMIT.to_string()
+            }
+        }
+        None => DEFAULT_POSTGRES_SYNCHRONOUS_COMMIT.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -357,6 +430,33 @@ mod tests {
         assert_eq!(
             sqlite_url_with_create("sqlite://:memory:"),
             "sqlite://file::memory:?mode=memory&cache=shared"
+        );
+    }
+
+    #[test]
+    fn synchronous_commit_defaults_off_to_match_the_sqlite_posture() {
+        assert_eq!(parse_postgres_synchronous_commit(None), "off");
+    }
+
+    #[test]
+    fn synchronous_commit_accepts_postgres_vocabulary_case_insensitively() {
+        assert_eq!(parse_postgres_synchronous_commit(Some(" ON ")), "on");
+        assert_eq!(parse_postgres_synchronous_commit(Some("local")), "local");
+        assert_eq!(
+            parse_postgres_synchronous_commit(Some("remote_apply")),
+            "remote_apply"
+        );
+    }
+
+    #[test]
+    fn synchronous_commit_rejects_values_postgres_would_not_accept() {
+        // The value lands in connection startup options, so anything outside
+        // the setting's own vocabulary falls back to the default instead of
+        // being passed through.
+        assert_eq!(parse_postgres_synchronous_commit(Some("true")), "off");
+        assert_eq!(
+            parse_postgres_synchronous_commit(Some("off; DROP TABLE jobs")),
+            "off"
         );
     }
 }

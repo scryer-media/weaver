@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::topology::{ArchiveMember, ArchivePendingSpan, ArchiveTopology};
 use crate::jobs::assembly::ArchiveType;
-use weaver_unrar::{
+use unrar_rs::{
     MemberInfo, RarArchive, RarVolumeFacts, archive::MemberPlannerState, crypto::KdfCache,
     path::sanitize_file_redirection_path, sanitize_path,
 };
@@ -77,6 +77,11 @@ pub(crate) struct RarSetState {
     pub(crate) active_workers: usize,
     pub(crate) in_flight_members: HashSet<String>,
     pub(crate) extraction_generation: u64,
+    /// Bumped whenever a volume's persisted facts or filename binding change.
+    /// The refresh loop's progress fingerprint folds this in, so a
+    /// content-level fact change (same volume key, different facts) re-arms a
+    /// parked refresh exactly like a brand-new volume would.
+    pub(crate) facts_generation: u64,
     pub(crate) phase: RarSetPhase,
     pub(crate) plan: Option<RarDerivedPlan>,
 }
@@ -92,6 +97,7 @@ impl Default for RarSetState {
             active_workers: 0,
             in_flight_members: HashSet::new(),
             extraction_generation: 0,
+            facts_generation: 0,
             phase: RarSetPhase::WaitingForVolumes,
             plan: None,
         }
@@ -151,13 +157,13 @@ impl PlannerMemberReadiness {
     }
 }
 
-pub(crate) fn contiguous_prefix_end(facts: &BTreeMap<u32, RarVolumeFacts>) -> Option<u32> {
-    if !facts.contains_key(&0) {
+pub(crate) fn contiguous_prefix_end<T>(volumes: &BTreeMap<u32, T>) -> Option<u32> {
+    if !volumes.contains_key(&0) {
         return None;
     }
 
     let mut next = 0u32;
-    while facts.contains_key(&next) {
+    while volumes.contains_key(&next) {
         next = next.saturating_add(1);
     }
     Some(next.saturating_sub(1))
@@ -216,7 +222,7 @@ pub(crate) fn build_plan(
     let final_volume_seen = facts
         .get(&prefix_end)
         .is_some_and(|volume_facts| !volume_facts.more_volumes);
-    let missing_for_member = |member: &weaver_unrar::MemberInfo| {
+    let missing_for_member = |member: &unrar_rs::MemberInfo| {
         let mut missing = planner_states
             .get(&member.name)
             .map(PlannerMemberReadiness::missing_volumes)
@@ -226,7 +232,7 @@ pub(crate) fn build_plan(
         }
         missing
     };
-    let present_unintegrated_continuations = |member: &weaver_unrar::MemberInfo| {
+    let present_unintegrated_continuations = |member: &unrar_rs::MemberInfo| {
         let member_name = sanitize_path(&member.name);
         if member_name.is_empty() {
             return Vec::new();

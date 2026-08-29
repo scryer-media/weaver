@@ -1,5 +1,6 @@
 mod common;
 
+use async_graphql::Value;
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 
 #[tokio::test]
@@ -65,6 +66,52 @@ async fn update_jobs_category() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert_eq!(data["job"]["category"].as_str().unwrap(), "movies");
+}
+
+#[tokio::test]
+async fn update_jobs_canonicalizes_aliases_and_rejects_unsafe_categories() {
+    let h = TestHarness::new().await;
+    let add_category = h
+        .execute(
+            r#"mutation {
+                addCategory(input: { name: "Movies", aliases: "film*" }) { id }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&add_category);
+    let id = h.submit_test_nzb("category-validation").await;
+
+    let canonicalized = h
+        .execute(&format!(
+            r#"mutation {{ updateJobs(ids: [{id}], category: "FILM-4K") }}"#
+        ))
+        .await;
+    assert_no_errors(&canonicalized);
+    let job = h
+        .execute(&format!(r#"{{ job(id: {id}) {{ category }} }}"#))
+        .await;
+    assert_eq!(
+        response_data(&job)["job"]["category"].as_str(),
+        Some("Movies")
+    );
+
+    let rejected = h
+        .execute(&format!(
+            r#"mutation {{ updateJobs(ids: [{id}], category: "../../outside") }}"#
+        ))
+        .await;
+    assert_has_errors(&rejected);
+    assert_eq!(
+        rejected.errors[0]
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get("code"))
+            .and_then(|value| match value {
+                Value::String(code) => Some(code.as_str()),
+                _ => None,
+            }),
+        Some("INVALID_INPUT")
+    );
 }
 
 #[tokio::test]

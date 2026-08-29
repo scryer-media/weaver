@@ -1,0 +1,7 @@
+{
+  "slug": "par2-heavy-damage-a",
+  "title": "E2E.Test.PAR2.HeavyDamage.A.2024.1080p-TESTGRP",
+  "description": "RAR5 with 5 corrupted regions (20KB total). Alias fixture used to force real queued repair contention.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success"
+}

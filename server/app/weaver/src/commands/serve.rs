@@ -5,21 +5,66 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{error, info, warn};
 
-use crate::{http, shutdown, wiring};
+use crate::{http, restart, shutdown, wiring};
 use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::{Config, SharedConfig};
 use weaver_server_core::{Database, Pipeline, SchedulerCommand, SchedulerHandle};
 
 pub(crate) async fn run(
-    mut config: Config,
+    config: Config,
     db: Database,
     restore_locator_dir: PathBuf,
     port: u16,
     base_url: &str,
     log_ring_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let security = RuntimeSecurityConfig::from_env()?;
+    let started_at = std::time::Instant::now();
+    let mut security = RuntimeSecurityConfig::from_env()?;
+    // Transitional, removed in 0.9.1: an install upgraded from a pre-0.9 data
+    // directory stored no bind address because it never had to — the default
+    // was network-wide. Writing that address down here, before the settlement
+    // below reads it, is what keeps such an install reachable on this very
+    // boot instead of narrowing it to loopback without a word. Delete this
+    // block, `weaver_server_core::upgrade_compat`, and its `mod` line together.
+    if let Err(error) = weaver_server_core::upgrade_compat::apply_pre_0_9_bind_compat_shim(
+        &db,
+        db.pre_migration_schema_version(),
+        std::env::var(weaver_server_core::security::ENV_HTTP_BIND_ADDRESS)
+            .ok()
+            .as_deref(),
+    ) {
+        // A compatibility default is not worth the process: an install that
+        // cannot record it still starts, on loopback, with the reason logged.
+        warn!(%error, "could not preserve the pre-0.9 network-wide bind address");
+    }
+    // The environment answers first, but a desktop or service install has no
+    // convenient environment to edit, so the stored settings are what the UI
+    // (and the first-run wizard) write. Settled here because this is the first
+    // point the database is readable. Both settlements are infallible by
+    // design: a bad stored bind address falls back to loopback and a bad
+    // stored trust list falls back to trusting nothing — a stored value must
+    // never cost the operator the process that edits it.
+    security.apply_stored_bind_address(
+        db.get_setting(weaver_server_core::security::SETTING_HTTP_BIND_ADDRESS)?
+            .as_deref(),
+    );
+    security.apply_stored_trust(
+        db.get_setting(weaver_server_core::security::SETTING_ACCESS_MODE)?
+            .as_deref(),
+        db.get_setting(weaver_server_core::security::SETTING_TRUSTED_NETWORKS)?
+            .as_deref(),
+    );
+    if let Some(reason) = security.bind_fallback.as_deref() {
+        warn!(reason, "stored bind address could not be honored");
+    }
+    crate::bootstrap::bootstrap_login_if_needed(&db).await?;
+    if security.has_trusted_cidrs() {
+        warn!(
+            trusted_cidrs = ?security.trusted_cidrs(),
+            "trusted-network clients receive loginless full administrative browser access"
+        );
+    }
     let data_dir = PathBuf::from(&config.data_dir);
     let intermediate_dir = PathBuf::from(config.intermediate_dir());
     let complete_dir = PathBuf::from(config.complete_dir());
@@ -36,10 +81,12 @@ pub(crate) async fn run(
         profile,
         buffers,
         write_buf_max,
-    } = wiring::build_runtime_context(&data_dir);
+    } = wiring::build_runtime_context(weaver_server_core::runtime::detect_startup_profile(
+        &data_dir,
+    ));
+    let system_profile = Arc::new(std::sync::RwLock::new(profile.clone()));
 
-    // Detect server capabilities (pipelining, etc.) and build NNTP client.
-    wiring::detect_server_capabilities(&mut config, &db).await;
+    // Build the NNTP client from capability values validated when servers were saved.
     let policy_db = db.clone();
     let policy_servers = config.servers.clone();
     let server_transfer_policy = Arc::new(
@@ -140,6 +187,17 @@ pub(crate) async fn run(
 
     // Create and start the pipeline.
     let maintenance_complete_dir = complete_dir.clone();
+    // Captured before the directories move into the pipeline. The collector
+    // stats these paths at scrape time, TTL-cached, so it never runs on a
+    // pipeline path.
+    let disk_space_collector = Arc::new(
+        weaver_server_core::operations::disk::DiskSpaceCollector::new(vec![
+            ("data", data_dir.clone()),
+            ("intermediate", intermediate_dir.clone()),
+            ("complete", complete_dir.clone()),
+        ]),
+    );
+    let iops_probe_dir = data_dir.clone();
     let mut pipeline = Pipeline::new(
         cmd_rx,
         event_tx,
@@ -160,9 +218,56 @@ pub(crate) async fn run(
     .await?;
 
     let nntp_pool = pipeline.nntp_pool();
-    let post_processing_service = pipeline.post_processing_service();
+    let post_processing_executor = pipeline.post_processing_executor();
     let scheduled_resume =
         weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
+
+    // Bind before the schema is built so the security snapshot the GraphQL
+    // context captures reflects what actually happened, including a fallback.
+    // The never-brick rule: a configured address this host cannot bind —
+    // a moved DHCP lease, a downed VPN interface, a restored backup from a
+    // different machine — must not cost the operator the process, because the
+    // UI it serves is the only reasonable place to fix the address. Loopback
+    // is retried instead and the deviation is surfaced as a banner. A loopback
+    // failure (the port itself is taken) remains fatal: there is nothing safer
+    // left to fall back to.
+    let desired_addr = SocketAddr::new(security.http_bind_address, port);
+    let listener = match tokio::net::TcpListener::bind(desired_addr).await {
+        Ok(listener) => listener,
+        // Raw, non-canonical loopback check on purpose: a configured
+        // `::ffff:127.0.0.1` that this host cannot bind should degrade to plain
+        // loopback, which canonicalizing here would turn into a fatal start.
+        Err(error) if !security.http_bind_address.is_loopback() => {
+            let fallback_addr = SocketAddr::new(
+                weaver_server_core::security::DEFAULT_HTTP_BIND_ADDRESS,
+                port,
+            );
+            warn!(
+                %desired_addr,
+                %error,
+                %fallback_addr,
+                "configured bind address is not usable on this host; falling back to loopback"
+            );
+            security.note_bind_fallback(format!(
+                "could not bind {desired_addr}: {error}; listening on {fallback_addr} instead — \
+                 fix or clear the address in Settings → Security"
+            ));
+            tokio::net::TcpListener::bind(fallback_addr)
+                .await
+                .map_err(|fallback_error| {
+                    format!(
+                        "failed to bind {fallback_addr} after {desired_addr} failed: \
+                         {fallback_error} — is another process using this port?"
+                    )
+                })?
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to bind to {desired_addr}: {error} — is another process using this port?"
+            )
+            .into());
+        }
+    };
 
     // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
     let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {
@@ -173,13 +278,18 @@ pub(crate) async fn run(
         server_transfer_policy: Arc::clone(&server_transfer_policy),
         auth_cache: login_auth_cache.clone(),
         api_key_cache: api_key_cache.clone(),
+        security: security.clone(),
         rss: rss.clone(),
         watch_folder: watch_folder.clone(),
         schedules: shared_schedules,
         log_buffer: log_ring_buffer,
+        system_runtime: weaver_server_api::SystemRuntimeContext {
+            profile: Arc::clone(&system_profile),
+            started_at,
+        },
         nntp_pool: Some(nntp_pool.clone()),
         spawn_history_delete_worker: true,
-        post_processing_service: Some(post_processing_service),
+        post_processing_executor: Some(post_processing_executor),
     });
 
     let metrics_exporter = http::PrometheusMetricsExporter::new(
@@ -187,6 +297,7 @@ pub(crate) async fn run(
         db.clone(),
         nntp_pool,
         Arc::clone(&server_transfer_policy),
+        shared_config.clone(),
     );
 
     let mut pipeline_task = tokio::spawn(async move {
@@ -202,8 +313,11 @@ pub(crate) async fn run(
         maintenance_complete_dir,
     );
 
-    // Run HTTP server.
-    let addr = SocketAddr::new(security.http_bind_address, port);
+    // The UI's restart button reaches the serve loop through this handle; the
+    // loop owns when the process is actually safe to replace.
+    let restart_controller = weaver_server_core::runtime::restart::RestartController::new();
+
+    // Run HTTP server on the listener bound above.
     let server_runtime = http::ServerRuntime {
         schema,
         handle: handle.clone(),
@@ -216,10 +330,47 @@ pub(crate) async fn run(
         watch_folder: watch_folder.clone(),
         metrics_exporter,
         config: shared_config.clone(),
+        http_metrics: http::HttpMetricsHandle::new(base_url.clone()),
         base_url,
         security,
+        disk_space: disk_space_collector,
+        restart: restart_controller.clone(),
     };
-    let mut server_task = tokio::spawn(http::run_server(server_runtime, addr));
+    let mut server_task = tokio::spawn(http::run_server(server_runtime, listener));
+
+    // Disk IOPS affects extraction admission only, so measure it after HTTP
+    // startup and apply the result to the live tuner without interrupting
+    // downloads or post-processing already in flight.
+    let _iops_probe_task = {
+        let handle = handle.clone();
+        let system_profile = Arc::clone(&system_profile);
+        let probe_dir = iops_probe_dir;
+        tokio::spawn(async move {
+            let random_read_iops = match tokio::task::spawn_blocking(move || {
+                weaver_server_core::runtime::measure_random_read_iops(&probe_dir)
+            })
+            .await
+            {
+                Ok(iops) => iops,
+                Err(error) => {
+                    warn!(error = %error, "disk probe task failed; using fallback IOPS");
+                    10_000.0
+                }
+            };
+            match handle.update_random_read_iops(random_read_iops).await {
+                Ok(()) => {
+                    system_profile
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .disk
+                        .random_read_iops = random_read_iops;
+                }
+                Err(error) => {
+                    warn!(error = %error, "failed to apply startup disk measurement");
+                }
+            }
+        })
+    };
 
     // Restore in-progress jobs from SQLite after the listener is available so
     // long restore passes do not block process readiness.
@@ -265,28 +416,12 @@ pub(crate) async fn run(
         })
     };
 
-    tokio::select! {
-        _ = shutdown::wait_for_shutdown() => {
-            info!("received shutdown signal, shutting down");
-            handle.shutdown().await.ok();
-            if let Err(join_error) = pipeline_task.await {
-                error!(error = %join_error, "pipeline task failed during shutdown");
-            }
-            finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
-            server_task.abort();
-            rss_task.abort();
-            watch_folder.stop().await;
-            metrics_history_task.abort();
-            maintenance_task.abort();
-            semantic_promotion_task.abort();
-            server_transfer_maintenance.abort();
-            wiring::flush_server_transfer_usage(
-                Arc::clone(&server_transfer_policy),
-                "serve shutdown",
-            )
-            .await;
-            Ok(())
-        }
+    // Both ways out of a healthy process run the same teardown; only what
+    // happens after it differs, so the arms settle an intent instead of each
+    // spelling the sequence out.
+    let stop = tokio::select! {
+        _ = shutdown::wait_for_shutdown() => ServeStop::Signal,
+        _ = restart_controller.requested() => ServeStop::Restart,
         result = &mut pipeline_task => {
             let error = shutdown::pipeline_exit_error(result);
             finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
@@ -302,7 +437,7 @@ pub(crate) async fn run(
                 "serve pipeline exit",
             )
             .await;
-            Err(error.into())
+            return Err(error.into());
         }
         result = &mut server_task => {
             handle.shutdown().await.ok();
@@ -321,11 +456,57 @@ pub(crate) async fn run(
                 "serve HTTP exit",
             )
             .await;
-            match result {
+            return match result {
                 Ok(Ok(())) => Err("HTTP server exited unexpectedly".into()),
                 Ok(Err(error)) => Err(error),
                 Err(join_error) => Err(format!("HTTP server task failed: {join_error}").into()),
-            }
+            };
+        }
+    };
+
+    match stop {
+        ServeStop::Signal => info!("received shutdown signal, shutting down"),
+        ServeStop::Restart => info!("restart requested, shutting down before starting again"),
+    }
+    handle.shutdown().await.ok();
+    if let Err(join_error) = pipeline_task.await {
+        error!(error = %join_error, "pipeline task failed during shutdown");
+    }
+    finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
+    server_task.abort();
+    // Awaited, not just aborted: a restart rebinds this port immediately, and
+    // on Windows a listening socket that outlives this process by a moment is
+    // enough to fail that bind.
+    let _ = server_task.await;
+    rss_task.abort();
+    watch_folder.stop().await;
+    metrics_history_task.abort();
+    maintenance_task.abort();
+    semantic_promotion_task.abort();
+    server_transfer_maintenance.abort();
+    wiring::flush_server_transfer_usage(Arc::clone(&server_transfer_policy), stop.flush_context())
+        .await;
+
+    match stop {
+        ServeStop::Signal => Ok(()),
+        // Unix re-execs in place, so on success this never returns.
+        ServeStop::Restart => restart::restart_now().map_err(Into::into),
+    }
+}
+
+/// Why the serve loop is leaving a healthy process: a signal, or a restart the
+/// operator asked for. The teardown is identical; only the last step differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeStop {
+    Signal,
+    Restart,
+}
+
+impl ServeStop {
+    fn flush_context(self) -> &'static str {
+        match self {
+            Self::Signal => "serve shutdown",
+            Self::Restart => "serve restart",
         }
     }
 }

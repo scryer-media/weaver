@@ -386,7 +386,7 @@ impl Database {
         }
 
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let chunk_size = id_chunk_size(bind_budget_for_engine(datastore.engine()), 1);
             let mut locked = HashSet::new();
             for chunk in ids.chunks(chunk_size) {
@@ -411,7 +411,7 @@ impl Database {
 
     pub fn has_any_locked_history_delete_targets(&self) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             Ok(SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT 1
@@ -433,7 +433,7 @@ impl Database {
         }
 
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let chunk_size = id_chunk_size(bind_budget_for_engine(datastore.engine()), 0);
             let mut present = BTreeSet::new();
             for chunk in ids.chunks(chunk_size) {
@@ -453,7 +453,7 @@ impl Database {
 
     pub fn list_all_history_job_ids(&self) -> Result<Vec<u64>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT job_id
@@ -672,7 +672,7 @@ impl Database {
         delete_files: bool,
     ) -> Result<Vec<HistoryDeleteTargetWork>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT target_id, state
@@ -785,7 +785,7 @@ impl Database {
         }
 
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let sql = format!(
                 "SELECT t.target_id, t.operation_id, t.state, t.error_message, o.payload_json
                  FROM async_operation_targets t
@@ -829,7 +829,7 @@ impl Database {
         active_only: bool,
     ) -> Result<Vec<HistoryDeleteOperationSummary>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let mut sql = String::from(
                 "SELECT o.id,
                         o.state,

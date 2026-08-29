@@ -3,7 +3,10 @@ use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidt
 use crate::jobs::{DuplicateAction, DuplicatePolicy};
 use crate::persistence::Database;
 use crate::settings::record::SettingRecord;
-use crate::settings::{BufferPoolOverrides, Config, RetryOverrides, TunerOverrides};
+use crate::settings::{
+    BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides, MetricsConfig,
+    PerJobSeries, RetryOverrides, TunerOverrides,
+};
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
 impl Database {
@@ -164,6 +167,43 @@ impl Database {
             }
         };
 
+        // Absent keys mean "defaults", and a partially configured table is
+        // normal: an operator who only ever flips `enabled` should not have to
+        // restate the scratch ceiling.
+        let direct_store = {
+            let enabled = settings
+                .get("direct_store.enabled")
+                .and_then(|v| v.parse().ok());
+            let holds_scratch_ceiling_bytes = settings
+                .get("direct_store.holds_scratch_ceiling_bytes")
+                .and_then(|v| v.parse().ok());
+            if enabled.is_some() || holds_scratch_ceiling_bytes.is_some() {
+                Some(DirectStoreOverrides {
+                    enabled,
+                    holds_scratch_ceiling_bytes,
+                })
+            } else {
+                None
+            }
+        };
+
+        let delivery_naming = {
+            let deobfuscate_delivered_members = settings
+                .get("delivery_naming.deobfuscate_delivered_members")
+                .and_then(|v| v.parse().ok());
+            let enable_srrdb_lookup = settings
+                .get("delivery_naming.enable_srrdb_lookup")
+                .and_then(|v| v.parse().ok());
+            if deobfuscate_delivered_members.is_some() || enable_srrdb_lookup.is_some() {
+                Some(DeliveryNamingOverrides {
+                    deobfuscate_delivered_members,
+                    enable_srrdb_lookup,
+                })
+            } else {
+                None
+            }
+        };
+
         let default_duplicate_policy = DuplicatePolicy::default();
         let duplicate_policy = DuplicatePolicy {
             strict_active_or_success: setting_duplicate_action(
@@ -195,6 +235,13 @@ impl Database {
             .unwrap_or(default_duplicate_policy.normalized_name),
         };
 
+        let metrics = MetricsConfig {
+            per_job_series: settings
+                .get("metrics.per_job_series")
+                .map(|value| PerJobSeries::from_str_or_default(value))
+                .unwrap_or_default(),
+        };
+
         Ok(Config {
             data_dir,
             intermediate_dir,
@@ -210,6 +257,9 @@ impl Database {
             ip_replacement_trial_extra_connections,
             watch_folder,
             duplicate_policy,
+            direct_store,
+            delivery_naming,
+            metrics,
             config_path: None,
         })
     }
@@ -322,6 +372,30 @@ impl Database {
             }
         }
 
+        if let Some(ref direct_store) = config.direct_store {
+            if let Some(enabled) = direct_store.enabled {
+                self.set_setting("direct_store.enabled", &enabled.to_string())?;
+            }
+            if let Some(bytes) = direct_store.holds_scratch_ceiling_bytes {
+                self.set_setting(
+                    "direct_store.holds_scratch_ceiling_bytes",
+                    &bytes.to_string(),
+                )?;
+            }
+        }
+
+        if let Some(ref delivery_naming) = config.delivery_naming {
+            if let Some(enabled) = delivery_naming.deobfuscate_delivered_members {
+                self.set_setting(
+                    "delivery_naming.deobfuscate_delivered_members",
+                    &enabled.to_string(),
+                )?;
+            }
+            if let Some(enabled) = delivery_naming.enable_srrdb_lookup {
+                self.set_setting("delivery_naming.enable_srrdb_lookup", &enabled.to_string())?;
+            }
+        }
+
         if let Some(ref retry) = config.retry {
             if let Some(v) = retry.max_retries {
                 self.set_setting("retry.max_retries", &v.to_string())?;
@@ -333,6 +407,11 @@ impl Database {
                 self.set_setting("retry.multiplier", &v.to_string())?;
             }
         }
+
+        self.set_setting(
+            "metrics.per_job_series",
+            config.metrics.per_job_series.as_str(),
+        )?;
 
         self.replace_servers(&config.servers)?;
         self.replace_categories(&config.categories)?;

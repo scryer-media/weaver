@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "description": "Declared coverage corpus for isolated client comparison. Fixture counts are coverage choices, not a model of Usenet posting frequency.",
+  "fixture_ids": [
+    "rar4-393-data-normal-solid-data-incompressible",
+    "rar4-data-normal-solid-data-incompressible",
+    "rar5-5-data-normal-solid-data-incompressible",
+    "rar5-6-data-normal-solid-data-incompressible",
+    "rar5-7-data-normal-solid-data-incompressible",
+    "rar4-393-headers-normal-solid-headers-compressible",
+    "rar4-headers-normal-solid-headers-compressible",
+    "rar5-5-headers-normal-solid-headers-compressible",
+    "rar5-6-headers-normal-solid-headers-compressible",
+    "rar5-7-headers-normal-solid-headers-compressible",
+    "rar4-393-clear-normal-nonsolid-none-incompressible",
+    "rar4-clear-normal-nonsolid-none-compressible",
+    "rar5-7-clear-normal-nonsolid-none-incompressible",
+    "rar4-393-store-store-nonsolid-none-incompressible",
+    "rar4-store-store-nonsolid-none-incompressible",
+    "rar5-5-store-store-nonsolid-none-incompressible",
+    "rar5-6-store-store-nonsolid-none-incompressible",
+    "rar5-7-store-store-nonsolid-none-compressible",
+    "rar5-7-bluray-normal-solid-none-incompressible",
+    "repair-rar4-par2-par2-light-normal-solid-none-incompressible",
+    "repair-rar5-par2-par2-heavy-normal-solid-data-incompressible",
+    "repair-rar4-393-recovery-rar-recovery-volume-light-normal-nonsolid-none-incompressible",
+    "repair-rar5-recovery-rar-recovery-volume-heavy-normal-solid-headers-incompressible",
+    "direct-mkv-200mb"
+  ]
+}

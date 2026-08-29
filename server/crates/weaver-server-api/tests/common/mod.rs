@@ -3,7 +3,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
+use std::sync::{
+    Arc, Condvar, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, RwLock as StdRwLock,
+};
 
 use async_graphql::{Request, Response, Variables};
 use serde_json::Value;
@@ -12,8 +14,8 @@ use tokio::task::JoinHandle;
 
 use weaver_server_api::auth::{CallerIdentity, CallerScope, LoginAuthCache};
 use weaver_server_api::{
-    RssService, SchemaContext, TestDbTaskHookGuard, WeaverSchema, build_schema,
-    install_test_db_task_hook,
+    RssService, SchemaContext, SystemRuntimeContext, TestDbTaskHookGuard, WeaverSchema,
+    build_schema, install_test_db_task_hook,
 };
 use weaver_server_core::auth::ApiKeyCache;
 use weaver_server_core::events::model::PipelineEvent;
@@ -140,6 +142,9 @@ pub struct TestHarness {
     pub server_transfer_policy:
         Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
     pub auth_cache: LoginAuthCache,
+    /// The same config the schema holds, so a policy mutation's live effect on
+    /// the trusted-network list is observable from a test.
+    pub security: weaver_server_core::security::RuntimeSecurityConfig,
     _scheduler_task: JoinHandle<()>,
     _tempdir: tempfile::TempDir,
 }
@@ -164,7 +169,29 @@ impl TestHarness {
         Self::new_with_options(false).await
     }
 
+    /// Like [`TestHarness::new`] but with an explicit security posture, for
+    /// tests that pin what strict security, an environment pin, or a widened
+    /// bind address refuse. The config is shared with the schema, so a policy
+    /// mutation's live effect is observable on the caller's copy.
+    pub async fn new_with_security(
+        security: weaver_server_core::security::RuntimeSecurityConfig,
+    ) -> Self {
+        Self::new_with_options_and_security(true, security).await
+    }
+
     async fn new_with_options(spawn_history_delete_worker: bool) -> Self {
+        Self::new_with_options_and_security(
+            spawn_history_delete_worker,
+            // Loopback, no environment override: the shape a fresh install has.
+            weaver_server_core::security::RuntimeSecurityConfig::default(),
+        )
+        .await
+    }
+
+    async fn new_with_options_and_security(
+        spawn_history_delete_worker: bool,
+        security: weaver_server_core::security::RuntimeSecurityConfig,
+    ) -> Self {
         let tempdir = tempfile::TempDir::new().expect("failed to create tempdir");
         let db = Database::open_in_memory().expect("failed to open in-memory DB");
 
@@ -183,6 +210,9 @@ impl TestHarness {
             ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
+            direct_store: None,
+            delivery_naming: None,
+            metrics: Default::default(),
             config_path: None,
         };
         let shared_config: SharedConfig = Arc::new(RwLock::new(config));
@@ -218,14 +248,45 @@ impl TestHarness {
             server_transfer_policy: Arc::clone(&server_transfer_policy),
             auth_cache: auth_cache.clone(),
             api_key_cache,
+            security: security.clone(),
             rss,
             watch_folder,
             schedules: shared_schedules,
             log_buffer:
                 weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
+            system_runtime: SystemRuntimeContext {
+                profile: Arc::new(StdRwLock::new(
+                    weaver_server_core::runtime::system_profile::SystemProfile {
+                        cpu: weaver_server_core::runtime::system_profile::CpuProfile {
+                            physical_cores: 4,
+                            logical_cores: 8,
+                            simd: weaver_server_core::runtime::system_profile::SimdSupport::default(
+                            ),
+                            cgroup_limit: None,
+                        },
+                        memory: weaver_server_core::runtime::system_profile::MemoryProfile {
+                            total_bytes: 8 * 1024 * 1024 * 1024,
+                            available_bytes: 4 * 1024 * 1024 * 1024,
+                            cgroup_limit: None,
+                        },
+                        disk: weaver_server_core::runtime::system_profile::DiskProfile {
+                            storage_class:
+                                weaver_server_core::runtime::system_profile::StorageClass::Unknown,
+                            filesystem:
+                                weaver_server_core::runtime::system_profile::FilesystemType::Unknown(
+                                    String::new(),
+                                ),
+                            sequential_write_mbps: 0.0,
+                            random_read_iops: 0.0,
+                            same_filesystem: true,
+                        },
+                    },
+                )),
+                started_at: std::time::Instant::now(),
+            },
             nntp_pool: None,
             spawn_history_delete_worker,
-            post_processing_service: None,
+            post_processing_executor: None,
         });
 
         Self {
@@ -238,6 +299,7 @@ impl TestHarness {
             shared_state,
             server_transfer_policy,
             auth_cache,
+            security,
             _scheduler_task: scheduler_task,
             _tempdir: tempdir,
         }
@@ -529,6 +591,7 @@ fn spawn_test_scheduler(
                         working_dir: PathBuf::from("/tmp/test"),
                         downloaded_bytes: 0,
                         failed_bytes: 0,
+                        probe_projected_failed_bytes: 0,
                         par2_bytes,
                         health_probing: false,
                         health_probe_round: 0,
@@ -540,6 +603,7 @@ fn spawn_test_scheduler(
                         download_queue: DownloadQueue::new(),
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
+                        category_bytes: None,
                         restored_download_floor_bytes: 0,
                     };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
@@ -677,6 +741,7 @@ fn spawn_test_scheduler(
                         working_dir,
                         downloaded_bytes: 0,
                         failed_bytes: 0,
+                        probe_projected_failed_bytes: 0,
                         par2_bytes,
                         health_probing: false,
                         health_probe_round: 0,
@@ -688,6 +753,7 @@ fn spawn_test_scheduler(
                         download_queue: DownloadQueue::new(),
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
+                        category_bytes: None,
                         restored_download_floor_bytes: 0,
                     };
                     jobs.insert(job_id, state);
@@ -787,6 +853,9 @@ fn spawn_test_scheduler(
                 SchedulerCommand::CancelPostProcessing { reply, .. } => {
                     let _ = reply.send(Ok(()));
                 }
+                SchedulerCommand::UpdateRandomReadIops { reply, .. } => {
+                    let _ = reply.send(());
+                }
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.
@@ -812,6 +881,8 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             download_retry_at_epoch_ms: None,
             status: state.status.clone(),
             download_state: state.download_state,
+            finalizing_download: false,
+            fetching_repair_data: false,
             post_state: state.post_state,
             run_state: state.run_state,
             progress: state.assembly.progress(),
@@ -822,6 +893,7 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             phase_progress: Vec::new(),
             failed_bytes: 0,
             health: 1000,
+            terminal_discards: Vec::new(),
             total_files: 0,
             completed_files: 0,
             remaining_par_files: 0,

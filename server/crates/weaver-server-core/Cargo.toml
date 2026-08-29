@@ -14,19 +14,20 @@ weaver-model = { path = "../../../shared/crates/weaver-model", default-features 
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
 weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
 weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false }
-weaver-par2 = { workspace = true, features = [
+par2-rs = { workspace = true, features = [
     "native-crypto",
 ] }
-weaver-unrar = { workspace = true, features = [
+unrar-rs = { workspace = true, features = [
     "crypto-aws-lc",
 ] }
 serde = { workspace = true }
 blake3 = { workspace = true }
 unicode-normalization = { workspace = true }
 unicase = { version = "2.9.0", default-features = false }
-crc32fast = { workspace = true }
+crc-fast = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
+http = { workspace = true }
 crossbeam-queue = { workspace = true }
 bitvec = { workspace = true }
 tokio = { workspace = true }
@@ -40,14 +41,18 @@ sha2 = { workspace = true }
 hmac = { workspace = true, default-features = false }
 reqwest = { workspace = true }
 regex = { workspace = true }
+ipnet = { workspace = true }
 quick-xml = { workspace = true }
 notify = { workspace = true }
 zstd = { workspace = true }
 zip = { workspace = true }
 tar = { workspace = true }
+cap-std = { workspace = true }
+cap-fs-ext = { workspace = true }
 flate2 = { workspace = true }
 brotli = { workspace = true }
 bzip2 = { workspace = true }
+liblzma = { workspace = true }
 sqlx = { workspace = true }
 rmp-serde = { workspace = true, default-features = false }
 tempfile = { workspace = true }
@@ -67,7 +72,7 @@ security-framework-sys = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { workspace = true }
 keyring-core = { workspace = true }
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
@@ -76,6 +81,7 @@ tempfile = { workspace = true }
 sevenz-rust2 = { workspace = true }
 axum = { workspace = true }
 criterion = "0.8"
+lzma-rust2 = { workspace = true, features = ["encoder"] }
 
 [[bench]]
 name = "infrastructure_retry"

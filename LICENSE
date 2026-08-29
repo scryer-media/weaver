@@ -1,22 +1,32 @@
 # Weaver License
 
-Weaver is licensed under GPL-3.0-or-later, with the additional UnRAR
-source-code restriction below for RAR extraction and recovery code.
+## Weaver-authored code
 
-Weaver does not bundle or distribute UnRAR source code, but its
-implementation was inspired by the UnRAR source.
+Except where a file states otherwise, source code authored for Weaver is
+licensed under the GNU General Public License, version 3 or, at your option,
+any later version (GPL-3.0-or-later).
 
-## UnRAR Source-Code Restriction
+## Additional permission to combine with unrar-rs
 
-UnRAR source code may be used in any software to handle
-RAR archives without limitations free of charge, but cannot be
-used to develop RAR (WinRAR) compatible archiver and to
-re-create RAR compression algorithm, which is proprietary.
-Distribution of modified UnRAR source code in separate form
-or as a part of other software is permitted, provided that
-full text of this paragraph, starting from "UnRAR source code"
-words, is included in license, or in documentation if license
-is not available, and in source code comments of resulting package.
+As an additional permission under section 7 of GNU GPL version 3, the
+copyright holders of Weaver grant permission to link or combine covered
+Weaver code with the unrar-rs library, including modified versions of that
+library governed by the UnRAR license restriction, and to convey the resulting
+combined work.
+
+This permission does not relicense unrar-rs or any UnRAR-derived material.
+Those portions remain governed by their applicable license terms. Nothing in
+this permission excuses a distributor from complying with those terms,
+including preservation of required license notices. See
+THIRD_PARTY_NOTICES.md for the applicable UnRAR notice.
+
+The Corresponding Source for a non-source distribution of such a combined
+work shall include the exact unrar-rs source used to build it, including any
+modifications and the scripts needed to control compilation and installation.
+
+You may remove this additional permission from a modified version of Weaver.
+Conveying that modified version combined with unrar-rs requires permission
+equivalent to this exception.
 
 ## GNU GPL v3 Text
 

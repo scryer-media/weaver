@@ -72,6 +72,48 @@ impl Pipeline {
                         "cancel is not supported while the final move is running".to_string(),
                     ))
                 } else if self.jobs.contains_key(&job_id) {
+                    // Normal job cancellation must also interrupt terminal
+                    // post-processing. The pipeline-level signal covers a run
+                    // waiting for admission; the executor-level signal covers a
+                    // script that is already running.
+                    let post_processing_done = self
+                        .terminal_post_processing_cancellations
+                        .get(&job_id)
+                        .map(tokio::sync::watch::Sender::subscribe);
+                    let pipeline_cancelled = self
+                        .terminal_post_processing_cancellations
+                        .get(&job_id)
+                        .is_some_and(|sender| sender.send(true).is_ok());
+                    let executor_cancelled =
+                        self.terminal_post_processing_executor.cancel_job(job_id.0);
+                    let par2_cancelled =
+                        if let Some(cancellation) = self.par2_cancellations.get(&job_id) {
+                            cancellation.cancel();
+                            true
+                        } else {
+                            false
+                        };
+                    let extraction_cleanup_wait = self.extraction_budgets.get(&job_id).cloned();
+                    let extraction_cancelled = if let Some(budget) = &extraction_cleanup_wait {
+                        budget.cancel();
+                        true
+                    } else {
+                        false
+                    };
+                    if pipeline_cancelled || executor_cancelled {
+                        tracing::debug!(
+                            job_id = job_id.0,
+                            "requested cancellation of active post-processing"
+                        );
+                    }
+                    if par2_cancelled || extraction_cancelled {
+                        tracing::debug!(
+                            job_id = job_id.0,
+                            par2_cancelled,
+                            extraction_cancelled,
+                            "requested cancellation of active repair or extraction"
+                        );
+                    }
                     let state = self
                         .jobs
                         .get(&job_id)
@@ -139,6 +181,8 @@ impl Pipeline {
                         self.jobs_finalizing_download.remove(&job_id);
                         self.active_downloads_by_job.remove(&job_id);
                         self.active_download_connections_by_job.remove(&job_id);
+                        self.active_completion_critical_connections_by_job
+                            .remove(&job_id);
                         self.active_downloads_by_file
                             .retain(|file_id, _| file_id.job_id != job_id);
                         self.active_decodes_by_job.remove(&job_id);
@@ -149,8 +193,10 @@ impl Pipeline {
                             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
                         self.cancel_infrastructure_retries_for_job(job_id);
                         self.download_wait_by_job.remove(&job_id);
-                        self.terminal_segment_failures
-                            .retain(|segment_id| segment_id.file_id.job_id != job_id);
+                        self.segment_terminal_states
+                            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+                        self.foreign_layout_watches
+                            .retain(|file_id, _| file_id.job_id != job_id);
                         self.rate_limit_reservations
                             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
                         self.job_last_download_activity.remove(&job_id);
@@ -158,15 +204,46 @@ impl Pipeline {
                         self.clear_job_write_backlog(job_id);
                         self.clear_job_progress_floor_runtime(job_id);
                         self.clear_job_phase_progress_runtime(job_id);
+                        self.discard_stage_timers(job_id);
                         self.clear_job_retention_excludes(job_id);
+
+                        // Low-frequency: one observation per cancellation. The
+                        // elapsed span comes from the `Instant` the job state
+                        // already carries, so no extra wall-clock source is
+                        // introduced.
+                        self.metrics.job_lifecycle.note_finished(
+                            crate::operations::instrumentation::JobResultKind::Cancelled,
+                            state.spec.category.as_deref().unwrap_or(""),
+                            Some(state.created_at.elapsed()),
+                        );
 
                         let working_dir = state.working_dir.clone();
                         let staging_dir = state.staging_dir.clone();
                         tokio::spawn(async move {
+                            // Let a cancelled post-processing script leave its
+                            // process group before its working directory is
+                            // removed. The sender is dropped by the terminal
+                            // completion handler once that run has ended.
+                            if let Some(mut post_processing_done) = post_processing_done {
+                                while post_processing_done.changed().await.is_ok() {}
+                            }
+                            if let Some(extraction_budget) = extraction_cleanup_wait {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    extraction_budget.wait_for_idle();
+                                })
+                                .await;
+                            }
                             // Close cached write handles first: the working-dir
                             // path may be reused verbatim by a re-added job, and a
-                            // stale handle would swallow its writes.
+                            // stale handle would swallow its writes. The staging
+                            // root gets the same treatment — direct-store writes
+                            // member payload there through the same pool, and its
+                            // path is deterministic per job id, so a re-added job
+                            // can reuse that one verbatim too.
                             crate::pipeline::close_cached_write_handles_under(&working_dir).await;
+                            if let Some(staging) = staging_dir.as_deref() {
+                                crate::pipeline::close_cached_write_handles_under(staging).await;
+                            }
                             if let Err(e) = tokio::fs::remove_dir_all(&working_dir).await
                                 && e.kind() != std::io::ErrorKind::NotFound
                             {
@@ -344,12 +421,12 @@ impl Pipeline {
                 let _ = reply.send(());
             }
             SchedulerCommand::PausePostProcessing { reply } => {
-                self.terminal_post_processing_service.pause();
+                self.terminal_post_processing_executor.pause();
                 self.shared_state.set_post_processing_paused(true);
                 let _ = reply.send(());
             }
             SchedulerCommand::ResumePostProcessing { reply } => {
-                self.terminal_post_processing_service.resume();
+                self.terminal_post_processing_executor.resume();
                 self.shared_state.set_post_processing_paused(false);
                 let _ = reply.send(());
             }
@@ -358,8 +435,9 @@ impl Pipeline {
                     .terminal_post_processing_cancellations
                     .get(&job_id)
                     .is_some_and(|sender| sender.send(true).is_ok());
-                let service_cancelled = self.terminal_post_processing_service.cancel_job(job_id.0);
-                let result = (pipeline_cancelled || service_cancelled)
+                let executor_cancelled =
+                    self.terminal_post_processing_executor.cancel_job(job_id.0);
+                let result = (pipeline_cancelled || executor_cancelled)
                     .then_some(())
                     .ok_or_else(|| {
                         crate::SchedulerError::Conflict(format!(
@@ -478,6 +556,13 @@ impl Pipeline {
                     // generation also invalidates the failure indices carried by
                     // in-flight delayed retries when they re-enter the queue.
                     self.pool_generation = self.pool_generation.wrapping_add(1);
+                    // Re-point the per-server metric counters at the new pool
+                    // layout. This is the only place the counter vector is
+                    // rebuilt, so the completion path can index it without a
+                    // lock; counters are keyed by stable server id, so lifetime
+                    // totals carry across the rebuild.
+                    self.server_counters =
+                        Self::activate_server_counters(&self.metrics, &self.nntp);
                     let recovery_requeues = self.wake_all_infrastructure_retries();
                     self.clear_retention_exclude_cache();
                     for state in self.jobs.values_mut() {
@@ -490,7 +575,6 @@ impl Pipeline {
                     self.owned_download_lane_pool.reset();
                     self.owned_download_lane_pool
                         .resize(total_connections.max(1));
-                    self.connection_ramp = total_connections.min(5);
                     self.tuner.set_connection_limit(total_connections);
                     tokio::spawn(async move { old_client.shutdown().await });
                     self.dispatch_downloads();
@@ -516,6 +600,22 @@ impl Pipeline {
                     ))
                 };
                 let _ = reply.send(result);
+            }
+            SchedulerCommand::UpdateRandomReadIops {
+                random_read_iops,
+                reply,
+            } => {
+                let prior_limit = self.tuner.max_concurrent_extractions();
+                self.tuner.set_random_read_iops(random_read_iops);
+                let next_limit = self.tuner.max_concurrent_extractions();
+                if next_limit > prior_limit {
+                    self.promote_queued_extractions();
+                }
+                info!(
+                    random_read_iops,
+                    prior_limit, next_limit, "applied startup disk measurement to runtime tuner"
+                );
+                let _ = reply.send(());
             }
             SchedulerCommand::UpdateRuntimePaths {
                 data_dir,
@@ -576,8 +676,10 @@ impl Pipeline {
                     return;
                 }
                 let db = self.db.clone();
-                let delete_result =
-                    tokio::task::spawn_blocking(move || db.delete_job_history(job_id.0)).await;
+                let delete_result = tokio::task::spawn_blocking(move || {
+                    db.delete_job_history_and_forget_duplicate_identity(job_id.0)
+                })
+                .await;
                 match delete_result {
                     Ok(Ok(_)) => {}
                     Ok(Err(crate::StateError::Conflict(message))) => {
@@ -627,8 +729,10 @@ impl Pipeline {
                     Vec::new()
                 };
                 let db = self.db.clone();
-                let delete_result =
-                    tokio::task::spawn_blocking(move || db.delete_all_job_history()).await;
+                let delete_result = tokio::task::spawn_blocking(move || {
+                    db.delete_all_job_history_and_forget_duplicate_identities()
+                })
+                .await;
                 match delete_result {
                     Ok(Ok(_)) => {}
                     Ok(Err(crate::StateError::Conflict(message))) => {

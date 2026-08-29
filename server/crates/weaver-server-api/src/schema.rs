@@ -22,7 +22,8 @@ use crate::history::types::{
 };
 use crate::jobs::types::{
     GlobalQueueState, Job, JobOutputFile, JobOutputResult, JobStatusGql, QueueEvent,
-    QueueFilterInput, QueueItem, QueueItemState, QueueSnapshot, QueueSummary,
+    QueueFilterInput, QueueItem, QueueItemState, QueuePage, QueuePageInput, QueuePriority,
+    QueueSnapshot, QueueSortDirection, QueueSortField, QueueSummary,
 };
 use crate::jobs::types::{
     decode_event_cursor, decode_offset_cursor, global_queue_state, metrics_from_snapshot,

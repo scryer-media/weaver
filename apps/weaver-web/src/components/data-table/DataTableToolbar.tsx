@@ -1,4 +1,5 @@
 import { startTransition, type ReactNode } from "react";
+import { Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -34,9 +35,10 @@ export function DataTableToolbar({
 }: DataTableToolbarProps) {
   return (
     <div className={cn("flex flex-col gap-3 lg:grid lg:grid-cols-[auto_minmax(0,1fr)_auto] lg:items-center lg:gap-4", className)}>
-      <div className={cn("max-w-md flex-1", searchContainerClassName)}>
+      <div className={cn("relative w-full sm:max-w-[260px]", searchContainerClassName)}>
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
         <Input
-          className={searchInputClassName}
+          className={cn("h-9 rounded-inner pl-8", searchInputClassName)}
           value={searchValue}
           onChange={(event) => {
             const value = event.target.value;

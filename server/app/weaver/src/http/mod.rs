@@ -2,13 +2,16 @@ mod assets;
 mod auth;
 mod backup;
 mod graphql;
+mod health;
 mod jobs;
 mod metrics;
 mod nzbget;
+mod request_metrics;
 mod routes;
+mod system;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::http::{HeaderValue, Method, Response as HttpResponse, StatusCode, header};
@@ -25,10 +28,13 @@ use weaver_server_api::{BackupService, RssService, WeaverSchema};
 use weaver_server_core::Database;
 use weaver_server_core::SchedulerHandle;
 use weaver_server_core::auth::{ApiKeyCache, LoginAuthCache};
+use weaver_server_core::operations::disk::DiskSpaceCollector;
+use weaver_server_core::operations::instrumentation::{DiskSpaceSnapshot, HttpMetricsSnapshot};
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::SharedConfig;
 
 pub(crate) use self::metrics::PrometheusMetricsExporter;
+pub(crate) use self::request_metrics::HttpMetricsHandle;
 
 #[derive(Clone)]
 struct SessionToken(Arc<String>);
@@ -39,6 +45,7 @@ struct RequestAuthContext {
     auth_cache: LoginAuthCache,
     api_key_cache: ApiKeyCache,
     session_token: SessionToken,
+    security: Arc<RuntimeSecurityConfig>,
 }
 
 pub struct ServerRuntime {
@@ -55,6 +62,41 @@ pub struct ServerRuntime {
     pub config: SharedConfig,
     pub base_url: String,
     pub security: RuntimeSecurityConfig,
+    /// Handle the restart endpoint pulls to ask the serve loop to tear down
+    /// and start again.
+    pub restart: weaver_server_core::runtime::restart::RestartController,
+    /// TTL-cached free-space sampler for the configured directory roles.
+    /// Constructed at wiring time from the resolved data/intermediate/complete
+    /// directories; read by the exporter at scrape time.
+    pub(crate) disk_space: Arc<DiskSpaceCollector>,
+    /// Per-route HTTP request counters and latency, written by the
+    /// `request_metrics` middleware and read by the exporter.
+    pub(crate) http_metrics: HttpMetricsHandle,
+}
+
+/// How long a sampled free-space reading is served from cache before the
+/// collector stats the filesystems again. A scrape interval is typically
+/// 15–60 s, and free space does not move meaningfully faster than this.
+pub(crate) const DISK_SPACE_SAMPLE_TTL: Duration = Duration::from_secs(30);
+
+impl ServerRuntime {
+    /// Free/total capacity for the configured directory roles, TTL-cached.
+    ///
+    /// `build_router` consumes the runtime, so the exporter reads the same
+    /// collector through the `Extension<Arc<DiskSpaceCollector>>` the router
+    /// installs; this accessor is the equivalent for anything still holding the
+    /// runtime itself.
+    #[allow(dead_code, reason = "read by the Prometheus exporter")]
+    pub(crate) fn disk_space_snapshot(&self) -> Vec<DiskSpaceSnapshot> {
+        self.disk_space.sample(DISK_SPACE_SAMPLE_TTL)
+    }
+
+    /// Per-route HTTP request counters and latency. Also reachable from a
+    /// handler as `Extension<HttpMetricsHandle>`.
+    #[allow(dead_code, reason = "read by the Prometheus exporter")]
+    pub(crate) fn http_metrics_snapshot(&self) -> HttpMetricsSnapshot {
+        self.http_metrics.snapshot()
+    }
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -111,12 +153,17 @@ fn cors_layer(
         .allow_credentials(true))
 }
 
+/// Runs the HTTP server on a listener the caller already bound. Binding
+/// happens in `serve.rs` so an unbindable configured address can fall back to
+/// loopback (and be reported) before the security snapshot is captured by the
+/// GraphQL schema — the never-brick rule for stored network settings.
 pub async fn run_server(
     runtime: ServerRuntime,
-    addr: SocketAddr,
+    listener: tokio::net::TcpListener,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let base_url = runtime.base_url.clone();
     let cors = cors_layer(&runtime.security)?;
+    let host_security = runtime.security.clone();
     let app = routes::build_router(runtime)
         .layer(compression_layer())
         .layer(
@@ -127,11 +174,10 @@ pub async fn run_server(
                 .zstd(true),
         )
         .layer(cors);
+    let app = routes::with_http_host_validation(app, host_security);
 
+    let addr = listener.local_addr()?;
     info!(%addr, base_url = if base_url.is_empty() { "/" } else { &base_url }, "starting HTTP server");
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-        format!("failed to bind to {addr}: {e} — is another process using this port?")
-    })?;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

@@ -1,0 +1,7 @@
+{
+  "slug": "rar4-corrupted",
+  "title": "E2E.Test.RAR4.Corrupted.2024.720p-TESTGRP",
+  "description": "RAR4 archive with a later 1MB zeroed region and no PAR2. Tests graceful extraction failure on unrecoverable corruption.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure"
+}

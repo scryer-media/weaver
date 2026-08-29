@@ -20,7 +20,9 @@ pub use backup::{
     backup_error_status_code,
 };
 pub use categories::types::*;
-pub use context::{SchemaContext, WeaverSchema, build_schema, export_schema_sdl};
+pub use context::{
+    SchemaContext, SystemRuntimeContext, WeaverSchema, build_schema, export_schema_sdl,
+};
 pub use history::types::*;
 pub use jobs::scheduled_resume::{ScheduledResumeCoordinator, ScheduledResumeError};
 pub use jobs::types::*;
@@ -34,6 +36,6 @@ pub use settings::types::*;
 pub use system::runtime::load_global_pause_from_db;
 pub use system::types::*;
 pub use weaver_server_core::ingest::{
-    CategoryResolutionMode, SubmissionOptions, SubmitNzbError, SubmittedJob, fetch_nzb_from_url,
-    init_job_counter, submit_nzb_bytes, submit_nzb_bytes_with_options,
+    SubmissionOptions, SubmitNzbError, SubmittedJob, fetch_nzb_from_url, init_job_counter,
+    submit_nzb_bytes, submit_nzb_bytes_with_options,
 };

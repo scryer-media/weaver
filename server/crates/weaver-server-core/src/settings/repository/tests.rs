@@ -30,6 +30,7 @@ fn server_crud() {
         connections: 10,
         active: true,
         supports_pipelining: false,
+        tls_name_mismatch_certificate_der: Some(vec![0x30, 0x82, 0x01, 0x0a]),
         priority: 0,
         backfill: false,
         retention_days: 0,
@@ -52,14 +53,20 @@ fn server_crud() {
     assert_eq!(servers[0].port, 443);
     assert_eq!(servers[0].max_download_speed, 2_500_000);
     assert_eq!(servers[0].download_quota, server.download_quota);
+    assert_eq!(
+        servers[0].tls_name_mismatch_certificate_der,
+        server.tls_name_mismatch_certificate_der
+    );
 
     let mut updated = server.clone();
     updated.connections = 20;
     updated.max_download_speed = 5_000_000;
+    updated.tls_name_mismatch_certificate_der = None;
     db.update_server(&updated).unwrap();
     let servers = db.list_servers().unwrap();
     assert_eq!(servers[0].connections, 20);
     assert_eq!(servers[0].max_download_speed, 5_000_000);
+    assert_eq!(servers[0].tls_name_mismatch_certificate_der, None);
 
     assert!(db.delete_server(1).unwrap());
     assert!(!db.delete_server(1).unwrap());
@@ -92,6 +99,7 @@ fn config_roundtrip() {
             connections: 5,
             active: true,
             supports_pipelining: true,
+            tls_name_mismatch_certificate_der: None,
             priority: 0,
             backfill: false,
             retention_days: 0,
@@ -126,6 +134,15 @@ fn config_roundtrip() {
             scanning_paused: false,
         },
         duplicate_policy: Default::default(),
+        direct_store: Some(crate::settings::DirectStoreOverrides {
+            enabled: Some(true),
+            holds_scratch_ceiling_bytes: Some(128 * 1024 * 1024),
+        }),
+        delivery_naming: Some(crate::settings::DeliveryNamingOverrides {
+            deobfuscate_delivered_members: Some(false),
+            enable_srrdb_lookup: Some(true),
+        }),
+        metrics: Default::default(),
         config_path: None,
     };
 
@@ -162,6 +179,48 @@ fn config_roundtrip() {
         Some("/media/movies".to_string())
     );
     assert_eq!(loaded.categories[0].aliases, "movie*, film*");
+    // Direct-store's switches are ordinary settings rows, so
+    // they survive a save/load like everything else here.
+    let direct_store = loaded
+        .direct_store
+        .expect("the direct-store table must survive the round trip");
+    assert_eq!(direct_store.enabled, Some(true));
+    assert_eq!(
+        direct_store.holds_scratch_ceiling_bytes,
+        Some(128 * 1024 * 1024)
+    );
+    let delivery_naming = loaded
+        .delivery_naming
+        .expect("the delivery-naming table must survive the round trip");
+    assert_eq!(delivery_naming.deobfuscate_delivered_members, Some(false));
+    assert_eq!(delivery_naming.enable_srrdb_lookup, Some(true));
+}
+
+/// An install that never touched delivery naming loads no table at all, so the
+/// accessors answer with the shipped defaults: rename on, srrdb off.
+#[test]
+fn an_unconfigured_delivery_naming_table_loads_as_absent_defaults() {
+    let db = Database::open_in_memory().unwrap();
+    db.set_setting("data_dir", "/tmp/weaver").unwrap();
+
+    let loaded = db.load_config().unwrap();
+
+    assert!(loaded.delivery_naming.is_none());
+    assert!(loaded.deobfuscate_delivered_members());
+    assert!(!loaded.enable_srrdb_lookup());
+}
+
+/// An install that never touched direct-store loads no table at all, which is
+/// what "every default" looks like — and it must not be confused with a table
+/// that explicitly says `false`.
+#[test]
+fn an_unconfigured_direct_store_loads_as_absent() {
+    let db = Database::open_in_memory().unwrap();
+    db.set_setting("data_dir", "/tmp/weaver").unwrap();
+
+    let loaded = db.load_config().unwrap();
+
+    assert!(loaded.direct_store.is_none());
 }
 
 #[test]

@@ -11,7 +11,8 @@
 use std::env;
 use std::ffi::c_void;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use weaver_yenc::crc::Crc32;
 use weaver_yenc::decode::decode_rapidyenc;
 
@@ -211,8 +212,18 @@ fn benches(c: &mut Criterion) {
             &rapid_out[..rapid_written],
             "{name} decoded byte parity"
         );
+        // Per-fixture CRC gate: the timing lanes below only measure the two CRC
+        // implementations, they never compare them, so the actual equality claim
+        // is made here over the decoded bytes.
+        let weaver_crc = {
+            let mut hasher = Crc32::new();
+            hasher.update(&weaver_out[..weaver_written]);
+            hasher.finalize()
+        };
+        let rapid_crc = rapidyenc.crc(&rapid_out[..rapid_written]);
+        assert_eq!(weaver_crc, rapid_crc, "{name} decoded CRC parity");
         eprintln!(
-            "parity ok [{name}]: {} encoded -> {} decoded",
+            "parity ok [{name}]: {} encoded -> {} decoded, crc={weaver_crc:#010x}",
             input.len(),
             weaver_written
         );
@@ -234,7 +245,7 @@ fn benches(c: &mut Criterion) {
     let mut weaver_out = vec![0u8; realshape.len() + 64];
     let written = decode_rapidyenc(realshape, &mut weaver_out).unwrap();
     let decoded = &weaver_out[..written];
-    c.bench_function("parity_crc32fast_decoded", |b| {
+    c.bench_function("parity_crc_fast_decoded", |b| {
         b.iter(|| {
             let mut hasher = Crc32::new();
             hasher.update(black_box(decoded));

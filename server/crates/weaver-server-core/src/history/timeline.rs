@@ -1,5 +1,8 @@
 use crate::StateError;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore, max_rows_for_tx};
+use crate::persistence::sql_runtime::{
+    POSTGRES_BATCH_BIND_LIMIT, SqlArg, SqlEngine, SqlRuntime, SqlTx, StoreDatastore,
+    max_rows_for_tx,
+};
 use crate::persistence::{Database, DatabaseWriterExecutor};
 use sqlx::{Postgres, QueryBuilder, Sqlite};
 
@@ -85,18 +88,64 @@ async fn bulk_insert_job_events_tx(
     Ok(())
 }
 
+fn build_job_events_pg_sql(row_count: usize) -> String {
+    let mut values = String::new();
+    for row in 0..row_count {
+        if row > 0 {
+            values.push_str(", ");
+        }
+        if row == 0 {
+            values.push_str("({}::bigint, {}::bigint, {}::text, {}::text, {}::text)");
+        } else {
+            values.push_str("({}, {}, {}, {}, {})");
+        }
+    }
+    format!("INSERT INTO job_events (job_id, timestamp, kind, message, file_id) VALUES {values}")
+}
+
 async fn insert_job_events_sql(
     datastore: StoreDatastore,
     events: Vec<JobEvent>,
 ) -> Result<(), StateError> {
-    SqlRuntime::run_in_transaction(&datastore, "insert_job_events", |tx| {
-        let events = events.clone();
-        Box::pin(async move {
-            bulk_insert_job_events_tx(tx, &events).await?;
+    match datastore.engine() {
+        SqlEngine::Sqlite => {
+            SqlRuntime::run_in_transaction(&datastore, "insert_job_events", |tx| {
+                let events = events.clone();
+                Box::pin(async move {
+                    bulk_insert_job_events_tx(tx, &events).await?;
+                    Ok(())
+                })
+            })
+            .await
+        }
+        // Timeline rows are append-only diagnostics with no parent guard, so
+        // there is nothing a surrounding transaction protects: each chunk is
+        // one autocommit statement, and the BEGIN/COMMIT round trips the old
+        // wrapper paid per call are gone.
+        SqlEngine::Postgres => {
+            const BINDS_PER_ROW: usize = 5;
+            let chunk_size = (POSTGRES_BATCH_BIND_LIMIT / BINDS_PER_ROW).max(1);
+            let started = std::time::Instant::now();
+            for chunk in events.chunks(chunk_size) {
+                let sql = build_job_events_pg_sql(chunk.len());
+                let mut args = Vec::with_capacity(chunk.len() * BINDS_PER_ROW);
+                for event in chunk {
+                    args.push(SqlArg::I64(event.job_id as i64));
+                    args.push(SqlArg::I64(event.timestamp));
+                    args.push(SqlArg::Text(event.kind.clone()));
+                    args.push(SqlArg::Text(event.message.clone()));
+                    args.push(SqlArg::OptText(event.file_id.clone()));
+                }
+                SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+            }
+            crate::runtime::perf_probe::record_sql_op(
+                "postgres",
+                "insert_job_events",
+                started.elapsed(),
+            );
             Ok(())
-        })
-    })
-    .await
+        }
+    }
 }
 
 impl Database {
@@ -145,7 +194,7 @@ impl Database {
     /// Load all events for a specific job, ordered by insertion order.
     pub fn get_job_events(&self, job_id: u64) -> Result<Vec<JobEvent>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT job_id, timestamp, kind, message, file_id
@@ -186,7 +235,7 @@ impl Database {
         cap: u32,
     ) -> Result<Vec<JobEvent>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let mut rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT job_id, timestamp, kind, message, file_id
@@ -221,7 +270,7 @@ impl Database {
         cap: u32,
     ) -> Result<Vec<JobEventRecord>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let mut rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT id, job_id, timestamp, kind, message, file_id
@@ -280,7 +329,7 @@ impl Database {
               GROUP BY job_id, kind"
         );
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[]).await?;
             let mut bounds: std::collections::HashMap<u64, Vec<(String, i64, i64)>> =
                 std::collections::HashMap::new();
@@ -326,7 +375,7 @@ impl Database {
               LIMIT {limit}"
         );
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[]).await?;
             rows.into_iter()
                 .map(|row| {

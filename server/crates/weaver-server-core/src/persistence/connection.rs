@@ -10,6 +10,7 @@ use std::time::Instant;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::StateError;
+use crate::operations::instrumentation::{DbRuntimeMetrics, DbRuntimeMetricsSnapshot};
 use crate::persistence::database_target::DatabaseTarget;
 use crate::persistence::sql_runtime::{StoreDatastore, db_err};
 use crate::persistence::sql_services::DatabaseServices;
@@ -37,7 +38,22 @@ enum PostgresDatabaseRuntimeJob {
 
 #[derive(Clone)]
 enum DatabaseRuntimeWorker {
-    Sqlite(SqliteDatabaseRuntimeWorker),
+    /// SQLite carries two executors on purpose. `writer` is a single thread —
+    /// SQLite is at its best with one writer, and serialising there is what keeps
+    /// same-key state transitions ordered. `reads` is a small multi-threaded
+    /// executor, because in WAL mode readers take a snapshot and neither block
+    /// the writer nor are blocked by it, so there is no reason for a query to
+    /// queue behind the download pipeline's writes. The pool already has 16
+    /// connections, each on its own sqlx worker thread; before this split, 15 of
+    /// them could never be in flight.
+    Sqlite {
+        writer: SqliteDatabaseRuntimeWorker,
+        reads: SqliteReadRuntimeWorker,
+    },
+    /// PostgreSQL needs none of this: its executor is already multi-threaded with
+    /// a permit per pooled connection, so reads and writes are concurrent
+    /// whichever entry point they use. `run_sql_blocking_read` forwards to the
+    /// same executor rather than adding a second one.
     Postgres(PostgresDatabaseRuntimeWorker),
 }
 
@@ -48,53 +64,191 @@ impl DatabaseRuntimeWorker {
                 PostgresDatabaseRuntimeWorker::start(postgres_db_concurrency_from_env())
                     .map(Self::Postgres)
             }
-            DatabaseTarget::SqlitePath(_) | DatabaseTarget::SqliteUrl(_) => {
-                SqliteDatabaseRuntimeWorker::start().map(Self::Sqlite)
-            }
+            DatabaseTarget::SqlitePath(_) | DatabaseTarget::SqliteUrl(_) => Ok(Self::Sqlite {
+                writer: SqliteDatabaseRuntimeWorker::start()?,
+                reads: SqliteReadRuntimeWorker::start(sqlite_read_concurrency_from_env())?,
+            }),
         }
     }
 
-    fn block_on<T, Fut>(&self, future: Fut) -> Result<T, StateError>
+    fn block_on<T, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        future: Fut,
+    ) -> Result<T, StateError>
     where
         T: Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
         match self {
-            Self::Sqlite(worker) => worker.block_on(future),
+            Self::Sqlite { writer, .. } => writer.block_on(caller, future),
             Self::Postgres(worker) => worker.block_on(future),
         }
     }
 
-    fn block_on_local<T, Build, Fut>(&self, build: Build) -> Result<T, StateError>
+    fn block_on_local<T, Build, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        build: Build,
+    ) -> Result<T, StateError>
     where
         T: Send + 'static,
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
         match self {
-            Self::Sqlite(worker) => worker.block_on_local(build),
+            Self::Sqlite { writer, .. } => writer.block_on_local(caller, build),
             Self::Postgres(_) => Err(StateError::Database(
                 "run_sql_blocking_local requires sqlite datastore".to_string(),
             )),
         }
     }
 
-    fn block_on_startup_local<T, Build, Fut>(&self, build: Build) -> Result<T, StateError>
+    /// Dispatch a **pure read** — no writes, and not part of a write transaction.
+    fn block_on_read<T, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        future: Fut,
+    ) -> Result<T, StateError>
+    where
+        T: Send + 'static,
+        Fut: Future<Output = Result<T, StateError>> + Send + 'static,
+    {
+        match self {
+            Self::Sqlite { reads, .. } => reads.block_on(caller, future),
+            Self::Postgres(worker) => worker.block_on(future),
+        }
+    }
+
+    fn block_on_startup_local<T, Build, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        build: Build,
+    ) -> Result<T, StateError>
     where
         T: Send + 'static,
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
         match self {
-            Self::Sqlite(worker) => worker.block_on_local(build),
+            Self::Sqlite { writer, .. } => writer.block_on_local(caller, build),
             Self::Postgres(worker) => worker.block_on_local(build),
+        }
+    }
+
+    /// Saturation and latency counters for whichever executor is in use.
+    ///
+    /// For SQLite this is the WRITE executor's gauge: the read lane is a
+    /// separate sqlx pool whose calls never queue behind the writer, so
+    /// folding it into this single snapshot would blur the one saturation
+    /// signal that matters (the serialized writer). Exposing the read lane
+    /// as its own metric is follow-up work on the metrics surface, not
+    /// something to smuggle into an accessor.
+    fn runtime_metrics(&self) -> &Arc<DbRuntimeMetrics> {
+        match self {
+            Self::Sqlite { writer, .. } => &writer.metrics,
+            Self::Postgres(worker) => &worker.metrics,
         }
     }
 }
 
+/// The SQLite executor is a single thread, so *every* database call in the
+/// process — reads included — is serialized behind whatever is already running
+/// or queued on it. A caller's wall time is therefore `wait + exec`, and only
+/// `exec` is that caller's own cost; `wait` is somebody else's work. Reporting
+/// only the sum (as `db.runtime.sqlite.block_on` did) makes a victim of queueing
+/// look identical to a slow query, which is what made post-processing finalize
+/// latency unattributable.
+///
+/// These probes split the two and attribute both to the `#[track_caller]` call
+/// site, and sample the queue depth seen at submit. All of it is behind
+/// `WEAVER_PROFILE_HOT_PATHS`; when that is off `record*` returns immediately
+/// and the only residual cost is the depth counter.
 #[derive(Clone)]
 struct SqliteDatabaseRuntimeWorker {
     tx: std_mpsc::Sender<SqliteDatabaseRuntimeJob>,
+    /// Executor saturation and operation latency. Not hot-path state: every
+    /// site that touches it is already blocking on a channel round-trip to the
+    /// database thread and already reads the clock for the `perf_probe` record
+    /// alongside it.
+    metrics: Arc<DbRuntimeMetrics>,
+    /// Jobs submitted but not yet picked up by the executor thread. The channel
+    /// itself is unbounded and exposes no depth, so this is the only queueing
+    /// signal available.
+    queue_depth: Arc<AtomicUsize>,
+}
+
+/// Bookkeeping shared by both submit paths: count the job in, and hand back the
+/// enqueue instant so the executor side can split wait from exec.
+struct SqliteSubmission {
+    queued_at: Instant,
+    queue_depth: Arc<AtomicUsize>,
+    caller: &'static std::panic::Location<'static>,
+}
+
+impl SqliteSubmission {
+    fn open(
+        worker: &SqliteDatabaseRuntimeWorker,
+        caller: &'static std::panic::Location<'static>,
+    ) -> Self {
+        let depth = worker.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
+        crate::runtime::perf_probe::record_value("db.sqlite.queue.depth_at_submit", depth as u64);
+        Self {
+            queued_at: Instant::now(),
+            queue_depth: worker.queue_depth.clone(),
+            caller,
+        }
+    }
+
+    /// Called on the executor thread the moment the job is picked up.
+    fn start(self) -> SqliteExecution {
+        let waited = self.queued_at.elapsed();
+        self.queue_depth.fetch_sub(1, Ordering::AcqRel);
+        // Guarded: building the per-caller label allocates, and this runs on
+        // every database call in the process. Nothing here may cost anything
+        // when profiling is off.
+        if crate::runtime::perf_probe::enabled() {
+            crate::runtime::perf_probe::record("db.sqlite.queue.wait", waited);
+            crate::runtime::perf_probe::record_owned(
+                format!("db.sqlite.caller.{}.wait", caller_label(self.caller)),
+                waited,
+            );
+        }
+        SqliteExecution {
+            started: Instant::now(),
+            caller: self.caller,
+        }
+    }
+}
+
+struct SqliteExecution {
+    started: Instant,
+    caller: &'static std::panic::Location<'static>,
+}
+
+impl Drop for SqliteExecution {
+    fn drop(&mut self) {
+        if !crate::runtime::perf_probe::enabled() {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        crate::runtime::perf_probe::record("db.sqlite.queue.exec", elapsed);
+        crate::runtime::perf_probe::record_owned(
+            format!("db.sqlite.caller.{}.exec", caller_label(self.caller)),
+            elapsed,
+        );
+    }
+}
+
+/// `file:line` of the call site, with the workspace-relative tail only so the
+/// bucket labels stay stable across checkouts.
+fn caller_label(location: &std::panic::Location<'static>) -> String {
+    let file = location.file();
+    let short = file
+        .rfind("/src/")
+        .map(|index| &file[index + 5..])
+        .unwrap_or(file);
+    format!("{short}:{}", location.line())
 }
 
 impl SqliteDatabaseRuntimeWorker {
@@ -131,45 +285,68 @@ impl SqliteDatabaseRuntimeWorker {
             .map_err(|_| StateError::Database("database runtime worker stopped".to_string()))?
             .map_err(StateError::Database)?;
 
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            // The sqlite runtime is a single serialized worker thread.
+            metrics: Arc::new(DbRuntimeMetrics::new("sqlite", 1)),
+            queue_depth: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
-    fn block_on<T, Fut>(&self, future: Fut) -> Result<T, StateError>
+    fn block_on<T, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        future: Fut,
+    ) -> Result<T, StateError>
     where
         T: Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
         let started = Instant::now();
+        let _in_flight = self.metrics.note_submission_started();
+        let submission = SqliteSubmission::open(self, caller);
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         self.tx
             .send(Box::new(move |runtime| {
+                let _execution = submission.start();
                 let _ = reply_tx.send(runtime.block_on(future));
             }))
             .map_err(|_| StateError::Database("database runtime worker stopped".to_string()))?;
         let result = reply_rx
             .recv()
             .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
-        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on", started.elapsed());
+        let elapsed = started.elapsed();
+        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on", elapsed);
+        self.metrics.note_submission_finished(elapsed);
         result
     }
 
-    fn block_on_local<T, Build, Fut>(&self, build: Build) -> Result<T, StateError>
+    fn block_on_local<T, Build, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        build: Build,
+    ) -> Result<T, StateError>
     where
         T: Send + 'static,
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
         let started = Instant::now();
+        let _in_flight = self.metrics.note_submission_started();
+        let submission = SqliteSubmission::open(self, caller);
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         self.tx
             .send(Box::new(move |runtime| {
+                let _execution = submission.start();
                 let _ = reply_tx.send(runtime.block_on(build()));
             }))
             .map_err(|_| StateError::Database("database runtime worker stopped".to_string()))?;
         let result = reply_rx
             .recv()
             .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
-        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on_local", started.elapsed());
+        let elapsed = started.elapsed();
+        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on_local", elapsed);
+        self.metrics.note_submission_finished(elapsed);
         result
     }
 }
@@ -180,6 +357,9 @@ struct PostgresDatabaseRuntimeWorker {
     in_flight: Arc<AtomicUsize>,
     blocked_submissions: Arc<AtomicUsize>,
     concurrency: usize,
+    /// Executor saturation and operation latency. See the sqlite worker for
+    /// why this is not hot-path state.
+    metrics: Arc<DbRuntimeMetrics>,
 }
 
 impl PostgresDatabaseRuntimeWorker {
@@ -255,6 +435,7 @@ impl PostgresDatabaseRuntimeWorker {
             in_flight,
             blocked_submissions,
             concurrency,
+            metrics: Arc::new(DbRuntimeMetrics::new("postgres", concurrency as u64)),
         })
     }
 
@@ -264,6 +445,7 @@ impl PostgresDatabaseRuntimeWorker {
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
         let started = Instant::now();
+        let _in_flight = self.metrics.note_submission_started();
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         let job = PostgresDatabaseRuntimeJob::Send(Box::new(move || {
             Box::pin(async move {
@@ -275,6 +457,7 @@ impl PostgresDatabaseRuntimeWorker {
             Ok(()) => {}
             Err(std_mpsc::TrySendError::Full(job)) => {
                 let blocked_started = Instant::now();
+                self.metrics.note_submission_blocked();
                 let blocked = self.blocked_submissions.fetch_add(1, Ordering::AcqRel) + 1;
                 tracing::debug!(
                     db_executor = "postgres",
@@ -307,7 +490,9 @@ impl PostgresDatabaseRuntimeWorker {
         let result = reply_rx
             .recv()
             .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
-        crate::runtime::perf_probe::record("db.runtime.postgres.block_on", started.elapsed());
+        let elapsed = started.elapsed();
+        crate::runtime::perf_probe::record("db.runtime.postgres.block_on", elapsed);
+        self.metrics.note_submission_finished(elapsed);
         result
     }
 
@@ -318,6 +503,7 @@ impl PostgresDatabaseRuntimeWorker {
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
         let started = Instant::now();
+        let _in_flight = self.metrics.note_submission_started();
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         let job = PostgresDatabaseRuntimeJob::Local(Box::new(move |runtime| {
             let _ = reply_tx.send(runtime.block_on(build()));
@@ -327,6 +513,7 @@ impl PostgresDatabaseRuntimeWorker {
             Ok(()) => {}
             Err(std_mpsc::TrySendError::Full(job)) => {
                 let blocked_started = Instant::now();
+                self.metrics.note_submission_blocked();
                 let blocked = self.blocked_submissions.fetch_add(1, Ordering::AcqRel) + 1;
                 tracing::debug!(
                     db_executor = "postgres",
@@ -353,9 +540,145 @@ impl PostgresDatabaseRuntimeWorker {
         let result = reply_rx
             .recv()
             .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
-        crate::runtime::perf_probe::record("db.runtime.postgres.block_on_local", started.elapsed());
+        let elapsed = started.elapsed();
+        crate::runtime::perf_probe::record("db.runtime.postgres.block_on_local", elapsed);
+        self.metrics.note_submission_finished(elapsed);
         result
     }
+}
+
+/// Multi-threaded executor for pure SQLite reads.
+///
+/// WAL gives every reader a consistent snapshot taken at its own BEGIN, and a
+/// reader neither blocks nor is blocked by the single writer. So reads only need
+/// an executor that can drive several of them at once; the concurrency limit is
+/// the pool size, since each in-flight read holds one pooled connection.
+///
+/// Ordering note, deliberately unchanged: a read submitted *after* a synchronous
+/// write call has returned still observes that write, because the caller blocked
+/// until the writer committed and the reader's snapshot is taken afterwards.
+/// Writes queued through `writer_tx` (`try_queue_write` / `try_queue_archive_job`)
+/// were already asynchronous with respect to readers before this split — that is
+/// why `flush_write_queue` and the archive `committed` oneshot exist — so callers
+/// that need read-your-write on those paths must keep using them.
+#[derive(Clone)]
+struct SqliteReadRuntimeWorker {
+    tx: std_mpsc::Sender<SqliteReadJob>,
+    queue_depth: Arc<AtomicUsize>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+type SqliteReadJob = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>;
+
+impl SqliteReadRuntimeWorker {
+    fn start(concurrency: usize) -> Result<Self, StateError> {
+        let concurrency = concurrency.max(1);
+        let (tx, rx) = std_mpsc::channel::<SqliteReadJob>();
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+
+        std::thread::Builder::new()
+            .name("weaver-sqlite-read-dispatch".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(concurrency)
+                    .thread_name("weaver-sqlite-read")
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string());
+                let runtime = match runtime {
+                    Ok(runtime) => {
+                        let _ = ready_tx.send(Ok(()));
+                        runtime
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                // Dispatch only: each job spawns onto the multi-threaded runtime
+                // and this loop moves straight to the next, so reads overlap
+                // instead of queueing behind each other.
+                while let Ok(job) = rx.recv() {
+                    job(&runtime);
+                }
+            })
+            .map_err(|error| StateError::Database(error.to_string()))?;
+
+        ready_rx
+            .recv()
+            .map_err(|_| StateError::Database("database read worker stopped".to_string()))?
+            .map_err(StateError::Database)?;
+
+        Ok(Self {
+            tx,
+            queue_depth: Arc::new(AtomicUsize::new(0)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    fn block_on<T, Fut>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        future: Fut,
+    ) -> Result<T, StateError>
+    where
+        T: Send + 'static,
+        Fut: Future<Output = Result<T, StateError>> + Send + 'static,
+    {
+        let started = Instant::now();
+        let queued_at = Instant::now();
+        let depth = self.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
+        crate::runtime::perf_probe::record_value("db.sqlite.read.depth_at_submit", depth as u64);
+        let queue_depth = self.queue_depth.clone();
+        let in_flight = self.in_flight.clone();
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        self.tx
+            .send(Box::new(move |runtime| {
+                runtime.spawn(async move {
+                    let waited = queued_at.elapsed();
+                    queue_depth.fetch_sub(1, Ordering::AcqRel);
+                    let active = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                    if crate::runtime::perf_probe::enabled() {
+                        crate::runtime::perf_probe::record("db.sqlite.read.wait", waited);
+                        crate::runtime::perf_probe::record_value(
+                            "db.sqlite.read.in_flight",
+                            active as u64,
+                        );
+                    }
+                    let exec_started = Instant::now();
+                    let result = future.await;
+                    in_flight.fetch_sub(1, Ordering::AcqRel);
+                    if crate::runtime::perf_probe::enabled() {
+                        let elapsed = exec_started.elapsed();
+                        crate::runtime::perf_probe::record("db.sqlite.read.exec", elapsed);
+                        crate::runtime::perf_probe::record_owned(
+                            format!("db.sqlite.read.caller.{}.exec", caller_label(caller)),
+                            elapsed,
+                        );
+                    }
+                    let _ = reply_tx.send(result);
+                });
+            }))
+            .map_err(|_| StateError::Database("database read worker stopped".to_string()))?;
+        let result = reply_rx
+            .recv()
+            .map_err(|_| StateError::Database("database read worker panicked".to_string()))?;
+        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on_read", started.elapsed());
+        result
+    }
+}
+
+/// Read concurrency defaults to the SQLite pool size: every in-flight read holds
+/// one pooled connection, so more workers than connections only queues inside
+/// sqlx instead of here.
+fn sqlite_read_concurrency_from_env() -> usize {
+    let pool_max = crate::persistence::sql_services::sqlite_max_connections_from_env() as usize;
+    std::env::var("WEAVER_SQLITE_READ_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(pool_max)
+        .clamp(1, pool_max.max(1))
 }
 
 fn postgres_db_concurrency_from_env() -> usize {
@@ -368,11 +691,12 @@ fn postgres_db_concurrency_from_env() -> usize {
         .clamp(1, pool_max.max(1))
 }
 
+#[track_caller]
 fn open_sql_services_blocking(
     sql_worker: &DatabaseRuntimeWorker,
     target: DatabaseTarget,
 ) -> Result<DatabaseServices, StateError> {
-    sql_worker.block_on_startup_local(move || {
+    sql_worker.block_on_startup_local(std::panic::Location::caller(), move || {
         DatabaseServices::open(target, crate::schema_migrations::MigrationMode::Apply)
     })
 }
@@ -397,12 +721,14 @@ impl DatabaseWriterExecutor {
         self.sql_services.datastore()
     }
 
+    #[track_caller]
     pub(crate) fn run_sql_blocking<T, Fut>(&self, future: Fut) -> Result<T, StateError>
     where
         T: Send + 'static,
         Fut: std::future::Future<Output = Result<T, StateError>> + Send + 'static,
     {
-        self.sql_worker.block_on(future)
+        self.sql_worker
+            .block_on(std::panic::Location::caller(), future)
     }
 
     pub(crate) fn job_history_cache_generation(&self) -> u64 {
@@ -421,6 +747,17 @@ impl DatabaseWriterExecutor {
 }
 
 type WriteOp = Box<dyn FnOnce(&Database) -> Result<(), StateError> + Send + 'static>;
+
+/// A writer-queue command plus the instant it was enqueued.
+///
+/// The ordered writer consumes one command at a time and awaits each before
+/// taking the next, so a command's latency is `queue wait + execution` exactly
+/// as on the SQLite executor below it. Carrying the enqueue instant is what lets
+/// the consumer report those two separately per command kind.
+struct QueuedWrite {
+    queued_at: Instant,
+    command: DbWriteCommand,
+}
 
 enum DbWriteCommand {
     ArchiveJob {
@@ -448,6 +785,19 @@ enum DbWriteCommand {
     Flush {
         reply: oneshot::Sender<()>,
     },
+}
+
+impl DbWriteCommand {
+    /// Stable bucket label. `Write` carries a caller-supplied `&'static str`, so
+    /// generic ordered writes stay distinguishable from each other.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::ArchiveJob { .. } => "archive_job",
+            Self::InsertJobEvents { .. } => "insert_job_events",
+            Self::Write { label, .. } => label,
+            Self::Flush { .. } => "flush",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -513,7 +863,7 @@ pub struct Database {
     target: DatabaseTarget,
     sql_services: DatabaseServices,
     sql_worker: DatabaseRuntimeWorker,
-    writer_tx: mpsc::Sender<DbWriteCommand>,
+    writer_tx: mpsc::Sender<QueuedWrite>,
     /// Count of in-flight background re-sends into the bounded writer queue
     /// (archive jobs and generic ordered writes) spawned when `try_send` hit a
     /// full queue. `flush_write_queue` waits for this to reach zero before its
@@ -526,6 +876,15 @@ pub struct Database {
 }
 
 impl Database {
+    /// Executor engine, saturation and operation-latency histogram for the
+    /// database runtime backing this handle.
+    ///
+    /// Read at scrape time. Cheap: a handful of `Relaxed` atomic loads plus one
+    /// `Vec` for the histogram buckets.
+    pub fn runtime_metrics_snapshot(&self) -> DbRuntimeMetricsSnapshot {
+        self.sql_worker.runtime_metrics().snapshot()
+    }
+
     /// Open (or create) the database at `path`.
     /// Runs schema migrations and configures SQLite pragmas.
     pub fn open(path: &Path) -> Result<Self, StateError> {
@@ -581,6 +940,21 @@ impl Database {
         self.sql_services.datastore()
     }
 
+    /// Stable, non-sensitive name of the configured persistence engine.
+    pub fn engine_name(&self) -> &'static str {
+        self.datastore().engine().as_str()
+    }
+
+    /// Highest migration version this database's ledger held when this handle
+    /// opened it, before the migrations that open ran. `None` means nothing had
+    /// ever migrated it — a database this process created.
+    ///
+    /// This is how startup tells a fresh install from an upgrade, and from
+    /// which release line it is upgrading.
+    pub fn pre_migration_schema_version(&self) -> Option<i64> {
+        self.sql_services.pre_migration_schema_version()
+    }
+
     pub(crate) fn database_target(&self) -> &DatabaseTarget {
         &self.target
     }
@@ -603,7 +977,7 @@ impl Database {
         let datastore = self.datastore();
         let worker = self.sql_worker.clone();
         drop(self);
-        worker.block_on(async move {
+        worker.block_on(std::panic::Location::caller(), async move {
             match datastore {
                 StoreDatastore::Sqlite { pool, .. } => pool.close().await,
                 StoreDatastore::Postgres { pool } => pool.close().await,
@@ -654,14 +1028,34 @@ impl Database {
             .clear();
     }
 
+    #[track_caller]
     pub(crate) fn run_sql_blocking<T, Fut>(&self, future: Fut) -> Result<T, StateError>
     where
         T: Send + 'static,
         Fut: std::future::Future<Output = Result<T, StateError>> + Send + 'static,
     {
-        self.sql_worker.block_on(future)
+        self.sql_worker
+            .block_on(std::panic::Location::caller(), future)
     }
 
+    /// Run a **pure read**: no writes, and not inside a write transaction.
+    ///
+    /// Reads dispatched here run on the multi-threaded read executor instead of
+    /// queueing behind the single writer. Use [`Self::run_sql_blocking`] for
+    /// anything that writes, and for reads that must sit inside a write
+    /// transaction (read-modify-write), where the ordering the single writer
+    /// provides is the point.
+    #[track_caller]
+    pub(crate) fn run_sql_blocking_read<T, Fut>(&self, future: Fut) -> Result<T, StateError>
+    where
+        T: Send + 'static,
+        Fut: std::future::Future<Output = Result<T, StateError>> + Send + 'static,
+    {
+        self.sql_worker
+            .block_on_read(std::panic::Location::caller(), future)
+    }
+
+    #[track_caller]
     pub(crate) fn run_sql_blocking_local<T, Build, Fut>(
         &self,
         build: Build,
@@ -671,7 +1065,8 @@ impl Database {
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<T, StateError>> + 'static,
     {
-        self.sql_worker.block_on_local(build)
+        self.sql_worker
+            .block_on_local(std::panic::Location::caller(), build)
     }
 
     /// Set the encryption key used to protect sensitive fields (passwords).
@@ -684,10 +1079,29 @@ impl Database {
         self.encryption_key.as_ref()
     }
 
+    /// Answer a trivial query, to prove the datastore is reachable.
+    ///
+    /// Deliberately touches no table: a readiness probe must report on the
+    /// connection, not on whether some particular schema object exists. This is
+    /// a blocking call — callers on an async runtime must wrap it in
+    /// `spawn_blocking`.
+    pub fn probe_liveness(&self) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            crate::persistence::sql_runtime::SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT 1 AS alive",
+                &[],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
     /// Check if the database has no settings (i.e. fresh / needs migration).
     pub fn is_empty(&self) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let count = crate::persistence::sql_runtime::SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT COUNT(*) AS count FROM settings",
@@ -725,13 +1139,25 @@ impl Database {
         }
     }
 
-    fn spawn_writer_task(&self, mut rx: mpsc::Receiver<DbWriteCommand>) {
+    fn spawn_writer_task(&self, mut rx: mpsc::Receiver<QueuedWrite>) {
         let writer = DatabaseWriterExecutor::from_database(self);
         // Handle used only to execute generic `Write` ops; carries a detached
         // sender so it never keeps the real writer channel open (see above).
         let writer_db = self.writer_task_handle();
         let worker = async move {
-            while let Some(command) = rx.recv().await {
+            while let Some(QueuedWrite { queued_at, command }) = rx.recv().await {
+                // Same guard as the SQLite executor: the per-command labels
+                // allocate, so nothing may be built unless profiling is on.
+                let _executed = crate::runtime::perf_probe::enabled().then(|| {
+                    let label = command.label();
+                    let waited = queued_at.elapsed();
+                    crate::runtime::perf_probe::record("db.writer_queue.wait", waited);
+                    crate::runtime::perf_probe::record_owned(
+                        format!("db.writer_queue.{label}.wait"),
+                        waited,
+                    );
+                    crate::runtime::perf_probe::owned_scope(format!("db.writer_queue.{label}.exec"))
+                });
                 match command {
                     DbWriteCommand::ArchiveJob {
                         job_id,
@@ -884,6 +1310,7 @@ impl Database {
         command: DbWriteCommand,
         context: &'static str,
     ) -> Result<(), StateError> {
+        let command = self.enqueue_write(command);
         match self.writer_tx.try_send(command) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
@@ -917,18 +1344,34 @@ impl Database {
         }
     }
 
+    /// Stamp a command with its enqueue instant and sample how full the ordered
+    /// writer queue already is. Depth is derived from the channel rather than a
+    /// separate counter so it cannot drift from reality.
+    fn enqueue_write(&self, command: DbWriteCommand) -> QueuedWrite {
+        let depth = self
+            .writer_tx
+            .max_capacity()
+            .saturating_sub(self.writer_tx.capacity());
+        crate::runtime::perf_probe::record_value("db.writer_queue.depth_at_submit", depth as u64);
+        QueuedWrite {
+            queued_at: Instant::now(),
+            command,
+        }
+    }
+
     pub async fn queue_archive_job(
         &self,
         job_id: crate::jobs::ids::JobId,
         history: crate::history::JobHistoryRow,
     ) -> Result<(), StateError> {
+        let command = self.enqueue_write(DbWriteCommand::ArchiveJob {
+            job_id,
+            history: Box::new(history),
+            typed_terminal_cause: None,
+            committed: None,
+        });
         self.writer_tx
-            .send(DbWriteCommand::ArchiveJob {
-                job_id,
-                history: Box::new(history),
-                typed_terminal_cause: None,
-                committed: None,
-            })
+            .send(command)
             .await
             .map_err(|_| StateError::Database("database writer queue closed".to_string()))
     }
@@ -937,8 +1380,9 @@ impl Database {
         &self,
         events: Vec<crate::history::JobEvent>,
     ) -> Result<(), StateError> {
+        let command = self.enqueue_write(DbWriteCommand::InsertJobEvents { events });
         self.writer_tx
-            .send(DbWriteCommand::InsertJobEvents { events })
+            .send(command)
             .await
             .map_err(|_| StateError::Database("database writer queue closed".to_string()))
     }
@@ -949,8 +1393,9 @@ impl Database {
         // behind every write that had already been accepted for the queue.
         self.wait_for_pending_write_retries().await;
         let (reply, rx) = oneshot::channel();
+        let command = self.enqueue_write(DbWriteCommand::Flush { reply });
         self.writer_tx
-            .send(DbWriteCommand::Flush { reply })
+            .send(command)
             .await
             .map_err(|_| StateError::Database("database writer queue closed".to_string()))?;
         rx.await
@@ -978,7 +1423,7 @@ impl Database {
         use crate::persistence::sql_runtime::SqlRuntime;
 
         let datastore = self.datastore();
-        let encrypted_credentials_exist = self.run_sql_blocking(async move {
+        let encrypted_credentials_exist = self.run_sql_blocking_read(async move {
             for query in [
                 "SELECT password FROM servers WHERE password IS NOT NULL",
                 "SELECT password FROM rss_feeds WHERE password IS NOT NULL",
@@ -990,19 +1435,14 @@ impl Database {
                     }
                 }
             }
-            for query in [
-                "SELECT secret_options_json FROM post_processing_profile_steps",
-                "SELECT secret_options_json FROM post_processing_job_plans",
-                "SELECT secret_options_json FROM post_processing_runs",
-            ] {
-                let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
-                for row in rows {
-                    if !post_processing_secret_ciphertexts(&row.text("secret_options_json")?)?
-                        .is_empty()
-                    {
-                        return Ok(true);
-                    }
-                }
+            if !post_processing_secret_ciphertexts(
+                stored_post_processing_options(datastore.read_exec())
+                    .await?
+                    .as_deref(),
+            )?
+            .is_empty()
+            {
+                return Ok(true);
             }
             Ok(false)
         })?;
@@ -1023,7 +1463,7 @@ impl Database {
 
         let datastore = self.datastore();
         let credential_key = key.clone();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             for (kind, query) in [
                 (
                     "server",
@@ -1048,37 +1488,21 @@ impl Database {
                     })?;
                 }
             }
-            for (kind, query) in [
-                (
-                    "profile",
-                    "SELECT secret_options_json FROM post_processing_profile_steps",
-                ),
-                (
-                    "frozen plan",
-                    "SELECT secret_options_json FROM post_processing_job_plans",
-                ),
-                (
-                    "run",
-                    "SELECT secret_options_json FROM post_processing_runs",
-                ),
-            ] {
-                let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
-                for row in rows {
-                    for ciphertext in post_processing_secret_ciphertexts(
-                        &row.text("secret_options_json")?,
-                    )? {
-                        if !is_encrypted(&ciphertext) {
-                            return Err(StateError::Conflict(format!(
-                                "persisted post-processing {kind} secret option is not encrypted"
-                            )));
-                        }
-                        decrypt_value(&credential_key, &ciphertext).map_err(|error| {
-                            StateError::Conflict(format!(
-                                "cannot decrypt persisted post-processing {kind} secret option: {error}"
-                            ))
-                        })?;
-                    }
+            for ciphertext in post_processing_secret_ciphertexts(
+                stored_post_processing_options(datastore.read_exec())
+                    .await?
+                    .as_deref(),
+            )? {
+                if !is_encrypted(&ciphertext) {
+                    return Err(StateError::Conflict(
+                        "persisted post-processing secret option is not encrypted".into(),
+                    ));
                 }
+                decrypt_value(&credential_key, &ciphertext).map_err(|error| {
+                    StateError::Conflict(format!(
+                        "cannot decrypt persisted post-processing secret option: {error}"
+                    ))
+                })?;
             }
             Ok(())
         })?;
@@ -1172,30 +1596,58 @@ impl Database {
     }
 }
 
-fn post_processing_secret_ciphertexts(raw: &str) -> Result<Vec<String>, StateError> {
+/// Read the raw stored post-processing option blob without decrypting anything.
+///
+/// This runs before a key is installed, so it must not go through the typed
+/// settings accessors that would try to decrypt.
+async fn stored_post_processing_options(
+    exec: crate::persistence::sql_runtime::SqlExec<'_, '_>,
+) -> Result<Option<String>, StateError> {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+
+    let row = SqlRuntime::fetch_optional(
+        exec,
+        "SELECT value FROM settings WHERE key = {}",
+        &[SqlArg::Text(
+            "post_processing.script_options.v1".to_string(),
+        )],
+    )
+    .await?;
+    row.map(|row| row.text("value")).transpose()
+}
+
+/// Every stored ciphertext across every script's secret options.
+fn post_processing_secret_ciphertexts(raw: Option<&str>) -> Result<Vec<String>, StateError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
     let value = serde_json::from_str::<serde_json::Value>(raw).map_err(|error| {
         StateError::Database(format!(
             "invalid persisted post-processing secret options: {error}"
         ))
     })?;
-    let entries = value.as_array().ok_or_else(|| {
-        StateError::Database("persisted post-processing secret options are not an array".into())
+    let scripts = value.as_object().ok_or_else(|| {
+        StateError::Database("persisted post-processing options are not an object".into())
     })?;
-    entries
-        .iter()
-        .map(|entry| {
-            entry
+    let mut ciphertexts = Vec::new();
+    for entry in scripts.values() {
+        let Some(secrets) = entry.get("secrets").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for secret in secrets {
+            let ciphertext = secret
                 .as_object()
-                .and_then(|entry| entry.get("ciphertext"))
+                .and_then(|secret| secret.get("ciphertext"))
                 .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
                 .ok_or_else(|| {
                     StateError::Database(
                         "persisted post-processing secret option has no ciphertext".into(),
                     )
-                })
-        })
-        .collect()
+                })?;
+            ciphertexts.push(ciphertext.to_string());
+        }
+    }
+    Ok(ciphertexts)
 }
 
 #[cfg(test)]

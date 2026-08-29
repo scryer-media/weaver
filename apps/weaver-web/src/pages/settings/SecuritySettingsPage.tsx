@@ -7,10 +7,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
+  ACCESS_POLICY_QUERY,
   CHANGE_PASSWORD_MUTATION,
   DISABLE_LOGIN_MUTATION,
   ENABLE_LOGIN_MUTATION,
+  HTTP_BIND_ADDRESS_QUERY,
   LOGIN_STATUS_QUERY,
+  SET_ACCESS_POLICY_MUTATION,
+  SET_HTTP_BIND_ADDRESS_MUTATION,
 } from "@/graphql/queries";
 
 interface LoginStatus {
@@ -254,14 +258,282 @@ function LoginProtectionSection() {
   );
 }
 
+interface BindAddressStatus {
+  address: string;
+  storedAddress: string | null;
+  source: "ENVIRONMENT" | "SETTING" | "DEFAULT";
+  editable: boolean;
+  exposedWithoutLogin: boolean;
+  restartRequired: boolean;
+  bindFallback: string | null;
+}
+
+interface AccessPolicyStatus {
+  mode: string;
+  trustedNetworks: string[];
+  editable: boolean;
+  envPinned: boolean;
+}
+
+function NetworkAccessSection() {
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [, setBindAddress] = useMutation(SET_HTTP_BIND_ADDRESS_MUTATION);
+  const [{ data, error: queryError }, refetch] = useQuery<{
+    httpBindAddress: BindAddressStatus;
+  }>({
+    query: HTTP_BIND_ADDRESS_QUERY,
+    requestPolicy: "network-only",
+  });
+
+  const status = data?.httpBindAddress ?? null;
+
+  // The draft mirrors the STORED value only — an empty box with the loopback
+  // placeholder is "not configured". Re-proposing the running address after a
+  // clear would let Save silently undo the clear.
+  useEffect(() => {
+    setDraft(status?.storedAddress ?? "");
+  }, [status]);
+
+  const save = async () => {
+    setError(null);
+    setSuccess(null);
+    setSaving(true);
+    const result = await setBindAddress({ address: draft.trim() });
+    setSaving(false);
+    if (result.error) {
+      setError(result.error.message.replace(/^\[GraphQL\]\s*/, ""));
+      return;
+    }
+    setSuccess(
+      draft.trim().length > 0
+        ? "Saved. Restart Weaver for the new address to take effect."
+        : "Cleared. Weaver returns to this machine only at its next restart.",
+    );
+    refetch({ requestPolicy: "network-only" });
+  };
+
+  return (
+    <SectionCard
+      title="Network access"
+      description="Which addresses Weaver answers on"
+    >
+      <div className="space-y-4">
+        {queryError ? (
+          <p className="text-sm text-destructive">{queryError.message}</p>
+        ) : null}
+
+        {status?.bindFallback ? (
+          <p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-500">
+            {status.bindFallback}
+          </p>
+        ) : null}
+
+        <p className="text-sm text-muted-foreground">
+          Weaver listens on <code>127.0.0.1</code> by default, which only this
+          machine can reach. Set <code>0.0.0.0</code> to answer on every
+          interface, or name a single interface address. Leave empty for the
+          default.
+        </p>
+
+        {status && !status.editable ? (
+          <p className="text-sm text-muted-foreground">
+            This is pinned by <code>WEAVER_HTTP_BIND_ADDRESS</code> in Weaver's
+            environment — a container image or service unit sets it — so it
+            cannot be changed here. Override the variable in your deployment
+            instead. Currently listening on <code>{status.address}</code>.
+          </p>
+        ) : (
+          <div className="flex flex-wrap items-end gap-3">
+            <div className="space-y-2">
+              <Label htmlFor="bind-address">Listen address</Label>
+              <Input
+                id="bind-address"
+                value={draft}
+                onChange={(event) => {
+                  setDraft(event.target.value);
+                  setSuccess(null);
+                }}
+                placeholder="127.0.0.1 (default)"
+                className="w-64"
+              />
+            </div>
+            <Button onClick={save} disabled={!status || saving}>
+              {saving ? "Saving…" : "Save"}
+            </Button>
+          </div>
+        )}
+
+        {status?.restartRequired ? (
+          <p className="text-sm text-amber-500">
+            {status.storedAddress ? (
+              <>
+                Saved as <code>{status.storedAddress}</code>.
+              </>
+            ) : (
+              <>Address cleared.</>
+            )}{" "}
+            Weaver is still listening on <code>{status.address}</code> until it
+            restarts.
+          </p>
+        ) : null}
+
+        {status?.exposedWithoutLogin ? (
+          <p className="text-sm text-amber-500">
+            With this address, Weaver is reachable beyond this machine after
+            the next restart while no login is configured. Enable login
+            protection below, or anyone who can reach it has full
+            administrative access.
+          </p>
+        ) : null}
+
+        {error ? <p className="text-sm text-destructive">{error}</p> : null}
+        {success ? <p className="text-sm text-emerald-500">{success}</p> : null}
+      </div>
+    </SectionCard>
+  );
+}
+
+const ACCESS_MODE_LABELS: Record<string, string> = {
+  login_required: "Login required for every browser",
+  login_except_local: "Login required, except trusted local networks",
+  no_login: "No login (this machine only)",
+  env: "Managed by WEAVER_TRUSTED_CIDRS in the environment",
+};
+
+function AccessPolicySection() {
+  const [mode, setMode] = useState<string | null>(null);
+  const [networksDraft, setNetworksDraft] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [, setPolicy] = useMutation(SET_ACCESS_POLICY_MUTATION);
+  const [{ data, error: queryError }, refetch] = useQuery<{
+    accessPolicy: AccessPolicyStatus;
+  }>({
+    query: ACCESS_POLICY_QUERY,
+    requestPolicy: "network-only",
+  });
+
+  const status = data?.accessPolicy ?? null;
+
+  useEffect(() => {
+    if (status) {
+      setMode(status.mode);
+      setNetworksDraft(status.trustedNetworks.join("\n"));
+    }
+  }, [status]);
+
+  const save = async () => {
+    if (!mode) {
+      return;
+    }
+    setError(null);
+    setSuccess(null);
+    setSaving(true);
+    const trustedNetworks =
+      mode === "login_except_local"
+        ? networksDraft
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0)
+        : undefined;
+    const result = await setPolicy({ mode, trustedNetworks });
+    setSaving(false);
+    if (result.error) {
+      setError(result.error.message.replace(/^\[GraphQL\]\s*/, ""));
+      return;
+    }
+    setSuccess("Access policy updated. Applies immediately.");
+    refetch({ requestPolicy: "network-only" });
+  };
+
+  return (
+    <SectionCard
+      title="Browser access"
+      description="Who may use the web UI without signing in"
+    >
+      <div className="space-y-4">
+        {queryError ? (
+          <p className="text-sm text-destructive">{queryError.message}</p>
+        ) : null}
+
+        {status?.envPinned ? (
+          <p className="text-sm text-muted-foreground">
+            {ACCESS_MODE_LABELS.env}. Trusted networks:{" "}
+            <code>{status.trustedNetworks.join(", ") || "none"}</code>. Change
+            the variable in your deployment to edit this.
+          </p>
+        ) : (
+          <>
+            <div className="space-y-2">
+              {(["login_required", "login_except_local", "no_login"] as const).map(
+                (candidate) => (
+                  <label key={candidate} className="flex cursor-pointer items-start gap-2">
+                    <input
+                      type="radio"
+                      name="access-policy-mode"
+                      className="mt-1"
+                      checked={mode === candidate}
+                      onChange={() => {
+                        setMode(candidate);
+                        setSuccess(null);
+                      }}
+                    />
+                    <span className="text-sm">{ACCESS_MODE_LABELS[candidate]}</span>
+                  </label>
+                ),
+              )}
+            </div>
+
+            {mode === "login_except_local" ? (
+              <div className="space-y-2">
+                <Label htmlFor="trusted-networks">
+                  Trusted networks (one CIDR per line)
+                </Label>
+                <textarea
+                  id="trusted-networks"
+                  value={networksDraft}
+                  onChange={(event) => {
+                    setNetworksDraft(event.target.value);
+                    setSuccess(null);
+                  }}
+                  rows={5}
+                  className="w-full max-w-md rounded-md border border-border bg-background p-2 font-mono text-sm"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Judged on the address a connection actually arrives from —
+                  behind a reverse proxy that is the proxy, and trusting it
+                  trusts everyone it forwards.
+                </p>
+              </div>
+            ) : null}
+
+            <Button onClick={save} disabled={!status || !mode || saving}>
+              {saving ? "Saving…" : "Save"}
+            </Button>
+          </>
+        )}
+
+        {error ? <p className="text-sm text-destructive">{error}</p> : null}
+        {success ? <p className="text-sm text-emerald-500">{success}</p> : null}
+      </div>
+    </SectionCard>
+  );
+}
+
 export function SecuritySettingsPage() {
   return (
     <div className="max-w-[1180px]">
       <SettingsPageHeader
         title="Security"
-        description="Manage login protection and API keys"
+        description="Manage network access, login protection, and API keys"
       />
       <div className="space-y-6">
+        <NetworkAccessSection />
+        <AccessPolicySection />
         <LoginProtectionSection />
         <ApiKeysSection />
       </div>

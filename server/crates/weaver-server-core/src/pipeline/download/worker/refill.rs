@@ -35,6 +35,7 @@ impl Pipeline {
             compatibility,
             response_tx,
         } = request;
+        let batch_class = DownloadBatchClass::from(&compatibility);
         if runtime_generation != self.pool_generation {
             let _ = response_tx.send(DownloadLaneRefillResponse {
                 lease: None,
@@ -123,53 +124,36 @@ impl Pipeline {
             let effective_capacity = self.effective_download_connection_capacity(
                 self.tuner.params().max_concurrent_downloads,
             );
-            let bandwidth_cap_tight = self.bandwidth_cap.cap_enabled()
-                && self.bandwidth_cap.remaining_bytes()
-                    <= self.bandwidth_cap.limit_bytes() * 15 / 100;
             let selected_hot = self.select_hot_dispatch_job(&eligible, now);
-            let bounded_share_plan = selected_hot.and_then(|(hot_priority, hot_job_id)| {
-                self.bounded_same_band_share_plan(
-                    &eligible,
-                    hot_priority,
-                    hot_job_id,
-                    effective_capacity,
-                    pressure,
-                    bandwidth_cap_tight,
-                )
-            });
-            self.update_hot_share_yield_signal(bounded_share_plan.as_ref());
+            // The yield signal is owned by the dispatch pass's critical-first
+            // phase, which is the only place that can tell dispatchable
+            // critical demand from work that is queued but unservable (a
+            // propagation hold, a durable-lead backlog, excluded servers).
+            // Recomputing it here from queued work alone would re-latch a
+            // signal that phase deliberately cleared and park every regular
+            // lane behind work no yielded connection could be handed to.
+            // Refill only reads it.
             match selected_hot {
-                Some((_hot_priority, hot_job_id)) if hot_job_id == job_id => {
-                    if bounded_share_plan
-                        .as_ref()
-                        .is_some_and(|plan| self.hot_share_yield_unmet(plan))
-                    {
-                        allow_refill = false;
-                        park_reason = LaneParkReason::HotShareYield;
-                    }
+                // Completion-critical demand is unmet somewhere and this lane
+                // is not itself carrying critical work: return it so the next
+                // dispatch pass can hand the connection to the critical-first
+                // phase. Applies uniformly to the hot job's own regular lane
+                // and to spillover lanes alike — critical work has no owner.
+                Some(_)
+                    if !batch_class.completion_critical
+                        && self.hot_share_yield_signal.is_requested() =>
+                {
+                    allow_refill = false;
+                    park_reason = LaneParkReason::HotShareYield;
                 }
+                // A completion-critical lane has no cap and the hot job's own
+                // regular lane is never reclaimed for capacity reasons — hot
+                // fills everything it can use.
+                Some((_hot_priority, hot_job_id))
+                    if batch_class.completion_critical || hot_job_id == job_id => {}
                 Some((hot_priority, hot_job_id)) => {
-                    let hot_speed_bps = self.hot_dispatch_speed_bps(now);
-                    self.hot_dispatch_expansion_window
-                        .refresh(now, hot_speed_bps);
-                    let recent_expansion_helped = self
-                        .hot_dispatch_expansion_window
-                        .recent_improvement_pct(now)
-                        >= HOT_DISPATCH_EXPANSION_HELPFUL_PERCENT;
-                    let best_mode_block_reason = self.hot_best_mode_block_reason(
-                        hot_job_id,
-                        effective_capacity,
-                        pressure,
-                        recent_expansion_helped,
-                    );
-                    let can_keep_bounded_same_band = spillover_loan_kind
-                        == Some(SpilloverLoanKind::BoundedSameBand)
-                        && requested_priority == Some(hot_priority)
-                        && bounded_share_plan.as_ref().is_some_and(|plan| {
-                            plan.peer_jobs.contains(&job_id)
-                                && self.hot_dispatch_spillover_loans.bounded_lent_connections()
-                                    <= plan.share_target
-                        });
+                    let best_mode_block_reason =
+                        self.hot_best_mode_block_reason(hot_job_id, effective_capacity);
                     let can_keep_lent_lane = requested_priority.is_some_and(|request_priority| {
                         spillover_loan_kind == Some(SpilloverLoanKind::MeasuredUnderfill)
                             && self.hot_dispatch_mode == DispatchShareMode::Shared
@@ -183,12 +167,6 @@ impl Pipeline {
                         allow_refill = false;
                         park_reason = LaneParkReason::SpilloverSpeedHarm;
                         self.block_or_reclaim_spillover(SpilloverDecision::ReclaimedSpeedHarm);
-                    } else if can_keep_bounded_same_band {
-                        self.hot_dispatch_last_lend_at = Some(now);
-                    } else if spillover_loan_kind == Some(SpilloverLoanKind::BoundedSameBand) {
-                        allow_refill = false;
-                        park_reason = LaneParkReason::SpilloverWithdraw;
-                        self.record_spillover_decision(SpilloverDecision::Reclaimed);
                     } else if can_keep_lent_lane {
                         self.hot_dispatch_last_lend_at = Some(now);
                     } else {
@@ -200,18 +178,8 @@ impl Pipeline {
                             );
                             park_reason = LaneParkReason::SpilloverWithdraw;
                         } else if best_mode_block_reason
-                            == HotBestModeBlockReason::RecentExpansionHelped
+                            == HotBestModeBlockReason::LaneCapacityAvailable
                         {
-                            self.set_hot_best_mode_block_reason(best_mode_block_reason);
-                            self.block_or_reclaim_spillover(
-                                SpilloverDecision::BlockedRecentExpansionHelped,
-                            );
-                            park_reason = LaneParkReason::SpilloverWithdraw;
-                        } else if matches!(
-                            best_mode_block_reason,
-                            HotBestModeBlockReason::LaneCapacityAvailable
-                                | HotBestModeBlockReason::PipelinePromotionPending
-                        ) {
                             self.set_hot_best_mode_block_reason(best_mode_block_reason);
                             self.block_or_reclaim_spillover(
                                 SpilloverDecision::BlockedBestModePending,
@@ -272,7 +240,6 @@ impl Pipeline {
             server_idx,
             supports_pipelining,
         );
-        let is_recovery = lease.compatibility.is_recovery;
         let work_count = lease.works.len();
         match response_tx.send(DownloadLaneRefillResponse {
             lease: Some(lease),
@@ -284,7 +251,7 @@ impl Pipeline {
                     .fetch_add(1, Ordering::Relaxed);
                 self.activate_download_batch(
                     job_id,
-                    is_recovery,
+                    batch_class,
                     next_mode,
                     work_count,
                     &activation_items,

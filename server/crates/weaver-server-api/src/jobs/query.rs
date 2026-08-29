@@ -1,14 +1,230 @@
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use super::*;
 use crate::jobs::types::{
     DuplicateIdentitySnapshotInfo, DuplicateSummaryInfo, PreparedQueueFilter,
-    load_duplicate_summaries_chunked, matches_queue_filter_prepared,
+    load_duplicate_summaries_chunked, matches_queue_filter_prepared, queue_display_titles_from_job,
+    queue_item_state_from_job_info, queue_table_item_from_job,
 };
 use crate::observability::with_timed_config_read;
 
 #[derive(Default)]
 pub(crate) struct JobsQuery;
+
+const MAX_QUEUE_PAGE_SIZE: usize = 500;
+
+fn queue_page_display_name(original_title: &str, name: &str, display_title: &str) -> String {
+    let release_name = if original_title.trim().is_empty() {
+        name.trim()
+    } else {
+        original_title.trim()
+    };
+    if release_name.is_empty() {
+        return display_title.to_string();
+    }
+
+    release_name
+        .replace('.', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn queue_page_job_display_name(info: &weaver_server_core::JobInfo) -> String {
+    let (original_title, display_title) = queue_display_titles_from_job(info);
+    queue_page_display_name(&original_title, &info.name, &display_title)
+}
+
+fn queue_display_state(state: QueueItemState) -> &'static str {
+    match state {
+        QueueItemState::Queued => "QUEUED",
+        QueueItemState::Downloading => "DOWNLOADING",
+        QueueItemState::FetchingRepairData => "FETCHING_REPAIR_DATA",
+        QueueItemState::FinalizingDownload => "FINALIZING_DOWNLOAD",
+        QueueItemState::Checking | QueueItemState::Verifying => "VERIFYING",
+        QueueItemState::Repairing => "REPAIRING",
+        QueueItemState::Extracting => "EXTRACTING",
+        QueueItemState::Finalizing => "MOVING",
+        QueueItemState::PostProcessing => "POST_PROCESSING",
+        QueueItemState::Completed => "COMPLETE",
+        QueueItemState::Failed => "FAILED",
+        QueueItemState::Paused => "PAUSED",
+    }
+}
+
+fn queue_page_job_matches(info: &weaver_server_core::JobInfo, input: &QueuePageInput) -> bool {
+    let state = queue_item_state_from_job_info(info);
+    if let Some(states) = input.states.as_ref()
+        && !states.is_empty()
+        && !states.contains(&state)
+    {
+        return false;
+    }
+
+    if let Some(priorities) = input.priorities.as_ref()
+        && !priorities.is_empty()
+        && !priorities.contains(&QueuePriority::from_metadata(&info.metadata))
+    {
+        return false;
+    }
+
+    if input.categories.as_ref().is_some_and(|categories| {
+        !categories.is_empty()
+            && !info
+                .category
+                .as_ref()
+                .is_some_and(|category| categories.contains(category))
+    }) {
+        return false;
+    }
+
+    let Some(search) = input
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|search| !search.is_empty())
+    else {
+        return true;
+    };
+    let (original_title, display_title) = queue_display_titles_from_job(info);
+    let search = search.to_lowercase();
+    [
+        queue_page_display_name(&original_title, &info.name, &display_title),
+        info.name.clone(),
+        display_title,
+    ]
+    .into_iter()
+    .any(|value| value.to_lowercase().contains(&search))
+}
+
+fn queue_page_job_progress(info: &weaver_server_core::JobInfo) -> f64 {
+    let progress = info.progress.clamp(0.0, 1.0);
+    if info.total_bytes == 0 {
+        return progress;
+    }
+    let processed_bytes = info
+        .downloaded_bytes
+        .saturating_add(info.failed_bytes)
+        .min(info.total_bytes);
+    progress.max(processed_bytes as f64 / info.total_bytes as f64)
+}
+
+fn queue_page_job_live_rate(info: &weaver_server_core::JobInfo) -> u64 {
+    info.phase_progress
+        .iter()
+        .filter_map(|phase| phase.rate_bps)
+        .max()
+        .unwrap_or_default()
+}
+
+fn queue_page_download_rank(state: QueueItemState) -> u8 {
+    match state {
+        QueueItemState::Downloading | QueueItemState::FetchingRepairData => 1,
+        _ => 0,
+    }
+}
+
+fn queue_page_download_order(
+    left: &weaver_server_core::JobInfo,
+    right: &weaver_server_core::JobInfo,
+) -> Ordering {
+    queue_page_download_rank(queue_item_state_from_job_info(right)).cmp(&queue_page_download_rank(
+        queue_item_state_from_job_info(left),
+    ))
+}
+
+fn queue_page_default_order(
+    left: &weaver_server_core::JobInfo,
+    right: &weaver_server_core::JobInfo,
+) -> Ordering {
+    queue_page_download_order(left, right)
+        .then_with(|| queue_page_job_live_rate(right).cmp(&queue_page_job_live_rate(left)))
+}
+
+fn queue_page_job_order(
+    left: &weaver_server_core::JobInfo,
+    right: &weaver_server_core::JobInfo,
+    input: &QueuePageInput,
+) -> Ordering {
+    let Some(sort_field) = input.sort_field else {
+        return Ordering::Equal;
+    };
+    let order = match sort_field {
+        QueueSortField::Name => {
+            queue_page_job_display_name(left).cmp(&queue_page_job_display_name(right))
+        }
+        QueueSortField::State => queue_display_state(queue_item_state_from_job_info(left))
+            .cmp(queue_display_state(queue_item_state_from_job_info(right))),
+        QueueSortField::Priority => QueuePriority::from_metadata(&left.metadata)
+            .rank()
+            .cmp(&QueuePriority::from_metadata(&right.metadata).rank()),
+        QueueSortField::Category => left
+            .category
+            .as_deref()
+            .unwrap_or("\u{2014}")
+            .cmp(right.category.as_deref().unwrap_or("\u{2014}")),
+        QueueSortField::Progress => {
+            queue_page_job_progress(left).total_cmp(&queue_page_job_progress(right))
+        }
+        QueueSortField::Size => left.total_bytes.cmp(&right.total_bytes),
+    };
+    let order = match input.sort_direction.unwrap_or(QueueSortDirection::Desc) {
+        QueueSortDirection::Asc => order,
+        QueueSortDirection::Desc => order.reverse(),
+    };
+    queue_page_download_order(left, right)
+        .then(order)
+        .then_with(|| left.job_id.0.cmp(&right.job_id.0))
+}
+
+fn queue_page_summary(
+    jobs: &[weaver_server_core::JobInfo],
+    metrics: &weaver_server_core::operations::metrics::MetricsSnapshot,
+) -> QueueSummary {
+    let mut summary = QueueSummary {
+        total_items: jobs.len() as u32,
+        queued_items: 0,
+        active_items: 0,
+        paused_items: 0,
+        failed_items: 0,
+        total_bytes: jobs.iter().map(|job| job.total_bytes).sum(),
+        downloaded_bytes: jobs.iter().map(|job| job.downloaded_bytes).sum(),
+        current_download_speed: metrics.current_download_speed,
+        verifying_items: 0,
+        repairing_items: 0,
+        extracting_items: 0,
+    };
+
+    for job in jobs {
+        match queue_item_state_from_job_info(job) {
+            QueueItemState::Queued => summary.queued_items += 1,
+            QueueItemState::Paused => summary.paused_items += 1,
+            QueueItemState::Failed => summary.failed_items += 1,
+            QueueItemState::Verifying | QueueItemState::Checking => {
+                summary.active_items += 1;
+                summary.verifying_items += 1;
+            }
+            QueueItemState::Repairing => {
+                summary.active_items += 1;
+                summary.repairing_items += 1;
+            }
+            QueueItemState::Extracting => {
+                summary.active_items += 1;
+                summary.extracting_items += 1;
+            }
+            QueueItemState::Downloading
+            | QueueItemState::FetchingRepairData
+            | QueueItemState::FinalizingDownload
+            | QueueItemState::Finalizing
+            | QueueItemState::PostProcessing => summary.active_items += 1,
+            QueueItemState::Completed => {}
+        }
+    }
+
+    summary
+}
 
 #[Object]
 impl JobsQuery {
@@ -44,6 +260,58 @@ impl JobsQuery {
             .collect();
         attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
         Ok(items)
+    }
+    /// Server-paginated queue rows for the interactive queue table.
+    #[graphql(guard = "ReadGuard")]
+    async fn queue_page(&self, ctx: &Context<'_>, input: QueuePageInput) -> Result<QueuePage> {
+        let handle = ctx.data::<SchedulerHandle>()?.clone();
+        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
+        // Capture before reading the scheduler so events produced while this page
+        // is assembled remain eligible for replay by queueEvents(after: ...).
+        let latest_cursor = replay.latest_cursor().await;
+        let mut all_jobs: Vec<weaver_server_core::JobInfo> = handle
+            .list_jobs()
+            .into_iter()
+            .filter(|info| {
+                !matches!(
+                    info.status,
+                    weaver_server_core::JobStatus::Complete
+                        | weaver_server_core::JobStatus::Failed { .. }
+                )
+            })
+            .collect();
+        let categories = all_jobs
+            .iter()
+            .filter_map(|job| job.category.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let metrics = handle.get_metrics();
+        let summary = queue_page_summary(&all_jobs, &metrics);
+        let page_size = (input.page_size as usize).clamp(1, MAX_QUEUE_PAGE_SIZE);
+        let offset = (input.page_index as usize).saturating_mul(page_size);
+        all_jobs.retain(|job| queue_page_job_matches(job, &input));
+        if input.sort_field.is_some() {
+            all_jobs.sort_by(|left, right| queue_page_job_order(left, right, &input));
+        } else {
+            all_jobs.sort_by(queue_page_default_order);
+        }
+        let total_count = u32::try_from(all_jobs.len()).unwrap_or(u32::MAX);
+        let mut items = all_jobs
+            .into_iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|job| queue_table_item_from_job(&job))
+            .collect::<Vec<_>>();
+        attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
+
+        Ok(QueuePage {
+            items,
+            total_count,
+            summary,
+            categories,
+            latest_cursor,
+        })
     }
     /// Public queue facade for one active item.
     #[graphql(guard = "ReadGuard")]
@@ -375,4 +643,21 @@ fn collect_files_recursive(dir: &std::path::Path, out: &mut Vec<JobOutputFile>) 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downloading_states_rank_above_queued() {
+        assert!(
+            queue_page_download_rank(QueueItemState::Downloading)
+                > queue_page_download_rank(QueueItemState::Queued)
+        );
+        assert!(
+            queue_page_download_rank(QueueItemState::FetchingRepairData)
+                > queue_page_download_rank(QueueItemState::Queued)
+        );
+    }
 }

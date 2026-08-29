@@ -46,11 +46,17 @@ macro_rules! segment_spec {
 mod archive_topology;
 mod core;
 mod decode_and_files;
+mod direct_store;
 mod download_dispatch;
 mod health_probe;
 mod par2_completion;
+mod par2_multiset_binding;
+mod par2_multiset_gate;
+mod par2_multiset_grid;
 mod rar_extraction;
 mod restore_history;
+mod sfv_completion;
+mod terminal_settlement;
 
 struct TestHarness {
     _temp_dir: TempDir,
@@ -96,6 +102,17 @@ impl TestHarness {
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
+            direct_store: None,
+            // Pinned off rather than left at the shipped default, so an
+            // extraction fixture whose member happens to be called
+            // `sample.mkv` keeps asserting extraction instead of asserting the
+            // delivery-naming policy. Tests that mean to exercise the pass turn
+            // it on for themselves.
+            delivery_naming: Some(crate::settings::DeliveryNamingOverrides {
+                deobfuscate_delivered_members: Some(false),
+                enable_srrdb_lookup: None,
+            }),
+            metrics: Default::default(),
             config_path: None,
         }));
 
@@ -228,6 +245,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         downloaded_bytes: 0,
         restored_download_floor_bytes: 0,
         failed_bytes: 0,
+        probe_projected_failed_bytes: 0,
         par2_bytes: 0,
         health_probing: false,
         health_probe_round: 0,
@@ -239,6 +257,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         download_queue: DownloadQueue::new(),
         recovery_queue: DownloadQueue::new(),
         staging_dir: None,
+        category_bytes: None,
     }
 }
 
@@ -252,6 +271,8 @@ fn finished_job_info(job_id: JobId) -> JobInfo {
         download_retry_at_epoch_ms: None,
         status: JobStatus::Complete,
         download_state: crate::jobs::model::DownloadState::Complete,
+        finalizing_download: false,
+        fetching_repair_data: false,
         post_state: crate::jobs::model::PostState::Idle,
         run_state: crate::jobs::model::RunState::Active,
         progress: 1.0,
@@ -262,6 +283,7 @@ fn finished_job_info(job_id: JobId) -> JobInfo {
         phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
+        terminal_discards: Vec::new(),
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,
@@ -322,10 +344,51 @@ async fn new_direct_pipeline_with_buffers(
     buffer_config: BufferPoolConfig,
     total_connections: usize,
 ) -> (Pipeline, PathBuf, PathBuf) {
-    let data_dir = temp_dir.path().join("data");
-    let intermediate_dir = temp_dir.path().join("intermediate");
-    let complete_dir = temp_dir.path().join("complete");
-    let db = Database::open(&temp_dir.path().join("weaver.db")).unwrap();
+    new_direct_pipeline_with(temp_dir, buffer_config, total_connections, None).await
+}
+
+/// [`new_direct_pipeline_with_buffers`], plus the `[direct_store]` config table.
+///
+/// Everything else in this module reaches for `set_gate`, which bypasses
+/// configuration entirely. The tests that exist to prove the *config* is the
+/// gate — and that the kill switch's sweep fires off it — must come through
+/// here instead.
+async fn new_direct_pipeline_with(
+    temp_dir: &TempDir,
+    buffer_config: BufferPoolConfig,
+    total_connections: usize,
+    direct_store: Option<crate::settings::DirectStoreOverrides>,
+) -> (Pipeline, PathBuf, PathBuf) {
+    new_direct_pipeline_at_roots(
+        temp_dir.path().join("data"),
+        temp_dir.path().join("intermediate"),
+        temp_dir.path().join("complete"),
+        temp_dir.path().join("weaver.db"),
+        buffer_config,
+        total_connections,
+        direct_store,
+    )
+    .await
+}
+
+/// [`new_direct_pipeline_with`] with the three roots given explicitly.
+///
+/// Everything else here puts `intermediate` and `complete` under one `TempDir`,
+/// which puts them on one filesystem — and the whole class of question this
+/// exists for ("is the publish a rename or a byte copy?") is unobservable there.
+/// The cross-device probe at the end of `direct_store.rs` hands in two roots on
+/// genuinely different mounts.
+#[allow(clippy::too_many_arguments)]
+async fn new_direct_pipeline_at_roots(
+    data_dir: PathBuf,
+    intermediate_dir: PathBuf,
+    complete_dir: PathBuf,
+    db_path: PathBuf,
+    buffer_config: BufferPoolConfig,
+    total_connections: usize,
+    direct_store: Option<crate::settings::DirectStoreOverrides>,
+) -> (Pipeline, PathBuf, PathBuf) {
+    let db = Database::open(&db_path).unwrap();
     let config: SharedConfig = Arc::new(RwLock::new(Config {
         data_dir: data_dir.display().to_string(),
         intermediate_dir: Some(intermediate_dir.display().to_string()),
@@ -341,6 +404,14 @@ async fn new_direct_pipeline_with_buffers(
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
+        direct_store,
+        // Pinned off for the same reason as the harness above: an extraction
+        // fixture must not start asserting the delivery-naming policy.
+        delivery_naming: Some(crate::settings::DeliveryNamingOverrides {
+            deobfuscate_delivered_members: Some(false),
+            enable_srrdb_lookup: None,
+        }),
+        metrics: Default::default(),
         config_path: None,
     }));
 
@@ -407,6 +478,24 @@ async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf)
             large_count: 2,
         },
         0,
+    )
+    .await
+}
+
+/// [`new_direct_pipeline`] whose direct-store gate comes from configuration.
+async fn new_config_gated_direct_pipeline(
+    temp_dir: &TempDir,
+    direct_store: crate::settings::DirectStoreOverrides,
+) -> (Pipeline, PathBuf, PathBuf) {
+    new_direct_pipeline_with(
+        temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        0,
+        Some(direct_store),
     )
     .await
 }
@@ -505,6 +594,126 @@ fn build_test_rar_file_header(
     unpacked_size: u64,
     data_crc: Option<u32>,
 ) -> Vec<u8> {
+    build_test_rar_file_header_with_extra(
+        filename,
+        common_flags_extra,
+        data_size,
+        unpacked_size,
+        data_crc,
+        &[],
+    )
+}
+
+/// A RAR5 file header carrying only a BLAKE2sp digest — no CRC32.
+///
+/// BLAKE2sp accepts bytes in order only, so a member whose *closing* header
+/// states one and nothing else can never be verified out of order.
+fn build_test_rar_blake2_extra(digest: [u8; 32]) -> Vec<u8> {
+    // `vint(record size) || vint(record type = FILE_HASH) || vint(algo =
+    // BLAKE2sp) || digest`, where the size covers everything after itself.
+    let mut record = Vec::new();
+    record.extend_from_slice(&encode_test_rar_vint(2));
+    record.extend_from_slice(&encode_test_rar_vint(0));
+    record.extend_from_slice(&digest);
+    let mut out = encode_test_rar_vint(record.len() as u64);
+    out.extend_from_slice(&record);
+    out
+}
+
+fn build_test_rar_file_header_with_extra(
+    filename: &str,
+    common_flags_extra: u64,
+    data_size: u64,
+    unpacked_size: u64,
+    data_crc: Option<u32>,
+    extra: &[u8],
+) -> Vec<u8> {
+    build_test_rar_data_header(
+        2,
+        filename,
+        common_flags_extra,
+        data_size,
+        unpacked_size,
+        data_crc,
+        extra,
+    )
+}
+
+/// RAR5 compression info for a member that is **not** stored.
+///
+/// The field is bit-packed — version in bits 0-5 (0 = RAR5), the per-member
+/// solid flag in bit 6, the method in bits 7-9 — and the stored-layout
+/// classifier reads exactly those three: a non-zero method makes a member
+/// `Compressed`, and the solid bit makes it `Solid`, which the classifier checks
+/// first. The data area a header like this describes is not really compressed,
+/// so a fixture using it is only good for what the *classification* decides.
+fn test_rar_compression_info(method: u64, solid: bool) -> u64 {
+    ((method & 0x07) << 7) | u64::from(solid) << 6
+}
+
+/// A RAR5 file header whose member is compressed (and optionally solid).
+fn build_test_rar_compressed_file_header(
+    filename: &str,
+    common_flags_extra: u64,
+    data_size: u64,
+    unpacked_size: u64,
+    data_crc: Option<u32>,
+    compression_info: u64,
+) -> Vec<u8> {
+    build_test_rar_data_header_with_compression(
+        2,
+        filename,
+        common_flags_extra,
+        data_size,
+        unpacked_size,
+        data_crc,
+        &[],
+        compression_info,
+    )
+}
+
+/// A RAR5 **service** header (type 3) with a data area.
+///
+/// Recovery records (`-rr`) and quick-open blocks take exactly this shape: the
+/// header body is a file header's, and the data area that follows belongs to no
+/// member — so a direct-store router files every byte of it into the envelope.
+fn build_test_rar_service_header(name: &str, data_size: u64) -> Vec<u8> {
+    build_test_rar_data_header(3, name, 0, data_size, data_size, None, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_test_rar_data_header(
+    header_type: u64,
+    filename: &str,
+    common_flags_extra: u64,
+    data_size: u64,
+    unpacked_size: u64,
+    data_crc: Option<u32>,
+    extra: &[u8],
+) -> Vec<u8> {
+    build_test_rar_data_header_with_compression(
+        header_type,
+        filename,
+        common_flags_extra,
+        data_size,
+        unpacked_size,
+        data_crc,
+        extra,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_test_rar_data_header_with_compression(
+    header_type: u64,
+    filename: &str,
+    common_flags_extra: u64,
+    data_size: u64,
+    unpacked_size: u64,
+    data_crc: Option<u32>,
+    extra: &[u8],
+    compression_info: u64,
+) -> Vec<u8> {
     let file_flags: u64 = if data_crc.is_some() { 0x0004 } else { 0 };
     let mut type_body = Vec::new();
     type_body.extend_from_slice(&encode_test_rar_vint(file_flags));
@@ -513,16 +722,26 @@ fn build_test_rar_file_header(
     if let Some(data_crc) = data_crc {
         type_body.extend_from_slice(&data_crc.to_le_bytes());
     }
-    type_body.extend_from_slice(&encode_test_rar_vint(0));
+    type_body.extend_from_slice(&encode_test_rar_vint(compression_info));
     type_body.extend_from_slice(&encode_test_rar_vint(1));
     type_body.extend_from_slice(&encode_test_rar_vint(filename.len() as u64));
     type_body.extend_from_slice(filename.as_bytes());
 
+    // Field order is fixed by the format: type, flags, extra size (when the
+    // extra-area flag is set), data size, type body, extra area last.
+    let mut common_flags = 0x0002 | common_flags_extra;
+    if !extra.is_empty() {
+        common_flags |= 0x0001;
+    }
     let mut body = Vec::new();
-    body.extend_from_slice(&encode_test_rar_vint(2));
-    body.extend_from_slice(&encode_test_rar_vint(0x0002 | common_flags_extra));
+    body.extend_from_slice(&encode_test_rar_vint(header_type));
+    body.extend_from_slice(&encode_test_rar_vint(common_flags));
+    if !extra.is_empty() {
+        body.extend_from_slice(&encode_test_rar_vint(extra.len() as u64));
+    }
     body.extend_from_slice(&encode_test_rar_vint(data_size));
     body.extend_from_slice(&type_body);
+    body.extend_from_slice(extra);
 
     let header_size = body.len() as u64;
     let header_size_bytes = encode_test_rar_vint(header_size);
@@ -533,6 +752,63 @@ fn build_test_rar_file_header(
     result.extend_from_slice(&header_size_bytes);
     result.extend_from_slice(&body);
     result
+}
+
+const TEST_RAR4_SIG: [u8; 7] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
+
+/// RAR4's fixed-layout common header: `crc16, type, flags, header size`.
+///
+/// The CRC16 is left zero — the parser warns on a mismatch and carries on, which
+/// is deliberate recovery behaviour, so a fixture does not need to compute it.
+fn build_test_rar4_block(header_type: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+    let header_size = (7 + body.len()) as u16;
+    let mut out = Vec::with_capacity(header_size as usize);
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.push(header_type);
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&header_size.to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+fn build_test_rar4_main_header(is_first_volume: bool) -> Vec<u8> {
+    // VOLUME | NEW_NUMBERING, plus FIRST_VOLUME on volume 0.
+    let mut flags = 0x0001u16 | 0x0010;
+    if is_first_volume {
+        flags |= 0x0100;
+    }
+    let mut body = Vec::new();
+    body.extend_from_slice(&0u16.to_le_bytes()); // high_pos_av
+    body.extend_from_slice(&0u32.to_le_bytes()); // pos_av
+    build_test_rar4_block(0x73, flags, &body)
+}
+
+fn build_test_rar4_end_header(more_volumes: bool) -> Vec<u8> {
+    let flags: u16 = if more_volumes { 0x0001 } else { 0 };
+    build_test_rar4_block(0x7b, flags, &[])
+}
+
+/// A stored RAR4 file header. `unpack_version` 29 is what makes a split part's
+/// CRC32 describe that part's packed bytes rather than nothing at all.
+fn build_test_rar4_file_header(
+    filename: &str,
+    split_flags: u16,
+    packed_size: u32,
+    unpacked_size: u32,
+    data_crc: u32,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&packed_size.to_le_bytes());
+    body.extend_from_slice(&unpacked_size.to_le_bytes());
+    body.push(3); // host OS: Unix
+    body.extend_from_slice(&data_crc.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // mtime
+    body.push(29); // unpack version
+    body.push(0x30); // method: store
+    body.extend_from_slice(&(filename.len() as u16).to_le_bytes());
+    body.extend_from_slice(&0o644u32.to_le_bytes());
+    body.extend_from_slice(filename.as_bytes());
+    build_test_rar4_block(0x74, 0x8000 | split_flags, &body)
 }
 
 fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
@@ -606,8 +882,29 @@ fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
-fn dummy_rar_volume_facts(volume_number: u32) -> weaver_unrar::RarVolumeFacts {
-    weaver_unrar::RarVolumeFacts {
+fn shortened_e01_rar_headers(files: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut archive = unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+    for (volume, (_, bytes)) in files.iter().enumerate().skip(1) {
+        archive
+            .add_volume(volume, Box::new(std::io::Cursor::new(bytes.clone())))
+            .unwrap();
+    }
+    let mut cached = serde_json::to_value(archive.export_headers()).unwrap();
+    let e01 = cached["members"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|member| member["name"] == "E01.mkv")
+        .unwrap();
+    let first_segment = e01["segments"].as_array().unwrap()[0].clone();
+    e01["segments"] = serde_json::json!([first_segment]);
+    e01["split_after"] = serde_json::json!(false);
+    rmp_serde::to_vec(&serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap())
+        .unwrap()
+}
+
+fn dummy_rar_volume_facts(volume_number: u32) -> unrar_rs::RarVolumeFacts {
+    unrar_rs::RarVolumeFacts {
         format: 5,
         volume_number,
         more_volumes: true,
@@ -628,12 +925,9 @@ fn dummy_rar_volume_facts(volume_number: u32) -> weaver_unrar::RarVolumeFacts {
     }
 }
 
-fn dummy_named_rar_volume_facts(
-    volume_number: u32,
-    member_name: &str,
-) -> weaver_unrar::RarVolumeFacts {
-    weaver_unrar::RarVolumeFacts {
-        members: vec![weaver_unrar::RarVolumeMemberFacts {
+fn dummy_named_rar_volume_facts(volume_number: u32, member_name: &str) -> unrar_rs::RarVolumeFacts {
+    unrar_rs::RarVolumeFacts {
+        members: vec![unrar_rs::RarVolumeMemberFacts {
             order: 0,
             name: member_name.to_string(),
             name_raw: Some(member_name.as_bytes().to_vec()),
@@ -648,7 +942,9 @@ fn dummy_named_rar_volume_facts(
             split_after: true,
             is_directory: false,
             is_encrypted: false,
-            host_os: Some(weaver_unrar::RarVolumeHostOs::Unix),
+            encryption: None,
+            rar4_salt: None,
+            host_os: Some(unrar_rs::RarVolumeHostOs::Unix),
             attributes: Some(0o644),
             owner: None,
             mtime_ns: None,
@@ -727,7 +1023,7 @@ fn many_standalone_files(prefix: &str, count: usize) -> Vec<(String, u32)> {
 }
 
 const TEST_HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
-const TEST_HOT_LEASE_WARMUP_WORK_LIMIT: usize = 16;
+const TEST_HOT_LEASE_COLD_START_WORK_LIMIT: usize = 16;
 
 fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes: u32) -> JobSpec {
     JobSpec {
@@ -782,7 +1078,7 @@ fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes:
 
 fn minimal_par2_file_set() -> Par2FileSet {
     Par2FileSet {
-        recovery_set_id: weaver_par2::RecoverySetId::from_bytes([0; 16]),
+        recovery_set_id: par2_rs::RecoverySetId::from_bytes([0; 16]),
         slice_size: 1,
         recovery_file_ids: Vec::new(),
         non_recovery_file_ids: Vec::new(),
@@ -806,13 +1102,13 @@ fn placement_par2_file_set(files: &[(String, Vec<u8>)]) -> Par2FileSet {
     for (index, (filename, bytes)) in files.iter().enumerate() {
         let mut raw_id = [0u8; 16];
         raw_id[12..].copy_from_slice(&((index as u32) + 1).to_be_bytes());
-        let file_id = weaver_par2::FileId::from_bytes(raw_id);
-        let hash_full = weaver_par2::checksum::md5(bytes);
-        let hash_16k = weaver_par2::checksum::md5(&bytes[..bytes.len().min(16 * 1024)]);
+        let file_id = par2_rs::FileId::from_bytes(raw_id);
+        let hash_full = par2_rs::checksum::md5(bytes);
+        let hash_16k = par2_rs::checksum::md5(&bytes[..bytes.len().min(16 * 1024)]);
         recovery_file_ids.push(file_id);
         descriptions.insert(
             file_id,
-            weaver_par2::FileDescription {
+            par2_rs::FileDescription {
                 file_id,
                 hash_full,
                 hash_16k,
@@ -824,7 +1120,7 @@ fn placement_par2_file_set(files: &[(String, Vec<u8>)]) -> Par2FileSet {
     }
 
     Par2FileSet {
-        recovery_set_id: weaver_par2::RecoverySetId::from_bytes([9; 16]),
+        recovery_set_id: par2_rs::RecoverySetId::from_bytes([9; 16]),
         slice_size,
         recovery_file_ids,
         non_recovery_file_ids: Vec::new(),
@@ -841,19 +1137,61 @@ fn install_test_par2_runtime(
     par2_set: Par2FileSet,
     files: &[(u32, &str, u32, bool)],
 ) {
+    let set_id = par2_set.recovery_set_id;
+    let candidates = pipeline
+        .par2_metadata_candidate_indices(job_id)
+        .into_iter()
+        .map(|(file_index, is_index, _)| {
+            let filename = pipeline
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.spec.files.get(file_index as usize))
+                .map(|file| file.filename.clone())
+                .unwrap_or_default();
+            (file_index, is_index, filename)
+        })
+        .collect::<Vec<_>>();
     let runtime = pipeline.ensure_par2_runtime(job_id);
-    runtime.set = Some(Arc::new(par2_set));
+    runtime.served = Some(set_id);
+    runtime.ensure_set_runtime(set_id).set = Some(Arc::new(par2_set));
     runtime.files.clear();
-    for (file_index, filename, recovery_blocks, promoted) in files {
+    for (file_index, is_index, filename) in candidates {
+        let discovery = if is_index {
+            Par2DiscoveryState::Parsed {
+                set_ids: vec![set_id],
+            }
+        } else {
+            Par2DiscoveryState::PrefixProbed {
+                set_ids: vec![set_id],
+            }
+        };
         runtime.files.insert(
-            *file_index,
+            file_index,
             Par2FileRuntime {
-                filename: (*filename).to_string(),
-                recovery_blocks: *recovery_blocks,
-                promoted: *promoted,
+                filename,
+                discovery,
+                ..Default::default()
             },
         );
     }
+    for (file_index, filename, recovery_blocks, promoted) in files {
+        let file = runtime.files.entry(*file_index).or_default();
+        file.filename = (*filename).to_string();
+        file.recovery_blocks = *recovery_blocks;
+        file.promoted = *promoted;
+        if matches!(file.discovery, Par2DiscoveryState::Unseen) {
+            file.discovery = Par2DiscoveryState::PrefixProbed {
+                set_ids: vec![set_id],
+            };
+        }
+    }
+    // Installing a set is this helper's stand-in for the packet arrivals that
+    // build one, and those evict any retained session before they touch the
+    // set. Without the same step here a test that swaps in a wider set keeps a
+    // session holding the narrower snapshot, and the next pass answers from it.
+    pipeline.evict_par2_repair_session(job_id, set_id);
+    pipeline.refresh_par2_checkpoint_plan(job_id);
+    pipeline.refresh_par2_md5_substitution_bindings(job_id);
 }
 
 fn build_test_par2_packet(
@@ -861,7 +1199,7 @@ fn build_test_par2_packet(
     body: &[u8],
     recovery_set_id: [u8; 16],
 ) -> Vec<u8> {
-    let length = (weaver_par2::packet::header::HEADER_SIZE + body.len()) as u64;
+    let length = (par2_rs::packet::header::HEADER_SIZE + body.len()) as u64;
     let mut hash_input = Vec::new();
     hash_input.extend_from_slice(&recovery_set_id);
     hash_input.extend_from_slice(packet_type);
@@ -869,7 +1207,7 @@ fn build_test_par2_packet(
     let packet_hash = checksum::md5(&hash_input);
 
     let mut data = Vec::new();
-    data.extend_from_slice(weaver_par2::packet::header::MAGIC);
+    data.extend_from_slice(par2_rs::packet::header::MAGIC);
     data.extend_from_slice(&length.to_le_bytes());
     data.extend_from_slice(&packet_hash);
     data.extend_from_slice(&recovery_set_id);
@@ -878,75 +1216,305 @@ fn build_test_par2_packet(
     data
 }
 
-fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> Vec<u8> {
-    let file_length = file_data.len() as u64;
-    let hash_full = checksum::md5(file_data);
-    let hash_16k = checksum::md5(&file_data[..file_data.len().min(16 * 1024)]);
+pub(super) fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> Vec<u8> {
+    build_test_par2_index_for_files(&[(filename, file_data)], slice_size)
+}
 
-    let mut file_id_input = Vec::new();
-    file_id_input.extend_from_slice(&hash_16k);
-    file_id_input.extend_from_slice(&file_length.to_le_bytes());
-    file_id_input.extend_from_slice(filename.as_bytes());
-    let file_id_bytes = checksum::md5(&file_id_input);
-
-    let num_slices = if file_length == 0 {
-        0
-    } else {
-        file_length.div_ceil(slice_size) as usize
-    };
-
-    let mut checksums = Vec::new();
-    for slice_index in 0..num_slices {
-        let start = slice_index as u64 * slice_size;
-        let end = ((start + slice_size) as usize).min(file_data.len());
-        let slice_data = &file_data[start as usize..end];
-        let mut state = weaver_par2::SliceChecksumState::new();
-        state.update(slice_data);
-        let (crc32, md5) =
-            state.finalize(((slice_data.len() as u64) < slice_size).then_some(slice_size));
-        checksums.push(weaver_par2::SliceChecksum { crc32, md5 });
+/// A `.volNN+CC.par2` byte stream carrying only the named recovery packets.
+///
+/// The index builders above stop at descriptions and slice checksums, and
+/// [`build_repairable_par2_set`] keeps its recovery slices in memory. Neither
+/// produces a *volume file*, which is what a test needs when the question is
+/// what weaver can read back off the disk — including from a volume that only
+/// partly arrived.
+pub(super) fn build_test_par2_recovery_volume(
+    recovery_set_id: [u8; 16],
+    slices: &[(u32, &[u8])],
+) -> Vec<u8> {
+    let mut stream = Vec::new();
+    for (exponent, data) in slices {
+        let mut body = Vec::with_capacity(4 + data.len());
+        body.extend_from_slice(&exponent.to_le_bytes());
+        body.extend_from_slice(data);
+        stream.extend_from_slice(&build_test_par2_packet(
+            par2_rs::packet::header::TYPE_RECOVERY,
+            &body,
+            recovery_set_id,
+        ));
     }
+    stream
+}
+
+/// Zero the payload of the recovery packet at `packet_index` in a volume built
+/// by [`build_test_par2_recovery_volume`], leaving its header intact.
+///
+/// That is the on-disk shape of a volume whose interior article never arrived:
+/// the scanner still finds the packet by its magic and header, and only the
+/// packet's own MD5 can tell that the bytes behind it are a hole.
+pub(super) fn punch_recovery_packet_payload(
+    volume: &mut [u8],
+    packet_index: usize,
+    slice_size: usize,
+) {
+    let packet_len = par2_rs::packet::header::HEADER_SIZE + 4 + slice_size;
+    let payload_start = packet_index * packet_len + par2_rs::packet::header::HEADER_SIZE + 4;
+    volume[payload_start..payload_start + slice_size].fill(0);
+}
+
+pub(super) fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_size: u64) -> Vec<u8> {
+    struct IndexedFile {
+        id: [u8; 16],
+        desc_body: Vec<u8>,
+        ifsc_body: Vec<u8>,
+    }
+
+    let indexed: Vec<IndexedFile> = files
+        .iter()
+        .map(|(filename, file_data)| {
+            let file_length = file_data.len() as u64;
+            let hash_full = checksum::md5(file_data);
+            let hash_16k = checksum::md5(&file_data[..file_data.len().min(16 * 1024)]);
+
+            let mut file_id_input = Vec::new();
+            file_id_input.extend_from_slice(&hash_16k);
+            file_id_input.extend_from_slice(&file_length.to_le_bytes());
+            file_id_input.extend_from_slice(filename.as_bytes());
+            let id = checksum::md5(&file_id_input);
+
+            let num_slices = if file_length == 0 {
+                0
+            } else {
+                file_length.div_ceil(slice_size) as usize
+            };
+
+            let mut desc_body = Vec::new();
+            desc_body.extend_from_slice(&id);
+            desc_body.extend_from_slice(&hash_full);
+            desc_body.extend_from_slice(&hash_16k);
+            desc_body.extend_from_slice(&file_length.to_le_bytes());
+            desc_body.extend_from_slice(filename.as_bytes());
+            while desc_body.len() % 4 != 0 {
+                desc_body.push(0);
+            }
+
+            let mut ifsc_body = Vec::new();
+            ifsc_body.extend_from_slice(&id);
+            for slice_index in 0..num_slices {
+                let start = slice_index as u64 * slice_size;
+                let end = ((start + slice_size) as usize).min(file_data.len());
+                let slice_data = &file_data[start as usize..end];
+                let mut state = par2_rs::SliceChecksumState::new();
+                state.update(slice_data);
+                let (crc32, md5) =
+                    state.finalize(((slice_data.len() as u64) < slice_size).then_some(slice_size));
+                ifsc_body.extend_from_slice(&md5);
+                ifsc_body.extend_from_slice(&crc32.to_le_bytes());
+            }
+
+            IndexedFile {
+                id,
+                desc_body,
+                ifsc_body,
+            }
+        })
+        .collect();
 
     let mut main_body = Vec::new();
     main_body.extend_from_slice(&slice_size.to_le_bytes());
-    main_body.extend_from_slice(&1u32.to_le_bytes());
-    main_body.extend_from_slice(&file_id_bytes);
+    main_body.extend_from_slice(&(indexed.len() as u32).to_le_bytes());
+    for file in &indexed {
+        main_body.extend_from_slice(&file.id);
+    }
     let recovery_set_id = checksum::md5(&main_body);
-
-    let mut file_desc_body = Vec::new();
-    file_desc_body.extend_from_slice(&file_id_bytes);
-    file_desc_body.extend_from_slice(&hash_full);
-    file_desc_body.extend_from_slice(&hash_16k);
-    file_desc_body.extend_from_slice(&file_length.to_le_bytes());
-    file_desc_body.extend_from_slice(filename.as_bytes());
-    while file_desc_body.len() % 4 != 0 {
-        file_desc_body.push(0);
-    }
-
-    let mut ifsc_body = Vec::new();
-    ifsc_body.extend_from_slice(&file_id_bytes);
-    for checksum in checksums {
-        ifsc_body.extend_from_slice(&checksum.md5);
-        ifsc_body.extend_from_slice(&checksum.crc32.to_le_bytes());
-    }
 
     let mut stream = Vec::new();
     stream.extend_from_slice(&build_test_par2_packet(
-        weaver_par2::packet::header::TYPE_MAIN,
+        par2_rs::packet::header::TYPE_MAIN,
         &main_body,
         recovery_set_id,
     ));
-    stream.extend_from_slice(&build_test_par2_packet(
-        weaver_par2::packet::header::TYPE_FILE_DESC,
-        &file_desc_body,
-        recovery_set_id,
-    ));
-    stream.extend_from_slice(&build_test_par2_packet(
-        weaver_par2::packet::header::TYPE_IFSC,
-        &ifsc_body,
-        recovery_set_id,
-    ));
+    for file in &indexed {
+        stream.extend_from_slice(&build_test_par2_packet(
+            par2_rs::packet::header::TYPE_FILE_DESC,
+            &file.desc_body,
+            recovery_set_id,
+        ));
+        stream.extend_from_slice(&build_test_par2_packet(
+            par2_rs::packet::header::TYPE_IFSC,
+            &file.ifsc_body,
+            recovery_set_id,
+        ));
+    }
     stream
+}
+
+/// A recovery set over several described files, with real recovery slices
+/// computed over the set's whole input-slice sequence (files in recovery-set
+/// order, each slice zero-padded to `slice_size`) — which is what makes a
+/// multi-file repair actually repairable in a test.
+pub(super) fn build_repairable_par2_set_for_files(
+    files: &[(&str, &[u8])],
+    slice_size: u64,
+    recovery_block_count: usize,
+) -> Par2FileSet {
+    struct Described {
+        file_id: par2_rs::FileId,
+        description: par2_rs::FileDescription,
+        slice_checksums: Vec<par2_rs::SliceChecksum>,
+        slice_count: usize,
+    }
+
+    let described: Vec<Described> = files
+        .iter()
+        .map(|(filename, file_data)| {
+            let file_length = file_data.len() as u64;
+            let hash_full = checksum::md5(file_data);
+            let hash_16k = checksum::md5(&file_data[..file_data.len().min(16 * 1024)]);
+
+            let mut file_id_input = Vec::new();
+            file_id_input.extend_from_slice(&hash_16k);
+            file_id_input.extend_from_slice(&file_length.to_le_bytes());
+            file_id_input.extend_from_slice(filename.as_bytes());
+            let file_id = par2_rs::FileId::from_bytes(checksum::md5(&file_id_input));
+
+            let slice_count = if file_length == 0 {
+                0usize
+            } else {
+                file_length.div_ceil(slice_size) as usize
+            };
+            let slice_checksums = (0..slice_count)
+                .map(|slice_index| {
+                    let start = slice_index as u64 * slice_size;
+                    let end = ((start + slice_size) as usize).min(file_data.len());
+                    let slice_data = &file_data[start as usize..end];
+                    let mut checksum_state = par2_rs::SliceChecksumState::new();
+                    checksum_state.update(slice_data);
+                    let pad_to = ((slice_data.len() as u64) < slice_size).then_some(slice_size);
+                    let (crc32, md5) = checksum_state.finalize(pad_to);
+                    par2_rs::SliceChecksum { crc32, md5 }
+                })
+                .collect();
+
+            Described {
+                file_id,
+                description: par2_rs::FileDescription {
+                    file_id,
+                    hash_full,
+                    hash_16k,
+                    length: file_length,
+                    par2_name: (*filename).to_string(),
+                    filename: (*filename).to_string(),
+                },
+                slice_checksums,
+                slice_count,
+            }
+        })
+        .collect();
+
+    let mut main_body = Vec::new();
+    main_body.extend_from_slice(&slice_size.to_le_bytes());
+    main_body.extend_from_slice(&(described.len() as u32).to_le_bytes());
+    for file in &described {
+        main_body.extend_from_slice(file.file_id.as_bytes());
+    }
+
+    let mut par2_set = Par2FileSet {
+        recovery_set_id: par2_rs::RecoverySetId::from_bytes(checksum::md5(&main_body)),
+        slice_size,
+        recovery_file_ids: described.iter().map(|file| file.file_id).collect(),
+        non_recovery_file_ids: Vec::new(),
+        files: described
+            .iter()
+            .map(|file| (file.file_id, file.description.clone()))
+            .collect(),
+        slice_checksums: described
+            .iter()
+            .map(|file| (file.file_id, file.slice_checksums.clone()))
+            .collect(),
+        recovery_slices: std::collections::BTreeMap::new(),
+        creator: None,
+    };
+
+    let slice_size_bytes = slice_size as usize;
+    let word_count = (slice_size_bytes / 2).max(1);
+    let total_slices: usize = described.iter().map(|file| file.slice_count).sum();
+    let constants = par2_rs::input_slice_constants(total_slices);
+
+    // The set's input-slice sequence: every file's slices in recovery-set
+    // order, each padded out to a full slice.
+    let mut padded = Vec::with_capacity(total_slices * slice_size_bytes);
+    for ((_, file_data), file) in files.iter().zip(described.iter()) {
+        let mut file_padded = file_data.to_vec();
+        file_padded.resize(file.slice_count * slice_size_bytes, 0);
+        padded.extend_from_slice(&file_padded);
+    }
+
+    for exponent in 0..recovery_block_count {
+        let exponent = exponent as u32;
+        let mut recovery = vec![0u8; slice_size_bytes];
+
+        for (input_index, &constant) in constants.iter().enumerate() {
+            let factor = par2_rs::gf_pow(constant, exponent);
+            for word_index in 0..word_count {
+                let input_word = u16::from_le_bytes([
+                    padded[input_index * slice_size_bytes + word_index * 2],
+                    padded[input_index * slice_size_bytes + word_index * 2 + 1],
+                ]);
+                let contribution = par2_rs::gf_mul(input_word, factor);
+                let current =
+                    u16::from_le_bytes([recovery[word_index * 2], recovery[word_index * 2 + 1]]);
+                let updated = par2_rs::gf_add(current, contribution).to_le_bytes();
+                recovery[word_index * 2] = updated[0];
+                recovery[word_index * 2 + 1] = updated[1];
+            }
+        }
+
+        par2_set.recovery_slices.insert(
+            exponent,
+            par2_rs::RecoverySlice {
+                exponent,
+                data: bytes::Bytes::from(recovery).into(),
+            },
+        );
+    }
+
+    par2_set
+}
+
+/// A recovery set whose recovery slices are placeholders rather than encoded
+/// blocks.
+///
+/// [`build_repairable_par2_set`] and its multi-file sibling encode real
+/// recovery data, at one field multiply per (input slice, recovery block) pair.
+/// That is nothing for the handful of slices those fixtures carry and
+/// completely impractical for a set shaped to stress a decode matrix, where the
+/// pair count runs into the hundreds of millions.
+///
+/// A *verdict* never looks at recovery bytes: availability is the count of
+/// recovery slices whose length matches the set's slice size, and repairability
+/// compares that count against the damage. So a fixture that only ever asks
+/// what the verdict is — and stops before anything plans or solves a repair —
+/// is served exactly as well by placeholders, in milliseconds instead of hours.
+///
+/// Never use this for a fixture that actually repairs: the bytes are zeros and
+/// would reconstruct garbage.
+pub(super) fn build_par2_set_with_uncomputed_recovery(
+    filename: &str,
+    file_data: &[u8],
+    slice_size: u64,
+    recovery_block_count: usize,
+) -> Par2FileSet {
+    let mut par2_set = build_repairable_par2_set_for_files(&[(filename, file_data)], slice_size, 0);
+    for exponent in 0..recovery_block_count as u32 {
+        par2_set.recovery_slices.insert(
+            exponent,
+            par2_rs::RecoverySlice {
+                exponent,
+                data: bytes::Bytes::from(vec![0u8; slice_size as usize]).into(),
+            },
+        );
+    }
+    par2_set
 }
 
 fn build_repairable_par2_set(
@@ -963,7 +1531,7 @@ fn build_repairable_par2_set(
     file_id_input.extend_from_slice(&hash_16k);
     file_id_input.extend_from_slice(&file_length.to_le_bytes());
     file_id_input.extend_from_slice(filename.as_bytes());
-    let file_id = weaver_par2::FileId::from_bytes(checksum::md5(&file_id_input));
+    let file_id = par2_rs::FileId::from_bytes(checksum::md5(&file_id_input));
 
     let mut slice_checksums = Vec::new();
     let slice_count = if file_length == 0 {
@@ -975,11 +1543,11 @@ fn build_repairable_par2_set(
         let start = slice_index as u64 * slice_size;
         let end = ((start + slice_size) as usize).min(file_data.len());
         let slice_data = &file_data[start as usize..end];
-        let mut checksum_state = weaver_par2::SliceChecksumState::new();
+        let mut checksum_state = par2_rs::SliceChecksumState::new();
         checksum_state.update(slice_data);
         let pad_to = ((slice_data.len() as u64) < slice_size).then_some(slice_size);
         let (crc32, md5) = checksum_state.finalize(pad_to);
-        slice_checksums.push(weaver_par2::SliceChecksum { crc32, md5 });
+        slice_checksums.push(par2_rs::SliceChecksum { crc32, md5 });
     }
 
     let mut main_body = Vec::new();
@@ -988,13 +1556,13 @@ fn build_repairable_par2_set(
     main_body.extend_from_slice(file_id.as_bytes());
 
     let mut par2_set = Par2FileSet {
-        recovery_set_id: weaver_par2::RecoverySetId::from_bytes(checksum::md5(&main_body)),
+        recovery_set_id: par2_rs::RecoverySetId::from_bytes(checksum::md5(&main_body)),
         slice_size,
         recovery_file_ids: vec![file_id],
         non_recovery_file_ids: Vec::new(),
         files: HashMap::from([(
             file_id,
-            weaver_par2::FileDescription {
+            par2_rs::FileDescription {
                 file_id,
                 hash_full,
                 hash_16k,
@@ -1010,7 +1578,7 @@ fn build_repairable_par2_set(
 
     let slice_size_bytes = slice_size as usize;
     let word_count = (slice_size_bytes / 2).max(1);
-    let constants = weaver_par2::input_slice_constants(slice_count);
+    let constants = par2_rs::input_slice_constants(slice_count);
     let mut padded = file_data.to_vec();
     padded.resize(slice_count * slice_size_bytes, 0);
 
@@ -1019,16 +1587,16 @@ fn build_repairable_par2_set(
         let mut recovery = vec![0u8; slice_size_bytes];
 
         for (input_index, &constant) in constants.iter().enumerate() {
-            let factor = weaver_par2::gf_pow(constant, exponent);
+            let factor = par2_rs::gf_pow(constant, exponent);
             for word_index in 0..word_count {
                 let input_word = u16::from_le_bytes([
                     padded[input_index * slice_size_bytes + word_index * 2],
                     padded[input_index * slice_size_bytes + word_index * 2 + 1],
                 ]);
-                let contribution = weaver_par2::gf_mul(input_word, factor);
+                let contribution = par2_rs::gf_mul(input_word, factor);
                 let current =
                     u16::from_le_bytes([recovery[word_index * 2], recovery[word_index * 2 + 1]]);
-                let updated = weaver_par2::gf_add(current, contribution).to_le_bytes();
+                let updated = par2_rs::gf_add(current, contribution).to_le_bytes();
                 recovery[word_index * 2] = updated[0];
                 recovery[word_index * 2 + 1] = updated[1];
             }
@@ -1036,7 +1604,7 @@ fn build_repairable_par2_set(
 
         par2_set.recovery_slices.insert(
             exponent,
-            weaver_par2::RecoverySlice {
+            par2_rs::RecoverySlice {
                 exponent,
                 data: bytes::Bytes::from(recovery).into(),
             },
@@ -1117,6 +1685,26 @@ async fn insert_active_job_with_persisted_nzb(
     spec: JobSpec,
     nzb_zstd: Vec<u8>,
 ) -> PathBuf {
+    insert_active_job_with_persisted_nzb_named(pipeline, job_id, spec, nzb_zstd, None).await
+}
+
+/// [`insert_active_job_with_persisted_nzb`] with the persisted NZB's **file
+/// name** chosen by the caller.
+///
+/// The name is not decoration: `nzb_password_candidates` reads a
+/// `{{password}}` convention out of the NZB path's stem, so it is the only way
+/// to exercise that candidate source. `None` keeps the job-id name every other
+/// caller gets.
+async fn insert_active_job_with_persisted_nzb_named(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    spec: JobSpec,
+    nzb_zstd: Vec<u8>,
+    nzb_file_name: Option<&str>,
+) -> PathBuf {
+    let nzb_file_name = nzb_file_name
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{}.nzb", job_id.0));
     let dir_name = crate::jobs::working_dir::sanitize_dirname(&spec.name);
     let candidate = pipeline.intermediate_dir.join(&dir_name);
     let working_dir = if candidate.exists() {
@@ -1138,7 +1726,7 @@ async fn insert_active_job_with_persisted_nzb(
         .create_active_job(&crate::ActiveJob {
             job_id,
             nzb_hash: [0; 32],
-            nzb_path: working_dir.join(format!("{}.nzb", job_id.0)),
+            nzb_path: working_dir.join(&nzb_file_name),
             nzb_zstd,
             output_dir: working_dir.clone(),
             created_at: 0,
@@ -1180,6 +1768,7 @@ async fn insert_active_job_with_persisted_nzb(
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,
             failed_bytes: 0,
+            probe_projected_failed_bytes: 0,
             par2_bytes,
             health_probing: false,
             health_probe_round: 0,
@@ -1191,6 +1780,7 @@ async fn insert_active_job_with_persisted_nzb(
             download_queue,
             recovery_queue,
             staging_dir: None,
+            category_bytes: None,
         },
     );
     pipeline.job_order.push(job_id);
@@ -1320,30 +1910,6 @@ async fn drain_rar_refreshes(pipeline: &mut Pipeline) {
     panic!("RAR refresh queue did not drain");
 }
 
-async fn drain_verified_suspect_persists(pipeline: &mut Pipeline) {
-    for _ in 0..32 {
-        while let Ok(done) = pipeline.verified_suspect_persist_done_rx.try_recv() {
-            pipeline.handle_verified_suspect_persist_done(done);
-        }
-        if pipeline
-            .verified_suspect_persist_state
-            .values()
-            .all(|state| state.in_flight_version.is_none())
-        {
-            return;
-        }
-        let done = tokio::time::timeout(
-            Duration::from_secs(5),
-            pipeline.verified_suspect_persist_done_rx.recv(),
-        )
-        .await
-        .expect("verified suspect persistence result should arrive")
-        .expect("verified suspect persistence channel should stay open");
-        pipeline.handle_verified_suspect_persist_done(done);
-    }
-    panic!("verified suspect persistence queue did not drain");
-}
-
 fn set_job_status_for_test(pipeline: &mut Pipeline, job_id: JobId, status: JobStatus) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     state.status = status;
@@ -1416,12 +1982,12 @@ async fn write_and_complete_file(
     let file_id = NzbFileId { job_id, file_index };
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state
-            .assembly
-            .file_mut(file_id)
-            .unwrap()
-            .commit_segment(0, bytes.len() as u32)
-            .unwrap();
+        let file = state.assembly.file_mut(file_id).unwrap();
+        // Mirror the decode worker: every accepted arrival records its
+        // placement before the commit, which is what the contiguity proof
+        // reads.
+        file.record_placement(0, 0, bytes.len() as u32);
+        file.commit_segment(0, bytes.len() as u32).unwrap();
     }
 
     pipeline
@@ -1495,28 +2061,82 @@ async fn submit_decoded_segment_with_part_crc_verified(
     expected_file_crc: Option<u32>,
     part_crc_verified: bool,
 ) {
+    submit_decoded_segment_with_segments(
+        pipeline,
+        file_id,
+        segment_number,
+        file_offset,
+        data,
+        filename,
+        expected_file_crc,
+        part_crc_verified,
+        None,
+    )
+    .await;
+}
+
+/// [`submit_decoded_segment_with_part_crc_verified`] with the decoder's CRC
+/// segmentation chosen by the caller.
+///
+/// `None` is what a decoder emits with no PAR2 block size declared: one segment
+/// covering the whole article. `Some` is what it emits once the recovery set has
+/// parsed and the lease carries its block size — segments cut on the block grid,
+/// which is the only shape the dual-CRC grid can close a block from.
+#[allow(clippy::too_many_arguments)]
+async fn submit_decoded_segment_with_segments(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    segment_number: u32,
+    file_offset: u64,
+    data: &[u8],
+    filename: &str,
+    expected_file_crc: Option<u32>,
+    part_crc_verified: bool,
+    segments: Option<Vec<weaver_yenc::Segment>>,
+) {
+    let file = pipeline
+        .jobs
+        .get(&file_id.job_id)
+        .and_then(|state| state.assembly.file(file_id))
+        .expect("active test file assembly");
+    let yenc_layout = YencLayoutAssertions {
+        file_size: file.total_bytes(),
+        part: Some(segment_number + 1),
+        total: Some(file.total_segments()),
+        begin: Some(file_offset + 1),
+        end: Some(file_offset + data.len() as u64),
+    };
+    let segments = segments.unwrap_or_else(|| {
+        vec![weaver_yenc::Segment {
+            file_offset: yenc_layout.begin.map_or(0, |begin| begin.saturating_sub(1)),
+            len: data.len() as u64,
+            crc32: par2_rs::checksum::crc32(data),
+        }]
+    });
     pipeline
-        .handle_decode_success(DecodeResult {
-            segment_id: SegmentId {
-                file_id,
-                segment_number,
+        .handle_decode_success(
+            DecodeResult {
+                encoding: SegmentEncoding::Yenc,
+                segment_id: SegmentId {
+                    file_id,
+                    segment_number,
+                },
+                raw_size: data.len() as u64,
+                yenc_layout,
+                crc_valid: true,
+                part_crc_verified,
+                part_crc: par2_rs::checksum::crc32(data),
+                expected_file_crc,
+                data: DecodedChunk::from(data.to_vec()),
+                yenc_name: filename.to_string(),
+                checkpoint_plan: pipeline.par2_checkpoint_plan(file_id.job_id),
+                segments,
             },
-            raw_size: data.len() as u64,
-            unverified_provenance: (!part_crc_verified).then(|| {
-                Box::new(UnverifiedSegmentProvenance {
-                    source_server_idx: None,
-                    exclude_servers: Vec::new(),
-                })
-            }),
-            file_offset,
-            decoded_size: data.len() as u32,
-            crc_valid: true,
-            part_crc_verified,
-            part_crc: weaver_par2::checksum::crc32(data),
-            expected_file_crc,
-            data: DecodedChunk::from(data.to_vec()),
-            yenc_name: filename.to_string(),
-        })
+            SegmentSource {
+                source_server_idx: None,
+                exclude_servers: Vec::new(),
+            },
+        )
         .await;
 }
 
@@ -1533,28 +2153,49 @@ async fn submit_decoded_segment_from_server(
     source_server_idx: Option<usize>,
     exclude_servers: Vec<usize>,
 ) {
+    let file = pipeline
+        .jobs
+        .get(&file_id.job_id)
+        .and_then(|state| state.assembly.file(file_id))
+        .expect("active test file assembly");
+    let yenc_layout = YencLayoutAssertions {
+        file_size: file.total_bytes(),
+        part: Some(segment_number + 1),
+        total: Some(file.total_segments()),
+        begin: Some(file_offset + 1),
+        end: Some(file_offset + data.len() as u64),
+    };
     pipeline
-        .handle_decode_success(DecodeResult {
-            segment_id: SegmentId {
-                file_id,
-                segment_number,
+        .handle_decode_success(
+            DecodeResult {
+                encoding: SegmentEncoding::Yenc,
+                segment_id: SegmentId {
+                    file_id,
+                    segment_number,
+                },
+                raw_size: data.len() as u64,
+                yenc_layout,
+                crc_valid: true,
+                part_crc_verified,
+                part_crc: par2_rs::checksum::crc32(data),
+                expected_file_crc,
+                data: DecodedChunk::from(data.to_vec()),
+                yenc_name: filename.to_string(),
+                checkpoint_plan: pipeline.par2_checkpoint_plan(file_id.job_id),
+                // What a decoder with no PAR2 block size declared emits: one
+                // segment covering the whole article, based where `=ypart`
+                // places it.
+                segments: vec![weaver_yenc::Segment {
+                    file_offset: yenc_layout.begin.map_or(0, |begin| begin.saturating_sub(1)),
+                    len: data.len() as u64,
+                    crc32: par2_rs::checksum::crc32(data),
+                }],
             },
-            raw_size: data.len() as u64,
-            unverified_provenance: (!part_crc_verified).then(|| {
-                Box::new(UnverifiedSegmentProvenance {
-                    source_server_idx,
-                    exclude_servers,
-                })
-            }),
-            file_offset,
-            decoded_size: data.len() as u32,
-            crc_valid: true,
-            part_crc_verified,
-            part_crc: weaver_par2::checksum::crc32(data),
-            expected_file_crc,
-            data: DecodedChunk::from(data.to_vec()),
-            yenc_name: filename.to_string(),
-        })
+            SegmentSource {
+                source_server_idx,
+                exclude_servers,
+            },
+        )
         .await;
 }
 
@@ -1566,7 +2207,7 @@ async fn persist_completed_file_hash(
     bytes: &[u8],
 ) {
     let filename = filename.to_string();
-    let hash = weaver_par2::checksum::md5(bytes);
+    let hash = par2_rs::checksum::md5(bytes);
     pipeline
         .db_blocking(move |db| db.complete_file(job_id, file_index, &filename, &hash))
         .await
@@ -1778,12 +2419,32 @@ fn debug_job_state(pipeline: &Pipeline, job_id: JobId) -> String {
     lines.join("\n")
 }
 
-async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
-    pipeline.pump_decode_queue();
-    while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
-        pipeline.check_job_completion(queued_job).await;
+async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
+    loop {
         pipeline.pump_decode_queue();
+        while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
+            pipeline.check_job_completion(queued_job).await;
+            pipeline.pump_decode_queue();
+        }
+        while let Ok(done) = pipeline.direct_post_repair_done_rx.try_recv() {
+            pipeline.handle_direct_post_repair_done(done);
+        }
+        if pipeline.direct_post_repair_in_flight.is_empty() {
+            return;
+        }
+        let done = tokio::time::timeout(
+            Duration::from_secs(5),
+            pipeline.direct_post_repair_done_rx.recv(),
+        )
+        .await
+        .expect("direct post-repair read-back should finish")
+        .expect("direct post-repair completion channel should stay open");
+        pipeline.handle_direct_post_repair_done(done);
     }
+}
+
+async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
+    settle_direct_post_repair_work(pipeline).await;
 
     settle_inflight_moves(pipeline).await;
 
@@ -1794,6 +2455,7 @@ async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
             pipeline.check_job_completion(queued_job).await;
             pipeline.pump_decode_queue();
         }
+        settle_direct_post_repair_work(pipeline).await;
     }
 
     settle_inflight_moves(pipeline).await;
@@ -1929,6 +2591,7 @@ fn rar_unlock_work(job_id: JobId, file_index: u32, priority: u32) -> DownloadWor
         byte_estimate: 1024,
         retry_count: 0,
         is_recovery: false,
+        completion_critical: false,
         exclude_servers: Vec::new(),
         avoid_server: None,
     }

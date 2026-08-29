@@ -103,20 +103,53 @@ fn extraction_chunk_from_row(row: SqlRow) -> Result<ExtractionChunk, StateError>
 }
 
 impl Database {
+    /// Completed-file digests that are safe to treat as *calculated from the
+    /// downloaded bytes*: rows whose `md5_provenance` records how the value
+    /// was obtained ('streamed' or 'verified'). Legacy rows — written before
+    /// provenance existed — are excluded here, because they may hold a PAR2
+    /// description's EXPECTED hash copied verbatim, and quick verification
+    /// must never treat an expectation as an observation. Use
+    /// [`Self::load_complete_file_hashes_any`] where a hash is only an
+    /// identity hint.
     pub fn load_complete_file_hashes(
         &self,
         job_id: JobId,
     ) -> Result<HashMap<u32, [u8; 16]>, StateError> {
+        self.load_complete_file_hashes_inner(job_id, true)
+    }
+
+    /// Every persisted completed-file digest regardless of provenance,
+    /// including legacy rows of unknown origin. Identity hints only — never
+    /// verification evidence.
+    pub fn load_complete_file_hashes_any(
+        &self,
+        job_id: JobId,
+    ) -> Result<HashMap<u32, [u8; 16]>, StateError> {
+        self.load_complete_file_hashes_inner(job_id, false)
+    }
+
+    fn load_complete_file_hashes_inner(
+        &self,
+        job_id: JobId,
+        trusted_only: bool,
+    ) -> Result<HashMap<u32, [u8; 16]>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
+        self.run_sql_blocking_read(async move {
+            // Explicit allowlist rather than IS NOT NULL: a future provenance
+            // label is untrusted until the code that writes it also teaches
+            // this filter what it means.
+            let sql = if trusted_only {
                 "SELECT file_index, md5
                  FROM active_files
-                 WHERE job_id = {}",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
+                 WHERE job_id = {} AND md5_provenance IN ('streamed', 'verified')"
+            } else {
+                "SELECT file_index, md5
+                 FROM active_files
+                 WHERE job_id = {}"
+            };
+            let rows =
+                SqlRuntime::fetch_all(datastore.read_exec(), sql, &[SqlArg::I64(job_id.0 as i64)])
+                    .await?;
 
             let mut hashes = HashMap::new();
             for row in rows {
@@ -134,7 +167,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<HashMap<u32, ActivePar2File>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT file_index, filename, recovery_block_count, promoted
@@ -159,7 +192,7 @@ impl Database {
 
     pub fn load_failed_extractions(&self, job_id: JobId) -> Result<HashSet<String>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT member_name FROM active_failed_extractions
@@ -175,7 +208,7 @@ impl Database {
 
     pub fn load_active_job_normalization_retried(&self, job_id: JobId) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT normalization_retried FROM active_jobs WHERE job_id = {}",
@@ -188,34 +221,9 @@ impl Database {
         })
     }
 
-    pub fn load_verified_suspect_volumes(
-        &self,
-        job_id: JobId,
-    ) -> Result<HashMap<String, HashSet<u32>>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT set_name, volume_index
-                 FROM active_rar_verified_suspect
-                 WHERE job_id = {}",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
-            let mut result = HashMap::<String, HashSet<u32>>::new();
-            for row in rows {
-                result
-                    .entry(row.text("set_name")?)
-                    .or_default()
-                    .insert(row.i64("volume_index")? as u32);
-            }
-            Ok(result)
-        })
-    }
-
     pub fn load_active_jobs(&self) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let mut jobs = HashMap::new();
 
             let rows = SqlRuntime::fetch_all(
@@ -410,7 +418,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<Option<PersistedNzbRecord>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT nzb_path, nzb_zstd
@@ -439,7 +447,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<(HashMap<u32, u64>, HashSet<u32>), StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT file_index, contiguous_bytes_written
@@ -476,7 +484,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<HashMap<u32, DetectedArchiveIdentity>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT file_index, kind, set_name, volume_index
@@ -502,7 +510,7 @@ impl Database {
 
     pub fn max_job_id_all(&self) -> Result<u64, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT MAX(id) AS id FROM (
@@ -532,7 +540,7 @@ impl Database {
     ) -> Result<Vec<ExtractionChunk>, StateError> {
         let datastore = self.datastore();
         let set_name = set_name.to_string();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT member_name, volume_index, bytes_written, temp_path,
@@ -554,7 +562,7 @@ impl Database {
     ) -> Result<Option<Vec<u8>>, StateError> {
         let datastore = self.datastore();
         let set_name = set_name.to_string();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT headers FROM active_archive_headers
@@ -572,7 +580,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<HashMap<String, Vec<u8>>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT set_name, headers FROM active_archive_headers
@@ -593,7 +601,7 @@ impl Database {
         job_id: JobId,
     ) -> Result<RarVolumeFactsBySet, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT set_name, volume_index, facts_blob
@@ -614,12 +622,37 @@ impl Database {
         })
     }
 
+    /// Reads every direct-store coverage checkpoint for a job, keyed by archive
+    /// set name. One statement, one row per set — restart never
+    /// pays a per-volume round trip.
+    pub fn load_direct_coverage(
+        &self,
+        job_id: JobId,
+    ) -> Result<HashMap<String, Vec<u8>>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT set_name, snapshot FROM active_direct_coverage
+                 WHERE job_id = {}
+                 ORDER BY set_name",
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?;
+            let mut coverage = HashMap::new();
+            for row in rows {
+                coverage.insert(row.text("set_name")?, row.bytes("snapshot")?);
+            }
+            Ok(coverage)
+        })
+    }
+
     pub fn load_deleted_volume_statuses(
         &self,
         job_id: JobId,
     ) -> Result<Vec<(String, u32)>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT set_name, volume_index

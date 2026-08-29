@@ -8,6 +8,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
+use weaver_yenc::CheckpointPlan;
 
 use crate::codec::{NntpCodec, NntpFrame, StreamChunk};
 use crate::commands::Command;
@@ -146,7 +147,14 @@ where
     (output, cpu)
 }
 
-fn deliver_fused_output_chunks<F>(
+/// Hand every decoded batch the fused decoder has produced to `on_chunk`, in
+/// order, before appending it to the article's own chunk list.
+///
+/// This is what makes the streaming design observable to a caller: batches are
+/// delivered as they are decoded, not once at article finish. Both the async
+/// and the blocking article readers route through here so neither can quietly
+/// stop firing the callback.
+pub(crate) fn deliver_fused_output_chunks<F>(
     chunks: Vec<Box<[u8]>>,
     article_chunks: &mut Vec<Box<[u8]>>,
     on_chunk: &mut F,
@@ -220,6 +228,20 @@ impl Default for NntpBufferProfile {
     }
 }
 
+/// How an NNTP connection determines PIPELINING support.
+///
+/// Application runtime connections use the persisted server setting. Explicit
+/// server validation opts into [`Self::Probe`] and performs one post-auth
+/// CAPABILITIES exchange instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PipeliningCapability {
+    /// Discover the capability from the server.
+    #[default]
+    Probe,
+    /// Use the persisted server setting and skip CAPABILITIES.
+    Known(bool),
+}
+
 /// Configuration for connecting to a single NNTP server.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -246,6 +268,11 @@ pub struct ServerConfig {
     /// Optional path to a PEM-encoded CA certificate to trust in addition
     /// to the system/Mozilla roots (e.g. self-signed or internal CAs).
     pub tls_ca_cert: Option<std::path::PathBuf>,
+    /// One explicitly adopted leaf certificate allowed only when normal TLS
+    /// verification fails because this server's hostname does not match.
+    pub tls_name_mismatch_certificate_der: Option<Vec<u8>>,
+    /// Source of the PIPELINING capability for this connection.
+    pub pipelining: PipeliningCapability,
 }
 
 impl Default for ServerConfig {
@@ -261,6 +288,8 @@ impl Default for ServerConfig {
             command_timeout: Duration::from_mins(1),
             buffer_profile: NntpBufferProfile::default(),
             tls_ca_cert: None,
+            tls_name_mismatch_certificate_der: None,
+            pipelining: PipeliningCapability::Probe,
         }
     }
 }
@@ -291,11 +320,25 @@ pub struct NntpConnection {
     credentials: Option<(String, String)>,
     /// Optional custom CA certificate path, kept for STARTTLS upgrades.
     tls_ca_cert: Option<std::path::PathBuf>,
+    /// Optional adopted leaf certificate, kept for STARTTLS upgrades.
+    tls_name_mismatch_certificate_der: Option<Vec<u8>>,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
+    /// Immutable geometry the next decoded article's CRC pass checkpoints at.
+    ///
+    /// Set per fetch by the lane rather than at connect time: connections are
+    /// pooled across jobs, and checkpoint geometry belongs to a job snapshot,
+    /// not to a socket. `None` is deliberately applied per response.
+    checkpoint_plan: CheckpointPlan,
 }
 
 impl NntpConnection {
+    /// Declare the checkpoint geometry for articles decoded on this connection
+    /// from now on. See [`Self::checkpoint_plan`].
+    pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
+        self.checkpoint_plan = checkpoint_plan;
+    }
+
     /// Connect to an NNTP server, perform TLS negotiation and authentication.
     pub async fn connect(config: &ServerConfig) -> Result<Self> {
         Self::connect_with_ip_policy(config, &[], 0).await
@@ -331,6 +374,7 @@ impl NntpConnection {
                 &config.host,
                 config.port,
                 config.tls_ca_cert.as_deref(),
+                config.tls_name_mismatch_certificate_der.as_deref(),
                 excluded_ips,
                 address_offset,
             )
@@ -354,7 +398,10 @@ impl NntpConnection {
             read_buf: BytesMut::with_capacity(read_buf_capacity),
             buffer_profile: config.buffer_profile,
             state: ConnectionState::Greeting,
-            capabilities: Capabilities::default(),
+            capabilities: match config.pipelining {
+                PipeliningCapability::Probe => Capabilities::default(),
+                PipeliningCapability::Known(supports) => Capabilities::from_pipelining(supports),
+            },
             host: config.host.clone(),
             remote_addr,
             created_at: now,
@@ -364,8 +411,10 @@ impl NntpConnection {
             current_group: None,
             credentials: None,
             tls_ca_cert: config.tls_ca_cert.clone(),
+            tls_name_mismatch_certificate_der: config.tls_name_mismatch_certificate_der.clone(),
             transfer_control: None,
             body_accounting: VecDeque::new(),
+            checkpoint_plan: CheckpointPlan::None,
         };
 
         // 2. Read greeting
@@ -384,24 +433,22 @@ impl NntpConnection {
             conn.do_starttls().await?;
         }
 
-        // 4. Fetch capabilities
-        conn.fetch_capabilities().await?;
-
-        // 5. MODE READER if needed
-        if conn.capabilities.mode_reader_required() {
-            debug!("sending MODE READER");
-            let resp = conn.send_command(&Command::ModeReader).await?;
-            if resp.code.is_error() && resp.code.raw() != 500 {
-                warn!(code = resp.code.raw(), "MODE READER failed");
-            }
+        // 4. MODE READER is safe to issue even when unsupported, and avoids a
+        // capability round trip on every pooled runtime connection.
+        debug!("sending MODE READER");
+        let resp = conn.send_command(&Command::ModeReader).await?;
+        if resp.code.is_error() && resp.code.raw() != 500 {
+            warn!(code = resp.code.raw(), "MODE READER failed");
         }
 
-        // 6. Authenticate if credentials provided
+        // 5. Authenticate if credentials provided
         if let (Some(user), Some(pass)) = (&config.username, &config.password) {
             conn.authenticate(user, pass).await?;
             conn.credentials = Some((user.clone(), pass.clone()));
+        }
 
-            // 7. Re-fetch capabilities — some servers change them after auth
+        // 6. Validation uses exactly one post-auth capability exchange.
+        if matches!(config.pipelining, PipeliningCapability::Probe) {
             conn.fetch_capabilities().await?;
         }
 
@@ -420,8 +467,13 @@ impl NntpConnection {
 
         // Take ownership of the transport, upgrade it, and put it back.
         let old_transport = self.transport.take().expect("transport must be present");
-        match crate::tls::upgrade_starttls(old_transport, &self.host, self.tls_ca_cert.as_deref())
-            .await
+        match crate::tls::upgrade_starttls(
+            old_transport,
+            &self.host,
+            self.tls_ca_cert.as_deref(),
+            self.tls_name_mismatch_certificate_der.as_deref(),
+        )
+        .await
         {
             Ok(upgraded) => {
                 self.transport = Some(upgraded);
@@ -883,6 +935,9 @@ impl NntpConnection {
     ///
     /// The returned data retains NNTP dot-stuffing. Use with `weaver_yenc::decode_nntp`
     /// which handles unstuffing inline during decode, avoiding a separate pass.
+    /// Size its destination from `weaver_yenc::max_decoded_len` of the returned
+    /// data, never from the article's declared `=ybegin size=` — a poster is
+    /// free to omit that field, and an undersized destination is a typed error.
     pub async fn body_by_id_raw(&mut self, message_id: &str) -> Result<MultiLineResponse> {
         self.body_by_id_raw_with_estimate(message_id, 0).await
     }
@@ -1323,6 +1378,7 @@ impl NntpConnection {
             }
         };
         decoder.set_profile_cpu(profile_cpu);
+        decoder.set_checkpoint_plan(self.checkpoint_plan.clone());
         let mut read_calls = 0u64;
         let mut read_bytes = 0u64;
         let mut transport_read = TransportReadStats::default();
@@ -1666,7 +1722,7 @@ mod tests {
     use crate::test_support::{
         ScriptedStep, spawn_scripted_server as spawn_shared_scripted_server,
     };
-    use crate::tls::ManualTlsStream;
+    use crate::tls::{ManualTlsStream, TLS_READ_TURN_LIMIT};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
@@ -1800,8 +1856,10 @@ mod tests {
             current_group: None,
             credentials: None,
             tls_ca_cert: None,
+            tls_name_mismatch_certificate_der: None,
             transfer_control: None,
             body_accounting: VecDeque::new(),
+            checkpoint_plan: CheckpointPlan::None,
         }
     }
 
@@ -2336,6 +2394,73 @@ mod tests {
         assert_eq!(read_buf.len(), TLS_DRAIN_PAYLOAD_BYTES);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_tls_transport_bounds_each_turn_and_preserves_stream() {
+        let (client_config, server_config) = test_tls_configs();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload_len = TLS_READ_TURN_LIMIT * 3 + 12_345;
+        let payload: Arc<[u8]> = (0..payload_len)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>()
+            .into();
+        let server_payload = Arc::clone(&payload);
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let acceptor = TlsAcceptor::from(server_config);
+            let mut tls = acceptor.accept(socket).await.unwrap();
+            tls.write_all(&server_payload).await.unwrap();
+            tls.flush().await.unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let remote_addr = tcp.peer_addr().unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let inner = ManualTlsStream::connect(tcp, client_config, server_name)
+            .await
+            .unwrap();
+        let mut transport = NntpTransport::ManualTls { inner, remote_addr };
+        let mut received = Vec::with_capacity(payload_len);
+        let mut read_buf = BytesMut::with_capacity(TLS_READ_TURN_LIMIT);
+        let mut read_calls = 0usize;
+
+        while received.len() < payload_len {
+            let read = tokio::time::timeout(
+                Duration::from_secs(5),
+                transport.read_into_buf_with_stats(&mut read_buf, usize::MAX),
+            )
+            .await
+            .expect("manual TLS read timed out")
+            .expect("manual TLS read failed");
+            assert_ne!(read.bytes, 0, "stream closed before the complete payload");
+            assert_eq!(read.bytes, read_buf.len());
+            assert!(
+                read.bytes <= TLS_READ_TURN_LIMIT,
+                "one read appended {} bytes, above the {}-byte turn limit",
+                read.bytes,
+                TLS_READ_TURN_LIMIT
+            );
+            received.extend_from_slice(&read_buf);
+            read_buf.clear();
+            read_calls += 1;
+        }
+
+        server.await.unwrap();
+        let eof = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport.read_into_buf(&mut read_buf, usize::MAX),
+        )
+        .await
+        .expect("manual TLS EOF read timed out")
+        .expect("manual TLS EOF read failed");
+
+        assert_eq!(eof, 0);
+        assert!(read_buf.is_empty());
+        assert!(read_calls >= 4);
+        assert_eq!(received.as_slice(), payload.as_ref());
+    }
+
     async fn spawn_scripted_server(steps: Vec<ScriptStep>, hold_open_after_last: Duration) -> u16 {
         spawn_shared_scripted_server(steps, hold_open_after_last).await
     }
@@ -2415,6 +2540,48 @@ mod tests {
         assert!(!cfg.starttls);
         assert!(cfg.username.is_none());
         assert!(cfg.password.is_none());
+        assert_eq!(cfg.pipelining, PipeliningCapability::Probe);
+    }
+
+    #[tokio::test]
+    async fn probe_fetches_capabilities_once_after_authentication() {
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("MODE READER"),
+                    response: b"500 MODE READER unsupported\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO USER"),
+                    response: b"381 password required\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO PASS"),
+                    response: b"281 authentication accepted\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"101 Capability list:\r\nPIPELINING\r\n.\r\n",
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let mut config = scripted_plain_config(port);
+        config.username = Some("user".into());
+        config.password = Some("pass".into());
+        let conn = NntpConnection::connect(&config).await.unwrap();
+        assert!(conn.capabilities().supports_pipelining());
     }
 
     #[tokio::test]
@@ -2466,11 +2633,6 @@ mod tests {
                 ScriptStep {
                     expect_prefix: None,
                     response: b"200 ready\r\n",
-                    delay: Duration::ZERO,
-                },
-                ScriptStep {
-                    expect_prefix: Some("CAPABILITIES"),
-                    response: b"500 unknown\r\n",
                     delay: Duration::ZERO,
                 },
                 ScriptStep {
@@ -2529,11 +2691,6 @@ mod tests {
                 ScriptStep {
                     expect_prefix: None,
                     response: b"200 ready\r\n",
-                    delay: Duration::ZERO,
-                },
-                ScriptStep {
-                    expect_prefix: Some("CAPABILITIES"),
-                    response: b"500 unknown\r\n",
                     delay: Duration::ZERO,
                 },
                 ScriptStep {
@@ -3085,11 +3242,6 @@ mod tests {
                     delay: Duration::ZERO,
                 },
                 ScriptStep {
-                    expect_prefix: Some("CAPABILITIES"),
-                    response: b"500 unknown\r\n",
-                    delay: Duration::ZERO,
-                },
-                ScriptStep {
                     expect_prefix: Some("AUTHINFO USER"),
                     response: b"381 password required\r\n",
                     delay: Duration::ZERO,
@@ -3177,18 +3329,21 @@ mod tests {
         let mut conn = NntpConnection::connect(&scripted_plain_config(port))
             .await
             .unwrap();
-        let mut chunk_lens = Vec::new();
+        let mut delivered: Vec<Vec<u8>> = Vec::new();
         let article = conn
             .stream_yenc_article("<test@example.com>", |chunk| {
-                chunk_lens.push(chunk.len());
+                delivered.push(chunk.to_vec());
                 Ok(())
             })
             .await
             .unwrap();
 
         assert_eq!(article.to_data(), original);
+        let chunk_lens: Vec<usize> = delivered.iter().map(Vec::len).collect();
         assert_eq!(chunk_lens, vec![FUSED_YENC_OUTPUT_BATCH_TARGET, 123]);
         assert_eq!(article.stats.output_batches, 2);
+        // The callback sees the same bytes as the buffered article, in order.
+        assert_eq!(delivered.concat(), article.to_data());
     }
 
     #[tokio::test]
@@ -3272,7 +3427,7 @@ mod tests {
 
         assert_eq!(chunks, vec![original.to_vec()]);
         assert_eq!(article.to_data(), original);
-        assert_eq!(article.result.bytes_written, original.len());
+        assert_eq!(article.yenc_result().bytes_written, original.len());
     }
 
     #[tokio::test]

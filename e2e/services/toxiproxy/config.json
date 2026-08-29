@@ -1,0 +1,14 @@
+[
+  {
+    "name": "nntp1",
+    "listen": "0.0.0.0:3119",
+    "upstream": "nntp:119",
+    "enabled": true
+  },
+  {
+    "name": "nntp2",
+    "listen": "0.0.0.0:4119",
+    "upstream": "nntp2:119",
+    "enabled": true
+  }
+]

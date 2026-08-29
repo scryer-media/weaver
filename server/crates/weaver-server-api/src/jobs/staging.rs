@@ -4,25 +4,70 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use async_graphql::UploadValue;
+use weaver_nzb::Nzb;
 
 use crate::auth::CallerIdentity;
 use weaver_server_core::auth::generate_api_key;
 use weaver_server_core::ingest::{
-    SubmitNzbError, nzb_to_submission_spec, persist_decoded_nzb_reader_to_zstd,
+    PreparedPersistedNzb, StagedSubmissionPreparation, SubmitNzbError,
+    XZ_DECODER_MEMORY_LIMIT_BYTES, nzb_to_submission_spec, parse_and_hash_persisted_nzb_bytes,
+    persist_decoded_nzb_reader_to_zstd, xz_multistream_decoder,
 };
+use weaver_server_core::jobs::FingerprintEvidence;
 use weaver_server_core::security::RuntimeSecurityConfig;
 
 const DEFAULT_STAGED_UPLOAD_TTL: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct StagedUploadEntry {
     pub(crate) id: String,
     pub(crate) owner: CallerIdentity,
     pub(crate) filename: String,
     pub(crate) nzb_zstd: Vec<u8>,
+    pub(crate) preparation: Option<StagedSubmissionPreparation>,
     created_at: Instant,
     last_touched_at: Instant,
+}
+
+fn staged_preparation_from_nzb(
+    nzb: &Nzb,
+    filename: &str,
+    job_hash: [u8; 32],
+) -> StagedSubmissionPreparation {
+    let spec = nzb_to_submission_spec(nzb, Some(filename), None, None, Vec::new());
+    let evidence = FingerprintEvidence::from_validated_spec(&spec, job_hash);
+    StagedSubmissionPreparation { spec, evidence }
+}
+
+impl StagedUploadEntry {
+    pub(crate) async fn rehydrate_preparation(&mut self) -> Result<(), SubmitNzbError> {
+        let filename = self.filename.clone();
+        let nzb_zstd = self.nzb_zstd.clone();
+        let preparation = tokio::task::spawn_blocking(move || {
+            let (nzb, raw_job_hash) = match parse_and_hash_persisted_nzb_bytes(&nzb_zstd) {
+                Ok(parsed) => parsed,
+                Err(weaver_server_core::ingest::PersistedNzbError::Io(error)) => {
+                    return Err(SubmitNzbError::Save(error));
+                }
+                Err(weaver_server_core::ingest::PersistedNzbError::Parse(error)) => {
+                    return Err(SubmitNzbError::Parse(error));
+                }
+            };
+            if nzb.files.is_empty() {
+                return Err(SubmitNzbError::Empty);
+            }
+            Ok(staged_preparation_from_nzb(&nzb, &filename, raw_job_hash))
+        })
+        .await
+        .map_err(|error| {
+            SubmitNzbError::State(weaver_server_core::StateError::Database(format!(
+                "staged submission preparation worker panicked: {error}"
+            )))
+        })??;
+        self.preparation = Some(preparation);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,7 +134,7 @@ impl StagedUploadManager {
         })
         .await
         .map_err(|error| SubmitNzbError::Upload(std::io::Error::other(error.to_string())))?;
-        let (nzb_zstd, nzb) = match persist_result {
+        let prepared = match persist_result {
             Ok(values) => values,
             Err(weaver_server_core::ingest::PersistedNzbError::Io(error)) => {
                 return Err(SubmitNzbError::Save(error));
@@ -98,11 +143,28 @@ impl StagedUploadManager {
                 return Err(SubmitNzbError::Parse(error));
             }
         };
-        if nzb.files.is_empty() {
+        if prepared.nzb.files.is_empty() {
             return Err(SubmitNzbError::Empty);
         }
 
-        let spec = nzb_to_submission_spec(&nzb, Some(filename.as_str()), None, None, Vec::new());
+        let PreparedPersistedNzb {
+            nzb_zstd,
+            nzb,
+            raw_job_hash,
+        } = prepared;
+        let filename_for_preparation = filename.clone();
+        let preparation = tokio::task::spawn_blocking(move || {
+            staged_preparation_from_nzb(&nzb, &filename_for_preparation, raw_job_hash)
+        })
+        .await
+        .map_err(|error| {
+            SubmitNzbError::State(weaver_server_core::StateError::Database(format!(
+                "staged submission preparation worker panicked: {error}"
+            )))
+        })?;
+        let display_name = preparation.spec.name.clone();
+        let total_files = preparation.spec.files.len() as u32;
+        let total_bytes = preparation.spec.total_bytes;
         let staged_upload_id = generate_api_key();
         let now = Instant::now();
         let entry = StagedUploadEntry {
@@ -110,6 +172,7 @@ impl StagedUploadManager {
             owner,
             filename: filename.clone(),
             nzb_zstd,
+            preparation: Some(preparation),
             created_at: now,
             last_touched_at: now,
         };
@@ -124,9 +187,9 @@ impl StagedUploadManager {
         Ok(StagedUploadSummary {
             staged_upload_id,
             filename,
-            display_name: spec.name,
-            total_files: spec.files.len() as u32,
-            total_bytes: spec.total_bytes,
+            display_name,
+            total_files,
+            total_bytes,
         })
     }
 
@@ -218,6 +281,7 @@ enum UploadEncoding {
     Gzip,
     Brotli,
     Deflate,
+    Xz,
 }
 
 fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
@@ -233,6 +297,9 @@ fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
     }
     if filename.ends_with(".deflate") {
         return UploadEncoding::Deflate;
+    }
+    if filename.ends_with(".xz") {
+        return UploadEncoding::Xz;
     }
 
     let Some(content_type) = upload.content_type.as_deref() else {
@@ -252,6 +319,7 @@ fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
         "application/deflate" | "application/x-deflate" | "application/octet-stream+deflate" => {
             UploadEncoding::Deflate
         }
+        "application/x-xz" | "application/xz" | "application/octet-stream+xz" => UploadEncoding::Xz,
         _ => UploadEncoding::Plain,
     }
 }
@@ -315,6 +383,10 @@ pub(crate) fn normalize_uploaded_nzb_reader(
         UploadEncoding::Gzip => Box::new(flate2::read::GzDecoder::new(source)),
         UploadEncoding::Brotli => Box::new(brotli::Decompressor::new(source, 64 * 1024)),
         UploadEncoding::Deflate => Box::new(flate2::read::DeflateDecoder::new(source)),
+        UploadEncoding::Xz => Box::new(
+            xz_multistream_decoder(source, XZ_DECODER_MEMORY_LIMIT_BYTES)
+                .map_err(SubmitNzbError::Upload)?,
+        ),
     };
 
     Ok(Box::new(LimitedReader::new(
@@ -327,6 +399,10 @@ pub(crate) fn normalize_uploaded_nzb_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
+    use std::io::Write;
+
+    use lzma_rust2::{XzOptions, XzWriter};
 
     fn minimal_nzb(name: &str) -> String {
         format!(
@@ -345,6 +421,34 @@ mod tests {
             filename: format!("{name}.nzb"),
             content_type: Some("application/x-nzb".to_string()),
             content: minimal_nzb(name).into_bytes().into(),
+        }
+    }
+
+    fn make_large_single_file_upload(segment_count: usize) -> UploadValue {
+        let mut xml = String::with_capacity(segment_count * 65);
+        xml.push_str(r#"<nzb><file poster="p" date="0" subject="large"><segments>"#);
+        for number in 1..=segment_count {
+            write!(
+                xml,
+                r#"<segment bytes="1" number="{number}">{number}@test</segment>"#
+            )
+            .unwrap();
+        }
+        xml.push_str("</segments></file></nzb>");
+        UploadValue {
+            filename: "large.nzb".to_string(),
+            content_type: Some("application/x-nzb".to_string()),
+            content: xml.into_bytes().into(),
+        }
+    }
+
+    fn make_xz_upload(filename: &str, content_type: &str, name: &str) -> UploadValue {
+        let mut writer = XzWriter::new(Vec::new(), XzOptions::with_preset(0)).unwrap();
+        writer.write_all(minimal_nzb(name).as_bytes()).unwrap();
+        UploadValue {
+            filename: filename.to_string(),
+            content_type: Some(content_type.to_string()),
+            content: writer.finish().unwrap().into(),
         }
     }
 
@@ -372,6 +476,54 @@ mod tests {
             manager.take_for_submit(&owner_b, std::slice::from_ref(&staged.staged_upload_id));
         assert!(found.is_empty());
         assert_eq!(missing, vec![staged.staged_upload_id]);
+    }
+
+    #[tokio::test]
+    async fn stages_xz_uploads_by_filename_or_mime_type() {
+        let manager =
+            StagedUploadManager::with_timing(Duration::from_secs(60), Duration::from_secs(60));
+        let owner = CallerIdentity::Local([4; 32]);
+
+        for (filename, content_type) in [
+            ("filename.nzb.xz", "application/octet-stream"),
+            ("mime.nzb", "application/x-xz"),
+        ] {
+            let staged = manager
+                .stage_upload(
+                    owner.clone(),
+                    make_xz_upload(filename, content_type, "xz-upload"),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(staged.filename, filename);
+            assert_eq!(staged.total_files, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn stages_a_file_above_the_former_per_file_segment_cap() {
+        const SEGMENTS: usize = 100_001;
+        let manager =
+            StagedUploadManager::with_timing(Duration::from_secs(60), Duration::from_secs(60));
+        let owner = CallerIdentity::Local([5; 32]);
+
+        let staged = manager
+            .stage_upload(owner, make_large_single_file_upload(SEGMENTS), None)
+            .await
+            .unwrap();
+
+        assert_eq!(staged.total_files, 1);
+        assert_eq!(staged.total_bytes, SEGMENTS as u64);
+        let entries = manager
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let preparation = entries[&staged.staged_upload_id]
+            .preparation
+            .as_ref()
+            .unwrap();
+        assert_eq!(preparation.spec.files[0].segments.len(), SEGMENTS);
     }
 
     #[tokio::test]

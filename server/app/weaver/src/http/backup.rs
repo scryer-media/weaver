@@ -5,12 +5,13 @@ use std::{path::PathBuf, sync::Arc};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{
-    Extension, FromRequestParts, Multipart,
+    ConnectInfo, Extension, FromRequestParts, Multipart,
     multipart::{Field, MultipartError},
 };
 use axum::http::{HeaderMap, StatusCode, header, request::Parts};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
+use std::net::SocketAddr;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 
@@ -94,10 +95,20 @@ async fn require_admin(
     auth_cache: &LoginAuthCache,
     api_key_cache: &ApiKeyCache,
     session_token: &str,
+    security: &RuntimeSecurityConfig,
+    peer: Option<SocketAddr>,
     headers: &HeaderMap,
 ) -> Result<(), StatusCode> {
-    let scope =
-        super::auth::resolve_scope(db, auth_cache, api_key_cache, session_token, headers).await?;
+    let scope = super::auth::resolve_scope(
+        db,
+        auth_cache,
+        api_key_cache,
+        session_token,
+        security,
+        super::auth::BrowserSessionPolicy::TrustedPeer(peer),
+        headers,
+    )
+    .await?;
     if scope.is_admin() {
         Ok(())
     } else {
@@ -106,14 +117,21 @@ async fn require_admin(
 }
 
 pub(super) async fn backup_status_handler(
-    Extension(db): Extension<Database>,
-    Extension(auth_cache): Extension<LoginAuthCache>,
-    Extension(api_key_cache): Extension<ApiKeyCache>,
     Extension(backup): Extension<BackupService>,
-    Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
+    Extension(request_auth): Extension<super::RequestAuthContext>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> Result<Json<BackupStatus>, StatusCode> {
-    require_admin(&db, &auth_cache, &api_key_cache, &session_token, &headers).await?;
+    require_admin(
+        &request_auth.db,
+        &request_auth.auth_cache,
+        &request_auth.api_key_cache,
+        request_auth.session_token.0.as_str(),
+        &request_auth.security,
+        peer.map(|Extension(ConnectInfo(peer))| peer),
+        &headers,
+    )
+    .await?;
     let status = backup
         .status()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -121,16 +139,22 @@ pub(super) async fn backup_status_handler(
 }
 
 pub(super) async fn backup_export_handler(
-    Extension(db): Extension<Database>,
-    Extension(auth_cache): Extension<LoginAuthCache>,
-    Extension(api_key_cache): Extension<ApiKeyCache>,
     Extension(backup): Extension<BackupService>,
-    Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
+    Extension(request_auth): Extension<super::RequestAuthContext>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(body): Json<BackupExportRequest>,
 ) -> Response {
-    if let Err(status) =
-        require_admin(&db, &auth_cache, &api_key_cache, &session_token, &headers).await
+    if let Err(status) = require_admin(
+        &request_auth.db,
+        &request_auth.auth_cache,
+        &request_auth.api_key_cache,
+        request_auth.session_token.0.as_str(),
+        &request_auth.security,
+        peer.map(|Extension(ConnectInfo(peer))| peer),
+        &headers,
+    )
+    .await
     {
         return status.into_response();
     }
@@ -171,11 +195,20 @@ pub(super) async fn backup_inspect_handler(
         session_token,
         security,
     }: BackupHandlerState,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    if let Err(status) =
-        require_admin(&db, &auth_cache, &api_key_cache, &session_token, &headers).await
+    if let Err(status) = require_admin(
+        &db,
+        &auth_cache,
+        &api_key_cache,
+        &session_token,
+        &security,
+        peer.map(|Extension(ConnectInfo(peer))| peer),
+        &headers,
+    )
+    .await
     {
         return status.into_response();
     }
@@ -223,11 +256,20 @@ pub(super) async fn backup_restore_handler(
         session_token,
         security,
     }: BackupHandlerState,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    if let Err(status) =
-        require_admin(&db, &auth_cache, &api_key_cache, &session_token, &headers).await
+    if let Err(status) = require_admin(
+        &db,
+        &auth_cache,
+        &api_key_cache,
+        &session_token,
+        &security,
+        peer.map(|Extension(ConnectInfo(peer))| peer),
+        &headers,
+    )
+    .await
     {
         return status.into_response();
     }

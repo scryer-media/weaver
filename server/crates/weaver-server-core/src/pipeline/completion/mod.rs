@@ -1,6 +1,6 @@
 use super::*;
 
-mod finalize;
+pub(crate) mod finalize;
 
 #[cfg(test)]
 pub(crate) use finalize::NestedExtractionDecision;

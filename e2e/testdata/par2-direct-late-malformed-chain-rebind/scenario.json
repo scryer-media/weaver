@@ -1,0 +1,34 @@
+{
+  "slug": "par2-direct-late-malformed-chain-rebind",
+  "title": "E2E.Test.PAR2.Direct.Late.Malformed.Chain.Rebind.2026.1080p-TESTGRP",
+  "description": "A store-method RAR5 set routes two canonical volumes directly, then its tail pair arrives under each other's PAR2-bound ordinal. Direct routing must demote on the malformed chain, preserve the routed volumes, and extract through canonical PAR2 identity without a second NNTP fetch.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "fixtureAssets": [
+    "direct-store-par2-repair/archive.part1.rar",
+    "direct-store-par2-repair/archive.part2.rar",
+    "direct-store-par2-repair/archive.part4.rar::violet.cascade.mkv.part3.rar",
+    "direct-store-par2-repair/archive.part3.rar::violet.cascade.mkv.part4.rar",
+    "direct-store-par2-repair/archive.par2"
+  ],
+  "nzb_subject_filename_overrides": {
+    "violet.cascade.mkv.part3.rar": "archive.part3.rar",
+    "violet.cascade.mkv.part4.rar": "archive.part4.rar"
+  },
+  "forbiddenJobEvents": ["RepairStarted", "RepairComplete", "RepairFailed", "ExtractionMemberFailed", "ExtractionFailed"],
+  "expectedOutputBLAKE3": {
+    "violet.cascade.s01e07.mkv": "69d3cd3c6a7bd0118985796437c52a761f0f718df90da0582de74a097276bca8"
+  },
+  "runtimeAssertions": {
+    "fileIdentityRewrite": {
+      "requiredCurrentFilenames": ["archive.part1.rar", "archive.part2.rar", "archive.part3.rar", "archive.part4.rar"],
+      "forbiddenCurrentFilenames": ["violet.cascade.mkv.part3.rar", "violet.cascade.mkv.part4.rar"],
+      "requiredClassificationSource": "par2"
+    },
+    "directStore": {
+      "expectedDemotionReason": "member_malformed_chain",
+      "requireRoutedByteMaterialization": true,
+      "forbidVolumeRefetch": true
+    }
+  }
+}

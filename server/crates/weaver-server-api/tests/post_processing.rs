@@ -2,185 +2,331 @@ mod common;
 
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 use weaver_server_api::auth::CallerScope;
-use weaver_server_core::post_processing::discovery::{
-    DiscoveryOptions, discover_and_record_extensions,
-};
-use weaver_server_core::post_processing::model::FrozenPlanProvenance;
+
+/// Write a bare script into the harness's `data_dir/scripts`.
+async fn write_script(harness: &TestHarness, name: &str, body: &str) {
+    let data_dir = std::path::PathBuf::from(harness.config.read().await.data_dir.clone());
+    let scripts = data_dir.join("scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::write(scripts.join(name), body).unwrap();
+}
 
 #[tokio::test]
-async fn settings_are_admin_only_and_disabled_by_default() {
+async fn settings_are_admin_only_and_execution_is_off_by_default() {
     let harness = TestHarness::new().await;
     let denied = harness
         .execute_as(
-            "{ postProcessingSettings { discoveryEnabled executionEnabled } }",
+            "{ postProcessingSettings { executionEnabled } }",
             CallerScope::Read,
         )
         .await;
     assert_has_errors(&denied);
 
     let response = harness
-        .execute("{ postProcessingSettings { discoveryEnabled executionEnabled concurrency } }")
+        .execute(
+            "{ postProcessingSettings { scriptDirectory executionEnabled concurrency terminationGraceSeconds strictSecurityRefusesExecution lists { global { script } } } }",
+        )
         .await;
     assert_no_errors(&response);
-    let data = response_data(&response);
-    assert_eq!(data["postProcessingSettings"]["discoveryEnabled"], false);
-    assert_eq!(data["postProcessingSettings"]["executionEnabled"], false);
-    assert_eq!(data["postProcessingSettings"]["concurrency"], 1);
+    let settings = &response_data(&response)["postProcessingSettings"];
+    assert!(std::path::Path::new(settings["scriptDirectory"].as_str().unwrap()).is_absolute());
+    assert_eq!(settings["executionEnabled"], false);
+    assert_eq!(settings["concurrency"], 1);
+    assert_eq!(settings["terminationGraceSeconds"], 10);
+    assert_eq!(settings["strictSecurityRefusesExecution"], false);
+    assert_eq!(settings["lists"]["global"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
-async fn settings_update_round_trips_and_control_scope_can_operate_queue() {
+async fn scripts_directory_is_admin_owned_and_clears_assignments_when_changed() {
+    let harness = TestHarness::new().await;
+    let denied = harness
+        .execute_as(
+            r#"mutation { setPostProcessingScriptDirectory(directory: "/tmp/scripts") { scriptDirectory } }"#,
+            CallerScope::Read,
+        )
+        .await;
+    assert_has_errors(&denied);
+
+    let lists = harness
+        .execute(
+            r#"mutation { setScriptLists(input: { global: [{ script: "notify.sh" }] }) { global { script } } }"#,
+        )
+        .await;
+    assert_no_errors(&lists);
+
+    let root = tempfile::tempdir().unwrap();
+    let requested = root.path().join("nested/scripts");
+    let requested_gql = serde_json::to_string(&requested).unwrap();
+    let response = harness
+        .execute(&format!(
+            "mutation {{ setPostProcessingScriptDirectory(directory: {requested_gql}) {{ scriptDirectory lists {{ global {{ script }} }} }} }}"
+        ))
+        .await;
+    assert_no_errors(&response);
+    let settings = &response_data(&response)["setPostProcessingScriptDirectory"];
+    let canonical = std::fs::canonicalize(&requested).unwrap();
+    assert_eq!(
+        settings["scriptDirectory"],
+        canonical.to_string_lossy().as_ref()
+    );
+    assert!(settings["lists"]["global"].as_array().unwrap().is_empty());
+
+    std::fs::write(
+        canonical.join("replacement.sh"),
+        "#!/bin/sh\necho replacement\n",
+    )
+    .unwrap();
+    let listing = harness.execute("{ scripts { scripts { name } } }").await;
+    assert_no_errors(&listing);
+    assert_eq!(
+        response_data(&listing)["scripts"]["scripts"][0]["name"],
+        "replacement.sh"
+    );
+}
+
+#[tokio::test]
+async fn settings_round_trip_and_reject_an_out_of_range_concurrency() {
     let harness = TestHarness::new().await;
     let response = harness
         .execute(
             r#"
             mutation {
-              updatePostProcessingSettings(input: {
-                discoveryEnabled: true
+              setPostProcessingSettings(input: {
                 executionEnabled: true
                 concurrency: 2
                 terminationGraceSeconds: 15
                 pythonInterpreter: "/usr/bin/python3"
-                allowedRoots: ["/downloads"]
               }) {
-                discoveryEnabled
                 executionEnabled
                 concurrency
                 terminationGraceSeconds
                 pythonInterpreter
-                allowedRoots
               }
             }
             "#,
         )
         .await;
     assert_no_errors(&response);
-    let data = response_data(&response);
-    let settings = &data["updatePostProcessingSettings"];
-    assert_eq!(settings["discoveryEnabled"], true);
+    let settings = &response_data(&response)["setPostProcessingSettings"];
     assert_eq!(settings["executionEnabled"], true);
     assert_eq!(settings["concurrency"], 2);
     assert_eq!(settings["terminationGraceSeconds"], 15);
     assert_eq!(settings["pythonInterpreter"], "/usr/bin/python3");
-    assert_eq!(settings["allowedRoots"][0], "/downloads");
+
+    let rejected = harness
+        .execute(
+            r#"mutation { setPostProcessingSettings(input: {
+                executionEnabled: true
+                concurrency: 99
+                terminationGraceSeconds: 15
+            }) { concurrency } }"#,
+        )
+        .await;
+    assert_has_errors(&rejected);
+}
+
+#[tokio::test]
+async fn scripts_are_listed_live_from_the_directory_with_their_problems() {
+    let harness = TestHarness::new().await;
+    write_script(&harness, "notify.sh", "#!/bin/sh\necho hi\n").await;
+    write_script(
+        &harness,
+        "legacy.py",
+        "#!/usr/bin/env python3\n### NZBGET POST-PROCESSING SCRIPT ###\n",
+    )
+    .await;
+    let data_dir = std::path::PathBuf::from(harness.config.read().await.data_dir.clone());
+    let broken = data_dir.join("scripts/broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join("manifest.json"), "{ not json").unwrap();
 
     let denied = harness
-        .execute_as("mutation { pausePostProcessingQueue }", CallerScope::Read)
+        .execute_as("{ scripts { scripts { name } } }", CallerScope::Read)
         .await;
     assert_has_errors(&denied);
-    let paused = harness
-        .execute_as(
-            "mutation { pausePostProcessingQueue }",
-            CallerScope::Control,
-        )
+
+    let response = harness
+        .execute("{ scripts { scripts { name displayName adapter } problems { name message } } }")
         .await;
-    assert_no_errors(&paused);
-    let resumed = harness
-        .execute_as(
-            "mutation { resumePostProcessingQueue }",
-            CallerScope::Control,
-        )
-        .await;
-    assert_no_errors(&resumed);
-    let denied_reorder = harness
-        .execute_as(
-            "mutation { reorderPostProcessingQueue(runIds: []) }",
-            CallerScope::Read,
-        )
-        .await;
-    assert_has_errors(&denied_reorder);
-    let reordered = harness
-        .execute_as(
-            "mutation { reorderPostProcessingQueue(runIds: []) }",
-            CallerScope::Control,
-        )
-        .await;
-    assert_no_errors(&reordered);
+    assert_no_errors(&response);
+    let listing = &response_data(&response)["scripts"];
+    let scripts = listing["scripts"].as_array().unwrap();
+    assert_eq!(scripts.len(), 2);
+    let by_name = |name: &str| {
+        scripts
+            .iter()
+            .find(|script| script["name"] == name)
+            .unwrap_or_else(|| panic!("{name} was not listed"))
+    };
+    assert_eq!(by_name("notify.sh")["adapter"], "SABNZBD");
+    assert_eq!(by_name("legacy.py")["adapter"], "NZBGET");
+    assert_eq!(listing["problems"].as_array().unwrap().len(), 1);
+    assert_eq!(listing["problems"][0]["name"], "broken");
 }
 
 #[tokio::test]
-async fn omitted_submission_selection_freezes_the_legacy_empty_plan() {
-    let harness = TestHarness::new().await;
-    let job_id = harness.submit_test_nzb("post-processing-compat").await;
-    let plan = harness
-        .db
-        .frozen_post_processing_plan(job_id)
-        .unwrap()
-        .expect("submission should freeze an explicit empty plan");
-    assert!(matches!(plan.provenance(), FrozenPlanProvenance::Empty));
-    assert!(plan.steps().is_empty());
-}
-
-#[tokio::test]
-async fn readable_state_queries_do_not_require_admin_scope() {
+async fn script_lists_round_trip_with_a_category_override() {
     let harness = TestHarness::new().await;
     let response = harness
-        .execute_as(
-            "{ postProcessingRevisions { extensionId } postProcessingProfiles { profileId } postProcessingQueue { runId } postProcessingArtifacts(runId: \"run-missing\") { path } }",
-            CallerScope::Read,
+        .execute(
+            r#"
+            mutation {
+              setScriptLists(input: {
+                global: [{ script: "notify.sh", enabled: true, timeoutSeconds: 30 }]
+                categories: [{ category: "movies", entries: [{ script: "sort.sh", enabled: false }] }]
+              }) {
+                global { script enabled timeoutSeconds }
+                categories { category entries { script enabled } }
+              }
+            }
+            "#,
         )
         .await;
     assert_no_errors(&response);
+    let lists = &response_data(&response)["setScriptLists"];
+    assert_eq!(lists["global"][0]["script"], "notify.sh");
+    assert_eq!(lists["global"][0]["timeoutSeconds"], 30);
+    assert_eq!(lists["categories"][0]["category"], "movies");
+    assert_eq!(lists["categories"][0]["entries"][0]["enabled"], false);
+
+    let settings = harness
+        .execute(
+            "{ postProcessingSettings { lists { global { script } categories { category } } } }",
+        )
+        .await;
+    assert_no_errors(&settings);
+    let lists = &response_data(&settings)["postProcessingSettings"]["lists"];
+    assert_eq!(lists["global"][0]["script"], "notify.sh");
+    assert_eq!(lists["categories"][0]["category"], "movies");
+
+    // A script name that could escape the directory is refused outright.
+    let rejected = harness
+        .execute(r#"mutation { setScriptLists(input: { global: [{ script: "../escape" }] }) { global { script } } }"#)
+        .await;
+    assert_has_errors(&rejected);
 }
 
 #[tokio::test]
-async fn manifest_diagnostics_are_admin_only_and_require_approval() {
+async fn script_options_are_validated_against_the_manifest_and_masked_when_secret() {
     let harness = TestHarness::new().await;
     let data_dir = std::path::PathBuf::from(harness.config.read().await.data_dir.clone());
-    let extension_dir = data_dir.join("scripts/diagnostic");
-    std::fs::create_dir_all(&extension_dir).unwrap();
+    let package = data_dir.join("scripts/email");
+    std::fs::create_dir_all(&package).unwrap();
     std::fs::write(
-        extension_dir.join("weaver-extension.json"),
-        r#"{
-            "schema_version": 1,
-            "kind": "native",
-            "id": "example.diagnostic",
-            "name": "Diagnostic Example",
+        package.join("manifest.json"),
+        serde_json::json!({
+            "main": "email.py",
+            "name": "email",
+            "kind": "POST-PROCESSING",
+            "displayName": "Email",
             "version": "1.0.0",
-            "entrypoint": "diagnostic",
-            "commands": [{
-                "name": "connectionTest",
-                "action": "Run connection test"
-            }],
-            "options": []
-        }"#,
+            "author": "Author",
+            "homepage": "https://example.invalid",
+            "license": "GNU",
+            "about": "About",
+            "description": [],
+            "requirements": [],
+            "queueEvents": "",
+            "taskTime": "",
+            "sections": [],
+            "commands": [],
+            "options": [
+                {"name": "Host", "displayName": "Host", "value": "mail.example.invalid", "description": [], "select": []},
+                {"name": "Token", "displayName": "Token", "value": "", "description": [], "select": [], "secret": true}
+            ]
+        })
+        .to_string(),
     )
     .unwrap();
-    std::fs::write(extension_dir.join("diagnostic"), b"diagnostic fixture").unwrap();
-    let manifest = discover_and_record_extensions(
-        &harness.db,
-        &data_dir,
-        DiscoveryOptions {
-            enabled: true,
-            bare_script_adapter: None,
-        },
-        1,
-    )
-    .unwrap()
-    .into_iter()
-    .next()
-    .unwrap()
-    .manifest;
-    let revision = manifest.revision();
-    let mutation = format!(
-        r#"mutation {{
-            runPostProcessingDiagnostic(input: {{
-                extensionId: "{}"
-                revisionId: "{}"
-                command: "connectionTest"
-            }}) {{ succeeded }}
-        }}"#,
-        revision.extension_id().as_str(),
-        revision.revision_id().as_str()
+    std::fs::write(package.join("email.py"), "#!/usr/bin/env python3\n").unwrap();
+
+    let response = harness
+        .execute(
+            r#"
+            mutation {
+              setScriptOptions(script: "email", options: [
+                { name: "Host", optionType: STRING, value: "smtp.example.invalid" }
+                { name: "Token", optionType: SECRET, value: "hunter2" }
+              ]) {
+                name
+                options { name optionType value defaultValue }
+              }
+            }
+            "#,
+        )
+        .await;
+    assert_no_errors(&response);
+    let script = &response_data(&response)["setScriptOptions"];
+    assert_eq!(script["name"], "email");
+    let options = script["options"].as_array().unwrap();
+    let host = options.iter().find(|o| o["name"] == "Host").unwrap();
+    assert_eq!(host["value"], "smtp.example.invalid");
+    assert_eq!(host["defaultValue"], "mail.example.invalid");
+    let token = options.iter().find(|o| o["name"] == "Token").unwrap();
+    assert_eq!(token["optionType"], "SECRET");
+    assert_eq!(
+        token["value"], "[REDACTED]",
+        "a stored secret must never be echoed back"
     );
 
-    let denied = harness.execute_as(&mutation, CallerScope::Control).await;
-    assert_has_errors(&denied);
-    let unapproved = harness.execute(&mutation).await;
-    assert_has_errors(&unapproved);
-    assert!(
-        unapproved.errors[0]
-            .message
-            .contains("approved extension revision")
+    // Options the manifest does not declare are refused rather than stored.
+    let rejected = harness
+        .execute(
+            r#"mutation { setScriptOptions(script: "email", options: [
+                { name: "Nope", optionType: STRING, value: "x" }
+            ]) { name } }"#,
+        )
+        .await;
+    assert_has_errors(&rejected);
+
+    // A script that is not in the directory cannot have options at all.
+    let missing = harness
+        .execute(r#"mutation { setScriptOptions(script: "gone.sh", options: []) { name } }"#)
+        .await;
+    assert_has_errors(&missing);
+}
+
+#[tokio::test]
+async fn results_are_readable_and_control_scope_owns_rerun_and_cancel() {
+    let harness = TestHarness::new().await;
+    let empty = harness
+        .execute_as(
+            "{ postProcessingResults(jobId: 1) { script status } }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&empty);
+    assert_eq!(
+        response_data(&empty)["postProcessingResults"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
     );
+
+    let denied = harness
+        .execute_as(
+            "mutation { rerunPostProcessing(jobId: 1) }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_has_errors(&denied);
+    // Control scope is allowed to ask, and is told the job has no history.
+    let no_history = harness
+        .execute_as(
+            "mutation { rerunPostProcessing(jobId: 1) }",
+            CallerScope::Control,
+        )
+        .await;
+    assert_has_errors(&no_history);
+    assert!(no_history.errors[0].message.contains("history"));
+
+    let denied = harness
+        .execute_as(
+            "mutation { cancelJobPostProcessing(jobId: 1) }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_has_errors(&denied);
 }

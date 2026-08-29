@@ -106,7 +106,7 @@ fn staging_cleanup_preserves_recent_dirs() {
 #[test]
 fn staging_cleanup_ignores_par2_backup_names() {
     let temp = tempfile::tempdir().unwrap();
-    let backup = temp.path().join(".weaver-par2-backup.123");
+    let backup = temp.path().join(".par2-rs-backup.123");
     std::fs::create_dir_all(&backup).unwrap();
 
     let report = cleanup_stale_staging_dirs_at(

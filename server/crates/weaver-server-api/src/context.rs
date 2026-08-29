@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_graphql::{Schema, SchemaBuilder};
@@ -17,6 +17,12 @@ use crate::schema::{MutationRoot, QueryRoot, SubscriptionRoot};
 pub type WeaverSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 pub const GRAPHQL_MAX_COMPLEXITY: usize = 512;
 pub const GRAPHQL_MAX_DEPTH: usize = 16;
+
+#[derive(Clone)]
+pub struct SystemRuntimeContext {
+    pub profile: Arc<RwLock<weaver_server_core::runtime::system_profile::SystemProfile>>,
+    pub started_at: std::time::Instant,
+}
 
 pub fn apply_graphql_query_guards<Query, Mutation, Subscription>(
     builder: SchemaBuilder<Query, Mutation, Subscription>,
@@ -41,10 +47,14 @@ pub struct SchemaContext {
         Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
     pub auth_cache: LoginAuthCache,
     pub api_key_cache: ApiKeyCache,
+    /// The security settings the process actually started with, so resolvers
+    /// can report the running bind address rather than re-deriving it.
+    pub security: weaver_server_core::security::RuntimeSecurityConfig,
     pub rss: RssService,
     pub watch_folder: WatchFolderService,
     pub schedules: weaver_server_core::bandwidth::schedule::SharedSchedules,
     pub log_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
+    pub system_runtime: SystemRuntimeContext,
     /// Live NNTP pool for per-server health metrics. `None` in contexts without a pool (tests).
     pub nntp_pool: Option<Arc<NntpPool>>,
     /// Whether to spawn the background history-delete worker. Always `true` in
@@ -53,10 +63,10 @@ pub struct SchemaContext {
     /// the assertion. The `HistoryDeleteManager` is still wired into the schema
     /// so on-demand delete mutations work regardless.
     pub spawn_history_delete_worker: bool,
-    /// Production passes the pipeline-owned service so automatic runs and API
-    /// reruns share concurrency, pause, and cancellation state.
-    pub post_processing_service:
-        Option<weaver_server_core::post_processing::service::PostProcessingService>,
+    /// Production passes the pipeline-owned executor so automatic runs and API
+    /// reruns share concurrency and cancellation state.
+    pub post_processing_executor:
+        Option<weaver_server_core::post_processing::executor::PostProcessingExecutor>,
 }
 
 /// Render the GraphQL SDL for the public API without constructing any runtime
@@ -66,13 +76,23 @@ pub struct SchemaContext {
 /// [`build_schema`] only bound complexity/depth and introspection, none of
 /// which change the emitted SDL.
 pub fn export_schema_sdl() -> String {
-    Schema::build(
+    let sdl = Schema::build(
         QueryRoot::default(),
         MutationRoot::default(),
         SubscriptionRoot::default(),
     )
     .finish()
-    .sdl()
+    .sdl();
+    let had_trailing_newline = sdl.ends_with('\n');
+    let mut normalized = sdl
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if had_trailing_newline {
+        normalized.push('\n');
+    }
+    normalized
 }
 
 pub fn build_schema(context: SchemaContext) -> WeaverSchema {
@@ -99,12 +119,22 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
         .expect("http client build should succeed");
     let staged_upload_manager = StagedUploadManager::new();
     staged_upload_manager.spawn_cleanup_worker();
-    let post_processing_service = context.post_processing_service.clone().unwrap_or_else(|| {
+    let post_processing_executor = context.post_processing_executor.clone().unwrap_or_else(|| {
         let settings = context.db.post_processing_settings().unwrap_or_default();
-        weaver_server_core::post_processing::service::PostProcessingService::new_with_termination_grace(
+        // Only reached in tests: production hands over the pipeline's executor.
+        let data_dir = context
+            .config
+            .try_read()
+            .map(|config| std::path::PathBuf::from(&config.data_dir))
+            .unwrap_or_default();
+        let script_directory = context
+            .db
+            .initialize_post_processing_script_directory(&data_dir, None)
+            .unwrap_or_else(|_| data_dir.join("scripts"));
+        weaver_server_core::post_processing::executor::PostProcessingExecutor::new(
             context.db.clone(),
+            script_directory,
             usize::from(settings.concurrency),
-            Duration::from_secs(settings.termination_grace_seconds),
         )
     });
 
@@ -120,15 +150,17 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     .data(context.server_transfer_policy)
     .data(context.auth_cache)
     .data(context.api_key_cache)
+    .data(context.security)
     .data(context.rss)
     .data(context.watch_folder)
     .data(context.schedules)
     .data(http_client)
     .data(context.log_buffer)
+    .data(context.system_runtime)
     .data(context.nntp_pool)
     .data(replay)
     .data(history_delete_manager)
     .data(staged_upload_manager);
-    let schema = schema.data(post_processing_service);
+    let schema = schema.data(post_processing_executor);
     schema.finish()
 }

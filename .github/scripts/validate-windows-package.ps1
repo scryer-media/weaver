@@ -6,7 +6,16 @@ param(
   [string]$ZipPath,
 
   [Parameter(Mandatory = $true)]
-  [string]$BuiltExePath
+  [string]$MsiPath,
+
+  [Parameter(Mandatory = $true)]
+  [string]$MsiMetadataPath,
+
+  [Parameter(Mandatory = $true)]
+  [string]$BuiltExePath,
+
+  [Parameter(Mandatory = $true)]
+  [string]$BuiltTrayPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,7 +25,9 @@ $defenderLog = "$prefix-defender-scan.log"
 $attachmentLog = "$prefix-attachment-services.log"
 $startupLog = "$prefix-noarg-startup.log"
 $wingetLog = "$prefix-winget-install.log"
-$validationRoot = Join-Path $env:RUNNER_TEMP "weaver-package-validation-$Architecture"
+$validationTempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
+$validationRoot = Join-Path $validationTempRoot "weaver-package-validation-$Architecture"
+$validationEncryptionKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 
 function Write-Log {
   param(
@@ -50,6 +61,28 @@ function Restore-EnvVar {
   } else {
     Set-Item -Path "Env:$Name" -Value $Value
   }
+}
+
+function Get-ProgramFiles64 {
+  if ($env:ProgramW6432) {
+    return $env:ProgramW6432
+  }
+
+  return ${env:ProgramFiles}
+}
+
+function Invoke-MsiExec {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string[]]$Arguments
+  )
+
+  # The package is x64-only. Sysnative ensures a mistakenly launched 32-bit
+  # PowerShell host still invokes the native 64-bit Windows Installer.
+  $msiExecDirectory = if ([Environment]::Is64BitProcess) { "System32" } else { "Sysnative" }
+  $msiExec = Join-Path $env:WINDIR "$msiExecDirectory\msiexec.exe"
+  $process = Start-Process -FilePath $msiExec -ArgumentList $Arguments -PassThru -Wait
+  return $process.ExitCode
 }
 
 function Get-MpCmdRun {
@@ -168,12 +201,17 @@ function Invoke-NoArgStartupSmoke {
   $oldLocalAppData = $env:LOCALAPPDATA
   $oldAppData = $env:APPDATA
   $oldBindAddress = $env:WEAVER_HTTP_BIND_ADDRESS
+  $oldEncryptionKey = $env:WEAVER_ENCRYPTION_KEY
   $process = $null
 
   try {
     $env:LOCALAPPDATA = $localAppData
     $env:APPDATA = $appData
     $env:WEAVER_HTTP_BIND_ADDRESS = "127.0.0.1"
+    # GitHub Actions and OpenSSH processes do not have an interactive Windows
+    # logon session, so Credential Manager is intentionally unavailable there.
+    # Use a fixed test-only key to exercise first-run and restart behavior.
+    $env:WEAVER_ENCRYPTION_KEY = $validationEncryptionKey
 
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse("127.0.0.1"), 9090)
     try {
@@ -195,27 +233,23 @@ function Invoke-NoArgStartupSmoke {
       }
 
       try {
-        $spa = Invoke-WebRequest -Uri "http://127.0.0.1:9090/" -WebSession $session -TimeoutSec 5
+        $spa = Invoke-WebRequest -Uri "http://127.0.0.1:9090/" -WebSession $session -TimeoutSec 5 -UseBasicParsing
         if ($spa.StatusCode -ne 200) {
           throw "SPA returned HTTP $($spa.StatusCode)"
         }
 
-        $payload = @{ query = "query { systemStatus { version } }" } | ConvertTo-Json -Compress
-        $api = Invoke-WebRequest -Uri "http://127.0.0.1:9090/graphql" -Method Post -ContentType "application/json" -Body $payload -WebSession $session -TimeoutSec 5
-        $responseText = if ($api.Content -is [byte[]]) {
-          [System.Text.Encoding]::UTF8.GetString($api.Content)
-        } else {
-          [string]$api.Content
-        }
-        $json = $responseText | ConvertFrom-Json
-        if ($json.errors) {
-          throw "GraphQL errors: $($json.errors | ConvertTo-Json -Compress -Depth 8)"
-        }
-        if (-not $json.data.systemStatus.version) {
-          throw "GraphQL systemStatus did not include a version"
+        $readiness = Invoke-WebRequest -Uri "http://127.0.0.1:9090/readyz" -WebSession $session -TimeoutSec 5 -UseBasicParsing
+        if ($readiness.StatusCode -ne 200) {
+          throw "readiness probe returned HTTP $($readiness.StatusCode)"
         }
 
-        Write-Log $startupLog "No-arg startup API smoke passed with version $($json.data.systemStatus.version)"
+        $payload = @{ query = "query { systemStatus { version } }" } | ConvertTo-Json -Compress
+        $api = Invoke-WebRequest -Uri "http://127.0.0.1:9090/graphql" -Method Post -ContentType "application/json" -Body $payload -WebSession $session -TimeoutSec 5 -UseBasicParsing -SkipHttpErrorCheck
+        if ([int]$api.StatusCode -ne 401) {
+          throw "unauthenticated GraphQL returned HTTP $($api.StatusCode), expected 401"
+        }
+
+        Write-Log $startupLog "No-arg startup API smoke passed; readiness is healthy and GraphQL authentication is enforced"
         $ready = $true
         break
       } catch {
@@ -259,128 +293,152 @@ function Invoke-NoArgStartupSmoke {
     Restore-EnvVar -Name "LOCALAPPDATA" -Value $oldLocalAppData
     Restore-EnvVar -Name "APPDATA" -Value $oldAppData
     Restore-EnvVar -Name "WEAVER_HTTP_BIND_ADDRESS" -Value $oldBindAddress
+    Restore-EnvVar -Name "WEAVER_ENCRYPTION_KEY" -Value $oldEncryptionKey
   }
 }
 
-function Assert-WindowsKeyPersistence {
+function Assert-NoArgKeyPersistence {
   $defaultLog = Join-Path $validationRoot "noarg-startup\local-app-data\weaver\logs\weaver.log"
   if (-not (Test-Path $defaultLog)) {
-    throw "Cannot verify Credential Manager persistence because $defaultLog does not exist."
+    throw "Cannot verify no-arg encryption-key persistence because $defaultLog does not exist."
   }
 
   $contents = Get-Content $defaultLog -Raw
-  if ($contents -notmatch "using encryption master key from Windows Credential Manager") {
-    throw "A repeated Windows startup did not reuse its Credential Manager encryption key."
+  if ($contents -notmatch "using encryption master key from WEAVER_ENCRYPTION_KEY") {
+    throw "A repeated no-arg startup did not use the explicit validation encryption key."
   }
-  Write-Log $startupLog "Repeated startup reused the Windows Credential Manager encryption key."
+  Write-Log $startupLog "Repeated no-arg startup used the explicit validation encryption key."
 }
 
-function Invoke-WinGetLocalInstallSmoke {
+function Write-WinGetMsiManifest {
   param(
     [Parameter(Mandatory = $true)]
-    [string]$PackageZip
+    [string]$ManifestRoot,
+
+    [Parameter(Mandatory = $true)]
+    [string]$PackageMsi,
+
+    [Parameter(Mandatory = $true)]
+    [string]$InstallerUrl,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ProductCode,
+
+    [Parameter(Mandatory = $true)]
+    [string]$PackageVersion
   )
 
-  $winget = (Get-Command winget.exe -ErrorAction SilentlyContinue).Source
-  if (-not $winget) {
-    Write-Log $wingetLog "winget.exe was not found; local manifest install smoke skipped."
-    return
-  }
-
-  $manifestRoot = Join-Path $validationRoot "winget-manifest"
   New-Item -ItemType Directory -Force -Path $manifestRoot | Out-Null
-  $zipHash = (Get-FileHash $PackageZip -Algorithm SHA256).Hash.ToUpperInvariant()
-  $zipUri = ([System.Uri](Resolve-Path $PackageZip).Path).AbsoluteUri
+  $msiHash = (Get-FileHash $PackageMsi -Algorithm SHA256).Hash.ToUpperInvariant()
   $wingetArchitecture = if ($Architecture -eq "x86_64") { "x64" } else { "arm64" }
 
   @"
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json
 PackageIdentifier: ScryerMedia.Weaver
-PackageVersion: 0.0.0
+PackageVersion: $PackageVersion
 DefaultLocale: en-US
 ManifestType: version
-ManifestVersion: 1.12.0
+ManifestVersion: 1.10.0
 "@ | Set-Content -Path (Join-Path $manifestRoot "ScryerMedia.Weaver.yaml") -Encoding utf8
 
   @"
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
 PackageIdentifier: ScryerMedia.Weaver
-PackageVersion: 0.0.0
+PackageVersion: $PackageVersion
 PackageLocale: en-US
 Publisher: Scryer Media
 PackageName: Weaver
 License: GPL-3.0
 ShortDescription: High-performance Usenet binary downloader.
 ManifestType: defaultLocale
-ManifestVersion: 1.12.0
+ManifestVersion: 1.10.0
 "@ | Set-Content -Path (Join-Path $manifestRoot "ScryerMedia.Weaver.locale.en-US.yaml") -Encoding utf8
 
   @"
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
 PackageIdentifier: ScryerMedia.Weaver
-PackageVersion: 0.0.0
-InstallerType: zip
-NestedInstallerType: portable
-NestedInstallerFiles:
-- RelativeFilePath: weaver.exe
-  PortableCommandAlias: weaver-ci-$Architecture
+PackageVersion: $PackageVersion
+InstallerType: msi
+UpgradeBehavior: uninstallPrevious
 Installers:
 - Architecture: $wingetArchitecture
-  InstallerUrl: $zipUri
-  InstallerSha256: $zipHash
+  InstallerUrl: $InstallerUrl
+  InstallerSha256: $msiHash
+  ProductCode: '$ProductCode'
 ManifestType: installer
-ManifestVersion: 1.12.0
+ManifestVersion: 1.10.0
 "@ | Set-Content -Path (Join-Path $manifestRoot "ScryerMedia.Weaver.installer.yaml") -Encoding utf8
-
-  Write-Log $wingetLog "Running winget local manifest install smoke from $manifestRoot"
-  $installSucceeded = $false
-  try {
-    & $winget settings --enable LocalManifestFiles *>> $wingetLog
-    & $winget install --manifest $manifestRoot --accept-package-agreements --accept-source-agreements --disable-interactivity *>> $wingetLog
-    if ($LASTEXITCODE -ne 0) {
-      throw "winget install exited with code $LASTEXITCODE"
-    }
-    $installSucceeded = $true
-    Write-Log $wingetLog "winget local manifest install smoke succeeded."
-
-    $aliasName = "weaver-ci-$Architecture"
-    $installedExe = (Get-Command $aliasName -ErrorAction SilentlyContinue).Source
-    if (-not $installedExe) {
-      $link = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links") -Filter "$aliasName*" -ErrorAction SilentlyContinue |
-        Select-Object -First 1 -ExpandProperty FullName
-      $installedExe = $link
-    }
-    if (-not $installedExe -or -not (Test-Path $installedExe)) {
-      throw "winget installed the package but did not create the $aliasName command alias"
-    }
-
-    & $installedExe --version *>> $wingetLog
-    if ($LASTEXITCODE -ne 0) {
-      throw "winget-installed Weaver --version exited with code $LASTEXITCODE"
-    }
-    Write-Log $wingetLog "winget-installed command alias executed successfully from $installedExe."
-
-    Invoke-NoArgStartupSmoke -ExePath $installedExe
-    Assert-WindowsKeyPersistence
-    Write-Log $wingetLog "winget-installed Weaver reused the Windows Credential Manager key."
-  } catch {
-    if ($installSucceeded) {
-      Write-Log $wingetLog "winget-installed Weaver validation failed: $($_.Exception.Message)"
-      throw
-    }
-    Write-Log $wingetLog "winget local manifest install smoke was inconclusive: $($_.Exception.Message)"
-    Write-Warning "winget local manifest install smoke was inconclusive; see $wingetLog."
-  } finally {
-    try {
-      & $winget uninstall --id ScryerMedia.Weaver --accept-source-agreements --disable-interactivity *>> $wingetLog
-    } catch {
-      Write-Log $wingetLog "winget cleanup failed or package was not installed: $($_.Exception.Message)"
-    } finally {
-      # This smoke is evidence-only: Defender, Attachment Services, and startup checks
-      # above are the release-blocking package validations. Do not let a local WinGet
-      # transport/install quirk leak through PowerShell's native-command exit code.
-      Reset-NativeExitCode
-    }
-  }
 }
 
+function Invoke-WinGetManifestValidation {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$PackageMsi,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ProductCode,
+
+    [Parameter(Mandatory = $true)]
+    [string]$PackageVersion
+  )
+
+  $winget = (Get-Command winget.exe -ErrorAction SilentlyContinue).Source
+  if (-not $winget) {
+    try {
+      Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop
+    } catch {
+      throw "winget.exe was not found and the App Installer could not be registered: $($_.Exception.Message)"
+    }
+
+    $appInstaller = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue |
+      Select-Object -First 1
+    if ($appInstaller) {
+      $candidate = Join-Path $appInstaller.InstallLocation "winget.exe"
+      if (Test-Path -LiteralPath $candidate) {
+        $winget = $candidate
+      }
+    }
+
+    if (-not $winget) {
+      $winget = (Get-Command winget.exe -ErrorAction SilentlyContinue).Source
+    }
+    if (-not $winget) {
+      throw "winget.exe was not found after registering the App Installer; MSI manifest validation is required."
+    }
+  }
+
+  $manifestRoot = Join-Path $validationRoot "winget-manifest"
+  $installerUrl = "https://github.com/scryer-media/weaver/releases/download/weaver-local-ci/weaver-windows-$Architecture.msi"
+  Write-WinGetMsiManifest `
+    -ManifestRoot $manifestRoot `
+    -PackageMsi $PackageMsi `
+    -InstallerUrl $installerUrl `
+    -ProductCode $ProductCode `
+    -PackageVersion $PackageVersion
+
+  $expectedSchemaHeaders = @{
+    "ScryerMedia.Weaver.yaml" = '# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json'
+    "ScryerMedia.Weaver.locale.en-US.yaml" = '# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json'
+    "ScryerMedia.Weaver.installer.yaml" = '# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json'
+  }
+  foreach ($manifest in $expectedSchemaHeaders.GetEnumerator()) {
+    $manifestPath = Join-Path $manifestRoot $manifest.Key
+    $actualHeader = Get-Content -LiteralPath $manifestPath -TotalCount 1
+    if ($actualHeader -ne $manifest.Value) {
+      throw "Generated WinGet manifest '$($manifest.Key)' has an invalid schema header: '$actualHeader'"
+    }
+  }
+
+  Write-Log $wingetLog "Validating the generated MSI winget manifest from $manifestRoot"
+  & $winget validate --manifest $manifestRoot --disable-interactivity *>> $wingetLog
+  $manifestValidationExitCode = $LASTEXITCODE
+  if ($manifestValidationExitCode -eq -1978335192) {
+    Write-Log $wingetLog "WinGet manifest validation succeeded with warnings; schema headers were checked explicitly."
+  } elseif ($manifestValidationExitCode -ne 0) {
+    Get-Content -LiteralPath $wingetLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+    throw "winget manifest validation exited with code $manifestValidationExitCode"
+  }
+}
 Remove-Item -Recurse -Force $validationRoot -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $validationRoot | Out-Null
 "" | Set-Content $defenderLog
@@ -389,12 +447,18 @@ New-Item -ItemType Directory -Force -Path $validationRoot | Out-Null
 "" | Set-Content $wingetLog
 
 $zipCopy = Join-Path $validationRoot (Split-Path $ZipPath -Leaf)
+$msiCopy = Join-Path $validationRoot (Split-Path $MsiPath -Leaf)
 $extractRoot = Join-Path $validationRoot "extracted"
 Copy-Item $ZipPath $zipCopy -Force
+Copy-Item $MsiPath $msiCopy -Force
 Expand-Archive -Path $zipCopy -DestinationPath $extractRoot -Force
 $packagedExe = Join-Path $extractRoot "weaver.exe"
+$packagedTray = Join-Path $extractRoot "weaver-tray.exe"
 if (-not (Test-Path $packagedExe)) {
   throw "Packaged zip did not contain weaver.exe at the zip root."
+}
+if (-not (Test-Path $packagedTray)) {
+  throw "Packaged zip did not contain weaver-tray.exe at the zip root."
 }
 
 $builtHash = (Get-FileHash $BuiltExePath -Algorithm SHA256).Hash
@@ -402,14 +466,98 @@ $packagedHash = (Get-FileHash $packagedExe -Algorithm SHA256).Hash
 if ($builtHash -ne $packagedHash) {
   throw "Packaged weaver.exe hash differs from built executable."
 }
+$builtTrayHash = (Get-FileHash $BuiltTrayPath -Algorithm SHA256).Hash
+$packagedTrayHash = (Get-FileHash $packagedTray -Algorithm SHA256).Hash
+if ($builtTrayHash -ne $packagedTrayHash) {
+  throw "Packaged weaver-tray.exe hash differs from built executable."
+}
+
+foreach ($unsignedArtifact in @($packagedExe, $packagedTray, $msiCopy)) {
+  $signature = Get-AuthenticodeSignature -FilePath $unsignedArtifact
+  if ($signature.Status -ne "NotSigned") {
+    throw "Expected intentionally unsigned artifact $unsignedArtifact, got Authenticode status $($signature.Status)."
+  }
+}
+
+$msiMetadata = Get-Content $MsiMetadataPath -Raw | ConvertFrom-Json
+if ($msiMetadata.product_code -notmatch '^\{[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$') {
+  throw "MSI metadata did not contain a valid ProductCode: $($msiMetadata.product_code)"
+}
+if ($msiMetadata.version -notmatch '^\d+\.\d+\.\d+$') {
+  throw "MSI metadata did not contain a valid release version: $($msiMetadata.version)"
+}
 
 Invoke-DefenderScan -Path $zipCopy
 Invoke-DefenderScan -Path $packagedExe
+Invoke-DefenderScan -Path $packagedTray
+Invoke-DefenderScan -Path $msiCopy
 
 $sourceUrl = "https://github.com/scryer-media/weaver/releases/download/weaver-local-ci/$(Split-Path $zipCopy -Leaf)"
 Invoke-AttachmentServicesSave -Path $zipCopy -Source $sourceUrl
+Invoke-AttachmentServicesSave -Path $msiCopy -Source ($sourceUrl -replace 'zip$', 'msi')
 
 Invoke-NoArgStartupSmoke -ExePath $packagedExe
 Invoke-NoArgStartupSmoke -ExePath $packagedExe
-Assert-WindowsKeyPersistence
-Invoke-WinGetLocalInstallSmoke -PackageZip $zipCopy
+Assert-NoArgKeyPersistence
+
+$desktopProfile = Join-Path $env:LOCALAPPDATA "ScryerMedia\Weaver"
+$profileMarker = Join-Path $desktopProfile "preserve-on-uninstall.txt"
+New-Item -ItemType Directory -Force -Path $desktopProfile | Out-Null
+"preserve me" | Set-Content $profileMarker
+$msiLog = "$prefix-msi-install.log"
+$msiExitCode = Invoke-MsiExec -Arguments @("/i", $msiCopy, "/qn", "/norestart", "/l*v", $msiLog)
+if ($msiExitCode -ne 0) {
+  throw "MSI install failed with exit code $msiExitCode. See $msiLog."
+}
+
+$installDir = Join-Path (Get-ProgramFiles64) "Scryer Media\Weaver"
+$installedExe = Join-Path $installDir "weaver.exe"
+$installedTray = Join-Path $installDir "weaver-tray.exe"
+foreach ($required in @($installedExe, $installedTray, (Join-Path $installDir "LICENSE"))) {
+  if (-not (Test-Path $required)) {
+    throw "MSI did not install expected payload file $required"
+  }
+}
+if ((Get-FileHash $installedExe -Algorithm SHA256).Hash -ne $builtHash) {
+  throw "MSI-installed weaver.exe hash differs from the built executable."
+}
+if ((Get-FileHash $installedTray -Algorithm SHA256).Hash -ne $builtTrayHash) {
+  throw "MSI-installed weaver-tray.exe hash differs from the built executable."
+}
+if (-not (Test-Path (Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Weaver\Weaver.lnk"))) {
+  throw "MSI did not create the Weaver Start Menu shortcut."
+}
+if (Get-Process weaver-tray -ErrorAction SilentlyContinue) {
+  throw "Silent MSI install started weaver-tray.exe; silent installs must stay quiet."
+}
+if (([Environment]::GetEnvironmentVariable("Path", "Machine")) -match [regex]::Escape($installDir)) {
+  throw "MSI added its install directory to the machine PATH."
+}
+if (Get-CimInstance Win32_Service | Where-Object { $_.PathName -match [regex]::Escape($installDir) }) {
+  throw "MSI registered a Windows service for Weaver."
+}
+
+& $installedExe --version *>> $msiLog
+if ($LASTEXITCODE -ne 0) {
+  throw "MSI-installed weaver.exe --version failed with exit code $LASTEXITCODE."
+}
+
+$msiExitCode = Invoke-MsiExec -Arguments @("/fa", $msiCopy, "/qn", "/norestart", "/l*v", $msiLog)
+if ($msiExitCode -ne 0) {
+  throw "MSI repair failed with exit code $msiExitCode. See $msiLog."
+}
+$msiExitCode = Invoke-MsiExec -Arguments @("/x", $msiMetadata.product_code, "/qn", "/norestart", "/l*v", $msiLog)
+if ($msiExitCode -ne 0) {
+  throw "MSI uninstall failed with exit code $msiExitCode. See $msiLog."
+}
+if (Test-Path $installDir) {
+  throw "MSI uninstall retained the Program Files payload directory $installDir."
+}
+if (-not (Test-Path $profileMarker)) {
+  throw "MSI uninstall removed desktop user data at $profileMarker."
+}
+
+Invoke-WinGetManifestValidation `
+  -PackageMsi $msiCopy `
+  -ProductCode $msiMetadata.product_code `
+  -PackageVersion $msiMetadata.version

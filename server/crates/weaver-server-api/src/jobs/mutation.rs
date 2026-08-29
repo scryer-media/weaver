@@ -19,9 +19,10 @@ use crate::jobs::types::{
 };
 use crate::{ScheduledResumeCoordinator, ScheduledResumeError};
 use weaver_server_core::ingest::{
-    SubmissionDuplicateOutcome, SubmissionOptions, SubmitNzbError, SubmittedJob,
-    fetch_nzb_from_url, materialize_semantic_promotion, submit_nzb_bytes_with_options,
-    submit_staged_nzb_zstd_with_options, submit_uploaded_nzb_reader_with_options,
+    ORIGINAL_TITLE_METADATA_KEY, SubmissionDuplicateOutcome, SubmissionOptions, SubmitNzbError,
+    SubmittedJob, fetch_nzb_from_url, materialize_semantic_promotion,
+    normalize_archive_password_candidate, submit_nzb_bytes_with_options,
+    submit_staged_prepared_nzb_with_options, submit_uploaded_nzb_reader_with_options,
 };
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::jobs::{
@@ -132,20 +133,6 @@ impl JobsMutation {
         let dupe_key = input.dupe_key.clone();
         let dupe_score = input.dupe_score;
         let dupe_mode = input.dupe_mode;
-        let post_processing_selection = input
-            .post_processing
-            .clone()
-            .map(crate::post_processing::types::PostProcessingSelectionInput::into_domain)
-            .transpose()
-            .map_err(|message| graphql_error("INVALID_INPUT", message))?;
-        let db_for_plan = db.clone();
-        let frozen_post_processing_plan = tokio::task::spawn_blocking(move || {
-            db_for_plan.freeze_submission_post_processing_plan(post_processing_selection.as_ref())
-        })
-        .await
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-        .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
-
         let (entries, missing) =
             manager.take_for_submit(&caller_identity, &input.staged_upload_ids);
         let mut found_by_id = entries
@@ -157,7 +144,7 @@ impl JobsMutation {
         let mut results = Vec::with_capacity(input.staged_upload_ids.len());
 
         for staged_upload_id in input.staged_upload_ids {
-            let Some(entry) = found_by_id.remove(&staged_upload_id) else {
+            let Some(mut entry) = found_by_id.remove(&staged_upload_id) else {
                 let error = if missing_ids.contains(&staged_upload_id) {
                     "staged upload expired; re-add file".to_string()
                 } else {
@@ -179,7 +166,7 @@ impl JobsMutation {
                 .as_deref()
                 .or(client_request_id.as_deref())
                 .map(|key| format!("{key}:staged:{staged_upload_id}"));
-            let mut options = graphql_submission_options(
+            let options = graphql_submission_options(
                 &caller_identity,
                 None,
                 staged_idempotency_key.as_deref(),
@@ -188,17 +175,51 @@ impl JobsMutation {
                 dupe_score,
                 dupe_mode,
             );
-            options.frozen_post_processing_plan = frozen_post_processing_plan.clone();
 
-            match submit_staged_nzb_zstd_with_options(
+            let original_title = entry.preparation.as_ref().and_then(|preparation| {
+                preparation
+                    .spec
+                    .metadata
+                    .iter()
+                    .find(|(key, _)| key == ORIGINAL_TITLE_METADATA_KEY)
+                    .cloned()
+            });
+            let Some(mut preparation) = entry.preparation.take() else {
+                manager.restore_entry(entry);
+                results.push(StagedNzbSubmissionResult {
+                    staged_upload_id,
+                    accepted: false,
+                    retained: false,
+                    status: None,
+                    item: None,
+                    semantic_duplicate: None,
+                    error: Some("staged upload is unavailable; re-add file".to_string()),
+                });
+                continue;
+            };
+            preparation.spec.password = normalize_archive_password_candidate(password.as_deref())
+                .or(preparation.spec.password);
+            preparation.spec.category = category.clone();
+            preparation.spec.metadata = metadata.clone();
+            if !preparation
+                .spec
+                .metadata
+                .iter()
+                .any(|(key, _)| key == ORIGINAL_TITLE_METADATA_KEY)
+                && let Some(original_title) = original_title
+            {
+                preparation.spec.metadata.push(original_title);
+            }
+            let nzb_zstd = std::mem::take(&mut entry.nzb_zstd);
+            let restore_nzb_zstd = nzb_zstd.clone();
+
+            match submit_staged_prepared_nzb_with_options(
                 db,
                 handle,
                 config,
-                entry.nzb_zstd.clone(),
+                preparation,
+                nzb_zstd,
                 Some(entry.filename.clone()),
-                password.clone(),
-                category.clone(),
-                metadata.clone(),
                 options,
             )
             .await
@@ -225,8 +246,13 @@ impl JobsMutation {
                 }
                 Err(error) => {
                     let structured = submission_result_from_error(client_request_id.clone(), error);
-                    manager.restore_entry(entry);
-                    let (status, semantic_duplicate, error) = match structured {
+                    entry.nzb_zstd = restore_nzb_zstd;
+                    let retention = entry.rehydrate_preparation().await;
+                    let retained = retention.is_ok();
+                    if retained {
+                        manager.restore_entry(entry);
+                    }
+                    let (status, semantic_duplicate, mut error) = match structured {
                         Ok(result) => (
                             Some(result.status),
                             result.semantic_duplicate,
@@ -238,10 +264,15 @@ impl JobsMutation {
                         ),
                         Err(error) => (None, None, error.to_string()),
                     };
+                    if let Err(retention_error) = retention {
+                        error = format!(
+                            "{error}; staged upload could not be retained: {retention_error}"
+                        );
+                    }
                     results.push(StagedNzbSubmissionResult {
                         staged_upload_id,
                         accepted: false,
-                        retained: true,
+                        retained,
                         status,
                         item: None,
                         semantic_duplicate,
@@ -469,12 +500,14 @@ impl JobsMutation {
     ) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let mut base_update = JobUpdate::default();
-        if let Some(category) = category {
-            base_update.category = if category.is_empty() {
-                FieldUpdate::Clear
-            } else {
-                FieldUpdate::Set(category)
-            };
+        if let Some(category) = category.as_deref() {
+            let resolved = weaver_server_core::ingest::resolve_submission_category(
+                ctx.data::<SharedConfig>()?,
+                Some(category),
+            )
+            .await
+            .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
+            base_update.category = resolved.map_or(FieldUpdate::Clear, FieldUpdate::Set);
         }
 
         let normalized_priority = priority
@@ -991,26 +1024,12 @@ async fn submission_result_item(
 
 async fn submit_from_facade_input(
     ctx: &Context<'_>,
-    mut input: SubmitNzbInput,
+    input: SubmitNzbInput,
 ) -> Result<SubmissionResult> {
     let handle = ctx.data::<SchedulerHandle>()?;
     let db = ctx.data::<Database>()?;
     let config = ctx.data::<SharedConfig>()?;
     let caller = caller_identity(ctx)?;
-    let post_processing_selection = input
-        .post_processing
-        .take()
-        .map(crate::post_processing::types::PostProcessingSelectionInput::into_domain)
-        .transpose()
-        .map_err(|message| graphql_error("INVALID_INPUT", message))?;
-    let db_for_plan = db.clone();
-    let frozen_post_processing_plan = tokio::task::spawn_blocking(move || {
-        db_for_plan.freeze_submission_post_processing_plan(post_processing_selection.as_ref())
-    })
-    .await
-    .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-    .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
-
     let (nzb_bytes, upload, filename) = match (input.nzb_base64, input.url, input.nzb_upload) {
         (Some(b64), None, None) => {
             let bytes = base64::engine::general_purpose::STANDARD
@@ -1043,7 +1062,7 @@ async fn submit_from_facade_input(
 
     let client_request_id = input.client_request_id.clone();
     let category = input.category.clone();
-    let mut options = graphql_submission_options(
+    let options = graphql_submission_options(
         &caller,
         client_request_id.as_deref(),
         input.idempotency_key.as_deref(),
@@ -1052,7 +1071,6 @@ async fn submit_from_facade_input(
         input.dupe_score,
         input.dupe_mode,
     );
-    options.frozen_post_processing_plan = frozen_post_processing_plan;
     let metadata = submit_metadata(input.attributes, input.client_request_id.clone())
         .map_err(|message| graphql_error("INVALID_INPUT", message))?;
 

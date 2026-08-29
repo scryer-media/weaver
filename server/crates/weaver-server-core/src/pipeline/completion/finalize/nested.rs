@@ -68,6 +68,9 @@ impl Pipeline {
             weaver_model::files::FileRole::TarBz2Archive => {
                 Some(crate::jobs::assembly::ArchiveType::TarBz2)
             }
+            weaver_model::files::FileRole::TarXzArchive => {
+                Some(crate::jobs::assembly::ArchiveType::TarXz)
+            }
             weaver_model::files::FileRole::GzArchive => {
                 Some(crate::jobs::assembly::ArchiveType::Gz)
             }
@@ -82,6 +85,9 @@ impl Pipeline {
             }
             weaver_model::files::FileRole::Bzip2Archive => {
                 Some(crate::jobs::assembly::ArchiveType::Bzip2)
+            }
+            weaver_model::files::FileRole::XzArchive => {
+                Some(crate::jobs::assembly::ArchiveType::Xz)
             }
             weaver_model::files::FileRole::SplitFile { .. } => {
                 Some(crate::jobs::assembly::ArchiveType::Split)
@@ -236,7 +242,10 @@ impl Pipeline {
                     continue;
                 }
                 if !file_type.is_file() {
-                    continue;
+                    return Err(format!(
+                        "extraction tree contains non-file/non-directory entry {}",
+                        path.display()
+                    ));
                 }
 
                 let relative_path = path
@@ -267,44 +276,6 @@ impl Pipeline {
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         Self::detect_nested_archive_identities(root, &mut files, password_candidates).await?;
         Ok(files)
-    }
-
-    fn clear_empty_dirs(root: &Path) -> Result<(), String> {
-        fn prune(root: &Path, current: &Path) -> Result<bool, String> {
-            let mut has_entries = false;
-            let entries = std::fs::read_dir(current)
-                .map_err(|error| format!("failed to read {}: {error}", current.display()))?;
-            for entry in entries {
-                let entry = entry.map_err(|error| {
-                    format!("failed to read entry in {}: {error}", current.display())
-                })?;
-                let path = entry.path();
-                let file_type = entry
-                    .file_type()
-                    .map_err(|error| format!("failed to stat {}: {error}", path.display()))?;
-                if file_type.is_dir() {
-                    if prune(root, &path)? {
-                        has_entries = true;
-                    }
-                } else {
-                    has_entries = true;
-                }
-            }
-
-            if current != root && !has_entries {
-                std::fs::remove_dir(current).map_err(|error| {
-                    format!("failed to remove empty dir {}: {error}", current.display())
-                })?;
-                return Ok(false);
-            }
-
-            Ok(has_entries)
-        }
-
-        if root.exists() {
-            let _ = prune(root, root)?;
-        }
-        Ok(())
     }
 
     pub(super) async fn clear_persisted_extracted_members(&self, job_id: JobId) {
@@ -499,6 +470,15 @@ impl Pipeline {
             .flat_map(|topology| topology.volume_map.keys().cloned())
             .collect();
         let scan_root = self.nested_scan_root(job_id)?;
+        if self
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.staging_dir.as_ref())
+            .is_some_and(|staging| staging == &scan_root)
+        {
+            let budget = self.extraction_budget(job_id, &scan_root)?;
+            ExtractionRoot::open(&scan_root)?.scan_no_links(&budget)?;
+        }
         let password_candidates = self.archive_password_candidates_for_job(job_id);
         let scanned_files = Self::scan_extraction_root(&scan_root, password_candidates).await?;
         let nested_archives: Vec<NestedArchiveFile> = scanned_files
@@ -541,26 +521,19 @@ impl Pipeline {
             return Ok(NestedExtractionDecision::PreserveOutputsAtDepthLimit);
         }
 
-        for file in &scanned_files {
-            if Self::archive_type_for_role(&file.effective_role()).is_some() {
-                continue;
-            }
-            let path = scan_root.join(&file.relative_path);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "failed to remove intermediate extracted file {}: {error}",
-                        path.display()
-                    ));
-                }
-            }
-        }
-        Self::clear_empty_dirs(&scan_root)?;
-
         self.clear_job_extraction_runtime(job_id);
         self.clear_job_rar_runtime(job_id);
+        // Direct-store bookkeeping is part of the outer world being discarded
+        // here, and leaving it behind is not inert: the rebuilt assembly
+        // assigns nested archives file indices from 0, and a *finalized* set —
+        // finalized is not demoted — still claims its source volume indices
+        // through `is_direct_source_file`. That guard then eats
+        // the `refresh_archive_state_for_completed_file` call for the colliding
+        // nested index, no scheduler state is ever registered, and the nested
+        // extraction fails with "had no scheduler state after topology
+        // refresh". The set already delivered everything it was for — its
+        // members are the very bytes being rebuilt over.
+        self.direct_store.clear_job(job_id);
         self.replace_failed_extraction_members(job_id, HashSet::new());
         self.clear_persisted_extracted_members(job_id).await;
 

@@ -1,0 +1,7 @@
+{
+  "slug": "par2-multi-set-archives-insufficient",
+  "title": "Cobalt.Harbor.PAR2.MultiSet.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "One posting carrying two independent damaged RAR5 archives and one PAR2 set for each. The primary archive is recoverable, but the secondary archive has only one recovery block for two damaged slices, so the aggregate job must fail repair.",
+  "category": "2000",
+  "expected_outcome": "repair_failure"
+}

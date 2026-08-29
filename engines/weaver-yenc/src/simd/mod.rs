@@ -13,6 +13,16 @@ use crate::error::YencError;
 #[cfg(target_arch = "x86_64")]
 type DecodeRunFn = fn(&[u8], usize, &mut [u8], usize) -> (usize, usize);
 
+#[cfg(target_arch = "x86_64")]
+type DecodeKernelFn = unsafe fn(
+    &[u8],
+    &mut [u8],
+    &mut KernelState,
+    bool,
+    bool,
+    bool,
+) -> Result<KernelOutcome, YencError>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecoderState {
     CrLf,
@@ -272,94 +282,41 @@ fn decode_kernel(
     preserve_pending: bool,
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
+    // The rapidyenc-derived SIMD kernels deliberately use full-width stores
+    // and require destination capacity at least as large as the encoded input.
+    // Keep those branch-free hot loops for callers with that headroom, while
+    // preserving this crate's stronger safe-API contract for compact buffers.
+    //
+    // This fallback is a documented, deliberate ~10x slowdown, not a hidden
+    // one: the whole-article entry points (`decode`, `decode_nntp`,
+    // `decode_with_options`) reject an undersized `output` with a typed
+    // `BufferTooSmall` before they ever reach here, so the only way to land on
+    // this branch is to call `decode_body`/`decode_chunk` directly, whose docs
+    // spell the trade-off out. See `crate::decode::max_decoded_len`.
+    if output.len() < input.len() {
+        return decode_kernel_scalar(
+            input,
+            output,
+            state,
+            dot_unstuffing,
+            preserve_pending,
+            search_end,
+        );
+    }
+
+    // Exactly one of the three blocks below survives `cfg` on any given target,
+    // and it is this function's tail expression there.
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512vbmi2")
-            && is_x86_feature_detected!("avx512vl")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx2")
-        {
-            return unsafe {
-                decode_kernel_avx512_vbmi2(
-                    input,
-                    output,
-                    state,
-                    dot_unstuffing,
-                    preserve_pending,
-                    search_end,
-                )
-            };
-        }
-        if is_x86_feature_detected!("avx2") {
-            return unsafe {
-                decode_kernel_avx2(
-                    input,
-                    output,
-                    state,
-                    dot_unstuffing,
-                    preserve_pending,
-                    search_end,
-                )
-            };
-        }
-        if is_x86_feature_detected!("avx")
-            && is_x86_feature_detected!("popcnt")
-            && is_x86_feature_detected!("sse4.1")
-            && is_x86_feature_detected!("ssse3")
-            && !x86_prefers_ssse3_over_sse41()
-            && !x86_prefers_sse2_over_ssse3()
-        {
-            return unsafe {
-                decode_kernel_avx(
-                    input,
-                    output,
-                    state,
-                    dot_unstuffing,
-                    preserve_pending,
-                    search_end,
-                )
-            };
-        }
-        if is_x86_feature_detected!("sse4.1")
-            && is_x86_feature_detected!("ssse3")
-            && !x86_prefers_ssse3_over_sse41()
-            && !x86_prefers_sse2_over_ssse3()
-        {
-            return unsafe {
-                decode_kernel_sse41(
-                    input,
-                    output,
-                    state,
-                    dot_unstuffing,
-                    preserve_pending,
-                    search_end,
-                )
-            };
-        }
-        if is_x86_feature_detected!("ssse3") && !x86_prefers_sse2_over_ssse3() {
-            return unsafe {
-                decode_kernel_ssse3(
-                    input,
-                    output,
-                    state,
-                    dot_unstuffing,
-                    preserve_pending,
-                    search_end,
-                )
-            };
-        }
-        if is_x86_feature_detected!("sse2") {
-            return unsafe {
-                decode_kernel_sse2(
-                    input,
-                    output,
-                    state,
-                    dot_unstuffing,
-                    preserve_pending,
-                    search_end,
-                )
-            };
+        unsafe {
+            dispatch_x86_decode_kernel()(
+                input,
+                output,
+                state,
+                dot_unstuffing,
+                preserve_pending,
+                search_end,
+            )
         }
     }
 
@@ -377,7 +334,7 @@ fn decode_kernel(
         }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         decode_kernel_scalar(
             input,
@@ -390,8 +347,200 @@ fn decode_kernel(
     }
 }
 
+/// The SIMD decode tier the production dispatcher selected on this host, as
+/// reported by [`selected_decoder_tier`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelectedDecoderTier {
+    Avx512Vbmi2,
+    Avx2,
+    Avx,
+    Sse41,
+    Ssse3,
+    Sse2,
+    Neon,
+    Scalar,
+}
+
+impl SelectedDecoderTier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Avx512Vbmi2 => "avx512-vbmi2",
+            Self::Avx2 => "avx2",
+            Self::Avx => "avx",
+            Self::Sse41 => "sse4.1",
+            Self::Ssse3 => "ssse3",
+            Self::Sse2 => "sse2",
+            Self::Neon => "neon",
+            Self::Scalar => "scalar",
+        }
+    }
+}
+
+/// The x86 decode tier this CPU dispatches to.
+///
+/// Split out of [`dispatch_x86_decode_kernel`] so the tier decision has one
+/// home: the dispatcher and the [`selected_decoder_tier`] reporting surface
+/// read the same answer and cannot drift.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum X86Tier {
+    Vbmi2,
+    Avx2,
+    Avx,
+    Sse41,
+    Ssse3,
+    Sse2,
+    Scalar,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_tier() -> X86Tier {
+    if vbmi2_tier_available() {
+        X86Tier::Vbmi2
+    } else if is_x86_feature_detected!("avx2")
+        // decode_kernel_avx2's attribute already carries the BMI sets;
+        // its gate must too, or a CPUID-masked host demoted out of the
+        // VBMI2 arm above would land on a kernel emitting andn/popcnt
+        // it never verified.
+        && is_x86_feature_detected!("bmi1")
+        && is_x86_feature_detected!("bmi2")
+        && is_x86_feature_detected!("popcnt")
+        && is_x86_feature_detected!("lzcnt")
+    {
+        X86Tier::Avx2
+    } else if is_x86_feature_detected!("avx")
+        && is_x86_feature_detected!("popcnt")
+        && is_x86_feature_detected!("sse4.1")
+        && is_x86_feature_detected!("ssse3")
+        && !x86_prefers_ssse3_over_sse41()
+        && !x86_prefers_sse2_over_ssse3()
+    {
+        X86Tier::Avx
+    } else if is_x86_feature_detected!("sse4.1")
+        && is_x86_feature_detected!("ssse3")
+        && !x86_prefers_ssse3_over_sse41()
+        && !x86_prefers_sse2_over_ssse3()
+    {
+        X86Tier::Sse41
+    } else if is_x86_feature_detected!("ssse3") && !x86_prefers_sse2_over_ssse3() {
+        X86Tier::Ssse3
+    } else if is_x86_feature_detected!("sse2") {
+        X86Tier::Sse2
+    } else {
+        X86Tier::Scalar
+    }
+}
+
+/// Return the exact SIMD tier selected by the production decoder dispatcher.
+pub fn selected_decoder_tier() -> SelectedDecoderTier {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match x86_tier() {
+            X86Tier::Vbmi2 => SelectedDecoderTier::Avx512Vbmi2,
+            X86Tier::Avx2 => SelectedDecoderTier::Avx2,
+            X86Tier::Avx => SelectedDecoderTier::Avx,
+            X86Tier::Sse41 => SelectedDecoderTier::Sse41,
+            X86Tier::Ssse3 => SelectedDecoderTier::Ssse3,
+            X86Tier::Sse2 => SelectedDecoderTier::Sse2,
+            X86Tier::Scalar => SelectedDecoderTier::Scalar,
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        SelectedDecoderTier::Neon
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        SelectedDecoderTier::Scalar
+    }
+}
+
+#[cfg(test)]
+mod selected_decoder_tier_tests {
+    use super::*;
+
+    #[test]
+    fn labels_are_stable_and_complete() {
+        let labels = [
+            SelectedDecoderTier::Avx512Vbmi2.as_str(),
+            SelectedDecoderTier::Avx2.as_str(),
+            SelectedDecoderTier::Avx.as_str(),
+            SelectedDecoderTier::Sse41.as_str(),
+            SelectedDecoderTier::Ssse3.as_str(),
+            SelectedDecoderTier::Sse2.as_str(),
+            SelectedDecoderTier::Neon.as_str(),
+            SelectedDecoderTier::Scalar.as_str(),
+        ];
+        let unique = labels.into_iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), labels.len());
+        assert!(unique.contains(selected_decoder_tier().as_str()));
+    }
+}
+
+/// Resolve the x86 decode tier once per process, not once per call.
+///
+/// The `is_x86_feature_detected!` chain is cheap but not free (an atomic load
+/// plus mask tests per feature), and the two guardrail helpers each issue a raw
+/// `CPUID` — a serializing instruction, and on some hypervisors a VM exit. That
+/// whole chain used to run on EVERY `decode_kernel` call, i.e. once per decoded
+/// chunk. Memoized behind a `OnceLock` (same shape as
+/// [`dispatch_x86_decode_normal_run`]), it runs once and the steady state is a
+/// single acquire load plus an indirect call.
+///
+/// Argument-dependent routing (the compact-output scalar fallback) stays at the
+/// call site — only the CPU-feature decision is cached here.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dispatch_x86_decode_kernel() -> DecodeKernelFn {
+    use std::sync::OnceLock;
+
+    static DISPATCH: OnceLock<DecodeKernelFn> = OnceLock::new();
+    *DISPATCH.get_or_init(|| match x86_tier() {
+        X86Tier::Vbmi2 => decode_kernel_avx512_vbmi2 as DecodeKernelFn,
+        X86Tier::Avx2 => decode_kernel_avx2 as DecodeKernelFn,
+        X86Tier::Avx => decode_kernel_avx as DecodeKernelFn,
+        X86Tier::Sse41 => decode_kernel_sse41 as DecodeKernelFn,
+        X86Tier::Ssse3 => decode_kernel_ssse3 as DecodeKernelFn,
+        X86Tier::Sse2 => decode_kernel_sse2 as DecodeKernelFn,
+        X86Tier::Scalar => decode_kernel_scalar as DecodeKernelFn,
+    })
+}
+
+/// The complete feature set the AVX-512 VBMI2 decode tier requires.
+///
+/// This is the single source of truth for "the VBMI2 tier is usable here": the
+/// dispatcher above gates on it, and the per-tier differential tests gate their
+/// VBMI2 legs on the same predicate, so a tier that CI thinks it exercised can
+/// never be one the dispatcher would have declined (or vice versa).
+///
+/// It is wider than the AVX-512 subsets the kernels name in `#[target_feature]`
+/// because those kernels also compile their scalar mask math with the
+/// BMI/POPCNT/LZCNT sets. Every VBMI2-capable CPU has them, but the portable
+/// build otherwise leaves ~20% on the table versus the same build with the
+/// features enabled globally (measured 45.6 -> 36.6 us realshape on Zen 4).
+/// Detecting them keeps the unsafe contract honest rather than
+/// architecture-implied.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn vbmi2_tier_available() -> bool {
+    is_x86_feature_detected!("avx512vbmi2")
+        && is_x86_feature_detected!("avx512vl")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("bmi1")
+        && is_x86_feature_detected!("bmi2")
+        && is_x86_feature_detected!("popcnt")
+        && is_x86_feature_detected!("lzcnt")
+}
+
+// Bit hack that resolves consecutive '=' escape runs. Inlined explicitly: this
+// and `final_state_after_block` are called once per 64-byte block from every
+// tier kernel, so leaving them to fat LTO made the BMI-widening win a
+// link-time-configuration accident rather than a property of the code.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-// Bit hack that resolves consecutive '=' escape runs.
+#[inline]
 fn fix_eq_mask(mask: u64, mask_shift1: u64) -> u64 {
     let start = mask & !mask_shift1;
     let even = 0x5555_5555_5555_5555u64;
@@ -400,6 +549,7 @@ fn fix_eq_mask(mask: u64, mask_shift1: u64) -> u64 {
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline]
 fn final_state_after_block(
     raw_breaks: u64,
     raw_cr: u64,

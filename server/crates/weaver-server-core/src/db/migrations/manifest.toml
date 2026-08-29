@@ -258,6 +258,108 @@ file = "migrations/0037_post_processing_extensions/postgres.sql"
 engine = "postgres"
 scope = "all"
 
+[[migration]]
+version = 38
+description = "direct-store coverage checkpoint"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0038_active_direct_coverage/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0038_active_direct_coverage/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 39
+description = "forget duplicate identities orphaned by history deletion"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0039_forget_orphaned_duplicate_identities/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0039_forget_orphaned_duplicate_identities/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 40
+description = "provenance for completed-file md5 rows"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0040_completed_hash_provenance/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0040_completed_hash_provenance/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 41
+description = "index post_processing_run_id lookups used by run finalize"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0041_post_processing_run_lookup_indexes/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0041_post_processing_run_lookup_indexes/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 42
+description = "replace the post-processing extension model with directory scripts"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0042_post_processing_scripts/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0042_post_processing_scripts/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 43
+description = "persist adopted TLS hostname-mismatch certificates"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0043_server_name_mismatch_certificate/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0043_server_name_mismatch_certificate/postgres.sql"
+engine = "postgres"
+scope = "all"
+
 [[baseline]]
 through_version = 21
 file = "migrations/0021_legacy_schema_parity/fresh.sql"

@@ -9,6 +9,47 @@ enum AcceptHistoryDeleteMode {
 	ALL_HISTORY
 }
 
+"""
+The browser-admission policy: mode, networks, and whether the UI may edit
+it (`WEAVER_TRUSTED_CIDRS` pins it read-only, like the bind variable).
+"""
+type AccessPolicyStatus {
+	"""
+	`login_required`, `login_except_local`, or `no_login`.
+	"""
+	mode: String!
+	"""
+	The trusted networks in force right now (live — policy edits apply
+	immediately, unlike the bind address).
+	"""
+	trustedNetworks: [String!]!
+	editable: Boolean!
+	"""
+	True when the environment supplied the list.
+	"""
+	envPinned: Boolean!
+	"""
+	True once an access mode has actually been stored and understood.
+
+	Distinguishes "the operator chose login-required" from "nothing is
+	stored and the query defaulted to login-required", which is what an
+	install upgraded from a version without these settings looks like. The
+	UI uses it to offer the security wizard exactly once.
+	"""
+	configured: Boolean!
+	"""
+	`WEAVER_STRICT_SECURITY` is on, so every trusting mode will be refused.
+	Exposed so the UI can disable those choices with the real reason rather
+	than letting the operator pick one and fail on submit.
+	"""
+	strictSecurity: Boolean!
+}
+
+type AdoptableTlsNameMismatchCertificate {
+	derBase64: String!
+	sha256Fingerprint: String!
+}
+
 type ApiKey {
 	id: Int!
 	name: String!
@@ -46,9 +87,21 @@ input CategoryInput {
 	aliases: String! = ""
 }
 
+type ConfiguredStorage {
+	labels: [String!]!
+	path: String!
+	capacity: DiskCapacity
+	error: String
+}
+
 type CreateApiKeyResult {
 	key: ApiKey!
 	rawKey: String!
+}
+
+enum DatabaseEngineGql {
+	SQLITE
+	POSTGRES
 }
 
 """
@@ -57,6 +110,23 @@ Implement the DateTime<Utc> scalar
 The input/output is a string in RFC3339 format.
 """
 scalar DateTime
+
+enum DecoderTierGql {
+	AVX_512_VBMI_2
+	AVX_2
+	AVX
+	SSE_41
+	SSSE_3
+	SSE_2
+	NEON
+	SCALAR
+}
+
+enum DeploymentEnvironmentGql {
+	NATIVE
+	DOCKER
+	CONTAINER
+}
 
 type DirectoryBrowseEntry {
 	name: String!
@@ -67,6 +137,12 @@ type DirectoryBrowseResult {
 	currentPath: String!
 	parentPath: String
 	entries: [DirectoryBrowseEntry!]!
+}
+
+type DiskCapacity {
+	totalBytes: Int!
+	usedBytes: Int!
+	freeBytes: Int!
 }
 
 """
@@ -210,11 +286,6 @@ type DuplicateSummaryInfo {
 	action: DuplicateActionGql!
 	primaryReason: DuplicateFingerprintKindGql
 	semantic: SemanticCandidateSnapshotInfo
-}
-
-type E2EpostProcessingSeed {
-	jobIds: [Int!]!
-	runIds: [String!]!
 }
 
 enum EventKind {
@@ -439,6 +510,63 @@ enum HistoryStatusFilter {
 	FAILURE
 }
 
+"""
+Which layer decided the address Weaver is listening on.
+"""
+enum HttpBindAddressSource {
+	"""
+	`WEAVER_HTTP_BIND_ADDRESS` is set and wins; the field is read-only.
+	"""
+	ENVIRONMENT
+	"""
+	Chosen in this UI and stored in the settings table.
+	"""
+	SETTING
+	"""
+	Nothing configured; loopback.
+	"""
+	DEFAULT
+}
+
+"""
+The listening address, where it came from, and whether that combination
+leaves the admin interface reachable without a login.
+"""
+type HttpBindAddressStatus {
+	"""
+	The address in force for the running process.
+	"""
+	address: String!
+	"""
+	The stored setting, which differs from `address` only when the
+	environment is overriding it or a change is awaiting a restart.
+	"""
+	storedAddress: String
+	source: HttpBindAddressSource!
+	"""
+	False when the environment pins the address, in which case editing it
+	here would be ignored.
+	"""
+	editable: Boolean!
+	"""
+	True when the address the NEXT restart will use is reachable beyond
+	this machine while no login is configured — evaluated against the
+	pending choice, so the warning fires when the decision is made rather
+	than after the restart that already exposed the instance.
+	"""
+	exposedWithoutLogin: Boolean!
+	"""
+	True when the address the next restart will use differs from the
+	running one — including a cleared setting falling back to loopback.
+	"""
+	restartRequired: Boolean!
+	"""
+	Set when the process could not bind its configured address and is
+	serving on loopback instead; the reason, verbatim, for a banner.
+	"""
+	bindFallback: String
+}
+
 enum IspBandwidthCapPeriodGql {
 	DAILY
 	WEEKLY
@@ -472,11 +600,6 @@ enum IspBandwidthCapWeekdayGql {
 	SAT
 	SUN
 }
-
-"""
-A scalar that can represent any JSON value.
-"""
-scalar JSON
 
 type Job {
 	id: Int!
@@ -623,6 +746,28 @@ type Metrics {
 	writeBufferedBytes: Int!
 	writeBufferedSegments: Int!
 	directWriteEvictions: Int!
+	"""
+	Lifetime count of archive sets direct-store admitted. Together with
+	the two below this is the external answer to "did direct routing carry
+	this work, or quietly fall back?" — output bytes are identical either
+	way.
+	"""
+	directSetsAdmitted: Int!
+	"""
+	Lifetime count of sets that left direct routing (demoted); per-reason
+	detail is in the server logs.
+	"""
+	directSetsDemoted: Int!
+	"""
+	Lifetime count of sets that completed without ever writing a source
+	volume to disk — direct-store's success case.
+	"""
+	directSetsFinalizedDirect: Int!
+	"""
+	Lifetime count of sets repaired in place without leaving direct
+	routing.
+	"""
+	directSetsRepairedWhileDirect: Int!
 	decodePressureSoftLimitBytes: Int!
 	decodePressureHardLimitBytes: Int!
 	writePressureSoftLimitBytes: Int!
@@ -636,14 +781,11 @@ type Metrics {
 	hotDispatchMode: String!
 	hotDispatchUnderfillMs: Int!
 	hotDispatchLentConnections: Int!
-	hotDispatchWarmupComplete: Boolean!
 	hotDispatchLastSpilloverDecision: String!
-	hotDispatchSpilloverBlockedWarmupTotal: Int!
 	hotDispatchSpilloverBlockedPressureTotal: Int!
 	hotDispatchSpilloverBlockedNearCapTotal: Int!
 	hotDispatchSpilloverBlockedHotCanUseCapacityTotal: Int!
 	hotDispatchSpilloverBlockedBestModePendingTotal: Int!
-	hotDispatchSpilloverBlockedRecentExpansionHelpedTotal: Int!
 	hotDispatchSpilloverBlockedCapSpeedTotal: Int!
 	hotDispatchSpilloverAllowedUnderfillTotal: Int!
 	hotDispatchSpilloverAllowedMeasuredUnderfillTotal: Int!
@@ -743,6 +885,21 @@ type MutationRoot {
 	Delete an API key by ID.
 	"""
 	deleteApiKey(id: Int!): [ApiKey!]!
+	"""
+	Set the address Weaver listens on, applied at the next restart.
+
+	Refused when `WEAVER_HTTP_BIND_ADDRESS` is set, rather than stored and
+	silently ignored: an operator who pinned the address in their
+	deployment should be told their edit would not take effect, not left to
+	discover it after a restart. An empty value clears the setting back to
+	the loopback default.
+	"""
+	setHttpBindAddress(address: String!): Boolean!
+	"""
+	Change the browser-admission policy: mode plus trusted networks.
+	Applies immediately — trust is live state, unlike the bind address.
+	"""
+	setAccessPolicy(mode: String!, trustedNetworks: [String!]): Boolean!
 	"""
 	Enable login protection with a username and password.
 	"""
@@ -886,30 +1043,25 @@ type MutationRoot {
 	Set the queue speed limit in bytes/sec. 0 means unlimited.
 	"""
 	setQueueSpeedLimit(bytesPerSec: Int!): QueueCommandResult!
-	updatePostProcessingSettings(input: PostProcessingSettingsInput!): PostProcessingSettingsGql!
-	discoverPostProcessingExtensions(bareScriptAdapter: PostProcessingAdapterInput): [PostProcessingExtensionRevision!]!
-	runPostProcessingDiagnostic(input: PostProcessingDiagnosticInput!): PostProcessingDiagnosticResult!
-	approvePostProcessingRevision(extensionId: String!, revisionId: String!): PostProcessingExtensionRevision!
-	disablePostProcessingRevision(extensionId: String!, revisionId: String!): Boolean!
-	revokePostProcessingRevision(extensionId: String!, revisionId: String!): Boolean!
-	savePostProcessingProfile(input: PostProcessingProfileInput!): PostProcessingProfile!
-	deletePostProcessingProfile(profileId: String!): Boolean!
-	assignGlobalPostProcessingProfile(profileId: String): Boolean!
-	assignCategoryPostProcessingProfile(category: String!, profileId: String): Boolean!
-	setJobPostProcessingSelection(jobId: Int!, selection: PostProcessingSelectionInput!): PostProcessingJobPlan!
+	setPostProcessingSettings(input: PostProcessingSettingsInput!): PostProcessingSettingsGql!
 	"""
-	Creates deterministic, metadata-only jobs and real queued
-	post-processing runs for the isolated browser release gate. The first
-	call omits `job_ids` and prepares two paused jobs so the browser can
-	exercise selection controls. The second call supplies those exact IDs
-	after the browser pauses the post-processing queue.
+	Select the sole live source of post-processing scripts. Changing it
+	clears name-based assignments and option values, never script files.
 	"""
-	seedE2EPostProcessingRuns(profileId: String!, jobIds: [Int!]): E2EpostProcessingSeed!
-	pausePostProcessingQueue: Boolean!
-	resumePostProcessingQueue: Boolean!
-	reorderPostProcessingQueue(runIds: [String!]!): [String!]!
+	setPostProcessingScriptDirectory(directory: String!): PostProcessingSettingsGql!
+	"""
+	Replace the global default list and every per-category override.
+	"""
+	setScriptLists(input: ScriptListsInput!): ScriptListsGql!
+	"""
+	Replace the stored option values for one script, validated against its manifest.
+	"""
+	setScriptOptions(script: String!, options: [ScriptOptionInput!]!): ScriptGql!
+	"""
+	Execute the job's script list again against its retained output directory.
+	"""
+	rerunPostProcessing(jobId: Int!): Boolean!
 	cancelJobPostProcessing(jobId: Int!): Boolean!
-	rerunPostProcessing(input: PostProcessingRerunInput!): PostProcessingRun!
 	"""
 	Add a new RSS feed.
 	"""
@@ -982,6 +1134,13 @@ type MutationRoot {
 	createDirectory(path: String!, name: String!): DirectoryBrowseResult!
 }
 
+enum OperatingSystemGql {
+	LINUX
+	MACOS
+	WINDOWS
+	UNKNOWN
+}
+
 type ParsedEpisode {
 	season: Int
 	episodeNumbers: [Int!]!
@@ -1029,217 +1188,31 @@ type PipelineEventGql {
 	message: String!
 }
 
-enum PostProcessingAdapterInput {
-	SABNZBD
-	NZBGET
-}
-
-type PostProcessingArtifact {
-	attemptId: String!
-	stepIndex: Int!
-	path: String!
-	exists: Boolean!
-	isFile: Boolean!
-	isDirectory: Boolean!
-	isSymlink: Boolean!
-	sizeBytes: Int
-}
-
-type PostProcessingAttempt {
-	attemptId: String!
-	runId: String!
-	stepIndex: Int!
-	status: String!
-	extensionId: String!
-	revisionId: String!
-	adapter: String!
-	workingDirectory: String
-	exitCode: Int
-	errorMessage: String
-	progress: JSON
-	outputTruncated: Boolean!
-	queuedAtEpochMs: Int!
-	startedAtEpochMs: Int
-	finishedAtEpochMs: Int
-}
-
-input PostProcessingDiagnosticInput {
-	extensionId: String!
-	revisionId: String!
-	command: String!
-	options: [PostProcessingOptionInput!]! = []
-}
-
-type PostProcessingDiagnosticOutputLine {
-	sequence: Int!
-	stream: String!
-	text: String!
-}
-
-type PostProcessingDiagnosticResult {
-	succeeded: Boolean!
-	exitCode: Int
-	errorMessage: String
-	outputTruncated: Boolean!
-	output: [PostProcessingDiagnosticOutputLine!]!
-}
-
-type PostProcessingExtensionRevision {
-	extensionId: String!
-	revisionId: String!
-	declaredVersion: String!
-	digest: String!
-	adapter: String!
-	displayName: String!
-	trustState: String!
-	managed: Boolean!
-	sourcePath: String
-	discoveredAtEpochMs: Int!
-	approvedAtEpochMs: Int
-	manifest: JSON!
-}
-
-type PostProcessingJobPlan {
-	jobId: Int!
-	definition: JSON!
-}
-
-type PostProcessingLogChunkGql {
-	sequence: Int!
-	stream: String!
-	text: String!
-	createdAtEpochMs: Int!
-}
-
-type PostProcessingLogPageGql {
-	chunks: [PostProcessingLogChunkGql!]!
-	nextCursor: Int
-	truncated: Boolean!
-}
-
-enum PostProcessingOnFailureInput {
-	STOP
-	CONTINUE
-}
-
-input PostProcessingOptionInput {
-	name: String!
-	kind: PostProcessingOptionValueKind!
-	value: String!
-}
-
-enum PostProcessingOptionValueKind {
-	STRING
-	INTEGER
-	NUMBER
-	BOOLEAN
-	SECRET
-}
-
-enum PostProcessingOutcomeImpactInput {
-	WARN
-	FAIL_JOB
-}
-
-type PostProcessingProfile {
-	profileId: String!
-	name: String!
-	enabled: Boolean!
-	createdAtEpochMs: Int!
-	updatedAtEpochMs: Int!
-	definition: JSON!
-}
-
-input PostProcessingProfileInput {
-	profileId: String!
-	name: String!
-	enabled: Boolean! = true
-	steps: [PostProcessingProfileStepInput!]!
-}
-
-input PostProcessingProfileStepInput {
-	extensionId: String!
-	revisionId: String
-	runWhen: PostProcessingRunWhenInput!
-	onFailure: PostProcessingOnFailureInput!
-	outcomeImpact: PostProcessingOutcomeImpactInput!
-	timeoutSeconds: Int
-	unlimitedTimeout: Boolean! = false
-	approvedRoots: [String!]! = []
-	requiredArtifactSuffixes: [String!]! = []
-	minimumArtifactCount: Int! = 0
-	options: [PostProcessingOptionInput!]! = []
-}
-
-input PostProcessingRerunInput {
-	runId: String!
-	mode: PostProcessingRerunModeInput!
-	stepIndexes: [Int!]! = []
-	rebindToLatestApproved: Boolean! = false
-}
-
-enum PostProcessingRerunModeInput {
-	ALL
-	SELECTED
-	FAILED_AND_LATER
-}
-
-type PostProcessingRun {
-	runId: String!
-	jobId: Int!
-	status: String!
-	pipelineOutcome: JSON!
-	summary: String!
-	terminalIntent: String!
-	plan: JSON!
-	rerunOfRunId: String
-	queuedAtEpochMs: Int!
-	queuePosition: Int!
-	startedAtEpochMs: Int
-	finishedAtEpochMs: Int
-}
-
-enum PostProcessingRunWhenInput {
-	ALWAYS
-	SUCCESS
-	FAILURE
-}
-
-input PostProcessingSelectionInput {
-	mode: PostProcessingSelectionModeInput!
-	profileId: String
-	extensionIds: [String!]! = []
-}
-
-enum PostProcessingSelectionModeInput {
-	INHERIT
-	DISABLED
-	PROFILE
-	EXTENSIONS
-}
-
 type PostProcessingSettingsGql {
-	discoveryEnabled: Boolean!
+	scriptDirectory: String!
 	executionEnabled: Boolean!
 	concurrency: Int!
 	terminationGraceSeconds: Int!
 	pythonInterpreter: String
 	powershellInterpreter: String
 	batchInterpreter: String
-	webhooksEnabled: Boolean!
-	allowedRoots: [String!]!
+	"""
+	True when `WEAVER_STRICT_SECURITY` refuses script execution outright.
+	"""
+	strictSecurityRefusesExecution: Boolean!
+	"""
+	Global default list plus every per-category override.
+	"""
+	lists: ScriptListsGql!
 }
 
 input PostProcessingSettingsInput {
-	discoveryEnabled: Boolean!
 	executionEnabled: Boolean!
 	concurrency: Int!
 	terminationGraceSeconds: Int!
 	pythonInterpreter: String
 	powershellInterpreter: String
 	batchInterpreter: String
-	webhooksEnabled: Boolean! = false
-	allowedRoots: [String!]! = []
 }
 
 type QueryRoot {
@@ -1247,6 +1220,20 @@ type QueryRoot {
 	Admin-facing auth status moved to query semantics.
 	"""
 	adminLoginStatus: LoginStatusResult!
+	"""
+	The address Weaver is listening on, and whether it can be changed here.
+
+	Exposed so the binding can be widened from the UI. That matters because
+	the loopback default is always reachable from the machine Weaver runs
+	on, which makes this the one place an operator can reliably get to —
+	unlike a service unit, a shortcut's environment, or a file under
+	Program Files.
+	"""
+	httpBindAddress: HttpBindAddressStatus!
+	"""
+	The browser-admission policy: who gets in without a login.
+	"""
+	accessPolicy: AccessPolicyStatus!
 	"""
 	List all API keys (without raw key values).
 	"""
@@ -1273,7 +1260,7 @@ type QueryRoot {
 	historyItemsCount(filter: QueueFilterInput): Int!
 	"""
 	Compatibility facade for recent queue lifecycle history.
-	
+
 	This is backed by the bounded in-memory replay window rather than
 	persisted queue events. Older entries fall out of the ring buffer, and
 	stale cursors degrade to `[]` for compatibility with the old table.
@@ -1299,6 +1286,10 @@ type QueryRoot {
 	Public queue facade for active or in-flight items.
 	"""
 	queueItems(filter: QueueFilterInput, first: Int, after: String): [QueueItem!]!
+	"""
+	Server-paginated queue rows for the interactive queue table.
+	"""
+	queuePage(input: QueuePageInput!): QueuePage!
 	"""
 	Public queue facade for one active item.
 	"""
@@ -1342,15 +1333,17 @@ type QueryRoot {
 	"""
 	jobOutputFiles(jobId: Int!): JobOutputResult
 	postProcessingSettings: PostProcessingSettingsGql!
-	postProcessingRevisions: [PostProcessingExtensionRevision!]!
-	postProcessingProfiles: [PostProcessingProfile!]!
-	postProcessingJobPlan(jobId: Int!): PostProcessingJobPlan
-	postProcessingRuns(jobId: Int, limit: Int! = 100): [PostProcessingRun!]!
-	postProcessingQueue: [PostProcessingRun!]!
-	postProcessingRun(runId: String!): PostProcessingRun
-	postProcessingAttempts(runId: String!): [PostProcessingAttempt!]!
-	postProcessingArtifacts(runId: String!): [PostProcessingArtifact!]!
-	postProcessingLogs(attemptId: String!, cursor: Int, limit: Int! = 200): PostProcessingLogPageGql!
+	"""
+	Live listing of the configured scripts directory, plus stored option values.
+
+	Nothing is cached: the directory is the source of truth, so a script
+	added a second ago is listed and one deleted a second ago is not.
+	"""
+	scripts: ScriptListingGql!
+	"""
+	Script results recorded for a job, from the live row or from history.
+	"""
+	postProcessingResults(jobId: Int!): [ScriptResultGql!]!
 	"""
 	List configured RSS feeds.
 	"""
@@ -1384,6 +1377,19 @@ type QueryRoot {
 	The running weaver binary version.
 	"""
 	version: String!
+	"""
+	Safe runtime and storage facts for the built-in troubleshooting UI.
+	"""
+	systemInfo: SystemInfo!
+	"""
+	Whether Weaver can restart itself here, and the deployment that decided
+	it — everything the security wizard needs in one field.
+
+	Deliberately its own small field rather than part of `systemInfo`,
+	whose resolver probes storage: the wizard asks this on every app load,
+	so the answer has to stay cheap.
+	"""
+	serverRestart: ServerRestartCapability!
 	"""
 	System status facade for integrations.
 	"""
@@ -1529,6 +1535,8 @@ extraction begins.
 enum QueueItemState {
 	QUEUED
 	DOWNLOADING
+	FETCHING_REPAIR_DATA
+	FINALIZING_DOWNLOAD
 	CHECKING
 	VERIFYING
 	REPAIRING
@@ -1548,6 +1556,28 @@ enum QueueMoveKind {
 	TOP
 	BOTTOM
 	OFFSET
+}
+
+type QueuePage {
+	items: [QueueItem!]!
+	totalCount: Int!
+	summary: QueueSummary!
+	categories: [String!]!
+	latestCursor: String!
+}
+
+input QueuePageInput {
+	pageIndex: Int!
+	pageSize: Int!
+	search: String
+	states: [QueueItemState!]
+	priorities: [QueuePriority!]
+	categories: [String!]
+	"""
+	Omit both fields to retain the scheduler's hot-download order.
+	"""
+	sortField: QueueSortField
+	sortDirection: QueueSortDirection
 }
 
 enum QueuePhase {
@@ -1584,6 +1614,12 @@ enum QueuePostState {
 	FAILED
 }
 
+enum QueuePriority {
+	LOW
+	NORMAL
+	HIGH
+}
+
 type QueueSnapshot {
 	items: [QueueItem!]!
 	summary: QueueSummary!
@@ -1591,6 +1627,20 @@ type QueueSnapshot {
 	globalState: GlobalQueueState!
 	latestCursor: String!
 	generatedAt: DateTime!
+}
+
+enum QueueSortDirection {
+	ASC
+	DESC
+}
+
+enum QueueSortField {
+	NAME
+	STATE
+	PRIORITY
+	CATEGORY
+	PROGRESS
+	SIZE
 }
 
 type QueueSummary {
@@ -1728,6 +1778,118 @@ input ScheduleInput {
 	speedLimitBytes: Int
 }
 
+enum ScriptAdapterGql {
+	SABNZBD
+	NZBGET
+}
+
+type ScriptCategoryListGql {
+	category: String!
+	entries: [ScriptListEntryGql!]!
+}
+
+input ScriptCategoryListInput {
+	category: String!
+	entries: [ScriptListEntryInput!]!
+}
+
+type ScriptGql {
+	name: String!
+	displayName: String!
+	adapter: ScriptAdapterGql!
+	version: String
+	options: [ScriptOptionGql!]!
+}
+
+type ScriptListEntryGql {
+	script: String!
+	enabled: Boolean!
+	timeoutSeconds: Int
+}
+
+input ScriptListEntryInput {
+	script: String!
+	enabled: Boolean! = true
+	timeoutSeconds: Int
+}
+
+type ScriptListingGql {
+	scripts: [ScriptGql!]!
+	"""
+	Entries that look like scripts but could not be listed, so an unparseable
+	manifest is visible instead of silently absent.
+	"""
+	problems: [ScriptProblemGql!]!
+}
+
+type ScriptListsGql {
+	global: [ScriptListEntryGql!]!
+	categories: [ScriptCategoryListGql!]!
+}
+
+input ScriptListsInput {
+	global: [ScriptListEntryInput!]! = []
+	categories: [ScriptCategoryListInput!]! = []
+}
+
+type ScriptOptionGql {
+	name: String!
+	section: String
+	optionType: ScriptOptionTypeGql!
+	displayName: String
+	description: [String!]!
+	select: [String!]!
+	required: Boolean!
+	"""
+	Manifest default, already masked when the option is secret.
+	"""
+	defaultValue: String
+	"""
+	Operator-supplied value, masked when the option is secret.
+	"""
+	value: String
+}
+
+input ScriptOptionInput {
+	name: String!
+	optionType: ScriptOptionTypeGql!
+	value: String!
+}
+
+enum ScriptOptionTypeGql {
+	STRING
+	INTEGER
+	NUMBER
+	BOOLEAN
+	SECRET
+}
+
+type ScriptProblemGql {
+	name: String!
+	message: String!
+}
+
+type ScriptResultGql {
+	script: String!
+	adapter: ScriptAdapterGql!
+	status: ScriptStatusGql!
+	exitCode: Int
+	durationMs: Int!
+	outputTail: String!
+	outputTruncated: Boolean!
+	errorMessage: String
+	finishedAtEpochMs: Int!
+}
+
+enum ScriptStatusGql {
+	SUCCEEDED
+	SKIPPED
+	WARNING
+	FAILED
+	TIMED_OUT
+	CANCELLED
+}
+
 type SemanticCandidateSnapshotInfo {
 	groupId: Int!
 	normalizedKey: String!
@@ -1792,6 +1954,7 @@ type Server {
 	maxDownloadSpeed: Int!
 	downloadQuota: ServerDownloadQuota!
 	tlsCaCert: String
+	tlsNameMismatchCertificateFingerprint: String
 }
 
 type ServerDetails {
@@ -1809,6 +1972,8 @@ type ServerDetails {
 	maxDownloadSpeed: Int!
 	downloadQuota: ServerDownloadQuota!
 	tlsCaCert: String
+	tlsNameMismatchCertificateDerBase64: String
+	tlsNameMismatchCertificateFingerprint: String
 }
 
 type ServerDownloadQuota {
@@ -1935,6 +2100,32 @@ input ServerInput {
 	"""
 	downloadQuota: ServerDownloadQuotaInput
 	tlsCaCert: String
+	"""
+	Base64 DER for one explicitly adopted certificate used only after a
+	normal hostname-verification failure.
+	"""
+	tlsNameMismatchCertificateDerBase64: String
+}
+
+"""
+Whether this deployment can restart Weaver from the browser.
+
+A container must not be exited from the UI — without a restart policy the
+operator would be left with nothing — so the deployment, not the operator,
+answers this.
+"""
+type ServerRestartCapability {
+	supported: Boolean!
+	"""
+	Set only when unsupported: what to do instead.
+	"""
+	reason: String
+	"""
+	The packaging that decided this answer. The security wizard reads it
+	here rather than from `systemInfo`, whose resolver probes storage —
+	this field must stay cheap enough to ask on every app load.
+	"""
+	deployment: DeploymentEnvironmentGql!
 }
 
 type ServiceLogsPayload {
@@ -2004,7 +2195,6 @@ input SubmitNzbInput {
 	dupeKey: String
 	dupeScore: Int
 	dupeMode: DuplicateMode
-	postProcessing: PostProcessingSelectionInput
 }
 
 input SubmitStagedNzbsInput {
@@ -2018,7 +2208,6 @@ input SubmitStagedNzbsInput {
 	dupeKey: String
 	dupeScore: Int
 	dupeMode: DuplicateMode
-	postProcessing: PostProcessingSelectionInput
 }
 
 type SubmitStagedNzbsResult {
@@ -2042,7 +2231,7 @@ type SubscriptionRoot {
 	jobDetailUpdates(jobId: Int!): JobDetailSnapshot!
 	"""
 	Subscribe to real-time job state snapshots.
-	
+
 	Pushes a full snapshot whenever a pipeline event fires, throttled to
 	at most once per 100ms so rapid-fire segment events don't flood the
 	client. Also ticks every 2s during idle so speed gauges stay fresh.
@@ -2054,7 +2243,7 @@ type SubscriptionRoot {
 	queueSnapshots(filter: QueueFilterInput): QueueSnapshot!
 	"""
 	Subscribe to live public queue events.
-	
+
 	Replays recent in-memory queue events after `after`, then continues
 	streaming live events from the same bounded replay buffer.
 	"""
@@ -2069,6 +2258,34 @@ type SubscriptionRoot {
 	systemMetricsUpdates: SystemMetricsSnapshot!
 }
 
+type SystemComputeInfo {
+	physicalCores: Int!
+	logicalCores: Int!
+	cgroupLimit: Float
+	decoderTier: DecoderTierGql!
+	simdFeatures: [String!]!
+}
+
+type SystemInfo {
+	version: String!
+	uptimeSeconds: Float!
+	deployment: DeploymentEnvironmentGql!
+	operatingSystem: OperatingSystemGql!
+	architecture: String!
+	databaseEngine: DatabaseEngineGql!
+	compute: SystemComputeInfo!
+	memory: SystemMemoryInfo!
+	primaryStorage: SystemStorageProfile!
+	configuredStorage: [ConfiguredStorage!]!
+}
+
+type SystemMemoryInfo {
+	totalBytes: Int!
+	availableAtStartupBytes: Int!
+	cgroupLimitBytes: Int
+	effectiveLimitBytes: Int!
+}
+
 type SystemMetricsSnapshot {
 	metrics: Metrics!
 	globalState: GlobalQueueState!
@@ -2080,11 +2297,18 @@ type SystemStatus {
 	summary: QueueSummary!
 }
 
+type SystemStorageProfile {
+	storageClass: String!
+	filesystem: String!
+	startupRandomReadIops: Float!
+}
+
 type TestConnectionResult {
 	success: Boolean!
 	message: String!
 	latencyMs: Int
 	supportsPipelining: Boolean!
+	adoptableTlsNameMismatchCertificate: AdoptableTlsNameMismatchCertificate
 }
 
 enum TimelineSpanState {

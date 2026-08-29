@@ -1,0 +1,13 @@
+{
+  "slug": "single-mkv-sparse-nzb",
+  "title": "E2E.Test.Single.MKV.Sparse.NZB.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "Large direct MKV payload reused from the single-mkv fixture, with generated NZB numbers rewritten into a sparse sequence. Tests that Weaver treats NZB numbering as ordering metadata rather than a dense assembly index on a non-trivial article set.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 768000,
+  "fixtureAssets": [
+    "single-mkv/test-media.mkv::sparse-nzb.mkv"
+  ],
+  "nzb_segment_number_start": 1001,
+  "nzb_segment_number_step": 2
+}

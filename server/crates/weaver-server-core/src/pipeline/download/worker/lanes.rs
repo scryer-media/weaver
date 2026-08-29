@@ -35,10 +35,7 @@ impl Pipeline {
             DownloadLaneMode::PipelineDepth2.max_depth(),
             SAB_BODY_PIPELINE_DEPTH
         );
-        let lane_id = DownloadLaneId(self.download_lane_runtime.next_lane_id);
-        self.download_lane_runtime.next_lane_id =
-            self.download_lane_runtime.next_lane_id.saturating_add(1);
-        debug!(lane_id = lane_id.0, mode = ?mode, "download lane started");
+        debug!(mode = ?mode, "download lane started");
         self.metrics
             .download_lanes_active
             .fetch_add(1, Ordering::Relaxed);
@@ -59,16 +56,6 @@ impl Pipeline {
                 .download_lanes_depth4_active
                 .fetch_add(1, Ordering::Relaxed),
         };
-        *self
-            .download_lane_runtime
-            .active_by_mode
-            .entry(mode)
-            .or_default() += 1;
-        *self
-            .download_lane_runtime
-            .active_by_state
-            .entry(DownloadLaneState::Issuing)
-            .or_default() += 1;
     }
 
     pub(in crate::pipeline) fn note_download_lane_released(
@@ -129,61 +116,240 @@ impl Pipeline {
                 .metrics
                 .download_lane_parks_ip_replacement_retired_total
                 .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::ServerTierChanged => self
-                .metrics
-                .download_lane_parks_server_tier_changed_total
-                .fetch_add(1, Ordering::Relaxed),
             LaneParkReason::ProofFailure => self
                 .metrics
                 .download_lane_parks_proof_failure_total
                 .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::ServerQuota => 0,
+            LaneParkReason::Capacity | LaneParkReason::ServerQuota => 0,
             LaneParkReason::Error => self
                 .metrics
                 .download_lane_parks_error_total
                 .fetch_add(1, Ordering::Relaxed),
         };
-        if let Some(active) = self.download_lane_runtime.active_by_mode.get_mut(&mode) {
-            *active = active.saturating_sub(1);
-            if *active == 0 {
-                self.download_lane_runtime.active_by_mode.remove(&mode);
-            }
-        }
-        if let Some(active) = self
-            .download_lane_runtime
-            .active_by_state
-            .get_mut(&DownloadLaneState::Issuing)
-        {
-            *active = active.saturating_sub(1);
-            if *active == 0 {
-                self.download_lane_runtime
-                    .active_by_state
-                    .remove(&DownloadLaneState::Issuing);
-            }
-        }
-        *self
-            .download_lane_runtime
-            .park_counts
-            .entry(reason)
-            .or_default() += 1;
     }
 
+    /// A wire outcome retired this segment: no server has it, or the budget
+    /// for asking ran out.
     pub(in crate::pipeline) fn book_failed_segment(&mut self, seg_id: SegmentId) {
+        self.book_terminal_segment(seg_id, SegmentTerminalState::Missing);
+    }
+
+    /// Move a segment into its one terminal state.
+    ///
+    /// # Why this is a transition and not an increment
+    ///
+    /// `failed_bytes` used to be an accumulator that several paths added to:
+    /// the terminal booking here, and a health probe that overwrote it with a
+    /// sampled *projection* over the whole payload. A job could therefore book
+    /// a projection first and then add real terminal failures on top of it, and
+    /// job 10220 did exactly that — 1.99 GB of failed bytes against a 1.21 GB
+    /// job, an impossibility that nothing in the arithmetic could refuse.
+    ///
+    /// So the ledger is no longer written to. It is *derived*: a segment enters
+    /// exactly one terminal state on the pending→terminal edge fired here, and
+    /// `failed_bytes` is the sum of the declared sizes of the segments holding
+    /// one. The size is the NZB's declaration, never a served size, because a
+    /// segment that fails has no served size worth the name — and because
+    /// health has to mean the same thing whatever a hostile server sends.
+    ///
+    /// Every path that retires a segment comes through here, including the ones
+    /// with no wire outcome at all (see the foreign-layout breaker). Returns
+    /// whether this call is the edge.
+    pub(in crate::pipeline) fn book_terminal_segment(
+        &mut self,
+        seg_id: SegmentId,
+        terminal_state: SegmentTerminalState,
+    ) -> bool {
         let job_id = seg_id.file_id.job_id;
-        let failed_bytes = self.health_counted_segment_bytes(seg_id);
-        if !self.terminal_segment_failures.insert(seg_id) {
-            return;
+        // A segment can become a PAR2 metadata probe after an earlier ordinary
+        // attempt already exhausted it. The ledger stays idempotent below,
+        // but discovery must still learn that its newly queued probe cannot
+        // produce metadata or it will wait forever in `work_is_queued`.
+        self.mark_promoted_recovery_segment_unavailable(seg_id);
+        if self.segment_already_delivered(seg_id) {
+            // Delivery is a terminal state too, and it is held in the assembly
+            // bitmap. A late failure result for an ordinal that already landed
+            // — a losing racer, a stale retry — must not book bytes the job has
+            // on disk.
+            return false;
+        }
+        let declared_bytes = self.health_counted_segment_bytes(seg_id);
+        // The state a segment holds is the first one it reached, and a later
+        // path must not overwrite it: a retry that exhausts after the article
+        // was already ruled missing does not change what happened to it.
+        match self.segment_terminal_states.entry(seg_id) {
+            std::collections::hash_map::Entry::Occupied(_) => return false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(terminal_state);
+            }
         }
         if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.failed_bytes = state.failed_bytes.saturating_add(failed_bytes);
+            state.failed_bytes = state.failed_bytes.saturating_add(declared_bytes);
         }
-        self.mark_promoted_recovery_segment_unavailable(seg_id);
+        self.skip_failed_uu_segment(seg_id);
         self.check_health(job_id);
+        true
     }
 
+    /// Whether the assembly already holds this segment's bytes.
+    fn segment_already_delivered(&self, seg_id: SegmentId) -> bool {
+        self.jobs
+            .get(&seg_id.file_id.job_id)
+            .and_then(|state| state.assembly.file(seg_id.file_id))
+            .is_some_and(|file| file.has_segment(seg_id.segment_number))
+    }
+
+    /// The job's failed bytes as the terminal states alone define them.
+    ///
+    /// The running figure on `JobState` is maintained by the single edge in
+    /// [`Self::book_terminal_segment`], so the two agree by construction; this
+    /// is what settlement re-derives against rather than trusting the running
+    /// figure it is about to persist forever.
+    pub(in crate::pipeline) fn derived_failed_bytes(&self, job_id: JobId) -> u64 {
+        self.segment_terminal_states
+            .keys()
+            .filter(|seg_id| seg_id.file_id.job_id == job_id)
+            .map(|seg_id| self.health_counted_segment_bytes(*seg_id))
+            .sum()
+    }
+
+    /// The failed bytes to write into the terminal record, pinned to what the
+    /// job could possibly have lost.
+    ///
+    /// `failed_bytes <= total_bytes` is not a style preference: job 10220 was
+    /// archived with 1.99 GB failed against 1.21 GB total, and every consumer
+    /// downstream — the health percentage, the API's granular failure fields,
+    /// the automation reading them — silently produced nonsense from it. The
+    /// derived ledger cannot exceed the total by construction, so a breach here
+    /// means an invariant broke upstream: say so, and refuse to persist the
+    /// impossible number either way.
+    pub(in crate::pipeline) fn settled_failed_bytes(&self, job_id: JobId, total_bytes: u64) -> u64 {
+        let failed_bytes = self
+            .jobs
+            .get(&job_id)
+            .map_or(0, |state| state.failed_bytes)
+            .max(self.derived_failed_bytes(job_id));
+        debug_assert!(
+            failed_bytes <= total_bytes,
+            "job {} settled with failed_bytes {failed_bytes} above total_bytes {total_bytes}",
+            job_id.0
+        );
+        if failed_bytes > total_bytes {
+            warn!(
+                job_id = job_id.0,
+                failed_bytes,
+                total_bytes,
+                "failed bytes exceeded the job size at settlement; clamping the terminal record"
+            );
+            return total_bytes;
+        }
+        failed_bytes
+    }
+
+    /// The declared bytes of this file's segments that reached a terminal
+    /// state without arriving.
+    pub(in crate::pipeline) fn file_terminal_failed_bytes(&self, file_id: NzbFileId) -> u64 {
+        self.segment_terminal_states
+            .keys()
+            .filter(|seg_id| seg_id.file_id == file_id)
+            .map(|seg_id| self.health_counted_segment_bytes(*seg_id))
+            .sum()
+    }
+
+    /// Unwedge a uuencode file whose cursor is waiting on a part that will
+    /// never arrive.
+    ///
+    /// Sequential assembly has no way past a permanently missing part on its
+    /// own: every later part's offset is defined by that part's decoded length,
+    /// which is now unknowable. The choice is to wedge the file forever or to
+    /// close the gap, and closing it is what both reference downloaders do.
+    ///
+    /// The consequence is stated plainly: every part after the hole is written
+    /// one hole-width early, so the file's bytes past that point are
+    /// **misaligned**, not merely incomplete. The file is marked damaged and
+    /// PAR2 is the authority on whether it can be recovered. Without PAR2 the
+    /// file is simply wrong, which is still better than a job that never
+    /// finishes — and the damage flag is what tells the truth about it.
+    pub(in crate::pipeline) fn skip_failed_uu_segment(&mut self, seg_id: SegmentId) {
+        let Some(uu) = self.uu_files.get_mut(&seg_id.file_id) else {
+            return;
+        };
+        if seg_id.segment_number != uu.next_index {
+            // Only the ordinal the cursor is actually waiting on can wedge it.
+            // A later failure is handled when the cursor reaches it.
+            return;
+        }
+        uu.damaged = true;
+        uu.next_index = uu.next_index.saturating_add(1);
+    }
+
+    /// Drop the job's terminal states, and the ledger derived from them.
+    ///
+    /// The two move together on purpose. Clearing the states alone would leave
+    /// the job carrying bytes nothing accounts for, and the next booking of the
+    /// same segment — a restarted job re-fetches every one of them — would add
+    /// those bytes a second time.
     pub(crate) fn clear_terminal_segment_failures(&mut self, job_id: JobId) {
-        self.terminal_segment_failures
-            .retain(|segment_id| segment_id.file_id.job_id != job_id);
+        self.segment_terminal_states
+            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.failed_bytes = 0;
+            state.probe_projected_failed_bytes = 0;
+        }
+        self.foreign_layout_watches
+            .retain(|file_id, _| file_id.job_id != job_id);
+        self.files_counted_missing
+            .retain(|file_id| file_id.job_id != job_id);
+    }
+
+    /// Count the files this job could not assemble from articles.
+    ///
+    /// Called once the download pipeline has drained with data files still
+    /// incomplete: that is the moment the remaining segments are known to be
+    /// unavailable across every configured server rather than merely late.
+    /// A file is counted **once**, with the number of segments still missing
+    /// at that moment — not once per failed segment — and the per-job guard
+    /// set keeps the many re-entries of the completion check from counting it
+    /// again. PAR2 may still rebuild the file afterwards; that is a repair,
+    /// and `weaver_repairs_total` is where it is accounted for. What this
+    /// counter answers is how much of the payload Usenet itself could not
+    /// supply.
+    ///
+    /// Per-file, per-job: a `HashMap` lookup and a `HashSet` insert here are
+    /// the same class of work `check_job_completion` around it already does,
+    /// and nothing on a per-segment path reaches this.
+    pub(in crate::pipeline) fn note_incomplete_files_after_download_drain(
+        &mut self,
+        job_id: JobId,
+    ) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let incomplete: Vec<(NzbFileId, u64)> = state
+            .assembly
+            .files()
+            .filter(|file| !file.is_complete())
+            // Recovery volumes are optional by design: an absent PAR2 block is
+            // not a file the job failed to assemble, it is recovery capacity
+            // that was never needed or never fetched.
+            .filter(|file| {
+                !matches!(
+                    file.role(),
+                    weaver_model::files::FileRole::Par2 {
+                        is_index: false,
+                        ..
+                    }
+                )
+            })
+            .map(|file| (file.file_id(), u64::from(file.missing_count())))
+            .collect();
+        for (file_id, missing_segments) in incomplete {
+            if self.files_counted_missing.insert(file_id) {
+                self.metrics
+                    .job_lifecycle
+                    .note_file_missing(missing_segments);
+            }
+        }
     }
 
     fn health_counted_segment_bytes(&self, segment_id: SegmentId) -> u64 {
@@ -474,18 +640,6 @@ impl Pipeline {
                 .download_lanes_depth4_active
                 .fetch_add(1, Ordering::Relaxed),
         };
-
-        if let Some(active) = self.download_lane_runtime.active_by_mode.get_mut(&previous) {
-            *active = active.saturating_sub(1);
-            if *active == 0 {
-                self.download_lane_runtime.active_by_mode.remove(&previous);
-            }
-        }
-        *self
-            .download_lane_runtime
-            .active_by_mode
-            .entry(next)
-            .or_default() += 1;
     }
 
     pub(crate) fn handle_owned_download_lane_event(
@@ -496,6 +650,39 @@ impl Pipeline {
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.owned_lane.event");
         match event {
             OwnedDownloadLaneEvent::AcquireFailed { lease, error } => {
+                if error.is_capacity_admission() {
+                    let DownloadBatchLease {
+                        job_id,
+                        lane_mode,
+                        spillover_loan_kind,
+                        compatibility,
+                        works,
+                        ..
+                    } = lease;
+                    debug!(
+                        job_id = job_id.0,
+                        works = works.len(),
+                        error = %error,
+                        "owned blocking lane capacity unavailable; returning work to scheduler"
+                    );
+                    crate::runtime::perf_probe::record_value(
+                        "download.owned_lane.acquire_failed_capacity_requeue",
+                        1,
+                    );
+                    for work in works {
+                        self.restore_owned_lane_unrequested_work(work);
+                    }
+                    self.handle_download_lane_parked(DownloadLaneParked {
+                        job_id,
+                        mode: lane_mode,
+                        spillover_loan_kind,
+                        completion_critical: compatibility.completion_critical,
+                        reason: LaneParkReason::Capacity,
+                        release_connection_slot: true,
+                        release_ip_replacement_burst: false,
+                    });
+                    return;
+                }
                 debug!(
                     job_id = lease.job_id.0,
                     works = lease.works.len(),
@@ -599,7 +786,7 @@ impl Pipeline {
         if let Some(state) = self.jobs.get_mut(&job_id)
             && !is_terminal_status(&state.status)
         {
-            if work.is_recovery {
+            if work.is_recovery && !work.completion_critical {
                 state.recovery_queue.push(work);
             } else {
                 state.download_queue.push(work);
@@ -626,6 +813,21 @@ impl Pipeline {
                 if *in_flight == 0 {
                     self.active_download_connections_by_job
                         .remove(&parked.job_id);
+                }
+            }
+            if parked.completion_critical {
+                self.active_completion_critical_connections = self
+                    .active_completion_critical_connections
+                    .saturating_sub(1);
+                if let Some(in_flight) = self
+                    .active_completion_critical_connections_by_job
+                    .get_mut(&parked.job_id)
+                {
+                    *in_flight = in_flight.saturating_sub(1);
+                    if *in_flight == 0 {
+                        self.active_completion_critical_connections_by_job
+                            .remove(&parked.job_id);
+                    }
                 }
             }
             self.clear_spillover_loan_if_idle();

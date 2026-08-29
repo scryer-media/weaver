@@ -1,0 +1,9 @@
+# Cache-hit override: NNTP article stores are baked into the local images.
+# Keep the cert volume for TLS, but do not mask /data with a named volume: that
+# would copy the full corpus out of the image for every phase.
+services:
+  nntp:
+    volumes: !override
+      - nntp-certs:/certs
+  nntp2:
+    volumes: !override []

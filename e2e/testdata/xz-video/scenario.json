@@ -1,0 +1,10 @@
+{
+  "slug": "xz-video",
+  "title": "E2E.Test.XZ.Video.2026.1080p-TESTGRP",
+  "description": "Video file in a standalone XZ stream. Tests direct XZ extraction of a media payload.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "test-media.mkv": "bd8b3991787e2bc03ae0f47bda585f1b9dbd831448493fe3c4a9118f4f947cf2"
+  }
+}

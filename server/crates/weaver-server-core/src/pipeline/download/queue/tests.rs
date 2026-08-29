@@ -17,6 +17,7 @@ fn make_work(job_id: u64, file_index: u32, seg: u32, priority: u32) -> DownloadW
         byte_estimate: 768_000,
         retry_count: 0,
         is_recovery: false,
+        completion_critical: false,
         exclude_servers: vec![],
         avoid_server: None,
     }
@@ -46,14 +47,19 @@ fn excluded_work_count_tracks_push_pop_and_bulk_removal() {
     assert_eq!(first.exclude_servers, vec![0]);
     assert_eq!(q.excluded_work_count(), 1);
 
-    q.remove_job(JobId(2));
+    let removed = q.extract_matching(|work| work.segment_id.file_id.job_id == JobId(2));
+    assert_eq!(removed.len(), 1);
     assert_eq!(q.excluded_work_count(), 0);
     assert_eq!(q.len(), 1);
 
     let mut again = make_work(3, 0, 0, 5);
     again.exclude_servers = vec![2];
     q.push(again);
-    assert_eq!(q.drain_job(JobId(3)).len(), 1);
+    assert_eq!(
+        q.extract_matching(|work| work.segment_id.file_id.job_id == JobId(3))
+            .len(),
+        1
+    );
     assert_eq!(q.excluded_work_count(), 0);
 
     let mut last = make_work(4, 0, 0, 5);
@@ -100,30 +106,122 @@ fn priority_ordering() {
 }
 
 #[test]
-fn reprioritize_job() {
+fn completion_critical_work_precedes_ordinary_priority() {
     let mut q = DownloadQueue::new();
-    // Job 1 segments at priority 1000 (PAR2 recovery, normally low priority).
-    q.push(make_work(1, 0, 0, 1000));
-    q.push(make_work(1, 0, 1, 1000));
-    // Job 2 segment at priority 10 (RAR volume).
-    q.push(make_work(2, 0, 0, 10));
+    q.push(make_work(1, 0, 0, 0));
+    let mut critical = make_work(1, 1, 0, 1000);
+    critical.is_recovery = true;
+    critical.completion_critical = true;
+    q.push(critical);
 
-    // Boost job 1 to priority 1 (damage detected, need recovery blocks).
-    q.reprioritize_job(JobId(1), 1);
-
-    // Job 1 segments should now come out first.
     let first = q.pop().unwrap();
-    assert_eq!(first.segment_id.file_id.job_id, JobId(1));
-    assert_eq!(first.priority, 1);
+    assert!(first.completion_critical);
+    assert_eq!(first.priority, 1000);
+    assert!(!q.pop().unwrap().completion_critical);
+}
 
-    let second = q.pop().unwrap();
-    assert_eq!(second.segment_id.file_id.job_id, JobId(1));
-    assert_eq!(second.priority, 1);
+#[test]
+fn compatibility_does_not_mix_critical_and_optional_recovery() {
+    let mut q = DownloadQueue::new();
+    let mut critical = make_work(1, 1, 0, 1000);
+    critical.is_recovery = true;
+    critical.completion_critical = true;
+    let mut optional = make_work(1, 1, 1, 1000);
+    optional.is_recovery = true;
+    q.push(optional);
+    q.push(critical);
 
-    // Job 2 last.
-    let third = q.pop().unwrap();
-    assert_eq!(third.segment_id.file_id.job_id, JobId(2));
-    assert_eq!(third.priority, 10);
+    let first = q.pop().unwrap();
+    assert!(first.completion_critical);
+    assert!(
+        q.pop_next_matching_in_class(first.completion_critical, |work| {
+            work.completion_critical == first.completion_critical
+        })
+        .is_none()
+    );
+    assert_eq!(q.len(), 1);
+}
+
+#[test]
+fn class_constrained_pop_preserves_constant_time_queue_class_counts() {
+    let mut q = DownloadQueue::new();
+    let ordinary = make_work(1, 0, 0, 0);
+    let mut critical = make_work(1, 1, 0, 1000);
+    critical.is_recovery = true;
+    critical.completion_critical = true;
+    q.push(ordinary);
+    q.push(critical);
+
+    assert!(q.has_completion_critical_work());
+    assert!(q.has_noncritical_work());
+    let selected = q
+        .pop_first_matching(|work| !work.completion_critical)
+        .expect("ordinary work must be selectable behind the critical heap head");
+    assert!(!selected.completion_critical);
+    assert!(q.has_completion_critical_work());
+    assert!(!q.has_noncritical_work());
+
+    q.push(make_work(1, 2, 0, 0));
+    let extracted = q.extract_matching(|work| work.completion_critical);
+    assert_eq!(extracted.len(), 1);
+    assert!(!q.has_completion_critical_work());
+    assert!(q.has_noncritical_work());
+
+    q.drain_all();
+    assert!(!q.has_completion_critical_work());
+    assert!(!q.has_noncritical_work());
+}
+
+#[test]
+fn class_constrained_head_pop_does_not_scan_past_incompatible_work() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 0, 0, 10));
+    q.push(make_work(1, 0, 1, 20));
+
+    assert!(
+        q.pop_next_matching_in_class(false, |work| work.segment_id.segment_number == 1)
+            .is_none(),
+        "ordinary dispatch must remain a heap-head operation"
+    );
+    assert_eq!(q.pop().unwrap().segment_id.segment_number, 0);
+    assert_eq!(q.pop().unwrap().segment_id.segment_number, 1);
+}
+
+#[test]
+fn recovery_presence_tracks_pop_extract_and_drain() {
+    let mut q = DownloadQueue::new();
+    let primary = make_work(1, 0, 0, 10);
+    let mut recovery = make_work(1, 1, 0, 20);
+    recovery.is_recovery = true;
+    let mut other_recovery = make_work(2, 0, 0, 30);
+    other_recovery.is_recovery = true;
+
+    q.push(primary);
+    q.push(recovery);
+    q.push(other_recovery);
+    assert!(q.has_recovery_work());
+
+    let extracted = q.extract_matching(|work| work.segment_id.file_id.job_id == JobId(2));
+    assert_eq!(extracted.len(), 1);
+    assert!(q.has_recovery_work());
+
+    let removed = q.extract_matching(|work| work.segment_id.file_id.job_id == JobId(1));
+    assert_eq!(removed.len(), 2);
+    assert!(!q.has_recovery_work());
+
+    let mut recovery = make_work(3, 0, 0, 10);
+    recovery.is_recovery = true;
+    q.push(recovery);
+    assert!(q.has_recovery_work());
+    assert!(q.pop().unwrap().is_recovery);
+    assert!(!q.has_recovery_work());
+
+    let mut last_recovery = make_work(4, 0, 0, 10);
+    last_recovery.is_recovery = true;
+    q.push(last_recovery);
+    assert!(q.has_recovery_work());
+    q.drain_all();
+    assert!(!q.has_recovery_work());
 }
 
 #[test]
@@ -219,6 +317,39 @@ fn rar_unlock_reprioritize_matching_uses_rank_inside_priority_band() {
 }
 
 #[test]
+fn promoted_identity_probe_leads_other_completion_critical_work() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 0, 0, 0));
+    q.push(make_work(1, 2, 0, 100));
+    q.push(make_work(1, 2, 1, 101));
+    let mut repair = make_work(1, 99, 0, 1000);
+    repair.is_recovery = true;
+    repair.completion_critical = true;
+    q.push(repair);
+
+    let promoted = q.promote_matching_to_completion_critical_with_rank(|work| {
+        if work.priority <= 1 {
+            Some((work.priority, None))
+        } else {
+            (work.segment_id.file_id.file_index == 2 && work.segment_id.segment_number == 0)
+                .then_some((2, Some(2)))
+        }
+    });
+
+    assert_eq!(promoted, 2);
+    let index = q.pop().unwrap();
+    assert_eq!(index.priority, 0);
+    assert!(index.completion_critical);
+    let probe = q.pop().unwrap();
+    assert_eq!(probe.segment_id.file_id.file_index, 2);
+    assert_eq!(probe.segment_id.segment_number, 0);
+    assert_eq!(probe.priority, 2);
+    assert!(probe.completion_critical);
+    assert!(q.pop().unwrap().completion_critical);
+    assert!(!q.pop().unwrap().completion_critical);
+}
+
+#[test]
 fn mixed_priorities() {
     let mut q = DownloadQueue::new();
 
@@ -237,21 +368,4 @@ fn mixed_priorities() {
     assert_eq!(items[1].priority, 1); // First RAR
     assert_eq!(items[2].priority, 11); // Second RAR
     assert_eq!(items[3].priority, 1000); // PAR2 recovery
-}
-
-#[test]
-fn remove_job() {
-    let mut q = DownloadQueue::new();
-    q.push(make_work(1, 0, 0, 10));
-    q.push(make_work(1, 0, 1, 10));
-    q.push(make_work(2, 0, 0, 10));
-    q.push(make_work(1, 1, 0, 10));
-    assert_eq!(q.len(), 4);
-
-    q.remove_job(JobId(1));
-    assert_eq!(q.len(), 1);
-
-    let remaining = q.pop().unwrap();
-    assert_eq!(remaining.segment_id.file_id.job_id, JobId(2));
-    assert!(q.is_empty());
 }

@@ -1,0 +1,8 @@
+{
+  "slug": "rar4-member-encrypted",
+  "title": "E2E.Test.RAR4.MemberEncrypted.2024.1080p-TESTGRP",
+  "description": "RAR4 with member-level encryption (-p). Headers readable, data encrypted.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "password": "e2e-test-password"
+}

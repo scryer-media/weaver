@@ -2,7 +2,7 @@ mod common;
 
 use std::io::Write;
 
-use async_graphql::{Request, UploadValue, Variables};
+use async_graphql::{Request, UploadValue, Value, Variables};
 use base64::Engine;
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 use serde_json::json;
@@ -526,6 +526,35 @@ async fn submit_with_category() {
     assert_eq!(
         data["submitNzb"]["item"]["category"].as_str().unwrap(),
         "movies"
+    );
+}
+
+#[tokio::test]
+async fn submit_rejects_unsafe_category_as_invalid_input() {
+    let h = TestHarness::new().await;
+    let nzb_b64 = encode_nzb(&minimal_nzb("unsafe-category-test"));
+
+    let response = h
+        .execute(&format!(
+            r#"mutation {{
+                submitNzb(input: {{ nzbBase64: "{nzb_b64}", category: "../../outside" }}) {{
+                    accepted
+                }}
+            }}"#
+        ))
+        .await;
+
+    assert_has_errors(&response);
+    assert_eq!(
+        response.errors[0]
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get("code"))
+            .and_then(|value| match value {
+                Value::String(code) => Some(code.as_str()),
+                _ => None,
+            }),
+        Some("INVALID_INPUT")
     );
 }
 

@@ -515,6 +515,9 @@ mod tests {
             ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
+            direct_store: None,
+            delivery_naming: None,
+            metrics: Default::default(),
             config_path: None,
         }))
     }
@@ -529,6 +532,8 @@ mod tests {
             download_retry_at_epoch_ms: None,
             status: JobStatus::Moving,
             download_state: DownloadState::Complete,
+            finalizing_download: false,
+            fetching_repair_data: false,
             post_state: PostState::Finalizing,
             run_state: RunState::Active,
             progress: 100.0,
@@ -539,6 +544,7 @@ mod tests {
             phase_progress: Vec::new(),
             failed_bytes: 0,
             health: 1000,
+            terminal_discards: Vec::new(),
             total_files: 1,
             completed_files: 1,
             remaining_par_files: 0,

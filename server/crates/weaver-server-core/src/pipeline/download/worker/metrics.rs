@@ -1,5 +1,58 @@
 use super::*;
 
+/// Record checkpoint geometry after an article has finished decoding. This is
+/// intentionally a completion-side probe: disabled profiling does one cached
+/// enable check and the decoder's cut loop stays free of locks, clocks, and
+/// metric allocations.
+fn record_checkpoint_observability(result: &weaver_yenc::DecodeResult) {
+    if !crate::runtime::perf_probe::enabled() {
+        return;
+    }
+
+    let shape = match &result.checkpoint_plan {
+        weaver_yenc::CheckpointPlan::None => "download.checkpoint_plan.none",
+        weaver_yenc::CheckpointPlan::Single(_) => "download.checkpoint_plan.single",
+        weaver_yenc::CheckpointPlan::Multi(_) => "download.checkpoint_plan.multi",
+    };
+    crate::runtime::perf_probe::record_value(shape, 1);
+    crate::runtime::perf_probe::record_value(
+        "download.checkpoint_plan.grid_count",
+        result.checkpoint_plan.grid_count() as u64,
+    );
+    crate::runtime::perf_probe::record_value(
+        "download.checkpoint_segments.emitted",
+        result.segments.len() as u64,
+    );
+
+    let Some(reason) = result.checkpoint_collapse_reason else {
+        return;
+    };
+    let label = match reason {
+        weaver_yenc::CheckpointCollapseReason::SegmentCount => {
+            "download.checkpoint_collapse.segment_count"
+        }
+        weaver_yenc::CheckpointCollapseReason::SegmentStorage => {
+            "download.checkpoint_collapse.segment_storage"
+        }
+        weaver_yenc::CheckpointCollapseReason::OfferWork => {
+            "download.checkpoint_collapse.offer_work"
+        }
+        weaver_yenc::CheckpointCollapseReason::BoundaryOverflow => {
+            "download.checkpoint_collapse.boundary_overflow"
+        }
+        weaver_yenc::CheckpointCollapseReason::MissingBoundary => {
+            "download.checkpoint_collapse.missing_boundary"
+        }
+        weaver_yenc::CheckpointCollapseReason::NonAdvancingBoundary => {
+            "download.checkpoint_collapse.nonadvancing_boundary"
+        }
+        weaver_yenc::CheckpointCollapseReason::OffsetOverflow => {
+            "download.checkpoint_collapse.offset_overflow"
+        }
+    };
+    crate::runtime::perf_probe::record_value(label, 1);
+}
+
 impl Pipeline {
     pub(in crate::pipeline::download::worker) fn log_download_dispatch_liveness_stall(
         &mut self,
@@ -133,7 +186,7 @@ impl Pipeline {
                 let weaver_nntp::client::DecodedBody {
                     raw_size,
                     decoded,
-                    result,
+                    body,
                     cpu,
                     io,
                 } = decoded;
@@ -287,30 +340,69 @@ impl Pipeline {
                     "download.fused.decoded.bytes",
                     io.decoded_bytes_written,
                 );
-                let file_offset = result
-                    .metadata
-                    .begin
-                    .map(|b| b.saturating_sub(1))
-                    .unwrap_or(0);
-
                 let data = {
                     let _cpu =
                         crate::runtime::perf_probe::cpu_scope("download.inline_decode.into_chunk");
                     DecodedChunk::from(decoded)
                 };
 
-                Ok(DownloadPayload::Decoded(DecodeResult {
-                    segment_id,
-                    raw_size: raw_size as u64,
-                    unverified_provenance: None,
-                    file_offset,
-                    decoded_size: result.bytes_written as u32,
-                    crc_valid: result.crc_valid,
-                    part_crc_verified: result.expected_part_crc.is_some() && result.crc_valid,
-                    part_crc: result.part_crc,
-                    expected_file_crc: result.expected_file_crc,
-                    data,
-                    yenc_name: result.metadata.name,
+                Ok(DownloadPayload::Decoded(match body {
+                    weaver_nntp::fused_yenc::FusedArticleBody::Yenc(result) => {
+                        record_checkpoint_observability(&result);
+                        let yenc_layout = YencLayoutAssertions {
+                            file_size: result.metadata.size,
+                            part: result.metadata.part,
+                            total: result.metadata.total,
+                            begin: result.metadata.begin,
+                            end: result.metadata.end,
+                        };
+
+                        DecodeResult {
+                            segment_id,
+                            raw_size: raw_size as u64,
+                            encoding: SegmentEncoding::Yenc,
+                            yenc_layout,
+                            crc_valid: crate::pipeline::crc_not_mismatched(result.crc_status),
+                            part_crc_verified: result.expected_part_crc.is_some()
+                                && crate::pipeline::crc_not_mismatched(result.crc_status),
+                            part_crc: result.part_crc,
+                            expected_file_crc: result.expected_file_crc,
+                            data,
+                            yenc_name: result.metadata.name,
+                            checkpoint_plan: result.checkpoint_plan,
+                            segments: result.segments,
+                        }
+                    }
+                    // uuencode declares no offsets, no size and no checksum, so
+                    // every field that would carry one is left at its "nothing
+                    // to say" value. In particular `segments` is empty: the
+                    // dual-CRC grid can only be fed block-aligned CRC evidence,
+                    // and there is none to give it here.
+                    weaver_nntp::fused_yenc::FusedArticleBody::Uu(outcome) => DecodeResult {
+                        segment_id,
+                        raw_size: raw_size as u64,
+                        encoding: SegmentEncoding::Uu(crate::pipeline::UuSegmentFacts {
+                            damaged: outcome.damaged,
+                            ended: outcome.ended,
+                        }),
+                        yenc_layout: YencLayoutAssertions {
+                            file_size: 0,
+                            part: None,
+                            total: None,
+                            begin: None,
+                            end: None,
+                        },
+                        // "Not known bad" — there is nothing to check against,
+                        // which is different from having checked and passed.
+                        crc_valid: true,
+                        part_crc_verified: false,
+                        part_crc: 0,
+                        expected_file_crc: None,
+                        data,
+                        yenc_name: outcome.filename.unwrap_or_default(),
+                        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                        segments: Vec::new(),
+                    },
                 }))
             }
             Err(weaver_nntp::client::DecodedBodyError::Nntp(error)) => {

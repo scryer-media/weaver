@@ -1,21 +1,22 @@
-//! Typed contracts for post-processing extensions.
+//! Post-processing scripts: files in an operator-configured directory, an
+//! ordered list per job, executed as a bounded step of job finalization.
 
-pub mod discovery;
+pub mod executor;
+pub mod listing;
 pub mod manifest;
 pub mod model;
-pub mod persistence;
 pub mod runner;
-pub mod service;
+pub mod settings;
 
 #[cfg(test)]
-mod discovery_tests;
+mod executor_tests;
+#[cfg(test)]
+mod listing_tests;
 #[cfg(test)]
 mod manifest_tests;
 #[cfg(test)]
 mod model_tests;
 #[cfg(test)]
-mod persistence_tests;
-#[cfg(test)]
 mod runner_tests;
 #[cfg(test)]
-mod service_tests;
+mod settings_tests;

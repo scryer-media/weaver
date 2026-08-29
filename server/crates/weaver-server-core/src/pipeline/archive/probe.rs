@@ -112,12 +112,26 @@ impl Pipeline {
         job_id: JobId,
         identity: ActiveFileIdentity,
     ) -> Result<(), String> {
+        let file_id = NzbFileId {
+            job_id,
+            file_index: identity.file_index,
+        };
+        let previous = self.effective_file_identity(job_id, file_id);
+        let filename_changed = previous
+            .as_ref()
+            .is_none_or(|previous| previous.current_filename != identity.current_filename);
         self.db
             .save_file_identity(job_id, &identity)
             .map_err(|error| format!("failed to save file identity: {error}"))?;
+        // Only a current-name change moves the bytes a retained PAR2 session
+        // refers to. Binding reads source and canonical aliases live.
+        if filename_changed {
+            self.invalidate_par2_session_for_identity_rebind(job_id);
+        }
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.file_identities.insert(identity.file_index, identity);
         }
+        self.refresh_par2_md5_substitution_binding(file_id);
         Ok(())
     }
 
@@ -150,6 +164,16 @@ impl Pipeline {
         file_id: NzbFileId,
         allow_probe: bool,
     ) {
+        // A direct set's source volume has no file: classifying
+        // it probes a path that does not exist, and the topology update it
+        // feeds would then dispatch incremental extraction over volumes nobody
+        // ever wrote. The routing seam suppresses its own call, but this
+        // function has nine other callers — completion checks, PAR2 merge, RAR
+        // finalization, the job service — and every one of them fires for a
+        // complete direct volume. The rule belongs at the entry, once.
+        if self.is_direct_source_file(file_id) {
+            return;
+        }
         self.classify_completed_file(job_id, file_id, allow_probe)
             .await;
 
@@ -178,7 +202,9 @@ impl Pipeline {
             | FileRole::DeflateArchive
             | FileRole::BrotliArchive
             | FileRole::ZstdArchive
-            | FileRole::Bzip2Archive => {
+            | FileRole::Bzip2Archive
+            | FileRole::XzArchive
+            | FileRole::TarXzArchive => {
                 self.try_update_7z_topology(job_id, file_id);
             }
             _ => {}

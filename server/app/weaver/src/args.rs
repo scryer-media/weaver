@@ -7,15 +7,31 @@ pub(crate) const DEFAULT_SERVE_PORT: u16 = 9090;
 pub(crate) const DEFAULT_SERVE_BASE_URL: &str = "/";
 
 #[derive(Parser)]
-#[command(name = "weaver", about = "Usenet binary downloader")]
+#[command(
+    name = "weaver",
+    about = "Usenet binary downloader",
+    version = env!("CARGO_PKG_VERSION")
+)]
 pub(crate) struct Cli {
     /// Path to configuration file.
     #[arg(short, long)]
     pub(crate) config: Option<PathBuf>,
 
     /// Write service logs to the given file.
+    ///
+    /// Also settable with WEAVER_LOG_FILE.
     #[arg(long, value_name = "PATH", global = true)]
     pub(crate) log_file: Option<PathBuf>,
+
+    /// Log record format for stdout and the log file: `text` or `json`.
+    ///
+    /// Also settable with WEAVER_LOG_FORMAT. The in-app log viewer always
+    /// receives the text format. Colouring is controlled separately by
+    /// WEAVER_LOG_COLOR (`auto`, `always`, `never`; `auto` colours only an
+    /// interactive terminal and honours NO_COLOR), and the default log level is
+    /// INFO unless RUST_LOG says otherwise.
+    #[arg(long, value_name = "FORMAT", global = true)]
+    pub(crate) log_format: Option<String>,
 
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
@@ -78,6 +94,18 @@ pub(crate) enum Command {
         /// Output directory (overrides config).
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Password for encrypted archive contents in the submitted NZB.
+        #[arg(long, value_name = "PASSWORD")]
+        password: Option<String>,
+
+        /// Write an immutable JSON terminal-status report after completion.
+        #[arg(long, value_name = "PATH")]
+        report: Option<PathBuf>,
+
+        /// Wait up to 30 seconds for this file after writing --report.
+        #[arg(long, value_name = "PATH", requires = "report")]
+        report_ack: Option<PathBuf>,
 
         /// Bypass semantic duplicate blocking for this submission.
         #[arg(long)]
@@ -144,9 +172,20 @@ pub(crate) enum Par2Command {
 mod tests {
     use std::path::PathBuf;
 
-    use clap::Parser;
+    use clap::{Parser, error::ErrorKind};
 
     use super::{Cli, Command, DEFAULT_CONFIG_FILE};
+
+    #[test]
+    fn version_flag_reports_the_package_version() {
+        let error = match Cli::try_parse_from(["weaver", "--version"]) {
+            Err(error) => error,
+            Ok(_) => panic!("version exits"),
+        };
+
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
 
     #[test]
     fn argless_invocation_defaults_to_serve() {
@@ -182,6 +221,37 @@ mod tests {
             cli.resolved_config_path(),
             PathBuf::from("custom-weaver.toml")
         );
+    }
+
+    #[test]
+    fn standalone_download_password_and_report_are_preserved() {
+        let cli = Cli::parse_from([
+            "weaver",
+            "download",
+            "fixture.nzb",
+            "--password",
+            "fixture-password",
+            "--report",
+            "result.json",
+            "--report-ack",
+            "result.ack",
+        ]);
+
+        match cli.command.expect("download command") {
+            Command::Download {
+                nzb,
+                password,
+                report,
+                report_ack,
+                ..
+            } => {
+                assert_eq!(nzb, PathBuf::from("fixture.nzb"));
+                assert_eq!(password.as_deref(), Some("fixture-password"));
+                assert_eq!(report, Some(PathBuf::from("result.json")));
+                assert_eq!(report_ack, Some(PathBuf::from("result.ack")));
+            }
+            _ => panic!("download arguments should parse as a download command"),
+        }
     }
 
     #[cfg(not(windows))]

@@ -1,11 +1,13 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Link, Outlet, useLocation } from "react-router";
 import { useTheme } from "next-themes";
+import { toast } from "sonner";
 import {
   Activity,
   Clock3,
   FolderUp,
   Heart,
+  Info,
   ListOrdered,
   Menu,
   Monitor,
@@ -17,13 +19,8 @@ import {
   Unplug,
 } from "lucide-react";
 import { useQuery, useSubscription } from "urql";
+import { useGraphqlConnectionState } from "@/graphql/client";
 import {
-  requestGraphqlClientRestart,
-  useGraphqlConnectionState,
-} from "@/graphql/client";
-import {
-  JOB_UPDATES_SUBSCRIPTION,
-  JOBS_PAGE_QUERY,
   LIVE_METRICS_QUERY,
   LIVE_METRICS_SUBSCRIPTION,
   VERSION_QUERY,
@@ -35,15 +32,7 @@ import { UploadModal } from "@/components/UploadModal";
 import { useSpeedHistory } from "@/lib/hooks/use-speed-history";
 import { LiveDataProvider, type DownloadBlockState } from "@/lib/context/live-data-context";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
-import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
-import {
-  normalizeFacadeJobProgress,
-  normalizeFacadeJobStatus,
-  normalizeGraphqlTimestamp,
-  normalizeJobData,
-  type GraphqlJobData,
-  type JobData,
-} from "@/lib/job-types";
+import type { JobData } from "@/lib/job-types";
 import { useTranslate } from "@/lib/context/translate-context";
 import { usePwa } from "@/lib/context/pwa-context";
 import { settingsNav } from "@/pages/settings/settings-nav";
@@ -52,7 +41,6 @@ import { Button } from "@/components/ui/button";
 import {
   Sheet,
   SheetContent,
-  SheetDescription,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
@@ -61,22 +49,12 @@ const navItems = [
   { to: "/", labelKey: "nav.jobs", icon: ListOrdered },
   { to: "/history", labelKey: "nav.history", icon: Clock3 },
   { to: "/monitoring", labelKey: "nav.monitoring", icon: Activity },
+  { to: "/system-info", labelKey: "nav.systemInfo", icon: Info },
   { to: "/logs", labelKey: "nav.logs", icon: ScrollText },
   { to: "/settings", labelKey: "nav.settings", icon: Settings },
 ];
 
-interface QueueSnapshotPayload {
-  items: GraphqlJobData[];
-  latestCursor: string;
-  globalState: {
-    isPaused: boolean;
-    downloadBlock: DownloadBlockState;
-  };
-}
-
-interface Snapshot {
-  jobs: JobData[];
-  latestCursor: string;
+interface GlobalQueueState {
   globalState: {
     isPaused: boolean;
     downloadBlock: DownloadBlockState;
@@ -85,7 +63,7 @@ interface Snapshot {
 
 interface LiveMetricsSnapshot {
   metrics: { currentDownloadSpeed: number };
-  globalState: Snapshot["globalState"];
+  globalState: GlobalQueueState["globalState"];
 }
 
 const EMPTY_JOBS: JobData[] = [];
@@ -102,208 +80,15 @@ const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
   timezoneName: "",
   scheduledSpeedLimit: 0,
 };
-const DEFAULT_GLOBAL_STATE: Snapshot["globalState"] = {
+const DEFAULT_GLOBAL_STATE: GlobalQueueState["globalState"] = {
   isPaused: false,
   downloadBlock: DEFAULT_DOWNLOAD_BLOCK,
 };
+const RECONNECT_TOAST_ID = "graphql-connection";
 
 const RoutedOutlet = memo(function RoutedOutlet() {
   return <Outlet />;
 });
-
-function sameStringArray(left: string[], right: string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-
-function sameEpisode(
-  left: JobData["parsedRelease"]["episode"],
-  right: GraphqlJobData["parsedRelease"]["episode"],
-): boolean {
-  if (left === right) {
-    return true;
-  }
-  if (!left || !right) {
-    return left == null && right == null;
-  }
-  return left.season === right.season
-    && left.absoluteEpisode === right.absoluteEpisode
-    && left.raw === right.raw
-    && left.episodeNumbers.length === right.episodeNumbers.length
-    && left.episodeNumbers.every((value, index) => value === right.episodeNumbers[index]);
-}
-
-function sameParsedRelease(left: JobData["parsedRelease"], right: GraphqlJobData["parsedRelease"]): boolean {
-  return left.normalizedTitle === right.normalizedTitle
-    && left.releaseGroup === right.releaseGroup
-    && sameStringArray(left.languagesAudio, right.languagesAudio)
-    && sameStringArray(left.languagesSubtitles, right.languagesSubtitles)
-    && left.year === right.year
-    && left.quality === right.quality
-    && left.source === right.source
-    && left.videoCodec === right.videoCodec
-    && left.videoEncoding === right.videoEncoding
-    && left.audio === right.audio
-    && sameStringArray(left.audioCodecs, right.audioCodecs)
-    && left.audioChannels === right.audioChannels
-    && left.isDualAudio === right.isDualAudio
-    && left.isAtmos === right.isAtmos
-    && left.isDolbyVision === right.isDolbyVision
-    && left.detectedHdr === right.detectedHdr
-    && left.isHdr10Plus === right.isHdr10Plus
-    && left.isHlg === right.isHlg
-    && left.fps === right.fps
-    && left.isProperUpload === right.isProperUpload
-    && left.isRepack === right.isRepack
-    && left.isRemux === right.isRemux
-    && left.isBdDisk === right.isBdDisk
-    && left.isAiEnhanced === right.isAiEnhanced
-    && left.isHardcodedSubs === right.isHardcodedSubs
-    && left.streamingService === right.streamingService
-    && left.edition === right.edition
-    && left.animeVersion === right.animeVersion
-    && left.parseConfidence === right.parseConfidence
-    && sameEpisode(left.episode, right.episode);
-}
-
-function sameMetadata(
-  left: { key: string; value: string }[],
-  right: { key: string; value: string }[] | undefined,
-): boolean {
-  const resolvedRight = right ?? [];
-  return left.length === resolvedRight.length
-    && left.every((entry, index) =>
-      entry.key === resolvedRight[index]?.key && entry.value === resolvedRight[index]?.value);
-}
-
-function samePhaseProgress(
-  left: JobData["phaseProgress"],
-  right: GraphqlJobData["phaseProgress"],
-): boolean {
-  const resolvedRight = right ?? [];
-  return left.length === resolvedRight.length
-    && left.every((phase, index) => {
-      const other = resolvedRight[index];
-      return other !== undefined
-        && phase.phase === other.phase
-        && phase.completedBytes === other.completedBytes
-        && phase.totalBytes === other.totalBytes
-        && phase.progressPercent === other.progressPercent
-        && phase.rateBps === other.rateBps
-        && phase.estimatedRemainingMs === other.estimatedRemainingMs
-        && phase.startedAtEpochMs === other.startedAtEpochMs
-        && phase.updatedAtEpochMs === other.updatedAtEpochMs;
-    });
-}
-
-function sameDeleteOperation(
-  left: JobData["deleteOperation"],
-  right: GraphqlJobData["deleteOperation"],
-): boolean {
-  if (left === right) {
-    return true;
-  }
-  if (!left || !right) {
-    return left == null && right == null;
-  }
-  return left.operationId === right.operationId
-    && left.state === right.state
-    && left.locked === right.locked
-    && left.deleteFiles === right.deleteFiles
-    && left.errorMessage === right.errorMessage;
-}
-
-function sameDownloadBlock(left: DownloadBlockState, right: DownloadBlockState): boolean {
-  return left.kind === right.kind
-    && left.capEnabled === right.capEnabled
-    && left.period === right.period
-    && left.usedBytes === right.usedBytes
-    && left.limitBytes === right.limitBytes
-    && left.remainingBytes === right.remainingBytes
-    && left.reservedBytes === right.reservedBytes
-    && left.windowStartsAtEpochMs === right.windowStartsAtEpochMs
-    && left.windowEndsAtEpochMs === right.windowEndsAtEpochMs
-    && left.timezoneName === right.timezoneName
-    && left.scheduledSpeedLimit === right.scheduledSpeedLimit;
-}
-
-function sameGlobalState(left: Snapshot["globalState"], right: QueueSnapshotPayload["globalState"]): boolean {
-  return left.isPaused === right.isPaused && sameDownloadBlock(left.downloadBlock, right.downloadBlock);
-}
-
-function matchesNormalizedJob(previous: JobData, next: GraphqlJobData): boolean {
-  return previous.id === next.id
-    && previous.name === next.name
-    && previous.displayTitle === next.displayTitle
-    && previous.originalTitle === next.originalTitle
-    && previous.parsedRelease !== undefined
-    && sameParsedRelease(previous.parsedRelease, next.parsedRelease)
-    && previous.status === normalizeFacadeJobStatus(next.status)
-    && previous.progress === normalizeFacadeJobProgress(next.progressPercent, next.progress)
-    && previous.progressPercent === (next.progressPercent ?? null)
-    && previous.totalBytes === next.totalBytes
-    && previous.downloadedBytes === next.downloadedBytes
-    && previous.optionalRecoveryBytes === next.optionalRecoveryBytes
-    && previous.optionalRecoveryDownloadedBytes === next.optionalRecoveryDownloadedBytes
-    && previous.failedBytes === next.failedBytes
-    && previous.health === next.health
-    && previous.hasPassword === next.hasPassword
-    && previous.category === next.category
-    && previous.createdAt === normalizeGraphqlTimestamp(next.createdAt)
-    && previous.completedAt === normalizeGraphqlTimestamp(next.completedAt)
-    && previous.error === (next.error ?? null)
-    && previous.outputDir === (next.outputDir ?? null)
-    && sameMetadata(previous.metadata, next.metadata ?? next.attributes)
-    && samePhaseProgress(previous.phaseProgress, next.phaseProgress)
-    && sameDeleteOperation(previous.deleteOperation ?? null, next.deleteOperation ?? null);
-}
-
-function mapQueueSnapshot(
-  snapshot: QueueSnapshotPayload | undefined,
-  previous?: Snapshot,
-): Snapshot | undefined {
-  if (!snapshot) {
-    return undefined;
-  }
-
-  const previousJobsById = new Map(previous?.jobs.map((job) => [job.id, job]) ?? []);
-  let reusedAllJobs = Boolean(previous) && snapshot.items.length === (previous?.jobs.length ?? 0);
-  const nextJobs = snapshot.items.map((job, index) => {
-    const previousAtIndex = previous?.jobs[index];
-    const candidate = previousAtIndex?.id === job.id
-      ? previousAtIndex
-      : previousJobsById.get(job.id);
-    if (candidate && matchesNormalizedJob(candidate, job)) {
-      return candidate;
-    }
-    reusedAllJobs = false;
-    return normalizeJobData(job);
-  });
-
-  const jobs = previous && reusedAllJobs && nextJobs.every((job, index) => job === previous.jobs[index])
-    ? previous.jobs
-    : nextJobs;
-  const globalState = previous && sameGlobalState(previous.globalState, snapshot.globalState)
-    ? previous.globalState
-    : snapshot.globalState;
-  const latestCursor = previous && previous.latestCursor === snapshot.latestCursor
-    ? previous.latestCursor
-    : (snapshot.latestCursor ?? previous?.latestCursor ?? "");
-
-  if (
-    previous
-    && jobs === previous.jobs
-    && globalState === previous.globalState
-    && latestCursor === previous.latestCursor
-  ) {
-    return previous;
-  }
-
-  return {
-    latestCursor,
-    globalState,
-    jobs,
-  };
-}
 
 function ThemeToggle({ className }: { className?: string }) {
   const { theme, setTheme } = useTheme();
@@ -354,28 +139,6 @@ function SponsorLink({ label }: { label: string }) {
   );
 }
 
-function DisconnectBanner({
-  title,
-  message,
-}: {
-  title: string;
-  message: string;
-}) {
-  return (
-    <div className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-3 text-amber-950 dark:text-amber-100">
-      <div className="flex items-center gap-3">
-        <div className="flex size-8 items-center justify-center rounded-full bg-amber-500/20">
-          <Unplug className="size-4" />
-        </div>
-        <div className="min-w-0">
-          <div className="text-sm font-semibold">{title}</div>
-          <div className="text-sm text-amber-900/80 dark:text-amber-100/80">{message}</div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function PwaUpdateBanner() {
   const t = useTranslate();
   const { updateAvailable, applyUpdate } = usePwa();
@@ -411,38 +174,23 @@ export function Layout() {
   const location = useLocation();
   const [uploadOpen, setUploadOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [polledSnapshot, setPolledSnapshot] = useState<QueueSnapshotPayload | undefined>();
   const [polledMetrics, setPolledMetrics] = useState<LiveMetricsSnapshot | undefined>();
+  const lastMetricsSubscriptionErrorRef = useRef<string | null>(null);
+  const lastMetricsConnectionAtRef = useRef<number | null | undefined>(undefined);
   const connectionState = useGraphqlConnectionState();
 
-  const [{ data: queryData }] = useQuery<{ queueSnapshot: QueueSnapshotPayload }>({
-    query: JOBS_PAGE_QUERY,
-  });
-  const [{ data: metricsQueryData }] = useQuery<LiveMetricsSnapshot>({
+  const [{ data: metricsQueryData }, reexecuteMetricsQuery] = useQuery<LiveMetricsSnapshot>({
     query: LIVE_METRICS_QUERY,
   });
   const [{ data: versionData }] = useQuery<{ version: string }>({
     query: VERSION_QUERY,
   });
-  const [{ data: snapshotSubscriptionData }] = useSubscription<{
-    queueSnapshots: QueueSnapshotPayload;
-  }>({
-    query: JOB_UPDATES_SUBSCRIPTION,
-  });
-  const [{ data: metricsSubscriptionData }] = useSubscription<{
+  const [{ data: metricsSubscriptionData, error: metricsSubscriptionError }] = useSubscription<{
     systemMetricsUpdates: LiveMetricsSnapshot;
   }>({
     query: LIVE_METRICS_SUBSCRIPTION,
   });
 
-  const reconnectPolling = useReconnectPolling<{ queueSnapshot: QueueSnapshotPayload }>({
-    enabled: connectionState.status === "disconnected",
-    query: JOBS_PAGE_QUERY,
-    onData: (nextSnapshot) => {
-      setPolledSnapshot(nextSnapshot.queueSnapshot);
-      requestGraphqlClientRestart();
-    },
-  });
   const reconnectMetricsPolling = useReconnectPolling<LiveMetricsSnapshot>({
     enabled: connectionState.status === "disconnected",
     query: LIVE_METRICS_QUERY,
@@ -452,71 +200,135 @@ export function Layout() {
   });
 
   useEffect(() => {
-    if (connectionState.status === "connected" && snapshotSubscriptionData?.queueSnapshots) {
-      setPolledSnapshot(undefined);
-    }
-  }, [connectionState.status, snapshotSubscriptionData]);
-
-  useEffect(() => {
     if (connectionState.status === "connected" && metricsSubscriptionData?.systemMetricsUpdates) {
       setPolledMetrics(undefined);
     }
   }, [connectionState.status, metricsSubscriptionData]);
 
-  const rawSnapshot =
-    polledSnapshot ?? snapshotSubscriptionData?.queueSnapshots ?? queryData?.queueSnapshot;
-  const previousSnapshotRef = useRef<Snapshot | undefined>(undefined);
-  const snapshot = useMemo(() => {
-    // eslint-disable-next-line react-hooks/refs -- queue snapshots are reconciled against the previous render to preserve row identity without scheduling another update
-    const previousSnapshot = previousSnapshotRef.current;
-    const nextSnapshot = mapQueueSnapshot(rawSnapshot, previousSnapshot);
-    // eslint-disable-next-line react-hooks/refs -- cache the reconciled snapshot for the next render
-    previousSnapshotRef.current = nextSnapshot;
-    return nextSnapshot;
-  }, [rawSnapshot]);
+  useEffect(() => {
+    if (connectionState.status !== "connected") {
+      return;
+    }
+    if (connectionState.lastConnectedAt === null) {
+      return;
+    }
+    if (lastMetricsConnectionAtRef.current === undefined) {
+      lastMetricsConnectionAtRef.current = connectionState.lastConnectedAt;
+      return;
+    }
+    if (lastMetricsConnectionAtRef.current === connectionState.lastConnectedAt) {
+      return;
+    }
+    lastMetricsConnectionAtRef.current = connectionState.lastConnectedAt;
+    void reexecuteMetricsQuery({ requestPolicy: "network-only" });
+  }, [
+    connectionState.lastConnectedAt,
+    connectionState.status,
+    reexecuteMetricsQuery,
+  ]);
 
-  const snapshotJobs = snapshot?.jobs ?? EMPTY_JOBS;
+  useEffect(() => {
+    if (!metricsSubscriptionError) {
+      lastMetricsSubscriptionErrorRef.current = null;
+      return;
+    }
+    const errorKey = metricsSubscriptionError.message;
+    if (lastMetricsSubscriptionErrorRef.current === errorKey) {
+      return;
+    }
+    lastMetricsSubscriptionErrorRef.current = errorKey;
+    void reexecuteMetricsQuery({ requestPolicy: "network-only" });
+  }, [metricsSubscriptionError, reexecuteMetricsQuery]);
+
   const metricsSnapshot =
-    polledMetrics ?? metricsSubscriptionData?.systemMetricsUpdates ?? metricsQueryData;
-  const currentGlobalState =
-    metricsSnapshot?.globalState ?? snapshot?.globalState ?? DEFAULT_GLOBAL_STATE;
-  const isPolling = reconnectPolling.isPolling || reconnectMetricsPolling.isPolling;
-  const liveData = useMemo(
+    polledMetrics
+    ?? (connectionState.status === "connected" && !metricsSubscriptionError
+      ? metricsSubscriptionData?.systemMetricsUpdates
+      : undefined)
+    ?? metricsQueryData;
+  const currentGlobalState = metricsSnapshot?.globalState ?? DEFAULT_GLOBAL_STATE;
+  const isPolling = reconnectMetricsPolling.isPolling;
+  const currentDownloadBlock = currentGlobalState.downloadBlock;
+  const liveDownloadBlock = useMemo(
     () => ({
-      jobs: snapshotJobs,
-      speed: metricsSnapshot?.metrics?.currentDownloadSpeed ?? 0,
-      isPaused: currentGlobalState.isPaused,
-      downloadBlock: currentGlobalState.downloadBlock,
-      connection: {
-        status: connectionState.status,
-        isDisconnected: connectionState.status === "disconnected",
-        isPolling,
-      },
+      capEnabled: currentDownloadBlock.capEnabled,
+      kind: currentDownloadBlock.kind,
+      limitBytes: currentDownloadBlock.limitBytes,
+      period: currentDownloadBlock.period,
+      remainingBytes: currentDownloadBlock.remainingBytes,
+      reservedBytes: currentDownloadBlock.reservedBytes,
+      scheduledSpeedLimit: currentDownloadBlock.scheduledSpeedLimit,
+      timezoneName: currentDownloadBlock.timezoneName,
+      usedBytes: currentDownloadBlock.usedBytes,
+      windowEndsAtEpochMs: currentDownloadBlock.windowEndsAtEpochMs,
+      windowStartsAtEpochMs: currentDownloadBlock.windowStartsAtEpochMs,
     }),
     [
-      connectionState.status,
-      currentGlobalState.downloadBlock,
-      currentGlobalState.isPaused,
+      currentDownloadBlock.capEnabled,
+      currentDownloadBlock.kind,
+      currentDownloadBlock.limitBytes,
+      currentDownloadBlock.period,
+      currentDownloadBlock.remainingBytes,
+      currentDownloadBlock.reservedBytes,
+      currentDownloadBlock.scheduledSpeedLimit,
+      currentDownloadBlock.timezoneName,
+      currentDownloadBlock.usedBytes,
+      currentDownloadBlock.windowEndsAtEpochMs,
+      currentDownloadBlock.windowStartsAtEpochMs,
+    ],
+  );
+  const liveConnection = useMemo(
+    () => ({
+      status: connectionState.status,
+      isDisconnected: connectionState.status === "disconnected",
       isPolling,
+    }),
+    [connectionState.status, isPolling],
+  );
+  const liveData = useMemo(
+    () => ({
+      jobs: EMPTY_JOBS,
+      speed: metricsSnapshot?.metrics?.currentDownloadSpeed ?? 0,
+      isPaused: currentGlobalState.isPaused,
+      downloadBlock: liveDownloadBlock,
+      connection: liveConnection,
+    }),
+    [
+      currentGlobalState.isPaused,
+      liveConnection,
+      liveDownloadBlock,
       metricsSnapshot?.metrics?.currentDownloadSpeed,
-      snapshotJobs,
     ],
   );
   const disconnectBannerMessage = liveData.connection.isPolling
     ? t("connection.pollingBody")
     : t("connection.retryingBody");
   const speedHistory = useSpeedHistory(liveData.speed);
-  const titleEtaSpeed = useStableEtaSpeed(liveData.jobs, liveData.speed);
+
+  useEffect(() => {
+    if (!liveData.connection.isDisconnected) {
+      toast.dismiss(RECONNECT_TOAST_ID);
+      return;
+    }
+
+    toast.loading(t("connection.disconnectedTitle"), {
+      id: RECONNECT_TOAST_ID,
+      description: disconnectBannerMessage,
+      duration: Infinity,
+      dismissible: true,
+      icon: <Unplug className="size-4 text-amber-500" />,
+    });
+  }, [disconnectBannerMessage, liveData.connection.isDisconnected, t]);
+
+  useEffect(() => () => {
+    toast.dismiss(RECONNECT_TOAST_ID);
+  }, []);
 
   const lastTitleUpdate = useRef(0);
   useEffect(() => {
     const now = Date.now();
-    const hasActive = liveData.jobs.some(
-      (job) => job.status !== "COMPLETE" && job.status !== "FAILED",
-    );
-
     const isIdle = !liveData.isPaused && liveData.speed === 0;
-    const isPaused = liveData.isPaused && hasActive;
+    const isPaused = liveData.isPaused;
     if (!isPaused && !isIdle && now - lastTitleUpdate.current < 2500) return;
     lastTitleUpdate.current = now;
 
@@ -526,19 +338,12 @@ export function Layout() {
     }
 
     if (liveData.speed > 0) {
-      const downloading = liveData.jobs.filter((job) => job.status === "DOWNLOADING");
-      const remaining = downloading.reduce(
-        (sum, job) => sum + (job.totalBytes - job.downloadedBytes),
-        0,
-      );
-      const formattedEta = formatEtaFromRemainingBytes(remaining, titleEtaSpeed);
-      const eta = formattedEta !== "\u2014" ? ` - ${formattedEta}` : "";
-      document.title = `${formatSpeed(liveData.speed)}${eta} - Weaver`;
+      document.title = `${formatSpeed(liveData.speed)} - Weaver`;
       return;
     }
 
     document.title = "Weaver";
-  }, [liveData, titleEtaSpeed]);
+  }, [liveData]);
 
   const isActive = (to: string) =>
     to === "/"
@@ -561,9 +366,6 @@ export function Layout() {
             <Link to="/" className="min-w-0">
               <div className="font-space-grotesk text-[22px] font-bold leading-none tracking-tight text-foreground">
                 Weaver
-              </div>
-              <div className="mt-1.5 text-[10.5px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">
-                Queue Control
               </div>
             </Link>
             <ThemeToggle />
@@ -668,15 +470,6 @@ export function Layout() {
             </span>
           </header>
 
-          {liveData.connection.isDisconnected ? (
-            <div className="flex-none">
-              <DisconnectBanner
-                title={t("connection.disconnectedTitle")}
-                message={disconnectBannerMessage}
-              />
-            </div>
-          ) : null}
-
           <div className="flex-1 overflow-y-auto">
             <div className="mx-auto w-full max-w-[1600px] px-4 py-5 sm:px-6 lg:px-8 lg:py-8">
               <RoutedOutlet />
@@ -691,9 +484,6 @@ export function Layout() {
             <SheetTitle className="font-space-grotesk text-xl font-bold text-foreground">
               Weaver
             </SheetTitle>
-            <SheetDescription className="text-[10.5px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">
-              Queue Control
-            </SheetDescription>
           </SheetHeader>
           <div className="flex min-h-0 flex-1 flex-col">
             <nav className="flex-1 overflow-y-auto px-3 py-4">

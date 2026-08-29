@@ -1,0 +1,14 @@
+{
+  "slug": "par2-ignorable-deficit",
+  "title": "Golden.Meridian.S02E03.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A PAR2-protected payload beside a 32 KiB text sidecar, five of whose eight blocks are destroyed against three recovery blocks. Every payload block verifies, so the only short file in the set is one whose extension marks it as furniture: the release is delivered whole, no repair is attempted for a file the parity cannot rebuild, and the damage is reported rather than fatal.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "forbiddenJobEvents": [
+    "RepairStarted",
+    "RepairFailed"
+  ],
+  "expectedOutputBLAKE3": {
+    "test-media.mkv": "bd8b3991787e2bc03ae0f47bda585f1b9dbd831448493fe3c4a9118f4f947cf2"
+  }
+}

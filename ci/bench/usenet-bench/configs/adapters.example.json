@@ -1,0 +1,66 @@
+{
+  "schema_version": 4,
+  "adapters": [
+    {
+      "client": "weaver",
+      "archive_toolchain": "vanilla",
+      "target": "docker-linux",
+      "command": ["/scratch/nntp-bench-bin/clientadapter"],
+      "environment": {
+        "CLIENT_IMAGE": "ghcr.io/scryer-media/weaver@sha256:REPLACE_WITH_POST_REPORT_RELEASE_DIGEST",
+        "CLIENT_NETWORK": "nntp-bench_benchmark",
+        "CLIENT_PLATFORM": "linux/amd64"
+      }
+    },
+    {
+      "client": "sabnzbd",
+      "archive_toolchain": "vanilla",
+      "target": "docker-linux",
+      "command": ["/scratch/nntp-bench-bin/clientadapter"],
+      "environment": {
+        "CLIENT_IMAGE": "lscr.io/linuxserver/sabnzbd@sha256:1a26f56dfc047b62d5ddc20bc92bdebfbe7c3cb58d2d3523958838a09182d77a",
+        "CLIENT_NETWORK": "nntp-bench_benchmark",
+        "CLIENT_PLATFORM": "linux/amd64"
+      }
+    },
+    {
+      "client": "sabnzbd",
+      "archive_toolchain": "rarpar",
+      "target": "docker-linux",
+      "command": ["/scratch/nntp-bench-bin/clientadapter"],
+      "environment": {
+        "CLIENT_IMAGE": "lscr.io/linuxserver/sabnzbd@sha256:1a26f56dfc047b62d5ddc20bc92bdebfbe7c3cb58d2d3523958838a09182d77a",
+        "CLIENT_NETWORK": "nntp-bench_benchmark",
+        "CLIENT_PLATFORM": "linux/amd64",
+        "CLIENT_RARPAR_BINARY": "/scratch/rarpar/rarpar-linux-amd64",
+        "CLIENT_RARPAR_VERSION": "REPLACE_WITH_RARPAR_RELEASE_VERSION",
+        "CLIENT_RARPAR_SHA256": "REPLACE_WITH_RARPAR_RELEASE_SHA256"
+      }
+    },
+    {
+      "client": "nzbget",
+      "archive_toolchain": "vanilla",
+      "target": "docker-linux",
+      "command": ["/scratch/nntp-bench-bin/clientadapter"],
+      "environment": {
+        "CLIENT_IMAGE": "lscr.io/linuxserver/nzbget@sha256:b22a2b8b366d1e68e6341435bdabd9ff859642cc2ff4a04243d0723521d69d2e",
+        "CLIENT_NETWORK": "nntp-bench_benchmark",
+        "CLIENT_PLATFORM": "linux/amd64"
+      }
+    },
+    {
+      "client": "nzbget",
+      "archive_toolchain": "rarpar",
+      "target": "docker-linux",
+      "command": ["/scratch/nntp-bench-bin/clientadapter"],
+      "environment": {
+        "CLIENT_IMAGE": "lscr.io/linuxserver/nzbget@sha256:b22a2b8b366d1e68e6341435bdabd9ff859642cc2ff4a04243d0723521d69d2e",
+        "CLIENT_NETWORK": "nntp-bench_benchmark",
+        "CLIENT_PLATFORM": "linux/amd64",
+        "CLIENT_RARPAR_BINARY": "/scratch/rarpar/rarpar-linux-amd64",
+        "CLIENT_RARPAR_VERSION": "REPLACE_WITH_RARPAR_RELEASE_VERSION",
+        "CLIENT_RARPAR_SHA256": "REPLACE_WITH_RARPAR_RELEASE_SHA256"
+      }
+    }
+  ]
+}

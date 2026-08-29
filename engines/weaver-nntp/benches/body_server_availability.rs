@@ -1,6 +1,7 @@
+use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use weaver_nntp::connection::ServerConfig;
 use weaver_nntp::health::HealthConfig;
 use weaver_nntp::pool::{NntpPool, PoolConfig, ServerPoolConfig};

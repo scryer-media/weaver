@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useSubscription } from "urql";
 import { Loader2 } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
@@ -8,9 +8,8 @@ import { StatTile } from "@/components/StatTile";
 import { TimeSeriesChart } from "@/components/TimeSeriesChart";
 import { Progress } from "@/components/ui/progress";
 import { SegmentedControl } from "@/components/ui/segmented-control";
-import { requestGraphqlClientRestart } from "@/graphql/client";
+import { requestGraphqlClientRestart, useGraphqlConnectionState } from "@/graphql/client";
 import {
-  DISK_USAGE_QUERY,
   METRICS_PAGE_QUERY,
   METRICS_PAGE_SUBSCRIPTION,
   SERVER_HEALTH_QUERY,
@@ -32,14 +31,6 @@ import {
 } from "@/lib/metrics";
 import { STATUS_BG_CLASS, statusToken } from "@/lib/status-tokens";
 import { cn } from "@/lib/utils";
-
-interface DiskUsageEntry {
-  label: string;
-  path: string;
-  totalBytes: number;
-  usedBytes: number;
-  freeBytes: number;
-}
 
 interface ServerHealthEntry {
   host: string;
@@ -74,16 +65,20 @@ export function MetricsPage() {
   const liveJobs = useLiveJobs();
   const livePaused = useLivePaused();
   const liveSpeed = useLiveSpeed();
+  const graphqlConnection = useGraphqlConnectionState();
   const [historyRange, setHistoryRange] = useState<MetricsHistoryRange>("ONE_HOUR");
   const [polledSnapshot, setPolledSnapshot] = useState<MetricsPageData | undefined>();
-  const [{ data: queryData, fetching, error }] = useQuery<MetricsPageData>({
+  const [subscriptionSnapshot, setSubscriptionSnapshot] = useState<MetricsPageData>();
+  const lastSubscriptionErrorRef = useRef<string | null>(null);
+  const lastConnectionAtRef = useRef<number | null | undefined>(undefined);
+  const [{ data: queryData, fetching, error }, reexecuteMetricsPage] = useQuery<MetricsPageData>({
     query: METRICS_PAGE_QUERY,
   });
   const handleSubscription = (
     _prev: MetricsPageData | undefined,
     response: { systemMetricsUpdates: MetricsPageData },
   ) => response.systemMetricsUpdates;
-  const [{ data: subscriptionData }] = useSubscription(
+  const [{ data: subscriptionData, error: subscriptionError }] = useSubscription(
     { query: METRICS_PAGE_SUBSCRIPTION },
     handleSubscription,
   );
@@ -97,17 +92,59 @@ export function MetricsPage() {
   });
 
   useEffect(() => {
-    if (!liveConnection.isDisconnected) {
+    if (liveConnection.isDisconnected) {
+      setSubscriptionSnapshot(undefined);
+    } else {
       setPolledSnapshot(undefined);
     }
   }, [liveConnection.isDisconnected]);
 
-  const [{ data: diskData }, reexecuteDiskUsage] = useQuery<{ diskUsage: DiskUsageEntry[] }>({
-    query: DISK_USAGE_QUERY,
-  });
+  useEffect(() => {
+    if (graphqlConnection.status === "connected" && subscriptionData) {
+      setSubscriptionSnapshot(subscriptionData);
+    }
+  }, [graphqlConnection.status, subscriptionData]);
+
   const [{ data: serverHealthData }, reexecuteServerHealth] = useQuery<{
     serverHealth: ServerHealthEntry[];
   }>({ query: SERVER_HEALTH_QUERY });
+
+  useEffect(() => {
+    if (graphqlConnection.status !== "connected" || graphqlConnection.lastConnectedAt === null) {
+      return;
+    }
+    if (lastConnectionAtRef.current === undefined) {
+      lastConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+      return;
+    }
+    if (lastConnectionAtRef.current === graphqlConnection.lastConnectedAt) {
+      return;
+    }
+    lastConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+    setSubscriptionSnapshot(undefined);
+    void reexecuteMetricsPage({ requestPolicy: "network-only" });
+    void reexecuteServerHealth({ requestPolicy: "network-only" });
+  }, [
+    graphqlConnection.lastConnectedAt,
+    graphqlConnection.status,
+    reexecuteMetricsPage,
+    reexecuteServerHealth,
+  ]);
+
+  useEffect(() => {
+    if (!subscriptionError) {
+      lastSubscriptionErrorRef.current = null;
+      return;
+    }
+    const errorKey = subscriptionError.message;
+    if (lastSubscriptionErrorRef.current === errorKey) {
+      return;
+    }
+    lastSubscriptionErrorRef.current = errorKey;
+    setSubscriptionSnapshot(undefined);
+    void reexecuteMetricsPage({ requestPolicy: "network-only" });
+    void reexecuteServerHealth({ requestPolicy: "network-only" });
+  }, [reexecuteMetricsPage, reexecuteServerHealth, subscriptionError]);
 
   useEffect(() => {
     if (liveConnection.isDisconnected) {
@@ -115,12 +152,10 @@ export function MetricsPage() {
     }
     const id = window.setInterval(() => {
       reexecuteServerHealth({ requestPolicy: "network-only" });
-      reexecuteDiskUsage({ requestPolicy: "network-only" });
     }, 5000);
     return () => window.clearInterval(id);
-  }, [liveConnection.isDisconnected, reexecuteDiskUsage, reexecuteServerHealth]);
+  }, [liveConnection.isDisconnected, reexecuteServerHealth]);
 
-  const diskUsage = diskData?.diskUsage ?? [];
   const serverHealth = serverHealthData?.serverHealth ?? [];
 
   const counts = useMemo(() => {
@@ -136,7 +171,7 @@ export function MetricsPage() {
     return { total, active, downloading, queued, paused, failed };
   }, [liveJobs]);
 
-  const snapshot = subscriptionData ?? polledSnapshot ?? queryData;
+  const snapshot = polledSnapshot ?? subscriptionSnapshot ?? queryData;
   const metrics = snapshot?.metrics;
   const isPaused = snapshot?.globalState?.isPaused ?? livePaused;
   const downloadBlock = snapshot?.globalState?.downloadBlock ?? liveDownloadBlock;
@@ -275,57 +310,6 @@ export function MetricsPage() {
               ariaLabel={t("metrics.historySectionTitle")}
             />
           </div>
-
-          {diskUsage.length ? (
-            <SectionCard title={t("metrics.diskUsage")} description={t("metrics.diskUsageDesc")}>
-              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                {diskUsage.map((mount) => {
-                  const pct = mount.totalBytes > 0 ? (mount.usedBytes / mount.totalBytes) * 100 : 0;
-                  const barClass =
-                    pct >= 85
-                      ? "bg-status-failed"
-                      : pct >= 65
-                        ? "bg-status-paused"
-                        : "bg-status-downloading";
-                  return (
-                    <div
-                      key={mount.path}
-                      className="rounded-inner border border-border bg-background/40 p-4"
-                    >
-                      <div className="flex items-baseline justify-between gap-3">
-                        <span className="truncate text-[13px] font-semibold text-foreground">
-                          {mount.label}
-                        </span>
-                        <span className="shrink-0 text-[12px] tabular-nums text-muted-foreground">
-                          {Math.round(pct)}%
-                        </span>
-                      </div>
-                      <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground" title={mount.path}>
-                        {mount.path}
-                      </div>
-                      <div className="mt-3 h-2 overflow-hidden rounded-pill bg-secondary">
-                        <div
-                          className={cn("h-full rounded-pill transition-[width] duration-500 motion-reduce:transition-none", barClass)}
-                          style={{ width: `${Math.min(100, pct)}%` }}
-                        />
-                      </div>
-                      <div className="mt-2.5 flex items-center justify-between text-[12px]">
-                        <span className="font-medium text-foreground">
-                          {formatBytes(mount.usedBytes)}{" "}
-                          <span className="font-normal text-muted-foreground">
-                            / {formatBytes(mount.totalBytes)}
-                          </span>
-                        </span>
-                        <span className="text-muted-foreground">
-                          {formatBytes(mount.freeBytes)} {t("metrics.diskFree")}
-                        </span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </SectionCard>
-          ) : null}
 
           {serverHealth.length ? (
             <SectionCard

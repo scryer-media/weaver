@@ -1,3 +1,4 @@
+use crate::jobs::persistence::CompletedHashProvenance;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -14,7 +15,7 @@ use crate::{
 fn fetch_i64(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) -> i64 {
     let datastore = db.datastore();
     let sql = sql.into();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         let row = SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args)
             .await?
             .ok_or_else(|| StateError::Database(format!("query returned no rows: {sql}")))?;
@@ -26,7 +27,7 @@ fn fetch_i64(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) -> i64 {
 fn fetch_i64_pair(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) -> (i64, i64) {
     let datastore = db.datastore();
     let sql = sql.into();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         let row = SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args)
             .await?
             .ok_or_else(|| StateError::Database(format!("query returned no rows: {sql}")))?;
@@ -51,7 +52,7 @@ fn fetch_text(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>, column: 
 fn execute_sql(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) {
     let datastore = db.datastore();
     let sql = sql.into();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
         Ok(())
     })
@@ -702,8 +703,6 @@ fn restart_runtime_state_roundtrip() {
     .unwrap();
     db.set_active_job_normalization_retried(JobId(1), true)
         .unwrap();
-    db.replace_verified_suspect_volumes(JobId(1), "show", &HashSet::from([37u32, 38u32]))
-        .unwrap();
 
     let failed = db.load_failed_extractions(JobId(1)).unwrap();
     assert_eq!(
@@ -711,10 +710,6 @@ fn restart_runtime_state_roundtrip() {
         HashSet::from(["E10.mkv".to_string(), "E15.mkv".to_string()])
     );
     assert!(db.load_active_job_normalization_retried(JobId(1)).unwrap());
-    assert_eq!(
-        db.load_verified_suspect_volumes(JobId(1)).unwrap(),
-        HashMap::from([("show".to_string(), HashSet::from([37u32, 38u32]))])
-    );
 }
 
 #[test]
@@ -899,6 +894,54 @@ fn archive_headers_roundtrip_and_delete() {
 }
 
 #[test]
+fn direct_coverage_roundtrip_and_delete() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+
+    db.save_direct_coverage(JobId(1), "Silver.Horizon.S01", &[1, 2, 3])
+        .unwrap();
+    db.save_direct_coverage(JobId(1), "Amber.Circuit", &[4, 5])
+        .unwrap();
+
+    let coverage = db.load_direct_coverage(JobId(1)).unwrap();
+    assert_eq!(coverage.len(), 2);
+    assert_eq!(coverage["Silver.Horizon.S01"], vec![1, 2, 3]);
+    assert_eq!(coverage["Amber.Circuit"], vec![4, 5]);
+
+    // One row per set: a second barrier replaces rather than appends.
+    db.save_direct_coverage(JobId(1), "Silver.Horizon.S01", &[9, 9, 9, 9])
+        .unwrap();
+    let coverage = db.load_direct_coverage(JobId(1)).unwrap();
+    assert_eq!(coverage.len(), 2);
+    assert_eq!(coverage["Silver.Horizon.S01"], vec![9, 9, 9, 9]);
+    assert_eq!(
+        fetch_i64(&db, "SELECT COUNT(*) FROM active_direct_coverage", vec![]),
+        2
+    );
+
+    db.delete_direct_coverage(JobId(1), "Silver.Horizon.S01")
+        .unwrap();
+    let coverage = db.load_direct_coverage(JobId(1)).unwrap();
+    assert_eq!(coverage.len(), 1);
+    assert!(coverage.contains_key("Amber.Circuit"));
+}
+
+#[test]
+fn direct_coverage_is_dropped_with_the_active_job() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    db.save_direct_coverage(JobId(1), "Silver.Horizon.S01", &[1, 2, 3])
+        .unwrap();
+
+    db.delete_active_job(JobId(1)).unwrap();
+
+    assert_eq!(
+        fetch_i64(&db, "SELECT COUNT(*) FROM active_direct_coverage", vec![]),
+        0
+    );
+}
+
+#[test]
 fn deleted_volume_statuses_roundtrip() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
@@ -994,8 +1037,6 @@ fn late_active_state_writes_noop_after_archive() {
     db.replace_failed_extractions(JobId(1), &HashSet::from(["bad.mkv".to_string()]))
         .unwrap();
     db.add_failed_extraction(JobId(1), "another.mkv").unwrap();
-    db.replace_verified_suspect_volumes(JobId(1), "show", &HashSet::from([1u32, 2u32]))
-        .unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let output_path = temp_dir.path().join("movie.mkv");
     std::fs::write(&output_path, b"movie").unwrap();
@@ -1032,10 +1073,13 @@ fn late_active_state_writes_noop_after_archive() {
         .unwrap();
     db.save_rar_volume_facts(JobId(1), "set", 0, &[4, 5, 6])
         .unwrap();
+    db.save_direct_coverage(JobId(1), "set", &[7, 8, 9])
+        .unwrap();
     db.set_volume_status(JobId(1), "set", 0, true, true, true)
         .unwrap();
 
     for table in [
+        "active_direct_coverage",
         "active_file_progress",
         "active_files",
         "active_par2",
@@ -1085,12 +1129,19 @@ fn prune_orphan_active_state_removes_only_orphans() {
          VALUES (102, 0, 'rar', 'set', 0)",
         vec![],
     );
+    execute_sql(
+        &db,
+        "INSERT INTO active_direct_coverage (job_id, set_name, snapshot)
+         VALUES (103, 'Silver.Horizon.S01', x'0304')",
+        vec![],
+    );
 
     let counts = db.prune_orphan_active_state().unwrap();
     assert_eq!(counts.active_file_progress, 1);
     assert_eq!(counts.active_archive_headers, 1);
     assert_eq!(counts.active_detected_archives, 1);
-    assert_eq!(counts.total_removed(), 3);
+    assert_eq!(counts.active_direct_coverage, 1);
+    assert_eq!(counts.total_removed(), 4);
 
     let remaining_progress = fetch_i64(
         &db,
@@ -1308,6 +1359,37 @@ fn save_file_identities_chunks_beyond_sqlite_bind_limit() {
 }
 
 #[test]
+fn trusted_hash_loader_admits_only_allowlisted_provenance() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    let entries = vec![(0u32, "data.rar".to_string(), Some([0x11; 16]))];
+    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed)
+        .unwrap();
+    assert_eq!(
+        db.load_complete_file_hashes(JobId(1)).unwrap().get(&0),
+        Some(&[0x11; 16])
+    );
+
+    // A provenance label this code has never written is untrusted until the
+    // writer that mints it also teaches the filter what it means — even
+    // though it is not NULL.
+    execute_sql(
+        &db,
+        "UPDATE active_files SET md5_provenance = 'imported' WHERE job_id = {} AND file_index = {}",
+        vec![SqlArg::I64(1), SqlArg::I64(0)],
+    );
+    assert_eq!(
+        db.load_complete_file_hashes(JobId(1)).unwrap().get(&0),
+        None
+    );
+    assert_eq!(
+        db.load_complete_file_hashes_any(JobId(1)).unwrap().get(&0),
+        Some(&[0x11; 16]),
+        "identity hints still see the row"
+    );
+}
+
+#[test]
 fn complete_files_bulk_upserts_hashes_and_is_idempotent() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
@@ -1316,7 +1398,8 @@ fn complete_files_bulk_upserts_hashes_and_is_idempotent() {
         (0u32, "data.rar".to_string(), Some([0x11; 16])),
         (1u32, "data.r00".to_string(), None),
     ];
-    db.complete_files(JobId(1), &entries).unwrap();
+    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed)
+        .unwrap();
 
     let jobs = db.load_active_jobs().unwrap();
     assert_eq!(jobs[&JobId(1)].complete_files.len(), 2);
@@ -1327,7 +1410,8 @@ fn complete_files_bulk_upserts_hashes_and_is_idempotent() {
 
     // Re-run upserts the filename/hash in place.
     let entries = vec![(0u32, "data-renamed.rar".to_string(), Some([0x22; 16]))];
-    db.complete_files(JobId(1), &entries).unwrap();
+    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed)
+        .unwrap();
     assert_eq!(
         fetch_text(
             &db,
@@ -1347,6 +1431,7 @@ fn complete_files_guards_absent_job() {
     db.complete_files(
         JobId(7),
         &[(0u32, "ghost.rar".to_string(), Some([0x01; 16]))],
+        CompletedHashProvenance::Streamed,
     )
     .unwrap();
     let count = fetch_i64(&db, "SELECT COUNT(*) FROM active_files", vec![]);
@@ -1361,7 +1446,8 @@ fn complete_files_chunks_beyond_sqlite_bind_limit() {
     let entries: Vec<(u32, String, Option<[u8; 16]>)> = (0..1500)
         .map(|i| (i, format!("file-{i}.rar"), Some([(i % 256) as u8; 16])))
         .collect();
-    db.complete_files(JobId(1), &entries).unwrap();
+    db.complete_files(JobId(1), &entries, CompletedHashProvenance::Streamed)
+        .unwrap();
 
     let count = fetch_i64(
         &db,

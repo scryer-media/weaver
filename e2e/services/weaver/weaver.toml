@@ -1,0 +1,39 @@
+data_dir = "/data"
+intermediate_dir = "/data/intermediate"
+complete_dir = "/data/complete"
+cleanup_after_extract = true
+max_retries = 3
+
+[[servers]]
+id = 1
+host = "nntp"
+port = 119
+tls = false
+username = "e2e-user"
+password = "e2e-pass"
+connections = 4
+active = true
+priority = 0
+
+[[servers]]
+id = 2
+host = "nntp2"
+port = 119
+tls = false
+username = "e2e-user"
+password = "e2e-pass"
+connections = 4
+active = true
+priority = 1
+
+[[categories]]
+id = 1
+name = "movies"
+
+[[categories]]
+id = 2
+name = "series"
+
+[[categories]]
+id = 3
+name = "anime"

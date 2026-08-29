@@ -57,6 +57,9 @@ impl Harness {
             cleanup_after_extract: Some(true),
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
+            direct_store: None,
+            delivery_naming: None,
+            metrics: Default::default(),
             config_path: None,
         }));
         let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
@@ -312,12 +315,27 @@ async fn expired_promotion_owner_cannot_materialize_after_reclaim() {
     assert_eq!(claimed.promotion_state, SemanticPromotionState::Claimed);
     assert!(claimed.source_stored);
 
+    // A promoted job enters the queue without ever passing through
+    // `submit_nzb`, so it is this call — not the original admission — that has
+    // to account for it in `weaver_jobs_submitted_total`.
+    let promoted_submissions = |handle: &SchedulerHandle| {
+        handle
+            .job_lifecycle_metrics_snapshot()
+            .submitted
+            .into_iter()
+            .filter(|row| row.origin == "internal-redownload")
+            .map(|row| row.count)
+            .sum::<u64>()
+    };
+    assert_eq!(promoted_submissions(&harness.handle), 0);
+
     assert_eq!(
         materialize_semantic_promotion(&harness.db, &harness.handle, current_owner)
             .await
             .unwrap(),
         fallback_job
     );
+    assert_eq!(promoted_submissions(&harness.handle), 1);
     assert!(harness.handle.get_job(fallback_job).is_ok());
     let active_jobs = harness.db.load_active_jobs().unwrap();
     assert_eq!(active_jobs.len(), 1);

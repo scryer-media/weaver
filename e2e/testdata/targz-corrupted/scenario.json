@@ -1,0 +1,7 @@
+{
+  "slug": "targz-corrupted",
+  "title": "E2E.Test.TAR.GZ.Corrupted.2024.1080p-TESTGRP",
+  "description": "Tar.gz archive with a later 1MB zeroed region and no PAR2. Tests graceful extraction failure on unrecoverable corruption.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure"
+}

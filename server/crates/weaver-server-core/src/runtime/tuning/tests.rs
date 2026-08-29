@@ -64,6 +64,11 @@ fn empty_metrics() -> MetricsSnapshot {
         write_buffered_bytes: 0,
         write_buffered_segments: 0,
         direct_write_evictions: 0,
+        direct_sets_admitted: 0,
+        direct_sets_demoted: 0,
+        direct_sets_finalized_direct: 0,
+        direct_sets_repaired_while_direct: 0,
+        deobfuscated_members_renamed: 0,
         decode_pressure_soft_limit_bytes: 0,
         decode_pressure_hard_limit_bytes: 0,
         write_pressure_soft_limit_bytes: 0,
@@ -78,18 +83,14 @@ fn empty_metrics() -> MetricsSnapshot {
         hot_dispatch_mode: crate::DispatchShareMode::Exclusive,
         hot_dispatch_underfill_ms: 0,
         hot_dispatch_lent_connections: 0,
-        hot_dispatch_warmup_complete: false,
         hot_dispatch_last_spillover_decision: crate::SpilloverDecision::None,
-        hot_dispatch_spillover_blocked_warmup_total: 0,
         hot_dispatch_spillover_blocked_pressure_total: 0,
         hot_dispatch_spillover_blocked_near_cap_total: 0,
         hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 0,
         hot_dispatch_spillover_blocked_best_mode_pending_total: 0,
-        hot_dispatch_spillover_blocked_recent_expansion_helped_total: 0,
         hot_dispatch_spillover_blocked_cap_speed_total: 0,
         hot_dispatch_spillover_allowed_underfill_total: 0,
         hot_dispatch_spillover_allowed_measured_underfill_total: 0,
-        hot_dispatch_spillover_allowed_bounded_same_band_total: 0,
         hot_dispatch_spillover_reclaimed_total: 0,
         hot_dispatch_hot_speed_bps: 0,
         hot_dispatch_exclusive_peak_bps: 0,
@@ -123,7 +124,6 @@ fn empty_metrics() -> MetricsSnapshot {
         download_lane_parks_spillover_withdraw_total: 0,
         download_lane_parks_spillover_speed_harm_total: 0,
         download_lane_parks_ip_replacement_retired_total: 0,
-        download_lane_parks_server_tier_changed_total: 0,
         download_lane_parks_proof_failure_total: 0,
         download_lane_parks_error_total: 0,
         download_lane_lease_items_total: 0,
@@ -355,4 +355,18 @@ fn set_connection_limit_decreases_capacity() {
     // Remove a server, now only 5 connections.
     tuner.set_connection_limit(5);
     assert_eq!(tuner.params().max_concurrent_downloads, 5);
+}
+
+#[test]
+fn random_read_iops_update_changes_future_extraction_admission_limit() {
+    let mut profile = hdd_profile(4);
+    profile.disk.random_read_iops = 0.0;
+    let mut tuner = RuntimeTuner::with_connection_limit(profile, 8);
+    assert_eq!(tuner.max_concurrent_extractions(), 1);
+
+    tuner.set_random_read_iops(1_500.0);
+    assert_eq!(tuner.max_concurrent_extractions(), 4);
+
+    tuner.set_random_read_iops(200.0);
+    assert_eq!(tuner.max_concurrent_extractions(), 1);
 }

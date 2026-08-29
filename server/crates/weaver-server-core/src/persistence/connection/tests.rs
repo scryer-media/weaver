@@ -14,7 +14,7 @@ use crate::settings::{BufferPoolOverrides, Config, RetryOverrides, TunerOverride
 
 fn fetch_i64(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> i64 {
     let datastore = db.datastore();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         let row = SqlRuntime::fetch_optional(datastore.read_exec(), sql, &args)
             .await?
             .ok_or_else(|| StateError::Database(format!("query returned no rows: {sql}")))?;
@@ -25,7 +25,7 @@ fn fetch_i64(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> i64 {
 
 fn fetch_text(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> String {
     let datastore = db.datastore();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         let row = SqlRuntime::fetch_optional(datastore.read_exec(), sql, &args)
             .await?
             .ok_or_else(|| StateError::Database(format!("query returned no rows: {sql}")))?;
@@ -36,7 +36,7 @@ fn fetch_text(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> String {
 
 fn execute(db: &Database, sql: &'static str, args: Vec<SqlArg>) {
     let datastore = db.datastore();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         SqlRuntime::execute(datastore.read_exec(), sql, &args).await?;
         Ok(())
     })
@@ -136,7 +136,7 @@ type ForeignKeyGroup = (String, String, Vec<(i64, String, String)>);
 
 fn extract_canonical_schema(db: &Database) -> CanonicalSchema {
     let datastore = db.datastore();
-    db.run_sql_blocking(async move {
+    db.run_sql_blocking_read(async move {
         match datastore.engine() {
             SqlEngine::Sqlite => extract_sqlite_schema(&datastore).await,
             SqlEngine::Postgres => extract_postgres_schema(&datastore).await,
@@ -1329,8 +1329,6 @@ async fn postgres_bulk_hot_paths_when_configured() {
         &HashSet::from(["bad-a.mkv".to_string(), "bad-b.mkv".to_string()]),
     )
     .unwrap();
-    db.replace_verified_suspect_volumes(job_id, "set", &HashSet::from([37_u32, 38_u32]))
-        .unwrap();
     db.replace_member_chunks(
         job_id,
         "set",
@@ -1379,13 +1377,6 @@ async fn postgres_bulk_hot_paths_when_configured() {
     assert_eq!(
         db.load_failed_extractions(job_id).unwrap(),
         HashSet::from(["bad-a.mkv".to_string(), "bad-b.mkv".to_string()])
-    );
-    assert_eq!(
-        db.load_verified_suspect_volumes(job_id)
-            .unwrap()
-            .get("set")
-            .cloned(),
-        Some(HashSet::from([37_u32, 38_u32]))
     );
     assert_eq!(db.get_extraction_chunks(job_id, "set").unwrap().len(), 2);
 
@@ -1454,6 +1445,7 @@ async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
             (0, "vol0-old.rar".to_string(), Some([0x11; 16])),
             (1, "vol1-old.rar".to_string(), None),
         ],
+        crate::jobs::persistence::CompletedHashProvenance::Streamed,
     )
     .unwrap();
     assert_eq!(
@@ -1732,6 +1724,79 @@ async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
     assert!(states[&1].locked && states[&1].delete_files);
     assert!(states[&TARGET_COUNT].locked);
 
+    // --- save_file_identity (identity + filename ride one statement) ------
+    let folded_identity = crate::jobs::record::ActiveFileIdentity {
+        file_index: 1,
+        source_filename: "vol1-source.rar".to_string(),
+        current_filename: "vol1-final.rar".to_string(),
+        canonical_filename: Some("vol1.part02.rar".to_string()),
+        classification: None,
+        classification_source: crate::jobs::record::FileIdentitySource::Probe,
+    };
+    db.save_file_identity(job_id, &folded_identity).unwrap();
+    assert_eq!(
+        fetch_text(
+            &db,
+            "SELECT filename AS value FROM active_files WHERE job_id = {} AND file_index = {}",
+            vec![SqlArg::I64(job_id.0 as i64), SqlArg::I64(1)],
+        ),
+        "vol1-final.rar"
+    );
+    assert_eq!(
+        fetch_text(
+            &db,
+            "SELECT canonical_filename AS value FROM active_file_identities
+              WHERE job_id = {} AND file_index = {}",
+            vec![SqlArg::I64(job_id.0 as i64), SqlArg::I64(1)],
+        ),
+        "vol1.part02.rar"
+    );
+    // Absent job: the shared FOR KEY SHARE guard no-ops both halves.
+    let folded_absent_job = crate::jobs::ids::JobId(999_721);
+    db.save_file_identity(folded_absent_job, &folded_identity)
+        .unwrap();
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM active_file_identities WHERE job_id = {}",
+            vec![SqlArg::I64(folded_absent_job.0 as i64)],
+        ),
+        0
+    );
+
+    // --- mark_file_incomplete (three deletes ride one statement) ----------
+    db.upsert_file_progress_batch(&[ActiveFileProgress {
+        job_id,
+        file_index: 1,
+        contiguous_bytes_written: 77,
+    }])
+    .unwrap();
+    db.mark_file_incomplete(job_id, 1).unwrap();
+    for (table, count_sql) in [
+        (
+            "active_files",
+            "SELECT COUNT(*) AS value FROM active_files WHERE job_id = {} AND file_index = {}",
+        ),
+        (
+            "active_file_progress",
+            "SELECT COUNT(*) AS value FROM active_file_progress WHERE job_id = {} AND file_index = {}",
+        ),
+        (
+            "active_detected_archives",
+            "SELECT COUNT(*) AS value FROM active_detected_archives WHERE job_id = {} AND file_index = {}",
+        ),
+    ] {
+        assert_eq!(
+            fetch_i64(
+                &db,
+                count_sql,
+                vec![SqlArg::I64(job_id.0 as i64), SqlArg::I64(1)],
+            ),
+            0,
+            "{table} row should be gone after mark_file_incomplete"
+        );
+    }
+
     drop(db);
     execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
     admin_pool.close().await;
@@ -1992,6 +2057,16 @@ async fn postgres_runtime_smoke_when_configured() {
     assert_eq!(
         fetch_text(
             &db,
+            "SELECT current_setting('synchronous_commit') AS value",
+            vec![],
+        ),
+        "off",
+        "weaver postgres sessions must run asynchronous commit, matching the \
+         SQLite synchronous=NORMAL durability posture"
+    );
+    assert_eq!(
+        fetch_text(
+            &db,
             "SELECT runtime_version AS value FROM _sqlx_migrations WHERE version = {}",
             vec![SqlArg::I64(current_schema_version())],
         ),
@@ -2037,6 +2112,7 @@ async fn postgres_runtime_smoke_when_configured() {
             connections: 12,
             active: true,
             supports_pipelining: true,
+            tls_name_mismatch_certificate_der: None,
             priority: 2,
             backfill: false,
             retention_days: 0,
@@ -2075,6 +2151,9 @@ async fn postgres_runtime_smoke_when_configured() {
         ip_replacement_trial_extra_connections: Some(1),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
+        direct_store: None,
+        delivery_naming: None,
+        metrics: Default::default(),
         config_path: None,
     };
     db.save_config(&config).unwrap();
@@ -2298,6 +2377,50 @@ async fn postgres_runtime_smoke_when_configured() {
     admin_pool.close().await;
 }
 
+/// The direct-store coverage checkpoint is one replaced row per
+/// archive set. This is the Postgres twin of the sqlite roundtrip in
+/// `jobs::repository::tests`, so both engines are proven to upsert, read back
+/// and delete through the same three statements.
+#[tokio::test]
+async fn postgres_direct_coverage_roundtrip_when_configured() {
+    let Some((admin_pool, schema, target_url)) =
+        create_postgres_test_schema("postgres_direct_coverage").await
+    else {
+        return;
+    };
+
+    let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
+    let job_id = crate::jobs::ids::JobId(4242);
+    db.create_active_job(&postgres_sample_job(job_id)).unwrap();
+
+    db.save_direct_coverage(job_id, "Silver.Horizon.S01", &[1, 2, 3])
+        .unwrap();
+    db.save_direct_coverage(job_id, "Amber.Circuit", &[4, 5])
+        .unwrap();
+    let coverage = db.load_direct_coverage(job_id).unwrap();
+    assert_eq!(coverage.len(), 2);
+    assert_eq!(coverage["Silver.Horizon.S01"], vec![1, 2, 3]);
+
+    db.save_direct_coverage(job_id, "Silver.Horizon.S01", &[9, 9, 9, 9])
+        .unwrap();
+    let coverage = db.load_direct_coverage(job_id).unwrap();
+    assert_eq!(coverage.len(), 2, "a barrier replaces, it never appends");
+    assert_eq!(coverage["Silver.Horizon.S01"], vec![9, 9, 9, 9]);
+
+    db.delete_direct_coverage(job_id, "Silver.Horizon.S01")
+        .unwrap();
+    let coverage = db.load_direct_coverage(job_id).unwrap();
+    assert_eq!(coverage.len(), 1);
+    assert!(coverage.contains_key("Amber.Circuit"));
+
+    db.delete_active_job(job_id).unwrap();
+    assert!(db.load_direct_coverage(job_id).unwrap().is_empty());
+
+    drop(db);
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
+    admin_pool.close().await;
+}
+
 #[tokio::test]
 async fn postgres_reserve_next_job_id_is_unique_under_concurrency_when_configured() {
     let Some((admin_pool, schema, target_url)) =
@@ -2341,129 +2464,88 @@ async fn postgres_post_processing_roundtrip_when_configured() {
 
     let mut db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
-    let digest =
-        crate::post_processing::model::ExtensionDigest::new(format!("blake3:{}", "c".repeat(64)))
-            .unwrap();
-    let manifest = crate::post_processing::manifest::parse_native_manifest(
-        r#"{
-            "schema_version": 1,
-            "kind": "native",
-            "id": "postgres.roundtrip",
-            "name": "Postgres Roundtrip",
-            "version": "1.0.0",
-            "entrypoint": "process.sh",
-            "commands": [],
-            "options": []
-        }"#,
-        crate::post_processing::model::VerifiedExtensionDigest::from_verified_package_digest(
-            digest,
-        ),
-    )
-    .unwrap();
-    db.upsert_discovered_extension(&manifest, Some("/scripts/postgres"), 10)
-        .unwrap();
-    let revision = manifest.revision();
-    db.approve_extension_revision(
-        revision.extension_id(),
-        revision.revision_id(),
-        "/managed/postgres",
-        20,
-    )
-    .unwrap();
-    let selection = crate::post_processing::model::SubmissionPlanSelection::extensions(vec![
-        crate::post_processing::model::ExtensionSelection::pinned(
-            revision.extension_id().clone(),
-            revision.revision_id().clone(),
-        ),
-    ])
-    .unwrap();
-    let plan = db
-        .resolve_post_processing_plan(Some(&selection), None)
-        .unwrap();
-    let run_id = db
-        .create_post_processing_run(
-            77,
-            &plan,
-            &crate::post_processing::model::PipelineOutcome::Succeeded,
-            crate::post_processing::persistence::TerminalIntent::Complete,
-            None,
-            30,
-        )
-        .unwrap();
-    assert!(db.mark_post_processing_run_running(&run_id, 40).unwrap());
-    let attempt_id = db
-        .enqueue_post_processing_attempt(
-            &run_id,
-            &plan.steps()[0],
-            manifest.adapter(),
-            Some(vec![7; 32]),
-            50,
-        )
-        .unwrap();
-    assert!(
-        db.mark_post_processing_attempt_starting(
-            &attempt_id,
-            &serde_json::json!({"adapter": "native"}),
-            "/work/postgres",
-            60,
-        )
-        .unwrap()
-    );
-    assert!(
-        db.mark_post_processing_attempt_running(&attempt_id)
-            .unwrap()
-    );
-    db.append_post_processing_log(
-        &attempt_id,
-        crate::post_processing::persistence::LogStream::Stdout,
-        b"postgres-log",
-        70,
-    )
-    .unwrap();
-    execute(
-        &db,
-        "UPDATE post_processing_attempts
-            SET output_truncated = TRUE
-          WHERE attempt_id = {}",
-        vec![SqlArg::Text(attempt_id.as_str().to_string())],
-    );
-    assert!(
-        db.finish_post_processing_attempt(
-            &attempt_id,
-            crate::post_processing::model::AttemptStatus::Succeeded,
-            Some(0),
-            None,
-            None,
-            false,
-            80,
-        )
-        .unwrap()
-    );
-    assert!(
-        db.finish_post_processing_run(
-            &run_id,
-            crate::post_processing::model::RunStatus::Succeeded,
-            crate::post_processing::model::PostProcessingSummary::Succeeded,
-            90,
-        )
-        .unwrap()
-    );
 
-    let stored_run = db.post_processing_run(&run_id).unwrap().unwrap();
-    assert_eq!(
-        stored_run.status,
-        crate::post_processing::model::RunStatus::Succeeded
+    let settings = crate::post_processing::model::PostProcessingSettings {
+        execution_enabled: true,
+        concurrency: 3,
+        termination_grace_seconds: 20,
+        ..Default::default()
+    };
+    db.save_post_processing_settings(&settings).unwrap();
+    assert_eq!(db.post_processing_settings().unwrap(), settings);
+
+    let script = crate::post_processing::model::ScriptName::new("notify.sh").unwrap();
+    let mut lists = crate::post_processing::model::ScriptLists {
+        global: crate::post_processing::model::ScriptList::new(vec![
+            crate::post_processing::model::ScriptListEntry::new(script.clone()),
+        ])
+        .unwrap(),
+        ..Default::default()
+    };
+    lists.categories.insert(
+        "movies".into(),
+        crate::post_processing::model::ScriptList::new(vec![]).unwrap(),
     );
-    let attempts = db.post_processing_attempts(&run_id).unwrap();
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].status,
-        crate::post_processing::model::AttemptStatus::Succeeded
-    );
-    assert!(attempts[0].output_truncated);
-    let logs = db.post_processing_logs(&attempt_id, None, 10).unwrap();
-    assert_eq!(logs.chunks.len(), 1);
-    assert_eq!(logs.chunks[0].payload, b"postgres-log");
+    db.save_post_processing_script_lists(&lists).unwrap();
+    assert_eq!(db.post_processing_script_lists().unwrap(), lists);
+
+    let options = vec![crate::post_processing::model::ResolvedOption::new(
+        crate::post_processing::model::OptionName::new("Token").unwrap(),
+        crate::post_processing::model::OptionValue::Secret(
+            crate::post_processing::model::SecretOptionValue::from_admin_input("hunter2"),
+        ),
+    )];
+    db.save_post_processing_script_options(&script, &options)
+        .unwrap();
+    let raw = db
+        .get_setting("post_processing.script_options.v1")
+        .unwrap()
+        .unwrap();
+    assert!(!raw.contains("hunter2"));
+    let loaded = db.post_processing_script_options(&script).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert!(loaded[0].value().is_secret());
+
+    let job_id = 4242;
+    db.insert_job_history(&crate::history::JobHistoryRow {
+        job_id,
+        job_hash: None,
+        name: "postgres roundtrip".into(),
+        status: "complete".into(),
+        error_message: None,
+        total_bytes: 1,
+        downloaded_bytes: 1,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1_000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1,
+        completed_at: 2,
+        metadata: None,
+    })
+    .unwrap();
+    let results = vec![crate::post_processing::model::ScriptResult {
+        script,
+        adapter: crate::post_processing::model::ScriptAdapter::Nzbget,
+        status: crate::post_processing::model::ScriptStatus::Succeeded,
+        exit_code: Some(93),
+        duration_ms: 5,
+        output_tail: "postgres-log".into(),
+        output_truncated: true,
+        error_message: None,
+        finished_at_epoch_ms: 3,
+    }];
+    db.save_job_post_processing_results(
+        job_id,
+        crate::post_processing::model::PostProcessingSummary::Succeeded,
+        &results,
+    )
+    .unwrap();
+    let stored = db.job_post_processing_results(job_id).unwrap();
+    assert_eq!(stored, results);
 
     drop(db);
     execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;

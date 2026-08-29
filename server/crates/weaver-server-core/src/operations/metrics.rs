@@ -4,6 +4,10 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use crate::operations::instrumentation::{
+    JobLifecycleMetrics, PipelineHistograms, ServerMetricsRegistry,
+};
+
 const SPEED_WINDOW_SAMPLES: usize = 50; // ~5 seconds at 100ms snapshot rate
 const SPEED_EMA_HALF_LIFE_SECS: f64 = 1.0;
 
@@ -117,17 +121,14 @@ impl DispatchShareMode {
 pub enum SpilloverDecision {
     #[default]
     None,
-    BlockedWarmup,
     BlockedPressure,
     BlockedNearCap,
     BlockedHotCanUseCapacity,
     AllowedUnderfill,
     Reclaimed,
     BlockedBestModePending,
-    BlockedRecentExpansionHelped,
     BlockedCapSpeed,
     AllowedMeasuredUnderfill,
-    AllowedBoundedSameBand,
     ReclaimedSpeedHarm,
 }
 
@@ -135,96 +136,119 @@ impl SpilloverDecision {
     pub const fn as_code(self) -> usize {
         match self {
             Self::None => 0,
-            Self::BlockedWarmup => 1,
-            Self::BlockedPressure => 2,
-            Self::BlockedNearCap => 3,
-            Self::BlockedHotCanUseCapacity => 4,
-            Self::AllowedUnderfill => 5,
-            Self::Reclaimed => 6,
-            Self::BlockedBestModePending => 7,
-            Self::BlockedRecentExpansionHelped => 8,
-            Self::BlockedCapSpeed => 9,
-            Self::AllowedMeasuredUnderfill => 10,
-            Self::ReclaimedSpeedHarm => 11,
-            Self::AllowedBoundedSameBand => 12,
+            Self::BlockedPressure => 1,
+            Self::BlockedNearCap => 2,
+            Self::BlockedHotCanUseCapacity => 3,
+            Self::AllowedUnderfill => 4,
+            Self::Reclaimed => 5,
+            Self::BlockedBestModePending => 6,
+            Self::BlockedCapSpeed => 7,
+            Self::AllowedMeasuredUnderfill => 8,
+            Self::ReclaimedSpeedHarm => 9,
         }
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::BlockedWarmup => "blocked_warmup",
             Self::BlockedPressure => "blocked_pressure",
             Self::BlockedNearCap => "blocked_near_cap",
             Self::BlockedHotCanUseCapacity => "blocked_hot_can_use_capacity",
             Self::AllowedUnderfill => "allowed_underfill",
             Self::Reclaimed => "reclaimed",
             Self::BlockedBestModePending => "blocked_best_mode_pending",
-            Self::BlockedRecentExpansionHelped => "blocked_recent_expansion_helped",
             Self::BlockedCapSpeed => "blocked_cap_speed",
             Self::AllowedMeasuredUnderfill => "allowed_measured_underfill",
-            Self::AllowedBoundedSameBand => "allowed_bounded_same_band",
             Self::ReclaimedSpeedHarm => "reclaimed_speed_harm",
         }
     }
 
     pub const fn from_code(code: usize) -> Self {
         match code {
-            1 => Self::BlockedWarmup,
-            2 => Self::BlockedPressure,
-            3 => Self::BlockedNearCap,
-            4 => Self::BlockedHotCanUseCapacity,
-            5 => Self::AllowedUnderfill,
-            6 => Self::Reclaimed,
-            7 => Self::BlockedBestModePending,
-            8 => Self::BlockedRecentExpansionHelped,
-            9 => Self::BlockedCapSpeed,
-            10 => Self::AllowedMeasuredUnderfill,
-            11 => Self::ReclaimedSpeedHarm,
-            12 => Self::AllowedBoundedSameBand,
+            1 => Self::BlockedPressure,
+            2 => Self::BlockedNearCap,
+            3 => Self::BlockedHotCanUseCapacity,
+            4 => Self::AllowedUnderfill,
+            5 => Self::Reclaimed,
+            6 => Self::BlockedBestModePending,
+            7 => Self::BlockedCapSpeed,
+            8 => Self::AllowedMeasuredUnderfill,
+            9 => Self::ReclaimedSpeedHarm,
             _ => Self::None,
         }
     }
 }
 
-/// Tracks download speed using a sliding window of byte samples.
-struct SpeedTracker {
-    /// Ring buffer of (timestamp, cumulative_bytes) samples.
+// Exhaustive variant lists for the label sets these enums drive. The
+// Prometheus exporter renders one series per variant, so a variant added
+// without a matching label silently disappears from `/metrics`; deriving the
+// label set from `ALL` makes that impossible.
+
+impl DownloadPressureState {
+    pub const ALL: [Self; 3] = [Self::Clear, Self::Soft, Self::Hard];
+}
+
+impl DownloadPressureReason {
+    pub const ALL: [Self; 4] = [Self::None, Self::Decode, Self::Write, Self::DecodeAndWrite];
+}
+
+impl DispatchShareMode {
+    pub const ALL: [Self; 2] = [Self::Exclusive, Self::Shared];
+}
+
+impl SpilloverDecision {
+    pub const ALL: [Self; 10] = [
+        Self::None,
+        Self::BlockedPressure,
+        Self::BlockedNearCap,
+        Self::BlockedHotCanUseCapacity,
+        Self::AllowedUnderfill,
+        Self::Reclaimed,
+        Self::BlockedBestModePending,
+        Self::BlockedCapSpeed,
+        Self::AllowedMeasuredUnderfill,
+        Self::ReclaimedSpeedHarm,
+    ];
+}
+
+/// Short-window rate for one monotonically increasing counter.
+///
+/// Holds a ring buffer of `(timestamp, cumulative)` samples and smooths the
+/// window's raw rate with a 1 s half-life EMA, so the published value follows
+/// pipeline ticks without showing every short-lived burst. Not hot-path code:
+/// it is advanced once per 100 ms metrics tick under the tracker mutex.
+struct RateSeries {
+    /// Ring buffer of (timestamp, cumulative value) samples.
     samples: Vec<(Instant, u64)>,
     /// Next write position in the ring buffer.
     pos: usize,
-    /// Last computed EMA-smoothed speed (bytes/sec).
-    speed: u64,
-    /// Floating-point accumulator used by the EMA.
-    ema_speed: f64,
+    /// Last computed EMA-smoothed rate (units/sec).
+    rate: f64,
     /// Timestamp of the last EMA update.
     last_ema_at: Option<Instant>,
 }
 
-impl SpeedTracker {
+impl RateSeries {
     fn new() -> Self {
         Self {
             samples: Vec::with_capacity(SPEED_WINDOW_SAMPLES),
             pos: 0,
-            speed: 0,
-            ema_speed: 0.0,
+            rate: 0.0,
             last_ema_at: None,
         }
     }
 
-    /// Record a sample and recompute speed on the pipeline metrics tick.
-    fn update(&mut self, now: Instant, bytes_downloaded: u64) -> u64 {
+    /// Record a sample and recompute the smoothed rate.
+    fn update(&mut self, now: Instant, cumulative: u64) -> f64 {
         if self.samples.len() < SPEED_WINDOW_SAMPLES {
-            self.samples.push((now, bytes_downloaded));
+            self.samples.push((now, cumulative));
         } else {
-            self.samples[self.pos] = (now, bytes_downloaded);
+            self.samples[self.pos] = (now, cumulative);
         }
         self.pos = (self.pos + 1) % SPEED_WINDOW_SAMPLES;
 
         // Compare newest sample to oldest in the current window, then smooth
-        // the raw rate with a 1s half-life EMA so the published metric follows
-        // pipeline ticks without showing every short-lived burst.
-        let newest = (now, bytes_downloaded);
+        // the raw rate with a 1s half-life EMA.
         let oldest_idx = if self.samples.len() < SPEED_WINDOW_SAMPLES {
             0
         } else {
@@ -232,37 +256,100 @@ impl SpeedTracker {
         };
         let oldest = self.samples[oldest_idx];
 
-        let dt = newest.0.duration_since(oldest.0).as_secs_f64();
+        let dt = now.duration_since(oldest.0).as_secs_f64();
         if dt > 0.05 {
-            let delta_bytes = newest.1.saturating_sub(oldest.1);
-            let raw_speed = delta_bytes as f64 / dt;
+            let delta = cumulative.saturating_sub(oldest.1);
+            let raw_rate = delta as f64 / dt;
 
             if let Some(last_ema_at) = self.last_ema_at {
                 let elapsed = now.duration_since(last_ema_at).as_secs_f64();
                 if elapsed > 0.0 {
                     let alpha = 1.0 - 0.5_f64.powf(elapsed / SPEED_EMA_HALF_LIFE_SECS);
-                    self.ema_speed += alpha * (raw_speed - self.ema_speed);
+                    self.rate += alpha * (raw_rate - self.rate);
                 } else {
-                    self.ema_speed = raw_speed;
+                    self.rate = raw_rate;
                 }
             } else {
-                self.ema_speed = raw_speed;
+                self.rate = raw_rate;
             }
 
             self.last_ema_at = Some(now);
-            if self.ema_speed < 1.0 {
-                self.ema_speed = 0.0;
+            if self.rate < f64::EPSILON {
+                self.rate = 0.0;
             }
-            self.speed = self.ema_speed as u64;
         }
-        self.speed
+        self.rate
+    }
+}
+
+/// Short-window rates published alongside the metrics snapshot.
+#[derive(Debug, Clone, Copy, Default)]
+struct CurrentRates {
+    /// Downloaded bytes per second.
+    download_bytes: u64,
+    /// Articles (segments) downloaded per second.
+    articles: f64,
+    /// Decoded MiB per second.
+    decode_mib: f64,
+}
+
+/// Tracks the three published "current" rates over a sliding window.
+///
+/// All three were once lifetime averages since process start, which made them
+/// useless as live indicators — a box that downloaded fast for an hour and then
+/// stalled kept reporting a healthy rate. They are now short-window rates
+/// computed on the same 100 ms tick that already takes this mutex.
+struct SpeedTracker {
+    bytes_downloaded: RateSeries,
+    segments_downloaded: RateSeries,
+    bytes_decoded: RateSeries,
+    last: CurrentRates,
+}
+
+impl SpeedTracker {
+    fn new() -> Self {
+        Self {
+            bytes_downloaded: RateSeries::new(),
+            segments_downloaded: RateSeries::new(),
+            bytes_decoded: RateSeries::new(),
+            last: CurrentRates::default(),
+        }
+    }
+
+    /// Record a sample of each series and recompute the published rates.
+    fn update(
+        &mut self,
+        now: Instant,
+        bytes_downloaded: u64,
+        segments_downloaded: u64,
+        bytes_decoded: u64,
+    ) -> CurrentRates {
+        // The byte rate keeps its historical rounding: sub-1 B/s reads as idle.
+        let download_bytes = self.bytes_downloaded.update(now, bytes_downloaded);
+        let download_bytes = if download_bytes < 1.0 {
+            0
+        } else {
+            download_bytes as u64
+        };
+        let rates = CurrentRates {
+            download_bytes,
+            articles: self.segments_downloaded.update(now, segments_downloaded),
+            decode_mib: self.bytes_decoded.update(now, bytes_decoded) / (1024.0 * 1024.0),
+        };
+        self.last = rates;
+        rates
+    }
+
+    /// The most recently computed rates, without advancing the window.
+    fn last(&self) -> CurrentRates {
+        self.last
     }
 }
 
 impl std::fmt::Debug for SpeedTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpeedTracker")
-            .field("speed", &self.speed)
+            .field("rates", &self.last)
             .finish()
     }
 }
@@ -287,6 +374,22 @@ pub struct PipelineMetrics {
     pub write_buffered_bytes: AtomicU64,
     pub write_buffered_segments: AtomicUsize,
     pub direct_write_evictions: AtomicU64,
+    /// Direct-store engagement, as lifetime counters. These four exist so an
+    /// external observer — the e2e harness, or someone staring at a production
+    /// box — can tell whether direct routing actually carried a job or quietly
+    /// fell back to the conventional path: the output bytes are identical
+    /// either way, so nothing downstream can answer that. Admitted says the
+    /// gate engaged; finalized-direct says a set completed without ever
+    /// writing a source volume; demoted says one left direct routing (the
+    /// per-reason breakdown stays in the logs and the `direct_store.demoted.*`
+    /// perf-probe keys); repaired-while-direct says damage was repaired
+    /// without leaving.
+    pub direct_sets_admitted: AtomicU64,
+    pub direct_sets_demoted: AtomicU64,
+    pub direct_sets_finalized_direct: AtomicU64,
+    pub direct_sets_repaired_while_direct: AtomicU64,
+    /// Delivered files renamed out of an obfuscated in-archive member name.
+    pub deobfuscated_members_renamed: AtomicU64,
     pub decode_pressure_soft_limit_bytes: AtomicU64,
     pub decode_pressure_hard_limit_bytes: AtomicU64,
     pub write_pressure_soft_limit_bytes: AtomicU64,
@@ -301,18 +404,14 @@ pub struct PipelineMetrics {
     pub hot_dispatch_mode: AtomicUsize,
     pub hot_dispatch_underfill_ms: AtomicU64,
     pub hot_dispatch_lent_connections: AtomicUsize,
-    pub hot_dispatch_warmup_complete: AtomicUsize,
     pub hot_dispatch_last_spillover_decision: AtomicUsize,
-    pub hot_dispatch_spillover_blocked_warmup_total: AtomicU64,
     pub hot_dispatch_spillover_blocked_pressure_total: AtomicU64,
     pub hot_dispatch_spillover_blocked_near_cap_total: AtomicU64,
     pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: AtomicU64,
     pub hot_dispatch_spillover_blocked_best_mode_pending_total: AtomicU64,
-    pub hot_dispatch_spillover_blocked_recent_expansion_helped_total: AtomicU64,
     pub hot_dispatch_spillover_blocked_cap_speed_total: AtomicU64,
     pub hot_dispatch_spillover_allowed_underfill_total: AtomicU64,
     pub hot_dispatch_spillover_allowed_measured_underfill_total: AtomicU64,
-    pub hot_dispatch_spillover_allowed_bounded_same_band_total: AtomicU64,
     pub hot_dispatch_spillover_reclaimed_total: AtomicU64,
     pub hot_dispatch_hot_speed_bps: AtomicU64,
     pub hot_dispatch_exclusive_peak_bps: AtomicU64,
@@ -346,7 +445,6 @@ pub struct PipelineMetrics {
     pub download_lane_parks_spillover_withdraw_total: AtomicU64,
     pub download_lane_parks_spillover_speed_harm_total: AtomicU64,
     pub download_lane_parks_ip_replacement_retired_total: AtomicU64,
-    pub download_lane_parks_server_tier_changed_total: AtomicU64,
     pub download_lane_parks_proof_failure_total: AtomicU64,
     pub download_lane_parks_error_total: AtomicU64,
     pub download_lane_lease_items_total: AtomicU64,
@@ -382,6 +480,7 @@ pub struct PipelineMetrics {
     pub verify_active: AtomicUsize,
     pub repair_active: AtomicUsize,
     pub extract_active: AtomicUsize,
+    extraction_rejections: [AtomicU64; 9],
     pub disk_write_latency_us: AtomicU64,
 
     // Retry tracking
@@ -409,6 +508,18 @@ pub struct PipelineMetrics {
     // Recovery
     pub recovery_queue_depth: AtomicUsize,
 
+    /// Per-server article attempt counters and latency. Deliberately *not*
+    /// folded into [`MetricsSnapshot`]: the 100 ms tick must stay a fixed-size
+    /// struct copy, so this is read on demand through
+    /// [`crate::SchedulerHandle::server_metrics_snapshot`].
+    pub server_metrics: ServerMetricsRegistry,
+    /// Job lifecycle counters and duration histograms, read on demand through
+    /// [`crate::SchedulerHandle::job_lifecycle_metrics_snapshot`].
+    pub job_lifecycle: JobLifecycleMetrics,
+    /// Pipeline stage duration histograms, read on demand through
+    /// [`crate::SchedulerHandle::pipeline_histograms_snapshot`].
+    pub pipeline_histograms: PipelineHistograms,
+
     // Timing (not atomic — set once at creation)
     pub start_time: Instant,
 }
@@ -429,6 +540,11 @@ impl PipelineMetrics {
             write_buffered_bytes: AtomicU64::new(0),
             write_buffered_segments: AtomicUsize::new(0),
             direct_write_evictions: AtomicU64::new(0),
+            direct_sets_admitted: AtomicU64::new(0),
+            direct_sets_demoted: AtomicU64::new(0),
+            direct_sets_finalized_direct: AtomicU64::new(0),
+            direct_sets_repaired_while_direct: AtomicU64::new(0),
+            deobfuscated_members_renamed: AtomicU64::new(0),
             decode_pressure_soft_limit_bytes: AtomicU64::new(0),
             decode_pressure_hard_limit_bytes: AtomicU64::new(0),
             write_pressure_soft_limit_bytes: AtomicU64::new(0),
@@ -443,20 +559,16 @@ impl PipelineMetrics {
             hot_dispatch_mode: AtomicUsize::new(DispatchShareMode::Exclusive.as_code()),
             hot_dispatch_underfill_ms: AtomicU64::new(0),
             hot_dispatch_lent_connections: AtomicUsize::new(0),
-            hot_dispatch_warmup_complete: AtomicUsize::new(0),
             hot_dispatch_last_spillover_decision: AtomicUsize::new(
                 SpilloverDecision::None.as_code(),
             ),
-            hot_dispatch_spillover_blocked_warmup_total: AtomicU64::new(0),
             hot_dispatch_spillover_blocked_pressure_total: AtomicU64::new(0),
             hot_dispatch_spillover_blocked_near_cap_total: AtomicU64::new(0),
             hot_dispatch_spillover_blocked_hot_can_use_capacity_total: AtomicU64::new(0),
             hot_dispatch_spillover_blocked_best_mode_pending_total: AtomicU64::new(0),
-            hot_dispatch_spillover_blocked_recent_expansion_helped_total: AtomicU64::new(0),
             hot_dispatch_spillover_blocked_cap_speed_total: AtomicU64::new(0),
             hot_dispatch_spillover_allowed_underfill_total: AtomicU64::new(0),
             hot_dispatch_spillover_allowed_measured_underfill_total: AtomicU64::new(0),
-            hot_dispatch_spillover_allowed_bounded_same_band_total: AtomicU64::new(0),
             hot_dispatch_spillover_reclaimed_total: AtomicU64::new(0),
             hot_dispatch_hot_speed_bps: AtomicU64::new(0),
             hot_dispatch_exclusive_peak_bps: AtomicU64::new(0),
@@ -490,7 +602,6 @@ impl PipelineMetrics {
             download_lane_parks_spillover_withdraw_total: AtomicU64::new(0),
             download_lane_parks_spillover_speed_harm_total: AtomicU64::new(0),
             download_lane_parks_ip_replacement_retired_total: AtomicU64::new(0),
-            download_lane_parks_server_tier_changed_total: AtomicU64::new(0),
             download_lane_parks_proof_failure_total: AtomicU64::new(0),
             download_lane_parks_error_total: AtomicU64::new(0),
             download_lane_lease_items_total: AtomicU64::new(0),
@@ -522,6 +633,7 @@ impl PipelineMetrics {
             verify_active: AtomicUsize::new(0),
             repair_active: AtomicUsize::new(0),
             extract_active: AtomicUsize::new(0),
+            extraction_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
             disk_write_latency_us: AtomicU64::new(0),
             segments_retried: AtomicU64::new(0),
             segments_failed_permanent: AtomicU64::new(0),
@@ -540,6 +652,9 @@ impl PipelineMetrics {
             speed_tracker: Mutex::new(SpeedTracker::new()),
             crc_errors: AtomicU64::new(0),
             recovery_queue_depth: AtomicUsize::new(0),
+            server_metrics: ServerMetricsRegistry::new(),
+            job_lifecycle: JobLifecycleMetrics::new(),
+            pipeline_histograms: PipelineHistograms::new(),
             start_time: Instant::now(),
         })
     }
@@ -548,6 +663,27 @@ impl PipelineMetrics {
         let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_sub(amount))
         });
+    }
+
+    pub(crate) fn note_extraction_rejection(&self, reason: &str) {
+        const REASONS: [&str; 9] = [
+            "unsafe_path",
+            "unsupported_entry",
+            "member_bytes",
+            "job_bytes",
+            "ratio",
+            "entries",
+            "deadline",
+            "memory",
+            "disk_reserve",
+        ];
+        if let Some(index) = REASONS.iter().position(|candidate| *candidate == reason) {
+            self.extraction_rejections[index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn extraction_rejections(&self) -> [u64; 9] {
+        std::array::from_fn(|index| self.extraction_rejections[index].load(Ordering::Relaxed))
     }
 
     pub fn set_ip_replacement_trial_extra_connections(&self, value: u8) {
@@ -633,14 +769,10 @@ impl PipelineMetrics {
         Self::saturating_sub_u64(&self.decode_active_bytes, raw_bytes);
     }
 
-    fn snapshot_with_speed(
-        &self,
-        bytes_downloaded: u64,
-        current_download_speed: u64,
-    ) -> MetricsSnapshot {
-        let elapsed = self.start_time.elapsed().as_secs_f64().max(0.001);
+    fn snapshot_with_speed(&self, bytes_downloaded: u64, rates: CurrentRates) -> MetricsSnapshot {
         let segments_downloaded = self.segments_downloaded.load(Ordering::Relaxed);
         let bytes_decoded = self.bytes_decoded.load(Ordering::Relaxed);
+        let current_download_speed = rates.download_bytes;
 
         MetricsSnapshot {
             bytes_downloaded,
@@ -656,6 +788,13 @@ impl PipelineMetrics {
             write_buffered_bytes: self.write_buffered_bytes.load(Ordering::Relaxed),
             write_buffered_segments: self.write_buffered_segments.load(Ordering::Relaxed),
             direct_write_evictions: self.direct_write_evictions.load(Ordering::Relaxed),
+            direct_sets_admitted: self.direct_sets_admitted.load(Ordering::Relaxed),
+            direct_sets_demoted: self.direct_sets_demoted.load(Ordering::Relaxed),
+            direct_sets_finalized_direct: self.direct_sets_finalized_direct.load(Ordering::Relaxed),
+            direct_sets_repaired_while_direct: self
+                .direct_sets_repaired_while_direct
+                .load(Ordering::Relaxed),
+            deobfuscated_members_renamed: self.deobfuscated_members_renamed.load(Ordering::Relaxed),
             decode_pressure_soft_limit_bytes: self
                 .decode_pressure_soft_limit_bytes
                 .load(Ordering::Relaxed),
@@ -694,15 +833,10 @@ impl PipelineMetrics {
             hot_dispatch_lent_connections: self
                 .hot_dispatch_lent_connections
                 .load(Ordering::Relaxed),
-            hot_dispatch_warmup_complete: self.hot_dispatch_warmup_complete.load(Ordering::Relaxed)
-                != 0,
             hot_dispatch_last_spillover_decision: SpilloverDecision::from_code(
                 self.hot_dispatch_last_spillover_decision
                     .load(Ordering::Relaxed),
             ),
-            hot_dispatch_spillover_blocked_warmup_total: self
-                .hot_dispatch_spillover_blocked_warmup_total
-                .load(Ordering::Relaxed),
             hot_dispatch_spillover_blocked_pressure_total: self
                 .hot_dispatch_spillover_blocked_pressure_total
                 .load(Ordering::Relaxed),
@@ -715,9 +849,6 @@ impl PipelineMetrics {
             hot_dispatch_spillover_blocked_best_mode_pending_total: self
                 .hot_dispatch_spillover_blocked_best_mode_pending_total
                 .load(Ordering::Relaxed),
-            hot_dispatch_spillover_blocked_recent_expansion_helped_total: self
-                .hot_dispatch_spillover_blocked_recent_expansion_helped_total
-                .load(Ordering::Relaxed),
             hot_dispatch_spillover_blocked_cap_speed_total: self
                 .hot_dispatch_spillover_blocked_cap_speed_total
                 .load(Ordering::Relaxed),
@@ -726,9 +857,6 @@ impl PipelineMetrics {
                 .load(Ordering::Relaxed),
             hot_dispatch_spillover_allowed_measured_underfill_total: self
                 .hot_dispatch_spillover_allowed_measured_underfill_total
-                .load(Ordering::Relaxed),
-            hot_dispatch_spillover_allowed_bounded_same_band_total: self
-                .hot_dispatch_spillover_allowed_bounded_same_band_total
                 .load(Ordering::Relaxed),
             hot_dispatch_spillover_reclaimed_total: self
                 .hot_dispatch_spillover_reclaimed_total
@@ -818,9 +946,6 @@ impl PipelineMetrics {
                 .load(Ordering::Relaxed),
             download_lane_parks_ip_replacement_retired_total: self
                 .download_lane_parks_ip_replacement_retired_total
-                .load(Ordering::Relaxed),
-            download_lane_parks_server_tier_changed_total: self
-                .download_lane_parks_server_tier_changed_total
                 .load(Ordering::Relaxed),
             download_lane_parks_proof_failure_total: self
                 .download_lane_parks_proof_failure_total
@@ -928,27 +1053,35 @@ impl PipelineMetrics {
             current_download_speed,
             crc_errors: self.crc_errors.load(Ordering::Relaxed),
             recovery_queue_depth: self.recovery_queue_depth.load(Ordering::Relaxed),
-            articles_per_sec: segments_downloaded as f64 / elapsed,
-            decode_rate_mbps: (bytes_decoded as f64 / (1024.0 * 1024.0)) / elapsed,
+            articles_per_sec: rates.articles,
+            decode_rate_mbps: rates.decode_mib,
         }
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
         let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
-        let current_download_speed = self
-            .speed_tracker
-            .lock()
-            .unwrap()
-            .update(Instant::now(), bytes_downloaded);
-        self.snapshot_with_speed(bytes_downloaded, current_download_speed)
+        let segments_downloaded = self.segments_downloaded.load(Ordering::Relaxed);
+        let bytes_decoded = self.bytes_decoded.load(Ordering::Relaxed);
+        // One mutex acquisition per 100 ms tick, on the metrics publisher — not
+        // a per-segment path. All three published rates advance together so they
+        // describe the same window.
+        let rates = self.speed_tracker.lock().unwrap().update(
+            Instant::now(),
+            bytes_downloaded,
+            segments_downloaded,
+            bytes_decoded,
+        );
+        self.snapshot_with_speed(bytes_downloaded, rates)
     }
 
     /// Return a fresh atomics-based metrics snapshot without advancing the
-    /// shared speed tracker. `current_download_speed` is left at zero so
-    /// callers can derive it from their own sampling cadence when needed.
+    /// shared speed tracker. The rate gauges carry the values the last real
+    /// tick computed, so an off-cadence reader sees the same live window rather
+    /// than a zero it would have to interpret as "stopped".
     pub fn raw_snapshot(&self) -> MetricsSnapshot {
         let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
-        self.snapshot_with_speed(bytes_downloaded, 0)
+        let rates = self.speed_tracker.lock().unwrap().last();
+        self.snapshot_with_speed(bytes_downloaded, rates)
     }
 }
 
@@ -968,6 +1101,11 @@ pub struct MetricsSnapshot {
     pub write_buffered_bytes: u64,
     pub write_buffered_segments: usize,
     pub direct_write_evictions: u64,
+    pub direct_sets_admitted: u64,
+    pub direct_sets_demoted: u64,
+    pub direct_sets_finalized_direct: u64,
+    pub direct_sets_repaired_while_direct: u64,
+    pub deobfuscated_members_renamed: u64,
     pub decode_pressure_soft_limit_bytes: u64,
     pub decode_pressure_hard_limit_bytes: u64,
     pub write_pressure_soft_limit_bytes: u64,
@@ -982,18 +1120,14 @@ pub struct MetricsSnapshot {
     pub hot_dispatch_mode: DispatchShareMode,
     pub hot_dispatch_underfill_ms: u64,
     pub hot_dispatch_lent_connections: usize,
-    pub hot_dispatch_warmup_complete: bool,
     pub hot_dispatch_last_spillover_decision: SpilloverDecision,
-    pub hot_dispatch_spillover_blocked_warmup_total: u64,
     pub hot_dispatch_spillover_blocked_pressure_total: u64,
     pub hot_dispatch_spillover_blocked_near_cap_total: u64,
     pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: u64,
     pub hot_dispatch_spillover_blocked_best_mode_pending_total: u64,
-    pub hot_dispatch_spillover_blocked_recent_expansion_helped_total: u64,
     pub hot_dispatch_spillover_blocked_cap_speed_total: u64,
     pub hot_dispatch_spillover_allowed_underfill_total: u64,
     pub hot_dispatch_spillover_allowed_measured_underfill_total: u64,
-    pub hot_dispatch_spillover_allowed_bounded_same_band_total: u64,
     pub hot_dispatch_spillover_reclaimed_total: u64,
     pub hot_dispatch_hot_speed_bps: u64,
     pub hot_dispatch_exclusive_peak_bps: u64,
@@ -1027,7 +1161,6 @@ pub struct MetricsSnapshot {
     pub download_lane_parks_spillover_withdraw_total: u64,
     pub download_lane_parks_spillover_speed_harm_total: u64,
     pub download_lane_parks_ip_replacement_retired_total: u64,
-    pub download_lane_parks_server_tier_changed_total: u64,
     pub download_lane_parks_proof_failure_total: u64,
     pub download_lane_parks_error_total: u64,
     pub download_lane_lease_items_total: u64,

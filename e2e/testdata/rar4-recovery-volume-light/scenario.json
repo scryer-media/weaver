@@ -1,0 +1,10 @@
+{
+  "slug": "rar4-recovery-volume-light",
+  "title": "E2E.Test.RAR4.RecoveryVolume.Light.2026.1080p-TESTGRP",
+  "description": "The RAR4 counterpart of the light case: four RAR4 volumes with one RAR3-format recovery volume, third data volume absent.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "work/payload/E2E Test RAR4 RecoveryVolume Light.mkv": "15849b0fd55c4b653829ae1b6cd3457442591cb158d4b1bdda5e88c1a4676a62"
+  }
+}

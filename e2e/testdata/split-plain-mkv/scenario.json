@@ -1,0 +1,7 @@
+{
+  "slug": "split-plain-mkv",
+  "title": "E2E.Test.Split.Plain.MKV.2024.1080p.WEB-DL.H264-TESTGRP",
+  "description": "Plain split-file volumes named like movie.mkv.001/.002/.003. Tests generic split topology registration and concatenation back into the MKV.",
+  "category": "2000",
+  "expected_outcome": "success"
+}

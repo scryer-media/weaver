@@ -1,8 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FocusEvent as ReactFocusEvent,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { ChevronRight } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 import { useTranslate } from "@/lib/context/translate-context";
 import { STATUS_BG_CLASS, type StatusToken } from "@/lib/status-tokens";
@@ -342,117 +352,111 @@ function DetailList({ items }: { items: DetailItem[] }) {
   );
 }
 
-function TimelineSpanPopover({
+function TimelineSpanButton({
   axisStart,
   axisEnd,
   row,
   span,
   open,
-  onPointerEnter,
-  onPointerLeave,
-  onFocus,
-  onBlur,
-  onToggle,
-  onOpenChange,
 }: {
   axisStart: number;
   axisEnd: number;
   row: PlotRow;
   span: PlotSpan;
   open: boolean;
-  onPointerEnter: () => void;
-  onPointerLeave: () => void;
-  onFocus: () => void;
-  onBlur: () => void;
-  onToggle: () => void;
-  onOpenChange: (nextOpen: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      data-timeline-span-key={span.key}
+      className={cn(
+        "absolute top-1/2 z-10 h-4 -translate-y-1/2 transition-opacity hover:opacity-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 before:absolute before:-inset-x-2 before:-inset-y-1 before:content-['']",
+      )}
+      style={spanStyle(span.startedAt, span.endedAt, axisStart, axisEnd)}
+      aria-label={`${row.title}: ${span.title}`}
+      aria-haspopup="dialog"
+      aria-expanded={open}
+    >
+      <span
+        className={cn(
+          "absolute inset-x-0 top-1/2 h-[9px] -translate-y-1/2 rounded-[2px] border border-background/40 shadow-sm",
+          span.colorClass,
+          span.state === "FAILED" && "bg-status-failed",
+          span.dashed && "border-dashed",
+        )}
+      />
+    </button>
+  );
+}
+
+function TimelineSpanDetails({
+  axisEnd,
+  row,
+  span,
+}: {
+  axisEnd: number;
+  row: PlotRow;
+  span: PlotSpan;
 }) {
   const t = useTranslate();
-  const preventAutoFocus = (event: Event) => event.preventDefault();
 
   return (
-    <Popover
-      modal={false}
-      open={open}
-      onOpenChange={onOpenChange}
-    >
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          className={cn(
-            "absolute top-1/2 z-10 h-4 -translate-y-1/2 transition-opacity hover:opacity-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 before:absolute before:-inset-x-2 before:-inset-y-1 before:content-['']",
-          )}
-          style={spanStyle(span.startedAt, span.endedAt, axisStart, axisEnd)}
-          aria-label={`${row.title}: ${span.title}`}
-          onPointerEnter={onPointerEnter}
-          onPointerLeave={onPointerLeave}
-          onFocus={onFocus}
-          onBlur={onBlur}
-          onClick={onToggle}
-        >
-          <span
-            className={cn(
-              "absolute inset-x-0 top-1/2 h-[9px] -translate-y-1/2 rounded-[2px] border border-background/40 shadow-sm",
-              span.colorClass,
-              span.state === "FAILED" && "bg-status-failed",
-              span.dashed && "border-dashed",
-            )}
-          />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent
-        side="top"
-        sideOffset={4}
-        className="w-[36rem] max-w-[calc(100vw-2rem)] space-y-3"
-        onOpenAutoFocus={preventAutoFocus}
-        onCloseAutoFocus={preventAutoFocus}
-        onPointerEnter={onPointerEnter}
-        onPointerLeave={onPointerLeave}
-      >
-        <div className="flex items-start justify-between gap-3">
-          <div className="space-y-1">
-            <div className="break-words text-sm font-medium text-foreground">{row.title}</div>
-            <div className="text-xs text-muted-foreground">{span.title}</div>
-          </div>
-          {row.badge ? <Badge variant={row.badge.variant}>{row.badge.label}</Badge> : null}
+    <>
+      <div className="flex items-start justify-between gap-3">
+        <div className="space-y-1">
+          <div className="break-words text-sm font-medium text-foreground">{row.title}</div>
+          <div className="text-xs text-muted-foreground">{span.title}</div>
         </div>
-        <DetailList
-          items={[
-            ...row.details,
-            {
-              label: t("timeline.segment"),
-              value: span.title,
-            },
-            ...(span.subtitle
-              ? [
-                  {
-                    label: t("timeline.detail"),
-                    value: span.subtitle,
-                  },
-                ]
-              : []),
-            ...span.details,
-            {
-              label: t("timeline.started"),
-              value: formatTime(span.startedAt),
-            },
-            {
-              label: t("timeline.ended"),
-              value: span.endedAt == null ? "-" : formatTime(span.endedAt),
-            },
-            {
-              label: t("timeline.spanDuration"),
-              value: formatDuration((span.endedAt ?? axisEnd) - span.startedAt),
-            },
-            {
-              label: t("timeline.state"),
-              value: spanStateLabel(t, span.state),
-            },
-          ]}
-        />
-      </PopoverContent>
-    </Popover>
+        {row.badge ? <Badge variant={row.badge.variant}>{row.badge.label}</Badge> : null}
+      </div>
+      <DetailList
+        items={[
+          ...row.details,
+          {
+            label: t("timeline.segment"),
+            value: span.title,
+          },
+          ...(span.subtitle
+            ? [
+                {
+                  label: t("timeline.detail"),
+                  value: span.subtitle,
+                },
+              ]
+            : []),
+          ...span.details,
+          {
+            label: t("timeline.started"),
+            value: formatTime(span.startedAt),
+          },
+          {
+            label: t("timeline.ended"),
+            value: span.endedAt == null ? "-" : formatTime(span.endedAt),
+          },
+          {
+            label: t("timeline.spanDuration"),
+            value: formatDuration((span.endedAt ?? axisEnd) - span.startedAt),
+          },
+          {
+            label: t("timeline.state"),
+            value: spanStateLabel(t, span.state),
+          },
+        ]}
+      />
+    </>
   );
+}
+
+function timelineSpanElement(target: EventTarget | null): HTMLButtonElement | null {
+  if (!(target instanceof Element)) {
+    return null;
+  }
+  const element = target.closest("button[data-timeline-span-key]");
+  return element instanceof HTMLButtonElement ? element : null;
+}
+
+function timelineSpanKey(target: EventTarget | null): string | null {
+  return timelineSpanElement(target)?.dataset.timelineSpanKey ?? null;
 }
 
 function SharedPlot({
@@ -469,6 +473,12 @@ function SharedPlot({
   const openTimerRef = useRef<number | null>(null);
   const closeTimerRef = useRef<number | null>(null);
   const pendingOpenKeyRef = useRef<string | null>(null);
+  const popoverAnchorRef = useRef<{ getBoundingClientRect: () => DOMRect } | null>(null);
+
+  const setPopoverAnchorPoint = useCallback((clientX: number, clientY: number) => {
+    const rect = DOMRect.fromRect({ x: clientX, y: clientY, width: 0, height: 0 });
+    popoverAnchorRef.current = { getBoundingClientRect: () => rect };
+  }, []);
 
   const clearOpenTimer = useCallback(() => {
     if (openTimerRef.current != null) {
@@ -536,105 +546,189 @@ function SharedPlot({
     setOpenSpanKey((current) => (current === spanKey ? null : spanKey));
   }, [clearTimers]);
 
-  const handleOpenChange = useCallback((spanKey: string, nextOpen: boolean) => {
+  const handleOpenChange = useCallback((nextOpen: boolean) => {
+    if (nextOpen) {
+      return;
+    }
     clearTimers();
-    setOpenSpanKey((current) => {
-      if (nextOpen) {
-        return current === spanKey ? current : spanKey;
-      }
-      return current === spanKey ? null : current;
-    });
+    setOpenSpanKey(null);
   }, [clearTimers]);
+
+  const handlePointerOver = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const spanElement = timelineSpanElement(event.target);
+    const spanKey = spanElement?.dataset.timelineSpanKey;
+    if (!spanKey || timelineSpanKey(event.relatedTarget) === spanKey) {
+      return;
+    }
+    setPopoverAnchorPoint(event.clientX, event.clientY);
+    scheduleOpen(spanKey);
+  }, [scheduleOpen, setPopoverAnchorPoint]);
+
+  const handlePointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const spanKey = timelineSpanKey(event.target);
+    if (!spanKey || openSpanKey === spanKey) {
+      return;
+    }
+    setPopoverAnchorPoint(event.clientX, event.clientY);
+  }, [openSpanKey, setPopoverAnchorPoint]);
+
+  const handlePointerOut = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const spanKey = timelineSpanKey(event.target);
+    if (!spanKey || timelineSpanKey(event.relatedTarget) === spanKey) {
+      return;
+    }
+    scheduleClose();
+  }, [scheduleClose]);
+
+  const handleFocus = useCallback((event: ReactFocusEvent<HTMLDivElement>) => {
+    const spanElement = timelineSpanElement(event.target);
+    const spanKey = spanElement?.dataset.timelineSpanKey;
+    if (!spanElement || !spanKey) {
+      return;
+    }
+    const rect = spanElement.getBoundingClientRect();
+    setPopoverAnchorPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    openImmediately(spanKey);
+  }, [openImmediately, setPopoverAnchorPoint]);
+
+  const handleBlur = useCallback((event: ReactFocusEvent<HTMLDivElement>) => {
+    const spanKey = timelineSpanKey(event.target);
+    if (!spanKey || timelineSpanKey(event.relatedTarget) === spanKey) {
+      return;
+    }
+    closeImmediately(spanKey);
+  }, [closeImmediately]);
+
+  const handleClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    const spanKey = timelineSpanKey(event.target);
+    if (spanKey) {
+      if (event.detail > 0) {
+        setPopoverAnchorPoint(event.clientX, event.clientY);
+      }
+      toggleOpen(spanKey);
+    }
+  }, [setPopoverAnchorPoint, toggleOpen]);
+
+  const openSpan = useMemo(() => {
+    if (!openSpanKey) {
+      return null;
+    }
+    for (const row of rows) {
+      const span = row.spans.find((candidate) => candidate.key === openSpanKey);
+      if (span) {
+        return { row, span };
+      }
+    }
+    return null;
+  }, [openSpanKey, rows]);
 
   useEffect(() => clearTimers, [clearTimers]);
 
   useEffect(() => {
     if (
       openSpanKey
-      && !rows.some((row) => row.spans.some((span) => span.key === openSpanKey))
+      && !openSpan
     ) {
       setOpenSpanKey(null);
     }
-  }, [openSpanKey, rows]);
+  }, [openSpan, openSpanKey]);
 
   return (
-    <div className="overflow-hidden rounded-2xl border border-border/60 bg-background/20">
-      <div className="grid grid-cols-1 md:grid-cols-[minmax(16rem,22rem)_1fr]">
-        <div className="hidden border-b border-border/50 px-3 py-1.5 md:block" />
-        <div className="border-b border-border/50 px-3 py-1.5">
-          <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.18em] text-muted-foreground/80 tabular-nums">
-            {ticks.map((tick) => (
-              <span key={tick.ratio}>{tick.label}</span>
-            ))}
-          </div>
-        </div>
-
-        {rows.map((row, index) => {
-          const isLast = index === rows.length - 1;
-          const rowPaddingClass = row.tone === "stage" ? "px-3 py-2.5" : "px-3 py-1.5";
-          const rowTitleClass =
-            row.tone === "stage"
-              ? "font-medium text-foreground"
-              : "text-[13px] leading-4 text-muted-foreground";
-          const plotHeightClass = row.tone === "stage" ? "h-7" : "h-6";
-
-          return (
-            <div key={row.key} className="contents">
-              <div className={cn(rowPaddingClass, !isLast && "border-b border-border/35")}>
-                <div
-                  className={cn(
-                    "min-w-0 break-words whitespace-normal text-sm leading-4",
-                    rowTitleClass,
-                  )}
-                >
-                  {row.displayTitle ?? row.title}
-                </div>
-              </div>
-
-              <div className={cn(rowPaddingClass, !isLast && "border-b border-border/35")}>
-                <div className={cn("relative", plotHeightClass)}>
-                  <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-border/20" />
-                  {ticks.slice(1, -1).map((tick) => (
-                    <div
-                      key={`${row.key}-${tick.ratio}`}
-                      className="absolute inset-y-0 w-px bg-border/40"
-                      style={{ left: `${tick.ratio * 100}%` }}
-                    />
-                  ))}
-
-                  {row.spans.map((span) => (
-                    <div key={span.key}>
-                      <TimelineSpanPopover
-                        axisStart={axisStart}
-                        axisEnd={axisEnd}
-                        row={row}
-                        span={span}
-                        open={openSpanKey === span.key}
-                        onPointerEnter={() => scheduleOpen(span.key)}
-                        onPointerLeave={() => scheduleClose()}
-                        onFocus={() => openImmediately(span.key)}
-                        onBlur={() => closeImmediately(span.key)}
-                        onToggle={() => toggleOpen(span.key)}
-                        onOpenChange={(nextOpen) => handleOpenChange(span.key, nextOpen)}
-                      />
-                      {span.endedAt != null ? (
-                        <div
-                          className={cn(
-                            "pointer-events-none absolute top-1/2 z-20 h-4 w-[2px] -translate-x-1/2 -translate-y-1/2 bg-foreground/80",
-                            span.state === "FAILED" && "bg-status-failed",
-                          )}
-                          style={pointStyle(span.endedAt, axisStart, axisEnd)}
-                        />
-                      ) : null}
-                    </div>
-                  ))}
-                </div>
-              </div>
+    <Popover modal={false} open={openSpan !== null} onOpenChange={handleOpenChange}>
+      <PopoverAnchor virtualRef={popoverAnchorRef} />
+      <div
+        className="overflow-hidden rounded-2xl border border-border/60 bg-background/20"
+        onPointerOver={handlePointerOver}
+        onPointerMove={handlePointerMove}
+        onPointerOut={handlePointerOut}
+        onFocus={handleFocus}
+        onBlur={handleBlur}
+        onClick={handleClick}
+      >
+        <div className="grid grid-cols-1 md:grid-cols-[minmax(16rem,22rem)_1fr]">
+          <div className="hidden border-b border-border/50 px-3 py-1.5 md:block" />
+          <div className="border-b border-border/50 px-3 py-1.5">
+            <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.18em] text-muted-foreground/80 tabular-nums">
+              {ticks.map((tick) => (
+                <span key={tick.ratio}>{tick.label}</span>
+              ))}
             </div>
-          );
-        })}
+          </div>
+
+          {rows.map((row, index) => {
+            const isLast = index === rows.length - 1;
+            const rowPaddingClass = row.tone === "stage" ? "px-3 py-2.5" : "px-3 py-1.5";
+            const rowTitleClass =
+              row.tone === "stage"
+                ? "font-medium text-foreground"
+                : "text-[13px] leading-4 text-muted-foreground";
+            const plotHeightClass = row.tone === "stage" ? "h-7" : "h-6";
+
+            return (
+              <div key={row.key} className="contents">
+                <div className={cn(rowPaddingClass, !isLast && "border-b border-border/35")}>
+                  <div
+                    className={cn(
+                      "min-w-0 break-words whitespace-normal text-sm leading-4",
+                      rowTitleClass,
+                    )}
+                  >
+                    {row.displayTitle ?? row.title}
+                  </div>
+                </div>
+
+                <div className={cn(rowPaddingClass, !isLast && "border-b border-border/35")}>
+                  <div className={cn("relative", plotHeightClass)}>
+                    <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-border/20" />
+                    {ticks.slice(1, -1).map((tick) => (
+                      <div
+                        key={`${row.key}-${tick.ratio}`}
+                        className="absolute inset-y-0 w-px bg-border/40"
+                        style={{ left: `${tick.ratio * 100}%` }}
+                      />
+                    ))}
+
+                    {row.spans.map((span) => (
+                      <Fragment key={span.key}>
+                        <TimelineSpanButton
+                          axisStart={axisStart}
+                          axisEnd={axisEnd}
+                          row={row}
+                          span={span}
+                          open={openSpanKey === span.key}
+                        />
+                        {span.endedAt != null ? (
+                          <div
+                            className={cn(
+                              "pointer-events-none absolute top-1/2 z-20 h-4 w-[2px] -translate-x-1/2 -translate-y-1/2 bg-foreground/80",
+                              span.state === "FAILED" && "bg-status-failed",
+                            )}
+                            style={pointStyle(span.endedAt, axisStart, axisEnd)}
+                          />
+                        ) : null}
+                      </Fragment>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
       </div>
-    </div>
+      {openSpan ? (
+        <PopoverContent
+          side="top"
+          sideOffset={4}
+          className="w-[36rem] max-w-[calc(100vw-2rem)] space-y-3"
+          onOpenAutoFocus={(event) => event.preventDefault()}
+          onCloseAutoFocus={(event) => event.preventDefault()}
+          onPointerEnter={() => clearCloseTimer()}
+          onPointerLeave={() => scheduleClose()}
+        >
+          <TimelineSpanDetails axisEnd={axisEnd} row={openSpan.row} span={openSpan.span} />
+        </PopoverContent>
+      ) : null}
+    </Popover>
   );
 }
 

@@ -62,6 +62,179 @@ async fn jobs_returns_submitted() {
 }
 
 #[tokio::test]
+async fn queue_page_default_order_preserves_scheduler_order_for_cold_jobs() {
+    let h = TestHarness::new().await;
+    h.submit_test_nzb("first-download").await;
+    h.submit_test_nzb("second-download").await;
+
+    let scheduler_response = h.execute("{ jobs { id } }").await;
+    assert_no_errors(&scheduler_response);
+    let scheduler_data = response_data(&scheduler_response);
+    let scheduler_first_id = scheduler_data["jobs"][0]["id"].as_u64();
+
+    let response = h
+        .execute(
+            r#"{
+              queuePage(input: { pageIndex: 0, pageSize: 50 }) {
+                items { id }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    assert_eq!(
+        data["queuePage"]["items"][0]["id"].as_u64(),
+        scheduler_first_id,
+    );
+}
+
+#[tokio::test]
+async fn queue_page_bounds_large_queues_and_filters_before_slicing() {
+    const JOB_COUNT: usize = 1_000;
+
+    let h = TestHarness::new().await;
+    for index in 0..JOB_COUNT {
+        let category = if index.is_multiple_of(2) {
+            "tv"
+        } else {
+            "movies"
+        };
+        let priority = if index.is_multiple_of(2) {
+            "HIGH"
+        } else {
+            "LOW"
+        };
+        h.submit_test_nzb_with_options(
+            &format!("queue-page-{index:04}"),
+            Some(category),
+            None,
+            &[("priority", priority)],
+        )
+        .await;
+    }
+
+    let first_page = h
+        .execute(
+            r#"{
+              queuePage(input: {
+                pageIndex: 0
+                pageSize: 1000
+                sortField: NAME
+                sortDirection: ASC
+              }) {
+                totalCount
+                categories
+                items { id duplicateSummary { action } }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&first_page);
+    let first_page_data = response_data(&first_page);
+    let first_page = &first_page_data["queuePage"];
+    assert_eq!(first_page["totalCount"].as_u64(), Some(JOB_COUNT as u64));
+    assert_eq!(first_page["items"].as_array().unwrap().len(), 500);
+    assert_eq!(
+        first_page["categories"],
+        serde_json::json!(["movies", "tv"])
+    );
+    assert!(
+        first_page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["duplicateSummary"]["action"] == "ACCEPT")
+    );
+
+    let second_page = h
+        .execute(
+            r#"{
+              queuePage(input: {
+                pageIndex: 1
+                pageSize: 500
+                sortField: NAME
+                sortDirection: ASC
+              }) {
+                totalCount
+                items { id }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&second_page);
+    let second_page_data = response_data(&second_page);
+    let second_page = &second_page_data["queuePage"];
+    assert_eq!(second_page["totalCount"].as_u64(), Some(JOB_COUNT as u64));
+    let first_page_ids: std::collections::BTreeSet<u64> = first_page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_u64().unwrap())
+        .collect();
+    let second_page_ids: std::collections::BTreeSet<u64> = second_page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(second_page_ids.len(), 500);
+    assert!(first_page_ids.is_disjoint(&second_page_ids));
+
+    let filtered = h
+        .execute(
+            r#"{
+              queuePage(input: {
+                pageIndex: 0
+                pageSize: 500
+                search: "queue-page-0999"
+                states: [QUEUED]
+                priorities: [LOW]
+                categories: ["movies"]
+                sortField: NAME
+                sortDirection: ASC
+              }) {
+                totalCount
+                items { name }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&filtered);
+    let filtered_data = response_data(&filtered);
+    let filtered = &filtered_data["queuePage"];
+    assert_eq!(filtered["totalCount"].as_u64(), Some(1));
+    assert_eq!(filtered["items"].as_array().unwrap().len(), 1);
+
+    let first_tie_id = h.submit_test_nzb("queue-page.tie").await;
+    let second_tie_id = h.submit_test_nzb("queue-page tie").await;
+    let tied_items = h
+        .execute(
+            r#"{
+              queuePage(input: {
+                pageIndex: 0
+                pageSize: 500
+                search: "queue-page tie"
+                sortField: NAME
+                sortDirection: ASC
+              }) {
+                items { id }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&tied_items);
+    let tied_items_data = response_data(&tied_items);
+    let tied_ids = tied_items_data["queuePage"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(tied_ids, vec![first_tie_id, second_tie_id]);
+}
+
+#[tokio::test]
 async fn queue_items_project_bulk_duplicate_summary() {
     let h = TestHarness::new().await;
     let job_id = h.submit_test_nzb("duplicate-summary-queue").await;

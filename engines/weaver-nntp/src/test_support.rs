@@ -47,11 +47,26 @@ where
         let (mut socket, _) = listener.accept().await.unwrap();
         for step in steps {
             if let Some(prefix) = step.expected_prefix() {
-                let line = read_command_line(&mut socket).await;
-                assert!(
-                    line.starts_with(prefix),
-                    "expected command starting with {prefix:?}, got {line:?}"
-                );
+                loop {
+                    let line = read_command_line(&mut socket).await;
+                    // Production setup always sends MODE READER. Most scripts
+                    // only care about the command under test, so model a
+                    // server that rejects this optional command unless a
+                    // script explicitly asserts it.
+                    if line.starts_with("MODE READER") && !prefix.starts_with("MODE READER") {
+                        socket
+                            .write_all(b"500 MODE READER unsupported\r\n")
+                            .await
+                            .unwrap();
+                        socket.flush().await.unwrap();
+                        continue;
+                    }
+                    assert!(
+                        line.starts_with(prefix),
+                        "expected command starting with {prefix:?}, got {line:?}"
+                    );
+                    break;
+                }
             }
             let delay = step.delay();
             if delay > Duration::ZERO {

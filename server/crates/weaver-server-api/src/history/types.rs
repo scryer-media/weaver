@@ -393,6 +393,58 @@ pub fn history_item_from_row(
         metadata: &metadata_pairs,
         category: row.category.as_deref(),
     });
+    history_item_from_display(
+        row,
+        delete_operation,
+        client_request_id,
+        attributes,
+        state,
+        display.original_title,
+        display.display_title,
+        display.parsed_release,
+    )
+}
+
+/// Projects only the fields rendered by the paginated History table. Full
+/// release parsing remains available to detail and compatibility facades.
+pub(crate) fn history_table_item_from_row(
+    row: &JobHistoryRow,
+    delete_operation: Option<HistoryDeleteRowState>,
+) -> HistoryItem {
+    let metadata_pairs = parse_history_metadata(row.metadata.as_deref());
+    let (client_request_id, attributes) = split_attributes(&metadata_pairs);
+    let state = history_state_from_row(row);
+    let (original_title, display_title) = history_display_titles(row, &metadata_pairs);
+    history_item_from_display(
+        row,
+        delete_operation,
+        client_request_id,
+        attributes,
+        state,
+        original_title,
+        display_title,
+        ParsedRelease::default(),
+    )
+}
+
+fn history_display_titles(row: &JobHistoryRow, metadata: &[(String, String)]) -> (String, String) {
+    let original_title = weaver_server_core::ingest::original_release_title(&row.name, metadata);
+    let display_title =
+        weaver_server_core::ingest::derive_release_name(Some(&original_title), Some(&row.name));
+    (original_title, display_title)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn history_item_from_display(
+    row: &JobHistoryRow,
+    delete_operation: Option<HistoryDeleteRowState>,
+    client_request_id: Option<String>,
+    attributes: Vec<Attribute>,
+    state: QueueItemState,
+    original_title: String,
+    display_title: String,
+    parsed_release: ParsedRelease,
+) -> HistoryItem {
     let progress_percent = if row.total_bytes == 0 {
         0.0
     } else {
@@ -402,9 +454,9 @@ pub fn history_item_from_row(
         id: row.job_id,
         job_hash: row.job_hash.as_ref().map(hex::encode),
         name: row.name.clone(),
-        display_title: display.display_title,
-        original_title: display.original_title,
-        parsed_release: display.parsed_release,
+        display_title,
+        original_title,
+        parsed_release,
         state,
         error: row.error_message.clone(),
         progress_percent,

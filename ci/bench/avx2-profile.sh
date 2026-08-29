@@ -5,8 +5,9 @@
 #
 # Target box: an AMD Zen 2/Zen 3 instance (AWS c5a / c6a) — AVX2-native, NO
 # AVX-512, so weaver naturally dispatches decode_kernel_avx2 (the tier we must
-# get within 5% of rapidyenc). Zen 2 == the SYLIX Windows target's uarch, so
-# numbers transfer directly. (Intel would dispatch VBMI2 — wrong tier here.)
+# get within 5% of rapidyenc). Zen 2 is also the uarch of the Windows AVX2
+# target we care about, so numbers transfer directly. (Intel would dispatch
+# VBMI2 — wrong tier here.)
 #
 # Why this exists: the Windows uProf "time-based hotspots" view is misleading on
 # an out-of-order core — it attributes samples to where retirement STALLS (the
@@ -74,7 +75,20 @@ install_deps() {
       build-essential cmake nasm git curl ca-certificates pkg-config linux-tools-generic
   if ! command -v cargo >/dev/null 2>&1; then
     log "installing rustup toolchain…"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    local rustup_init
+    rustup_init="$(mktemp)"
+    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+      --output "$rustup_init" \
+      https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init
+    if ! printf '%s  %s\n' \
+      ead833fc004f6930a3f67a3762701e87dc10f77c89e52493b51b96c30f4b5319 \
+      "$rustup_init" | sha256sum --check --status; then
+      rm -f "$rustup_init"
+      die "rustup-init checksum verification failed"
+    fi
+    chmod +x "$rustup_init"
+    "$rustup_init" -y --profile minimal
+    rm -f "$rustup_init"
     # shellcheck disable=SC1091
     . "$HOME/.cargo/env"; export PATH="$HOME/.cargo/bin:$PATH"
   fi

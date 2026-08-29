@@ -183,6 +183,12 @@ impl RuntimeTuner {
         &self.profile
     }
 
+    /// Apply the asynchronous startup disk measurement without disrupting
+    /// active work. Extraction admission reads this value on each promotion.
+    pub fn set_random_read_iops(&mut self, random_read_iops: f64) {
+        self.profile.disk.random_read_iops = random_read_iops;
+    }
+
     /// Maximum concurrent streaming member extractions, adaptive to disk type.
     ///
     /// SSD: no seek penalty, scale with CPU cores (2-6).

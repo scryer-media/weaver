@@ -1,0 +1,11 @@
+{
+  "slug": "direct-store-encrypted",
+  "title": "Quartz.Harbor.S01E06.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "RAR5 store-method set with data encryption. Headers stay readable and every part is Store with uniform key material, which is the encrypted shape direct-store carries rather than refuses.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "quartz.harbor.s01e06.mkv": "bdc5dff0310c4fc3c308246d999af21d669bf2dc55e2aee16f2a2e7d5dbf536b"
+  },
+  "password": "weaver-e2e-direct-password"
+}

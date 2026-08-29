@@ -1,0 +1,10 @@
+{
+  "slug": "direct-store-rar4",
+  "title": "Crimson.Vector.S01E03.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "RAR4 store-method set across two volumes, its member under a directory so the RAR4 backslash path separator is in play. The format is read from the volume signature, not assumed, so RAR4 routes direct as RAR5 does.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "work/crimson.vector.s01e03.mkv": "ac5df2b08baa912e94924eed671a13e910b60bdda5e6210b2d2da15d67fa3fc1"
+  }
+}

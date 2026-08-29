@@ -2,6 +2,7 @@ mod common;
 
 use std::time::Duration;
 
+use async_graphql::Value;
 use common::{
     BlockingDbOperation, TestHarness, assert_has_errors, assert_no_errors, local_request,
     response_data,
@@ -155,6 +156,46 @@ async fn add_category_whitespace_name() {
         )
         .await;
     assert_has_errors(&resp);
+}
+
+#[tokio::test]
+async fn unsafe_category_name_requires_an_explicit_destination() {
+    let h = TestHarness::new().await;
+    let rejected = h
+        .execute(
+            r#"mutation {
+                addCategory(input: { name: "movies/4k" }) { id }
+            }"#,
+        )
+        .await;
+    assert_has_errors(&rejected);
+    assert_eq!(
+        rejected.errors[0]
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get("code"))
+            .and_then(|value| match value {
+                Value::String(code) => Some(code.as_str()),
+                _ => None,
+            }),
+        Some("INVALID_INPUT")
+    );
+
+    let accepted = h
+        .execute(
+            r#"mutation {
+                addCategory(input: { name: "movies/4k", destDir: "/admin/movies-4k" }) {
+                    id
+                    name
+                    destDir
+                }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&accepted);
+    let category = &response_data(&accepted)["addCategory"];
+    assert_eq!(category["name"].as_str(), Some("movies/4k"));
+    assert_eq!(category["destDir"].as_str(), Some("/admin/movies-4k"));
 }
 
 #[tokio::test]

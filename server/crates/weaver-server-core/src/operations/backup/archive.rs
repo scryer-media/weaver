@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -8,25 +8,15 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 
-use super::manifest::{
-    BackupManifest, BackupServiceError, ManagedPackageInventory, io_err,
-    validate_manifest_structure,
-};
+use super::manifest::{BackupManifest, BackupServiceError, io_err, validate_manifest_structure};
 use super::permissions::set_file_owner_only;
-use crate::post_processing::discovery::{hash_package, package_files};
 use crate::security::RuntimeSecurityConfig;
-
-pub(crate) struct ManagedPackageSource {
-    pub inventory: ManagedPackageInventory,
-    pub path: PathBuf,
-}
 
 #[cfg(test)]
 pub(crate) fn write_plain_archive(
     dest: &Path,
     manifest: &BackupManifest,
     backup_db_path: &Path,
-    managed_packages: &[ManagedPackageSource],
 ) -> Result<(), std::io::Error> {
     let file = File::create(dest)?;
     let encoder = zstd::stream::write::Encoder::new(file, 19)?;
@@ -39,16 +29,6 @@ pub(crate) fn write_plain_archive(
     header.set_cksum();
     tar.append_data(&mut header, "manifest.json", manifest_bytes.as_slice())?;
     tar.append_path_with_name(backup_db_path, "backup.db")?;
-
-    for package in managed_packages {
-        let files = package_files(&package.path).map_err(std::io::Error::other)?;
-        for (relative, absolute) in files {
-            tar.append_path_with_name(
-                absolute,
-                Path::new(&package.inventory.archive_prefix).join(relative),
-            )?;
-        }
-    }
 
     let encoder = tar.into_inner()?;
     encoder.finish()?;
@@ -70,6 +50,9 @@ const MAX_BUNDLE_CUMULATIVE_PATH_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BUNDLE_LONG_NAME_BYTES: usize =
     MAX_BUNDLE_CUMULATIVE_PATH_BYTES + MAX_BUNDLE_ARCHIVE_ENTRIES;
 const MAX_BACKUP_ZSTD_WINDOW_LOG: u32 = 26;
+/// Top-level directory pre-0.9 bundles used for extension packages. Weaver no
+/// longer writes it; the name survives only to recognize and skip those entries.
+const LEGACY_MANAGED_PACKAGE_DIR: &str = "managed-extensions";
 
 struct AtomicOutputWriter {
     temp: tempfile::NamedTempFile,
@@ -374,26 +357,12 @@ impl<R: Read> Read for BundleChunkReader<R> {
 
 type BundleWriteEntry = (PathBuf, PathBuf, bool);
 
-fn bundle_write_entries(
-    staging_root: &Path,
-    managed_packages: &[ManagedPackageSource],
-) -> Result<Vec<BundleWriteEntry>, std::io::Error> {
+fn bundle_write_entries(staging_root: &Path) -> Result<Vec<BundleWriteEntry>, std::io::Error> {
     let manifest_path = staging_root.join("manifest.json");
     let manifest: BackupManifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     validate_manifest_structure(&manifest)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    if manifest.managed_packages
-        != managed_packages
-            .iter()
-            .map(|package| package.inventory.clone())
-            .collect::<Vec<_>>()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "managed package sources do not match the backup manifest",
-        ));
-    }
 
     let mut entries = vec![
         (manifest_path, PathBuf::from("manifest.json"), false),
@@ -431,38 +400,6 @@ fn bundle_write_entries(
             false,
         )
     }));
-
-    for package in managed_packages {
-        let files = package_files(&package.path).map_err(std::io::Error::other)?;
-        let bytes = files.iter().try_fold(0_u64, |total, (_, path)| {
-            total
-                .checked_add(std::fs::metadata(path)?.len())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "managed package is too large",
-                    )
-                })
-        })?;
-        if files.len() != package.inventory.file_count
-            || bytes != package.inventory.uncompressed_bytes
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "managed package {} no longer matches its inventory",
-                    package.inventory.digest
-                ),
-            ));
-        }
-        entries.extend(files.into_iter().map(|(relative, absolute)| {
-            (
-                absolute,
-                Path::new(&package.inventory.archive_prefix).join(relative),
-                true,
-            )
-        }));
-    }
 
     let expansion_limit =
         RuntimeSecurityConfig::from_env_or_default_for_tests().backup_upload_limit_bytes;
@@ -515,9 +452,8 @@ pub(crate) fn write_bundle_archive(
     destination: &Path,
     password: &str,
     staging_root: &Path,
-    managed_packages: &[ManagedPackageSource],
 ) -> Result<(), std::io::Error> {
-    let entries = bundle_write_entries(staging_root, managed_packages)?;
+    let entries = bundle_write_entries(staging_root)?;
     let atomic = AtomicOutputWriter::new(destination)?;
     let encrypted = BundleChunkWriter::new(atomic, password)?;
     let encoder = zstd::stream::write::Encoder::new(encrypted, 3)?;
@@ -665,22 +601,18 @@ fn is_windows_device_name(component: &str) -> bool {
     })
 }
 
-fn managed_package_path(
-    path: &Path,
-    package_indices: &HashMap<PathBuf, usize>,
-) -> Option<(usize, bool)> {
-    let mut components = path.components();
-    let mut prefix = PathBuf::new();
-    for _ in 0..3 {
-        let Component::Normal(component) = components.next()? else {
-            return None;
-        };
-        prefix.push(component);
-    }
-    package_indices
-        .get(&prefix)
-        .copied()
-        .map(|index| (index, components.next().is_some()))
+/// Whether this entry is an extension package from a pre-0.9 bundle.
+///
+/// Those entries are recognized so they can be skipped rather than rejected as
+/// undeclared: the rest of the bundle is the operator's real data, and refusing
+/// the whole restore over a payload nothing reads any more would cost them far
+/// more than the packages are worth. Path safety is already enforced for every
+/// entry before this is consulted.
+fn is_legacy_managed_package_path(path: &Path) -> bool {
+    path.components().next()
+        == Some(Component::Normal(std::ffi::OsStr::new(
+            LEGACY_MANAGED_PACKAGE_DIR,
+        )))
 }
 
 fn unpack_bundle_entries<R: Read>(
@@ -692,8 +624,6 @@ fn unpack_bundle_entries<R: Read>(
         RuntimeSecurityConfig::from_env_or_default_for_tests().backup_upload_limit_bytes;
     let mut seen = HashSet::new();
     let mut manifest = None::<BackupManifest>;
-    let mut package_stats = Vec::<(u64, u64)>::new();
-    let mut package_indices = HashMap::<PathBuf, usize>::new();
     let mut total = 0_u64;
     let mut raw_entry_count = 0_usize;
     let mut file_entry_count = 0_usize;
@@ -795,13 +725,6 @@ fn unpack_bundle_entries<R: Read>(
             }
             validate_manifest_structure(&parsed)?;
             std::fs::write(output_dir.join("manifest.json"), bytes).map_err(io_err)?;
-            package_stats = vec![(0, 0); parsed.managed_packages.len()];
-            package_indices = parsed
-                .managed_packages
-                .iter()
-                .enumerate()
-                .map(|(index, package)| (PathBuf::from(&package.archive_prefix), index))
-                .collect();
             manifest = Some(parsed);
             continue;
         }
@@ -815,8 +738,12 @@ fn unpack_bundle_entries<R: Read>(
                 "instance-secrets.json exceeds 1 MiB".into(),
             ));
         }
-        let package_index = managed_package_path(&path, &package_indices)
-            .and_then(|(index, has_relative)| has_relative.then_some(index));
+        // Skipped, not unpacked: the body is left unread and the iterator moves
+        // to the next entry. Everything protective above — the entry, size, and
+        // path-safety limits — has already been applied to it.
+        if is_legacy_managed_package_path(&path) {
+            continue;
+        }
         let declared = name == "instance-secrets.json"
             || path
                 .strip_prefix("tables")
@@ -826,26 +753,11 @@ fn unpack_bundle_entries<R: Read>(
                     relative
                         .strip_suffix(".ndjson")
                         .is_some_and(|table| manifest.tables.contains_key(table))
-                })
-            || package_index.is_some();
+                });
         if !declared {
             return Err(BackupServiceError::Validation(format!(
                 "backup archive contains undeclared entry {name}"
             )));
-        }
-        if let Some(index) = package_index {
-            let package = &manifest.managed_packages[index];
-            let stats = &mut package_stats[index];
-            stats.0 = stats.0.saturating_add(1);
-            stats.1 = stats.1.checked_add(size).ok_or_else(|| {
-                BackupServiceError::Validation("managed package is too large".into())
-            })?;
-            if stats.0 > package.file_count as u64 || stats.1 > package.uncompressed_bytes {
-                return Err(BackupServiceError::Validation(format!(
-                    "managed package {} exceeds its declared expansion limits",
-                    package.digest
-                )));
-            }
         }
         let destination = output_dir.join(&path);
         if let Some(parent) = destination.parent() {
@@ -860,14 +772,6 @@ fn unpack_bundle_entries<R: Read>(
     }
     let manifest = manifest
         .ok_or_else(|| BackupServiceError::Validation("backup is missing manifest.json".into()))?;
-    for (package, (files, bytes)) in manifest.managed_packages.iter().zip(package_stats) {
-        if files != package.file_count as u64 || bytes != package.uncompressed_bytes {
-            return Err(BackupServiceError::Validation(format!(
-                "managed package {} does not match its declared inventory",
-                package.digest
-            )));
-        }
-    }
     Ok(manifest)
 }
 
@@ -1021,40 +925,6 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
     key
 }
 
-#[cfg(test)]
-pub(crate) fn encrypt_archive(
-    input: &Path,
-    output: &Path,
-    password: &str,
-) -> Result<(), std::io::Error> {
-    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
-
-    let mut plaintext = Vec::new();
-    File::open(input)?.read_to_end(&mut plaintext)?;
-
-    let mut salt = [0u8; SALT_LEN];
-    getrandom::fill(&mut salt).map_err(|e| std::io::Error::other(e.to_string()))?;
-
-    let key = derive_key(password, &salt);
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(std::io::Error::other)?;
-
-    let mut nonce_bytes = [0u8; 12];
-    getrandom::fill(&mut nonce_bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let nonce = Nonce::try_from(nonce_bytes.as_slice()).map_err(std::io::Error::other)?;
-
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_ref())
-        .map_err(|e| std::io::Error::other(format!("encryption failed: {e}")))?;
-
-    let mut out = File::create(output)?;
-    use std::io::Write;
-    out.write_all(ENCRYPT_MAGIC)?;
-    out.write_all(&salt)?;
-    out.write_all(&nonce_bytes)?;
-    out.write_all(&ciphertext)?;
-    Ok(())
-}
-
 pub(crate) fn maybe_decrypt_archive(
     input: &Path,
     password: Option<String>,
@@ -1140,7 +1010,6 @@ pub(crate) fn unpack_plain_archive(
     let mut manifest: Option<BackupManifest> = None;
     let mut saw_backup_db = false;
     let mut seen_paths = HashSet::new();
-    let mut package_stats: HashMap<String, (usize, u64)> = HashMap::new();
     let mut total_uncompressed_bytes = 0_u64;
     let mut entry_count = 0_usize;
     let mut path_bytes = 0_usize;
@@ -1228,46 +1097,12 @@ pub(crate) fn unpack_plain_archive(
                 saw_backup_db = true;
                 unpack_regular_file_new(&mut entry, &output_dir.join("backup.db"))?;
             }
+            // The legacy format only ever held these two members; its manifest
+            // is refused outright if it declares anything else.
             other => {
-                let manifest = manifest.as_ref().ok_or_else(|| {
-                    BackupServiceError::Validation(
-                        "backup archive is missing manifest.json as its first entry".into(),
-                    )
-                })?;
-                let Some(package) = manifest.managed_packages.iter().find(|package| {
-                    path.strip_prefix(&package.archive_prefix)
-                        .is_ok_and(|relative| !relative.as_os_str().is_empty())
-                }) else {
-                    return Err(BackupServiceError::Validation(format!(
-                        "backup archive contains unexpected entry {other}"
-                    )));
-                };
-                let relative = path
-                    .strip_prefix(&package.archive_prefix)
-                    .map_err(|_| BackupServiceError::Validation("invalid package path".into()))?;
-                if relative
-                    .components()
-                    .any(|component| !matches!(component, Component::Normal(_)))
-                {
-                    return Err(BackupServiceError::Validation(
-                        "managed package contains an unsafe path".into(),
-                    ));
-                }
-                let stats = package_stats
-                    .entry(package.digest.clone())
-                    .or_insert((0, 0));
-                stats.0 = stats.0.saturating_add(1);
-                stats.1 = stats.1.saturating_add(size);
-                if stats.0 > package.file_count || stats.1 > package.uncompressed_bytes {
-                    return Err(BackupServiceError::Validation(
-                        "managed package exceeds its declared inventory".into(),
-                    ));
-                }
-                let destination = output_dir.join(&package.archive_prefix).join(relative);
-                if let Some(parent) = destination.parent() {
-                    std::fs::create_dir_all(parent).map_err(io_err)?;
-                }
-                unpack_regular_file_new(&mut entry, &destination)?;
+                return Err(BackupServiceError::Validation(format!(
+                    "backup archive contains unexpected entry {other}"
+                )));
             }
         }
     }
@@ -1286,25 +1121,6 @@ pub(crate) fn unpack_plain_archive(
         return Err(BackupServiceError::Validation(
             "backup archive is missing backup.db".to_string(),
         ));
-    }
-    for package in &manifest.managed_packages {
-        if package_stats.get(&package.digest).copied()
-            != Some((package.file_count, package.uncompressed_bytes))
-        {
-            return Err(BackupServiceError::Validation(format!(
-                "managed package {} does not match its inventory",
-                package.digest
-            )));
-        }
-        let package_path = output_dir.join(&package.archive_prefix);
-        let actual = hash_package(&package_path)
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        if actual.as_str() != package.digest {
-            return Err(BackupServiceError::Validation(format!(
-                "managed package {} failed digest verification",
-                package.digest
-            )));
-        }
     }
     Ok(manifest)
 }
@@ -1423,29 +1239,29 @@ mod bundle_envelope_tests {
     #[test]
     fn archive_paths_are_portable_to_windows() {
         for path in [
-            "managed-extensions/blake3/abc/CON",
-            "managed-extensions/blake3/abc/com1.txt",
-            "managed-extensions/blake3/abc/name:stream",
-            "managed-extensions/blake3/abc/trailing.",
-            r"managed-extensions\blake3\abc\script.ps1",
+            "tables/CON",
+            "tables/com1.txt",
+            "tables/name:stream",
+            "tables/trailing.",
+            r"tables\settings.ndjson",
         ] {
             assert!(!is_portable_archive_path(Path::new(path)), "{path}");
         }
         assert!(is_portable_archive_path(Path::new(
-            "managed-extensions/blake3/abc/script.ps1"
+            "tables/settings.ndjson"
         )));
     }
 
     #[test]
-    fn managed_package_paths_longer_than_the_tar_name_field_round_trip() {
+    fn archive_paths_longer_than_the_tar_name_field_round_trip() {
         let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("script.py");
-        std::fs::write(&source, b"print('ok')\n").unwrap();
-        let destination = PathBuf::from("managed-extensions/blake3")
+        let source = root.path().join("part.ndjson");
+        std::fs::write(&source, b"{}\n").unwrap();
+        let destination = PathBuf::from("tables")
             .join("a".repeat(64))
             .join("nested")
             .join("b".repeat(80))
-            .join("script.py");
+            .join("part.ndjson");
         assert!(destination.as_os_str().len() > 100);
 
         let mut bytes = Vec::new();
@@ -1461,6 +1277,101 @@ mod bundle_envelope_tests {
         assert_eq!(entry.path().unwrap(), destination.as_path());
         assert!(entry.header().entry_type().is_file());
         assert!(entries.next().is_none());
+    }
+
+    /// A bundle written before extension packages were removed, complete with
+    /// the `managed-extensions/` payload and the inventory that declared it.
+    fn legacy_package_bundle() -> Vec<u8> {
+        use super::super::manifest::{BACKUP_FORMAT_VERSION, BACKUP_SCOPE};
+
+        let table = "settings";
+        let rows = b"{\"key\":\"a\",\"value\":\"b\"}\n";
+        let secrets = b"{\"encryption_master_key\":\"k\",\"key_source\":\"test\"}";
+        let table_checksum = blake3::hash(rows).to_hex().to_string();
+        let secrets_checksum = blake3::hash(secrets).to_hex().to_string();
+        let digest = "a".repeat(64);
+        let manifest = serde_json::json!({
+            "format_version": BACKUP_FORMAT_VERSION,
+            "scope": BACKUP_SCOPE,
+            "created_at_epoch_ms": 0,
+            "weaver_schema_version": 0,
+            "source_weaver_version": "0.8.3",
+            "source_engine": "sqlite",
+            "included_tables": [table],
+            "tables": {
+                table: { "rows": 1, "columns": ["key", "value"], "checksum": table_checksum }
+            },
+            "part_checksums": {
+                format!("tables/{table}.ndjson"): table_checksum,
+                "instance-secrets.json": secrets_checksum,
+            },
+            "source_paths": {
+                "data_dir": "/data",
+                "intermediate_dir": "/data/intermediate",
+                "complete_dir": "/data/complete"
+            },
+            "encrypted": true,
+            "managed_packages": [{
+                "digest": format!("blake3:{digest}"),
+                "archive_prefix": format!("managed-extensions/blake3/{digest}"),
+                "file_count": 1,
+                "uncompressed_bytes": 12
+            }],
+            "notes": []
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+        let mut bytes = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut bytes);
+            for (path, payload) in [
+                ("manifest.json", manifest_bytes.as_slice()),
+                ("instance-secrets.json", secrets.as_slice()),
+                (concat!("tables/", "settings", ".ndjson"), rows.as_slice()),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(payload.len() as u64);
+                header.set_mode(0o600);
+                header.set_cksum();
+                archive.append_data(&mut header, path, payload).unwrap();
+            }
+            let script = b"print('ok')";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(script.len() as u64);
+            header.set_mode(0o700);
+            header.set_cksum();
+            archive
+                .append_data(
+                    &mut header,
+                    format!("managed-extensions/blake3/{digest}/script.py"),
+                    script.as_slice(),
+                )
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_bundle_carrying_extension_packages_still_restores_without_them() {
+        // The whole reason these entries are recognized rather than rejected:
+        // the rest of the bundle is the operator's real data, and refusing it
+        // over a payload nothing reads any more would cost them the restore.
+        let output = tempfile::tempdir().unwrap();
+        let manifest =
+            unpack_bundle_entries(std::io::Cursor::new(legacy_package_bundle()), output.path())
+                .unwrap();
+
+        assert!(output.path().join("tables/settings.ndjson").is_file());
+        assert!(output.path().join("instance-secrets.json").is_file());
+        // Recognized, and left where it was: nothing extracts into a location
+        // no version of Weaver reads any more.
+        assert!(!output.path().join("managed-extensions").exists());
+        // And the operator is told, rather than left to notice.
+        let warning = manifest
+            .legacy_package_warning()
+            .expect("a carried package warns");
+        assert!(warning.contains("scripts directory"), "{warning}");
     }
 
     #[test]

@@ -9,11 +9,11 @@ use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, trace, warn};
-use weaver_yenc::{DecodeResult as YencDecodeResult, YencError};
+use weaver_yenc::{CheckpointPlan, YencError};
 
 use crate::connection::ServerConfig;
 use crate::error::{NntpError, Result};
-use crate::fused_yenc::{FusedYencArticleStats, FusedYencError};
+use crate::fused_yenc::{FusedArticleBody, FusedYencArticleStats, FusedYencError};
 use crate::health::{CooldownReason, ServerState};
 use crate::pool::{
     BodyServerAvailability, NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig,
@@ -68,12 +68,53 @@ pub struct NntpClient {
     soft_timeout: Duration,
 }
 
+/// Why a synchronous owned BODY lane could not be acquired.
+///
+/// Capacity outcomes are separated from server availability and transport
+/// failures so callers can return leased work to the scheduler without
+/// tearing down healthy cached lanes or consuming a download retry.
+#[derive(Debug)]
+pub enum BlockingBodyLaneAcquireError {
+    ProviderCapacity(NntpError),
+    LocalCapacity,
+    NoEligibleServer,
+    Other(NntpError),
+}
+
+impl BlockingBodyLaneAcquireError {
+    fn from_connect_error(error: NntpError) -> Self {
+        if matches!(error, NntpError::TooManyConnections) {
+            Self::ProviderCapacity(error)
+        } else {
+            Self::Other(error)
+        }
+    }
+
+    pub fn is_capacity_admission(&self) -> bool {
+        matches!(self, Self::ProviderCapacity(_) | Self::LocalCapacity)
+    }
+}
+
+impl std::fmt::Display for BlockingBodyLaneAcquireError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProviderCapacity(error) | Self::Other(error) => error.fmt(formatter),
+            Self::LocalCapacity => formatter.write_str("blocking BODY lane capacity is saturated"),
+            Self::NoEligibleServer => formatter.write_str("no eligible blocking BODY server"),
+        }
+    }
+}
+
+impl std::error::Error for BlockingBodyLaneAcquireError {}
+
 /// A BODY fetch that was streamed and decoded inline.
 #[derive(Debug)]
 pub struct DecodedBody {
     pub raw_size: u32,
     pub decoded: Vec<Box<[u8]>>,
-    pub result: YencDecodeResult,
+    /// What the body decoded to. yEnc and uuencode carry different evidence, so
+    /// this is a sum type rather than a yEnc result with absent fields.
+    pub body: FusedArticleBody,
     pub cpu: DecodedBodyCpu,
     pub io: DecodedBodyIo,
 }
@@ -237,6 +278,9 @@ pub enum BodyLaneMode {
 }
 
 fn supports_blocking_tls_body_lane(config: &ServerConfig) -> bool {
+    if config.tls_name_mismatch_certificate_der.is_some() {
+        return blocking_tls_lane_eligible(config, crate::tls::NntpTlsBackend::ManualRustls);
+    }
     match crate::tls::selected_blocking_tls_backend() {
         Ok(backend) => blocking_tls_lane_eligible(config, backend),
         Err(_) => false,
@@ -290,6 +334,7 @@ pub struct BodyLaneLease {
     mode: BodyLaneMode,
     rtt_ewma: Option<Duration>,
     rtt_samples: VecDeque<Duration>,
+    checkpoint_plan: CheckpointPlan,
 }
 
 struct DecodedBatchItem {
@@ -339,6 +384,16 @@ impl BodyLaneLease {
         self.conn
             .as_ref()
             .is_some_and(|conn| conn.capabilities().supports_pipelining())
+    }
+
+    /// Checkpoint every decoded article according to the immutable geometry
+    /// snapshot captured by its batch.
+    ///
+    /// A download batch belongs to one job, so the caller sets this once per
+    /// batch. It is re-applied before every response, including `None`, so a
+    /// pooled connection cannot carry another job's geometry.
+    pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
+        self.checkpoint_plan = checkpoint_plan;
     }
 
     pub fn park(self) {}
@@ -543,6 +598,10 @@ impl BodyLaneLease {
         for (response_idx, message_id) in message_ids.iter().take(requested).enumerate() {
             let item_started = Instant::now();
             let mut budget = ActiveTransferBudget::new(self.client.soft_timeout);
+            self.conn
+                .as_mut()
+                .expect("connection is available while reading pipeline body")
+                .set_checkpoint_plan(self.checkpoint_plan.clone());
             let result = NntpClient::read_decoded_pipelined_body(
                 self.conn
                     .as_mut()
@@ -688,9 +747,11 @@ impl BodyLaneLease {
         estimated_body_bytes: u64,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
         let mut budget = ActiveTransferBudget::new(self.client.soft_timeout);
+        let checkpoint_plan = self.checkpoint_plan.clone();
         let Some(conn) = self.conn.as_mut() else {
             return Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed));
         };
+        conn.set_checkpoint_plan(checkpoint_plan);
 
         let stream_result = conn
             .stream_yenc_article_with_active_budget(
@@ -707,7 +768,7 @@ impl BodyLaneLease {
                 cpu: decoded_cpu_from_fused_stats(&article.stats),
                 io: decoded_io_from_fused_stats(&article.stats),
                 decoded: article.chunks,
-                result: article.result,
+                body: article.body,
             }),
             Err(FusedYencError::Yenc(error)) => {
                 Err(DecodedBodyError::Decode { raw_size: 0, error })
@@ -934,6 +995,7 @@ impl NntpClient {
                 mode: BodyLaneMode::Sequential,
                 rtt_ewma: None,
                 rtt_samples: VecDeque::with_capacity(16),
+                checkpoint_plan: CheckpointPlan::None,
             }),
             Ok(Err(error)) => {
                 if is_connection_error(&error) {
@@ -2038,7 +2100,7 @@ impl NntpClient {
         &self,
         groups: &[String],
         exclude: &[usize],
-    ) -> Result<crate::blocking::BlockingBodyLane> {
+    ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
         self.try_acquire_blocking_body_lane_with_estimate(groups, exclude, 0)
     }
 
@@ -2057,20 +2119,32 @@ impl NntpClient {
         groups: &[String],
         exclude: &[usize],
         requested_body_bytes: u64,
-    ) -> Result<crate::blocking::BlockingBodyLane> {
+    ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
         let selection = self.blocking_body_server_selection(exclude, requested_body_bytes);
-        if selection.eligible.is_empty()
-            && let Some(rejection) = selection.quota_blocked
-        {
-            return Err(NntpError::quota_blocked(rejection));
+        if selection.eligible.is_empty() {
+            return Err(match selection.quota_blocked {
+                Some(rejection) => {
+                    BlockingBodyLaneAcquireError::Other(NntpError::quota_blocked(rejection))
+                }
+                None => BlockingBodyLaneAcquireError::NoEligibleServer,
+            });
         }
+
+        let mut saw_local_capacity = false;
+        let mut provider_capacity_error = None;
+        let mut other_error = None;
         for server in selection.eligible {
             let permit = match self.pool.try_acquire_blocking_permit(server) {
                 Ok(permit) => permit,
-                Err(_) => continue,
+                Err(_) => {
+                    saw_local_capacity = true;
+                    continue;
+                }
             };
-            let (config, excluded_ips, address_offset) =
-                self.pool.blocking_connect_plan(server, &[])?;
+            let (config, excluded_ips, address_offset) = self
+                .pool
+                .blocking_connect_plan(server, &[])
+                .map_err(BlockingBodyLaneAcquireError::Other)?;
             if !supports_blocking_tls_body_lane(&config) {
                 continue;
             }
@@ -2095,11 +2169,28 @@ impl NntpClient {
                         elapsed_ms = started.elapsed().as_millis(),
                         "blocking BODY lane connect failed"
                     );
-                    continue;
+                    match BlockingBodyLaneAcquireError::from_connect_error(error) {
+                        BlockingBodyLaneAcquireError::ProviderCapacity(error) => {
+                            provider_capacity_error = Some(error);
+                        }
+                        BlockingBodyLaneAcquireError::Other(error) => {
+                            other_error = Some(error);
+                        }
+                        BlockingBodyLaneAcquireError::LocalCapacity
+                        | BlockingBodyLaneAcquireError::NoEligibleServer => unreachable!(),
+                    }
                 }
             }
         }
-        Err(NntpError::PoolExhausted)
+        if let Some(error) = provider_capacity_error {
+            Err(BlockingBodyLaneAcquireError::ProviderCapacity(error))
+        } else if let Some(error) = other_error {
+            Err(BlockingBodyLaneAcquireError::Other(error))
+        } else if saw_local_capacity {
+            Err(BlockingBodyLaneAcquireError::LocalCapacity)
+        } else {
+            Err(BlockingBodyLaneAcquireError::NoEligibleServer)
+        }
     }
 
     pub fn has_blocking_body_lane_candidate(&self, exclude: &[usize]) -> bool {
@@ -2107,7 +2198,7 @@ impl NntpClient {
             .eligible
             .into_iter()
             .any(|server| {
-                if self.pool.server_load(server.0).0 == 0 {
+                if self.pool.server_load(server.0).1 == 0 {
                     return false;
                 }
                 let Ok((config, _, _)) = self.pool.blocking_connect_plan(server, &[]) else {
@@ -2218,15 +2309,12 @@ impl NntpClient {
 
     fn record_blocking_connect_failure(&self, server_idx: usize, error: &NntpError) {
         if matches!(error, NntpError::TooManyConnections) {
-            if self
-                .pool
-                .record_provider_capacity_rejection(ServerId(server_idx))
-            {
-                self.pool
-                    .health()
-                    .blocking_lock()
-                    .record_cooldown(server_idx, CooldownReason::Capacity);
-            }
+            // Provider admission pressure belongs to the adaptive connection
+            // limit, not server health. Cooling the whole server here also
+            // blocks already-established healthy lanes from refilling, which
+            // can strand a job after the limit has converged.
+            self.pool
+                .record_provider_capacity_rejection(ServerId(server_idx));
         } else if matches!(
             error,
             NntpError::AuthenticationFailed
@@ -2732,7 +2820,7 @@ impl NntpClient {
                         cpu: decoded_cpu_from_fused_stats(&article.stats),
                         io: decoded_io_from_fused_stats(&article.stats),
                         decoded: article.chunks,
-                        result: article.result,
+                        body: article.body,
                     });
                 }
                 Err(FusedYencError::Yenc(error)) => {
@@ -2785,7 +2873,7 @@ impl NntpClient {
                 cpu: decoded_cpu_from_fused_stats(&article.stats),
                 io: decoded_io_from_fused_stats(&article.stats),
                 decoded: article.chunks,
-                result: article.result,
+                body: article.body,
             }),
             Err(FusedYencError::Yenc(error)) => {
                 Err(DecodedBodyError::Decode { raw_size: 0, error })
@@ -3061,6 +3149,16 @@ mod tests {
         spawn_shared_scripted_server(steps, Duration::ZERO).await
     }
 
+    async fn reject_mode_reader(socket: &mut TcpStream) {
+        let mode_reader = read_command_line(socket).await;
+        assert!(mode_reader.starts_with("MODE READER"));
+        socket
+            .write_all(b"500 MODE READER unsupported\r\n")
+            .await
+            .unwrap();
+        socket.flush().await.unwrap();
+    }
+
     async fn spawn_trickling_body_server(line_delay: Duration) -> u16 {
         const LINE: &[u8] = b"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\r\n";
 
@@ -3070,6 +3168,7 @@ mod tests {
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.write_all(b"200 ready\r\n").await.unwrap();
+            reject_mode_reader(&mut socket).await;
 
             let capabilities = read_command_line(&mut socket).await;
             assert!(capabilities.starts_with("CAPABILITIES"));
@@ -3106,6 +3205,7 @@ mod tests {
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.write_all(b"200 ready\r\n").await.unwrap();
+            reject_mode_reader(&mut socket).await;
 
             let capabilities = read_command_line(&mut socket).await;
             assert!(capabilities.starts_with("CAPABILITIES"));
@@ -3135,13 +3235,7 @@ mod tests {
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.write_all(b"200 ready\r\n").await.unwrap();
-
-            let capabilities = read_command_line(&mut socket).await;
-            assert!(capabilities.starts_with("CAPABILITIES"));
-            socket
-                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
-                .await
-                .unwrap();
+            reject_mode_reader(&mut socket).await;
 
             let initial_user = read_command_line(&mut socket).await;
             assert!(initial_user.starts_with("AUTHINFO USER "));
@@ -3181,6 +3275,7 @@ mod tests {
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.write_all(b"200 ready\r\n").await.unwrap();
+            reject_mode_reader(&mut socket).await;
 
             let capabilities = read_command_line(&mut socket).await;
             assert!(capabilities.starts_with("CAPABILITIES"));
@@ -3244,6 +3339,15 @@ mod tests {
                     socket.flush().await.unwrap();
 
                     while let Some(line) = try_read_command_line(&mut socket).await {
+                        if line.starts_with("MODE READER") {
+                            socket
+                                .write_all(b"500 MODE READER unsupported\r\n")
+                                .await
+                                .unwrap();
+                            socket.flush().await.unwrap();
+                            continue;
+                        }
+
                         if line.starts_with("CAPABILITIES") {
                             socket
                                 .write_all(
@@ -3294,6 +3398,130 @@ mod tests {
         }
     }
 
+    fn yenc_body_response(message_id: &str, data: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        weaver_yenc::encode(data, &mut encoded, 128, "checkpoint-plan.bin").unwrap();
+
+        let mut response = format!("222 0 {message_id} body follows\r\n").into_bytes();
+        response.extend_from_slice(&encoded);
+        response.extend_from_slice(b".\r\n");
+        response
+    }
+
+    async fn spawn_checkpoint_plan_pipelining_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"200 ready\r\n").await.unwrap();
+            socket.flush().await.unwrap();
+            reject_mode_reader(&mut socket).await;
+
+            let capabilities = read_command_line(&mut socket).await;
+            assert!(capabilities.starts_with("CAPABILITIES"));
+            socket
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n")
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            let first = read_command_line(&mut socket).await;
+            assert_eq!(first, "BODY <first@checkpoint.test>\r\n");
+            let second =
+                tokio::time::timeout(Duration::from_secs(1), read_command_line(&mut socket))
+                    .await
+                    .expect("depth-2 lane must issue both BODY commands before a response");
+            assert_eq!(second, "BODY <second@checkpoint.test>\r\n");
+            socket
+                .write_all(&yenc_body_response(
+                    "<first@checkpoint.test>",
+                    &(0..512u16).map(|byte| byte as u8).collect::<Vec<_>>(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .write_all(&yenc_body_response(
+                    "<second@checkpoint.test>",
+                    &(0..512u16)
+                        .map(|byte| (byte.wrapping_mul(17)) as u8)
+                        .collect::<Vec<_>>(),
+                ))
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            let refill = read_command_line(&mut socket).await;
+            assert_eq!(refill, "BODY <refill@checkpoint.test>\r\n");
+            socket
+                .write_all(&yenc_body_response(
+                    "<refill@checkpoint.test>",
+                    &vec![0x5a; 512],
+                ))
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            let pooled = read_command_line(&mut socket).await;
+            assert_eq!(pooled, "BODY <pooled@checkpoint.test>\r\n");
+            socket
+                .write_all(&yenc_body_response(
+                    "<pooled@checkpoint.test>",
+                    &vec![0xa5; 512],
+                ))
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+        });
+
+        port
+    }
+
+    async fn spawn_stat_server(expect_pipelined: bool) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"200 ready\r\n").await.unwrap();
+            socket.flush().await.unwrap();
+            reject_mode_reader(&mut socket).await;
+
+            let first = read_command_line(&mut socket).await;
+            assert!(first.starts_with("STAT <first@example.com>"));
+            if expect_pipelined {
+                let second = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    read_command_line(&mut socket),
+                )
+                .await
+                .expect("known pipelining mode must send the next STAT before a response");
+                assert!(second.starts_with("STAT <second@example.com>"));
+                socket
+                    .write_all(
+                        b"223 1 <first@example.com> article exists\r\n223 2 <second@example.com> article exists\r\n",
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                socket
+                    .write_all(b"223 1 <first@example.com> article exists\r\n")
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+                let second = read_command_line(&mut socket).await;
+                assert!(second.starts_with("STAT <second@example.com>"));
+                socket
+                    .write_all(b"223 2 <second@example.com> article exists\r\n")
+                    .await
+                    .unwrap();
+            }
+            socket.flush().await.unwrap();
+        });
+
+        port
+    }
+
     fn scripted_blocking_s2n_server(port: u16, max_connections: usize) -> ServerPoolConfig {
         ServerPoolConfig {
             server: ServerConfig {
@@ -3318,6 +3546,73 @@ mod tests {
         let _another = kind;
     }
 
+    #[tokio::test]
+    async fn body_lane_multi_checkpoint_plan_resets_for_refill_and_pool_reuse() {
+        let port = spawn_checkpoint_plan_pipelining_server().await;
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_server(port, 0)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+        let checkpoint_plan = CheckpointPlan::from_sizes([
+            std::num::NonZeroU64::new(64).unwrap(),
+            std::num::NonZeroU64::new(96).unwrap(),
+        ])
+        .plan;
+
+        let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
+        assert!(lane.supports_pipelining());
+        lane.set_checkpoint_plan(checkpoint_plan.clone());
+        let message_ids = vec![
+            "<first@checkpoint.test>".to_string(),
+            "<second@checkpoint.test>".to_string(),
+        ];
+        let mut callbacks = Vec::new();
+        let stats = lane
+            .fetch_decoded_pipeline_depth2(&message_ids, |index, trace, meta| {
+                callbacks.push((index, trace, meta));
+                std::future::ready(())
+            })
+            .await;
+
+        assert_eq!(stats.offered, 2);
+        assert_eq!(stats.requested, 2);
+        assert_eq!(stats.completed, 2);
+        assert_eq!(callbacks.len(), 2);
+        for (expected_index, (index, trace, _)) in callbacks.iter().enumerate() {
+            assert_eq!(*index, expected_index);
+            let body = trace.result.as_ref().unwrap().body.yenc().unwrap();
+            assert_eq!(body.checkpoint_plan, checkpoint_plan);
+            assert!(
+                body.segments.len() > 1,
+                "multi-grid plan must refine segments"
+            );
+        }
+
+        lane.set_checkpoint_plan(CheckpointPlan::None);
+        let refill = lane
+            .fetch_decoded_sequential("<refill@checkpoint.test>")
+            .await;
+        let refill = refill.result.unwrap();
+        let refill_body = refill.body.yenc().unwrap();
+        assert_eq!(refill_body.checkpoint_plan, CheckpointPlan::None);
+        assert_eq!(refill_body.segments.len(), 1);
+        lane.park();
+        // Returning a pooled connection is spawned on drop; let that task park
+        // the sole fixture connection before proving the next lane reuses it.
+        tokio::task::yield_now().await;
+
+        let mut reused_lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
+        let pooled = reused_lane
+            .fetch_decoded_sequential("<pooled@checkpoint.test>")
+            .await;
+        let pooled = pooled.result.unwrap();
+        let pooled_body = pooled.body.yenc().unwrap();
+        assert_eq!(pooled_body.checkpoint_plan, CheckpointPlan::None);
+        assert_eq!(pooled_body.segments.len(), 1);
+    }
+
     #[test]
     fn blocking_body_lane_candidate_honors_exclusions_and_capacity() {
         let client = NntpClient::new(NntpClientConfig {
@@ -3337,6 +3632,32 @@ mod tests {
             soft_timeout: Duration::from_secs(15),
         });
         assert!(!saturated.has_blocking_body_lane_candidate(&[]));
+    }
+
+    #[test]
+    fn blocking_body_lane_candidate_survives_temporary_permit_saturation() {
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_blocking_s2n_server(1, 2)],
+            max_idle_age: Duration::from_secs(30),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
+        });
+        let first = client
+            .pool()
+            .try_acquire_blocking_permit(ServerId(0))
+            .unwrap();
+        let second = client
+            .pool()
+            .try_acquire_blocking_permit(ServerId(0))
+            .unwrap();
+
+        assert_eq!(client.pool().server_load(0), (0, 2));
+        assert!(
+            client.has_blocking_body_lane_candidate(&[]),
+            "leased permits can belong to reusable owned-lane caches"
+        );
+
+        drop((first, second));
     }
 
     #[test]
@@ -3619,6 +3940,39 @@ mod tests {
         let health = client.pool().health().lock().await;
         assert_eq!(health.server(0).failure_count, 0);
         assert_eq!(health.server(0).consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn blocking_capacity_floor_never_cools_healthy_server() {
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_blocking_s2n_server(563, 2)],
+            max_idle_age: Duration::from_secs(30),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
+        });
+
+        client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
+        client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
+
+        assert_eq!(client.pool().effective_connections(ServerId(0)), Some(1));
+        let mut health = client.pool().health().lock().await;
+        assert_eq!(health.server(0).state(), &ServerState::Healthy);
+        assert!(health.is_available(0));
+    }
+
+    #[test]
+    fn blocking_lane_preserves_provider_capacity_rejection() {
+        let error =
+            NntpError::from_status(crate::types::StatusCode::new(502), "Too many connections");
+        let error = BlockingBodyLaneAcquireError::from_connect_error(error);
+
+        assert!(
+            matches!(
+                error,
+                BlockingBodyLaneAcquireError::ProviderCapacity(NntpError::TooManyConnections)
+            ),
+            "unexpected blocking lane error: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -4105,7 +4459,7 @@ mod tests {
             .expect("blocking selection must surface the same quota block");
         assert!(matches!(
             blocking,
-            NntpError::QuotaBlocked(rejection)
+            BlockingBodyLaneAcquireError::Other(NntpError::QuotaBlocked(rejection))
                 if rejection.stable_server_id == StableServerId(1_001)
                     && rejection.retry_at == Some(earlier)
         ));
@@ -4838,6 +5192,7 @@ mod tests {
                 accepted_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 socket.write_all(b"200 ready\r\n").await.unwrap();
                 socket.flush().await.unwrap();
+                reject_mode_reader(&mut socket).await;
                 let line = read_command_line(&mut socket).await;
                 assert!(line.starts_with("CAPABILITIES"));
                 socket
@@ -4894,6 +5249,7 @@ mod tests {
                 accepted_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 socket.write_all(b"200 ready\r\n").await.unwrap();
                 socket.flush().await.unwrap();
+                reject_mode_reader(&mut socket).await;
                 let line = read_command_line(&mut socket).await;
                 assert!(line.starts_with("CAPABILITIES"));
                 socket
@@ -5157,6 +5513,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn known_pipelining_pipelines_stats_without_capabilities() {
+        let port = spawn_stat_server(true).await;
+        let mut server = scripted_server(port, 0);
+        server.server.pipelining = crate::connection::PipeliningCapability::Known(true);
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![server],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        assert_eq!(
+            client
+                .stat_many(&["<first@example.com>", "<second@example.com>"])
+                .await
+                .unwrap(),
+            vec![true, true]
+        );
+    }
+
+    #[tokio::test]
+    async fn known_non_pipelining_serializes_stats_without_capabilities() {
+        let port = spawn_stat_server(false).await;
+        let mut server = scripted_server(port, 0);
+        server.server.pipelining = crate::connection::PipeliningCapability::Known(false);
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![server],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        assert_eq!(
+            client
+                .stat_many(&["<first@example.com>", "<second@example.com>"])
+                .await
+                .unwrap(),
+            vec![true, true]
+        );
+    }
+
+    #[tokio::test]
     async fn stat_many_fails_over_after_malformed_pipelined_response_when_article_is_confirmed() {
         let primary_port = spawn_scripted_server(vec![
             ScriptStep {
@@ -5398,6 +5796,14 @@ mod tests {
             &lane_config(true, false, true),
             NntpTlsBackend::ManualRustls
         ));
+    }
+
+    #[test]
+    fn adopted_name_mismatch_certificate_forces_the_rustls_body_lane() {
+        let mut config = lane_config(true, false, false);
+        config.tls_name_mismatch_certificate_der = Some(vec![0x30, 0x82, 0x01, 0x0a]);
+
+        assert!(supports_blocking_tls_body_lane(&config));
     }
 
     #[cfg(not(windows))]

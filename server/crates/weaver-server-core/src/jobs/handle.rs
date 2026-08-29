@@ -3,7 +3,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod};
@@ -17,6 +17,76 @@ use crate::jobs::model::{JobSpec, JobStatus, JobUpdate};
 use crate::operations::metrics::{MetricsSnapshot, PipelineMetrics};
 
 pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
+
+type JobCancellationCallback = Arc<dyn Fn() + Send + Sync>;
+
+/// Signals active job work without waiting for the single-threaded scheduler
+/// loop. This lets a user cancellation interrupt a repair that currently owns
+/// that loop before the queued cancellation command is handled.
+#[derive(Clone, Default)]
+struct JobCancellationRegistry {
+    state: Arc<Mutex<JobCancellationState>>,
+}
+
+#[derive(Default)]
+struct JobCancellationState {
+    callbacks: HashMap<JobId, Vec<JobCancellationCallback>>,
+    requested: HashSet<JobId>,
+}
+
+impl JobCancellationRegistry {
+    fn register(&self, job_id: JobId, callback: JobCancellationCallback) {
+        let cancel_now = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("job cancellation registry poisoned");
+            let cancel_now = state.requested.contains(&job_id);
+            state
+                .callbacks
+                .entry(job_id)
+                .or_default()
+                .push(Arc::clone(&callback));
+            cancel_now
+        };
+        if cancel_now {
+            callback();
+        }
+    }
+
+    fn cancel(&self, job_id: JobId) -> bool {
+        let callbacks = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("job cancellation registry poisoned");
+            state.requested.insert(job_id);
+            state.callbacks.get(&job_id).cloned().unwrap_or_default()
+        };
+        let cancelled = !callbacks.is_empty();
+        for callback in callbacks {
+            callback();
+        }
+        cancelled
+    }
+
+    fn requested(&self, job_id: JobId) -> bool {
+        self.state
+            .lock()
+            .expect("job cancellation registry poisoned")
+            .requested
+            .contains(&job_id)
+    }
+
+    fn clear(&self, job_id: JobId) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("job cancellation registry poisoned");
+        state.callbacks.remove(&job_id);
+        state.requested.remove(&job_id);
+    }
+}
 
 /// Shared read-only view of pipeline state for the control plane.
 ///
@@ -36,6 +106,7 @@ pub struct SharedPipelineState {
         Arc<RwLock<Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>>>,
     nntp_pool: Arc<RwLock<Option<Arc<weaver_nntp::pool::NntpPool>>>>,
     nntp_runtime_activation: Arc<RwLock<Option<NntpRuntimeActivation>>>,
+    job_cancellations: JobCancellationRegistry,
 }
 
 impl SharedPipelineState {
@@ -54,6 +125,7 @@ impl SharedPipelineState {
             server_transfer_policy: Arc::new(RwLock::new(None)),
             nntp_pool: Arc::new(RwLock::new(None)),
             nntp_runtime_activation: Arc::new(RwLock::new(None)),
+            job_cancellations: JobCancellationRegistry::default(),
         }
     }
 
@@ -90,6 +162,26 @@ impl SharedPipelineState {
 
     pub fn raw_metrics_snapshot(&self) -> MetricsSnapshot {
         self.metrics.raw_snapshot()
+    }
+
+    pub(crate) fn register_job_cancellation(
+        &self,
+        job_id: JobId,
+        callback: JobCancellationCallback,
+    ) {
+        self.job_cancellations.register(job_id, callback);
+    }
+
+    pub(crate) fn cancel_active_job_work(&self, job_id: JobId) -> bool {
+        self.job_cancellations.cancel(job_id)
+    }
+
+    pub(crate) fn is_job_cancellation_requested(&self, job_id: JobId) -> bool {
+        self.job_cancellations.requested(job_id)
+    }
+
+    pub(crate) fn clear_job_cancellations(&self, job_id: JobId) {
+        self.job_cancellations.clear(job_id);
     }
 
     pub fn metrics(&self) -> &Arc<PipelineMetrics> {
@@ -199,6 +291,29 @@ pub enum DownloadBlockKind {
     Scheduled,
     IspCap,
     ServerQuota,
+}
+
+impl DownloadBlockKind {
+    /// Every variant, in gate-reason label order. The Prometheus exporter
+    /// renders one series per variant; deriving the label set from `ALL` keeps
+    /// a new gate reason from silently vanishing off `/metrics`.
+    pub const ALL: [Self; 5] = [
+        Self::None,
+        Self::ManualPause,
+        Self::Scheduled,
+        Self::IspCap,
+        Self::ServerQuota,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ManualPause => "manual_pause",
+            Self::Scheduled => "scheduled",
+            Self::IspCap => "isp_cap",
+            Self::ServerQuota => "server_quota",
+        }
+    }
 }
 
 /// Where a manual queue reorder should land a job. The order only breaks ties
@@ -451,6 +566,11 @@ pub enum SchedulerCommand {
         total_connections: usize,
         reply: oneshot::Sender<Result<NntpRuntimeActivation, SchedulerError>>,
     },
+    /// Apply the asynchronous random-read disk measurement to the tuner.
+    UpdateRandomReadIops {
+        random_read_iops: f64,
+        reply: oneshot::Sender<()>,
+    },
     /// Update runtime storage directories after a restore.
     UpdateRuntimePaths {
         data_dir: PathBuf,
@@ -491,6 +611,12 @@ pub struct JobInfo {
     pub name: String,
     pub status: JobStatus,
     pub download_state: crate::jobs::model::DownloadState,
+    /// Network download is complete, but decode/write or PAR2 discovery work remains.
+    #[serde(default)]
+    pub finalizing_download: bool,
+    /// Weaver is fetching the minimum PAR2 metadata or recovery data needed to finish.
+    #[serde(default)]
+    pub fetching_repair_data: bool,
     pub post_state: crate::jobs::model::PostState,
     pub run_state: crate::jobs::model::RunState,
     pub progress: f64,
@@ -503,7 +629,16 @@ pub struct JobInfo {
     /// Bytes from segments that are permanently lost (430 / max retries).
     pub failed_bytes: u64,
     /// Job health 0-1000 (1000 = perfect). Drops as articles fail.
+    ///
+    /// For a job that reached a terminal status this is the settled figure —
+    /// what the claim census concluded was delivered — not the live wire
+    /// counter, which knows nothing of the repairs and discards that answered
+    /// its misses.
     pub health: u32,
+    /// Files the settlement dropped from the delivery, with the bytes each one
+    /// took out of the accounting. Empty for every job that discarded nothing.
+    #[serde(default)]
+    pub terminal_discards: Vec<crate::jobs::model::TerminalDiscard>,
     /// Total files in the NZB (all roles).
     #[serde(default)]
     pub total_files: u32,
@@ -644,6 +779,9 @@ impl SchedulerHandle {
         job_id: JobId,
         origin: CancellationOrigin,
     ) -> Result<(), SchedulerError> {
+        if matches!(origin, CancellationOrigin::User) {
+            self.state.cancel_active_job_work(job_id);
+        }
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::CancelJob {
@@ -773,6 +911,67 @@ impl SchedulerHandle {
     /// Get current metrics (reads from shared state, no channel round-trip).
     pub fn get_metrics(&self) -> MetricsSnapshot {
         self.state.metrics_snapshot()
+    }
+
+    pub fn get_extraction_rejections(&self) -> [u64; 9] {
+        self.state.metrics().extraction_rejections()
+    }
+
+    /// Whether the pipeline task is gone.
+    ///
+    /// Reads the command channel's liveness without sending anything through
+    /// it, so a readiness probe can tell "the scheduler died" from "the
+    /// scheduler is busy" — a probe that queued a command behind the pipeline
+    /// loop would fail exactly when the box is most loaded.
+    pub fn is_closed(&self) -> bool {
+        self.cmd_tx.is_closed()
+    }
+
+    /// Count one job accepted into the pipeline, labelled by where it came
+    /// from and which category it landed in.
+    ///
+    /// Called from the submission path, which is the only place that knows the
+    /// origin. Low-frequency by construction (one call per submitted job), so
+    /// the label map behind it is never contended.
+    pub fn note_job_submitted(
+        &self,
+        origin: crate::jobs::SubmissionOrigin,
+        category: Option<&str>,
+    ) {
+        self.state
+            .metrics()
+            .job_lifecycle
+            .note_submitted(origin.as_str(), category.unwrap_or(""));
+    }
+
+    /// Per-server article attempt counters and latency for the servers of the
+    /// currently active NNTP generation.
+    ///
+    /// Read on demand rather than folded into [`MetricsSnapshot`]: the 100 ms
+    /// snapshot tick must stay a fixed-size struct copy with no `Vec` in it.
+    /// This reads through a `RwLock` that is only ever write-locked when a new
+    /// NNTP runtime generation is activated, so it never contends with the
+    /// per-article path that increments the counters.
+    pub fn server_metrics_snapshot(
+        &self,
+    ) -> Vec<crate::operations::instrumentation::ServerMetricsSnapshot> {
+        self.state.metrics().server_metrics.snapshot()
+    }
+
+    /// Job lifecycle counters and duration histograms. Read on demand; see
+    /// [`Self::server_metrics_snapshot`] for why this is not in the tick.
+    pub fn job_lifecycle_metrics_snapshot(
+        &self,
+    ) -> crate::operations::instrumentation::JobLifecycleMetricsSnapshot {
+        self.state.metrics().job_lifecycle.snapshot()
+    }
+
+    /// Pipeline stage duration histograms. Read on demand; see
+    /// [`Self::server_metrics_snapshot`] for why this is not in the tick.
+    pub fn pipeline_histograms_snapshot(
+        &self,
+    ) -> crate::operations::instrumentation::PipelineHistogramsSnapshot {
+        self.state.metrics().pipeline_histograms.snapshot()
     }
 
     /// Get a fresh atomics-based metrics snapshot without advancing the shared
@@ -953,6 +1152,23 @@ impl SchedulerHandle {
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+    }
+
+    /// Update disk tuning after the background startup measurement completes.
+    pub async fn update_random_read_iops(
+        &self,
+        random_read_iops: f64,
+    ) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::UpdateRandomReadIops {
+                random_read_iops,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        Ok(())
     }
 
     /// Update the pipeline's runtime directories for future jobs.

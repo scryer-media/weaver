@@ -10,34 +10,68 @@ pub(super) unsafe fn decode_kernel_sse2(
     preserve_pending: bool,
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
-    // Hot path: faithful rapidyenc `do_decode_sse` port at ISA_LEVEL_SSE2
-    // (FAST_MATCH=false, BLEND_ADD=false). Other combos keep the general kernel.
-    if dot_unstuffing
-        && !search_end
+    let mode = DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    };
+
+    // Head resolution (search_end only): a terminator/control sequence whose
+    // `\r\n` sits in the PREVIOUS chunk is invisible to the flat raw loop, so
+    // resolve those entry shapes with the scalar machine first. Gated on the
+    // same length as the raw path, so short inputs keep today's routing exactly.
+    let mut head_src = 0usize;
+    let mut head_dst = 0usize;
+    if search_end
+        && dot_unstuffing
         && input.len() > 64
+        && x86_search_end_head(input, output, state, mode, &mut head_src, &mut head_dst)?
+    {
+        return Ok(KernelOutcome {
+            consumed: head_src,
+            written: head_dst,
+            end: state.end.into(),
+        });
+    }
+
+    // Hot path: faithful rapidyenc `do_decode_sse` port at ISA_LEVEL_SSE2
+    // (FAST_MATCH=false, BLEND_ADD=false), both `searchEnd` instantiations.
+    // Other combos keep the general kernel.
+    if dot_unstuffing
+        && input.len() - head_src > 64
         && matches!(
             state.state,
             DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
         )
     {
-        let mode = DecodeStepMode {
-            dot_unstuffing,
-            preserve_pending,
-            search_end,
+        // `head_src`/`head_dst` are 0 unless the head loop ran, so the
+        // `::<false>` instantiation always sees the untouched full buffers.
+        let outcome = if search_end {
+            unsafe {
+                decode_kernel_sse2_raw::<true>(
+                    &input[head_src..],
+                    &mut output[head_dst..],
+                    state,
+                    mode,
+                )
+            }
+        } else {
+            unsafe { decode_kernel_sse2_raw::<false>(input, output, state, mode) }
         };
-        return unsafe { decode_kernel_sse2_raw(input, output, state, mode) };
+        return x86_fold_head(outcome, head_src, head_dst);
     }
-    unsafe {
+    let outcome = unsafe {
         decode_kernel_simd64(
-            input,
-            output,
+            &input[head_src..],
+            &mut output[head_dst..],
             state,
             dot_unstuffing,
             preserve_pending,
             search_end,
             try_decode_sse2_block,
         )
-    }
+    };
+    x86_fold_head(outcome, head_src, head_dst)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -50,34 +84,62 @@ pub(super) unsafe fn decode_kernel_ssse3(
     preserve_pending: bool,
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
-    // Hot path: faithful rapidyenc `do_decode_sse` port at ISA_LEVEL_SSSE3
-    // (FAST_MATCH=true, BLEND_ADD=false). Other combos keep the general kernel.
-    if dot_unstuffing
-        && !search_end
+    let mode = DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    };
+
+    let mut head_src = 0usize;
+    let mut head_dst = 0usize;
+    if search_end
+        && dot_unstuffing
         && input.len() > 64
+        && x86_search_end_head(input, output, state, mode, &mut head_src, &mut head_dst)?
+    {
+        return Ok(KernelOutcome {
+            consumed: head_src,
+            written: head_dst,
+            end: state.end.into(),
+        });
+    }
+
+    // Hot path: faithful rapidyenc `do_decode_sse` port at ISA_LEVEL_SSSE3
+    // (FAST_MATCH=true, BLEND_ADD=false), both `searchEnd` instantiations.
+    // Other combos keep the general kernel.
+    if dot_unstuffing
+        && input.len() - head_src > 64
         && matches!(
             state.state,
             DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
         )
     {
-        let mode = DecodeStepMode {
-            dot_unstuffing,
-            preserve_pending,
-            search_end,
+        let outcome = if search_end {
+            unsafe {
+                decode_kernel_ssse3_raw::<true>(
+                    &input[head_src..],
+                    &mut output[head_dst..],
+                    state,
+                    mode,
+                )
+            }
+        } else {
+            unsafe { decode_kernel_ssse3_raw::<false>(input, output, state, mode) }
         };
-        return unsafe { decode_kernel_ssse3_raw(input, output, state, mode) };
+        return x86_fold_head(outcome, head_src, head_dst);
     }
-    unsafe {
+    let outcome = unsafe {
         decode_kernel_simd64_ssse3_line_aware(
-            input,
-            output,
+            &input[head_src..],
+            &mut output[head_dst..],
             state,
             dot_unstuffing,
             preserve_pending,
             search_end,
             try_decode_ssse3_block,
         )
-    }
+    };
+    x86_fold_head(outcome, head_src, head_dst)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -90,34 +152,62 @@ pub(super) unsafe fn decode_kernel_sse41(
     preserve_pending: bool,
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
-    // Hot path: faithful rapidyenc `do_decode_sse` port at ISA_LEVEL_SSE4_POPCNT
-    // (FAST_MATCH=true, BLEND_ADD=true). Other combos keep the general kernel.
-    if dot_unstuffing
-        && !search_end
+    let mode = DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    };
+
+    let mut head_src = 0usize;
+    let mut head_dst = 0usize;
+    if search_end
+        && dot_unstuffing
         && input.len() > 64
+        && x86_search_end_head(input, output, state, mode, &mut head_src, &mut head_dst)?
+    {
+        return Ok(KernelOutcome {
+            consumed: head_src,
+            written: head_dst,
+            end: state.end.into(),
+        });
+    }
+
+    // Hot path: faithful rapidyenc `do_decode_sse` port at ISA_LEVEL_SSE4_POPCNT
+    // (FAST_MATCH=true, BLEND_ADD=true), both `searchEnd` instantiations. Other
+    // combos keep the general kernel.
+    if dot_unstuffing
+        && input.len() - head_src > 64
         && matches!(
             state.state,
             DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
         )
     {
-        let mode = DecodeStepMode {
-            dot_unstuffing,
-            preserve_pending,
-            search_end,
+        let outcome = if search_end {
+            unsafe {
+                decode_kernel_sse41_raw::<true>(
+                    &input[head_src..],
+                    &mut output[head_dst..],
+                    state,
+                    mode,
+                )
+            }
+        } else {
+            unsafe { decode_kernel_sse41_raw::<false>(input, output, state, mode) }
         };
-        return unsafe { decode_kernel_sse41_raw(input, output, state, mode) };
+        return x86_fold_head(outcome, head_src, head_dst);
     }
-    unsafe {
+    let outcome = unsafe {
         decode_kernel_simd64_ssse3_line_aware(
-            input,
-            output,
+            &input[head_src..],
+            &mut output[head_dst..],
             state,
             dot_unstuffing,
             preserve_pending,
             search_end,
             try_decode_sse41_block,
         )
-    }
+    };
+    x86_fold_head(outcome, head_src, head_dst)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -130,34 +220,61 @@ pub(super) unsafe fn decode_kernel_avx(
     preserve_pending: bool,
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
+    let mode = DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    };
+
+    let mut head_src = 0usize;
+    let mut head_dst = 0usize;
+    if search_end
+        && dot_unstuffing
+        && input.len() > 64
+        && x86_search_end_head(input, output, state, mode, &mut head_src, &mut head_dst)?
+    {
+        return Ok(KernelOutcome {
+            consumed: head_src,
+            written: head_dst,
+            end: state.end.into(),
+        });
+    }
+
     // AVX reuses the SSE4.1/POPCNT raw kernel (weaver treats AVX == SSE4.1 for
     // the 128-bit decode body, matching `try_decode_avx_block`).
     if dot_unstuffing
-        && !search_end
-        && input.len() > 64
+        && input.len() - head_src > 64
         && matches!(
             state.state,
             DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
         )
     {
-        let mode = DecodeStepMode {
-            dot_unstuffing,
-            preserve_pending,
-            search_end,
+        let outcome = if search_end {
+            unsafe {
+                decode_kernel_sse41_raw::<true>(
+                    &input[head_src..],
+                    &mut output[head_dst..],
+                    state,
+                    mode,
+                )
+            }
+        } else {
+            unsafe { decode_kernel_sse41_raw::<false>(input, output, state, mode) }
         };
-        return unsafe { decode_kernel_sse41_raw(input, output, state, mode) };
+        return x86_fold_head(outcome, head_src, head_dst);
     }
-    unsafe {
+    let outcome = unsafe {
         decode_kernel_simd64_ssse3_line_aware(
-            input,
-            output,
+            &input[head_src..],
+            &mut output[head_dst..],
             state,
             dot_unstuffing,
             preserve_pending,
             search_end,
             try_decode_avx_block,
         )
-    }
+    };
+    x86_fold_head(outcome, head_src, head_dst)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -377,13 +494,21 @@ pub(super) unsafe fn try_decode_ssse3_block(
         return Ok(Some(64));
     }
 
-    let eq = if specials != 0 {
-        unsafe { sse2_mask64(vectors, b'=') }
+    let (eq_cmp, eq) = if specials != 0 {
+        unsafe { sse_eq_compares(vectors) }
     } else {
-        0
+        ([_mm_setzero_si128(); 4], 0)
     };
     let esc_first = esc_first as u64;
-    let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+    let eq_shift1 = (eq << 1) | esc_first;
+    // `fix_eq_mask` is the identity on a mask with no consecutive `=`, so this
+    // is value-identical to running it unconditionally.
+    let collision = (eq & eq_shift1) != 0;
+    let fixed_eq = if collision {
+        fix_eq_mask(eq, eq_shift1)
+    } else {
+        eq
+    };
     let escaped = (fixed_eq << 1) | esc_first;
     let entry_line_start = (state.state == DecoderState::CrLf) as u64;
 
@@ -451,15 +576,49 @@ pub(super) unsafe fn try_decode_ssse3_block(
         return Ok(Some(64));
     }
 
-    let decoded_a = unsafe { ssse3_decode_with_escape_mask(a, (escaped & 0xffff) as u16) };
-    let decoded_b = unsafe { ssse3_decode_with_escape_mask(b, ((escaped >> 16) & 0xffff) as u16) };
-    let decoded_c = unsafe { ssse3_decode_with_escape_mask(c, ((escaped >> 32) & 0xffff) as u16) };
-    let decoded_d = unsafe { ssse3_decode_with_escape_mask(d, ((escaped >> 48) & 0xffff) as u16) };
+    // Isolated escapes (the overwhelmingly common case) come straight off the
+    // `=` compares; only a genuine consecutive-`=` run needs the corrected
+    // `escaped` mask expanded through the scalar offset array.
+    let decoded = if collision {
+        [
+            unsafe { sse_escape_decode(a, (escaped & 0xffff) as u16) },
+            unsafe { sse_escape_decode(b, ((escaped >> 16) & 0xffff) as u16) },
+            unsafe { sse_escape_decode(c, ((escaped >> 32) & 0xffff) as u16) },
+            unsafe { sse_escape_decode(d, ((escaped >> 48) & 0xffff) as u16) },
+        ]
+    } else {
+        unsafe { sse_decode_isolated_escapes::<false>(vectors, eq_cmp, esc_first != 0) }
+    };
 
-    unsafe { compact_store_16_ssse3(decoded_a, (skip & 0xffff) as u16, output, dst) };
-    unsafe { compact_store_16_ssse3(decoded_b, ((skip >> 16) & 0xffff) as u16, output, dst) };
-    unsafe { compact_store_16_ssse3(decoded_c, ((skip >> 32) & 0xffff) as u16, output, dst) };
-    unsafe { compact_store_16_ssse3(decoded_d, ((skip >> 48) & 0xffff) as u16, output, dst) };
+    let table = compact_table_16();
+    unsafe { compact_store_16_ssse3(decoded[0], (skip & 0xffff) as u16, table, output, dst) };
+    unsafe {
+        compact_store_16_ssse3(
+            decoded[1],
+            ((skip >> 16) & 0xffff) as u16,
+            table,
+            output,
+            dst,
+        )
+    };
+    unsafe {
+        compact_store_16_ssse3(
+            decoded[2],
+            ((skip >> 32) & 0xffff) as u16,
+            table,
+            output,
+            dst,
+        )
+    };
+    unsafe {
+        compact_store_16_ssse3(
+            decoded[3],
+            ((skip >> 48) & 0xffff) as u16,
+            table,
+            output,
+            dst,
+        )
+    };
 
     state.state = x86_final_state_after_block(
         fixed_eq,
@@ -530,13 +689,21 @@ pub(super) unsafe fn try_decode_sse41_block(
         return Ok(Some(64));
     }
 
-    let eq = if specials != 0 {
-        unsafe { sse2_mask64(vectors, b'=') }
+    let (eq_cmp, eq) = if specials != 0 {
+        unsafe { sse_eq_compares(vectors) }
     } else {
-        0
+        ([_mm_setzero_si128(); 4], 0)
     };
     let esc_first = esc_first as u64;
-    let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+    let eq_shift1 = (eq << 1) | esc_first;
+    // `fix_eq_mask` is the identity on a mask with no consecutive `=`, so this
+    // is value-identical to running it unconditionally.
+    let collision = (eq & eq_shift1) != 0;
+    let fixed_eq = if collision {
+        fix_eq_mask(eq, eq_shift1)
+    } else {
+        eq
+    };
     let escaped = (fixed_eq << 1) | esc_first;
     let entry_line_start = (state.state == DecoderState::CrLf) as u64;
 
@@ -604,15 +771,49 @@ pub(super) unsafe fn try_decode_sse41_block(
         return Ok(Some(64));
     }
 
-    let decoded_a = unsafe { sse41_decode_with_escape_mask(a, (escaped & 0xffff) as u16) };
-    let decoded_b = unsafe { sse41_decode_with_escape_mask(b, ((escaped >> 16) & 0xffff) as u16) };
-    let decoded_c = unsafe { sse41_decode_with_escape_mask(c, ((escaped >> 32) & 0xffff) as u16) };
-    let decoded_d = unsafe { sse41_decode_with_escape_mask(d, ((escaped >> 48) & 0xffff) as u16) };
+    // Isolated escapes (the overwhelmingly common case) come straight off the
+    // `=` compares; only a genuine consecutive-`=` run needs the corrected
+    // `escaped` mask expanded through the scalar offset array.
+    let decoded = if collision {
+        [
+            unsafe { sse_escape_decode(a, (escaped & 0xffff) as u16) },
+            unsafe { sse_escape_decode(b, ((escaped >> 16) & 0xffff) as u16) },
+            unsafe { sse_escape_decode(c, ((escaped >> 32) & 0xffff) as u16) },
+            unsafe { sse_escape_decode(d, ((escaped >> 48) & 0xffff) as u16) },
+        ]
+    } else {
+        unsafe { sse_decode_isolated_escapes::<true>(vectors, eq_cmp, esc_first != 0) }
+    };
 
-    unsafe { compact_store_16_ssse3(decoded_a, (skip & 0xffff) as u16, output, dst) };
-    unsafe { compact_store_16_ssse3(decoded_b, ((skip >> 16) & 0xffff) as u16, output, dst) };
-    unsafe { compact_store_16_ssse3(decoded_c, ((skip >> 32) & 0xffff) as u16, output, dst) };
-    unsafe { compact_store_16_ssse3(decoded_d, ((skip >> 48) & 0xffff) as u16, output, dst) };
+    let table = compact_table_16();
+    unsafe { compact_store_16_ssse3(decoded[0], (skip & 0xffff) as u16, table, output, dst) };
+    unsafe {
+        compact_store_16_ssse3(
+            decoded[1],
+            ((skip >> 16) & 0xffff) as u16,
+            table,
+            output,
+            dst,
+        )
+    };
+    unsafe {
+        compact_store_16_ssse3(
+            decoded[2],
+            ((skip >> 32) & 0xffff) as u16,
+            table,
+            output,
+            dst,
+        )
+    };
+    unsafe {
+        compact_store_16_ssse3(
+            decoded[3],
+            ((skip >> 48) & 0xffff) as u16,
+            table,
+            output,
+            dst,
+        )
+    };
 
     state.state = x86_final_state_after_block(
         fixed_eq,
@@ -717,42 +918,85 @@ pub(super) unsafe fn sse2_mask64(vectors: [std::arch::x86_64::__m128i; 4], byte:
     a | (b << 16) | (c << 32) | (d << 48)
 }
 
+/// The four per-lane `=` compares of a 64-byte block plus the 64-bit `=` mask
+/// they reduce to. Keeping the compare vectors alive is what lets the escape
+/// offsets be selected straight off them ([`sse_decode_isolated_escapes`])
+/// instead of rebuilding a byte mask from `escaped` through memory.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "ssse3")]
-pub(super) unsafe fn ssse3_decode_with_escape_mask(
-    block: std::arch::x86_64::__m128i,
-    escaped: u16,
-) -> std::arch::x86_64::__m128i {
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn sse_eq_compares(
+    vectors: [std::arch::x86_64::__m128i; 4],
+) -> ([std::arch::x86_64::__m128i; 4], u64) {
     use std::arch::x86_64::*;
 
-    let mut offsets = [42u8.wrapping_neg(); 16];
-    for (lane, offset) in offsets.iter_mut().enumerate() {
-        if escaped & (1u16 << lane) != 0 {
-            *offset = 106u8.wrapping_neg();
-        }
-    }
-    let offsets = unsafe { _mm_loadu_si128(offsets.as_ptr() as *const __m128i) };
-    _mm_add_epi8(block, offsets)
+    let needle = _mm_set1_epi8(b'=' as i8);
+    let cmp = [
+        _mm_cmpeq_epi8(vectors[0], needle),
+        _mm_cmpeq_epi8(vectors[1], needle),
+        _mm_cmpeq_epi8(vectors[2], needle),
+        _mm_cmpeq_epi8(vectors[3], needle),
+    ];
+    let mask = (_mm_movemask_epi8(cmp[0]) as u16 as u64)
+        | ((_mm_movemask_epi8(cmp[1]) as u16 as u64) << 16)
+        | ((_mm_movemask_epi8(cmp[2]) as u16 as u64) << 32)
+        | ((_mm_movemask_epi8(cmp[3]) as u16 as u64) << 48);
+    (cmp, mask)
 }
 
+/// Isolated-escape decode for the four 16-byte lanes of a 64-byte block — the
+/// case `escaped == (eq << 1) | esc_first`, i.e. no consecutive-`=` run. The
+/// escaped lanes are exactly the `=` compares shifted one byte, so they come
+/// straight out of the compare vectors (the shape [`sse_raw_body`] already
+/// uses); lane 0's cross-block carry rides in through `yenc_offset` byte 0 (the
+/// oracle's `-42-64` trick). No mask→memory round-trip anywhere.
+///
+/// `BLEND_ADD` picks the SSE4.1 `pblendvb` offset select; the SSSE3 tier adds
+/// the `-64` marker onto `-42` instead. Both need SSSE3 (`palignr`) for the
+/// lane-to-lane escape carry, so this is never instantiated for plain SSE2.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse4.1")]
-pub(super) unsafe fn sse41_decode_with_escape_mask(
-    block: std::arch::x86_64::__m128i,
-    escaped: u16,
-) -> std::arch::x86_64::__m128i {
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn sse_decode_isolated_escapes<const BLEND_ADD: bool>(
+    vectors: [std::arch::x86_64::__m128i; 4],
+    eq_cmp: [std::arch::x86_64::__m128i; 4],
+    esc_first: bool,
+) -> [std::arch::x86_64::__m128i; 4] {
     use std::arch::x86_64::*;
 
-    let mut mask = [0u8; 16];
-    for (lane, mask_byte) in mask.iter_mut().enumerate() {
-        if escaped & (1u16 << lane) != 0 {
-            *mask_byte = 0xff;
-        }
+    let sub42 = _mm_set1_epi8(42i8.wrapping_neg());
+    let sub106 = _mm_set1_epi8(106i8.wrapping_neg());
+    let neg64 = _mm_set1_epi8(-64);
+    // byte 0 becomes -106 when an escape straddled in from the previous block.
+    let yenc_offset = if esc_first {
+        _mm_xor_si128(sub42, _mm_cvtsi32_si128(0x40))
+    } else {
+        sub42
+    };
+    // Lane i's escaped bytes are lane i's `=` compare shifted up one byte, with
+    // lane i-1's top byte carried in through palignr.
+    let sel = [
+        _mm_slli_si128::<1>(eq_cmp[0]),
+        _mm_alignr_epi8::<15>(eq_cmp[1], eq_cmp[0]),
+        _mm_alignr_epi8::<15>(eq_cmp[2], eq_cmp[1]),
+        _mm_alignr_epi8::<15>(eq_cmp[3], eq_cmp[2]),
+    ];
+    let base = [yenc_offset, sub42, sub42, sub42];
+    let mut decoded = [_mm_setzero_si128(); 4];
+    for lane in 0..4 {
+        decoded[lane] = if BLEND_ADD {
+            _mm_add_epi8(
+                vectors[lane],
+                _mm_blendv_epi8(base[lane], sub106, sel[lane]),
+            )
+        } else {
+            _mm_add_epi8(
+                _mm_add_epi8(vectors[lane], base[lane]),
+                _mm_and_si128(sel[lane], neg64),
+            )
+        };
     }
-    let mask = unsafe { _mm_loadu_si128(mask.as_ptr() as *const __m128i) };
-    let normal = _mm_set1_epi8(-42);
-    let escaped_offset = _mm_set1_epi8(-106);
-    _mm_add_epi8(block, _mm_blendv_epi8(normal, escaped_offset, mask))
+    decoded
 }
 
 /// Line-aware 64-byte-block driver for the pre-AVX2 tiers in the portable
@@ -909,6 +1153,7 @@ pub(super) unsafe fn try_decode_ssse3_line(
     // output cursor and hands the line back to the general path.
     let chunks = line_length / WIDTH;
     let sub42 = _mm_set1_epi8(42i8.wrapping_neg());
+    let table = compact_table_16();
     let dst_start = *dst;
     let mut esc_first = 0u64;
     for chunk_idx in 0..chunks {
@@ -918,8 +1163,14 @@ pub(super) unsafe fn try_decode_ssse3_line(
             *dst = dst_start;
             return Ok(None);
         }
-        let eq = unsafe { sse2_mask64(vectors, b'=') };
-        let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+        let (eq_cmp, eq) = unsafe { sse_eq_compares(vectors) };
+        let eq_shift1 = (eq << 1) | esc_first;
+        let collision = (eq & eq_shift1) != 0;
+        let fixed_eq = if collision {
+            fix_eq_mask(eq, eq_shift1)
+        } else {
+            eq
+        };
         let escaped = (fixed_eq << 1) | esc_first;
         let skip = fixed_eq;
 
@@ -944,11 +1195,19 @@ pub(super) unsafe fn try_decode_ssse3_line(
             }
             *dst += WIDTH;
         } else {
-            for (group, &vector) in vectors.iter().enumerate() {
-                let group_escaped = ((escaped >> (group * 16)) & 0xffff) as u16;
-                let decoded = unsafe { ssse3_decode_with_escape_mask(vector, group_escaped) };
+            let decoded = if collision {
+                [
+                    unsafe { sse_escape_decode(vectors[0], (escaped & 0xffff) as u16) },
+                    unsafe { sse_escape_decode(vectors[1], ((escaped >> 16) & 0xffff) as u16) },
+                    unsafe { sse_escape_decode(vectors[2], ((escaped >> 32) & 0xffff) as u16) },
+                    unsafe { sse_escape_decode(vectors[3], ((escaped >> 48) & 0xffff) as u16) },
+                ]
+            } else {
+                unsafe { sse_decode_isolated_escapes::<false>(vectors, eq_cmp, esc_first != 0) }
+            };
+            for (group, &vector) in decoded.iter().enumerate() {
                 let group_skip = ((skip >> (group * 16)) & 0xffff) as u16;
-                unsafe { compact_store_16_ssse3(decoded, group_skip, output, dst) };
+                unsafe { compact_store_16_ssse3(vector, group_skip, table, output, dst) };
             }
         }
 
@@ -965,6 +1224,7 @@ pub(super) unsafe fn try_decode_ssse3_line(
 pub(super) unsafe fn compact_store_16_ssse3(
     decoded: std::arch::x86_64::__m128i,
     skip_mask: u16,
+    table: &[[u8; 16]; 32768],
     output: &mut [u8],
     dst: &mut usize,
 ) {
@@ -975,9 +1235,11 @@ pub(super) unsafe fn compact_store_16_ssse3(
     // overwritten by the next store.
     debug_assert!(output.len().saturating_sub(*dst) >= 16);
     let keep = 16 - skip_mask.count_ones() as usize;
-    let shuffle = unsafe {
-        _mm_loadu_si128(compact_table_16()[(skip_mask & 0x7fff) as usize].as_ptr() as *const __m128i)
-    };
+    // `table` is hoisted by the caller: the shuffle LUT lives behind a
+    // `OnceLock`, and fetching it here ran the atomic acquire load four times
+    // per 64-byte block.
+    let shuffle =
+        unsafe { _mm_loadu_si128(table[(skip_mask & 0x7fff) as usize].as_ptr() as *const __m128i) };
     let packed = _mm_shuffle_epi8(decoded, shuffle);
     unsafe { _mm_storeu_si128(output.as_mut_ptr().add(*dst) as *mut __m128i, packed) };
     *dst += keep;
@@ -1104,10 +1366,12 @@ fn sse2_unshuf_table() -> &'static [[u8; 16]; 16] {
 unsafe fn sse_compact_vect(
     mask16: u32,
     mut data: std::arch::x86_64::__m128i,
+    table: &[[u8; 16]; 16],
 ) -> std::arch::x86_64::__m128i {
     use std::arch::x86_64::*;
 
-    let table = sse2_unshuf_table();
+    // `table` is hoisted by the caller (the `OnceLock` acquire load must not sit
+    // inside the per-window compaction).
     let mut m = mask16 & 0xffff;
     while m != 0 {
         let bit = 31 - m.leading_zeros(); // highest set bit, 0..=15
@@ -1153,7 +1417,7 @@ unsafe fn sse_escape_decode(
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool>(
+unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool, const SEARCH_END: bool>(
     input: &[u8],
     output: &mut [u8],
     state: &mut KernelState,
@@ -1164,6 +1428,10 @@ unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool>(
 
     let mut src = 0usize;
     let mut dst = 0usize;
+    // Oracle `lenBuffer` for `isRaw && searchEnd` is `width-1 + 3 + 1`
+    // (decoder_common.h:44-46) == this 35, and the widest lookahead here is the
+    // lane-B `+4` view ending at `src + WIDTH + 3`; the loop bound
+    // (`src + WIDTH <= len - tail`) leaves a further WIDTH bytes of slack.
     let tail = WIDTH - 1 + 4; // 35
     let simd_limit = input.len().saturating_sub(tail);
 
@@ -1174,6 +1442,12 @@ unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool>(
     let eq_needle = _mm_set1_epi8(b'=' as i8);
     let cr = _mm_set1_epi8(b'\r' as i8);
     let lf = _mm_set1_epi8(b'\n' as i8);
+    let y_needle = _mm_set1_epi8(b'y' as i8);
+    let eq_y = _mm_set1_epi16(0x793d); // "=y", u16-aligned
+    // Compaction LUTs, hoisted out of the window loop (both live behind a
+    // `OnceLock`; the acquire load must not run per window).
+    let table = compact_table_16();
+    let unshuf = sse2_unshuf_table();
     // Single 16-byte specials LUT (`_mm_shuffle_epi8` is 16-lane): slot i maps
     // `.`\n`\r`= to itself, everything else to -1 (never self-matches).
     let special_lut = _mm_set_epi8(
@@ -1223,6 +1497,11 @@ unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool>(
             lf_compare = _mm_insert_epi16::<0>(lf_compare, word);
         }
     }
+
+    // Set when the SEARCH_END probe aborts a window (oracle `len += i; break;`):
+    // the window is left unconsumed and the exit state comes from the
+    // no-backtrack rule instead of the trailing-bytes lookback.
+    let mut broke = false;
 
     if input.len() > WIDTH * 2 {
         while src + WIDTH <= simd_limit {
@@ -1282,6 +1561,23 @@ unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool>(
                 if mask != mask_eq {
                     let tmp2a = _mm_loadu_si128(input.as_ptr().add(src + 2) as *const __m128i);
                     let tmp2b = _mm_loadu_si128(input.as_ptr().add(src + 18) as *const __m128i);
+                    // `=` at lane+2 (oracle decoder_sse_base.h:224-232). SSSE3+
+                    // takes lane A's view from the two `=` compares via palignr
+                    // instead of a second unaligned load.
+                    let match2_eq_a = if SEARCH_END {
+                        if FAST_MATCH {
+                            _mm_alignr_epi8::<2>(cmp_eq_b, cmp_eq_a)
+                        } else {
+                            _mm_cmpeq_epi8(eq_needle, tmp2a)
+                        }
+                    } else {
+                        _mm_setzero_si128()
+                    };
+                    let match2_eq_b = if SEARCH_END {
+                        _mm_cmpeq_epi8(eq_needle, tmp2b)
+                    } else {
+                        _mm_setzero_si128()
+                    };
                     if FAST_MATCH {
                         cmp_cr_a = _mm_cmpeq_epi8(o_data_a, cr);
                         cmp_cr_b = _mm_cmpeq_epi8(o_data_b, cr);
@@ -1305,6 +1601,68 @@ unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool>(
                         let m1nl_b = _mm_and_si128(m1lf_b, cmp_cr_b);
                         let m2nldot_a = _mm_and_si128(m2cr_a, m1nl_a);
                         let mut m2nldot_b = _mm_and_si128(m2cr_b, m1nl_b);
+
+                        // Terminator probe with a stuffed dot in the window
+                        // (oracle decoder_sse_base.h:285-372): `\r\n.\r\n`,
+                        // `\r\n.=y` and `\r\n=y`. Runs BEFORE the `mask` merge,
+                        // so an aborted window reports the pre-merge mask to
+                        // the no-backtrack exit rule, exactly like the oracle.
+                        if SEARCH_END {
+                            let tmp3a =
+                                _mm_loadu_si128(input.as_ptr().add(src + 3) as *const __m128i);
+                            let tmp3b =
+                                _mm_loadu_si128(input.as_ptr().add(src + 19) as *const __m128i);
+                            let tmp4a =
+                                _mm_loadu_si128(input.as_ptr().add(src + 4) as *const __m128i);
+                            let tmp4b =
+                                _mm_loadu_si128(input.as_ptr().add(src + 20) as *const __m128i);
+
+                            let m3cr_a = _mm_cmpeq_epi8(cr, tmp3a);
+                            let m3cr_b = _mm_cmpeq_epi8(cr, tmp3b);
+                            let m4lf_a = _mm_cmpeq_epi8(tmp4a, lf);
+                            let m4lf_b = _mm_cmpeq_epi8(tmp4b, lf);
+                            // `=y` at lane+3 for ODD lanes: the u16-aligned pair
+                            // (lane+3, lane+4) of the `+4` view, kept in the
+                            // high byte of its u16 by the `slli` (oracle :354).
+                            let m4eqy_a = _mm_slli_epi16::<8>(_mm_cmpeq_epi16(tmp4a, eq_y));
+                            let m4eqy_b = _mm_slli_epi16::<8>(_mm_cmpeq_epi16(tmp4b, eq_y));
+                            // `=y` at lane+2.
+                            let m3eqy_a =
+                                _mm_and_si128(match2_eq_a, _mm_cmpeq_epi8(y_needle, tmp3a));
+                            let m3eqy_b =
+                                _mm_and_si128(match2_eq_b, _mm_cmpeq_epi8(y_needle, tmp3b));
+                            // `srli_epi16(m3eqy, 8)` moves each odd lane's
+                            // "`=y` at lane+2" down to the even lane below it,
+                            // where it reads "`=y` at lane+3" — the even-lane
+                            // half of the same predicate (oracle :359-360).
+                            let m4end_a = _mm_and_si128(
+                                _mm_or_si128(
+                                    _mm_and_si128(m3cr_a, m4lf_a),
+                                    _mm_or_si128(m4eqy_a, _mm_srli_epi16::<8>(m3eqy_a)),
+                                ),
+                                m2nldot_a,
+                            );
+                            let m4end_b = _mm_and_si128(
+                                _mm_or_si128(
+                                    _mm_and_si128(m3cr_b, m4lf_b),
+                                    _mm_or_si128(m4eqy_b, _mm_srli_epi16::<8>(m3eqy_b)),
+                                ),
+                                m2nldot_b,
+                            );
+                            // `\r\n=y`.
+                            let m3end_a = _mm_and_si128(m3eqy_a, m1nl_a);
+                            let m3end_b = _mm_and_si128(m3eqy_b, m1nl_b);
+                            let any_end = _mm_movemask_epi8(_mm_or_si128(
+                                _mm_or_si128(m4end_a, m3end_a),
+                                _mm_or_si128(m4end_b, m3end_b),
+                            ));
+                            if any_end != 0 {
+                                state.state = x86_break_state(input, src, mask as u64, esc_first);
+                                broke = true;
+                                break;
+                            }
+                        }
+
                         mask |= (_mm_movemask_epi8(m2nldot_a) as u32) << 2;
                         mask |= (_mm_movemask_epi8(m2nldot_b) as u32) << 18; // u32 drops bits >=32
                         m2nldot_b = _mm_srli_si128::<14>(m2nldot_b);
@@ -1314,10 +1672,66 @@ unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool>(
                             // '.' | '\n' == '.' folds the carry into lf_compare.
                             lf_compare = _mm_or_si128(_mm_and_si128(m2nldot_b, dot), lf);
                         }
-                    } else if FAST_MATCH {
-                        min_mask = dot;
                     } else {
-                        lf_compare = lf;
+                        // Terminator probe without a stuffed dot in the window
+                        // (oracle decoder_sse_base.h:398-489): only `\r\n=y` is
+                        // reachable — any `\r\n.` shape would have set `partial`.
+                        //
+                        // DELIBERATE ASYMMETRY WITH NEON — MEASURED, DO NOT
+                        // "FIX" BY SYMMETRY. See the matching note in
+                        // `x86_avx2::decode_kernel_avx2_raw` for the full 2026-08-13
+                        // A/B. This tier is the one the Synology DS1819+
+                        // (Denverton C3538, no AVX) dispatches to, and it was
+                        // measured there specifically because the searchEnd tax
+                        // is ~2x the oracle's ratio on that box. Porting NEON's
+                        // mask-space test + pending carry made it WORSE, not
+                        // better: until_end +6.3% realshape / +5.2% esc_only,
+                        // bench-shape +4.3% / +4.2%, with decode_only flat.
+                        // `esc_only` never reaches this branch, so that ~5% is
+                        // the carry's unconditional loop-top re-test on its own —
+                        // a narrow core pays for the serial scalar dependency
+                        // exactly where the vector work it removes was already
+                        // off the critical path. A carry-free variant (mask-space
+                        // gate only) measured neutral (realshape +0.4%, crlf
+                        // -2.1%, esc_only +2.3%). Neither adopted.
+                        if SEARCH_END {
+                            let tmp3a =
+                                _mm_loadu_si128(input.as_ptr().add(src + 3) as *const __m128i);
+                            let tmp3b =
+                                _mm_loadu_si128(input.as_ptr().add(src + 19) as *const __m128i);
+                            let m3eqy_a =
+                                _mm_and_si128(match2_eq_a, _mm_cmpeq_epi8(y_needle, tmp3a));
+                            let m3eqy_b =
+                                _mm_and_si128(match2_eq_b, _mm_cmpeq_epi8(y_needle, tmp3b));
+                            if _mm_movemask_epi8(_mm_or_si128(m3eqy_a, m3eqy_b)) != 0 {
+                                let cr_a = _mm_cmpeq_epi8(o_data_a, cr);
+                                let cr_b = _mm_cmpeq_epi8(o_data_b, cr);
+                                let m1lf_a = _mm_cmpeq_epi8(
+                                    lf,
+                                    _mm_loadu_si128(input.as_ptr().add(src + 1) as *const __m128i),
+                                );
+                                let m1lf_b = _mm_cmpeq_epi8(
+                                    lf,
+                                    _mm_loadu_si128(input.as_ptr().add(src + 17) as *const __m128i),
+                                );
+                                let end_found = _mm_movemask_epi8(_mm_or_si128(
+                                    _mm_and_si128(m3eqy_a, _mm_and_si128(m1lf_a, cr_a)),
+                                    _mm_and_si128(m3eqy_b, _mm_and_si128(m1lf_b, cr_b)),
+                                ));
+                                if end_found != 0 {
+                                    state.state =
+                                        x86_break_state(input, src, mask as u64, esc_first);
+                                    broke = true;
+                                    break;
+                                }
+                            }
+                        }
+                        // `\r\n` present but no stuffed dot: reset the carry.
+                        if FAST_MATCH {
+                            min_mask = dot;
+                        } else {
+                            lf_compare = lf;
+                        }
                     }
                 }
                 // when mask == mask_eq the carry is intentionally left intact.
@@ -1389,18 +1803,19 @@ unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool>(
 
                 // --- compaction (skip == mask & !escaped) -----------------
                 if FAST_MATCH {
-                    compact_store_16_ssse3(data_a, (skip & 0xffff) as u16, output, &mut dst);
+                    compact_store_16_ssse3(data_a, (skip & 0xffff) as u16, table, output, &mut dst);
                     compact_store_16_ssse3(
                         data_b,
                         ((skip >> 16) & 0xffff) as u16,
+                        table,
                         output,
                         &mut dst,
                     );
                 } else {
-                    let packed_a = sse_compact_vect(skip & 0xffff, data_a);
+                    let packed_a = sse_compact_vect(skip & 0xffff, data_a, unshuf);
                     _mm_storeu_si128(output.as_mut_ptr().add(dst) as *mut __m128i, packed_a);
                     dst += 16 - (skip & 0xffff).count_ones() as usize;
-                    let packed_b = sse_compact_vect(skip >> 16, data_b);
+                    let packed_b = sse_compact_vect(skip >> 16, data_b, unshuf);
                     _mm_storeu_si128(output.as_mut_ptr().add(dst) as *mut __m128i, packed_b);
                     dst += 16 - (skip >> 16).count_ones() as usize;
                 }
@@ -1426,7 +1841,9 @@ unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool>(
     // fires the gate but is too short for a 32-byte window (`simd_limit < 32`),
     // so `src` stays 0 and the carried entry state (e.g. `CrLf` with a stuffed
     // dot at byte 0) must survive untouched into the scalar epilogue.
-    if src > 0 {
+    // A SEARCH_END break already set the state from the no-backtrack rule over
+    // the unconsumed window, so the (backtracking) lookback must not run.
+    if !broke && src > 0 {
         let out_next_mask: u16 = if src >= 2 && src + 1 < input.len() {
             if input[src - 2] == b'\r' && input[src - 1] == b'\n' && input[src] == b'.' {
                 1
@@ -1465,33 +1882,33 @@ unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool>(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn decode_kernel_sse2_raw(
+unsafe fn decode_kernel_sse2_raw<const SEARCH_END: bool>(
     input: &[u8],
     output: &mut [u8],
     state: &mut KernelState,
     mode: DecodeStepMode,
 ) -> Result<KernelOutcome, YencError> {
-    unsafe { sse_raw_body::<false, false>(input, output, state, mode) }
+    unsafe { sse_raw_body::<false, false, SEARCH_END>(input, output, state, mode) }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
-unsafe fn decode_kernel_ssse3_raw(
+unsafe fn decode_kernel_ssse3_raw<const SEARCH_END: bool>(
     input: &[u8],
     output: &mut [u8],
     state: &mut KernelState,
     mode: DecodeStepMode,
 ) -> Result<KernelOutcome, YencError> {
-    unsafe { sse_raw_body::<true, false>(input, output, state, mode) }
+    unsafe { sse_raw_body::<true, false, SEARCH_END>(input, output, state, mode) }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1,ssse3")]
-unsafe fn decode_kernel_sse41_raw(
+unsafe fn decode_kernel_sse41_raw<const SEARCH_END: bool>(
     input: &[u8],
     output: &mut [u8],
     state: &mut KernelState,
     mode: DecodeStepMode,
 ) -> Result<KernelOutcome, YencError> {
-    unsafe { sse_raw_body::<true, true>(input, output, state, mode) }
+    unsafe { sse_raw_body::<true, true, SEARCH_END>(input, output, state, mode) }
 }

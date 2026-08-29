@@ -1,0 +1,27 @@
+{
+  "slug": "par2-optional-prefix-hole",
+  "title": "E2E.Test.PAR2.Optional.Prefix.Hole.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A clean payload beside an optional PAR2 recovery carrier whose leading article is unavailable while a later article remains posted. The incomplete carrier must exhaust without blocking completion or starting repair.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 65536,
+  "fixtureAssets": [
+    "single-mkv/test-media.mkv",
+    "par2-direct-repair/test-media.mkv.par2",
+    "par2-obfuscated-rar-rewrite/archive.rar.vol00+1.par2"
+  ],
+  "deleteSegmentNumbers": [
+    1
+  ],
+  "deleteSegmentSubjectContains": [
+    "archive.rar.vol00+1.par2"
+  ],
+  "forbiddenJobEvents": [
+    "RepairStarted",
+    "RepairComplete",
+    "RepairFailed"
+  ],
+  "expectedOutputBLAKE3": {
+    "E2E Test PAR2 Optional Prefix Hole.mkv": "8139650c53be5684ab9cf20e34996fcfb510f118ee652ad7b949c32e8cb8b08a"
+  }
+}

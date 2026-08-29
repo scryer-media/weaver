@@ -2,8 +2,7 @@
 # avx2-aws-userdata.sh — EC2 cloud-init user-data. Runs on boot as root on a
 # fresh Ubuntu 24.04 AMD Zen2/Zen3 (c5a/c6a) instance and drives the whole AVX2
 # weaver-vs-rapidyenc perf profile end to end, unattended:
-#   1. fetch the weaver working tree (S3 tarball — handles uncommitted WIP —
-#      or a git clone as fallback)
+#   1. fetch the Weaver source archive from S3, or clone a Git ref as fallback
 #   2. run ci/bench/avx2-profile.sh (installs its own deps, builds weaver +
 #      rapidyenc, runs same-run ratio + perf topdown/annotate)
 #   3. push the results tarball to S3 AND echo summary+perf-stat to the serial
@@ -64,7 +63,8 @@ sudo -u "$RUN_USER" -H bash -lc "cd '$WEAVER_DIR' && chmod +x ci/bench/avx2-prof
   || echo "WARN: avx2-profile.sh returned non-zero (results may still be partial)"
 
 # ── 3. collect + publish results ─────────────────────────────────────────────
-RES_DIR="$(ls -1dt "$WEAVER_DIR"/ci/bench/results/avx2-* 2>/dev/null | head -1)"
+RES_DIR="$(find "$WEAVER_DIR/ci/bench/results" -mindepth 1 -maxdepth 1 \
+  -type d -name 'avx2-*' -print 2>/dev/null | sort -r | head -1)"
 if [ -n "$RES_DIR" ] && [ -d "$RES_DIR" ]; then
   TARBALL="/tmp/avx2-results-$(basename "$RES_DIR").tar.gz"
   tar czf "$TARBALL" -C "$(dirname "$RES_DIR")" "$(basename "$RES_DIR")"

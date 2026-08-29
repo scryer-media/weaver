@@ -70,8 +70,27 @@ pub(crate) fn record_value(label: &'static str, value: u64) {
     profiler().record_value(label.to_string(), value);
 }
 
+pub(crate) fn record_value_owned(label: String, value: u64) {
+    if !enabled() {
+        return;
+    }
+    profiler().record_value(label, value);
+}
+
 pub(crate) fn scope(label: &'static str) -> Scope {
     Scope {
+        label,
+        started: Instant::now(),
+        enabled: enabled(),
+    }
+}
+
+/// [`scope`] for a label only known at runtime (per-command / per-caller
+/// buckets). The `String` is built by the caller either way, so this stays out
+/// of the disabled fast path by never being reached when profiling is off —
+/// callers guard with [`enabled`] or accept one allocation.
+pub(crate) fn owned_scope(label: String) -> OwnedScope {
+    OwnedScope {
         label,
         started: Instant::now(),
         enabled: enabled(),
@@ -113,10 +132,42 @@ pub(crate) struct Scope {
     enabled: bool,
 }
 
+impl Scope {
+    /// Close the scope early and hand its wall duration back to the caller.
+    ///
+    /// Exactly **one** clock read: the returned `Duration` is the same value
+    /// the probe records, so a caller that wants both a profile bucket and a
+    /// metric observation never reads the clock twice. Clearing `enabled`
+    /// makes the `Drop` below a no-op, which is what keeps the second read
+    /// from happening.
+    pub(crate) fn finish(mut self) -> Duration {
+        let elapsed = self.started.elapsed();
+        if self.enabled {
+            profiler().record(self.label.to_string(), elapsed);
+            self.enabled = false;
+        }
+        elapsed
+    }
+}
+
 impl Drop for Scope {
     fn drop(&mut self) {
         if self.enabled {
             profiler().record(self.label.to_string(), self.started.elapsed());
+        }
+    }
+}
+
+pub(crate) struct OwnedScope {
+    label: String,
+    started: Instant,
+    enabled: bool,
+}
+
+impl Drop for OwnedScope {
+    fn drop(&mut self) {
+        if self.enabled {
+            profiler().record(std::mem::take(&mut self.label), self.started.elapsed());
         }
     }
 }
@@ -358,14 +409,15 @@ fn ns_to_us(ns: u128) -> u64 {
     u64::try_from(ns / 1_000).unwrap_or(u64::MAX)
 }
 
+/// Cumulative process (or thread) CPU time split by mode.
 #[derive(Clone, Copy)]
-struct CpuUsage {
+pub(crate) struct CpuUsage {
     user: Duration,
     system: Duration,
 }
 
 impl CpuUsage {
-    fn total(self) -> Duration {
+    pub(crate) fn total(self) -> Duration {
         self.user.saturating_add(self.system)
     }
 
@@ -389,8 +441,10 @@ fn cpu_util_pct(cpu: Duration, wall: Duration) -> u64 {
     u64::try_from(cpu.as_millis().saturating_mul(100) / wall_ms).unwrap_or(u64::MAX)
 }
 
+/// Cumulative CPU time consumed by this process. Shared with
+/// `runtime::process_metrics`, which samples it at scrape time.
 #[cfg(unix)]
-fn process_cpu_usage() -> Option<CpuUsage> {
+pub(crate) fn process_cpu_usage() -> Option<CpuUsage> {
     let mut usage = MaybeUninit::<libc::rusage>::uninit();
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
     if rc != 0 {
@@ -410,8 +464,10 @@ fn timeval_to_duration(timeval: libc::timeval) -> Duration {
     Duration::new(seconds, micros.saturating_mul(1_000))
 }
 
+/// Cumulative CPU time consumed by this process. Shared with
+/// `runtime::process_metrics`, which samples it at scrape time.
 #[cfg(windows)]
-fn process_cpu_usage() -> Option<CpuUsage> {
+pub(crate) fn process_cpu_usage() -> Option<CpuUsage> {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
     let mut times = [zero_filetime(); 4];
@@ -445,7 +501,7 @@ fn filetime_to_duration(filetime: windows_sys::Win32::Foundation::FILETIME) -> D
 }
 
 #[cfg(not(any(unix, windows)))]
-fn process_cpu_usage() -> Option<CpuUsage> {
+pub(crate) fn process_cpu_usage() -> Option<CpuUsage> {
     None
 }
 
@@ -523,6 +579,7 @@ fn classify_sql(template: &str) -> String {
         "active_rar_volume_facts",
         "active_detected_archives",
         "active_archive_headers",
+        "active_direct_coverage",
         "active_volume_status",
         "active_files",
         "active_jobs",

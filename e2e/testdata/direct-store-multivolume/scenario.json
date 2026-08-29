@@ -1,0 +1,10 @@
+{
+  "slug": "direct-store-multivolume",
+  "title": "Amber.Trail.S01E02.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "RAR5 store-method set split across three 8 MiB volumes, so one member spans volume boundaries.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "amber.trail.s01e02.mkv": "0f9527235f4aeccd73d0ef80e25572b51b96d4a9dfe96d24a73911590efed9ab"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "slug": "rar4-multi-member",
+  "title": "E2E.Test.RAR4.MultiMember.S01E01.E03.1080p-TESTGRP",
+  "description": "RAR4 with 3 episode members. Tests RAR4 multi-member extraction",
+  "category": "5000",
+  "expected_outcome": "success"
+}

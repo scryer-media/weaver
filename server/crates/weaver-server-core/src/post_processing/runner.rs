@@ -1,32 +1,41 @@
+//! Process execution for one script.
+//!
+//! The SABnzbd and NZBGet environment contracts are the load-bearing asset here:
+//! the existing ecosystem of scripts runs unmodified because `SAB_*`,
+//! `NZBPP_*`, `NZBPO_*` and `NZBOP_*` are built exactly as those programs build
+//! them, and the exit codes are interpreted the same way.
+
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, Mac, digest::KeyInit};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::watch;
 
-use super::model::{
-    ApprovedFilesystemRoot, ExtensionAdapter, ExtensionManifest, PipelineOutcome, ResolvedOption,
-    ResolvedOptionValue, TimeoutPolicy,
-};
-use super::persistence::{LogStream, MAX_LOGICAL_LINE_BYTES, MAX_PERSISTED_ATTEMPT_OUTPUT_BYTES};
+use super::model::{OptionValue, PipelineOutcome, ResolvedOption, ScriptAdapter, ScriptManifest};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 pub const DEFAULT_TERMINATION_GRACE: Duration = Duration::from_secs(10);
+/// A user cancellation must not inherit an arbitrarily long script shutdown grace.
+const MAX_USER_CANCELLATION_GRACE: Duration = Duration::from_secs(5);
+/// Per-script output retained on the job. Anything beyond this keeps the tail.
+pub const MAX_SCRIPT_OUTPUT_BYTES: u64 = 256 * 1024;
+pub const MAX_LOGICAL_LINE_BYTES: usize = 64 * 1024;
+
 const SUPERVISOR_ARG: &str = "__post-processing-supervisor";
 const MAX_SUPERVISOR_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_WEBHOOK_RETRIES: u32 = 10;
-const MAX_CONTROL_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
+
+fn user_cancellation_grace(grace: Duration) -> Duration {
+    grace.min(MAX_USER_CANCELLATION_GRACE)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct InterpreterConfig {
@@ -86,18 +95,15 @@ pub struct CompatibilityFacts {
 }
 
 #[derive(Debug, Clone)]
-pub struct ExtensionExecutionRequest {
-    pub attempt_id: String,
-    pub manifest: ExtensionManifest,
-    pub managed_path: PathBuf,
+pub struct ScriptExecutionRequest {
+    pub manifest: ScriptManifest,
+    /// Package directory for a manifest package, or the scripts directory for a bare script.
+    pub root: PathBuf,
     pub options: Vec<ResolvedOption>,
-    pub approved_roots: Vec<ApprovedFilesystemRoot>,
     pub context: JobExecutionContext,
-    pub timeout_policy: TimeoutPolicy,
+    pub timeout: Option<Duration>,
     pub termination_grace: Duration,
     pub interpreters: InterpreterConfig,
-    pub control_token: Option<String>,
-    pub diagnostic_command: Option<String>,
     #[doc(hidden)]
     pub supervisor_executable: Option<PathBuf>,
 }
@@ -105,64 +111,33 @@ pub struct ExtensionExecutionRequest {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ExecutionDisposition {
     Succeeded,
+    /// NZBGet exit 95: the script decided it had nothing to do.
     Skipped,
+    /// A SABnzbd script exited nonzero, which SABnzbd records as a warning.
+    Warned,
     Failed,
-    RepairRequested,
     Cancelled,
     TimedOut,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Default, Serialize, Deserialize)]
-pub struct ControlEffects {
-    pub directory: Option<PathBuf>,
-    pub final_directory: Option<PathBuf>,
-    pub parameters: BTreeMap<String, String>,
-    pub mark_bad: bool,
-    pub repair_requested: bool,
-    pub progress: Option<serde_json::Value>,
-    pub metadata: BTreeMap<String, serde_json::Value>,
-    pub artifacts: Vec<PathBuf>,
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct CapturedOutputLine {
-    pub sequence: u64,
-    pub stream: LogStream,
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ExtensionExecutionResult {
+pub struct ScriptExecutionResult {
     pub disposition: ExecutionDisposition,
     pub exit_code: Option<i32>,
-    pub output: Vec<CapturedOutputLine>,
+    /// Captured stdout/stderr, already truncated to the tail budget and redacted.
+    pub output: Vec<u8>,
     pub output_truncated: bool,
-    pub effects: ControlEffects,
     pub error_message: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunnerError {
-    #[error("managed extension entrypoint is unavailable or unsafe")]
+    #[error("script entrypoint is unavailable or unsafe")]
     InvalidEntrypoint,
-    #[error("managed extension package no longer matches its approved digest")]
-    UntrustedPackage,
-    #[error("extension interpreter is unavailable: {0}")]
-    MissingInterpreter(&'static str),
-    #[error("extension environment value is invalid")]
+    #[error("script environment value is invalid")]
     InvalidEnvironment,
-    #[error("extension timeout is too large for this platform")]
+    #[error("script timeout is too large for this platform")]
     InvalidTimeout,
-    #[error("extension control command requested a path outside approved roots")]
-    UnapprovedPath,
-    #[error("extension control effect contains sensitive data")]
-    SensitiveControlEffect,
-    #[error("this extension adapter does not support manifest diagnostics")]
-    UnsupportedDiagnosticAdapter,
-    #[error("webhook extension configuration is invalid: {0}")]
-    InvalidWebhookConfiguration(String),
-    #[error("webhook extension request failed: {0}")]
-    WebhookRequest(String),
     #[error("post-processing supervisor protocol failed: {0}")]
     SupervisorProtocol(String),
     #[error("post-processing process failed: {0}")]
@@ -194,47 +169,16 @@ impl OsStringWire {
     }
 }
 
-struct PreparedExecution {
-    supervisor_executable: Option<PathBuf>,
-    supervisor: SupervisorRequest,
-    adapter: ExtensionAdapter,
-    roots: Vec<PathBuf>,
-}
-
-pub async fn execute_extension(
-    request: ExtensionExecutionRequest,
+/// Run one script to completion, honouring cancellation and the timeout.
+pub async fn execute_script(
+    request: ScriptExecutionRequest,
     cancellation: Option<watch::Receiver<bool>>,
-) -> Result<ExtensionExecutionResult, RunnerError> {
-    execute_extension_inner(request, cancellation, None).await
-}
-
-pub async fn execute_extension_with_spawn_callback<F>(
-    request: ExtensionExecutionRequest,
-    cancellation: Option<watch::Receiver<bool>>,
-    on_spawn: F,
-) -> Result<ExtensionExecutionResult, RunnerError>
-where
-    F: FnOnce() -> Result<(), RunnerError> + Send + 'static,
-{
-    execute_extension_inner(request, cancellation, Some(Box::new(on_spawn))).await
-}
-
-async fn execute_extension_inner(
-    request: ExtensionExecutionRequest,
-    cancellation: Option<watch::Receiver<bool>>,
-    on_spawn: Option<Box<dyn FnOnce() -> Result<(), RunnerError> + Send>>,
-) -> Result<ExtensionExecutionResult, RunnerError> {
-    super::discovery::verify_managed_extension(
-        &request.managed_path,
-        request.manifest.revision().digest(),
-    )
-    .map_err(|_| RunnerError::UntrustedPackage)?;
-    let attempt_id = request.attempt_id.clone();
+) -> Result<ScriptExecutionResult, RunnerError> {
     let mut secrets = request
         .options
         .iter()
         .filter_map(|option| match option.value() {
-            ResolvedOptionValue::Secret(value) if !value.expose_for_execution().is_empty() => {
+            OptionValue::Secret(value) if !value.expose_for_execution().is_empty() => {
                 Some(value.expose_for_execution().as_bytes().to_vec())
             }
             _ => None,
@@ -249,80 +193,67 @@ async fn execute_extension_inner(
     {
         secrets.push(password.as_bytes().to_vec());
     }
-    if let Some(token) = request
-        .control_token
-        .as_deref()
-        .filter(|token| !token.is_empty())
-    {
-        secrets.push(token.as_bytes().to_vec());
-    }
-    let extension_id = request
-        .manifest
-        .revision()
-        .extension_id()
-        .as_str()
-        .to_string();
-    let timeout = timeout_duration(request.timeout_policy);
+
+    let adapter = request.manifest.adapter();
+    let display_name = request.manifest.display_name().to_string();
     let grace = if request.termination_grace.is_zero() {
         DEFAULT_TERMINATION_GRACE
     } else {
         request.termination_grace
     };
-    if timeout.is_some_and(|duration| Instant::now().checked_add(duration).is_none())
+    if request
+        .timeout
+        .is_some_and(|duration| Instant::now().checked_add(duration).is_none())
         || Instant::now().checked_add(grace).is_none()
     {
         return Err(RunnerError::InvalidTimeout);
     }
-    let adapter = request.manifest.adapter();
-    let prepared = (adapter != ExtensionAdapter::Webhook)
-        .then(|| prepare_execution(&request))
-        .transpose()?;
+
+    let prepared = prepare_execution(&request)?;
     tracing::info!(
-        attempt_id,
-        extension_id,
-        adapter = ?adapter,
-        timeout_seconds = timeout.map(|duration| duration.as_secs()),
-        "starting post-processing attempt"
+        script = %display_name,
+        adapter = adapter.as_str(),
+        job_id = request.context.job_id,
+        timeout_seconds = request.timeout.map(|duration| duration.as_secs()),
+        "starting post-processing script"
     );
     let started = Instant::now();
-    let mut result = if let Some(prepared) = prepared {
-        execute_supervised(prepared, timeout, grace, cancellation, on_spawn).await
-    } else {
-        execute_webhook(&request, timeout, cancellation, on_spawn).await
-    };
-    result = result
-        .and_then(|mut result| {
-            redact_execution_result(&mut result, &secrets)?;
-            Ok(result)
-        })
-        .map_err(|error| redact_runner_error(error, &secrets));
+    let mut result = execute_supervised(prepared, request.timeout, grace, cancellation).await;
+    if let Ok(result) = result.as_mut() {
+        result.output = redact_bytes(&result.output, &secrets);
+        if let Some(message) = &mut result.error_message {
+            *message = redact_string(message, &secrets);
+        }
+    }
     match &result {
         Ok(result) => tracing::info!(
-            attempt_id,
-            extension_id,
+            script = %display_name,
             result = ?result.disposition,
             exit_code = result.exit_code,
             duration_ms = started.elapsed().as_millis() as u64,
             output_truncated = result.output_truncated,
-            "post-processing attempt finished"
+            "post-processing script finished"
         ),
         Err(error) => tracing::info!(
-            attempt_id,
-            extension_id,
+            script = %display_name,
             error = %error,
             duration_ms = started.elapsed().as_millis() as u64,
-            "post-processing attempt could not run"
+            "post-processing script could not run"
         ),
     }
-    result
+    result.map_err(|error| redact_runner_error(error, &secrets))
 }
 
-fn prepare_execution(
-    request: &ExtensionExecutionRequest,
-) -> Result<PreparedExecution, RunnerError> {
-    let managed = fs::canonicalize(&request.managed_path)?;
-    let entrypoint = fs::canonicalize(managed.join(request.manifest.entrypoint()))?;
-    if !entrypoint.starts_with(&managed) || !entrypoint.is_file() {
+struct PreparedExecution {
+    supervisor_executable: Option<PathBuf>,
+    supervisor: SupervisorRequest,
+    adapter: ScriptAdapter,
+}
+
+fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecution, RunnerError> {
+    let root = fs::canonicalize(&request.root)?;
+    let entrypoint = fs::canonicalize(root.join(request.manifest.entrypoint()))?;
+    if !entrypoint.starts_with(&root) || !entrypoint.is_file() {
         return Err(RunnerError::InvalidEntrypoint);
     }
 
@@ -330,27 +261,8 @@ fn prepare_execution(
     let mut env = sanitized_platform_environment()?;
     let adapter_args = adapter_environment_and_args(request, &mut env)?;
     args.extend(adapter_args);
-    if let Some(token) = &request.control_token {
-        insert_env(&mut env, "WEAVER_PP_CONTROL_TOKEN", token)?;
-    }
-    insert_env(
-        &mut env,
-        "WEAVER_PP_ATTEMPT_ID",
-        request.attempt_id.as_str(),
-    )?;
 
-    let working_directory = fs::canonicalize(&request.context.working_directory)?;
     let final_directory = fs::canonicalize(&request.context.final_directory)?;
-    let mut roots = vec![working_directory.clone(), final_directory];
-    for root in &request.approved_roots {
-        match fs::canonicalize(root.as_str()) {
-            Ok(root) => roots.push(root),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    roots.sort();
-    roots.dedup();
 
     Ok(PreparedExecution {
         supervisor_executable: request.supervisor_executable.clone(),
@@ -361,10 +273,9 @@ fn prepare_execution(
                 .map(OsStringWire::from_os)
                 .collect::<Result<_, _>>()?,
             env,
-            cwd: working_directory,
+            cwd: final_directory,
         },
         adapter: request.manifest.adapter(),
-        roots,
     })
 }
 
@@ -430,25 +341,6 @@ fn resolve_program(
     }
 }
 
-fn native_context(request: &ExtensionExecutionRequest) -> serde_json::Value {
-    let context = &request.context;
-    serde_json::json!({
-        "schemaVersion": 1,
-        "attemptId": request.attempt_id,
-        "command": request.diagnostic_command.as_deref(),
-        "job": {
-            "id": context.job_id,
-            "name": context.name,
-            "nzbFilename": context.nzb_filename,
-            "category": context.category,
-            "workingDirectory": context.working_directory,
-            "finalDirectory": context.final_directory,
-        },
-        "pipelineOutcome": context.pipeline_outcome,
-        "options": option_object(&request.options),
-    })
-}
-
 #[cfg(unix)]
 fn parse_shebang(entrypoint: &Path) -> Result<Option<(PathBuf, Vec<OsString>)>, RunnerError> {
     let mut file = fs::File::open(entrypoint)?;
@@ -473,27 +365,12 @@ fn parse_shebang(entrypoint: &Path) -> Result<Option<(PathBuf, Vec<OsString>)>, 
 }
 
 fn adapter_environment_and_args(
-    request: &ExtensionExecutionRequest,
+    request: &ScriptExecutionRequest,
     env: &mut BTreeMap<OsStringWire, OsStringWire>,
 ) -> Result<Vec<OsString>, RunnerError> {
     let context = &request.context;
     match request.manifest.adapter() {
-        ExtensionAdapter::Native => {
-            if let Some(command) = request.diagnostic_command.as_deref() {
-                insert_env(env, "WEAVER_PP_COMMAND", command)?;
-            }
-            insert_env(
-                env,
-                "WEAVER_PP_CONTEXT",
-                &serde_json::to_string(&native_context(request))
-                    .map_err(|error| RunnerError::SupervisorProtocol(error.to_string()))?,
-            )?;
-            Ok(vec![])
-        }
-        ExtensionAdapter::Sabnzbd => {
-            if request.diagnostic_command.is_some() {
-                return Err(RunnerError::UnsupportedDiagnosticAdapter);
-            }
+        ScriptAdapter::Sabnzbd => {
             let status = sab_pipeline_status(&context.pipeline_outcome).to_string();
             let script_name = request
                 .manifest
@@ -509,7 +386,7 @@ fn adapter_environment_and_args(
                 ("SAB_GROUP", context.group.clone().unwrap_or_default()),
                 (
                     "SAB_COMPLETE_DIR",
-                    path_text(&context.working_directory)?.to_string(),
+                    path_text(&context.final_directory)?.to_string(),
                 ),
                 ("SAB_STATUS", "Running".to_string()),
                 ("SAB_PP_STATUS", status.clone()),
@@ -562,7 +439,7 @@ fn adapter_environment_and_args(
             }
             insert_options(env, "SAB_OPTION_", &request.options)?;
             Ok(vec![
-                context.working_directory.as_os_str().to_owned(),
+                context.final_directory.as_os_str().to_owned(),
                 OsString::from(&context.nzb_filename),
                 OsString::from(&context.name),
                 OsString::new(),
@@ -572,22 +449,12 @@ fn adapter_environment_and_args(
                 OsString::new(),
             ])
         }
-        ExtensionAdapter::Nzbget => {
-            if let Some(command) = request.diagnostic_command.as_deref() {
-                insert_env(env, "NZBCP_COMMAND", command)?;
-                insert_compat_options(env, "NZBPO", &request.options)?;
-                insert_nzbget_global_options(env, &context.compatibility)?;
-                return Ok(vec![]);
-            }
+        ScriptAdapter::Nzbget => {
             let status = nzbget_pipeline_status(context);
             let total_status = status.split_once('/').map_or(status, |(total, _)| total);
             insert_env(env, "NZBPP_NZBID", &context.job_id.to_string())?;
             insert_env(env, "NZBPP_NZBNAME", &context.name)?;
-            insert_env(
-                env,
-                "NZBPP_DIRECTORY",
-                path_text(&context.working_directory)?,
-            )?;
+            insert_env(env, "NZBPP_DIRECTORY", path_text(&context.final_directory)?)?;
             insert_env(env, "NZBPP_NZBFILENAME", &context.nzb_filename)?;
             insert_env(env, "NZBPP_QUEUEDFILE", &context.nzb_filename)?;
             insert_env(
@@ -628,9 +495,6 @@ fn adapter_environment_and_args(
             insert_nzbget_global_options(env, &context.compatibility)?;
             Ok(vec![])
         }
-        ExtensionAdapter::Webhook => Err(RunnerError::SupervisorProtocol(
-            "adapter used the wrong execution path".into(),
-        )),
     }
 }
 
@@ -762,160 +626,14 @@ fn insert_compat_options(
     Ok(())
 }
 
-fn option_object(options: &[ResolvedOption]) -> serde_json::Map<String, serde_json::Value> {
-    options
-        .iter()
-        .map(|option| {
-            (
-                option.name().as_str().to_string(),
-                option_value_json(option.value()),
-            )
-        })
-        .collect()
-}
-
-fn resolved_option<'a>(
-    request: &'a ExtensionExecutionRequest,
-    name: &str,
-) -> Option<&'a ResolvedOptionValue> {
-    request
-        .options
-        .iter()
-        .find(|option| option.name().as_str().eq_ignore_ascii_case(name))
-        .map(ResolvedOption::value)
-}
-
-fn option_value_text(value: &ResolvedOptionValue) -> String {
+fn option_value_text(value: &OptionValue) -> String {
     match value {
-        ResolvedOptionValue::String(value) => value.clone(),
-        ResolvedOptionValue::Integer(value) => value.to_string(),
-        ResolvedOptionValue::Number(value) => value.to_string(),
-        ResolvedOptionValue::Boolean(value) => if *value { "yes" } else { "no" }.to_string(),
-        ResolvedOptionValue::Secret(value) => value.expose_for_execution().to_string(),
+        OptionValue::String(value) => value.clone(),
+        OptionValue::Integer(value) => value.to_string(),
+        OptionValue::Number(value) => value.to_string(),
+        OptionValue::Boolean(value) => if *value { "yes" } else { "no" }.to_string(),
+        OptionValue::Secret(value) => value.expose_for_execution().to_string(),
     }
-}
-
-fn option_value_json(value: &ResolvedOptionValue) -> serde_json::Value {
-    match value {
-        ResolvedOptionValue::String(value) => serde_json::Value::String(value.clone()),
-        ResolvedOptionValue::Integer(value) => (*value).into(),
-        ResolvedOptionValue::Number(value) => serde_json::Value::Number(value.clone()),
-        ResolvedOptionValue::Boolean(value) => (*value).into(),
-        ResolvedOptionValue::Secret(value) => {
-            serde_json::Value::String(value.expose_for_execution().to_string())
-        }
-    }
-}
-
-fn redact_execution_result(
-    result: &mut ExtensionExecutionResult,
-    secrets: &[Vec<u8>],
-) -> Result<(), RunnerError> {
-    ensure_effect_paths_are_not_sensitive(&result.effects, secrets)?;
-    redact_output_lines(&mut result.output, secrets);
-    redact_string_map(&mut result.effects.parameters, secrets);
-    if let Some(progress) = &mut result.effects.progress {
-        redact_json(progress, secrets);
-    }
-    let metadata = std::mem::take(&mut result.effects.metadata);
-    for (key, mut value) in metadata {
-        redact_json(&mut value, secrets);
-        result
-            .effects
-            .metadata
-            .insert(redact_string(&key, secrets), value);
-    }
-    if let Some(message) = &mut result.error_message {
-        *message = redact_string(message, secrets);
-    }
-    Ok(())
-}
-
-fn ensure_effect_paths_are_not_sensitive(
-    effects: &ControlEffects,
-    secrets: &[Vec<u8>],
-) -> Result<(), RunnerError> {
-    let sensitive = effects
-        .directory
-        .iter()
-        .chain(effects.final_directory.iter())
-        .chain(effects.artifacts.iter())
-        .any(|path| contains_secret(path.to_string_lossy().as_bytes(), secrets));
-    if sensitive {
-        return Err(RunnerError::SensitiveControlEffect);
-    }
-    Ok(())
-}
-
-fn redact_output_lines(lines: &mut [CapturedOutputLine], secrets: &[Vec<u8>]) {
-    for stream in [LogStream::Stdout, LogStream::Stderr, LogStream::System] {
-        let indexes = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| (line.stream == stream).then_some(index))
-            .collect::<Vec<_>>();
-        let combined = indexes
-            .iter()
-            .flat_map(|index| lines[*index].bytes.iter().copied())
-            .collect::<Vec<_>>();
-        let mut mask = vec![false; combined.len()];
-        for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
-            let mut cursor = 0;
-            while cursor + secret.len() <= combined.len() {
-                let Some(offset) = combined[cursor..]
-                    .windows(secret.len())
-                    .position(|candidate| candidate == secret.as_slice())
-                else {
-                    break;
-                };
-                let start = cursor + offset;
-                mask[start..start + secret.len()].fill(true);
-                cursor = start + 1;
-            }
-        }
-        let mut offset = 0;
-        for index in indexes {
-            let length = lines[index].bytes.len();
-            lines[index].bytes =
-                redact_masked_bytes(&lines[index].bytes, &mask[offset..offset + length]);
-            offset += length;
-        }
-    }
-}
-
-fn redact_masked_bytes(input: &[u8], mask: &[bool]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(input.len());
-    let mut cursor = 0;
-    while cursor < input.len() {
-        if !mask[cursor] {
-            output.push(input[cursor]);
-            cursor += 1;
-            continue;
-        }
-        output.extend_from_slice(b"[REDACTED]");
-        while cursor < input.len() && mask[cursor] {
-            cursor += 1;
-        }
-    }
-    output
-}
-
-fn redact_string_map(values: &mut BTreeMap<String, String>, secrets: &[Vec<u8>]) {
-    let original = std::mem::take(values);
-    for (key, value) in original {
-        values.insert(redact_string(&key, secrets), redact_string(&value, secrets));
-    }
-}
-
-fn contains_secret(input: &[u8], secrets: &[Vec<u8>]) -> bool {
-    secrets
-        .iter()
-        .filter(|secret| !secret.is_empty())
-        .any(|secret| {
-            input
-                .windows(secret.len())
-                .any(|candidate| candidate == secret.as_slice())
-        })
 }
 
 fn redact_bytes(input: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
@@ -941,36 +659,11 @@ fn redact_string(input: &str, secrets: &[Vec<u8>]) -> String {
     String::from_utf8_lossy(&redact_bytes(input.as_bytes(), secrets)).into_owned()
 }
 
-fn redact_json(value: &mut serde_json::Value, secrets: &[Vec<u8>]) {
-    match value {
-        serde_json::Value::String(value) => *value = redact_string(value, secrets),
-        serde_json::Value::Array(values) => {
-            values
-                .iter_mut()
-                .for_each(|value| redact_json(value, secrets));
-        }
-        serde_json::Value::Object(values) => {
-            let original = std::mem::take(values);
-            for (key, mut value) in original {
-                redact_json(&mut value, secrets);
-                values.insert(redact_string(&key, secrets), value);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn redact_runner_error(error: RunnerError, secrets: &[Vec<u8>]) -> RunnerError {
     if secrets.is_empty() {
         return error;
     }
     match error {
-        RunnerError::InvalidWebhookConfiguration(message) => {
-            RunnerError::InvalidWebhookConfiguration(redact_string(&message, secrets))
-        }
-        RunnerError::WebhookRequest(message) => {
-            RunnerError::WebhookRequest(redact_string(&message, secrets))
-        }
         RunnerError::SupervisorProtocol(message) => {
             RunnerError::SupervisorProtocol(redact_string(&message, secrets))
         }
@@ -998,297 +691,12 @@ fn path_text(path: &Path) -> Result<&str, RunnerError> {
     path.to_str().ok_or(RunnerError::InvalidEnvironment)
 }
 
-fn timeout_duration(policy: TimeoutPolicy) -> Option<Duration> {
-    match policy {
-        TimeoutPolicy::Default24Hours => Some(DEFAULT_TIMEOUT),
-        TimeoutPolicy::Finite(seconds) => Some(Duration::from_secs(seconds.get())),
-        TimeoutPolicy::Unlimited => None,
-    }
-}
-
-async fn execute_webhook(
-    request: &ExtensionExecutionRequest,
-    timeout: Option<Duration>,
-    cancellation: Option<watch::Receiver<bool>>,
-    on_spawn: Option<Box<dyn FnOnce() -> Result<(), RunnerError> + Send>>,
-) -> Result<ExtensionExecutionResult, RunnerError> {
-    let operation = execute_webhook_with_retries(request, cancellation, on_spawn);
-    if let Some(timeout) = timeout {
-        match tokio::time::timeout(timeout, operation).await {
-            Ok(result) => result,
-            Err(_) => Ok(terminal_webhook_result(
-                ExecutionDisposition::TimedOut,
-                None,
-                Some("webhook attempt timed out".into()),
-            )),
-        }
-    } else {
-        operation.await
-    }
-}
-
-async fn execute_webhook_with_retries(
-    request: &ExtensionExecutionRequest,
-    mut cancellation: Option<watch::Receiver<bool>>,
-    on_spawn: Option<Box<dyn FnOnce() -> Result<(), RunnerError> + Send>>,
-) -> Result<ExtensionExecutionResult, RunnerError> {
-    let url = webhook_url(request)?;
-    let retries = webhook_retries(request)?;
-    let payload = webhook_payload(request);
-    let body = serde_json::to_vec(&payload)
-        .map_err(|error| RunnerError::InvalidWebhookConfiguration(error.to_string()))?;
-    let hmac_signature = webhook_secret(request, "webhook_hmac_secret")
-        .map(|secret| {
-            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| {
-                RunnerError::InvalidWebhookConfiguration("invalid HMAC secret".into())
-            })?;
-            mac.update(&body);
-            Ok::<_, RunnerError>(format!(
-                "sha256={}",
-                hex::encode(mac.finalize().into_bytes())
-            ))
-        })
-        .transpose()?;
-    let bearer = webhook_secret(request, "webhook_bearer_token");
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|_| RunnerError::WebhookRequest("could not build HTTP client".into()))?;
-
-    if let Some(on_spawn) = on_spawn {
-        on_spawn()?;
-    }
-    if cancellation
-        .as_ref()
-        .is_some_and(|receiver| *receiver.borrow())
-    {
-        return Ok(terminal_webhook_result(
-            ExecutionDisposition::Cancelled,
-            None,
-            Some("webhook attempt cancelled".into()),
-        ));
-    }
-
-    for retry in 0..=retries {
-        let mut builder = client
-            .post(url.clone())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header("Idempotency-Key", &request.attempt_id)
-            .header("X-Weaver-Attempt-ID", &request.attempt_id)
-            .body(body.clone());
-        if let Some(signature) = &hmac_signature {
-            builder = builder.header("X-Weaver-Signature", signature);
-        }
-        if let Some(token) = bearer.as_deref() {
-            builder = builder.bearer_auth(token);
-        }
-
-        let response = tokio::select! {
-            response = builder.send() => response,
-            () = wait_for_cancellation(&mut cancellation) => {
-                return Ok(terminal_webhook_result(
-                    ExecutionDisposition::Cancelled,
-                    None,
-                    Some("webhook attempt cancelled".into()),
-                ));
-            }
-        };
-        match response {
-            Ok(response)
-                if retry < retries
-                    && (response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        || response.status().is_server_error()) =>
-            {
-                tracing::debug!(
-                    attempt_id = request.attempt_id,
-                    retry,
-                    status = response.status().as_u16(),
-                    "retrying post-processing webhook"
-                );
-            }
-            Ok(response) => return webhook_response_result(response).await,
-            Err(error) if retry < retries => {
-                tracing::debug!(
-                    attempt_id = request.attempt_id,
-                    retry,
-                    timeout = error.is_timeout(),
-                    connect = error.is_connect(),
-                    "retrying post-processing webhook after transport failure"
-                );
-            }
-            Err(_) => return Err(RunnerError::WebhookRequest("transport failure".into())),
-        }
-
-        let backoff = Duration::from_millis(250_u64.saturating_mul(1_u64 << retry.min(6)));
-        tokio::select! {
-            () = tokio::time::sleep(backoff) => {}
-            () = wait_for_cancellation(&mut cancellation) => {
-                return Ok(terminal_webhook_result(
-                    ExecutionDisposition::Cancelled,
-                    None,
-                    Some("webhook attempt cancelled".into()),
-                ));
-            }
-        }
-    }
-    Err(RunnerError::WebhookRequest(
-        "webhook retry loop ended unexpectedly".into(),
-    ))
-}
-
-async fn wait_for_cancellation(cancellation: &mut Option<watch::Receiver<bool>>) {
-    let Some(receiver) = cancellation else {
-        std::future::pending::<()>().await;
-        return;
-    };
-    if *receiver.borrow() {
-        return;
-    }
-    let _ = receiver.changed().await;
-}
-
-fn webhook_url(request: &ExtensionExecutionRequest) -> Result<reqwest::Url, RunnerError> {
-    let raw = resolved_option(request, "webhook_url")
-        .map(option_value_text)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            RunnerError::InvalidWebhookConfiguration("webhook_url is required".into())
-        })?;
-    let url = reqwest::Url::parse(&raw)
-        .map_err(|error| RunnerError::InvalidWebhookConfiguration(error.to_string()))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(RunnerError::InvalidWebhookConfiguration(
-            "webhook_url must use http or https".into(),
-        ));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(RunnerError::InvalidWebhookConfiguration(
-            "webhook_url must not contain user information".into(),
-        ));
-    }
-    Ok(url)
-}
-
-fn webhook_retries(request: &ExtensionExecutionRequest) -> Result<u32, RunnerError> {
-    let Some(value) = resolved_option(request, "webhook_retries") else {
-        return Ok(2);
-    };
-    let retries = option_value_text(value).parse::<u32>().map_err(|_| {
-        RunnerError::InvalidWebhookConfiguration(
-            "webhook_retries must be an unsigned integer".into(),
-        )
-    })?;
-    if retries > MAX_WEBHOOK_RETRIES {
-        return Err(RunnerError::InvalidWebhookConfiguration(format!(
-            "webhook_retries cannot exceed {MAX_WEBHOOK_RETRIES}"
-        )));
-    }
-    Ok(retries)
-}
-
-fn webhook_secret(request: &ExtensionExecutionRequest, name: &str) -> Option<String> {
-    resolved_option(request, name)
-        .map(option_value_text)
-        .filter(|value| !value.is_empty())
-}
-
-fn webhook_payload(request: &ExtensionExecutionRequest) -> serde_json::Value {
-    let mut context = native_context(request);
-    let options = request
-        .options
-        .iter()
-        .filter(|option| {
-            !matches!(option.value(), ResolvedOptionValue::Secret(_))
-                && !option
-                    .name()
-                    .as_str()
-                    .to_ascii_lowercase()
-                    .starts_with("webhook_")
-        })
-        .map(|option| {
-            (
-                option.name().as_str().to_string(),
-                option_value_json(option.value()),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    context["options"] = options.into();
-    context
-}
-
-async fn webhook_response_result(
-    mut response: reqwest::Response,
-) -> Result<ExtensionExecutionResult, RunnerError> {
-    let status = response.status();
-    let header = format!("HTTP {}\n", status.as_u16()).into_bytes();
-    let max_body = usize::try_from(MAX_PERSISTED_ATTEMPT_OUTPUT_BYTES)
-        .unwrap_or(usize::MAX)
-        .saturating_sub(header.len());
-    let mut body = Vec::new();
-    let mut truncated = false;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| RunnerError::WebhookRequest("response body read failed".into()))?
-    {
-        let remaining = max_body.saturating_sub(body.len());
-        if chunk.len() > remaining {
-            body.extend_from_slice(&chunk[..remaining]);
-            truncated = true;
-            break;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    let mut output = vec![CapturedOutputLine {
-        sequence: 0,
-        stream: LogStream::Stdout,
-        bytes: header,
-    }];
-    for (index, bytes) in body.chunks(MAX_LOGICAL_LINE_BYTES).enumerate() {
-        output.push(CapturedOutputLine {
-            sequence: u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1),
-            stream: LogStream::Stdout,
-            bytes: bytes.to_vec(),
-        });
-    }
-    let succeeded = status.is_success();
-    Ok(ExtensionExecutionResult {
-        disposition: if succeeded {
-            ExecutionDisposition::Succeeded
-        } else {
-            ExecutionDisposition::Failed
-        },
-        exit_code: Some(i32::from(status.as_u16())),
-        output,
-        output_truncated: truncated,
-        effects: ControlEffects::default(),
-        error_message: (!succeeded).then(|| format!("webhook returned HTTP {}", status.as_u16())),
-    })
-}
-
-fn terminal_webhook_result(
-    disposition: ExecutionDisposition,
-    exit_code: Option<i32>,
-    error_message: Option<String>,
-) -> ExtensionExecutionResult {
-    ExtensionExecutionResult {
-        disposition,
-        exit_code,
-        output: vec![],
-        output_truncated: false,
-        effects: ControlEffects::default(),
-        error_message,
-    }
-}
-
 async fn execute_supervised(
     prepared: PreparedExecution,
     timeout: Option<Duration>,
     grace: Duration,
     cancellation: Option<watch::Receiver<bool>>,
-    on_spawn: Option<Box<dyn FnOnce() -> Result<(), RunnerError> + Send>>,
-) -> Result<ExtensionExecutionResult, RunnerError> {
+) -> Result<ScriptExecutionResult, RunnerError> {
     let executable = prepared
         .supervisor_executable
         .clone()
@@ -1306,14 +714,10 @@ async fn execute_supervised(
         use std::os::unix::process::CommandExt;
         command.as_std_mut().process_group(0);
     }
+    let spawn_started = Instant::now();
     let mut child = command.spawn()?;
     let supervisor_pid = child.id();
-    if let Some(on_spawn) = on_spawn
-        && let Err(error) = on_spawn()
-    {
-        terminate_supervisor(&mut child, supervisor_pid, grace).await?;
-        return Err(error);
-    }
+    crate::runtime::perf_probe::record("pp.runner.spawn_supervisor", spawn_started.elapsed());
     let request_json = serde_json::to_vec(&prepared.supervisor)
         .map_err(|error| RunnerError::SupervisorProtocol(error.to_string()))?;
     let request_length = u64::try_from(request_json.len())
@@ -1330,27 +734,14 @@ async fn execute_supervised(
     stdin.write_all(&request_json).await?;
 
     let output = Arc::new(Mutex::new(BoundedOutput::default()));
-    let sequence = Arc::new(AtomicU64::new(0));
     let stdout = child.stdout.take().ok_or_else(|| {
         RunnerError::SupervisorProtocol("supervisor stdout was unavailable".into())
     })?;
     let stderr = child.stderr.take().ok_or_else(|| {
         RunnerError::SupervisorProtocol("supervisor stderr was unavailable".into())
     })?;
-    let stdout_task = tokio::spawn(capture_stream(
-        stdout,
-        LogStream::Stdout,
-        output.clone(),
-        sequence.clone(),
-        prepared.adapter,
-    ));
-    let stderr_task = tokio::spawn(capture_stream(
-        stderr,
-        LogStream::Stderr,
-        output.clone(),
-        sequence,
-        prepared.adapter,
-    ));
+    let stdout_task = tokio::spawn(capture_stream(stdout, output.clone()));
+    let stderr_task = tokio::spawn(capture_stream(stderr, output.clone()));
 
     let deadline = timeout
         .map(|timeout| {
@@ -1360,25 +751,48 @@ async fn execute_supervised(
         })
         .transpose()?;
     let mut cancellation = cancellation;
-    let (status, forced) = loop {
-        if let Some(status) = child.try_wait()? {
-            break (Some(status), None);
+    // Exit, cancellation and the timeout are all awaited together rather than
+    // polled: waiting on the child reports the exit as soon as it happens, so a
+    // script producing no output costs no wall clock beyond its own runtime.
+    let (status, forced) = {
+        let cancelled = async {
+            match cancellation.as_mut() {
+                Some(receiver) => loop {
+                    if *receiver.borrow() {
+                        return;
+                    }
+                    if receiver.changed().await.is_err() {
+                        // Sender gone: nothing can cancel us any more.
+                        std::future::pending::<()>().await;
+                    }
+                },
+                // No cancellation channel: never fires.
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let timed_out = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            status = child.wait() => (Some(status?), None),
+            () = cancelled => {
+                terminate_supervisor(
+                    &mut child,
+                    supervisor_pid,
+                    user_cancellation_grace(grace),
+                )
+                .await?;
+                (None, Some(ExecutionDisposition::Cancelled))
+            }
+            () = timed_out => {
+                terminate_supervisor(&mut child, supervisor_pid, grace).await?;
+                (None, Some(ExecutionDisposition::TimedOut))
+            }
         }
-        if cancellation
-            .as_ref()
-            .is_some_and(|receiver| *receiver.borrow())
-        {
-            terminate_supervisor(&mut child, supervisor_pid, grace).await?;
-            break (None, Some(ExecutionDisposition::Cancelled));
-        }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            terminate_supervisor(&mut child, supervisor_pid, grace).await?;
-            break (None, Some(ExecutionDisposition::TimedOut));
-        }
-        if let Some(receiver) = cancellation.as_mut() {
-            let _ = receiver.has_changed();
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     };
     drop(stdin);
     stdout_task
@@ -1391,33 +805,25 @@ async fn execute_supervised(
         .map_err(|_| RunnerError::SupervisorProtocol("output collector remained shared".into()))?
         .into_inner()
         .map_err(|_| RunnerError::SupervisorProtocol("output collector was poisoned".into()))?;
-    let mut lines = captured.lines.into_iter().collect::<Vec<_>>();
-    lines.sort_by_key(|line| line.sequence);
-    if captured.control_overflow {
-        return Err(RunnerError::SupervisorProtocol(
-            "post-processing control output exceeded its logical-line or 4 MiB cumulative limit"
-                .into(),
-        ));
-    }
-    let mut control_lines = captured.control_lines;
-    control_lines.sort_by_key(|line| line.sequence);
-    let mut effects = parse_control_effects(prepared.adapter, &control_lines)?;
-    validate_effect_paths(&mut effects, &prepared.roots)?;
     let exit_code = status.as_ref().and_then(ExitStatus::code);
     let disposition = forced.unwrap_or_else(|| adapter_disposition(prepared.adapter, exit_code));
-    if disposition == ExecutionDisposition::RepairRequested {
-        effects.repair_requested = true;
+    if prepared.adapter == ScriptAdapter::Nzbget && exit_code == Some(92) {
+        // NZBGet's par-check request has no successor: repair is native and
+        // already authoritative by the time scripts run.
+        tracing::info!(
+            "post-processing script requested a PAR check (exit 92); weaver's repair stage is authoritative"
+        );
     }
-    Ok(ExtensionExecutionResult {
+    let output_truncated = captured.truncated;
+    Ok(ScriptExecutionResult {
         disposition,
         exit_code,
-        output: lines,
-        output_truncated: captured.truncated,
-        effects,
+        output: captured.into_bytes(),
+        output_truncated,
         error_message: match disposition {
-            ExecutionDisposition::TimedOut => Some("post-processing attempt timed out".into()),
-            ExecutionDisposition::Cancelled => Some("post-processing attempt was cancelled".into()),
-            ExecutionDisposition::Failed => Some(match exit_code {
+            ExecutionDisposition::TimedOut => Some("post-processing script timed out".into()),
+            ExecutionDisposition::Cancelled => Some("post-processing script was cancelled".into()),
+            ExecutionDisposition::Failed | ExecutionDisposition::Warned => Some(match exit_code {
                 Some(code) => format!("post-processing script exited with status {code}"),
                 None => "post-processing script terminated without an exit status".into(),
             }),
@@ -1428,40 +834,30 @@ async fn execute_supervised(
 
 #[derive(Default)]
 struct BoundedOutput {
-    lines: VecDeque<CapturedOutputLine>,
+    lines: VecDeque<Vec<u8>>,
     bytes: u64,
     truncated: bool,
-    control_lines: Vec<CapturedOutputLine>,
-    control_bytes: u64,
-    control_overflow: bool,
 }
 
 impl BoundedOutput {
-    fn push(&mut self, line: CapturedOutputLine, adapter: ExtensionAdapter) {
-        if is_control_line(adapter, &line) {
-            self.control_bytes = self.control_bytes.saturating_add(line.bytes.len() as u64);
-            if self.control_bytes <= MAX_CONTROL_OUTPUT_BYTES {
-                self.control_lines.push(line.clone());
-            } else {
-                self.control_overflow = true;
-            }
-        }
-        self.bytes = self.bytes.saturating_add(line.bytes.len() as u64);
+    fn push(&mut self, line: Vec<u8>) {
+        self.bytes = self.bytes.saturating_add(line.len() as u64);
         self.lines.push_back(line);
-        while self.bytes > MAX_PERSISTED_ATTEMPT_OUTPUT_BYTES && self.lines.len() > 1 {
-            let removed = self.lines.remove(1).expect("line after header exists");
-            self.bytes = self.bytes.saturating_sub(removed.bytes.len() as u64);
+        while self.bytes > MAX_SCRIPT_OUTPUT_BYTES && self.lines.len() > 1 {
+            let removed = self.lines.pop_front().expect("non-empty");
+            self.bytes = self.bytes.saturating_sub(removed.len() as u64);
             self.truncated = true;
         }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.lines.into_iter().flatten().collect()
     }
 }
 
 async fn capture_stream<R: AsyncRead + Unpin>(
     mut reader: R,
-    stream: LogStream,
     output: Arc<Mutex<BoundedOutput>>,
-    sequence: Arc<AtomicU64>,
-    adapter: ExtensionAdapter,
 ) -> Result<(), io::Error> {
     let mut pending = Vec::new();
     let mut buffer = [0_u8; 8192];
@@ -1472,218 +868,32 @@ async fn capture_stream<R: AsyncRead + Unpin>(
         }
         pending.extend_from_slice(&buffer[..count]);
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-            let mut line = pending.drain(..=newline).collect::<Vec<_>>();
-            split_and_capture(&mut line, stream, &output, &sequence, adapter);
+            let line = pending.drain(..=newline).collect::<Vec<_>>();
+            output.lock().expect("output collector poisoned").push(line);
         }
         while pending.len() > MAX_LOGICAL_LINE_BYTES {
-            if is_control_prefix(adapter, stream, &pending) {
-                output
-                    .lock()
-                    .expect("output collector poisoned")
-                    .control_overflow = true;
-            }
-            let mut line = pending.drain(..MAX_LOGICAL_LINE_BYTES).collect::<Vec<_>>();
-            split_and_capture(&mut line, stream, &output, &sequence, adapter);
+            let line = pending.drain(..MAX_LOGICAL_LINE_BYTES).collect::<Vec<_>>();
+            output.lock().expect("output collector poisoned").push(line);
         }
     }
     if !pending.is_empty() {
-        split_and_capture(&mut pending, stream, &output, &sequence, adapter);
+        output
+            .lock()
+            .expect("output collector poisoned")
+            .push(std::mem::take(&mut pending));
     }
     Ok(())
 }
 
-fn split_and_capture(
-    bytes: &mut Vec<u8>,
-    stream: LogStream,
-    output: &Arc<Mutex<BoundedOutput>>,
-    sequence: &AtomicU64,
-    adapter: ExtensionAdapter,
-) {
-    output.lock().expect("output collector poisoned").push(
-        CapturedOutputLine {
-            sequence: sequence.fetch_add(1, Ordering::Relaxed),
-            stream,
-            bytes: std::mem::take(bytes),
-        },
-        adapter,
-    );
-}
-
-fn is_control_line(adapter: ExtensionAdapter, line: &CapturedOutputLine) -> bool {
-    is_control_prefix(adapter, line.stream, &line.bytes)
-}
-
-fn is_control_prefix(adapter: ExtensionAdapter, stream: LogStream, bytes: &[u8]) -> bool {
-    stream == LogStream::Stdout
-        && match adapter {
-            ExtensionAdapter::Native => bytes.starts_with(b"[WEAVER] "),
-            ExtensionAdapter::Nzbget => bytes.starts_with(b"[NZB] "),
-            ExtensionAdapter::Sabnzbd | ExtensionAdapter::Webhook => false,
-        }
-}
-
-fn adapter_disposition(adapter: ExtensionAdapter, exit_code: Option<i32>) -> ExecutionDisposition {
+/// SABnzbd records any nonzero exit as a warning; NZBGet defines 93/94/95.
+fn adapter_disposition(adapter: ScriptAdapter, exit_code: Option<i32>) -> ExecutionDisposition {
     match (adapter, exit_code) {
-        (ExtensionAdapter::Native, Some(0)) | (ExtensionAdapter::Sabnzbd, Some(0)) => {
-            ExecutionDisposition::Succeeded
-        }
-        (ExtensionAdapter::Native, Some(10)) => ExecutionDisposition::Skipped,
-        (ExtensionAdapter::Nzbget, Some(92)) => ExecutionDisposition::RepairRequested,
-        (ExtensionAdapter::Nzbget, Some(93)) => ExecutionDisposition::Succeeded,
-        (ExtensionAdapter::Nzbget, Some(95)) => ExecutionDisposition::Skipped,
-        _ => ExecutionDisposition::Failed,
+        (ScriptAdapter::Sabnzbd, Some(0)) => ExecutionDisposition::Succeeded,
+        (ScriptAdapter::Sabnzbd, _) => ExecutionDisposition::Warned,
+        (ScriptAdapter::Nzbget, Some(92 | 93)) => ExecutionDisposition::Succeeded,
+        (ScriptAdapter::Nzbget, Some(95)) => ExecutionDisposition::Skipped,
+        (ScriptAdapter::Nzbget, _) => ExecutionDisposition::Failed,
     }
-}
-
-fn parse_control_effects(
-    adapter: ExtensionAdapter,
-    lines: &[CapturedOutputLine],
-) -> Result<ControlEffects, RunnerError> {
-    let mut effects = ControlEffects::default();
-    for line in lines.iter().filter(|line| line.stream == LogStream::Stdout) {
-        let text = String::from_utf8_lossy(&line.bytes);
-        let text = text.trim_end_matches(['\r', '\n']);
-        match adapter {
-            ExtensionAdapter::Native => {
-                let Some(frame) = text.strip_prefix("[WEAVER] ") else {
-                    continue;
-                };
-                let value: serde_json::Value = serde_json::from_str(frame).map_err(|error| {
-                    RunnerError::SupervisorProtocol(format!(
-                        "invalid native control frame: {error}"
-                    ))
-                })?;
-                apply_native_frame(&mut effects, value)?;
-            }
-            ExtensionAdapter::Nzbget => {
-                let Some(command) = text.strip_prefix("[NZB] ") else {
-                    continue;
-                };
-                apply_nzbget_command(&mut effects, command)?;
-            }
-            ExtensionAdapter::Sabnzbd | ExtensionAdapter::Webhook => {}
-        }
-    }
-    Ok(effects)
-}
-
-fn apply_native_frame(
-    effects: &mut ControlEffects,
-    value: serde_json::Value,
-) -> Result<(), RunnerError> {
-    let object = value.as_object().ok_or_else(|| {
-        RunnerError::SupervisorProtocol("native control frame must be an object".into())
-    })?;
-    let kind = object
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            RunnerError::SupervisorProtocol("native control frame is missing type".into())
-        })?;
-    match kind {
-        "progress" => effects.progress = Some(value),
-        "metadata" => {
-            let key = object
-                .get("key")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    RunnerError::SupervisorProtocol("metadata frame is missing key".into())
-                })?;
-            let value = object
-                .get("value")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            effects.metadata.insert(key.to_string(), value);
-        }
-        "artifact" => {
-            let path = object
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    RunnerError::SupervisorProtocol("artifact frame is missing path".into())
-                })?;
-            effects.artifacts.push(PathBuf::from(path));
-        }
-        "directory" => {
-            let path = object
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    RunnerError::SupervisorProtocol("directory frame is missing path".into())
-                })?;
-            effects.directory = Some(PathBuf::from(path));
-        }
-        "finalDirectory" => {
-            let path = object
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    RunnerError::SupervisorProtocol("finalDirectory frame is missing path".into())
-                })?;
-            effects.final_directory = Some(PathBuf::from(path));
-        }
-        "bad" => effects.mark_bad = true,
-        "repair" => effects.repair_requested = true,
-        other => {
-            return Err(RunnerError::SupervisorProtocol(format!(
-                "unsupported native control frame type {other}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn apply_nzbget_command(effects: &mut ControlEffects, command: &str) -> Result<(), RunnerError> {
-    if let Some(path) = command.strip_prefix("DIRECTORY=") {
-        effects.directory = Some(PathBuf::from(path));
-    } else if let Some(path) = command.strip_prefix("FINALDIR=") {
-        effects.final_directory = Some(PathBuf::from(path));
-    } else if let Some(parameter) = command.strip_prefix("NZBPR_") {
-        let (name, value) = parameter.split_once('=').ok_or_else(|| {
-            RunnerError::SupervisorProtocol("invalid NZBPR control command".into())
-        })?;
-        if name.is_empty() || name.chars().any(char::is_control) {
-            return Err(RunnerError::SupervisorProtocol(
-                "invalid NZBPR parameter name".into(),
-            ));
-        }
-        effects
-            .parameters
-            .insert(name.to_string(), value.to_string());
-    } else if command == "MARK=BAD" {
-        effects.mark_bad = true;
-    } else {
-        return Err(RunnerError::SupervisorProtocol(
-            "unsupported NZBGet control command".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_effect_paths(
-    effects: &mut ControlEffects,
-    roots: &[PathBuf],
-) -> Result<(), RunnerError> {
-    for path in effects
-        .directory
-        .iter_mut()
-        .chain(effects.final_directory.iter_mut())
-        .chain(effects.artifacts.iter_mut())
-    {
-        let canonical = canonicalize_effect_path(path)?;
-        if !roots.iter().any(|root| canonical.starts_with(root)) {
-            return Err(RunnerError::UnapprovedPath);
-        }
-        *path = canonical;
-    }
-    Ok(())
-}
-
-fn canonicalize_effect_path(path: &Path) -> Result<PathBuf, RunnerError> {
-    if !path.is_absolute() {
-        return Err(RunnerError::UnapprovedPath);
-    }
-    fs::canonicalize(path).map_err(|_| RunnerError::UnapprovedPath)
 }
 
 async fn terminate_supervisor(
@@ -1714,6 +924,7 @@ async fn terminate_supervisor(
         let _ = child.wait().await?;
         return Ok(());
     }
+    let _ = pid;
     child.kill().await?;
     let _ = child.wait().await?;
     Ok(())
@@ -1853,7 +1064,7 @@ fn terminate_on_parent_pipe_loss(_child: &mut std::process::Child) {
 
 #[cfg(test)]
 pub(crate) fn adapter_contract_for_test(
-    request: &ExtensionExecutionRequest,
+    request: &ScriptExecutionRequest,
 ) -> Result<(Vec<String>, BTreeMap<String, String>), RunnerError> {
     let mut env = BTreeMap::new();
     let args = adapter_environment_and_args(request, &mut env)?
@@ -1882,41 +1093,21 @@ pub(crate) fn adapter_contract_for_test(
 }
 
 #[cfg(test)]
-pub(crate) fn control_effects_for_test(
-    adapter: ExtensionAdapter,
-    lines: &[CapturedOutputLine],
-) -> Result<ControlEffects, RunnerError> {
-    parse_control_effects(adapter, lines)
+pub(crate) fn adapter_disposition_for_test(
+    adapter: ScriptAdapter,
+    exit_code: Option<i32>,
+) -> ExecutionDisposition {
+    adapter_disposition(adapter, exit_code)
 }
 
 #[cfg(test)]
-pub(crate) fn bounded_output_for_test(
-    adapter: ExtensionAdapter,
-    lines: Vec<Vec<u8>>,
-) -> Result<(Vec<CapturedOutputLine>, ControlEffects, bool), RunnerError> {
+pub(crate) fn bounded_output_for_test(lines: Vec<Vec<u8>>) -> (Vec<u8>, bool) {
     let mut captured = BoundedOutput::default();
-    for (sequence, bytes) in lines.into_iter().enumerate() {
-        captured.push(
-            CapturedOutputLine {
-                sequence: sequence as u64,
-                stream: LogStream::Stdout,
-                bytes,
-            },
-            adapter,
-        );
+    for line in lines {
+        captured.push(line);
     }
-    if captured.control_overflow {
-        return Err(RunnerError::SupervisorProtocol(
-            "post-processing control output exceeded its logical-line or 4 MiB cumulative limit"
-                .into(),
-        ));
-    }
-    let effects = parse_control_effects(adapter, &captured.control_lines)?;
-    Ok((
-        captured.lines.into_iter().collect(),
-        effects,
-        captured.truncated,
-    ))
+    let truncated = captured.truncated;
+    (captured.into_bytes(), truncated)
 }
 
 #[cfg(test)]
@@ -1925,18 +1116,8 @@ pub(crate) fn redact_bytes_for_test(input: &[u8], secrets: &[Vec<u8>]) -> Vec<u8
 }
 
 #[cfg(test)]
-pub(crate) fn redact_execution_result_for_test(
-    result: &mut ExtensionExecutionResult,
-    secrets: &[Vec<u8>],
-) -> Result<(), RunnerError> {
-    redact_execution_result(result, secrets)
-}
-
-#[cfg(test)]
-pub(crate) fn webhook_url_for_test(
-    request: &ExtensionExecutionRequest,
-) -> Result<reqwest::Url, RunnerError> {
-    webhook_url(request)
+pub(crate) fn cancellation_grace_for_test(grace: Duration) -> Duration {
+    user_cancellation_grace(grace)
 }
 
 #[cfg(windows)]

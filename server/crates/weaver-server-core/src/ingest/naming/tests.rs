@@ -1,4 +1,4 @@
-use super::derive_release_name;
+use super::{derive_release_name, strip_nzb_source_suffix};
 
 #[test]
 fn prefers_parsed_release_title() {
@@ -46,6 +46,26 @@ fn falls_back_to_basic_cleanup() {
         derive_release_name(Some("some._unknown.release_name.nzb"), None),
         "some unknown release name"
     );
+}
+
+#[test]
+fn strips_compressed_nzb_suffix_case_insensitively() {
+    assert_eq!(
+        strip_nzb_source_suffix("Some.Release.NZB.XZ"),
+        Some("Some.Release")
+    );
+    assert_eq!(
+        derive_release_name(Some("Some.Release.NZB.XZ"), None),
+        "Some Release"
+    );
+}
+
+#[test]
+fn strips_compressed_nzb_suffix_without_splitting_unicode() {
+    assert_eq!(strip_nzb_source_suffix("Молоко.nzb"), Some("Молоко"));
+    assert_eq!(strip_nzb_source_suffix("日本語.NZB.XZ"), Some("日本語"));
+    assert_eq!(strip_nzb_source_suffix("abc日本語"), None);
+    assert_eq!(derive_release_name(Some("日本語"), None), "日本語");
 }
 
 #[test]

@@ -1,0 +1,7 @@
+{
+  "slug": "obfuscated-rar-unknown-numeric",
+  "title": "E2E.Test.RAR5.Obfuscated.Unknown.Numeric.2024.1080p-TESTGRP",
+  "description": "Obfuscated RAR5 multi-volume set renamed to .10/.11/.12. Exercises content-signature recovery for unknown numeric suffix volumes.",
+  "category": "2000",
+  "expected_outcome": "success"
+}

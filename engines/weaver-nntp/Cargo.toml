@@ -12,7 +12,7 @@ weaver-yenc = { path = "../weaver-yenc", default-features = false }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
-rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
 webpki-roots = { workspace = true, default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }

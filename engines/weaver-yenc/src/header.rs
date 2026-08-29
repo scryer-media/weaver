@@ -1,5 +1,6 @@
+use crate::decode::DecodeOptions;
 use crate::error::YencError;
-use crate::types::YencMetadata;
+use crate::types::{YencHeaderDefects, YencMetadata};
 
 /// Parsed =yend trailer fields.
 #[derive(Debug, Default)]
@@ -8,16 +9,44 @@ pub struct YendFields {
     pub part: Option<u32>,
     pub pcrc32: Option<u32>,
     pub crc32: Option<u32>,
+    /// Trailer damage that was tolerated (unparseable `size=`/`crc32=`).
+    pub defects: YencHeaderDefects,
+}
+
+/// Match `keyword` at the start of `line`, requiring a space or tab separator
+/// immediately after it.
+///
+/// Both reference decoders detect control lines with a literal, case-sensitive
+/// prefix that *includes* the trailing space (sabctools `starts_with(line,
+/// "=ybegin ")`, nzbget `strncmp(buffer, "=ybegin ", 8)`), so a bare `=ybegin`
+/// with no separator is deliberately not a header there and is not one here
+/// either. The separator requirement is also what keeps junk lines that merely
+/// share a prefix (`=yb`, `=ybeginner notes`) from being mistaken for headers.
+///
+/// Weaver additionally accepts a tab separator, where both references accept
+/// only a space. That is a strict superset: it decodes articles they would
+/// treat as non-binary and cannot change how any article they accept is parsed.
+///
+/// Returns the field content after the keyword, line ending trimmed.
+fn strip_keyword<'a>(line: &'a [u8], keyword: &[u8]) -> Option<&'a [u8]> {
+    let rest = line.strip_prefix(keyword)?;
+    match rest.first() {
+        Some(b' ' | b'\t') => Some(trim_line_end(rest)),
+        _ => None,
+    }
+}
+
+/// True when `line` begins a yEnc control line for `keyword` (`=ybegin`,
+/// `=ypart`, `=yend`).
+pub fn is_control_line(line: &[u8], keyword: &[u8]) -> bool {
+    strip_keyword(line, keyword).is_some()
 }
 
 pub fn parse_ybegin_line(line: &[u8]) -> Result<YencMetadata, YencError> {
-    let content = line
-        .strip_prefix(b"=ybegin ")
-        .ok_or_else(|| YencError::InvalidHeader {
-            field: "=ybegin".to_string(),
-            reason: "missing =ybegin prefix".to_string(),
-        })?;
-    let content = trim_line_end(content);
+    let content = strip_keyword(line, b"=ybegin").ok_or_else(|| YencError::InvalidHeader {
+        field: "=ybegin".to_string(),
+        reason: "missing =ybegin prefix".to_string(),
+    })?;
     let mut fields = YbeginFieldRefs::default();
     visit_fields(content, |key, value| {
         if key_eq_ascii_ignore_case(key, b"name") {
@@ -33,25 +62,45 @@ pub fn parse_ybegin_line(line: &[u8]) -> Result<YencMetadata, YencError> {
         }
     });
 
+    // Reference decoders do not require any =ybegin field: sabctools reads
+    // `part`/`begin`/`end` and hands the rest to Python, and SABnzbd falls back
+    // to the NZB/subject when `name=` or `size=` are missing. Missing or
+    // unparseable fields therefore degrade to a neutral value and are recorded
+    // in `defects` rather than failing the article.
+    let mut defects = YencHeaderDefects::default();
+    let (size, size_missing, size_invalid) = tolerant_u64(fields.size);
+    defects.missing_size = size_missing;
+    defects.invalid_size = size_invalid;
+    let (line_length, line_missing, line_invalid) = tolerant_u64(fields.line);
+    defects.missing_line = line_missing;
+    defects.invalid_line = line_invalid;
+    let name = match fields.name {
+        Some(value) => bytes_to_string(value),
+        None => {
+            defects.missing_name = true;
+            String::new()
+        }
+    };
+
     Ok(YencMetadata {
-        name: bytes_to_string(required_field(fields.name, "name")?),
-        size: required_u64_field(fields.size, "size")?,
-        line_length: required_u64_field(fields.line, "line")? as u32,
-        part: optional_u64_field(fields.part, "part")?.map(|v| v as u32),
-        total: optional_u64_field(fields.total, "total")?.map(|v| v as u32),
+        name,
+        size: size.unwrap_or(0),
+        line_length: u32::try_from(line_length.unwrap_or(0)).unwrap_or(u32::MAX),
+        // `part`/`total` steer control flow (multi-part needs =ypart), so an
+        // unparseable value is treated as absent rather than guessed at.
+        part: tolerant_u64(fields.part).0.map(saturating_u32),
+        total: tolerant_u64(fields.total).0.map(saturating_u32),
         begin: None,
         end: None,
+        defects,
     })
 }
 
 pub fn apply_ypart_line(line: &[u8], metadata: &mut YencMetadata) -> Result<(), YencError> {
-    let content = line
-        .strip_prefix(b"=ypart ")
-        .ok_or_else(|| YencError::InvalidHeader {
-            field: "=ypart".to_string(),
-            reason: "missing =ypart prefix".to_string(),
-        })?;
-    let content = trim_line_end(content);
+    let content = strip_keyword(line, b"=ypart").ok_or_else(|| YencError::InvalidHeader {
+        field: "=ypart".to_string(),
+        reason: "missing =ypart prefix".to_string(),
+    })?;
     let mut fields = YpartFieldRefs::default();
     visit_fields(content, |key, value| {
         if key_eq_ascii_ignore_case(key, b"begin") {
@@ -63,17 +112,21 @@ pub fn apply_ypart_line(line: &[u8], metadata: &mut YencMetadata) -> Result<(), 
     let begin = required_u64_field(fields.begin, "begin")?;
     let end = required_u64_field(fields.end, "end")?;
 
+    // `end < begin` would make the part length negative; there is no sane
+    // recovery, so it stays a hard error (and keeps the length arithmetic from
+    // ever underflowing).
     if end < begin {
         return Err(YencError::InvalidHeader {
             field: "end".to_string(),
             reason: format!("end ({end}) < begin ({begin})"),
         });
     }
+    // `end > size` is a broken-poster class the ecosystem shrugs off: neither
+    // sabctools nor nzbget cross-checks =ypart against =ybegin size=. The part
+    // length (end - begin + 1) is still authoritative and still verified
+    // against the decoded byte count, so record the inconsistency and continue.
     if end > metadata.size {
-        return Err(YencError::InvalidHeader {
-            field: "end".to_string(),
-            reason: format!("end ({end}) > file size ({})", metadata.size),
-        });
+        metadata.defects.ypart_end_exceeds_size = true;
     }
 
     metadata.begin = Some(begin);
@@ -82,13 +135,10 @@ pub fn apply_ypart_line(line: &[u8], metadata: &mut YencMetadata) -> Result<(), 
 }
 
 pub fn parse_yend_line(line: &[u8]) -> Result<YendFields, YencError> {
-    let content = line
-        .strip_prefix(b"=yend ")
-        .ok_or_else(|| YencError::InvalidHeader {
-            field: "=yend".to_string(),
-            reason: "missing =yend prefix".to_string(),
-        })?;
-    let content = trim_line_end(content);
+    let content = strip_keyword(line, b"=yend").ok_or_else(|| YencError::InvalidHeader {
+        field: "=yend".to_string(),
+        reason: "missing =yend prefix".to_string(),
+    })?;
     let mut fields = YendFieldRefs::default();
     visit_fields(content, |key, value| {
         if key_eq_ascii_ignore_case(key, b"size") {
@@ -102,18 +152,60 @@ pub fn parse_yend_line(line: &[u8]) -> Result<YendFields, YencError> {
         }
     });
 
+    let mut defects = YencHeaderDefects::default();
+    let (size, _, size_invalid) = tolerant_u64(fields.size);
+    defects.invalid_yend_size = size_invalid;
+    // A CRC that cannot be parsed carries no information, so it is dropped
+    // rather than allowed to fail an otherwise complete article: this matches
+    // strtoul-based reference parsers, which never reject on a bad CRC field.
+    // Dropping it leaves the article *unverified*, which `CrcVerification`
+    // reports distinctly from *verified*.
+    let pcrc32 = fields
+        .pcrc32
+        .and_then(|value| parse_crc_hex_bytes(value).inspect_none(&mut defects.invalid_pcrc32));
+    let crc32 = fields
+        .crc32
+        .and_then(|value| parse_crc_hex_bytes(value).inspect_none(&mut defects.invalid_crc32));
+
     Ok(YendFields {
-        size: optional_u64_field(fields.size, "size")?,
-        part: optional_u64_field(fields.part, "part")?.map(|v| v as u32),
-        pcrc32: fields
-            .pcrc32
-            .map(|s| parse_crc_hex_bytes(s, "pcrc32"))
-            .transpose()?,
-        crc32: fields
-            .crc32
-            .map(|s| parse_crc_hex_bytes(s, "crc32"))
-            .transpose()?,
+        size,
+        part: tolerant_u64(fields.part).0.map(saturating_u32),
+        pcrc32,
+        crc32,
+        defects,
     })
+}
+
+/// Small helper so `Option`-returning field parses can flag their own defect
+/// inline without an intermediate `match`.
+trait InspectNone: Sized {
+    fn inspect_none(self, flag: &mut bool) -> Self;
+}
+
+impl<T> InspectNone for Option<T> {
+    fn inspect_none(self, flag: &mut bool) -> Self {
+        if self.is_none() {
+            *flag = true;
+        }
+        self
+    }
+}
+
+/// Parse an optional integer field, reporting `(value, missing, invalid)`.
+/// An unparseable value is reported as absent so callers degrade the same way
+/// for "not written" and "written as garbage".
+fn tolerant_u64(field: Option<&[u8]>) -> (Option<u64>, bool, bool) {
+    match field {
+        None => (None, true, false),
+        Some(value) => match parse_u64_opt(value) {
+            Some(parsed) => (Some(parsed), false, false),
+            None => (None, false, true),
+        },
+    }
+}
+
+fn saturating_u32(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// Result of parsing all yEnc headers from an article.
@@ -125,25 +217,113 @@ pub struct ParsedHeaders {
     pub yend: Option<YendFields>,
 }
 
-/// Find a line starting with the given prefix. Returns the byte offset of the
-/// prefix within `input`, or `None`.
-fn find_line_start(input: &[u8], prefix: &[u8]) -> Option<usize> {
-    // Check if the input itself starts with the prefix.
-    if input.starts_with(prefix) {
+/// Find a line starting with the given yEnc control keyword. Returns the byte
+/// offset of the keyword within `input`, or `None`.
+///
+/// The keyword must be followed by ASCII whitespace or end-of-line, so junk
+/// lines that merely share a prefix (`=yb`, `=ybegin_notes`) never match.
+fn find_line_start(input: &[u8], keyword: &[u8]) -> Option<usize> {
+    find_line_start_within(input, keyword, usize::MAX)
+}
+
+/// [`find_line_start`], giving up once a candidate line would start past
+/// `max_start`.
+///
+/// The bound matters for `=ybegin`: the streaming and fused decoders both stop
+/// scanning after [`crate::decode::MAX_HEADER_SCAN_BYTES`] of leading junk, and
+/// the whole-buffer path has to agree with them about which articles are
+/// header-less rather than scanning an arbitrarily long body.
+fn find_line_start_within(input: &[u8], keyword: &[u8], max_start: usize) -> Option<usize> {
+    // Check if the input itself starts with the keyword.
+    if is_control_line(input, keyword) {
         return Some(0);
     }
-    // Search for \n followed by the prefix (handles both \r\n and bare \n).
+    // Search for \n followed by the keyword (handles both \r\n and bare \n).
     let mut pos = 0;
     while pos < input.len() {
         if let Some(idx) = memchr_lf(&input[pos..]) {
             let abs = pos + idx + 1; // byte after \n
-            if abs < input.len() && input[abs..].starts_with(prefix) {
+            if abs > max_start {
+                return None;
+            }
+            if abs < input.len() && is_control_line(&input[abs..], keyword) {
                 return Some(abs);
             }
             pos = abs;
         } else {
             break;
         }
+    }
+    None
+}
+
+/// The yEnc control line that ends a body, located by the same rule the SIMD
+/// kernel's `search_end` uses.
+#[derive(Debug, Clone, Copy)]
+struct BodyControlLine {
+    /// First byte that is no longer body data (the `\r` of the `\r\n`, or
+    /// `data_start` when the body is empty). The kernel emits nothing for the
+    /// line break or for the `=y` that follows it, so this is exactly where its
+    /// decoded output stops.
+    data_end: usize,
+    /// Offset of the `=` that begins the control line, after any NNTP-stuffed
+    /// dot the kernel would have stripped.
+    keyword_start: usize,
+}
+
+/// `=y` at `at`, allowing the one NNTP-stuffed `.` the kernel strips at line
+/// start in raw mode.
+fn control_keyword_at(input: &[u8], at: usize, dot_unstuffing: bool) -> Option<usize> {
+    let rest = input.get(at..)?;
+    if rest.starts_with(b"=y") {
+        return Some(at);
+    }
+    if dot_unstuffing && rest.first() == Some(&b'.') && rest[1..].starts_with(b"=y") {
+        return Some(at + 1);
+    }
+    None
+}
+
+/// Find the control line that ends the body, matching the SIMD kernel's stop
+/// rule byte for byte.
+///
+/// The kernel reaches its line-start state only through a literal `\r\n` (a
+/// bare `\n` leaves it mid-line) and then stops at *any* `=y`, not specifically
+/// at `=yend`. Scanning for `=yend` lines instead — which is what this used to
+/// do — made the whole-buffer path disagree with the streaming and fused paths
+/// on three reachable inputs: a `\r\n=y…` line that is not `=yend` (the kernel
+/// stops and the article fails; the line scan decoded it as body data), a bare
+/// `\n=yend ` (the line scan accepted a trailer the kernel never stops at), and
+/// a dot-stuffed `\r\n.=yend ` (the kernel strips the dot, the line scan did
+/// not).
+fn find_body_control_line(
+    input: &[u8],
+    from: usize,
+    dot_unstuffing: bool,
+) -> Option<BodyControlLine> {
+    // A body always begins immediately after a header line's terminator, and
+    // the kernel starts a body in its line-start state, so `from` itself is a
+    // candidate.
+    if let Some(keyword_start) = control_keyword_at(input, from, dot_unstuffing) {
+        return Some(BodyControlLine {
+            data_end: from,
+            keyword_start,
+        });
+    }
+
+    let mut pos = from;
+    while let Some(rel) = memchr_lf(&input[pos..]) {
+        let lf = pos + rel;
+        if lf > from
+            && input[lf - 1] == b'\r'
+            && let Some(keyword_start) = control_keyword_at(input, lf + 1, dot_unstuffing)
+        {
+            return Some(BodyControlLine {
+                data_end: lf - 1,
+                keyword_start,
+            });
+        }
+        pos = lf + 1;
     }
     None
 }
@@ -219,7 +399,14 @@ fn visit_fields<'a>(line: &'a [u8], mut visit: impl FnMut(&[u8], &'a [u8])) {
         let Some(eq_pos) = remaining.iter().position(|&b| b == b'=') else {
             return;
         };
-        let key = &remaining[..eq_pos];
+        // The key is the last whitespace-delimited token before `=`, so a stray
+        // token with no `=` of its own (`=ybegin junk line=128`) does not
+        // swallow the following field's name.
+        let key_start = remaining[..eq_pos]
+            .iter()
+            .rposition(|b| b.is_ascii_whitespace())
+            .map_or(0, |idx| idx + 1);
+        let key = &remaining[key_start..eq_pos];
         let value_start = eq_pos + 1;
 
         if key_eq_ascii_ignore_case(key, b"name") {
@@ -244,53 +431,80 @@ fn required_field<'a>(field: Option<&'a [u8]>, label: &str) -> Result<&'a [u8], 
     field.ok_or_else(|| YencError::MissingField(label.to_string()))
 }
 
-fn optional_u64_field(field: Option<&[u8]>, label: &str) -> Result<Option<u64>, YencError> {
-    field.map(|value| parse_u64_bytes(value, label)).transpose()
-}
-
 fn required_u64_field(field: Option<&[u8]>, label: &str) -> Result<u64, YencError> {
     parse_u64_bytes(required_field(field, label)?, label)
 }
 
-fn parse_u64_bytes(value: &[u8], label: &str) -> Result<u64, YencError> {
+/// Parse an unsigned decimal field value. Zero-alloc and overflow-checked:
+/// `None` for empty, non-digit, or wider-than-`u64` input.
+///
+/// Digits only, matching sabctools' `extract_int`, which requires a digit
+/// immediately after the field name and therefore rejects `size=-1000` and
+/// `size= 10` rather than storing a nonsense value.
+fn parse_u64_opt(value: &[u8]) -> Option<u64> {
     let value = value.trim_ascii();
     if value.is_empty() {
-        return Err(YencError::InvalidHeader {
-            field: label.to_string(),
-            reason: "invalid integer: ".to_string(),
-        });
+        return None;
     }
 
     let mut parsed = 0u64;
     for &byte in value {
         if !byte.is_ascii_digit() {
-            return Err(YencError::InvalidHeader {
-                field: label.to_string(),
-                reason: format!("invalid integer: {}", bytes_to_string(value)),
-            });
+            return None;
         }
         parsed = parsed
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(u64::from(byte - b'0')))
-            .ok_or_else(|| YencError::InvalidHeader {
-                field: label.to_string(),
-                reason: format!("invalid integer: {}", bytes_to_string(value)),
-            })?;
+            .checked_mul(10)?
+            .checked_add(u64::from(byte - b'0'))?;
     }
 
-    Ok(parsed)
+    Some(parsed)
 }
 
-fn parse_crc_hex_bytes(value: &[u8], label: &str) -> Result<u32, YencError> {
-    let value = value.trim_ascii();
-    let value_str = std::str::from_utf8(value).map_err(|_| YencError::InvalidHeader {
+/// `parse_u64_opt` with a labelled error, for the two `=ypart` fields that are
+/// still genuinely required.
+fn parse_u64_bytes(value: &[u8], label: &str) -> Result<u64, YencError> {
+    parse_u64_opt(value).ok_or_else(|| YencError::InvalidHeader {
         field: label.to_string(),
-        reason: format!("invalid hex value: {}", bytes_to_string(value)),
-    })?;
-    u32::from_str_radix(value_str, 16).map_err(|_| YencError::InvalidHeader {
-        field: label.to_string(),
-        reason: format!("invalid hex value: {value_str}"),
+        reason: format!("invalid integer: {}", bytes_to_string(value.trim_ascii())),
     })
+}
+
+/// Parse a `crc32=`/`pcrc32=` hex value, zero-alloc and overflow-checked.
+///
+/// Returns `None` for anything that is not a usable CRC. Callers treat `None`
+/// as "the poster did not give us a CRC": an unparseable CRC carries no
+/// verification value, and failing the whole article over it is exactly the
+/// strictness the reference decoders do not have.
+///
+/// Matching sabctools (`from_chars` into a `uint64_t`, then truncated):
+///  * fewer than 8 digits is fine — some encoders omit leading zeros;
+///  * up to 16 digits is accepted and truncated to the low 32 bits, which
+///    sabctools does deliberately for posters that emit over-long hashes;
+///  * wider than 64 bits is unusable.
+///
+/// Two deliberate divergences, both toward tolerance, because sabctools turns
+/// these into a *wrong* expected CRC that then fails the article:
+///  * an empty value is absent here, where sabctools yields `0`;
+///  * a value with non-hex bytes is absent here, where sabctools keeps the
+///    leading hex run (`1234ZZZZ` -> `0x1234`).
+fn parse_crc_hex_bytes(value: &[u8]) -> Option<u32> {
+    let value = value.trim_ascii();
+    if value.is_empty() {
+        return None;
+    }
+
+    let mut parsed: u64 = 0;
+    for &byte in value {
+        let digit = match byte {
+            b'0'..=b'9' => u64::from(byte - b'0'),
+            b'a'..=b'f' => u64::from(byte - b'a') + 10,
+            b'A'..=b'F' => u64::from(byte - b'A') + 10,
+            _ => return None,
+        };
+        parsed = parsed.checked_mul(16)?.checked_add(digit)?;
+    }
+
+    Some(parsed as u32)
 }
 
 fn key_eq_ascii_ignore_case(actual: &[u8], expected: &[u8]) -> bool {
@@ -301,158 +515,76 @@ fn key_eq_ascii_ignore_case(actual: &[u8], expected: &[u8]) -> bool {
             .all(|(&a, &b)| a.eq_ignore_ascii_case(&b))
 }
 
-/// Parse key=value fields from a header line's content (after the keyword like `=ybegin `).
-/// The `name` field is treated specially: it consumes everything from `name=` to end of line.
-fn parse_fields(line: &str) -> Vec<(String, String)> {
-    let mut fields = Vec::new();
-    let mut remaining = line;
-
-    loop {
-        remaining = remaining.trim_start();
-        if remaining.is_empty() {
-            break;
-        }
-
-        // Check if this is the `name` field -- it must be last and consumes the rest.
-        if let Some(value) = remaining.strip_prefix("name=") {
-            // Trim trailing whitespace (e.g. trailing \r that wasn't stripped).
-            let value = value.trim_end();
-            fields.push(("name".to_string(), value.to_string()));
-            break;
-        }
-
-        // Find the `=` separator for key=value.
-        if let Some(eq_pos) = remaining.find('=') {
-            let key = remaining[..eq_pos].trim();
-            let after_eq = &remaining[eq_pos + 1..];
-
-            // Value extends to the next space (or end of string).
-            let value_end = after_eq.find(' ').unwrap_or(after_eq.len());
-            let value = &after_eq[..value_end];
-
-            fields.push((key.to_lowercase(), value.to_string()));
-            remaining = &after_eq[value_end..];
-        } else {
-            // No more key=value pairs.
-            break;
-        }
-    }
-
-    fields
-}
-
-/// Parse a hex string (case-insensitive) into a u32 CRC value.
-fn parse_crc_hex(s: &str) -> Result<u32, YencError> {
-    u32::from_str_radix(s.trim(), 16).map_err(|_| YencError::InvalidHeader {
-        field: "crc".to_string(),
-        reason: format!("invalid hex value: {s}"),
-    })
-}
-
 /// Parse all yEnc headers from an article body.
 ///
 /// Returns parsed metadata, the byte range of encoded data, and =yend fields.
+///
+/// This is a thin composition over the byte-wise line parsers above
+/// ([`parse_ybegin_line`], [`apply_ypart_line`], [`parse_yend_line`]) so that
+/// the whole-buffer path and the streaming/fused paths share exactly one set of
+/// header semantics — same case-insensitivity, same tab handling, same
+/// tolerance for missing fields.
 pub fn parse_headers(input: &[u8]) -> Result<ParsedHeaders, YencError> {
-    // Find =ybegin line.
-    let ybegin_start = find_line_start(input, b"=ybegin ").ok_or(YencError::MissingHeader)?;
+    parse_headers_with_options(input, DecodeOptions::default())
+}
+
+/// [`parse_headers`] told whether the article still carries NNTP dot-stuffing.
+///
+/// Only the trailer scan cares: in raw mode the kernel strips one leading `.`
+/// at line start before looking for `=y`, so `\r\n.=yend ` is a trailer there
+/// and body data otherwise.
+pub fn parse_headers_with_options(
+    input: &[u8],
+    options: DecodeOptions,
+) -> Result<ParsedHeaders, YencError> {
+    // Scan for the =ybegin line: SABnzbd and nzbget both search the article for
+    // it rather than demanding it be the first line, so leading junk (headers
+    // left in the body, poster banners, blank lines) does not kill the article.
+    //
+    // Bounded at the same 64 KiB the streaming and fused decoders use, so all
+    // three entry points call the same articles header-less.
+    let ybegin_start =
+        find_line_start_within(input, b"=ybegin", crate::decode::MAX_HEADER_SCAN_BYTES)
+            .ok_or(YencError::MissingHeader)?;
     let (ybegin_line_end, after_ybegin) = line_end(input, ybegin_start);
 
-    let ybegin_content = &input[ybegin_start + 8..ybegin_line_end];
-    let ybegin_str = bytes_to_string(ybegin_content);
-
-    let ybegin_fields = parse_fields(&ybegin_str);
-
-    // Extract required fields from =ybegin.
-    let line_length: u32 = get_field_u64(&ybegin_fields, "line")? as u32;
-    let size: u64 = get_field_u64(&ybegin_fields, "size")?;
-    let name = get_field_str(&ybegin_fields, "name")?;
-    let part: Option<u32> = get_optional_field_u64(&ybegin_fields, "part")?.map(|v| v as u32);
-    let total: Option<u32> = get_optional_field_u64(&ybegin_fields, "total")?.map(|v| v as u32);
+    let mut metadata = parse_ybegin_line(&input[ybegin_start..ybegin_line_end])?;
+    metadata.defects.junk_before_ybegin = ybegin_start > 0;
 
     // If multi-part, parse =ypart.
-    let (begin, end, data_start) = if part.is_some() {
-        let ypart_start = find_line_start(&input[after_ybegin..], b"=ypart ")
+    let data_start = if metadata.part.is_some() {
+        let ypart_start = find_line_start(&input[after_ybegin..], b"=ypart")
             .map(|off| off + after_ybegin)
             .ok_or(YencError::MissingField("=ypart".to_string()))?;
         let (ypart_line_end, after_ypart) = line_end(input, ypart_start);
 
-        let ypart_content = &input[ypart_start + 7..ypart_line_end];
-        let ypart_str = bytes_to_string(ypart_content);
-
-        let ypart_fields = parse_fields(&ypart_str);
-        let begin = get_field_u64(&ypart_fields, "begin")?;
-        let end = get_field_u64(&ypart_fields, "end")?;
-
-        // Validate that the part range is sane.
-        if end < begin {
-            return Err(YencError::InvalidHeader {
-                field: "end".to_string(),
-                reason: format!("end ({end}) < begin ({begin})"),
-            });
-        }
-        if end > size {
-            return Err(YencError::InvalidHeader {
-                field: "end".to_string(),
-                reason: format!("end ({end}) > file size ({size})"),
-            });
-        }
-
-        (Some(begin), Some(end), after_ypart)
+        apply_ypart_line(&input[ypart_start..ypart_line_end], &mut metadata)?;
+        after_ypart
     } else {
-        (None, None, after_ybegin)
+        after_ybegin
     };
 
-    // Find =yend line.
-    let yend = if let Some(yend_start) = find_line_start(&input[data_start..], b"=yend ") {
-        let yend_abs = yend_start + data_start;
-        let (yend_line_end, _) = line_end(input, yend_abs);
+    // Find the control line that ends the body, by the kernel's stop rule.
+    let (yend_fields, data_end) =
+        match find_body_control_line(input, data_start, options.dot_unstuffing) {
+            Some(control) => {
+                let (line_end, _) = line_end(input, control.keyword_start);
+                let line = &input[control.keyword_start..line_end];
 
-        let yend_content = &input[yend_abs + 6..yend_line_end];
-        let yend_str = bytes_to_string(yend_content);
+                if !is_control_line(line, b"=yend") {
+                    // The kernel already stopped here, so there is no reading of
+                    // this article that keeps decoding. The streaming and fused
+                    // decoders reject it with this exact error.
+                    return Err(YencError::InvalidHeader {
+                        field: "=yend".to_string(),
+                        reason: "unexpected trailing line after yEnc body".to_string(),
+                    });
+                }
 
-        let yend_fields = parse_fields(&yend_str);
-
-        // Compute data_end: the byte just before the =yend line (before preceding \r\n or \n).
-        let data_end = if yend_abs > 0 && input[yend_abs - 1] == b'\n' {
-            if yend_abs >= 2 && input[yend_abs - 2] == b'\r' {
-                yend_abs - 2
-            } else {
-                yend_abs - 1
+                (Some(parse_yend_line(line)?), control.data_end)
             }
-        } else {
-            yend_abs
+            None => (None, input.len()),
         };
-
-        let yend_parsed = YendFields {
-            size: get_optional_field_u64(&yend_fields, "size")?,
-            part: get_optional_field_u64(&yend_fields, "part")?.map(|v| v as u32),
-            pcrc32: get_optional_field_str(&yend_fields, "pcrc32")
-                .map(|s| parse_crc_hex(&s))
-                .transpose()?,
-            crc32: get_optional_field_str(&yend_fields, "crc32")
-                .map(|s| parse_crc_hex(&s))
-                .transpose()?,
-        };
-
-        Some((yend_parsed, data_end))
-    } else {
-        None
-    };
-
-    let (yend_fields, data_end) = match yend {
-        Some((fields, end)) => (Some(fields), end),
-        None => (None, input.len()),
-    };
-
-    let metadata = YencMetadata {
-        name,
-        size,
-        line_length,
-        part,
-        total,
-        begin,
-        end,
-    };
 
     Ok(ParsedHeaders {
         metadata,
@@ -498,51 +630,6 @@ pub fn extract_filename_from_subject(subject: &str) -> Option<String> {
     None
 }
 
-fn get_field_str(fields: &[(String, String)], name: &str) -> Result<String, YencError> {
-    fields
-        .iter()
-        .find(|(k, _)| k == name)
-        .map(|(_, v)| v.clone())
-        .ok_or_else(|| YencError::MissingField(name.to_string()))
-}
-
-fn get_optional_field_str(fields: &[(String, String)], name: &str) -> Option<String> {
-    fields
-        .iter()
-        .find(|(k, _)| k == name)
-        .map(|(_, v)| v.clone())
-}
-
-fn get_field_u64(fields: &[(String, String)], name: &str) -> Result<u64, YencError> {
-    let value_str = get_field_str(fields, name)?;
-    value_str
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| YencError::InvalidHeader {
-            field: name.to_string(),
-            reason: format!("invalid integer: {value_str}"),
-        })
-}
-
-fn get_optional_field_u64(
-    fields: &[(String, String)],
-    name: &str,
-) -> Result<Option<u64>, YencError> {
-    match get_optional_field_str(fields, name) {
-        Some(v) => {
-            let parsed = v
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| YencError::InvalidHeader {
-                    field: name.to_string(),
-                    reason: format!("invalid integer: {v}"),
-                })?;
-            Ok(Some(parsed))
-        }
-        None => Ok(None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,12 +661,42 @@ mod tests {
         assert_eq!(metadata.end, Some(512));
     }
 
+    /// `=ypart end=` past `=ybegin size=` is a known broken-poster class.
+    /// Neither sabctools nor nzbget cross-checks the two, so weaver records the
+    /// inconsistency instead of failing the article.
     #[test]
-    fn apply_ypart_line_validates_range_against_size() {
+    fn apply_ypart_line_tolerates_end_past_declared_file_size() {
         let mut metadata =
             parse_ybegin_line(b"=ybegin part=1 total=2 line=128 size=4096 name=test.bin\r\n")
                 .unwrap();
-        let err = apply_ypart_line(b"=ypart begin=1 end=4097\r\n", &mut metadata).unwrap_err();
+        apply_ypart_line(b"=ypart begin=1 end=4097\r\n", &mut metadata).unwrap();
+
+        assert_eq!(metadata.begin, Some(1));
+        assert_eq!(metadata.end, Some(4097));
+        assert!(metadata.defects.ypart_end_exceeds_size);
+    }
+
+    #[test]
+    fn apply_ypart_line_end_below_declared_file_size_is_clean() {
+        let mut metadata =
+            parse_ybegin_line(b"=ybegin part=1 total=2 line=128 size=4096 name=test.bin\r\n")
+                .unwrap();
+        apply_ypart_line(b"=ypart begin=1 end=4095\r\n", &mut metadata).unwrap();
+
+        assert_eq!(metadata.end, Some(4095));
+        assert!(!metadata.defects.ypart_end_exceeds_size);
+        assert!(!metadata.defects.any());
+    }
+
+    /// `end < begin` stays a hard error: the part length would be negative, and
+    /// weaver's assembler places bytes by `begin`, so guessing would write a
+    /// corrupt file rather than fail an article.
+    #[test]
+    fn apply_ypart_line_still_rejects_end_before_begin() {
+        let mut metadata =
+            parse_ybegin_line(b"=ybegin part=1 total=2 line=128 size=4096 name=test.bin\r\n")
+                .unwrap();
+        let err = apply_ypart_line(b"=ypart begin=100 end=50\r\n", &mut metadata).unwrap_err();
 
         assert!(matches!(err, YencError::InvalidHeader { field, .. } if field == "end"));
     }
@@ -669,13 +786,30 @@ mod tests {
         assert_eq!(yend.crc32, Some(0xABCDEF01));
     }
 
+    /// Bare-LF articles: the `=ybegin` scan accepts them (all three entry
+    /// points find headers line-wise, LF-anchored), but the *trailer* does not
+    /// — the SIMD kernel reaches its line-start state only through a literal
+    /// CRLF, so `\n=yend` is body data to the streaming and fused decoders and
+    /// must be body data here too. See
+    /// `decode::tests::bare_lf_trailer_is_body_data_in_every_entry_point`.
     #[test]
-    fn bare_lf_line_endings() {
+    fn bare_lf_line_endings_find_ybegin_but_not_the_trailer() {
         let input = b"=ybegin line=128 size=100 name=test.bin\n\
                        data\n\
                        =yend size=100 crc32=12345678\n";
         let parsed = parse_headers(input).unwrap();
         assert_eq!(parsed.metadata.name, "test.bin");
+        assert!(parsed.yend.is_none());
+        assert_eq!(parsed.data_end, input.len());
+    }
+
+    /// The same article with CRLF endings does find its trailer.
+    #[test]
+    fn crlf_trailer_is_found() {
+        let input = b"=ybegin line=128 size=100 name=test.bin\r\n\
+                       data\r\n\
+                       =yend size=100 crc32=12345678\r\n";
+        let parsed = parse_headers(input).unwrap();
         let yend = parsed.yend.unwrap();
         assert_eq!(yend.crc32, Some(0x12345678));
     }
@@ -696,12 +830,16 @@ mod tests {
         assert_eq!(parsed.data_end, input.len());
     }
 
+    /// No `=ybegin` field is required. sabctools defaults every numeric
+    /// field to 0 and leaves `file_name` unset; nothing raises.
     #[test]
-    fn missing_required_field() {
-        // Missing `size` field.
+    fn missing_size_field_is_tolerated() {
         let input = b"=ybegin line=128 name=test.bin\r\ndata\r\n=yend size=100\r\n";
-        let result = parse_headers(input);
-        assert!(matches!(result, Err(YencError::MissingField(_))));
+        let parsed = parse_headers(input).unwrap();
+        assert_eq!(parsed.metadata.size, 0);
+        assert_eq!(parsed.metadata.name, "test.bin");
+        assert!(parsed.metadata.defects.missing_size);
+        assert!(!parsed.metadata.defects.invalid_size);
     }
 
     #[test]
@@ -741,37 +879,238 @@ mod tests {
                        =yend size=100\r\n";
         let parsed = parse_headers(input).unwrap();
         assert_eq!(parsed.metadata.name, "test.bin");
+        assert!(parsed.metadata.defects.junk_before_ybegin);
+    }
+
+    // ── One byte-wise field parser behind every entry point ──────────────
+
+    #[test]
+    fn fields_tolerate_tabs_and_runs_of_spaces() {
+        let metadata =
+            parse_ybegin_line(b"=ybegin\tline=128 \t size=100\tname=test file.bin\r\n").unwrap();
+        assert_eq!(metadata.line_length, 128);
+        assert_eq!(metadata.size, 100);
+        assert_eq!(metadata.name, "test file.bin");
+        assert!(!metadata.defects.any());
     }
 
     #[test]
-    fn parse_fields_handles_tabs_and_extra_spaces() {
-        let fields = parse_fields("  line=128  size=100  name=test file.bin");
-        assert!(fields.iter().any(|(k, v)| k == "line" && v == "128"));
-        assert!(fields.iter().any(|(k, v)| k == "size" && v == "100"));
-        assert!(
-            fields
-                .iter()
-                .any(|(k, v)| k == "name" && v == "test file.bin")
-        );
+    fn field_names_are_case_insensitive_on_every_entry_point() {
+        let metadata = parse_ybegin_line(b"=ybegin LINE=128 Size=100 NaMe=Test.BIN\r\n").unwrap();
+        assert_eq!(metadata.line_length, 128);
+        assert_eq!(metadata.size, 100);
+        // The value's own case is preserved; only the key is folded.
+        assert_eq!(metadata.name, "Test.BIN");
+
+        let yend = parse_yend_line(b"=yend SIZE=100 PCRC32=abcdef12 CRC32=01234567\r\n").unwrap();
+        assert_eq!(yend.size, Some(100));
+        assert_eq!(yend.pcrc32, Some(0xABCDEF12));
+        assert_eq!(yend.crc32, Some(0x01234567));
+
+        // parse_headers must agree, since it is now the same parser.
+        let input = b"=ybegin LINE=128 Size=100 NaMe=Test.BIN\r\ndata\r\n=yend SIZE=100\r\n";
+        let parsed = parse_headers(input).unwrap();
+        assert_eq!(parsed.metadata.line_length, 128);
+        assert_eq!(parsed.metadata.name, "Test.BIN");
+        assert_eq!(parsed.yend.unwrap().size, Some(100));
     }
+
+    #[test]
+    fn stray_token_does_not_swallow_the_next_field_name() {
+        let metadata = parse_ybegin_line(b"=ybegin junk line=128 size=100 name=x.bin\r\n").unwrap();
+        assert_eq!(metadata.line_length, 128);
+        assert_eq!(metadata.size, 100);
+        assert_eq!(metadata.name, "x.bin");
+    }
+
+    // ── crc32 parsing degrades to "absent", never to a failure ──────────
 
     #[test]
     fn short_crc_hex() {
         // Some encoders omit leading zeros.
-        let result = parse_crc_hex("1a2b");
-        assert_eq!(result.unwrap(), 0x1A2B);
+        assert_eq!(parse_crc_hex_bytes(b"1a2b"), Some(0x1A2B));
     }
 
     #[test]
     fn crc_hex_full_width() {
-        let result = parse_crc_hex("DEADBEEF");
-        assert_eq!(result.unwrap(), 0xDEADBEEF);
+        assert_eq!(parse_crc_hex_bytes(b"DEADBEEF"), Some(0xDEADBEEF));
     }
 
     #[test]
-    fn invalid_crc_hex() {
-        let result = parse_crc_hex("GGGG");
-        assert!(result.is_err());
+    fn crc_hex_garbage_reads_as_absent() {
+        for garbage in [
+            b"GGGG".as_slice(),
+            b"".as_slice(),
+            b"   ".as_slice(),
+            b"1234ZZZZ".as_slice(),
+            b"0x1234".as_slice(),
+            b"-1".as_slice(),
+            // Wider than 64 bits: sabctools' from_chars reports out_of_range.
+            b"DEADBEEFDEADBEEF0".as_slice(),
+        ] {
+            assert_eq!(
+                parse_crc_hex_bytes(garbage),
+                None,
+                "expected {garbage:?} to read as absent"
+            );
+        }
+    }
+
+    #[test]
+    fn crc_hex_over_long_truncates_to_low_32_bits_like_sabctools() {
+        assert_eq!(parse_crc_hex_bytes(b"AAAAAAAADEADBEEF"), Some(0xDEADBEEF));
+    }
+
+    #[test]
+    fn yend_records_unparseable_crc_as_absent_with_a_defect() {
+        let yend = parse_yend_line(b"=yend size=10 pcrc32=nothex crc32=\r\n").unwrap();
+
+        assert_eq!(yend.size, Some(10));
+        assert_eq!(yend.pcrc32, None);
+        assert_eq!(yend.crc32, None);
+        assert!(yend.defects.invalid_pcrc32);
+        assert!(yend.defects.invalid_crc32);
+        assert!(!yend.defects.invalid_yend_size);
+    }
+
+    #[test]
+    fn yend_records_unparseable_size_as_absent_with_a_defect() {
+        let yend = parse_yend_line(b"=yend size=-5 crc32=DEADBEEF\r\n").unwrap();
+
+        assert_eq!(yend.size, None);
+        assert_eq!(yend.crc32, Some(0xDEADBEEF));
+        assert!(yend.defects.invalid_yend_size);
+    }
+
+    // ── Every combination of missing =ybegin fields ─────────────────────
+
+    #[test]
+    fn every_combination_of_missing_ybegin_fields_parses() {
+        for line_field in [None, Some("line=128")] {
+            for size_field in [None, Some("size=100")] {
+                for name_field in [None, Some("name=test.bin")] {
+                    let mut header = String::from("=ybegin");
+                    for field in [line_field, size_field, name_field].into_iter().flatten() {
+                        header.push(' ');
+                        header.push_str(field);
+                    }
+                    // A bare `=ybegin` still needs its separator to be detected
+                    // at all -- both references key on the literal "=ybegin ".
+                    header.push_str(" \r\n");
+
+                    let metadata = parse_ybegin_line(header.as_bytes())
+                        .unwrap_or_else(|err| panic!("{header:?} should parse, got {err}"));
+
+                    assert_eq!(
+                        metadata.line_length,
+                        if line_field.is_some() { 128 } else { 0 }
+                    );
+                    assert_eq!(metadata.size, if size_field.is_some() { 100 } else { 0 });
+                    assert_eq!(
+                        metadata.name,
+                        if name_field.is_some() { "test.bin" } else { "" }
+                    );
+                    assert_eq!(metadata.defects.missing_line, line_field.is_none());
+                    assert_eq!(metadata.defects.missing_size, size_field.is_none());
+                    assert_eq!(metadata.defects.missing_name, name_field.is_none());
+                    assert!(!metadata.defects.invalid_line);
+                    assert!(!metadata.defects.invalid_size);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unparseable_ybegin_numbers_read_as_absent() {
+        // sabctools' extract_int requires a digit right after the needle, so
+        // `size=-1000` leaves file_size at its default rather than storing -1000.
+        let metadata = parse_ybegin_line(b"=ybegin line=abc size=-1000 name=neg.bin\r\n").unwrap();
+
+        assert_eq!(metadata.size, 0);
+        assert_eq!(metadata.line_length, 0);
+        assert!(metadata.defects.invalid_size);
+        assert!(metadata.defects.invalid_line);
+        assert!(!metadata.defects.missing_size);
+        assert!(!metadata.defects.missing_line);
+    }
+
+    #[test]
+    fn unparseable_part_field_falls_back_to_single_part() {
+        let metadata = parse_ybegin_line(b"=ybegin part=x line=128 size=1 name=a.bin\r\n").unwrap();
+        assert_eq!(metadata.part, None);
+    }
+
+    #[test]
+    fn oversized_numbers_do_not_panic_or_wrap() {
+        let huge = "9".repeat(40);
+        let header = format!("=ybegin part={huge} total={huge} line={huge} size={huge} name=b\r\n");
+        let metadata = parse_ybegin_line(header.as_bytes()).unwrap();
+
+        assert_eq!(metadata.size, 0);
+        assert_eq!(metadata.line_length, 0);
+        assert_eq!(metadata.part, None);
+        assert_eq!(metadata.total, None);
+        assert!(metadata.defects.invalid_size);
+    }
+
+    #[test]
+    fn line_length_wider_than_u32_saturates_rather_than_wrapping() {
+        let metadata = parse_ybegin_line(b"=ybegin line=4294967296 size=1 name=b.bin\r\n").unwrap();
+        assert_eq!(metadata.line_length, u32::MAX);
+    }
+
+    // ── Control-line detection ──────────────────────────────────────────
+
+    #[test]
+    fn keyword_detection_requires_a_separator() {
+        // Real headers.
+        assert!(is_control_line(
+            b"=ybegin line=1 size=1 name=a\r\n",
+            b"=ybegin"
+        ));
+        assert!(is_control_line(b"=ybegin\tline=1\r\n", b"=ybegin"));
+        assert!(is_control_line(b"=ybegin \r\n", b"=ybegin"));
+
+        // Look-alikes that must not be mistaken for headers.
+        for junk in [
+            b"=yb\r\n".as_slice(),
+            b"=ybegi\r\n".as_slice(),
+            b"=ybegin\r\n".as_slice(),
+            b"=ybeginner notes\r\n".as_slice(),
+            b"=ybegin=1\r\n".as_slice(),
+            b"x=ybegin size=1\r\n".as_slice(),
+        ] {
+            assert!(
+                !is_control_line(junk, b"=ybegin"),
+                "expected {junk:?} not to be a =ybegin line"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_skips_junk_lines_that_contain_equals_and_partial_prefixes() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"Subject: something = other\r\n");
+        input.extend_from_slice(b"=yb\r\n");
+        input.extend_from_slice(b"=ybegi partial\r\n");
+        input.extend_from_slice(b"=ybeginner notes here\r\n");
+        input.extend_from_slice(b"\r\n");
+        input.extend_from_slice(b"=ybegin line=128 size=100 name=real.bin\r\n");
+        input.extend_from_slice(b"data\r\n");
+        input.extend_from_slice(b"=yend size=100\r\n");
+
+        let parsed = parse_headers(&input).unwrap();
+        assert_eq!(parsed.metadata.name, "real.bin");
+        assert_eq!(parsed.metadata.size, 100);
+        assert!(parsed.metadata.defects.junk_before_ybegin);
+    }
+
+    #[test]
+    fn scan_finds_ybegin_after_bare_lf_junk() {
+        let input = b"junk\n=ybegin line=128 size=100 name=lf.bin\ndata\n=yend size=100\n";
+        let parsed = parse_headers(input).unwrap();
+        assert_eq!(parsed.metadata.name, "lf.bin");
+        assert!(parsed.metadata.defects.junk_before_ybegin);
     }
 
     #[test]
@@ -794,13 +1133,15 @@ mod tests {
     }
 
     #[test]
-    fn ypart_end_exceeds_file_size() {
+    fn ypart_end_exceeds_file_size_is_recorded_not_rejected() {
         let input = b"=ybegin part=1 line=128 size=1000 name=myfile.dat\r\n\
                        =ypart begin=1 end=2000\r\n\
                        data\r\n\
                        =yend size=2000\r\n";
-        let result = parse_headers(input);
-        assert!(matches!(result, Err(YencError::InvalidHeader { .. })));
+        let parsed = parse_headers(input).unwrap();
+        assert_eq!(parsed.metadata.begin, Some(1));
+        assert_eq!(parsed.metadata.end, Some(2000));
+        assert!(parsed.metadata.defects.ypart_end_exceeds_size);
     }
 
     #[test]

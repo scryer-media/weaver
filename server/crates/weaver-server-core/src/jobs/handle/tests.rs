@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::events::model::PipelineEvent;
@@ -123,6 +124,8 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             download_retry_at_epoch_ms: None,
             status: state.status.clone(),
             download_state: state.download_state,
+            finalizing_download: false,
+            fetching_repair_data: false,
             post_state: state.post_state,
             run_state: state.run_state,
             progress: state.assembly.progress(),
@@ -133,6 +136,7 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             phase_progress: Vec::new(),
             failed_bytes: 0,
             health: 1000,
+            terminal_discards: Vec::new(),
             total_files: 0,
             completed_files: 0,
             remaining_par_files: 0,
@@ -274,6 +278,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         downloaded_bytes: 0,
                         restored_download_floor_bytes: 0,
                         failed_bytes: 0,
+                        probe_projected_failed_bytes: 0,
                         par2_bytes,
                         health_probing: false,
                         health_probe_round: 0,
@@ -285,6 +290,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         download_queue: DownloadQueue::new(),
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
+                        category_bytes: None,
                     };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
                         job_id,
@@ -425,6 +431,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         downloaded_bytes: 0,
                         restored_download_floor_bytes: 0,
                         failed_bytes: 0,
+                        probe_projected_failed_bytes: 0,
                         par2_bytes,
                         health_probing: false,
                         health_probe_round: 0,
@@ -436,6 +443,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         download_queue: DownloadQueue::new(),
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
+                        category_bytes: None,
                     };
                     jobs.insert(job_id, state);
                     let _ = reply.send(Ok(()));
@@ -526,6 +534,9 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::CancelPostProcessing { reply, .. } => {
                     let _ = reply.send(Ok(()));
                 }
+                SchedulerCommand::UpdateRandomReadIops { reply, .. } => {
+                    let _ = reply.send(());
+                }
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.
@@ -560,6 +571,16 @@ fn sample_nzb_zstd() -> Vec<u8> {
         </nzb>"#,
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn update_random_read_iops_reaches_scheduler() {
+    let (handle, task) = test_scheduler();
+
+    handle.update_random_read_iops(1_500.0).await.unwrap();
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap();
 }
 
 #[tokio::test]
@@ -921,4 +942,30 @@ async fn reorder_jobs_batch_rejects_unknown_id_without_partial_application() {
 
     handle.shutdown().await.unwrap();
     task.await.unwrap();
+}
+
+#[test]
+fn job_cancellation_callbacks_fire_before_scheduler_work_and_can_be_cleared() {
+    let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let callback_cancelled = Arc::clone(&cancelled);
+    state.register_job_cancellation(
+        JobId(42),
+        Arc::new(move || callback_cancelled.store(true, Ordering::Release)),
+    );
+
+    assert!(state.cancel_active_job_work(JobId(42)));
+    assert!(cancelled.load(Ordering::Acquire));
+
+    state.clear_job_cancellations(JobId(42));
+    assert!(!state.cancel_active_job_work(JobId(42)));
+
+    assert!(!state.cancel_active_job_work(JobId(43)));
+    let late_cancelled = Arc::new(AtomicBool::new(false));
+    let late_callback_cancelled = Arc::clone(&late_cancelled);
+    state.register_job_cancellation(
+        JobId(43),
+        Arc::new(move || late_callback_cancelled.store(true, Ordering::Release)),
+    );
+    assert!(late_cancelled.load(Ordering::Acquire));
 }

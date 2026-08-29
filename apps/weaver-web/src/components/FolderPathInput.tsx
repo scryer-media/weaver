@@ -11,6 +11,7 @@ type FolderPathInputProps = {
   onChange: (value: string) => void;
   placeholder?: string;
   disabled?: boolean;
+  readOnly?: boolean;
   browseLabel?: string;
   className?: string;
   inputClassName?: string;
@@ -22,6 +23,7 @@ export function FolderPathInput({
   onChange,
   placeholder,
   disabled = false,
+  readOnly = true,
   browseLabel,
   className,
   inputClassName,
@@ -50,12 +52,13 @@ export function FolderPathInput({
           id={inputId}
           type="text"
           value={value}
-          readOnly
+          readOnly={readOnly}
           disabled={disabled}
           placeholder={placeholder}
-          onClick={openBrowser}
-          onKeyDown={handleKeyDown}
-          className={cn("min-w-0 cursor-pointer font-mono", inputClassName)}
+          onChange={(event) => onChange(event.target.value)}
+          onClick={readOnly ? openBrowser : undefined}
+          onKeyDown={readOnly ? handleKeyDown : undefined}
+          className={cn("min-w-0 font-mono", readOnly && "cursor-pointer", inputClassName)}
         />
         <Button
           type="button"

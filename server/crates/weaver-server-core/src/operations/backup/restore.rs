@@ -398,13 +398,6 @@ async fn rewrite_backup_db_artifact(rewrite: BackupDbRewrite) -> Result<(), Back
             .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
     }
 
-    sqlx::query(
-        "UPDATE post_processing_extension_revisions
-            SET managed_path = NULL, discovered_source_path = NULL",
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
     rewrite_legacy_machine_paths(&mut tx, &path_remaps).await?;
 
     match &intermediate_dir {
@@ -456,13 +449,10 @@ async fn rewrite_legacy_machine_paths(
     tx: &mut Transaction<'_, Sqlite>,
     roots: &[PathRemap],
 ) -> Result<(), BackupServiceError> {
-    let settings = sqlx::query(
-        "SELECT key, value FROM settings
-          WHERE key IN ('watch_folder.path', 'post_processing.settings.v1')",
-    )
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
+    let settings = sqlx::query("SELECT key, value FROM settings WHERE key = 'watch_folder.path'")
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
     let mut disable_watch_folder = false;
     for row in settings {
         let key: String = row
@@ -471,14 +461,11 @@ async fn rewrite_legacy_machine_paths(
         let value: String = row
             .try_get("value")
             .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        let rewritten = if key == "watch_folder.path" {
+        let rewritten = {
             let mapped =
                 rewrite_first_matching_prefix(&value, roots).map(|path| path.display().to_string());
             disable_watch_folder = mapped.is_none();
             mapped.unwrap_or_default()
-        } else {
-            rewrite_post_processing_settings(&value, roots)
-                .map_err(|error| BackupServiceError::Validation(error.to_string()))?
         };
         set_or_insert_setting(tx, &key, &rewritten).await?;
     }
@@ -486,87 +473,6 @@ async fn rewrite_legacy_machine_paths(
         set_or_insert_setting(tx, "watch_folder.mode", "off").await?;
     }
 
-    let attempts =
-        sqlx::query("SELECT attempt_id, working_directory FROM post_processing_attempts")
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-    for row in attempts {
-        let attempt_id: String = row
-            .try_get("attempt_id")
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        let working_directory: Option<String> = row
-            .try_get("working_directory")
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        let Some(working_directory) = working_directory
-            .as_deref()
-            .and_then(|path| rewrite_first_matching_prefix(path, roots))
-        else {
-            continue;
-        };
-        sqlx::query(
-            "UPDATE post_processing_attempts
-                SET working_directory = ?
-              WHERE attempt_id = ?",
-        )
-        .bind(working_directory.display().to_string())
-        .bind(attempt_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-    }
-
-    let profile_steps = sqlx::query(
-        "SELECT profile_id, step_index, policy_json FROM post_processing_profile_steps",
-    )
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-    for row in profile_steps {
-        let profile_id: String = row
-            .try_get("profile_id")
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        let step_index: i64 = row
-            .try_get("step_index")
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        let raw: String = row
-            .try_get("policy_json")
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        let rewritten = rewrite_approved_roots_json(&raw, roots)
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        sqlx::query(
-            "UPDATE post_processing_profile_steps
-                SET policy_json = ?
-              WHERE profile_id = ? AND step_index = ?",
-        )
-        .bind(rewritten)
-        .bind(profile_id)
-        .bind(step_index)
-        .execute(&mut **tx)
-        .await
-        .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-    }
-
-    let plans = sqlx::query("SELECT job_id, plan_json FROM post_processing_job_plans")
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-    for row in plans {
-        let job_id: i64 = row
-            .try_get("job_id")
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        let raw: String = row
-            .try_get("plan_json")
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        let rewritten = rewrite_approved_roots_json(&raw, roots)
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        sqlx::query("UPDATE post_processing_job_plans SET plan_json = ? WHERE job_id = ?")
-            .bind(rewritten)
-            .bind(job_id)
-            .execute(&mut **tx)
-            .await
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-    }
     Ok(())
 }
 
@@ -685,12 +591,6 @@ pub(crate) fn rewrite_logical_bundle_for_restore(
             "complete_dir" => resolved.complete.display().to_string(),
             "watch_folder.path" => restored_watch_path.clone().unwrap_or_default(),
             "watch_folder.mode" if disable_watch_folder => "off".into(),
-            "post_processing.settings.v1" => rewrite_post_processing_settings(
-                row.get("value")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-                &path_remaps,
-            )?,
             _ => return Ok(()),
         };
         row.insert("value".into(), serde_json::Value::String(replacement));
@@ -760,53 +660,6 @@ pub(crate) fn rewrite_logical_bundle_for_restore(
         for column in ["output_dir", "nzb_path"] {
             rewrite_path_value(row, column, &path_remaps);
         }
-        Ok(())
-    })?;
-    rewrite_manifest_table(
-        root,
-        manifest,
-        "post_processing_extension_revisions",
-        |row| {
-            row.insert("discovered_source_path".into(), serde_json::Value::Null);
-            let Some(digest) = row.get("digest").and_then(serde_json::Value::as_str) else {
-                return Ok(());
-            };
-            if row
-                .get("managed_path")
-                .is_some_and(|value| !value.is_null())
-            {
-                let hex = digest.strip_prefix("blake3:").ok_or_else(|| {
-                    crate::StateError::Database("invalid managed package digest".into())
-                })?;
-                row.insert(
-                    "managed_path".into(),
-                    serde_json::Value::String(
-                        resolved
-                            .data
-                            .join("managed-extensions/blake3")
-                            .join(hex)
-                            .display()
-                            .to_string(),
-                    ),
-                );
-            }
-            Ok(())
-        },
-    )?;
-    rewrite_manifest_table(root, manifest, "post_processing_attempts", |row| {
-        rewrite_path_value(row, "working_directory", &path_remaps);
-        Ok(())
-    })?;
-    rewrite_manifest_table(root, manifest, "post_processing_profile_steps", |row| {
-        rewrite_json_column(row, "policy_json", &path_remaps)?;
-        Ok(())
-    })?;
-    rewrite_manifest_table(root, manifest, "post_processing_job_plans", |row| {
-        rewrite_json_column(row, "plan_json", &path_remaps)?;
-        Ok(())
-    })?;
-    rewrite_manifest_table(root, manifest, "post_processing_runs", |row| {
-        rewrite_json_column(row, "plan_json", &path_remaps)?;
         Ok(())
     })?;
 
@@ -899,94 +752,6 @@ fn rewrite_first_matching_prefix(path: &str, roots: &[PathRemap]) -> Option<Path
         .find_map(|remap| rewrite_stored_prefix(path, &remap.source, &remap.target))
 }
 
-fn rewrite_post_processing_settings(
-    raw: &str,
-    roots: &[PathRemap],
-) -> Result<String, crate::StateError> {
-    let mut value: serde_json::Value = serde_json::from_str(raw)
-        .map_err(|error| crate::StateError::Database(error.to_string()))?;
-    let object = value.as_object_mut().ok_or_else(|| {
-        crate::StateError::Database("post-processing settings are not a JSON object".into())
-    })?;
-    for key in ["allowedRoots", "allowed_roots"] {
-        if let Some(allowed) = object.get_mut(key) {
-            rewrite_root_array(allowed, roots)?;
-        }
-    }
-    serde_json::to_string(&value).map_err(|error| crate::StateError::Database(error.to_string()))
-}
-
-fn rewrite_json_column(
-    row: &mut serde_json::Map<String, serde_json::Value>,
-    column: &str,
-    roots: &[PathRemap],
-) -> Result<(), crate::StateError> {
-    let Some(raw) = row.get(column).and_then(serde_json::Value::as_str) else {
-        return Ok(());
-    };
-    let rewritten = rewrite_approved_roots_json(raw, roots)?;
-    row.insert(column.into(), serde_json::Value::String(rewritten));
-    Ok(())
-}
-
-fn rewrite_approved_roots_json(
-    raw: &str,
-    roots: &[PathRemap],
-) -> Result<String, crate::StateError> {
-    let mut value: serde_json::Value = serde_json::from_str(raw)
-        .map_err(|error| crate::StateError::Database(error.to_string()))?;
-    rewrite_approved_roots(&mut value, roots)?;
-    serde_json::to_string(&value).map_err(|error| crate::StateError::Database(error.to_string()))
-}
-
-fn rewrite_approved_roots(
-    value: &mut serde_json::Value,
-    roots: &[PathRemap],
-) -> Result<(), crate::StateError> {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, value) in object {
-                if matches!(key.as_str(), "approved_roots" | "approvedRoots") {
-                    rewrite_root_array(value, roots)?;
-                } else {
-                    rewrite_approved_roots(value, roots)?;
-                }
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                rewrite_approved_roots(value, roots)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn rewrite_root_array(
-    value: &mut serde_json::Value,
-    roots: &[PathRemap],
-) -> Result<(), crate::StateError> {
-    let values = value.as_array_mut().ok_or_else(|| {
-        crate::StateError::Database("approved filesystem roots are not an array".into())
-    })?;
-    let mut rewritten = Vec::with_capacity(values.len());
-    for value in values.iter() {
-        let root = value.as_str().ok_or_else(|| {
-            crate::StateError::Database("approved filesystem root is not a string".into())
-        })?;
-        let Some(path) = rewrite_first_matching_prefix(root, roots) else {
-            continue;
-        };
-        let path = serde_json::Value::String(path.display().to_string());
-        if !rewritten.contains(&path) {
-            rewritten.push(path);
-        }
-    }
-    *values = rewritten;
-    Ok(())
-}
-
 #[cfg(test)]
 fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
     let status = job_status_from_persisted_str(&row.status, row.error_message.as_deref());
@@ -1004,6 +769,8 @@ fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
         name: row.name,
         status: status.clone(),
         download_state,
+        finalizing_download: false,
+        fetching_repair_data: false,
         post_state,
         run_state,
         progress: 1.0,
@@ -1014,6 +781,7 @@ fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
         phase_progress: Vec::new(),
         failed_bytes: row.failed_bytes,
         health: row.health,
+        terminal_discards: Vec::new(),
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,

@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use tokio::time::Instant;
 
 #[allow(dead_code, unused_imports)]

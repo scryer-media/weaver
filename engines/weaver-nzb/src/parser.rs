@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::{BufRead, Cursor, Read};
+use std::io::{BufRead, Cursor};
 
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
@@ -9,7 +9,6 @@ use crate::types::{Nzb, NzbFile, NzbMeta, NzbSegment};
 
 pub const MAX_NZB_XML_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_NZB_FILES: usize = 100_000;
-pub const MAX_SEGMENTS_PER_FILE: usize = 100_000;
 pub const MAX_NZB_SEGMENTS: usize = 2_000_000;
 pub const MAX_DECLARED_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
 const MAX_SEGMENT_BYTES: u32 = 32 * 1024 * 1024;
@@ -18,7 +17,6 @@ const MAX_SEGMENT_BYTES: u32 = 32 * 1024 * 1024;
 struct ParserLimits {
     max_xml_bytes: usize,
     max_files: usize,
-    max_segments_per_file: usize,
     max_segments: usize,
     max_declared_bytes: u64,
 }
@@ -26,46 +24,38 @@ struct ParserLimits {
 const DEFAULT_LIMITS: ParserLimits = ParserLimits {
     max_xml_bytes: MAX_NZB_XML_BYTES,
     max_files: MAX_NZB_FILES,
-    max_segments_per_file: MAX_SEGMENTS_PER_FILE,
     max_segments: MAX_NZB_SEGMENTS,
     max_declared_bytes: MAX_DECLARED_BYTES,
 };
 
 /// Parse an NZB XML document from bytes.
 pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
-    parse_nzb_with_limits(xml, DEFAULT_LIMITS)
+    parse_nzb_reader(Cursor::new(xml))
 }
 
+#[cfg(test)]
 fn parse_nzb_with_limits(xml: &[u8], limits: ParserLimits) -> Result<Nzb, NzbError> {
-    if xml.len() > limits.max_xml_bytes {
-        return Err(NzbError::ResourceLimit(format!(
-            "XML document is {} bytes; max is {}",
-            xml.len(),
-            limits.max_xml_bytes
-        )));
-    }
-    parse_nzb_reader_with_limits(Cursor::new(xml), limits)
+    parse_nzb_reader_limited(Cursor::new(xml), limits)
 }
 
-/// Parse an NZB XML document from a buffered reader.
+/// Parse an NZB XML document incrementally from a buffered reader.
 pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
     parse_nzb_reader_limited(reader, DEFAULT_LIMITS)
 }
 
-fn parse_nzb_reader_limited<R: BufRead>(
-    mut reader: R,
-    limits: ParserLimits,
-) -> Result<Nzb, NzbError> {
+fn parse_nzb_reader_limited<R: BufRead>(reader: R, limits: ParserLimits) -> Result<Nzb, NzbError> {
     let read_limit = limits.max_xml_bytes.checked_add(1).ok_or_else(|| {
         NzbError::ResourceLimit("XML byte cap is too large to enforce".to_string())
     })?;
-    let mut xml = Vec::with_capacity(limits.max_xml_bytes.min(64 * 1024));
-    reader
-        .by_ref()
-        .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
-        .read_to_end(&mut xml)
-        .map_err(|e| NzbError::Xml(e.to_string()))?;
-    parse_nzb_with_limits(&xml, limits)
+    let mut reader = reader.take(u64::try_from(read_limit).unwrap_or(u64::MAX));
+    let result = parse_nzb_reader_with_limits(&mut reader, limits);
+    if reader.limit() == 0 {
+        return Err(NzbError::ResourceLimit(format!(
+            "XML document exceeds {} bytes",
+            limits.max_xml_bytes
+        )));
+    }
+    result
 }
 
 fn parse_nzb_reader_with_limits<R: BufRead>(
@@ -285,12 +275,6 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                 } else {
                                     f.segment_numbers.insert(number);
                                     f.message_ids.insert(message_id.clone());
-                                    if f.segments.len() >= limits.max_segments_per_file {
-                                        return Err(NzbError::ResourceLimit(format!(
-                                            "file has more than {} segments",
-                                            limits.max_segments_per_file
-                                        )));
-                                    }
                                     if total_segments >= limits.max_segments {
                                         return Err(NzbError::ResourceLimit(format!(
                                             "NZB has more than {} segments",
@@ -433,6 +417,8 @@ impl SegmentBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
     use weaver_model::files::FileRole;
 
@@ -876,7 +862,6 @@ mod tests {
         ParserLimits {
             max_xml_bytes: 4096,
             max_files: 100,
-            max_segments_per_file: 100,
             max_segments: 100,
             max_declared_bytes: 1024,
         }
@@ -958,6 +943,41 @@ mod tests {
     }
 
     #[test]
+    fn reader_accepts_exact_byte_cap_and_rejects_one_more_byte() {
+        let xml = br#"<nzb><file poster="p" date="0" subject="one"><segments><segment bytes="1" number="1">one</segment></segments></file></nzb>"#;
+        let limits = ParserLimits {
+            max_xml_bytes: xml.len(),
+            ..test_limits()
+        };
+        assert!(parse_nzb_reader_limited(Cursor::new(xml), limits).is_ok());
+
+        let mut oversized = xml.to_vec();
+        oversized.push(b' ');
+        let err = parse_nzb_reader_limited(Cursor::new(oversized), limits).unwrap_err();
+        assert!(matches!(err, NzbError::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn small_chunk_reader_matches_byte_parser() {
+        let expected = parse_nzb(FULL_NZB).unwrap();
+        let reader = std::io::BufReader::with_capacity(7, Cursor::new(FULL_NZB));
+        let actual = parse_nzb_reader(reader).unwrap();
+
+        assert_eq!(actual.meta.title, expected.meta.title);
+        assert_eq!(actual.meta.password, expected.meta.password);
+        assert_eq!(actual.files.len(), expected.files.len());
+        for (actual, expected) in actual.files.iter().zip(&expected.files) {
+            assert_eq!(actual.subject, expected.subject);
+            assert_eq!(actual.segments.len(), expected.segments.len());
+            for (actual, expected) in actual.segments.iter().zip(&expected.segments) {
+                assert_eq!(actual.number, expected.number);
+                assert_eq!(actual.bytes, expected.bytes);
+                assert_eq!(actual.message_id, expected.message_id);
+            }
+        }
+    }
+
+    #[test]
     fn rejects_file_count_over_cap() {
         let xml = br#"<nzb>
   <file poster="p" date="0" subject="one">
@@ -980,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_per_file_segment_count_over_cap() {
+    fn aggregate_segment_limit_applies_within_one_file() {
         let xml = br#"<nzb>
   <file poster="p" date="0" subject="one">
     <segments>
@@ -990,15 +1010,53 @@ mod tests {
   </file>
 </nzb>"#;
 
-        let err = parse_nzb_with_limits(
+        let nzb = parse_nzb_with_limits(
             xml,
             ParserLimits {
-                max_segments_per_file: 1,
+                max_segments: 2,
+                ..test_limits()
+            },
+        )
+        .unwrap();
+        assert_eq!(nzb.files[0].segments.len(), 2);
+
+        let over_limit = br#"<nzb>
+  <file poster="p" date="0" subject="one">
+    <segments>
+      <segment bytes="1" number="1">one</segment>
+      <segment bytes="1" number="2">two</segment>
+      <segment bytes="1" number="3">three</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let err = parse_nzb_with_limits(
+            over_limit,
+            ParserLimits {
+                max_segments: 2,
                 ..test_limits()
             },
         )
         .unwrap_err();
         assert!(matches!(err, NzbError::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn accepts_more_than_the_former_per_file_segment_cap() {
+        const SEGMENTS: usize = 100_001;
+        let mut xml = String::with_capacity(SEGMENTS * 65);
+        xml.push_str(r#"<nzb><file poster="p" date="0" subject="large"><segments>"#);
+        for number in 1..=SEGMENTS {
+            write!(
+                xml,
+                r#"<segment bytes="1" number="{number}">{number}@test</segment>"#
+            )
+            .unwrap();
+        }
+        xml.push_str("</segments></file></nzb>");
+
+        let nzb = parse_nzb(xml.as_bytes()).unwrap();
+        assert_eq!(nzb.files.len(), 1);
+        assert_eq!(nzb.files[0].segments.len(), SEGMENTS);
     }
 
     #[test]

@@ -1,32 +1,33 @@
+//! NZBGet `manifest.json` v2 parsing and legacy bare-script adapter detection.
+//!
+//! The manifest supplies a display name, the options schema (including which
+//! options are secret), and the NZBGet adapter. Anything without a manifest is a
+//! bare script and runs under the SABnzbd contract unless it carries NZBGet's
+//! legacy header comment.
+
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::model::{
-    CommandName, DeclaredExtensionVersion, ExtensionAdapter, ExtensionCommand, ExtensionId,
-    ExtensionManifest, ExtensionOption, ExtensionOptionType, ExtensionRevision,
-    ExtensionSelectValue, NzbgetCompatibilityName, NzbgetSection, OptionName,
-    PostProcessingValidationError, ResolvedOptionValue, VerifiedExtensionDigest,
+    NzbgetCompatibilityName, NzbgetSection, OptionName, OptionValue, PostProcessingValidationError,
+    ScriptAdapter, ScriptManifest, ScriptOption, ScriptOptionType, ScriptSelectValue,
 };
 
-/// Manifest parse failure without leaking manifest secrets.
+/// Manifest parse failure without leaking manifest contents.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ManifestError {
     InvalidJson,
     InvalidShape,
-    UnsupportedSchema(u16),
     UnsupportedKind,
-    ShapeConflict,
     Validation(PostProcessingValidationError),
 }
 
 impl std::fmt::Display for ManifestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
-            Self::InvalidJson => "invalid extension manifest JSON",
-            Self::InvalidShape => "invalid extension manifest shape",
-            Self::UnsupportedSchema(_) => "unsupported extension manifest schema",
-            Self::UnsupportedKind => "unsupported extension manifest kind",
-            Self::ShapeConflict => "conflicting native and NZBGet manifest shapes",
+            Self::InvalidJson => "invalid script manifest JSON",
+            Self::InvalidShape => "invalid script manifest shape",
+            Self::UnsupportedKind => "manifest does not declare a POST-PROCESSING script",
             Self::Validation(error) => return error.fmt(f),
         };
         f.write_str(message)
@@ -41,31 +42,15 @@ impl From<PostProcessingValidationError> for ManifestError {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum BareScriptAdapter {
-    Sabnzbd,
-    Nzbget,
-}
-
-impl From<BareScriptAdapter> for ExtensionAdapter {
-    fn from(adapter: BareScriptAdapter) -> Self {
-        match adapter {
-            BareScriptAdapter::Sabnzbd => Self::Sabnzbd,
-            BareScriptAdapter::Nzbget => Self::Nzbget,
-        }
-    }
-}
+/// The NZBGet manifest file name looked for inside a package directory.
+pub const NZBGET_MANIFEST_FILE: &str = "manifest.json";
 
 const LEGACY_NZBGET_HEADER: &str = "### NZBGET POST-PROCESSING SCRIPT";
 const MAX_LEGACY_PREAMBLE_LINES: usize = 64;
 const MAX_LEGACY_PREAMBLE_BYTES: usize = 8 * 1024;
 
 /// Detects only the exact NZBGet comment header in an initial blank/shebang/comment preamble.
-/// Bare scripts never infer native support.
-pub fn detect_bare_script_adapter(
-    script: &str,
-    caller_default: Option<BareScriptAdapter>,
-) -> ExtensionAdapter {
+pub fn detect_bare_script_adapter(script: &str) -> ScriptAdapter {
     let script = script.strip_prefix('\u{feff}').unwrap_or(script);
     let mut inspected_bytes = 0;
     let mut saw_nonblank = false;
@@ -91,59 +76,18 @@ pub fn detect_bare_script_adapter(
                 .chars()
                 .all(|character| character == '#' || character.is_ascii_whitespace())
         {
-            return ExtensionAdapter::Nzbget;
+            return ScriptAdapter::Nzbget;
         }
     }
-    caller_default.unwrap_or(BareScriptAdapter::Sabnzbd).into()
+    ScriptAdapter::Sabnzbd
 }
 
-/// Parses native schema v1 after package discovery supplied a verified package digest.
-pub fn parse_native_manifest(
-    input: &str,
-    verified_digest: VerifiedExtensionDigest,
-) -> Result<ExtensionManifest, ManifestError> {
-    let value = parse_json(input)?;
-    reject_native_conflicts(&value)?;
-    let raw: NativeManifestV1Raw =
-        serde_json::from_value(value).map_err(|_| ManifestError::InvalidShape)?;
-    if raw.schema_version != 1 {
-        return Err(ManifestError::UnsupportedSchema(raw.schema_version));
+/// Parses the NZBGet v24+/v2 manifest contract.
+pub fn parse_nzbget_manifest(input: &str) -> Result<ScriptManifest, ManifestError> {
+    let value: Value = serde_json::from_str(input).map_err(|_| ManifestError::InvalidJson)?;
+    if !value.is_object() {
+        return Err(ManifestError::InvalidShape);
     }
-    let adapter = match raw.kind.as_str() {
-        "native" => ExtensionAdapter::Native,
-        "webhook" => ExtensionAdapter::Webhook,
-        _ => return Err(ManifestError::UnsupportedKind),
-    };
-    let revision = ExtensionRevision::from_verified(
-        ExtensionId::new(raw.id)?,
-        DeclaredExtensionVersion::new(raw.version)?,
-        verified_digest,
-    );
-    build_manifest(
-        adapter,
-        None,
-        raw.name,
-        revision,
-        raw.entrypoint,
-        vec![],
-        raw.commands
-            .into_iter()
-            .map(NativeCommandRaw::into_command)
-            .collect::<Result<_, _>>()?,
-        raw.options
-            .into_iter()
-            .map(NativeOptionRaw::into_option)
-            .collect::<Result<_, _>>()?,
-    )
-}
-
-/// Parses the NZBGet v24+/v2 manifest contract after package verification supplied its digest.
-pub fn parse_nzbget_manifest(
-    input: &str,
-    verified_digest: VerifiedExtensionDigest,
-) -> Result<ExtensionManifest, ManifestError> {
-    let value = parse_json(input)?;
-    reject_nzbget_conflicts(&value)?;
     let raw: NzbgetManifestRaw =
         serde_json::from_value(value).map_err(|_| ManifestError::InvalidShape)?;
     if !raw
@@ -154,172 +98,22 @@ pub fn parse_nzbget_manifest(
         return Err(ManifestError::UnsupportedKind);
     }
     let compatibility_name = NzbgetCompatibilityName::new(raw.name)?;
-    let revision = ExtensionRevision::from_verified(
-        compatibility_name.weaver_extension_id()?,
-        DeclaredExtensionVersion::new(raw.version)?,
-        verified_digest,
-    );
-    build_manifest(
-        ExtensionAdapter::Nzbget,
+    ScriptManifest::new(
+        ScriptAdapter::Nzbget,
         Some(compatibility_name),
         raw.display_name,
-        revision,
+        Some(raw.version),
         raw.main,
         raw.sections
             .into_iter()
             .filter_map(parse_nzbget_section)
-            .collect(),
-        raw.commands
-            .into_iter()
-            .filter_map(parse_nzbget_command)
             .collect(),
         raw.options
             .into_iter()
             .filter_map(parse_nzbget_option)
             .collect(),
     )
-}
-
-fn parse_json(input: &str) -> Result<Value, ManifestError> {
-    serde_json::from_str(input).map_err(|_| ManifestError::InvalidJson)
-}
-
-fn reject_native_conflicts(value: &Value) -> Result<(), ManifestError> {
-    let Some(object) = value.as_object() else {
-        return Err(ManifestError::InvalidShape);
-    };
-    if object.contains_key("main")
-        || object.contains_key("displayName")
-        || object.contains_key("sections")
-        || object.contains_key("approval")
-        || object.contains_key("trust")
-    {
-        return Err(ManifestError::ShapeConflict);
-    }
-    Ok(())
-}
-
-fn reject_nzbget_conflicts(value: &Value) -> Result<(), ManifestError> {
-    let Some(object) = value.as_object() else {
-        return Err(ManifestError::InvalidShape);
-    };
-    if object.contains_key("schema_version")
-        || object.contains_key("id")
-        || object.contains_key("entrypoint")
-        || object.contains_key("approval")
-        || object.contains_key("trust")
-    {
-        return Err(ManifestError::ShapeConflict);
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_manifest(
-    adapter: ExtensionAdapter,
-    compatibility_name: Option<NzbgetCompatibilityName>,
-    display_name: String,
-    revision: ExtensionRevision,
-    entrypoint: String,
-    sections: Vec<NzbgetSection>,
-    commands: Vec<ExtensionCommand>,
-    options: Vec<ExtensionOption>,
-) -> Result<ExtensionManifest, ManifestError> {
-    ExtensionManifest::new(
-        adapter,
-        compatibility_name,
-        display_name,
-        revision,
-        entrypoint,
-        sections,
-        commands,
-        options,
-    )
     .map_err(Into::into)
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NativeManifestV1Raw {
-    schema_version: u16,
-    kind: String,
-    id: String,
-    name: String,
-    version: String,
-    entrypoint: String,
-    #[serde(default)]
-    commands: Vec<NativeCommandRaw>,
-    #[serde(default)]
-    options: Vec<NativeOptionRaw>,
-}
-
-#[derive(Deserialize)]
-struct NativeCommandRaw {
-    name: String,
-    #[serde(default)]
-    section: Option<String>,
-    #[serde(default)]
-    action: Option<String>,
-    #[serde(default)]
-    display_name: Option<String>,
-    #[serde(default)]
-    description: TextLines,
-}
-
-impl NativeCommandRaw {
-    fn into_command(self) -> Result<ExtensionCommand, ManifestError> {
-        let action = self.action.unwrap_or_else(|| self.name.clone());
-        ExtensionCommand::new(
-            self.section,
-            CommandName::new(self.name)?,
-            action,
-            self.display_name,
-            self.description.0,
-        )
-        .map_err(Into::into)
-    }
-}
-
-#[derive(Deserialize)]
-struct NativeOptionRaw {
-    name: String,
-    #[serde(rename = "type")]
-    option_type: ExtensionOptionType,
-    #[serde(default)]
-    default: Option<Value>,
-    #[serde(default)]
-    section: Option<String>,
-    #[serde(default)]
-    display_name: Option<String>,
-    #[serde(default)]
-    description: TextLines,
-    #[serde(default)]
-    select: Vec<Value>,
-    #[serde(default)]
-    required: bool,
-}
-
-impl NativeOptionRaw {
-    fn into_option(self) -> Result<ExtensionOption, ManifestError> {
-        if self.option_type == ExtensionOptionType::Secret && self.default.is_some() {
-            return Err(PostProcessingValidationError::InvalidOptionDefault.into());
-        }
-        let default = self
-            .default
-            .map(|value| value_to_option_value(value, self.option_type))
-            .transpose()?;
-        ExtensionOption::new(
-            self.section,
-            OptionName::new(self.name)?,
-            self.option_type,
-            default,
-            self.display_name,
-            self.description.0,
-            select_values(self.select),
-            self.required,
-        )
-        .map_err(Into::into)
-    }
 }
 
 #[derive(Deserialize)]
@@ -350,7 +144,6 @@ struct NzbgetManifestRaw {
     _nzbget_min_version: Option<String>,
     #[serde(default)]
     sections: Vec<Value>,
-    commands: Vec<Value>,
     options: Vec<Value>,
     #[serde(flatten)]
     _metadata: std::collections::BTreeMap<String, Value>,
@@ -363,52 +156,13 @@ struct NzbgetSectionRaw {
     multi: bool,
 }
 
-impl NzbgetSectionRaw {
-    fn into_section(self) -> Result<NzbgetSection, ManifestError> {
-        NzbgetSection::new(self.name, self.prefix, self.multi).map_err(Into::into)
-    }
-}
-
 fn parse_nzbget_section(value: Value) -> Option<NzbgetSection> {
     let name = value.as_object()?.get("name")?.as_str()?;
     if name.eq_ignore_ascii_case("options") {
         return None;
     }
-    serde_json::from_value::<NzbgetSectionRaw>(value)
-        .ok()?
-        .into_section()
-        .ok()
-}
-
-#[derive(Deserialize)]
-struct NzbgetCommandRaw {
-    name: String,
-    #[serde(default)]
-    section: Option<String>,
-    #[serde(rename = "displayName")]
-    display_name: String,
-    action: String,
-    description: Vec<Value>,
-}
-
-impl NzbgetCommandRaw {
-    fn into_command(self) -> Result<ExtensionCommand, ManifestError> {
-        ExtensionCommand::new(
-            self.section,
-            CommandName::new(self.name)?,
-            self.action,
-            Some(self.display_name),
-            string_values(self.description),
-        )
-        .map_err(Into::into)
-    }
-}
-
-fn parse_nzbget_command(value: Value) -> Option<ExtensionCommand> {
-    serde_json::from_value::<NzbgetCommandRaw>(value)
-        .ok()?
-        .into_command()
-        .ok()
+    let raw = serde_json::from_value::<NzbgetSectionRaw>(value).ok()?;
+    NzbgetSection::new(raw.name, raw.prefix, raw.multi).ok()
 }
 
 #[derive(Deserialize)]
@@ -421,86 +175,52 @@ struct NzbgetOptionRaw {
     display_name: String,
     description: Vec<Value>,
     select: Vec<Value>,
+    /// NZBGet has no secret option type; weaver honours an explicit opt-in so
+    /// credentials in a manifest package go through the settings encryption
+    /// envelope and are masked in the UI.
+    #[serde(default)]
+    secret: bool,
 }
 
-impl NzbgetOptionRaw {
-    fn into_option(self) -> Result<ExtensionOption, ManifestError> {
-        let (option_type, default) = nzbget_option_value(self.value)?;
-        ExtensionOption::new(
-            self.section,
-            OptionName::new(self.name)?,
-            option_type,
-            Some(default),
-            Some(self.display_name),
-            string_values(self.description),
-            select_values(self.select),
-            false,
-        )
-        .map_err(Into::into)
-    }
+fn parse_nzbget_option(value: Value) -> Option<ScriptOption> {
+    let raw = serde_json::from_value::<NzbgetOptionRaw>(value).ok()?;
+    let (option_type, default) = if raw.secret {
+        (ScriptOptionType::Secret, None)
+    } else {
+        let (option_type, default) = nzbget_option_value(raw.value).ok()?;
+        (option_type, Some(default))
+    };
+    ScriptOption::new(
+        raw.section,
+        OptionName::new(raw.name).ok()?,
+        option_type,
+        default,
+        Some(raw.display_name),
+        string_values(raw.description),
+        select_values(raw.select),
+        false,
+    )
+    .ok()
 }
 
-fn parse_nzbget_option(value: Value) -> Option<ExtensionOption> {
-    serde_json::from_value::<NzbgetOptionRaw>(value)
-        .ok()?
-        .into_option()
-        .ok()
-}
-
-fn value_to_option_value(
-    value: Value,
-    option_type: ExtensionOptionType,
-) -> Result<ResolvedOptionValue, ManifestError> {
-    match (value, option_type) {
-        (Value::String(value), ExtensionOptionType::String) => {
-            Ok(ResolvedOptionValue::String(value))
-        }
-        (Value::Number(value), ExtensionOptionType::Integer) => value
-            .as_i64()
-            .map(ResolvedOptionValue::Integer)
-            .ok_or(ManifestError::InvalidShape),
-        (Value::Number(value), ExtensionOptionType::Number) => {
-            Ok(ResolvedOptionValue::Number(value))
-        }
-        (Value::Bool(value), ExtensionOptionType::Boolean) => {
-            Ok(ResolvedOptionValue::Boolean(value))
-        }
-        _ => Err(ManifestError::InvalidShape),
-    }
-}
-
-fn nzbget_option_value(
-    value: Value,
-) -> Result<(ExtensionOptionType, ResolvedOptionValue), ManifestError> {
+fn nzbget_option_value(value: Value) -> Result<(ScriptOptionType, OptionValue), ManifestError> {
     match value {
-        Value::String(value) => Ok((
-            ExtensionOptionType::String,
-            ResolvedOptionValue::String(value),
-        )),
-        Value::Bool(value) => Ok((
-            ExtensionOptionType::Boolean,
-            ResolvedOptionValue::Boolean(value),
-        )),
+        Value::String(value) => Ok((ScriptOptionType::String, OptionValue::String(value))),
+        Value::Bool(value) => Ok((ScriptOptionType::Boolean, OptionValue::Boolean(value))),
         Value::Number(value) => match value.as_i64() {
-            Some(value) => Ok((
-                ExtensionOptionType::Integer,
-                ResolvedOptionValue::Integer(value),
-            )),
-            None => Ok((
-                ExtensionOptionType::Number,
-                ResolvedOptionValue::Number(value),
-            )),
+            Some(value) => Ok((ScriptOptionType::Integer, OptionValue::Integer(value))),
+            None => Ok((ScriptOptionType::Number, OptionValue::Number(value))),
         },
         _ => Err(ManifestError::InvalidShape),
     }
 }
 
-fn select_values(values: Vec<Value>) -> Vec<ExtensionSelectValue> {
+fn select_values(values: Vec<Value>) -> Vec<ScriptSelectValue> {
     values
         .into_iter()
         .filter_map(|value| match value {
-            Value::String(value) => Some(ExtensionSelectValue::String(value)),
-            Value::Number(value) => Some(ExtensionSelectValue::Number(value)),
+            Value::String(value) => Some(ScriptSelectValue::String(value)),
+            Value::Number(value) => Some(ScriptSelectValue::Number(value)),
             _ => None,
         })
         .collect()
@@ -514,26 +234,4 @@ fn string_values(values: Vec<Value>) -> Vec<String> {
             _ => None,
         })
         .collect()
-}
-
-#[derive(Default)]
-struct TextLines(Vec<String>);
-
-impl<'de> Deserialize<'de> for TextLines {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum TextLinesWire {
-            One(String),
-            Many(Vec<String>),
-        }
-        match Option::<TextLinesWire>::deserialize(deserializer)? {
-            None => Ok(Self::default()),
-            Some(TextLinesWire::One(value)) => Ok(Self(vec![value])),
-            Some(TextLinesWire::Many(values)) => Ok(Self(values)),
-        }
-    }
 }

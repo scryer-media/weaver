@@ -15,6 +15,7 @@ import {
   useState,
 } from "react";
 import { Link } from "react-router";
+import { toast } from "sonner";
 import { useMutation, useQuery, useSubscription } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { DataTable } from "@/components/data-table/DataTable";
@@ -28,6 +29,7 @@ import { formatBytes } from "@/components/SpeedDisplay";
 import { cn } from "@/lib/utils";
 import { STATUS_BG_CLASS, STATUS_TEXT_CLASS } from "@/lib/status-tokens";
 import { useTranslate } from "@/lib/context/translate-context";
+import { useGraphqlConnectionState } from "@/graphql/client";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
 import {
   formatJobReleaseName,
@@ -43,10 +45,12 @@ import {
   REDOWNLOAD_JOB_MUTATION,
   REPROCESS_JOB_MUTATION,
 } from "@/graphql/queries";
+
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+
+const HISTORY_DELETE_TOAST_ID = "history-delete-progress";
 
 type HistoryJob = {
   id: number;
@@ -290,10 +294,13 @@ function reconcileDeleteOperations(
 
 export function History() {
   const t = useTranslate();
+  const graphqlConnection = useGraphqlConnectionState();
   const previousDeleteOperationsRef = useRef<HistoryDeleteOperationSummary[]>([]);
   const previousRawJobsRef = useRef<HistoryJob[]>([]);
   const previousVisibleJobsRef = useRef<HistoryJob[]>([]);
   const deleteOperationsFetchingRef = useRef(false);
+  const lastHistoryConnectionAtRef = useRef<number | null | undefined>(undefined);
+  const lastHistoryEventErrorRef = useRef<string | null>(null);
   const [historyPreferences, setHistoryPreferences] = useTablePreferences(
     "weaver.history.table.preferences",
     DEFAULT_HISTORY_PREFERENCES,
@@ -319,6 +326,20 @@ export function History() {
     () => buildHistoryPageInput(historyPreferences, deferredSearch, pageIndex),
     [deferredSearch, historyPreferences, pageIndex],
   );
+  const historyQueryKey = useMemo(() => JSON.stringify(historyPageInput), [historyPageInput]);
+  const historyTableVirtualization = useMemo(
+    () => ({
+      estimatedRowHeight: 64,
+      overscan: 8,
+      resetKey: historyQueryKey,
+    }),
+    [historyQueryKey],
+  );
+  const historyRowClassName = useCallback((row: { getIsSelected: () => boolean; original: HistoryJob }) => cn(
+    "text-[13px]",
+    row.getIsSelected() && "bg-primary/[0.06]",
+    row.original.deleteOperation?.locked && "bg-status-paused/5 opacity-75",
+  ), []);
 
   const [{ data, fetching }, reexecuteHistoryPage] = useQuery<HistoryPageResponse>({
     query: HISTORY_PAGE_QUERY,
@@ -515,6 +536,27 @@ export function History() {
   }, [awaitingDeleteStatusRefresh, deleteStatusRefreshStarted, fetchingDeleteOperations]);
 
   useEffect(() => {
+    if (!hasActiveDeleteOperations) {
+      toast.dismiss(HISTORY_DELETE_TOAST_ID);
+      return;
+    }
+
+    const progress = [
+      `${deleteProgress.totalTargets} tracked`,
+      deleteProgress.runningTargets > 0 && `${deleteProgress.runningTargets} running`,
+      deleteProgress.queuedTargets > 0 && `${deleteProgress.queuedTargets} queued`,
+      deleteProgress.failedTargets > 0 && `${deleteProgress.failedTargets} failed`,
+    ].filter(Boolean).join(" • ");
+
+    toast.loading("Deleting history items", {
+      id: HISTORY_DELETE_TOAST_ID,
+      description: progress,
+      duration: Infinity,
+      dismissible: true,
+    });
+  }, [deleteProgress, hasActiveDeleteOperations]);
+
+  useEffect(() => {
     if (hasActiveDeleteOperations) {
       if (!hadActiveDeleteOperations) {
         setHadActiveDeleteOperations(true);
@@ -562,7 +604,45 @@ export function History() {
     },
     [hasActiveDeleteOperations, refetchHistoryPage, reexecuteHistoryDeleteOperations],
   );
-  useSubscription({ query: HISTORY_FACADE_EVENTS_SUBSCRIPTION }, handleSubscription);
+  const [{ error: historyEventError }] = useSubscription(
+    { query: HISTORY_FACADE_EVENTS_SUBSCRIPTION },
+    handleSubscription,
+  );
+
+  useEffect(() => {
+    if (graphqlConnection.status !== "connected" || graphqlConnection.lastConnectedAt === null) {
+      return;
+    }
+    if (lastHistoryConnectionAtRef.current === undefined) {
+      lastHistoryConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+      return;
+    }
+    if (lastHistoryConnectionAtRef.current === graphqlConnection.lastConnectedAt) {
+      return;
+    }
+    lastHistoryConnectionAtRef.current = graphqlConnection.lastConnectedAt;
+    void refetchHistoryPage();
+    void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
+  }, [
+    graphqlConnection.lastConnectedAt,
+    graphqlConnection.status,
+    refetchHistoryPage,
+    reexecuteHistoryDeleteOperations,
+  ]);
+
+  useEffect(() => {
+    if (!historyEventError) {
+      lastHistoryEventErrorRef.current = null;
+      return;
+    }
+    const errorKey = historyEventError.message;
+    if (lastHistoryEventErrorRef.current === errorKey) {
+      return;
+    }
+    lastHistoryEventErrorRef.current = errorKey;
+    void refetchHistoryPage();
+    void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
+  }, [historyEventError, refetchHistoryPage, reexecuteHistoryDeleteOperations]);
 
   const timestampFormatter = useMemo(
     () =>
@@ -773,7 +853,7 @@ export function History() {
         ),
         meta: {
           headerClassName: "h-7 w-[52px] px-2 text-center",
-          cellClassName: "p-0 text-center",
+          cellClassName: "p-0 text-center align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -790,9 +870,7 @@ export function History() {
               >
                 {displayName}
               </Link>
-              {deleteOperation?.locked ? (
-                <span className="text-[10.5px] text-status-paused">Deleting…</span>
-              ) : deleteOperation?.state === "FAILED" ? (
+              {deleteOperation?.state === "FAILED" ? (
                 <span
                   className="block truncate text-[10.5px] text-status-failed"
                   title={deleteOperation.errorMessage ?? "Delete failed"}
@@ -805,23 +883,21 @@ export function History() {
         },
         meta: {
           headerClassName: "min-w-[280px] px-4 text-left",
-          cellClassName: "min-w-[280px] px-4 py-3 text-left align-top",
+          cellClassName: "min-w-[280px] px-4 py-3 text-left align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
         accessorKey: "status",
         header: ({ column }) => <DataTableColumnHeader column={column} title={t("table.status")} />,
         cell: ({ row }) => (
-          <div className="space-y-1">
-            <JobStatusBadge status={row.original.status} />
-            {row.original.deleteOperation?.locked ? (
-              <div className="text-[10.5px] text-status-paused">Locked</div>
-            ) : null}
-          </div>
+          <JobStatusBadge
+            status={row.original.status}
+            label={row.original.deleteOperation?.locked ? "DELETING" : undefined}
+          />
         ),
         meta: {
           headerClassName: "w-[130px] px-4 text-left",
-          cellClassName: "px-4 py-3 text-left align-top",
+          cellClassName: "px-4 py-3 text-left align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -838,7 +914,7 @@ export function History() {
         ),
         meta: {
           headerClassName: "min-w-[180px] px-4 text-left",
-          cellClassName: "min-w-[180px] px-4 py-3 text-left align-top",
+          cellClassName: "min-w-[180px] px-4 py-3 text-left align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -856,7 +932,7 @@ export function History() {
         },
         meta: {
           headerClassName: "w-[110px] px-4 text-left",
-          cellClassName: "w-[110px] px-4 py-3 text-left align-top",
+          cellClassName: "w-[110px] px-4 py-3 text-left align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -870,7 +946,7 @@ export function History() {
         ),
         meta: {
           headerClassName: "w-[110px] px-4 text-left",
-          cellClassName: "w-[110px] px-4 py-3 text-left align-top",
+          cellClassName: "w-[110px] px-4 py-3 text-left align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -886,7 +962,7 @@ export function History() {
         ),
         meta: {
           headerClassName: "min-w-[120px] px-4 text-left",
-          cellClassName: "min-w-[120px] px-4 py-3 text-left align-top",
+          cellClassName: "min-w-[120px] px-4 py-3 text-left align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -896,7 +972,7 @@ export function History() {
         cell: ({ row }) => renderActions(row.original, "size-8", "size-4"),
         meta: {
           headerClassName: "w-[144px] px-4 text-right",
-          cellClassName: "w-[144px] p-0 text-right align-top",
+          cellClassName: "w-[144px] p-0 text-right align-middle",
         } satisfies DataTableColumnMeta,
       },
     ],
@@ -1037,7 +1113,23 @@ export function History() {
     setPageIndex(0);
   }
 
-  const showEmptyState = !fetching && counts.all === 0 && totalCount === 0 && historyPreferences.search.length === 0 && historyPreferences.status === "all";
+  const hasNoHistory = counts.all === 0 && totalCount === 0 && historyPreferences.search.length === 0 && historyPreferences.status === "all";
+  const historyEmptyState = fetching && !data ? (
+    <div className="py-12 text-center text-muted-foreground">{t("label.loading")}</div>
+  ) : hasNoHistory ? (
+    <div className="py-4">
+      <EmptyState title={t("history.title")} description={t("history.empty")} />
+    </div>
+  ) : (
+    <div className="space-y-3 py-12 text-center">
+      <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
+      <div>
+        <Button variant="outline" onClick={resetHistoryView}>
+          {t("action.clearFilters")}
+        </Button>
+      </div>
+    </div>
+  );
 
   return (
     <div className="space-y-6">
@@ -1046,9 +1138,6 @@ export function History() {
           <h1 className="font-space-grotesk text-[34px] font-bold leading-none tracking-tight">
             {t("history.title")}
           </h1>
-          <p className="mt-2 text-[13px] text-muted-foreground">
-            {counts.success} {t("history.filterSuccess").toLowerCase()} · {counts.failure} {t("history.filterFailure").toLowerCase()} · {counts.all} total
-          </p>
         </div>
         {counts.all > 0 ? (
           <div className="flex gap-3">
@@ -1067,42 +1156,7 @@ export function History() {
         ) : null}
       </div>
 
-      {hasActiveDeleteOperations ? (
-        <Card className="sticky top-4 z-10 rounded-card border-status-paused/30 bg-status-paused/5">
-          <CardContent className="flex flex-wrap items-center justify-between gap-3 py-4">
-            <div className="space-y-1">
-              <div className="text-sm font-medium text-foreground">Deleting history items</div>
-              <div className="text-xs text-muted-foreground">
-                {deleteProgress.totalTargets}
-                {" "}tracked
-                {deleteProgress.runningTargets > 0
-                  ? ` • ${deleteProgress.runningTargets} running`
-                  : ""}
-                {deleteProgress.queuedTargets > 0
-                  ? ` • ${deleteProgress.queuedTargets} queued`
-                  : ""}
-                {deleteProgress.failedTargets > 0
-                  ? ` • ${deleteProgress.failedTargets} failed`
-                  : ""}
-              </div>
-            </div>
-            <div className="text-sm font-medium text-status-paused">
-              Rows stay visible until each delete finishes
-            </div>
-          </CardContent>
-        </Card>
-      ) : null}
-
-      {fetching && !data ? (
-        <Card className="rounded-card">
-          <CardContent className="py-12 text-center text-muted-foreground">
-            {t("label.loading")}
-          </CardContent>
-        </Card>
-      ) : showEmptyState ? (
-        <EmptyState title={t("history.title")} description={t("history.empty")} />
-      ) : (
-        <div className="space-y-4">
+      <div className="space-y-4">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="relative w-full sm:max-w-[260px]">
               <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -1204,21 +1258,9 @@ export function History() {
               table={historyTable}
               tableClassName="table-fixed"
               wrapperClassName="max-h-[70vh]"
-              rowClassName={(row) => cn(
-                "text-[13px]",
-                row.getIsSelected() && "bg-primary/[0.06]",
-                row.original.deleteOperation?.locked && "bg-status-paused/5 opacity-75",
-              )}
-              emptyState={
-                <div className="space-y-3 py-12 text-center">
-                  <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
-                  <div>
-                    <Button variant="outline" onClick={resetHistoryView}>
-                      {t("action.clearFilters")}
-                    </Button>
-                  </div>
-                </div>
-              }
+              rowClassName={historyRowClassName}
+              virtualization={historyTableVirtualization}
+              emptyState={historyEmptyState}
             />
             <DataTablePagination
               table={historyTable}
@@ -1229,11 +1271,11 @@ export function History() {
               nextLabel={t("action.next")}
             />
           </div>
-        </div>
-      )}
+      </div>
 
       <ConfirmDialog
         open={deleteConfirmId != null}
+        testId="history-delete-confirm"
         title={t("confirm.deleteHistory")}
         message={t("confirm.deleteHistoryMessage")}
         confirmLabel={t("confirm.deleteHistoryConfirm")}
@@ -1281,6 +1323,7 @@ export function History() {
 
       <ConfirmDialog
         open={deleteBatchConfirm}
+        testId="history-delete-batch-confirm"
         title={t("confirm.deleteHistoryBatch", { count: selectedCount })}
         message={t("confirm.deleteHistoryBatchMessage", { count: selectedCount })}
         confirmLabel={t("confirm.deleteHistoryConfirm")}
@@ -1311,6 +1354,7 @@ export function History() {
 
       <ConfirmDialog
         open={deleteAllConfirm}
+        testId="history-delete-all-confirm"
         title={t("confirm.deleteAllHistory")}
         message={t("confirm.deleteAllHistoryMessage")}
         confirmLabel={t("confirm.deleteHistoryConfirm")}
