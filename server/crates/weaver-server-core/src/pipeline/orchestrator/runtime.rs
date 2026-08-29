@@ -293,6 +293,8 @@ impl Pipeline {
             download_write_hard_pressure_latched: false,
             download_pressure_hard_stall_started_at: None,
             download_pressure_soft_dispatch_after: None,
+            snapshot_published_at: None,
+            snapshot_publish_pending: false,
             download_restart_durable_lead_retry_after: HashMap::new(),
             propagation_ready_at: HashMap::new(),
             propagation_delay_forced: None,
@@ -1010,6 +1012,7 @@ impl Pipeline {
                     _ = metrics_snapshot_interval.tick() => {
                         self.sample_phase_progress();
                         self.shared_state.refresh_metrics_snapshot();
+                        self.flush_pending_snapshot();
                         // Fallback wake for refills held under hard pressure, in
                         // case the backlog drained without a download event.
                         self.maybe_service_deferred_lane_refills();
@@ -1099,7 +1102,7 @@ impl Pipeline {
             }
 
             self.pump_decode_queue();
-            self.publish_snapshot();
+            self.publish_snapshot_debounced();
         }
 
         self.drain().await;
@@ -1145,8 +1148,44 @@ impl Pipeline {
     }
 
     pub(crate) fn publish_snapshot(&mut self) {
+        self.snapshot_published_at = Some(Instant::now());
+        self.snapshot_publish_pending = false;
         let _ = self.refresh_bandwidth_cap_window();
         self.shared_state.publish_jobs(self.list_jobs());
+    }
+
+    /// Publish the job snapshot unless one was already published inside the
+    /// debounce window; a suppressed publish is owed and caught up by the
+    /// metrics tick.
+    ///
+    /// The run loop turns once per pipeline event — every download result,
+    /// decode completion, and lane refill — and `list_jobs` rebuilds the whole
+    /// snapshot (per-job clones plus per-file walks) on each call, so an
+    /// unconditional per-turn publish scaled the orchestrator's overhead with
+    /// article rate. Bumping the revision also wakes every quota-parked retry
+    /// task, each of which re-reads its job from the published list; the same
+    /// window bounds that herd. Explicit callers — command handlers, status
+    /// transitions — keep the immediate `publish_snapshot` so user-visible
+    /// changes never wait on the window.
+    pub(crate) fn publish_snapshot_debounced(&mut self) {
+        const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(100);
+        if self
+            .snapshot_published_at
+            .is_some_and(|at| at.elapsed() < SNAPSHOT_DEBOUNCE)
+        {
+            self.snapshot_publish_pending = true;
+            return;
+        }
+        self.publish_snapshot();
+    }
+
+    /// The trailing edge of the debounce: publish a suppressed snapshot once
+    /// the periodic tick comes around, so the last event before a quiet spell
+    /// still reaches the UI.
+    pub(crate) fn flush_pending_snapshot(&mut self) {
+        if self.snapshot_publish_pending {
+            self.publish_snapshot();
+        }
     }
 
     fn update_parked_infrastructure_metric(&self) {

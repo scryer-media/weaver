@@ -1579,32 +1579,32 @@ impl Pipeline {
                     "download.yenc_part_crc.not_verified",
                     std::time::Duration::from_nanos(1),
                 );
-                let yenc_name_lower = yenc_name.to_ascii_lowercase();
-                let is_rar_volume = yenc_name_lower.ends_with(".rar")
-                    || yenc_name_lower.rsplit_once('.').is_some_and(|(_, ext)| {
-                        ext.len() == 3
-                            && ext.starts_with('r')
-                            && ext.as_bytes()[1..].iter().all(u8::is_ascii_digit)
-                    });
-                let unverified_bucket = if yenc_name_lower.ends_with(".par2") {
-                    "download.yenc_part_crc.not_verified.par2"
-                } else if is_rar_volume {
-                    "download.yenc_part_crc.not_verified.rar"
-                } else {
-                    "download.yenc_part_crc.not_verified.other"
-                };
-                crate::runtime::perf_probe::record(
-                    unverified_bucket,
-                    std::time::Duration::from_nanos(1),
-                );
-                info!(
-                    job_id = job_id.0,
-                    file_id = %file_id,
-                    segment = %segment_id,
-                    file_index = file_id.file_index,
-                    yenc_name = %yenc_name,
-                    "yEnc part CRC was not independently verified"
-                );
+                // The per-kind buckets exist for profiling sessions; the
+                // classification allocates (a lowercased copy of the name), so
+                // articles on a normal run skip it. Uuencode articles and old
+                // yEnc posts without `pcrc32=` take this branch for EVERY
+                // segment, which is also why the log lives at the per-file
+                // first-unverified seam below rather than here.
+                if crate::runtime::perf_probe::enabled() {
+                    let yenc_name_lower = yenc_name.to_ascii_lowercase();
+                    let is_rar_volume = yenc_name_lower.ends_with(".rar")
+                        || yenc_name_lower.rsplit_once('.').is_some_and(|(_, ext)| {
+                            ext.len() == 3
+                                && ext.starts_with('r')
+                                && ext.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+                        });
+                    let unverified_bucket = if yenc_name_lower.ends_with(".par2") {
+                        "download.yenc_part_crc.not_verified.par2"
+                    } else if is_rar_volume {
+                        "download.yenc_part_crc.not_verified.rar"
+                    } else {
+                        "download.yenc_part_crc.not_verified.other"
+                    };
+                    crate::runtime::perf_probe::record(
+                        unverified_bucket,
+                        std::time::Duration::from_nanos(1),
+                    );
+                }
             }
 
             let _ = self.event_tx.send(PipelineEvent::SegmentDecoded {
@@ -1627,11 +1627,26 @@ impl Pipeline {
                         self.unverified_segments.remove(&file_id);
                     }
                 }
-            } else {
-                self.unverified_segments
-                    .entry(file_id)
-                    .or_default()
-                    .insert(segment_id.segment_number, source);
+            } else if !encoding.is_uu() {
+                // uuencode is excluded: the candidate map feeds whole-file CRC
+                // recovery, which triggers only when a posted `=yend crc32`
+                // disagrees — and uuencode carries no CRC of any kind, so its
+                // segments could never be recovered through it. Its damage
+                // reporting lives in `finish_uu_file`.
+                let file_candidates = self.unverified_segments.entry(file_id).or_default();
+                if file_candidates.is_empty() {
+                    // Once per file, on its first unverified article: the
+                    // per-segment form of this log emitted one line (and one
+                    // name allocation) per article on posts without `pcrc32=`.
+                    info!(
+                        job_id = job_id.0,
+                        file_id = %file_id,
+                        file_index = file_id.file_index,
+                        yenc_name = %yenc_name,
+                        "file's yEnc part CRCs are not independently verified"
+                    );
+                }
+                file_candidates.insert(segment_id.segment_number, source);
             }
 
             let mut buffered_segment = BufferedDecodedSegment {

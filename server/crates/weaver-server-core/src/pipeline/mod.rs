@@ -2645,6 +2645,10 @@ pub struct Pipeline {
     pub(super) download_pressure_hard_stall_started_at: Option<Instant>,
     /// Next time soft byte pressure may issue a replacement article.
     pub(super) download_pressure_soft_dispatch_after: Option<Instant>,
+    /// When the job snapshot was last rebuilt and published.
+    pub(super) snapshot_published_at: Option<Instant>,
+    /// Whether a debounced snapshot publish is owed once the window reopens.
+    pub(super) snapshot_publish_pending: bool,
     /// Per-job delay after restart-durable-lead throttling parks primary work.
     pub(super) download_restart_durable_lead_retry_after: HashMap<JobId, Instant>,
     /// When each deferred job's articles become old enough to fetch.
