@@ -1054,9 +1054,49 @@ fn verify_in_scope(
 /// pass over virtual volumes and wants the same terms; see
 /// [`crate::pipeline::Pipeline::verify_direct_sets_quietly`].
 pub(in crate::pipeline) fn selective_pass_verify_options() -> par2_rs::VerifyOptions {
-    par2_rs::VerifyOptions {
-        fast_verify: true,
-        ..par2_rs::VerifyOptions::default()
+    let mut options = par2_rs::VerifyOptions::default();
+    options.fast_verify = true;
+    options
+}
+
+/// A repairer scan carry built from the authoritative whole-set pass this
+/// module just ran, so the damaged path's repairer analysis does not re-read
+/// bytes that pass already hashed.
+///
+/// Fingerprints are captured at each description's sanitized name — the same
+/// resolution the pass read through when its plan proposed no moves, which is
+/// the only shape the caller builds a carry for. Any file this cannot account
+/// for refuses the whole carry rather than shipping a partial attestation:
+/// a `Renamed` verdict means the layout is not the canonical one the carry
+/// describes, and a present-attested file that fails to stat means the bytes
+/// are not where the attestation says. par2-rs refusing the finished carry is
+/// logged and dropped — the analysis then scans exactly as it always did.
+pub(in crate::pipeline) fn build_host_verification_carry(
+    verify_dir: &std::path::Path,
+    par2_set: &par2_rs::Par2FileSet,
+    verification: &par2_rs::VerificationResult,
+) -> Option<std::sync::Arc<par2_rs::ScanCarry>> {
+    let mut fingerprints: HashMap<par2_rs::FileId, par2_rs::FileStatFingerprint> = HashMap::new();
+    for file in &verification.files {
+        match &file.status {
+            par2_rs::verify::FileStatus::Missing => continue,
+            par2_rs::verify::FileStatus::Renamed(_) => return None,
+            par2_rs::verify::FileStatus::Complete | par2_rs::verify::FileStatus::Damaged(_) => {}
+        }
+        let description = par2_set.file_description(&file.file_id)?;
+        let path = verify_dir.join(sanitize_download_filename(&description.filename));
+        let fingerprint = par2_rs::FileStatFingerprint::capture_path(&path)?;
+        fingerprints.insert(file.file_id, fingerprint);
+    }
+    match par2_rs::ScanCarry::from_verification(verify_dir, par2_set, verification, &fingerprints) {
+        Ok(carry) => Some(std::sync::Arc::new(carry)),
+        Err(error) => {
+            debug!(
+                error = %error,
+                "host verification carry refused — the repairer will scan normally"
+            );
+            None
+        }
     }
 }
 
@@ -2811,6 +2851,21 @@ impl Pipeline {
         }
 
         let cancellation = self.par2_cancellation_token(job_id);
+        // The carry the previous pass over this set left behind — a repairer
+        // analysis, a repair, or this module's own authoritative verification.
+        // Seeding it is what keeps analysis → repair (and host verify →
+        // analysis) from re-reading bytes the earlier pass already hashed;
+        // par2-rs stat-gates the carry and re-checks bytes before mutating,
+        // so a stale one degrades to the full scan this call always did.
+        let carry_set_id = par2_set.recovery_set_id;
+        let seeded_scan_carry = self
+            .ensure_par2_runtime(job_id)
+            .set_runtime_mut(carry_set_id)
+            .and_then(|set_runtime| set_runtime.scan_carry.clone());
+        #[cfg(test)]
+        if seeded_scan_carry.is_some() {
+            self.par2_scan_carry_seeded_calls += 1;
+        }
         let mut repair_task = tokio::task::spawn_blocking(move || {
             if repair {
                 crate::e2e_failpoint::maybe_delay("repair.task_start");
@@ -2820,6 +2875,7 @@ impl Pipeline {
             options.repair = repair;
             options.memory_limit = Some(memory_limit);
             options.cancel = Some(cancellation);
+            options.scan_carry = seeded_scan_carry;
             if let Some(counters) = phase_counters {
                 options.progress = Some(Arc::new(move |update: par2_rs::ProgressUpdate| {
                     if !matches!(
@@ -2839,11 +2895,11 @@ impl Pipeline {
                 }));
             }
             let repairer = par2_rs::Par2Repairer::new(options);
-            let (outcome, _) = repairer
+            let (outcome, scan_carry) = repairer
                 .verify_or_repair_carrying()
                 .map_err(|e| format!("PAR2 repairer failed: {e}"))?;
             ensure_par2_repair_completed(&outcome, repair)?;
-            Ok(outcome)
+            Ok((outcome, scan_carry))
         });
         let repair_result = if repair {
             loop {
@@ -2863,7 +2919,22 @@ impl Pipeline {
         }
 
         match repair_result {
-            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Ok((outcome, scan_carry))) => {
+                // Replaced unconditionally: a pass that produced no carry may
+                // have moved bytes, which makes any older stash a lie about
+                // the layout on disk.
+                #[cfg(test)]
+                if scan_carry.is_some() {
+                    self.par2_scan_carry_stashed_calls += 1;
+                }
+                if let Some(set_runtime) = self
+                    .ensure_par2_runtime(job_id)
+                    .set_runtime_mut(carry_set_id)
+                {
+                    set_runtime.scan_carry = scan_carry;
+                }
+                Ok(outcome)
+            }
             Ok(Err(error)) => Err(error),
             Err(error) => Err(format!("repair task panicked: {error}")),
         }
@@ -3116,6 +3187,7 @@ impl Pipeline {
         self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
         info!(job_id = job_id.0, "par2 verification started");
 
+        let pass_set_id = par2_set.recovery_set_id;
         let verify_dir = working_dir.clone();
         let pp_pool = self.pp_pool.clone();
         // A direct set's source volumes are not on disk, so the
@@ -3165,9 +3237,27 @@ impl Pipeline {
                 };
 
                 let Some(direct) = direct else {
-                    let file_access =
-                        par2_rs::PlacementFileAccess::from_plan(verify_dir, &par2_set, &plan);
-                    return Ok((verify_in_scope(&scope, &par2_set, &file_access), plan));
+                    let file_access = par2_rs::PlacementFileAccess::from_plan(
+                        verify_dir.clone(),
+                        &par2_set,
+                        &plan,
+                    );
+                    let verification = verify_in_scope(&scope, &par2_set, &file_access);
+                    // A damaged whole-set verdict is about to send this job to
+                    // the repairer, whose analysis would re-read every byte
+                    // this pass just hashed. Hand the pass across the boundary
+                    // instead — only when every file sits at its described
+                    // name, because that is the layout the carry attests.
+                    let host_carry = if matches!(scope, Par2PassScope::WholeSet)
+                        && plan.swaps.is_empty()
+                        && plan.renames.is_empty()
+                        && verification.needs_repair()
+                    {
+                        build_host_verification_carry(&verify_dir, &par2_set, &verification)
+                    } else {
+                        None
+                    };
+                    return Ok((verification, plan, host_carry));
                 };
 
                 // The scan walked a directory the direct volumes are absent
@@ -3234,7 +3324,9 @@ impl Pipeline {
                     cipher_refusals = cipher.refusals(),
                     "authoritative PAR2 pass read a direct set's volumes virtually"
                 );
-                Ok((verification, plan))
+                // No host carry from the virtual pass: its volumes are not on
+                // disk, so there is nothing a stat fingerprint could attest.
+                Ok((verification, plan, None))
             })
         })
         .await;
@@ -3242,7 +3334,21 @@ impl Pipeline {
         self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
 
         match verify_result {
-            Ok(Ok(result)) => Ok(result),
+            Ok(Ok((verification, plan, host_carry))) => {
+                if let Some(carry) = host_carry {
+                    #[cfg(test)]
+                    {
+                        self.par2_host_carry_builds += 1;
+                    }
+                    if let Some(set_runtime) = self
+                        .ensure_par2_runtime(job_id)
+                        .set_runtime_mut(pass_set_id)
+                    {
+                        set_runtime.scan_carry = Some(carry);
+                    }
+                }
+                Ok((verification, plan))
+            }
             Ok(Err(message)) => Err(message),
             Err(error) => Err(format!("verification task panicked: {error}")),
         }

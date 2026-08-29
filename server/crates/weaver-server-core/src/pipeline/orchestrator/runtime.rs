@@ -207,6 +207,12 @@ impl Pipeline {
             #[cfg(test)]
             par2_quick_partial_verify_calls: 0,
             #[cfg(test)]
+            par2_scan_carry_seeded_calls: 0,
+            #[cfg(test)]
+            par2_scan_carry_stashed_calls: 0,
+            #[cfg(test)]
+            par2_host_carry_builds: 0,
+            #[cfg(test)]
             par2_ignore_extensions_override: None,
             #[cfg(test)]
             par2_recovery_salvage_scans: 0,

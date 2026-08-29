@@ -1482,6 +1482,14 @@ pub(super) struct Par2SetRuntime {
     /// Last time the retained session was taken or restored, for global LRU
     /// eviction when the shared retained-state budget is exceeded.
     pub(super) session_last_used: Option<Instant>,
+    /// Scan state carried between repairer passes over this set: the carry the
+    /// last completed `Par2Repairer` pass returned, or one built from this
+    /// module's own authoritative verification. Seeded into the next repairer
+    /// run's options so an analysis or repair does not re-read bytes a
+    /// previous pass already hashed. par2-rs validates a consumed carry
+    /// against per-file stat fingerprints and re-checks bytes before any
+    /// mutating request, so a stale stash costs nothing but the seed.
+    pub(super) scan_carry: Option<std::sync::Arc<par2_rs::ScanCarry>>,
     /// Completed files whose current identity/checksum evidence was admitted
     /// to the retained session.
     pub(super) session_evidence_file_ids: HashSet<NzbFileId>,
@@ -2346,6 +2354,16 @@ pub struct Pipeline {
     pub(super) par2_quick_verify_calls: usize,
     #[cfg(test)]
     pub(super) par2_quick_partial_verify_calls: usize,
+    /// Repairer runs that were seeded with a stashed scan carry — a previous
+    /// pass's returned carry or a host-verification one.
+    #[cfg(test)]
+    pub(super) par2_scan_carry_seeded_calls: usize,
+    /// Repairer runs whose returned scan carry was stashed for the next pass.
+    #[cfg(test)]
+    pub(super) par2_scan_carry_stashed_calls: usize,
+    /// Host-verification carries built from a damaged authoritative pass.
+    #[cfg(test)]
+    pub(super) par2_host_carry_builds: usize,
     /// Forces the PAR2 ignore-extension list for a test, so the "override
     /// disables it" case can be exercised without mutating a process-global
     /// environment variable while other tests are running.

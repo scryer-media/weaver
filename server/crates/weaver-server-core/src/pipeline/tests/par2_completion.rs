@@ -8056,6 +8056,58 @@ async fn mixed_damage_with_sufficient_blocks_repairs_the_furniture_too() {
     );
 }
 
+#[tokio::test]
+async fn a_damaged_authoritative_verification_builds_a_carry_the_repairer_accepts() {
+    // The hand-off `run_par2_placement_pass` performs when its whole-set pass
+    // finds damage over an in-place layout, pinned at the unit: the pass's own
+    // verification builds a carry, and a repairer seeded with it reaches the
+    // same verdict without the pass being re-run cold.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir.path().to_path_buf();
+    let payload_filename = "payload.mkv";
+    let original: Vec<u8> = (0..256u32).map(|value| (value % 251) as u8).collect();
+    let mut damaged = original.clone();
+    for byte in &mut damaged[128..] {
+        *byte = 0;
+    }
+    std::fs::write(dir.join(payload_filename), &damaged).unwrap();
+    let par2_set = build_repairable_par2_set(payload_filename, &original, 64, 2);
+
+    let empty_plan = par2_rs::PlacementPlan {
+        exact: Vec::new(),
+        swaps: Vec::new(),
+        renames: Vec::new(),
+        unresolved: Vec::new(),
+        conflicts: Vec::new(),
+    };
+    let access = par2_rs::PlacementFileAccess::from_plan(dir.clone(), &par2_set, &empty_plan);
+    let verification = par2_rs::verify_all(&par2_set, &access);
+    assert!(
+        verification.needs_repair(),
+        "precondition: the authoritative pass sees the damage"
+    );
+
+    let carry = crate::pipeline::completion::finalize::check::build_host_verification_carry(
+        &dir,
+        &par2_set,
+        &verification,
+    )
+    .expect("a damaged in-place layout must build a host carry");
+
+    let mut options = par2_rs::Par2RepairerOptions::new(dir, Vec::new());
+    options.file_set = Some(par2_set.clone());
+    options.repair = false;
+    options.scan_carry = Some(carry);
+    let repairer = par2_rs::Par2Repairer::new(options);
+    let (outcome, _) = repairer
+        .verify_or_repair_carrying()
+        .expect("a repairer seeded with the host carry runs");
+    assert_eq!(
+        outcome.verification.total_missing_blocks, verification.total_missing_blocks,
+        "the seeded analysis reaches the verdict the host pass already proved"
+    );
+}
+
 /// Mixed damage with the blocks short still fails.
 ///
 /// The furniture's slices cannot be excused out of the solve: a payload file's
@@ -14076,4 +14128,143 @@ async fn a_damaged_job_defers_repairer_analysis_until_its_downloads_drain() {
     );
     assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
     assert_eq!(pipeline.par2_repairer_execute_calls, 1);
+}
+
+#[tokio::test]
+async fn the_one_shot_repairer_chains_scan_carry_between_analysis_and_repair() {
+    // With the retained stateful session forced off — the shape a session
+    // eviction, open failure, or restart leaves behind — the one-shot
+    // repairer runs analysis and repair as two separate constructions. The
+    // carry the analysis pass returns must seed the repair pass, so the
+    // repair does not re-read what the analysis just hashed.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.stateful_par2_session_forced = Some(false);
+    let job_id = JobId(30189);
+    let payload_filename = "payload.mkv";
+    let index_filename = "repair.par2";
+    let recovery_filename = "repair.vol00+01.par2";
+    let original_payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let mut damaged_payload = original_payload.clone();
+    for byte in &mut damaged_payload[64..128] {
+        *byte = 0;
+    }
+    let par2_bytes = build_test_par2_index(payload_filename, &original_payload, 64);
+    let recovery_bytes = vec![0xAA; 64];
+    let spec = JobSpec {
+        name: "One Shot Carry Chain".to_string(),
+        password: None,
+        total_bytes: (original_payload.len() + par2_bytes.len() + recovery_bytes.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "one-shot-carry-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "one-shot-carry-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "one-shot-carry-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: recovery_filename.to_string(),
+                role: FileRole::from_filename(recovery_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: recovery_bytes.len() as u32,
+                    message_id: "one-shot-carry-recovery@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    tokio::fs::write(working_dir.join(payload_filename), &damaged_payload)
+        .await
+        .unwrap();
+    {
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Repairing;
+        state.refresh_runtime_lanes_from_status();
+        state
+            .assembly
+            .file_mut(file_id)
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+        state
+            .assembly
+            .file_mut(file_id)
+            .unwrap()
+            .commit_segment(1, 64)
+            .unwrap();
+    }
+    write_and_complete_file(&mut pipeline, job_id, 1, index_filename, &par2_bytes).await;
+    write_and_complete_file(&mut pipeline, job_id, 2, recovery_filename, &recovery_bytes).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &original_payload, 64, 1),
+        &[
+            (1, index_filename, 0, false),
+            (2, recovery_filename, 1, true),
+        ],
+    );
+
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
+    assert_eq!(pipeline.par2_repairer_execute_calls, 1);
+    eprintln!(
+        "carry counters: seeded={} stashed={} host={}",
+        pipeline.par2_scan_carry_seeded_calls,
+        pipeline.par2_scan_carry_stashed_calls,
+        pipeline.par2_host_carry_builds
+    );
+    assert!(
+        pipeline.par2_scan_carry_seeded_calls >= 1,
+        "the repair run must consume the carry an earlier pass produced \
+         (seeded={} stashed={} host={})",
+        pipeline.par2_scan_carry_seeded_calls,
+        pipeline.par2_scan_carry_stashed_calls,
+        pipeline.par2_host_carry_builds
+    );
+    assert!(
+        pipeline.par2_scan_carry_stashed_calls >= 1,
+        "a completed pass must leave its carry behind for the next one"
+    );
 }
