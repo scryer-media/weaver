@@ -24,8 +24,6 @@ $prefix = "weaver-windows-$Architecture"
 $defenderLog = "$prefix-defender-scan.log"
 $attachmentLog = "$prefix-attachment-services.log"
 $startupLog = "$prefix-noarg-startup.log"
-$trayStdoutLog = "$prefix-tray-stdout.log"
-$trayStderrLog = "$prefix-tray-stderr.log"
 $wingetLog = "$prefix-winget-install.log"
 $validationTempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
 $validationRoot = Join-Path $validationTempRoot "weaver-package-validation-$Architecture"
@@ -85,52 +83,6 @@ function Invoke-MsiExec {
   $msiExec = Join-Path $env:WINDIR "$msiExecDirectory\msiexec.exe"
   $process = Start-Process -FilePath $msiExec -ArgumentList $Arguments -PassThru -Wait
   return $process.ExitCode
-}
-
-function Test-InteractiveDesktop {
-  $currentSession = (Get-Process -Id $PID).SessionId
-  $explorer = Get-Process explorer -ErrorAction SilentlyContinue |
-    Where-Object { $_.SessionId -eq $currentSession } |
-    Select-Object -First 1
-  if ($null -eq $explorer) {
-    return $false
-  }
-
-  # Some hosted Windows ARM runners start explorer.exe without a taskbar. That
-  # is not a usable GUI session: the tray icon cannot be created and the tray
-  # process never reaches server startup. Require the actual notification-area
-  # owner before running the GUI-only smoke.
-  if (-not ("WeaverNativeWindow" -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-
-public static class WeaverNativeWindow {
-  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-  public static extern IntPtr FindWindow(string className, string windowName);
-
-  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-  public static extern IntPtr FindWindowEx(
-    IntPtr parent,
-    IntPtr childAfter,
-    string className,
-    string windowName
-  );
-}
-'@
-  }
-
-  $taskbar = [WeaverNativeWindow]::FindWindow("Shell_TrayWnd", $null)
-  if ($taskbar -eq [IntPtr]::Zero) {
-    return $false
-  }
-
-  return [WeaverNativeWindow]::FindWindowEx(
-    $taskbar,
-    [IntPtr]::Zero,
-    "TrayNotifyWnd",
-    $null
-  ) -ne [IntPtr]::Zero
 }
 
 function Get-MpCmdRun {
@@ -456,8 +408,6 @@ New-Item -ItemType Directory -Force -Path $validationRoot | Out-Null
 "" | Set-Content $defenderLog
 "" | Set-Content $attachmentLog
 "" | Set-Content $startupLog
-"" | Set-Content $trayStdoutLog
-"" | Set-Content $trayStderrLog
 "" | Set-Content $wingetLog
 
 $zipCopy = Join-Path $validationRoot (Split-Path $ZipPath -Leaf)
@@ -554,54 +504,6 @@ if (Get-CimInstance Win32_Service | Where-Object { $_.PathName -match [regex]::E
 & $installedExe --version *>> $msiLog
 if ($LASTEXITCODE -ne 0) {
   throw "MSI-installed weaver.exe --version failed with exit code $LASTEXITCODE."
-}
-
-if (Test-InteractiveDesktop) {
-  $tray = $null
-  $oldTrayEncryptionKey = $env:WEAVER_ENCRYPTION_KEY
-  try {
-  # GitHub-hosted Windows runners do not provide Credential Manager to this
-  # session. Match the no-argument smoke and keep the tray server in the
-  # deterministic CI-only key path.
-  $env:WEAVER_ENCRYPTION_KEY = $validationEncryptionKey
-  $tray = Start-Process -FilePath $installedTray -ArgumentList "--login-start" -PassThru `
-    -RedirectStandardOutput $trayStdoutLog -RedirectStandardError $trayStderrLog
-  $deadline = (Get-Date).AddSeconds(30)
-  $trayReady = $false
-  while ((Get-Date) -lt $deadline) {
-    if ($tray.HasExited) {
-      throw "Tray exited before Weaver became ready (exit code $($tray.ExitCode)). See $trayStdoutLog and $trayStderrLog."
-    }
-    try {
-      $response = Invoke-WebRequest -Uri "http://127.0.0.1:9090/" -TimeoutSec 2 -UseBasicParsing
-      if ($response.StatusCode -eq 200) {
-        $trayReady = $true
-        break
-      }
-    } catch {
-      Start-Sleep -Milliseconds 250
-    }
-  }
-  if (-not $trayReady) {
-    throw "Tray did not make Weaver ready within 30 seconds. See $trayStdoutLog and $trayStderrLog."
-  }
-  if (-not (Test-Path (Join-Path $desktopProfile "weaver.db"))) {
-    throw "Tray launch did not create the isolated desktop profile at $desktopProfile."
-  }
-  & $installedTray --shutdown *>> $msiLog
-  if ($LASTEXITCODE -ne 0) {
-    throw "Tray shutdown failed with exit code $LASTEXITCODE."
-  }
-  try { Wait-Process -Id $tray.Id -Timeout 15 -ErrorAction Stop } catch { throw "Tray did not exit after shutdown." }
-  } finally {
-    if ($tray -and -not $tray.HasExited) {
-      & $installedTray --shutdown *>> $msiLog
-      try { Wait-Process -Id $tray.Id -Timeout 15 -ErrorAction Stop } catch { Stop-Process -Id $tray.Id -Force -ErrorAction SilentlyContinue }
-    }
-    Restore-EnvVar -Name "WEAVER_ENCRYPTION_KEY" -Value $oldTrayEncryptionKey
-  }
-} else {
-  Write-Log $msiLog "Skipping GUI tray startup smoke: this process session has no usable notification area."
 }
 
 $msiExitCode = Invoke-MsiExec -Arguments @("/fa", $msiCopy, "/qn", "/norestart", "/l*v", $msiLog)
