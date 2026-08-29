@@ -445,7 +445,6 @@ pub struct PipelineMetrics {
     pub download_lane_parks_spillover_withdraw_total: AtomicU64,
     pub download_lane_parks_spillover_speed_harm_total: AtomicU64,
     pub download_lane_parks_ip_replacement_retired_total: AtomicU64,
-    pub download_lane_parks_server_tier_changed_total: AtomicU64,
     pub download_lane_parks_proof_failure_total: AtomicU64,
     pub download_lane_parks_error_total: AtomicU64,
     pub download_lane_lease_items_total: AtomicU64,
@@ -603,7 +602,6 @@ impl PipelineMetrics {
             download_lane_parks_spillover_withdraw_total: AtomicU64::new(0),
             download_lane_parks_spillover_speed_harm_total: AtomicU64::new(0),
             download_lane_parks_ip_replacement_retired_total: AtomicU64::new(0),
-            download_lane_parks_server_tier_changed_total: AtomicU64::new(0),
             download_lane_parks_proof_failure_total: AtomicU64::new(0),
             download_lane_parks_error_total: AtomicU64::new(0),
             download_lane_lease_items_total: AtomicU64::new(0),
@@ -949,9 +947,6 @@ impl PipelineMetrics {
             download_lane_parks_ip_replacement_retired_total: self
                 .download_lane_parks_ip_replacement_retired_total
                 .load(Ordering::Relaxed),
-            download_lane_parks_server_tier_changed_total: self
-                .download_lane_parks_server_tier_changed_total
-                .load(Ordering::Relaxed),
             download_lane_parks_proof_failure_total: self
                 .download_lane_parks_proof_failure_total
                 .load(Ordering::Relaxed),
@@ -1166,7 +1161,6 @@ pub struct MetricsSnapshot {
     pub download_lane_parks_spillover_withdraw_total: u64,
     pub download_lane_parks_spillover_speed_harm_total: u64,
     pub download_lane_parks_ip_replacement_retired_total: u64,
-    pub download_lane_parks_server_tier_changed_total: u64,
     pub download_lane_parks_proof_failure_total: u64,
     pub download_lane_parks_error_total: u64,
     pub download_lane_lease_items_total: u64,

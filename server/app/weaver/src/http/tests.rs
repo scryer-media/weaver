@@ -4342,7 +4342,6 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         download_lane_parks_spillover_withdraw_total: 39,
         download_lane_parks_spillover_speed_harm_total: 0,
         download_lane_parks_ip_replacement_retired_total: 0,
-        download_lane_parks_server_tier_changed_total: 40,
         download_lane_parks_proof_failure_total: 41,
         download_lane_parks_error_total: 42,
         download_lane_lease_items_total: 43,
@@ -4566,11 +4565,6 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         )
     );
     assert!(
-        rendered.contains(
-            "weaver_pipeline_download_lane_parks_total{reason=\"server_tier_changed\"} 40"
-        )
-    );
-    assert!(
         rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"proof_failure\"} 41")
     );
     assert!(rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"error\"} 42"));
@@ -4785,7 +4779,6 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_lane_parks_spillover_withdraw_total: 0,
         download_lane_parks_spillover_speed_harm_total: 0,
         download_lane_parks_ip_replacement_retired_total: 0,
-        download_lane_parks_server_tier_changed_total: 0,
         download_lane_parks_proof_failure_total: 0,
         download_lane_parks_error_total: 0,
         download_lane_lease_items_total: 0,
@@ -5196,7 +5189,6 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
             "spillover_withdraw",
             "spillover_speed_harm",
             "ip_replacement_retired",
-            "server_tier_changed",
             "proof_failure",
             "error",
         ],

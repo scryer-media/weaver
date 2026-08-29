@@ -626,10 +626,6 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
             snapshot.download_lane_parks_ip_replacement_retired_total,
         ),
         (
-            "server_tier_changed",
-            snapshot.download_lane_parks_server_tier_changed_total,
-        ),
-        (
             "proof_failure",
             snapshot.download_lane_parks_proof_failure_total,
         ),

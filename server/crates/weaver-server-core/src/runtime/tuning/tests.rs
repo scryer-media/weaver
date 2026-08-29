@@ -124,7 +124,6 @@ fn empty_metrics() -> MetricsSnapshot {
         download_lane_parks_spillover_withdraw_total: 0,
         download_lane_parks_spillover_speed_harm_total: 0,
         download_lane_parks_ip_replacement_retired_total: 0,
-        download_lane_parks_server_tier_changed_total: 0,
         download_lane_parks_proof_failure_total: 0,
         download_lane_parks_error_total: 0,
         download_lane_lease_items_total: 0,

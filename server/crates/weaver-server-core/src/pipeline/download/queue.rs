@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use crate::jobs::ids::{JobId, MessageId, SegmentId};
+use crate::jobs::ids::{MessageId, SegmentId};
 
 /// A work item representing a segment to download.
 pub struct DownloadWork {
@@ -182,19 +182,6 @@ impl DownloadQueue {
             .chain(self.ordinary_heap.iter())
     }
 
-    pub fn pop_next_pipelining_compatible_with(
-        &mut self,
-        anchor: &DownloadWork,
-    ) -> Option<DownloadWork> {
-        self.pop_next_matching_in_class(anchor.completion_critical, |work| {
-            work.priority == anchor.priority
-                && work.is_recovery == anchor.is_recovery
-                && work.completion_critical == anchor.completion_critical
-                && work.groups == anchor.groups
-                && work.exclude_servers == anchor.exclude_servers
-        })
-    }
-
     pub fn pop_next_matching(
         &mut self,
         mut matches: impl FnMut(&DownloadWork) -> bool,
@@ -353,10 +340,6 @@ impl DownloadQueue {
         out.extend(self.iter().map(|item| item.0.work.segment_id));
     }
 
-    pub fn has_primary_work(&self) -> bool {
-        self.len() > self.recovery_work
-    }
-
     pub fn has_completion_critical_work(&self) -> bool {
         !self.completion_critical_heap.is_empty()
     }
@@ -374,52 +357,6 @@ impl DownloadQueue {
             .chain(self.ordinary_heap.drain())
             .map(|Reverse(pw)| pw.work)
             .collect()
-    }
-
-    /// Remove all queued segments for a given job.
-    pub fn remove_job(&mut self, job_id: JobId) {
-        for heap in [&mut self.completion_critical_heap, &mut self.ordinary_heap] {
-            let items: Vec<_> = heap.drain().collect();
-            for item in items {
-                if item.0.work.segment_id.file_id.job_id != job_id {
-                    heap.push(item);
-                }
-            }
-        }
-        self.recount_derived_counts();
-    }
-
-    /// Remove and return all queued segments for a given job.
-    pub fn drain_job(&mut self, job_id: JobId) -> Vec<DownloadWork> {
-        let mut drained = Vec::new();
-        for heap in [&mut self.completion_critical_heap, &mut self.ordinary_heap] {
-            let items: Vec<_> = heap.drain().collect();
-            for item in items {
-                if item.0.work.segment_id.file_id.job_id == job_id {
-                    drained.push(item.0.work);
-                } else {
-                    heap.push(item);
-                }
-            }
-        }
-        self.recount_derived_counts();
-        drained
-    }
-
-    /// Boost priority of all segments for a given job (used when damage detected
-    /// to prioritize downloading PAR2 recovery blocks).
-    pub fn reprioritize_job(&mut self, job_id: JobId, new_priority_base: u32) {
-        for heap in [&mut self.completion_critical_heap, &mut self.ordinary_heap] {
-            let items: Vec<_> = heap.drain().collect();
-            for Reverse(mut pw) in items {
-                if pw.work.segment_id.file_id.job_id == job_id {
-                    pw.priority = new_priority_base;
-                    pw.rank = None;
-                    pw.work.priority = new_priority_base;
-                }
-                heap.push(Reverse(pw));
-            }
-        }
     }
 
     /// Recompute priorities for selected queued work while preserving insertion

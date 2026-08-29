@@ -35,10 +35,7 @@ impl Pipeline {
             DownloadLaneMode::PipelineDepth2.max_depth(),
             SAB_BODY_PIPELINE_DEPTH
         );
-        let lane_id = DownloadLaneId(self.download_lane_runtime.next_lane_id);
-        self.download_lane_runtime.next_lane_id =
-            self.download_lane_runtime.next_lane_id.saturating_add(1);
-        debug!(lane_id = lane_id.0, mode = ?mode, "download lane started");
+        debug!(mode = ?mode, "download lane started");
         self.metrics
             .download_lanes_active
             .fetch_add(1, Ordering::Relaxed);
@@ -59,16 +56,6 @@ impl Pipeline {
                 .download_lanes_depth4_active
                 .fetch_add(1, Ordering::Relaxed),
         };
-        *self
-            .download_lane_runtime
-            .active_by_mode
-            .entry(mode)
-            .or_default() += 1;
-        *self
-            .download_lane_runtime
-            .active_by_state
-            .entry(DownloadLaneState::Issuing)
-            .or_default() += 1;
     }
 
     pub(in crate::pipeline) fn note_download_lane_released(
@@ -129,10 +116,6 @@ impl Pipeline {
                 .metrics
                 .download_lane_parks_ip_replacement_retired_total
                 .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::ServerTierChanged => self
-                .metrics
-                .download_lane_parks_server_tier_changed_total
-                .fetch_add(1, Ordering::Relaxed),
             LaneParkReason::ProofFailure => self
                 .metrics
                 .download_lane_parks_proof_failure_total
@@ -143,29 +126,6 @@ impl Pipeline {
                 .download_lane_parks_error_total
                 .fetch_add(1, Ordering::Relaxed),
         };
-        if let Some(active) = self.download_lane_runtime.active_by_mode.get_mut(&mode) {
-            *active = active.saturating_sub(1);
-            if *active == 0 {
-                self.download_lane_runtime.active_by_mode.remove(&mode);
-            }
-        }
-        if let Some(active) = self
-            .download_lane_runtime
-            .active_by_state
-            .get_mut(&DownloadLaneState::Issuing)
-        {
-            *active = active.saturating_sub(1);
-            if *active == 0 {
-                self.download_lane_runtime
-                    .active_by_state
-                    .remove(&DownloadLaneState::Issuing);
-            }
-        }
-        *self
-            .download_lane_runtime
-            .park_counts
-            .entry(reason)
-            .or_default() += 1;
     }
 
     /// A wire outcome retired this segment: no server has it, or the budget
@@ -680,18 +640,6 @@ impl Pipeline {
                 .download_lanes_depth4_active
                 .fetch_add(1, Ordering::Relaxed),
         };
-
-        if let Some(active) = self.download_lane_runtime.active_by_mode.get_mut(&previous) {
-            *active = active.saturating_sub(1);
-            if *active == 0 {
-                self.download_lane_runtime.active_by_mode.remove(&previous);
-            }
-        }
-        *self
-            .download_lane_runtime
-            .active_by_mode
-            .entry(next)
-            .or_default() += 1;
     }
 
     pub(crate) fn handle_owned_download_lane_event(

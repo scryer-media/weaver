@@ -47,14 +47,19 @@ fn excluded_work_count_tracks_push_pop_and_bulk_removal() {
     assert_eq!(first.exclude_servers, vec![0]);
     assert_eq!(q.excluded_work_count(), 1);
 
-    q.remove_job(JobId(2));
+    let removed = q.extract_matching(|work| work.segment_id.file_id.job_id == JobId(2));
+    assert_eq!(removed.len(), 1);
     assert_eq!(q.excluded_work_count(), 0);
     assert_eq!(q.len(), 1);
 
     let mut again = make_work(3, 0, 0, 5);
     again.exclude_servers = vec![2];
     q.push(again);
-    assert_eq!(q.drain_job(JobId(3)).len(), 1);
+    assert_eq!(
+        q.extract_matching(|work| work.segment_id.file_id.job_id == JobId(3))
+            .len(),
+        1
+    );
     assert_eq!(q.excluded_work_count(), 0);
 
     let mut last = make_work(4, 0, 0, 5);
@@ -128,7 +133,12 @@ fn compatibility_does_not_mix_critical_and_optional_recovery() {
 
     let first = q.pop().unwrap();
     assert!(first.completion_critical);
-    assert!(q.pop_next_pipelining_compatible_with(&first).is_none());
+    assert!(
+        q.pop_next_matching_in_class(first.completion_critical, |work| {
+            work.completion_critical == first.completion_critical
+        })
+        .is_none()
+    );
     assert_eq!(q.len(), 1);
 }
 
@@ -178,7 +188,7 @@ fn class_constrained_head_pop_does_not_scan_past_incompatible_work() {
 }
 
 #[test]
-fn recovery_presence_tracks_pop_extract_remove_and_drain() {
+fn recovery_presence_tracks_pop_extract_and_drain() {
     let mut q = DownloadQueue::new();
     let primary = make_work(1, 0, 0, 10);
     let mut recovery = make_work(1, 1, 0, 20);
@@ -189,15 +199,14 @@ fn recovery_presence_tracks_pop_extract_remove_and_drain() {
     q.push(primary);
     q.push(recovery);
     q.push(other_recovery);
-    assert!(q.has_primary_work());
     assert!(q.has_recovery_work());
 
     let extracted = q.extract_matching(|work| work.segment_id.file_id.job_id == JobId(2));
     assert_eq!(extracted.len(), 1);
     assert!(q.has_recovery_work());
 
-    q.remove_job(JobId(1));
-    assert!(!q.has_primary_work());
+    let removed = q.extract_matching(|work| work.segment_id.file_id.job_id == JobId(1));
+    assert_eq!(removed.len(), 2);
     assert!(!q.has_recovery_work());
 
     let mut recovery = make_work(3, 0, 0, 10);
@@ -207,38 +216,12 @@ fn recovery_presence_tracks_pop_extract_remove_and_drain() {
     assert!(q.pop().unwrap().is_recovery);
     assert!(!q.has_recovery_work());
 
-    q.push(make_work(4, 0, 0, 10));
-    assert!(q.has_primary_work());
+    let mut last_recovery = make_work(4, 0, 0, 10);
+    last_recovery.is_recovery = true;
+    q.push(last_recovery);
+    assert!(q.has_recovery_work());
     q.drain_all();
-    assert!(!q.has_primary_work());
     assert!(!q.has_recovery_work());
-}
-
-#[test]
-fn reprioritize_job() {
-    let mut q = DownloadQueue::new();
-    // Job 1 segments at priority 1000 (PAR2 recovery, normally low priority).
-    q.push(make_work(1, 0, 0, 1000));
-    q.push(make_work(1, 0, 1, 1000));
-    // Job 2 segment at priority 10 (RAR volume).
-    q.push(make_work(2, 0, 0, 10));
-
-    // Boost job 1 to priority 1 (damage detected, need recovery blocks).
-    q.reprioritize_job(JobId(1), 1);
-
-    // Job 1 segments should now come out first.
-    let first = q.pop().unwrap();
-    assert_eq!(first.segment_id.file_id.job_id, JobId(1));
-    assert_eq!(first.priority, 1);
-
-    let second = q.pop().unwrap();
-    assert_eq!(second.segment_id.file_id.job_id, JobId(1));
-    assert_eq!(second.priority, 1);
-
-    // Job 2 last.
-    let third = q.pop().unwrap();
-    assert_eq!(third.segment_id.file_id.job_id, JobId(2));
-    assert_eq!(third.priority, 10);
 }
 
 #[test]
@@ -385,21 +368,4 @@ fn mixed_priorities() {
     assert_eq!(items[1].priority, 1); // First RAR
     assert_eq!(items[2].priority, 11); // Second RAR
     assert_eq!(items[3].priority, 1000); // PAR2 recovery
-}
-
-#[test]
-fn remove_job() {
-    let mut q = DownloadQueue::new();
-    q.push(make_work(1, 0, 0, 10));
-    q.push(make_work(1, 0, 1, 10));
-    q.push(make_work(2, 0, 0, 10));
-    q.push(make_work(1, 1, 0, 10));
-    assert_eq!(q.len(), 4);
-
-    q.remove_job(JobId(1));
-    assert_eq!(q.len(), 1);
-
-    let remaining = q.pop().unwrap();
-    assert_eq!(remaining.segment_id.file_id.job_id, JobId(2));
-    assert!(q.is_empty());
 }
