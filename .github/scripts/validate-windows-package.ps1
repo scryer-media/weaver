@@ -384,7 +384,27 @@ function Invoke-WinGetManifestValidation {
 
   $winget = (Get-Command winget.exe -ErrorAction SilentlyContinue).Source
   if (-not $winget) {
-    throw "winget.exe was not found; MSI manifest validation is required."
+    try {
+      Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop
+    } catch {
+      throw "winget.exe was not found and the App Installer could not be registered: $($_.Exception.Message)"
+    }
+
+    $appInstaller = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue |
+      Select-Object -First 1
+    if ($appInstaller) {
+      $candidate = Join-Path $appInstaller.InstallLocation "winget.exe"
+      if (Test-Path -LiteralPath $candidate) {
+        $winget = $candidate
+      }
+    }
+
+    if (-not $winget) {
+      $winget = (Get-Command winget.exe -ErrorAction SilentlyContinue).Source
+    }
+    if (-not $winget) {
+      throw "winget.exe was not found after registering the App Installer; MSI manifest validation is required."
+    }
   }
 
   $manifestRoot = Join-Path $validationRoot "winget-manifest"
@@ -396,12 +416,28 @@ function Invoke-WinGetManifestValidation {
     -ProductCode $ProductCode `
     -PackageVersion $PackageVersion
 
+  $expectedSchemaHeaders = @{
+    "ScryerMedia.Weaver.yaml" = '# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json'
+    "ScryerMedia.Weaver.locale.en-US.yaml" = '# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json'
+    "ScryerMedia.Weaver.installer.yaml" = '# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json'
+  }
+  foreach ($manifest in $expectedSchemaHeaders.GetEnumerator()) {
+    $manifestPath = Join-Path $manifestRoot $manifest.Key
+    $actualHeader = Get-Content -LiteralPath $manifestPath -TotalCount 1
+    if ($actualHeader -ne $manifest.Value) {
+      throw "Generated WinGet manifest '$($manifest.Key)' has an invalid schema header: '$actualHeader'"
+    }
+  }
+
   Write-Log $wingetLog "Validating the generated MSI winget manifest from $manifestRoot"
   & $winget validate --manifest $manifestRoot --disable-interactivity *>> $wingetLog
-  if ($LASTEXITCODE -ne 0) {
-    throw "winget manifest validation exited with code $LASTEXITCODE"
+  $manifestValidationExitCode = $LASTEXITCODE
+  if ($manifestValidationExitCode -eq -1978335192) {
+    Write-Log $wingetLog "WinGet manifest validation succeeded with warnings; schema headers were checked explicitly."
+  } elseif ($manifestValidationExitCode -ne 0) {
+    Get-Content -LiteralPath $wingetLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+    throw "winget manifest validation exited with code $manifestValidationExitCode"
   }
-  Write-Log $wingetLog "Generated MSI winget manifest validation succeeded."
 }
 Remove-Item -Recurse -Force $validationRoot -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $validationRoot | Out-Null
