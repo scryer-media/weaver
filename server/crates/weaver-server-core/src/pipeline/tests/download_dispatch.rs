@@ -9060,7 +9060,9 @@ async fn the_deferral_boundary_is_posted_at_plus_the_delay() {
 #[tokio::test]
 async fn a_job_becomes_eligible_when_its_delay_elapses() {
     // The transition itself, on a real clock with a delay small enough to wait
-    // for.
+    // for. Use the same future-date clamp as the dispatch regression above so
+    // crossing an epoch-second boundary during setup cannot consume this
+    // sub-second delay before the first consult caches its `Instant`.
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.propagation_delay_forced = Some(Duration::from_millis(120));
@@ -9068,7 +9070,7 @@ async fn a_job_becomes_eligible_when_its_delay_elapses() {
     insert_active_job(
         &mut pipeline,
         job_id,
-        posted_job_spec("Silver Horizon Soon", Some(now_epoch_secs())),
+        posted_job_spec("Silver Horizon Soon", Some(now_epoch_secs() + 60)),
     )
     .await;
     assert!(
