@@ -27,7 +27,6 @@ impl Pipeline {
         self.rar_sets.remove(&set_key);
         self.rar_refresh_state.remove(&set_key);
         self.mark_rar_unlock_priorities_dirty(job_id);
-        self.persist_verified_suspect_volumes(job_id, set_name, &HashSet::new());
     }
 
     pub(crate) fn invalidate_archive_set_for_identity_rebind(
@@ -51,7 +50,6 @@ impl Pipeline {
             })
             .unwrap_or_default();
 
-        let mut persisted_suspect_volumes = None;
         let refresh_in_flight = self
             .rar_refresh_state
             .get(&set_key)
@@ -67,7 +65,6 @@ impl Pipeline {
                 // rebuild refreshes them from the corrected on-disk bytes.
                 state.verified_suspect_volumes.insert(*volume);
             }
-            persisted_suspect_volumes = Some(state.verified_suspect_volumes.clone());
             state.plan = None;
             state.extraction_generation = state.extraction_generation.saturating_add(1);
             state.volume_files.is_empty()
@@ -81,17 +78,12 @@ impl Pipeline {
         if remove_empty_set {
             self.rar_sets.remove(&set_key);
             self.rar_refresh_state.remove(&set_key);
-            persisted_suspect_volumes = Some(HashSet::new());
         } else if let Some(state) = self.rar_sets.get_mut(&set_key) {
             state.phase = if state.active_workers > 0 || !state.in_flight_members.is_empty() {
                 crate::pipeline::archive::rar_state::RarSetPhase::Extracting
             } else {
                 crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes
             };
-        }
-
-        if let Some(suspect_volumes) = persisted_suspect_volumes {
-            self.persist_verified_suspect_volumes(job_id, set_name, &suspect_volumes);
         }
 
         // The affected volume facts force the next rebuild to refresh these
@@ -217,7 +209,6 @@ impl Pipeline {
                 );
             }
         }
-        self.persist_verified_suspect_volumes(job_id, set_name, &HashSet::new());
     }
 
     fn rar_volume_numbers_by_filename(&self, job_id: JobId) -> HashMap<String, u32> {
@@ -367,19 +358,17 @@ impl Pipeline {
         let plan_names: HashSet<String> =
             plans.iter().map(|(set_name, _)| set_name.clone()).collect();
         for set_name in self.rar_set_names_for_job(job_id) {
-            if !plan_names.contains(&set_name) {
-                if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
-                    state.verified_suspect_volumes.clear();
-                }
-                self.persist_verified_suspect_volumes(job_id, &set_name, &HashSet::new());
+            if !plan_names.contains(&set_name)
+                && let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone()))
+            {
+                state.verified_suspect_volumes.clear();
             }
         }
 
         for (set_name, suspect) in plans {
             if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
-                state.verified_suspect_volumes = suspect.clone();
+                state.verified_suspect_volumes = suspect;
             }
-            self.persist_verified_suspect_volumes(job_id, &set_name, &suspect);
         }
     }
 

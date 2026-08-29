@@ -1910,30 +1910,6 @@ async fn drain_rar_refreshes(pipeline: &mut Pipeline) {
     panic!("RAR refresh queue did not drain");
 }
 
-async fn drain_verified_suspect_persists(pipeline: &mut Pipeline) {
-    for _ in 0..32 {
-        while let Ok(done) = pipeline.verified_suspect_persist_done_rx.try_recv() {
-            pipeline.handle_verified_suspect_persist_done(done);
-        }
-        if pipeline
-            .verified_suspect_persist_state
-            .values()
-            .all(|state| state.in_flight_version.is_none())
-        {
-            return;
-        }
-        let done = tokio::time::timeout(
-            Duration::from_secs(5),
-            pipeline.verified_suspect_persist_done_rx.recv(),
-        )
-        .await
-        .expect("verified suspect persistence result should arrive")
-        .expect("verified suspect persistence channel should stay open");
-        pipeline.handle_verified_suspect_persist_done(done);
-    }
-    panic!("verified suspect persistence queue did not drain");
-}
-
 fn set_job_status_for_test(pipeline: &mut Pipeline, job_id: JobId, status: JobStatus) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     state.status = status;

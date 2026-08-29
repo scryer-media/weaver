@@ -1233,21 +1233,6 @@ pub(in crate::pipeline) struct RarCapacityRetry {
     pub(super) kind: RarCapacityRetryKind,
 }
 
-pub(super) struct VerifiedSuspectPersistDone {
-    pub(super) job_id: JobId,
-    pub(super) set_name: String,
-    pub(super) version: u64,
-    pub(super) result: Result<(), String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(super) struct VerifiedSuspectPersistState {
-    pub(super) desired: HashSet<u32>,
-    pub(super) in_flight_version: Option<u64>,
-    pub(super) next_version: u64,
-    pub(super) queued: bool,
-}
-
 pub(crate) enum RarPasswordAttemptError {
     Rar(unrar_rs::RarError),
     Fatal(String),
@@ -2595,9 +2580,6 @@ pub struct Pipeline {
     /// Channel for delayed RAR capacity-pressure refresh/extraction wakeups.
     pub(in crate::pipeline) rar_capacity_retry_tx: mpsc::Sender<RarCapacityRetry>,
     pub(in crate::pipeline) rar_capacity_retry_rx: mpsc::Receiver<RarCapacityRetry>,
-    /// Channel for serialized verified-suspect persistence completions.
-    pub(super) verified_suspect_persist_done_tx: mpsc::Sender<VerifiedSuspectPersistDone>,
-    pub(super) verified_suspect_persist_done_rx: mpsc::Receiver<VerifiedSuspectPersistDone>,
     /// Channel for background final-move results.
     pub(super) move_done_tx: mpsc::Sender<MoveToCompleteDone>,
     pub(super) move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
@@ -2770,8 +2752,6 @@ pub struct Pipeline {
     /// Runtime-only coalescing state for delayed RAR capacity-pressure retries.
     pub(in crate::pipeline) pending_rar_capacity_retries:
         HashSet<(JobId, String, RarCapacityRetryKind)>,
-    /// Runtime-only serialized persistence state for verified suspect volumes.
-    verified_suspect_persist_state: HashMap<(JobId, String), VerifiedSuspectPersistState>,
     /// Members currently blocked on future RAR volumes. Used to emit stable
     /// waiting-started / waiting-finished events without relying on log text.
     pub(super) rar_waiting_members: HashMap<(JobId, String, String), usize>,

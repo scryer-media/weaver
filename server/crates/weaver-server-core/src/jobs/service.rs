@@ -417,16 +417,6 @@ impl Pipeline {
         self.clear_job_write_backlog(job_id);
         self.replace_failed_extraction_members(job_id, HashSet::new());
         self.set_normalization_retried_state(job_id, false);
-        if let Err(error) = self
-            .db_blocking(move |db| db.clear_verified_suspect_volumes(job_id))
-            .await
-        {
-            error!(
-                job_id = job_id.0,
-                error = %error,
-                "failed to clear persisted verified suspect RAR volumes during failed-job restart"
-            );
-        }
     }
 
     fn declared_archive_identity(

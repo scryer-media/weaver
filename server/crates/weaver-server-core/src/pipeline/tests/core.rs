@@ -286,38 +286,6 @@ async fn final_volume_refresh_heals_encrypted_multivolume_member_span_before_sch
 }
 
 #[tokio::test]
-async fn verified_suspect_persist_serializes_latest_value_per_set() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(40123);
-    let files = build_multifile_multivolume_rar_set();
-    let spec = rar_job_spec("RAR Suspect Persist Queue", &files);
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    pipeline.persist_verified_suspect_volumes(job_id, "show", &HashSet::from([1u32]));
-    pipeline.persist_verified_suspect_volumes(job_id, "show", &HashSet::from([2u32, 3u32]));
-
-    let key = (job_id, "show".to_string());
-    let persist_state = pipeline
-        .verified_suspect_persist_state
-        .get(&key)
-        .expect("verified suspect persistence state should exist");
-    assert!(persist_state.in_flight_version.is_some());
-    assert!(persist_state.queued);
-    assert_eq!(persist_state.desired, HashSet::from([2u32, 3u32]));
-
-    drain_verified_suspect_persists(&mut pipeline).await;
-
-    assert!(
-        pipeline
-            .db
-            .load_verified_suspect_volumes(job_id)
-            .unwrap()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
 async fn submit_nzb_persists_zstd_and_creates_active_job() {
     let harness = TestHarness::new().await;
     let nzb_bytes = sample_nzb_bytes();

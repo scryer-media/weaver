@@ -88,8 +88,6 @@ impl Pipeline {
         let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
         let (rar_refresh_done_tx, rar_refresh_done_rx) = mpsc::channel(32);
         let (rar_capacity_retry_tx, rar_capacity_retry_rx) = mpsc::channel(32);
-        let (verified_suspect_persist_done_tx, verified_suspect_persist_done_rx) =
-            mpsc::channel(32);
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
         let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
             mpsc::channel(32);
@@ -273,8 +271,6 @@ impl Pipeline {
             rar_refresh_done_rx,
             rar_capacity_retry_tx,
             rar_capacity_retry_rx,
-            verified_suspect_persist_done_tx,
-            verified_suspect_persist_done_rx,
             move_done_tx,
             move_done_rx,
             terminal_post_processing_done_tx,
@@ -345,7 +341,6 @@ impl Pipeline {
             rar_unlock_priority_dirty_jobs: HashSet::new(),
             rar_unlock_boosted_files: HashMap::new(),
             pending_rar_capacity_retries: HashSet::new(),
-            verified_suspect_persist_state: HashMap::new(),
             rar_waiting_members: HashMap::new(),
             normalization_retried: HashSet::new(),
             pending_concat: HashMap::new(),
@@ -989,9 +984,6 @@ impl Pipeline {
                     }
                     Some(retry) = self.rar_capacity_retry_rx.recv() => {
                         self.handle_rar_capacity_retry(retry).await;
-                    }
-                    Some(done) = self.verified_suspect_persist_done_rx.recv() => {
-                        self.handle_verified_suspect_persist_done(done);
                     }
                     Some(done) = self.move_done_rx.recv() => {
                         self.handle_move_to_complete_done(done).await;

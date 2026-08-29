@@ -4194,14 +4194,6 @@ async fn restore_job_does_not_rehydrate_lossy_extraction_attempt_state() {
             .db
             .set_active_job_normalization_retried(job_id, true)
             .unwrap();
-        pipeline
-            .db
-            .replace_verified_suspect_volumes(
-                job_id,
-                "show",
-                &std::collections::HashSet::from([1u32, 2u32]),
-            )
-            .unwrap();
         working_dir
     };
 
