@@ -13,7 +13,7 @@ use crate::{Database, StateError};
 
 /// First migration of the 0.9.0 line. A ledger that stops below this was last
 /// written by a pre-0.9.0 binary: 0.7.8 shipped through migration 0037 and
-/// 0.8.3 through 0039, while 0040-0042 are 0.9.0's own.
+/// 0.8.3 through 0039, while 0040-0043 are 0.9.0's own.
 const FIRST_0_9_MIGRATION_VERSION: i64 = 40;
 
 /// The address a pre-0.9.0 install listened on without ever being told to:
@@ -230,6 +230,69 @@ mod tests {
         let fresh = Database::open(&dir.path().join("fresh.db")).expect("database opens");
         assert_eq!(fresh.pre_migration_schema_version(), None);
         assert!(!boot(&fresh, fresh.pre_migration_schema_version(), None).shimmed);
+    }
+
+    #[test]
+    fn published_homebrew_0_7_8_database_keeps_encryption_and_bind_on_upgrade() {
+        // Produced by the published 0.7.8 Apple Silicon binary from the
+        // plaintext below using this fixed 32-byte key. Keeping the old
+        // ciphertext here makes this a cross-version compatibility fixture,
+        // rather than a round trip through 0.9's own encryption code.
+        const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        const PLAINTEXT: &str = "brew-secret";
+        const CIPHERTEXT: &str = "enc:v1:+91fp7tOWIhqdjBbuRoZ4YLAwScwPfE9KHfueKckM+AYfUeBCvNc";
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("weaver.db");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&format!("sqlite://{}?mode=rwc", path.display()))
+                .await
+                .expect("test database opens");
+            let catalog = crate::schema_migrations::embedded_catalog().expect("catalog");
+            let payload = crate::schema_migrations::embedded_payload_bytes().expect("payload");
+            crate::schema_migrations::replay_catalog_into_fresh_db(
+                &pool,
+                &catalog,
+                &payload,
+                Some(LEDGER_0_7_8),
+                true,
+            )
+            .await
+            .expect("0.7.8-shaped database");
+            sqlx::query(
+                "INSERT INTO servers (id, host, port, tls, username, password) \
+                 VALUES (1, 'news.example.invalid', 119, 0, 'brew-user', ?)",
+            )
+            .bind(CIPHERTEXT)
+            .execute(&pool)
+            .await
+            .expect("0.7.8 encrypted server fixture");
+            pool.close().await;
+        });
+        drop(runtime);
+
+        let mut db = Database::open(&path).expect("0.7.8 database upgrades");
+        assert_eq!(db.pre_migration_schema_version(), Some(LEDGER_0_7_8));
+
+        let key = crate::persistence::encryption::EncryptionKey::from_base64(KEY)
+            .expect("fixture key parses");
+        db.validate_encrypted_credentials(&key)
+            .expect("0.7.8 ciphertext decrypts after upgrade");
+        db.set_encryption_key(key);
+        let config = db.load_config().expect("upgraded config loads");
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].password.as_deref(), Some(PLAINTEXT));
+
+        let upgraded = boot(&db, db.pre_migration_schema_version(), None);
+        assert!(upgraded.shimmed);
+        assert_eq!(stored_bind(&db).as_deref(), Some("0.0.0.0"));
+        assert_eq!(upgraded.security.http_bind_address, wide());
     }
 
     #[test]

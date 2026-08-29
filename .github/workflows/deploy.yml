@@ -2029,6 +2029,21 @@ jobs:
             raise "#{label}: expected #{expected.inspect}, got #{actual.inspect}" unless expected == actual
           end
 
+          def assert_source(source, pattern, label)
+            raise "Homebrew upgrade contract missing: #{label}" unless source.match?(pattern)
+          end
+
+          def refute_source(source, pattern, label)
+            raise "Homebrew upgrade contract changed: #{label}" if source.match?(pattern)
+          end
+
+          assert_source(source, /WEAVER_CONFIG=#\{var\}\/weaver/, "stable data directory")
+          assert_source(source, /CONFIG_FILE="#\{etc\}\/weaver\/config\.env"/, "stable service config path")
+          assert_source(source, /unless config_file\.exist\?\s+config_file\.write/m, "existing service config is preserved")
+          assert_source(source, /run \[opt_libexec\/"weaver-service"\]/, "service uses the upgrade-stable opt path")
+          refute_source(source, /^\s*WEAVER_HTTP_BIND_ADDRESS=/, "formula must not suppress the pre-0.9 bind shim")
+          refute_source(source, /^\s*WEAVER_(?:ENCRYPTION_KEY|FORCE_KEY_FILE)=/, "formula must not change the existing encryption-key source")
+
           checksums = {
             "weaver-linux-x86_64-portable.tar.gz" => "linux-x86-portable",
             "weaver-linux-arm64-portable.tar.gz" => "linux-arm-portable",
