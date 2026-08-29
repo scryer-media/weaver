@@ -2747,9 +2747,12 @@ mod tests {
 
     #[test]
     fn blocking_rustls_rate_wait_is_excluded_from_active_budget() {
+        const BODY_LEN: usize = 2_000;
+        const ACTIVE_BUDGET: Duration = Duration::from_millis(500);
+
         let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
             "<rate-wait@test>",
-            TestArticle::Body(vec![b'A'; 1_200]),
+            TestArticle::Body(vec![b'A'; BODY_LEN]),
         )]);
         let mut conn = connect_with_backend(&config, NntpTlsBackend::ManualRustls);
         let control = crate::transfer::ServerTransferRegistry::new().configure(
@@ -2761,15 +2764,18 @@ mod tests {
         );
         conn.set_transfer_control(Some(control));
         conn.select_group("alt.test").unwrap();
-        let mut budget = ActiveTransferBudget::new(Duration::from_millis(50));
+        let mut budget = ActiveTransferBudget::new(ACTIVE_BUDGET);
 
-        let started = Instant::now();
         let article = conn
             .stream_yenc_article_with_active_budget("<rate-wait@test>", 0, &mut budget)
             .expect("deliberate rate wait must not exhaust the active budget");
 
-        assert!(started.elapsed() >= Duration::from_millis(100));
-        assert_eq!(article.into_data(), vec![b'A'; 1_200]);
+        assert!(
+            article.stats.throttle_wait > ACTIVE_BUDGET,
+            "test must force a throttle wait longer than the active budget: {:?}",
+            article.stats.throttle_wait
+        );
+        assert_eq!(article.into_data(), vec![b'A'; BODY_LEN]);
         conn.quit().unwrap();
         handle.join().unwrap();
         let _ = std::fs::remove_file(ca_path);
