@@ -114,26 +114,25 @@ test("subscription loss polls and reconnects without losing the visible applicat
   let disconnected = false;
   let pollingRequests = 0;
   let socketConnections = 0;
-  let releaseReconnect!: () => void;
-  const reconnectAllowed = new Promise<void>((resolve) => {
-    releaseReconnect = resolve;
-  });
   let liveBrowserSocket: WebSocketRoute | undefined;
   let liveServerSocket: WebSocketRoute | undefined;
+  let blockedReconnectSocket: WebSocketRoute | undefined;
 
   page.on("request", (request) => {
     if (
       disconnected
       && request.method() === "POST"
       && request.url().includes("/graphql")
-      && /QueueSnapshot|LiveMetrics/.test(request.postData() ?? "")
+      && /QueuePage|LiveMetrics/.test(request.postData() ?? "")
     ) {
       pollingRequests += 1;
     }
   });
-  await page.routeWebSocket(/\/graphql\/ws(?:\?|$)/, async (socket) => {
+  await page.routeWebSocket(/\/graphql\/ws(?:\?|$)/, (socket) => {
     if (blockReconnects) {
-      await reconnectAllowed;
+      // Return so Playwright can still observe the HTTP polling fallback.
+      blockedReconnectSocket = socket;
+      return;
     }
     liveBrowserSocket = socket;
     liveServerSocket = socket.connectToServer();
@@ -157,7 +156,10 @@ test("subscription loss polls and reconnects without losing the visible applicat
     await expect(page.getByRole("main")).toBeVisible();
   } finally {
     blockReconnects = false;
-    releaseReconnect();
+    await blockedReconnectSocket?.close({
+      code: 1012,
+      reason: "Weaver e2e reconnect interruption released",
+    });
   }
   await expect.poll(() => socketConnections, { timeout: 20_000 }).toBeGreaterThan(1);
   await expect(
