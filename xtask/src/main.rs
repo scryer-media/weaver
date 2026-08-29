@@ -1606,7 +1606,9 @@ fn winget_installer_manifest(
         .iter()
         .map(|artifact| {
             format!(
-                "- Architecture: {}\n  InstallerUrl: {}\n  InstallerSha256: {}\n  ProductCode: {}",
+                // The braces must be single-quoted: unquoted, YAML parses
+                // {GUID} as a flow mapping and winget rejects the manifest.
+                "- Architecture: {}\n  InstallerUrl: {}\n  InstallerSha256: {}\n  ProductCode: '{}'",
                 artifact.architecture,
                 artifact.installer_url,
                 artifact.installer_sha256,
@@ -3292,8 +3294,8 @@ mod tests {
         assert!(manifest.contains("PackageVersion: 0.6.6"));
         assert!(manifest.contains("InstallerType: msi"));
         assert!(manifest.contains("UpgradeBehavior: uninstallPrevious"));
-        assert!(manifest.contains("ProductCode: {694CA1CE-CB74-486A-BB1A-005D1D2051A2}"));
-        assert!(manifest.contains("ProductCode: {AD8E9924-5148-4052-9A91-E4B7B47C9CD7}"));
+        assert!(manifest.contains("ProductCode: '{694CA1CE-CB74-486A-BB1A-005D1D2051A2}'"));
+        assert!(manifest.contains("ProductCode: '{AD8E9924-5148-4052-9A91-E4B7B47C9CD7}'"));
         assert!(manifest.contains("Architecture: x64"));
         assert!(manifest.contains("Architecture: arm64"));
         assert!(manifest.contains(WINGET_WINDOWS_X64_ASSET));

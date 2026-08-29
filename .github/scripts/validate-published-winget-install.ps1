@@ -54,9 +54,9 @@ function Install-PublishedMsiWithWinGet {
 
   for ($attempt = 1; $attempt -le 5; $attempt++) {
     if ($Verb -eq "install") {
-      & $winget install --manifest $ManifestRoot --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+      & $winget install --manifest $manifestDirectory --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
     } else {
-      & $winget upgrade --manifest $ManifestRoot --installer-type msi --uninstall-previous --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+      & $winget upgrade --manifest $manifestDirectory --installer-type msi --uninstall-previous --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
     }
     if ($LASTEXITCODE -eq 0) {
       return
@@ -70,17 +70,31 @@ function Install-PublishedMsiWithWinGet {
 }
 
 function Get-ManifestMsiProductCode {
-  $installerManifests = @(Get-ChildItem -LiteralPath $ManifestRoot -Recurse -File -Filter "$packageId.installer.yaml")
-  if ($installerManifests.Count -ne 1) {
-    throw "Expected exactly one $packageId installer manifest beneath $ManifestRoot, found $($installerManifests.Count)."
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$ManifestDirectory
+  )
+
+  $installerManifest = Join-Path $ManifestDirectory "$packageId.installer.yaml"
+  if (-not (Test-Path $installerManifest)) {
+    throw "WinGet installer manifest was not found at $installerManifest."
   }
 
-  $productCodeLines = @(Select-String -LiteralPath $installerManifests[0].FullName -Pattern '^ProductCode:\s*(.+?)\s*$')
-  if ($productCodeLines.Count -ne 1) {
-    throw "Expected exactly one ProductCode in $($installerManifests[0].FullName), found $($productCodeLines.Count)."
+  # The installer manifest lists one entry per architecture, each with its own
+  # indented ProductCode; the smoke test runs on x64, so that entry is the
+  # installation identity to parse out.
+  $x64Installer = $false
+  foreach ($line in Get-Content -LiteralPath $installerManifest) {
+    if ($line -match '^\s*-\s*Architecture:\s*(?<architecture>\S+)\s*$') {
+      $x64Installer = $Matches.architecture -eq "x64"
+      continue
+    }
+    if ($x64Installer -and $line -match '^\s*ProductCode:\s*''?(?<productCode>\{[0-9A-Fa-f-]+\})''?\s*$') {
+      return $Matches.productCode
+    }
   }
 
-  return $productCodeLines[0].Matches[0].Groups[1].Value.Trim()
+  throw "WinGet installer manifest did not declare an x64 MSI ProductCode."
 }
 
 function Remove-WeaverMsi {
@@ -116,15 +130,31 @@ if (-not (Test-Path $ManifestRoot)) {
   throw "WinGet manifest root does not exist: $ManifestRoot"
 }
 
+# winget's --manifest argument wants the directory that directly contains the
+# manifest YAML files, and the packaged archive nests them under
+# ScryerMedia.Weaver/<version>/, so resolve that leaf directory first.
+$manifestDirectories = @(
+  Get-ChildItem -Path $ManifestRoot -Recurse -File -Filter "*.yaml" |
+    ForEach-Object { $_.DirectoryName } |
+    Sort-Object -Unique
+)
+if ($manifestDirectories.Count -ne 1) {
+  throw "Expected exactly one directory containing WinGet manifest YAML files below $ManifestRoot; found $($manifestDirectories.Count)."
+}
+$manifestDirectory = $manifestDirectories[0]
+
 & $winget settings --enable LocalManifestFiles
 if ($LASTEXITCODE -ne 0) {
   throw "Unable to enable local manifest files in winget (exit code $LASTEXITCODE)."
 }
-& $winget validate --manifest $ManifestRoot --disable-interactivity
-if ($LASTEXITCODE -ne 0) {
-  throw "Published winget manifest validation failed with exit code $LASTEXITCODE."
+& $winget validate --manifest $manifestDirectory --disable-interactivity
+$manifestValidationExitCode = $LASTEXITCODE
+if ($manifestValidationExitCode -eq -1978335192) {
+  Write-Warning "Published winget manifest validation succeeded with warnings. Continuing to the install smoke test."
+} elseif ($manifestValidationExitCode -ne 0) {
+  throw "Published winget manifest validation failed with exit code $manifestValidationExitCode."
 }
-$msiProductCode = Get-ManifestMsiProductCode
+$msiProductCode = Get-ManifestMsiProductCode -ManifestDirectory $manifestDirectory
 
 $directInstallCompleted = $false
 try {
