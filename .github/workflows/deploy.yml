@@ -1784,57 +1784,22 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Install SLSA verifier
         uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
-      - name: Download linux x86_64 portable artifact
+      # Merge every run-scoped release artifact into one flat directory, the
+      # same hand-off scryer's release job uses. Each of those artifacts is
+      # uploaded with a flat root (packages, winget manifests, provenance
+      # inputs), so the merge yields exactly the layout the -maxdepth 1 asset
+      # census and the release-upload globs expect.
+      - name: Download release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: weaver-linux-x86_64-portable-${{ github.run_id }}
+          pattern: weaver-*-${{ github.run_id }}
           path: artifacts
-      - name: Download linux arm64 portable artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-linux-arm64-portable-${{ github.run_id }}
-          path: artifacts
-      - name: Download darwin x86_64 portable artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-darwin-x86_64-portable-${{ github.run_id }}
-          path: artifacts
-      - name: Download darwin arm64 portable artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-darwin-arm64-portable-${{ github.run_id }}
-          path: artifacts
-      - name: Download windows x86_64 artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-windows-x86_64-${{ github.run_id }}
-          path: artifacts
-      - name: Download windows arm64 artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-windows-arm64-${{ github.run_id }}
-          path: artifacts
-      - name: Download release provenance inputs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: weaver-release-provenance-inputs-${{ github.run_id }}
-          path: artifacts
+          merge-multiple: true
       - name: Download signed SLSA provenance
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: weaver-provenance.intoto.jsonl
           path: artifacts
-      # The provenance-inputs artifact preserves its workspace-relative upload
-      # layout (artifacts/, release-inputs/), so its files arrive nested one
-      # level deeper than every later step expects. Hoist the winget manifest
-      # archive and the SBOMs up to the flat artifacts/ root that the
-      # -maxdepth 1 asset census and the release-upload globs operate on.
-      - name: Flatten provenance input artifacts
-        run: |
-          set -euo pipefail
-          mv artifacts/artifacts/weaver-winget-manifests.tar.gz artifacts/
-          mv artifacts/release-inputs/*.spdx.json artifacts/
-          rmdir artifacts/artifacts artifacts/release-inputs
       - name: Verify release provenance and sign checksums
         env:
           IDENTITY: ^https://github.com/${{ github.repository }}/.github/workflows/deploy.yml@refs/tags/weaver-v.*$
@@ -2369,14 +2334,18 @@ jobs:
             done
           } | sed -e 's#artifacts/##' -e 's#release-inputs/##' > slsa-subjects.txt
           test "$(wc -l < slsa-subjects.txt)" -eq 16
+          cp slsa-subjects.txt release-inputs/
+      # Upload a single directory so the artifact root is flat, like every
+      # other release artifact: a multi-path upload keys off the workspace
+      # root and nests release-inputs/ one level deep, which hides the SBOMs
+      # from the github-release job's merged flat download. The winget
+      # manifest archive is not bundled here; it reaches github-release via
+      # its own weaver-winget-manifests artifact.
       - name: Upload release provenance inputs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: weaver-release-provenance-inputs-${{ github.run_id }}
-          path: |
-            artifacts/weaver-winget-manifests.tar.gz
-            release-inputs/
-            slsa-subjects.txt
+          path: release-inputs/
           if-no-files-found: error
           retention-days: 14
       - name: Encode SLSA subjects
