@@ -528,7 +528,8 @@ async function exerciseMultiServerFallbackAndGlobalBlock(
   await resetServerQuota(request, primary.id);
   await resetServerQuota(request, secondary.id);
 
-  await runMirroredProbe(request, "fallback", articleBytes, 4);
+  const fallbackJobId = await runMirroredProbe(request, "fallback", articleBytes, 4);
+  await waitForCompletedJob(request, fallbackJobId);
   await expect
     .poll(async () => {
       const [primaryQuota, secondaryQuota] = await Promise.all([
@@ -676,6 +677,27 @@ async function cancelOutstandingJobs(request: APIRequestContext): Promise<void> 
     .toBe(0);
 }
 
+async function waitForCompletedJob(
+  request: APIRequestContext,
+  jobId: number,
+): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        const data = await graphql<{ historyItem: { state: string } | null }>(
+          request,
+          `query WeaverE2EQuotaHistory($id: Int!) {
+            historyItem(id: $id) { state }
+          }`,
+          { id: jobId },
+        );
+        return data.historyItem?.state ?? "PENDING";
+      },
+      { timeout: 30_000, intervals: [100, 250, 500] },
+    )
+    .toBe("COMPLETED");
+}
+
 function setClock(instant: string): void {
   const clockFile = process.env.E2E_WEAVER_CLOCK_FILE!;
   const owner = fs.statSync(clockFile);
@@ -814,7 +836,7 @@ async function runMirroredProbe(
   label: string,
   bytes: number,
   count: number,
-): Promise<void> {
+): Promise<number> {
   const articles = Array.from({ length: count }, (_, index) => ({
     messageId: `weaver-quota-${label}-${index + 1}@e2e.invalid`,
     bytes,
@@ -823,9 +845,10 @@ async function runMirroredProbe(
     await postProbeArticle(article.messageId, article.bytes, "nntp");
     await postProbeArticle(article.messageId, article.bytes, "nntp2");
   }
-  expect(
-    await submitProbeNzb(request, `weaver-quota-${label}`, articles),
-  ).toMatchObject({ accepted: true });
+  const submission = await submitProbeNzb(request, `weaver-quota-${label}`, articles);
+  expect(submission).toMatchObject({ accepted: true });
+  expect(submission.jobId).not.toBeNull();
+  return submission.jobId!;
 }
 
 async function createSchedule(
