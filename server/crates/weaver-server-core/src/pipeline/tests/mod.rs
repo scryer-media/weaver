@@ -56,6 +56,7 @@ mod par2_multiset_grid;
 mod rar_extraction;
 mod restore_history;
 mod sfv_completion;
+mod terminal_settlement;
 
 struct TestHarness {
     _temp_dir: TempDir,
@@ -244,6 +245,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         downloaded_bytes: 0,
         restored_download_floor_bytes: 0,
         failed_bytes: 0,
+        probe_projected_failed_bytes: 0,
         par2_bytes: 0,
         health_probing: false,
         health_probe_round: 0,
@@ -281,6 +283,7 @@ fn finished_job_info(job_id: JobId) -> JobInfo {
         phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
+        terminal_discards: Vec::new(),
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,
@@ -1765,6 +1768,7 @@ async fn insert_active_job_with_persisted_nzb_named(
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,
             failed_bytes: 0,
+            probe_projected_failed_bytes: 0,
             par2_bytes,
             health_probing: false,
             health_probe_round: 0,

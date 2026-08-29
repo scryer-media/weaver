@@ -40,7 +40,7 @@ pub(super) enum AuthoritativeLayoutError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum YencLayoutMismatch {
+pub(in crate::pipeline) enum YencLayoutMismatch {
     /// Decoded more bytes than the segment declared. yEnc expands, so this
     /// cannot happen for a well-formed article.
     DecodedSizeAboveDeclared,

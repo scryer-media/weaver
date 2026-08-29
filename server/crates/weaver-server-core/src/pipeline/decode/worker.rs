@@ -1208,7 +1208,7 @@ impl Pipeline {
                 );
                 return;
             }
-            self.book_failed_segment(segment_id);
+            self.book_terminal_segment(segment_id, SegmentTerminalState::DecodeExhausted);
             return;
         }
 
@@ -1465,7 +1465,12 @@ impl Pipeline {
                 }
             } else {
                 match validate_yenc_layout(expected_layout, yenc_layout, decoded_len) {
-                    Ok(file_offset) => file_offset,
+                    Ok(file_offset) => {
+                        // The declared file exists on the wire. Nothing this
+                        // file's articles say afterwards may retire it.
+                        self.disarm_foreign_layout_watch(file_id);
+                        file_offset
+                    }
                     Err(mismatch) => {
                         let error = format_yenc_layout_mismatch(
                             mismatch,
@@ -1474,6 +1479,8 @@ impl Pipeline {
                             decoded_len,
                         );
                         self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                        drop(_cpu_scope);
+                        self.note_yenc_layout_refusal(segment_id, mismatch, yenc_layout);
                         self.handle_decode_failure(
                             segment_id,
                             &error,
