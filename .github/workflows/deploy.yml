@@ -2317,7 +2317,7 @@ jobs:
       actions: read
       contents: read
     outputs:
-      base64_subjects: ${{ steps.subjects.outputs.base64-subjects }}
+      base64_subjects: ${{ steps.subjects.outputs.base64_subjects }}
     steps:
       - name: Download release assets and WinGet package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -2364,9 +2364,8 @@ jobs:
           retention-days: 14
       - name: Encode SLSA subjects
         id: subjects
-        uses: slsa-framework/slsa-github-generator/actions/generator/generic/create-base64-subjects-from-file@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
-        with:
-          path: slsa-subjects.txt
+        shell: bash
+        run: echo "base64_subjects=$(base64 < slsa-subjects.txt | tr -d '\n')" >> "$GITHUB_OUTPUT"
 
   generate-release-provenance:
     name: generate-release-provenance
@@ -2376,7 +2375,8 @@ jobs:
       actions: read
       contents: write
       id-token: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
+    # The prebuilt SLSA builder loader requires a refs/tags/vX.Y.Z workflow ref.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
     with:
-      base64-subjects-as-file: ${{ needs.prepare-release-provenance.outputs.base64_subjects }}
+      base64-subjects: ${{ needs.prepare-release-provenance.outputs.base64_subjects }}
       provenance-name: weaver-provenance.intoto.jsonl
