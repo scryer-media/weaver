@@ -1329,8 +1329,6 @@ async fn postgres_bulk_hot_paths_when_configured() {
         &HashSet::from(["bad-a.mkv".to_string(), "bad-b.mkv".to_string()]),
     )
     .unwrap();
-    db.replace_verified_suspect_volumes(job_id, "set", &HashSet::from([37_u32, 38_u32]))
-        .unwrap();
     db.replace_member_chunks(
         job_id,
         "set",
@@ -1379,13 +1377,6 @@ async fn postgres_bulk_hot_paths_when_configured() {
     assert_eq!(
         db.load_failed_extractions(job_id).unwrap(),
         HashSet::from(["bad-a.mkv".to_string(), "bad-b.mkv".to_string()])
-    );
-    assert_eq!(
-        db.load_verified_suspect_volumes(job_id)
-            .unwrap()
-            .get("set")
-            .cloned(),
-        Some(HashSet::from([37_u32, 38_u32]))
     );
     assert_eq!(db.get_extraction_chunks(job_id, "set").unwrap().len(), 2);
 
@@ -1732,6 +1723,79 @@ async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
     assert_eq!(states[&1].operation_id, operation_id);
     assert!(states[&1].locked && states[&1].delete_files);
     assert!(states[&TARGET_COUNT].locked);
+
+    // --- save_file_identity (identity + filename ride one statement) ------
+    let folded_identity = crate::jobs::record::ActiveFileIdentity {
+        file_index: 1,
+        source_filename: "vol1-source.rar".to_string(),
+        current_filename: "vol1-final.rar".to_string(),
+        canonical_filename: Some("vol1.part02.rar".to_string()),
+        classification: None,
+        classification_source: crate::jobs::record::FileIdentitySource::Probe,
+    };
+    db.save_file_identity(job_id, &folded_identity).unwrap();
+    assert_eq!(
+        fetch_text(
+            &db,
+            "SELECT filename AS value FROM active_files WHERE job_id = {} AND file_index = {}",
+            vec![SqlArg::I64(job_id.0 as i64), SqlArg::I64(1)],
+        ),
+        "vol1-final.rar"
+    );
+    assert_eq!(
+        fetch_text(
+            &db,
+            "SELECT canonical_filename AS value FROM active_file_identities
+              WHERE job_id = {} AND file_index = {}",
+            vec![SqlArg::I64(job_id.0 as i64), SqlArg::I64(1)],
+        ),
+        "vol1.part02.rar"
+    );
+    // Absent job: the shared FOR KEY SHARE guard no-ops both halves.
+    let folded_absent_job = crate::jobs::ids::JobId(999_721);
+    db.save_file_identity(folded_absent_job, &folded_identity)
+        .unwrap();
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM active_file_identities WHERE job_id = {}",
+            vec![SqlArg::I64(folded_absent_job.0 as i64)],
+        ),
+        0
+    );
+
+    // --- mark_file_incomplete (three deletes ride one statement) ----------
+    db.upsert_file_progress_batch(&[ActiveFileProgress {
+        job_id,
+        file_index: 1,
+        contiguous_bytes_written: 77,
+    }])
+    .unwrap();
+    db.mark_file_incomplete(job_id, 1).unwrap();
+    for (table, count_sql) in [
+        (
+            "active_files",
+            "SELECT COUNT(*) AS value FROM active_files WHERE job_id = {} AND file_index = {}",
+        ),
+        (
+            "active_file_progress",
+            "SELECT COUNT(*) AS value FROM active_file_progress WHERE job_id = {} AND file_index = {}",
+        ),
+        (
+            "active_detected_archives",
+            "SELECT COUNT(*) AS value FROM active_detected_archives WHERE job_id = {} AND file_index = {}",
+        ),
+    ] {
+        assert_eq!(
+            fetch_i64(
+                &db,
+                count_sql,
+                vec![SqlArg::I64(job_id.0 as i64), SqlArg::I64(1)],
+            ),
+            0,
+            "{table} row should be gone after mark_file_incomplete"
+        );
+    }
 
     drop(db);
     execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;

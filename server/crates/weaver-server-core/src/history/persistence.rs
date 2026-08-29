@@ -3,8 +3,27 @@ use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::history::{parse_history_metadata, public_history_attributes};
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, max_rows_for_tx};
+use crate::persistence::sql_runtime::{
+    POSTGRES_BATCH_BIND_LIMIT, SqlArg, SqlEngine, SqlRuntime, SqlTx, max_rows_for_tx,
+};
 use sqlx::{Postgres, QueryBuilder, Sqlite};
+
+fn build_integration_events_pg_sql(row_count: usize) -> String {
+    let mut values = String::new();
+    for row in 0..row_count {
+        if row > 0 {
+            values.push_str(", ");
+        }
+        if row == 0 {
+            values.push_str("({}::bigint, {}::text, {}::bigint, {}::text)");
+        } else {
+            values.push_str("({}, {}, {}, {})");
+        }
+    }
+    format!(
+        "INSERT INTO integration_events (timestamp, kind, item_id, payload_json) VALUES {values}"
+    )
+}
 
 async fn bulk_insert_integration_events_tx(
     tx: &mut SqlTx<'_>,
@@ -256,14 +275,43 @@ impl Database {
         let datastore = self.datastore();
         let events = events.to_vec();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "insert_integration_events", |tx| {
-                let events = events.clone();
-                Box::pin(async move {
-                    bulk_insert_integration_events_tx(tx, &events).await?;
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "insert_integration_events", |tx| {
+                        let events = events.clone();
+                        Box::pin(async move {
+                            bulk_insert_integration_events_tx(tx, &events).await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // Integration events are append-only rows with no parent guard,
+                // so each chunk rides one autocommit statement instead of
+                // paying a BEGIN/COMMIT pair around it.
+                SqlEngine::Postgres => {
+                    const BINDS_PER_ROW: usize = 4;
+                    let chunk_size = (POSTGRES_BATCH_BIND_LIMIT / BINDS_PER_ROW).max(1);
+                    let started = std::time::Instant::now();
+                    for chunk in events.chunks(chunk_size) {
+                        let sql = build_integration_events_pg_sql(chunk.len());
+                        let mut args = Vec::with_capacity(chunk.len() * BINDS_PER_ROW);
+                        for event in chunk {
+                            args.push(SqlArg::I64(event.timestamp));
+                            args.push(SqlArg::Text(event.kind.clone()));
+                            args.push(SqlArg::OptI64(event.item_id.map(|value| value as i64)));
+                            args.push(SqlArg::Text(event.payload_json.clone()));
+                        }
+                        SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+                    }
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "insert_integration_events",
+                        started.elapsed(),
+                    );
                     Ok(())
-                })
-            })
-            .await
+                }
+            }
         })
     }
 

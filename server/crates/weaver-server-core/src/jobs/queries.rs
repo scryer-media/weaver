@@ -221,31 +221,6 @@ impl Database {
         })
     }
 
-    pub fn load_verified_suspect_volumes(
-        &self,
-        job_id: JobId,
-    ) -> Result<HashMap<String, HashSet<u32>>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT set_name, volume_index
-                 FROM active_rar_verified_suspect
-                 WHERE job_id = {}",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
-            let mut result = HashMap::<String, HashSet<u32>>::new();
-            for row in rows {
-                result
-                    .entry(row.text("set_name")?)
-                    .or_default()
-                    .insert(row.i64("volume_index")? as u32);
-            }
-            Ok(result)
-        })
-    }
-
     pub fn load_active_jobs(&self) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {

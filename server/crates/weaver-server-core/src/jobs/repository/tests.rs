@@ -703,8 +703,6 @@ fn restart_runtime_state_roundtrip() {
     .unwrap();
     db.set_active_job_normalization_retried(JobId(1), true)
         .unwrap();
-    db.replace_verified_suspect_volumes(JobId(1), "show", &HashSet::from([37u32, 38u32]))
-        .unwrap();
 
     let failed = db.load_failed_extractions(JobId(1)).unwrap();
     assert_eq!(
@@ -712,10 +710,6 @@ fn restart_runtime_state_roundtrip() {
         HashSet::from(["E10.mkv".to_string(), "E15.mkv".to_string()])
     );
     assert!(db.load_active_job_normalization_retried(JobId(1)).unwrap());
-    assert_eq!(
-        db.load_verified_suspect_volumes(JobId(1)).unwrap(),
-        HashMap::from([("show".to_string(), HashSet::from([37u32, 38u32]))])
-    );
 }
 
 #[test]
@@ -1043,8 +1037,6 @@ fn late_active_state_writes_noop_after_archive() {
     db.replace_failed_extractions(JobId(1), &HashSet::from(["bad.mkv".to_string()]))
         .unwrap();
     db.add_failed_extraction(JobId(1), "another.mkv").unwrap();
-    db.replace_verified_suspect_volumes(JobId(1), "show", &HashSet::from([1u32, 2u32]))
-        .unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let output_path = temp_dir.path().join("movie.mkv");
     std::fs::write(&output_path, b"movie").unwrap();
