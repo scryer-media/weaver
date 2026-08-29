@@ -11,6 +11,57 @@ use crate::jobs::record::ActiveFileIdentity;
 use crate::pipeline::download::queue::{DownloadQueue, DownloadWork};
 use weaver_model::files::FileRole;
 
+/// Why a payload file left the delivery accounting entirely.
+///
+/// A discard is not damage. The file's bytes are neither delivered nor missing
+/// from the delivery — they were never part of it, because the settlement
+/// established that nothing was ever going to be assembled from them and that
+/// nothing depended on them. Health measures what the user received against
+/// what the job set out to deliver, so a discard leaves both sides of that
+/// fraction rather than counting against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalDiscardKind {
+    /// A repost that collided with this job's message ids. Every article the
+    /// servers hold under them belongs to a different, coherent file, so the
+    /// file this NZB declared could not have arrived from any server.
+    UnfetchableDuplicate,
+    /// A split part whose bytes the PAR2 join already folded into an output the
+    /// verdict vouched for. It is a spent input, not an outstanding file.
+    RepairLeftover,
+    /// Recovery capacity the job never needed. Recovery volumes have never
+    /// counted toward health, so nothing has to move them out of an accounting
+    /// they were never in; the variant exists so a surface that reports
+    /// discards can name one when it has to.
+    UnneededRecoveryVolume,
+}
+
+impl TerminalDiscardKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnfetchableDuplicate => "unfetchable_duplicate",
+            Self::RepairLeftover => "repair_leftover",
+            Self::UnneededRecoveryVolume => "unneeded_recovery_volume",
+        }
+    }
+}
+
+/// One file the settlement dropped, and what dropping it cost.
+///
+/// Structured on purpose: this is the record a UI renders as "discarded
+/// unfetchable duplicate, 1.09 GB", and a sentence assembled here would only
+/// have to be taken apart again by whoever displays it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalDiscard {
+    /// The NZB file index, which is the file's identity for this job.
+    pub file_index: u32,
+    pub filename: String,
+    pub kind: TerminalDiscardKind,
+    /// Declared bytes that left both the health denominator and the failed-byte
+    /// ledger.
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArchivePasswordSource {
     Explicit,
@@ -506,8 +557,22 @@ pub struct JobState {
     /// Conservative restored progress floor from persisted file-write checkpoints.
     /// This is only used for reporting after restart and must not affect scheduling.
     pub restored_download_floor_bytes: u64,
-    /// Bytes from segments that are permanently lost (430 / max retries exhausted).
+    /// Bytes from segments that are permanently lost (430 / max retries
+    /// exhausted). See [`JobState::probe_projected_failed_bytes`] for the
+    /// estimate that is deliberately kept out of it.
+    ///
+    /// Derived state: the sum of the *declared* sizes of the segments holding a
+    /// terminal state. Only the pipeline's single terminal-state transition
+    /// moves it, and nothing may add to it directly.
     pub failed_bytes: u64,
+    /// What the last conclusive health-probe round estimated was already dead,
+    /// extrapolated from its sample across the whole payload.
+    ///
+    /// Deliberately not folded into `failed_bytes`: it is an estimate over a
+    /// sample rather than a per-segment fact, and mixing the two is what once
+    /// let a job book more failed bytes than the job contained. Only the health
+    /// policy reads it, and only to fail a dead release early.
+    pub probe_projected_failed_bytes: u64,
     /// Total bytes of PAR2 recovery files, cached from spec at job creation.
     pub par2_bytes: u64,
     /// Whether health probes have been dispatched for this job.

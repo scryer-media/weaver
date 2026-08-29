@@ -473,9 +473,17 @@ async fn missed_probe_rearms_on_next_failed_byte() {
         .get(&job_id)
         .unwrap()
         .next_health_probe_failed_bytes;
+    // A probe that missed re-arms on the next byte of new damage, measured
+    // against the figure the health policy decides on: the booked ledger, or
+    // this round's projection when it estimated more of the payload dead.
+    let state = pipeline.jobs.get(&job_id).unwrap();
     assert_eq!(
         rearm_watermark,
-        pipeline.jobs.get(&job_id).unwrap().failed_bytes + 1
+        Pipeline::health_decision_failed_bytes(state) + 1
+    );
+    assert!(
+        state.probe_projected_failed_bytes > state.failed_bytes,
+        "the projection is what the round learned, and it stays out of the ledger"
     );
 
     {

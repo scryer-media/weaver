@@ -2692,7 +2692,7 @@ impl Pipeline {
                 }
                 if missing
                     .iter()
-                    .all(|(segment_id, _, _)| self.terminal_segment_failures.contains(segment_id))
+                    .all(|(segment_id, _, _)| self.segment_terminal_states.contains_key(segment_id))
                 {
                     self.direct_store.settle_materialized_file(file_id);
                     continue;
@@ -2719,7 +2719,7 @@ impl Pipeline {
                     .collect();
                 let mut rescued = Vec::new();
                 for (segment_id, work, _) in missing {
-                    if self.terminal_segment_failures.contains(&segment_id) {
+                    if self.segment_terminal_states.contains_key(&segment_id) {
                         continue;
                     }
                     if pending.rescued.contains(&segment_id) {
@@ -2737,7 +2737,7 @@ impl Pipeline {
                 }
                 if missing_ids
                     .iter()
-                    .all(|segment_id| self.terminal_segment_failures.contains(segment_id))
+                    .all(|segment_id| self.segment_terminal_states.contains_key(segment_id))
                 {
                     self.direct_store.settle_materialized_file(file_id);
                 } else {

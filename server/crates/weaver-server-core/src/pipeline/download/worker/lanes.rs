@@ -168,22 +168,132 @@ impl Pipeline {
             .or_default() += 1;
     }
 
+    /// A wire outcome retired this segment: no server has it, or the budget
+    /// for asking ran out.
     pub(in crate::pipeline) fn book_failed_segment(&mut self, seg_id: SegmentId) {
+        self.book_terminal_segment(seg_id, SegmentTerminalState::Missing);
+    }
+
+    /// Move a segment into its one terminal state.
+    ///
+    /// # Why this is a transition and not an increment
+    ///
+    /// `failed_bytes` used to be an accumulator that several paths added to:
+    /// the terminal booking here, and a health probe that overwrote it with a
+    /// sampled *projection* over the whole payload. A job could therefore book
+    /// a projection first and then add real terminal failures on top of it, and
+    /// job 10220 did exactly that — 1.99 GB of failed bytes against a 1.21 GB
+    /// job, an impossibility that nothing in the arithmetic could refuse.
+    ///
+    /// So the ledger is no longer written to. It is *derived*: a segment enters
+    /// exactly one terminal state on the pending→terminal edge fired here, and
+    /// `failed_bytes` is the sum of the declared sizes of the segments holding
+    /// one. The size is the NZB's declaration, never a served size, because a
+    /// segment that fails has no served size worth the name — and because
+    /// health has to mean the same thing whatever a hostile server sends.
+    ///
+    /// Every path that retires a segment comes through here, including the ones
+    /// with no wire outcome at all (see the foreign-layout breaker). Returns
+    /// whether this call is the edge.
+    pub(in crate::pipeline) fn book_terminal_segment(
+        &mut self,
+        seg_id: SegmentId,
+        terminal_state: SegmentTerminalState,
+    ) -> bool {
         let job_id = seg_id.file_id.job_id;
         // A segment can become a PAR2 metadata probe after an earlier ordinary
-        // attempt already exhausted it. Health bytes stay idempotent below,
+        // attempt already exhausted it. The ledger stays idempotent below,
         // but discovery must still learn that its newly queued probe cannot
         // produce metadata or it will wait forever in `work_is_queued`.
         self.mark_promoted_recovery_segment_unavailable(seg_id);
-        let failed_bytes = self.health_counted_segment_bytes(seg_id);
-        if !self.terminal_segment_failures.insert(seg_id) {
-            return;
+        if self.segment_already_delivered(seg_id) {
+            // Delivery is a terminal state too, and it is held in the assembly
+            // bitmap. A late failure result for an ordinal that already landed
+            // — a losing racer, a stale retry — must not book bytes the job has
+            // on disk.
+            return false;
+        }
+        let declared_bytes = self.health_counted_segment_bytes(seg_id);
+        // The state a segment holds is the first one it reached, and a later
+        // path must not overwrite it: a retry that exhausts after the article
+        // was already ruled missing does not change what happened to it.
+        match self.segment_terminal_states.entry(seg_id) {
+            std::collections::hash_map::Entry::Occupied(_) => return false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(terminal_state);
+            }
         }
         if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.failed_bytes = state.failed_bytes.saturating_add(failed_bytes);
+            state.failed_bytes = state.failed_bytes.saturating_add(declared_bytes);
         }
         self.skip_failed_uu_segment(seg_id);
         self.check_health(job_id);
+        true
+    }
+
+    /// Whether the assembly already holds this segment's bytes.
+    fn segment_already_delivered(&self, seg_id: SegmentId) -> bool {
+        self.jobs
+            .get(&seg_id.file_id.job_id)
+            .and_then(|state| state.assembly.file(seg_id.file_id))
+            .is_some_and(|file| file.has_segment(seg_id.segment_number))
+    }
+
+    /// The job's failed bytes as the terminal states alone define them.
+    ///
+    /// The running figure on `JobState` is maintained by the single edge in
+    /// [`Self::book_terminal_segment`], so the two agree by construction; this
+    /// is what settlement re-derives against rather than trusting the running
+    /// figure it is about to persist forever.
+    pub(in crate::pipeline) fn derived_failed_bytes(&self, job_id: JobId) -> u64 {
+        self.segment_terminal_states
+            .keys()
+            .filter(|seg_id| seg_id.file_id.job_id == job_id)
+            .map(|seg_id| self.health_counted_segment_bytes(*seg_id))
+            .sum()
+    }
+
+    /// The failed bytes to write into the terminal record, pinned to what the
+    /// job could possibly have lost.
+    ///
+    /// `failed_bytes <= total_bytes` is not a style preference: job 10220 was
+    /// archived with 1.99 GB failed against 1.21 GB total, and every consumer
+    /// downstream — the health percentage, the API's granular failure fields,
+    /// the automation reading them — silently produced nonsense from it. The
+    /// derived ledger cannot exceed the total by construction, so a breach here
+    /// means an invariant broke upstream: say so, and refuse to persist the
+    /// impossible number either way.
+    pub(in crate::pipeline) fn settled_failed_bytes(&self, job_id: JobId, total_bytes: u64) -> u64 {
+        let failed_bytes = self
+            .jobs
+            .get(&job_id)
+            .map_or(0, |state| state.failed_bytes)
+            .max(self.derived_failed_bytes(job_id));
+        debug_assert!(
+            failed_bytes <= total_bytes,
+            "job {} settled with failed_bytes {failed_bytes} above total_bytes {total_bytes}",
+            job_id.0
+        );
+        if failed_bytes > total_bytes {
+            warn!(
+                job_id = job_id.0,
+                failed_bytes,
+                total_bytes,
+                "failed bytes exceeded the job size at settlement; clamping the terminal record"
+            );
+            return total_bytes;
+        }
+        failed_bytes
+    }
+
+    /// The declared bytes of this file's segments that reached a terminal
+    /// state without arriving.
+    pub(in crate::pipeline) fn file_terminal_failed_bytes(&self, file_id: NzbFileId) -> u64 {
+        self.segment_terminal_states
+            .keys()
+            .filter(|seg_id| seg_id.file_id == file_id)
+            .map(|seg_id| self.health_counted_segment_bytes(*seg_id))
+            .sum()
     }
 
     /// Unwedge a uuencode file whose cursor is waiting on a part that will
@@ -213,9 +323,21 @@ impl Pipeline {
         uu.next_index = uu.next_index.saturating_add(1);
     }
 
+    /// Drop the job's terminal states, and the ledger derived from them.
+    ///
+    /// The two move together on purpose. Clearing the states alone would leave
+    /// the job carrying bytes nothing accounts for, and the next booking of the
+    /// same segment — a restarted job re-fetches every one of them — would add
+    /// those bytes a second time.
     pub(crate) fn clear_terminal_segment_failures(&mut self, job_id: JobId) {
-        self.terminal_segment_failures
-            .retain(|segment_id| segment_id.file_id.job_id != job_id);
+        self.segment_terminal_states
+            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.failed_bytes = 0;
+            state.probe_projected_failed_bytes = 0;
+        }
+        self.foreign_layout_watches
+            .retain(|file_id, _| file_id.job_id != job_id);
         self.files_counted_missing
             .retain(|file_id| file_id.job_id != job_id);
     }

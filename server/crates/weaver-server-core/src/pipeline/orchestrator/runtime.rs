@@ -180,7 +180,11 @@ impl Pipeline {
             pending_retries_by_job: HashMap::new(),
             pending_retries_by_segment: HashMap::new(),
             download_wait_by_job: HashMap::new(),
-            terminal_segment_failures: HashSet::new(),
+            segment_terminal_states: HashMap::new(),
+            foreign_layout_watches: HashMap::new(),
+            #[cfg(test)]
+            foreign_layout_breaker_override: None,
+            terminal_reconciliations: HashMap::new(),
             files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),
             intermediate_dir,

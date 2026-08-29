@@ -2203,6 +2203,90 @@ impl IpRttEwma {
     }
 }
 
+/// The one way a segment can stop being outstanding without arriving.
+///
+/// A segment reaches exactly one of these, exactly once, and the job's
+/// `failed_bytes` is the sum of the *declared* sizes of the segments that hold
+/// one. Delivery is the fourth terminal state and is recorded where it already
+/// was — the assembly bitmap — so a delivered segment never appears here at
+/// all.
+///
+/// The distinction between the variants is diagnostic; every one of them
+/// contributes the same declared bytes. What matters is that there is one
+/// place a segment can acquire a state and no place at all where bytes are
+/// added without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::pipeline) enum SegmentTerminalState {
+    /// Every configured server refused the article.
+    Missing,
+    /// The download retry budget ran out without a usable body.
+    RetriesExhausted,
+    /// Bodies arrived but no attempt decoded into the declared placement.
+    DecodeExhausted,
+    /// Retired without a wire outcome: the servers are serving a different
+    /// file under these message ids, so the declared bytes cannot arrive.
+    ForeignLayout,
+}
+
+/// What the settlement concluded a delivered job actually delivered.
+///
+/// Built once, from the claim census, at the last gate before the payload
+/// leaves the working directory — while every settlement fact that decided the
+/// job is still in hand. The terminal record is written from this rather than
+/// from the live wire counters, which know only what the download layer saw and
+/// nothing about what repair, verification or a discard did with it afterwards.
+#[derive(Debug, Clone, Default)]
+pub(in crate::pipeline) struct TerminalReconciliation {
+    /// Declared bytes of the delivered files that really are short.
+    pub(in crate::pipeline) failed_bytes: u64,
+    /// Health over the delivered files alone, 0-1000.
+    pub(in crate::pipeline) health: u32,
+    /// Files that left the accounting, and why.
+    pub(in crate::pipeline) discards: Vec<crate::jobs::model::TerminalDiscard>,
+}
+
+/// The layout a refused article says its bytes belong to.
+///
+/// Two fields, and only the first is evidence. `=ypart total=` is part
+/// geometry — the NZB is authoritative for a file's part count, so an article
+/// that names a different one is describing a different file. `=ybegin size=`
+/// is a header real posters misstate all the time, so it corroborates a
+/// geometry disagreement and never triggers one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::pipeline) struct ForeignYencGeometry {
+    pub(in crate::pipeline) served_total: Option<u32>,
+    pub(in crate::pipeline) served_file_size: u64,
+}
+
+/// Per-file evidence that the servers hold a different file under this file's
+/// message ids.
+///
+/// One consistent foreign geometry across many distinct segments is not
+/// damage: a corrupt article disagrees with the declared layout in a way that
+/// varies article by article, while a message-id collision with a repost
+/// disagrees the *same* way every time, because every article really does
+/// belong to one other, coherent file. Varying geometries therefore keep the
+/// file fetching; agreeing ones retire it.
+#[derive(Debug)]
+pub(in crate::pipeline) struct ForeignLayoutWatch {
+    /// The geometry the current run of refusals agrees on. Replaced — and the
+    /// segment run restarted — the moment a refusal disagrees with it.
+    pub(in crate::pipeline) geometry: ForeignYencGeometry,
+    /// Distinct segment ordinals that refused with `geometry`.
+    pub(in crate::pipeline) segments: HashSet<u32>,
+    /// At least one refusal in the current run disagreed on *part* geometry
+    /// rather than only on the `=ybegin size=` header. Real posts misstate that
+    /// header, so a run made purely of size disagreements corroborates nothing
+    /// and must never retire a file on its own.
+    pub(in crate::pipeline) geometry_disagreed: bool,
+    /// A segment of this file decoded into the declared layout. Permanent:
+    /// the declared file demonstrably exists on the wire, so no amount of
+    /// later foreign evidence may retire it.
+    pub(in crate::pipeline) disarmed: bool,
+    /// The breaker already fired for this file.
+    pub(in crate::pipeline) tripped: bool,
+}
+
 /// The pipeline engine. Owns the scheduler loop and drives work through
 /// download → decode → commit → verify → repair → extract stages.
 pub struct Pipeline {
@@ -2302,8 +2386,21 @@ pub struct Pipeline {
     /// Delayed retry tasks by exact segment.
     pub(super) pending_retries_by_segment: HashMap<SegmentId, usize>,
     pub(super) download_wait_by_job: HashMap<JobId, DownloadWaitStatus>,
-    /// Idempotent terminal segment accounting.
-    pub(in crate::pipeline) terminal_segment_failures: HashSet<SegmentId>,
+    /// The one terminal state each segment reached, and the only thing the
+    /// per-job failed-byte ledger is derived from.
+    pub(in crate::pipeline) segment_terminal_states: HashMap<SegmentId, SegmentTerminalState>,
+    /// Per-file watch on articles that decode against a layout the NZB never
+    /// declared. Empty for every ordinary job: an entry appears only once a
+    /// file has refused an article on part geometry.
+    pub(in crate::pipeline) foreign_layout_watches: HashMap<NzbFileId, ForeignLayoutWatch>,
+    /// Stands in for the `WEAVER_FOREIGN_LAYOUT_BREAKER` escape hatch, which is
+    /// read once per process and so cannot be exercised both ways in one test
+    /// binary.
+    #[cfg(test)]
+    pub(in crate::pipeline) foreign_layout_breaker_override: Option<bool>,
+    /// What the claim census concluded for a job on its way out, keyed until
+    /// the terminal record has been written from it.
+    pub(in crate::pipeline) terminal_reconciliations: HashMap<JobId, TerminalReconciliation>,
     /// Files already counted into `weaver_files_missing_total`. A completion
     /// check re-enters many times per job; this keeps the counter per-file
     /// rather than per-check. Per-file, so the set is bounded by the job's

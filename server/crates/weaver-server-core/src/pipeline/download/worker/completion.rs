@@ -1039,7 +1039,7 @@ impl Pipeline {
                         // Retry exhaustion is as terminal as a missing
                         // article: without this, health stays optimistic and
                         // recovery promotion waits for post-download verify.
-                        self.book_failed_segment(seg_id);
+                        self.book_terminal_segment(seg_id, SegmentTerminalState::RetriesExhausted);
                     } else if let Some(state) = self.jobs.get(&job_id) {
                         let file_idx = seg_id.file_id.file_index as usize;
                         if let Some(file_spec) = state.spec.files.get(file_idx)

@@ -1778,13 +1778,13 @@ async fn terminal_accounting_is_idempotent() {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
-        state.failed_bytes = 17;
     }
 
     pipeline.book_failed_segment(segment_id);
     pipeline.book_failed_segment(segment_id);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 145);
-    assert_eq!(pipeline.terminal_segment_failures.len(), 1);
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 128);
+    assert_eq!(pipeline.segment_terminal_states.len(), 1);
+    assert_eq!(pipeline.derived_failed_bytes(job_id), 128);
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
@@ -1793,13 +1793,127 @@ async fn terminal_accounting_is_idempotent() {
         };
     }
     pipeline.reprocess_job(job_id).await.unwrap();
-    assert!(!pipeline.terminal_segment_failures.contains(&segment_id));
+    assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
     assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 0);
 
+    // Reprocessing a job that is still resident rebuilds its assembly with
+    // every segment already committed, so the ledger has nothing left to book:
+    // delivery is a terminal state too, and it outranks a failure result.
     pipeline.book_failed_segment(segment_id);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 128);
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 0);
+    assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
     pipeline.purge_terminal_job_runtime(job_id);
-    assert!(!pipeline.terminal_segment_failures.contains(&segment_id));
+    assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
+}
+
+/// Every segment of a file dies, some of them only after a retry that also
+/// died. The ledger is the sum of the declared segment sizes, counted once
+/// each — not once per attempt.
+#[tokio::test]
+async fn a_file_whose_every_segment_dies_books_each_declared_size_exactly_once() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20018);
+    let segment_sizes = [1_000u32, 2_000, 3_000, 4_000];
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Silver Horizon", "silver-horizon.mkv", &segment_sizes),
+    )
+    .await;
+    {
+        // Health policy is not what is under test. A recovery set large enough
+        // to make the critical threshold zero keeps a wholly dead file in the
+        // deferral arm instead of aborting the job out from under the ledger.
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.next_health_probe_failed_bytes = u64::MAX;
+        state.par2_bytes = state.spec.total_bytes;
+    }
+
+    let segment = |segment_number| SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number,
+    };
+
+    // Each ordinal is retired twice over, through both wire-outcome paths, in
+    // the order a real pass produces: a first attempt gives up, the retry that
+    // followed it gives up as well.
+    for segment_number in 0..segment_sizes.len() as u32 {
+        pipeline.book_terminal_segment(segment(segment_number), SegmentTerminalState::Missing);
+        pipeline.book_terminal_segment(
+            segment(segment_number),
+            SegmentTerminalState::RetriesExhausted,
+        );
+    }
+
+    let expected: u64 = segment_sizes.iter().map(|bytes| *bytes as u64).sum();
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, expected);
+    assert_eq!(pipeline.derived_failed_bytes(job_id), expected);
+    assert_eq!(
+        pipeline.segment_terminal_states.len(),
+        segment_sizes.len(),
+        "a segment holds one terminal state, and the first one it reached"
+    );
+    assert!(
+        pipeline
+            .segment_terminal_states
+            .values()
+            .all(|state| *state == SegmentTerminalState::Missing)
+    );
+}
+
+/// A mixed pass: some segments fail, retry, and fail again; others fail once
+/// and then arrive. Only the terminal failures are booked, and the segments
+/// that landed contribute nothing however many times they failed first.
+#[tokio::test]
+async fn segments_that_arrive_after_a_failure_leave_the_ledger_untouched() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20019);
+    let segment_sizes = [1_000u32, 2_000, 3_000, 4_000];
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Silver Horizon", "silver-horizon.mkv", &segment_sizes),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.next_health_probe_failed_bytes = u64::MAX;
+        state.par2_bytes = state.spec.total_bytes;
+    }
+
+    let segment = |segment_number| SegmentId {
+        file_id,
+        segment_number,
+    };
+
+    // Ordinals 1 and 3 fail once, then arrive on the retry.
+    pipeline.book_terminal_segment(segment(0), SegmentTerminalState::Missing);
+    pipeline.book_terminal_segment(segment(2), SegmentTerminalState::DecodeExhausted);
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let file = state.assembly.file_mut(file_id).unwrap();
+        file.commit_segment(1, 2_000).unwrap();
+        file.commit_segment(3, 4_000).unwrap();
+    }
+    // A losing racer for an ordinal that already landed reports afterwards.
+    pipeline.book_terminal_segment(segment(1), SegmentTerminalState::RetriesExhausted);
+    pipeline.book_terminal_segment(segment(3), SegmentTerminalState::Missing);
+    // And the two dead ordinals exhaust their own retries.
+    pipeline.book_terminal_segment(segment(0), SegmentTerminalState::RetriesExhausted);
+    pipeline.book_terminal_segment(segment(2), SegmentTerminalState::RetriesExhausted);
+
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 4_000);
+    assert_eq!(pipeline.derived_failed_bytes(job_id), 4_000);
+    assert_eq!(pipeline.segment_terminal_states.len(), 2);
 }
 
 /// `weaver_files_missing_total` counts **files**, not failed segments, and it

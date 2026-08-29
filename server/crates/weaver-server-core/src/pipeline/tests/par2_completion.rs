@@ -4199,7 +4199,11 @@ async fn probe_projection_uses_only_payload_bytes() {
     });
 
     let state = pipeline.jobs.get(&job_id).unwrap();
-    assert_eq!(state.failed_bytes, 128);
+    assert_eq!(state.probe_projected_failed_bytes, 128);
+    assert_eq!(
+        state.failed_bytes, 0,
+        "the projection is a health signal, not a terminal-state fact, so the ledger stays empty"
+    );
     assert_eq!(state.last_health_probe_failed_bytes, 128);
     assert!(matches!(state.status, JobStatus::Downloading));
 }

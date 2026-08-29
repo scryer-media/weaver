@@ -3120,18 +3120,19 @@ async fn a_demotion_falls_back_to_refetching_when_its_envelope_is_gone() {
     let rescued = queued_segments(&mut pipeline, job_id);
     assert_eq!(rescued, expected);
     pipeline
-        .terminal_segment_failures
-        .extend(
-            rescued
-                .iter()
-                .map(|(file_index, segment_number)| SegmentId {
+        .segment_terminal_states
+        .extend(rescued.iter().map(|(file_index, segment_number)| {
+            (
+                SegmentId {
                     file_id: NzbFileId {
                         job_id,
                         file_index: *file_index,
                     },
                     segment_number: *segment_number,
-                }),
-        );
+                },
+                crate::pipeline::SegmentTerminalState::Missing,
+            )
+        }));
     assert!(
         pipeline.demoted_materializations_ready_for_par2(job_id, set_id),
         "terminally unavailable articles release the demotion gate"
