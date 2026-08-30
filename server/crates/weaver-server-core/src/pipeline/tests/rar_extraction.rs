@@ -1,4 +1,5 @@
 use super::*;
+use crate::pipeline::completion::finalize::rar::{ArchiveSetRetirement, UnmaterializedArchiveSet};
 
 #[tokio::test]
 async fn extraction_reserves_member_totals_at_open() {
@@ -9829,11 +9830,351 @@ async fn a_stale_alias_set_with_no_live_claimants_retires_instead_of_failing() {
         .rar_sets
         .insert((claimed_job, "claimed".to_string()), claimed);
 
+    assert_eq!(
+        pipeline.clear_archive_set_if_unreferenced_and_idle(claimed_job, "claimed"),
+        ArchiveSetRetirement::StillReferenced,
+        "the helper must say why it did nothing rather than leave the caller to guess"
+    );
     let _ = pipeline.extract_rar_set(claimed_job, "claimed").await;
     assert!(
         pipeline
             .rar_sets
             .contains_key(&(claimed_job, "claimed".to_string())),
         "a set with live claimants is never retired by the missing-volume path"
+    );
+}
+
+/// A job whose RAR volumes are complete in the ledger but were never written
+/// under the names its live identities classify them into.
+///
+/// Nothing is written to the working directory on purpose: this is the state a
+/// direct set leaves behind, where the bytes were routed straight to their
+/// members and no volume file ever existed to reopen.
+async fn claimed_alias_set_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    name: &str,
+    alias: &str,
+    volumes: &[String],
+) {
+    let files: Vec<(String, Vec<u8>)> = volumes
+        .iter()
+        .map(|filename| (filename.clone(), vec![0u8; 64]))
+        .collect();
+    insert_active_job(pipeline, job_id, rar_job_spec(name, &files)).await;
+    set_job_status_for_test(pipeline, job_id, JobStatus::Downloading);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        let file_id = NzbFileId {
+            job_id,
+            file_index: file_index as u32,
+        };
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            let file = state.assembly.file_mut(file_id).unwrap();
+            file.record_placement(0, 0, bytes.len() as u32);
+            file.commit_segment(0, bytes.len() as u32).unwrap();
+        }
+        pipeline
+            .set_file_identity(
+                job_id,
+                crate::jobs::record::ActiveFileIdentity {
+                    file_index: file_index as u32,
+                    source_filename: filename.clone(),
+                    current_filename: filename.clone(),
+                    canonical_filename: Some(filename.clone()),
+                    classification: Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                        kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
+                        set_name: alias.to_string(),
+                        volume_index: Some(file_index as u32),
+                    }),
+                    classification_source: crate::jobs::record::FileIdentitySource::Par2,
+                },
+            )
+            .unwrap();
+    }
+}
+
+/// Turns the completion loop the way the run loop does: pop everything the
+/// queue holds, check it, and let each check re-arm whatever it wants to.
+async fn drain_completion_checks(pipeline: &mut Pipeline, rounds: usize) -> usize {
+    let mut checks = 0;
+    for _ in 0..rounds {
+        let queued = pipeline.pending_completion_checks.len();
+        if queued == 0 {
+            break;
+        }
+        for _ in 0..queued {
+            let Some(job_id) = pipeline.pending_completion_checks.pop_front() else {
+                break;
+            };
+            pipeline.check_job_completion(job_id).await;
+            checks += 1;
+        }
+    }
+    checks
+}
+
+#[tokio::test]
+async fn a_claimed_alias_set_the_job_already_extracted_is_absorbed_not_rescheduled() {
+    // One step past the job-10162 shape: the alias name is not merely a
+    // surviving topology entry, it is what every live identity says it is — so
+    // retirement is refused — and no runtime set was ever registered under it,
+    // so the map key the guard used to read as proof of retirement was never
+    // there to begin with. Announcing a retirement that did not happen and
+    // re-arming the completion check hands the same name straight back: the
+    // check draws its candidates from the live classifications, which nothing
+    // touched.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90213);
+    let alias = "kP42x7aliasCrystalMeridian";
+    let canonical = "crystal.meridian";
+    let volumes = [
+        "crystal.meridian.part001.rar".to_string(),
+        "crystal.meridian.part002.rar".to_string(),
+    ];
+    claimed_alias_set_job(
+        &mut pipeline,
+        job_id,
+        "Crystal Meridian Claimed Alias",
+        alias,
+        &volumes,
+    )
+    .await;
+
+    // The canonical set holds the same files and has already delivered them.
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .assembly
+        .set_archive_topology(
+            canonical.to_string(),
+            crate::jobs::assembly::ArchiveTopology {
+                archive_type: crate::jobs::assembly::ArchiveType::Rar,
+                volume_map: HashMap::from([(volumes[0].clone(), 0), (volumes[1].clone(), 1)]),
+                complete_volumes: [0u32, 1].into_iter().collect(),
+                expected_volume_count: Some(2),
+                members: Vec::new(),
+                unresolved_spans: Vec::new(),
+            },
+        );
+    pipeline
+        .extracted_archives
+        .entry(job_id)
+        .or_default()
+        .insert(canonical.to_string());
+
+    assert!(
+        pipeline.volume_paths_for_rar_set(job_id, alias).is_empty()
+            && !pipeline.rar_sets.contains_key(&(job_id, alias.to_string())),
+        "the fixture must reproduce the shape: nothing on disk and no runtime set"
+    );
+    assert_eq!(
+        pipeline.clear_archive_set_if_unreferenced_and_idle(job_id, alias),
+        ArchiveSetRetirement::StillReferenced,
+        "the live classifications keep claiming the alias, so retirement cannot run — and \
+         those same classifications keep offering it to the completion check"
+    );
+
+    assert_eq!(
+        pipeline.extract_rar_set(job_id, alias).await,
+        Ok(0),
+        "a job whose content is already delivered is not failed over a second name for it"
+    );
+    assert!(
+        pipeline
+            .extracted_archives
+            .get(&job_id)
+            .is_some_and(|sets| sets.contains(alias)),
+        "the alias must be answered rather than retired: retirement never ran, so only an \
+         absorption can stop the check re-offering the name"
+    );
+
+    let checks = drain_completion_checks(&mut pipeline, 16).await;
+    assert!(
+        checks <= 4,
+        "the completion check must reach a fixed point, not re-arm itself: {checks} checks ran"
+    );
+    assert!(
+        pipeline.pending_completion_checks.is_empty(),
+        "no completion check may be left armed with nothing to do"
+    );
+    assert!(
+        pipeline
+            .inflight_extractions
+            .get(&job_id)
+            .is_none_or(|sets| sets.is_empty()),
+        "the absorbed name must never be dispatched to an extraction with nothing to open"
+    );
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Moving)
+        ),
+        "the job finalizes on the content it already holds: {:?}",
+        job_status_for_assert(&pipeline, job_id)
+    );
+}
+
+#[tokio::test]
+async fn a_claimed_alias_set_this_job_never_materialized_is_absorbed() {
+    // The same shape with no surviving name link: an identity rebind can
+    // rewrite either side of it, so the alias's own materialization record is
+    // what settles the question. Volume facts are persisted the moment a
+    // volume's headers parse off real bytes, and this job has none under the
+    // alias — it was named, never written.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90214);
+    let alias = "zT08m3aliasSilverHorizon";
+    let volumes = [
+        "silver.horizon.part001.rar".to_string(),
+        "silver.horizon.part002.rar".to_string(),
+    ];
+    claimed_alias_set_job(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon Unmaterialized Alias",
+        alias,
+        &volumes,
+    )
+    .await;
+    pipeline
+        .extracted_archives
+        .entry(job_id)
+        .or_default()
+        .insert("silver.horizon".to_string());
+
+    assert_eq!(
+        pipeline.classify_unmaterialized_archive_set(job_id, alias),
+        UnmaterializedArchiveSet::NeverMaterialized,
+    );
+    assert_eq!(pipeline.extract_rar_set(job_id, alias).await, Ok(0));
+    assert!(
+        pipeline
+            .extracted_archives
+            .get(&job_id)
+            .is_some_and(|sets| sets.contains(alias))
+    );
+
+    drain_completion_checks(&mut pipeline, 16).await;
+    assert!(pipeline.pending_completion_checks.is_empty());
+}
+
+#[tokio::test]
+async fn a_claimed_alias_set_is_absorbed_on_persisted_facts_after_a_restart() {
+    // The restart cut of the same shape: `extracted_archives` is runtime
+    // memory and comes back empty, so the in-memory record of where the bytes
+    // went is gone. The persisted volume facts survive, and facts parsed under
+    // another set name are the durable half of the same story — this job read
+    // real archive bytes under that name, and never parsed any under the
+    // alias.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90216);
+    let alias = "qV31k9aliasAmberRelay";
+    let volumes = [
+        "amber.relay.part001.rar".to_string(),
+        "amber.relay.part002.rar".to_string(),
+    ];
+    claimed_alias_set_job(
+        &mut pipeline,
+        job_id,
+        "Amber Relay Restarted Alias",
+        alias,
+        &volumes,
+    )
+    .await;
+
+    pipeline
+        .db
+        .save_rar_volume_facts(job_id, "amber.relay", 0, b"facts")
+        .unwrap();
+
+    assert!(
+        !pipeline.extracted_archives.contains_key(&job_id),
+        "the fixture must reproduce the post-restart shape: no in-memory extracted record"
+    );
+    assert_eq!(
+        pipeline.classify_unmaterialized_archive_set(job_id, alias),
+        UnmaterializedArchiveSet::NeverMaterialized,
+        "facts persisted under another set name must carry the absorption across a restart"
+    );
+    assert_eq!(pipeline.extract_rar_set(job_id, alias).await, Ok(0));
+    assert!(
+        pipeline
+            .extracted_archives
+            .get(&job_id)
+            .is_some_and(|sets| sets.contains(alias))
+    );
+
+    drain_completion_checks(&mut pipeline, 16).await;
+    assert!(pipeline.pending_completion_checks.is_empty());
+}
+
+#[tokio::test]
+async fn a_claimed_set_with_genuinely_missing_volumes_fails_once_instead_of_looping() {
+    // Nothing was ever extracted for this job and nothing is on disk: the
+    // volumes are simply absent. That is a real failure and it must be reported
+    // once — never as a retirement, and never as a reschedule that comes back.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90215);
+    let alias = "hR55w2aliasEmberCascade";
+    let volumes = [
+        "ember.cascade.part001.rar".to_string(),
+        "ember.cascade.part002.rar".to_string(),
+    ];
+    claimed_alias_set_job(
+        &mut pipeline,
+        job_id,
+        "Ember Cascade Missing Volumes",
+        alias,
+        &volumes,
+    )
+    .await;
+
+    assert_eq!(
+        pipeline.classify_unmaterialized_archive_set(job_id, alias),
+        UnmaterializedArchiveSet::MissingVolumes,
+        "with nothing extracted anywhere, the bytes went nowhere: this is a real absence"
+    );
+
+    // The first visit dispatches the extraction whose failure fails the job.
+    assert_eq!(pipeline.extract_rar_set(job_id, alias).await, Ok(0));
+    assert!(
+        !pipeline
+            .extracted_archives
+            .get(&job_id)
+            .is_some_and(|sets| sets.contains(alias)),
+        "a genuinely missing set is never absorbed"
+    );
+    // A check that re-runs before that failure lands says so synchronously
+    // rather than queueing a second doomed extraction behind the first.
+    assert!(
+        pipeline.extract_rar_set(job_id, alias).await.is_err(),
+        "the second visit must report the absence, not spawn again"
+    );
+
+    let done = tokio::time::timeout(Duration::from_secs(5), pipeline.extract_done_rx.recv())
+        .await
+        .expect("the dispatched extraction should report back")
+        .expect("the extraction channel should stay open");
+    pipeline.handle_extraction_done(done).await;
+
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "a set with no volumes and nowhere for its bytes to have gone fails the job: {:?}",
+        job_status_for_assert(&pipeline, job_id)
+    );
+    drain_completion_checks(&mut pipeline, 16).await;
+    assert!(
+        pipeline.pending_completion_checks.is_empty(),
+        "a failed job holds no armed completion check"
     );
 }

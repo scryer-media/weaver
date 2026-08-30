@@ -317,6 +317,7 @@ impl Pipeline {
             extraction_budgets: HashMap::new(),
             extracted_members: HashMap::new(),
             extracted_archives: HashMap::new(),
+            missing_volume_archive_sets: HashMap::new(),
             decode_retries: HashMap::new(),
             unverified_segments: HashMap::new(),
             file_crc_recoveries: HashMap::new(),

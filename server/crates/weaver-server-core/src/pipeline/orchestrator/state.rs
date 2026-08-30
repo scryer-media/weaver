@@ -174,6 +174,7 @@ impl Pipeline {
     pub(crate) fn clear_job_extraction_runtime(&mut self, job_id: JobId) {
         self.extracted_members.remove(&job_id);
         self.extracted_archives.remove(&job_id);
+        self.missing_volume_archive_sets.remove(&job_id);
         self.inflight_extractions.remove(&job_id);
         self.failed_extractions.remove(&job_id);
         self.pending_concat.remove(&job_id);

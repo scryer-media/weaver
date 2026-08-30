@@ -5,6 +5,49 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::collections::BTreeMap;
 
+/// What [`Pipeline::clear_archive_set_if_unreferenced_and_idle`] did.
+///
+/// Retirement has three outcomes and only one of them touches any state, so the
+/// caller has to be told which one it got. The absence of a `rar_sets` key is
+/// not evidence of retirement: a set can be a bare name with no runtime entry at
+/// all, and reading "no key" as "retired" invents a teardown that never
+/// happened — and then re-arms the completion check that produced the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchiveSetRetirement {
+    /// A worker or an in-flight member is still reading the set.
+    Busy,
+    /// Live file identities still classify into the set, so its names remain
+    /// this job's own answer for those bytes.
+    StillReferenced,
+    /// The set was actually torn down through
+    /// [`Pipeline::clear_archive_set_for_source_retry`].
+    Retired,
+}
+
+/// What a RAR set with no on-disk volumes and live claimants turned out to be.
+///
+/// Reached only from extraction entry, where the set's names resolve to nothing
+/// readable yet live file identities still classify into it — so retirement is
+/// refused and there is nothing to open. The job is either already whole under
+/// another name or genuinely short of volumes, and the two must be told apart
+/// before anything reschedules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnmaterializedArchiveSet {
+    /// The claimants' bytes were consumed by the named set of the same job,
+    /// which has already extracted or finalized. This name is a second view of
+    /// content the job already holds.
+    ConsumedBy(String),
+    /// No name link survives an identity rebind either way, but the job
+    /// demonstrably consumed archive content under another name — extracted in
+    /// this run, or volume facts persisted under another set — and never
+    /// parsed a RAR header under this set's name: it was named, never
+    /// materialized.
+    NeverMaterialized,
+    /// Volumes are genuinely absent — nothing consumed them and nothing left
+    /// can deliver them.
+    MissingVolumes,
+}
+
 impl Pipeline {
     pub(crate) fn purge_empty_rar_set_if_idle(&mut self, job_id: JobId, set_name: &str) {
         let set_key = (job_id, set_name.to_string());
@@ -108,14 +151,14 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         set_name: &str,
-    ) {
+    ) -> ArchiveSetRetirement {
         let set_key = (job_id, set_name.to_string());
         let busy = self
             .rar_sets
             .get(&set_key)
             .is_some_and(|state| state.active_workers > 0 || !state.in_flight_members.is_empty());
         if busy {
-            return;
+            return ArchiveSetRetirement::Busy;
         }
 
         let still_referenced = self.jobs.get(&job_id).is_some_and(|state| {
@@ -130,10 +173,161 @@ impl Pipeline {
             })
         });
         if still_referenced {
-            return;
+            return ArchiveSetRetirement::StillReferenced;
         }
 
         self.clear_archive_set_for_source_retry(job_id, set_name);
+        ArchiveSetRetirement::Retired
+    }
+
+    /// Rules on a set whose names resolve to nothing on disk while live file
+    /// identities still claim them.
+    ///
+    /// Three facts are available and none of them is a map key. Whether every
+    /// claimant is complete says whether anything is still owed to this job.
+    /// Whether another already-extracted set of the job knows these files under
+    /// any of their names says where the bytes went. Whether this job ever
+    /// persisted volume facts under this name says whether the set was ever
+    /// more than a name — facts are written the moment a volume's headers parse
+    /// off real bytes, so a set with none never had a volume to read.
+    pub(crate) fn classify_unmaterialized_archive_set(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> UnmaterializedArchiveSet {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return UnmaterializedArchiveSet::MissingVolumes;
+        };
+
+        // Every name this job has known these files by. A PAR2 rebind moves a
+        // file between its posted name and its canonical one, and the set that
+        // actually consumed the bytes may be keyed off either side.
+        let mut claimant_names: HashSet<String> = HashSet::new();
+        let mut claimants = 0usize;
+        for file in state.assembly.files() {
+            if !matches!(
+                self.classified_role_for_file(job_id, file),
+                weaver_model::files::FileRole::RarVolume { .. }
+            ) || self
+                .classified_archive_set_name_for_file(job_id, file)
+                .as_deref()
+                != Some(set_name)
+            {
+                continue;
+            }
+            // A claimant still short of its bytes is the ordinary missing-volume
+            // story: something is still owed to this job, and no other set can
+            // be holding what never arrived.
+            if !file.is_complete() {
+                return UnmaterializedArchiveSet::MissingVolumes;
+            }
+            claimants += 1;
+            claimant_names.insert(file.filename().to_string());
+            if let Some(identity) = self.effective_file_identity(job_id, file.file_id()) {
+                claimant_names.insert(identity.source_filename);
+                claimant_names.insert(identity.current_filename);
+                if let Some(canonical) = identity.canonical_filename {
+                    claimant_names.insert(canonical);
+                }
+            }
+        }
+        if claimants == 0 {
+            return UnmaterializedArchiveSet::MissingVolumes;
+        }
+
+        let mut extracted: Vec<String> = self
+            .extracted_archives
+            .get(&job_id)
+            .map(|sets| {
+                sets.iter()
+                    .filter(|name| name.as_str() != set_name)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        extracted.sort();
+
+        for owner in &extracted {
+            let owned_by_topology =
+                state
+                    .assembly
+                    .archive_topology_for(owner)
+                    .is_some_and(|topology| {
+                        topology
+                            .volume_map
+                            .keys()
+                            .any(|filename| claimant_names.contains(filename))
+                    });
+            let owned_by_runtime =
+                self.rar_sets
+                    .get(&(job_id, owner.clone()))
+                    .is_some_and(|owner_state| {
+                        owner_state
+                            .volume_files
+                            .values()
+                            .any(|filename| claimant_names.contains(filename))
+                    });
+            if owned_by_topology || owned_by_runtime {
+                return UnmaterializedArchiveSet::ConsumedBy(owner.clone());
+            }
+        }
+
+        // `extracted_archives` is runtime memory and does not survive a
+        // restart, so it cannot be the only admissible proof that this job's
+        // archive content went somewhere real. The persisted volume facts are
+        // durable: facts parsed under another set name record that real archive
+        // bytes were read under that name, which is the same consumption story
+        // after a restart has wiped the in-memory record.
+        if self
+            .rar_sets
+            .get(&(job_id, set_name.to_string()))
+            .is_some_and(|state| !state.facts.is_empty())
+        {
+            return UnmaterializedArchiveSet::MissingVolumes;
+        }
+        match self.db.load_all_rar_volume_facts(job_id) {
+            Ok(facts) => {
+                let named_here = facts
+                    .get(set_name)
+                    .is_some_and(|volumes| !volumes.is_empty());
+                let parsed_elsewhere = facts
+                    .iter()
+                    .any(|(name, volumes)| name != set_name && !volumes.is_empty());
+                if !named_here && (!extracted.is_empty() || parsed_elsewhere) {
+                    return UnmaterializedArchiveSet::NeverMaterialized;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error = %error,
+                    "failed to read persisted RAR volume facts; treating the set as materialized"
+                );
+                // Unreadable evidence is not absence of evidence: fall through
+                // to the conservative answer so an unread row cannot absorb a
+                // set whose volumes are genuinely missing.
+            }
+        }
+
+        UnmaterializedArchiveSet::MissingVolumes
+    }
+
+    /// Records a set as extracted so the completion check stops offering it.
+    ///
+    /// The candidate-name sources cannot be edited away here — a live file's
+    /// classification is the job's own record of what that file is, and
+    /// rewriting it to make a completion check quieter would lose the only
+    /// trace of the rebind. Marking the set extracted leaves those sources
+    /// intact and still moves the check forward: the name is offered again and
+    /// answered immediately, instead of being dispatched to an extraction that
+    /// has nothing to open.
+    pub(crate) fn absorb_archive_set_into_extracted(&mut self, job_id: JobId, set_name: &str) {
+        self.extracted_archives
+            .entry(job_id)
+            .or_default()
+            .insert(set_name.to_string());
+        self.schedule_job_completion_check(job_id);
     }
 
     pub(crate) fn clear_archive_set_for_source_retry(&mut self, job_id: JobId, set_name: &str) {

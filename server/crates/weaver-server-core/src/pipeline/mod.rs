@@ -2706,6 +2706,12 @@ pub struct Pipeline {
     /// Archives whose extraction has completed successfully (by archive name).
     /// For RAR this is the set name; for 7z/zip/tar/gz it's the archive name.
     pub(super) extracted_archives: HashMap<JobId, HashSet<String>>,
+    /// Archive sets a missing-volumes failure has already been dispatched for.
+    /// Such a set has live claimants, no runtime state and nothing on disk, so
+    /// extraction can only report the same failure again; the first report is
+    /// the one that fails the job, and this stops a completion check that
+    /// re-runs before it lands from queueing a second doomed extraction.
+    pub(super) missing_volume_archive_sets: HashMap<JobId, HashSet<String>>,
     /// Tracks decode failure retries per segment. When yEnc decode fails (CRC/size
     /// mismatch), the segment is re-downloaded. After `MAX_SEGMENT_RETRIES` decode
     /// failures, the segment is marked permanently failed.

@@ -485,6 +485,9 @@ impl Pipeline {
             }
         }
         self.extracted_archives.remove(&job_id);
+        // The extracted output this job was judged against is gone, so the
+        // verdict that a set had no volumes left to read goes with it.
+        self.missing_volume_archive_sets.remove(&job_id);
         self.clear_persisted_extracted_members(job_id).await;
         let set_names = self.rar_set_names_for_job(job_id);
         let members_to_clear: Vec<String> = missing_members.clone();
