@@ -1338,7 +1338,22 @@ impl Pipeline {
                 let facts =
                     Self::parse_rar_volume_facts_from_path(path, password_candidates.clone())
                         .await?;
-                restored.push((facts.volume_number, relative_path, facts));
+                // The restored file's name is the layout's statement of which
+                // volume this is, and the ledger is keyed by layout numbering.
+                // The parsed header number stands in only when the name does
+                // not classify as a RAR volume at all.
+                let observed_volume = std::path::Path::new(&relative_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(weaver_model::files::FileRole::from_filename)
+                    .and_then(|role| match role {
+                        weaver_model::files::FileRole::RarVolume { volume_number } => {
+                            Some(volume_number)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(facts.volume_number);
+                restored.push((observed_volume, relative_path, facts));
             }
 
             if restored.is_empty() {
