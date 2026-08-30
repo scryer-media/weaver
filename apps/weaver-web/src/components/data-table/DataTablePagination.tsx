@@ -1,4 +1,5 @@
-import type { Table as TanstackTable } from "@tanstack/react-table";
+import type { RowData } from "@tanstack/react-table";
+import type { LegacyReactTable as TanstackTable } from "@tanstack/react-table/legacy";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -9,7 +10,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-type DataTablePaginationProps<TData> = {
+type DataTablePaginationProps<TData extends RowData> = {
   table: TanstackTable<TData>;
   totalCount?: number;
   pageSizeOptions?: number[];
@@ -18,7 +19,7 @@ type DataTablePaginationProps<TData> = {
   nextLabel: string;
 };
 
-export function DataTablePagination<TData>({
+export function DataTablePagination<TData extends RowData>({
   table,
   totalCount,
   pageSizeOptions = [25, 50, 100, 500],

@@ -1,15 +1,16 @@
-import type { Column } from "@tanstack/react-table";
+import type { LegacyColumn as Column } from "@tanstack/react-table/legacy";
+import type { RowData } from "@tanstack/react-table";
 import { ArrowDown, ArrowUp, ArrowUpDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
-type DataTableColumnHeaderProps<TData, TValue> = {
+type DataTableColumnHeaderProps<TData extends RowData, TValue> = {
   column: Column<TData, TValue>;
   title: string;
   className?: string;
 };
 
-export function DataTableColumnHeader<TData, TValue>({
+export function DataTableColumnHeader<TData extends RowData, TValue>({
   column,
   title,
   className,

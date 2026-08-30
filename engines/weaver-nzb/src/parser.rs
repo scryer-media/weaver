@@ -94,37 +94,33 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                 let name = e.name();
                 let local = local_name(name.as_ref());
                 match local {
-                    b"head" => in_head = true,
-                    b"meta" if in_head => {
+                    "head" => in_head = true,
+                    "meta" if in_head => {
                         current_meta_type = None;
                         for attr in e.attributes() {
                             let attr = attr.map_err(|e| NzbError::Xml(e.to_string()))?;
-                            if attr.key.as_ref() == b"type" {
-                                current_meta_type =
-                                    Some(String::from_utf8_lossy(&attr.value).into_owned());
+                            if attr.key.as_ref() == "type" {
+                                current_meta_type = Some(attr.value.into_owned());
                             }
                         }
                         text_buf.clear();
                     }
-                    b"file" => {
+                    "file" => {
                         let mut poster = None;
                         let mut date = None;
                         let mut subject = None;
                         for attr in e.attributes() {
                             let attr = attr.map_err(|e| NzbError::Xml(e.to_string()))?;
                             match attr.key.as_ref() {
-                                b"poster" => {
+                                "poster" => {
                                     poster = Some(
-                                        attr.decoded_and_normalized_value(
-                                            XmlVersion::Implicit1_0,
-                                            reader.decoder(),
-                                        )
-                                        .map_err(|e| NzbError::Xml(e.to_string()))?
-                                        .into_owned(),
+                                        attr.normalized_value(XmlVersion::Implicit1_0)
+                                            .map_err(|e| NzbError::Xml(e.to_string()))?
+                                            .into_owned(),
                                     );
                                 }
-                                b"date" => {
-                                    let val = String::from_utf8_lossy(&attr.value).into_owned();
+                                "date" => {
+                                    let val = attr.value.into_owned();
                                     match val.parse::<u64>() {
                                         Ok(parsed) => date = Some(parsed),
                                         Err(_) => {
@@ -136,14 +132,11 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                         }
                                     }
                                 }
-                                b"subject" => {
+                                "subject" => {
                                     subject = Some(
-                                        attr.decoded_and_normalized_value(
-                                            XmlVersion::Implicit1_0,
-                                            reader.decoder(),
-                                        )
-                                        .map_err(|e| NzbError::Xml(e.to_string()))?
-                                        .into_owned(),
+                                        attr.normalized_value(XmlVersion::Implicit1_0)
+                                            .map_err(|e| NzbError::Xml(e.to_string()))?
+                                            .into_owned(),
                                     );
                                 }
                                 _ => {}
@@ -167,20 +160,20 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             message_ids: HashSet::new(),
                         });
                     }
-                    b"groups" if current_file.is_some() => in_groups = true,
-                    b"group" if in_groups => {
+                    "groups" if current_file.is_some() => in_groups = true,
+                    "group" if in_groups => {
                         text_buf.clear();
                     }
-                    b"segments" if current_file.is_some() => in_segments = true,
-                    b"segment" if in_segments => {
+                    "segments" if current_file.is_some() => in_segments = true,
+                    "segment" if in_segments => {
                         let mut bytes = None;
                         let mut number = None;
                         let mut invalid_reason = None;
                         for attr in e.attributes() {
                             let attr = attr.map_err(|e| NzbError::Xml(e.to_string()))?;
                             match attr.key.as_ref() {
-                                b"bytes" => {
-                                    let val = String::from_utf8_lossy(&attr.value).into_owned();
+                                "bytes" => {
+                                    let val = attr.value.into_owned();
                                     match val.parse::<u32>() {
                                         Ok(parsed) => bytes = Some(parsed),
                                         Err(_) => {
@@ -190,8 +183,8 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                         }
                                     }
                                 }
-                                b"number" => {
-                                    let val = String::from_utf8_lossy(&attr.value).into_owned();
+                                "number" => {
+                                    let val = attr.value.into_owned();
                                     match val.parse::<u32>() {
                                         Ok(parsed) => number = Some(parsed),
                                         Err(_) => {
@@ -219,8 +212,8 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                 let name = e.name();
                 let local = local_name(name.as_ref());
                 match local {
-                    b"head" => in_head = false,
-                    b"meta" if in_head => {
+                    "head" => in_head = false,
+                    "meta" if in_head => {
                         if let Some(key) = current_meta_type.take() {
                             match key.as_str() {
                                 "title" => meta_title = Some(text_buf.clone()),
@@ -229,15 +222,15 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             }
                         }
                     }
-                    b"group" if in_groups => {
+                    "group" if in_groups => {
                         if let Some(ref mut f) = current_file
                             && !text_buf.is_empty()
                         {
                             f.groups.push(text_buf.clone());
                         }
                     }
-                    b"groups" => in_groups = false,
-                    b"segment" if in_segments => {
+                    "groups" => in_groups = false,
+                    "segment" if in_segments => {
                         if let Some(seg) = current_segment.take()
                             && let Some(ref mut f) = current_file
                         {
@@ -304,8 +297,8 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             }
                         }
                     }
-                    b"segments" => in_segments = false,
-                    b"file" => {
+                    "segments" => in_segments = false,
+                    "file" => {
                         if let Some(f) = current_file.take() {
                             if f.segments.is_empty() {
                                 tracing::warn!(
@@ -336,7 +329,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
             }
 
             Ok(Event::Text(e)) => {
-                let decoded = e.decode().map_err(|e| NzbError::Xml(e.to_string()))?;
+                let decoded = e.xml_content(XmlVersion::Implicit1_0);
                 text_buf = quick_xml::escape::unescape(&decoded)
                     .map_err(|e| NzbError::Xml(e.to_string()))?
                     .into_owned();
@@ -365,8 +358,8 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
 }
 
 /// Strip namespace prefix from an element name (e.g. `nzb:file` -> `file`).
-fn local_name(name: &[u8]) -> &[u8] {
-    match name.iter().position(|&b| b == b':') {
+fn local_name(name: &str) -> &str {
+    match name.find(':') {
         Some(pos) => &name[pos + 1..],
         None => name,
     }

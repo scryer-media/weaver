@@ -177,7 +177,7 @@ function ensureSeries(
     metric,
     variant,
     labels: normalizedLabels,
-    values: new Array(buffer.timestampsMs.length).fill(0),
+    values: Array.from({ length: buffer.timestampsMs.length }, () => 0),
   };
   buffer.series.push(nextSeries);
   return nextSeries;
@@ -346,11 +346,14 @@ function lookupSeriesValues(
   )?.values;
 
   if (!values) {
-    return new Array(buffer.timestampsMs.length).fill(0);
+    return Array.from({ length: buffer.timestampsMs.length }, () => 0);
   }
 
   if (values.length < buffer.timestampsMs.length) {
-    return [...values, ...new Array(buffer.timestampsMs.length - values.length).fill(0)];
+    return [
+      ...values,
+      ...Array.from({ length: buffer.timestampsMs.length - values.length }, () => 0),
+    ];
   }
 
   return values.slice(0, buffer.timestampsMs.length);
@@ -361,7 +364,7 @@ function buildRateSeries(timestampsMs: number[], values: number[]): number[] {
     return [];
   }
 
-  const rates = new Array(values.length).fill(0);
+  const rates = Array.from({ length: values.length }, () => 0);
   for (let index = 1; index < values.length; index += 1) {
     const elapsedSec = (timestampsMs[index] - timestampsMs[index - 1]) / 1000;
     if (elapsedSec <= 0) {

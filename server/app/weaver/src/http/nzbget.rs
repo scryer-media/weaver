@@ -437,15 +437,15 @@ pub(super) fn authentication_error_response(path: &str, status: StatusCode) -> R
     }
 }
 
-fn xml_local_name(name: &[u8]) -> &[u8] {
-    match name.iter().position(|byte| *byte == b':') {
+fn xml_local_name(name: &str) -> &str {
+    match name.find(':') {
         Some(index) => &name[index + 1..],
         None => name,
     }
 }
 
 fn xml_decode_text(event: &quick_xml::events::BytesText<'_>) -> Result<String, String> {
-    let decoded = event.decode().map_err(|error| error.to_string())?;
+    let decoded = event.xml_content(quick_xml::XmlVersion::Implicit1_0);
     Ok(quick_xml::escape::unescape(&decoded)
         .map(|text| text.into_owned())
         .unwrap_or_else(|_| decoded.into_owned()))
@@ -470,13 +470,13 @@ fn parse_xmlrpc_call(body: &[u8]) -> Result<XmlRpcCall, String> {
         {
             quick_xml::events::Event::Eof => break,
             quick_xml::events::Event::Start(event) => {
-                let name = xml_local_name(event.name().as_ref()).to_vec();
-                match name.as_slice() {
-                    b"methodCall" => saw_method_call = true,
-                    b"methodName" => {
-                        method = Some(read_xml_text_until_end(&mut reader, b"methodName")?);
+                let name = xml_local_name(event.name().as_ref()).to_owned();
+                match name.as_str() {
+                    "methodCall" => saw_method_call = true,
+                    "methodName" => {
+                        method = Some(read_xml_text_until_end(&mut reader, "methodName")?);
                     }
-                    b"value" => {
+                    "value" => {
                         if params.len() >= XMLRPC_MAX_PARAMS {
                             return Err(format!("more than {XMLRPC_MAX_PARAMS} parameters"));
                         }
@@ -490,7 +490,7 @@ fn parse_xmlrpc_call(body: &[u8]) -> Result<XmlRpcCall, String> {
             // it falls through and is dropped, shifting every later positional
             // argument left (parse_xmlrpc_array already handles it this way).
             quick_xml::events::Event::Empty(event)
-                if xml_local_name(event.name().as_ref()) == b"value" =>
+                if xml_local_name(event.name().as_ref()) == "value" =>
             {
                 if params.len() >= XMLRPC_MAX_PARAMS {
                     return Err(format!("more than {XMLRPC_MAX_PARAMS} parameters"));
@@ -514,7 +514,7 @@ fn parse_xmlrpc_call(body: &[u8]) -> Result<XmlRpcCall, String> {
 
 fn read_xml_text_until_end(
     reader: &mut quick_xml::Reader<&[u8]>,
-    end: &[u8],
+    end: &str,
 ) -> Result<String, String> {
     let mut buf = Vec::new();
     let mut text = String::new();
@@ -525,14 +525,14 @@ fn read_xml_text_until_end(
         {
             quick_xml::events::Event::Text(event) => text.push_str(&xml_decode_text(&event)?),
             quick_xml::events::Event::CData(event) => {
-                text.push_str(&String::from_utf8_lossy(event.as_ref()));
+                text.push_str(event.as_ref());
             }
-            // quick-xml 0.41 tokenizes each entity reference (&amp; &lt; &#65; …)
+            // quick-xml tokenizes each entity reference (&amp; &lt; &#65; …)
             // as its own event; without this arm the catch-all below faults the
             // whole call on any typed value containing an entity — real indexer
             // URLs (`&`), filenames, and passwords with & < > ".
             quick_xml::events::Event::GeneralRef(event) => {
-                let raw = format!("&{};", event.decode().map_err(|error| error.to_string())?);
+                let raw = format!("&{};", event.as_ref());
                 text.push_str(
                     &quick_xml::escape::unescape(&raw).map_err(|error| error.to_string())?,
                 );
@@ -543,16 +543,10 @@ fn read_xml_text_until_end(
                 return Ok(text);
             }
             quick_xml::events::Event::Eof => {
-                return Err(format!(
-                    "unexpected EOF inside <{}>",
-                    String::from_utf8_lossy(end)
-                ));
+                return Err(format!("unexpected EOF inside <{end}>",));
             }
             _ => {
-                return Err(format!(
-                    "unexpected markup inside <{}>",
-                    String::from_utf8_lossy(end)
-                ));
+                return Err(format!("unexpected markup inside <{end}>",));
             }
         }
         buf.clear();
@@ -578,26 +572,26 @@ fn parse_xmlrpc_value(
         {
             quick_xml::events::Event::Text(event) => text.push_str(&xml_decode_text(&event)?),
             quick_xml::events::Event::CData(event) => {
-                text.push_str(&String::from_utf8_lossy(event.as_ref()));
+                text.push_str(event.as_ref());
             }
-            // Resolve entity refs (0.41 emits them as their own event) into the
+            // Resolve entity refs into the
             // text buffer, so an untyped <value>a&amp;b</value> becomes "a&b"
             // instead of silently dropping the entity.
             quick_xml::events::Event::GeneralRef(event) => {
-                let raw = format!("&{};", event.decode().map_err(|error| error.to_string())?);
+                let raw = format!("&{};", event.as_ref());
                 text.push_str(
                     &quick_xml::escape::unescape(&raw).map_err(|error| error.to_string())?,
                 );
             }
             quick_xml::events::Event::Start(event) => {
-                let name = xml_local_name(event.name().as_ref()).to_vec();
-                let value = match name.as_slice() {
+                let name = xml_local_name(event.name().as_ref()).to_owned();
+                let value = match name.as_str() {
                     // Base64 payloads stay textual: the append handler decodes
                     // base64 content itself, matching NZBGet's string usage.
-                    b"string" | b"base64" | b"dateTime.iso8601" => {
+                    "string" | "base64" | "dateTime.iso8601" => {
                         Value::String(read_xml_text_until_end(reader, &name)?)
                     }
-                    b"i4" | b"int" | b"i8" => {
+                    "i4" | "int" | "i8" => {
                         let text = read_xml_text_until_end(reader, &name)?;
                         let parsed = text
                             .trim()
@@ -605,11 +599,11 @@ fn parse_xmlrpc_value(
                             .map_err(|_| format!("invalid integer '{}'", text.trim()))?;
                         Value::from(parsed)
                     }
-                    b"boolean" => {
+                    "boolean" => {
                         let text = read_xml_text_until_end(reader, &name)?;
                         Value::Bool(matches!(text.trim(), "1" | "true" | "TRUE" | "True"))
                     }
-                    b"double" => {
+                    "double" => {
                         let text = read_xml_text_until_end(reader, &name)?;
                         let parsed = text
                             .trim()
@@ -617,32 +611,29 @@ fn parse_xmlrpc_value(
                             .map_err(|_| format!("invalid double '{}'", text.trim()))?;
                         json!(parsed)
                     }
-                    b"nil" => {
+                    "nil" => {
                         read_xml_text_until_end(reader, &name)?;
                         Value::Null
                     }
-                    b"array" => parse_xmlrpc_array(reader, depth + 1)?,
-                    b"struct" => parse_xmlrpc_struct(reader, depth + 1)?,
+                    "array" => parse_xmlrpc_array(reader, depth + 1)?,
+                    "struct" => parse_xmlrpc_struct(reader, depth + 1)?,
                     other => {
-                        return Err(format!(
-                            "unsupported XML-RPC value type '{}'",
-                            String::from_utf8_lossy(other)
-                        ));
+                        return Err(format!("unsupported XML-RPC value type '{other}'"));
                     }
                 };
                 typed = Some(value);
             }
             quick_xml::events::Event::Empty(event) => {
-                let name = xml_local_name(event.name().as_ref()).to_vec();
-                typed = Some(match name.as_slice() {
-                    b"nil" => Value::Null,
-                    b"array" => Value::Array(Vec::new()),
-                    b"struct" => Value::Object(serde_json::Map::new()),
+                let name = xml_local_name(event.name().as_ref()).to_owned();
+                typed = Some(match name.as_str() {
+                    "nil" => Value::Null,
+                    "array" => Value::Array(Vec::new()),
+                    "struct" => Value::Object(serde_json::Map::new()),
                     _ => Value::String(String::new()),
                 });
             }
             quick_xml::events::Event::End(event)
-                if xml_local_name(event.name().as_ref()) == b"value" =>
+                if xml_local_name(event.name().as_ref()) == "value" =>
             {
                 // Untyped <value>text</value> is a string per the XML-RPC spec.
                 // Trim only the untyped form (structural whitespace now reaches
@@ -670,25 +661,22 @@ fn parse_xmlrpc_array(
             .map_err(|error| error.to_string())?
         {
             quick_xml::events::Event::Start(event) => {
-                let name = xml_local_name(event.name().as_ref()).to_vec();
-                match name.as_slice() {
-                    b"data" => {}
-                    b"value" => items.push(parse_xmlrpc_value(reader, depth + 1)?),
+                let name = xml_local_name(event.name().as_ref()).to_owned();
+                match name.as_str() {
+                    "data" => {}
+                    "value" => items.push(parse_xmlrpc_value(reader, depth + 1)?),
                     other => {
-                        return Err(format!(
-                            "unexpected element '{}' in array",
-                            String::from_utf8_lossy(other)
-                        ));
+                        return Err(format!("unexpected element '{other}' in array"));
                     }
                 }
             }
             quick_xml::events::Event::Empty(event)
-                if xml_local_name(event.name().as_ref()) == b"value" =>
+                if xml_local_name(event.name().as_ref()) == "value" =>
             {
                 items.push(Value::String(String::new()));
             }
             quick_xml::events::Event::End(event)
-                if xml_local_name(event.name().as_ref()) == b"array" =>
+                if xml_local_name(event.name().as_ref()) == "array" =>
             {
                 return Ok(Value::Array(items));
             }
@@ -712,15 +700,15 @@ fn parse_xmlrpc_struct(
             .map_err(|error| error.to_string())?
         {
             quick_xml::events::Event::Start(event) => {
-                let name = xml_local_name(event.name().as_ref()).to_vec();
-                match name.as_slice() {
-                    b"member" => member_name = None,
-                    b"name" => {
+                let name = xml_local_name(event.name().as_ref()).to_owned();
+                match name.as_str() {
+                    "member" => member_name = None,
+                    "name" => {
                         // Keys are identifiers; trim explicitly since trim_text is off.
                         member_name =
-                            Some(read_xml_text_until_end(reader, b"name")?.trim().to_string());
+                            Some(read_xml_text_until_end(reader, "name")?.trim().to_string());
                     }
-                    b"value" => {
+                    "value" => {
                         let value = parse_xmlrpc_value(reader, depth + 1)?;
                         let key = member_name
                             .take()
@@ -728,10 +716,7 @@ fn parse_xmlrpc_struct(
                         map.insert(key, value);
                     }
                     other => {
-                        return Err(format!(
-                            "unexpected element '{}' in struct",
-                            String::from_utf8_lossy(other)
-                        ));
+                        return Err(format!("unexpected element '{other}' in struct"));
                     }
                 }
             }
@@ -739,7 +724,7 @@ fn parse_xmlrpc_struct(
             // <value/> handling in parse_xmlrpc_call/array; without it the member
             // is silently dropped (and even bypasses the unexpected-element guard).
             quick_xml::events::Event::Empty(event)
-                if xml_local_name(event.name().as_ref()) == b"value" =>
+                if xml_local_name(event.name().as_ref()) == "value" =>
             {
                 let key = member_name
                     .take()
@@ -747,7 +732,7 @@ fn parse_xmlrpc_struct(
                 map.insert(key, Value::String(String::new()));
             }
             quick_xml::events::Event::End(event)
-                if xml_local_name(event.name().as_ref()) == b"struct" =>
+                if xml_local_name(event.name().as_ref()) == "struct" =>
             {
                 return Ok(Value::Object(map));
             }

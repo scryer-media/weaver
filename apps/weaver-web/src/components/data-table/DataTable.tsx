@@ -7,7 +7,11 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
-import { flexRender, type Row, type Table as TanstackTable } from "@tanstack/react-table";
+import { flexRender, type RowData } from "@tanstack/react-table";
+import type {
+  LegacyRow as Row,
+  LegacyTable as TanstackTable,
+} from "@tanstack/react-table/legacy";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Table,
@@ -30,7 +34,7 @@ type DataTableVirtualization = {
   resetKey?: string | number;
 };
 
-type DataTableProps<TData> = {
+type DataTableProps<TData extends RowData> = {
   table: TanstackTable<TData>;
   emptyState: ReactNode;
   renderExpandedRow?: (row: Row<TData>) => ReactNode;
@@ -51,7 +55,7 @@ function shouldIgnoreRowClick(target: EventTarget | null) {
     );
 }
 
-type VirtualizedDataTableRowProps<TData> = {
+type VirtualizedDataTableRowProps<TData extends RowData> = {
   row: Row<TData>;
   rowIndex: number;
   isSelected: boolean;
@@ -60,7 +64,7 @@ type VirtualizedDataTableRowProps<TData> = {
   measureElement: (element: HTMLTableRowElement | null) => void;
 };
 
-function VirtualizedDataTableRowInner<TData>({
+function VirtualizedDataTableRowInner<TData extends RowData>({
   row,
   rowIndex,
   isSelected,
@@ -95,7 +99,7 @@ function VirtualizedDataTableRowInner<TData>({
 
 const VirtualizedDataTableRow = memo(VirtualizedDataTableRowInner) as typeof VirtualizedDataTableRowInner;
 
-type VirtualizedDataTableBodyProps<TData> = {
+type VirtualizedDataTableBodyProps<TData extends RowData> = {
   rows: Row<TData>[];
   columnCount: number;
   emptyState: ReactNode;
@@ -105,7 +109,7 @@ type VirtualizedDataTableBodyProps<TData> = {
   virtualization: DataTableVirtualization;
 };
 
-function VirtualizedDataTableBody<TData>({
+function VirtualizedDataTableBody<TData extends RowData>({
   rows,
   columnCount,
   emptyState,
@@ -180,7 +184,7 @@ function VirtualizedDataTableBody<TData>({
   );
 }
 
-export function DataTable<TData>({
+export function DataTable<TData extends RowData>({
   table,
   emptyState,
   renderExpandedRow,

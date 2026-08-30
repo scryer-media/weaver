@@ -325,11 +325,15 @@ fn parsed_release_from_parser(value: ParsedReleaseMetadata) -> ParsedRelease {
         languages_subtitles: value.languages_subtitles,
         year: value.year.and_then(|year| u32::try_from(year).ok()),
         quality: value.quality,
-        source: value.source,
-        video_codec: value.video_codec,
+        source: value.source.map(|source| source.as_str().to_owned()),
+        video_codec: value.video_codec.map(|codec| codec.as_str().to_owned()),
         video_encoding: value.video_encoding,
-        audio: value.audio,
-        audio_codecs: value.audio_codecs,
+        audio: value.audio.map(|codec| codec.as_str().to_owned()),
+        audio_codecs: value
+            .audio_codecs
+            .into_iter()
+            .map(|codec| codec.as_str().to_owned())
+            .collect(),
         audio_channels: value.audio_channels,
         is_dual_audio: value.is_dual_audio,
         is_atmos: value.is_atmos,
@@ -344,7 +348,9 @@ fn parsed_release_from_parser(value: ParsedReleaseMetadata) -> ParsedRelease {
         is_bd_disk: value.is_bd_disk,
         is_ai_enhanced: value.is_ai_enhanced,
         is_hardcoded_subs: value.is_hardcoded_subs,
-        streaming_service: value.streaming_service,
+        streaming_service: value
+            .streaming_service
+            .map(|service| service.as_str().to_owned()),
         edition: value.edition,
         anime_version: value.anime_version,
         episode: value.episode.map(parsed_episode_from_parser),

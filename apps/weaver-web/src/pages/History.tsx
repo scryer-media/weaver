@@ -1,10 +1,12 @@
 import {
-  getCoreRowModel,
-  useReactTable,
-  type ColumnDef,
   type RowSelectionState,
   type SortingState,
 } from "@tanstack/react-table";
+import {
+  getCoreRowModel,
+  useLegacyTable as useReactTable,
+  type LegacyColumnDef as ColumnDef,
+} from "@tanstack/react-table/legacy";
 import { Download, RefreshCcw, Search, Trash2 } from "lucide-react";
 import {
   useCallback,
