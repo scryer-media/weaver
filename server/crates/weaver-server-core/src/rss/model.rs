@@ -192,8 +192,8 @@ pub(crate) fn parse_feed_items(xml: &[u8]) -> Result<Vec<FeedItem>, String> {
             Ok(Event::Eof) => break,
             Ok(Event::Start(e)) => {
                 let name = e.name();
-                let raw = String::from_utf8_lossy(name.as_ref()).to_ascii_lowercase();
-                let local = String::from_utf8_lossy(local_name(name.as_ref())).to_ascii_lowercase();
+                let raw = name.as_ref().to_ascii_lowercase();
+                let local = local_name(name.as_ref()).to_ascii_lowercase();
                 if local == "item" || local == "entry" {
                     current_entry = Some(ParsedFeedEntry::default());
                 } else if let Some(entry) = current_entry.as_mut() {
@@ -203,22 +203,22 @@ pub(crate) fn parse_feed_items(xml: &[u8]) -> Result<Vec<FeedItem>, String> {
             }
             Ok(Event::Empty(e)) => {
                 let name = e.name();
-                let raw = String::from_utf8_lossy(name.as_ref()).to_ascii_lowercase();
-                let local = String::from_utf8_lossy(local_name(name.as_ref())).to_ascii_lowercase();
+                let raw = name.as_ref().to_ascii_lowercase();
+                let local = local_name(name.as_ref()).to_ascii_lowercase();
                 if let Some(entry) = current_entry.as_mut() {
                     apply_empty_feed_element(&reader, &e, &raw, &local, entry)?;
                 }
                 text_buf.clear();
             }
             Ok(Event::Text(e)) => {
-                let decoded = e.decode().map_err(|e| e.to_string())?;
+                let decoded = e.xml_content(XmlVersion::Implicit1_0);
                 text_buf = quick_xml::escape::unescape(&decoded)
                     .map_err(|e| e.to_string())?
                     .into_owned();
             }
             Ok(Event::End(e)) => {
                 let name = e.name();
-                let local = String::from_utf8_lossy(local_name(name.as_ref())).to_ascii_lowercase();
+                let local = local_name(name.as_ref()).to_ascii_lowercase();
                 if local == "item" || local == "entry" {
                     if let Some(entry) = current_entry.take() {
                         items.push(feed_item_from_entry(entry));
@@ -291,7 +291,7 @@ fn apply_empty_feed_element<R: std::io::BufRead>(
     match local_name {
         "link" => {
             if let Some(link) = feed_link_from_attrs(reader, element)? {
-                let rel = attr_value_by_name(reader, element, b"rel")?;
+                let rel = attr_value_by_name(reader, element, "rel")?;
                 if rel
                     .as_deref()
                     .is_some_and(|rel| rel.eq_ignore_ascii_case("enclosure"))
@@ -312,7 +312,7 @@ fn apply_empty_feed_element<R: std::io::BufRead>(
             }
         }
         "category" => {
-            if let Some(term) = attr_value_by_name(reader, element, b"term")?
+            if let Some(term) = attr_value_by_name(reader, element, "term")?
                 && !term.is_empty()
             {
                 entry.categories.push(term);
@@ -345,33 +345,33 @@ fn feed_link_from_attrs<R: std::io::BufRead>(
     reader: &Reader<R>,
     element: &BytesStart<'_>,
 ) -> Result<Option<ParsedFeedLink>, String> {
-    let href = match attr_value_by_name(reader, element, b"href")? {
+    let href = match attr_value_by_name(reader, element, "href")? {
         Some(href) => Some(href),
-        None => attr_value_by_name(reader, element, b"url")?,
+        None => attr_value_by_name(reader, element, "url")?,
     };
     let Some(href) = href.filter(|href| !href.is_empty()) else {
         return Ok(None);
     };
-    let length = match attr_value_by_name(reader, element, b"length")? {
+    let length = match attr_value_by_name(reader, element, "length")? {
         Some(length) => Some(length),
-        None => attr_value_by_name(reader, element, b"filesize")?,
+        None => attr_value_by_name(reader, element, "filesize")?,
     }
     .and_then(|value| value.parse::<u64>().ok());
     Ok(Some(ParsedFeedLink { href, length }))
 }
 
 fn attr_value_by_name<R: std::io::BufRead>(
-    reader: &Reader<R>,
+    _reader: &Reader<R>,
     element: &BytesStart<'_>,
-    wanted: &[u8],
+    wanted: &str,
 ) -> Result<Option<String>, String> {
     for attr in element.attributes() {
         let attr = attr.map_err(|e| e.to_string())?;
         if local_name(attr.key.as_ref()).eq_ignore_ascii_case(wanted) {
             let value = attr
-                .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                .normalized_value(XmlVersion::Implicit1_0)
                 .map(std::borrow::Cow::into_owned)
-                .unwrap_or_else(|_| String::from_utf8_lossy(&attr.value).into_owned());
+                .unwrap_or_else(|_| attr.value.into_owned());
             return Ok(Some(value));
         }
     }
@@ -385,8 +385,8 @@ fn parse_feed_timestamp(value: &str) -> Option<i64> {
         .map(|timestamp| timestamp.timestamp())
 }
 
-fn local_name(name: &[u8]) -> &[u8] {
-    name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
+fn local_name(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
 }
 
 pub(crate) fn looks_like_direct_nzb_url(url: &str) -> bool {

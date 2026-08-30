@@ -23,9 +23,9 @@
     "test:audit-selector-quality": "node --test scripts/selector-quality.test.mjs"
   },
   "devDependencies": {
-    "@playwright/test": "1.58.2",
-    "@types/node": "24.13.3",
-    "playwright": "1.58.2",
-    "typescript": "5.9.3"
+    "@playwright/test": "1.62.1",
+    "@types/node": "26.4.0",
+    "playwright": "1.62.1",
+    "typescript": "7.0.2"
   }
 }

@@ -845,6 +845,46 @@ func Recipes() []Recipe {
 	})
 
 	add(Recipe{
+		Slug: "direct-store-par2-alias-restart", Family: "PAR2",
+		Notes: "One late-sorted, extensionless PAR2 index names the direct-store-multivolume payload as an opaque set while the scenario posts the same RAR bytes under their declared archive names. After a restart, durable RAR facts therefore belong to archive while the live PAR2 identity claimant belongs to the opaque alias.",
+		Inputs: []string{
+			"testdata/direct-store-multivolume/archive.part1.rar",
+			"testdata/direct-store-multivolume/archive.part2.rar",
+			"testdata/direct-store-multivolume/archive.part3.rar",
+			"testdata/direct-store-multivolume/archive.part4.rar",
+		},
+		Build: func(ctx context.Context, env *Env) error {
+			const alias = "a31f592e0b874d3ea8c44161b77f3049"
+			volumes := make([]string, 0, 4)
+			for index := 1; index <= 4; index++ {
+				volume := fmt.Sprintf("%s.part%d.rar", alias, index)
+				source := filepath.Join(env.Root, "testdata", "direct-store-multivolume", fmt.Sprintf("archive.part%d.rar", index))
+				if err := CopyFile(source, env.OutputPath(volume)); err != nil {
+					return err
+				}
+				volumes = append(volumes, volume)
+			}
+			if err := env.PAR2(ctx, PAR2Spec{
+				Base: "zz-par2-alias.par2", SliceSize: 65536, RecoveryBlocks: 1, RecoveryFiles: 1, Sources: volumes,
+			}); err != nil {
+				return err
+			}
+			if err := os.Rename(env.OutputPath("zz-par2-alias.par2"), env.OutputPath("zz-par2-alias-index")); err != nil {
+				return err
+			}
+			if err := removeOutput(env, "zz-par2-alias.vol0+1.par2"); err != nil {
+				return err
+			}
+			for _, volume := range volumes {
+				if err := removeOutput(env, volume); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	})
+
+	add(Recipe{
 		Slug: "par2-rar-placement-normalization-multi-swap", Family: "PAR2",
 		Notes: "Six small RAR5 volumes staged with two swapped pairs, 2 with 3 and 5 with 6, beside canonical sidecars, so placement normalisation has to move two pairs without ever verifying.",
 		Build: func(ctx context.Context, env *Env) error {

@@ -1,3 +1,4 @@
+use super::rar::{ArchiveSetRetirement, UnmaterializedArchiveSet};
 use super::*;
 use crate::pipeline::extraction::{BudgetedReader, RarExtractionOpenRequest};
 use std::collections::HashSet;
@@ -772,18 +773,77 @@ impl Pipeline {
             // finalizes without ever writing the alias names to disk). Such a
             // set defends nothing — the real content belongs to the set the
             // live identities claim — so retire it instead of failing a clean
-            // job over it. A set that live files still classify into keeps the
-            // hard error inside the task below: that one is genuinely missing
-            // volumes.
-            self.clear_archive_set_if_unreferenced_and_idle(job_id, set_name);
-            if !self.rar_sets.contains_key(&(job_id, set_name.to_string())) {
-                info!(
-                    job_id = job_id.0,
-                    set_name = %set_name,
-                    "retired a stale archive set — no on-disk volumes and no live file claims its names"
-                );
-                self.schedule_job_completion_check(job_id);
-                return Ok(0);
+            // job over it.
+            //
+            // Only an actual teardown may take the retirement exit. Retirement
+            // is refused whenever the set is busy or still claimed, and every
+            // source the completion check draws candidate names from — the
+            // topologies, the runtime map, the live classifications — is
+            // untouched in that case, so announcing a retirement that did not
+            // happen and re-arming the check hands the same name back on the
+            // next pass, forever.
+            match self.clear_archive_set_if_unreferenced_and_idle(job_id, set_name) {
+                ArchiveSetRetirement::Retired => {
+                    info!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        "retired a stale archive set — no on-disk volumes and no live file claims its names"
+                    );
+                    self.schedule_job_completion_check(job_id);
+                    return Ok(0);
+                }
+                // Something is reading the set; the task below rules on it, as
+                // it did before this guard existed.
+                ArchiveSetRetirement::Busy => {}
+                ArchiveSetRetirement::StillReferenced => {
+                    // A claimed name with no runtime entry of its own is the
+                    // shape retirement cannot reach and extraction cannot use:
+                    // there is nothing to tear down and nothing to open. Ask
+                    // where the bytes went before deciding it is a failure —
+                    // the claimants may be complete under a set this job has
+                    // already extracted, which is exactly the clean job the
+                    // retirement exit was written to protect.
+                    if !self.rar_sets.contains_key(&(job_id, set_name.to_string())) {
+                        match self.classify_unmaterialized_archive_set(job_id, set_name) {
+                            UnmaterializedArchiveSet::ConsumedBy(owner) => {
+                                info!(
+                                    job_id = job_id.0,
+                                    set_name = %set_name,
+                                    owner = %owner,
+                                    "absorbed a claimed archive set with no volumes into the set that already extracted its files"
+                                );
+                                self.absorb_archive_set_into_extracted(job_id, set_name);
+                                return Ok(0);
+                            }
+                            UnmaterializedArchiveSet::NeverMaterialized => {
+                                info!(
+                                    job_id = job_id.0,
+                                    set_name = %set_name,
+                                    "absorbed a claimed archive set this job never materialized — no volume facts were ever parsed under its name"
+                                );
+                                self.absorb_archive_set_into_extracted(job_id, set_name);
+                                return Ok(0);
+                            }
+                            UnmaterializedArchiveSet::MissingVolumes => {
+                                // Genuinely short of volumes. The task below
+                                // reports that once and the job fails on it; a
+                                // completion check that re-runs before the
+                                // failure lands must not queue a second doomed
+                                // extraction behind the first.
+                                if !self
+                                    .missing_volume_archive_sets
+                                    .entry(job_id)
+                                    .or_default()
+                                    .insert(set_name.to_string())
+                                {
+                                    return Err(format!(
+                                        "no on-disk RAR volumes for set '{set_name}'"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 

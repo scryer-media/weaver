@@ -88,41 +88,41 @@
   "go_writers": [
     {
       "id": "go-fixture-bytes",
-      "go": "1.26.2",
+      "go": "1.27.0",
       "module": "std",
       "writes": "deterministic payload streams and format-agnostic byte edits: split, concatenate, truncate, zero or overwrite a range, rename"
     },
     {
       "id": "go-archive-zip",
-      "go": "1.26.2",
+      "go": "1.27.0",
       "module": "std",
       "package": "archive/zip",
       "writes": "zip containers, including the legacy PKWARE ZipCrypto member cipher"
     },
     {
       "id": "go-archive-tar",
-      "go": "1.26.2",
+      "go": "1.27.0",
       "module": "std",
       "package": "archive/tar",
       "writes": "ustar/GNU tar containers"
     },
     {
       "id": "go-compress-gzip",
-      "go": "1.26.2",
+      "go": "1.27.0",
       "module": "std",
       "package": "compress/gzip",
       "writes": "gzip streams"
     },
     {
       "id": "go-compress-flate",
-      "go": "1.26.2",
+      "go": "1.27.0",
       "module": "std",
       "package": "compress/flate",
       "writes": "raw DEFLATE streams"
     },
     {
       "id": "go-klauspost-zstd@v1.19.2",
-      "go": "1.26.2",
+      "go": "1.27.0",
       "module": "github.com/klauspost/compress",
       "version": "v1.19.2",
       "package": "zstd",
@@ -130,17 +130,17 @@
     },
     {
       "id": "go-dsnet-bzip2@v0.0.1",
-      "go": "1.26.2",
+      "go": "1.27.0",
       "module": "github.com/dsnet/compress",
       "version": "v0.0.1",
       "package": "bzip2",
       "writes": "bzip2 streams"
     },
     {
-      "id": "go-andybalholm-brotli@v1.2.2",
-      "go": "1.26.2",
+      "id": "go-andybalholm-brotli@v1.2.3",
+      "go": "1.27.0",
       "module": "github.com/andybalholm/brotli",
-      "version": "v1.2.2",
+      "version": "v1.2.3",
       "writes": "brotli streams"
     }
   ]

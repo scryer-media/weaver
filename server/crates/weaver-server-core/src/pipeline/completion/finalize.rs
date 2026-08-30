@@ -70,6 +70,6 @@ pub(crate) mod deobfuscate;
 mod extract;
 mod nested;
 mod output;
-mod rar;
+pub(crate) mod rar;
 mod sfv;
 mod status;

@@ -617,7 +617,7 @@ func TestGoWriterAttributionFollowsTheExtension(t *testing.T) {
 		"archive.tar.gz":         {"go-fixture-bytes", "go-archive-tar", "go-compress-gzip"},
 		"archive.tbz2":           {"go-fixture-bytes", "go-archive-tar", "go-dsnet-bzip2@v0.0.1"},
 		"test-media.mkv.zst":     {"go-fixture-bytes", "go-klauspost-zstd@v1.19.2"},
-		"test-media.mkv.br":      {"go-fixture-bytes", "go-andybalholm-brotli@v1.2.2"},
+		"test-media.mkv.br":      {"go-fixture-bytes", "go-andybalholm-brotli@v1.2.3"},
 		"test-media.mkv.deflate": {"go-fixture-bytes", "go-compress-flate"},
 		"archive.rar":            {"go-fixture-bytes"},
 	}

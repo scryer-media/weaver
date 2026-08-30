@@ -58,7 +58,7 @@ services:
   # bandwidth limits, timeouts at the TCP stack level.
   # API on port 8474 for runtime toxic management.
   toxiproxy:
-    image: ghcr.io/shopify/toxiproxy:latest
+    image: ghcr.io/shopify/toxiproxy:latest@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
     ports:
       - "${E2E_TOXIPROXY_API_PORT:-8474}:8474"   # toxiproxy API
       - "${E2E_TOXIPROXY_NNTP1_PORT:-3119}:3119" # proxied NNTP server 1
@@ -159,7 +159,7 @@ services:
       retries: 20
 
   nzbget:
-    image: lscr.io/linuxserver/nzbget:latest
+    image: lscr.io/linuxserver/nzbget:latest@sha256:5f3d3fa71029004156eff2cbf4ef4455ce4ce59517cf13fa7d1d7c8a4cd2c8a4
     depends_on:
       nntp:
         condition: service_healthy
@@ -185,7 +185,7 @@ services:
       retries: 20
 
   sabnzbd:
-    image: lscr.io/linuxserver/sabnzbd:4.5.5-ls244
+    image: lscr.io/linuxserver/sabnzbd:4.5.5-ls244@sha256:1a26f56dfc047b62d5ddc20bc92bdebfbe7c3cb58d2d3523958838a09182d77a
     depends_on:
       nntp:
         condition: service_healthy
@@ -214,7 +214,7 @@ services:
   # both SQLite and this service, so its environment and volume are named apart
   # from the rest of the stack and are torn down with the run.
   weaver-postgres:
-    image: postgres:18
+    image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
     environment:
       POSTGRES_DB: "${E2E_WEAVER_POSTGRES_DB:-weaver}"
       POSTGRES_USER: "${E2E_WEAVER_POSTGRES_USER:-weaver}"

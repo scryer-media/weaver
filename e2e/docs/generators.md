@@ -132,14 +132,14 @@ payload almost every archive wraps), `clip-preview` (5 MiB exactly),
 | `par2cmdline-turbo-1.4.0` | `v1.4.0.tar.gz`, SHA-256 `6f2cb042…d1b972` | every PAR2 recovery set |
 | `uudeview-0.5.20` | `uudeview_0.5.20.orig.tar.gz`, SHA-256 `a2a44fa5…70a414` | every uuencoded article, and the decoder each one is proved against |
 | `ffmpeg-7.1-ubuntu2404` | image digest `sha256:292a972c…71931d` | every video clip |
-| `go-fixture-bytes` | Go 1.26.2, stdlib | payload streams and every byte edit |
-| `go-archive-zip` | Go 1.26.2, `archive/zip` | zip containers, including ZipCrypto |
-| `go-archive-tar` | Go 1.26.2, `archive/tar` | tar containers |
-| `go-compress-gzip` | Go 1.26.2, `compress/gzip` | gzip streams |
-| `go-compress-flate` | Go 1.26.2, `compress/flate` | raw DEFLATE streams |
+| `go-fixture-bytes` | Go 1.27.0, stdlib | payload streams and every byte edit |
+| `go-archive-zip` | Go 1.27.0, `archive/zip` | zip containers, including ZipCrypto |
+| `go-archive-tar` | Go 1.27.0, `archive/tar` | tar containers |
+| `go-compress-gzip` | Go 1.27.0, `compress/gzip` | gzip streams |
+| `go-compress-flate` | Go 1.27.0, `compress/flate` | raw DEFLATE streams |
 | `go-klauspost-zstd@v1.19.2` | `github.com/klauspost/compress v1.19.2` | zstd streams |
 | `go-dsnet-bzip2@v0.0.1` | `github.com/dsnet/compress v0.0.1` | bzip2 streams |
-| `go-andybalholm-brotli@v1.2.2` | `github.com/andybalholm/brotli v1.2.2` | brotli streams |
+| `go-andybalholm-brotli@v1.2.3` | `github.com/andybalholm/brotli v1.2.3` | brotli streams |
 
 The SHA-256 of each container pin was obtained by downloading the artifact over
 HTTPS and hashing the bytes that arrived; the URL in the table is the one that

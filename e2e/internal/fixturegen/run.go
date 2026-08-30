@@ -427,7 +427,7 @@ func goWriterIDs(lock Lock, files []string) []string {
 		case strings.HasSuffix(name, ".zst"):
 			ids = append(ids, "go-klauspost-zstd@v1.19.2")
 		case strings.HasSuffix(name, ".br"):
-			ids = append(ids, "go-andybalholm-brotli@v1.2.2")
+			ids = append(ids, "go-andybalholm-brotli@v1.2.3")
 		}
 	}
 	known := map[string]struct{}{}

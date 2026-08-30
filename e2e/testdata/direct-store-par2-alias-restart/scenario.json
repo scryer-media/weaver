@@ -1,0 +1,33 @@
+{
+  "slug": "direct-store-par2-alias-restart",
+  "title": "Amber.Trail.S01E02.2026.1080p.WEB-DL.H264-PARALIAS",
+  "description": "Stored RAR volumes arrive under their declared archive names while PAR2 identifies the same bytes as an opaque set. The restart flow proves a durable canonical RAR set cannot wedge behind the stale PAR2 alias claimant after its physical volumes have been released.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "fixtureAssets": [
+    "direct-store-multivolume/archive.part1.rar::archive.part1.rar",
+    "direct-store-multivolume/archive.part2.rar::archive.part2.rar",
+    "direct-store-multivolume/archive.part3.rar::archive.part3.rar",
+    "direct-store-multivolume/archive.part4.rar::archive.part4.rar"
+  ],
+  "expectedOutputBLAKE3": {
+    "amber.trail.s01e02.mkv": "0f9527235f4aeccd73d0ef80e25572b51b96d4a9dfe96d24a73911590efed9ab"
+  },
+  "runtimeAssertions": {
+    "fileIdentityRewrite": {
+      "requiredCurrentFilenames": [
+        "archive.part1.rar",
+        "archive.part2.rar",
+        "archive.part3.rar",
+        "archive.part4.rar"
+      ],
+      "forbiddenCurrentFilenames": [
+        "a31f592e0b874d3ea8c44161b77f3049.part1.rar",
+        "a31f592e0b874d3ea8c44161b77f3049.part2.rar",
+        "a31f592e0b874d3ea8c44161b77f3049.part3.rar",
+        "a31f592e0b874d3ea8c44161b77f3049.part4.rar"
+      ],
+      "requiredClassificationSource": "par2"
+    }
+  }
+}

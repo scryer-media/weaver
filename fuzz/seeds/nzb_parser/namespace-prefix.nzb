@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<n:nzb xmlns:n="http://www.newzbin.com/DTD/2003/nzb">
+  <n:file poster="p" date="0" subject="namespaced.bin">
+    <n:groups><n:group>alt.binaries.test</n:group></n:groups>
+    <n:segments><n:segment bytes="1" number="1">id@example</n:segment></n:segments>
+  </n:file>
+</n:nzb>

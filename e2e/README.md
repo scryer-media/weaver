@@ -32,7 +32,7 @@ suite is the criterion, not the workaround.
 
 | Requirement | Used for |
 | --- | --- |
-| Go 1.26+ | the harness, the corpus tool and the fixture generator (`go run ./cmd/…`) |
+| Go 1.27+ | the harness, the corpus tool and the fixture generator (`go run ./cmd/…`) |
 | [Task](https://taskfile.dev) | the `task` targets below; every one maps to a `weaver-e2e` subcommand, which is the real interface |
 | Docker with Compose v2 | the stack: two NNTP servers, Nyuu, Toxiproxy, SABnzbd, NZBGet, PostgreSQL, Playwright, a fixed RSS fixture, and Weaver itself |
 | Rust (the toolchain in `../rust-toolchain.toml`) | building the Weaver binary for managed-local phases and the local Weaver image; the harness asks `rustup which cargo` so a stray older toolchain on `PATH` cannot be picked up |

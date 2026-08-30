@@ -6,7 +6,7 @@
       "path": "cmd/fixturegen",
       "toolchains": [
         "ffmpeg-7.1-ubuntu2404",
-        "go-andybalholm-brotli@v1.2.2",
+        "go-andybalholm-brotli@v1.2.3",
         "go-archive-tar",
         "go-archive-zip",
         "go-compress-flate",
@@ -55,7 +55,7 @@
         "generator": "fixturegen",
         "toolchains": [
           "ffmpeg-7.1-ubuntu2404",
-          "go-andybalholm-brotli@v1.2.2",
+          "go-andybalholm-brotli@v1.2.3",
           "go-fixture-bytes"
         ],
         "inputs": [
@@ -83,8 +83,8 @@
     },
     {
       "path": "testdata/deflate-single/test-media.mkv.deflate",
-      "size": 5243290,
-      "blake3": "eba6439acee14d005fbb97ef441c32764ac50f57a9e3cac033cd8eab96d6b326",
+      "size": 5243287,
+      "blake3": "6f2138dafb8008a4fb7f1f4491079a5b15df08f703d03f3d62cd434a2482ff7d",
       "format": "deflate",
       "source": {
         "kind": "generated",
@@ -194,6 +194,26 @@
         "toolchains": [
           "go-fixture-bytes",
           "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par2-alias-restart/zz-par2-alias-index",
+      "size": 8924,
+      "blake3": "c5798074a0974c40f9fdd95d58862d9e9e66479a4d742a56f33abb1d3bf84cac",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ],
+        "inputs": [
+          "testdata/direct-store-multivolume/archive.part1.rar",
+          "testdata/direct-store-multivolume/archive.part2.rar",
+          "testdata/direct-store-multivolume/archive.part3.rar",
+          "testdata/direct-store-multivolume/archive.part4.rar"
         ]
       }
     },
@@ -404,8 +424,8 @@
     },
     {
       "path": "testdata/gzip-corrupted/test-media.mkv.gz",
-      "size": 84303766,
-      "blake3": "f0ea3b659983abb1d721efb616d36f83e58186fbff5446d4ee32d6779ec0abe3",
+      "size": 84066940,
+      "blake3": "64ed4b55a7bffeb801200b88ed3f04eaacb9ed891d0d46ad2b64742ef35cdea6",
       "format": "gzip",
       "source": {
         "kind": "generated",
@@ -422,8 +442,8 @@
     },
     {
       "path": "testdata/gzip-single/test-media.mkv.gz",
-      "size": 84303766,
-      "blake3": "309fb0b81ccff483eccb8c2cf3f519b9a63a03fcb3050e97afb7554903cb0376",
+      "size": 84066940,
+      "blake3": "5e51fb9192cdea6c1e4221de3a7fd81fe3c2502cd3d95f38b025e723afd62dcd",
       "format": "gzip",
       "source": {
         "kind": "generated",
@@ -4930,8 +4950,8 @@
     },
     {
       "path": "testdata/tar-gzip-archive/archive.tar.gzip",
-      "size": 5243940,
-      "blake3": "1eeda434576ac88c1bde95f19af6ae2ff4aec6b8b5fa5b57a5d308209876bb26",
+      "size": 5243907,
+      "blake3": "bee32d3d2ca1121dc9a7eafe22058cb8d5f914b6f86810747296604f4d40da97",
       "format": "tar.gz",
       "source": {
         "kind": "generated",
@@ -4949,8 +4969,8 @@
     },
     {
       "path": "testdata/targz-archive/archive.tar.gz",
-      "size": 252925194,
-      "blake3": "4bf5286f65e305aab92898ad7297d4656ab7c71e35669e5ab8d70528995684ab",
+      "size": 252226258,
+      "blake3": "d38b76dfb3246db697e55ba8dc24a2b837f173cbece6d1023666c31fc767670f",
       "format": "tar.gz",
       "source": {
         "kind": "generated",
@@ -4968,8 +4988,8 @@
     },
     {
       "path": "testdata/targz-corrupted/archive.tar.gz",
-      "size": 252925194,
-      "blake3": "006fdc4a019a7c325b41248d9f02dbc59b8ab7d3bd007548b7762c3a45da429d",
+      "size": 252226258,
+      "blake3": "3c06a1b23f00f74aa731c425f564dbf3e127558f2c226e2f5978f93af77b06df",
       "format": "tar.gz",
       "source": {
         "kind": "generated",
@@ -5006,8 +5026,8 @@
     },
     {
       "path": "testdata/tgz-archive/archive.tgz",
-      "size": 5243940,
-      "blake3": "1eeda434576ac88c1bde95f19af6ae2ff4aec6b8b5fa5b57a5d308209876bb26",
+      "size": 5243907,
+      "blake3": "bee32d3d2ca1121dc9a7eafe22058cb8d5f914b6f86810747296604f4d40da97",
       "format": "tar.gz",
       "source": {
         "kind": "generated",

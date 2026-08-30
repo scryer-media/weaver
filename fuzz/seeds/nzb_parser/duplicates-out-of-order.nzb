@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="duplicates.bin">
+    <groups><group>g</group></groups>
+    <segments>
+      <segment bytes="3" number="3">third</segment>
+      <segment bytes="1" number="1">same-id</segment>
+      <segment bytes="2" number="1">duplicate-number</segment>
+      <segment bytes="2" number="2">same-id</segment>
+      <segment bytes="100" number="100">sparse</segment>
+    </segments>
+  </file>
+</nzb>

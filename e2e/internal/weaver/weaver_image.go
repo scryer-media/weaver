@@ -26,9 +26,9 @@ const weaverImageBuilderWorkdir = "/app"
 
 // Bootstrap base image. It exists only to supply rustup, cargo and a Debian
 // userland; the compiler that actually builds weaver is the one
-// rust-toolchain.toml pins, installed explicitly below. This tag deliberately
-// does not track the repo pin -- it just has to exist on Docker Hub.
-const weaverImageBootstrapBase = "rust:1.96-slim-bookworm"
+// rust-toolchain.toml pins, installed explicitly below. The digest keeps the
+// bootstrap userland stable independently of that compiler selection.
+const weaverImageBootstrapBase = "rust:1.96-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3"
 
 // Used when weaver has no readable rust-toolchain.toml. rustup would still pick
 // up a toolchain file copied into the image, so this only covers the case where
@@ -291,7 +291,7 @@ RUN --mount=type=cache,id=weaver-e2e-cargo-registry,target=/usr/local/cargo/regi
     cargo build --release --locked -p weaver --target "$(cat /tmp/weaver-target)" && \
     cp "target/$(cat /tmp/weaver-target)/release/weaver" /tmp/weaver-portable
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata util-linux wget && \
     rm -rf /var/lib/apt/lists/*
 COPY docker/entrypoint.sh /entrypoint.sh

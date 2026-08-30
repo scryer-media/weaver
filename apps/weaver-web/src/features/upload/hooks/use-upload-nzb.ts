@@ -462,10 +462,7 @@ export function useUploadNzb(options?: {
   const handleFiles = useCallback(
     (nextFiles: File[]) => {
       setError(null);
-      if (
-        nextFiles.length > 0 &&
-        nextFiles.some((file) => !isSupportedNzbUploadFilename(file.name))
-      ) {
+      if (nextFiles.some((file) => !isSupportedNzbUploadFilename(file.name))) {
         setError(t("upload.invalidFiles"));
         return;
       }

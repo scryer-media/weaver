@@ -1,10 +1,12 @@
 import {
-  getCoreRowModel,
-  useReactTable,
-  type ColumnDef,
   type RowSelectionState,
   type SortingState,
 } from "@tanstack/react-table";
+import {
+  getCoreRowModel,
+  useLegacyTable as useReactTable,
+  type LegacyColumnDef as ColumnDef,
+} from "@tanstack/react-table/legacy";
 import {
   ChevronDown,
   ListFilter,

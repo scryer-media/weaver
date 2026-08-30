@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<nzb>
+  <file poster="p&amp;q" date="0" subject="Title &amp; More - &quot;file.rar&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="1" number="1">&lt;abc@host&gt;</segment></segments>
+  </file>
+</nzb>

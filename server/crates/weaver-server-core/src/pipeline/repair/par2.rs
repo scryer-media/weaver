@@ -619,7 +619,9 @@ impl Pipeline {
         }
 
         for set_name in stale_rar_sets {
-            self.clear_archive_set_if_unreferenced_and_idle(job_id, &set_name);
+            // A set the rebind left stale retires here when nothing holds it;
+            // when something does, the extraction path rules on it later.
+            let _ = self.clear_archive_set_if_unreferenced_and_idle(job_id, &set_name);
         }
         let empty_idle_sets = self
             .rar_sets

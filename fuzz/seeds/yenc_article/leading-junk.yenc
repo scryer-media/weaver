@@ -1,0 +1,7 @@
+Path: news.example
+=yb
+=ybegi partial
+
+=ybegin line=128 size=3 name=junk.bin
+klm
+=yend size=3

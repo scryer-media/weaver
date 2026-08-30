@@ -273,13 +273,13 @@ dependencies = [
 
 [[package]]
 name = "argon2"
-version = "0.5.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+checksum = "134c52ddac6d63c576bef8168db10c83c49c26444ecbc68060fef078925a901c"
 dependencies = [
  "base64ct",
  "blake2",
- "cpufeatures 0.2.17",
+ "cpufeatures 0.3.1",
  "password-hash",
 ]
 
@@ -764,11 +764,11 @@ dependencies = [
 
 [[package]]
 name = "blake2"
-version = "0.10.6"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+checksum = "5b5d4d889834ee8ecfc0f8426ad30faf7cdcb10f741a8e6d7224d95325479f6f"
 dependencies = [
- "digest 0.10.7",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -811,15 +811,6 @@ checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array 0.4.14",
  "zeroize",
-]
-
-[[package]]
-name = "block-padding"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
-dependencies = [
- "generic-array",
 ]
 
 [[package]]
@@ -942,15 +933,6 @@ name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
-
-[[package]]
-name = "cbc"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
-dependencies = [
- "cipher 0.4.4",
-]
 
 [[package]]
 name = "cbc"
@@ -1741,6 +1723,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
+name = "fixedbitset"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
 name = "flate2"
 version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2529,7 +2517,6 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
- "block-padding 0.3.3",
  "generic-array",
 ]
 
@@ -2539,7 +2526,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
- "block-padding 0.4.2",
+ "block-padding",
  "hybrid-array 0.4.14",
 ]
 
@@ -2708,9 +2695,9 @@ dependencies = [
 
 [[package]]
 name = "keyring"
-version = "4.1.6"
+version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72585bb6cc9bc370d1d545b7e23fcce71dfd4461c5e15275e3cf51bdfd9a980a"
+checksum = "2270074a3d26bcac93c1dc5d2845eb4c089e8d761ccf6e0ea266a16004640627"
 dependencies = [
  "apple-native-keyring-store",
  "keyring-core",
@@ -2851,18 +2838,12 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lzma-rust2"
-version = "0.18.1"
+version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "243cb2271683c2855cad62142cbf38199db439b1b1e1ccdd5a011342894dd7cc"
+checksum = "5e2a88783b84d2d67ef2791778a9e76bfb68b8017aaf6c9d7d5f2626a478b16c"
 dependencies = [
  "sha2 0.11.0",
 ]
-
-[[package]]
-name = "lzma-rust2"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c1bf3331fb5cf60f2ef15b63361f6cc39492a5d94c096053c395515e17d147f"
 
 [[package]]
 name = "matchers"
@@ -3215,24 +3196,6 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddbf8171058b0256cc12f93bb162da0bf12331eb0afa995f30892c6aa7b2a678"
-dependencies = [
- "bytes",
- "cap-std",
- "crc-fast",
- "libc",
- "md-5",
- "memmap2",
- "rayon",
- "reedsolomon-rs",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
-name = "par2-rs"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4e76b0a6663ba5412782fcbcf247338b49bd9cd7c5bfa248695b076463a0dd"
@@ -3281,13 +3244,11 @@ dependencies = [
 
 [[package]]
 name = "password-hash"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
 dependencies = [
- "base64ct",
- "rand_core 0.6.4",
- "subtle",
+ "phc",
 ]
 
 [[package]]
@@ -3334,6 +3295,16 @@ checksum = "5a07a60cc7a4d00c91f95c685609d1d2f79050e6804b70ebedd7650f0b839bcf"
 dependencies = [
  "memchr",
  "ucd-trie",
+]
+
+[[package]]
+name = "phc"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44dc769b75f93afdddd8c7fa12d685292ddeff1e66f7f0f3a234cf1818afe892"
+dependencies = [
+ "base64ct",
+ "ctutils",
 ]
 
 [[package]]
@@ -3505,9 +3476,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro-error-attr3"
-version = "3.1.0"
+version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0084e6206a967a2dad822180626b2f6b07a3b379325e8f1ec0438e33a469ba7"
+checksum = "9e564d14133360e1ae169ffde5da25881b5fa47261665b8e5713c212c27799da"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3515,9 +3486,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro-error3"
-version = "3.1.0"
+version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cf066225f2373bc711684792b69bdeac0356019b007e721090c24d92d5d5a50"
+checksum = "8f0d4471b3436c22106b21913b1dda531558918ae9b7ec55d58aa84b43552233"
 dependencies = [
  "proc-macro-error-attr3",
  "proc-macro2",
@@ -3536,9 +3507,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
  "memchr",
 ]
@@ -4107,11 +4078,12 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scryer-release-parser"
-version = "0.12.0"
-source = "git+https://github.com/scryer-media/scryer?tag=scryer-v0.12.0#dc5ef9f71043b992bb937becdbc842cd713f5f98"
+version = "0.18.21"
+source = "git+https://github.com/scryer-media/scryer?tag=scryer-v0.18.21#00c31f2a9655647b8ae5be96d1c8552bf3aed91a"
 dependencies = [
  "aho-corasick",
  "chrono",
+ "fixedbitset",
  "html-escape",
  "serde",
  "smallvec",
@@ -4153,20 +4125,20 @@ dependencies = [
 
 [[package]]
 name = "secret-service"
-version = "5.1.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a62d7f86047af0077255a29494136b9aaaf697c76ff70b8e49cded4e2623c14"
+checksum = "5107b24b91445dd2aa449a258a1807b63240942157292354dc5bfdbeb8bc6db8"
 dependencies = [
- "aes 0.8.4",
- "cbc 0.1.2",
+ "aes 0.9.3",
+ "cbc",
  "futures-util",
- "generic-array",
- "getrandom 0.2.17",
- "hkdf 0.12.4",
+ "getrandom 0.4.3",
+ "hkdf 0.13.0",
+ "hybrid-array 0.4.14",
  "num",
  "once_cell",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "zbus",
 ]
 
@@ -4293,19 +4265,19 @@ dependencies = [
 
 [[package]]
 name = "sevenz-rust2"
-version = "0.21.6"
+version = "0.22.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7e6633e9d494e3b8e69b6e806cd76fb19e5d60b7aedcf35ac051e78c4f0c27c"
+checksum = "cb967eb8b29410e61e8c9005058fcfd5889d0b827856beb25529c73dfc86a98a"
 dependencies = [
  "aes 0.9.3",
  "brotli",
  "bzip2",
- "cbc 0.2.1",
+ "cbc",
  "crc32fast",
  "flate2",
  "getrandom 0.4.3",
  "js-sys",
- "lzma-rust2 0.19.0",
+ "lzma-rust2",
  "ppmd-rust",
  "sha2 0.11.0",
  "wasm-bindgen",
@@ -5479,7 +5451,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.9.3"
+version = "0.9.5"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -5496,7 +5468,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "mime_guess",
- "par2-rs 0.8.0",
+ "par2-rs",
  "quick-xml",
  "rayon",
  "reqwest",
@@ -5527,14 +5499,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.9.3"
+version = "0.9.5"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.9.3"
+version = "0.9.5"
 dependencies = [
  "bytes",
  "criterion",
@@ -5560,7 +5532,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.9.3"
+version = "0.9.5"
 dependencies = [
  "quick-xml",
  "serde",
@@ -5571,7 +5543,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.9.3"
+version = "0.9.5"
 dependencies = [
  "aes-gcm 0.11.1",
  "age",
@@ -5586,7 +5558,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "hmac 0.13.0",
- "lzma-rust2 0.18.1",
+ "lzma-rust2",
  "pbkdf2 0.13.0",
  "regex",
  "reqwest",
@@ -5609,7 +5581,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.9.3"
+version = "0.9.5"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -5637,9 +5609,9 @@ dependencies = [
  "keyring-core",
  "libc",
  "liblzma",
- "lzma-rust2 0.18.1",
+ "lzma-rust2",
  "notify",
- "par2-rs 0.8.0",
+ "par2-rs",
  "pbkdf2 0.13.0",
  "quick-xml",
  "rayon",
@@ -5673,14 +5645,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.9.3"
+version = "0.9.5"
 dependencies = [
  "cc",
  "crc-fast",
  "criterion",
  "libloading",
  "memchr",
- "par2-rs 0.7.1",
+ "par2-rs",
  "thiserror 2.0.20",
 ]
 

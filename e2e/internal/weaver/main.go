@@ -1239,6 +1239,7 @@ var chaosSeedFixtureSlugs = append(
 )
 
 var restartFixtureSlugs = []string{
+	"direct-store-par2-alias-restart",
 	"par2-heavy-damage",
 	"par2-heavy-damage-a",
 	"par2-small-repair",
