@@ -3,6 +3,7 @@ package weaver
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +36,89 @@ func TestInferForcedRuntimeLanes(t *testing.T) {
 		if gotRun == nil || *gotRun != tc.wantRun {
 			t.Fatalf("%s: expected run lane %q, got %#v", tc.status, tc.wantRun, gotRun)
 		}
+	}
+}
+
+func TestRestartCasesIncludeDirectStorePar2AliasRegression(t *testing.T) {
+	const caseName = "direct_store_par2_alias_claimant_completes_after_restart"
+	for _, tc := range restartCases() {
+		if tc.Name != caseName {
+			continue
+		}
+		if len(tc.Slugs) != 1 || tc.Slugs[0] != "direct-store-par2-alias-restart" {
+			t.Fatalf("%s has unexpected fixtures: %v", caseName, tc.Slugs)
+		}
+		if tc.Run == nil {
+			t.Fatalf("%s has no flow", caseName)
+		}
+		return
+	}
+	t.Fatalf("restart suite does not include %s", caseName)
+}
+
+func TestCapturePar2AliasStateReportsSplitOwnershipAndMissingVolumes(t *testing.T) {
+	t.Setenv(weaverDatastoreEnv, string(weaverDatastoreSQLite))
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "weaver.sqlite")
+	outputDir := filepath.Join(root, "intermediate")
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE active_jobs (job_id INTEGER PRIMARY KEY, output_dir TEXT NOT NULL)`)
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE active_file_identities (
+		job_id INTEGER NOT NULL,
+		file_index INTEGER NOT NULL,
+		current_filename TEXT NOT NULL,
+		canonical_filename TEXT,
+		classification_kind TEXT,
+		classification_set_name TEXT
+	)`)
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE active_rar_volume_facts (
+		job_id INTEGER NOT NULL,
+		set_name TEXT NOT NULL,
+		volume_index INTEGER NOT NULL,
+		facts_blob BLOB NOT NULL
+	)`)
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE active_extracted (job_id INTEGER NOT NULL)`)
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE active_extraction_chunks (job_id INTEGER NOT NULL)`)
+	if _, err := db.Exec(`INSERT INTO active_jobs (job_id, output_dir) VALUES (?, ?)`, 11809, outputDir); err != nil {
+		t.Fatal(err)
+	}
+	for index := 1; index <= 4; index++ {
+		current := fmt.Sprintf("archive.part%d.rar", index)
+		canonical := fmt.Sprintf("%s.part%d.rar", restartPar2AliasSet, index)
+		if _, err := db.Exec(`
+			INSERT INTO active_file_identities
+			(job_id, file_index, current_filename, canonical_filename, classification_kind, classification_set_name)
+			VALUES (?, ?, ?, ?, 'rar', ?)
+		`, 11809, index-1, current, canonical, restartPar2AliasSet); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`
+			INSERT INTO active_rar_volume_facts (job_id, set_name, volume_index, facts_blob)
+			VALUES (?, 'archive', ?, X'01')
+		`, 11809, index-1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	state, err := capturePar2AliasState(dbPath, 11809)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.IdentityCount != 4 || state.AliasClaimants != 4 {
+		t.Fatalf("unexpected alias identity counts: %+v", state)
+	}
+	if len(state.ClassificationSets) != 1 || state.ClassificationSets[0] != restartPar2AliasSet {
+		t.Fatalf("unexpected classification sets: %v", state.ClassificationSets)
+	}
+	if len(state.FactSets) != 1 || state.FactSets["archive"] != 4 {
+		t.Fatalf("unexpected durable RAR fact ownership: %v", state.FactSets)
+	}
+	if len(state.ExistingVolumePaths) != 0 {
+		t.Fatalf("expected no materialized RAR volumes, got %v", state.ExistingVolumePaths)
 	}
 }
 

@@ -163,6 +163,8 @@
     "restart": {
       "description": "What the restart suite seeds: restartFixtureSlugs.",
       "include": [
+        "testdata/direct-store-multivolume/**",
+        "testdata/direct-store-par2-alias-restart/**",
         "testdata/par2-heavy-damage/**",
         "testdata/par2-heavy-damage-a/**",
         "testdata/par2-small-repair/**",
@@ -182,6 +184,7 @@
         "testdata/direct-store-encrypted/**",
         "testdata/direct-store-multi-member/**",
         "testdata/direct-store-multivolume/**",
+        "testdata/direct-store-par2-alias-restart/**",
         "testdata/direct-store-par2-repair/**",
         "testdata/direct-store-rar4/**",
         "testdata/direct-store-single/**",

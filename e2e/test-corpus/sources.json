@@ -198,6 +198,26 @@
       }
     },
     {
+      "path": "testdata/direct-store-par2-alias-restart/zz-par2-alias-index",
+      "size": 8924,
+      "blake3": "c5798074a0974c40f9fdd95d58862d9e9e66479a4d742a56f33abb1d3bf84cac",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ],
+        "inputs": [
+          "testdata/direct-store-multivolume/archive.part1.rar",
+          "testdata/direct-store-multivolume/archive.part2.rar",
+          "testdata/direct-store-multivolume/archive.part3.rar",
+          "testdata/direct-store-multivolume/archive.part4.rar"
+        ]
+      }
+    },
+    {
       "path": "testdata/direct-store-par2-repair/archive.par2",
       "size": 41108,
       "blake3": "b03f6deea737237791210883319a4400bceaa17137b5580793b94369bb65d72a",

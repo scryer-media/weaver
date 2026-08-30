@@ -25,7 +25,10 @@ const (
 	restartProfileCurrent  restartProfile = "current"
 )
 
-const restartExtractDelayEnv = "WEAVER_E2E_DELAY=extract.member_start=20000"
+const (
+	restartExtractDelayEnv = "WEAVER_E2E_DELAY=extract.member_start=20000"
+	restartPar2AliasSet    = "a31f592e0b874d3ea8c44161b77f3049"
+)
 
 type restartClassification string
 
@@ -124,6 +127,18 @@ type restartExtractedMember struct {
 	JobID      int    `json:"job_id"`
 	MemberName string `json:"member_name"`
 	OutputPath string `json:"output_path"`
+}
+
+type restartPar2AliasState struct {
+	IdentityCount       int            `json:"identity_count"`
+	AliasClaimants      int            `json:"alias_claimants"`
+	CurrentFilenames    []string       `json:"current_filenames"`
+	CanonicalFilenames  []string       `json:"canonical_filenames"`
+	ClassificationSets  []string       `json:"classification_sets"`
+	FactSets            map[string]int `json:"fact_sets"`
+	ExistingVolumePaths []string       `json:"existing_volume_paths"`
+	ActiveExtracted     int            `json:"active_extracted"`
+	ExtractionChunks    int            `json:"extraction_chunks"`
 }
 
 type restartFilesystemSnapshot struct {
@@ -236,6 +251,13 @@ func restartCases() []restartCase {
 			Slugs:       []string{"par2-small-repair"},
 			Timeout:     15 * time.Minute,
 			Run:         runVerificationReconcilesStaleExtractingRuntime,
+		},
+		{
+			Name:        "direct_store_par2_alias_claimant_completes_after_restart",
+			Description: "A consumed direct-store RAR set must not wedge behind its unmaterialized PAR2 alias after restart",
+			Slugs:       []string{"direct-store-par2-alias-restart"},
+			Timeout:     8 * time.Minute,
+			Run:         runDirectStorePar2AliasClaimantCompletesAfterRestart,
 		},
 	}
 }
@@ -1233,6 +1255,105 @@ func countActiveExtractedMembers(dbPath string, jobID int) (int, error) {
 		return 0, err
 	}
 	return count, nil
+}
+
+func capturePar2AliasState(dbPath string, jobID int) (restartPar2AliasState, error) {
+	state := restartPar2AliasState{FactSets: map[string]int{}}
+	db, datastore, err := openWeaverStateDB(dbPath)
+	if err != nil {
+		return state, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query(rebindWeaverSQL(datastore, `
+		SELECT current_filename,
+		       COALESCE(canonical_filename, ''),
+		       COALESCE(classification_set_name, '')
+		FROM active_file_identities
+		WHERE job_id = ? AND LOWER(COALESCE(classification_kind, '')) = 'rar'
+		ORDER BY file_index
+	`), jobID)
+	if err != nil {
+		return state, err
+	}
+	classificationSets := map[string]bool{}
+	for rows.Next() {
+		var current, canonical, classificationSet string
+		if err := rows.Scan(&current, &canonical, &classificationSet); err != nil {
+			rows.Close()
+			return state, err
+		}
+		state.IdentityCount++
+		state.CurrentFilenames = append(state.CurrentFilenames, current)
+		state.CanonicalFilenames = append(state.CanonicalFilenames, canonical)
+		if classificationSet != "" {
+			classificationSets[classificationSet] = true
+		}
+		if classificationSet == restartPar2AliasSet {
+			state.AliasClaimants++
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return state, err
+	}
+	if err := rows.Err(); err != nil {
+		return state, err
+	}
+	for setName := range classificationSets {
+		state.ClassificationSets = append(state.ClassificationSets, setName)
+	}
+	sort.Strings(state.ClassificationSets)
+
+	factRows, err := db.Query(rebindWeaverSQL(datastore, `
+		SELECT set_name, COUNT(*)
+		FROM active_rar_volume_facts
+		WHERE job_id = ?
+		GROUP BY set_name
+		ORDER BY set_name
+	`), jobID)
+	if err != nil {
+		return state, err
+	}
+	for factRows.Next() {
+		var setName string
+		var count int
+		if err := factRows.Scan(&setName, &count); err != nil {
+			factRows.Close()
+			return state, err
+		}
+		state.FactSets[setName] = count
+	}
+	if err := factRows.Close(); err != nil {
+		return state, err
+	}
+	if err := factRows.Err(); err != nil {
+		return state, err
+	}
+
+	for table, destination := range map[string]*int{
+		"active_extracted":         &state.ActiveExtracted,
+		"active_extraction_chunks": &state.ExtractionChunks,
+	} {
+		query := rebindWeaverSQL(datastore, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE job_id = ?", table))
+		if err := db.QueryRow(query, jobID).Scan(destination); err != nil {
+			return state, err
+		}
+	}
+
+	var outputDir string
+	if err := db.QueryRow(rebindWeaverSQL(datastore, `SELECT output_dir FROM active_jobs WHERE job_id = ?`), jobID).Scan(&outputDir); err != nil {
+		return state, err
+	}
+	for _, filename := range state.CurrentFilenames {
+		path := filepath.Join(outputDir, filename)
+		if _, err := os.Stat(path); err == nil {
+			state.ExistingVolumePaths = append(state.ExistingVolumePaths, path)
+		} else if !os.IsNotExist(err) {
+			return state, err
+		}
+	}
+	sort.Strings(state.ExistingVolumePaths)
+	return state, nil
 }
 
 func jobEventKinds(dbPath string, jobID int) ([]string, error) {
@@ -2598,5 +2719,107 @@ func runVerificationReconcilesStaleExtractingRuntime(ctx *restartCaseContext) (r
 		gap,
 		"job completed, but the stale extracting runtime was never observed leaving extracting before terminalization",
 		fmt.Sprintf("verification restart failed to reconcile stale extracting runtime (final=%s log=%s)", statuses[jobID], ctx.caseLogPath),
+	), nil
+}
+
+func runDirectStorePar2AliasClaimantCompletesAfterRestart(ctx *restartCaseContext) (restartCaseResult, error) {
+	const slug = "direct-store-par2-alias-restart"
+	// One connection makes the extensionless, late-sorted PAR2 index arrive only
+	// after all four archive volumes have established their canonical RAR facts.
+	if err := ctx.startWeaverWithConnections("status.enter_verifying", 1); err != nil {
+		return restartCaseResult{}, err
+	}
+	jobID, err := ctx.submitSlug(slug)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	if err := ctx.waitForCrash(5 * time.Minute); err != nil {
+		return restartCaseResult{}, err
+	}
+	if !logContains(ctx.caseLogPath, "status.enter_verifying") {
+		return restartCaseResult{}, fmt.Errorf("expected verifying failpoint evidence in log before PAR2 alias restart")
+	}
+
+	dbPath := filepath.Join(ctx.CaseDir, "weaver.db")
+	_, preFS, preMetrics, err := ctx.captureEvidence("pre_crash", "")
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	aliasState, err := capturePar2AliasState(dbPath, jobID)
+	if err != nil {
+		return restartCaseResult{}, fmt.Errorf("capture PAR2 alias state: %w", err)
+	}
+	writeRestartJSON(filepath.Join(ctx.CaseDir, "pre_crash_par2_alias_state.json"), aliasState)
+
+	expectedCurrent := []string{
+		"archive.part1.rar",
+		"archive.part2.rar",
+		"archive.part3.rar",
+		"archive.part4.rar",
+	}
+	expectedCanonical := make([]string, 0, len(expectedCurrent))
+	for index := 1; index <= len(expectedCurrent); index++ {
+		expectedCanonical = append(expectedCanonical, fmt.Sprintf("%s.part%d.rar", restartPar2AliasSet, index))
+	}
+	sort.Strings(expectedCurrent)
+	sort.Strings(expectedCanonical)
+	current := append([]string(nil), aliasState.CurrentFilenames...)
+	canonical := append([]string(nil), aliasState.CanonicalFilenames...)
+	sort.Strings(current)
+	sort.Strings(canonical)
+	_, stagedPath, stagedSize, staged := stagingMemberFromSnapshot(preFS, jobID, true)
+	exactFailureShape := aliasState.IdentityCount == 4 &&
+		aliasState.AliasClaimants == 4 &&
+		len(aliasState.ClassificationSets) == 1 &&
+		aliasState.ClassificationSets[0] == restartPar2AliasSet &&
+		strings.Join(current, "\x00") == strings.Join(expectedCurrent, "\x00") &&
+		strings.Join(canonical, "\x00") == strings.Join(expectedCanonical, "\x00") &&
+		len(aliasState.FactSets) == 1 &&
+		aliasState.FactSets["archive"] == 4 &&
+		len(aliasState.ExistingVolumePaths) == 0 &&
+		aliasState.ActiveExtracted == 0 &&
+		aliasState.ExtractionChunks == 0 &&
+		staged && stagedSize == 24<<20
+	if !exactFailureShape {
+		return restartCaseResult{}, fmt.Errorf(
+			"fixture did not reach the job-11809 failure shape (state=%+v staged=%v staged_path=%s staged_size=%d)",
+			aliasState,
+			staged,
+			stagedPath,
+			stagedSize,
+		)
+	}
+
+	if err := ctx.restartWeaver(); err != nil {
+		return restartCaseResult{}, err
+	}
+	statuses, err := ctx.waitForAllTerminal([]int{jobID}, 3*time.Minute)
+	if err != nil {
+		return restartCaseResult{}, fmt.Errorf("PAR2 alias claimant did not leave the completion loop after restart: %w", err)
+	}
+	_, _, metrics, err := ctx.captureEvidence("post_restart", "")
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	refetchedIDs, refetchedBodies := bodyFetchesSinceRestartPoint(preMetrics, metrics)
+	digestErr := assertOutputBLAKE3(dbPath, jobID, ctx.Scenarios[slug].ExpectedOutputBLAKE3)
+	logData, _ := os.ReadFile(ctx.caseLogPath)
+	retirementLoops := strings.Count(
+		stripANSIEscapeSequences(string(logData)),
+		"retired a stale archive set — no on-disk volumes and no live file claims its names",
+	)
+
+	pass := statuses[jobID] == "COMPLETE" && digestErr == nil && refetchedIDs == 0 && retirementLoops <= 1
+	digestFailure := ""
+	if digestErr != nil {
+		digestFailure = digestErr.Error()
+	}
+	return classifyRestartResult(
+		ctx.Profile,
+		pass,
+		fmt.Sprintf("consumed canonical RAR set absorbed its unmaterialized PAR2 alias after restart (refetched articles %d bodies %d retirement_loops=%d)", refetchedIDs, refetchedBodies, retirementLoops),
+		false,
+		"",
+		fmt.Sprintf("PAR2 alias restart failed (final=%s refetched articles %d bodies %d retirement_loops=%d digest=%s)", statuses[jobID], refetchedIDs, refetchedBodies, retirementLoops, digestFailure),
 	), nil
 }
