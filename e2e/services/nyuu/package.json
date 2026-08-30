@@ -1,0 +1,7 @@
+{
+  "name": "weaver-e2e-nyuu",
+  "private": true,
+  "dependencies": {
+    "nyuu": "0.4.2"
+  }
+}
