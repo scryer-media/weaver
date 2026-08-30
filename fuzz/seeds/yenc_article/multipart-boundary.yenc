@@ -1,0 +1,4 @@
+=ybegin part=1 total=2 line=128 size=2 name=part.bin
+=ypart begin=1 end=3
+klm
+=yend size=3 part=1 pcrc32=nothex

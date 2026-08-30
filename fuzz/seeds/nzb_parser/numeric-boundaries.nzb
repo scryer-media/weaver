@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="18446744073709551616" subject="numeric.bin">
+    <groups><group>g</group></groups>
+    <segments>
+      <segment bytes="33554432" number="4294967295">max-values</segment>
+      <segment bytes="18446744073709551616" number="18446744073709551616">overflow</segment>
+      <segment bytes="1" number="2">valid</segment>
+    </segments>
+  </file>
+</nzb>

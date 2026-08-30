@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nzb PUBLIC "-//newzBin//DTD NZB 1.1//EN" "http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd">
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head>
+    <meta type="title">Some Title</meta>
+    <meta type="password">secret</meta>
+    <meta type="tag">category</meta>
+  </head>
+  <file poster="user@example.com" date="1234567890" subject="Title - &quot;file.rar&quot; yEnc (1/2)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment bytes="500000" number="1">abc123@example.com</segment>
+      <segment bytes="500000" number="2">def456@example.com</segment>
+    </segments>
+  </file>
+  <file poster="other@example.com" date="1234567891" subject="Title - &quot;file.r00&quot; yEnc (1/1)">
+    <groups>
+      <group>alt.binaries.test</group>
+      <group>alt.binaries.misc</group>
+    </groups>
+    <segments><segment bytes="300000" number="1">ghi789@example.com</segment></segments>
+  </file>
+</nzb>

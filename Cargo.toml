@@ -9,6 +9,7 @@ members = [
     "engines/weaver-nzb",
     "engines/weaver-yenc",
 ]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

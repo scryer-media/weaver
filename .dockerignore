@@ -1,8 +1,12 @@
 .git
 .github
 .vscode
+**/worktrees
 
 target
+target-*
+**/target
+fuzz/artifacts
 tmp
 *.db
 *.db-*

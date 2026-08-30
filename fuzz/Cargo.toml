@@ -1,0 +1,27 @@
+[package]
+name = "weaver-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+weaver-nzb = { path = "../engines/weaver-nzb", default-features = false }
+weaver-yenc = { path = "../engines/weaver-yenc", default-features = false }
+
+[[bin]]
+name = "nzb_parser"
+path = "fuzz_targets/nzb_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yenc_article"
+path = "fuzz_targets/yenc_article.rs"
+test = false
+doc = false
+bench = false

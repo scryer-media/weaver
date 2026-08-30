@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nzb>
+  <file poster="poster" date="0" subject="sample.bin">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="3" number="1">sample@example.test</segment></segments>
+  </file>
+</nzb>
