@@ -1019,6 +1019,9 @@ async fn a_refresh_gap_the_plan_cannot_close_parks_instead_of_respawning() {
             headers: Vec::new(),
             rebuild_source:
                 crate::pipeline::archive::topology::RarTopologyRebuildSource::VolumeZero,
+            // The refresh saw only volume 0 — the same starved view the plan
+            // absorbed, so the facts stay unabsorbed round after round.
+            integrated_volumes: BTreeSet::from([0]),
         }
     };
     let request = RarRefreshRequest {
@@ -1130,6 +1133,7 @@ async fn rar_refresh_follow_up_does_not_starve_covered_ready_members() {
             .load_rar_snapshot(job_id, "show")
             .expect("RAR snapshot should exist after volumes 0-1"),
         rebuild_source: crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+        integrated_volumes: BTreeSet::from([0, 1]),
     };
     let request = RarRefreshRequest {
         target_completed_volume: 1,
@@ -1292,6 +1296,7 @@ async fn rar_refresh_done_uses_actual_refreshed_frontier() {
             .load_rar_snapshot(job_id, "show")
             .expect("RAR snapshot should exist"),
         rebuild_source: crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+        integrated_volumes: BTreeSet::from([0, 1]),
     };
 
     pipeline
@@ -1386,6 +1391,7 @@ async fn stale_post_extraction_refresh_does_not_replace_live_rar_plan() {
                 headers: stale_headers,
                 rebuild_source:
                     crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+                integrated_volumes: BTreeSet::new(),
             }),
         })
         .await;
@@ -1509,6 +1515,7 @@ async fn identity_rebind_rejects_an_older_rar_refresh_snapshot() {
                 headers: stale_headers.clone(),
                 rebuild_source:
                     crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+                integrated_volumes: BTreeSet::new(),
             }),
         })
         .await;
@@ -1608,6 +1615,7 @@ async fn source_retry_discards_an_in_flight_refresh_without_resurrecting_its_set
                 headers: stale_headers,
                 rebuild_source:
                     crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+                integrated_volumes: BTreeSet::new(),
             }),
         })
         .await;
@@ -10112,6 +10120,138 @@ async fn a_claimed_alias_set_is_absorbed_on_persisted_facts_after_a_restart() {
 
     drain_completion_checks(&mut pipeline, 16).await;
     assert!(pipeline.pending_completion_checks.is_empty());
+}
+
+#[tokio::test]
+async fn a_refresh_that_integrated_a_members_span_satisfies_the_coverage_it_owed() {
+    // The job-11857 shape: a restored set holds every volume on disk while the
+    // facts ledger recorded only a prefix. Coverage measured by fact-backed
+    // `complete_volumes` makes `rar_member_refresh_request` demand a refresh
+    // that registers no fact and so can never answer the demand — a full-speed
+    // livelock. Coverage is what the refresh integrated into the header view;
+    // a rebuild that saw the member's whole span settles the demand it
+    // triggered.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90217);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Silver Horizon Prefix Facts",
+            &[("silver.horizon.mkv".to_string(), 64)],
+        ),
+    )
+    .await;
+
+    let set_name = "silver.horizon";
+    let member = "silver.horizon.mkv";
+    let topology = crate::jobs::assembly::ArchiveTopology {
+        archive_type: crate::jobs::assembly::ArchiveType::Rar,
+        volume_map: HashMap::from([
+            ("silver.horizon.rar".to_string(), 0),
+            ("silver.horizon.r00".to_string(), 1),
+            ("silver.horizon.r01".to_string(), 2),
+        ]),
+        // The ledger's view: only the prefix ever registered facts.
+        complete_volumes: [0u32, 1].into_iter().collect(),
+        expected_volume_count: Some(3),
+        members: vec![crate::jobs::assembly::ArchiveMember {
+            name: member.to_string(),
+            first_volume: 0,
+            last_volume: 2,
+            unpacked_size: 64,
+        }],
+        unresolved_spans: Vec::new(),
+    };
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .assembly
+        .set_archive_topology(set_name.to_string(), topology.clone());
+
+    let key = (job_id, set_name.to_string());
+    let mut set_state = crate::pipeline::archive::rar_state::RarSetState::default();
+    for (filename, volume) in &topology.volume_map {
+        set_state.volume_files.insert(*volume, filename.clone());
+    }
+    pipeline.rar_sets.insert(key.clone(), set_state);
+
+    let request = RarRefreshRequest {
+        target_completed_volume: 2,
+        reason: RefreshReason::CoverageExpansion,
+    };
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: Some(request),
+            queued: None,
+            latest_completed_volume: 2,
+            // The stale baseline a fact-derived measure produces.
+            refreshed_volumes: BTreeSet::from([0, 1]),
+            structure_dirty: false,
+            last_error: None,
+            last_completion_fingerprint: None,
+        },
+    );
+
+    assert!(
+        pipeline
+            .rar_member_refresh_request(job_id, set_name, member)
+            .is_some(),
+        "before the refresh lands, the member's span exceeds the recorded coverage"
+    );
+
+    pipeline
+        .handle_rar_refresh_done(RarRefreshDone {
+            job_id,
+            set_name: set_name.to_string(),
+            request,
+            extraction_generation: 0,
+            result: Ok(ComputedRarSetState {
+                plan: crate::pipeline::archive::rar_state::RarDerivedPlan {
+                    phase: crate::pipeline::archive::rar_state::RarSetPhase::Ready,
+                    is_solid: false,
+                    ready_members: vec![crate::pipeline::archive::rar_state::RarReadyMember {
+                        name: member.to_string(),
+                    }],
+                    member_names: vec![member.to_string()],
+                    member_dependencies: HashMap::new(),
+                    waiting_on_volumes: HashSet::new(),
+                    deletion_eligible: HashSet::new(),
+                    delete_decisions: BTreeMap::new(),
+                    topology: topology.clone(),
+                    fallback_reason: None,
+                },
+                headers: Vec::new(),
+                rebuild_source:
+                    crate::pipeline::archive::topology::RarTopologyRebuildSource::VolumeZero,
+                // What the rebuild actually opened: the whole set, facts or no
+                // facts.
+                integrated_volumes: BTreeSet::from([0, 1, 2]),
+            }),
+        })
+        .await;
+
+    let refresh = pipeline
+        .rar_refresh_state
+        .get(&key)
+        .expect("refresh state should remain");
+    assert_eq!(
+        refresh.refreshed_volumes,
+        BTreeSet::from([0, 1, 2]),
+        "coverage records what the refresh integrated, not what the facts ledger holds"
+    );
+    assert!(
+        refresh.in_flight.is_none() && refresh.queued.is_none(),
+        "a refresh that integrated the span leaves nothing owed — no respawn"
+    );
+    assert_eq!(
+        pipeline.rar_member_refresh_request(job_id, set_name, member),
+        None,
+        "the demand this refresh was spawned for is satisfied by its own completion"
+    );
 }
 
 #[tokio::test]

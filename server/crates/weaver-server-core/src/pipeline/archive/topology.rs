@@ -1076,11 +1076,21 @@ impl Pipeline {
                 worker_active,
             )?;
 
+            // The archive's own presence set is the coverage this refresh can
+            // vouch for — every volume the loop above attached, refreshed, or
+            // added, plus any the cached header view already held.
+            let integrated_volumes: BTreeSet<u32> = archive
+                .present_volumes()
+                .into_iter()
+                .map(|volume| volume as u32)
+                .collect();
+
             Ok((
                 plan,
                 archive.serialize_headers(),
                 rebuild_source,
                 using_cached_headers,
+                integrated_volumes,
             ))
         };
 
@@ -1162,7 +1172,7 @@ impl Pipeline {
             }
         }
 
-        let (mut plan, mut headers, mut rebuild_source, mut used_cached_headers) =
+        let (mut plan, mut headers, mut rebuild_source, mut used_cached_headers, mut integrated) =
             attach_volumes_and_build_plan(
                 archive,
                 rebuild_source,
@@ -1186,7 +1196,13 @@ impl Pipeline {
             );
 
             let selection = open_from_volume_zero()?;
-            (plan, headers, rebuild_source, used_cached_headers) = attach_volumes_and_build_plan(
+            (
+                plan,
+                headers,
+                rebuild_source,
+                used_cached_headers,
+                integrated,
+            ) = attach_volumes_and_build_plan(
                 selection.value,
                 RarTopologyRebuildSource::VolumeZero,
                 false,
@@ -1213,7 +1229,13 @@ impl Pipeline {
             );
 
             let selection = open_from_volume_zero()?;
-            (plan, headers, rebuild_source, used_cached_headers) = attach_volumes_and_build_plan(
+            (
+                plan,
+                headers,
+                rebuild_source,
+                used_cached_headers,
+                integrated,
+            ) = attach_volumes_and_build_plan(
                 selection.value,
                 RarTopologyRebuildSource::VolumeZero,
                 false,
@@ -1232,6 +1254,7 @@ impl Pipeline {
             plan,
             headers,
             rebuild_source,
+            integrated_volumes: integrated,
         })
     }
 
@@ -1247,13 +1270,14 @@ impl Pipeline {
             rebuild_source = computed.rebuild_source.as_str(),
             "RAR plan rebuilt"
         );
-        let refreshed_volumes: BTreeSet<u32> = computed
-            .plan
-            .topology
-            .complete_volumes
-            .iter()
-            .copied()
-            .collect();
+        // Coverage is what the refresh integrated into the header view, not
+        // the plan's fact-derived `complete_volumes`. A restored job can hold
+        // every volume on disk while the facts ledger records only a prefix;
+        // measuring coverage by facts made `rar_member_refresh_request` demand
+        // a refresh no refresh could ever satisfy — a full-speed livelock.
+        // The integrated set is the quantity the demand is actually about:
+        // whether a rebuild has seen the member's span.
+        let refreshed_volumes = computed.integrated_volumes;
         let latest_refreshed_volume = refreshed_volumes.iter().next_back().copied().unwrap_or(0);
         self.set_rar_snapshot(job_id, set_name, computed.headers);
         self.apply_rar_plan(job_id, set_name, computed.plan);
