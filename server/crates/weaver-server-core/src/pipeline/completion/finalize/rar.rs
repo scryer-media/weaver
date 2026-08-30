@@ -1343,7 +1343,7 @@ impl Pipeline {
                 // number when the format states one and by this layout claim
                 // otherwise — without the layout claim, an old-numbering RAR4
                 // volume (whose headers state nothing) would register as 0.
-                let observed_volume = std::path::Path::new(&relative_path)
+                let layout_volume = std::path::Path::new(&relative_path)
                     .file_name()
                     .and_then(|name| name.to_str())
                     .map(weaver_model::files::FileRole::from_filename)
@@ -1352,9 +1352,9 @@ impl Pipeline {
                             Some(volume_number)
                         }
                         _ => None,
-                    })
-                    .unwrap_or(facts.volume_number);
-                restored.push((observed_volume, relative_path, facts));
+                    });
+                let registered_volume = Self::rar_registration_volume(layout_volume, &facts);
+                restored.push((registered_volume, relative_path, facts));
             }
 
             if restored.is_empty() {

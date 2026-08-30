@@ -10478,7 +10478,7 @@ async fn restore_rebuilds_layout_keys_for_an_old_numbering_rar4_set() {
         unrar_rs::RarArchive::parse_volume_facts(std::io::Cursor::new(files[0].1.clone()), None)
             .unwrap();
     assert_eq!(
-        facts.volume_number, 0,
+        facts.volume_number, None,
         "old numbering states no volume number"
     );
     let blob = rmp_serde::to_vec_named(&facts).unwrap();

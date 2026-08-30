@@ -906,7 +906,7 @@ fn shortened_e01_rar_headers(files: &[(String, Vec<u8>)]) -> Vec<u8> {
 fn dummy_rar_volume_facts(volume_number: u32) -> unrar_rs::RarVolumeFacts {
     unrar_rs::RarVolumeFacts {
         format: 5,
-        volume_number,
+        volume_number: Some(volume_number),
         more_volumes: true,
         is_solid: false,
         is_encrypted: false,

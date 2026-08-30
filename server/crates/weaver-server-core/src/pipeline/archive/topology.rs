@@ -702,16 +702,16 @@ impl Pipeline {
     /// claims — and the layout-derived volume otherwise. RAR5 states a number
     /// in the main header of every volume past the first and a numbered RAR4
     /// set states one in its end record; an old-numbering RAR4 set (.rar/.rNN)
-    /// states none anywhere and every volume parses as 0, so treating the
-    /// parse as identity there collapses the whole set onto one key.
+    /// states none anywhere, and treating an unstated number as an identity
+    /// collapses the whole set onto one key. `None` is the format staying
+    /// silent; a stated `Some(0)` wins like any other stated number.
     pub(in crate::pipeline) fn rar_registration_volume(
         observed_volume: Option<u32>,
         facts: &unrar_rs::RarVolumeFacts,
     ) -> u32 {
-        if facts.volume_number != 0 {
-            facts.volume_number
-        } else {
-            observed_volume.unwrap_or(0)
+        match facts.volume_number {
+            Some(stated) => stated,
+            None => observed_volume.unwrap_or(0),
         }
     }
 
@@ -725,15 +725,15 @@ impl Pipeline {
     ) -> Result<bool, String> {
         let volume = Self::rar_registration_volume(observed_volume, &facts);
         if let Some(expected_volume) = observed_volume
-            && facts.volume_number != 0
-            && facts.volume_number != expected_volume
+            && let Some(stated_volume) = facts.volume_number
+            && stated_volume != expected_volume
         {
             info!(
                 job_id = job_id.0,
                 set_name = %set_name,
                 filename = %filename,
                 expected_volume,
-                parsed_volume = facts.volume_number,
+                parsed_volume = stated_volume,
                 "RAR header states a volume number that disagrees with the layout; the header wins"
             );
         }
@@ -1799,13 +1799,15 @@ impl Pipeline {
         for (expected_volume_number, filename, path) in volume_paths {
             let facts =
                 Self::parse_rar_volume_facts_from_path(path, password_candidates.clone()).await?;
-            if facts.volume_number != 0 && facts.volume_number != expected_volume_number {
+            if let Some(stated_volume) = facts.volume_number
+                && stated_volume != expected_volume_number
+            {
                 info!(
                     job_id = job_id.0,
                     set_name = %set_name,
                     filename = %filename,
                     expected_volume = expected_volume_number,
-                    parsed_volume = facts.volume_number,
+                    parsed_volume = stated_volume,
                     "RAR facts refresh detected volume-number mismatch after normalization"
                 );
             }
@@ -1974,17 +1976,19 @@ impl Pipeline {
             for (volume_index, blob) in facts_rows {
                 match rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob) {
                     Ok(facts) => {
-                        // The row key is the layout-derived volume registration
-                        // used; the blob's own number is whatever the header
-                        // stated, which for an old-numbering RAR4 set is
-                        // nothing (parsed as 0). Re-keying by the blob would
-                        // collapse every such row onto volume 0.
-                        if facts.volume_number != 0 && facts.volume_number != volume_index {
+                        // The row key is the volume registration keyed by; the
+                        // blob's own number is whatever the header stated,
+                        // which for an old-numbering RAR4 set is nothing.
+                        // Re-keying by the blob would collapse every such row
+                        // onto one slot.
+                        if let Some(stated_volume) = facts.volume_number
+                            && stated_volume != volume_index
+                        {
                             warn!(
                                 job_id = job_id.0,
                                 set_name = %set_name,
                                 stored_volume = volume_index,
-                                parsed_volume = facts.volume_number,
+                                parsed_volume = stated_volume,
                                 "persisted RAR facts row key disagrees with the header's stated volume number"
                             );
                         }

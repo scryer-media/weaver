@@ -493,7 +493,7 @@ impl Pipeline {
             return Ok(Some(DetectedArchiveIdentity {
                 kind: PersistedDetectedArchiveKind::Rar,
                 set_name: candidate.set_key.clone(),
-                volume_index: Some(facts.volume_number),
+                volume_index: facts.volume_number,
             }));
         }
 

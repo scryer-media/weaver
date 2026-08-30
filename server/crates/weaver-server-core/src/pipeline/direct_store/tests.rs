@@ -4370,7 +4370,7 @@ fn volume_facts(
     unrar_rs::RarVolumeFacts {
         // RAR5.
         format: 5,
-        volume_number,
+        volume_number: Some(volume_number),
         more_volumes,
         is_solid: false,
         is_encrypted: false,
