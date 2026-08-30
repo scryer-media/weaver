@@ -695,6 +695,26 @@ impl Pipeline {
         .map_err(|e| format!("RAR facts parser task panicked: {e}"))?
     }
 
+    /// The ledger key for one parsed volume.
+    ///
+    /// The header's stated number when the format states one — a swapped or
+    /// misnamed arrival registers as what its bytes are, not what the filename
+    /// claims — and the layout-derived volume otherwise. RAR5 states a number
+    /// in the main header of every volume past the first and a numbered RAR4
+    /// set states one in its end record; an old-numbering RAR4 set (.rar/.rNN)
+    /// states none anywhere and every volume parses as 0, so treating the
+    /// parse as identity there collapses the whole set onto one key.
+    pub(in crate::pipeline) fn rar_registration_volume(
+        observed_volume: Option<u32>,
+        facts: &unrar_rs::RarVolumeFacts,
+    ) -> u32 {
+        if facts.volume_number != 0 {
+            facts.volume_number
+        } else {
+            observed_volume.unwrap_or(0)
+        }
+    }
+
     pub(crate) fn persist_rar_volume_facts(
         &mut self,
         job_id: JobId,
@@ -703,14 +723,7 @@ impl Pipeline {
         observed_volume: Option<u32>,
         facts: unrar_rs::RarVolumeFacts,
     ) -> Result<bool, String> {
-        // The layout names the volume; the header validates it. RAR5 states a
-        // per-volume number in its main header and a numbered RAR4 set states
-        // one in its end record, but an old-numbering RAR4 set (.rar/.rNN)
-        // states none anywhere and parses as 0 — so keying the ledger by the
-        // parsed number collapses every volume of such a set onto one entry.
-        // The layout-derived volume is the key; the parsed number is only a
-        // cross-check, and 0 also means "the format stated nothing".
-        let volume = observed_volume.unwrap_or(facts.volume_number);
+        let volume = Self::rar_registration_volume(observed_volume, &facts);
         if let Some(expected_volume) = observed_volume
             && facts.volume_number != 0
             && facts.volume_number != expected_volume
@@ -721,7 +734,7 @@ impl Pipeline {
                 filename = %filename,
                 expected_volume,
                 parsed_volume = facts.volume_number,
-                "RAR header states a volume number that disagrees with the layout"
+                "RAR header states a volume number that disagrees with the layout; the header wins"
             );
         }
 
@@ -1796,7 +1809,8 @@ impl Pipeline {
                     "RAR facts refresh detected volume-number mismatch after normalization"
                 );
             }
-            parsed.push((expected_volume_number, filename, facts));
+            let volume = Self::rar_registration_volume(Some(expected_volume_number), &facts);
+            parsed.push((volume, filename, facts));
         }
 
         let state = self
@@ -2044,18 +2058,20 @@ impl Pipeline {
                     .await
                 {
                     Ok(facts) => {
-                        // Keyed by the layout-derived volume, like registration:
-                        // an old-numbering RAR4 header states no number and
-                        // every volume of the set parses as 0, so keying by the
-                        // parse would fold the whole set onto one slot here and
-                        // then discard every other loaded fact as "stale". The
+                        // Keyed exactly like registration: the stated number
+                        // when the header states one, the layout otherwise. An
+                        // old-numbering RAR4 header states no number and every
+                        // volume of the set parses as 0, so keying restore by
+                        // the parse alone folds the whole set onto one slot and
+                        // then discards every other loaded fact as "stale". The
                         // fresh parse also replaces any loaded row outright — a
                         // row mis-keyed by an older binary must not survive
                         // under a key the header never earned.
-                        live_volumes.insert(layout_volume);
+                        let volume = Self::rar_registration_volume(Some(layout_volume), &facts);
+                        live_volumes.insert(volume);
                         if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
-                            Self::register_rar_volume_file(state, layout_volume, filename);
-                            state.facts.insert(layout_volume, facts);
+                            Self::register_rar_volume_file(state, volume, filename);
+                            state.facts.insert(volume, facts);
                         }
                     }
                     Err(error) => {
@@ -2164,6 +2180,11 @@ impl Pipeline {
 
         match Self::parse_rar_volume_facts_from_path(path, password_candidates).await {
             Ok(facts) => {
+                // The key the facts registered under. Asking about the raw
+                // parsed number instead asks about volume 0 for every
+                // old-numbering RAR4 volume, whose headers state no number.
+                let registered_volume =
+                    Self::rar_registration_volume(Some(observed_volume), &facts);
                 let changed = match self.persist_rar_volume_facts(
                     job_id,
                     &set_name,
@@ -2175,7 +2196,7 @@ impl Pipeline {
                     Err(error) => {
                         warn!(
                             job_id = job_id.0,
-                            volume = observed_volume,
+                            volume = registered_volume,
                             set_name = %set_name,
                             error = %error,
                             "failed to register RAR volume facts"
@@ -2185,27 +2206,23 @@ impl Pipeline {
                 };
                 debug!(
                     job_id = job_id.0,
-                    volume = observed_volume,
+                    volume = registered_volume,
                     set_name = %set_name,
                     "RAR volume facts parsed"
                 );
-                // The topology speaks layout numbering — its volume slots come
-                // from the same classification `observed_volume` did — so the
-                // membership check must too. Asking about the parsed number
-                // asks about volume 0 for every old-numbering RAR4 volume.
                 let topology_missing_volume = self.jobs.get(&job_id).is_some_and(|state| {
                     state
                         .assembly
                         .archive_topology_for(&set_name)
                         .is_none_or(|topology| {
-                            !topology.complete_volumes.contains(&observed_volume)
+                            !topology.complete_volumes.contains(&registered_volume)
                         })
                 });
                 if changed || topology_missing_volume {
                     self.enqueue_rar_set_refresh(
                         job_id,
                         &set_name,
-                        observed_volume,
+                        registered_volume,
                         RefreshReason::CoverageExpansion,
                     );
                 }

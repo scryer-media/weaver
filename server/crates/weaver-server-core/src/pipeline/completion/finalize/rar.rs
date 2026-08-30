@@ -1339,9 +1339,10 @@ impl Pipeline {
                     Self::parse_rar_volume_facts_from_path(path, password_candidates.clone())
                         .await?;
                 // The restored file's name is the layout's statement of which
-                // volume this is, and the ledger is keyed by layout numbering.
-                // The parsed header number stands in only when the name does
-                // not classify as a RAR volume at all.
+                // volume this is. Registration keys by the header's stated
+                // number when the format states one and by this layout claim
+                // otherwise — without the layout claim, an old-numbering RAR4
+                // volume (whose headers state nothing) would register as 0.
                 let observed_volume = std::path::Path::new(&relative_path)
                     .file_name()
                     .and_then(|name| name.to_str())
