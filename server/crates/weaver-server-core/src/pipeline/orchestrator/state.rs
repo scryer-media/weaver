@@ -103,14 +103,46 @@ impl Pipeline {
     }
 
     pub(crate) fn note_write_buffered(&mut self, bytes: usize, segments: usize) {
-        self.write_buffered_bytes += bytes;
-        self.write_buffered_segments += segments;
+        self.write_buffered_bytes = self.write_buffered_bytes.saturating_add(bytes);
+        self.write_buffered_segments = self.write_buffered_segments.saturating_add(segments);
         self.publish_write_backlog_metrics();
     }
 
     pub(crate) fn release_write_buffered(&mut self, bytes: usize, segments: usize) {
+        debug_assert!(
+            self.write_buffered_bytes >= bytes,
+            "resident write backlog over-release: have {}, releasing {bytes}",
+            self.write_buffered_bytes
+        );
+        debug_assert!(
+            self.write_buffered_segments >= segments,
+            "resident write segment backlog over-release: have {}, releasing {segments}",
+            self.write_buffered_segments
+        );
         self.write_buffered_bytes = self.write_buffered_bytes.saturating_sub(bytes);
         self.write_buffered_segments = self.write_buffered_segments.saturating_sub(segments);
+        self.publish_write_backlog_metrics();
+    }
+
+    pub(crate) fn note_uu_spooled(&mut self, bytes: usize, segments: usize) {
+        self.uu_spooled_bytes = self.uu_spooled_bytes.saturating_add(bytes);
+        self.uu_spooled_segments = self.uu_spooled_segments.saturating_add(segments);
+        self.publish_write_backlog_metrics();
+    }
+
+    pub(crate) fn release_uu_spooled(&mut self, bytes: usize, segments: usize) {
+        debug_assert!(
+            self.uu_spooled_bytes >= bytes,
+            "UU spool backlog over-release: have {}, releasing {bytes}",
+            self.uu_spooled_bytes
+        );
+        debug_assert!(
+            self.uu_spooled_segments >= segments,
+            "UU spool segment backlog over-release: have {}, releasing {segments}",
+            self.uu_spooled_segments
+        );
+        self.uu_spooled_bytes = self.uu_spooled_bytes.saturating_sub(bytes);
+        self.uu_spooled_segments = self.uu_spooled_segments.saturating_sub(segments);
         self.publish_write_backlog_metrics();
     }
 
@@ -121,6 +153,17 @@ impl Pipeline {
         self.metrics
             .write_buffered_segments
             .store(self.write_buffered_segments, Ordering::Relaxed);
+        self.metrics.write_pending_bytes.store(
+            self.write_buffered_bytes
+                .saturating_add(self.uu_spooled_bytes) as u64,
+            Ordering::Relaxed,
+        );
+        self.metrics
+            .uu_spooled_bytes
+            .store(self.uu_spooled_bytes as u64, Ordering::Relaxed);
+        self.metrics
+            .uu_spooled_segments
+            .store(self.uu_spooled_segments, Ordering::Relaxed);
     }
 
     pub(crate) fn publish_active_stage_metrics(&self) {
@@ -148,17 +191,20 @@ impl Pipeline {
 
         let mut released_bytes = 0usize;
         let mut released_segments = 0usize;
+        let mut released_spooled_bytes = 0usize;
+        let mut released_spooled_segments = 0usize;
         for file_id in file_ids {
             if let Some(buf) = self.write_buffers.remove(&file_id) {
                 released_bytes += buf.buffered_bytes();
                 released_segments += buf.buffered_len();
             }
-            // Parked uuencode parts are held in memory for want of an offset,
-            // so they have to be released on the same teardown the write buffer
-            // is, or a torn-down job keeps its bytes alive.
+            // Memory and disk parks use distinct ledgers. Removing the entry
+            // drops `TempPath` and unlinks every remaining per-job spool file.
             if let Some(uu) = self.uu_files.remove(&file_id) {
-                released_bytes += uu.parked_bytes();
-                released_segments += uu.parked.len();
+                released_bytes += uu.parked_memory_bytes();
+                released_segments += uu.parked.len() - uu.parked_spooled_segments();
+                released_spooled_bytes += uu.parked_spooled_bytes();
+                released_spooled_segments += uu.parked_spooled_segments();
             }
             self.uu_park_requeues
                 .retain(|segment_id, _| segment_id.file_id != file_id);
@@ -169,6 +215,10 @@ impl Pipeline {
         if released_bytes > 0 || released_segments > 0 {
             self.release_write_buffered(released_bytes, released_segments);
         }
+        if released_spooled_bytes > 0 || released_spooled_segments > 0 {
+            self.release_uu_spooled(released_spooled_bytes, released_spooled_segments);
+        }
+        remove_empty_uu_park_dir(&self.uu_spool_root, job_id);
     }
 
     pub(crate) fn clear_job_extraction_runtime(&mut self, job_id: JobId) {

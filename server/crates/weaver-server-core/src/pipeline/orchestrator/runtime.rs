@@ -74,6 +74,9 @@ impl Pipeline {
         tokio::fs::create_dir_all(&data_dir).await?;
         tokio::fs::create_dir_all(&intermediate_dir).await?;
         tokio::fs::create_dir_all(&complete_dir).await?;
+        let uu_spool_root = intermediate_dir.join(".uu-park");
+        let cleanup_root = uu_spool_root.clone();
+        tokio::task::spawn_blocking(move || clear_stale_uu_park_root(&cleanup_root)).await??;
         let extraction_limits = Arc::new(ExtractionLimits::from_env(&complete_dir)?);
 
         let (download_done_tx, download_done_rx) = mpsc::channel(256);
@@ -188,6 +191,7 @@ impl Pipeline {
             intermediate_dir,
             complete_dir,
             nzb_dir: data_dir.join(".weaver-nzbs"),
+            uu_spool_root,
             pending_file_progress: HashMap::new(),
             persisted_file_progress: HashMap::new(),
             file_hash_states: HashMap::new(),
@@ -301,6 +305,8 @@ impl Pipeline {
             last_download_dispatch_stall_log_at: None,
             write_buffered_bytes: 0,
             write_buffered_segments: 0,
+            uu_spooled_bytes: 0,
+            uu_spooled_segments: 0,
             write_buffers: HashMap::new(),
             file_prefix_16k: HashMap::new(),
             file_declared_size: HashMap::new(),

@@ -72,8 +72,11 @@ fn sample_snapshot(
         decode_pending_bytes: 0,
         decode_active_bytes: 0,
         commit_pending: queue_depth / 3,
+        write_pending_bytes: current_download_speed * 2,
         write_buffered_bytes: current_download_speed * 2,
         write_buffered_segments: queue_depth + 1,
+        uu_spooled_bytes: 0,
+        uu_spooled_segments: 0,
         direct_write_evictions: 0,
         direct_sets_admitted: 0,
         direct_sets_demoted: 0,
@@ -215,6 +218,47 @@ fn raw_metrics_history_point_deserializes_legacy_metric_array_lengths() {
     assert_eq!(decoded.gauge_values[12], 2.0);
     assert_eq!(decoded.gauge_values[13], 0.0);
     assert_eq!(decoded.job_status_values[11], 3.0);
+}
+
+#[test]
+fn uu_spool_gauges_append_after_legacy_history_slots() {
+    assert_eq!(
+        &GAUGE_METRIC_KEYS[..24],
+        [
+            "weaver_pipeline_current_download_speed_bytes_per_second",
+            "weaver_pipeline_download_queue_depth",
+            "weaver_pipeline_active_downloads",
+            "weaver_pipeline_active_decodes",
+            "weaver_pipeline_decode_pending",
+            "weaver_pipeline_decode_pending_bytes",
+            "weaver_pipeline_decode_active_bytes",
+            "weaver_pipeline_commit_pending",
+            "weaver_pipeline_recovery_queue_depth",
+            "weaver_pipeline_verify_active",
+            "weaver_pipeline_repair_active",
+            "weaver_pipeline_extract_active",
+            "weaver_pipeline_write_buffered_bytes",
+            "weaver_pipeline_write_buffered_segments",
+            "weaver_pipeline_decode_pressure_soft_limit_bytes",
+            "weaver_pipeline_decode_pressure_hard_limit_bytes",
+            "weaver_pipeline_write_pressure_soft_limit_bytes",
+            "weaver_pipeline_write_pressure_hard_limit_bytes",
+            "weaver_pipeline_download_pressure_state",
+            "weaver_pipeline_download_pressure_reason",
+            "weaver_pipeline_download_pressure_current_stall_seconds",
+            "weaver_pipeline_disk_write_latency_microseconds",
+            "weaver_pipeline_articles_per_second",
+            "weaver_pipeline_decode_rate_mebibytes_per_second",
+        ]
+    );
+    assert_eq!(
+        &GAUGE_METRIC_KEYS[24..],
+        [
+            "weaver_pipeline_write_pending_bytes",
+            "weaver_pipeline_uu_spooled_bytes",
+            "weaver_pipeline_uu_spooled_segments",
+        ]
+    );
 }
 
 #[test]

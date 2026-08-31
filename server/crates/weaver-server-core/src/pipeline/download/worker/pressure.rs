@@ -287,7 +287,7 @@ impl Pipeline {
         let decode_delay =
             Self::soft_pressure_delay_for(pressure.decode_backlog_bytes, decode_soft, decode_hard);
         let write_delay =
-            Self::soft_pressure_delay_for(pressure.write_buffered_bytes, write_soft, write_hard);
+            Self::soft_pressure_delay_for(pressure.write_pending_bytes, write_soft, write_hard);
         decode_delay.max(write_delay)
     }
 
@@ -383,7 +383,15 @@ impl Pipeline {
             .decode_pending_bytes
             .load(Ordering::Relaxed)
             .saturating_add(self.metrics.decode_active_bytes.load(Ordering::Relaxed));
+        // Keep hard pressure tied to resident memory. The total pending gauge
+        // includes transient UU spill files and is deliberately soft-only so
+        // a missing prefix can still dispatch and make the spool drain.
         let write_bytes = self.metrics.write_buffered_bytes.load(Ordering::Relaxed);
+        let write_pending_bytes = self
+            .metrics
+            .write_pending_bytes
+            .load(Ordering::Relaxed)
+            .max(write_bytes);
 
         if decode_bytes >= decode_hard {
             self.download_decode_hard_pressure_latched = true;
@@ -399,7 +407,7 @@ impl Pipeline {
         let decode_hard_pressure = self.download_decode_hard_pressure_latched;
         let write_hard_pressure = self.download_write_hard_pressure_latched;
         let decode_soft_pressure = decode_bytes >= decode_soft;
-        let write_soft_pressure = write_bytes >= write_soft;
+        let write_soft_pressure = write_pending_bytes >= write_soft;
 
         let (state, reason) = if decode_hard_pressure || write_hard_pressure {
             (
@@ -440,6 +448,7 @@ impl Pipeline {
             reason,
             decode_backlog_bytes: decode_bytes,
             write_buffered_bytes: write_bytes,
+            write_pending_bytes,
             decode_hard_limit_bytes: decode_hard,
             write_hard_limit_bytes: write_hard,
         }

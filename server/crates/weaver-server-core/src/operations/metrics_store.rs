@@ -65,6 +65,9 @@ pub const GAUGE_METRIC_KEYS: [&str; NUM_GAUGE_METRICS] = [
     "weaver_pipeline_disk_write_latency_microseconds",
     "weaver_pipeline_articles_per_second",
     "weaver_pipeline_decode_rate_mebibytes_per_second",
+    "weaver_pipeline_write_pending_bytes",
+    "weaver_pipeline_uu_spooled_bytes",
+    "weaver_pipeline_uu_spooled_segments",
 ];
 
 pub const JOB_STATUS_KEYS: [&str; NUM_JOB_STATUS_METRICS] = [
@@ -85,7 +88,7 @@ pub const JOB_STATUS_KEYS: [&str; NUM_JOB_STATUS_METRICS] = [
 ];
 
 const NUM_COUNTER_METRICS: usize = 19;
-const NUM_GAUGE_METRICS: usize = 24;
+const NUM_GAUGE_METRICS: usize = 27;
 const NUM_JOB_STATUS_METRICS: usize = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +293,9 @@ impl RawMetricsHistoryPoint {
                 snapshot.disk_write_latency_us as f64,
                 snapshot.articles_per_sec,
                 snapshot.decode_rate_mbps,
+                snapshot.write_pending_bytes as f64,
+                snapshot.uu_spooled_bytes as f64,
+                snapshot.uu_spooled_segments as f64,
             ],
             job_status_values: job_status_counts(jobs),
         }

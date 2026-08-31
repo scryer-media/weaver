@@ -144,6 +144,12 @@ metric_families! {
         "Buffered write bytes.");
     WRITE_BUFFERED_SEGMENTS = ("weaver_pipeline_write_buffered_segments", Gauge, [],
         "Buffered write segments.");
+    WRITE_PENDING_BYTES = ("weaver_pipeline_write_pending_bytes", Gauge, [],
+        "Total pending write bytes, including UU spool files.");
+    UU_SPOOLED_BYTES = ("weaver_pipeline_uu_spooled_bytes", Gauge, [],
+        "Disk-backed UU bytes waiting for their missing prefix.");
+    UU_SPOOLED_SEGMENTS = ("weaver_pipeline_uu_spooled_segments", Gauge, [],
+        "Disk-backed UU segments waiting for their missing prefix.");
     DECODE_SOFT_LIMIT = ("weaver_pipeline_decode_pressure_soft_limit_bytes", Gauge, [],
         "Decode soft pressure limit in bytes.");
     DECODE_HARD_LIMIT = ("weaver_pipeline_decode_pressure_hard_limit_bytes", Gauge, [],

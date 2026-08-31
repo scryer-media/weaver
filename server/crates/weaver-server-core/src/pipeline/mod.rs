@@ -22,7 +22,7 @@ use orchestrator::{is_terminal_status, write_segment_to_disk, write_segments_to_
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -1724,12 +1724,88 @@ impl SegmentEncoding {
     }
 }
 
+/// Storage for a uuencode part waiting for its prefix.
+///
+/// Disk-backed entries retain their trusted decoded length alongside the
+/// temporary path. The spool file's metadata is never used for allocation or
+/// validation when the part is released.
+enum UuParkedEntry {
+    Memory(DecodedChunk),
+    Spilled {
+        path: tempfile::TempPath,
+        decoded_bytes: usize,
+    },
+}
+
+impl UuParkedEntry {
+    fn decoded_bytes(&self) -> usize {
+        match self {
+            Self::Memory(chunk) => chunk.len_bytes(),
+            Self::Spilled { decoded_bytes, .. } => *decoded_bytes,
+        }
+    }
+
+    fn is_spilled(&self) -> bool {
+        matches!(self, Self::Spilled { .. })
+    }
+}
+
+/// Remove every stale child of the transient UU spool root without following
+/// links outside it. UU assembly checkpoints are not restored after restart.
+pub(super) fn clear_stale_uu_park_root(root: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(std::io::Error::other(format!(
+                "UU spool root is not a directory: {}",
+                root.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(root)?;
+        }
+        Err(error) => return Err(error),
+    }
+
+    for child in std::fs::read_dir(root)? {
+        let child = child?;
+        let path = child.path();
+        let file_type = child.file_type()?;
+        if file_type.is_dir() {
+            std::fs::remove_dir_all(path)?;
+        } else {
+            // This removes a symlink itself rather than its target.
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove a job's spool directory once its final transient file is gone.
+///
+/// An occupied directory belongs to another still-parked part, and a missing
+/// one means a prior cleanup already won the race; neither is an error.
+pub(super) fn remove_empty_uu_park_dir(root: &Path, job_id: JobId) {
+    let path = root.join(job_id.0.to_string());
+    if let Err(error) = std::fs::remove_dir(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+        && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
+    {
+        warn!(
+            job_id = job_id.0,
+            path = %path.display(),
+            error = %error,
+            "failed to remove empty UU spool directory"
+        );
+    }
+}
+
 /// Sequential-assembly state for one uuencode file.
 ///
 /// A uuencode part's position is the cumulative *decoded* length of every part
 /// before it, which is only knowable once that whole prefix has arrived. So
 /// assembly is strictly sequential: a part that arrives early has to wait, and
-/// it has to wait in memory, because there is no offset to write it to yet.
+/// it has to wait until its prefix provides an offset.
 /// That is the structural difference from yEnc, whose out-of-order parts can be
 /// persisted immediately at the offset their own header declares.
 #[derive(Default)]
@@ -1742,7 +1818,7 @@ pub(super) struct UuFileAssembly {
     ///
     /// Bounded by the same per-file limit the write reorder buffer uses; see
     /// the admission check at the placement seam for what happens on overflow.
-    pub(super) parked: BTreeMap<u32, DecodedChunk>,
+    parked: BTreeMap<u32, UuParkedEntry>,
     /// A part decoded with damage, or a gap was closed by shifting later parts
     /// down over a part that never arrived.
     pub(super) damaged: bool,
@@ -1770,9 +1846,29 @@ pub(super) struct UuFileAssembly {
 }
 
 impl UuFileAssembly {
-    /// Bytes currently held for parts waiting on their prefix.
-    pub(super) fn parked_bytes(&self) -> usize {
-        self.parked.values().map(|chunk| chunk.len_bytes()).sum()
+    /// Resident bytes held for parts waiting on their prefix.
+    pub(super) fn parked_memory_bytes(&self) -> usize {
+        self.parked
+            .values()
+            .filter(|entry| !entry.is_spilled())
+            .map(UuParkedEntry::decoded_bytes)
+            .sum()
+    }
+
+    /// Disk-backed bytes held for parts waiting on their prefix.
+    pub(super) fn parked_spooled_bytes(&self) -> usize {
+        self.parked
+            .values()
+            .filter(|entry| entry.is_spilled())
+            .map(UuParkedEntry::decoded_bytes)
+            .sum()
+    }
+
+    pub(super) fn parked_spooled_segments(&self) -> usize {
+        self.parked
+            .values()
+            .filter(|entry| entry.is_spilled())
+            .count()
     }
 }
 
@@ -2679,6 +2775,12 @@ pub struct Pipeline {
     pub(super) write_buffered_bytes: usize,
     /// Current in-memory decoded segment count retained for sequential write ordering.
     pub(super) write_buffered_segments: usize,
+    /// Disk-backed uuencode parts waiting for their missing prefix.
+    pub(super) uu_spooled_bytes: usize,
+    /// Disk-backed uuencode segment count waiting for their missing prefix.
+    pub(super) uu_spooled_segments: usize,
+    /// Reserved transient spool root below the configured intermediate directory.
+    pub(super) uu_spool_root: PathBuf,
     /// Per-file write reorder buffers for decoded segments waiting on write order.
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
     /// The first [`PAR2_HASH_16K_BYTES`] decoded bytes of each file, anchored at

@@ -129,7 +129,10 @@ pub(crate) struct DownloadPressure {
     state: DownloadPressureState,
     reason: DownloadPressureReason,
     decode_backlog_bytes: u64,
+    /// Resident bytes: this alone controls hard write pressure.
     write_buffered_bytes: u64,
+    /// Resident plus UU-spooled bytes: this controls soft pacing.
+    write_pending_bytes: u64,
     decode_hard_limit_bytes: u64,
     write_hard_limit_bytes: u64,
 }
