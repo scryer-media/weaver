@@ -4055,6 +4055,85 @@ async fn dispatch_downloads_respects_hard_write_byte_pressure() {
 }
 
 #[tokio::test]
+async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 1,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    let job_id = JobId(20015);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "UU Spool Cursor Admission",
+            &[("queued.bin".to_string(), 512)],
+        ),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let work = |segment_number, message_id| DownloadWork {
+        segment_id: SegmentId {
+            file_id,
+            segment_number,
+        },
+        message_id: MessageId::new(message_id),
+        groups: vec!["alt.binaries.test".to_string()],
+        priority: 0,
+        byte_estimate: 512,
+        retry_count: 0,
+        is_recovery: false,
+        completion_critical: false,
+        exclude_servers: Vec::new(),
+        avoid_server: None,
+    };
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.download_queue = DownloadQueue::new();
+    // The later segment is deliberately the queue head. Capped admission must
+    // scan past it to fetch the ordinal that can release the parked prefix.
+    state
+        .download_queue
+        .push(work(1, "uu-later@example.invalid"));
+    state
+        .download_queue
+        .push(work(0, "uu-prefix@example.invalid"));
+    pipeline.uu_files.insert(
+        file_id,
+        UuFileAssembly {
+            next_index: 0,
+            ..UuFileAssembly::default()
+        },
+    );
+    pipeline.uu_spool_max_segments = 0;
+    pipeline.uu_spool_available_bytes_for_test = Some(Some(u64::MAX));
+
+    let pressure = pipeline.refresh_download_pressure();
+    let lease = pipeline
+        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .expect("the cursor-closing prefix must still lease");
+
+    assert_eq!(lease.works.len(), 1);
+    assert_eq!(lease.works[0].segment_id.segment_number, 0);
+    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 1);
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .download_queue
+            .peek_next_matching(|_| true)
+            .map(|work| work.segment_id.segment_number),
+        Some(1)
+    );
+}
+
+#[tokio::test]
 async fn refresh_download_pressure_reports_combined_hard_byte_pressure() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

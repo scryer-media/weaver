@@ -15,11 +15,77 @@ impl DownloadPressure {
     }
 
     pub(in crate::pipeline::download::worker) fn suppresses_spillover(self) -> bool {
-        self.state == DownloadPressureState::Soft
+        self.state == DownloadPressureState::Soft || self.uu_spool_admission_capped
     }
 }
 
 impl Pipeline {
+    /// The cache avoids turning every dispatch decision into a filesystem
+    /// query while still making low-space admission responsive.
+    const UU_SPOOL_DISK_SPACE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+    pub(in crate::pipeline) fn uu_spool_admission_capped(
+        &mut self,
+        additional_spooled_bytes: usize,
+    ) -> bool {
+        let byte_limit_reached = self
+            .uu_spooled_bytes
+            .saturating_add(additional_spooled_bytes)
+            > self.uu_spool_max_bytes;
+        let segment_limit_reached = self.uu_parked_segments >= self.uu_spool_max_segments;
+        let required_free = self
+            .uu_spool_min_free_bytes
+            .saturating_add(additional_spooled_bytes as u64);
+        let free_space_too_low = self
+            .uu_spool_available_bytes()
+            .is_none_or(|available| available < required_free);
+
+        byte_limit_reached || segment_limit_reached || free_space_too_low
+    }
+
+    fn uu_spool_available_bytes(&mut self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(available) = self.uu_spool_available_bytes_for_test {
+            return available;
+        }
+
+        let now = Instant::now();
+        if self
+            .uu_spool_last_free_space_check
+            .is_some_and(|checked_at| {
+                now.saturating_duration_since(checked_at) < Self::UU_SPOOL_DISK_SPACE_CHECK_INTERVAL
+            })
+        {
+            return self.uu_spool_available_bytes;
+        }
+
+        let available = crate::operations::disk_space(&self.intermediate_dir)
+            .map(|space| space.available_bytes);
+        self.uu_spool_last_free_space_check = Some(now);
+        self.uu_spool_available_bytes = available;
+        available
+    }
+
+    pub(in crate::pipeline::download::worker) fn uu_spool_cursor_ordinals(
+        &self,
+    ) -> HashMap<NzbFileId, u32> {
+        self.uu_files
+            .iter()
+            .map(|(file_id, uu)| (*file_id, uu.next_index))
+            .collect()
+    }
+
+    pub(in crate::pipeline::download::worker) fn uu_work_closes_cursor(
+        cursors: &HashMap<NzbFileId, u32>,
+        work: &DownloadWork,
+    ) -> bool {
+        // Before a file's first UU part identifies its encoding, ordinal zero
+        // is the only work that could establish its cursor. Permitting it also
+        // leaves yEnc's ordinary ordering unchanged while the UU cache pauses.
+        cursors.get(&work.segment_id.file_id).copied().unwrap_or(0)
+            == work.segment_id.segment_number
+    }
+
     pub(in crate::pipeline::download::worker) fn download_pressure_limits(
         &self,
     ) -> (u64, u64, u64, u64) {
@@ -287,7 +353,7 @@ impl Pipeline {
         let decode_delay =
             Self::soft_pressure_delay_for(pressure.decode_backlog_bytes, decode_soft, decode_hard);
         let write_delay =
-            Self::soft_pressure_delay_for(pressure.write_buffered_bytes, write_soft, write_hard);
+            Self::soft_pressure_delay_for(pressure.write_pending_bytes, write_soft, write_hard);
         decode_delay.max(write_delay)
     }
 
@@ -389,7 +455,16 @@ impl Pipeline {
             .load(Ordering::Relaxed)
             .saturating_add(self.metrics.decode_active_bytes.load(Ordering::Relaxed))
             .saturating_add(released_result_bytes);
+        // Keep hard pressure tied to resident memory. The total pending gauge
+        // includes transient UU spill files and is deliberately soft-only so
+        // a missing prefix can still dispatch and make the spool drain.
         let write_bytes = self.metrics.write_buffered_bytes.load(Ordering::Relaxed);
+        let write_pending_bytes = self
+            .metrics
+            .write_pending_bytes
+            .load(Ordering::Relaxed)
+            .max(write_bytes);
+        let uu_spool_admission_capped = self.uu_spool_admission_capped(0);
 
         if decode_bytes >= decode_hard {
             self.download_decode_hard_pressure_latched = true;
@@ -405,7 +480,7 @@ impl Pipeline {
         let decode_hard_pressure = self.download_decode_hard_pressure_latched;
         let write_hard_pressure = self.download_write_hard_pressure_latched;
         let decode_soft_pressure = decode_bytes >= decode_soft;
-        let write_soft_pressure = write_bytes >= write_soft;
+        let write_soft_pressure = write_pending_bytes >= write_soft;
 
         let (state, reason) = if decode_hard_pressure || write_hard_pressure {
             (
@@ -446,6 +521,8 @@ impl Pipeline {
             reason,
             decode_backlog_bytes: decode_bytes,
             write_buffered_bytes: write_bytes,
+            write_pending_bytes,
+            uu_spool_admission_capped,
             decode_hard_limit_bytes: decode_hard,
             write_hard_limit_bytes: write_hard,
         }

@@ -6,9 +6,11 @@ use std::time::Instant;
 
 use super::*;
 use crate::pipeline::direct_store::wiring::{DirectFileTarget, DirectRouteOutcome};
+use tempfile::Builder;
 
 const MAX_DEFERRED_FILE_HASH_DATA_BYTES: usize = 128 * 1024 * 1024;
 const OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS: usize = 16;
+const UU_SPOOL_FILE_PREFIX: &str = "part-";
 
 #[derive(Clone, Copy, Debug)]
 enum SegmentHashMode {
@@ -46,6 +48,20 @@ enum UuPlacement {
     /// The cursor already shifted past this ordinal after it was booked failed,
     /// so its bytes have no home and never will. Dropped terminally.
     Stale,
+}
+
+fn prepare_uu_spool_dir(path: &std::path::Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(io::Error::other(format!(
+                "UU spool directory is not a directory: {}",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::create_dir_all(path),
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Debug)]
@@ -1292,7 +1308,17 @@ impl Pipeline {
         if !is_uu {
             return;
         }
-        while let Some((segment_number, data)) = self.take_next_ready_uu_segment(file_id) {
+        loop {
+            let next = match self.take_next_ready_uu_segment(file_id).await {
+                Ok(next) => next,
+                Err(error) => {
+                    self.fail_job_for_disk_write(error, "UU spool read failed");
+                    return;
+                }
+            };
+            let Some((segment_number, data)) = next else {
+                break;
+            };
             let released = DecodeResult {
                 segment_id: SegmentId {
                     file_id,
@@ -1427,8 +1453,16 @@ impl Pipeline {
                         // bound must be re-fetched: its bytes are gone, and the
                         // download layer already counts it as delivered.
                         drop(_cpu_scope);
-                        let displaced =
-                            self.park_uu_segment(file_id, segment_id.segment_number, data);
+                        let displaced = match self
+                            .park_uu_segment(file_id, segment_id.segment_number, data)
+                            .await
+                        {
+                            Ok(displaced) => displaced,
+                            Err(error) => {
+                                self.fail_job_for_disk_write(error, "UU spool write failed");
+                                return;
+                            }
+                        };
                         for ordinal in displaced {
                             self.requeue_displaced_uu_segment(SegmentId {
                                 file_id,
@@ -2013,30 +2047,116 @@ impl Pipeline {
     /// considers that segment finished; without a fresh fetch its data exists
     /// nowhere, and the cursor would wedge permanently the moment it reached
     /// that ordinal.
-    #[must_use]
-    fn park_uu_segment(
+    async fn spill_uu_segment(
+        &self,
+        file_id: NzbFileId,
+        data: DecodedChunk,
+    ) -> Result<UuParkedEntry, SegmentWriteError> {
+        let decoded_bytes = data.len_bytes();
+        let spool_dir = self.uu_spool_root.join(file_id.job_id.0.to_string());
+        let entry = tokio::task::spawn_blocking(move || {
+            prepare_uu_spool_dir(&spool_dir)?;
+            // tempfile creates its file with owner-only permissions. Keep the
+            // TempPath alive in the park so every removal unlinks it.
+            let mut file = Builder::new()
+                .prefix(UU_SPOOL_FILE_PREFIX)
+                .tempfile_in(&spool_dir)?;
+            data.write_to(file.as_file_mut())?;
+            file.as_file_mut().sync_all()?;
+            Ok::<_, io::Error>(UuParkedEntry::Spilled {
+                path: file.into_temp_path(),
+                decoded_bytes,
+            })
+        })
+        .await
+        .map_err(|error| {
+            SegmentWriteError::new(
+                file_id,
+                io::Error::other(format!("UU spool task failed: {error}")),
+            )
+        })?
+        .map_err(|error| SegmentWriteError::new(file_id, error))?;
+        Ok(entry)
+    }
+
+    fn release_uu_parked_entry(&mut self, job_id: JobId, entry: UuParkedEntry) {
+        match entry {
+            UuParkedEntry::Memory(data) => self.release_write_buffered(data.len_bytes(), 1),
+            UuParkedEntry::Spilled {
+                path,
+                decoded_bytes,
+            } => {
+                self.release_uu_spooled(decoded_bytes, 1);
+                drop(path);
+                remove_empty_uu_park_dir(&self.uu_spool_root, job_id);
+            }
+        }
+        self.release_uu_parked_segment();
+    }
+
+    /// Store an ahead-of-cursor part after its memory-or-disk form has been
+    /// fully prepared. Memory is charged only after insertion succeeds; disk
+    /// spill writes complete before their entry becomes visible to the cursor.
+    async fn park_uu_segment(
         &mut self,
         file_id: NzbFileId,
         segment_number: u32,
         data: DecodedChunk,
-    ) -> Vec<u32> {
+    ) -> Result<Vec<u32>, SegmentWriteError> {
         let max_pending = self.write_buf_max_pending;
-        let Some(uu) = self.uu_files.get_mut(&file_id) else {
-            return Vec::new();
+        let decoded_bytes = data.len_bytes();
+        let projected_resident = self.write_buffered_bytes.saturating_add(decoded_bytes);
+        let spills = projected_resident >= self.write_backlog_budget_bytes;
+        if self.uu_spool_admission_capped(0)
+            || (spills && self.uu_spool_admission_capped(decoded_bytes))
+        {
+            // The part is already decoded, but holding it would exceed the
+            // aggregate cache cap or consume the intermediate filesystem's
+            // reserved free space. Requeue without retry burn, exactly like a
+            // per-file farthest-part displacement.
+            return Ok(vec![segment_number]);
+        }
+        let entry = if spills {
+            self.spill_uu_segment(file_id, data).await?
+        } else {
+            UuParkedEntry::Memory(data)
         };
-        uu.parked.insert(segment_number, data);
+        let inserted_spilled = entry.is_spilled();
+        let inserted_bytes = entry.decoded_bytes();
+        let Some(uu) = self.uu_files.get_mut(&file_id) else {
+            return Ok(Vec::new());
+        };
 
+        let replacement = uu.parked.insert(segment_number, entry);
         let mut displaced = Vec::new();
+        let mut displaced_entries = Vec::new();
         while uu.parked.len() > max_pending {
             // Displace from the far end: those parts are the furthest from the
             // cursor, so re-fetching them is the least urgent work.
             let Some(highest) = uu.parked.keys().next_back().copied() else {
                 break;
             };
-            uu.parked.remove(&highest);
+            let entry = uu
+                .parked
+                .remove(&highest)
+                .expect("UU park contained its selected farthest ordinal");
             displaced.push(highest);
+            displaced_entries.push(entry);
         }
-        displaced
+
+        if inserted_spilled {
+            self.note_uu_spooled(inserted_bytes, 1);
+        } else {
+            self.note_write_buffered(inserted_bytes, 1);
+        }
+        self.note_uu_parked_segment();
+        if let Some(entry) = replacement {
+            self.release_uu_parked_entry(file_id.job_id, entry);
+        }
+        for entry in displaced_entries {
+            self.release_uu_parked_entry(file_id.job_id, entry);
+        }
+        Ok(displaced)
     }
 
     /// Return a uuencode segment to the download queue because of park
@@ -2132,10 +2252,75 @@ impl Pipeline {
     /// which advances the cursor again and so makes the call after it the one
     /// that finds the next part. That keeps a single place where a segment is
     /// placed, written and accounted for, however long the released run is.
-    fn take_next_ready_uu_segment(&mut self, file_id: NzbFileId) -> Option<(u32, DecodedChunk)> {
-        let uu = self.uu_files.get_mut(&file_id)?;
-        let index = uu.next_index;
-        uu.parked.remove(&index).map(|data| (index, data))
+    async fn take_next_ready_uu_segment(
+        &mut self,
+        file_id: NzbFileId,
+    ) -> Result<Option<(u32, DecodedChunk)>, SegmentWriteError> {
+        let next = self.uu_files.get_mut(&file_id).and_then(|uu| {
+            let index = uu.next_index;
+            uu.parked.remove(&index).map(|entry| (index, entry))
+        });
+        let Some((index, entry)) = next else {
+            return Ok(None);
+        };
+
+        match entry {
+            UuParkedEntry::Memory(data) => {
+                self.release_write_buffered(data.len_bytes(), 1);
+                self.release_uu_parked_segment();
+                Ok(Some((index, data)))
+            }
+            UuParkedEntry::Spilled {
+                path,
+                decoded_bytes,
+            } => {
+                // The entry left the disk park before its read starts. Its
+                // recorded decoded length, rather than file metadata, bounds
+                // allocation and validates the entire spool contents.
+                self.release_uu_spooled(decoded_bytes, 1);
+                self.release_uu_parked_segment();
+                let read_result = tokio::task::spawn_blocking(move || {
+                    let read_result = (|| -> io::Result<DecodedChunk> {
+                        let mut file = File::open(&path)?;
+                        let mut bytes = Vec::new();
+                        bytes.try_reserve_exact(decoded_bytes).map_err(|error| {
+                            io::Error::other(format!(
+                                "failed to reserve {decoded_bytes} bytes for UU spool read: {error}"
+                            ))
+                        })?;
+                        bytes.resize(decoded_bytes, 0);
+                        file.read_exact(&mut bytes)?;
+                        let mut extra = [0u8; 1];
+                        if file.read(&mut extra)? != 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "UU spool file contains more bytes than recorded",
+                            ));
+                        }
+                        Ok(bytes.into())
+                    })();
+                    // Always remove the transient file, including after a
+                    // truncated, oversized, or missing-file read failure.
+                    let remove_result = path.close();
+                    match (read_result, remove_result) {
+                        (Err(error), _) => Err(error),
+                        (Ok(_), Err(error)) => Err(error),
+                        (Ok(data), Ok(())) => Ok(data),
+                    }
+                })
+                .await;
+                remove_empty_uu_park_dir(&self.uu_spool_root, file_id.job_id);
+                let data = read_result
+                    .map_err(|error| {
+                        SegmentWriteError::new(
+                            file_id,
+                            io::Error::other(format!("UU spool read task failed: {error}")),
+                        )
+                    })?
+                    .map_err(|error| SegmentWriteError::new(file_id, error))?;
+                Ok(Some((index, data)))
+            }
+        }
     }
 
     /// Close out a uuencode file's sequential state and report its condition.
@@ -2167,20 +2352,56 @@ impl Pipeline {
     fn finish_uu_file(&mut self, file_id: NzbFileId) -> Option<String> {
         self.uu_park_requeues
             .retain(|segment_id, _| segment_id.file_id != file_id);
-        let uu = self.uu_files.get_mut(&file_id)?;
-        uu.parked.clear();
-        let filename = uu.filename.clone();
-        if uu.finished {
+        let (
+            filename,
+            finished,
+            damaged,
+            saw_end,
+            memory_bytes,
+            memory_segments,
+            spooled_bytes,
+            spooled_segments,
+        ) = {
+            let uu = self.uu_files.get_mut(&file_id)?;
+            let spooled_segments = uu.parked_spooled_segments();
+            let memory_segments = uu.parked.len().saturating_sub(spooled_segments);
+            let memory_bytes = uu.parked_memory_bytes();
+            let spooled_bytes = uu.parked_spooled_bytes();
+            uu.parked.clear();
+            (
+                uu.filename.clone(),
+                uu.finished,
+                uu.damaged,
+                uu.saw_end,
+                memory_bytes,
+                memory_segments,
+                spooled_bytes,
+                spooled_segments,
+            )
+        };
+        if memory_bytes > 0 || memory_segments > 0 {
+            self.release_write_buffered(memory_bytes, memory_segments);
+        }
+        if spooled_bytes > 0 || spooled_segments > 0 {
+            self.release_uu_spooled(spooled_bytes, spooled_segments);
+        }
+        for _ in 0..memory_segments.saturating_add(spooled_segments) {
+            self.release_uu_parked_segment();
+        }
+        remove_empty_uu_park_dir(&self.uu_spool_root, file_id.job_id);
+        if finished {
             // A duplicate arrival re-runs the completion branch; the condition
             // was reported the first time through.
             return filename;
         }
-        uu.finished = true;
-        if uu.damaged || !uu.saw_end {
+        if let Some(uu) = self.uu_files.get_mut(&file_id) {
+            uu.finished = true;
+        }
+        if damaged || !saw_end {
             warn!(
                 file_id = %file_id,
-                decode_damage = uu.damaged,
-                missing_end_marker = !uu.saw_end,
+                decode_damage = damaged,
+                missing_end_marker = !saw_end,
                 "uuencode file completed in a damaged state; PAR2 is the authority on recovery"
             );
         }
