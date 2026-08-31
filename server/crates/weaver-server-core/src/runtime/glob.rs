@@ -1,35 +1,45 @@
-//! Small, allocation-bounded glob helpers for operator-supplied patterns.
+//! Small glob helpers for operator-supplied patterns.
 
 /// Case-insensitive glob matcher supporting `*` (any sequence) and `?` (any
 /// single character). Other characters are literals.
 pub(crate) fn glob_match_ci(pattern: &str, input: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let input: Vec<char> = input.chars().collect();
+    if !pattern.contains(['*', '?']) {
+        return pattern.eq_ignore_ascii_case(input);
+    }
+
     let (mut pattern_index, mut input_index) = (0, 0);
-    let (mut star_index, mut star_input_index) = (usize::MAX, 0);
+    let (mut star_index, mut star_input_index) = (None, 0);
 
     while input_index < input.len() {
-        if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
-            star_index = pattern_index;
+        let pattern_char = pattern[pattern_index..].chars().next();
+        let input_char = input[input_index..]
+            .chars()
+            .next()
+            .expect("input index is on a UTF-8 boundary");
+        if pattern_char == Some('*') {
+            star_index = Some(pattern_index);
             star_input_index = input_index;
-            pattern_index += 1;
-        } else if pattern_index < pattern.len()
-            && (pattern[pattern_index] == '?'
-                || pattern[pattern_index].eq_ignore_ascii_case(&input[input_index]))
+            pattern_index += '*'.len_utf8();
+        } else if pattern_char == Some('?')
+            || pattern_char.is_some_and(|character| character.eq_ignore_ascii_case(&input_char))
         {
-            pattern_index += 1;
-            input_index += 1;
-        } else if star_index != usize::MAX {
-            pattern_index = star_index + 1;
-            star_input_index += 1;
+            pattern_index += pattern_char.expect("checked above").len_utf8();
+            input_index += input_char.len_utf8();
+        } else if let Some(star) = star_index {
+            pattern_index = star + '*'.len_utf8();
+            let star_input_char = input[star_input_index..]
+                .chars()
+                .next()
+                .expect("star input index is on a UTF-8 boundary");
+            star_input_index += star_input_char.len_utf8();
             input_index = star_input_index;
         } else {
             return false;
         }
     }
 
-    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
-        pattern_index += 1;
+    while pattern[pattern_index..].starts_with('*') {
+        pattern_index += '*'.len_utf8();
     }
     pattern_index == pattern.len()
 }
@@ -43,5 +53,11 @@ mod tests {
         assert!(glob_match_ci("r??", "R42"));
         assert!(glob_match_ci("zip*", "ZiP64"));
         assert!(!glob_match_ci("r??", "r007"));
+    }
+
+    #[test]
+    fn wildcard_matches_one_unicode_character_without_allocating() {
+        assert!(glob_match_ci("?x", "éx"));
+        assert!(!glob_match_ci("?x", "ééx"));
     }
 }

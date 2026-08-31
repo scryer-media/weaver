@@ -352,6 +352,7 @@ impl Pipeline {
             extraction_limits,
             process_memory_budget,
             extraction_budgets: HashMap::new(),
+            unacceptable_extension_policies: HashMap::new(),
             extracted_members: HashMap::new(),
             extracted_archives: HashMap::new(),
             missing_volume_archive_sets: HashMap::new(),

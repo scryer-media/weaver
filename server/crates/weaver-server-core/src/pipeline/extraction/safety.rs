@@ -87,6 +87,7 @@ pub(crate) enum ExtractionRejectionReason {
     Deadline,
     Memory,
     DiskReserve,
+    ContentPolicy,
 }
 
 impl ExtractionRejectionReason {
@@ -101,6 +102,7 @@ impl ExtractionRejectionReason {
             Self::Deadline => "deadline",
             Self::Memory => "memory",
             Self::DiskReserve => "disk_reserve",
+            Self::ContentPolicy => "content_policy",
         }
     }
 }
@@ -428,6 +430,14 @@ impl JobExtractionBudget {
 
     pub(crate) fn reject_unsupported_entry(&self, detail: impl Into<String>) -> String {
         self.reject(ExtractionRejectionReason::UnsupportedEntry, detail.into())
+            .to_string()
+    }
+
+    /// Reject material that policy must not permit to reach publication. This
+    /// shares the extraction budget's cancellation signal so sibling workers
+    /// stop at their next checkpoint.
+    pub(crate) fn reject_content_policy(&self, detail: impl Into<String>) -> String {
+        self.reject(ExtractionRejectionReason::ContentPolicy, detail.into())
             .to_string()
     }
 

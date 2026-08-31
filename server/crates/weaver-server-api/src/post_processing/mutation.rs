@@ -26,22 +26,50 @@ impl PostProcessingMutation {
         ctx: &Context<'_>,
         input: PostProcessingSettingsInput,
     ) -> Result<PostProcessingSettingsGql> {
-        let settings = PostProcessingSettings::from(input)
-            .normalized()
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        let PostProcessingSettingsInput {
+            execution_enabled,
+            concurrency,
+            termination_grace_seconds,
+            python_interpreter,
+            powershell_interpreter,
+            batch_interpreter,
+            unacceptable_extensions,
+        } = input;
+        if unacceptable_extensions.is_null() {
+            return Err(async_graphql::Error::new(
+                "unacceptableExtensions must be omitted or a list, not null",
+            ));
+        }
         // Refused here as well as at run time: an operator who turns the switch
         // on under strict security should be told immediately, not discover it
         // in a job log later.
-        if settings.execution_enabled && strict_security_enabled() {
+        if execution_enabled && strict_security_enabled() {
             return Err(async_graphql::Error::new(
                 "WEAVER_STRICT_SECURITY=1 refuses post-processing script execution",
             ));
         }
         let db = ctx.data::<Database>()?.clone();
-        let saved = settings.clone();
-        let (lists, script_directory) = tokio::task::spawn_blocking(move || {
-            db.save_post_processing_settings(&saved)?;
+        let (settings, lists, script_directory) = tokio::task::spawn_blocking(move || {
+            let (unacceptable_extensions, preserve_extensions) = match unacceptable_extensions {
+                async_graphql::MaybeUndefined::Undefined => (Vec::new(), true),
+                async_graphql::MaybeUndefined::Value(extensions) => (extensions, false),
+                async_graphql::MaybeUndefined::Null => unreachable!("checked before worker"),
+            };
+            let settings = PostProcessingSettings {
+                execution_enabled,
+                concurrency,
+                termination_grace_seconds,
+                python_interpreter,
+                powershell_interpreter,
+                batch_interpreter,
+                unacceptable_extensions,
+            };
+            let settings = db.save_post_processing_settings_preserving_extensions(
+                settings,
+                preserve_extensions,
+            )?;
             Ok::<_, weaver_server_core::StateError>((
+                settings,
                 db.post_processing_script_lists()?,
                 db.post_processing_script_directory()?,
             ))

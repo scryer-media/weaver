@@ -87,7 +87,7 @@ async fn scripts_directory_is_admin_owned_and_clears_assignments_when_changed() 
 }
 
 #[tokio::test]
-async fn settings_round_trip_and_reject_an_out_of_range_concurrency() {
+async fn settings_round_trip_preserves_omitted_extensions_and_rejects_invalid_updates() {
     let harness = TestHarness::new().await;
     let response = harness
         .execute(
@@ -121,6 +121,21 @@ async fn settings_round_trip_and_reject_an_out_of_range_concurrency() {
         serde_json::json!(["exe", "r??"])
     );
 
+    let omitted = harness
+        .execute(
+            r#"mutation { setPostProcessingSettings(input: {
+                executionEnabled: true
+                concurrency: 3
+                terminationGraceSeconds: 20
+            }) { concurrency unacceptableExtensions } }"#,
+        )
+        .await;
+    assert_no_errors(&omitted);
+    assert_eq!(
+        response_data(&omitted)["setPostProcessingSettings"]["unacceptableExtensions"],
+        serde_json::json!(["exe", "r??"])
+    );
+
     let rejected = harness
         .execute(
             r#"mutation { setPostProcessingSettings(input: {
@@ -143,6 +158,43 @@ async fn settings_round_trip_and_reject_an_out_of_range_concurrency() {
         )
         .await;
     assert_has_errors(&invalid_pattern);
+
+    let null_policy = harness
+        .execute(
+            r#"mutation { setPostProcessingSettings(input: {
+                executionEnabled: true
+                concurrency: 3
+                terminationGraceSeconds: 20
+                unacceptableExtensions: null
+            }) { unacceptableExtensions } }"#,
+        )
+        .await;
+    assert_has_errors(&null_policy);
+
+    let persisted = harness
+        .execute("{ postProcessingSettings { unacceptableExtensions } }")
+        .await;
+    assert_no_errors(&persisted);
+    assert_eq!(
+        response_data(&persisted)["postProcessingSettings"]["unacceptableExtensions"],
+        serde_json::json!(["exe", "r??"])
+    );
+
+    let disabled = harness
+        .execute(
+            r#"mutation { setPostProcessingSettings(input: {
+                executionEnabled: true
+                concurrency: 3
+                terminationGraceSeconds: 20
+                unacceptableExtensions: []
+            }) { unacceptableExtensions } }"#,
+        )
+        .await;
+    assert_no_errors(&disabled);
+    assert_eq!(
+        response_data(&disabled)["setPostProcessingSettings"]["unacceptableExtensions"],
+        serde_json::json!([])
+    );
 }
 
 #[tokio::test]

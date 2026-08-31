@@ -9371,6 +9371,8 @@ async fn unacceptable_rar_member_is_rejected_before_extraction() {
     }
 
     assert_eq!(pipeline.extract_rar_set(job_id, "show").await.unwrap(), 0);
+    let done = next_extraction_done(&mut pipeline).await;
+    pipeline.handle_extraction_done(done).await;
     assert!(
         pipeline
             .inflight_extractions

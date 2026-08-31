@@ -639,6 +639,13 @@ impl Pipeline {
         if !self.maybe_start_extraction(job_id).await {
             return;
         }
+        let policy = match self.unacceptable_extension_policy_snapshot(job_id).await {
+            Ok(policy) => policy,
+            Err(error) => {
+                self.fail_delivery_security_check(job_id, error);
+                return;
+            }
+        };
 
         let mut scheduled_slots = 0usize;
         for ready_set in ready_sets {
@@ -742,6 +749,7 @@ impl Pipeline {
                 let cached_headers_for_task = cached_headers.clone();
                 let password_candidates_for_task = password_candidates.clone();
                 let shared_kdf_cache_for_task = shared_kdf_cache.clone();
+                let policy_for_task = Arc::clone(&policy);
                 let pp_pool = self.pp_pool.clone();
                 tokio::task::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
@@ -762,6 +770,13 @@ impl Pipeline {
                                         budget: Some(Arc::clone(&budget)),
                                     },
                                 )?;
+                            if let Some((member, pattern)) =
+                                Self::blocked_rar_member(&selection.archive, &policy_for_task)
+                            {
+                                return Err(budget.reject_content_policy(format!(
+                                    "unacceptable extension '{pattern}' matched RAR member '{member}' before extraction"
+                                )));
+                            }
                             let _memory_permit =
                                 budget.reserve_memory_wait(selection.decoder_memory_bytes)?;
                             let mut archive = selection.archive;

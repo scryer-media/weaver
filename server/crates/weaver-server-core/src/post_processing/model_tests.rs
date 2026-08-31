@@ -277,13 +277,22 @@ fn settings_bound_concurrency_and_require_a_grace_period() {
 #[test]
 fn unacceptable_extension_patterns_are_normalized_and_match_final_extensions() {
     let settings = PostProcessingSettings {
-        unacceptable_extensions: vec![" R?? ".into(), "ZIP*".into(), "EXE".into(), "exe".into()],
+        unacceptable_extensions: vec![
+            " R?? ".into(),
+            "ZIP*".into(),
+            "EXE".into(),
+            "exe".into(),
+            "?x".into(),
+        ],
         ..PostProcessingSettings::default()
     }
     .normalized()
     .unwrap();
 
-    assert_eq!(settings.unacceptable_extensions, ["exe", "r??", "zip*"]);
+    assert_eq!(
+        settings.unacceptable_extensions,
+        ["?x", "exe", "r??", "zip*"]
+    );
     assert_eq!(
         settings.unacceptable_extension_match("payload.ExE"),
         Some("exe")
@@ -299,6 +308,14 @@ fn unacceptable_extension_patterns_are_normalized_and_match_final_extensions() {
     assert_eq!(settings.unacceptable_extension_match("archive.r007"), None);
     assert_eq!(settings.unacceptable_extension_match("no_extension"), None);
     assert_eq!(settings.unacceptable_extension_match(".hidden"), None);
+    assert_eq!(
+        settings.unacceptable_extension_match("folder/.hidden"),
+        None
+    );
+    assert_eq!(
+        settings.unacceptable_extension_match("payload.éx"),
+        Some("?x")
+    );
 }
 
 #[test]

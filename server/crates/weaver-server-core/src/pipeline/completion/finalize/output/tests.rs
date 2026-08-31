@@ -13,6 +13,7 @@ fn safe_move_uses_rename_without_copy_on_the_same_filesystem() {
     move_path_with_safe_rename_or_copy_fallback_using(
         &src,
         &dst,
+        b"renamed payload".len() as u64,
         Arc::clone(&counters),
         |src, dst| {
             rename_calls.set(rename_calls.get() + 1);
@@ -47,6 +48,7 @@ fn same_filesystem_directory_publication_renames_without_copy() {
     move_path_with_safe_rename_or_copy_fallback_using(
         &src,
         &dst,
+        b"renamed payload".len() as u64,
         Arc::new(PhaseCounters::default()),
         rename_path_for_publication,
         |_, _, _| {
@@ -77,6 +79,7 @@ fn safe_move_uses_exactly_one_copy_after_cross_device_rename_failure() {
     move_path_with_safe_rename_or_copy_fallback_using(
         &src,
         &dst,
+        b"copied payload".len() as u64,
         Arc::clone(&counters),
         |_, _| {
             rename_calls.set(rename_calls.get() + 1);
@@ -114,6 +117,7 @@ fn safe_move_does_not_copy_after_an_unrelated_rename_failure() {
     let error = move_path_with_safe_rename_or_copy_fallback_using(
         &src,
         &dst,
+        b"unmoved payload".len() as u64,
         counters,
         |_, _| {
             Err(std::io::Error::new(
@@ -212,6 +216,7 @@ async fn final_move_does_not_overwrite_existing_destination_file() {
         dest,
         Arc::new(PhaseCounters::default()),
         None,
+        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
     )
     .await
     {
@@ -219,7 +224,7 @@ async fn final_move_does_not_overwrite_existing_destination_file() {
         Err(error) => error,
     };
 
-    assert!(error.contains("destination already exists"));
+    assert!(error.to_string().contains("destination already exists"));
     assert_eq!(std::fs::read(&src).unwrap(), b"new payload");
     assert_eq!(std::fs::read(&dst).unwrap(), b"existing payload");
 }
@@ -295,7 +300,7 @@ fn copy_fallback_preserves_nested_symlink_entries() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn final_move_preserves_symlink_entries() {
+async fn final_move_refuses_symlink_entries_before_creating_the_destination() {
     let temp = tempfile::tempdir().unwrap();
     let working = temp.path().join("working");
     let staging = temp.path().join("staging");
@@ -313,19 +318,13 @@ async fn final_move_preserves_symlink_entries() {
         dest.clone(),
         Arc::new(PhaseCounters::default()),
         None,
+        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
     )
     .await
-    .unwrap();
+    .unwrap_err();
 
-    assert_eq!(result.moved_entries, 1);
-    let placed = dest.join("linked.bin");
-    assert!(
-        std::fs::symlink_metadata(&placed)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert_eq!(std::fs::read_link(placed).unwrap(), target);
+    assert!(result.to_string().contains("link or reparse point"));
+    assert!(!dest.exists());
 }
 
 /// The seam the rename pass runs at has to see both delivery routes as one set.
@@ -357,6 +356,7 @@ async fn the_rename_pass_sees_staging_and_working_output_as_one_delivery() {
             job_display_name: "Silver Horizon 2024".to_string(),
             srrdb: None,
         }),
+        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
     )
     .await
     .unwrap();
@@ -386,6 +386,7 @@ async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
         dest.clone(),
         Arc::new(PhaseCounters::default()),
         None,
+        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
     )
     .await
     .unwrap();
@@ -410,19 +411,16 @@ fn prepublication_scan_checks_both_delivery_roots() {
     }
     .normalized()
     .unwrap();
-    let rejection = scan_delivery_sources(&working, Some(&staging), &settings)
-        .unwrap()
-        .expect("staging output must be inspected");
+    let error = validate_delivery_sources(&working, Some(&staging), &settings).unwrap_err();
 
-    assert_eq!(rejection.pattern, "exe");
-    assert_eq!(rejection.relative_path, "nested.exe");
+    assert!(error.contains("unacceptable extension 'exe' matched 'staging/nested.exe'"));
     assert!(working.join("safe.mkv").exists());
     assert!(staging.join("nested.exe").exists());
 }
 
 #[cfg(unix)]
 #[test]
-fn prepublication_scan_does_not_follow_symlinked_directories() {
+fn prepublication_scan_refuses_symlinked_directories() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
@@ -438,9 +436,41 @@ fn prepublication_scan_does_not_follow_symlinked_directories() {
         ..PostProcessingSettings::default()
     };
 
-    assert!(
-        scan_delivery_sources(&working, None, &settings)
-            .unwrap()
-            .is_none()
+    let error = validate_delivery_sources(&working, None, &settings).unwrap_err();
+    assert!(error.contains("link or reparse point"));
+}
+
+#[test]
+fn prepublication_scan_counts_sparse_files_without_reading_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    std::fs::create_dir_all(&working).unwrap();
+    let payload = std::fs::File::create(working.join("payload.mkv")).unwrap();
+    payload.set_len(200 * 1024 * 1024 * 1024).unwrap();
+
+    let validation =
+        validate_delivery_sources(&working, None, &PostProcessingSettings::default()).unwrap();
+
+    assert_eq!(validation.total_bytes, 200 * 1024 * 1024 * 1024);
+    assert_eq!(
+        validation.root_entry_bytes[&working.join("payload.mkv")],
+        200 * 1024 * 1024 * 1024
     );
+}
+
+#[test]
+fn prepublication_scan_handles_deep_output_trees_iteratively() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let mut nested = working.clone();
+    for _ in 0..128 {
+        nested.push("nested");
+    }
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("payload.mkv"), b"safe").unwrap();
+
+    let validation =
+        validate_delivery_sources(&working, None, &PostProcessingSettings::default()).unwrap();
+
+    assert_eq!(validation.total_bytes, 4);
 }

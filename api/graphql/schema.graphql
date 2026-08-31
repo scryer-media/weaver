@@ -374,6 +374,7 @@ type GeneralSettings {
 	maxDownloadSpeed: Int!
 	maxRetries: Int!
 	ipReplacementTrialExtraConnections: Int!
+	enableSrrdbLookup: Boolean!
 	ispBandwidthCap: IspBandwidthCapSettings
 	watchFolder: WatchFolderSettings!
 	duplicatePolicy: DuplicatePolicySettings!
@@ -386,6 +387,7 @@ input GeneralSettingsInput {
 	maxDownloadSpeed: Int
 	maxRetries: Int
 	ipReplacementTrialExtraConnections: Int
+	enableSrrdbLookup: Boolean
 	ispBandwidthCap: IspBandwidthCapSettingsInput
 	watchFolder: WatchFolderSettingsInput
 	duplicatePolicy: DuplicatePolicySettingsInput
@@ -952,12 +954,14 @@ type MutationRoot {
 	"""
 	redownloadJob(id: Int!): Boolean!
 	"""
-	Delete a completed/failed/cancelled job from history.
+	Delete completed/failed/cancelled jobs from history.
+	`deleteFiles: true` requires admin scope.
 	Returns the remaining history jobs after deletion.
 	"""
 	acceptHistoryDelete(input: AcceptHistoryDeleteInput!): HistoryDeleteAcceptance!
 	"""
 	Delete a completed/failed/cancelled job from history.
+	`deleteFiles: true` requires admin scope.
 	Returns the remaining history jobs after deletion.
 	"""
 	deleteHistory(id: Int!, deleteFiles: Boolean! = false): [HistoryItem!]!
@@ -970,11 +974,13 @@ type MutationRoot {
 	promoteDuplicateCandidate(id: Int!): SemanticPromotionResult!
 	"""
 	Delete multiple completed/failed/cancelled jobs from history by ID.
+	`deleteFiles: true` requires admin scope.
 	Returns the remaining history jobs after deletion.
 	"""
 	deleteHistoryBatch(ids: [Int!]!, deleteFiles: Boolean! = false): [HistoryItem!]!
 	"""
 	Delete all completed/failed/cancelled jobs from history.
+	`deleteFiles: true` requires admin scope.
 	"""
 	deleteAllHistory(deleteFiles: Boolean! = false): [HistoryItem!]!
 	"""
@@ -1028,7 +1034,7 @@ type MutationRoot {
 	"""
 	redownloadQueueItem(id: Int!): QueueCommandResult!
 	"""
-	Remove history items by ID.
+	Remove history items by ID. `deleteFiles: true` requires admin scope.
 	"""
 	removeHistoryItems(ids: [Int!]!, deleteFiles: Boolean! = false): HistoryCommandResult!
 	"""
@@ -1196,6 +1202,7 @@ type PostProcessingSettingsGql {
 	pythonInterpreter: String
 	powershellInterpreter: String
 	batchInterpreter: String
+	unacceptableExtensions: [String!]!
 	"""
 	True when `WEAVER_STRICT_SECURITY` refuses script execution outright.
 	"""
@@ -1213,6 +1220,11 @@ input PostProcessingSettingsInput {
 	pythonInterpreter: String
 	powershellInterpreter: String
 	batchInterpreter: String
+	"""
+	Omission preserves the existing policy; a supplied empty list disables
+	it. `null` is deliberately distinguishable and refused by the mutation.
+	"""
+	unacceptableExtensions: [String!]
 }
 
 type QueryRoot {

@@ -306,10 +306,12 @@ impl Pipeline {
         }
     }
 
-    /// Reject content that must not reach terminal post-processing scripts or
-    /// the complete directory. Unlike ordinary pipeline failures, this route
-    /// deliberately does not expose the rejected working tree to scripts.
-    pub(super) fn reject_unacceptable_extension(&mut self, job_id: JobId, error: String) {
+    /// Reject untrusted delivery content or an incomplete security check
+    /// without exposing the working tree to terminal scripts or publication.
+    pub(super) fn fail_delivery_security_check(&mut self, job_id: JobId, error: String) {
+        if let Some(budget) = self.extraction_budgets.get(&job_id) {
+            budget.reject_content_policy(error.clone());
+        }
         let (released_repair, released_extract) =
             self.prepare_failed_job_runtime(job_id, &error, false);
         self.finish_failed_job(job_id, error, released_repair, released_extract);
@@ -425,6 +427,9 @@ impl Pipeline {
         } else {
             self.extraction_budgets.remove(&job_id)
         };
+        if !preserve_staging {
+            self.unacceptable_extension_policies.remove(&job_id);
+        }
         if released_repair {
             self.metrics.repair_active.fetch_sub(1, Ordering::Relaxed);
         }

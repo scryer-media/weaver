@@ -587,7 +587,7 @@ async fn failed_final_move_marks_job_failed_instead_of_complete() {
     let JobStatus::Failed { error } = &status else {
         unreachable!();
     };
-    assert!(error.contains("failed to read working directory"));
+    assert!(error.contains("no delivery source exists"));
     assert!(
         !complete_dir
             .join(crate::jobs::working_dir::sanitize_dirname(job_name))
@@ -636,7 +636,7 @@ async fn unacceptable_extension_rejection_never_starts_a_final_move_or_scripts()
 
     pipeline.start_move_to_complete(job_id).await.unwrap();
 
-    assert!(pipeline.move_done_rx.try_recv().is_err());
+    settle_inflight_moves(&mut pipeline).await;
     assert!(pipeline.inflight_terminal_post_processing.is_empty());
     assert!(
         !complete_dir

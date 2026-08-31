@@ -1,6 +1,6 @@
 use super::*;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::deobfuscate::{self, DeliveryNamingPlan, SrrdbInputs};
 use crate::jobs::working_dir::{WORKING_DIR_MARKER, mark_weaver_owned_output_dir};
@@ -33,33 +33,59 @@ struct UnacceptableExtensionMatch {
     pattern: String,
 }
 
-/// Inspect precisely the entries the final move can publish without following
-/// symlinks. A rejection occurs before the destination directory is allocated.
-fn scan_delivery_sources(
-    working_dir: &std::path::Path,
-    staging_dir: Option<&std::path::Path>,
+#[derive(Debug, Default)]
+struct DeliverySourceValidation {
+    total_bytes: u64,
+    root_entry_bytes: HashMap<PathBuf, u64>,
+}
+
+enum DeliveryPolicySource {
+    Persisted(crate::Database),
+    #[cfg(test)]
+    Fixed(PostProcessingSettings),
+}
+
+/// Inspect exactly the entries the final move can publish, without following
+/// links. This one iterative walk both enforces the extension policy and
+/// supplies the byte totals used by move progress.
+fn validate_delivery_sources(
+    working_dir: &Path,
+    staging_dir: Option<&Path>,
     settings: &PostProcessingSettings,
-) -> Result<Option<UnacceptableExtensionMatch>, String> {
-    if let Some(staging_dir) = staging_dir
-        && let Some(rejection) = scan_delivery_root(staging_dir, &[".weaver-chunks"], settings)?
-    {
-        return Ok(Some(rejection));
+) -> Result<DeliverySourceValidation, String> {
+    let mut validation = DeliverySourceValidation::default();
+    let mut source_exists = false;
+    if let Some(staging_dir) = staging_dir {
+        source_exists |= scan_delivery_root(
+            staging_dir,
+            "staging",
+            &[".weaver-chunks"],
+            settings,
+            &mut validation,
+        )?;
     }
-    scan_delivery_root(
+    source_exists |= scan_delivery_root(
         working_dir,
+        "working",
         &[".weaver-chunks", ".weaver-staging", WORKING_DIR_MARKER],
         settings,
-    )
+        &mut validation,
+    )?;
+    source_exists
+        .then_some(validation)
+        .ok_or_else(|| format!("no delivery source exists at {}", working_dir.display()))
 }
 
 fn scan_delivery_root(
-    root: &std::path::Path,
+    root: &Path,
+    source_name: &str,
     ignored_entries: &[&str],
     settings: &PostProcessingSettings,
-) -> Result<Option<UnacceptableExtensionMatch>, String> {
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    validation: &mut DeliverySourceValidation,
+) -> Result<bool, String> {
+    let root_metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
             return Err(format!(
                 "could not inspect delivery root {}: {error}",
@@ -67,6 +93,15 @@ fn scan_delivery_root(
             ));
         }
     };
+    if file_type_is_link_or_reparse(&root_metadata.file_type()) || !root_metadata.is_dir() {
+        return Err(format!("unsafe delivery root {}", root.display()));
+    }
+    let entries = std::fs::read_dir(root).map_err(|error| {
+        format!(
+            "could not inspect delivery root {}: {error}",
+            root.display()
+        )
+    })?;
     for entry in entries {
         let entry = entry.map_err(|error| {
             format!(
@@ -81,58 +116,79 @@ fn scan_delivery_root(
         {
             continue;
         }
-        if let Some(rejection) = scan_delivery_path(root, &entry.path(), settings)? {
-            return Ok(Some(rejection));
-        }
-    }
-    Ok(None)
-}
-
-fn scan_delivery_path(
-    root: &std::path::Path,
-    path: &std::path::Path,
-    settings: &PostProcessingSettings,
-) -> Result<Option<UnacceptableExtensionMatch>, String> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-        format!(
-            "could not inspect delivery entry {}: {error}",
-            path.display()
-        )
-    })?;
-    if metadata.is_dir() {
-        let entries = std::fs::read_dir(path).map_err(|error| {
-            format!(
-                "could not inspect delivery directory {}: {error}",
-                path.display()
-            )
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
+        let entry_path = entry.path();
+        let entry_name = entry.file_name();
+        let mut entry_bytes = 0u64;
+        let mut stack = vec![(entry_path.clone(), PathBuf::from(&entry_name))];
+        while let Some((path, relative_path)) = stack.pop() {
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
                 format!(
-                    "could not inspect delivery directory {}: {error}",
+                    "could not inspect delivery entry {}: {error}",
                     path.display()
                 )
             })?;
-            if let Some(rejection) = scan_delivery_path(root, &entry.path(), settings)? {
-                return Ok(Some(rejection));
+            if file_type_is_link_or_reparse(&metadata.file_type()) {
+                return Err(format!(
+                    "unsafe delivery link or reparse point at {}/{}",
+                    source_name,
+                    relative_path.display()
+                ));
             }
+            if metadata.is_dir() {
+                let children = std::fs::read_dir(&path).map_err(|error| {
+                    format!(
+                        "could not inspect delivery directory {}: {error}",
+                        path.display()
+                    )
+                })?;
+                for child in children {
+                    let child = child.map_err(|error| {
+                        format!(
+                            "could not inspect delivery directory {}: {error}",
+                            path.display()
+                        )
+                    })?;
+                    stack.push((child.path(), relative_path.join(child.file_name())));
+                }
+                continue;
+            }
+            if !metadata.is_file() {
+                return Err(format!(
+                    "unsupported delivery entry at {}/{}",
+                    source_name,
+                    relative_path.display()
+                ));
+            }
+            let filename = path.file_name().unwrap_or_default().to_string_lossy();
+            if let Some(pattern) = settings.unacceptable_extension_match(&filename) {
+                let rejection = UnacceptableExtensionMatch {
+                    relative_path: format!("{source_name}/{}", relative_path.display()),
+                    pattern: pattern.to_string(),
+                };
+                return Err(format!(
+                    "unacceptable extension '{}' matched '{}' before publication",
+                    rejection.pattern, rejection.relative_path
+                ));
+            }
+            entry_bytes = entry_bytes.saturating_add(metadata.len());
+            validation.total_bytes = validation.total_bytes.saturating_add(metadata.len());
         }
-        return Ok(None);
+        validation.root_entry_bytes.insert(entry_path, entry_bytes);
     }
+    Ok(true)
+}
 
-    let filename = path.file_name().unwrap_or_default().to_string_lossy();
-    let Some(pattern) = settings.unacceptable_extension_match(&filename) else {
-        return Ok(None);
-    };
-    let relative_path = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned();
-    Ok(Some(UnacceptableExtensionMatch {
-        relative_path,
-        pattern: pattern.to_string(),
-    }))
+fn file_type_is_link_or_reparse(file_type: &std::fs::FileType) -> bool {
+    if file_type.is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        return file_type.is_reparse_point();
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn move_path_with_copy_fallback(
@@ -231,11 +287,13 @@ fn rename_path_for_publication(
 fn move_path_with_safe_rename_or_copy_fallback(
     src: &std::path::Path,
     dst: &std::path::Path,
+    source_bytes: u64,
     phase_counters: Arc<PhaseCounters>,
 ) -> Result<(), (std::io::Error, std::io::Error)> {
     move_path_with_safe_rename_or_copy_fallback_using(
         src,
         dst,
+        source_bytes,
         phase_counters,
         rename_path_for_publication,
         move_path_with_copy_fallback,
@@ -245,6 +303,7 @@ fn move_path_with_safe_rename_or_copy_fallback(
 fn move_path_with_safe_rename_or_copy_fallback_using<R, C>(
     src: &std::path::Path,
     dst: &std::path::Path,
+    source_bytes: u64,
     phase_counters: Arc<PhaseCounters>,
     rename: R,
     copy: C,
@@ -253,13 +312,12 @@ where
     R: FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
     C: FnOnce(&std::path::Path, &std::path::Path, &PhaseCounters) -> std::io::Result<()>,
 {
-    let path_bytes = path_regular_file_bytes(src).unwrap_or(0);
     match rename(src, dst) {
         Ok(()) => {
-            if path_bytes > 0 {
+            if source_bytes > 0 {
                 phase_counters
                     .completed_bytes
-                    .fetch_add(path_bytes, Ordering::Relaxed);
+                    .fetch_add(source_bytes, Ordering::Relaxed);
             }
             Ok(())
         }
@@ -273,25 +331,6 @@ where
     }
 }
 
-fn path_regular_file_bytes(path: &std::path::Path) -> std::io::Result<u64> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        return Ok(0);
-    }
-    if metadata.is_file() {
-        return Ok(metadata.len());
-    }
-    if !metadata.is_dir() {
-        return Ok(0);
-    }
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        total = total.saturating_add(path_regular_file_bytes(&entry.path())?);
-    }
-    Ok(total)
-}
-
 async fn run_move_to_complete(
     job_id: JobId,
     working_dir: PathBuf,
@@ -299,7 +338,8 @@ async fn run_move_to_complete(
     dest: PathBuf,
     phase_counters: Arc<PhaseCounters>,
     naming: Option<DeliveryNamingPlan>,
-) -> Result<MoveToCompleteResult, String> {
+    policy_source: DeliveryPolicySource,
+) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
     // Every cached disk write handle under either of the job's roots must be
     // closed before its files are renamed or moved. The staging root is not
     // only extraction output any more: direct-store writes member payload
@@ -309,36 +349,47 @@ async fn run_move_to_complete(
         crate::pipeline::close_cached_write_handles_under(staging).await;
     }
 
-    // Verify at least one source directory exists before creating
-    // the destination, so a missing source doesn't leave behind an
-    // empty complete dir.
-    let staging_exists = staging_dir.as_ref().is_some_and(|s| s.exists());
-    let working_exists = working_dir.exists();
-    if !staging_exists && !working_exists {
-        return Err(format!(
-            "failed to read working directory {} for move: No such file or directory (os error 2)",
-            working_dir.display()
-        ));
-    }
-
-    let total_bytes = {
+    let policy = match policy_source {
+        DeliveryPolicySource::Persisted(database) => {
+            tokio::task::spawn_blocking(move || database.post_processing_settings())
+                .await
+                .map_err(|error| {
+                    MoveToCompleteFailure::Security(format!(
+                        "could not load unacceptable extension policy: {error}"
+                    ))
+                })?
+                .map_err(|error| {
+                    MoveToCompleteFailure::Security(format!(
+                        "could not load unacceptable extension policy: {error}"
+                    ))
+                })?
+        }
+        #[cfg(test)]
+        DeliveryPolicySource::Fixed(policy) => policy,
+    };
+    let validation = {
         let working_dir = working_dir.clone();
         let staging_dir = staging_dir.clone();
         tokio::task::spawn_blocking(move || {
-            move_sources_regular_file_bytes(&working_dir, staging_dir.as_deref())
+            validate_delivery_sources(&working_dir, staging_dir.as_deref(), &policy)
         })
         .await
-        .unwrap_or(0)
+        .map_err(|error| {
+            MoveToCompleteFailure::Security(format!(
+                "delivery security scan worker failed: {error}"
+            ))
+        })?
+        .map_err(MoveToCompleteFailure::Security)?
     };
     phase_counters
         .total_bytes
-        .store(total_bytes, Ordering::Relaxed);
+        .store(validation.total_bytes, Ordering::Relaxed);
 
     if let Err(error) = tokio::fs::create_dir_all(&dest).await {
-        return Err(format!(
+        return Err(MoveToCompleteFailure::Operational(format!(
             "failed to create complete directory {}: {error}",
             dest.display()
-        ));
+        )));
     }
 
     let mut moved = 0u32;
@@ -365,11 +416,17 @@ async fn run_move_to_complete(
             }
             let src = entry.path();
             let dst = dest.join(&file_name);
+            let source_bytes = validation.root_entry_bytes.get(&src).copied().unwrap_or(0);
             let src_fb = src.clone();
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
             match tokio::task::spawn_blocking(move || {
-                move_path_with_safe_rename_or_copy_fallback(&src_fb, &dst_fb, counters)
+                move_path_with_safe_rename_or_copy_fallback(
+                    &src_fb,
+                    &dst_fb,
+                    source_bytes,
+                    counters,
+                )
             })
             .await
             {
@@ -409,11 +466,17 @@ async fn run_move_to_complete(
             if dst.exists() && !runtime_fs::paths_equivalent_for_placement(&src, &dst) {
                 continue;
             }
+            let source_bytes = validation.root_entry_bytes.get(&src).copied().unwrap_or(0);
             let src_fb = src.clone();
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
             match tokio::task::spawn_blocking(move || {
-                move_path_with_safe_rename_or_copy_fallback(&src_fb, &dst_fb, counters)
+                move_path_with_safe_rename_or_copy_fallback(
+                    &src_fb,
+                    &dst_fb,
+                    source_bytes,
+                    counters,
+                )
             })
             .await
             {
@@ -443,12 +506,12 @@ async fn run_move_to_complete(
         for failure in &failures {
             warn!(job_id = job_id.0, error = %failure, "failed to move entry to complete directory");
         }
-        return Err(format!(
+        return Err(MoveToCompleteFailure::Operational(format!(
             "failed to move {} entr{} to complete directory: {}",
             failures.len(),
             if failures.len() == 1 { "y" } else { "ies" },
             failures[0]
-        ));
+        )));
     }
 
     // Both delivery routes have landed in `dest` and nothing else will be added
@@ -517,36 +580,6 @@ async fn run_move_to_complete(
         moved_entries: moved,
         renamed_members,
     })
-}
-
-fn move_sources_regular_file_bytes(
-    working_dir: &std::path::Path,
-    staging_dir: Option<&std::path::Path>,
-) -> u64 {
-    let mut total = 0u64;
-    if let Some(staging) = staging_dir
-        && let Ok(entries) = std::fs::read_dir(staging)
-    {
-        for entry in entries.flatten() {
-            if entry.file_name() == ".weaver-chunks" {
-                continue;
-            }
-            total = total.saturating_add(path_regular_file_bytes(&entry.path()).unwrap_or(0));
-        }
-    }
-    if let Ok(entries) = std::fs::read_dir(working_dir) {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            if file_name == ".weaver-chunks"
-                || file_name == ".weaver-staging"
-                || file_name == WORKING_DIR_MARKER
-            {
-                continue;
-            }
-            total = total.saturating_add(path_regular_file_bytes(&entry.path()).unwrap_or(0));
-        }
-    }
-    total
 }
 
 fn complete_parent_for_category(
@@ -780,39 +813,6 @@ impl Pipeline {
             )
         };
 
-        if let Some(staging) = staging_dir.as_deref() {
-            let budget = self.extraction_budget(job_id, staging)?;
-            ExtractionRoot::open(staging)?.scan_no_links(&budget)?;
-        }
-
-        let settings = self
-            .db_blocking(|db| db.post_processing_settings())
-            .await
-            .map_err(|error| format!("could not load unacceptable extension policy: {error}"))?;
-        if !settings.unacceptable_extensions.is_empty() {
-            let working_dir_for_scan = working_dir.clone();
-            let staging_dir_for_scan = staging_dir.clone();
-            let rejection = tokio::task::spawn_blocking(move || {
-                scan_delivery_sources(
-                    &working_dir_for_scan,
-                    staging_dir_for_scan.as_deref(),
-                    &settings,
-                )
-            })
-            .await
-            .map_err(|error| format!("unacceptable extension scan worker failed: {error}"))??;
-            if let Some(rejection) = rejection {
-                self.reject_unacceptable_extension(
-                    job_id,
-                    format!(
-                        "unacceptable extension '{}' matched '{}' before publication",
-                        rejection.pattern, rejection.relative_path
-                    ),
-                );
-                return Ok(());
-            }
-        }
-
         self.phase_end(job_id, JobPhase::Extracting);
         self.phase_end(job_id, JobPhase::Repairing);
         let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
@@ -831,6 +831,7 @@ impl Pipeline {
         self.publish_snapshot();
 
         let naming = self.delivery_naming_plan(job_id, &job_name).await;
+        let policy_source = DeliveryPolicySource::Persisted(self.db.clone());
 
         let move_done_tx = self.move_done_tx.clone();
         info!(
@@ -847,6 +848,7 @@ impl Pipeline {
                 dest.clone(),
                 phase_counters,
                 naming,
+                policy_source,
             )
             .await;
             match &result {
@@ -915,7 +917,10 @@ impl Pipeline {
                 );
                 self.start_terminal_post_processing(job_id);
             }
-            Err(error) => self.fail_job(job_id, error),
+            Err(MoveToCompleteFailure::Security(error)) => {
+                self.fail_delivery_security_check(job_id, error);
+            }
+            Err(MoveToCompleteFailure::Operational(error)) => self.fail_job(job_id, error),
         }
     }
 

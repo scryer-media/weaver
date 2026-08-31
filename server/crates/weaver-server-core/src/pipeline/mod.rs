@@ -43,6 +43,7 @@ use crate::jobs::assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
 use crate::jobs::{JobPhase, JobPhaseProgress, PhaseAttemptCounters, PhaseCounters};
+use crate::post_processing::model::PostProcessingSettings;
 use crate::runtime::buffers::{BufferHandle, BufferPool};
 use crate::runtime::system_profile::SystemProfile;
 use crate::{
@@ -1649,16 +1650,33 @@ pub(super) enum ExtractionDone {
     },
 }
 
+#[derive(Debug)]
 pub(super) struct MoveToCompleteResult {
     pub(super) moved_entries: u32,
     /// Delivered files the deobfuscation pass renamed on the way out.
     pub(super) renamed_members: u32,
 }
 
+/// A final-move refusal that must never enter terminal post-processing versus
+/// an ordinary move failure, whose legacy script handling remains intact.
+#[derive(Debug)]
+pub(super) enum MoveToCompleteFailure {
+    Security(String),
+    Operational(String),
+}
+
+impl std::fmt::Display for MoveToCompleteFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Security(message) | Self::Operational(message) => formatter.write_str(message),
+        }
+    }
+}
+
 pub(super) struct MoveToCompleteDone {
     pub(super) job_id: JobId,
     pub(super) dest: PathBuf,
-    pub(super) result: Result<MoveToCompleteResult, String>,
+    pub(super) result: Result<MoveToCompleteResult, MoveToCompleteFailure>,
 }
 
 pub(super) enum TerminalPostProcessingEvent {
@@ -2961,6 +2979,9 @@ pub struct Pipeline {
     pub(super) process_memory_budget: Arc<ProcessMemoryBudget>,
     /// One shared output budget per job, retained across nested extraction layers.
     pub(super) extraction_budgets: HashMap<JobId, Arc<JobExtractionBudget>>,
+    /// A job's normalized unacceptable-extension policy is fixed at its first
+    /// archive extraction and reused by every subsequent RAR set and retry.
+    pub(super) unacceptable_extension_policies: HashMap<JobId, Arc<PostProcessingSettings>>,
 }
 
 #[cfg(test)]
