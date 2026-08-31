@@ -103,6 +103,14 @@ exactly one of `WEAVER_BOOTSTRAP_LOGIN_PASSWORD` or
 `WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE`. Bootstrap credentials are used only
 when no login is already stored; they never overwrite an existing login.
 
+RSS feeds may use local, private, link-local, or container-network addresses
+by default. Feed Basic Auth credentials are sent only to requests whose scheme,
+host, and effective port exactly match the configured feed URL; redirected or
+item requests to another origin never receive them. Set
+`WEAVER_RSS_ALLOW_PRIVATE_NETWORK=false` to limit RSS fetching to public
+egress. Decompressed RSS feed bodies are capped at 16 MiB; the separate NZB
+response limit remains configurable with `WEAVER_NZB_DECOMPRESSED_LIMIT_BYTES`.
+
 ## API
 
 Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and subscription support. The same API powers the web UI, so anything you can do in the interface is available programmatically.

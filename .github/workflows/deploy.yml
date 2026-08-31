@@ -76,21 +76,43 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+    outputs:
+      release_tag: ${{ steps.release_identity.outputs.release_tag }}
+      version: ${{ steps.release_identity.outputs.version }}
     steps:
       - name: Checkout release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+      - name: Validate canonical stable release tag
+        id: release_identity
+        shell: bash
+        run: bash .github/scripts/validate-release-tag.sh
       - name: Verify trusted tag and release-branch ancestry
+        env:
+          RELEASE_TAG: ${{ steps.release_identity.outputs.release_tag }}
+          VERSION: ${{ steps.release_identity.outputs.version }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#weaver-v}"
-          release_branch="release-${version}"
+          release_branch="release-${VERSION}"
           git config gpg.format ssh
           git config gpg.ssh.allowedSignersFile "$GITHUB_WORKSPACE/.github/release-signing-allowed-signers"
-          git verify-tag "$GITHUB_REF_NAME"
+          git verify-tag "$RELEASE_TAG"
           git fetch --no-tags origin "refs/heads/${release_branch}:refs/remotes/origin/${release_branch}"
-          git merge-base --is-ancestor "${GITHUB_REF_NAME}^{commit}" "origin/${release_branch}"
+          git merge-base --is-ancestor "${RELEASE_TAG}^{commit}" "origin/${release_branch}"
+
+  workflow-contract:
+    name: workflow-contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Test release tag validator fixtures
+        shell: bash
+        run: bash .github/scripts/test-validate-release-tag.sh
+      - name: Check release workflow contract
+        shell: bash
+        run: bash .github/scripts/check-deploy-workflow-contract.sh
 
   # ── Parallel lint / check jobs (no dependencies) ─────────────────────────
 
@@ -1646,8 +1668,9 @@ jobs:
         id: tags
         env:
           IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/weaver
+          VERSION: ${{ needs.verify-release-tag.outputs.version }}
         run: |
-          VERSION="${GITHUB_REF_NAME#weaver-v}"
+          set -euo pipefail
           SHORT_SHA=$(printf '%s' "$GITHUB_SHA" | cut -c1-7)
           {
             echo "base<<EOF"
@@ -1685,7 +1708,7 @@ jobs:
   generate-container-provenance:
     name: generate-container-provenance
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-    needs: [docker-publish]
+    needs: [verify-release-tag, docker-publish]
     permissions:
       actions: read
       contents: read
@@ -1705,7 +1728,7 @@ jobs:
     name: verify-container-release
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
     runs-on: ubuntu-24.04
-    needs: [docker-publish, generate-container-provenance]
+    needs: [verify-release-tag, docker-publish, generate-container-provenance]
     permissions:
       id-token: write
       packages: read
@@ -1757,6 +1780,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs:
+      - verify-release-tag
       - rust-fmt
       - rust-clippy
       - rust-audit
@@ -1803,6 +1827,7 @@ jobs:
       - name: Verify release provenance and sign checksums
         env:
           IDENTITY: ^https://github.com/${{ github.repository }}/.github/workflows/deploy.yml@refs/tags/weaver-v.*$
+          RELEASE_TAG: ${{ needs.verify-release-tag.outputs.release_tag }}
         run: |
           set -euo pipefail
           mapfile -t release_assets < <(find artifacts -maxdepth 1 -type f \( -name 'weaver-*.tar.gz' -o -name 'weaver-*.zip' -o -name 'weaver-*.msi' -o -name 'weaver-*.spdx.json' \) -printf '%f\n' | sort)
@@ -1815,7 +1840,7 @@ jobs:
             slsa-verifier verify-artifact "artifacts/${asset}" \
               --provenance-path artifacts/weaver-provenance.intoto.jsonl \
               --source-uri "github.com/${GITHUB_REPOSITORY}" \
-              --source-tag "${GITHUB_REF_NAME}"
+              --source-tag "$RELEASE_TAG"
           done
           (
             cd artifacts
@@ -1840,9 +1865,11 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.verify-release-tag.outputs.release_tag }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_TAG" \
             --generate-notes \
             artifacts/weaver-*.tar.gz \
             artifacts/weaver-*.zip \
@@ -1854,15 +1881,14 @@ jobs:
             artifacts/weaver-provenance.intoto.jsonl
       - name: Update Homebrew tap
         env:
-          TAP_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+          VERSION: ${{ needs.verify-release-tag.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#weaver-v}"
+          set -euo pipefail
           LINUX_X86_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-linux-x86_64-portable.tar.gz | cut -d ' ' -f1)
           LINUX_ARM_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-linux-arm64-portable.tar.gz | cut -d ' ' -f1)
           DARWIN_X86_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-darwin-x86_64-portable.tar.gz | cut -d ' ' -f1)
           DARWIN_ARM_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-darwin-arm64-portable.tar.gz | cut -d ' ' -f1)
-          REPO="${{ github.repository }}"
 
           mkdir -p formula
           cat > formula/weaver-usenet.rb << FORMULA
@@ -1908,10 +1934,10 @@ jobs:
 
           class WeaverUsenet < Formula
             desc "Unified Usenet binary downloader, repair, and extraction engine"
-            homepage "https://github.com/${REPO}"
+            homepage "https://github.com/${REPOSITORY}"
             version "${VERSION}"
             license "MIT"
-            RELEASE_REPO = "${REPO}"
+            RELEASE_REPO = "${REPOSITORY}"
             RELEASE_VERSION = "${VERSION}"
             CHECKSUMS = {
               "weaver-linux-x86_64-portable.tar.gz" => "${LINUX_X86_PORTABLE_SHA}",
@@ -2002,6 +2028,7 @@ jobs:
           sed -i 's/^          //' formula/weaver-usenet.rb
       - name: Smoke test Homebrew asset selection
         run: |
+          set -euo pipefail
           ruby <<'RUBY'
           source = File.read("formula/weaver-usenet.rb")
           helper_source = source.split(/^class WeaverUsenet < Formula$/).first
@@ -2050,16 +2077,17 @@ jobs:
           RUBY
       - name: Publish Homebrew tap update
         env:
-          TAP_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+          GH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+          VERSION: ${{ needs.verify-release-tag.outputs.version }}
         run: |
-          if [ -z "$TAP_TOKEN" ]; then
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
             echo "TAP_PUSH_TOKEN not set; skipping tap update."
             exit 0
           fi
-          VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#weaver-v}"
 
-          git clone "https://${TAP_TOKEN}@github.com/scryer-media/homebrew-weaver.git" tap-repo
+          gh auth setup-git
+          git clone --depth 1 https://github.com/scryer-media/homebrew-weaver.git tap-repo
           mkdir -p tap-repo/Formula
           cp formula/weaver-usenet.rb tap-repo/Formula/weaver-usenet.rb
           cd tap-repo
@@ -2076,7 +2104,7 @@ jobs:
   marketing-site-rebuild:
     name: marketing-site-rebuild
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-    needs: [github-release]
+    needs: [verify-release-tag, github-release]
     runs-on: ubuntu-24.04
     continue-on-error: true
     permissions:
@@ -2084,23 +2112,20 @@ jobs:
     steps:
       - name: Trigger marketing site rebuild
         env:
-          WEB_TOKEN: ${{ secrets.WEB_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.WEB_DISPATCH_TOKEN }}
         run: |
-          if [ -z "$WEB_TOKEN" ]; then
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
             echo "WEB_DISPATCH_TOKEN not set; skipping site rebuild."
             exit 0
           fi
-          git clone "https://${WEB_TOKEN}@github.com/scryer-media/web.git" web-repo
-          cd web-repo
-          git config user.name "github-actions[bot]"
-          git config user.email "133935777+NZBMan@users.noreply.github.com"
-          git commit --allow-empty -m "rebuild: ${{ github.ref_name }}"
-          git push origin HEAD:main
+          gh api --method POST repos/scryer-media/web/dispatches \
+            -f event_type=release-published
 
   winget-published-install:
     name: winget-published-install
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-    needs: [github-release]
+    needs: [verify-release-tag, github-release]
     runs-on: windows-2025-vs2026
     timeout-minutes: 20
     permissions:
@@ -2116,14 +2141,15 @@ jobs:
 
       - name: Install the published x64 MSI through WinGet
         shell: pwsh
+        env:
+          VERSION: ${{ needs.verify-release-tag.outputs.version }}
         run: |
           $manifestRoot = ".\\winget-manifests"
           New-Item -ItemType Directory -Force -Path $manifestRoot | Out-Null
           tar -xzf winget-submission/weaver-winget-manifests.tar.gz -C $manifestRoot
-          $version = "${{ github.ref_name }}".Replace("weaver-v", "")
           .\.github\scripts\validate-published-winget-install.ps1 `
             -ManifestRoot $manifestRoot `
-            -ExpectedVersion $version
+            -ExpectedVersion $env:VERSION
 
   winget-submit:
     name: winget-submit
@@ -2131,7 +2157,7 @@ jobs:
     # the org-level WINGET_TOKEN secret authenticates the PR, so this job
     # runs on every release tag rather than being gated behind a variable.
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-    needs: [github-release, winget-published-install]
+    needs: [verify-release-tag, github-release, winget-published-install]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -2147,6 +2173,7 @@ jobs:
       - name: Submit WinGet manifest pull request
         env:
           GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          VERSION: ${{ needs.verify-release-tag.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -2154,8 +2181,6 @@ jobs:
             echo "WINGET_TOKEN is required to submit the WinGet manifest pull request." >&2
             exit 1
           fi
-
-          VERSION="${GITHUB_REF_NAME#weaver-v}"
           BRANCH="scryer-media-weaver-${VERSION}"
           ARCHIVE="${GITHUB_WORKSPACE}/winget-submission/weaver-winget-manifests.tar.gz"
           STAGING_DIR="$(mktemp -d)"
@@ -2229,10 +2254,14 @@ jobs:
     name: winget-prep
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    needs: [rust-package-windows-x86_64, rust-package-windows-arm64]
+    needs: [verify-release-tag, rust-package-windows-x86_64, rust-package-windows-arm64]
     permissions:
       contents: read
     if: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'weaver-v') }}
+    env:
+      RELEASE_TAG: ${{ needs.verify-release-tag.outputs.release_tag }}
+      VERSION: ${{ needs.verify-release-tag.outputs.version }}
+      REPOSITORY: ${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -2249,24 +2278,16 @@ jobs:
           pattern: weaver-windows-*-${{ github.run_id }}
           merge-multiple: true
 
-      - name: Resolve WinGet metadata
-        id: winget_meta
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#weaver-v}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "release_date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
-
       - name: Generate WinGet manifests
         shell: bash
         run: |
           set -euo pipefail
+          RELEASE_DATE="$(date -u +%F)"
           cargo xtask ci winget \
-            --version "${{ steps.winget_meta.outputs.version }}" \
-            --tag "${{ github.ref_name }}" \
-            --repository "${{ github.repository }}" \
-            --release-date "${{ steps.winget_meta.outputs.release_date }}" \
+            --version "$VERSION" \
+            --tag "$RELEASE_TAG" \
+            --repository "$REPOSITORY" \
+            --release-date "$RELEASE_DATE" \
             --artifacts-dir release-artifacts \
             --output-dir winget-manifests
 

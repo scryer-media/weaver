@@ -47,6 +47,26 @@ impl Guard for ControlGuard {
     }
 }
 
+/// Require an administrator only for mutations that also remove completed
+/// output. History-only removal remains available to control callers.
+pub fn require_admin_for_file_delete(ctx: &Context<'_>, delete_files: bool) -> Result<()> {
+    if !delete_files {
+        return Ok(());
+    }
+
+    let scope = ctx
+        .data::<CallerScope>()
+        .map_err(|_| internal_error("missing caller scope"))?;
+    if scope.is_admin() {
+        Ok(())
+    } else {
+        Err(graphql_error(
+            "FORBIDDEN",
+            "admin scope required to delete completed files",
+        ))
+    }
+}
+
 pub fn graphql_error(code: &'static str, message: impl Into<String>) -> Error {
     Error::new(message.into()).extend_with(|_, ext| {
         ext.set("code", code);

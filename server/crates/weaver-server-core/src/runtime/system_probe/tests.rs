@@ -1,4 +1,42 @@
 use super::*;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[test]
+fn startup_and_extraction_memory_consumers_share_cached_process_facts() {
+    let cache = OnceLock::new();
+    let memory_probes = AtomicUsize::new(0);
+    let cgroup_probes = AtomicUsize::new(0);
+
+    let facts = cached_process_memory_facts(
+        &cache,
+        || {
+            memory_probes.fetch_add(1, Ordering::Relaxed);
+            Some((16_u64 << 30, 8_u64 << 30))
+        },
+        || {
+            cgroup_probes.fetch_add(1, Ordering::Relaxed);
+            Some(6_u64 << 30)
+        },
+    );
+    let profile = memory_profile_from_facts(facts);
+    let effective_total = facts
+        .memory_bytes
+        .map(|(total, _)| total.min(facts.cgroup_limit.unwrap_or(total)));
+
+    let same_facts = cached_process_memory_facts(
+        &cache,
+        || panic!("memory detection must be cached"),
+        || panic!("cgroup detection must be cached"),
+    );
+
+    assert!(std::ptr::eq(facts, same_facts));
+    assert_eq!(profile.total_bytes, 16_u64 << 30);
+    assert_eq!(profile.cgroup_limit, Some(6_u64 << 30));
+    assert_eq!(effective_total, Some(6_u64 << 30));
+    assert_eq!(memory_probes.load(Ordering::Relaxed), 1);
+    assert_eq!(cgroup_probes.load(Ordering::Relaxed), 1);
+}
 
 #[test]
 fn nested_cgroup_v2_memory_limits_include_systemd_ancestors() {

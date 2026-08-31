@@ -1704,7 +1704,7 @@ async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
         .unwrap();
     }
     let operation_id = db
-        .insert_history_delete_operation(&target_ids, true)
+        .insert_history_delete_operation(&target_ids, true, true)
         .expect("history delete operation should be created");
     assert_eq!(
         fetch_i64(

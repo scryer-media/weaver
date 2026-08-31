@@ -132,7 +132,7 @@ services:
       WEAVER_DATABASE_URL: "${E2E_WEAVER_DATABASE_URL:-}"
       WEAVER_E2E_MODE: "${E2E_WEAVER_MODE:-0}"
       WEAVER_E2E_CLOCK_FILE: "${E2E_WEAVER_CLOCK_FILE:-}"
-      WEAVER_RSS_ALLOW_PRIVATE_NETWORK: "${WEAVER_RSS_ALLOW_PRIVATE_NETWORK:-false}"
+      WEAVER_RSS_ALLOW_PRIVATE_NETWORK: "${WEAVER_RSS_ALLOW_PRIVATE_NETWORK:-true}"
       WEAVER_BASE_URL: "${E2E_WEAVER_BASE_URL:-/}"
       # This grants loginless administration to every isolated test-network
       # client solely to preserve E2E browser behavior. Never copy it into

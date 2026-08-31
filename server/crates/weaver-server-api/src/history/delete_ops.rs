@@ -44,6 +44,7 @@ impl HistoryDeleteManager {
     pub(crate) async fn accept_history_delete(
         &self,
         input: AcceptHistoryDeleteInput,
+        file_delete_authorized: bool,
     ) -> Result<HistoryDeleteAcceptance> {
         let acceptance = match input.mode {
             AcceptHistoryDeleteMode::Ids => {
@@ -58,7 +59,11 @@ impl HistoryDeleteManager {
                 let db = self.db.clone();
                 let ids_for_insert = ids.clone();
                 let operation_id = tokio::task::spawn_blocking(move || {
-                    db.insert_history_delete_operation(&ids_for_insert, input.delete_files)
+                    db.insert_history_delete_operation(
+                        &ids_for_insert,
+                        input.delete_files,
+                        file_delete_authorized,
+                    )
                 })
                 .await
                 .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
@@ -73,7 +78,10 @@ impl HistoryDeleteManager {
             AcceptHistoryDeleteMode::AllHistory => {
                 let db = self.db.clone();
                 let (operation_id, ids) = tokio::task::spawn_blocking(move || {
-                    db.insert_all_history_delete_operation(input.delete_files)
+                    db.insert_all_history_delete_operation(
+                        input.delete_files,
+                        file_delete_authorized,
+                    )
                 })
                 .await
                 .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
@@ -152,6 +160,25 @@ impl HistoryDeleteManager {
     }
 
     async fn process_operation(&self, operation: HistoryDeleteOperationRow) -> Result<()> {
+        if operation.delete_files && !operation.file_delete_authorized {
+            const RESUBMIT_MESSAGE: &str =
+                "file deletion was not authorized; resubmit with an admin-scoped caller";
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || {
+                db.fail_pending_history_delete_operation_targets(operation.id, RESUBMIT_MESSAGE)
+            })
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.finalize_history_delete_operation(operation.id))
+                .await
+                .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+                .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+            return Ok(());
+        }
+
         let db = self.db.clone();
         let targets = tokio::task::spawn_blocking(move || {
             db.list_history_delete_operation_targets(operation.id, operation.delete_files)
@@ -262,5 +289,143 @@ fn map_insert_error(error: HistoryDeleteOperationInsertError) -> async_graphql::
         HistoryDeleteOperationInsertError::State(state_error) => {
             graphql_error("INTERNAL", state_error.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::{broadcast, mpsc};
+    use weaver_server_core::JobHistoryRow;
+    use weaver_server_core::jobs::handle::SharedPipelineState;
+    use weaver_server_core::operations::metrics::PipelineMetrics;
+
+    fn history(job_id: u64) -> JobHistoryRow {
+        JobHistoryRow {
+            job_id,
+            job_hash: None,
+            name: format!("job-{job_id}"),
+            status: "complete".to_string(),
+            error_message: None,
+            total_bytes: 1,
+            downloaded_bytes: 1,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1000,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: 1,
+            completed_at: 2,
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn unproven_file_delete_never_reaches_the_scheduler() {
+        let db = Database::open_in_memory().unwrap();
+        let output_root = tempfile::tempdir().unwrap();
+        let output_dir = output_root.path().join("legacy-output");
+        std::fs::create_dir(&output_dir).unwrap();
+        std::fs::write(output_dir.join("payload.bin"), b"retain me").unwrap();
+        let mut row = history(7);
+        row.output_dir = Some(output_dir.to_string_lossy().to_string());
+        db.insert_job_history(&row).unwrap();
+        let operation_id = db
+            .insert_history_delete_operation(&[7], true, false)
+            .unwrap();
+        let _claimed_before_restart = db.next_history_delete_operation().unwrap().unwrap();
+        db.recover_running_history_delete_operations().unwrap();
+        let operation = db.next_history_delete_operation().unwrap().unwrap();
+
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (event_tx, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            command_tx,
+            event_tx,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        let manager = HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1));
+
+        manager.process_operation(operation).await.unwrap();
+
+        assert!(matches!(
+            command_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(db.get_job_history(7).unwrap().is_some());
+        assert!(output_dir.join("payload.bin").is_file());
+        let state = db.list_history_delete_row_states(&[7]).unwrap();
+        assert_eq!(state[&7].state, AsyncOperationTargetState::Failed);
+        assert_eq!(
+            state[&7].error_message.as_deref(),
+            Some("file deletion was not authorized; resubmit with an admin-scoped caller")
+        );
+        let summaries = db.list_history_delete_operations(false).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, operation_id);
+        assert_eq!(
+            summaries[0].state,
+            weaver_server_core::AsyncOperationState::CompletedWithErrors
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_file_delete_survives_recovery_and_removes_its_output() {
+        let db = Database::open_in_memory().unwrap();
+        let output_root = tempfile::tempdir().unwrap();
+        let output_dir = output_root.path().join("authorized-output");
+        std::fs::create_dir(&output_dir).unwrap();
+        std::fs::write(output_dir.join("payload.bin"), b"delete me").unwrap();
+        let mut row = history(8);
+        row.output_dir = Some(output_dir.to_string_lossy().to_string());
+        db.insert_job_history(&row).unwrap();
+        db.insert_history_delete_operation(&[8], true, true)
+            .unwrap();
+        let _claimed_before_restart = db.next_history_delete_operation().unwrap().unwrap();
+        db.recover_running_history_delete_operations().unwrap();
+        let operation = db.next_history_delete_operation().unwrap().unwrap();
+        assert!(operation.file_delete_authorized);
+
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (event_tx, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            command_tx,
+            event_tx,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        let db_for_scheduler = db.clone();
+        let scheduler = tokio::spawn(async move {
+            let command = command_rx.recv().await.expect("expected history delete");
+            let weaver_server_core::SchedulerCommand::DeleteHistory {
+                job_id,
+                delete_files,
+                reply,
+            } = command
+            else {
+                panic!("expected history delete command");
+            };
+            assert!(delete_files);
+            let output_dir = db_for_scheduler
+                .get_job_history(job_id.0)
+                .unwrap()
+                .and_then(|row| row.output_dir)
+                .expect("recorded output directory");
+            std::fs::remove_dir_all(output_dir).unwrap();
+            db_for_scheduler.delete_job_history(job_id.0).unwrap();
+            reply.send(Ok(())).unwrap();
+        });
+        let manager = HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1));
+
+        manager.process_operation(operation).await.unwrap();
+        scheduler.await.unwrap();
+
+        assert!(db.get_job_history(8).unwrap().is_none());
+        assert!(!output_dir.exists());
+        assert_eq!(
+            db.list_history_delete_operations(false).unwrap()[0].state,
+            weaver_server_core::AsyncOperationState::Completed
+        );
     }
 }

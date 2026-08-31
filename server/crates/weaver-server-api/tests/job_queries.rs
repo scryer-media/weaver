@@ -1,6 +1,6 @@
 mod common;
 
-use common::{TestHarness, assert_no_errors, response_data};
+use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 use tokio::time::{Duration, sleep};
 use weaver_server_core::{CLIENT_REQUEST_ID_ATTRIBUTE_KEY, JobHistoryRow};
 
@@ -958,6 +958,169 @@ async fn history_page_remains_paged_after_deleting_the_first_page() {
 // History Delete
 // ---------------------------------------------------------------------------
 
+fn assert_file_delete_forbidden(response: &async_graphql::Response) {
+    assert_has_errors(response);
+    assert_eq!(
+        response.errors[0].message,
+        "admin scope required to delete completed files"
+    );
+    assert_eq!(
+        response.errors[0]
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get("code"))
+            .and_then(|value| match value {
+                async_graphql::Value::String(code) => Some(code.as_str()),
+                _ => None,
+            }),
+        Some("FORBIDDEN")
+    );
+}
+
+#[tokio::test]
+async fn control_scope_cannot_delete_completed_files_through_any_history_mutation() {
+    let mutations = [
+        (
+            "acceptHistoryDelete",
+            "mutation { acceptHistoryDelete(input: { mode: IDS, ids: [1, 2], deleteFiles: true }) { operationId } }",
+        ),
+        (
+            "deleteHistory",
+            "mutation { deleteHistory(id: 1, deleteFiles: true) { id } }",
+        ),
+        (
+            "deleteHistoryBatch",
+            "mutation { deleteHistoryBatch(ids: [1, 2], deleteFiles: true) { id } }",
+        ),
+        (
+            "deleteAllHistory",
+            "mutation { deleteAllHistory(deleteFiles: true) { id } }",
+        ),
+        (
+            "removeHistoryItems",
+            "mutation { removeHistoryItems(ids: [1, 2], deleteFiles: true) { success } }",
+        ),
+    ];
+
+    for (name, mutation) in mutations {
+        let h = TestHarness::new_without_history_delete_worker().await;
+        let output_root = tempfile::tempdir().unwrap();
+        for id in [1, 2] {
+            let output_dir = output_root.path().join(format!("job-{id}"));
+            std::fs::create_dir(&output_dir).unwrap();
+            std::fs::write(output_dir.join("payload.bin"), b"retained").unwrap();
+            let mut row =
+                sample_history_row(id, &format!("history-{id}"), "complete", 100 + id as i64);
+            row.output_dir = Some(output_dir.to_string_lossy().to_string());
+            h.insert_history_row(&row);
+        }
+
+        let response = h
+            .execute_as(mutation, weaver_server_core::auth::CallerScope::Control)
+            .await;
+        assert_file_delete_forbidden(&response);
+        assert!(
+            h.db.get_job_history(1).unwrap().is_some()
+                && h.db.get_job_history(2).unwrap().is_some(),
+            "{name} must reject atomically before removing history"
+        );
+        assert!(
+            output_root.path().join("job-1/payload.bin").is_file(),
+            "{name}"
+        );
+        assert!(
+            output_root.path().join("job-2/payload.bin").is_file(),
+            "{name}"
+        );
+        assert!(
+            h.db.list_history_delete_operations(false)
+                .unwrap()
+                .is_empty(),
+            "{name} must not queue a durable operation"
+        );
+        assert!(
+            h.db.list_history_delete_row_states(&[1, 2])
+                .unwrap()
+                .is_empty(),
+            "{name} must not lock history rows"
+        );
+    }
+}
+
+#[tokio::test]
+async fn control_scope_can_remove_history_without_deleting_completed_files() {
+    let h = TestHarness::new().await;
+    let output_root = tempfile::tempdir().unwrap();
+    let output_dir = output_root.path().join("completed-job");
+    std::fs::create_dir(&output_dir).unwrap();
+    std::fs::write(output_dir.join("payload.bin"), b"retained").unwrap();
+    let mut row = sample_history_row(1, "history-only", "complete", 101);
+    row.output_dir = Some(output_dir.to_string_lossy().to_string());
+    h.insert_history_row(&row);
+
+    let response = h
+        .execute_as(
+            "mutation { deleteHistory(id: 1, deleteFiles: false) { id } }",
+            weaver_server_core::auth::CallerScope::Control,
+        )
+        .await;
+
+    assert_no_errors(&response);
+    assert!(h.db.get_job_history(1).unwrap().is_none());
+    assert!(output_dir.join("payload.bin").is_file());
+}
+
+#[tokio::test]
+async fn admin_scope_deletes_completed_output_through_the_direct_path() {
+    let h = TestHarness::new().await;
+    let output_root = tempfile::tempdir().unwrap();
+    let output_dir = output_root.path().join("completed-job");
+    std::fs::create_dir(&output_dir).unwrap();
+    std::fs::write(output_dir.join("payload.bin"), b"delete me").unwrap();
+    let mut row = sample_history_row(1, "admin-direct", "complete", 101);
+    row.output_dir = Some(output_dir.to_string_lossy().to_string());
+    h.insert_history_row(&row);
+
+    let response = h
+        .execute_as(
+            "mutation { deleteHistory(id: 1, deleteFiles: true) { id } }",
+            weaver_server_core::auth::CallerScope::Admin,
+        )
+        .await;
+
+    assert_no_errors(&response);
+    assert!(h.db.get_job_history(1).unwrap().is_none());
+    assert!(!output_dir.exists());
+}
+
+#[tokio::test]
+async fn authorized_durable_file_delete_removes_completed_output() {
+    let h = TestHarness::new().await;
+    let output_root = tempfile::tempdir().unwrap();
+    let output_dir = output_root.path().join("completed-job");
+    std::fs::create_dir(&output_dir).unwrap();
+    std::fs::write(output_dir.join("payload.bin"), b"delete me").unwrap();
+    let mut row = sample_history_row(1, "durable-local", "complete", 101);
+    row.output_dir = Some(output_dir.to_string_lossy().to_string());
+    h.insert_history_row(&row);
+
+    let response = h
+        .execute(
+            "mutation { acceptHistoryDelete(input: { mode: IDS, ids: [1], deleteFiles: true }) { operationId } }",
+        )
+        .await;
+    assert_no_errors(&response);
+
+    for _ in 0..20 {
+        if h.db.get_job_history(1).unwrap().is_none() && !output_dir.exists() {
+            return;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!("authorized durable delete did not remove the history row and output directory");
+}
+
 #[tokio::test]
 async fn delete_history_nonexistent() {
     let h = TestHarness::new().await;
@@ -1005,7 +1168,7 @@ async fn history_page_exposes_delete_operation_state() {
         1_700_000_001,
     ));
     let operation_id =
-        h.db.insert_history_delete_operation(&[1], true)
+        h.db.insert_history_delete_operation(&[1], true, true)
             .expect("failed to seed delete operation");
 
     let resp = h
@@ -1053,7 +1216,7 @@ async fn job_detail_snapshot_exposes_history_delete_state() {
         1_700_000_007,
     ));
     let operation_id =
-        h.db.insert_history_delete_operation(&[7], false)
+        h.db.insert_history_delete_operation(&[7], false, false)
             .expect("failed to seed delete operation");
 
     let resp = h
@@ -1178,7 +1341,7 @@ async fn accept_history_delete_conflicts_with_locked_rows() {
         "complete",
         1_700_000_022,
     ));
-    h.db.insert_history_delete_operation(&[21], false)
+    h.db.insert_history_delete_operation(&[21], false, false)
         .expect("failed to seed locked delete operation");
 
     let resp = h

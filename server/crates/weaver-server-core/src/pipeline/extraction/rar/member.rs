@@ -5,7 +5,7 @@ use super::readahead::ReadaheadVolumeProvider;
 use super::source::BoundedRarSourcePool;
 use super::*;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Once, OnceLock};
 
 pub(crate) struct RarExtractionContext<'a> {
     pub(crate) volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
@@ -101,6 +101,15 @@ struct RarDictionaryLimit {
     max_dict_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RarProcessPolicy {
+    effective_memory_bytes: Option<u64>,
+    requested_max_dict_bytes: Option<u64>,
+}
+
+static RAR_PROCESS_POLICY: OnceLock<RarProcessPolicy> = OnceLock::new();
+static RAR_DICT_CLAMP_WARNING: Once = Once::new();
+
 fn parse_rar_max_dict_request(value: Option<&str>) -> Result<Option<u64>, ()> {
     match value {
         None => Ok(None),
@@ -141,6 +150,25 @@ fn configured_rar_max_dict_request() -> Option<u64> {
     }
 }
 
+fn cached_rar_process_policy(
+    cache: &OnceLock<RarProcessPolicy>,
+    detect_total_memory_bytes: impl FnOnce() -> Option<u64>,
+    configured_rar_max_dict_request: impl FnOnce() -> Option<u64>,
+) -> &RarProcessPolicy {
+    cache.get_or_init(|| RarProcessPolicy {
+        effective_memory_bytes: detect_total_memory_bytes(),
+        requested_max_dict_bytes: configured_rar_max_dict_request(),
+    })
+}
+
+fn rar_process_policy() -> &'static RarProcessPolicy {
+    cached_rar_process_policy(
+        &RAR_PROCESS_POLICY,
+        crate::runtime::system_probe::detect_total_memory_bytes,
+        configured_rar_max_dict_request,
+    )
+}
+
 fn resolve_rar_dictionary_limit(
     effective_memory_bytes: Option<u64>,
     extraction_memory_limit: u64,
@@ -166,21 +194,24 @@ pub(crate) fn apply_server_rar_limits_with_memory_limit(
     archive: &mut unrar_rs::RarArchive,
     extraction_memory_limit: u64,
 ) -> u64 {
-    let requested_max_dict_bytes = configured_rar_max_dict_request();
+    let process_policy = rar_process_policy();
+    let requested_max_dict_bytes = process_policy.requested_max_dict_bytes;
     let resolved = resolve_rar_dictionary_limit(
-        crate::runtime::system_probe::detect_total_memory_bytes(),
+        process_policy.effective_memory_bytes,
         extraction_memory_limit,
         requested_max_dict_bytes,
     );
     if let Some(requested_max_dict_bytes) = requested_max_dict_bytes
         && requested_max_dict_bytes > resolved.memory_ceiling_bytes
     {
-        tracing::warn!(
-            env = RAR_MAX_DICT_ENV,
-            requested_max_dict_bytes,
-            memory_ceiling_bytes = resolved.memory_ceiling_bytes,
-            "RAR max dictionary override exceeds the available extraction memory and was clamped"
-        );
+        RAR_DICT_CLAMP_WARNING.call_once(|| {
+            tracing::warn!(
+                env = RAR_MAX_DICT_ENV,
+                requested_max_dict_bytes,
+                memory_ceiling_bytes = resolved.memory_ceiling_bytes,
+                "RAR max dictionary override exceeds the available extraction memory and was clamped"
+            );
+        });
     }
     let limits = unrar_rs::Limits {
         max_dict_size: resolved.max_dict_bytes,
@@ -1459,6 +1490,44 @@ mod tests {
         );
         assert_eq!(parse_rar_max_dict_request(Some("0")), Err(()));
         assert_eq!(parse_rar_max_dict_request(Some("not-a-number")), Err(()));
+    }
+
+    #[test]
+    fn rar_process_policy_is_cached_across_password_attempts() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        let cache = OnceLock::new();
+        let memory_probes = std::sync::atomic::AtomicUsize::new(0);
+        let environment_reads = std::sync::atomic::AtomicUsize::new(0);
+
+        for _password in ["first", "second", "third"] {
+            let policy = cached_rar_process_policy(
+                &cache,
+                || {
+                    memory_probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(16 * GIB)
+                },
+                || {
+                    environment_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(2 * GIB)
+                },
+            );
+            assert_eq!(
+                resolve_rar_dictionary_limit(
+                    policy.effective_memory_bytes,
+                    4 * GIB,
+                    policy.requested_max_dict_bytes,
+                )
+                .max_dict_bytes,
+                2 * GIB
+            );
+        }
+
+        assert_eq!(memory_probes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            environment_reads.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]

@@ -2876,6 +2876,135 @@ async fn uu_segments_park_until_their_prefix_arrives() {
 }
 
 #[tokio::test]
+async fn uu_spills_reassemble_before_obfuscated_sfv_verification() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.write_backlog_budget_bytes = 1;
+
+    let job_id = JobId(20169);
+    let payload_filename = "silver-horizon.bin";
+    let listing_filename = "oBfU5CaTeD-0001";
+    let parts = [vec![b'a'; 80], vec![b'b'; 90], vec![b'c'; 100]];
+    let payload = parts.concat();
+    let listing = format!(
+        "{payload_filename} {:08x}\n",
+        par2_rs::checksum::crc32(&payload)
+    );
+    let declared_sizes = parts
+        .iter()
+        .map(|part| (part.len() as f64 * 1.38).ceil() as u32)
+        .collect::<Vec<_>>();
+    let mut spec = standalone_job_spec(
+        "UU Spill Then Obfuscated SFV",
+        &[
+            (payload_filename.to_string(), declared_sizes[0]),
+            (listing_filename.to_string(), listing.len() as u32),
+        ],
+    );
+    let payload_file = &mut spec.files[0];
+    payload_file.segments.clear();
+    for (index, bytes) in declared_sizes.iter().enumerate() {
+        payload_file.segments.push(segment_spec! {
+            number: index as u32,
+            bytes: *bytes,
+            message_id: format!("uu-sfv-{index}@example.com"),
+        });
+    }
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let payload_file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_uu_segment_named(
+        &mut pipeline,
+        payload_file_id,
+        2,
+        &parts[2],
+        false,
+        true,
+        payload_filename,
+    )
+    .await;
+    submit_uu_segment_named(
+        &mut pipeline,
+        payload_file_id,
+        1,
+        &parts[1],
+        false,
+        false,
+        payload_filename,
+    )
+    .await;
+
+    let first_spool = match pipeline
+        .uu_files
+        .get(&payload_file_id)
+        .and_then(|uu| uu.parked.get(&1))
+    {
+        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        _ => panic!("part 1 must spill while the prefix is missing"),
+    };
+    let second_spool = match pipeline
+        .uu_files
+        .get(&payload_file_id)
+        .and_then(|uu| uu.parked.get(&2))
+    {
+        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        _ => panic!("part 2 must spill while the prefix is missing"),
+    };
+    assert_eq!(std::fs::read(&first_spool).unwrap(), parts[1]);
+    assert_eq!(std::fs::read(&second_spool).unwrap(), parts[2]);
+    assert_eq!(pipeline.uu_spooled_bytes, parts[1].len() + parts[2].len());
+    assert_eq!(pipeline.uu_spooled_segments, 2);
+
+    submit_uu_segment_named(
+        &mut pipeline,
+        payload_file_id,
+        0,
+        &parts[0],
+        false,
+        false,
+        payload_filename,
+    )
+    .await;
+    assert_eq!(
+        tokio::fs::read(working_dir.join(payload_filename))
+            .await
+            .unwrap(),
+        payload
+    );
+    assert_eq!(pipeline.uu_spooled_bytes, 0);
+    assert_eq!(pipeline.uu_spooled_segments, 0);
+
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        1,
+        listing_filename,
+        listing.as_bytes(),
+    )
+    .await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.download_queue = DownloadQueue::new();
+    state.recovery_queue = DownloadQueue::new();
+    state.status = JobStatus::Downloading;
+    state.refresh_runtime_lanes_from_status();
+
+    pipeline.check_job_completion(job_id).await;
+
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "reassembled UU payload must pass its obfuscated SFV listing"
+    );
+    assert_eq!(pipeline.sfv_verify_read_splits, vec![(0usize, 1usize)]);
+    assert!(pipeline.jobs_with_verification_outcome.contains(&job_id));
+}
+
+#[tokio::test]
 async fn uu_park_spills_after_resident_budget_and_drains_in_order() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

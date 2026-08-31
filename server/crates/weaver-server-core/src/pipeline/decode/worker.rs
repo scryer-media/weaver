@@ -2062,7 +2062,10 @@ impl Pipeline {
                 .prefix(UU_SPOOL_FILE_PREFIX)
                 .tempfile_in(&spool_dir)?;
             data.write_to(file.as_file_mut())?;
-            file.as_file_mut().sync_all()?;
+            // This is a transient reorder spool, not crash-durable storage.
+            // `into_temp_path` closes the completed file before publishing
+            // it to the park; readers therefore only observe a full write
+            // without serializing every ahead-of-cursor segment on `sync_all`.
             Ok::<_, io::Error>(UuParkedEntry::Spilled {
                 path: file.into_temp_path(),
                 decoded_bytes,

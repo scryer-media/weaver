@@ -19,6 +19,7 @@ use crate::settings::SharedConfig;
 use crate::{Database, RssFeedRow, RssRuleRow, RssSeenItemRow};
 
 const MAX_RSS_REDIRECTS: usize = 10;
+pub(super) const MAX_RSS_FEED_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct RssFeedSyncReport {
@@ -187,9 +188,10 @@ impl RssService {
         url: &str,
         conditional: bool,
     ) -> Result<reqwest::Response, RssServiceError> {
-        let original_url =
+        let feed_url =
+            reqwest::Url::parse(&feed.url).map_err(|e| RssServiceError::Http(e.to_string()))?;
+        let mut current_url =
             reqwest::Url::parse(url).map_err(|e| RssServiceError::Http(e.to_string()))?;
-        let mut current_url = original_url.clone();
 
         for redirect_count in 0..=MAX_RSS_REDIRECTS {
             let target =
@@ -208,7 +210,7 @@ impl RssService {
                 .map_err(|e| RssServiceError::Http(e.to_string()))?;
 
             let mut request = client.get(target.url.clone());
-            if current_url.origin() == original_url.origin() {
+            if same_rss_origin(&current_url, &feed_url) {
                 request = apply_basic_auth(request, feed);
             }
             if conditional && redirect_count == 0 {
@@ -276,7 +278,16 @@ impl RssService {
     }
 }
 
-async fn read_response_with_limit(
+fn same_rss_origin(request_url: &reqwest::Url, feed_url: &reqwest::Url) -> bool {
+    request_url.scheme() == feed_url.scheme()
+        && request_url
+            .host_str()
+            .zip(feed_url.host_str())
+            .is_some_and(|(request_host, feed_host)| request_host.eq_ignore_ascii_case(feed_host))
+        && request_url.port_or_known_default() == feed_url.port_or_known_default()
+}
+
+pub(super) async fn read_response_with_limit(
     mut response: reqwest::Response,
     limit: u64,
 ) -> Result<Vec<u8>, String> {

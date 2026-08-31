@@ -382,7 +382,7 @@ impl RuntimeSecurityConfig {
                 ENV_NZB_DECOMPRESSED_LIMIT_BYTES,
                 DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES,
             )?,
-            rss_allow_private_network: parse_bool_env(ENV_RSS_ALLOW_PRIVATE_NETWORK, false)?,
+            rss_allow_private_network: parse_bool_env(ENV_RSS_ALLOW_PRIVATE_NETWORK, true)?,
             strict_security,
             trusted_cidrs: Arc::new(RwLock::new(trusted_cidrs)),
             // An env-pinned deployment has already declared its policy, so it
@@ -596,7 +596,7 @@ impl Default for RuntimeSecurityConfig {
             backup_upload_limit_bytes: DEFAULT_BACKUP_UPLOAD_LIMIT_BYTES,
             nzb_upload_limit_bytes: DEFAULT_NZB_UPLOAD_LIMIT_BYTES,
             nzb_decompressed_limit_bytes: DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES,
-            rss_allow_private_network: false,
+            rss_allow_private_network: true,
             strict_security: false,
             trusted_cidrs: Arc::new(RwLock::new(Vec::new())),
             security_configured: Arc::new(AtomicBool::new(false)),
@@ -1119,9 +1119,23 @@ mod tests {
             config.nzb_decompressed_limit_bytes,
             DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES
         );
-        assert!(!config.rss_allow_private_network);
+        assert!(config.rss_allow_private_network);
         assert!(!config.strict_security);
         assert!(!config.security_configured());
+    }
+
+    #[test]
+    fn security_env_can_disable_private_rss_fetching() {
+        let _guard = env_lock();
+        clear_env();
+        unsafe {
+            env::set_var(ENV_RSS_ALLOW_PRIVATE_NETWORK, "false");
+        }
+
+        let config = RuntimeSecurityConfig::from_env().unwrap();
+
+        assert!(!config.rss_allow_private_network);
+        clear_env();
     }
 
     #[test]

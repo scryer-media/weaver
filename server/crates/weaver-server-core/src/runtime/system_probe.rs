@@ -9,6 +9,7 @@ use std::path::Path;
 use std::path::{Component, PathBuf};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
+use std::sync::OnceLock;
 
 use super::system_profile::*;
 use tracing::debug;
@@ -176,19 +177,48 @@ fn detect_cgroup_cpu_limit() -> Option<f64> {
 // Memory
 // ---------------------------------------------------------------------------
 
-fn detect_memory() -> MemoryProfile {
-    let (total, available) = detect_memory_bytes().unwrap_or((
+#[derive(Clone, Copy, Debug)]
+struct ProcessMemoryFacts {
+    memory_bytes: Option<(u64, u64)>,
+    cgroup_limit: Option<u64>,
+}
+
+static PROCESS_MEMORY_FACTS: OnceLock<ProcessMemoryFacts> = OnceLock::new();
+
+fn cached_process_memory_facts(
+    cache: &OnceLock<ProcessMemoryFacts>,
+    detect_memory_bytes: impl FnOnce() -> Option<(u64, u64)>,
+    detect_cgroup_memory_limit: impl FnOnce() -> Option<u64>,
+) -> &ProcessMemoryFacts {
+    cache.get_or_init(|| ProcessMemoryFacts {
+        memory_bytes: detect_memory_bytes(),
+        cgroup_limit: detect_cgroup_memory_limit(),
+    })
+}
+
+fn process_memory_facts() -> &'static ProcessMemoryFacts {
+    cached_process_memory_facts(
+        &PROCESS_MEMORY_FACTS,
+        detect_memory_bytes,
+        detect_cgroup_memory_limit,
+    )
+}
+
+fn memory_profile_from_facts(facts: &ProcessMemoryFacts) -> MemoryProfile {
+    let (total, available) = facts.memory_bytes.unwrap_or((
         16 * 1024 * 1024 * 1024, // 16 GiB default
         8 * 1024 * 1024 * 1024,  // 8 GiB default
     ));
 
-    let cgroup_limit = detect_cgroup_memory_limit();
-
     MemoryProfile {
         total_bytes: total,
         available_bytes: available,
-        cgroup_limit,
+        cgroup_limit: facts.cgroup_limit,
     }
+}
+
+fn detect_memory() -> MemoryProfile {
+    memory_profile_from_facts(process_memory_facts())
 }
 
 /// Total memory the process can actually use: physical total, clamped by any
@@ -196,8 +226,9 @@ fn detect_memory() -> MemoryProfile {
 /// budget). Used for memory-scaled policy defaults (e.g. the RAR
 /// dictionary-size ceiling).
 pub(crate) fn detect_total_memory_bytes() -> Option<u64> {
-    let total = detect_memory_bytes().map(|(total, _)| total)?;
-    Some(match detect_cgroup_memory_limit() {
+    let facts = process_memory_facts();
+    let total = facts.memory_bytes.map(|(total, _)| total)?;
+    Some(match facts.cgroup_limit {
         Some(limit) => total.min(limit),
         None => total,
     })
