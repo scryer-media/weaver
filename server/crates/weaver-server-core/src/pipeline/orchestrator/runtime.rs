@@ -1,5 +1,25 @@
 use super::*;
 
+const UU_SPOOL_MIN_BYTES: usize = 64 * 1024 * 1024;
+const UU_SPOOL_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const UU_SPOOL_WRITE_BACKLOG_MULTIPLIER: usize = 8;
+const UU_SPOOL_MIN_SEGMENTS: usize = 1_024;
+const UU_SPOOL_MAX_SEGMENTS: usize = 16_384;
+const UU_SPOOL_SEGMENT_MULTIPLIER: usize = 64;
+const UU_SPOOL_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
+
+fn compute_uu_spool_max_bytes(write_backlog_budget_bytes: usize) -> usize {
+    write_backlog_budget_bytes
+        .saturating_mul(UU_SPOOL_WRITE_BACKLOG_MULTIPLIER)
+        .clamp(UU_SPOOL_MIN_BYTES, UU_SPOOL_MAX_BYTES)
+}
+
+fn compute_uu_spool_max_segments(write_buf_max_pending: usize) -> usize {
+    write_buf_max_pending
+        .saturating_mul(UU_SPOOL_SEGMENT_MULTIPLIER)
+        .clamp(UU_SPOOL_MIN_SEGMENTS, UU_SPOOL_MAX_SEGMENTS)
+}
+
 impl Pipeline {
     const METRICS_SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
     const STATE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -192,6 +212,13 @@ impl Pipeline {
             complete_dir,
             nzb_dir: data_dir.join(".weaver-nzbs"),
             uu_spool_root,
+            uu_spool_max_bytes: compute_uu_spool_max_bytes(write_backlog_budget_bytes),
+            uu_spool_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
+            uu_spool_min_free_bytes: UU_SPOOL_MIN_FREE_BYTES,
+            uu_spool_last_free_space_check: None,
+            uu_spool_available_bytes: None,
+            #[cfg(test)]
+            uu_spool_available_bytes_for_test: None,
             pending_file_progress: HashMap::new(),
             persisted_file_progress: HashMap::new(),
             file_hash_states: HashMap::new(),
@@ -307,6 +334,7 @@ impl Pipeline {
             write_buffered_segments: 0,
             uu_spooled_bytes: 0,
             uu_spooled_segments: 0,
+            uu_parked_segments: 0,
             write_buffers: HashMap::new(),
             file_prefix_16k: HashMap::new(),
             file_declared_size: HashMap::new(),

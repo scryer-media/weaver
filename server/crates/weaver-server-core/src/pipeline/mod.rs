@@ -2779,8 +2779,26 @@ pub struct Pipeline {
     pub(super) uu_spooled_bytes: usize,
     /// Disk-backed uuencode segment count waiting for their missing prefix.
     pub(super) uu_spooled_segments: usize,
+    /// Every UU part held ahead of its cursor, regardless of storage form.
+    ///
+    /// This bounds map and temporary-path overhead even when decoded bytes are
+    /// tiny.
+    pub(super) uu_parked_segments: usize,
     /// Reserved transient spool root below the configured intermediate directory.
     pub(super) uu_spool_root: PathBuf,
+    /// Aggregate disk-backed UU byte admission limit.
+    pub(super) uu_spool_max_bytes: usize,
+    /// Aggregate ahead-of-cursor UU entry admission limit.
+    pub(super) uu_spool_max_segments: usize,
+    /// Free space preserved on the intermediate filesystem while spilling UU.
+    pub(super) uu_spool_min_free_bytes: u64,
+    /// Most recent free-space sample for the spool filesystem.
+    pub(super) uu_spool_last_free_space_check: Option<Instant>,
+    /// Cached available bytes for the spool filesystem; `None` means unknown.
+    pub(super) uu_spool_available_bytes: Option<u64>,
+    #[cfg(test)]
+    /// Test-only free-space result; `Some(None)` exercises a failed probe.
+    pub(super) uu_spool_available_bytes_for_test: Option<Option<u64>>,
     /// Per-file write reorder buffers for decoded segments waiting on write order.
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
     /// The first [`PAR2_HASH_16K_BYTES`] decoded bytes of each file, anchored at

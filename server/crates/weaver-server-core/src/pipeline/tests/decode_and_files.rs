@@ -2857,6 +2857,7 @@ async fn uu_segments_park_until_their_prefix_arrives() {
     );
     assert_eq!(pipeline.uu_spooled_bytes, 0);
     assert_eq!(pipeline.uu_spooled_segments, 0);
+    assert_eq!(pipeline.uu_parked_segments, 2);
 
     submit_uu_segment(&mut pipeline, file_id, 0, &parts[0], false, false).await;
 
@@ -2866,6 +2867,7 @@ async fn uu_segments_park_until_their_prefix_arrives() {
     assert_eq!(written, parts.concat());
     assert_eq!(pipeline.write_buffered_bytes, 0);
     assert_eq!(pipeline.uu_spooled_bytes, 0);
+    assert_eq!(pipeline.uu_parked_segments, 0);
     assert_eq!(
         pipeline.metrics.write_pending_bytes.load(Ordering::Relaxed),
         0
@@ -2907,6 +2909,7 @@ async fn uu_park_spills_after_resident_budget_and_drains_in_order() {
     assert_eq!(pipeline.write_buffered_bytes, parts[2].len());
     assert_eq!(pipeline.uu_spooled_bytes, parts[1].len());
     assert_eq!(pipeline.uu_spooled_segments, 1);
+    assert_eq!(pipeline.uu_parked_segments, 2);
     assert_eq!(
         pipeline.metrics.write_pending_bytes.load(Ordering::Relaxed),
         (parts[1].len() + parts[2].len()) as u64
@@ -2938,11 +2941,55 @@ async fn uu_park_spills_after_resident_budget_and_drains_in_order() {
     assert_eq!(pipeline.write_buffered_bytes, 0);
     assert_eq!(pipeline.uu_spooled_bytes, 0);
     assert_eq!(pipeline.uu_spooled_segments, 0);
+    assert_eq!(pipeline.uu_parked_segments, 0);
     assert!(!pipeline.uu_spool_root.join(job_id.0.to_string()).exists());
     assert_eq!(
         pipeline.metrics.write_pending_bytes.load(Ordering::Relaxed),
         0
     );
+}
+
+#[tokio::test]
+async fn uu_park_admission_requeues_ahead_parts_at_byte_segment_and_disk_limits() {
+    let parts: Vec<Vec<u8>> = vec![vec![b'a'; 80], vec![b'b'; 90]];
+    for (case, max_bytes, max_segments, available_bytes) in [
+        ("byte", parts[1].len() - 1, usize::MAX, u64::MAX),
+        ("segment", usize::MAX, 0, u64::MAX),
+        ("disk", usize::MAX, usize::MAX, 0),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.write_backlog_budget_bytes = 1;
+        pipeline.uu_spool_max_bytes = max_bytes;
+        pipeline.uu_spool_max_segments = max_segments;
+        pipeline.uu_spool_available_bytes_for_test = Some(Some(available_bytes));
+        let job_id = JobId(20180 + u64::from(case == "segment") + 2 * u64::from(case == "disk"));
+        insert_active_job(
+            &mut pipeline,
+            job_id,
+            uu_job_spec(&parts.iter().map(|part| part.len()).collect::<Vec<_>>()),
+        )
+        .await;
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+
+        submit_uu_segment(&mut pipeline, file_id, 1, &parts[1], false, true).await;
+
+        assert_eq!(
+            pipeline.uu_files.get(&file_id).map(|uu| uu.parked.len()),
+            Some(0),
+            "{case} admission cap must not retain the ahead part"
+        );
+        assert_eq!(pipeline.uu_spooled_bytes, 0, "{case}");
+        assert_eq!(pipeline.uu_spooled_segments, 0, "{case}");
+        assert_eq!(pipeline.uu_parked_segments, 0, "{case}");
+        assert!(
+            !pipeline.uu_spool_root.join(job_id.0.to_string()).exists(),
+            "{case} admission cap must not create a spool directory"
+        );
+    }
 }
 
 #[tokio::test]

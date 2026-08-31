@@ -2091,6 +2091,7 @@ impl Pipeline {
                 remove_empty_uu_park_dir(&self.uu_spool_root, job_id);
             }
         }
+        self.release_uu_parked_segment();
     }
 
     /// Store an ahead-of-cursor part after its memory-or-disk form has been
@@ -2105,10 +2106,20 @@ impl Pipeline {
         let max_pending = self.write_buf_max_pending;
         let decoded_bytes = data.len_bytes();
         let projected_resident = self.write_buffered_bytes.saturating_add(decoded_bytes);
-        let entry = if projected_resident < self.write_backlog_budget_bytes {
-            UuParkedEntry::Memory(data)
-        } else {
+        let spills = projected_resident >= self.write_backlog_budget_bytes;
+        if self.uu_spool_admission_capped(0)
+            || (spills && self.uu_spool_admission_capped(decoded_bytes))
+        {
+            // The part is already decoded, but holding it would exceed the
+            // aggregate cache cap or consume the intermediate filesystem's
+            // reserved free space. Requeue without retry burn, exactly like a
+            // per-file farthest-part displacement.
+            return Ok(vec![segment_number]);
+        }
+        let entry = if spills {
             self.spill_uu_segment(file_id, data).await?
+        } else {
+            UuParkedEntry::Memory(data)
         };
         let inserted_spilled = entry.is_spilled();
         let inserted_bytes = entry.decoded_bytes();
@@ -2138,6 +2149,7 @@ impl Pipeline {
         } else {
             self.note_write_buffered(inserted_bytes, 1);
         }
+        self.note_uu_parked_segment();
         if let Some(entry) = replacement {
             self.release_uu_parked_entry(file_id.job_id, entry);
         }
@@ -2255,6 +2267,7 @@ impl Pipeline {
         match entry {
             UuParkedEntry::Memory(data) => {
                 self.release_write_buffered(data.len_bytes(), 1);
+                self.release_uu_parked_segment();
                 Ok(Some((index, data)))
             }
             UuParkedEntry::Spilled {
@@ -2265,6 +2278,7 @@ impl Pipeline {
                 // recorded decoded length, rather than file metadata, bounds
                 // allocation and validates the entire spool contents.
                 self.release_uu_spooled(decoded_bytes, 1);
+                self.release_uu_parked_segment();
                 let read_result = tokio::task::spawn_blocking(move || {
                     let read_result = (|| -> io::Result<DecodedChunk> {
                         let mut file = File::open(&path)?;
@@ -2370,6 +2384,9 @@ impl Pipeline {
         }
         if spooled_bytes > 0 || spooled_segments > 0 {
             self.release_uu_spooled(spooled_bytes, spooled_segments);
+        }
+        for _ in 0..memory_segments.saturating_add(spooled_segments) {
+            self.release_uu_parked_segment();
         }
         remove_empty_uu_park_dir(&self.uu_spool_root, file_id.job_id);
         if finished {

@@ -133,6 +133,8 @@ pub(crate) struct DownloadPressure {
     write_buffered_bytes: u64,
     /// Resident plus UU-spooled bytes: this controls soft pacing.
     write_pending_bytes: u64,
+    /// Aggregate UU spool admission is capped; only cursor-closing work may run.
+    uu_spool_admission_capped: bool,
     decode_hard_limit_bytes: u64,
     write_hard_limit_bytes: u64,
 }
