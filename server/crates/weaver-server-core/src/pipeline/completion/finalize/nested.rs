@@ -175,7 +175,7 @@ impl Pipeline {
                 file.detected_archive = Some(crate::jobs::assembly::DetectedArchiveIdentity {
                     kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
                     set_name: set_key,
-                    volume_index: Some(facts.volume_number),
+                    volume_index: facts.volume_number,
                 });
                 continue;
             }

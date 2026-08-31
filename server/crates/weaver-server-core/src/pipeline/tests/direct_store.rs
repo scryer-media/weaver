@@ -12646,12 +12646,12 @@ const TEST_RAR4_SALT: [u8; 8] = [0x9B; 8];
 ///
 /// RAR4 has no per-volume number anywhere else — RAR5 carries one in the main
 /// header, RAR4 carries it in `ENDARC` behind the `VOLUME_NUMBER` flag — and
-/// `unrar-rs` reads `RarVolumeFacts::volume_number` from exactly there. The
-/// **conventional** path keys its whole per-set volume map by that number
-/// (`persist_rar_volume_facts`), so a set whose volumes all report volume 0
-/// collapses into one entry and never assembles. Direct-store does not care:
-/// it numbers volumes by NZB file index, which is why the plaintext RAR4
-/// fixture gets away without this. A *differential* needs both halves to work.
+/// `unrar-rs` reads `RarVolumeFacts::volume_number` from exactly there. Both
+/// halves of a differential key volumes by the layout rather than by that
+/// parsed number (an old-numbering set states none at all), but a numbered end
+/// record is what modern RAR4 writers emit for `.partNN` sets, and it is the
+/// cross-check the conventional path (`persist_rar_volume_facts`) holds the
+/// layout against — so the realistic fixture states it.
 fn build_test_rar4_end_header_numbered(more_volumes: bool, volume: u16) -> Vec<u8> {
     let mut flags: u16 = 0x0004; // VOLUME_NUMBER
     if more_volumes {

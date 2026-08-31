@@ -3173,16 +3173,18 @@ impl DirectSetRouter {
         // disagree about what this file is. Nothing can reconcile that — one
         // of them is describing a different file — so the set demotes before
         // the layout adopts a member from the wrong position. An absent number
-        // parses as zero and stays silent (every unnumbered RAR4 volume would
-        // otherwise demote), with one exception the format guarantees: a RAR5
-        // *set member* always declares a nonzero number past the first volume,
-        // so zero under a nonzero binding is itself a disagreement.
+        // stays silent (every unnumbered RAR4 volume would otherwise demote),
+        // with one exception the format guarantees: a RAR5 *set member* always
+        // declares its number past the first volume, so an absent number under
+        // a nonzero binding is itself a disagreement — and a stated number
+        // that disagrees demotes even when what it states is zero.
         if self.plan.identity.is_some() {
-            let declared_disagrees =
-                facts.volume_number != volume_index && facts.volume_number != 0;
+            let declared_disagrees = facts
+                .volume_number
+                .is_some_and(|stated| stated != volume_index);
             let rar5_missing_number = facts.archive_format() == ArchiveFormat::Rar5
                 && facts.is_volume
-                && facts.volume_number == 0
+                && facts.volume_number.is_none()
                 && volume_index != 0;
             if declared_disagrees || rar5_missing_number {
                 return Err(self.fail(DemotionReason::IdentityVolumeMismatch));

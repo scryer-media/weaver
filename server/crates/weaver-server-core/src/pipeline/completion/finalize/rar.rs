@@ -1338,7 +1338,23 @@ impl Pipeline {
                 let facts =
                     Self::parse_rar_volume_facts_from_path(path, password_candidates.clone())
                         .await?;
-                restored.push((facts.volume_number, relative_path, facts));
+                // The restored file's name is the layout's statement of which
+                // volume this is. Registration keys by the header's stated
+                // number when the format states one and by this layout claim
+                // otherwise — without the layout claim, an old-numbering RAR4
+                // volume (whose headers state nothing) would register as 0.
+                let layout_volume = std::path::Path::new(&relative_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(weaver_model::files::FileRole::from_filename)
+                    .and_then(|role| match role {
+                        weaver_model::files::FileRole::RarVolume { volume_number } => {
+                            Some(volume_number)
+                        }
+                        _ => None,
+                    });
+                let registered_volume = Self::rar_registration_volume(layout_volume, &facts);
+                restored.push((registered_volume, relative_path, facts));
             }
 
             if restored.is_empty() {

@@ -817,7 +817,7 @@ fn build_plan_blocks_ready_member_when_present_same_name_continuation_is_uninteg
 
     let mut unintegrated_tail =
         RarArchive::parse_volume_facts(Cursor::new(files[4].1.clone()), None).unwrap();
-    unintegrated_tail.volume_number = 5;
+    unintegrated_tail.volume_number = Some(5);
     for member in &mut unintegrated_tail.members {
         member.split_before = true;
         member.split_after = false;

@@ -695,6 +695,26 @@ impl Pipeline {
         .map_err(|e| format!("RAR facts parser task panicked: {e}"))?
     }
 
+    /// The ledger key for one parsed volume.
+    ///
+    /// The header's stated number when the format states one — a swapped or
+    /// misnamed arrival registers as what its bytes are, not what the filename
+    /// claims — and the layout-derived volume otherwise. RAR5 states a number
+    /// in the main header of every volume past the first and a numbered RAR4
+    /// set states one in its end record; an old-numbering RAR4 set (.rar/.rNN)
+    /// states none anywhere, and treating an unstated number as an identity
+    /// collapses the whole set onto one key. `None` is the format staying
+    /// silent; a stated `Some(0)` wins like any other stated number.
+    pub(in crate::pipeline) fn rar_registration_volume(
+        observed_volume: Option<u32>,
+        facts: &unrar_rs::RarVolumeFacts,
+    ) -> u32 {
+        match facts.volume_number {
+            Some(stated) => stated,
+            None => observed_volume.unwrap_or(0),
+        }
+    }
+
     pub(crate) fn persist_rar_volume_facts(
         &mut self,
         job_id: JobId,
@@ -703,23 +723,25 @@ impl Pipeline {
         observed_volume: Option<u32>,
         facts: unrar_rs::RarVolumeFacts,
     ) -> Result<bool, String> {
+        let volume = Self::rar_registration_volume(observed_volume, &facts);
         if let Some(expected_volume) = observed_volume
-            && facts.volume_number != expected_volume
+            && let Some(stated_volume) = facts.volume_number
+            && stated_volume != expected_volume
         {
             info!(
                 job_id = job_id.0,
                 set_name = %set_name,
                 filename = %filename,
                 expected_volume,
-                parsed_volume = facts.volume_number,
-                "RAR facts parse detected filename-to-volume mismatch"
+                parsed_volume = stated_volume,
+                "RAR header states a volume number that disagrees with the layout; the header wins"
             );
         }
 
         let state_key = (job_id, set_name.to_string());
         let unchanged = self.rar_sets.get(&state_key).is_some_and(|state| {
-            state.facts.get(&facts.volume_number) == Some(&facts)
-                && state.volume_files.get(&facts.volume_number) == Some(&filename.to_string())
+            state.facts.get(&volume) == Some(&facts)
+                && state.volume_files.get(&volume) == Some(&filename.to_string())
         });
         if unchanged {
             return Ok(false);
@@ -728,12 +750,12 @@ impl Pipeline {
         let encoded = rmp_serde::to_vec_named(&facts)
             .map_err(|error| format!("failed to encode RAR volume facts: {error}"))?;
         self.db
-            .save_rar_volume_facts(job_id, set_name, facts.volume_number, &encoded)
+            .save_rar_volume_facts(job_id, set_name, volume, &encoded)
             .map_err(|error| format!("failed to persist RAR volume facts: {error}"))?;
 
         let state = self.rar_sets.entry(state_key).or_default();
-        Self::register_rar_volume_file(state, facts.volume_number, filename.to_string());
-        state.facts.insert(facts.volume_number, facts);
+        Self::register_rar_volume_file(state, volume, filename.to_string());
+        state.facts.insert(volume, facts);
         state.facts_generation = state.facts_generation.wrapping_add(1);
 
         Ok(true)
@@ -1076,11 +1098,21 @@ impl Pipeline {
                 worker_active,
             )?;
 
+            // The archive's own presence set is the coverage this refresh can
+            // vouch for — every volume the loop above attached, refreshed, or
+            // added, plus any the cached header view already held.
+            let integrated_volumes: BTreeSet<u32> = archive
+                .present_volumes()
+                .into_iter()
+                .map(|volume| volume as u32)
+                .collect();
+
             Ok((
                 plan,
                 archive.serialize_headers(),
                 rebuild_source,
                 using_cached_headers,
+                integrated_volumes,
             ))
         };
 
@@ -1162,7 +1194,7 @@ impl Pipeline {
             }
         }
 
-        let (mut plan, mut headers, mut rebuild_source, mut used_cached_headers) =
+        let (mut plan, mut headers, mut rebuild_source, mut used_cached_headers, mut integrated) =
             attach_volumes_and_build_plan(
                 archive,
                 rebuild_source,
@@ -1186,7 +1218,13 @@ impl Pipeline {
             );
 
             let selection = open_from_volume_zero()?;
-            (plan, headers, rebuild_source, used_cached_headers) = attach_volumes_and_build_plan(
+            (
+                plan,
+                headers,
+                rebuild_source,
+                used_cached_headers,
+                integrated,
+            ) = attach_volumes_and_build_plan(
                 selection.value,
                 RarTopologyRebuildSource::VolumeZero,
                 false,
@@ -1213,7 +1251,13 @@ impl Pipeline {
             );
 
             let selection = open_from_volume_zero()?;
-            (plan, headers, rebuild_source, used_cached_headers) = attach_volumes_and_build_plan(
+            (
+                plan,
+                headers,
+                rebuild_source,
+                used_cached_headers,
+                integrated,
+            ) = attach_volumes_and_build_plan(
                 selection.value,
                 RarTopologyRebuildSource::VolumeZero,
                 false,
@@ -1232,6 +1276,7 @@ impl Pipeline {
             plan,
             headers,
             rebuild_source,
+            integrated_volumes: integrated,
         })
     }
 
@@ -1247,13 +1292,14 @@ impl Pipeline {
             rebuild_source = computed.rebuild_source.as_str(),
             "RAR plan rebuilt"
         );
-        let refreshed_volumes: BTreeSet<u32> = computed
-            .plan
-            .topology
-            .complete_volumes
-            .iter()
-            .copied()
-            .collect();
+        // Coverage is what the refresh integrated into the header view, not
+        // the plan's fact-derived `complete_volumes`. A restored job can hold
+        // every volume on disk while the facts ledger records only a prefix;
+        // measuring coverage by facts made `rar_member_refresh_request` demand
+        // a refresh no refresh could ever satisfy — a full-speed livelock.
+        // The integrated set is the quantity the demand is actually about:
+        // whether a rebuild has seen the member's span.
+        let refreshed_volumes = computed.integrated_volumes;
         let latest_refreshed_volume = refreshed_volumes.iter().next_back().copied().unwrap_or(0);
         self.set_rar_snapshot(job_id, set_name, computed.headers);
         self.apply_rar_plan(job_id, set_name, computed.plan);
@@ -1753,17 +1799,20 @@ impl Pipeline {
         for (expected_volume_number, filename, path) in volume_paths {
             let facts =
                 Self::parse_rar_volume_facts_from_path(path, password_candidates.clone()).await?;
-            if facts.volume_number != expected_volume_number {
+            if let Some(stated_volume) = facts.volume_number
+                && stated_volume != expected_volume_number
+            {
                 info!(
                     job_id = job_id.0,
                     set_name = %set_name,
                     filename = %filename,
                     expected_volume = expected_volume_number,
-                    parsed_volume = facts.volume_number,
+                    parsed_volume = stated_volume,
                     "RAR facts refresh detected volume-number mismatch after normalization"
                 );
             }
-            parsed.push((facts.volume_number, filename, facts));
+            let volume = Self::rar_registration_volume(Some(expected_volume_number), &facts);
+            parsed.push((volume, filename, facts));
         }
 
         let state = self
@@ -1927,16 +1976,23 @@ impl Pipeline {
             for (volume_index, blob) in facts_rows {
                 match rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob) {
                     Ok(facts) => {
-                        if facts.volume_number != volume_index {
+                        // The row key is the volume registration keyed by; the
+                        // blob's own number is whatever the header stated,
+                        // which for an old-numbering RAR4 set is nothing.
+                        // Re-keying by the blob would collapse every such row
+                        // onto one slot.
+                        if let Some(stated_volume) = facts.volume_number
+                            && stated_volume != volume_index
+                        {
                             warn!(
                                 job_id = job_id.0,
                                 set_name = %set_name,
                                 stored_volume = volume_index,
-                                parsed_volume = facts.volume_number,
-                                "persisted RAR facts volume key did not match parsed volume number"
+                                parsed_volume = stated_volume,
+                                "persisted RAR facts row key disagrees with the header's stated volume number"
                             );
                         }
-                        state.facts.insert(facts.volume_number, facts);
+                        state.facts.insert(volume_index, facts);
                     }
                     Err(error) => {
                         warn!(
@@ -1980,7 +2036,7 @@ impl Pipeline {
                     .assembly
                     .files()
                     .filter_map(|file_asm| {
-                        let weaver_model::files::FileRole::RarVolume { .. } =
+                        let weaver_model::files::FileRole::RarVolume { volume_number } =
                             self.classified_role_for_file(job_id, file_asm)
                         else {
                             return None;
@@ -1995,20 +2051,31 @@ impl Pipeline {
                         }
                         let current_filename = self.current_filename_for_file(job_id, file_asm);
                         let path = state.working_dir.join(&current_filename);
-                        path.exists().then_some((current_filename, path))
+                        path.exists()
+                            .then_some((volume_number, current_filename, path))
                     })
                     .collect::<Vec<_>>()
             };
             let mut live_volumes = HashSet::new();
-            for (filename, path) in volume_files {
+            for (layout_volume, filename, path) in volume_files {
                 match Self::parse_rar_volume_facts_from_path(path, password_candidates.clone())
                     .await
                 {
                     Ok(facts) => {
-                        live_volumes.insert(facts.volume_number);
+                        // Keyed exactly like registration: the stated number
+                        // when the header states one, the layout otherwise. An
+                        // old-numbering RAR4 header states no number and every
+                        // volume of the set parses as 0, so keying restore by
+                        // the parse alone folds the whole set onto one slot and
+                        // then discards every other loaded fact as "stale". The
+                        // fresh parse also replaces any loaded row outright — a
+                        // row mis-keyed by an older binary must not survive
+                        // under a key the header never earned.
+                        let volume = Self::rar_registration_volume(Some(layout_volume), &facts);
+                        live_volumes.insert(volume);
                         if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
-                            Self::register_rar_volume_file(state, facts.volume_number, filename);
-                            state.facts.entry(facts.volume_number).or_insert(facts);
+                            Self::register_rar_volume_file(state, volume, filename);
+                            state.facts.insert(volume, facts);
                         }
                     }
                     Err(error) => {
@@ -2117,7 +2184,11 @@ impl Pipeline {
 
         match Self::parse_rar_volume_facts_from_path(path, password_candidates).await {
             Ok(facts) => {
-                let parsed_volume = facts.volume_number;
+                // The key the facts registered under. Asking about the raw
+                // parsed number instead asks about volume 0 for every
+                // old-numbering RAR4 volume, whose headers state no number.
+                let registered_volume =
+                    Self::rar_registration_volume(Some(observed_volume), &facts);
                 let changed = match self.persist_rar_volume_facts(
                     job_id,
                     &set_name,
@@ -2129,7 +2200,7 @@ impl Pipeline {
                     Err(error) => {
                         warn!(
                             job_id = job_id.0,
-                            volume = parsed_volume,
+                            volume = registered_volume,
                             set_name = %set_name,
                             error = %error,
                             "failed to register RAR volume facts"
@@ -2139,7 +2210,7 @@ impl Pipeline {
                 };
                 debug!(
                     job_id = job_id.0,
-                    volume = parsed_volume,
+                    volume = registered_volume,
                     set_name = %set_name,
                     "RAR volume facts parsed"
                 );
@@ -2147,13 +2218,15 @@ impl Pipeline {
                     state
                         .assembly
                         .archive_topology_for(&set_name)
-                        .is_none_or(|topology| !topology.complete_volumes.contains(&parsed_volume))
+                        .is_none_or(|topology| {
+                            !topology.complete_volumes.contains(&registered_volume)
+                        })
                 });
                 if changed || topology_missing_volume {
                     self.enqueue_rar_set_refresh(
                         job_id,
                         &set_name,
-                        parsed_volume,
+                        registered_volume,
                         RefreshReason::CoverageExpansion,
                     );
                 }

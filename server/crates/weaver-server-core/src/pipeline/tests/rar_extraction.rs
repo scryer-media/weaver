@@ -1019,6 +1019,9 @@ async fn a_refresh_gap_the_plan_cannot_close_parks_instead_of_respawning() {
             headers: Vec::new(),
             rebuild_source:
                 crate::pipeline::archive::topology::RarTopologyRebuildSource::VolumeZero,
+            // The refresh saw only volume 0 — the same starved view the plan
+            // absorbed, so the facts stay unabsorbed round after round.
+            integrated_volumes: BTreeSet::from([0]),
         }
     };
     let request = RarRefreshRequest {
@@ -1130,6 +1133,7 @@ async fn rar_refresh_follow_up_does_not_starve_covered_ready_members() {
             .load_rar_snapshot(job_id, "show")
             .expect("RAR snapshot should exist after volumes 0-1"),
         rebuild_source: crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+        integrated_volumes: BTreeSet::from([0, 1]),
     };
     let request = RarRefreshRequest {
         target_completed_volume: 1,
@@ -1292,6 +1296,7 @@ async fn rar_refresh_done_uses_actual_refreshed_frontier() {
             .load_rar_snapshot(job_id, "show")
             .expect("RAR snapshot should exist"),
         rebuild_source: crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+        integrated_volumes: BTreeSet::from([0, 1]),
     };
 
     pipeline
@@ -1386,6 +1391,7 @@ async fn stale_post_extraction_refresh_does_not_replace_live_rar_plan() {
                 headers: stale_headers,
                 rebuild_source:
                     crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+                integrated_volumes: BTreeSet::new(),
             }),
         })
         .await;
@@ -1509,6 +1515,7 @@ async fn identity_rebind_rejects_an_older_rar_refresh_snapshot() {
                 headers: stale_headers.clone(),
                 rebuild_source:
                     crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+                integrated_volumes: BTreeSet::new(),
             }),
         })
         .await;
@@ -1608,6 +1615,7 @@ async fn source_retry_discards_an_in_flight_refresh_without_resurrecting_its_set
                 headers: stale_headers,
                 rebuild_source:
                     crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+                integrated_volumes: BTreeSet::new(),
             }),
         })
         .await;
@@ -10115,6 +10123,138 @@ async fn a_claimed_alias_set_is_absorbed_on_persisted_facts_after_a_restart() {
 }
 
 #[tokio::test]
+async fn a_refresh_that_integrated_a_members_span_satisfies_the_coverage_it_owed() {
+    // The job-11857 shape: a restored set holds every volume on disk while the
+    // facts ledger recorded only a prefix. Coverage measured by fact-backed
+    // `complete_volumes` makes `rar_member_refresh_request` demand a refresh
+    // that registers no fact and so can never answer the demand — a full-speed
+    // livelock. Coverage is what the refresh integrated into the header view;
+    // a rebuild that saw the member's whole span settles the demand it
+    // triggered.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90217);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Silver Horizon Prefix Facts",
+            &[("silver.horizon.mkv".to_string(), 64)],
+        ),
+    )
+    .await;
+
+    let set_name = "silver.horizon";
+    let member = "silver.horizon.mkv";
+    let topology = crate::jobs::assembly::ArchiveTopology {
+        archive_type: crate::jobs::assembly::ArchiveType::Rar,
+        volume_map: HashMap::from([
+            ("silver.horizon.rar".to_string(), 0),
+            ("silver.horizon.r00".to_string(), 1),
+            ("silver.horizon.r01".to_string(), 2),
+        ]),
+        // The ledger's view: only the prefix ever registered facts.
+        complete_volumes: [0u32, 1].into_iter().collect(),
+        expected_volume_count: Some(3),
+        members: vec![crate::jobs::assembly::ArchiveMember {
+            name: member.to_string(),
+            first_volume: 0,
+            last_volume: 2,
+            unpacked_size: 64,
+        }],
+        unresolved_spans: Vec::new(),
+    };
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .assembly
+        .set_archive_topology(set_name.to_string(), topology.clone());
+
+    let key = (job_id, set_name.to_string());
+    let mut set_state = crate::pipeline::archive::rar_state::RarSetState::default();
+    for (filename, volume) in &topology.volume_map {
+        set_state.volume_files.insert(*volume, filename.clone());
+    }
+    pipeline.rar_sets.insert(key.clone(), set_state);
+
+    let request = RarRefreshRequest {
+        target_completed_volume: 2,
+        reason: RefreshReason::CoverageExpansion,
+    };
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: Some(request),
+            queued: None,
+            latest_completed_volume: 2,
+            // The stale baseline a fact-derived measure produces.
+            refreshed_volumes: BTreeSet::from([0, 1]),
+            structure_dirty: false,
+            last_error: None,
+            last_completion_fingerprint: None,
+        },
+    );
+
+    assert!(
+        pipeline
+            .rar_member_refresh_request(job_id, set_name, member)
+            .is_some(),
+        "before the refresh lands, the member's span exceeds the recorded coverage"
+    );
+
+    pipeline
+        .handle_rar_refresh_done(RarRefreshDone {
+            job_id,
+            set_name: set_name.to_string(),
+            request,
+            extraction_generation: 0,
+            result: Ok(ComputedRarSetState {
+                plan: crate::pipeline::archive::rar_state::RarDerivedPlan {
+                    phase: crate::pipeline::archive::rar_state::RarSetPhase::Ready,
+                    is_solid: false,
+                    ready_members: vec![crate::pipeline::archive::rar_state::RarReadyMember {
+                        name: member.to_string(),
+                    }],
+                    member_names: vec![member.to_string()],
+                    member_dependencies: HashMap::new(),
+                    waiting_on_volumes: HashSet::new(),
+                    deletion_eligible: HashSet::new(),
+                    delete_decisions: BTreeMap::new(),
+                    topology: topology.clone(),
+                    fallback_reason: None,
+                },
+                headers: Vec::new(),
+                rebuild_source:
+                    crate::pipeline::archive::topology::RarTopologyRebuildSource::VolumeZero,
+                // What the rebuild actually opened: the whole set, facts or no
+                // facts.
+                integrated_volumes: BTreeSet::from([0, 1, 2]),
+            }),
+        })
+        .await;
+
+    let refresh = pipeline
+        .rar_refresh_state
+        .get(&key)
+        .expect("refresh state should remain");
+    assert_eq!(
+        refresh.refreshed_volumes,
+        BTreeSet::from([0, 1, 2]),
+        "coverage records what the refresh integrated, not what the facts ledger holds"
+    );
+    assert!(
+        refresh.in_flight.is_none() && refresh.queued.is_none(),
+        "a refresh that integrated the span leaves nothing owed — no respawn"
+    );
+    assert_eq!(
+        pipeline.rar_member_refresh_request(job_id, set_name, member),
+        None,
+        "the demand this refresh was spawned for is satisfied by its own completion"
+    );
+}
+
+#[tokio::test]
 async fn a_claimed_set_with_genuinely_missing_volumes_fails_once_instead_of_looping() {
     // Nothing was ever extracted for this job and nothing is on disk: the
     // volumes are simply absent. That is a real failure and it must be reported
@@ -10176,5 +10316,202 @@ async fn a_claimed_set_with_genuinely_missing_volumes_fails_once_instead_of_loop
     assert!(
         pipeline.pending_completion_checks.is_empty(),
         "a failed job holds no armed completion check"
+    );
+}
+
+/// A single stored member split across an **old-numbering** RAR4 set —
+/// `<base>.rar`, `<base>.r00`, `<base>.r01`, … — the one multi-volume RAR
+/// shape whose headers state no per-volume number anywhere: RAR4's main header
+/// has no number field (that is RAR5's), and these end records carry no
+/// `VOLUME_NUMBER` flag (a numbered `ENDARC` is what modern `.partNN` writers
+/// emit). Every volume of such a set parses as volume 0; only the filename
+/// says which volume a file is.
+fn single_member_rar4_old_numbering_set(
+    base: &str,
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+) -> Vec<(String, Vec<u8>)> {
+    let member_crc = checksum::crc32(payload);
+    let chunk = payload.len().div_ceil(volume_count);
+    (0..volume_count)
+        .map(|volume| {
+            let start = (volume * chunk).min(payload.len());
+            let end = ((volume + 1) * chunk).min(payload.len());
+            let part = &payload[start..end];
+            let is_first = volume == 0;
+            let is_last = volume + 1 == volume_count;
+            let mut split_flags = 0u16;
+            if !is_first {
+                split_flags |= 0x0001;
+            }
+            if !is_last {
+                split_flags |= 0x0002;
+            }
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&TEST_RAR4_SIG);
+            // VOLUME only — no NEW_NUMBERING, exactly like the old scheme.
+            bytes.extend_from_slice(&build_test_rar4_block(0x73, 0x0001, &[0u8; 6]));
+            bytes.extend_from_slice(&build_test_rar4_file_header(
+                member_name,
+                split_flags,
+                part.len() as u32,
+                payload.len() as u32,
+                if is_last {
+                    member_crc
+                } else {
+                    checksum::crc32(part)
+                },
+            ));
+            bytes.extend_from_slice(part);
+            bytes.extend_from_slice(&build_test_rar4_end_header(!is_last));
+            let filename = if is_first {
+                format!("{base}.rar")
+            } else {
+                format!("{base}.r{:02}", volume - 1)
+            };
+            (filename, bytes)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_old_numbering_rar4_set_keys_facts_by_the_layout_not_the_parsed_number() {
+    // Production job 11857: an old-numbering RAR4 set's headers state no
+    // volume number, so every volume parses as volume 0. Keying the facts
+    // ledger by that parse folded the whole set onto one entry, the ledger
+    // never grew past a prefix, and the member gate demanded coverage no
+    // refresh could record. The layout names the volume; the header only
+    // validates it.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90218);
+    let payload = vec![0x5Au8; 96];
+    let files =
+        single_member_rar4_old_numbering_set("silver.horizon", "silver.horizon.mkv", &payload, 3);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Silver Horizon Old Numbering", &files),
+    )
+    .await;
+
+    for (index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, index as u32, filename, bytes).await;
+    }
+
+    let key = (job_id, "silver.horizon".to_string());
+    let state = pipeline.rar_sets.get(&key).expect("RAR set state");
+    assert_eq!(
+        state.facts.keys().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1, 2]),
+        "facts key by the layout-derived volume even when every header parses as volume 0"
+    );
+    assert_eq!(
+        state.volume_files.get(&0).map(String::as_str),
+        Some("silver.horizon.rar")
+    );
+    assert_eq!(
+        state.volume_files.get(&1).map(String::as_str),
+        Some("silver.horizon.r00")
+    );
+    assert_eq!(
+        state.volume_files.get(&2).map(String::as_str),
+        Some("silver.horizon.r01")
+    );
+    let plan = state.plan.as_ref().expect("completed set derives a plan");
+    assert_eq!(
+        plan.topology.complete_volumes,
+        HashSet::from([0, 1, 2]),
+        "the ledger's completeness view covers the whole set, not a collapsed prefix"
+    );
+    assert_eq!(
+        pipeline.rar_member_refresh_request(job_id, "silver.horizon", "silver.horizon.mkv"),
+        None,
+        "a fully-present set owes no coverage refresh"
+    );
+}
+
+#[tokio::test]
+async fn restore_rebuilds_layout_keys_for_an_old_numbering_rar4_set() {
+    // The restart half of job 11857: the legacy ledger holds one collapsed row
+    // (every header parses as volume 0) while the whole set sits on disk.
+    // Restore must trust the row's layout key, rebuild the live map by the
+    // layout, and let fresh parses win — not fold the set back onto volume 0
+    // and then discard everything else as stale.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90219);
+    let payload = vec![0xC3u8; 96];
+    let files =
+        single_member_rar4_old_numbering_set("silver.horizon", "silver.horizon.mkv", &payload, 3);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Silver Horizon Restored Old Numbering", &files),
+    )
+    .await;
+
+    // All three volumes are on disk and complete in the assembly, but nothing
+    // ran through live registration: this is a job coming back from a restart.
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    for (index, (filename, bytes)) in files.iter().enumerate() {
+        tokio::fs::write(working_dir.join(filename), bytes)
+            .await
+            .unwrap();
+        pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .assembly
+            .file_mut(NzbFileId {
+                job_id,
+                file_index: index as u32,
+            })
+            .unwrap()
+            .commit_segment(0, bytes.len() as u32)
+            .unwrap();
+    }
+
+    // The legacy DB shape: one row, keyed by the collapsed parse.
+    let facts =
+        unrar_rs::RarArchive::parse_volume_facts(std::io::Cursor::new(files[0].1.clone()), None)
+            .unwrap();
+    assert_eq!(
+        facts.volume_number, None,
+        "old numbering states no volume number"
+    );
+    let blob = rmp_serde::to_vec_named(&facts).unwrap();
+    pipeline
+        .db
+        .save_rar_volume_facts(job_id, "silver.horizon", 0, &blob)
+        .unwrap();
+
+    pipeline.restore_rar_state_for_job(job_id).await;
+
+    let key = (job_id, "silver.horizon".to_string());
+    let state = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("RAR set state survives restore");
+    assert_eq!(
+        state.facts.keys().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1, 2]),
+        "restore rebuilds the ledger by layout keys instead of collapsing onto the parsed 0"
+    );
+    assert_eq!(
+        state.volume_files.get(&1).map(String::as_str),
+        Some("silver.horizon.r00"),
+        "the live volume-file map is layout-keyed, one entry per file"
+    );
+    let plan = state
+        .plan
+        .as_ref()
+        .expect("restore recomputes the plan for a set with facts");
+    assert_eq!(plan.topology.complete_volumes, HashSet::from([0, 1, 2]));
+    assert_eq!(
+        pipeline.rar_member_refresh_request(job_id, "silver.horizon", "silver.horizon.mkv"),
+        None,
+        "a restored, fully-present set owes no coverage refresh"
     );
 }

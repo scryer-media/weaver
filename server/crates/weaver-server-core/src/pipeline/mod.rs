@@ -1210,6 +1210,14 @@ pub(super) struct ComputedRarSetState {
     pub(super) plan: RarDerivedPlan,
     pub(super) headers: Vec<u8>,
     pub(super) rebuild_source: archive::topology::RarTopologyRebuildSource,
+    /// The volumes this refresh actually integrated into the header view.
+    ///
+    /// Not the plan's `complete_volumes`: that set is derived from the facts
+    /// ledger, and a restored job can hold volumes on disk that the ledger
+    /// never recorded. Refresh coverage has to measure what the refresh saw,
+    /// or a coverage demand it can never satisfy re-issues itself after every
+    /// completion.
+    pub(super) integrated_volumes: BTreeSet<u32>,
 }
 
 pub(super) struct RarRefreshDone {
