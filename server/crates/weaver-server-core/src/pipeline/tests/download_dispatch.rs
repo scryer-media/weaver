@@ -4116,6 +4116,181 @@ async fn refresh_download_pressure_counts_active_decode_bytes() {
 }
 
 #[tokio::test]
+async fn refresh_download_pressure_combines_pending_active_and_released_result_bytes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.decode_backlog_budget_bytes = 1000;
+    pipeline
+        .metrics
+        .decode_pending_bytes
+        .store(100, Ordering::Relaxed);
+    pipeline
+        .metrics
+        .decode_active_bytes
+        .store(200, Ordering::Relaxed);
+    pipeline
+        .pending_released_download_result_bytes_by_job
+        .insert(JobId(20027), 200);
+    pipeline
+        .pending_released_download_result_bytes_by_job
+        .insert(JobId(20028), 200);
+
+    pipeline.refresh_download_pressure();
+
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Soft.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::Decode.as_code()
+    );
+
+    pipeline
+        .pending_released_download_result_bytes_by_job
+        .insert(JobId(20028), 500);
+    pipeline.refresh_download_pressure();
+
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Hard.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::Decode.as_code()
+    );
+}
+
+#[tokio::test]
+async fn refresh_download_pressure_saturates_released_result_byte_aggregation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.decode_backlog_budget_bytes = 1000;
+    pipeline
+        .metrics
+        .decode_pending_bytes
+        .store(1, Ordering::Relaxed);
+    pipeline
+        .metrics
+        .decode_active_bytes
+        .store(1, Ordering::Relaxed);
+    pipeline
+        .pending_released_download_result_bytes_by_job
+        .insert(JobId(20029), u64::MAX);
+    pipeline
+        .pending_released_download_result_bytes_by_job
+        .insert(JobId(20030), 1);
+
+    pipeline.refresh_download_pressure();
+
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Hard.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::Decode.as_code()
+    );
+}
+
+#[tokio::test]
+async fn released_result_bytes_block_dispatch_until_processing_clears_hysteresis() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        1,
+    )
+    .await;
+    let queued_job_id = JobId(20031);
+    insert_active_job(
+        &mut pipeline,
+        queued_job_id,
+        standalone_job_spec(
+            "Released Result Pressure",
+            &[("queued.bin".to_string(), 512)],
+        ),
+    )
+    .await;
+    let released_job_id = JobId(20032);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id: released_job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let payload = Bytes::from(vec![0; 1024]);
+    pipeline.decode_backlog_budget_bytes = payload.len();
+    pipeline.note_released_download_result_pending(released_job_id, payload.len() as u64);
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Hard.as_code()
+    );
+
+    pipeline
+        .process_released_download_done(DownloadResult {
+            runtime_generation: 0,
+            segment_id,
+            data: Ok(DownloadPayload::Raw(payload)),
+            attempts: vec![],
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: vec![],
+            release_connection_slot: false,
+        })
+        .await;
+
+    pipeline.refresh_download_pressure();
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Clear.as_code()
+    );
+    assert!(
+        !pipeline
+            .pending_released_download_result_bytes_by_job
+            .contains_key(&released_job_id)
+    );
+
+    pipeline.dispatch_downloads();
+    assert!(pipeline.active_downloads > 0);
+}
+
+#[tokio::test]
 async fn dispatch_downloads_allows_postprocessing_status_with_remaining_download_work() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
@@ -6153,6 +6328,18 @@ async fn released_download_result_fences_completion_until_processed() {
     assert!(!pipeline.job_has_pending_download_pipeline_work(job_id));
     pipeline.note_released_download_result_pending(job_id, b"discarded".len() as u64);
     assert!(pipeline.job_has_pending_download_pipeline_work(job_id));
+    assert_eq!(
+        pipeline
+            .pending_released_download_results_by_job
+            .get(&job_id),
+        Some(&1)
+    );
+    assert_eq!(
+        pipeline
+            .pending_released_download_result_bytes_by_job
+            .get(&job_id),
+        Some(&(b"discarded".len() as u64))
+    );
 
     pipeline
         .process_released_download_done(DownloadResult {
@@ -6170,6 +6357,79 @@ async fn released_download_result_fences_completion_until_processed() {
         .await;
 
     assert!(!pipeline.job_has_pending_download_pipeline_work(job_id));
+    assert!(
+        !pipeline
+            .pending_released_download_results_by_job
+            .contains_key(&job_id)
+    );
+    assert!(
+        !pipeline
+            .pending_released_download_result_bytes_by_job
+            .contains_key(&job_id)
+    );
+}
+
+#[tokio::test]
+async fn failed_job_retains_released_result_ledgers_until_terminal_processing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20033);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Failed Released Result", &[("failed.bin".to_string(), 16)]),
+    )
+    .await;
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let payload = Bytes::from_static(b"failed-result");
+    pipeline.note_released_download_result_pending(job_id, payload.len() as u64);
+
+    pipeline.fail_job(job_id, "expected failure".to_string());
+
+    assert_eq!(
+        pipeline
+            .pending_released_download_results_by_job
+            .get(&job_id),
+        Some(&1)
+    );
+    assert_eq!(
+        pipeline
+            .pending_released_download_result_bytes_by_job
+            .get(&job_id),
+        Some(&(payload.len() as u64))
+    );
+
+    pipeline
+        .process_released_download_done(DownloadResult {
+            runtime_generation: 0,
+            segment_id,
+            data: Ok(DownloadPayload::Raw(payload)),
+            attempts: vec![],
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: vec![],
+            release_connection_slot: false,
+        })
+        .await;
+
+    assert!(
+        !pipeline
+            .pending_released_download_results_by_job
+            .contains_key(&job_id)
+    );
+    assert!(
+        !pipeline
+            .pending_released_download_result_bytes_by_job
+            .contains_key(&job_id)
+    );
 }
 
 #[tokio::test]
@@ -6184,6 +6444,7 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
         },
         segment_number: 0,
     };
+    let decoded_payload = b"owned-decoded".to_vec();
 
     pipeline.active_downloads = 1;
     pipeline.active_downloads_by_job.insert(job_id, 1);
@@ -6198,7 +6459,26 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
             results: vec![DownloadResult {
                 runtime_generation: 0,
                 segment_id,
-                data: Ok(DownloadPayload::Raw(Bytes::from_static(b"owned"))),
+                data: Ok(DownloadPayload::Decoded(DecodeResult {
+                    encoding: SegmentEncoding::Yenc,
+                    segment_id,
+                    raw_size: decoded_payload.len() as u64,
+                    yenc_layout: YencLayoutAssertions {
+                        file_size: decoded_payload.len() as u64,
+                        part: Some(1),
+                        total: Some(1),
+                        begin: Some(1),
+                        end: Some(decoded_payload.len() as u64),
+                    },
+                    crc_valid: true,
+                    part_crc_verified: false,
+                    part_crc: par2_rs::checksum::crc32(&decoded_payload),
+                    expected_file_crc: None,
+                    data: DecodedChunk::from(decoded_payload.clone()),
+                    yenc_name: "owned.bin".to_string(),
+                    checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                    segments: Vec::new(),
+                })),
                 attempts: vec![],
                 lane_observation: None,
                 source_server_idx: None,
@@ -6227,7 +6507,27 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
             .get(&job_id),
         Some(&1)
     );
+    assert_eq!(
+        pipeline
+            .pending_released_download_result_bytes_by_job
+            .get(&job_id),
+        Some(&(decoded_payload.len() as u64))
+    );
     assert!(ack_rx.try_recv().is_ok());
+
+    pipeline
+        .process_released_download_done(pending.pop_front().unwrap())
+        .await;
+    assert!(
+        !pipeline
+            .pending_released_download_results_by_job
+            .contains_key(&job_id)
+    );
+    assert!(
+        !pipeline
+            .pending_released_download_result_bytes_by_job
+            .contains_key(&job_id)
+    );
 }
 
 #[tokio::test]

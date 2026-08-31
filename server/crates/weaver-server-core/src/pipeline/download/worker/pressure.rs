@@ -378,11 +378,17 @@ impl Pipeline {
 
     pub(crate) fn refresh_download_pressure(&mut self) -> DownloadPressure {
         let (decode_soft, decode_hard, write_soft, write_hard) = self.download_pressure_limits();
+        let released_result_bytes = self
+            .pending_released_download_result_bytes_by_job
+            .values()
+            .copied()
+            .fold(0, u64::saturating_add);
         let decode_bytes = self
             .metrics
             .decode_pending_bytes
             .load(Ordering::Relaxed)
-            .saturating_add(self.metrics.decode_active_bytes.load(Ordering::Relaxed));
+            .saturating_add(self.metrics.decode_active_bytes.load(Ordering::Relaxed))
+            .saturating_add(released_result_bytes);
         let write_bytes = self.metrics.write_buffered_bytes.load(Ordering::Relaxed);
 
         if decode_bytes >= decode_hard {

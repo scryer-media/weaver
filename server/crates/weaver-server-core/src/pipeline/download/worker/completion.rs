@@ -404,15 +404,17 @@ impl Pipeline {
     }
 
     pub(crate) fn note_released_download_result_pending(&mut self, job_id: JobId, bytes: u64) {
-        *self
+        let pending = self
             .pending_released_download_results_by_job
             .entry(job_id)
-            .or_insert(0) += 1;
+            .or_insert(0);
+        *pending = pending.saturating_add(1);
         if bytes != 0 {
-            *self
+            let pending_bytes = self
                 .pending_released_download_result_bytes_by_job
                 .entry(job_id)
-                .or_insert(0) += bytes;
+                .or_insert(0);
+            *pending_bytes = pending_bytes.saturating_add(bytes);
         }
     }
 
