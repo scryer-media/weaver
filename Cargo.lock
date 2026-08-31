@@ -5451,7 +5451,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -5499,14 +5499,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "bytes",
  "criterion",
@@ -5532,7 +5532,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "quick-xml",
  "serde",
@@ -5543,7 +5543,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "aes-gcm 0.11.1",
  "age",
@@ -5581,7 +5581,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -5645,7 +5645,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "cc",
  "crc-fast",
