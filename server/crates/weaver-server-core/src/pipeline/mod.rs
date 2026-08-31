@@ -5,6 +5,7 @@ mod capacity;
 mod completion;
 mod decode;
 mod direct_store;
+pub mod direct_unpack;
 pub mod download;
 mod extraction;
 mod health;

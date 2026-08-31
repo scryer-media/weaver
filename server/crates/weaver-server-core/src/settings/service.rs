@@ -4,8 +4,8 @@ use crate::jobs::{DuplicateAction, DuplicatePolicy};
 use crate::persistence::Database;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
-    BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides, MetricsConfig,
-    PerJobSeries, RetryOverrides, TunerOverrides,
+    BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
+    DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides, TunerOverrides,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
@@ -187,6 +187,15 @@ impl Database {
             }
         };
 
+        let direct_unpack = {
+            let enabled = settings
+                .get("direct_unpack.enabled")
+                .and_then(|v| v.parse().ok());
+            enabled.map(|enabled| DirectUnpackOverrides {
+                enabled: Some(enabled),
+            })
+        };
+
         let delivery_naming = {
             let deobfuscate_delivered_members = settings
                 .get("delivery_naming.deobfuscate_delivered_members")
@@ -258,6 +267,7 @@ impl Database {
             watch_folder,
             duplicate_policy,
             direct_store,
+            direct_unpack,
             delivery_naming,
             metrics,
             config_path: None,
@@ -382,6 +392,12 @@ impl Database {
                     &bytes.to_string(),
                 )?;
             }
+        }
+
+        if let Some(ref direct_unpack) = config.direct_unpack
+            && let Some(enabled) = direct_unpack.enabled
+        {
+            self.set_setting("direct_unpack.enabled", &enabled.to_string())?;
         }
 
         if let Some(ref delivery_naming) = config.delivery_naming {

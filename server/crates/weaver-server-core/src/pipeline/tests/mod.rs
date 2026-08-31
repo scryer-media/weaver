@@ -103,6 +103,7 @@ impl TestHarness {
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
+            direct_unpack: None,
             // Pinned off rather than left at the shipped default, so an
             // extraction fixture whose member happens to be called
             // `sample.mkv` keeps asserting extraction instead of asserting the
@@ -405,6 +406,7 @@ async fn new_direct_pipeline_at_roots(
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store,
+        direct_unpack: None,
         // Pinned off for the same reason as the harness above: an extraction
         // fixture must not start asserting the delivery-naming policy.
         delivery_naming: Some(crate::settings::DeliveryNamingOverrides {

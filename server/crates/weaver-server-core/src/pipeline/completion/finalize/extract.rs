@@ -54,6 +54,168 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
+/// Everything the 7z extraction body needs apart from the archive bytes.
+///
+/// Bundled rather than passed loose because the body is now shared: the
+/// conventional path and the direct-unpack chase differ only in the reader they
+/// hand it, and a struct keeps that the single visible difference.
+pub(in crate::pipeline) struct SevenZipExtractionContext {
+    pub(in crate::pipeline) job_id: JobId,
+    pub(in crate::pipeline) set_name: String,
+    pub(in crate::pipeline) output_dir: PathBuf,
+    pub(in crate::pipeline) root: Arc<ExtractionRoot>,
+    pub(in crate::pipeline) budget: Arc<JobExtractionBudget>,
+    pub(in crate::pipeline) password: sevenz_rust2::Password,
+    pub(in crate::pipeline) event_tx: broadcast::Sender<PipelineEvent>,
+    pub(in crate::pipeline) phase_counters: Arc<PhaseCounters>,
+}
+
+/// Decode one 7z set through `open_reader`, writing members under the context's
+/// extraction root.
+///
+/// # Why a factory and not a reader
+///
+/// The archive is opened twice: once to read the entry table and validate every
+/// member's path and size before a single byte is written, and once to extract.
+/// `ArchiveReader::new` consumes its reader, so the second pass needs a fresh
+/// one. `open_reader` therefore produces a new reader per pass, and owns the
+/// wording of its own open failures — which is what keeps the conventional
+/// path's error strings unchanged.
+///
+/// # What a reader may be
+///
+/// Callers may wrap the archive in a [`std::io::BufReader`], and direct unpack
+/// will: a gated reader returns short reads at the download frontier, and
+/// buffering absorbs those. Nothing here may assume unbuffered access or keep
+/// its own idea of the stream position — position is whatever the reader says
+/// it is, and every seek goes through the reader rather than around it.
+pub(in crate::pipeline) fn extract_7z_stream<R, F>(
+    context: &SevenZipExtractionContext,
+    mut open_reader: F,
+) -> Result<FullSetExtractionOutcome, String>
+where
+    R: std::io::Read + std::io::Seek + Send,
+    F: FnMut() -> Result<R, String>,
+{
+    let SevenZipExtractionContext {
+        job_id,
+        set_name,
+        output_dir,
+        root,
+        budget,
+        password,
+        event_tx,
+        phase_counters,
+    } = context;
+    let job_id = *job_id;
+
+    // Metadata pass: every member's path and declared size is checked before
+    // anything is created on disk.
+    let known_total = {
+        let reader = BudgetedReader::new(open_reader()?, Arc::clone(budget));
+        let archive_reader = sevenz_rust2::ArchiveReader::new(reader, password.clone())
+            .map_err(|e| format!("failed to read 7z archive: {e}"))?;
+        for entry in &archive_reader.archive().files {
+            budget.check_member_metadata(entry.name(), entry.size())?;
+            root.validate_relative_path(entry.name())
+                .map_err(|error| budget.reject_unsafe_path(error))?;
+        }
+        archive_reader
+            .archive()
+            .files
+            .iter()
+            .filter(|entry| !entry.is_directory())
+            .map(|entry| entry.size())
+            .sum::<u64>()
+    };
+    phase_counters
+        .total_bytes
+        .fetch_add(known_total, Ordering::Relaxed);
+
+    let mut extracted_members = Vec::new();
+    let extracted_members_ref = &mut extracted_members;
+    let event_tx_ref = event_tx;
+    let root_ref = root;
+    let budget_ref = budget;
+
+    let extract_fn = |entry: &sevenz_rust2::ArchiveEntry,
+                      reader: &mut dyn std::io::Read,
+                      _dest: &PathBuf|
+     -> Result<bool, sevenz_rust2::Error> {
+        let safe_path = root_ref
+            .validate_relative_path(entry.name())
+            .map_err(|error| std::io::Error::other(budget_ref.reject_unsafe_path(error)))?;
+        budget_ref
+            .check_member_metadata(entry.name(), entry.size())
+            .map_err(std::io::Error::other)?;
+        if entry.is_directory() {
+            root_ref
+                .create_dir(&safe_path, budget_ref)
+                .map_err(std::io::Error::other)?;
+            return Ok(true);
+        }
+
+        let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberStarted {
+            job_id,
+            set_name: set_name.clone(),
+            member: entry.name().to_string(),
+        });
+
+        let file = root_ref
+            .create_file(&safe_path, budget_ref)
+            .map_err(std::io::Error::other)?;
+        let attempt = Arc::new(PhaseAttemptCounters::new(Arc::clone(phase_counters)));
+        let mut file = CountingWriter::new(file, Arc::clone(&attempt));
+        let bytes_written = match std::io::copy(reader, &mut file) {
+            Ok(bytes) => {
+                attempt.commit();
+                bytes
+            }
+            Err(error) => {
+                attempt.rollback();
+                return Err(error.into());
+            }
+        };
+
+        tracing::info!(
+            job_id = job_id.0,
+            member = entry.name(),
+            bytes_written,
+            total_bytes = entry.size(),
+            "member extracted"
+        );
+        let _ = event_tx_ref.send(PipelineEvent::ExtractionProgress {
+            job_id,
+            member: entry.name().to_string(),
+            bytes_written,
+            total_bytes: entry.size(),
+        });
+        let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberFinished {
+            job_id,
+            set_name: set_name.clone(),
+            member: entry.name().to_string(),
+        });
+
+        extracted_members_ref.push(entry.name().to_string());
+        Ok(true)
+    };
+
+    let reader = BudgetedReader::new(open_reader()?, Arc::clone(budget));
+    sevenz_rust2::decompress_with_extract_fn_and_password(
+        reader,
+        output_dir,
+        password.clone(),
+        extract_fn,
+    )
+    .map_err(|e| format!("7z extraction failed: {e}"))?;
+
+    Ok(FullSetExtractionOutcome {
+        extracted: extracted_members,
+        failed: Vec::new(),
+        selected_password: None,
+    })
+}
+
 fn validate_zip_entry_path(raw_name: &str) -> Result<PathBuf, String> {
     validate_archive_entry_path(raw_name, "zip")
 }
@@ -1175,39 +1337,52 @@ impl Pipeline {
         spawned
     }
 
+    /// The part files of a 7z set, in archive order.
+    ///
+    /// Ordered by the topology's volume map, which is what makes the
+    /// concatenation of these files the archive stream. Direct unpack needs the
+    /// identical list in the identical order — it reads the same bytes through
+    /// a gated view — so the ordering lives here rather than being rebuilt at
+    /// each call site.
+    pub(in crate::pipeline) fn sevenz_set_part_paths(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Result<Vec<PathBuf>, String> {
+        let state = self
+            .jobs
+            .get(&job_id)
+            .ok_or_else(|| format!("job {job_id:?} not found"))?;
+        let topo = state
+            .assembly
+            .archive_topology_for(set_name)
+            .ok_or_else(|| format!("no topology for set '{set_name}'"))?;
+
+        // Collect files belonging to this set using the topology's volume_map.
+        let set_filenames: std::collections::HashSet<&str> =
+            topo.volume_map.keys().map(|s| s.as_str()).collect();
+        let mut parts: Vec<(u32, PathBuf)> = Vec::new();
+
+        for file_asm in state.assembly.files() {
+            let current_filename = self.current_filename_for_file(job_id, file_asm);
+            if set_filenames.contains(current_filename.as_str()) {
+                let vol = topo.volume_map.get(&current_filename).copied().unwrap_or(0);
+                if let Some(path) = self.resolve_job_input_path(job_id, &current_filename) {
+                    parts.push((vol, path));
+                }
+            }
+        }
+        parts.sort_by_key(|(n, _)| *n);
+        Ok(parts.into_iter().map(|(_, p)| p).collect())
+    }
+
     /// Extract a single 7z archive set. Only collects files belonging to the named set.
     pub(crate) async fn extract_7z_set(
         &mut self,
         job_id: JobId,
         set_name: &str,
     ) -> Result<u32, String> {
-        let file_paths = {
-            let state = self
-                .jobs
-                .get(&job_id)
-                .ok_or_else(|| format!("job {job_id:?} not found"))?;
-            let topo = state
-                .assembly
-                .archive_topology_for(set_name)
-                .ok_or_else(|| format!("no topology for set '{set_name}'"))?;
-
-            // Collect files belonging to this set using the topology's volume_map.
-            let set_filenames: std::collections::HashSet<&str> =
-                topo.volume_map.keys().map(|s| s.as_str()).collect();
-            let mut parts: Vec<(u32, PathBuf)> = Vec::new();
-
-            for file_asm in state.assembly.files() {
-                let current_filename = self.current_filename_for_file(job_id, file_asm);
-                if set_filenames.contains(current_filename.as_str()) {
-                    let vol = topo.volume_map.get(&current_filename).copied().unwrap_or(0);
-                    if let Some(path) = self.resolve_job_input_path(job_id, &current_filename) {
-                        parts.push((vol, path));
-                    }
-                }
-            }
-            parts.sort_by_key(|(n, _)| *n);
-            parts.into_iter().map(|(_, p)| p).collect::<Vec<PathBuf>>()
-        };
+        let file_paths = self.sevenz_set_part_paths(job_id, set_name)?;
         let password = self.primary_archive_password_for_job(job_id);
 
         let output_dir = self.extraction_staging_dir(job_id);
@@ -1240,153 +1415,34 @@ impl Pipeline {
                     } else {
                         sevenz_rust2::Password::empty()
                     };
-                    let known_total = if file_paths.len() == 1 {
-                        let file = std::fs::File::open(&file_paths[0])
-                            .map_err(|e| format!("failed to open 7z file: {e}"))?;
-                        let file = BudgetedReader::new(file, Arc::clone(&budget));
-                        let archive_reader = sevenz_rust2::ArchiveReader::new(file, pw.clone())
-                            .map_err(|e| format!("failed to read 7z archive: {e}"))?;
-                        for entry in &archive_reader.archive().files {
-                            budget.check_member_metadata(entry.name(), entry.size())?;
-                            root.validate_relative_path(entry.name())
-                                .map_err(|error| budget.reject_unsafe_path(error))?;
-                        }
-                        archive_reader
-                            .archive()
-                            .files
-                            .iter()
-                            .filter(|entry| !entry.is_directory())
-                            .map(|entry| entry.size())
-                            .sum::<u64>()
-                    } else {
-                        let reader = crate::pipeline::archive::split_reader::SplitFileReader::open(
-                            &file_paths,
-                        )
-                        .map_err(|e| format!("failed to open 7z split files: {e}"))?;
-                        let reader = BudgetedReader::new(reader, Arc::clone(&budget));
-                        let archive_reader =
-                            sevenz_rust2::ArchiveReader::new(reader, pw.clone())
-                                .map_err(|e| format!("failed to read 7z archive: {e}"))?;
-                        for entry in &archive_reader.archive().files {
-                            budget.check_member_metadata(entry.name(), entry.size())?;
-                            root.validate_relative_path(entry.name())
-                                .map_err(|error| budget.reject_unsafe_path(error))?;
-                        }
-                        archive_reader
-                            .archive()
-                            .files
-                            .iter()
-                            .filter(|entry| !entry.is_directory())
-                            .map(|entry| entry.size())
-                            .sum::<u64>()
-                    };
-                    phase_counters
-                        .total_bytes
-                        .fetch_add(known_total, Ordering::Relaxed);
 
-                    let mut extracted_members = Vec::new();
-                    let extracted_members_ref = &mut extracted_members;
-                    let event_tx_ref = &event_tx;
-                    let root_ref = &root;
-                    let budget_ref = &budget;
-
-                    let extract_fn = |entry: &sevenz_rust2::ArchiveEntry,
-                                      reader: &mut dyn std::io::Read,
-                                      _dest: &PathBuf|
-                     -> Result<bool, sevenz_rust2::Error> {
-                        let safe_path =
-                            root_ref
-                                .validate_relative_path(entry.name())
-                                .map_err(|error| {
-                                    std::io::Error::other(budget_ref.reject_unsafe_path(error))
-                                })?;
-                        budget_ref
-                            .check_member_metadata(entry.name(), entry.size())
-                            .map_err(std::io::Error::other)?;
-                        if entry.is_directory() {
-                            root_ref
-                                .create_dir(&safe_path, budget_ref)
-                                .map_err(std::io::Error::other)?;
-                            return Ok(true);
-                        }
-
-                        let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberStarted {
-                            job_id,
-                            set_name: set_name_owned.clone(),
-                            member: entry.name().to_string(),
-                        });
-
-                        let file = root_ref
-                            .create_file(&safe_path, budget_ref)
-                            .map_err(std::io::Error::other)?;
-                        let attempt =
-                            Arc::new(PhaseAttemptCounters::new(Arc::clone(&phase_counters)));
-                        let mut file = CountingWriter::new(file, Arc::clone(&attempt));
-                        let bytes_written = match std::io::copy(reader, &mut file) {
-                            Ok(bytes) => {
-                                attempt.commit();
-                                bytes
-                            }
-                            Err(error) => {
-                                attempt.rollback();
-                                return Err(error.into());
-                            }
-                        };
-
-                        tracing::info!(
-                            job_id = job_id.0,
-                            member = entry.name(),
-                            bytes_written,
-                            total_bytes = entry.size(),
-                            "member extracted"
-                        );
-                        let _ = event_tx_ref.send(PipelineEvent::ExtractionProgress {
-                            job_id,
-                            member: entry.name().to_string(),
-                            bytes_written,
-                            total_bytes: entry.size(),
-                        });
-                        let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberFinished {
-                            job_id,
-                            set_name: set_name_owned.clone(),
-                            member: entry.name().to_string(),
-                        });
-
-                        extracted_members_ref.push(entry.name().to_string());
-                        Ok(true)
+                    let context = SevenZipExtractionContext {
+                        job_id,
+                        set_name: set_name_owned,
+                        output_dir,
+                        root,
+                        budget,
+                        password: pw,
+                        event_tx,
+                        phase_counters,
                     };
 
+                    // A one-part set is a plain file; anything more is the
+                    // concatenation of its parts. That is the only difference
+                    // between the two conventional paths.
                     if file_paths.len() == 1 {
-                        let file = std::fs::File::open(&file_paths[0])
-                            .map_err(|e| format!("failed to open 7z file: {e}"))?;
-                        let file = BudgetedReader::new(file, Arc::clone(&budget));
-                        sevenz_rust2::decompress_with_extract_fn_and_password(
-                            file,
-                            &output_dir,
-                            pw,
-                            extract_fn,
-                        )
-                        .map_err(|e| format!("7z extraction failed: {e}"))?;
+                        extract_7z_stream(&context, || {
+                            std::fs::File::open(&file_paths[0])
+                                .map_err(|e| format!("failed to open 7z file: {e}"))
+                        })
                     } else {
-                        let reader = crate::pipeline::archive::split_reader::SplitFileReader::open(
-                            &file_paths,
-                        )
-                        .map_err(|e| format!("failed to open 7z split files: {e}"))?;
-                        let reader = BudgetedReader::new(reader, Arc::clone(&budget));
-                        sevenz_rust2::decompress_with_extract_fn_and_password(
-                            reader,
-                            &output_dir,
-                            pw,
-                            extract_fn,
-                        )
-                        .map_err(|e| format!("7z extraction failed: {e}"))?;
+                        extract_7z_stream(&context, || {
+                            crate::pipeline::archive::split_reader::SplitFileReader::open(
+                                &file_paths,
+                            )
+                            .map_err(|e| format!("failed to open 7z split files: {e}"))
+                        })
                     }
-
-                    Ok(FullSetExtractionOutcome {
-                        extracted: extracted_members,
-                        failed: Vec::new(),
-                        selected_password: None,
-                    })
                 })
             })
             .await;
