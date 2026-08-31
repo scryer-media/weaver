@@ -6307,14 +6307,23 @@ impl Pipeline {
         job_id: JobId,
         set_index: usize,
     ) -> Result<Vec<String>, String> {
-        let Some(set) = self.direct_store.set(job_id, set_index) else {
-            return Ok(Vec::new());
+        let (set_name, names) = {
+            let Some(set) = self.direct_store.set(job_id, set_index) else {
+                return Ok(Vec::new());
+            };
+            (
+                set.set_name().to_string(),
+                set.router.tolerated_member_names(),
+            )
         };
-        let names = set.router.tolerated_member_names();
         if names.is_empty() {
             return Ok(Vec::new());
         }
-        let set_name = set.set_name().to_string();
+        let staging = self.extraction_staging_dir(job_id);
+        let extraction_budget = self.extraction_budget(job_id, &staging)?;
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return Ok(Vec::new());
+        };
         // An `-hp` set's virtual volumes are as header-encrypted as
         // the posted ones, so this extraction cannot even *open* the archive
         // without the key the router proved — and for a `-p` set a tolerated
@@ -6405,17 +6414,7 @@ impl Pipeline {
             .copied()
             .filter(|volume_index| *volume_index != first_volume)
             .collect();
-
-        for (_, destination) in &targets {
-            if let Some(parent) = destination.parent()
-                && let Err(error) = tokio::fs::create_dir_all(parent).await
-            {
-                return Err(format!(
-                    "failed to create {} for a tolerated member: {error}",
-                    parent.display()
-                ));
-            }
-        }
+        let extraction_memory_limit = self.extraction_limits.max_memory_bytes;
 
         let extracted = tokio::task::spawn_blocking(move || {
             let reader = provider
@@ -6429,7 +6428,11 @@ impl Pipeline {
             // The same decode ceilings the incremental extractor applies. A
             // tolerated member is small by budget, but the *declared* dictionary
             // in a hostile header is not bounded by anything the budget checks.
-            crate::pipeline::extraction::apply_server_rar_limits(&mut archive);
+            let max_dict_bytes =
+                crate::pipeline::extraction::apply_server_rar_limits_with_memory_limit(
+                    &mut archive,
+                    extraction_memory_limit,
+                );
             for volume_index in other_volumes {
                 let Some(reader) = provider.open(volume_index) else {
                     continue;
@@ -6439,6 +6442,26 @@ impl Pipeline {
                     .map_err(|error| {
                         format!("failed to add virtual volume {volume_index}: {error}")
                     })?;
+            }
+            crate::pipeline::extraction::ensure_rar_dictionary_within_limit(
+                &archive,
+                max_dict_bytes,
+            )
+            .map_err(|error| format!("RAR dictionary admission failed: {error}"))?;
+            let _memory_permit = extraction_budget
+                .reserve_memory_wait(crate::pipeline::extraction::rar_decoder_memory_bytes(
+                    &archive,
+                ))
+                .map_err(|error| format!("RAR decoder memory admission failed: {error}"))?;
+            for (_, destination) in &targets {
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        format!(
+                            "failed to create {} for a tolerated member: {error}",
+                            parent.display()
+                        )
+                    })?;
+                }
             }
             let options = unrar_rs::ExtractOptions {
                 verify: true,

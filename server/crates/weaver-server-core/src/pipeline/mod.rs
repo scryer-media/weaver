@@ -59,7 +59,9 @@ use self::archive::rar_state::{RarDerivedPlan, RarSetState};
 use self::download::{
     DownloadLaneMode, DownloadLaneRuntimeState, JobTransportProfile, LaneParkReason,
 };
-use self::extraction::{ExtractionLimits, ExtractionRoot, JobExtractionBudget};
+use self::extraction::{
+    ExtractionLimits, ExtractionRoot, JobExtractionBudget, ProcessMemoryBudget,
+};
 
 /// Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
@@ -2835,6 +2837,8 @@ pub struct Pipeline {
     pub(super) pp_pool: Arc<rayon::ThreadPool>,
     /// Environment-derived, always-on extraction ceilings.
     pub(super) extraction_limits: Arc<ExtractionLimits>,
+    /// One decoder-memory allowance shared by every extraction job.
+    pub(super) process_memory_budget: Arc<ProcessMemoryBudget>,
     /// One shared output budget per job, retained across nested extraction layers.
     pub(super) extraction_budgets: HashMap<JobId, Arc<JobExtractionBudget>>,
 }

@@ -75,6 +75,8 @@ impl Pipeline {
         tokio::fs::create_dir_all(&intermediate_dir).await?;
         tokio::fs::create_dir_all(&complete_dir).await?;
         let extraction_limits = Arc::new(ExtractionLimits::from_env(&complete_dir)?);
+        let process_memory_budget =
+            Arc::new(ProcessMemoryBudget::new(extraction_limits.max_memory_bytes));
 
         let (download_done_tx, download_done_rx) = mpsc::channel(256);
         let (download_refill_tx, download_refill_rx) = mpsc::channel(256);
@@ -314,6 +316,7 @@ impl Pipeline {
                 direct_store_settings,
             ),
             extraction_limits,
+            process_memory_budget,
             extraction_budgets: HashMap::new(),
             extracted_members: HashMap::new(),
             extracted_archives: HashMap::new(),

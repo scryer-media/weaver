@@ -5,6 +5,8 @@
 //! since this only executes once during initialization.
 
 use std::path::Path;
+#[cfg(any(target_os = "linux", test))]
+use std::path::{Component, PathBuf};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 
@@ -299,22 +301,159 @@ fn extract_vm_stat_pages(line: &str, prefix: &str) -> Option<u64> {
     after_colon.trim().trim_end_matches('.').parse().ok()
 }
 
-/// Read cgroup v2 memory limit.
+/// Read the process's cgroup memory limit, including nested cgroup v2 and v1
+/// hierarchies. `/sys/fs/cgroup/memory.max` alone is only the namespace root;
+/// a systemd service can be constrained farther down that tree.
 fn detect_cgroup_memory_limit() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let content = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
-        let trimmed = content.trim();
-        if trimmed == "max" {
-            return None;
-        }
-        trimmed.parse().ok()
+        let cgroups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+        cgroup_memory_limit_from(&cgroups, &mountinfo, |path| {
+            std::fs::read_to_string(path).ok()
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
     {
         None
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone)]
+struct CgroupMount {
+    root: PathBuf,
+    mount_point: PathBuf,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_memory_limit_from(
+    cgroups: &str,
+    mountinfo: &str,
+    mut read_file: impl FnMut(&Path) -> Option<String>,
+) -> Option<u64> {
+    let v2 = cgroup_path_for_controller(cgroups, None)
+        .zip(cgroup_mount_for(mountinfo, "cgroup2", None))
+        .and_then(|(path, mount)| {
+            cgroup_limit_in_hierarchy(&mount, path, "memory.max", &mut read_file)
+        });
+    let v1 = cgroup_path_for_controller(cgroups, Some("memory"))
+        .zip(cgroup_mount_for(mountinfo, "cgroup", Some("memory")))
+        .and_then(|(path, mount)| {
+            cgroup_limit_in_hierarchy(&mount, path, "memory.limit_in_bytes", &mut read_file)
+        });
+
+    match (v2, v1) {
+        (Some(v2), Some(v1)) => Some(v2.min(v1)),
+        (Some(limit), None) | (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_path_for_controller<'a>(cgroups: &'a str, controller: Option<&str>) -> Option<&'a str> {
+    cgroups.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let _hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        let path = fields.next()?;
+        let matches = match controller {
+            Some(controller) => controllers.split(',').any(|entry| entry == controller),
+            None => controllers.is_empty(),
+        };
+        matches.then_some(path)
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_mount_for(
+    mountinfo: &str,
+    filesystem: &str,
+    controller: Option<&str>,
+) -> Option<CgroupMount> {
+    mountinfo.lines().find_map(|line| {
+        let (left, right) = line.split_once(" - ")?;
+        let mut fields = left.split_whitespace();
+        let _mount_id = fields.next()?;
+        let _parent_id = fields.next()?;
+        let _major_minor = fields.next()?;
+        let root = fields.next()?;
+        let mount_point = fields.next()?;
+        let fs_type = right.split_whitespace().next()?;
+        if fs_type != filesystem {
+            return None;
+        }
+        if let Some(controller) = controller
+            && !right
+                .split_whitespace()
+                .flat_map(|field| field.split(','))
+                .any(|entry| entry == controller)
+        {
+            return None;
+        }
+        Some(CgroupMount {
+            root: PathBuf::from(root),
+            mount_point: PathBuf::from(mount_point),
+        })
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_limit_in_hierarchy(
+    mount: &CgroupMount,
+    cgroup_path: &str,
+    limit_file: &str,
+    read_file: &mut impl FnMut(&Path) -> Option<String>,
+) -> Option<u64> {
+    let mut directory = cgroup_directory(mount, cgroup_path)?;
+    let mut limit = None;
+    loop {
+        if let Some(value) = read_file(&directory.join(limit_file))
+            .as_deref()
+            .and_then(parse_cgroup_memory_limit)
+        {
+            limit = Some(limit.map_or(value, |current: u64| current.min(value)));
+        }
+        if directory == mount.mount_point {
+            break;
+        }
+        if !directory.pop() || !directory.starts_with(&mount.mount_point) {
+            break;
+        }
+    }
+    limit
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_directory(mount: &CgroupMount, cgroup_path: &str) -> Option<PathBuf> {
+    let group = Path::new(cgroup_path).strip_prefix("/").ok()?;
+    let root = mount.root.strip_prefix("/").ok()?;
+    let relative = if root.as_os_str().is_empty() {
+        group
+    } else {
+        group.strip_prefix(root).ok()?
+    };
+    let mut directory = mount.mount_point.clone();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => directory.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(directory)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_memory_limit(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value == "max" {
+        return None;
+    }
+    let limit = value.parse::<u64>().ok()?;
+    // cgroup v1 represents no limit as a value just below i64::MAX.
+    (limit < (1_u64 << 60)).then_some(limit)
 }
 
 // ---------------------------------------------------------------------------

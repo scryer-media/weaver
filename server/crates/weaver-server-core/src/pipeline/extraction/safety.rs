@@ -134,9 +134,71 @@ struct ActiveState {
     writers: u64,
 }
 
+/// Decoder-window bytes reserved by every extraction job in this pipeline.
+///
+/// Decoder dictionaries are allocated inside third-party codecs, outside the
+/// ordinary output budgets. Keep one charge for the whole process so several
+/// jobs cannot each consume the configured memory allowance concurrently.
+#[derive(Debug)]
+pub(crate) struct ProcessMemoryBudget {
+    limit: u64,
+    reserved: AtomicU64,
+    idle: Mutex<()>,
+    released: Condvar,
+}
+
+impl ProcessMemoryBudget {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            reserved: AtomicU64::new(0),
+            idle: Mutex::new(()),
+            released: Condvar::new(),
+        }
+    }
+
+    fn reserve_wait<F>(
+        self: &Arc<Self>,
+        bytes: u64,
+        mut check_active: F,
+    ) -> Result<ProcessMemoryPermit, String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        if bytes > self.limit {
+            return Err(format!(
+                "decoder requires {bytes} bytes, process limit is {}",
+                self.limit
+            ));
+        }
+
+        let mut wait_guard = self.idle.lock().expect("process memory state poisoned");
+        loop {
+            check_active()?;
+            if reserve_atomic(&self.reserved, bytes, self.limit).is_ok() {
+                return Ok(ProcessMemoryPermit {
+                    budget: Arc::clone(self),
+                    bytes,
+                });
+            }
+            let (guard, _) = self
+                .released
+                .wait_timeout(wait_guard, Duration::from_millis(250))
+                .expect("process memory state poisoned");
+            wait_guard = guard;
+        }
+    }
+
+    #[cfg(test)]
+    fn reserved_bytes(&self) -> u64 {
+        self.reserved.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct JobExtractionBudget {
     limits: Arc<ExtractionLimits>,
+    process_memory: Arc<ProcessMemoryBudget>,
     root_path: PathBuf,
     ratio_limit_bytes: u64,
     effective_job_limit_bytes: u64,
@@ -161,6 +223,27 @@ impl JobExtractionBudget {
         initial_bytes: u64,
         metrics: Arc<PipelineMetrics>,
     ) -> Result<Arc<Self>, String> {
+        let process_memory = Arc::new(ProcessMemoryBudget::new(limits.max_memory_bytes));
+        Self::new_with_process_memory(
+            limits,
+            process_memory,
+            root_path,
+            declared_archive_bytes,
+            initial_entries,
+            initial_bytes,
+            metrics,
+        )
+    }
+
+    pub(crate) fn new_with_process_memory(
+        limits: Arc<ExtractionLimits>,
+        process_memory: Arc<ProcessMemoryBudget>,
+        root_path: PathBuf,
+        declared_archive_bytes: u64,
+        initial_entries: u64,
+        initial_bytes: u64,
+        metrics: Arc<PipelineMetrics>,
+    ) -> Result<Arc<Self>, String> {
         let ratio_limit_bytes = declared_archive_bytes
             .saturating_mul(limits.max_ratio)
             .max(GIB);
@@ -171,6 +254,7 @@ impl JobExtractionBudget {
             .unwrap_or(0);
         let budget = Arc::new(Self {
             limits,
+            process_memory,
             root_path,
             ratio_limit_bytes,
             effective_job_limit_bytes,
@@ -277,8 +361,20 @@ impl JobExtractionBudget {
         loop {
             self.check_active().map_err(|error| error.to_string())?;
             if reserve_atomic(&self.memory_reserved, bytes, self.limits.max_memory_bytes).is_ok() {
+                let process_memory = self
+                    .process_memory
+                    .reserve_wait(bytes, || {
+                        self.check_active().map_err(|error| error.to_string())
+                    })
+                    .map_err(|error| {
+                        self.memory_reserved.fetch_sub(bytes, Ordering::AcqRel);
+                        self.idle.notify_all();
+                        self.reject(ExtractionRejectionReason::Memory, error)
+                            .to_string()
+                    })?;
                 return Ok(MemoryPermit {
                     budget: Arc::clone(self),
+                    _process_memory: process_memory,
                     bytes,
                 });
             }
@@ -568,6 +664,7 @@ impl Drop for TaskPermit {
 #[derive(Debug)]
 pub(crate) struct MemoryPermit {
     budget: Arc<JobExtractionBudget>,
+    _process_memory: ProcessMemoryPermit,
     bytes: u64,
 }
 
@@ -577,6 +674,19 @@ impl Drop for MemoryPermit {
             .memory_reserved
             .fetch_sub(self.bytes, Ordering::AcqRel);
         self.budget.idle.notify_all();
+    }
+}
+
+#[derive(Debug)]
+struct ProcessMemoryPermit {
+    budget: Arc<ProcessMemoryBudget>,
+    bytes: u64,
+}
+
+impl Drop for ProcessMemoryPermit {
+    fn drop(&mut self) {
+        self.budget.reserved.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.budget.released.notify_all();
     }
 }
 
@@ -623,14 +733,6 @@ impl<W> BudgetedWriter<W> {
             budget,
             member_written: 0,
         }
-    }
-
-    /// The wrapped handle, for operations that act on the file itself rather
-    /// than on its contents — preallocation, for one. Reading and writing
-    /// still go through the budgeted `Write` impl, which is where the byte
-    /// accounting lives.
-    pub(crate) fn get_ref(&self) -> &W {
-        &self.inner
     }
 }
 
@@ -1238,6 +1340,110 @@ mod tests {
         assert!(!waiter.is_finished());
         drop(first);
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn decoder_memory_is_shared_across_job_budgets() {
+        let temp = tempfile::tempdir().unwrap();
+        let limits = Arc::new(ExtractionLimits {
+            max_memory_bytes: 8 * GIB,
+            ..(*limits()).clone()
+        });
+        let process_memory = Arc::new(ProcessMemoryBudget::new(8 * GIB));
+        let first_budget = JobExtractionBudget::new_with_process_memory(
+            Arc::clone(&limits),
+            Arc::clone(&process_memory),
+            temp.path().to_path_buf(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+        let second_budget = JobExtractionBudget::new_with_process_memory(
+            limits,
+            Arc::clone(&process_memory),
+            temp.path().to_path_buf(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+
+        let first = first_budget.reserve_memory_wait(6 * GIB).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _second = second_budget.reserve_memory_wait(4 * GIB).unwrap();
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(process_memory.reserved_bytes(), 6 * GIB);
+        assert!(!waiter.is_finished());
+
+        drop(first);
+        waiter.join().unwrap();
+        assert_eq!(process_memory.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn cancelled_job_leaves_shared_memory_wait_before_holder_releases() {
+        let temp = tempfile::tempdir().unwrap();
+        let limits = Arc::new(ExtractionLimits {
+            max_memory_bytes: 8 * GIB,
+            ..(*limits()).clone()
+        });
+        let process_memory = Arc::new(ProcessMemoryBudget::new(8 * GIB));
+        let holder_budget = JobExtractionBudget::new_with_process_memory(
+            Arc::clone(&limits),
+            Arc::clone(&process_memory),
+            temp.path().to_path_buf(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+        let waiting_budget = JobExtractionBudget::new_with_process_memory(
+            limits,
+            Arc::clone(&process_memory),
+            temp.path().to_path_buf(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+
+        let holder = holder_budget.reserve_memory_wait(6 * GIB).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiting_budget_for_thread = Arc::clone(&waiting_budget);
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = waiting_budget_for_thread
+                .reserve_memory_wait(4 * GIB)
+                .map(|_| ());
+            let _ = done_tx.send(result);
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(process_memory.reserved_bytes(), 6 * GIB);
+        assert!(!waiter.is_finished());
+
+        waiting_budget.cancel();
+
+        let error = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled job should leave the shared-memory wait")
+            .unwrap_err();
+        assert!(error.contains("job extraction was cancelled"));
+        assert_eq!(process_memory.reserved_bytes(), 6 * GIB);
+
+        waiter.join().unwrap();
+        drop(holder);
+        assert_eq!(process_memory.reserved_bytes(), 0);
     }
 
     #[test]

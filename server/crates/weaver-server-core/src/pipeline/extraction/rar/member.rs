@@ -84,61 +84,135 @@ impl Drop for PhaseAttemptRollbackGuard {
 }
 
 const RAR_MAX_DICT_ENV: &str = "WEAVER_RAR_MAX_DICT_BYTES";
-/// Engine default (256 MiB) refuses every real RAR7 archive, whose
-/// dictionaries are >4 GiB by construction. Floor of the scaled default.
-const RAR_MAX_DICT_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
+/// Use a conservative fallback only when the host's effective memory cannot
+/// be detected.
+const RAR_MAX_DICT_FALLBACK_BYTES: u64 = 256 * 1024 * 1024;
+/// Match UnRAR's default while still respecting the process and per-job caps.
+const RAR_MAX_DICT_DEFAULT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// unrar's own compatibility ceiling for declared dictionary sizes.
 const RAR_MAX_DICT_CEILING_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// UnRAR widens every non-store LZ window below this value before allocating
+/// the decoder, including RAR4 members with a smaller declared value.
+const RAR_MIN_LZ_WINDOW_BYTES: u64 = 0x40000;
 
-/// Maximum RAR dictionary size the server will decode.
-///
-/// `WEAVER_RAR_MAX_DICT_BYTES` overrides; otherwise half of physical memory,
-/// clamped to [256 MiB, 64 GiB]. The dictionary window is the dominant
-/// allocation when extracting solid/big-dictionary archives, so this scales
-/// the admission policy with the machine instead of refusing all RAR7 input.
-fn configured_rar_max_dict_bytes() -> u64 {
-    static CONFIGURED: OnceLock<u64> = OnceLock::new();
-    *CONFIGURED.get_or_init(|| {
-        if let Ok(value) = std::env::var(RAR_MAX_DICT_ENV) {
-            match value.trim().parse::<u64>() {
-                Ok(bytes) if bytes > 0 => return bytes,
-                _ => tracing::warn!(
-                    env = RAR_MAX_DICT_ENV,
-                    value,
-                    "invalid RAR max dictionary override; using memory-scaled default"
-                ),
-            }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RarDictionaryLimit {
+    memory_ceiling_bytes: u64,
+    max_dict_bytes: u64,
+}
+
+fn parse_rar_max_dict_request(value: Option<&str>) -> Result<Option<u64>, ()> {
+    match value {
+        None => Ok(None),
+        Some(value) => value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|bytes| *bytes > 0)
+            .map(Some)
+            .ok_or(()),
+    }
+}
+
+fn configured_rar_max_dict_request() -> Option<u64> {
+    let value = match std::env::var(RAR_MAX_DICT_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return None,
+        Err(error) => {
+            tracing::warn!(
+                env = RAR_MAX_DICT_ENV,
+                %error,
+                "failed to read RAR max dictionary override; using memory-scaled default"
+            );
+            return None;
         }
-        crate::runtime::system_probe::detect_total_memory_bytes()
-            .map(|total| (total / 2).clamp(RAR_MAX_DICT_FLOOR_BYTES, RAR_MAX_DICT_CEILING_BYTES))
-            .unwrap_or(RAR_MAX_DICT_FLOOR_BYTES)
-    })
+    };
+
+    match parse_rar_max_dict_request(Some(&value)) {
+        Ok(request) => request,
+        Err(()) => {
+            tracing::warn!(
+                env = RAR_MAX_DICT_ENV,
+                value,
+                "invalid RAR max dictionary override; using memory-scaled default"
+            );
+            None
+        }
+    }
 }
 
-/// Apply the server's decode limits to a freshly opened archive.
-pub(crate) fn apply_server_rar_limits(archive: &mut unrar_rs::RarArchive) {
-    apply_server_rar_limits_with_memory_limit(archive, u64::MAX);
+fn resolve_rar_dictionary_limit(
+    effective_memory_bytes: Option<u64>,
+    extraction_memory_limit: u64,
+    requested_max_dict_bytes: Option<u64>,
+) -> RarDictionaryLimit {
+    let memory_ceiling_bytes = effective_memory_bytes
+        .map(|bytes| bytes / 2)
+        .unwrap_or(RAR_MAX_DICT_FALLBACK_BYTES)
+        .min(RAR_MAX_DICT_CEILING_BYTES)
+        .min(extraction_memory_limit);
+    let default_max_dict_bytes = RAR_MAX_DICT_DEFAULT_BYTES.min(memory_ceiling_bytes);
+    let max_dict_bytes = requested_max_dict_bytes
+        .unwrap_or(default_max_dict_bytes)
+        .min(memory_ceiling_bytes);
+
+    RarDictionaryLimit {
+        memory_ceiling_bytes,
+        max_dict_bytes,
+    }
 }
 
-fn apply_server_rar_limits_with_memory_limit(
+pub(crate) fn apply_server_rar_limits_with_memory_limit(
     archive: &mut unrar_rs::RarArchive,
     extraction_memory_limit: u64,
-) {
+) -> u64 {
+    let requested_max_dict_bytes = configured_rar_max_dict_request();
+    let resolved = resolve_rar_dictionary_limit(
+        crate::runtime::system_probe::detect_total_memory_bytes(),
+        extraction_memory_limit,
+        requested_max_dict_bytes,
+    );
+    if let Some(requested_max_dict_bytes) = requested_max_dict_bytes
+        && requested_max_dict_bytes > resolved.memory_ceiling_bytes
+    {
+        tracing::warn!(
+            env = RAR_MAX_DICT_ENV,
+            requested_max_dict_bytes,
+            memory_ceiling_bytes = resolved.memory_ceiling_bytes,
+            "RAR max dictionary override exceeds the available extraction memory and was clamped"
+        );
+    }
     let limits = unrar_rs::Limits {
-        max_dict_size: configured_rar_max_dict_bytes().min(extraction_memory_limit),
+        max_dict_size: resolved.max_dict_bytes,
         ..Default::default()
     };
     archive.set_limits(limits);
+    resolved.max_dict_bytes
 }
 
-fn rar_decoder_memory_bytes(archive: &unrar_rs::RarArchive) -> u64 {
+pub(crate) fn rar_decoder_memory_bytes(archive: &unrar_rs::RarArchive) -> u64 {
     archive
         .metadata()
         .members
         .iter()
-        .map(|member| member.compression.dict_size)
+        .filter(|member| member.compression.method != unrar_rs::CompressionMethod::Store)
+        .map(|member| member.compression.dict_size.max(RAR_MIN_LZ_WINDOW_BYTES))
         .max()
         .unwrap_or(0)
+}
+
+pub(crate) fn ensure_rar_dictionary_within_limit(
+    archive: &unrar_rs::RarArchive,
+    max_dict_bytes: u64,
+) -> Result<(), unrar_rs::RarError> {
+    let required = rar_decoder_memory_bytes(archive);
+    if required > max_dict_bytes {
+        return Err(unrar_rs::RarError::DictionaryTooLarge {
+            size: required,
+            max: max_dict_bytes,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,17 +608,6 @@ impl Pipeline {
             budget.reject_unsafe_path(format!("RAR partial output escaped staging root: {error}"))
         })?;
         let partial_file = root.create_file(partial_relative, &budget)?;
-        // Reserve the extent up front so a large member does not stream into a
-        // fragmented file. This borrows the capability handle as a plain `File`
-        // view rather than taking ownership of it, and it changes allocation
-        // only — every byte still goes through the budgeted writer.
-        {
-            use cap_std::io_lifetimes::AsFilelike;
-            unrar_rs::RarArchive::preallocate_output_file(
-                &partial_file.get_ref().as_filelike_view::<std::fs::File>(),
-                unpacked_size,
-            );
-        }
         let shared = Rc::new(RefCell::new(SharedOutputFile {
             inner: std::io::BufWriter::with_capacity(8 * 1024 * 1024, partial_file),
         }));
@@ -939,7 +1002,7 @@ impl Pipeline {
                 )?
             }
         };
-        apply_server_rar_limits_with_memory_limit(
+        let max_dict_bytes = apply_server_rar_limits_with_memory_limit(
             &mut archive,
             inputs
                 .budget
@@ -960,6 +1023,8 @@ impl Pipeline {
         let bounded_sources = retain_attached_readers.then(BoundedRarSourcePool::single_fd);
 
         if has_cached_headers && !refresh_provided_volumes && !retain_attached_readers {
+            ensure_rar_dictionary_within_limit(&archive, max_dict_bytes)
+                .map_err(crate::pipeline::RarPasswordAttemptError::from)?;
             return Ok(archive);
         }
 
@@ -1063,6 +1128,8 @@ impl Pipeline {
             }
         }
 
+        ensure_rar_dictionary_within_limit(&archive, max_dict_bytes)
+            .map_err(crate::pipeline::RarPasswordAttemptError::from)?;
         Ok(archive)
     }
 
@@ -1310,6 +1377,136 @@ impl Pipeline {
 mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn rar_dictionary_limit_resolver_bounds_defaults_and_requests() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+
+        assert_eq!(
+            resolve_rar_dictionary_limit(Some(512 * MIB), u64::MAX, None),
+            RarDictionaryLimit {
+                memory_ceiling_bytes: 256 * MIB,
+                max_dict_bytes: 256 * MIB,
+            }
+        );
+        assert_eq!(
+            resolve_rar_dictionary_limit(Some(16 * GIB), u64::MAX, None),
+            RarDictionaryLimit {
+                memory_ceiling_bytes: 8 * GIB,
+                max_dict_bytes: 4 * GIB,
+            }
+        );
+        // `detect_total_memory_bytes` has already applied the cgroup clamp,
+        // so the resolver receives that effective value directly.
+        assert_eq!(
+            resolve_rar_dictionary_limit(Some(2 * GIB), u64::MAX, None),
+            RarDictionaryLimit {
+                memory_ceiling_bytes: GIB,
+                max_dict_bytes: GIB,
+            }
+        );
+        assert_eq!(
+            resolve_rar_dictionary_limit(None, u64::MAX, None),
+            RarDictionaryLimit {
+                memory_ceiling_bytes: 256 * MIB,
+                max_dict_bytes: 256 * MIB,
+            }
+        );
+        assert_eq!(
+            resolve_rar_dictionary_limit(Some(16 * GIB), u64::MAX, Some(8 * GIB)),
+            RarDictionaryLimit {
+                memory_ceiling_bytes: 8 * GIB,
+                max_dict_bytes: 8 * GIB,
+            }
+        );
+        assert_eq!(
+            resolve_rar_dictionary_limit(Some(16 * GIB), u64::MAX, Some(16 * GIB)),
+            RarDictionaryLimit {
+                memory_ceiling_bytes: 8 * GIB,
+                max_dict_bytes: 8 * GIB,
+            }
+        );
+        assert_eq!(
+            resolve_rar_dictionary_limit(Some(16 * GIB), u64::MAX, Some(128 * MIB)),
+            RarDictionaryLimit {
+                memory_ceiling_bytes: 8 * GIB,
+                max_dict_bytes: 128 * MIB,
+            }
+        );
+        assert_eq!(
+            resolve_rar_dictionary_limit(Some(16 * GIB), GIB, Some(8 * GIB)),
+            RarDictionaryLimit {
+                memory_ceiling_bytes: GIB,
+                max_dict_bytes: GIB,
+            }
+        );
+        assert_eq!(
+            resolve_rar_dictionary_limit(Some(0), u64::MAX, None),
+            RarDictionaryLimit {
+                memory_ceiling_bytes: 0,
+                max_dict_bytes: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn rar_dictionary_limit_request_parser_rejects_zero_and_malformed_values() {
+        assert_eq!(parse_rar_max_dict_request(None), Ok(None));
+        assert_eq!(
+            parse_rar_max_dict_request(Some(" 1048576 ")),
+            Ok(Some(1_048_576))
+        );
+        assert_eq!(parse_rar_max_dict_request(Some("0")), Err(()));
+        assert_eq!(parse_rar_max_dict_request(Some("not-a-number")), Err(()));
+    }
+
+    #[test]
+    fn oversized_dictionary_metadata_is_rejected_before_extraction_creates_a_partial() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("oversized.rar");
+        std::fs::write(&archive_path, build_large_dictionary_rar()).unwrap();
+        let budget = JobExtractionBudget::new(
+            Arc::new(ExtractionLimits {
+                max_job_bytes: 16 * GIB,
+                max_member_bytes: 16 * GIB,
+                max_entries: 16,
+                max_ratio: 1,
+                max_seconds: 60,
+                min_free_bytes: 0,
+                max_memory_bytes: 4 * GIB,
+            }),
+            temp.path().to_path_buf(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+        let requested = vec!["oversized.bin".to_string()];
+
+        let error =
+            match Pipeline::open_rar_archive_from_snapshot_or_disk(RarArchiveSnapshotOpenRequest {
+                set_name: "oversized-dictionary",
+                volume_paths: std::collections::BTreeMap::from([(0, archive_path)]),
+                password_candidates: Vec::new(),
+                cached_headers: None,
+                shared_kdf_cache: Arc::new(unrar_rs::crypto::KdfCache::new()),
+                open_mode: RarArchiveOpenMode::AttachOnly,
+                requested_members: Some(&requested),
+                already_extracted: None,
+                budget: Some(budget),
+            }) {
+                Ok(_) => {
+                    panic!("an oversized dictionary must be rejected during archive admission")
+                }
+                Err(error) => error,
+            };
+
+        assert!(error.contains("dictionary"), "unexpected error: {error}");
+        assert!(!temp.path().join("oversized.bin.partial").exists());
+    }
 
     /// The solid branch of the password probe, over a real solid archive.
     ///
@@ -1641,6 +1838,23 @@ mod tests {
         result.extend_from_slice(&header_size_bytes);
         result.extend_from_slice(&body);
         result
+    }
+
+    fn build_large_dictionary_rar() -> Vec<u8> {
+        // RAR7, normal compression, dictionary code 16 = 8 GiB.
+        let compression_info = 1 | (3 << 7) | (16 << 10);
+        let mut bytes = TEST_RAR5_SIG.to_vec();
+        bytes.extend_from_slice(&build_test_rar_main_header(0, None));
+        bytes.extend_from_slice(&build_test_rar_file_header(
+            "oversized.bin",
+            0,
+            compression_info,
+            0,
+            0,
+            None,
+        ));
+        bytes.extend_from_slice(&build_test_rar_end_header(false));
+        bytes
     }
 
     fn build_solid_store_multivolume_rar_set(volume_count: usize) -> Vec<(String, Vec<u8>)> {
