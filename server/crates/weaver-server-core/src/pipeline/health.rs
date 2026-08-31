@@ -306,6 +306,15 @@ impl Pipeline {
         }
     }
 
+    /// Reject content that must not reach terminal post-processing scripts or
+    /// the complete directory. Unlike ordinary pipeline failures, this route
+    /// deliberately does not expose the rejected working tree to scripts.
+    pub(super) fn reject_unacceptable_extension(&mut self, job_id: JobId, error: String) {
+        let (released_repair, released_extract) =
+            self.prepare_failed_job_runtime(job_id, &error, false);
+        self.finish_failed_job(job_id, error, released_repair, released_extract);
+    }
+
     /// Mark a job as failed and purge its queued segments.
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
         // Terminal transition: a job dying without a recovery set never had a

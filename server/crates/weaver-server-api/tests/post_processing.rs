@@ -24,7 +24,7 @@ async fn settings_are_admin_only_and_execution_is_off_by_default() {
 
     let response = harness
         .execute(
-            "{ postProcessingSettings { scriptDirectory executionEnabled concurrency terminationGraceSeconds strictSecurityRefusesExecution lists { global { script } } } }",
+            "{ postProcessingSettings { scriptDirectory executionEnabled concurrency terminationGraceSeconds unacceptableExtensions strictSecurityRefusesExecution lists { global { script } } } }",
         )
         .await;
     assert_no_errors(&response);
@@ -33,6 +33,7 @@ async fn settings_are_admin_only_and_execution_is_off_by_default() {
     assert_eq!(settings["executionEnabled"], false);
     assert_eq!(settings["concurrency"], 1);
     assert_eq!(settings["terminationGraceSeconds"], 10);
+    assert_eq!(settings["unacceptableExtensions"], serde_json::json!([]));
     assert_eq!(settings["strictSecurityRefusesExecution"], false);
     assert_eq!(settings["lists"]["global"].as_array().unwrap().len(), 0);
 }
@@ -97,11 +98,13 @@ async fn settings_round_trip_and_reject_an_out_of_range_concurrency() {
                 concurrency: 2
                 terminationGraceSeconds: 15
                 pythonInterpreter: "/usr/bin/python3"
+                unacceptableExtensions: ["EXE", "r??"]
               }) {
                 executionEnabled
                 concurrency
                 terminationGraceSeconds
                 pythonInterpreter
+                unacceptableExtensions
               }
             }
             "#,
@@ -113,6 +116,10 @@ async fn settings_round_trip_and_reject_an_out_of_range_concurrency() {
     assert_eq!(settings["concurrency"], 2);
     assert_eq!(settings["terminationGraceSeconds"], 15);
     assert_eq!(settings["pythonInterpreter"], "/usr/bin/python3");
+    assert_eq!(
+        settings["unacceptableExtensions"],
+        serde_json::json!(["exe", "r??"])
+    );
 
     let rejected = harness
         .execute(
@@ -124,6 +131,18 @@ async fn settings_round_trip_and_reject_an_out_of_range_concurrency() {
         )
         .await;
     assert_has_errors(&rejected);
+
+    let invalid_pattern = harness
+        .execute(
+            r#"mutation { setPostProcessingSettings(input: {
+                executionEnabled: false
+                concurrency: 1
+                terminationGraceSeconds: 10
+                unacceptableExtensions: [".exe"]
+            }) { unacceptableExtensions } }"#,
+        )
+        .await;
+    assert_has_errors(&invalid_pattern);
 }
 
 #[tokio::test]

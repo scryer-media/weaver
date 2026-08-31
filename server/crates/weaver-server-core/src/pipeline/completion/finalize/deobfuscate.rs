@@ -20,7 +20,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use tracing::{debug, info, warn};
@@ -32,41 +31,6 @@ use crate::jobs::working_dir::OUTPUT_DIR_MARKER;
 
 /// Public release index, queried by the CRC32 of a file inside the archives.
 pub(super) const SRRDB_API_BASE: &str = "https://api.srrdb.com/v1";
-
-/// Environment switch for the release-index rung: `WEAVER_SRRDB_LOOKUP`.
-///
-/// **This is how the rung is turned on today**, and the reason it exists rather
-/// than the config row alone is consent: the lookup is the one step of
-/// completion that leaves the operator's network, and until the settings UI can
-/// say so in words, a switch visible in the process environment is a better
-/// place to make that choice than a row in a file. It overrides config in both
-/// directions — an off word forces the rung off even where config enabled it —
-/// and leaving it unset defers to config, which defaults off.
-pub(crate) const SRRDB_LOOKUP_ENV: &str = "WEAVER_SRRDB_LOOKUP";
-
-/// Whether the environment says anything about the release-index rung. Read
-/// once, in the same style as the direct-store gate.
-fn env_srrdb_lookup() -> Option<bool> {
-    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
-    *OVERRIDE.get_or_init(|| {
-        crate::pipeline::direct_store::parse_enabled(
-            std::env::var(SRRDB_LOOKUP_ENV).ok().as_deref(),
-        )
-    })
-}
-
-/// The rung's gate: the environment first, config behind it.
-///
-/// Split from the reader so the precedence is testable without mutating process
-/// state, exactly as the direct-store gate splits `resolve_parts`.
-pub(crate) fn srrdb_lookup_enabled(env: Option<bool>, from_config: bool) -> bool {
-    env.unwrap_or(from_config)
-}
-
-/// The live gate, for callers that are not a test pinning the inputs.
-pub(crate) fn srrdb_lookup_enabled_now(from_config: bool) -> bool {
-    srrdb_lookup_enabled(env_srrdb_lookup(), from_config)
-}
 
 /// One attempt, bounded. A release name is a nicety; completion waiting on a
 /// third party is not acceptable at any duration a user would notice.
@@ -381,33 +345,6 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1024 * 1024;
-
-    #[test]
-    fn the_environment_has_the_last_word_on_the_outbound_rung() {
-        // Unset defers to config, which is where the default-off lives.
-        assert!(!srrdb_lookup_enabled(None, false));
-        assert!(srrdb_lookup_enabled(None, true));
-        // Set overrides config in BOTH directions: the switch exists so an
-        // operator can grant consent without editing config, and withdraw it
-        // without trusting that the config write took.
-        assert!(srrdb_lookup_enabled(Some(true), false));
-        assert!(!srrdb_lookup_enabled(Some(false), true));
-    }
-
-    #[test]
-    fn the_switch_reads_the_same_on_off_words_as_the_direct_store_gate() {
-        // One vocabulary for every operator switch: the parser is shared with
-        // the direct-store gate rather than restated here.
-        use crate::pipeline::direct_store::parse_enabled;
-        assert_eq!(parse_enabled(Some("1")), Some(true));
-        assert_eq!(parse_enabled(Some(" YES ")), Some(true));
-        assert_eq!(parse_enabled(Some("off")), Some(false));
-        // A typo must not read as "off" — it defers to config instead, so a
-        // fat-fingered variable cannot silently withdraw a granted consent in
-        // the direction the operator did not ask for.
-        assert_eq!(parse_enabled(Some("ture")), None);
-        assert_eq!(parse_enabled(None), None);
-    }
 
     fn plan(job_display_name: &str) -> DeliveryNamingPlan {
         DeliveryNamingPlan {

@@ -296,6 +296,7 @@ const GENERAL_SETTINGS_FIELDS = `
     maxDownloadSpeed
     maxRetries
     ipReplacementTrialExtraConnections
+    enableSrrdbLookup
     duplicatePolicy {
       strictActiveOrSuccess
       strictFailedOrCancelled
@@ -1504,6 +1505,7 @@ const POST_PROCESSING_SETTINGS_FIELDS = gql`
     pythonInterpreter
     powershellInterpreter
     batchInterpreter
+    unacceptableExtensions
     strictSecurityRefusesExecution
     lists {
       global {

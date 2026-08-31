@@ -232,8 +232,8 @@ impl Database {
         &self,
         settings: &PostProcessingSettings,
     ) -> Result<(), StateError> {
-        settings.validate().map_err(state_err)?;
-        self.set_setting(SETTINGS_KEY, &to_json(settings)?)
+        let settings = settings.clone().normalized().map_err(state_err)?;
+        self.set_setting(SETTINGS_KEY, &to_json(&settings)?)
     }
 
     pub fn post_processing_script_lists(&self) -> Result<ScriptLists, StateError> {

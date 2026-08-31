@@ -108,9 +108,6 @@ impl Config {
     /// operator's network, so it stays an explicit opt-in even though the
     /// request carries nothing but a checksum.
     ///
-    /// **The `WEAVER_SRRDB_LOOKUP` environment switch overrides this in both
-    /// directions and is how the rung is turned on today** — this row is the
-    /// durable home the settings UI will eventually own.
     pub fn enable_srrdb_lookup(&self) -> bool {
         self.delivery_naming
             .as_ref()

@@ -9342,6 +9342,56 @@ async fn extracting_rar_restart_with_failed_member_enters_repair_or_relaunches()
 }
 
 #[tokio::test]
+async fn unacceptable_rar_member_is_rejected_before_extraction() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31203);
+    let mut files = build_multifile_multivolume_rar_set();
+    for (_, bytes) in &mut files {
+        if let Some(offset) = bytes
+            .windows(b"E01.mkv".len())
+            .position(|window| window == b"E01.mkv")
+        {
+            bytes[offset..offset + b"E01.mkv".len()].copy_from_slice(b"E01.exe");
+        }
+    }
+    pipeline
+        .db
+        .save_post_processing_settings(&crate::post_processing::model::PostProcessingSettings {
+            unacceptable_extensions: vec!["exe".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    let spec = rar_job_spec("RAR Header Rejection", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    assert_eq!(pipeline.extract_rar_set(job_id, "show").await.unwrap(), 0);
+    assert!(
+        pipeline
+            .inflight_extractions
+            .get(&job_id)
+            .is_none_or(|sets| !sets.contains("show"))
+    );
+    let status = job_status_for_assert(&pipeline, job_id).unwrap();
+    let JobStatus::Failed { error } = status else {
+        panic!("a confirmed RAR member extension must fail the job");
+    };
+    assert!(error.contains("RAR member 'E01.exe' before extraction"));
+    assert!(
+        !complete_dir
+            .join(crate::jobs::working_dir::sanitize_dirname(
+                "RAR Header Rejection"
+            ))
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn direct_full_set_rar_extraction_registers_and_blocks_incremental_batches() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

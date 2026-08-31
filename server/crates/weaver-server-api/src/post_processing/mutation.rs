@@ -26,9 +26,8 @@ impl PostProcessingMutation {
         ctx: &Context<'_>,
         input: PostProcessingSettingsInput,
     ) -> Result<PostProcessingSettingsGql> {
-        let settings = PostProcessingSettings::from(input);
-        settings
-            .validate()
+        let settings = PostProcessingSettings::from(input)
+            .normalized()
             .map_err(|error| async_graphql::Error::new(error.to_string()))?;
         // Refused here as well as at run time: an operator who turns the switch
         // on under strict security should be told immediately, not discover it

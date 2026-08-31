@@ -19,6 +19,7 @@ pub struct PostProcessingSettingsGql {
     pub python_interpreter: Option<String>,
     pub powershell_interpreter: Option<String>,
     pub batch_interpreter: Option<String>,
+    pub unacceptable_extensions: Vec<String>,
     /// True when `WEAVER_STRICT_SECURITY` refuses script execution outright.
     pub strict_security_refuses_execution: bool,
     /// Global default list plus every per-category override.
@@ -40,6 +41,7 @@ impl PostProcessingSettingsGql {
             python_interpreter: value.python_interpreter,
             powershell_interpreter: value.powershell_interpreter,
             batch_interpreter: value.batch_interpreter,
+            unacceptable_extensions: value.unacceptable_extensions,
             strict_security_refuses_execution: strict_security,
             lists: lists.into(),
         }
@@ -54,6 +56,8 @@ pub struct PostProcessingSettingsInput {
     pub python_interpreter: Option<String>,
     pub powershell_interpreter: Option<String>,
     pub batch_interpreter: Option<String>,
+    #[graphql(default)]
+    pub unacceptable_extensions: Vec<String>,
 }
 
 impl From<PostProcessingSettingsInput> for PostProcessingSettings {
@@ -65,6 +69,7 @@ impl From<PostProcessingSettingsInput> for PostProcessingSettings {
             python_interpreter: value.python_interpreter,
             powershell_interpreter: value.powershell_interpreter,
             batch_interpreter: value.batch_interpreter,
+            unacceptable_extensions: value.unacceptable_extensions,
         }
     }
 }

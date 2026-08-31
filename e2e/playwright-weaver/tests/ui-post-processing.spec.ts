@@ -60,6 +60,9 @@ test("post-processing settings, the live script list, and real script execution 
   await page.locator("#pp-grace").fill("5");
   await page.getByRole("button", { name: "Save settings" }).click();
   await expect(page.getByText("Post-processing settings saved.")).toBeVisible();
+  await page.getByLabel("Unacceptable extension patterns").fill("EXE, r??");
+  await page.getByRole("button", { name: "Save extension policy" }).click();
+  await expect(page.getByText("Post-processing settings saved.")).toBeVisible();
 
   // 2. Scripts are listed live from the directory, with unreadable ones surfaced.
   const problems = page.getByRole("region", { name: "Script problems" });
@@ -99,6 +102,7 @@ test("post-processing settings, the live script list, and real script execution 
   await page.reload();
   await expect(page.locator("#pp-concurrency")).toHaveValue("2");
   await expect(page.locator("#pp-grace")).toHaveValue("5");
+  await expect(page.getByLabel("Unacceptable extension patterns")).toHaveValue("exe, r??");
   await page.getByLabel("Script options").click();
   await page.getByRole("option", { name: POST_PROCESSING_NZBGET_DISPLAY_NAME }).click();
   await expect(optionsGroup.getByLabel("Label")).toHaveValue("e2e-label");

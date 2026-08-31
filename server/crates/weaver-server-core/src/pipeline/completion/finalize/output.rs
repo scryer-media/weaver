@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use super::deobfuscate::{self, DeliveryNamingPlan, SrrdbInputs};
 use crate::jobs::working_dir::{WORKING_DIR_MARKER, mark_weaver_owned_output_dir};
+use crate::post_processing::model::PostProcessingSettings;
 use crate::runtime::{file_cache, fs as runtime_fs};
 
 /// Folds one volume's member headers into the checksum map. A member spanning
@@ -24,6 +25,114 @@ fn record_member_crc32(by_name: &mut HashMap<String, u32>, facts: &unrar_rs::Rar
             .unwrap_or(&member.name);
         by_name.insert(name.to_ascii_lowercase(), crc32);
     }
+}
+
+#[derive(Debug)]
+struct UnacceptableExtensionMatch {
+    relative_path: String,
+    pattern: String,
+}
+
+/// Inspect precisely the entries the final move can publish without following
+/// symlinks. A rejection occurs before the destination directory is allocated.
+fn scan_delivery_sources(
+    working_dir: &std::path::Path,
+    staging_dir: Option<&std::path::Path>,
+    settings: &PostProcessingSettings,
+) -> Result<Option<UnacceptableExtensionMatch>, String> {
+    if let Some(staging_dir) = staging_dir
+        && let Some(rejection) = scan_delivery_root(staging_dir, &[".weaver-chunks"], settings)?
+    {
+        return Ok(Some(rejection));
+    }
+    scan_delivery_root(
+        working_dir,
+        &[".weaver-chunks", ".weaver-staging", WORKING_DIR_MARKER],
+        settings,
+    )
+}
+
+fn scan_delivery_root(
+    root: &std::path::Path,
+    ignored_entries: &[&str],
+    settings: &PostProcessingSettings,
+) -> Result<Option<UnacceptableExtensionMatch>, String> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "could not inspect delivery root {}: {error}",
+                root.display()
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not inspect delivery root {}: {error}",
+                root.display()
+            )
+        })?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| ignored_entries.contains(&name))
+        {
+            continue;
+        }
+        if let Some(rejection) = scan_delivery_path(root, &entry.path(), settings)? {
+            return Ok(Some(rejection));
+        }
+    }
+    Ok(None)
+}
+
+fn scan_delivery_path(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    settings: &PostProcessingSettings,
+) -> Result<Option<UnacceptableExtensionMatch>, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "could not inspect delivery entry {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.is_dir() {
+        let entries = std::fs::read_dir(path).map_err(|error| {
+            format!(
+                "could not inspect delivery directory {}: {error}",
+                path.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "could not inspect delivery directory {}: {error}",
+                    path.display()
+                )
+            })?;
+            if let Some(rejection) = scan_delivery_path(root, &entry.path(), settings)? {
+                return Ok(Some(rejection));
+            }
+        }
+        return Ok(None);
+    }
+
+    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    let Some(pattern) = settings.unacceptable_extension_match(&filename) else {
+        return Ok(None);
+    };
+    let relative_path = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned();
+    Ok(Some(UnacceptableExtensionMatch {
+        relative_path,
+        pattern: pattern.to_string(),
+    }))
 }
 
 fn move_path_with_copy_fallback(
@@ -571,14 +680,9 @@ impl Pipeline {
         if !enabled {
             return None;
         }
-        // The environment has the last word on the outbound rung — see
-        // [`deobfuscate::SRRDB_LOOKUP_ENV`] for why consent lives there until
-        // the settings UI can ask for it in words.
-        let srrdb_enabled = deobfuscate::srrdb_lookup_enabled_now(srrdb_from_config);
-
         // The checksum map is only ever read by the lookup, so an operator who
         // never opted in never pays for gathering it.
-        let srrdb = srrdb_enabled.then(|| SrrdbInputs {
+        let srrdb = srrdb_from_config.then(|| SrrdbInputs {
             base_url: deobfuscate::SRRDB_API_BASE.to_string(),
             crc32_by_member_name: HashMap::new(),
         });
@@ -679,6 +783,34 @@ impl Pipeline {
         if let Some(staging) = staging_dir.as_deref() {
             let budget = self.extraction_budget(job_id, staging)?;
             ExtractionRoot::open(staging)?.scan_no_links(&budget)?;
+        }
+
+        let settings = self
+            .db_blocking(|db| db.post_processing_settings())
+            .await
+            .map_err(|error| format!("could not load unacceptable extension policy: {error}"))?;
+        if !settings.unacceptable_extensions.is_empty() {
+            let working_dir_for_scan = working_dir.clone();
+            let staging_dir_for_scan = staging_dir.clone();
+            let rejection = tokio::task::spawn_blocking(move || {
+                scan_delivery_sources(
+                    &working_dir_for_scan,
+                    staging_dir_for_scan.as_deref(),
+                    &settings,
+                )
+            })
+            .await
+            .map_err(|error| format!("unacceptable extension scan worker failed: {error}"))??;
+            if let Some(rejection) = rejection {
+                self.reject_unacceptable_extension(
+                    job_id,
+                    format!(
+                        "unacceptable extension '{}' matched '{}' before publication",
+                        rejection.pattern, rejection.relative_path
+                    ),
+                );
+                return Ok(());
+            }
         }
 
         self.phase_end(job_id, JobPhase::Extracting);

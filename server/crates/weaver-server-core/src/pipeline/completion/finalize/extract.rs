@@ -847,6 +847,80 @@ impl Pipeline {
             }
         }
 
+        let settings = self
+            .db_blocking(|db| db.post_processing_settings())
+            .await
+            .map_err(|error| format!("could not load unacceptable extension policy: {error}"))?;
+        if !settings.unacceptable_extensions.is_empty() && !volume_paths.is_empty() {
+            let shared_kdf_cache = self
+                .rar_sets
+                .get(&(job_id, set_name.to_string()))
+                .map(|state| state.shared_kdf_cache.clone())
+                .unwrap_or_else(|| std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()));
+            let open_mode =
+                if self.rar_volume_paths_need_header_refresh(job_id, set_name, &volume_paths) {
+                    crate::pipeline::extraction::RarArchiveOpenMode::RefreshProvidedVolumes
+                } else {
+                    crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly
+                };
+            let set_name_owned = set_name.to_string();
+            let inspection_volume_paths = volume_paths.clone();
+            let inspection_password_candidates = password_candidates.clone();
+            let inspection_cached_headers = cached_headers.clone();
+            let inspection =
+                tokio::task::spawn_blocking(move || {
+                    let selection = Self::open_rar_archive_for_extraction_with_password_candidates(
+                        RarExtractionOpenRequest {
+                            set_name: &set_name_owned,
+                            volume_paths: inspection_volume_paths,
+                            password_candidates: inspection_password_candidates,
+                            cached_headers: inspection_cached_headers,
+                            shared_kdf_cache,
+                            open_mode,
+                            requested_members: &[],
+                            already_extracted: None,
+                            budget: None,
+                        },
+                    )?;
+                    Ok::<_, String>(selection.archive.metadata().members.iter().find_map(
+                        |member| {
+                            (!member.is_directory)
+                                .then(|| settings.unacceptable_extension_match(&member.name))
+                                .flatten()
+                                .map(|pattern| (member.name.clone(), pattern.to_string()))
+                        },
+                    ))
+                })
+                .await;
+            match inspection {
+                Ok(Ok(Some((member, pattern)))) => {
+                    self.reject_unacceptable_extension(
+                        job_id,
+                        format!(
+                            "unacceptable extension '{pattern}' matched RAR member '{member}' before extraction"
+                        ),
+                    );
+                    return Ok(0);
+                }
+                Ok(Ok(None)) => {}
+                // Header encryption, missing passwords, and incomplete archive facts are
+                // non-decisive. Extraction retains its existing error handling and the
+                // pre-publication guard will still inspect every materialized output.
+                Ok(Err(error)) => tracing::debug!(
+                    job_id = job_id.0,
+                    set_name,
+                    error = %error,
+                    "could not inspect RAR members for unacceptable extensions"
+                ),
+                Err(error) => tracing::warn!(
+                    job_id = job_id.0,
+                    set_name,
+                    error = %error,
+                    "unacceptable extension RAR inspection worker failed"
+                ),
+            }
+        }
+
         if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.to_string())) {
             set_state.active_workers = 1;
             set_state.in_flight_members.clear();

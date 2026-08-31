@@ -393,3 +393,54 @@ async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
     assert_eq!(result.renamed_members, 0);
     assert!(dest.join("Yb5drZSkNi20UCMkb.mkv").is_file());
 }
+
+#[test]
+fn prepublication_scan_checks_both_delivery_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let staging = temp.path().join("staging");
+    std::fs::create_dir_all(working.join("nested")).unwrap();
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(working.join("safe.mkv"), b"safe").unwrap();
+    std::fs::write(staging.join("nested.exe"), b"rejected").unwrap();
+
+    let settings = PostProcessingSettings {
+        unacceptable_extensions: vec!["EXE".into()],
+        ..PostProcessingSettings::default()
+    }
+    .normalized()
+    .unwrap();
+    let rejection = scan_delivery_sources(&working, Some(&staging), &settings)
+        .unwrap()
+        .expect("staging output must be inspected");
+
+    assert_eq!(rejection.pattern, "exe");
+    assert_eq!(rejection.relative_path, "nested.exe");
+    assert!(working.join("safe.mkv").exists());
+    assert!(staging.join("nested.exe").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn prepublication_scan_does_not_follow_symlinked_directories() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&working).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("payload.exe"), b"rejected if followed").unwrap();
+    symlink(&outside, working.join("linked")).unwrap();
+
+    let settings = PostProcessingSettings {
+        unacceptable_extensions: vec!["exe".into()],
+        ..PostProcessingSettings::default()
+    };
+
+    assert!(
+        scan_delivery_sources(&working, None, &settings)
+            .unwrap()
+            .is_none()
+    );
+}

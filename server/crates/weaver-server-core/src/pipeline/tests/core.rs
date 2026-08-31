@@ -596,6 +596,72 @@ async fn failed_final_move_marks_job_failed_instead_of_complete() {
 }
 
 #[tokio::test]
+async fn unacceptable_extension_rejection_never_starts_a_final_move_or_scripts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10069);
+    let job_name = "Rejected Before Publication";
+    pipeline
+        .db
+        .save_post_processing_settings(&crate::post_processing::model::PostProcessingSettings {
+            execution_enabled: true,
+            unacceptable_extensions: vec!["exe".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    pipeline
+        .db
+        .save_post_processing_script_lists(&crate::post_processing::model::ScriptLists {
+            global: crate::post_processing::model::ScriptList::new(vec![
+                crate::post_processing::model::ScriptListEntry::new(
+                    crate::post_processing::model::ScriptName::new("sentinel.sh").unwrap(),
+                ),
+            ])
+            .unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let working_dir = intermediate_dir.join("rejected-before-publication");
+    tokio::fs::create_dir_all(working_dir.join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::write(working_dir.join("nested/payload.EXE"), b"rejected")
+        .await
+        .unwrap();
+    pipeline.jobs.insert(
+        job_id,
+        minimal_job_state(job_id, job_name, working_dir.clone()),
+    );
+
+    pipeline.start_move_to_complete(job_id).await.unwrap();
+
+    assert!(pipeline.move_done_rx.try_recv().is_err());
+    assert!(pipeline.inflight_terminal_post_processing.is_empty());
+    assert!(
+        !complete_dir
+            .join(crate::jobs::working_dir::sanitize_dirname(job_name))
+            .exists()
+    );
+    let status = job_status_for_assert(&pipeline, job_id).unwrap();
+    let JobStatus::Failed { error } = status else {
+        panic!("unacceptable extension must fail the job");
+    };
+    assert!(error.contains("unacceptable extension 'exe'"));
+    assert!(
+        pipeline
+            .db
+            .job_post_processing_summary(job_id.0)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        working_dir.exists(),
+        "the rejected source was never published"
+    );
+}
+
+#[tokio::test]
 async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(

@@ -6,12 +6,15 @@ const afterRestart = process.env.E2E_WEAVER_UI_STAGE === "after-restart";
 const persistedCategory = "e2e-product-category-persisted";
 const persistedSchedule = "e2e-off-peak-persisted";
 
-test("general speed and bandwidth-cap settings persist through browser controls", async ({ cleanPage: page }) => {
+test("general speed, SRRDB lookup, and bandwidth-cap settings persist through browser controls", async ({ cleanPage: page }) => {
   await page.goto("/settings/general");
   const speed = page.getByRole("slider", { name: "Speed Limit" });
+  const srrdbLookup = page.getByRole("switch", { name: "Use SRRDB release lookup" });
   await expect(speed).toBeVisible();
+  await expect(srrdbLookup).toBeVisible();
   if (afterRestart) {
     await expect(speed).toHaveValue(String(8 * 1024 * 1024));
+    await expect(srrdbLookup).toBeChecked();
     await page.goto("/settings/bandwidth");
     await expect(page.getByRole("spinbutton", { name: "Billing Day" })).toHaveValue("17");
     return;
@@ -25,6 +28,11 @@ test("general speed and bandwidth-cap settings persist through browser controls"
   await expect(page.getByText("Saved", { exact: true })).toBeVisible();
   await page.reload();
   await expect(speed).toHaveValue(String(8 * 1024 * 1024));
+  await expect(srrdbLookup).not.toBeChecked();
+  await srrdbLookup.click();
+  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await page.reload();
+  await expect(srrdbLookup).toBeChecked();
 
   await page.goto("/settings/bandwidth");
   const monthlyDay = page.getByRole("spinbutton", { name: "Billing Day" });

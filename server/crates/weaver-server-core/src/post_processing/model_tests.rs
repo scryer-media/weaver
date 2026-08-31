@@ -273,3 +273,41 @@ fn settings_bound_concurrency_and_require_a_grace_period() {
     settings.termination_grace_seconds = 0;
     assert!(settings.validate().is_err());
 }
+
+#[test]
+fn unacceptable_extension_patterns_are_normalized_and_match_final_extensions() {
+    let settings = PostProcessingSettings {
+        unacceptable_extensions: vec![" R?? ".into(), "ZIP*".into(), "EXE".into(), "exe".into()],
+        ..PostProcessingSettings::default()
+    }
+    .normalized()
+    .unwrap();
+
+    assert_eq!(settings.unacceptable_extensions, ["exe", "r??", "zip*"]);
+    assert_eq!(
+        settings.unacceptable_extension_match("payload.ExE"),
+        Some("exe")
+    );
+    assert_eq!(
+        settings.unacceptable_extension_match("archive.R42"),
+        Some("r??")
+    );
+    assert_eq!(
+        settings.unacceptable_extension_match("archive.Zip64"),
+        Some("zip*")
+    );
+    assert_eq!(settings.unacceptable_extension_match("archive.r007"), None);
+    assert_eq!(settings.unacceptable_extension_match("no_extension"), None);
+    assert_eq!(settings.unacceptable_extension_match(".hidden"), None);
+}
+
+#[test]
+fn unacceptable_extension_patterns_reject_paths_dots_and_regex_syntax() {
+    for pattern in [".exe", "*.exe", "re:exe", "folder/exe", "exe\\payload", ""] {
+        let settings = PostProcessingSettings {
+            unacceptable_extensions: vec![pattern.into()],
+            ..PostProcessingSettings::default()
+        };
+        assert!(settings.normalized().is_err(), "accepted {pattern:?}");
+    }
+}

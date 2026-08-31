@@ -38,6 +38,7 @@ impl SettingsMutation {
         let max_download_speed = input.max_download_speed;
         let max_retries = input.max_retries;
         let ip_replacement_trial_extra_connections = input.ip_replacement_trial_extra_connections;
+        let enable_srrdb_lookup = input.enable_srrdb_lookup;
         let isp_bandwidth_cap = input.isp_bandwidth_cap.clone();
         let duplicate_policy_update = input.duplicate_policy.clone();
         let watch_folder_update = input
@@ -70,6 +71,7 @@ impl SettingsMutation {
             ip_replacement_trial_extra_connections,
             watch_folder_update.clone(),
             duplicate_policy_update.clone(),
+            enable_srrdb_lookup,
         );
         let settings_persist = {
             let db = db.clone();
@@ -212,6 +214,12 @@ impl SettingsMutation {
                                 )?;
                             }
                         }
+                        if let Some(enabled) = persist_input.9 {
+                            db.set_setting(
+                                "delivery_naming.enable_srrdb_lookup",
+                                &enabled.to_string(),
+                            )?;
+                        }
                         Ok(())
                     },
                 )
@@ -260,6 +268,11 @@ impl SettingsMutation {
                 if let Some(extra) = ip_replacement_trial_extra_connections {
                     cfg.ip_replacement_trial_extra_connections = Some(extra);
                 }
+                if let Some(enabled) = enable_srrdb_lookup {
+                    cfg.delivery_naming
+                        .get_or_insert_with(Default::default)
+                        .enable_srrdb_lookup = Some(enabled);
+                }
                 if let Some(ref watch) = watch_folder_update {
                     apply_watch_folder_update(&mut cfg.watch_folder, watch);
                 }
@@ -283,6 +296,7 @@ impl SettingsMutation {
                     max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
                     ip_replacement_trial_extra_connections: cfg
                         .ip_replacement_trial_extra_connections(),
+                    enable_srrdb_lookup: cfg.enable_srrdb_lookup(),
                     isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
                     watch_folder: (&cfg.watch_folder).into(),
                     duplicate_policy: cfg.duplicate_policy.into(),

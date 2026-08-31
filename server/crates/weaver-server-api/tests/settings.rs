@@ -3,13 +3,14 @@ mod common;
 use std::time::Duration;
 
 use common::{BlockingDbOperation, TestHarness, assert_no_errors, local_request, response_data};
+use weaver_server_core::auth::CallerScope;
 
 #[tokio::test]
 async fn get_settings_defaults() {
     let h = TestHarness::new().await;
     let resp = h
         .execute(
-            r#"{ settings { dataDir intermediateDir completeDir cleanupAfterExtract maxDownloadSpeed maxRetries } }"#,
+            r#"{ settings { dataDir intermediateDir completeDir cleanupAfterExtract maxDownloadSpeed maxRetries enableSrrdbLookup } }"#,
         )
         .await;
     assert_no_errors(&resp);
@@ -26,6 +27,7 @@ async fn get_settings_defaults() {
     assert_eq!(s["maxDownloadSpeed"].as_u64().unwrap(), 0);
     // maxRetries defaults to 3.
     assert_eq!(s["maxRetries"].as_u64().unwrap(), 3);
+    assert!(!s["enableSrrdbLookup"].as_bool().unwrap());
 }
 
 #[tokio::test]
@@ -123,6 +125,51 @@ async fn update_max_download_speed() {
     assert_eq!(
         data["updateSettings"]["maxDownloadSpeed"].as_u64().unwrap(),
         5242880
+    );
+}
+
+#[tokio::test]
+async fn srrdb_lookup_is_admin_only_and_persists_to_the_live_config() {
+    let h = TestHarness::new().await;
+    let query = "{ settings { enableSrrdbLookup } }";
+    let mutation =
+        "mutation { updateSettings(input: { enableSrrdbLookup: true }) { enableSrrdbLookup } }";
+
+    for scope in [CallerScope::Read, CallerScope::Control] {
+        for document in [query, mutation] {
+            let response = h.execute_as(document, scope).await;
+            assert!(
+                response
+                    .errors
+                    .iter()
+                    .any(|error| error.message.contains("admin scope required")),
+                "{scope:?} was not refused for {document}: {:?}",
+                response.errors
+            );
+        }
+    }
+
+    let response = h.execute(mutation).await;
+    assert_no_errors(&response);
+    assert!(
+        response_data(&response)["updateSettings"]["enableSrrdbLookup"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(
+        h.db.get_setting("delivery_naming.enable_srrdb_lookup")
+            .unwrap()
+            .as_deref(),
+        Some("true")
+    );
+    assert!(h.config.read().await.enable_srrdb_lookup());
+
+    let response = h.execute(query).await;
+    assert_no_errors(&response);
+    assert!(
+        response_data(&response)["settings"]["enableSrrdbLookup"]
+            .as_bool()
+            .unwrap()
     );
 }
 

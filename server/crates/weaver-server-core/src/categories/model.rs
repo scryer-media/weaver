@@ -59,7 +59,7 @@ pub(crate) fn resolve_category_config<'a>(
     for cat in categories {
         for alias in cat.aliases.split(',') {
             let alias = alias.trim();
-            if !alias.is_empty() && glob_match_ci(alias, input_lower) {
+            if !alias.is_empty() && crate::runtime::glob::glob_match_ci(alias, input_lower) {
                 return Some(cat);
             }
         }
@@ -120,36 +120,6 @@ pub fn completion_parent(
         return Err("unsafe completion category escaped the complete directory".to_string());
     }
     Ok(parent)
-}
-
-/// Simple case-insensitive glob matcher supporting `*` (any sequence) and `?` (any single char).
-fn glob_match_ci(pattern: &str, input: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let s: Vec<char> = input.chars().collect();
-    let (mut pi, mut si) = (0, 0);
-    let (mut star_pi, mut star_si) = (usize::MAX, 0);
-
-    while si < s.len() {
-        if pi < p.len() && p[pi] == '*' {
-            star_pi = pi;
-            star_si = si;
-            pi += 1;
-        } else if pi < p.len() && (p[pi] == '?' || p[pi].eq_ignore_ascii_case(&s[si])) {
-            pi += 1;
-            si += 1;
-        } else if star_pi != usize::MAX {
-            pi = star_pi + 1;
-            star_si += 1;
-            si = star_si;
-        } else {
-            return false;
-        }
-    }
-
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
 }
 
 #[cfg(test)]
