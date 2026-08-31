@@ -2162,7 +2162,7 @@ func runNyuuPost(
 			"exec",
 			"-T",
 			"nyuu",
-			"nyuu",
+			"/opt/nyuu/node_modules/.bin/nyuu",
 		),
 		"-h", host, "-P", port, "--ssl=false",
 		"-u", nntpUsername(),
