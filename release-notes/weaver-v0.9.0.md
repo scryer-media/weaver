@@ -175,6 +175,11 @@ release.
 - Release packaging is standardized on portable artifacts for Linux, macOS,
   and Windows across x86-64 and ARM64, with platform-specific validation and
   signed release metadata.
+- macOS releases add a branded `weaver-darwin-<arch>.dmg` containing a
+  Weaver.app desktop bundle, alongside the existing portable tarball. Each
+  image is mounted and checked in CI and ships with its own SBOM. Images are
+  signed; when a release is not notarized, the first launch needs a one-time
+  right-click → **Open** to satisfy Gatekeeper.
 - Windows startup, notification-area detection, resource embedding, package
   validation, GraphQL version checks, and native toolchain handling are
   hardened.

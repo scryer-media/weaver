@@ -4,6 +4,12 @@
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <ws2:longPathAware xmlns:ws2="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</ws2:longPathAware>
+      <!-- The desktop wrapper hosts WebView2, which scales its own content
+           per monitor. Without this the app window is bitmap-stretched the
+           moment it is dragged to a display with a different scale factor.
+           weaver.exe embeds the same manifest and creates no windows, so the
+           setting is inert there. -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
     </windowsSettings>
   </application>
 </assembly>

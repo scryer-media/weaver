@@ -28,6 +28,24 @@ You may remove this additional permission from a modified version of Weaver.
 Conveying that modified version combined with unrar-rs requires permission
 equivalent to this exception.
 
+## Additional permission to combine with the Microsoft WebView2 loader
+
+The Windows desktop wrapper links Microsoft's WebView2 loader library, which
+locates the Microsoft Edge WebView2 Runtime installed on the user's machine.
+As an additional permission under section 7 of GNU GPL version 3, the
+copyright holders of Weaver grant permission to link or combine covered
+Weaver code with the WebView2 loader library distributed by Microsoft, and to
+convey the resulting combined work.
+
+This permission does not relicense the WebView2 loader or the WebView2
+Runtime. Those components remain governed by Microsoft's applicable license
+terms, and are not part of the Corresponding Source of Weaver. See
+THIRD_PARTY_NOTICES.md for the applicable notice.
+
+You may remove this additional permission from a modified version of Weaver.
+Conveying that modified version combined with the WebView2 loader requires
+permission equivalent to this exception.
+
 ## GNU GPL v3 Text
 
 The complete GNU General Public License version 3 text follows unchanged.

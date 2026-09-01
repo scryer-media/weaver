@@ -24,3 +24,18 @@ is not available, and in source code comments of resulting package.
 
 The exact unrar-rs version incorporated by a build is recorded in `Cargo.lock`.
 The upstream package is available at <https://crates.io/crates/unrar-rs>.
+
+## Microsoft Edge WebView2
+
+Official Windows builds of the desktop wrapper (`weaver-tray.exe`) statically
+link the WebView2 loader library that Microsoft distributes with the WebView2
+SDK, obtained through the `webview2-com-sys` crate. The loader locates and
+starts the Microsoft Edge WebView2 Runtime already installed on the user's
+machine; no part of the runtime itself is redistributed with Weaver.
+
+The WebView2 loader and the WebView2 Runtime are Microsoft software governed
+by Microsoft's own license terms, not by Weaver's license. The exact
+`webview2-com-sys` version incorporated by a build is recorded in
+`Cargo.lock`. The upstream package is available at
+<https://crates.io/crates/webview2-com-sys>, and the SDK it repackages at
+<https://developer.microsoft.com/microsoft-edge/webview2/>.
