@@ -131,9 +131,15 @@ func TestSaltedEntryMayNotCarryASizeOrDigest(t *testing.T) {
 	}
 }
 
-// The committed ledger is the real subject: exactly the AES fixtures are
-// salted, and every one of them belongs to a recipe that admits it cannot pin
-// its bytes.
+// The committed ledger is the real subject: exactly the fixtures whose writer
+// draws a salt are salted — the 7-Zip AES chains, and the RAR5 `-p` encrypted
+// repair set — and every one belongs to a recipe that admits it cannot pin its
+// bytes.
+func saltedWriterPath(path string) bool {
+	return strings.Contains(path, "aes256") ||
+		strings.Contains(path, "direct-store-encrypted-par2-repair")
+}
+
 func TestCommittedSaltedEntriesAreOnlyTheSaltedWriters(t *testing.T) {
 	ledger, _, err := corpus.LoadLedger(repoRoot)
 	if err != nil {
@@ -146,8 +152,8 @@ func TestCommittedSaltedEntriesAreOnlyTheSaltedWriters(t *testing.T) {
 		if !file.Salted {
 			continue
 		}
-		if !strings.Contains(file.Path, "aes256") {
-			t.Errorf("%s is salted but is not an AES fixture; salting is for writers that draw a salt", file.Path)
+		if !saltedWriterPath(file.Path) {
+			t.Errorf("%s is salted but its writer is not known to draw a salt; salting must not spread past the writers that force it", file.Path)
 		}
 	}
 }

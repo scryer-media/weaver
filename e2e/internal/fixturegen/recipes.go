@@ -777,6 +777,38 @@ func Recipes() []Recipe {
 		},
 	})
 
+	// Repair and encryption together. PAR2 covers the archive bytes as posted
+	// — the AES ciphertext — so repair rewrites ciphertext on disk and the
+	// password only matters downstream, when extraction decodes the repaired
+	// volumes. The chase reads the damaged ciphertext like any other bytes, so
+	// whichever way the repair decision lands (resume or taint), the decrypted
+	// member digest is the proof the repaired bytes are the posted bytes.
+	// Salted, like every AES fixture: the archive draws a fresh salt per
+	// build and the parity is computed over that build's ciphertext.
+	add(Recipe{
+		Slug: "direct-unpack-aes256-repair", Family: "direct-unpack",
+		Notes: "A three-volume AES256 7z (data encrypted, headers readable) with parity over the ciphertext and a damaged second volume, so PAR2 repair rewrites encrypted bytes and extraction with the password must still produce the member exactly.",
+		Build: sequence(
+			splitSevenZipIntoParts("direct-unpack-aes256", DirectUnpackVolumes),
+			par2(PAR2Spec{
+				Base: "archive.7z.par2", SliceSize: 65536, RecoveryBlocks: 16,
+				Sources: []string{"archive.7z.001", "archive.7z.002", "archive.7z.003"},
+			}),
+			zeroOutput("archive.7z.002", 65536, 16384),
+		),
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			// The member inside the ciphertext is the deterministic payload the
+			// aes256 artifact was built over; re-deriving it is exact even
+			// though the archive bytes never are.
+			_ = ctx
+			payload := env.StagePath(sevenZipSingleMember)
+			if err := deterministicPayload(payload, sevenZipMatrixPayloadBytes, 1); err != nil {
+				return nil, err
+			}
+			return map[string]string{sevenZipSingleMember: payload}, nil
+		},
+	})
+
 	// The same three volumes again under their own slug, for the restart
 	// phase. A separate slug rather than reusing the codec-matrix one because
 	// the two want opposite assertions: the functional run demands the chase

@@ -119,7 +119,7 @@ func DirectStoreRecipes() []Recipe {
 		writer: DirectStoreRAR5Writer, format: RAR5, volumeSize: "8m",
 		members: []directStoreMember{{"violet.cascade.s01e07.mkv", 24 << 20, "violet-cascade"}},
 	}
-	recipes = append(recipes, repair.recipe(func(ctx context.Context, env *Env) error {
+	directStorePar2 := func(ctx context.Context, env *Env) error {
 		volumes, err := env.Outputs()
 		if err != nil {
 			return err
@@ -127,7 +127,23 @@ func DirectStoreRecipes() []Recipe {
 		return env.PAR2(ctx, PAR2Spec{
 			Base: "archive.par2", RedundancyPercent: 20, RecoveryFiles: 4, Sources: volumes,
 		})
-	}))
+	}
+	recipes = append(recipes, repair.recipe(directStorePar2))
+
+	// Repair and encryption together, which neither fixture above exercises.
+	// PAR2 covers the archive bytes as posted — the *encrypted* bytes — so
+	// repair reconstructs ciphertext and never touches a key: the store hands
+	// it clean-volume bytes verbatim and the rewritten volume is ciphertext
+	// again. Nothing in that chain should re-encrypt, and this fixture is what
+	// proves it: if the store served anything but byte-exact archive data, the
+	// repaired set would fail extraction only when a password is in play.
+	encryptedRepair := directStore{
+		slug:   "direct-store-encrypted-par2-repair",
+		notes:  "Four stored volumes with `-p` data encryption and PAR2 recovery at 20%. The scenario deletes the tail articles of an interior volume; repair rewrites ciphertext in place while the clean volumes stay virtual, and extraction with the password is the proof the repaired bytes are the posted bytes.",
+		writer: DirectStoreRAR5Writer, format: RAR5, volumeSize: "8m", password: DirectStorePassword,
+		members: []directStoreMember{{"obsidian.current.s01e08.mkv", 24 << 20, "obsidian-current"}},
+	}
+	recipes = append(recipes, encryptedRepair.recipe(directStorePar2))
 	return recipes
 }
 
