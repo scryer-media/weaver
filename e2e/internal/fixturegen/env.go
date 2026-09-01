@@ -48,8 +48,9 @@ type Env struct {
 	Docker    *Docker
 	Artifacts *ArtifactCache
 
-	mu   sync.Mutex
-	used map[string]struct{}
+	mu            sync.Mutex
+	used          map[string]struct{}
+	usedArtifacts map[string]string
 }
 
 func (env *Env) usedToolchain(id string) {
@@ -59,6 +60,30 @@ func (env *Env) usedToolchain(id string) {
 		env.used = map[string]struct{}{}
 	}
 	env.used[id] = struct{}{}
+}
+
+// usedArtifact records an artifact this scenario consumed, and the cache
+// identity it had at the time. Written into the scenario's stamp so a salted
+// output — which the ledger accepts on presence alone — can still be rebuilt
+// when the artifact underneath it changes.
+func (env *Env) usedArtifact(name, identity string) {
+	env.mu.Lock()
+	defer env.mu.Unlock()
+	if env.usedArtifacts == nil {
+		env.usedArtifacts = map[string]string{}
+	}
+	env.usedArtifacts[name] = identity
+}
+
+// UsedArtifacts is the artifact-to-identity map this scenario was built from.
+func (env *Env) UsedArtifacts() map[string]string {
+	env.mu.Lock()
+	defer env.mu.Unlock()
+	out := make(map[string]string, len(env.usedArtifacts))
+	for name, identity := range env.usedArtifacts {
+		out[name] = identity
+	}
+	return out
 }
 
 // UsedToolchains lists, sorted, every pinned toolchain this scenario actually
@@ -205,16 +230,63 @@ type Artifact struct {
 // on disk so a single-scenario rebuild still agrees with the rest of the
 // corpus.
 type ArtifactCache struct {
-	Dir     string
-	Table   map[string]Artifact
+	Dir   string
+	Table map[string]Artifact
+	// Lock and Root are what an artifact's cache identity is computed from:
+	// the toolchain pins it builds with, and the generator source that builds
+	// it. Zero values fall back to name-keyed directories, which is only what
+	// a test that never builds anything wants.
+	Lock    Lock
+	Root    string
 	mu      sync.Mutex
 	pending map[string]*sync.WaitGroup
 	failed  map[string]error
+	// identities memoises the per-artifact key so a fan-out of scenarios does
+	// not re-hash the generator source once per lookup.
+	identities map[string]string
 }
 
 // NewArtifactCache prepares a cache rooted at dir.
 func NewArtifactCache(dir string, table map[string]Artifact) *ArtifactCache {
-	return &ArtifactCache{Dir: dir, Table: table, pending: map[string]*sync.WaitGroup{}, failed: map[string]error{}}
+	return &ArtifactCache{
+		Dir: dir, Table: table,
+		pending: map[string]*sync.WaitGroup{}, failed: map[string]error{},
+		identities: map[string]string{},
+	}
+}
+
+// WithBuildIdentity supplies what the cache keys on. Called once, before use.
+func (cache *ArtifactCache) WithBuildIdentity(lock Lock, root string) *ArtifactCache {
+	cache.Lock = lock
+	cache.Root = root
+	pruneLegacyArtifactDirs(cache.Dir, cache.Table)
+	return cache
+}
+
+// Identity is the cache key for one artifact: what its bytes depend on.
+func (cache *ArtifactCache) Identity(name string) string {
+	artifact, ok := cache.Table[name]
+	if !ok {
+		return ""
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if cached, ok := cache.identities[name]; ok {
+		return cached
+	}
+	identity := artifactIdentity(artifact, cache.Lock, cache.Root)
+	cache.identities[name] = identity
+	return identity
+}
+
+// dirFor is where an artifact's files live: keyed by identity, so a build that
+// changed never reads what the old one left behind.
+func (cache *ArtifactCache) dirFor(name string) string {
+	identity := cache.Identity(name)
+	if identity == "" {
+		return filepath.Join(cache.Dir, name)
+	}
+	return filepath.Join(cache.Dir, name+"@"+identity)
 }
 
 // Files returns every file of an artifact, in declaration order.
@@ -228,7 +300,7 @@ func (cache *ArtifactCache) Files(ctx context.Context, env *Env, name string) ([
 	}
 	paths := make([]string, 0, len(artifact.Files))
 	for _, file := range artifact.Files {
-		paths = append(paths, filepath.Join(cache.Dir, name, filepath.FromSlash(file)))
+		paths = append(paths, filepath.Join(cache.dirFor(name), filepath.FromSlash(file)))
 	}
 	return paths, nil
 }
@@ -246,7 +318,8 @@ func (cache *ArtifactCache) ensure(ctx context.Context, env *Env, artifact Artif
 	for _, id := range artifact.Toolchains {
 		env.usedToolchain(id)
 	}
-	target := filepath.Join(cache.Dir, artifact.Name)
+	env.usedArtifact(artifact.Name, cache.Identity(artifact.Name))
+	target := cache.dirFor(artifact.Name)
 	cache.mu.Lock()
 	if err, done := cache.failed[artifact.Name]; done {
 		cache.mu.Unlock()
@@ -280,7 +353,7 @@ func (cache *ArtifactCache) ensure(ctx context.Context, env *Env, artifact Artif
 }
 
 func (cache *ArtifactCache) build(ctx context.Context, env *Env, artifact Artifact, target string) error {
-	work := filepath.Join(cache.Dir, ".build-"+artifact.Name)
+	work := filepath.Join(cache.Dir, ".build-"+artifact.Name+"@"+cache.Identity(artifact.Name))
 	if !artifact.Resumable {
 		if err := os.RemoveAll(work); err != nil {
 			return err

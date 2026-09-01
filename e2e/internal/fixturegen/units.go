@@ -261,7 +261,8 @@ func BuildArtifacts(ctx context.Context, config Config) error {
 		return err
 	}
 	table := Artifacts()
-	cache := NewArtifactCache(filepath.Join(config.Root, "target", "fixturegen", "artifacts"), table)
+	cache := NewArtifactCache(filepath.Join(config.Root, "target", "fixturegen", "artifacts"), table).
+		WithBuildIdentity(lock, config.Root)
 	docker := &Docker{Root: config.Root, Verbose: config.Verbose}
 	workRoot := filepath.Join(config.Root, "target", "fixturegen", "work")
 	if err := os.MkdirAll(workRoot, 0o755); err != nil {

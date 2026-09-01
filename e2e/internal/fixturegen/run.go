@@ -81,7 +81,8 @@ func Run(ctx context.Context, config Config) ([]Result, error) {
 		return nil, nil
 	}
 
-	cache := NewArtifactCache(filepath.Join(config.Root, "target", "fixturegen", "artifacts"), Artifacts())
+	cache := NewArtifactCache(filepath.Join(config.Root, "target", "fixturegen", "artifacts"), Artifacts()).
+		WithBuildIdentity(lock, config.Root)
 	docker := &Docker{Root: config.Root, Verbose: config.Verbose}
 	workRoot := filepath.Join(config.Root, "target", "fixturegen", "work")
 	if err := os.MkdirAll(workRoot, 0o755); err != nil {
@@ -206,6 +207,13 @@ func generate(
 		if err := RewriteScenarioDigests(scenario, rendered); err != nil {
 			return Result{}, err
 		}
+	}
+	// Record what this was built from. A salted scenario is accepted on
+	// presence alone, so without this a stale artifact underneath one would
+	// never be noticed; with it, a changed artifact identity rebuilds the
+	// scenario the same way a changed digest rebuilds a hashed one.
+	if err := writeScenarioStamp(config.Root, recipe.Slug, env.UsedArtifacts()); err != nil {
+		return Result{}, err
 	}
 	if err := os.RemoveAll(work); err != nil {
 		return Result{}, err

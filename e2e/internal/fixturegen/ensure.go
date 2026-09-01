@@ -170,6 +170,30 @@ func Ensure(ctx context.Context, config EnsureConfig) (EnsureReport, error) {
 		logf("%d salted path(s) are verified by presence only; their writer draws a salt and their bytes cannot be pinned",
 			len(report.Salted))
 	}
+
+	// Presence is the whole check for a salted path's *bytes*, but not for what
+	// produced them. A salted scenario built from an artifact that has since
+	// changed is as stale as a hashed one whose digest moved — and nothing
+	// about its bytes can say so, because they were never pinned. The stamp
+	// can, so a salted scenario whose stamp no longer matches is put back on
+	// the missing list and rebuilt.
+	saltedStale := saltedSlugsNeedingRebuild(config.Root, report.Salted, identityCache(config.Root))
+	if len(saltedStale) > 0 {
+		logf("%d salted scenario(s) were built from artifacts that have since changed and will be rebuilt: %s",
+			len(saltedStale), strings.Join(saltedStale, ", "))
+		stale := make(map[string]struct{}, len(saltedStale))
+		for _, slug := range saltedStale {
+			stale[slug] = struct{}{}
+		}
+		for _, path := range report.Salted {
+			if slug, ok := slugOfPath(path); ok {
+				if _, isStale := stale[slug]; isStale && !containsPath(missing, path) {
+					missing = append(missing, path)
+				}
+			}
+		}
+		sort.Strings(missing)
+	}
 	if report.FetchSkipped != "" {
 		logf("published corpus not used: %s", report.FetchSkipped)
 	}
