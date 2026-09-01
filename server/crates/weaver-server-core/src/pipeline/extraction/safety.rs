@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use cap_fs_ext::DirExt;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
+use tracing::{info, warn};
 
 use crate::operations::disk::disk_space;
 use crate::operations::metrics::PipelineMetrics;
@@ -136,11 +137,22 @@ struct ActiveState {
     writers: u64,
 }
 
+/// How long an extraction may wait for process-wide decoder memory before it
+/// says so. Generous: a legitimate queue behind a large archive is normal, and
+/// this is meant to catch a hold that is not going to end, not to narrate
+/// ordinary contention.
+const PROCESS_MEMORY_WAIT_WARN_AFTER: Duration = Duration::from_secs(30);
+
 /// Decoder-window bytes reserved by every extraction job in this pipeline.
 ///
 /// Decoder dictionaries are allocated inside third-party codecs, outside the
 /// ordinary output budgets. Keep one charge for the whole process so several
 /// jobs cannot each consume the configured memory allowance concurrently.
+///
+/// The limit is `ExtractionLimits::max_memory_bytes` — the same number a 7z
+/// extraction reserves in full — so 7z extractions are serialised across the
+/// whole process, and a holder that blocks blocks all of them. See
+/// `one_full_ceiling_reservation_serialises_every_job_in_the_process`.
 #[derive(Debug)]
 pub(crate) struct ProcessMemoryBudget {
     limit: u64,
@@ -175,13 +187,39 @@ impl ProcessMemoryBudget {
         }
 
         let mut wait_guard = self.idle.lock().expect("process memory state poisoned");
+        let started = Instant::now();
+        let mut announced = false;
         loop {
             check_active()?;
             if reserve_atomic(&self.reserved, bytes, self.limit).is_ok() {
+                if announced {
+                    info!(
+                        requested_bytes = bytes,
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "extraction memory reservation granted after waiting"
+                    );
+                }
                 return Ok(ProcessMemoryPermit {
                     budget: Arc::clone(self),
                     bytes,
                 });
+            }
+            // This wait has no deadline, by design: the holder will finish. But
+            // an extraction that reserves the whole process allowance and then
+            // blocks — a direct-unpack chase parked on its download, say — holds
+            // every other extraction in the process behind it, and until now it
+            // did so in complete silence for as long as it took. Say what is
+            // being waited for, once, so a stalled pipeline names its own cause.
+            if !announced && started.elapsed() >= PROCESS_MEMORY_WAIT_WARN_AFTER {
+                announced = true;
+                warn!(
+                    requested_bytes = bytes,
+                    reserved_bytes = self.reserved.load(Ordering::Acquire),
+                    limit_bytes = self.limit,
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "extraction is still waiting for process-wide decoder memory; \
+                     another extraction is holding it"
+                );
             }
             let (guard, _) = self
                 .released
@@ -360,9 +398,18 @@ impl JobExtractionBudget {
             .active
             .lock()
             .expect("extraction active state poisoned");
+        let started = Instant::now();
+        let mut announced = false;
         loop {
             self.check_active().map_err(|error| error.to_string())?;
             if reserve_atomic(&self.memory_reserved, bytes, self.limits.max_memory_bytes).is_ok() {
+                if announced {
+                    info!(
+                        requested_bytes = bytes,
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "job decoder memory granted after waiting"
+                    );
+                }
                 let process_memory = self
                     .process_memory
                     .reserve_wait(bytes, || {
@@ -379,6 +426,20 @@ impl JobExtractionBudget {
                     _process_memory: process_memory,
                     bytes,
                 });
+            }
+            // The per-job stage had no wait announcement at all, only the
+            // process-wide one below it — so a job whose own budget was
+            // exhausted by a concurrent decoder waited here in the same silence
+            // the process stage used to.
+            if !announced && started.elapsed() >= PROCESS_MEMORY_WAIT_WARN_AFTER {
+                announced = true;
+                warn!(
+                    requested_bytes = bytes,
+                    reserved_bytes = self.memory_reserved.load(Ordering::Acquire),
+                    limit_bytes = self.limits.max_memory_bytes,
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "extraction is still waiting for this job's decoder memory"
+                );
             }
             let (guard, _) = self
                 .idle
@@ -1524,5 +1585,74 @@ mod tests {
         let error = ExtractionRoot::open(&job_root).unwrap_err();
         assert!(error.contains("without following links"));
         assert!(outside.path().exists());
+    }
+
+    /// Two jobs, one process-wide decoder-memory pool, and the reservation every
+    /// 7z extraction actually makes.
+    ///
+    /// `ProcessMemoryBudget` is constructed with `limits.max_memory_bytes` — the
+    /// same number a 7z extraction passes to `reserve_memory_wait` — so one
+    /// extraction holding its reservation holds *all* of it, and every other 7z
+    /// extraction in the process blocks until that one lets go. The wait has no
+    /// deadline, so "until it lets go" is unbounded: a direct-unpack chase that
+    /// takes this permit and then parks on a download it is chasing stops every
+    /// other extraction in the pipeline for as long as it is parked.
+    ///
+    /// This test states the property rather than asserting it is wrong; the
+    /// serialisation is deliberate (decoder dictionaries are allocated outside
+    /// the ordinary budgets). What it pins is the blast radius, so a change to
+    /// either number has to come here and say so.
+    #[test]
+    fn one_full_ceiling_reservation_serialises_every_job_in_the_process() {
+        let shared = Arc::new(ProcessMemoryBudget::new(limits().max_memory_bytes));
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let budget_for = |dir: &tempfile::TempDir| {
+            JobExtractionBudget::new_with_process_memory(
+                Arc::new((*limits()).clone()),
+                Arc::clone(&shared),
+                dir.path().to_path_buf(),
+                1,
+                0,
+                0,
+                PipelineMetrics::new(),
+            )
+            .unwrap()
+        };
+        let first = budget_for(&first_dir);
+        let second = budget_for(&second_dir);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "these are separate jobs with separate per-job budgets"
+        );
+
+        // What both the chase and conventional 7z extraction reserve.
+        let held = first.reserve_memory_wait(first.max_memory_bytes()).unwrap();
+        assert_eq!(shared.reserved_bytes(), limits().max_memory_bytes);
+
+        let blocked = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&blocked);
+        let waiter_budget = Arc::clone(&second);
+        let waiter = std::thread::spawn(move || {
+            let permit = waiter_budget
+                .reserve_memory_wait(waiter_budget.max_memory_bytes())
+                .unwrap();
+            observed.store(true, Ordering::Release);
+            drop(permit);
+        });
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !blocked.load(Ordering::Acquire),
+            "a second job cannot get decoder memory while the first holds the whole pool"
+        );
+
+        drop(held);
+        waiter.join().unwrap();
+        assert!(
+            blocked.load(Ordering::Acquire),
+            "and it proceeds the moment the holder releases"
+        );
+        assert_eq!(shared.reserved_bytes(), 0);
     }
 }
