@@ -97,7 +97,7 @@ tasks:
       - "{{.E2E_BIN}} test-all {{.CLI_ARGS}}"
 
   functional:
-    desc: Run Weaver functional full-suite phases with the dashboard
+    desc: Run the Functional SQLite phase with the dashboard (Postgres stays in the full gate)
     dir: "{{.TASKFILE_DIR}}"
     deps: [build]
     cmds:
