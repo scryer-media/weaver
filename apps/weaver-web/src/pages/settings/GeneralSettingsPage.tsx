@@ -247,6 +247,7 @@ export function GeneralSettingsPage() {
   };
 
   const updateSrrdbLookup = async (enabled: boolean) => {
+    const previous = srrdbLookup;
     setSrrdbLookup(enabled);
     const result = await updateSettings({
       input: { enableSrrdbLookup: enabled },
@@ -255,8 +256,9 @@ export function GeneralSettingsPage() {
     if (result.data?.updateSettings) {
       applyUpdatedSettings(result.data.updateSettings);
       toast.success(t("settings.saved"), { id: "general-settings-save" });
-    } else if (result.error) {
-      toast.error(result.error.message ?? "Unable to save settings.", {
+    } else {
+      setSrrdbLookup(previous);
+      toast.error(result.error?.message ?? "Unable to save settings.", {
         id: "general-settings-save",
       });
     }
