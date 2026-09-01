@@ -3,15 +3,18 @@
 //!
 //! # Where a chase begins
 //!
-//! Admission runs when a 7z set's topology is built or updated, which is when a
-//! part of it finishes downloading. That is the earliest moment the *ordered
-//! part list* exists — and the gated reader is nothing without it, because the
-//! archive stream is the concatenation of those parts in that order. For a
-//! **split** set the topology names every part, complete or not, as soon as any
-//! one of them lands, so the chase starts with parts still arriving and has
-//! real work to overlap. For a **single-file** set the topology appears only
-//! when the whole file is down, so admission succeeds but there is nothing left
-//! to overlap; see the note on [`DirectUnpackRuntime`].
+//! A **split** set arms off its topology, which is built when one of its parts
+//! finishes downloading. That is the earliest moment the *ordered part list*
+//! exists, and the gated reader is nothing without it: the archive stream is
+//! the concatenation of those parts in that order. The topology names every
+//! part, complete or not, so the chase starts with parts still arriving.
+//!
+//! A **single** `.7z` has no order to discover, so it does not wait for a
+//! topology at all — it arms as a one-part set the moment its first 32 bytes
+//! are committed, which is the earliest anything can be known about it. Its
+//! length is the header's word until the file finishes; completion settles it,
+//! and a disagreement aborts the set rather than feeding the decoder a stream
+//! that is not the archive the header described.
 //!
 //! Admission is retried, not latched, while the answer is merely "not yet" — no
 //! bytes on part one, no topology. It latches permanently on a real refusal, so
@@ -269,6 +272,18 @@ pub(crate) struct DirectUnpackRuntime {
     settings: Option<DirectUnpackSettings>,
     /// Sets currently being chased.
     armed: HashMap<(JobId, String), ArmedSet>,
+    /// Files that are a bare `.7z` and have not been offered to arming yet.
+    ///
+    /// A split set arms off its topology, which appears when a part completes.
+    /// A single file has no topology until the whole thing has landed, so its
+    /// arming has to ride the commit path instead — and this set is what keeps
+    /// that ride free: when it is empty, which is every job that carries no
+    /// unsplit 7z, the hot path's added cost is one `is_empty`.
+    pending_single_arm: HashSet<crate::jobs::ids::NzbFileId>,
+    /// Sets held parked through a PAR2 repair rather than tainted, because
+    /// every byte their decoder had already consumed was vouched for by the
+    /// recovery set. Released when the repair reports success.
+    parked_through_repair: HashSet<(JobId, String)>,
     /// Chases that have been woken with an abort and are awaiting a join. Kept
     /// apart from `armed` so an abort can be signalled synchronously from the
     /// paths that end a download, and joined later from the run loop.
@@ -309,10 +324,16 @@ impl DirectUnpackRuntime {
         self.counters
     }
 
-    /// Whether any set anywhere is being chased. The watermark hook's first and
-    /// usually only question.
+    /// Whether the commit hook has nothing at all to do: nothing being chased,
+    /// and no bare `.7z` waiting to arm.
     fn idle(&self) -> bool {
-        self.armed.is_empty()
+        self.armed.is_empty() && self.pending_single_arm.is_empty()
+    }
+
+    /// Whether the commit hook has any bare `.7z` waiting to arm.
+    #[cfg(test)]
+    pub(crate) fn no_pending_single_arm(&self) -> bool {
+        self.pending_single_arm.is_empty()
     }
 
     #[cfg(test)]
@@ -362,7 +383,19 @@ impl Pipeline {
         if paths.is_empty() {
             return;
         }
+        self.arm_direct_unpack_with_paths(job_id, set_name, paths);
+    }
 
+    /// Arm a set over an explicit ordered part list.
+    ///
+    /// Split sets reach this through the topology, which is the only thing that
+    /// knows their order. A bare `.7z` reaches it directly with a one-element
+    /// list, because there is no order to discover and waiting for a topology
+    /// would mean waiting for the whole file — which is the entire overlap.
+    ///
+    /// Callers are responsible for the gate and the already-armed checks; by
+    /// here the decision to try is made.
+    fn arm_direct_unpack_with_paths(&mut self, job_id: JobId, set_name: &str, paths: Vec<PathBuf>) {
         // The signature header lives in the first 32 bytes of part one. Read it
         // from the file rather than from any in-memory view: the file is what
         // the chase will read, and if those bytes are not there yet there is
@@ -669,7 +702,10 @@ impl Pipeline {
         if file_asm.is_complete() {
             let filename = self.current_filename_for_file(job_id, file_asm);
             let received = file_asm.received_bytes();
-            self.direct_unpack_note_commit(job_id, &filename, received, true);
+            self.direct_unpack_note_commit(file_id, &filename, received, true);
+            // Its grid verdicts are final now, so this is when damage becomes
+            // knowable — and when the frontier has to stop short of it.
+            self.cap_chased_part_at_damage(file_id, &filename);
         }
 
         let Some(state) = self.jobs.get(&job_id) else {
@@ -690,6 +726,88 @@ impl Pipeline {
             return;
         };
         self.try_arm_direct_unpack(job_id, &set_name);
+    }
+
+    /// Register a job's bare `.7z` files as arming candidates.
+    ///
+    /// Called once at admission. Nothing is registered when the gate is off, so
+    /// a dark pipeline keeps an empty set and the commit hook keeps costing one
+    /// `is_empty`.
+    pub(crate) fn register_direct_unpack_singles(&mut self, job_id: JobId, spec: &crate::JobSpec) {
+        if self.direct_unpack.gate() != DirectUnpackGate::Enabled {
+            return;
+        }
+        for (file_index, file) in spec.files.iter().enumerate() {
+            if matches!(file.role, weaver_model::files::FileRole::SevenZipArchive) {
+                self.direct_unpack
+                    .pending_single_arm
+                    .insert(crate::jobs::ids::NzbFileId {
+                        job_id,
+                        file_index: file_index as u32,
+                    });
+            }
+        }
+    }
+
+    /// Try to arm a bare `.7z` from its opening bytes.
+    ///
+    /// Rides the commit path rather than the completion path: waiting for
+    /// completion would mean waiting for the whole archive, which is exactly the
+    /// overlap this exists to win. The candidate is retired from the pending set
+    /// on any outcome that settles it — armed, refused, or no longer a single
+    /// 7z — so the ride is paid for once.
+    fn try_arm_single_sevenz(&mut self, file_id: crate::jobs::ids::NzbFileId, floor: u64) {
+        if floor < SIGNATURE_HEADER_LEN {
+            return;
+        }
+        let job_id = file_id.job_id;
+
+        let Some(state) = self.jobs.get(&job_id) else {
+            self.direct_unpack.pending_single_arm.remove(&file_id);
+            return;
+        };
+        let Some(file_asm) = state.assembly.file(file_id) else {
+            self.direct_unpack.pending_single_arm.remove(&file_id);
+            return;
+        };
+        // Classification can move a file off `SevenZipArchive` — a rename, or a
+        // set that turns out to be split after all. Either way it is no longer
+        // this path's business.
+        if !matches!(
+            self.classified_role_for_file(job_id, file_asm),
+            weaver_model::files::FileRole::SevenZipArchive
+        ) {
+            self.direct_unpack.pending_single_arm.remove(&file_id);
+            return;
+        }
+        let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file_asm) else {
+            return;
+        };
+        let filename = self.current_filename_for_file(job_id, file_asm);
+        let Some(path) = self.resolve_job_input_path(job_id, &filename) else {
+            self.direct_unpack.pending_single_arm.remove(&file_id);
+            return;
+        };
+
+        let key = (job_id, set_name.clone());
+        if self.direct_unpack.armed.contains_key(&key)
+            || self.direct_unpack.latched.contains_key(&key)
+            || self.direct_unpack.outcomes.contains_key(&key)
+        {
+            self.direct_unpack.pending_single_arm.remove(&file_id);
+            return;
+        }
+
+        self.arm_direct_unpack_with_paths(job_id, &set_name, vec![path]);
+
+        // Armed or refused, the candidate is settled either way. A refusal
+        // latches, so leaving it pending would re-read the same 32 bytes on
+        // every commit for the rest of the download.
+        if self.direct_unpack.armed.contains_key(&key)
+            || self.direct_unpack.latched.contains_key(&key)
+        {
+            self.direct_unpack.pending_single_arm.remove(&file_id);
+        }
     }
 
     fn latch_direct_unpack_refusal(
@@ -874,8 +992,8 @@ impl Pipeline {
     /// On the download's commit path. When nothing is being chased this is a
     /// single `is_empty` and a return.
     pub(in crate::pipeline) fn direct_unpack_note_commit(
-        &self,
-        job_id: JobId,
+        &mut self,
+        file_id: crate::jobs::ids::NzbFileId,
         filename: &str,
         committed_bytes: u64,
         complete: bool,
@@ -883,6 +1001,14 @@ impl Pipeline {
         if self.direct_unpack.idle() {
             return;
         }
+        let job_id = file_id.job_id;
+
+        // A bare `.7z` waiting on its opening bytes arms here, because this is
+        // the only place that learns the floor moved.
+        if self.direct_unpack.pending_single_arm.contains(&file_id) {
+            self.try_arm_single_sevenz(file_id, committed_bytes);
+        }
+
         let Some(targets) = self.direct_unpack.watermark_targets.get(&job_id) else {
             return;
         };
@@ -1301,15 +1427,57 @@ impl Pipeline {
         }
     }
 
-    /// Taint every chase belonging to a job.
+    /// Hold a part's frontier below damage the recovery set has reported.
     ///
-    /// The conservative arm, for the repairer itself: par2-rs reports the files
-    /// it rewrote as its own `FileId`s and its progress callback carries byte
-    /// counts rather than names, so mapping a repair back to archive parts is
-    /// guesswork. Tainting the whole job costs a re-extraction of sets that may
-    /// not have been touched, which is exactly what would have happened without
-    /// this feature.
-    pub(in crate::pipeline) fn taint_direct_unpack_job(&mut self, job_id: JobId) {
+    /// Called when a chased part finishes downloading, which is when its grid
+    /// verdicts are final. Computing them earlier would mean rebuilding the
+    /// verdict map on every commit; computing them here costs one map build per
+    /// chased file and still lands before repair, because repair does not run
+    /// until the whole download has drained.
+    ///
+    /// Bytes the decoder consumed *before* this cap went up are not protected
+    /// by it — that is what the repair-time vouching check is for.
+    fn cap_chased_part_at_damage(&self, file_id: crate::jobs::ids::NzbFileId, filename: &str) {
+        if self.direct_unpack.armed.is_empty() {
+            return;
+        }
+        let job_id = file_id.job_id;
+        let Some((set_name, index)) = self
+            .direct_unpack
+            .watermark_targets
+            .get(&job_id)
+            .and_then(|targets| targets.get(filename))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(armed) = self.direct_unpack.armed.get(&(job_id, set_name.clone())) else {
+            return;
+        };
+        let Some(floor) = self.in_stream_damage_floor(file_id) else {
+            return;
+        };
+        info!(
+            job_id = job_id.0,
+            set_name,
+            part = index,
+            damage_floor = floor,
+            "holding a chased part below reported damage until repair"
+        );
+        armed.coverage.cap_at_damage(index, floor);
+    }
+
+    /// Decide, per chased set, whether a repair about to run can coexist with
+    /// what the chase has already read.
+    ///
+    /// The vouching rule: every byte the decoder consumed must lie inside the
+    /// contiguous run of blocks the recovery set positively found Intact. If it
+    /// does, repair cannot rewrite anything the chase has folded into its
+    /// output, so the chase is parked through the repair instead of thrown
+    /// away. Anything less — a consumed byte past the vouched prefix, a file
+    /// with no binding, a set whose parts cannot be resolved — falls back to
+    /// the unconditional taint this replaced.
+    pub(in crate::pipeline) fn decide_direct_unpack_before_repair(&mut self, job_id: JobId) {
         if self.direct_unpack.armed.is_empty() && self.direct_unpack.outcomes.is_empty() {
             return;
         }
@@ -1321,8 +1489,194 @@ impl Pipeline {
             .filter(|(key_job, _)| *key_job == job_id)
             .map(|(_, set_name)| set_name.clone())
             .collect();
+
         for set_name in sets {
-            self.taint_direct_unpack_set(job_id, &set_name);
+            if self.direct_unpack_set_is_vouched(job_id, &set_name) {
+                info!(
+                    job_id = job_id.0,
+                    set_name,
+                    "every byte this chase consumed is vouched for; parking it through the repair"
+                );
+                self.direct_unpack
+                    .parked_through_repair
+                    .insert((job_id, set_name));
+            } else {
+                self.taint_direct_unpack_set(job_id, &set_name);
+            }
+        }
+    }
+
+    /// Whether the recovery set positively vouches for every byte this set's
+    /// chase has consumed.
+    fn direct_unpack_set_is_vouched(&self, job_id: JobId, set_name: &str) -> bool {
+        let Ok(paths) = self.sevenz_set_part_paths(job_id, set_name) else {
+            return false;
+        };
+        if paths.is_empty() {
+            return false;
+        }
+        let key = (job_id, set_name.to_string());
+        let coverage = self
+            .direct_unpack
+            .armed
+            .get(&key)
+            .map(|armed| Arc::clone(&armed.coverage));
+        // A finished chase read its whole archive, so every byte of every part
+        // has to be vouched for. A running one only has to answer for what it
+        // actually took.
+        let finished = coverage.is_none();
+
+        for (index, path) in paths.iter().enumerate() {
+            let Some(file_id) = self.direct_unpack_file_id_for_part(job_id, path) else {
+                return false;
+            };
+            let Some(intact_prefix) = self.in_stream_intact_prefix(file_id) else {
+                return false;
+            };
+            let consumed = match &coverage {
+                Some(coverage) => coverage.consumed_high_water(index),
+                None => match self.direct_unpack_known_part_len(job_id, path) {
+                    Some(len) => len,
+                    None => return false,
+                },
+            };
+            if consumed > intact_prefix {
+                debug!(
+                    job_id = job_id.0,
+                    set_name,
+                    part = index,
+                    consumed,
+                    intact_prefix,
+                    finished,
+                    "chase consumed past the vouched prefix; repair must taint it"
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Mark a set as parked through a repair, without going through the
+    /// vouching decision. Lets a test exercise the release and failure paths
+    /// without standing up a PAR2 binding and a populated grid.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn park_direct_unpack_through_repair_for_test(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+    ) {
+        self.direct_unpack
+            .parked_through_repair
+            .insert((job_id, set_name.to_string()));
+    }
+
+    /// Settle the chases a repair was parked over, whichever way the repair
+    /// ended.
+    ///
+    /// The single seam every exit from the repairer uses, so that adding an
+    /// early return there cannot silently strand a parked chase: a set held
+    /// under a damage cap is waiting on a frontier only this call advances, and
+    /// nothing else in the pipeline will notice it is waiting.
+    ///
+    /// A no-op unless this was an actual repair — an analysis pass rewrites
+    /// nothing, so it parks nothing.
+    pub(in crate::pipeline) fn settle_direct_unpack_after_repair(
+        &mut self,
+        job_id: JobId,
+        repair: bool,
+        outcome: &Result<par2_rs::Par2RepairOutcome, String>,
+    ) {
+        if !repair {
+            return;
+        }
+        match outcome {
+            Ok(_) => self.release_direct_unpack_after_repair(job_id),
+            Err(error) => self.fail_direct_unpack_after_repair(job_id, error),
+        }
+    }
+
+    /// End the chases a repair was allowed to run underneath, because the
+    /// repair did not finish.
+    ///
+    /// The symmetric half of [`Self::release_direct_unpack_after_repair`]. A
+    /// set parked through a repair is parked at its damage cap, and only the
+    /// repair's success was ever going to lift it — so a repair that fails
+    /// leaves a blocking thread waiting on bytes nothing will now write. The
+    /// job may well fail terminally straight after, which would abort it
+    /// anyway, but it may also not: the failure could be one set's among
+    /// several. This closes that gap without depending on what happens next.
+    pub(in crate::pipeline) fn fail_direct_unpack_after_repair(
+        &mut self,
+        job_id: JobId,
+        reason: &str,
+    ) {
+        if self.direct_unpack.parked_through_repair.is_empty() {
+            return;
+        }
+        let stranded: Vec<String> = self
+            .direct_unpack
+            .parked_through_repair
+            .iter()
+            .filter(|(key_job, _)| *key_job == job_id)
+            .map(|(_, set_name)| set_name.clone())
+            .collect();
+
+        for set_name in stranded {
+            self.direct_unpack
+                .parked_through_repair
+                .remove(&(job_id, set_name.clone()));
+            self.direct_unpack_abort_set(job_id, &set_name, reason, AbortLatch::Permanent);
+        }
+    }
+
+    /// Reopen the chases a repair was allowed to run underneath.
+    ///
+    /// The parts on disk are now the repaired ones and the recovery set has
+    /// vouched for everything already consumed, so the frontier opens to the
+    /// whole file and the decoder finishes at disk speed.
+    pub(in crate::pipeline) fn release_direct_unpack_after_repair(&mut self, job_id: JobId) {
+        if self.direct_unpack.parked_through_repair.is_empty() {
+            return;
+        }
+        let released: Vec<String> = self
+            .direct_unpack
+            .parked_through_repair
+            .iter()
+            .filter(|(key_job, _)| *key_job == job_id)
+            .map(|(_, set_name)| set_name.clone())
+            .collect();
+
+        for set_name in released {
+            self.direct_unpack
+                .parked_through_repair
+                .remove(&(job_id, set_name.clone()));
+            let Ok(paths) = self.sevenz_set_part_paths(job_id, &set_name) else {
+                continue;
+            };
+            let Some(armed) = self.direct_unpack.armed.get(&(job_id, set_name.clone())) else {
+                // A finished chase has nothing to release: it was vouched for,
+                // so its outcome stands as it is.
+                continue;
+            };
+            let coverage = Arc::clone(&armed.coverage);
+            for (index, path) in paths.iter().enumerate() {
+                match std::fs::metadata(path) {
+                    Ok(meta) => coverage.release_after_repair(index, meta.len()),
+                    Err(error) => {
+                        // The repair reported success and the part is not
+                        // there. Skipping would leave this part's cap in place
+                        // and the chase parked until job teardown; saying so
+                        // ends it now, with a reason.
+                        coverage.abort(format!("part {index} is unreadable after repair: {error}"));
+                        break;
+                    }
+                }
+            }
+            info!(
+                job_id = job_id.0,
+                set_name, "repair finished; the parked chase resumes over the repaired bytes"
+            );
+            record_event("resumed_after_repair");
         }
     }
 
@@ -1360,6 +1714,12 @@ impl Pipeline {
             .outcomes
             .retain(|(outcome_job, _), _| *outcome_job != job_id);
         self.direct_unpack.watermark_targets.remove(&job_id);
+        self.direct_unpack
+            .pending_single_arm
+            .retain(|file_id| file_id.job_id != job_id);
+        self.direct_unpack
+            .parked_through_repair
+            .retain(|(parked_job, _)| *parked_job != job_id);
     }
 }
 

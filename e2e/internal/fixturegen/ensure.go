@@ -173,10 +173,17 @@ func Ensure(ctx context.Context, config EnsureConfig) (EnsureReport, error) {
 		return report, err
 	}
 	results, err := Run(ctx, Config{
-		Root:         config.Root,
-		Slugs:        slugs,
-		Workers:      config.Workers,
-		UpdateLedger: true,
+		Root:    config.Root,
+		Slugs:   slugs,
+		Workers: config.Workers,
+		// Seeding regenerates fixtures to *match* the committed ledger, never
+		// to redefine it. Refreshing digests here would turn a reproducibility
+		// defect into a silent corpus fork: the bytes on disk would stop being
+		// the bytes the ledger describes, and every consumer keyed on the
+		// ledger — the NNTP seed fingerprint above all — would quietly move
+		// with them. Writing the ledger is `cmd/fixturegen`'s job, on an
+		// explicit generation run.
+		UpdateLedger: false,
 		Verbose:      config.Verbose,
 		Log:          config.Log,
 	})
@@ -190,28 +197,43 @@ func Ensure(ctx context.Context, config EnsureConfig) (EnsureReport, error) {
 	}
 	sort.Strings(report.GeneratedSlugs)
 
-	// The ledger was rewritten for what was generated; re-read it and require
-	// the tree to agree with it, digest and all.
+	// The ledger must not have moved: generation ran with UpdateLedger off, so
+	// anything here is a bug worth shouting about rather than absorbing.
 	ledgerAfter, err := os.ReadFile(corpus.HostPath(config.Root, corpus.LedgerFile))
 	if err != nil {
 		return report, err
 	}
 	report.LedgerChanged = string(ledgerBefore) != string(ledgerAfter)
 	if report.LedgerChanged {
-		logf("note: the generated fixtures are a local corpus revision — %s now carries their refreshed digests and differs from any published manifest", corpus.LedgerFile)
+		return report, fmt.Errorf("%s was rewritten during seeding; seeding must never redefine the corpus", corpus.LedgerFile)
 	}
-	ledger, _, err = corpus.LoadLedger(config.Root)
-	if err != nil {
-		return report, err
-	}
+
 	still, err := missingPaths(config.Root, ledger, wanted, true)
 	if err != nil {
 		return report, err
 	}
 	report.Generated = difference(missing, still)
 	if len(still) > 0 {
+		// Tell the two cases apart. A path that is simply absent is a
+		// generation failure; a path that exists but hashes differently is a
+		// *reproducibility* failure, and saying so is the difference between
+		// one named defect and a hundred downstream health errors.
+		var absent, mismatched []string
+		for _, p := range still {
+			if _, err := os.Stat(corpus.HostPath(config.Root, p)); err == nil {
+				mismatched = append(mismatched, p)
+			} else {
+				absent = append(absent, p)
+			}
+		}
+		if len(mismatched) > 0 {
+			return report, fmt.Errorf(
+				"%d fixture(s) regenerated to different bytes than %s records — generation is not reproducible on this machine, "+
+					"so the corpus cannot be rebuilt from recipes here; fetch the published corpus instead:\n  %s",
+				len(mismatched), corpus.LedgerFile, strings.Join(mismatched, "\n  "))
+		}
 		return report, fmt.Errorf("%d fixture path(s) are still missing after generation:\n  %s",
-			len(still), strings.Join(still, "\n  "))
+			len(absent), strings.Join(absent, "\n  "))
 	}
 	return report, nil
 }

@@ -1132,6 +1132,7 @@ var canonicalFixtureSlugs = []string{
 	"direct-unpack-ppmd",
 	"direct-unpack-ppmd-split",
 	"direct-unpack-repair",
+	"direct-unpack-repair-unvouched",
 	"direct-unpack-solid",
 	"direct-unpack-solid-split",
 	"7z-encrypted",

@@ -394,3 +394,255 @@ fn a_part_count_mismatch_is_refused_at_open() {
     let error = GatedSplitReader::open(&fixture.paths, coverage).expect_err("mismatch");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
+
+// ---------------------------------------------------------------------------
+// Repair-resume: damage caps, consumed high-water, release
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_damage_cap_holds_the_frontier_below_the_damaged_byte() {
+    let coverage = SetCoverage::new(1);
+    coverage.set_total_len(100_000);
+    coverage.advance_watermark(0, 80_000);
+
+    // Everything up to the watermark is servable while nothing is known damaged.
+    assert_eq!(coverage.readable_at(0, 0).expect("readable"), 80_000);
+
+    // The recovery set reports damage at 40_000: the frontier stops there even
+    // though the download has committed far past it.
+    coverage.cap_at_damage(0, 40_000);
+    assert!(coverage.has_damage_cap());
+    assert_eq!(coverage.readable_at(0, 0).expect("readable"), 40_000);
+    assert_eq!(coverage.readable_at(0, 39_999).expect("readable"), 1);
+}
+
+#[test]
+fn a_damage_cap_only_ever_lowers_the_frontier() {
+    let coverage = SetCoverage::new(1);
+    coverage.set_total_len(100_000);
+    coverage.advance_watermark(0, 90_000);
+
+    coverage.cap_at_damage(0, 50_000);
+    // A later, higher damage report does not make the earlier one wrong.
+    coverage.cap_at_damage(0, 70_000);
+    assert_eq!(coverage.readable_at(0, 0).expect("readable"), 50_000);
+    // A lower one does lower it further.
+    coverage.cap_at_damage(0, 20_000);
+    assert_eq!(coverage.readable_at(0, 0).expect("readable"), 20_000);
+}
+
+/// A capped part is not "finished" for the reader even when the download says
+/// it is: repair is still to come, and the bytes above the cap are exactly the
+/// ones it will rewrite.
+#[test]
+fn a_capped_part_parks_rather_than_reporting_end_of_part() {
+    let fixture = split_fixture(payload(60_000, 71), &[]);
+    let coverage = std::sync::Arc::new(SetCoverage::new(1));
+    coverage.set_total_len(60_000);
+    coverage.note_part_len(0, 60_000);
+    coverage.advance_watermark(0, 60_000);
+    coverage.cap_at_damage(0, 20_000);
+    coverage.mark_part_complete(0);
+
+    let paths = fixture.paths.clone();
+    let reader_coverage = std::sync::Arc::clone(&coverage);
+    let worker = thread::spawn(move || {
+        let mut reader = GatedSplitReader::open(&paths, reader_coverage).expect("open reader");
+        reader
+            .seek(SeekFrom::Start(20_000))
+            .expect("seek to the cap");
+        let mut buf = [0u8; 512];
+        reader.read_exact(&mut buf).map(|()| buf)
+    });
+
+    thread::sleep(SETTLE);
+    assert!(
+        coverage.park_count() > 0,
+        "a read at the damage cap must park, not report end of part"
+    );
+
+    // Repair lands: the cap goes, the frontier opens, the reader finishes.
+    coverage.release_after_repair(0, 60_000);
+    let read = worker.join().expect("reader thread").expect("read");
+    assert_eq!(read.as_slice(), &fixture.bytes[20_000..20_512]);
+}
+
+#[test]
+fn the_consumed_high_water_tracks_what_the_decoder_actually_read() {
+    let fixture = split_fixture(payload(40_000, 73), &[15_000]);
+    let coverage = settled_coverage(&fixture);
+    let mut reader =
+        GatedSplitReader::open(&fixture.paths, std::sync::Arc::clone(&coverage)).expect("open");
+
+    assert_eq!(coverage.consumed_high_water(0), 0, "nothing read yet");
+
+    let mut buf = [0u8; 4_096];
+    reader.read_exact(&mut buf).expect("read");
+    assert_eq!(
+        coverage.consumed_high_water(0),
+        4_096,
+        "the high-water is what was taken, not what was available"
+    );
+
+    // Reading into the second part moves that part's high-water, not part 0's.
+    reader.seek(SeekFrom::Start(15_000)).expect("seek");
+    reader.read_exact(&mut buf).expect("read");
+    assert_eq!(coverage.consumed_high_water(1), 4_096);
+    assert_eq!(coverage.consumed_high_water(0), 4_096);
+}
+
+#[test]
+fn releasing_after_repair_clears_the_cap_and_settles_the_length() {
+    let coverage = SetCoverage::new(1);
+    coverage.set_total_len(50_000);
+    coverage.advance_watermark(0, 30_000);
+    coverage.cap_at_damage(0, 10_000);
+
+    coverage.release_after_repair(0, 50_000);
+
+    assert!(!coverage.has_damage_cap());
+    let progress = coverage.part_progress(0).expect("in range");
+    assert_eq!(progress.len, Some(50_000));
+    assert_eq!(progress.watermark, 50_000);
+    assert!(progress.complete);
+    assert_eq!(coverage.readable_at(0, 0).expect("readable"), 50_000);
+}
+
+/// Review question (a): a reader parked *under a damage cap* is parked on a
+/// condition only repair can satisfy. If repair never comes, the abort path has
+/// to reach it — otherwise the blocking thread waits forever.
+#[test]
+fn abort_unblocks_a_reader_parked_under_a_damage_cap() {
+    let fixture = split_fixture(payload(50_000, 79), &[]);
+    let coverage = std::sync::Arc::new(SetCoverage::new(1));
+    coverage.set_total_len(50_000);
+    coverage.note_part_len(0, 50_000);
+    coverage.advance_watermark(0, 50_000);
+    coverage.mark_part_complete(0);
+    // Damage known: the frontier stops at 10_000 even though the part is
+    // complete and every byte is on disk.
+    coverage.cap_at_damage(0, 10_000);
+
+    let paths = fixture.paths.clone();
+    let reader_coverage = std::sync::Arc::clone(&coverage);
+    let worker = thread::spawn(move || {
+        let mut reader = GatedSplitReader::open(&paths, reader_coverage).expect("open reader");
+        reader
+            .seek(SeekFrom::Start(10_000))
+            .expect("seek to the cap");
+        let mut buf = [0u8; 256];
+        reader
+            .read_exact(&mut buf)
+            .expect_err("aborted while parked")
+    });
+
+    thread::sleep(SETTLE);
+    assert!(
+        coverage.park_count() > 0,
+        "the reader should be parked under the cap"
+    );
+
+    coverage.abort("PAR2 repair failed");
+
+    let error = worker.join().expect("reader thread");
+    assert!(
+        error.to_string().contains("PAR2 repair failed"),
+        "a capped park must be reachable by abort: {error}"
+    );
+}
+
+/// Review question (b): repair writes the file the recovery set describes,
+/// which can be *shorter* than what was on disk. Releasing must not leave a
+/// watermark describing bytes the repaired file no longer has.
+#[test]
+fn releasing_a_shrunk_part_clamps_the_watermark_to_the_repaired_length() {
+    let coverage = SetCoverage::new(1);
+    coverage.set_total_len(30_000);
+    coverage.advance_watermark(0, 50_000);
+    coverage.cap_at_damage(0, 5_000);
+
+    // Repair truncated the over-long part to its described 30_000 bytes.
+    coverage.release_after_repair(0, 30_000);
+
+    let progress = coverage.part_progress(0).expect("in range");
+    assert_eq!(progress.len, Some(30_000));
+    assert_eq!(
+        progress.watermark, 30_000,
+        "the pre-repair watermark described bytes the repaired file does not have"
+    );
+    assert_eq!(coverage.readable_at(0, 0).expect("readable"), 30_000);
+    assert!(coverage.abort_reason().is_none(), "nothing was over-read");
+}
+
+/// The same shrink, but the decoder had already read past where repair cut. The
+/// vouch this release rests on was about bytes that no longer exist.
+#[test]
+fn releasing_below_what_was_already_read_aborts_instead() {
+    let coverage = SetCoverage::new(1);
+    coverage.set_total_len(40_000);
+    coverage.advance_watermark(0, 40_000);
+    coverage.note_consumed(0, 25_000);
+    coverage.cap_at_damage(0, 30_000);
+
+    coverage.release_after_repair(0, 20_000);
+
+    let reason = coverage
+        .abort_reason()
+        .expect("a cut below the read head must abort");
+    assert!(
+        reason.contains("20000") && reason.contains("25000"),
+        "unexpected reason: {reason}"
+    );
+    assert!(coverage.readable_at(0, 0).is_err());
+}
+
+/// The whole point of repair-resume: a chase parked below damage picks up over
+/// the repaired bytes and finishes, rather than being thrown away.
+#[test]
+fn a_parked_chase_resumes_over_repaired_bytes_and_reads_the_whole_stream() {
+    // The "damaged" part on disk, and what repair will write in its place.
+    let repaired = payload(80_000, 83);
+    let mut damaged = repaired.clone();
+    for byte in damaged[40_000..48_000].iter_mut() {
+        *byte = 0;
+    }
+    let fixture = split_fixture(damaged, &[]);
+
+    let coverage = std::sync::Arc::new(SetCoverage::new(1));
+    coverage.set_total_len(80_000);
+    coverage.note_part_len(0, 80_000);
+    coverage.advance_watermark(0, 80_000);
+    coverage.mark_part_complete(0);
+    // The grid reports damage at 40_000, so the chase is held below it.
+    coverage.cap_at_damage(0, 40_000);
+
+    let paths = fixture.paths.clone();
+    let reader_coverage = std::sync::Arc::clone(&coverage);
+    let worker = thread::spawn(move || {
+        let mut reader = GatedSplitReader::open(&paths, reader_coverage).expect("open reader");
+        let mut read = Vec::new();
+        reader.read_to_end(&mut read).expect("read to end");
+        read
+    });
+
+    thread::sleep(SETTLE);
+    assert!(
+        coverage.park_count() > 0,
+        "the chase must park at the damage cap, not read the damaged bytes"
+    );
+    assert!(
+        coverage.consumed_high_water(0) <= 40_000,
+        "nothing past the cap may have been consumed"
+    );
+
+    // Repair lands: the file on disk becomes the repaired one, and the set is
+    // released.
+    std::fs::write(&fixture.paths[0], &repaired).unwrap();
+    coverage.release_after_repair(0, repaired.len() as u64);
+
+    assert_eq!(
+        worker.join().expect("reader thread"),
+        repaired,
+        "the resumed chase must deliver the repaired bytes end to end"
+    );
+}

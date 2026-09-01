@@ -1746,6 +1746,10 @@ async fn insert_active_job_with_persisted_nzb_named(
         .unwrap();
     let (assembly, download_queue, recovery_queue) =
         Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
+    // Mirror admission: `add_job` registers a job's bare `.7z` files as
+    // direct-unpack arming candidates, and this harness hand-builds the state
+    // `add_job` would otherwise have produced.
+    pipeline.register_direct_unpack_singles(job_id, &spec);
     let par2_bytes = spec.par2_bytes();
     pipeline.jobs.insert(
         job_id,

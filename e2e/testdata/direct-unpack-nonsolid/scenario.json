@@ -1,12 +1,12 @@
 {
   "slug": "direct-unpack-nonsolid",
   "title": "Silver.Horizon.Non-solid.2024.720p.WEB.x264-WEAVER",
-  "description": "Single .7z, Non-solid. the same three members in their own blocks. A single .7z has no topology until the whole file lands, so this asserts the ordinary conventional outcome.",
+  "description": "Single .7z, Non-solid. the same three members in their own blocks. A single .7z arms from its signature header as a one-part set; this scenario asserts completion and content only.",
   "category": "2000",
   "expected_outcome": "success",
   "expectedOutputBLAKE3": {
-    "silver_horizon_part1.mkv": "5a2e23cc7140ebf76bb53aa6b00338b7e935a0f039dd3a1d234f8087963c059a",
-    "silver_horizon_part2.mkv": "5a2e23cc7140ebf76bb53aa6b00338b7e935a0f039dd3a1d234f8087963c059a",
-    "silver_horizon_part3.mkv": "5a2e23cc7140ebf76bb53aa6b00338b7e935a0f039dd3a1d234f8087963c059a"
+    "silver_horizon_part1.mkv": "779fad2c06e827cf1cd4a6793a655a1504119962c8ebfdc0b35d1eab2d84327a",
+    "silver_horizon_part2.mkv": "26da180308fbd02e0179eecbfc6ef3dd2046e3a5c6fe902bf6871b48c92d842d",
+    "silver_horizon_part3.mkv": "26da180308fbd02e0179eecbfc6ef3dd2046e3a5c6fe902bf6871b48c92d842d"
   }
 }

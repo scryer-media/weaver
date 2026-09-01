@@ -34,6 +34,19 @@ pub struct PartProgress {
     pub len: Option<u64>,
     /// Whether the part is finished; no further bytes will arrive.
     pub complete: bool,
+    /// The furthest byte offset actually handed to the decoder.
+    ///
+    /// Not the same as the watermark: the watermark is what *could* be read,
+    /// this is what *was*. Repair only has to care about bytes the decoder has
+    /// already folded into its output — everything above this line it can
+    /// rewrite freely, because the chase has not looked at it yet.
+    pub consumed_high_water: u64,
+    /// A ceiling on the servable watermark, set when the recovery data says a
+    /// byte range of this part is damaged.
+    ///
+    /// `None` until damage is known, which is why this costs a clean job
+    /// nothing: no damage, no cap, and the frontier stays the download's own.
+    pub damage_cap: Option<u64>,
 }
 
 /// Where an archive offset sits relative to one part.
@@ -49,6 +62,17 @@ pub enum PositionInPart {
         /// This part's final length.
         len: u64,
     },
+}
+
+impl PartProgress {
+    /// How far a reader may go: the committed frontier, held back to just
+    /// below any known damage.
+    fn servable(&self) -> u64 {
+        match self.damage_cap {
+            Some(cap) => self.watermark.min(cap),
+            None => self.watermark,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -198,6 +222,113 @@ impl SetCoverage {
             Some(len) => part.watermark = part.watermark.max(len),
             None => part.len = Some(part.watermark),
         }
+
+        Self::reconcile_total_when_settled(&mut state);
+
+        drop(state);
+        self.advanced.notify_all();
+    }
+
+    /// Record how far the decoder has actually read into a part.
+    ///
+    /// Monotone. Called from the chase's own thread after each read, never from
+    /// the download path, so the lock it takes is uncontended in the common
+    /// case and absent entirely when nothing is being chased.
+    pub fn note_consumed(&self, index: usize, offset: u64) {
+        let mut state = self.lock();
+        let Some(part) = state.parts.get_mut(index) else {
+            debug_assert!(false, "part index {index} out of range");
+            return;
+        };
+        if offset > part.consumed_high_water {
+            part.consumed_high_water = offset;
+        }
+    }
+
+    /// The furthest byte the decoder has read from a part.
+    pub fn consumed_high_water(&self, index: usize) -> u64 {
+        self.lock()
+            .parts
+            .get(index)
+            .map(|part| part.consumed_high_water)
+            .unwrap_or(0)
+    }
+
+    /// Hold a part's servable frontier below a byte the recovery data says is
+    /// damaged.
+    ///
+    /// Monotone downward: once the frontier is known to be unsafe past a point
+    /// it never moves back up, because a later, higher damage report does not
+    /// make an earlier, lower one wrong. Clean sets never call this, which is
+    /// why they keep exactly the overlap they had before repair-resume existed.
+    pub fn cap_at_damage(&self, index: usize, offset: u64) {
+        let mut state = self.lock();
+        let Some(part) = state.parts.get_mut(index) else {
+            debug_assert!(false, "part index {index} out of range");
+            return;
+        };
+        let capped = match part.damage_cap {
+            Some(existing) => existing.min(offset),
+            None => offset,
+        };
+        if part.damage_cap == Some(capped) {
+            return;
+        }
+        part.damage_cap = Some(capped);
+        drop(state);
+        // A cap can only ever *lower* the frontier, so nobody is unblocked by
+        // it — but a reader parked inside the newly-capped range has to be
+        // woken to re-evaluate rather than left waiting on a watermark that
+        // will never reach it.
+        self.advanced.notify_all();
+    }
+
+    /// Whether any part is being held back by known damage.
+    pub fn has_damage_cap(&self) -> bool {
+        self.lock()
+            .parts
+            .iter()
+            .any(|part| part.damage_cap.is_some())
+    }
+
+    /// Release a part after repair has rewritten it: drop the damage cap, fix
+    /// the final length, and open the frontier to the whole file.
+    ///
+    /// The bytes on disk are now the repaired ones, and the chase is parked
+    /// below the damage it was warned about — so from here it reads at disk
+    /// speed over data the recovery set has vouched for.
+    pub fn release_after_repair(&self, index: usize, len: u64) {
+        let mut state = self.lock();
+        let Some(part) = state.parts.get_mut(index) else {
+            debug_assert!(false, "part index {index} out of range");
+            return;
+        };
+
+        // Repair writes the file the recovery set describes, which is not
+        // always the file that was on disk: an over-long part is truncated to
+        // its described length. If that cut lands below what the decoder has
+        // already read, the vouch this release rests on was about bytes that no
+        // longer exist, and resuming would splice a repaired tail onto a stale
+        // head. There is no recovering from that here.
+        if len < part.consumed_high_water {
+            let reason = format!(
+                "repair left part {index} at {len} bytes, below the {} already read from it",
+                part.consumed_high_water
+            );
+            Self::abort_locked(&mut state, reason);
+            drop(state);
+            self.advanced.notify_all();
+            return;
+        }
+
+        part.damage_cap = None;
+        part.len = Some(len);
+        // Exactly `len`, never `max`: a shrunk part's old watermark describes
+        // bytes the repaired file does not have, and leaving it would send the
+        // reader off the end.
+        part.watermark = len;
+        part.complete = true;
+        Self::reconcile_total_when_settled(&mut state);
         drop(state);
         self.advanced.notify_all();
     }
@@ -212,6 +343,37 @@ impl SetCoverage {
         Self::abort_locked(&mut state, reason.into());
         drop(state);
         self.advanced.notify_all();
+    }
+
+    /// Once every part has settled, what they sum to has to be what the
+    /// signature header said the archive was.
+    ///
+    /// A disagreement means the parts on disk are not the archive the header
+    /// describes, and the decoder would meet it as an unexplained EOF somewhere
+    /// in the middle. It matters most for a one-part set — a bare `.7z` armed
+    /// from its opening bytes has nothing but the header's word for its length
+    /// until the file finishes — but it is worth checking for any shape, and
+    /// after a repair as much as after a download.
+    fn reconcile_total_when_settled(state: &mut CoverageState) {
+        let Some(total) = state.total_len else {
+            return;
+        };
+        if !state.parts.iter().all(|part| part.complete) {
+            return;
+        }
+        let summed = state
+            .parts
+            .iter()
+            .map(|part| part.len.unwrap_or(part.watermark))
+            .try_fold(0u64, |sum, len| sum.checked_add(len));
+        match summed {
+            Some(summed) if summed == total => {}
+            Some(summed) => Self::abort_locked(
+                state,
+                format!("parts settled at {summed} bytes but the archive header declared {total}"),
+            ),
+            None => Self::abort_locked(state, "part lengths overflow".to_string()),
+        }
     }
 
     fn abort_locked(state: &mut CoverageState, reason: String) {
@@ -266,10 +428,15 @@ impl SetCoverage {
             if part.len.is_some_and(|len| offset >= len) {
                 return Ok(0);
             }
-            if offset < part.watermark {
-                return Ok(part.watermark - offset);
+            let servable = part.servable();
+            if offset < servable {
+                return Ok(servable - offset);
             }
-            if part.complete {
+            // A part held back by a damage cap is not finished as far as the
+            // reader is concerned, however complete the download believes it
+            // is: repair is still to come, and the bytes above the cap are
+            // exactly the ones it will rewrite.
+            if part.complete && part.damage_cap.is_none() {
                 return Ok(0);
             }
             state = self.park(state);
@@ -296,9 +463,10 @@ impl SetCoverage {
             }
             let part = Self::part_at(&state, index)?;
 
-            if offset < part.watermark {
+            let servable = part.servable();
+            if offset < servable {
                 return Ok(PositionInPart::Inside {
-                    available: part.watermark - offset,
+                    available: servable - offset,
                 });
             }
             if let Some(len) = part.len {
@@ -307,13 +475,13 @@ impl SetCoverage {
                 }
                 // Inside the declared length but past the watermark: the bytes
                 // are still coming, unless the part has stopped growing.
-                if part.complete {
+                if part.complete && part.damage_cap.is_none() {
                     return Err(io::Error::other(format!(
                         "part {index} stopped at {} bytes, short of its declared length {len}",
                         part.watermark
                     )));
                 }
-            } else if part.complete {
+            } else if part.complete && part.damage_cap.is_none() {
                 // A complete part's length is its watermark, so this offset is
                 // past the end of it.
                 return Ok(PositionInPart::Beyond {

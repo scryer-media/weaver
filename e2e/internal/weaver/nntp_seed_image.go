@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/scryer-media/weaver/e2e/internal/fixturegen"
+	"sync"
 )
 
 // A cache image is intentionally keyed only by the generated corpus. The
@@ -637,4 +638,29 @@ func tryAcquireNntpSeedImageLock(
 		}
 	}
 	return nil, false, fmt.Errorf("acquire pre-seeded NNTP image lock after reclaim")
+}
+
+// The image sets this run actually captured, by seed profile.
+//
+// The set's name is a fingerprint over the corpus files, so recomputing it at
+// phase-launch time asks a question whose answer can change mid-run — and the
+// wrong answer is indistinguishable from "no cache", which downgrades silently
+// to a store that does not carry this run's fixtures. Recording what was
+// captured turns that into a pin.
+var (
+	preseededImageSetsMu sync.Mutex
+	preseededImageSets   = map[string]nntpSeedImageSet{}
+)
+
+func recordPreseededImageSet(profile string, set nntpSeedImageSet) {
+	preseededImageSetsMu.Lock()
+	defer preseededImageSetsMu.Unlock()
+	preseededImageSets[profile] = set
+}
+
+func preseededImageSet(profile string) (nntpSeedImageSet, bool) {
+	preseededImageSetsMu.Lock()
+	defer preseededImageSetsMu.Unlock()
+	set, ok := preseededImageSets[profile]
+	return set, ok
 }

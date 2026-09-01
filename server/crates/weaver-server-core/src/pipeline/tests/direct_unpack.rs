@@ -310,7 +310,15 @@ async fn a_drip_fed_split_set_is_chased_to_byte_identical_members() {
                 file.write_all(&bytes[written..end]).unwrap();
             }
             written = end;
-            pipeline.direct_unpack_note_commit(job_id, filename, written as u64, false);
+            pipeline.direct_unpack_note_commit(
+                NzbFileId {
+                    job_id,
+                    file_index: file_index as u32,
+                },
+                filename,
+                written as u64,
+                false,
+            );
             tokio::task::yield_now().await;
         }
         // Completion is what settles the part's exact length.
@@ -996,4 +1004,319 @@ async fn arming_pulls_the_tail_window_forward_in_a_deep_queue() {
         middle_part, 2,
         "a middle part is outside the window entirely"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Single-file .7z early arming
+// ---------------------------------------------------------------------------
+
+/// A bare `.7z` is a one-part set, so it has no order to discover and no reason
+/// to wait for a topology. It arms as soon as its signature header is on disk —
+/// 32 bytes — which is the whole overlap an unsplit archive can win.
+#[tokio::test]
+async fn a_single_7z_arms_from_its_first_32_bytes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41300);
+
+    let archive = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sevenz/generated_bcj2_silver_horizon.7z"),
+    )
+    .unwrap();
+    let files = vec![("silver_horizon.7z".to_string(), archive.clone())];
+    let spec = rar_job_spec("Silver Horizon", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    let path = working_dir.join("silver_horizon.7z");
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    // One byte short of a signature header: nothing to decide on yet.
+    std::fs::write(&path, &archive[..31]).unwrap();
+    pipeline.direct_unpack_note_commit(file_id, "silver_horizon.7z", 31, false);
+    assert!(
+        !pipeline.direct_unpack.is_armed(job_id, "silver_horizon.7z"),
+        "31 bytes is not a signature header"
+    );
+
+    // The 32nd byte is enough.
+    std::fs::write(&path, &archive[..64 * 1024]).unwrap();
+    pipeline.direct_unpack_note_commit(file_id, "silver_horizon.7z", 64 * 1024, false);
+    assert!(
+        pipeline.direct_unpack.is_armed(job_id, "silver_horizon.7z"),
+        "a single .7z must arm from its header, not from its completion"
+    );
+
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, "silver_horizon.7z")
+        .expect("armed");
+    assert_eq!(
+        coverage.total_len().unwrap(),
+        archive.len() as u64,
+        "the header's declared total is the archive's real length"
+    );
+
+    pipeline.direct_unpack_forget_job(job_id);
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The header's declared total is taken on trust while the file is still
+/// arriving. Completion is when it gets checked, and a file that settles at a
+/// different length is not the archive the header described.
+#[tokio::test]
+async fn a_single_7z_whose_length_contradicts_its_header_aborts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41310);
+
+    let archive = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sevenz/generated_bcj2_silver_horizon.7z"),
+    )
+    .unwrap();
+    let files = vec![("silver_horizon.7z".to_string(), archive.clone())];
+    let spec = rar_job_spec("Silver Horizon", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    std::fs::write(working_dir.join("silver_horizon.7z"), &archive[..64 * 1024]).unwrap();
+    pipeline.direct_unpack_note_commit(file_id, "silver_horizon.7z", 64 * 1024, false);
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, "silver_horizon.7z")
+        .expect("armed");
+
+    // The file settles shorter than the header promised.
+    let short = archive.len() as u64 - 4_096;
+    coverage.advance_watermark(0, short);
+    coverage.mark_part_complete(0);
+
+    let reason = coverage.abort_reason().expect("a contradiction aborts");
+    assert!(
+        reason.contains("declared") && reason.contains(&archive.len().to_string()),
+        "unexpected abort reason: {reason}"
+    );
+
+    pipeline.direct_unpack_forget_job(job_id);
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The commit hook is on the download's hot path, so a job that carries no
+/// unsplit 7z must leave it costing one `is_empty` and nothing else — no
+/// registration, no lookup, no arming attempt.
+#[tokio::test]
+async fn a_job_without_a_single_7z_registers_no_arming_candidates() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41320);
+
+    // A split set: every part is a SevenZipSplit, none is a bare archive.
+    let files = sevenz_fixture_bytes("generated_split_store_plain.7z");
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    assert!(
+        pipeline.direct_unpack.no_pending_single_arm(),
+        "a split set must not register single-file arming candidates"
+    );
+
+    // And with the gate off, not even a bare .7z registers.
+    let dark_job = JobId(41321);
+    pipeline.direct_unpack = DirectUnpackRuntime::default();
+    let single = vec![("silver_horizon.7z".to_string(), vec![0u8; 4_096])];
+    let spec = rar_job_spec("Silver Horizon", &single);
+    insert_active_job(&mut pipeline, dark_job, spec).await;
+    assert!(
+        pipeline.direct_unpack.no_pending_single_arm(),
+        "a dark pipeline must register nothing"
+    );
+}
+
+/// The repair-time decision is allowed to spare a chase only when the recovery
+/// set positively vouches for every byte it consumed. With no binding and no
+/// grid verdicts — which is the state of any set the recovery data does not
+/// describe — nothing is vouched, and the behaviour must be exactly the taint
+/// it was before repair-resume existed.
+///
+/// This is the guard on the fallback. Everything above it is an optimisation;
+/// this is the thing that must not regress.
+#[tokio::test]
+async fn a_repair_over_an_unvouched_chase_taints_exactly_as_before() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41400);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
+
+    // The rest of the set reaches disk so the conventional fallback has a whole
+    // archive to read, but no PAR2 set binds these files: there are no verdicts
+    // to vouch with.
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    for (filename, bytes) in files.iter().skip(1) {
+        std::fs::write(working_dir.join(filename), bytes).unwrap();
+    }
+
+    // The real repair-time entry point.
+    pipeline.decide_direct_unpack_before_repair(job_id);
+
+    assert!(
+        !pipeline.direct_unpack.is_armed(job_id, set_name),
+        "an unvouched chase must be ended by the repair decision"
+    );
+    assert_eq!(
+        pipeline.direct_unpack.counters().demoted_repair_rewrote,
+        1,
+        "the fallback must still book a repair-rewrote demotion"
+    );
+    assert_eq!(
+        pipeline.direct_unpack.latched_reason(job_id, set_name),
+        Some("repair_rewrote")
+    );
+
+    // And the set extracts conventionally, correctly.
+    pipeline.extract_7z_set(job_id, set_name).await.unwrap();
+    let done = next_extraction_done(&mut pipeline).await;
+    let ExtractionDone::FullSet { result, .. } = done else {
+        panic!("expected a full-set extraction result");
+    };
+    let outcome = result.expect("conventional extraction of intact sources");
+    assert_eq!(outcome.extracted.len(), 1);
+    assert_eq!(pipeline.direct_unpack.counters().consumed, 0);
+    // Nothing is left for dispatch to *discard*: tainting a running chase ends
+    // it on the spot, so the demotion is the whole accounting. `discarded`
+    // counts outcomes thrown away at consumption, which this never reached.
+    assert_eq!(pipeline.direct_unpack.counters().discarded, 0);
+
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A repair that fails leaves nothing to lift the damage caps, so the sets it
+/// was allowed to run underneath have to be ended rather than left parked.
+#[tokio::test]
+async fn a_failed_repair_releases_the_chases_it_was_parked_over() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41410);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("armed");
+
+    // Stand in for the vouched decision: the set is parked through a repair.
+    pipeline.park_direct_unpack_through_repair_for_test(job_id, set_name);
+
+    pipeline.fail_direct_unpack_after_repair(job_id, "PAR2 repair failed");
+
+    assert!(
+        !pipeline.direct_unpack.is_armed(job_id, set_name),
+        "a stranded chase must be ended when its repair fails"
+    );
+    let reason = coverage
+        .abort_reason()
+        .expect("the parked reader must be woken");
+    assert!(reason.contains("PAR2 repair failed"), "reason: {reason}");
+
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The seam every exit from the repairer funnels through. A parked chase is
+/// waiting on a frontier only this call advances, so both directions matter —
+/// and so does the analysis case, which parks nothing and must release nothing.
+#[tokio::test]
+async fn the_repair_settle_seam_releases_on_success_and_ends_on_failure() {
+    async fn armed_and_parked(
+        temp_dir: &tempfile::TempDir,
+        job_id: JobId,
+    ) -> (
+        Pipeline,
+        std::sync::Arc<crate::pipeline::direct_unpack::SetCoverage>,
+    ) {
+        let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+        enable_direct_unpack(&mut pipeline);
+        let set_name = "generated_split_store_plain.7z";
+        let files = sevenz_fixture_bytes(set_name);
+        let spec = rar_job_spec("Silver Horizon Split", &files);
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        write_and_complete_file(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+        let coverage = pipeline
+            .direct_unpack
+            .armed_coverage(job_id, set_name)
+            .expect("armed");
+        pipeline.park_direct_unpack_through_repair_for_test(job_id, set_name);
+        (pipeline, coverage)
+    }
+
+    let set_name = "generated_split_store_plain.7z";
+
+    // An analysis pass parks nothing, so it must leave the set exactly as it is.
+    {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, coverage) = armed_and_parked(&temp_dir, JobId(41500)).await;
+        pipeline.settle_direct_unpack_after_repair(JobId(41500), false, &Err("unused".to_string()));
+        assert!(pipeline.direct_unpack.is_armed(JobId(41500), set_name));
+        assert!(coverage.abort_reason().is_none());
+        pipeline.direct_unpack_forget_job(JobId(41500));
+        for _ in 0..600 {
+            pipeline.reap_direct_unpack().await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // A failed repair ends the parked chase and wakes its reader.
+    {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, coverage) = armed_and_parked(&temp_dir, JobId(41510)).await;
+        pipeline.settle_direct_unpack_after_repair(
+            JobId(41510),
+            true,
+            &Err("evidence candidates failed".to_string()),
+        );
+        assert!(!pipeline.direct_unpack.is_armed(JobId(41510), set_name));
+        let reason = coverage.abort_reason().expect("the parked reader is woken");
+        assert!(
+            reason.contains("evidence candidates failed"),
+            "reason: {reason}"
+        );
+        for _ in 0..600 {
+            pipeline.reap_direct_unpack().await;
+            tokio::task::yield_now().await;
+        }
+    }
 }

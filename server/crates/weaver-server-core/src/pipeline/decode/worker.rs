@@ -2507,12 +2507,7 @@ impl Pipeline {
         // on disk and a direct-unpack chase may read them. Costs one `is_empty`
         // when nothing is being chased, which is the overwhelmingly common
         // case and the reason this is a call rather than a check inlined here.
-        self.direct_unpack_note_commit(
-            file_id.job_id,
-            &filename,
-            contiguous_end_after_ready,
-            false,
-        );
+        self.direct_unpack_note_commit(file_id, &filename, contiguous_end_after_ready, false);
         // Hot-path safe: `write_start.elapsed()` is the single clock read this
         // path already performs for the `disk_write_latency_us` gauge, and the
         // histogram observes exactly that same span so the two agree. The

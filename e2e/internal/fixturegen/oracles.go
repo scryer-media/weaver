@@ -151,6 +151,13 @@ type SevenZipSpec struct {
 	// Solid packs the members into one block (`-ms=on`). The default is off,
 	// which is what every pre-existing fixture relies on.
 	Solid bool
+	// Deterministic drops everything 7-Zip would otherwise stamp into the
+	// archive from its environment: the three timestamp fields it copies off
+	// the input files. With those off, and with a payload that is itself
+	// derived rather than encoded, the same inputs give byte-identical output
+	// on any machine — which is what lets a scenario be regenerated instead of
+	// fetched without the ledger moving underneath it.
+	Deterministic bool
 	// Methods are raw coder-chain switches, for example
 	// []string{"-m0=Delta:4", "-m1=LZMA2"}. Passed through verbatim so a recipe
 	// can name any chain the pinned 7-Zip writes; mutually exclusive with
@@ -204,6 +211,9 @@ func (env *Env) SevenZip(ctx context.Context, spec SevenZipSpec) error {
 		if spec.EncryptHeaders {
 			args = append(args, "-mhe=on")
 		}
+	}
+	if spec.Deterministic {
+		args = append(args, "-mtm=off", "-mtc=off", "-mta=off")
 	}
 	args = append(args, "../"+outputDir+"/"+spec.Archive)
 	args = append(args, spec.Members...)
