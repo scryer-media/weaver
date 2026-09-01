@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn member_crc_map_preserves_paths_and_rejects_conflicting_values() {
+    let mut by_path = HashMap::new();
+    let mut ambiguous_paths = HashSet::new();
+
+    record_member_crc32_value(
+        &mut by_path,
+        &mut ambiguous_paths,
+        "disc-one\\payload.mkv",
+        0x1111_1111,
+    );
+    record_member_crc32_value(
+        &mut by_path,
+        &mut ambiguous_paths,
+        "disc-two/payload.mkv",
+        0x2222_2222,
+    );
+
+    assert_eq!(by_path["disc-one/payload.mkv"], 0x1111_1111);
+    assert_eq!(by_path["disc-two/payload.mkv"], 0x2222_2222);
+
+    record_member_crc32_value(
+        &mut by_path,
+        &mut ambiguous_paths,
+        "disc-one/payload.mkv",
+        0x3333_3333,
+    );
+    record_member_crc32_value(
+        &mut by_path,
+        &mut ambiguous_paths,
+        "disc-one/payload.mkv",
+        0x1111_1111,
+    );
+
+    assert!(!by_path.contains_key("disc-one/payload.mkv"));
+    assert!(ambiguous_paths.contains("disc-one/payload.mkv"));
+    assert_eq!(by_path["disc-two/payload.mkv"], 0x2222_2222);
+}
+
+#[test]
 fn safe_move_uses_rename_without_copy_on_the_same_filesystem() {
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("source.bin");
@@ -196,6 +235,26 @@ fn copy_cleanup_does_not_remove_replaced_parent_destination() {
 }
 
 #[tokio::test]
+async fn destination_claim_skips_a_directory_populated_by_another_process() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("complete");
+    let occupied = parent.join("release");
+    std::fs::create_dir_all(&occupied).unwrap();
+    std::fs::write(occupied.join("blocked.exe"), b"existing payload").unwrap();
+
+    let claimed = claim_complete_destination_path(&parent, "release", JobId(42), &HashSet::new())
+        .await
+        .unwrap();
+
+    assert_eq!(claimed, parent.join("release.#42"));
+    assert_eq!(
+        std::fs::read(occupied.join("blocked.exe")).unwrap(),
+        b"existing payload"
+    );
+    assert!(std::fs::read_dir(claimed).unwrap().next().is_none());
+}
+
+#[tokio::test]
 async fn final_move_does_not_overwrite_existing_destination_file() {
     let temp = tempfile::tempdir().unwrap();
     let working = temp.path().join("working");
@@ -224,7 +283,7 @@ async fn final_move_does_not_overwrite_existing_destination_file() {
         Err(error) => error,
     };
 
-    assert!(error.to_string().contains("destination already exists"));
+    assert!(error.to_string().contains("populated before publication"));
     assert_eq!(std::fs::read(&src).unwrap(), b"new payload");
     assert_eq!(std::fs::read(&dst).unwrap(), b"existing payload");
 }
@@ -300,7 +359,7 @@ fn copy_fallback_preserves_nested_symlink_entries() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn final_move_refuses_symlink_entries_before_creating_the_destination() {
+async fn final_move_refuses_symlink_entries_and_releases_its_empty_destination_claim() {
     let temp = tempfile::tempdir().unwrap();
     let working = temp.path().join("working");
     let staging = temp.path().join("staging");
@@ -308,6 +367,7 @@ async fn final_move_refuses_symlink_entries_before_creating_the_destination() {
     let target = temp.path().join("target.bin");
     std::fs::create_dir_all(&working).unwrap();
     std::fs::create_dir_all(&staging).unwrap();
+    std::fs::create_dir(&dest).unwrap();
     std::fs::write(&target, b"target payload").unwrap();
     std::os::unix::fs::symlink(&target, staging.join("linked.bin")).unwrap();
 
@@ -339,6 +399,7 @@ async fn the_rename_pass_sees_staging_and_working_output_as_one_delivery() {
     let dest = temp.path().join("complete");
     std::fs::create_dir_all(&working).unwrap();
     std::fs::create_dir_all(&staging).unwrap();
+    std::fs::create_dir(&dest).unwrap();
 
     // The payload arrives by the direct-store route...
     let payload = std::fs::File::create(staging.join("Yb5drZSkNi20UCMkb.mkv")).unwrap();
@@ -376,6 +437,7 @@ async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
     let working = temp.path().join("working");
     let dest = temp.path().join("complete");
     std::fs::create_dir_all(&working).unwrap();
+    std::fs::create_dir(&dest).unwrap();
     let payload = std::fs::File::create(working.join("Yb5drZSkNi20UCMkb.mkv")).unwrap();
     payload.set_len(64 * 1024 * 1024).unwrap();
 

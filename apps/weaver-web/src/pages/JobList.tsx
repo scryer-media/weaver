@@ -430,7 +430,8 @@ const QueueNameCell = memo(function QueueNameCell({
     <div className="min-w-0">
       <Link
         to={`/jobs/${jobId}`}
-        className="block whitespace-normal break-words text-xs font-medium leading-snug text-foreground"
+        title={displayName}
+        className="block truncate text-xs font-medium leading-snug text-foreground"
       >
         {displayName}
       </Link>
