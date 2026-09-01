@@ -55,6 +55,9 @@ pub struct Config {
     /// RAR direct-store routing. Absent means "every default".
     #[serde(default)]
     pub direct_store: Option<DirectStoreOverrides>,
+    /// 7z direct unpack. Absent means "every default".
+    #[serde(default)]
+    pub direct_unpack: Option<DirectUnpackOverrides>,
     /// Naming policy for the files a finished job delivers. Absent means
     /// "every default".
     #[serde(default)]
@@ -227,6 +230,24 @@ pub struct DirectStoreOverrides {
     pub holds_scratch_ceiling_bytes: Option<u64>,
 }
 
+/// Operator-facing switches for 7z direct unpack (`[direct_unpack]`).
+///
+/// Same precedence as `[direct_store]` — **environment over config over
+/// default** — resolved in `pipeline::direct_unpack::DirectUnpackSettings::resolve`;
+/// see that type for the variable name.
+///
+/// Every field is optional so an absent `[direct_unpack]` table, a partially
+/// filled one and an older config file all mean "use the defaults".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DirectUnpackOverrides {
+    /// Begin extracting a 7z set while its parts are still downloading, instead
+    /// of waiting for the whole set to land.
+    ///
+    /// **Defaults to off.** Turning the default on is a release decision, not a
+    /// config default change.
+    pub enabled: Option<bool>,
+}
+
 /// Operator-facing switches for how a finished job names what it delivers
 /// (`[delivery_naming]`).
 ///
@@ -354,6 +375,7 @@ mod tests {
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: DuplicatePolicy::default(),
             direct_store: None,
+            direct_unpack: None,
             delivery_naming: None,
             metrics: Default::default(),
             config_path: None,

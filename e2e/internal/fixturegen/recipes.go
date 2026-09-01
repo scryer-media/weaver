@@ -26,6 +26,11 @@ const (
 // far enough into the file that the container header still parses and the
 // failure surfaces as a checksum mismatch rather than an unreadable archive.
 const (
+	// Volumes every direct-unpack split fixture is cut into. Three is enough
+	// that a chase has parts still arriving while it decodes the ones already
+	// down, and a fixed count keeps the ledger contract writable.
+	DirectUnpackVolumes = 3
+
 	CorruptOffset = 10 << 20
 	CorruptLength = 1 << 20
 	TruncateBytes = 1 << 20
@@ -676,6 +681,74 @@ func Recipes() []Recipe {
 			zeroOutput("archive.7z.002", 5<<20, CorruptLength),
 			truncateOutput("archive.7z.003", TruncateBytes),
 		),
+	})
+
+	// ------------------------------------------- direct-unpack codec matrix
+	//
+	// Two scenarios per coder chain: the whole archive, and the same bytes cut
+	// into volumes. A 7z volume set is a plain byte split, so the split variant
+	// costs one Go pass and stays byte-identical to the single file — which is
+	// what makes "same content, both shapes" cheap enough to do for every codec.
+	//
+	// The split shape is the one direct unpack can actually overlap; a single
+	// `.7z` has no topology until the whole file has landed, so its scenarios
+	// assert the ordinary conventional outcome.
+	for _, codec := range sevenZipCodecMatrix() {
+		artifact := "direct-unpack-" + codec.Slug
+		add(Recipe{
+			Slug: "direct-unpack-" + codec.Slug, Family: "direct-unpack",
+			Notes:           codec.Notes,
+			Build:           publish(artifact, "archive.7z"),
+			ExpectedOutputs: codec.ExpectedOutputs(),
+		})
+		add(Recipe{
+			Slug: "direct-unpack-" + codec.Slug + "-split", Family: "direct-unpack",
+			Notes:           codec.Notes + " Cut into volumes so the chase has parts still arriving while it decodes.",
+			Build:           splitSevenZipIntoParts(artifact, DirectUnpackVolumes),
+			ExpectedOutputs: codec.ExpectedOutputs(),
+		})
+	}
+
+	// A split 7z with parity and a damaged volume, so PAR2 repair rewrites a
+	// part the chase has already read. The chase must notice and stand down,
+	// and the conventional path must then deliver correct bytes from the
+	// repaired volumes — the one interaction where direct unpack could
+	// silently ship a stale decode if the taint plumbing were wrong.
+	add(Recipe{
+		Slug: "direct-unpack-repair", Family: "direct-unpack",
+		Notes: "A three-volume LZMA2 7z with parity, one volume damaged well past its header, so repair runs before extraction and rewrites bytes a chase has already consumed.",
+		Build: sequence(
+			splitSevenZipIntoParts("direct-unpack-lzma2", DirectUnpackVolumes),
+			par2(PAR2Spec{
+				Base: "archive.7z.par2", SliceSize: 16384, RecoveryBlocks: 16,
+				Sources: []string{"archive.7z.001", "archive.7z.002", "archive.7z.003"},
+			}),
+			zeroOutput("archive.7z.002", 4*16384, 2*16384),
+		),
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			clip, err := env.ArtifactFile(ctx, "clip-small", "small.mkv")
+			if err != nil {
+				return nil, err
+			}
+			return map[string]string{sevenZipSingleMember: clip}, nil
+		},
+	})
+
+	// The same three volumes again under their own slug, for the restart
+	// phase. A separate slug rather than reusing the codec-matrix one because
+	// the two want opposite assertions: the functional run demands the chase
+	// was consumed, and a restart mid-chase deliberately kills it.
+	add(Recipe{
+		Slug: "direct-unpack-restart", Family: "direct-unpack",
+		Notes: "A three-volume LZMA2 7z for the restart phase: weaver is restarted mid-download, so the chase dies with the process and has to re-arm from the persisted progress floor.",
+		Build: splitSevenZipIntoParts("direct-unpack-lzma2", DirectUnpackVolumes),
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			clip, err := env.ArtifactFile(ctx, "clip-small", "small.mkv")
+			if err != nil {
+				return nil, err
+			}
+			return map[string]string{sevenZipSingleMember: clip}, nil
+		},
 	})
 
 	// -------------------------------------------------------- obfuscation
@@ -1816,6 +1889,32 @@ func splitSevenZip(artifact string) func(context.Context, *Env) error {
 			return err
 		}
 		_, err = SplitFile(source, 30<<20, func(index int) string {
+			return env.OutputPath(fmt.Sprintf("archive.7z.%03d", index+1))
+		})
+		return err
+	}
+}
+
+// splitSevenZipIntoParts cuts a published 7z into exactly `parts` volumes.
+//
+// Size-based, like the corpus's other splits, would make the volume count a
+// function of how well each codec happened to compress the clip — and the
+// ledger names the files a recipe must produce, so a count that moves with the
+// coder is a contract that cannot be written down. Fixing the count instead
+// makes every codec's split shape identical, which is also what makes them
+// comparable.
+func splitSevenZipIntoParts(artifact string, parts int64) func(context.Context, *Env) error {
+	return func(ctx context.Context, env *Env) error {
+		source, err := env.ArtifactPath(ctx, artifact)
+		if err != nil {
+			return err
+		}
+		info, err := os.Stat(source)
+		if err != nil {
+			return err
+		}
+		chunk := (info.Size() + parts - 1) / parts
+		_, err = SplitFile(source, chunk, func(index int) string {
 			return env.OutputPath(fmt.Sprintf("archive.7z.%03d", index+1))
 		})
 		return err

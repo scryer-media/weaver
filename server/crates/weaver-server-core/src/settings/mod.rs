@@ -7,6 +7,7 @@ pub mod repository;
 pub mod service;
 
 pub use model::{
-    BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides, MetricsConfig,
-    PerJobSeries, RetryOverrides, SharedConfig, TunerOverrides,
+    BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
+    DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides, SharedConfig,
+    TunerOverrides,
 };

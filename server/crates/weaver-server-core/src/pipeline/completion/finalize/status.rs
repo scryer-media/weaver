@@ -568,6 +568,15 @@ impl Pipeline {
         if matches!(previous_run_state, crate::jobs::model::RunState::Paused) {
             return Ok(());
         }
+        // A pause stops new dispatch but never resumes on a schedule, so a
+        // parked chase would hold a blocking thread for as long as the operator
+        // leaves the job paused. Retryable: nothing about the archive was
+        // wrong, so a part completing after resume can arm it again.
+        self.direct_unpack_abort_job(
+            job_id,
+            "job paused",
+            crate::pipeline::direct_unpack::wiring::AbortLatch::Retryable,
+        );
         let pauseable_download_lane = matches!(
             previous_download_state,
             crate::jobs::model::DownloadState::Queued

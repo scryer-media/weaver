@@ -534,6 +534,9 @@ impl Pipeline {
         // refresh". The set already delivered everything it was for — its
         // members are the very bytes being rebuilt over.
         self.direct_store.clear_job(job_id);
+        // The assembly is about to be rebuilt with fresh file indices, so any
+        // chase keyed to the old one is describing a job that no longer exists.
+        self.direct_unpack_forget_job(job_id);
         self.replace_failed_extraction_members(job_id, HashSet::new());
         self.clear_persisted_extracted_members(job_id).await;
 

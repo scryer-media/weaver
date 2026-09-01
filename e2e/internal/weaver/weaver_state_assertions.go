@@ -637,6 +637,12 @@ func applyTerminalStateCheck(dbPath string, jobID int, slug string, status strin
 				return "DIRECT_STORE_ASSERTION_ERROR", err.Error()
 			}
 		}
+		if err == nil && scenario.directUnpackAssertion() != nil {
+			if err := assertDirectUnpackScenario(jobID, scenario.directUnpackAssertion()); err != nil {
+				log.Printf("  %s: direct-unpack runtime assertion failed after %s: %v", slug, status, err)
+				return "DIRECT_UNPACK_ASSERTION_ERROR", err.Error()
+			}
+		}
 	}
 	return status, ""
 }
@@ -673,6 +679,81 @@ func assertDirectStoreScenario(jobID int, assertion *ScenarioDirectStoreAssertio
 	}
 	if assertion.RequireRoutedByteMaterialization && !seenMaterialization {
 		return errors.New("direct-store did not materialize the demoted set from routed bytes")
+	}
+	return nil
+}
+
+// The lines the direct-unpack controller emits. Asserting on these rather than
+// on output bytes is the only external evidence there is: an installed chase
+// and a conventional extraction produce byte-identical members, which is the
+// whole point of the feature.
+const (
+	directUnpackArmedMessage    = "direct unpack armed"
+	directUnpackConsumedMessage = "installed direct-unpack members instead of re-extracting"
+	directUnpackDemotedMessage  = "direct unpack demoted"
+	directUnpackAbortedMessage  = "direct unpack aborted"
+)
+
+func assertDirectUnpackScenario(jobID int, assertion *ScenarioDirectUnpackAssertion) error {
+	if assertion == nil {
+		return nil
+	}
+	raw, err := os.ReadFile(localWeaverLogPath())
+	if err != nil {
+		return fmt.Errorf("read weaver log: %w", err)
+	}
+
+	wantJobID := strconv.Itoa(jobID)
+	armed := 0
+	consumed := false
+	seenDemotion := false
+	anyActivity := false
+	for _, rawLine := range strings.Split(string(raw), "\n") {
+		line := ansiEscape.ReplaceAllString(rawLine, "")
+		if directLogJobID(line) != wantJobID {
+			continue
+		}
+		switch {
+		case strings.Contains(line, directUnpackArmedMessage):
+			armed++
+			anyActivity = true
+		case strings.Contains(line, directUnpackConsumedMessage):
+			consumed = true
+			anyActivity = true
+		case strings.Contains(line, directUnpackDemotedMessage):
+			anyActivity = true
+			if assertion.ExpectedDemotionReason != "" &&
+				directDemotionReason(line) == assertion.ExpectedDemotionReason {
+				seenDemotion = true
+			}
+		case strings.Contains(line, directUnpackAbortedMessage):
+			anyActivity = true
+		}
+	}
+
+	// Darkness is only meaningful in a phase that ran without the gate; with it
+	// on, activity is the expected result rather than a failure.
+	if assertion.ForbidAnyActivity && !directUnpackEnabledForPhase() {
+		if anyActivity {
+			return errors.New("direct unpack left traces in the log with the gate off")
+		}
+		return nil
+	}
+	if !directUnpackEnabledForPhase() {
+		return nil
+	}
+
+	if assertion.RequireArmed && armed == 0 {
+		return errors.New("direct unpack never armed this set")
+	}
+	if assertion.RequireConsumed && !consumed {
+		return errors.New("direct unpack did not install its members; the set was extracted conventionally")
+	}
+	if assertion.RequireRearmAfterRestart && armed < 2 {
+		return fmt.Errorf("direct unpack armed %d time(s); a restart mid-chase must re-arm", armed)
+	}
+	if assertion.ExpectedDemotionReason != "" && !seenDemotion {
+		return fmt.Errorf("direct unpack did not demote with %q", assertion.ExpectedDemotionReason)
 	}
 	return nil
 }

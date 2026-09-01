@@ -203,6 +203,20 @@ impl Pipeline {
     /// resolve through their own paths; the transition is idempotent, so when
     /// they land as failures they book nothing twice.
     fn retire_undispatched_segments(&mut self, file_id: NzbFileId) -> usize {
+        // This file is being abandoned mid-job, so its bytes stop here while
+        // the job itself keeps running. A chase whose part this is would park
+        // on a watermark that can never advance again.
+        if let Some(state) = self.jobs.get(&file_id.job_id)
+            && let Some(file_asm) = state.assembly.file(file_id)
+        {
+            let filename = self.current_filename_for_file(file_id.job_id, file_asm);
+            self.direct_unpack_abort_sets_containing(
+                file_id.job_id,
+                &filename,
+                "archive part abandoned by the foreign-layout breaker",
+            );
+        }
+
         let undispatched: Vec<SegmentId> = {
             let Some(state) = self.jobs.get_mut(&file_id.job_id) else {
                 return 0;

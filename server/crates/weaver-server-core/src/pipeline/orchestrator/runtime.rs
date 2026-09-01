@@ -57,6 +57,7 @@ impl Pipeline {
             initial_bandwidth_policy,
             ip_replacement_trial_extra_connections,
             direct_store_settings,
+            direct_unpack_settings,
         ) = {
             let cfg = config.read().await;
             (
@@ -70,6 +71,9 @@ impl Pipeline {
                 // redownloads mid-flight direct work, not that it takes effect
                 // mid-job.
                 crate::pipeline::direct_store::DirectStoreSettings::resolve(&cfg),
+                // Same contract, same reason: resolved once so a set admitted
+                // under an enabled gate cannot find it disabled mid-chase.
+                crate::pipeline::direct_unpack::DirectUnpackSettings::resolve(&cfg),
             )
         };
         metrics.set_ip_replacement_trial_extra_connections(ip_replacement_trial_extra_connections);
@@ -89,6 +93,9 @@ impl Pipeline {
                 holds_scratch_ceiling_bytes = direct_store_settings.holds_scratch_ceiling_bytes,
                 "RAR direct-store routing enabled"
             );
+        }
+        if direct_unpack_settings.gate.is_enabled() {
+            info!("7z direct unpack enabled");
         }
 
         tokio::fs::create_dir_all(&data_dir).await?;
@@ -349,6 +356,10 @@ impl Pipeline {
             direct_store: crate::pipeline::direct_store::wiring::DirectStoreRuntime::with_settings(
                 direct_store_settings,
             ),
+            direct_unpack:
+                crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime::with_settings(
+                    direct_unpack_settings,
+                ),
             extraction_limits,
             process_memory_budget,
             extraction_budgets: HashMap::new(),
@@ -750,6 +761,11 @@ impl Pipeline {
         // barrier poll keeps demanding checkpoints for a working directory that
         // is being deleted.
         self.direct_store.clear_job(job_id);
+        // Same reasoning, one step further: a direct-unpack worker is a
+        // *blocking thread* parked on this job's bytes. Left behind it is not
+        // merely stale state — it never wakes, and the working directory it
+        // holds open is about to be deleted underneath it.
+        self.direct_unpack_forget_job(job_id);
     }
 
     pub(crate) fn note_download_activity(&mut self, job_id: JobId) {
@@ -921,6 +937,10 @@ impl Pipeline {
             // idle set still checkpoints and a busy one is never checked more
             // often than the pipeline turns.
             self.poll_direct_store_barriers().await;
+            // Joins chases that finished or were aborted since the last turn.
+            // Polled here for the same reason: a chase must never be awaited
+            // inline, because it is still following a live download.
+            self.reap_direct_unpack().await;
 
             let rate_delay = self.rate_limiter.time_until_ready();
             let rate_sleep = tokio::time::sleep(rate_delay);
@@ -1388,6 +1408,11 @@ impl Pipeline {
     }
 
     pub(crate) async fn drain(&mut self) {
+        // First, because a parked chase is a blocking thread that nothing else
+        // here will ever wake: the pipeline's other state dies with the struct,
+        // but a thread waiting on a condvar does not. Both shutdown arms reach
+        // this, so aborting here covers the one that does not demand barriers.
+        self.direct_unpack_shutdown("pipeline shutting down").await;
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
         self.deferred_lane_refills.clear();

@@ -5,6 +5,7 @@ mod capacity;
 mod completion;
 mod decode;
 mod direct_store;
+pub mod direct_unpack;
 pub mod download;
 mod extraction;
 mod health;
@@ -2849,6 +2850,9 @@ pub struct Pipeline {
     /// Direct-store routing state: admitted archive sets, their routers and
     /// their coverage barriers. Inert while the gate is off.
     pub(super) direct_store: direct_store::wiring::DirectStoreRuntime,
+    /// Direct-unpack state: 7z sets being decoded while they download. Inert
+    /// while the gate is off.
+    pub(super) direct_unpack: direct_unpack::wiring::DirectUnpackRuntime,
     /// RAR members already extracted per job (for incremental RAR extraction).
     pub(super) extracted_members: HashMap<JobId, HashSet<String>>,
     /// Archives whose extraction has completed successfully (by archive name).

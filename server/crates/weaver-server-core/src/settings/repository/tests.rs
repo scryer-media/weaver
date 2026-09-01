@@ -138,6 +138,9 @@ fn config_roundtrip() {
             enabled: Some(true),
             holds_scratch_ceiling_bytes: Some(128 * 1024 * 1024),
         }),
+        direct_unpack: Some(crate::settings::DirectUnpackOverrides {
+            enabled: Some(true),
+        }),
         delivery_naming: Some(crate::settings::DeliveryNamingOverrides {
             deobfuscate_delivered_members: Some(false),
             enable_srrdb_lookup: Some(true),
@@ -189,11 +192,48 @@ fn config_roundtrip() {
         direct_store.holds_scratch_ceiling_bytes,
         Some(128 * 1024 * 1024)
     );
+    let direct_unpack = loaded
+        .direct_unpack
+        .expect("the direct-unpack table must survive the round trip");
+    assert_eq!(direct_unpack.enabled, Some(true));
     let delivery_naming = loaded
         .delivery_naming
         .expect("the delivery-naming table must survive the round trip");
     assert_eq!(delivery_naming.deobfuscate_delivered_members, Some(false));
     assert_eq!(delivery_naming.enable_srrdb_lookup, Some(true));
+}
+
+/// An install that never touched direct unpack loads no table at all, which is
+/// "every default" — and must not be confused with a table that explicitly says
+/// `false`, since the resolved gate is off either way but the config surface is
+/// not.
+#[test]
+fn an_unconfigured_direct_unpack_loads_as_absent() {
+    let db = Database::open_in_memory().unwrap();
+    db.set_setting("data_dir", "/tmp/weaver").unwrap();
+
+    let loaded = db.load_config().unwrap();
+
+    assert!(loaded.direct_unpack.is_none());
+}
+
+/// A table that explicitly disables direct unpack round-trips as `Some(false)`,
+/// not as an absent table.
+#[test]
+fn an_explicitly_disabled_direct_unpack_round_trips() {
+    let db = Database::open_in_memory().unwrap();
+    db.set_setting("data_dir", "/tmp/weaver").unwrap();
+    db.set_setting("direct_unpack.enabled", "false").unwrap();
+
+    let loaded = db.load_config().unwrap();
+
+    assert_eq!(
+        loaded
+            .direct_unpack
+            .expect("an explicit false is still a table")
+            .enabled,
+        Some(false)
+    );
 }
 
 /// An install that never touched delivery naming loads no table at all, so the

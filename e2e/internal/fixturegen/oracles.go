@@ -148,6 +148,14 @@ type SevenZipSpec struct {
 	Password string
 	// EncryptHeaders adds `-mhe=on`.
 	EncryptHeaders bool
+	// Solid packs the members into one block (`-ms=on`). The default is off,
+	// which is what every pre-existing fixture relies on.
+	Solid bool
+	// Methods are raw coder-chain switches, for example
+	// []string{"-m0=Delta:4", "-m1=LZMA2"}. Passed through verbatim so a recipe
+	// can name any chain the pinned 7-Zip writes; mutually exclusive with
+	// Store, which is just the Copy chain spelled shorter.
+	Methods []string
 }
 
 // SevenZip runs the pinned 7-Zip console binary over the stage directory.
@@ -166,11 +174,25 @@ func (env *Env) SevenZip(ctx context.Context, spec SevenZipSpec) error {
 	}
 	args := []string{"a", "-t" + format, "-bso0", "-bsp0", "-y"}
 	if format == "7z" {
-		args = append(args, "-ms=off")
+		if spec.Solid {
+			args = append(args, "-ms=on")
+		} else {
+			args = append(args, "-ms=off")
+		}
 	}
-	if spec.Store {
+	switch {
+	case spec.Store:
 		args = append(args, "-m0=Copy", "-mx0")
-	} else {
+	case len(spec.Methods) > 0:
+		// An explicit chain still needs a level: 7-Zip derives dictionary and
+		// word sizes from it even when the coder is named outright.
+		level := spec.Level
+		if level == "" {
+			level = "-mx1"
+		}
+		args = append(args, level)
+		args = append(args, spec.Methods...)
+	default:
 		level := spec.Level
 		if level == "" {
 			level = "-mx1"
