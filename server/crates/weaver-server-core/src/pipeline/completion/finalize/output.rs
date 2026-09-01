@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::deobfuscate::{self, DeliveryNamingPlan, SrrdbInputs};
@@ -7,10 +7,43 @@ use crate::jobs::working_dir::{WORKING_DIR_MARKER, mark_weaver_owned_output_dir}
 use crate::post_processing::model::PostProcessingSettings;
 use crate::runtime::{file_cache, fs as runtime_fs};
 
+fn record_member_crc32_value(
+    by_path: &mut HashMap<String, u32>,
+    ambiguous_paths: &mut HashSet<String>,
+    member_name: &str,
+    crc32: u32,
+) {
+    let Ok(relative_path) =
+        crate::pipeline::direct_store::plan::DirectSetPlan::destination_relative_name(member_name)
+    else {
+        return;
+    };
+    let key = relative_path.to_ascii_lowercase();
+    if ambiguous_paths.contains(&key) {
+        return;
+    }
+    match by_path.get(&key).copied() {
+        None => {
+            by_path.insert(key, crc32);
+        }
+        Some(existing) if existing == crc32 => {}
+        Some(_) => {
+            by_path.remove(&key);
+            ambiguous_paths.insert(key);
+        }
+    }
+}
+
 /// Folds one volume's member headers into the checksum map. A member spanning
-/// volumes states its checksum on the header that ends it, so later volumes
-/// overwrite earlier `None`s naturally by only writing what they know.
-fn record_member_crc32(by_name: &mut HashMap<String, u32>, facts: &unrar_rs::RarVolumeFacts) {
+/// volumes states its checksum on the header that ends it, so earlier volumes
+/// simply contribute nothing. Conflicting checksums for the same normalized
+/// delivery path make that path unusable instead of picking an iteration-order
+/// winner.
+fn record_member_crc32(
+    by_path: &mut HashMap<String, u32>,
+    ambiguous_paths: &mut HashSet<String>,
+    facts: &unrar_rs::RarVolumeFacts,
+) {
     for member in &facts.members {
         if member.is_directory {
             continue;
@@ -18,12 +51,7 @@ fn record_member_crc32(by_name: &mut HashMap<String, u32>, facts: &unrar_rs::Rar
         let Some(crc32) = member.data_crc32 else {
             continue;
         };
-        let name = member
-            .name
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(&member.name);
-        by_name.insert(name.to_ascii_lowercase(), crc32);
+        record_member_crc32_value(by_path, ambiguous_paths, &member.name, crc32);
     }
 }
 
@@ -340,6 +368,35 @@ async fn run_move_to_complete(
     naming: Option<DeliveryNamingPlan>,
     policy_source: DeliveryPolicySource,
 ) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
+    let claimed_dest = dest.clone();
+    let result = run_move_to_claimed_destination(
+        job_id,
+        working_dir,
+        staging_dir,
+        dest,
+        phase_counters,
+        naming,
+        policy_source,
+    )
+    .await;
+    if result.is_err() {
+        // The actor exclusively created this directory before launching the
+        // worker. Remove the abandoned claim only when it is still empty;
+        // partial output is deliberately retained for diagnosis and retry.
+        let _ = tokio::fs::remove_dir(&claimed_dest).await;
+    }
+    result
+}
+
+async fn run_move_to_claimed_destination(
+    job_id: JobId,
+    working_dir: PathBuf,
+    staging_dir: Option<PathBuf>,
+    dest: PathBuf,
+    phase_counters: Arc<PhaseCounters>,
+    naming: Option<DeliveryNamingPlan>,
+    policy_source: DeliveryPolicySource,
+) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
     // Every cached disk write handle under either of the job's roots must be
     // closed before its files are renamed or moved. The staging root is not
     // only extraction output any more: direct-store writes member payload
@@ -385,9 +442,37 @@ async fn run_move_to_complete(
         .total_bytes
         .store(validation.total_bytes, Ordering::Relaxed);
 
-    if let Err(error) = tokio::fs::create_dir_all(&dest).await {
-        return Err(MoveToCompleteFailure::Operational(format!(
-            "failed to create complete directory {}: {error}",
+    let dest_metadata = tokio::fs::symlink_metadata(&dest).await.map_err(|error| {
+        MoveToCompleteFailure::Operational(format!(
+            "could not inspect claimed complete directory {}: {error}",
+            dest.display()
+        ))
+    })?;
+    if !dest_metadata.is_dir() || file_type_is_link_or_reparse(&dest_metadata.file_type()) {
+        return Err(MoveToCompleteFailure::Security(format!(
+            "claimed complete destination changed before publication: {}",
+            dest.display()
+        )));
+    }
+    let mut existing_entries = tokio::fs::read_dir(&dest).await.map_err(|error| {
+        MoveToCompleteFailure::Operational(format!(
+            "could not inspect claimed complete directory {}: {error}",
+            dest.display()
+        ))
+    })?;
+    if existing_entries
+        .next_entry()
+        .await
+        .map_err(|error| {
+            MoveToCompleteFailure::Operational(format!(
+                "could not inspect claimed complete directory {}: {error}",
+                dest.display()
+            ))
+        })?
+        .is_some()
+    {
+        return Err(MoveToCompleteFailure::Security(format!(
+            "claimed complete directory was populated before publication: {}",
             dest.display()
         )));
     }
@@ -590,6 +675,49 @@ fn complete_parent_for_category(
     crate::categories::completion_parent(complete_dir, categories, category)
 }
 
+fn complete_destination_candidate(
+    parent: &Path,
+    dir_name: &str,
+    job_id: JobId,
+    attempt: u32,
+) -> PathBuf {
+    match attempt {
+        0 => parent.join(dir_name),
+        1 => parent.join(weaver_model::files::path_component_with_suffix(
+            dir_name,
+            &format!(".#{}", job_id.0),
+        )),
+        _ => parent.join(weaver_model::files::path_component_with_suffix(
+            dir_name,
+            &format!(".#{}.{}", job_id.0, attempt - 1),
+        )),
+    }
+}
+
+async fn claim_complete_destination_path(
+    parent: &Path,
+    dir_name: &str,
+    job_id: JobId,
+    reserved: &HashSet<PathBuf>,
+) -> std::io::Result<PathBuf> {
+    tokio::fs::create_dir_all(parent).await?;
+
+    let mut attempt = 0u32;
+    loop {
+        let candidate = complete_destination_candidate(parent, dir_name, job_id, attempt);
+        if !reserved.contains(&candidate) {
+            match tokio::fs::create_dir(&candidate).await {
+                Ok(()) => return Ok(candidate),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        attempt = attempt.checked_add(1).ok_or_else(|| {
+            std::io::Error::other("exhausted complete-directory collision suffixes")
+        })?;
+    }
+}
+
 #[cfg(test)]
 mod category_destination_tests {
     use super::*;
@@ -642,15 +770,7 @@ mod category_destination_tests {
 }
 
 impl Pipeline {
-    fn complete_destination_is_reserved(&self, job_id: JobId, candidate: &std::path::Path) -> bool {
-        self.reserved_complete_destinations
-            .iter()
-            .any(|(reserved_job_id, reserved_path)| {
-                *reserved_job_id != job_id && reserved_path == candidate
-            })
-    }
-
-    async fn compute_complete_destination(
+    async fn claim_complete_destination(
         &self,
         job_id: JobId,
         job_name: &str,
@@ -661,34 +781,20 @@ impl Pipeline {
             let cfg = self.config.read().await;
             complete_parent_for_category(&self.complete_dir, &cfg.categories, category)?
         };
-        let base_dest = parent.join(&dir_name);
-
-        if !base_dest.exists() && !self.complete_destination_is_reserved(job_id, &base_dest) {
-            return Ok(base_dest);
-        }
-
-        let parent = base_dest
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let suffixed = parent.join(weaver_model::files::path_component_with_suffix(
-            &dir_name,
-            &format!(".#{}", job_id.0),
-        ));
-        if !suffixed.exists() && !self.complete_destination_is_reserved(job_id, &suffixed) {
-            return Ok(suffixed);
-        }
-
-        let mut attempt = 1u32;
-        loop {
-            let candidate = parent.join(weaver_model::files::path_component_with_suffix(
-                &dir_name,
-                &format!(".#{}.{}", job_id.0, attempt),
-            ));
-            if !candidate.exists() && !self.complete_destination_is_reserved(job_id, &candidate) {
-                return Ok(candidate);
-            }
-            attempt += 1;
-        }
+        let reserved: HashSet<PathBuf> = self
+            .reserved_complete_destinations
+            .iter()
+            .filter(|(reserved_job_id, _)| **reserved_job_id != job_id)
+            .map(|(_, path)| path.clone())
+            .collect();
+        claim_complete_destination_path(&parent, &dir_name, job_id, &reserved)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to reserve a complete directory under {}: {error}",
+                    parent.display()
+                )
+            })
     }
 
     /// Resolves everything the delivery rename pass needs, on this task, before
@@ -717,11 +823,11 @@ impl Pipeline {
         // never opted in never pays for gathering it.
         let srrdb = srrdb_from_config.then(|| SrrdbInputs {
             base_url: deobfuscate::SRRDB_API_BASE.to_string(),
-            crc32_by_member_name: HashMap::new(),
+            crc32_by_member_path: HashMap::new(),
         });
         let srrdb = match srrdb {
             Some(mut inputs) => {
-                inputs.crc32_by_member_name = self.member_crc32_by_name(job_id).await;
+                inputs.crc32_by_member_path = self.member_crc32_by_path(job_id).await;
                 Some(inputs)
             }
             None => None,
@@ -733,8 +839,8 @@ impl Pipeline {
         })
     }
 
-    /// The CRC32 each archive header stated for its member, keyed by the
-    /// member's filename lowercased.
+    /// The CRC32 each archive header stated for its member, keyed by its
+    /// normalized, lowercased delivery-relative path.
     ///
     /// Read from two places because the two delivery routes keep the same facts
     /// in different homes: extraction keeps a set's parsed headers in memory
@@ -742,14 +848,15 @@ impl Pipeline {
     /// them to the durable facts table. Reading both makes the map route-blind.
     /// A member the headers never stated a checksum for is simply absent, and
     /// the lookup falls back to the job name for it.
-    async fn member_crc32_by_name(&self, job_id: JobId) -> HashMap<String, u32> {
-        let mut by_name = HashMap::new();
+    async fn member_crc32_by_path(&self, job_id: JobId) -> HashMap<String, u32> {
+        let mut by_path = HashMap::new();
+        let mut ambiguous_paths = HashSet::new();
         for ((set_job_id, _), state) in &self.rar_sets {
             if *set_job_id != job_id {
                 continue;
             }
             for facts in state.facts.values() {
-                record_member_crc32(&mut by_name, facts);
+                record_member_crc32(&mut by_path, &mut ambiguous_paths, facts);
             }
         }
 
@@ -762,7 +869,7 @@ impl Pipeline {
                     for (_, blob) in volumes {
                         if let Ok(facts) = rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob)
                         {
-                            record_member_crc32(&mut by_name, &facts);
+                            record_member_crc32(&mut by_path, &mut ambiguous_paths, &facts);
                         }
                     }
                 }
@@ -773,7 +880,7 @@ impl Pipeline {
                 "could not read persisted volume facts for the release-index lookup"
             ),
         }
-        by_name
+        by_path
     }
 
     /// Move extracted/completed files from the intermediate working directory
@@ -819,7 +926,7 @@ impl Pipeline {
         self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
 
         let dest = self
-            .compute_complete_destination(job_id, &job_name, category.as_deref())
+            .claim_complete_destination(job_id, &job_name, category.as_deref())
             .await?;
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());

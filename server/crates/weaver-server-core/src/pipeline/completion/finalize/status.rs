@@ -576,6 +576,7 @@ impl Pipeline {
             job_id,
             "job paused",
             crate::pipeline::direct_unpack::wiring::AbortLatch::Retryable,
+            crate::pipeline::direct_unpack::wiring::DemotionReason::DownloadEnded,
         );
         let pauseable_download_lane = matches!(
             previous_download_state,

@@ -987,7 +987,12 @@ impl Pipeline {
                 }
                 // Something is reading the set; the task below rules on it, as
                 // it did before this guard existed.
-                ArchiveSetRetirement::Busy => {}
+                //
+                // `NotRar` joins it: this whole retirement path reasons in RAR
+                // terms, and a set it cannot describe must not be torn down by
+                // it. Falling through leaves the decision where it was before
+                // the guard existed, which is the conservative direction.
+                ArchiveSetRetirement::Busy | ArchiveSetRetirement::NotRar => {}
                 ArchiveSetRetirement::StillReferenced => {
                     // A claimed name with no runtime entry of its own is the
                     // shape retirement cannot reach and extraction cannot use:
@@ -1379,32 +1384,76 @@ impl Pipeline {
                 }
                 crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(pending) => {
                     // Every part is complete by now, so this is finishing at
-                    // disk speed rather than at download speed.
-                    match pending.handle.await {
-                        Ok(Ok(outcome)) => Some((
-                            outcome,
-                            pending.staging_dir,
-                            pending.counters.total_bytes.load(Ordering::Relaxed),
-                            pending.counters.completed_bytes.load(Ordering::Relaxed),
-                        )),
-                        Ok(Err(error)) => {
-                            tracing::debug!(
-                                job_id = job_id.0,
-                                error = %error,
-                                "chase failed at consumption; extracting conventionally"
-                            );
-                            let _ = std::fs::remove_dir_all(&pending.staging_dir);
-                            None
-                        }
-                        Err(error) => {
+                    // disk speed rather than at download speed — but "should
+                    // finish quickly" is not a guarantee, and this await used to
+                    // have no deadline. A chase that never exits (one still
+                    // queued behind occupied chase workers, say, which cannot
+                    // even see its own abort) made extraction never return, left
+                    // the job in Extracting forever, and held a global
+                    // extraction slot until the job was cancelled. That is the
+                    // whole shape of the round-9 slow tail.
+                    //
+                    // On the deadline: end the chase's coverage so its worker
+                    // has something to fail on if it is inside the reader, say
+                    // so loudly, and extract conventionally. One warning line
+                    // and a working job, instead of a wedge.
+                    let deadline = tokio::time::sleep(
+                        crate::pipeline::direct_unpack::wiring::pending_chase_deadline(),
+                    );
+                    tokio::pin!(deadline);
+                    let mut handle = pending.handle;
+                    let joined = tokio::select! {
+                        joined = &mut handle => Some(joined),
+                        _ = &mut deadline => None,
+                    };
+                    match joined {
+                        // The deadline won. End the chase's coverage so a worker
+                        // inside the reader has something to fail on, drop its
+                        // staging, and fall through to conventional extraction
+                        // below — which is the whole point: the job finishes.
+                        None => {
                             tracing::warn!(
                                 job_id = job_id.0,
-                                error = %error,
-                                "chase worker panicked; extracting conventionally"
+                                set_name = %pending.set_name,
+                                waited_s =
+                                    crate::pipeline::direct_unpack::wiring::pending_chase_deadline()
+                                        .as_secs(),
+                                "chase did not finish within the consumption deadline; \
+                                 ending it and extracting conventionally"
                             );
+                            pending
+                                .coverage
+                                .abort("chase exceeded the consumption deadline");
+                            handle.abort();
                             let _ = std::fs::remove_dir_all(&pending.staging_dir);
                             None
                         }
+                        Some(joined) => match joined {
+                            Ok(Ok(outcome)) => Some((
+                                outcome,
+                                pending.staging_dir,
+                                pending.counters.total_bytes.load(Ordering::Relaxed),
+                                pending.counters.completed_bytes.load(Ordering::Relaxed),
+                            )),
+                            Ok(Err(error)) => {
+                                tracing::debug!(
+                                    job_id = job_id.0,
+                                    error = %error,
+                                    "chase failed at consumption; extracting conventionally"
+                                );
+                                let _ = std::fs::remove_dir_all(&pending.staging_dir);
+                                None
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    job_id = job_id.0,
+                                    error = %error,
+                                    "chase worker panicked; extracting conventionally"
+                                );
+                                let _ = std::fs::remove_dir_all(&pending.staging_dir);
+                                None
+                            }
+                        },
                     }
                 }
                 crate::pipeline::direct_unpack::wiring::ChaseDisposition::None => None,

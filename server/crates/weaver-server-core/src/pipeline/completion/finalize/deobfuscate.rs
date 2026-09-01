@@ -36,6 +36,11 @@ pub(super) const SRRDB_API_BASE: &str = "https://api.srrdb.com/v1";
 /// third party is not acceptable at any duration a user would notice.
 const SRRDB_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound on decoded SRRDB response bytes. Live archive-CRC responses are
+/// normally only a few KiB; one MiB leaves substantial headroom while refusing
+/// an unexpectedly large third-party payload.
+const MAX_SRRDB_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// Bounds on the delivery walk. A delivery is a handful of files in practice;
 /// these exist so a pathological tree cannot turn a cosmetic pass into work.
 const MAX_SCAN_DEPTH: u32 = 8;
@@ -53,12 +58,13 @@ pub(crate) struct DeliveryNamingPlan {
 }
 
 /// The CRC32s the archives' headers stated for their members, keyed by the
-/// member's filename lowercased. Both delivery routes learn these from the same
-/// headers, so the map covers extraction and direct-store alike.
+/// normalized, lowercased delivery-relative path. Both delivery routes learn
+/// these from the same headers, so the map covers extraction and direct-store
+/// alike without collapsing members in different directories.
 #[derive(Debug, Clone)]
 pub(crate) struct SrrdbInputs {
     pub(crate) base_url: String,
-    pub(crate) crc32_by_member_name: HashMap<String, u32>,
+    pub(crate) crc32_by_member_path: HashMap<String, u32>,
 }
 
 /// Renames the delivery's payload when it still wears an obfuscated name.
@@ -96,9 +102,9 @@ pub(super) async fn rename_obfuscated_members(
     let Some(candidate) = weaver_nzb::select_rename_candidate(&entries) else {
         return 0;
     };
-    let candidate_name = file_name_of(entries[candidate].relative_path);
+    let candidate_path = entries[candidate].relative_path;
 
-    let target = resolve_target_name(job_id, candidate_name, plan).await;
+    let target = resolve_target_name(job_id, candidate_path, plan).await;
     let Some(target_stem) = target else {
         return 0;
     };
@@ -132,11 +138,11 @@ pub(super) async fn rename_obfuscated_members(
 /// operator has for correlating the file with its post.
 async fn resolve_target_name(
     job_id: JobId,
-    candidate_name: &str,
+    candidate_path: &str,
     plan: &DeliveryNamingPlan,
 ) -> Option<String> {
     let from_srrdb = match plan.srrdb.as_ref() {
-        Some(inputs) => srrdb_target(job_id, candidate_name, inputs).await,
+        Some(inputs) => srrdb_target(job_id, candidate_path, inputs).await,
         None => None,
     };
 
@@ -146,7 +152,7 @@ async fn resolve_target_name(
     if weaver_nzb::looks_obfuscated_for_delivery(&target) {
         debug!(
             job_id = job_id.0,
-            member = %candidate_name,
+            member = %candidate_path,
             "skipping member deobfuscation because the rename target is obfuscated too"
         );
         return None;
@@ -154,10 +160,10 @@ async fn resolve_target_name(
     Some(target)
 }
 
-async fn srrdb_target(job_id: JobId, candidate_name: &str, inputs: &SrrdbInputs) -> Option<String> {
+async fn srrdb_target(job_id: JobId, candidate_path: &str, inputs: &SrrdbInputs) -> Option<String> {
     let crc32 = *inputs
-        .crc32_by_member_name
-        .get(&candidate_name.to_ascii_lowercase())?;
+        .crc32_by_member_path
+        .get(&candidate_path.to_ascii_lowercase())?;
 
     // The request body is the checksum and nothing else — no filename, no job
     // name, no post identity.
@@ -210,27 +216,116 @@ pub(super) fn srrdb_search_url(base_url: &str, crc32: u32) -> String {
 /// pointed at exactly one release. Zero results is a miss; several are an
 /// ambiguity we have no way to break, and guessing would rename the payload
 /// after the wrong release.
+#[cfg(test)]
 pub(super) fn parse_srrdb_release(body: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct SearchResponse {
-        #[serde(default)]
-        results: Vec<SearchResult>,
-    }
-    #[derive(serde::Deserialize)]
-    struct SearchResult {
-        #[serde(default)]
-        release: String,
-    }
+    parse_srrdb_release_reader(body.as_bytes())
+}
 
-    let parsed: SearchResponse = serde_json::from_str(body).ok()?;
-    let [result] = parsed.results.as_slice() else {
+#[derive(serde::Deserialize)]
+struct SrrdbSearchResponse {
+    #[serde(default)]
+    results: SrrdbSearchResults,
+}
+
+#[derive(Default)]
+struct SrrdbSearchResults {
+    release: Option<String>,
+    ambiguous: bool,
+}
+
+impl<'de> serde::Deserialize<'de> for SrrdbSearchResults {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ResultsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ResultsVisitor {
+            type Value = SrrdbSearchResults;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an array of SRRDB search results")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                #[derive(serde::Deserialize)]
+                struct SearchResult {
+                    #[serde(default)]
+                    release: String,
+                }
+
+                let Some(first) = sequence.next_element::<SearchResult>()? else {
+                    return Ok(SrrdbSearchResults::default());
+                };
+                let mut results = SrrdbSearchResults {
+                    release: Some(first.release),
+                    ambiguous: false,
+                };
+                if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    results.release = None;
+                    results.ambiguous = true;
+                    while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                }
+                Ok(results)
+            }
+        }
+
+        deserializer.deserialize_seq(ResultsVisitor)
+    }
+}
+
+fn parse_srrdb_release_reader(reader: impl std::io::Read) -> Option<String> {
+    let parsed: SrrdbSearchResponse = serde_json::from_reader(reader).ok()?;
+    if parsed.results.ambiguous {
         return None;
-    };
-    let release = result.release.trim();
+    }
+    let release = parsed.results.release?;
+    let release = release.trim();
     if release.is_empty() {
         return None;
     }
     Some(release.to_string())
+}
+
+struct SrrdbBodyReader {
+    receiver: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    chunk: bytes::Bytes,
+    offset: usize,
+}
+
+impl SrrdbBodyReader {
+    fn new(receiver: tokio::sync::mpsc::Receiver<bytes::Bytes>) -> Self {
+        Self {
+            receiver,
+            chunk: bytes::Bytes::new(),
+            offset: 0,
+        }
+    }
+}
+
+impl std::io::Read for SrrdbBodyReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.offset < self.chunk.len() {
+                let available = &self.chunk[self.offset..];
+                let copied = available.len().min(output.len());
+                output[..copied].copy_from_slice(&available[..copied]);
+                self.offset += copied;
+                return Ok(copied);
+            }
+            let Some(chunk) = self.receiver.blocking_recv() else {
+                return Ok(0);
+            };
+            self.chunk = chunk;
+            self.offset = 0;
+        }
+    }
 }
 
 async fn fetch_srrdb_release(base_url: &str, crc32: u32) -> Option<String> {
@@ -240,12 +335,47 @@ async fn fetch_srrdb_release(base_url: &str, crc32: u32) -> Option<String> {
         .user_agent("weaver-srrdb/1")
         .build()
         .ok()?;
-    let response = client.get(url).send().await.ok()?;
+    let mut response = client.get(url).send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }
-    let body = response.text().await.ok()?;
-    parse_srrdb_release(&body)
+
+    // Feed the response through a small channel into serde's reader-based
+    // parser. The body is never buffered in full, and decoded bytes are counted
+    // as they arrive so compression cannot bypass the response ceiling.
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel(2);
+    let parse_task = tokio::task::spawn_blocking(move || {
+        parse_srrdb_release_reader(SrrdbBodyReader::new(body_rx))
+    });
+    let mut received_bytes = 0usize;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let Some(next_received_bytes) = received_bytes.checked_add(chunk.len()) else {
+                    drop(body_tx);
+                    let _ = parse_task.await;
+                    return None;
+                };
+                if next_received_bytes > MAX_SRRDB_RESPONSE_BYTES {
+                    drop(body_tx);
+                    let _ = parse_task.await;
+                    return None;
+                }
+                received_bytes = next_received_bytes;
+                if body_tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                drop(body_tx);
+                let _ = parse_task.await;
+                return None;
+            }
+        }
+    }
+    drop(body_tx);
+    parse_task.await.ok().flatten()
 }
 
 /// Collects the delivery's regular files as root-relative, `/`-separated paths.
@@ -334,12 +464,6 @@ fn apply_renames(job_id: JobId, root: &Path, renames: &[PlannedRename]) -> u32 {
     applied
 }
 
-fn file_name_of(relative_path: &str) -> &str {
-    relative_path
-        .rfind('/')
-        .map_or(relative_path, |slash| &relative_path[slash + 1..])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,7 +485,7 @@ mod tests {
                 // by the kernel, with no name resolution and nothing leaving
                 // the machine.
                 base_url: "http://127.0.0.1:1/v1".to_string(),
-                crc32_by_member_name: HashMap::from([(member.to_ascii_lowercase(), crc32)]),
+                crc32_by_member_path: HashMap::from([(member.to_ascii_lowercase(), crc32)]),
             }),
         }
     }
@@ -422,6 +546,65 @@ mod tests {
         assert_eq!(parse_srrdb_release(r#"{"results":[{"release":""}]}"#), None);
         assert_eq!(parse_srrdb_release("not json at all"), None);
         assert_eq!(parse_srrdb_release("{}"), None);
+    }
+
+    #[tokio::test]
+    async fn a_large_release_index_response_is_streamed_without_rejection() {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::routing::get;
+
+        async fn search(State(body): State<String>) -> String {
+            body
+        }
+
+        let mut body =
+            r#"{"results":[{"release":"Silver.Horizon.2024.1080p.WEB-DL.x264-CREW"}]}"#.to_string();
+        body.push_str(&" ".repeat(128 * 1024));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/v1/search/{query}", get(search))
+            .with_state(body);
+        let served = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let release = fetch_srrdb_release(&base_url, 0x0a1b_2c3d).await;
+        served.abort();
+
+        assert_eq!(
+            release.as_deref(),
+            Some("Silver.Horizon.2024.1080p.WEB-DL.x264-CREW")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_release_index_response_over_one_mib_is_rejected() {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::routing::get;
+
+        async fn search(State(body): State<String>) -> String {
+            body
+        }
+
+        let mut body =
+            r#"{"results":[{"release":"Silver.Horizon.2024.1080p.WEB-DL.x264-CREW"}]}"#.to_string();
+        body.push_str(&" ".repeat(MAX_SRRDB_RESPONSE_BYTES));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/v1/search/{query}", get(search))
+            .with_state(body);
+        let served = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let release = fetch_srrdb_release(&base_url, 0x0a1b_2c3d).await;
+        served.abort();
+
+        assert_eq!(release, None);
     }
 
     // ── the pass over a real directory ──────────────────────────────────
@@ -563,10 +746,14 @@ mod tests {
         });
 
         let root = tempfile::tempdir().unwrap();
-        write_file(root.path(), "Yb5drZSkNi20UCMkb.mkv", 64 * MIB);
-        write_file(root.path(), "Yb5drZSkNi20UCMkb.eng.srt", 4096);
+        write_file(root.path(), "feature/Yb5drZSkNi20UCMkb.mkv", 64 * MIB);
+        write_file(root.path(), "feature/Yb5drZSkNi20UCMkb.eng.srt", 4096);
 
-        let mut plan = plan_with_srrdb("Quiet Harbour 2021", "Yb5drZSkNi20UCMkb.mkv", 0x0a1b_2c3d);
+        let mut plan = plan_with_srrdb(
+            "Quiet Harbour 2021",
+            "feature/Yb5drZSkNi20UCMkb.mkv",
+            0x0a1b_2c3d,
+        );
         plan.srrdb.as_mut().unwrap().base_url = base_url;
 
         let renamed = rename_obfuscated_members(JobId(8), root.path(), &plan).await;
@@ -582,8 +769,8 @@ mod tests {
         assert_eq!(
             delivered_names(root.path()),
             vec![
-                "Silver.Horizon.2024.1080p.WEB-DL.x264-CREW.eng.srt".to_string(),
-                "Silver.Horizon.2024.1080p.WEB-DL.x264-CREW.mkv".to_string(),
+                "feature/Silver.Horizon.2024.1080p.WEB-DL.x264-CREW.eng.srt".to_string(),
+                "feature/Silver.Horizon.2024.1080p.WEB-DL.x264-CREW.mkv".to_string(),
             ],
             "the release name outranks the job name, and the helper follows the payload"
         );

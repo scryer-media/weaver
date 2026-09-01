@@ -221,6 +221,15 @@ impl SetCoverage {
     /// Monotonic: a lower value than the one already recorded is ignored, so an
     /// out-of-order flush report cannot retract bytes a reader may already have
     /// served.
+    ///
+    /// A watermark past a declared length is a contradiction in the coverage,
+    /// not a programming error to assert on: one of the two facts was wrong, and
+    /// which one is not knowable from here. It aborts the set — one demoted
+    /// chase and a conventional extraction — in *every* build profile. It used
+    /// to be a `debug_assert!`, which under a debug build panicked the pipeline
+    /// task and took the whole job pass down with it, and under a release build
+    /// silently served bytes past a boundary a reader had already mapped later
+    /// parts against.
     pub fn advance_watermark(&self, index: usize, watermark: u64) {
         let mut state = self.lock();
         let Some(part) = state.parts.get_mut(index) else {
@@ -230,11 +239,16 @@ impl SetCoverage {
         if watermark <= part.watermark {
             return;
         }
-        debug_assert!(
-            part.len.is_none_or(|len| watermark <= len),
-            "watermark {watermark} exceeds declared part length {:?}",
-            part.len
-        );
+        if let Some(len) = part.len
+            && watermark > len
+        {
+            let reason =
+                format!("part {index} committed {watermark} bytes past its declared length {len}");
+            Self::abort_locked(&mut state, reason);
+            drop(state);
+            self.advanced.notify_all();
+            return;
+        }
         part.watermark = watermark;
         drop(state);
         self.advanced.notify_all();
@@ -280,6 +294,19 @@ impl SetCoverage {
         if offset > part.consumed_high_water {
             part.consumed_high_water = offset;
         }
+    }
+
+    /// Whether a part has already been marked finished.
+    ///
+    /// The settle passes ask before touching a part: one that settled through
+    /// its own completion commit needs nothing added and, in the strict pass, is
+    /// not something to complain about.
+    pub fn part_is_complete(&self, index: usize) -> bool {
+        self.lock()
+            .parts
+            .get(index)
+            .map(|part| part.complete)
+            .unwrap_or(false)
     }
 
     /// The furthest byte the decoder has read from a part.
