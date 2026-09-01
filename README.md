@@ -42,6 +42,13 @@ Instead of the traditional sequential approach (download everything, then repair
 
 All installation instructions can be found on the [Weaver docs website](https://www.scryer.media/weaver/docs/installation/)
 
+On macOS the desktop build ships as `weaver-darwin-<arch>.dmg`: open it and drag
+Weaver to Applications. Release images are signed, but notarization is not part
+of every release, so the first launch may need a one-time right-click → **Open**
+to get past Gatekeeper; afterwards it opens normally. The
+`weaver-darwin-<arch>-portable.tar.gz` archive remains the choice for headless
+and service installs.
+
 ## Docker
 
 ### Unraid

@@ -26,3 +26,9 @@ pub(crate) const SHUTDOWN_MESSAGE: u32 = WM_APP + 3;
 /// that started its own replacement would leave the tray supervising a
 /// process it did not start.
 pub(crate) const RESTART_MESSAGE: u32 = WM_APP + 4;
+/// Posted by the tray to itself when WebView2 could not be started, so the
+/// failure is handled from the message loop rather than from inside a WebView2
+/// callback that has no access to the tray's state. `weaver.exe` never posts
+/// it; it lives here so every `WM_APP` offset the tray answers on is assigned
+/// in one place and cannot be reused by accident.
+pub(crate) const WEBVIEW_FAILED_MESSAGE: u32 = WM_APP + 5;
