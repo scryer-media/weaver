@@ -667,6 +667,9 @@ impl Pipeline {
             .as_secs();
         let (assembly, download_queue, recovery_queue) =
             Self::build_job_assembly(job_id, &spec, &HashSet::new());
+        // A bare `.7z` has no topology to wait for, so it arms off its opening
+        // bytes instead — which means the commit path has to know it is coming.
+        self.register_direct_unpack_singles(job_id, &spec);
         let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
         let initial_file_identities = file_identities.values().cloned().collect::<Vec<_>>();
         let (initial_status, initial_download_state, initial_post_state, initial_run_state) =
@@ -1514,6 +1517,9 @@ impl Pipeline {
         }
         let (assembly, download_queue, recovery_queue) =
             Self::build_job_assembly(job_id, &spec, &restore_skip_plan.skip);
+        // A restored job resumes mid-download; its unsplit archives are still
+        // candidates, and their persisted floor is what they will arm from.
+        self.register_direct_unpack_singles(job_id, &spec);
         let status = Self::normalize_restored_status(status, &download_queue, &recovery_queue);
 
         let skip_ref = &restore_skip_plan.skip;

@@ -2616,12 +2616,22 @@ impl Pipeline {
     ) -> Result<par2_rs::Par2RepairOutcome, String> {
         let set_id = par2_set.recovery_set_id;
         if repair {
-            // The repairer is about to rewrite damaged sources in place. Any
-            // chase that already read them is describing bytes that will not
-            // survive this call, and par2-rs reports what it rewrote as its own
-            // file ids rather than as weaver filenames — so the whole job's
-            // chases are tainted rather than guessing which sets were touched.
-            self.taint_direct_unpack_job(job_id);
+            // The repairer is about to rewrite damaged sources in place. A
+            // chase that consumed only bytes the recovery set positively found
+            // Intact is safe to leave parked through that — repair cannot
+            // rewrite what it has already read — and resumes afterwards over
+            // the repaired file. Anything else is tainted, exactly as it was
+            // before: par2-rs reports what it rewrote as its own file ids
+            // rather than as weaver filenames, so an unvouched chase gets no
+            // benefit of the doubt.
+            // INVARIANT: every exit from this function below this line must
+            // settle the sets this leaves parked, via
+            // `settle_direct_unpack_after_repair`. A set parked through a
+            // repair is held under a damage cap that only that call lifts, and
+            // a chase left under one waits on a frontier nothing will advance —
+            // silently, until the job is torn down. If you add an early return
+            // below, settle first.
+            self.decide_direct_unpack_before_repair(job_id);
             // What the directory held before the repairer touched it, so the
             // artefacts it leaves behind can be named afterwards by difference
             // rather than by guessing at a backup-suffix convention that lives
@@ -2732,7 +2742,9 @@ impl Pipeline {
                     if repair {
                         self.phase_end(job_id, JobPhase::Repairing);
                     }
-                    return Err(error);
+                    let outcome = Err(error);
+                    self.settle_direct_unpack_after_repair(job_id, repair, &outcome);
+                    return outcome;
                 }
             };
             // Analysis reads the live grid here. Repair uses the local
@@ -2814,7 +2826,9 @@ impl Pipeline {
                             "filesystem PAR2 repair exhausted file descriptors; the bounded retry lacks a complete source map"
                         );
                         self.phase_end(job_id, JobPhase::Repairing);
-                        return Err(error.message);
+                        let outcome = Err(error.message);
+                        self.settle_direct_unpack_after_repair(job_id, repair, &outcome);
+                        return outcome;
                     }
                     warn!(
                         job_id = job_id.0,
@@ -2861,6 +2875,7 @@ impl Pipeline {
             if repair {
                 self.phase_end(job_id, JobPhase::Repairing);
             }
+            self.settle_direct_unpack_after_repair(job_id, repair, &retained_outcome);
             return retained_outcome;
         }
 
@@ -2947,10 +2962,20 @@ impl Pipeline {
                 {
                     set_runtime.scan_carry = scan_carry;
                 }
-                Ok(outcome)
+                let outcome = Ok(outcome);
+                self.settle_direct_unpack_after_repair(job_id, repair, &outcome);
+                outcome
             }
-            Ok(Err(error)) => Err(error),
-            Err(error) => Err(format!("repair task panicked: {error}")),
+            Ok(Err(error)) => {
+                let outcome = Err(error);
+                self.settle_direct_unpack_after_repair(job_id, repair, &outcome);
+                outcome
+            }
+            Err(error) => {
+                let outcome = Err(format!("repair task panicked: {error}"));
+                self.settle_direct_unpack_after_repair(job_id, repair, &outcome);
+                outcome
+            }
         }
     }
 

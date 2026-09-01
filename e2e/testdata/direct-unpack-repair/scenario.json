@@ -1,16 +1,17 @@
 {
   "slug": "direct-unpack-repair",
   "title": "Silver.Horizon.Repair.Split.2024.720p.WEB.x264-WEAVER",
-  "description": "Split .7z (3 volumes) with PAR2 parity and a damaged second volume. Repair rewrites bytes the chase already read, so the chase must stand down and the conventional path must deliver correct output from the repaired volumes.",
+  "description": "Split .7z (3 volumes) with PAR2 parity and a damaged second volume. The chase is held below the damaged bytes rather than fed them, parks through the repair, and resumes over the repaired volumes \u2014 so it survives repair instead of being discarded.",
   "category": "2000",
   "expected_outcome": "success",
   "expectedOutputBLAKE3": {
-    "silver_horizon.mkv": "5a2e23cc7140ebf76bb53aa6b00338b7e935a0f039dd3a1d234f8087963c059a"
+    "silver_horizon.mkv": "779fad2c06e827cf1cd4a6793a655a1504119962c8ebfdc0b35d1eab2d84327a"
   },
   "runtimeAssertions": {
     "directUnpack": {
       "requireArmed": true,
-      "expectedDemotionReason": "repair_rewrote"
+      "requireConsumed": true
     }
-  }
+  },
+  "segment_size": 8192
 }

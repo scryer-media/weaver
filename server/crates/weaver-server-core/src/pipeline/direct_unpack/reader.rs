@@ -206,6 +206,11 @@ impl Read for GatedSplitReader {
         file.seek(SeekFrom::Start(local))?;
         let read = file.read(&mut buf[..wanted])?;
         self.position += read as u64;
+        // What the decoder has actually taken, as opposed to what it could
+        // have. Repair only has to leave *these* bytes alone.
+        if read > 0 {
+            self.coverage.note_consumed(index, local + read as u64);
+        }
         Ok(read)
     }
 }

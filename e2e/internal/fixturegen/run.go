@@ -181,8 +181,12 @@ func generate(
 	}
 
 	// A preview run into --out has no scenario.json to keep in step; the
-	// digests are only rewritten where the scenarios actually live.
-	if recipe.ExpectedOutputs != nil && config.Out == "" {
+	// digests are only rewritten where the scenarios actually live — and only
+	// on a run that is allowed to redefine the corpus. A seeding run
+	// regenerates fixtures to match what is committed, so rewriting a
+	// scenario's expected digests there would paper over exactly the drift the
+	// digests exist to catch.
+	if recipe.ExpectedOutputs != nil && config.Out == "" && config.UpdateLedger {
 		digests, err := recipe.ExpectedOutputs(ctx, env)
 		if err != nil {
 			return Result{}, err

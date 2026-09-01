@@ -697,15 +697,17 @@ func Recipes() []Recipe {
 		artifact := "direct-unpack-" + codec.Slug
 		add(Recipe{
 			Slug: "direct-unpack-" + codec.Slug, Family: "direct-unpack",
-			Notes:           codec.Notes,
-			Build:           publish(artifact, "archive.7z"),
-			ExpectedOutputs: codec.ExpectedOutputs(),
+			ByteReproducible: !codec.SaltsItsOwnKey,
+			Notes:            codec.Notes,
+			Build:            publish(artifact, "archive.7z"),
+			ExpectedOutputs:  codec.ExpectedOutputs(),
 		})
 		add(Recipe{
 			Slug: "direct-unpack-" + codec.Slug + "-split", Family: "direct-unpack",
-			Notes:           codec.Notes + " Cut into volumes so the chase has parts still arriving while it decodes.",
-			Build:           splitSevenZipIntoParts(artifact, DirectUnpackVolumes),
-			ExpectedOutputs: codec.ExpectedOutputs(),
+			ByteReproducible: !codec.SaltsItsOwnKey,
+			Notes:            codec.Notes + " Cut into volumes so the chase has parts still arriving while it decodes.",
+			Build:            splitSevenZipIntoParts(artifact, DirectUnpackVolumes),
+			ExpectedOutputs:  codec.ExpectedOutputs(),
 		})
 	}
 
@@ -715,8 +717,48 @@ func Recipes() []Recipe {
 	// repaired volumes — the one interaction where direct unpack could
 	// silently ship a stale decode if the taint plumbing were wrong.
 	add(Recipe{
-		Slug: "direct-unpack-repair", Family: "direct-unpack",
+		Slug: "direct-unpack-repair", Family: "direct-unpack", ByteReproducible: true,
 		Notes: "A three-volume LZMA2 7z with parity, one volume damaged well past its header, so repair runs before extraction and rewrites bytes a chase has already consumed.",
+		Build: sequence(
+			splitSevenZipIntoParts("direct-unpack-lzma2", DirectUnpackVolumes),
+			// A 64 KiB slice with 8 KiB articles (the scenario pins
+			// `segment_size`) puts every article wholly inside one block, which
+			// is what lets the in-stream grid close blocks and produce the
+			// Intact verdicts the repair-resume decision vouches with. An
+			// article that straddles a block boundary cannot be split from its
+			// CRC alone and leaves the block unclaimed — which is the case the
+			// `-unvouched` scenario below is built to exercise instead.
+			par2(PAR2Spec{
+				Base: "archive.7z.par2", SliceSize: 65536, RecoveryBlocks: 16,
+				Sources: []string{"archive.7z.001", "archive.7z.002", "archive.7z.003"},
+			}),
+			// Damage the second block of the middle volume, leaving its first
+			// block intact — so the chase has a vouched prefix to have consumed
+			// and a damage floor to be held at.
+			zeroOutput("archive.7z.002", 65536, 16384),
+		),
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			// These volumes carry the member the lzma2 artifact was built over,
+			// and that payload is a pure function of its seed — so re-deriving
+			// it here is exact.
+			_ = ctx
+			payload := env.StagePath(sevenZipSingleMember)
+			if err := deterministicPayload(payload, sevenZipMatrixPayloadBytes, 1); err != nil {
+				return nil, err
+			}
+			return map[string]string{sevenZipSingleMember: payload}, nil
+		},
+	})
+
+	// The counterpart to `direct-unpack-repair`: the same damaged shape, but
+	// with a slice size the harness's default 750 KiB articles straddle. No
+	// block is ever independently claimed, so the recovery set vouches for
+	// nothing, and the repair-time decision must fall back to the taint it
+	// always did. This is the guard on the fallback, expressed as a fixture
+	// rather than only as a unit test.
+	add(Recipe{
+		Slug: "direct-unpack-repair-unvouched", Family: "direct-unpack", ByteReproducible: true,
+		Notes: "A three-volume LZMA2 7z with parity whose 16 KiB slices are straddled by the default article size, so the in-stream grid claims no block and repair cannot be vouched against.",
 		Build: sequence(
 			splitSevenZipIntoParts("direct-unpack-lzma2", DirectUnpackVolumes),
 			par2(PAR2Spec{
@@ -726,11 +768,12 @@ func Recipes() []Recipe {
 			zeroOutput("archive.7z.002", 4*16384, 2*16384),
 		),
 		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
-			clip, err := env.ArtifactFile(ctx, "clip-small", "small.mkv")
-			if err != nil {
+			_ = ctx
+			payload := env.StagePath(sevenZipSingleMember)
+			if err := deterministicPayload(payload, sevenZipMatrixPayloadBytes, 1); err != nil {
 				return nil, err
 			}
-			return map[string]string{sevenZipSingleMember: clip}, nil
+			return map[string]string{sevenZipSingleMember: payload}, nil
 		},
 	})
 
@@ -739,15 +782,19 @@ func Recipes() []Recipe {
 	// the two want opposite assertions: the functional run demands the chase
 	// was consumed, and a restart mid-chase deliberately kills it.
 	add(Recipe{
-		Slug: "direct-unpack-restart", Family: "direct-unpack",
+		Slug: "direct-unpack-restart", Family: "direct-unpack", ByteReproducible: true,
 		Notes: "A three-volume LZMA2 7z for the restart phase: weaver is restarted mid-download, so the chase dies with the process and has to re-arm from the persisted progress floor.",
 		Build: splitSevenZipIntoParts("direct-unpack-lzma2", DirectUnpackVolumes),
 		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
-			clip, err := env.ArtifactFile(ctx, "clip-small", "small.mkv")
-			if err != nil {
+			// These volumes carry the member the lzma2 artifact was built over,
+			// and that payload is a pure function of its seed — so re-deriving
+			// it here is exact.
+			_ = ctx
+			payload := env.StagePath(sevenZipSingleMember)
+			if err := deterministicPayload(payload, sevenZipMatrixPayloadBytes, 1); err != nil {
 				return nil, err
 			}
-			return map[string]string{sevenZipSingleMember: clip}, nil
+			return map[string]string{sevenZipSingleMember: payload}, nil
 		},
 	})
 

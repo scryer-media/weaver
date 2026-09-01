@@ -1,6 +1,37 @@
 package fixturegen
 
-import "context"
+import (
+	"context"
+	"os"
+)
+
+// Payload size for the codec matrix. Big enough that every coder does real
+// work and a three-way split has substance, small enough that thirteen chains
+// build in seconds.
+const sevenZipMatrixPayloadBytes = 384 * 1024
+
+// deterministicPayload writes `len` bytes of a fixed pseudo-random stream.
+//
+// Derived rather than encoded, on purpose. The corpus's clips come out of
+// ffmpeg, which is not bit-reproducible across machines — an x264 encode of the
+// same filter graph gives different bytes — so a fixture built on one would
+// regenerate to a different digest than the ledger records. These bytes are a
+// pure function of the seed, so the same recipe gives the same archive
+// anywhere, and the ledger can be a contract rather than a snapshot.
+//
+// Incompressible-ish by construction, which is also what a codec matrix wants:
+// every coder has to move real volume rather than emit a run-length token.
+func deterministicPayload(path string, length int, seed uint64) error {
+	state := seed | 1
+	buf := make([]byte, length)
+	for i := range buf {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		buf[i] = byte(state >> 24)
+	}
+	return os.WriteFile(path, buf, 0o644)
+}
 
 // The three invented member names the solid and non-solid fixtures pack, so a
 // multi-member 7z is distinguishable from a single-member one by listing alone.
@@ -20,6 +51,13 @@ type sevenZipCodec struct {
 	Notes string
 	// Password, when the scenario has to supply one.
 	Password string
+	// SaltsItsOwnKey is true for the AES chains. 7-Zip draws a fresh random
+	// salt and IV for every encrypted archive and offers no switch to fix
+	// them, so those fixtures cannot be byte-reproducible however deterministic
+	// their payload is — which is exactly the case `ByteReproducible` is
+	// defined to exclude. They are reproducible in *shape*, and the published
+	// corpus is what keeps their bytes stable across machines.
+	SaltsItsOwnKey bool
 	// Build writes the archive.
 	Build func(context.Context, *Env) error
 	// Members are the entry names extraction must produce, in archive order.
@@ -30,14 +68,23 @@ type sevenZipCodec struct {
 // bytes it carries, so fixturegen can fill the scenario's expected digests.
 func (codec sevenZipCodec) ExpectedOutputs() func(context.Context, *Env) (map[string]string, error) {
 	members := codec.Members
-	return func(ctx context.Context, env *Env) (map[string]string, error) {
-		clip, err := env.ArtifactFile(ctx, "clip-small", "small.mkv")
-		if err != nil {
-			return nil, err
-		}
+	return func(_ context.Context, env *Env) (map[string]string, error) {
+		// Re-derive the payload rather than reach for the staged copy: a
+		// scenario that only publishes or splits an artifact has its own empty
+		// stage, and the bytes are a pure function of the seed anyway, so
+		// writing them again is both cheaper and more honest than depending on
+		// which scenario happened to stage them.
 		outputs := make(map[string]string, len(members))
-		for _, member := range members {
-			outputs[member] = clip
+		for index, member := range members {
+			path := env.StagePath(member)
+			seed := uint64(1)
+			if len(members) > 1 {
+				seed = uint64(index) + 1
+			}
+			if err := deterministicPayload(path, sevenZipMatrixPayloadBytes, seed); err != nil {
+				return nil, err
+			}
+			outputs[member] = path
 		}
 		return outputs, nil
 	}
@@ -47,11 +94,16 @@ func (codec sevenZipCodec) ExpectedOutputs() func(context.Context, *Env) (map[st
 // over it with the given chain.
 func oneMember(spec SevenZipSpec) func(context.Context, *Env) error {
 	return func(ctx context.Context, env *Env) error {
-		if err := env.Stage(ctx, "clip-small", sevenZipSingleMember); err != nil {
+		if err := deterministicPayload(
+			env.StagePath(sevenZipSingleMember),
+			sevenZipMatrixPayloadBytes,
+			1,
+		); err != nil {
 			return err
 		}
 		spec.Archive = "archive.7z"
 		spec.Members = []string{sevenZipSingleMember}
+		spec.Deterministic = true
 		return env.SevenZip(ctx, spec)
 	}
 }
@@ -60,13 +112,18 @@ func oneMember(spec SevenZipSpec) func(context.Context, *Env) error {
 // solidity is observable.
 func threeMembers(spec SevenZipSpec) func(context.Context, *Env) error {
 	return func(ctx context.Context, env *Env) error {
-		for _, member := range sevenZipMatrixMembers {
-			if err := env.Stage(ctx, "clip-small", member); err != nil {
+		for index, member := range sevenZipMatrixMembers {
+			if err := deterministicPayload(
+				env.StagePath(member),
+				sevenZipMatrixPayloadBytes,
+				uint64(index)+1,
+			); err != nil {
 				return err
 			}
 		}
 		spec.Archive = "archive.7z"
 		spec.Members = sevenZipMatrixMembers
+		spec.Deterministic = true
 		return env.SevenZip(ctx, spec)
 	}
 }
@@ -125,16 +182,18 @@ func sevenZipCodecMatrix() []sevenZipCodec {
 			}}),
 		},
 		{
-			Slug:     "aes256",
-			Notes:    "AES256 over the member data with the headers left readable, so the entry table lists without a password.",
-			Password: CorpusPassword,
-			Build:    oneMember(SevenZipSpec{Methods: []string{"-m0=LZMA2"}, Password: CorpusPassword}),
+			Slug:           "aes256",
+			Notes:          "AES256 over the member data with the headers left readable, so the entry table lists without a password.",
+			Password:       CorpusPassword,
+			SaltsItsOwnKey: true,
+			Build:          oneMember(SevenZipSpec{Methods: []string{"-m0=LZMA2"}, Password: CorpusPassword}),
 		},
 		{
-			Slug:     "aes256-header",
-			Notes:    "AES256 with `-mhe=on`, so the end header is itself an encrypted packed stream and nothing lists without the password.",
-			Password: CorpusPassword,
-			Members:  []string{sevenZipSingleMember}, Build: oneMember(SevenZipSpec{
+			Slug:           "aes256-header",
+			Notes:          "AES256 with `-mhe=on`, so the end header is itself an encrypted packed stream and nothing lists without the password.",
+			Password:       CorpusPassword,
+			SaltsItsOwnKey: true,
+			Members:        []string{sevenZipSingleMember}, Build: oneMember(SevenZipSpec{
 				Methods: []string{"-m0=LZMA2"}, Password: CorpusPassword, EncryptHeaders: true,
 			}),
 		},

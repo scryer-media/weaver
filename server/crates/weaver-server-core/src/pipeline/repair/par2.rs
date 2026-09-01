@@ -1300,6 +1300,60 @@ impl Pipeline {
         (!verdicts.is_empty()).then_some(verdicts)
     }
 
+    /// The lowest byte offset of a block the recovery set says is damaged.
+    ///
+    /// Derived from the same in-stream grid the settle path uses, so it costs
+    /// no extra reads: the verdicts were accumulated as articles landed.
+    /// `None` when nothing is known to be damaged, which is every clean file.
+    pub(crate) fn in_stream_damage_floor(&self, file_id: NzbFileId) -> Option<u64> {
+        let binding = self.resolve_par2_file_binding(file_id)?;
+        let set = self.par2_set_for(file_id.job_id, binding.recovery_set_id)?;
+        let slice = set.slice_size;
+        self.block_crcs
+            .verdicts_against(file_id, set, binding.par2_file_id)
+            .iter()
+            .filter(|(_, verdict)| {
+                matches!(verdict, crate::pipeline::integrity::BlockVerdict::Damaged)
+            })
+            .filter_map(|(&index, _)| u64::from(index).checked_mul(slice))
+            .min()
+    }
+
+    /// How many bytes from the start of a file the recovery set has positively
+    /// vouched for, as a contiguous run.
+    ///
+    /// Only blocks the grid actually claimed *and* found Intact count, and only
+    /// while they are consecutive from block zero. A block the grid never
+    /// claimed — `NoReference`, or simply absent because no article closed it —
+    /// stops the run: unverified is not the same as intact, and this number is
+    /// used to decide that repair cannot touch what the decoder already read.
+    ///
+    /// The basis is CRC32, from PAR2's IFSC. A block whose CRC32 matches but
+    /// whose MD5 does not would be rewritten by repair below this line, and the
+    /// chase would keep a decode of the pre-repair bytes. Downstream 7z entry
+    /// CRCs catch that for entries that carry one; entries without a CRC carry
+    /// the residual. Stated rather than defended against: closing it means
+    /// hashing the prefix, which is the read this whole path exists to avoid.
+    pub(crate) fn in_stream_intact_prefix(&self, file_id: NzbFileId) -> Option<u64> {
+        let binding = self.resolve_par2_file_binding(file_id)?;
+        let set = self.par2_set_for(file_id.job_id, binding.recovery_set_id)?;
+        let slice = set.slice_size;
+        let verdicts = self
+            .block_crcs
+            .verdicts_against(file_id, set, binding.par2_file_id);
+
+        let mut prefix = 0u64;
+        for index in 0.. {
+            match verdicts.get(&index) {
+                Some(crate::pipeline::integrity::BlockVerdict::Intact { .. }) => {
+                    prefix = prefix.checked_add(slice)?;
+                }
+                _ => break,
+            }
+        }
+        Some(prefix)
+    }
+
     /// A completed file's PAR2 identity, provable from the in-stream dual-CRC
     /// grid alone.
     ///

@@ -1010,6 +1010,12 @@ func prepareFullPreseededRuntimes(
 		if err != nil {
 			return fmt.Errorf("prepare cache image identity for %s: %w", profile, err)
 		}
+		// Pin what this run captured. The identity is a fingerprint over the
+		// corpus files, and anything that rewrites one of them between here and
+		// phase launch would otherwise make the phase recompute a different
+		// name, find no such image, and quietly fall back to the base store —
+		// serving articles that do not match the NZBs it is about to run.
+		recordPreseededImageSet(profile, set)
 
 		fixturesRoot := filepath.Join(tempRoot, "preseeded", profile, "fixtures")
 		if set.ready() {
@@ -1353,7 +1359,20 @@ func (p *fullPhaseContext) env() map[string]string {
 		env["E2E_SEED_JOBS"] = seedJobs
 	}
 	if nntpSeedImageCacheEnabled() && strings.TrimSpace(p.SeedProfile) != "" {
-		if set, err := nntpSeedImageSetForProfile(p.SeedProfile, fixtureSlugsForSeedProfile(p.SeedProfile)); err == nil {
+		if set, ok := preseededImageSet(p.SeedProfile); ok {
+			// Captured this run: the phase must use exactly that store. A miss
+			// here means the image vanished or its identity moved underneath
+			// us, and running anyway would serve the wrong articles to every
+			// scenario — which looks like a product regression rather than the
+			// harness fault it is.
+			if !set.ready() {
+				log.Fatalf(
+					"pre-seeded NNTP images for profile %q are gone at phase launch (%s / %s); "+
+						"refusing to fall back to the base store, which does not carry this run's corpus",
+					p.SeedProfile, set.Primary, set.Backup)
+			}
+			set.applyToPhaseEnv(env, true)
+		} else if set, err := nntpSeedImageSetForProfile(p.SeedProfile, fixtureSlugsForSeedProfile(p.SeedProfile)); err == nil {
 			set.applyToPhaseEnv(env, set.ready())
 		}
 	}
