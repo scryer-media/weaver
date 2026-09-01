@@ -709,6 +709,48 @@ func Recipes() []Recipe {
 		})
 	}
 
+	// A split 7z with parity and a damaged volume, so PAR2 repair rewrites a
+	// part the chase has already read. The chase must notice and stand down,
+	// and the conventional path must then deliver correct bytes from the
+	// repaired volumes — the one interaction where direct unpack could
+	// silently ship a stale decode if the taint plumbing were wrong.
+	add(Recipe{
+		Slug: "direct-unpack-repair", Family: "direct-unpack",
+		Notes: "A three-volume LZMA2 7z with parity, one volume damaged well past its header, so repair runs before extraction and rewrites bytes a chase has already consumed.",
+		Build: sequence(
+			splitSevenZipIntoParts("direct-unpack-lzma2", DirectUnpackVolumes),
+			par2(PAR2Spec{
+				Base: "archive.7z.par2", SliceSize: 16384, RecoveryBlocks: 16,
+				Sources: []string{"archive.7z.001", "archive.7z.002", "archive.7z.003"},
+			}),
+			zeroOutput("archive.7z.002", 4*16384, 2*16384),
+		),
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			clip, err := env.ArtifactFile(ctx, "clip-small", "small.mkv")
+			if err != nil {
+				return nil, err
+			}
+			return map[string]string{sevenZipSingleMember: clip}, nil
+		},
+	})
+
+	// The same three volumes again under their own slug, for the restart
+	// phase. A separate slug rather than reusing the codec-matrix one because
+	// the two want opposite assertions: the functional run demands the chase
+	// was consumed, and a restart mid-chase deliberately kills it.
+	add(Recipe{
+		Slug: "direct-unpack-restart", Family: "direct-unpack",
+		Notes: "A three-volume LZMA2 7z for the restart phase: weaver is restarted mid-download, so the chase dies with the process and has to re-arm from the persisted progress floor.",
+		Build: splitSevenZipIntoParts("direct-unpack-lzma2", DirectUnpackVolumes),
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			clip, err := env.ArtifactFile(ctx, "clip-small", "small.mkv")
+			if err != nil {
+				return nil, err
+			}
+			return map[string]string{sevenZipSingleMember: clip}, nil
+		},
+	})
+
 	// -------------------------------------------------------- obfuscation
 	add(Recipe{
 		Slug: "obfuscated-rar", Family: "obfuscated",

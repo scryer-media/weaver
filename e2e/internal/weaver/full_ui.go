@@ -74,8 +74,8 @@ var fullPhaseDefinitions = []fullPhaseDefinition{
 	{name: "NNTP Chaos", command: "chaos-test", slug: "nntp-chaos", seedProfile: "chaos", datastore: weaverDatastoreSQLite},
 	{name: "TCP Chaos", command: "tcp-chaos", slug: "tcp-chaos", seedProfile: "tcp-chaos", datastore: weaverDatastoreSQLite},
 	{name: "Container Restart", command: "container-restart", slug: "container-restart", skipSeed: true, datastore: weaverDatastoreSQLite},
-	{name: "Restart SQLite", command: "restart-all", slug: "restart-sqlite", seedProfile: "restart", datastore: weaverDatastoreSQLite},
-	{name: "Restart Postgres", command: "restart-all", slug: "restart-postgres", seedProfile: "restart", datastore: weaverDatastorePostgres},
+	{name: "Restart SQLite", command: "restart-all", slug: "restart-sqlite", seedProfile: "restart", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_DIRECT_UNPACK": "1"}},
+	{name: "Restart Postgres", command: "restart-all", slug: "restart-postgres", seedProfile: "restart", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_DIRECT_UNPACK": "1"}},
 	{name: "Product Behavior Gate", command: "release-gate", slug: "product-behavior", skipSeed: true, datastore: weaverDatastoreSQLite},
 }
 

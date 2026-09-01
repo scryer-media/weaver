@@ -6,5 +6,12 @@
   "expected_outcome": "success",
   "expectedOutputBLAKE3": {
     "silver_horizon.mkv": "5a2e23cc7140ebf76bb53aa6b00338b7e935a0f039dd3a1d234f8087963c059a"
+  },
+  "runtimeAssertions": {
+    "directUnpack": {
+      "requireArmed": true,
+      "requireConsumed": true,
+      "forbidAnyActivity": true
+    }
   }
 }

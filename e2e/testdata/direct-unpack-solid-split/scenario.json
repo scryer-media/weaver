@@ -8,5 +8,11 @@
     "silver_horizon_part1.mkv": "5a2e23cc7140ebf76bb53aa6b00338b7e935a0f039dd3a1d234f8087963c059a",
     "silver_horizon_part2.mkv": "5a2e23cc7140ebf76bb53aa6b00338b7e935a0f039dd3a1d234f8087963c059a",
     "silver_horizon_part3.mkv": "5a2e23cc7140ebf76bb53aa6b00338b7e935a0f039dd3a1d234f8087963c059a"
+  },
+  "runtimeAssertions": {
+    "directUnpack": {
+      "requireArmed": true,
+      "requireConsumed": true
+    }
   }
 }
