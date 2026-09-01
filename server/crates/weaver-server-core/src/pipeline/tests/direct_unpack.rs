@@ -515,8 +515,14 @@ async fn a_renamed_part_demotes_the_chase() {
     );
 }
 
+/// The genuine end of the road: parts that never arrived and never will.
+///
+/// It takes both passes. The lenient one deliberately holds its fire — at that
+/// moment it cannot tell a part whose commit is still in flight from one that
+/// has none — and the strict one, which runs from the completion check after
+/// decode has drained, is what ends the chase.
 #[tokio::test]
-async fn a_download_that_ends_with_a_part_missing_aborts_the_chase() {
+async fn a_download_that_ends_with_a_part_missing_aborts_the_chase_at_the_strict_pass() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     enable_direct_unpack(&mut pipeline);
@@ -531,10 +537,22 @@ async fn a_download_that_ends_with_a_part_missing_aborts_the_chase() {
 
     // Every other part never arrives; the download pass ends anyway.
     pipeline.settle_direct_unpack_after_download(job_id);
+    assert!(
+        pipeline.direct_unpack.is_armed(job_id, set_name),
+        "the lenient pass must not end a chase on parts whose commits could still be in flight"
+    );
+
+    // Decode has drained by the time the completion check runs. Nothing is
+    // coming for those parts.
+    pipeline.settle_direct_unpack_at_completion(job_id);
 
     assert!(
         !pipeline.direct_unpack.is_armed(job_id, set_name),
         "a chase waiting on bytes that stopped coming must be ended"
+    );
+    assert_eq!(
+        pipeline.direct_unpack.latched_reason(job_id, set_name),
+        Some("download_ended")
     );
 }
 
@@ -1181,7 +1199,7 @@ async fn a_repair_over_an_unvouched_chase_taints_exactly_as_before() {
     }
 
     // The real repair-time entry point.
-    pipeline.decide_direct_unpack_before_repair(job_id);
+    pipeline.decide_direct_unpack_before_repair(job_id, None);
 
     assert!(
         !pipeline.direct_unpack.is_armed(job_id, set_name),
@@ -1244,6 +1262,24 @@ async fn a_failed_repair_releases_the_chases_it_was_parked_over() {
     assert!(
         !pipeline.direct_unpack.is_armed(job_id, set_name),
         "a stranded chase must be ended when its repair fails"
+    );
+    // Its own reason. A failed repair rewrote nothing, so booking this as
+    // `repair_rewrote` would name something that did not happen — and the
+    // download did not end either, which is what it used to claim.
+    assert_eq!(pipeline.direct_unpack.counters().demoted_repair_failed, 1);
+    assert_eq!(
+        pipeline.direct_unpack.counters().demoted_repair_rewrote,
+        0,
+        "nothing was rewritten"
+    );
+    assert_eq!(
+        pipeline.direct_unpack.counters().demoted_download_ended,
+        0,
+        "and the download did not end"
+    );
+    assert_eq!(
+        pipeline.direct_unpack.latched_reason(job_id, set_name),
+        Some("repair_failed")
     );
     let reason = coverage
         .abort_reason()
@@ -1368,7 +1404,7 @@ async fn a_chase_consumes_readahead_and_the_archive_tail_within_microseconds() {
     // With no grid verdicts behind it — the state of any set the recovery data
     // has not independently claimed — nothing vouches, and the fallback taint
     // is the correct outcome.
-    pipeline.decide_direct_unpack_before_repair(job_id);
+    pipeline.decide_direct_unpack_before_repair(job_id, None);
     let tainted = !pipeline.direct_unpack.is_armed(job_id, set_name);
 
     pipeline.direct_unpack_forget_job(job_id);
@@ -1434,13 +1470,19 @@ async fn a_set_armed_after_its_download_ended_is_not_killed_by_the_settle() {
     );
 }
 
-/// The tighter form of the `direct-unpack-solid-split` race: the set arms as
-/// its first part completes and the download ends before the rest have been
-/// reconciled into the assembly. The bytes are all on disk by then — no more
-/// are coming — so the settle must finish the coverage from what is there
-/// rather than kill a chase that is about to succeed.
+/// The panic, at the seam that caused it.
+///
+/// The download drains while a part's writes are still flushing, so the file on
+/// disk measures far short of what the part will actually be. The settle used to
+/// read that length and declare it — and the real completion commit, arriving
+/// moments later with the true and larger length, then had no truthful move
+/// left: it advanced a watermark past a declared length and tripped an assert
+/// that killed the whole pipeline task.
+///
+/// The settle must not look at the file at all. It leaves the part alone, the
+/// commit lands, and the part settles at its real length.
 #[tokio::test]
-async fn a_settle_finishes_parts_that_are_on_disk_but_not_yet_reconciled() {
+async fn a_settle_that_races_a_flush_leaves_the_part_for_its_commit() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     enable_direct_unpack(&mut pipeline);
@@ -1456,40 +1498,112 @@ async fn a_settle_finishes_parts_that_are_on_disk_but_not_yet_reconciled() {
     write_and_complete_file(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
     assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
 
-    // The remaining parts land on disk while the assembly has not caught up.
+    // Part 1 is mid-flush: a prefix of it is on disk, and the assembly does not
+    // describe it yet. This is exactly the state that produced a 12,288,000-byte
+    // length for a 21,097,033-byte part.
     let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
-    for (filename, bytes) in files.iter().skip(1) {
-        std::fs::write(working_dir.join(filename), bytes).unwrap();
-    }
+    let short_prefix = files[1].1.len() / 3;
+    std::fs::write(working_dir.join(&files[1].0), &files[1].1[..short_prefix]).unwrap();
 
     pipeline.settle_direct_unpack_after_download(job_id);
 
-    let armed = pipeline.direct_unpack.is_armed(job_id, set_name);
-    let coverage = pipeline.direct_unpack.armed_coverage(job_id, set_name);
-    let settled = coverage.as_ref().map(|coverage| {
-        (0..files.len()).all(|index| {
-            coverage
-                .part_progress(index)
-                .map(|part| part.complete)
-                .unwrap_or(false)
-        })
-    });
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("the lenient settle must not end this chase");
+    assert!(
+        coverage.abort_reason().is_none(),
+        "the lenient settle must not have contradicted anything"
+    );
+    let progress = coverage.part_progress(1).expect("part 1 exists");
+    assert!(
+        !progress.complete && progress.len.is_none(),
+        "the settle must take no length from a file that is still being written, got {progress:?}"
+    );
+
+    // Now the commit that was in flight lands, with the whole truth.
+    write_and_complete_file(&mut pipeline, job_id, 1, &files[1].0, &files[1].1).await;
+
+    let progress = coverage.part_progress(1).expect("part 1 exists");
+    assert_eq!(
+        (progress.complete, progress.len),
+        (true, Some(files[1].1.len() as u64)),
+        "the completion commit must settle the part at its real length"
+    );
+    assert!(
+        coverage.abort_reason().is_none(),
+        "and it must not have contradicted a fabricated one"
+    );
+    assert_eq!(
+        pipeline.direct_unpack.counters().demoted_download_ended,
+        0,
+        "nothing here is a demotion"
+    );
 
     pipeline.direct_unpack_forget_job(job_id);
     for _ in 0..600 {
         pipeline.reap_direct_unpack().await;
         tokio::task::yield_now().await;
     }
+}
+
+/// The `direct-unpack-solid-split` abort: the settle ran 1ms after arming, while
+/// a part's writes were still buffered and its file did not exist on disk at
+/// all. Nothing about that says the part is not coming.
+#[tokio::test]
+async fn a_settle_before_a_parts_file_exists_does_not_end_the_chase() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41630);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
+
+    // No file for parts 1.. exists yet, and the download pass reports drained.
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    for (filename, _) in files.iter().skip(1) {
+        assert!(!working_dir.join(filename).exists());
+    }
+    pipeline.settle_direct_unpack_after_download(job_id);
 
     assert!(
-        armed,
-        "a set whose parts are all on disk must survive the download-end settle"
+        pipeline.direct_unpack.is_armed(job_id, set_name),
+        "a chase must survive a settle that merely ran ahead of the decode stage"
     );
-    assert_eq!(
-        settled,
-        Some(true),
-        "every part must be settled from what is on disk"
+
+    // The buffered writes drain and every part settles.
+    for (file_index, (filename, bytes)) in files.iter().enumerate().skip(1) {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("still armed");
+    assert!(
+        (0..files.len()).all(|index| coverage
+            .part_progress(index)
+            .is_ok_and(|part| part.complete)),
+        "every part settles from its own commit"
     );
+
+    // And the strict pass, which runs after all that, finds nothing to object to.
+    pipeline.settle_direct_unpack_at_completion(job_id);
+    assert!(
+        pipeline.direct_unpack.is_armed(job_id, set_name),
+        "the strict pass must be a no-op once every part has settled"
+    );
+
+    pipeline.direct_unpack_forget_job(job_id);
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
 }
 
 /// A successful repair outcome, for driving the settle seam directly.
@@ -1552,12 +1666,445 @@ async fn a_gated_chase_with_no_vouching_evidence_demotes_after_the_repair() {
         !pipeline.direct_unpack.is_armed(job_id, set_name),
         "a stalled gated chase must not survive the repair that could have freed it"
     );
+    // One demotion, counted once, under its own name. The abort used to record
+    // a `DownloadEnded` of its own on top of this, so a single stalled chase
+    // booked two demotions and latched under a reason that had not happened.
     assert_eq!(pipeline.direct_unpack.counters().demoted_gated_stall, 1);
+    assert_eq!(
+        pipeline.direct_unpack.counters().demoted_download_ended,
+        0,
+        "the abort must not also book a download-ended demotion"
+    );
+    assert_eq!(
+        pipeline.direct_unpack.latched_reason(job_id, set_name),
+        Some("gated_stall"),
+        "and the latch must name what actually happened"
+    );
     let reason = coverage
         .abort_reason()
         .expect("the parked reader must be woken");
     assert!(reason.contains("gated chase stalled"), "reason: {reason}");
 
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The real vouch path: PAR2 binding, grid, verdicts
+//
+// These stand up an actual recovery set over the actual part files and feed the
+// actual article-evidence call the decode worker makes. The coverage-layer
+// tests above can prove the frontier arithmetic but not this: whether the
+// evidence the arithmetic runs on exists at all.
+// ---------------------------------------------------------------------------
+
+/// The block size the recovery sets in this section describe their files on.
+const VOUCH_SLICE: u64 = 65_536;
+
+/// Offer one article per recovery-set block, through the same entry point the
+/// decode worker uses.
+///
+/// `plan` is the checkpoint geometry the decoder actually applied, which is the
+/// whole point: an article decoded before the PAR2 packets were parsed was cut
+/// on no grid at all, and no later knowledge can retroactively cut it.
+fn feed_block_aligned_articles(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    bytes: &[u8],
+    plan: &weaver_yenc::CheckpointPlan,
+) {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let end = (offset + VOUCH_SLICE as usize).min(bytes.len());
+        let chunk = &bytes[offset..end];
+        let crc32 = par2_rs::checksum::crc32(chunk);
+        pipeline.note_block_crc_segments_for_plan(
+            file_id,
+            plan,
+            offset as u64,
+            chunk.len() as u64,
+            crc32,
+            true,
+            false,
+            &[weaver_yenc::Segment {
+                file_offset: offset as u64,
+                len: chunk.len() as u64,
+                crc32,
+            }],
+        );
+        offset = end;
+    }
+    // What the decode worker does once the file's last write lands: the length
+    // is what makes the short final block's extent decidable, and without it
+    // that block stays unclaimed and the intact prefix stops one block early.
+    pipeline
+        .block_crcs
+        .note_file_len(file_id, bytes.len() as u64);
+}
+
+/// Stand up a job whose 7z parts are described by a real recovery set, with the
+/// chase armed on part 0.
+///
+/// `plan_for_articles` decides whether the article evidence lands on the
+/// recovery set's grid or on no grid at all.
+async fn armed_chase_with_real_par2(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    set_name: &str,
+    plan_for_articles: impl Fn(&weaver_yenc::CheckpointPlan) -> weaver_yenc::CheckpointPlan,
+) -> Vec<(String, Vec<u8>)> {
+    let files = sevenz_fixture_bytes(set_name);
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(pipeline, job_id, spec).await;
+
+    let described: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let par2_set = build_repairable_par2_set_for_files(&described, VOUCH_SLICE, 4);
+    install_test_par2_runtime(pipeline, job_id, par2_set, &[]);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+
+    let registered = pipeline.par2_checkpoint_plan(job_id);
+    let plan = plan_for_articles(&registered);
+    for (file_index, (_, bytes)) in files.iter().enumerate() {
+        feed_block_aligned_articles(
+            pipeline,
+            NzbFileId {
+                job_id,
+                file_index: file_index as u32,
+            },
+            bytes,
+            &plan,
+        );
+    }
+
+    files
+}
+
+/// The control: articles cut on the recovery set's own grid produce verdicts,
+/// the verdicts produce a vouched prefix, and a chase inside it survives repair.
+///
+/// This is the shape the vouching rule was designed against, and it has to hold
+/// before the failure below means anything.
+#[tokio::test]
+async fn a_chase_inside_a_populated_grids_intact_prefix_is_vouched() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41800);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = armed_chase_with_real_par2(&mut pipeline, job_id, set_name, |registered| {
+        registered.clone()
+    })
+    .await;
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    // Part 0 is 163,840 bytes: two full 64 KiB blocks and a 32,768-byte tail.
+    // All three vouch — the short final block included, because the completed
+    // file's length has been recorded and its extent is therefore decidable.
+    // The prefix is quantised to whole blocks, so it reaches the block boundary
+    // above the file rather than the file's own length.
+    let described_blocks = files[0].1.len().div_ceil(VOUCH_SLICE as usize) as u64;
+    assert_eq!(
+        pipeline.in_stream_intact_prefix(file_id),
+        Some(described_blocks * VOUCH_SLICE),
+        "a grid cut on the recovery set's own slice size must vouch the whole part"
+    );
+
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("armed");
+    // The chase is a real decode; pin what it has read so the decision is about
+    // the evidence rather than about timing.
+    coverage.note_consumed(0, 2 * VOUCH_SLICE);
+
+    pipeline.decide_direct_unpack_before_repair(job_id, None);
+
+    assert!(
+        pipeline.direct_unpack.is_armed(job_id, set_name),
+        "a chase inside the vouched prefix must be parked through the repair, not tainted"
+    );
+
+    pipeline.direct_unpack_forget_job(job_id);
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The round-8 failure, reproduced.
+///
+/// The recovery set binds the part and describes every one of its blocks. What
+/// is missing is the *grid*: these articles were decoded before the PAR2
+/// packets were parsed, so the decoder cut them on no checkpoint geometry, and
+/// `note_article_on_grids` will not retroactively claim them — doing so would
+/// imply cuts the decoder never made. `verdicts_against` therefore returns an
+/// empty map, the intact prefix walks to zero, and every byte the chase read is
+/// past it.
+///
+/// Locally the tiny `.par2` articles race the data volumes, so whichever data
+/// articles decode inside that window are grid-less for good — which is why the
+/// e2e failure was intermittent rather than reproducible.
+#[tokio::test]
+async fn a_chase_over_a_part_whose_grid_never_formed_cannot_be_vouched() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41810);
+    let set_name = "generated_split_store_plain.7z";
+
+    // The articles are offered with the plan that was current *before* the
+    // recovery set registered: none.
+    armed_chase_with_real_par2(&mut pipeline, job_id, set_name, |_| {
+        weaver_yenc::CheckpointPlan::None
+    })
+    .await;
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    assert!(
+        pipeline.resolve_par2_file_binding(file_id).is_some(),
+        "the part is bound: this is not a binding failure"
+    );
+    assert!(
+        pipeline.block_crc_verdicts(file_id).is_none(),
+        "and it has no verdicts at all, because it has no grid"
+    );
+    assert_eq!(
+        pipeline.in_stream_intact_prefix(file_id),
+        Some(0),
+        "so the in-stream prefix vouches for nothing"
+    );
+
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("armed");
+    coverage.note_consumed(0, 700_000.min(2 * VOUCH_SLICE));
+
+    pipeline.decide_direct_unpack_before_repair(job_id, None);
+
+    assert!(
+        !pipeline.direct_unpack.is_armed(job_id, set_name),
+        "with no grid evidence the chase is refused — this is the failure under test"
+    );
+    assert_eq!(
+        pipeline.direct_unpack.counters().demoted_repair_rewrote,
+        1,
+        "and it is booked as a repair-rewrote taint"
+    );
+
+    pipeline.direct_unpack_forget_job(job_id);
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
+}
+
+/// One analysis verdict per part, as the analysis pass would report it.
+fn analysis_verification(
+    par2_set: &par2_rs::Par2FileSet,
+    statuses: &[(&str, par2_rs::verify::FileStatus)],
+) -> par2_rs::VerificationResult {
+    let files = statuses
+        .iter()
+        .map(|(filename, status)| {
+            let (file_id, _) = par2_set
+                .files
+                .iter()
+                .find(|(_, description)| description.filename == *filename)
+                .expect("the recovery set describes this file");
+            par2_rs::verify::FileVerification {
+                file_id: *file_id,
+                filename: (*filename).to_string(),
+                status: status.clone(),
+                valid_slices: Vec::new(),
+                missing_slice_count: 0,
+            }
+        })
+        .collect();
+    par2_rs::VerificationResult {
+        files,
+        recovery_blocks_available: 4,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    }
+}
+
+/// The fix for the failure above: a part with no grid claim falls back to the
+/// analysis pass's own file-level verdict.
+///
+/// `Complete` there is a full-MD5 match read from disk — strictly stronger than
+/// any run of CRC32 block claims — and a file the analysis found complete is not
+/// one the repair is going to write to. Same setup as the failing test, same
+/// missing grid; the only addition is the evidence the analysis already had.
+#[tokio::test]
+async fn a_part_with_no_grid_is_vouched_by_the_analysis_file_verdict() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41820);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = armed_chase_with_real_par2(&mut pipeline, job_id, set_name, |_| {
+        weaver_yenc::CheckpointPlan::None
+    })
+    .await;
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    assert_eq!(
+        pipeline.in_stream_intact_prefix(file_id),
+        Some(0),
+        "the grid still vouches for nothing — the fallback is what has to carry this"
+    );
+
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("armed");
+    coverage.note_consumed(0, 2 * VOUCH_SLICE);
+
+    let par2_set = pipeline.par2_set(job_id).expect("installed").clone();
+    let statuses: Vec<(&str, par2_rs::verify::FileStatus)> = files
+        .iter()
+        .map(|(name, _)| (name.as_str(), par2_rs::verify::FileStatus::Complete))
+        .collect();
+    let verification = analysis_verification(&par2_set, &statuses);
+
+    pipeline.decide_direct_unpack_before_repair(job_id, Some(&verification));
+
+    assert!(
+        pipeline.direct_unpack.is_armed(job_id, set_name),
+        "a part the analysis verified complete must be vouched despite having no grid"
+    );
+    assert_eq!(
+        pipeline.direct_unpack.counters().demoted_repair_rewrote,
+        0,
+        "and nothing is tainted"
+    );
+
+    pipeline.direct_unpack_forget_job(job_id);
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The fallback must never vouch a file the repair intends to rewrite.
+///
+/// This is the whole safety condition. A damaged part with no grid claim looks
+/// exactly like a clean one to the in-stream evidence — both vouch for nothing —
+/// so if the fallback were keyed on anything looser than `Complete` it would
+/// hand a chase a file that is about to change underneath it.
+#[tokio::test]
+async fn the_analysis_fallback_refuses_a_part_the_repair_will_rewrite() {
+    for damaged_status in [
+        par2_rs::verify::FileStatus::Damaged(3),
+        par2_rs::verify::FileStatus::Missing,
+        par2_rs::verify::FileStatus::Renamed(std::path::PathBuf::from("elsewhere.7z.001")),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        enable_direct_unpack(&mut pipeline);
+        let job_id = JobId(41830);
+        let set_name = "generated_split_store_plain.7z";
+
+        let files = armed_chase_with_real_par2(&mut pipeline, job_id, set_name, |_| {
+            weaver_yenc::CheckpointPlan::None
+        })
+        .await;
+
+        let coverage = pipeline
+            .direct_unpack
+            .armed_coverage(job_id, set_name)
+            .expect("armed");
+        coverage.note_consumed(0, 2 * VOUCH_SLICE);
+
+        let par2_set = pipeline.par2_set(job_id).expect("installed").clone();
+        // Every part complete except the one the chase has actually read.
+        let statuses: Vec<(&str, par2_rs::verify::FileStatus)> = files
+            .iter()
+            .enumerate()
+            .map(|(index, (name, _))| {
+                let status = if index == 0 {
+                    damaged_status.clone()
+                } else {
+                    par2_rs::verify::FileStatus::Complete
+                };
+                (name.as_str(), status)
+            })
+            .collect();
+        let verification = analysis_verification(&par2_set, &statuses);
+
+        pipeline.decide_direct_unpack_before_repair(job_id, Some(&verification));
+
+        assert!(
+            !pipeline.direct_unpack.is_armed(job_id, set_name),
+            "the fallback must refuse a part whose analysis status is {damaged_status:?}"
+        );
+
+        pipeline.direct_unpack_forget_job(job_id);
+        for _ in 0..600 {
+            pipeline.reap_direct_unpack().await;
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+/// A part the analysis never classified stays unvouched, and so does one whose
+/// analysis result is absent entirely.
+#[tokio::test]
+async fn an_unclassified_part_is_not_vouched_by_the_fallback() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41840);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = armed_chase_with_real_par2(&mut pipeline, job_id, set_name, |_| {
+        weaver_yenc::CheckpointPlan::None
+    })
+    .await;
+
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("armed");
+    coverage.note_consumed(0, 2 * VOUCH_SLICE);
+
+    // The analysis reported on every part except the one that was read.
+    let par2_set = pipeline.par2_set(job_id).expect("installed").clone();
+    let statuses: Vec<(&str, par2_rs::verify::FileStatus)> = files
+        .iter()
+        .skip(1)
+        .map(|(name, _)| (name.as_str(), par2_rs::verify::FileStatus::Complete))
+        .collect();
+    let verification = analysis_verification(&par2_set, &statuses);
+
+    pipeline.decide_direct_unpack_before_repair(job_id, Some(&verification));
+
+    assert!(
+        !pipeline.direct_unpack.is_armed(job_id, set_name),
+        "silence from the analysis is not a verdict"
+    );
+
+    pipeline.direct_unpack_forget_job(job_id);
     for _ in 0..600 {
         pipeline.reap_direct_unpack().await;
         tokio::task::yield_now().await;

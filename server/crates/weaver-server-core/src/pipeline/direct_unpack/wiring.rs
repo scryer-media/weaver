@@ -88,6 +88,18 @@ impl RefusalReason {
     }
 }
 
+/// Which half of the end-of-download settle is running.
+///
+/// The two passes differ only in what they do about a part the assembly cannot
+/// yet describe: the lenient one leaves it for the completion commit still in
+/// flight, and the strict one — which runs only once decode has drained — ends
+/// the chase, because no such commit is coming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettlePass {
+    Lenient,
+    Strict,
+}
+
 /// Whether an aborted set may ever be chased again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbortLatch {
@@ -110,6 +122,11 @@ pub enum DemotionReason {
     DecodeFailed,
     /// PAR2 repair replaced bytes the chase had already read.
     RepairRewrote,
+    /// The chase was parked through a PAR2 repair, and the repair did not
+    /// finish. Distinct from [`Self::RepairRewrote`]: a failed repair rewrote
+    /// nothing, and the chase dies because the success that was going to lift
+    /// its damage caps never came.
+    RepairFailed,
     /// The set was gated on recovery-set evidence that never arrived, and the
     /// repair has concluded, so nothing will unpark it.
     GatedStall,
@@ -122,6 +139,7 @@ impl DemotionReason {
             Self::PartUnreadable => "part_unreadable",
             Self::DecodeFailed => "decode_failed",
             Self::RepairRewrote => "repair_rewrote",
+            Self::RepairFailed => "repair_failed",
             Self::GatedStall => "gated_stall",
         }
     }
@@ -181,6 +199,7 @@ pub struct DirectUnpackCounters {
     pub demoted_part_unreadable: u64,
     pub demoted_decode_failed: u64,
     pub demoted_repair_rewrote: u64,
+    pub demoted_repair_failed: u64,
     pub demoted_gated_stall: u64,
     /// Chases whose members were installed instead of re-extracting.
     pub consumed: u64,
@@ -221,6 +240,7 @@ impl DirectUnpackCounters {
             DemotionReason::PartUnreadable => self.demoted_part_unreadable += 1,
             DemotionReason::DecodeFailed => self.demoted_decode_failed += 1,
             DemotionReason::RepairRewrote => self.demoted_repair_rewrote += 1,
+            DemotionReason::RepairFailed => self.demoted_repair_failed += 1,
             DemotionReason::GatedStall => self.demoted_gated_stall += 1,
         }
     }
@@ -296,6 +316,13 @@ pub(crate) struct DirectUnpackRuntime {
     draining: Vec<((JobId, String), ArmedSet)>,
     /// Sets that will never arm again, with the reason they were refused.
     latched: HashMap<(JobId, String), &'static str>,
+    /// Jobs whose download has drained at least once, so the strict settle pass
+    /// is entitled to run for them.
+    ///
+    /// Without this the strict pass would have no way to tell "the assembly does
+    /// not describe this part yet" from "the assembly will never describe this
+    /// part", and would end chases in the middle of a healthy download.
+    download_settled: HashSet<JobId>,
     /// `filename -> (set name, part index)` per job, for the watermark hook.
     /// Keyed so the hot path can look up by borrowed `&str` without allocating.
     watermark_targets: HashMap<JobId, HashMap<String, (String, usize)>>,
@@ -1062,6 +1089,7 @@ impl Pipeline {
         job_id: JobId,
         reason: &str,
         latch: AbortLatch,
+        demotion: DemotionReason,
     ) {
         if !self.direct_unpack.armed.is_empty() {
             let keys: Vec<(JobId, String)> = self
@@ -1072,7 +1100,7 @@ impl Pipeline {
                 .cloned()
                 .collect();
             for (_, set_name) in keys {
-                self.direct_unpack_abort_set(job_id, &set_name, reason, latch);
+                self.direct_unpack_abort_set(job_id, &set_name, reason, latch, demotion);
             }
         }
         if latch == AbortLatch::Permanent {
@@ -1086,12 +1114,19 @@ impl Pipeline {
     /// [`AbortLatch::Retryable`] — the bytes stopped for a reason that says
     /// nothing about the archive, and holding a blocking thread parked for the
     /// length of an indefinite pause is worse than starting over on resume.
+    ///
+    /// `demotion` is the single place this abort is counted and latched. It used
+    /// to be hard-coded to [`DemotionReason::DownloadEnded`], which meant a
+    /// caller that had already recorded its own reason produced two counter
+    /// increments for one demotion and latched the set under a string naming
+    /// something that had not happened. One abort, one count, one name.
     pub(in crate::pipeline) fn direct_unpack_abort_set(
         &mut self,
         job_id: JobId,
         set_name: &str,
         reason: &str,
         latch: AbortLatch,
+        demotion: DemotionReason,
     ) {
         let Some(armed) = self
             .direct_unpack
@@ -1105,18 +1140,17 @@ impl Pipeline {
         // and a join that happened first would hang here instead of there.
         armed.coverage.abort(reason.to_string());
 
-        self.direct_unpack
-            .counters
-            .record_demotion(DemotionReason::DownloadEnded);
+        self.direct_unpack.counters.record_demotion(demotion);
         if latch == AbortLatch::Permanent {
             self.direct_unpack
                 .latched
-                .insert((job_id, set_name.to_string()), "download_ended");
+                .insert((job_id, set_name.to_string()), demotion.as_str());
         }
         info!(
             job_id = job_id.0,
             set_name,
             reason,
+            demotion = demotion.as_str(),
             retryable = latch == AbortLatch::Retryable,
             elapsed_ms = armed.started_at.elapsed().as_millis() as u64,
             "direct unpack aborted"
@@ -1139,7 +1173,12 @@ impl Pipeline {
             .into_iter()
             .collect();
         for job_id in jobs {
-            self.direct_unpack_abort_job(job_id, reason, AbortLatch::Permanent);
+            self.direct_unpack_abort_job(
+                job_id,
+                reason,
+                AbortLatch::Permanent,
+                DemotionReason::DownloadEnded,
+            );
         }
         while !self.direct_unpack.draining.is_empty() {
             let draining = std::mem::take(&mut self.direct_unpack.draining);
@@ -1173,7 +1212,13 @@ impl Pipeline {
         else {
             return;
         };
-        self.direct_unpack_abort_set(job_id, &set_name, reason, AbortLatch::Permanent);
+        self.direct_unpack_abort_set(
+            job_id,
+            &set_name,
+            reason,
+            AbortLatch::Permanent,
+            DemotionReason::DownloadEnded,
+        );
     }
 
     fn remove_direct_unpack_staging(&self, key: &(JobId, String), staging_dir: &std::path::Path) {
@@ -1192,11 +1237,59 @@ impl Pipeline {
 
     /// Settle every chase for a job whose download has stopped producing bytes.
     ///
-    /// A set whose parts all finished needs nothing — the coverage is already
-    /// complete and the worker will run to the end. A set with a part that
-    /// never finished will never get one, so it is aborted rather than left
-    /// parked on bytes that are not coming.
+    /// # Why this runs in two passes
+    ///
+    /// The download draining and a part's bytes being *committed* are different
+    /// moments. `maybe_finish_download_pass` fires when no article is in flight,
+    /// but the decode results for the last articles are processed after that —
+    /// so this pass routinely runs while a part's final writes are still moving
+    /// through the decode and commit stages.
+    ///
+    /// That is why neither pass may take a length from `std::fs::metadata`. The
+    /// file's size on disk at this instant is not the part's final length: a
+    /// part mid-flush measures short, and `persist_out_of_order_segments` leaves
+    /// sparse holes, so a file can also measure *long* over bytes nothing has
+    /// verified. Declaring either as the part length is how a chase was handed a
+    /// 12,288,000-byte length for a 21,097,033-byte part, and the real
+    /// completion commit that followed had no truthful move left to make. The
+    /// arming path already carries this rule — seed from the progress floor,
+    /// never from the file's length on disk — and settle is now held to it too.
+    ///
+    /// So the lenient pass settles only what the assembly *knows*
+    /// (`is_complete` → `received_bytes`, the sum of what was actually decoded
+    /// and committed) and leaves everything else alone: those parts have
+    /// completion commits in flight that will settle them correctly a moment
+    /// later. The strict pass — [`Self::settle_direct_unpack_at_completion`],
+    /// run from the completion check once decode has drained — is what ends a
+    /// chase whose parts genuinely never arrived.
+    ///
+    /// The window between the two passes is not a wedge risk: a decode that dies
+    /// takes the job with it, and the job-failed, paused and removed seams all
+    /// abort every chase.
     pub(in crate::pipeline) fn settle_direct_unpack_after_download(&mut self, job_id: JobId) {
+        self.direct_unpack.download_settled.insert(job_id);
+        self.settle_direct_unpack_parts(job_id, SettlePass::Lenient);
+    }
+
+    /// The strict half of the settle: parts the assembly still cannot describe
+    /// are never going to be described, so their chases end by name.
+    ///
+    /// Runs from the completion check, which is scheduled by the same call that
+    /// runs the lenient pass and re-runs on every later check. By then the
+    /// decode queue has drained, so a part with no assembly length here has no
+    /// commit in flight to wait for. Idempotent: a set whose parts all settled
+    /// finds nothing to do, and a set that was aborted is no longer armed.
+    pub(in crate::pipeline) fn settle_direct_unpack_at_completion(&mut self, job_id: JobId) {
+        // Only for a job whose download has actually drained. A completion check
+        // fires for plenty of other reasons, and a part the assembly cannot
+        // describe mid-download is simply a part that has not finished yet.
+        if !self.direct_unpack.download_settled.contains(&job_id) {
+            return;
+        }
+        self.settle_direct_unpack_parts(job_id, SettlePass::Strict);
+    }
+
+    fn settle_direct_unpack_parts(&mut self, job_id: JobId, pass: SettlePass) {
         if self.direct_unpack.armed.is_empty() {
             return;
         }
@@ -1214,27 +1307,32 @@ impl Pipeline {
             };
             let mut unsettled: Vec<String> = Vec::new();
             for (index, path) in paths.iter().enumerate() {
-                // No more bytes are coming for this job, so whatever is on disk
-                // is this part's final content. The assembly's own view is
-                // preferred where it has one; where it does not — a set that
-                // armed on the very last part's completion, which is when its
-                // topology first existed, can reach here before every file has
-                // been reconciled — the file's length on disk is just as final
-                // and just as true. Only a part with no file at all is
-                // genuinely incomplete.
-                let len = self
-                    .direct_unpack_known_part_len(job_id, path)
-                    .or_else(|| std::fs::metadata(path).ok().map(|meta| meta.len()));
-                match len {
+                // Already settled by its own completion commit: nothing to add,
+                // and nothing to complain about in the strict pass either.
+                if self
+                    .direct_unpack
+                    .armed
+                    .get(&(job_id, set_name.clone()))
+                    .is_some_and(|armed| armed.coverage.part_is_complete(index))
+                {
+                    continue;
+                }
+                match self.direct_unpack_known_part_len(job_id, path) {
                     Some(len) => {
                         if let Some(armed) =
                             self.direct_unpack.armed.get(&(job_id, set_name.clone()))
                         {
-                            armed.coverage.advance_watermark(index, len);
+                            // Order matters: declare the length first, so a
+                            // watermark that disagrees with it is caught as the
+                            // contradiction it is rather than silently kept.
                             armed.coverage.note_part_len(index, len);
+                            armed.coverage.advance_watermark(index, len);
                             armed.coverage.mark_part_complete(index);
                         }
                     }
+                    // The lenient pass leaves this part entirely alone. Its
+                    // completion commit is in flight and knows the truth.
+                    None if pass == SettlePass::Lenient => {}
                     None => unsettled.push(format!(
                         "{} (part {index})",
                         path.file_name()
@@ -1251,13 +1349,14 @@ impl Pipeline {
                     job_id = job_id.0,
                     set_name,
                     unsettled = %unsettled.join(", "),
-                    "direct unpack has parts with no bytes at all after the download ended"
+                    "direct unpack has parts the assembly cannot describe after the download ended"
                 );
                 self.direct_unpack_abort_set(
                     job_id,
                     &set_name,
                     "download ended with parts incomplete",
                     AbortLatch::Permanent,
+                    DemotionReason::DownloadEnded,
                 );
             }
         }
@@ -1505,7 +1604,13 @@ impl Pipeline {
         index: usize,
         coverage: &Arc<SetCoverage>,
     ) {
-        if let Some(floor) = self.in_stream_damage_floor(file_id) {
+        // One verdict-map build serves both facts. Reading them through the
+        // separate accessors built the same map twice on every commit of a
+        // gated part.
+        let Some((floor, prefix)) = self.in_stream_chase_evidence(file_id) else {
+            return;
+        };
+        if let Some(floor) = floor {
             if !coverage.is_gated() {
                 info!(
                     job_id = file_id.job_id.0,
@@ -1517,9 +1622,7 @@ impl Pipeline {
             }
             coverage.cap_at_damage(index, floor);
         }
-        if let Some(prefix) = self.in_stream_intact_prefix(file_id) {
-            coverage.note_vouched_prefix(index, prefix);
-        }
+        coverage.note_vouched_prefix(index, prefix);
     }
 
     /// Refresh evidence for a chased part named by its filename.
@@ -1565,7 +1668,15 @@ impl Pipeline {
     /// away. Anything less — a consumed byte past the vouched prefix, a file
     /// with no binding, a set whose parts cannot be resolved — falls back to
     /// the unconditional taint this replaced.
-    pub(in crate::pipeline) fn decide_direct_unpack_before_repair(&mut self, job_id: JobId) {
+    ///
+    /// `verification` is the analysis pass's own file-level result, which runs
+    /// immediately before this and is the second source of vouching evidence.
+    /// See [`Self::direct_unpack_set_is_vouched`] for why it is needed.
+    pub(in crate::pipeline) fn decide_direct_unpack_before_repair(
+        &mut self,
+        job_id: JobId,
+        verification: Option<&par2_rs::VerificationResult>,
+    ) {
         if self.direct_unpack.armed.is_empty() && self.direct_unpack.outcomes.is_empty() {
             return;
         }
@@ -1579,7 +1690,7 @@ impl Pipeline {
             .collect();
 
         for set_name in sets {
-            if self.direct_unpack_set_is_vouched(job_id, &set_name) {
+            if self.direct_unpack_set_is_vouched(job_id, &set_name, verification) {
                 info!(
                     job_id = job_id.0,
                     set_name,
@@ -1596,15 +1707,50 @@ impl Pipeline {
 
     /// Whether the recovery set positively vouches for every byte this set's
     /// chase has consumed.
-    fn direct_unpack_set_is_vouched(&self, job_id: JobId, set_name: &str) -> bool {
+    ///
+    /// # Two sources of evidence, and why one is not enough
+    ///
+    /// The in-stream grid is the cheap source: verdicts accumulated as articles
+    /// landed, costing no reads. But a grid only exists for articles that were
+    /// cut on it, and the decoder cuts an article on the checkpoint geometry it
+    /// had *at the time* — a grid learned later cannot consume those segments,
+    /// because claiming them would imply cuts the decoder never emitted. A
+    /// recovery set's `.par2` articles are tiny and race the data volumes they
+    /// describe, so on a fast link the first stretch of a part routinely decodes
+    /// before the slice size is known. Those blocks are unclaimed for good, the
+    /// intact prefix walks to zero, and a chase that read a single byte is
+    /// refused — intermittently, depending on who won the race.
+    ///
+    /// So a part with no grid claim falls back to `verification`, the analysis
+    /// pass's own file-level result, which ran immediately before this and read
+    /// the files from disk. `FileStatus::Complete` there means the file's full
+    /// MD5 matched — a strictly stronger statement than any prefix of CRC32
+    /// block claims — and a file the analysis found complete is not one the
+    /// repair is going to rewrite. That vouches the whole part.
+    ///
+    /// Every other status is a refusal, not a fallback: `Damaged` and `Missing`
+    /// are files the repair intends to rewrite, and `Renamed` means the path
+    /// this chase is reading is not the one the analysis judged. A part the
+    /// analysis did not classify at all stays unvouched.
+    fn direct_unpack_set_is_vouched(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        verification: Option<&par2_rs::VerificationResult>,
+    ) -> bool {
         // Every `false` below names itself. This decision is the difference
         // between a chase surviving a repair and being thrown away, it fires
         // once per repaired set, and its inputs are spread across the topology,
         // the assembly and the PAR2 runtime — so an unexplained refusal is a
         // gate run spent bisecting. It is a per-set decision on a cold path;
         // the logging costs nothing that matters.
+        //
+        // At `info!`, not `debug!`. The reason was previously invisible in the
+        // one place it is needed most — a gate run's captured logs carry no
+        // `direct_unpack` debug lines at all — so a refusal that cost a chase
+        // its whole overlap looked identical to one that never happened.
         let refuse = |reason: &str, part: Option<usize>| {
-            debug!(
+            info!(
                 job_id = job_id.0,
                 set_name, part, reason, "direct unpack cannot vouch this set against the repair"
             );
@@ -1614,7 +1760,7 @@ impl Pipeline {
         let paths = match self.sevenz_set_part_paths(job_id, set_name) {
             Ok(paths) => paths,
             Err(error) => {
-                debug!(
+                info!(
                     job_id = job_id.0,
                     set_name,
                     error = %error,
@@ -1644,11 +1790,19 @@ impl Pipeline {
                     Some(index),
                 );
             };
-            let Some(intact_prefix) = self.in_stream_intact_prefix(file_id) else {
-                return refuse(
-                    "the recovery set does not bind this part, so nothing vouches for it",
-                    Some(index),
-                );
+            let in_stream_prefix = self.in_stream_intact_prefix(file_id);
+            // The analysis verified this exact file complete by full MD5, so the
+            // repair will not touch it and every byte of it is vouched.
+            let verified_whole_file = self.par2_analysis_found_part_complete(file_id, verification);
+            let intact_prefix = match (in_stream_prefix, verified_whole_file) {
+                (_, true) => u64::MAX,
+                (Some(prefix), false) => prefix,
+                (None, false) => {
+                    return refuse(
+                        "the recovery set does not bind this part, so nothing vouches for it",
+                        Some(index),
+                    );
+                }
             };
             let consumed = match &coverage {
                 Some(coverage) => coverage.consumed_high_water(index),
@@ -1663,7 +1817,7 @@ impl Pipeline {
                 },
             };
             if consumed > intact_prefix {
-                debug!(
+                info!(
                     job_id = job_id.0,
                     set_name,
                     part = index,
@@ -1676,6 +1830,37 @@ impl Pipeline {
             }
         }
         true
+    }
+
+    /// Whether the analysis pass found this part's file complete on disk.
+    ///
+    /// Matched on the recovery set's own file id rather than on a filename: the
+    /// binding already resolved which description this part is, and a filename
+    /// comparison would have to re-derive that against renames and obfuscation.
+    /// In a job carrying more than one recovery set, a part bound to a set other
+    /// than the one being repaired simply finds no matching id and is not
+    /// vouched — the safe direction, and the same answer as no evidence.
+    ///
+    /// Only `Complete` answers true. It is the one status that means the repair
+    /// has nothing to write to this file, which is the whole question being
+    /// asked — `Damaged` and `Missing` are files it will rewrite, and `Renamed`
+    /// says the analysis judged some other path.
+    fn par2_analysis_found_part_complete(
+        &self,
+        file_id: crate::jobs::ids::NzbFileId,
+        verification: Option<&par2_rs::VerificationResult>,
+    ) -> bool {
+        let Some(verification) = verification else {
+            return false;
+        };
+        let Some(binding) = self.resolve_par2_file_binding(file_id) else {
+            return false;
+        };
+        verification
+            .files
+            .iter()
+            .find(|file| file.file_id == binding.par2_file_id)
+            .is_some_and(|file| matches!(file.status, par2_rs::verify::FileStatus::Complete))
     }
 
     /// Mark a set as parked through a repair, without going through the
@@ -1722,14 +1907,14 @@ impl Pipeline {
                 "direct unpack demoted — the repair concluded and this gated chase is still \
                  waiting on evidence that will not arrive"
             );
-            self.direct_unpack
-                .counters
-                .record_demotion(DemotionReason::GatedStall);
+            // The abort records the demotion; counting it here as well would
+            // book one demotion twice.
             self.direct_unpack_abort_set(
                 job_id,
                 &set_name,
                 "gated chase stalled: no vouching evidence after repair",
                 AbortLatch::Permanent,
+                DemotionReason::GatedStall,
             );
         }
     }
@@ -1792,7 +1977,13 @@ impl Pipeline {
             self.direct_unpack
                 .parked_through_repair
                 .remove(&(job_id, set_name.clone()));
-            self.direct_unpack_abort_set(job_id, &set_name, reason, AbortLatch::Permanent);
+            self.direct_unpack_abort_set(
+                job_id,
+                &set_name,
+                reason,
+                AbortLatch::Permanent,
+                DemotionReason::RepairFailed,
+            );
         }
     }
 
@@ -1873,7 +2064,12 @@ impl Pipeline {
 
     /// Drop every trace of a job, aborting anything still running.
     pub(crate) fn direct_unpack_forget_job(&mut self, job_id: JobId) {
-        self.direct_unpack_abort_job(job_id, "job removed", AbortLatch::Permanent);
+        self.direct_unpack_abort_job(
+            job_id,
+            "job removed",
+            AbortLatch::Permanent,
+            DemotionReason::DownloadEnded,
+        );
         self.direct_unpack
             .latched
             .retain(|(latched_job, _), _| *latched_job != job_id);
@@ -1887,6 +2083,7 @@ impl Pipeline {
         self.direct_unpack
             .parked_through_repair
             .retain(|(parked_job, _)| *parked_job != job_id);
+        self.direct_unpack.download_settled.remove(&job_id);
     }
 }
 

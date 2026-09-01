@@ -1435,14 +1435,13 @@
     },
     {
       "path": "testdata/direct-unpack-repair-unvouched/archive.7z.001",
-      "size": 131125,
-      "blake3": "355742f5fe0550fde090f337cdd11406d3b095c575894391ad2da95ad40b1a83",
+      "size": 1428487,
+      "blake3": "6b3337f879b5fcba13eb7dc188bfa546a94e8214d10b04835c46f6411db73784",
       "format": "7z",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "ffmpeg-7.1-ubuntu2404",
           "go-fixture-bytes",
           "par2cmdline-turbo-1.4.0",
           "sevenzip-26.02"
@@ -1451,14 +1450,13 @@
     },
     {
       "path": "testdata/direct-unpack-repair-unvouched/archive.7z.002",
-      "size": 131125,
-      "blake3": "2ecb9b323c19603ca0f40e8becc7b00be1fc946ca1542f874cc3322bda59c22e",
+      "size": 1428487,
+      "blake3": "aec2f1a04d3227bb5d929b117831837c04d44970f1672d38bcb7f40c43229e48",
       "format": "7z-part",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "ffmpeg-7.1-ubuntu2404",
           "go-fixture-bytes",
           "par2cmdline-turbo-1.4.0",
           "sevenzip-26.02"
@@ -1467,14 +1465,58 @@
     },
     {
       "path": "testdata/direct-unpack-repair-unvouched/archive.7z.003",
-      "size": 131124,
-      "blake3": "e42a7d338d329ea1bb2155171581522d0f14fa9332731afaab15b485a5391ed8",
+      "size": 1428487,
+      "blake3": "6e27080a439d3d12c26aeb1b6da37d81a69f45610b04e927f05cbbc737e97384",
       "format": "7z-part",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.004",
+      "size": 1428487,
+      "blake3": "095ea56a7ad18bd069bb47c912567af8943d083393cf482a557bd18a0b57a5e8",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.005",
+      "size": 1428487,
+      "blake3": "b655a29b117cc9454214c73e65e8bf195595df7a71e0d80eec0b33461920694e",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.006",
+      "size": 1428487,
+      "blake3": "39143f9a11083df54ff5980b0106a885ac31b6b7b4a60caf3d179538d72d67cd",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
           "go-fixture-bytes",
           "par2cmdline-turbo-1.4.0",
           "sevenzip-26.02"
@@ -1483,14 +1525,13 @@
     },
     {
       "path": "testdata/direct-unpack-repair-unvouched/archive.7z.par2",
-      "size": 1420,
-      "blake3": "4fdba1e5d584e68f63df3aa4a28586fd4cbc44d498850247dd6f5a00e3f70e15",
+      "size": 12136,
+      "blake3": "84b3d6a2765da311a252453aa20eeab018ad9d9d8789ee364321ce4dea7b4927",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "ffmpeg-7.1-ubuntu2404",
           "go-fixture-bytes",
           "par2cmdline-turbo-1.4.0",
           "sevenzip-26.02"
@@ -1499,14 +1540,13 @@
     },
     {
       "path": "testdata/direct-unpack-repair-unvouched/archive.7z.vol00+1.par2",
-      "size": 17872,
-      "blake3": "fb22b36e251356dd2ea7b157af55d0b9a2699bcbdbe6a5bde52c0615ee599648",
+      "size": 28588,
+      "blake3": "97875810435ca71af46d1db6b3b6b4138ea7c92a0125a8520d74b1873db95869",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "ffmpeg-7.1-ubuntu2404",
           "go-fixture-bytes",
           "par2cmdline-turbo-1.4.0",
           "sevenzip-26.02"
@@ -1515,14 +1555,13 @@
     },
     {
       "path": "testdata/direct-unpack-repair-unvouched/archive.7z.vol01+2.par2",
-      "size": 35636,
-      "blake3": "2b78b8fe29513f42ead8ada43b430e894fe407f2ed6e8c90e3950fb28f22b396",
+      "size": 57068,
+      "blake3": "064cf9de0afe70f788ebe22c921959a926f869a7f5b1a4a4a6d3187fa543d644",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "ffmpeg-7.1-ubuntu2404",
           "go-fixture-bytes",
           "par2cmdline-turbo-1.4.0",
           "sevenzip-26.02"
@@ -1531,14 +1570,13 @@
     },
     {
       "path": "testdata/direct-unpack-repair-unvouched/archive.7z.vol03+4.par2",
-      "size": 69852,
-      "blake3": "18807fe9c121046762de1283fe7d34c720cec5cfde90524d7b0e3fb7d210e76b",
+      "size": 102000,
+      "blake3": "afabc5640299eecaafec654b50f519b877c72d1a566a1a46c7b71650ca17bc46",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "ffmpeg-7.1-ubuntu2404",
           "go-fixture-bytes",
           "par2cmdline-turbo-1.4.0",
           "sevenzip-26.02"
@@ -1547,14 +1585,13 @@
     },
     {
       "path": "testdata/direct-unpack-repair-unvouched/archive.7z.vol07+8.par2",
-      "size": 136972,
-      "blake3": "19da1ea696079c8c83db439ba4d0c59beade93ce8174e0ca80cb6c7ecb1dbd5b",
+      "size": 179836,
+      "blake3": "e41348d3c18db487ea37cc2cda2b4f229c2b6aaf7d9113d5ca0351bcf8585874",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "ffmpeg-7.1-ubuntu2404",
           "go-fixture-bytes",
           "par2cmdline-turbo-1.4.0",
           "sevenzip-26.02"
@@ -1563,14 +1600,13 @@
     },
     {
       "path": "testdata/direct-unpack-repair-unvouched/archive.7z.vol15+1.par2",
-      "size": 17872,
-      "blake3": "fadd4335e0f8463412c00bb6f398f2e2e6d7e9876e60c7dde873d5833eea617e",
+      "size": 28588,
+      "blake3": "1404b7f1fc4bfd337c67a7a1e7b234c6d30609e2f6da695f02249d653f17f4cc",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "ffmpeg-7.1-ubuntu2404",
           "go-fixture-bytes",
           "par2cmdline-turbo-1.4.0",
           "sevenzip-26.02"

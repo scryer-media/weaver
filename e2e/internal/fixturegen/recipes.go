@@ -743,6 +743,12 @@ func Recipes() []Recipe {
 	//
 	// If any of those move, the scenario stops testing repair-resume and starts
 	// testing whichever race replaced it.
+	//
+	// Note that the park here no longer rests on the grid alone. Parts 0-3 are
+	// vouched by the analysis pass's file-level verdicts whether or not their
+	// articles beat the recovery set's own registration, so the scenario is
+	// deterministic from two independent directions: the grid gates part 4, and
+	// the file verdicts vouch everything the chase actually read.
 	add(Recipe{
 		Slug: "direct-unpack-repair", Family: "direct-unpack", ByteReproducible: true,
 		Notes: "An 8 MiB PPMd 7z in six volumes with parity, damaged in the second block of the fifth volume, so the chase gates on the damage and parks there rather than consuming it.",
@@ -766,27 +772,60 @@ func Recipes() []Recipe {
 		},
 	})
 
-	// The counterpart to `direct-unpack-repair`: the same damaged shape, but
-	// with a slice size the harness's default 750 KiB articles straddle. No
-	// block is ever independently claimed, so the recovery set vouches for
-	// nothing, and the repair-time decision must fall back to the taint it
-	// always did. This is the guard on the fallback, expressed as a fixture
-	// rather than only as a unit test.
+	// The counterpart to `direct-unpack-repair`: the same source, the same
+	// volumes and the same damage, but with a slice size the harness's default
+	// 750 KiB articles straddle. No article ever lies wholly inside a block, so
+	// no block is ever independently claimed, so no grid exists at all — and
+	// with no grid there is no Damaged verdict, which means this set never
+	// gates.
+	//
+	// That makes it the proof of the OTHER vouching source. The chase runs free
+	// and reads whatever it can; at repair-decision time the in-stream evidence
+	// vouches for precisely nothing, and the only thing standing between the
+	// chase and the bin is the analysis pass's own file-level verdict on each
+	// part. It has to park and resume on that alone.
+	//
+	// THE INVARIANT IT DEPENDS ON. Because nothing gates it, this fixture cannot
+	// rely on a cap to hold the chase back — it needs the decode to be slower
+	// than the decision, which is the same bound its sibling uses:
+	//   - The same 8 MiB PPMd source artifact in six ~1.4 MiB volumes. PPMd
+	//     measures about 9 MB/s over this archive, so reaching part 4's damage
+	//     at roughly 5.5 MiB in takes on the order of 600 ms, while the local
+	//     download, the PAR2 analysis and the repair decision all land in tens
+	//     of milliseconds.
+	//   - So at the decision the chase has consumed a few hundred KiB of part 0
+	//     — a file the analysis verifies Complete, hence vouched by the
+	//     fallback — plus the tail probe in part 5, also Complete. Part 4, the
+	//     damaged one, has been consumed to zero bytes and vouches trivially.
+	//   - 16 KiB slices against the default 750 KiB articles. This is the whole
+	//     premise; pinning `segment_size` in the scenario would close blocks and
+	//     turn this back into its sibling.
+	//   - Damage in the same place as the sibling, so the two differ in exactly
+	//     one variable: whether a grid exists.
+	//
+	// It used to be a three-volume LZMA2 archive damaged in part 1, asserting a
+	// `repair_rewrote` taint. That was a race, not a test: with no gating, the
+	// decision (~14 ms) was competing with an LZMA2 decoder reaching the zeroed
+	// bytes about 131 KB in, and it won twice by scheduler grace. The taint path
+	// keeps its coverage in the unit and pipeline suites, where it can be made
+	// deterministic.
 	add(Recipe{
 		Slug: "direct-unpack-repair-unvouched", Family: "direct-unpack", ByteReproducible: true,
-		Notes: "A three-volume LZMA2 7z with parity whose 16 KiB slices are straddled by the default article size, so the in-stream grid claims no block and repair cannot be vouched against.",
+		Notes: "The same 8 MiB PPMd six-volume archive and damage as direct-unpack-repair, but with 16 KiB parity slices the default article size straddles: no block closes, no grid forms, nothing gates, and the chase must be vouched through the repair by the analysis pass's file-level verdicts alone.",
 		Build: sequence(
-			splitSevenZipIntoParts("direct-unpack-lzma2", DirectUnpackVolumes),
+			splitSevenZipIntoParts("direct-unpack-repair-source", DirectUnpackRepairVolumes),
 			par2(PAR2Spec{
 				Base: "archive.7z.par2", SliceSize: 16384, RecoveryBlocks: 16,
-				Sources: []string{"archive.7z.001", "archive.7z.002", "archive.7z.003"},
+				Sources: []string{
+					"archive.7z.001", "archive.7z.002", "archive.7z.003",
+					"archive.7z.004", "archive.7z.005", "archive.7z.006",
+				},
 			}),
-			zeroOutput("archive.7z.002", 4*16384, 2*16384),
+			zeroOutput("archive.7z.005", 65536, 65536),
 		),
-		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
-			_ = ctx
+		ExpectedOutputs: func(_ context.Context, env *Env) (map[string]string, error) {
 			payload := env.StagePath(sevenZipSingleMember)
-			if err := deterministicPayload(payload, sevenZipMatrixPayloadBytes, 1); err != nil {
+			if err := DirectUnpackRepairPayload(payload); err != nil {
 				return nil, err
 			}
 			return map[string]string{sevenZipSingleMember: payload}, nil

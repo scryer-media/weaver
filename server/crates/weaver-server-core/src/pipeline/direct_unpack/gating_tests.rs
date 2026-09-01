@@ -871,3 +871,49 @@ fn abort_unblocks_a_reader_parked_under_the_gate() {
         "a gated park must be reachable by abort: {error}"
     );
 }
+
+/// A watermark past a declared length is a contradiction in the coverage, and it
+/// has to be survivable.
+///
+/// It used to be a `debug_assert!`. Under a debug build that panicked the
+/// pipeline task the moment a settle fabricated a short length for a part whose
+/// real completion commit was still in flight — one bad set took down the whole
+/// job pass and every scenario queued behind it. Under a release build it did
+/// something worse and quieter: kept serving, with a part boundary that every
+/// later part's offset had been mapped against.
+#[test]
+fn a_watermark_past_a_declared_length_demotes_the_set_instead_of_panicking() {
+    let coverage = SetCoverage::new(2);
+    coverage.note_part_len(0, 12_288_000);
+
+    coverage.advance_watermark(0, 21_097_033);
+
+    let reason = coverage
+        .abort_reason()
+        .expect("the contradiction must abort the set");
+    assert!(
+        reason.contains("21097033") && reason.contains("12288000"),
+        "the abort must name both numbers: {reason}"
+    );
+    assert!(
+        coverage.readable_at(0, 0).is_err(),
+        "and every subsequent read must fail rather than serve past the boundary"
+    );
+}
+
+/// The guard must not fire on the ordinary case it sits next to: a watermark
+/// that reaches a declared length exactly is a part that finished, not a
+/// contradiction.
+#[test]
+fn a_watermark_that_lands_exactly_on_the_declared_length_is_fine() {
+    let coverage = SetCoverage::new(1);
+    coverage.note_part_len(0, 4_096);
+    coverage.advance_watermark(0, 4_096);
+
+    assert!(coverage.abort_reason().is_none());
+    assert_eq!(
+        coverage.part_progress(0).expect("part 0").watermark,
+        4_096,
+        "the watermark must have been accepted"
+    );
+}

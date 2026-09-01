@@ -2607,12 +2607,16 @@ impl Pipeline {
         outcome
     }
 
+    /// `verification` is the analysis result that led here, and is the
+    /// file-level half of the direct-unpack vouching evidence. `None` for a
+    /// preview run, which rewrites nothing and so parks nothing.
     async fn run_par2_repairer(
         &mut self,
         job_id: JobId,
         par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
         repair: bool,
+        verification: Option<&par2_rs::VerificationResult>,
     ) -> Result<par2_rs::Par2RepairOutcome, String> {
         let set_id = par2_set.recovery_set_id;
         if repair {
@@ -2631,7 +2635,7 @@ impl Pipeline {
             // a chase left under one waits on a frontier nothing will advance —
             // silently, until the job is torn down. If you add an early return
             // below, settle first.
-            self.decide_direct_unpack_before_repair(job_id);
+            self.decide_direct_unpack_before_repair(job_id, verification);
             // What the directory held before the repairer touched it, so the
             // artefacts it leaves behind can be named afterwards by difference
             // rather than by guessing at a backup-suffix convention that lives
@@ -3006,7 +3010,7 @@ impl Pipeline {
         info!(job_id = job_id.0, "par2 damaged-path analysis started");
 
         let outcome_result = self
-            .run_par2_repairer(job_id, par2_set, working_dir, false)
+            .run_par2_repairer(job_id, par2_set, working_dir, false, None)
             .await;
 
         self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
@@ -6073,6 +6077,7 @@ impl Pipeline {
                 &file.filename,
                 "split topology retired by its recovery data",
                 crate::pipeline::direct_unpack::wiring::AbortLatch::Permanent,
+                crate::pipeline::direct_unpack::wiring::DemotionReason::DownloadEnded,
             );
             let parts: HashSet<String> = topology.volume_map.keys().cloned().collect();
             info!(
@@ -6775,6 +6780,15 @@ impl Pipeline {
             }
             return;
         }
+
+        // The strict half of the direct-unpack settle. The lenient half ran when
+        // the download drained, but decode results for the last articles are
+        // processed after that point, so it deliberately left any part the
+        // assembly could not yet describe alone. By here those commits have
+        // landed, so a part still without a length is one that will never have
+        // one — and its chase ends by name instead of parking forever.
+        // Idempotent: later completion checks find nothing left to settle.
+        self.settle_direct_unpack_at_completion(job_id);
 
         self.reapply_promoted_recovery_queue(job_id);
         // Restored jobs retain completed bytes but not the bounded decode
@@ -7973,7 +7987,13 @@ impl Pipeline {
                     }
 
                     match self
-                        .run_par2_repairer(job_id, Arc::clone(&par2_set), working_dir.clone(), true)
+                        .run_par2_repairer(
+                            job_id,
+                            Arc::clone(&par2_set),
+                            working_dir.clone(),
+                            true,
+                            Some(verification),
+                        )
                         .await
                     {
                         Ok(outcome) => {
@@ -8411,6 +8431,7 @@ impl Pipeline {
                             Arc::clone(&par2_set),
                             working_dir.clone(),
                             false,
+                            None,
                         )
                         .await
                     {
@@ -8518,7 +8539,13 @@ impl Pipeline {
                     }
 
                     match self
-                        .run_par2_repairer(job_id, Arc::clone(&par2_set), working_dir.clone(), true)
+                        .run_par2_repairer(
+                            job_id,
+                            Arc::clone(&par2_set),
+                            working_dir.clone(),
+                            true,
+                            Some(&verification),
+                        )
                         .await
                     {
                         Ok(outcome) => {
