@@ -110,6 +110,9 @@ pub enum DemotionReason {
     DecodeFailed,
     /// PAR2 repair replaced bytes the chase had already read.
     RepairRewrote,
+    /// The set was gated on recovery-set evidence that never arrived, and the
+    /// repair has concluded, so nothing will unpark it.
+    GatedStall,
 }
 
 impl DemotionReason {
@@ -119,6 +122,7 @@ impl DemotionReason {
             Self::PartUnreadable => "part_unreadable",
             Self::DecodeFailed => "decode_failed",
             Self::RepairRewrote => "repair_rewrote",
+            Self::GatedStall => "gated_stall",
         }
     }
 }
@@ -177,6 +181,7 @@ pub struct DirectUnpackCounters {
     pub demoted_part_unreadable: u64,
     pub demoted_decode_failed: u64,
     pub demoted_repair_rewrote: u64,
+    pub demoted_gated_stall: u64,
     /// Chases whose members were installed instead of re-extracting.
     pub consumed: u64,
     /// Chases whose output was thrown away in favour of conventional extraction.
@@ -216,6 +221,7 @@ impl DirectUnpackCounters {
             DemotionReason::PartUnreadable => self.demoted_part_unreadable += 1,
             DemotionReason::DecodeFailed => self.demoted_decode_failed += 1,
             DemotionReason::RepairRewrote => self.demoted_repair_rewrote += 1,
+            DemotionReason::GatedStall => self.demoted_gated_stall += 1,
         }
     }
 }
@@ -519,6 +525,12 @@ impl Pipeline {
             if let Some(len) = self.direct_unpack_known_part_len(job_id, path) {
                 coverage.note_part_len(index, len);
                 coverage.mark_part_complete(index);
+                // A part that finished *before* the set armed never sees the
+                // completion seam, so without this its damage would go
+                // unnoticed and the set would never gate on it.
+                if let Some(file_id) = self.direct_unpack_file_id_for_part(job_id, path) {
+                    self.refresh_chased_part_evidence(file_id, set_name, index, &coverage);
+                }
             }
         }
 
@@ -705,7 +717,7 @@ impl Pipeline {
             self.direct_unpack_note_commit(file_id, &filename, received, true);
             // Its grid verdicts are final now, so this is when damage becomes
             // knowable — and when the frontier has to stop short of it.
-            self.cap_chased_part_at_damage(file_id, &filename);
+            self.refresh_chased_part_by_filename(file_id, &filename, false);
         }
 
         let Some(state) = self.jobs.get(&job_id) else {
@@ -1022,6 +1034,14 @@ impl Pipeline {
         armed.coverage.advance_watermark(*index, committed_bytes);
         if complete {
             armed.coverage.mark_part_complete(*index);
+        }
+        let gated = armed.coverage.is_gated();
+        if gated {
+            // A gated set serves only what is vouched, so its prefixes have to
+            // keep up with the download or the chase parks on a part it is
+            // entitled to be reading. Reached only on a set already known to
+            // carry damage.
+            self.refresh_chased_part_by_filename(file_id, filename, true);
         }
     }
 
@@ -1460,17 +1480,58 @@ impl Pipeline {
         }
     }
 
-    /// Hold a part's frontier below damage the recovery set has reported.
+    /// Feed one part's recovery-set evidence into its coverage.
     ///
-    /// Called when a chased part finishes downloading, which is when its grid
-    /// verdicts are final. Computing them earlier would mean rebuilding the
-    /// verdict map on every commit; computing them here costs one map build per
-    /// chased file and still lands before repair, because repair does not run
-    /// until the whole download has drained.
+    /// Two facts come out of the same verdict map, so they are taken together:
+    /// the lowest damaged byte, which caps the part and gates the set; and how
+    /// far the set has positively vouched for it, which is what a gated set is
+    /// allowed to serve.
     ///
-    /// Bytes the decoder consumed *before* this cap went up are not protected
-    /// by it — that is what the repair-time vouching check is for.
-    fn cap_chased_part_at_damage(&self, file_id: crate::jobs::ids::NzbFileId, filename: &str) {
+    /// Cost lands where the damage is. An ungated set pays this once per part,
+    /// at completion, exactly as before — one map build per chased file. A
+    /// gated set pays it per commit, because a gated frontier that only moved
+    /// at completion would park a chase for the whole of a part it is entitled
+    /// to be reading. Gated sets are the damaged minority; clean ones never
+    /// reach the per-commit path at all.
+    ///
+    /// The prefix is banked even while the set is ungated. It costs nothing to
+    /// serve then, but a part that completes clean *before* the gate flips gets
+    /// no later refresh — its commits are over — and a banked prefix is what
+    /// lets it keep serving fully once damage elsewhere gates the set.
+    fn refresh_chased_part_evidence(
+        &self,
+        file_id: crate::jobs::ids::NzbFileId,
+        set_name: &str,
+        index: usize,
+        coverage: &Arc<SetCoverage>,
+    ) {
+        if let Some(floor) = self.in_stream_damage_floor(file_id) {
+            if !coverage.is_gated() {
+                info!(
+                    job_id = file_id.job_id.0,
+                    set_name,
+                    part = index,
+                    damage_floor = floor,
+                    "recovery data reports damage; the set now serves only vouched bytes"
+                );
+            }
+            coverage.cap_at_damage(index, floor);
+        }
+        if let Some(prefix) = self.in_stream_intact_prefix(file_id) {
+            coverage.note_vouched_prefix(index, prefix);
+        }
+    }
+
+    /// Refresh evidence for a chased part named by its filename.
+    ///
+    /// Called when a part completes, and — once the set is gated — on every
+    /// commit, so a vouched prefix can advance while the part is still arriving.
+    fn refresh_chased_part_by_filename(
+        &self,
+        file_id: crate::jobs::ids::NzbFileId,
+        filename: &str,
+        only_when_gated: bool,
+    ) {
         if self.direct_unpack.armed.is_empty() {
             return;
         }
@@ -1487,17 +1548,11 @@ impl Pipeline {
         let Some(armed) = self.direct_unpack.armed.get(&(job_id, set_name.clone())) else {
             return;
         };
-        let Some(floor) = self.in_stream_damage_floor(file_id) else {
+        if only_when_gated && !armed.coverage.is_gated() {
             return;
-        };
-        info!(
-            job_id = job_id.0,
-            set_name,
-            part = index,
-            damage_floor = floor,
-            "holding a chased part below reported damage until repair"
-        );
-        armed.coverage.cap_at_damage(index, floor);
+        }
+        let coverage = Arc::clone(&armed.coverage);
+        self.refresh_chased_part_evidence(file_id, &set_name, index, &coverage);
     }
 
     /// Decide, per chased set, whether a repair about to run can coexist with
@@ -1637,6 +1692,48 @@ impl Pipeline {
             .insert((job_id, set_name.to_string()));
     }
 
+    /// End any gated chase the repair left behind still holding its frontier.
+    ///
+    /// Gating parks a chase on evidence it expects to arrive. Usually it does —
+    /// more articles land, prefixes advance, or repair rewrites the part and
+    /// releases it. But a set whose claims never come (articles that straddle
+    /// every slice boundary claim no block at all) is parked on evidence that
+    /// will never exist, and by this point the download has drained and the
+    /// repair has concluded: nothing left in the system will move it. Waiting
+    /// forever is the one outcome a blocking thread must never have, so it
+    /// demotes here, by name.
+    fn demote_stalled_gated_chases(&mut self, job_id: JobId) {
+        if self.direct_unpack.armed.is_empty() {
+            return;
+        }
+        let stalled: Vec<String> = self
+            .direct_unpack
+            .armed
+            .iter()
+            .filter(|((armed_job, _), armed)| *armed_job == job_id && armed.coverage.is_gated())
+            .map(|((_, set_name), _)| set_name.clone())
+            .collect();
+
+        for set_name in stalled {
+            warn!(
+                job_id = job_id.0,
+                set_name,
+                reason = DemotionReason::GatedStall.as_str(),
+                "direct unpack demoted — the repair concluded and this gated chase is still \
+                 waiting on evidence that will not arrive"
+            );
+            self.direct_unpack
+                .counters
+                .record_demotion(DemotionReason::GatedStall);
+            self.direct_unpack_abort_set(
+                job_id,
+                &set_name,
+                "gated chase stalled: no vouching evidence after repair",
+                AbortLatch::Permanent,
+            );
+        }
+    }
+
     /// Settle the chases a repair was parked over, whichever way the repair
     /// ended.
     ///
@@ -1660,6 +1757,9 @@ impl Pipeline {
             Ok(_) => self.release_direct_unpack_after_repair(job_id),
             Err(error) => self.fail_direct_unpack_after_repair(job_id, error),
         }
+        // Whatever the repair did, anything still gated after it is waiting on
+        // evidence nothing will now produce.
+        self.demote_stalled_gated_chases(job_id);
     }
 
     /// End the chases a repair was allowed to run underneath, because the

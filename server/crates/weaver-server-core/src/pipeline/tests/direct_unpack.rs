@@ -1491,3 +1491,75 @@ async fn a_settle_finishes_parts_that_are_on_disk_but_not_yet_reconciled() {
         "every part must be settled from what is on disk"
     );
 }
+
+/// A successful repair outcome, for driving the settle seam directly.
+fn repaired_outcome() -> par2_rs::Par2RepairOutcome {
+    par2_rs::Par2RepairOutcome {
+        status: par2_rs::Par2RepairStatus::Repaired,
+        files_complete: 3,
+        files_renamed: 0,
+        files_damaged: 0,
+        files_missing: 0,
+        available_blocks: 1,
+        missing_blocks: 0,
+        recovery_blocks_available: 1,
+        recovery_blocks_used: 1,
+        bytes_copied: 0,
+        bytes_reconstructed: 1024,
+        packets: par2_rs::PacketDiagnostics::default(),
+        scan: par2_rs::ScanDiagnostics::default(),
+        carry: par2_rs::repairer::CarryDiagnostics::default(),
+        verification: par2_rs::VerificationResult {
+            files: Vec::new(),
+            recovery_blocks_available: 1,
+            total_missing_blocks: 0,
+            repairable: par2_rs::verify::Repairability::NotNeeded,
+        },
+    }
+}
+
+/// The starvation escape. A gated set whose claims never arrive — the
+/// straddled-slice geometry, where no block is ever independently claimed — is
+/// parked on evidence that does not exist. Once the repair has concluded there
+/// is nothing left in the system that could unpark it, so it must demote by
+/// name rather than hold a blocking thread for ever.
+#[tokio::test]
+async fn a_gated_chase_with_no_vouching_evidence_demotes_after_the_repair() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41700);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("armed");
+
+    // Damage is reported, so the set gates — but nothing ever vouches for
+    // anything, which is exactly what straddled articles produce.
+    coverage.cap_at_damage(1, 0);
+    assert!(coverage.is_gated());
+
+    // The repair concludes. Nothing released this set, and no claim is coming.
+    pipeline.settle_direct_unpack_after_repair(job_id, true, &Ok(repaired_outcome()));
+
+    assert!(
+        !pipeline.direct_unpack.is_armed(job_id, set_name),
+        "a stalled gated chase must not survive the repair that could have freed it"
+    );
+    assert_eq!(pipeline.direct_unpack.counters().demoted_gated_stall, 1);
+    let reason = coverage
+        .abort_reason()
+        .expect("the parked reader must be woken");
+    assert!(reason.contains("gated chase stalled"), "reason: {reason}");
+
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
+}

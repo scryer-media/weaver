@@ -37,6 +37,38 @@ func deterministicPayload(path string, length int, seed uint64) error {
 // multi-member 7z is distinguishable from a single-member one by listing alone.
 const sevenZipSingleMember = "silver_horizon.mkv"
 
+// Payload for the repair-resume fixture.
+//
+// Big enough that decoding it takes far longer than downloading it locally,
+// which is the property the whole scenario rests on — see the invariant on the
+// `direct-unpack-repair` recipe.
+const directUnpackRepairPayloadBytes = 8 * 1024 * 1024
+
+// DirectUnpackRepairPayload writes the repair fixture's payload. Exported for
+// the recipe's expected-output oracle, which re-derives it rather than keeping
+// a copy.
+func DirectUnpackRepairPayload(path string) error {
+	return deterministicPayload(path, directUnpackRepairPayloadBytes, 7)
+}
+
+// BuildDirectUnpackRepairSource writes the PPMd archive the repair fixture
+// splits.
+//
+// PPMd on purpose: it is the slowest decoder in the matrix by a wide margin, and
+// the scenario needs the chase to still be working through the early parts when
+// the later ones land and their verdicts arrive.
+func BuildDirectUnpackRepairSource(ctx context.Context, env *Env) error {
+	if err := DirectUnpackRepairPayload(env.StagePath(sevenZipSingleMember)); err != nil {
+		return err
+	}
+	return env.SevenZip(ctx, SevenZipSpec{
+		Archive:       "archive.7z",
+		Members:       []string{sevenZipSingleMember},
+		Methods:       []string{"-m0=PPMd"},
+		Deterministic: true,
+	})
+}
+
 var sevenZipMatrixMembers = []string{
 	"silver_horizon_part1.mkv",
 	"silver_horizon_part2.mkv",

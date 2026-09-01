@@ -31,6 +31,10 @@ const (
 	// down, and a fixed count keeps the ledger contract writable.
 	DirectUnpackVolumes = 3
 
+	// The repair fixture is cut into more, larger volumes so the damage can sit
+	// beyond anything the chase reads early. See the invariant on its recipe.
+	DirectUnpackRepairVolumes = 6
+
 	CorruptOffset = 10 << 20
 	CorruptLength = 1 << 20
 	TruncateBytes = 1 << 20
@@ -711,39 +715,51 @@ func Recipes() []Recipe {
 		})
 	}
 
-	// A split 7z with parity and a damaged volume, so PAR2 repair rewrites a
-	// part the chase has already read. The chase must notice and stand down,
-	// and the conventional path must then deliver correct bytes from the
-	// repaired volumes — the one interaction where direct unpack could
-	// silently ship a stale decode if the taint plumbing were wrong.
+	// The repair-resume fixture, and the one scenario whose geometry is load
+	// bearing rather than incidental.
+	//
+	// THE INVARIANT IT DEPENDS ON. The chase reads through a 128 KiB
+	// `BufReader`, so its read position never runs more than 128 KiB ahead of
+	// its decode position, and the decoder's one out-of-order move is a probe
+	// at the archive's tail for the end header. Everything else is a single
+	// forward sweep. So: put the damage far enough in that neither the
+	// readahead from part 0 nor the tail probe can reach it before the recovery
+	// data has had its say, and the chase is guaranteed to be parked at the
+	// damage rather than racing it.
+	//
+	// The numbers that make that true here:
+	//   - 8 MiB of derived, incompressible payload under PPMd, the slowest
+	//     decoder in the matrix. Decoding parts 0-3 takes orders of magnitude
+	//     longer than downloading the whole set from a container on the same
+	//     host, so gating engages long before the chase approaches part 4.
+	//   - Six volumes of about 1.4 MiB. Part 0's readahead reaches 128 KiB;
+	//     the tail probe touches part 5. Neither comes near part 4.
+	//   - Damage in part 4's SECOND 64 KiB block, so part 4 still has a vouched
+	//     first block to serve and the cap has somewhere to sit.
+	//   - 64 KiB PAR2 slices against 8 KiB articles (the scenario pins
+	//     `segment_size`), so every article lies wholly inside one block and
+	//     the in-stream grid can actually claim them. Straddled articles claim
+	//     nothing, which is what the `-unvouched` fixture below is for.
+	//
+	// If any of those move, the scenario stops testing repair-resume and starts
+	// testing whichever race replaced it.
 	add(Recipe{
 		Slug: "direct-unpack-repair", Family: "direct-unpack", ByteReproducible: true,
-		Notes: "A three-volume LZMA2 7z with parity, one volume damaged well past its header, so repair runs before extraction and rewrites bytes a chase has already consumed.",
+		Notes: "An 8 MiB PPMd 7z in six volumes with parity, damaged in the second block of the fifth volume, so the chase gates on the damage and parks there rather than consuming it.",
 		Build: sequence(
-			splitSevenZipIntoParts("direct-unpack-lzma2", DirectUnpackVolumes),
-			// A 64 KiB slice with 8 KiB articles (the scenario pins
-			// `segment_size`) puts every article wholly inside one block, which
-			// is what lets the in-stream grid close blocks and produce the
-			// Intact verdicts the repair-resume decision vouches with. An
-			// article that straddles a block boundary cannot be split from its
-			// CRC alone and leaves the block unclaimed — which is the case the
-			// `-unvouched` scenario below is built to exercise instead.
+			splitSevenZipIntoParts("direct-unpack-repair-source", DirectUnpackRepairVolumes),
 			par2(PAR2Spec{
 				Base: "archive.7z.par2", SliceSize: 65536, RecoveryBlocks: 16,
-				Sources: []string{"archive.7z.001", "archive.7z.002", "archive.7z.003"},
+				Sources: []string{
+					"archive.7z.001", "archive.7z.002", "archive.7z.003",
+					"archive.7z.004", "archive.7z.005", "archive.7z.006",
+				},
 			}),
-			// Damage the second block of the middle volume, leaving its first
-			// block intact — so the chase has a vouched prefix to have consumed
-			// and a damage floor to be held at.
-			zeroOutput("archive.7z.002", 65536, 16384),
+			zeroOutput("archive.7z.005", 65536, 65536),
 		),
-		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
-			// These volumes carry the member the lzma2 artifact was built over,
-			// and that payload is a pure function of its seed — so re-deriving
-			// it here is exact.
-			_ = ctx
+		ExpectedOutputs: func(_ context.Context, env *Env) (map[string]string, error) {
 			payload := env.StagePath(sevenZipSingleMember)
-			if err := deterministicPayload(payload, sevenZipMatrixPayloadBytes, 1); err != nil {
+			if err := DirectUnpackRepairPayload(payload); err != nil {
 				return nil, err
 			}
 			return map[string]string{sevenZipSingleMember: payload}, nil
