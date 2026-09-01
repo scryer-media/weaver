@@ -62,6 +62,9 @@ type EnsureReport struct {
 	// Byte-reproducible families regenerate to identical digests and leave
 	// the ledger as it was.
 	LedgerChanged bool
+	// Salted counts the wanted paths verified by presence alone, because their
+	// writer draws a salt and their bytes cannot be pinned.
+	Salted []string
 }
 
 // Ensure makes every selected fixture present, in this order: whatever is
@@ -85,6 +88,9 @@ func Ensure(ctx context.Context, config EnsureConfig) (EnsureReport, error) {
 
 	ledger, _, err := corpus.LoadLedger(config.Root)
 	if err != nil {
+		return report, err
+	}
+	if err := ValidateSaltedEntries(ledger, Recipes()); err != nil {
 		return report, err
 	}
 	profiles, err := corpus.LoadProfiles(config.Root)
@@ -153,6 +159,16 @@ func Ensure(ctx context.Context, config EnsureConfig) (EnsureReport, error) {
 			return report, err
 		}
 		report.Fetched = difference(beforeFetch, missing)
+	}
+	for _, p := range wanted {
+		if entry, ok := ledger.Entry(p); ok && entry.Salted {
+			report.Salted = append(report.Salted, p)
+		}
+	}
+	sort.Strings(report.Salted)
+	if len(report.Salted) > 0 {
+		logf("%d salted path(s) are verified by presence only; their writer draws a salt and their bytes cannot be pinned",
+			len(report.Salted))
 	}
 	if report.FetchSkipped != "" {
 		logf("published corpus not used: %s", report.FetchSkipped)
@@ -282,7 +298,18 @@ func missingPaths(root string, ledger *corpus.Ledger, wanted []string, digest bo
 		}
 		host := corpus.HostPath(root, p)
 		info, err := os.Stat(host)
-		if err != nil || !info.Mode().IsRegular() || info.Size() != entry.Size {
+		if err != nil || !info.Mode().IsRegular() {
+			missing = append(missing, p)
+			continue
+		}
+		if entry.Salted {
+			// Present is the whole test. A salted fixture's bytes differ on
+			// every machine that generates them, so there is nothing to compare
+			// a size or a digest against — and comparing anyway is exactly how
+			// a locally-generated one would be declared "missing" forever.
+			continue
+		}
+		if info.Size() != entry.Size {
 			missing = append(missing, p)
 			continue
 		}

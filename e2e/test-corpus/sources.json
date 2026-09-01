@@ -410,8 +410,9 @@
     },
     {
       "path": "testdata/direct-unpack-aes256-header-split/archive.7z.001",
-      "size": 131158,
-      "blake3": "796a81575765fc61be27eba410cd6c3a855508546b155a69bf65ef8590a4752c",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
       "format": "7z",
       "source": {
         "kind": "generated",
@@ -425,8 +426,9 @@
     },
     {
       "path": "testdata/direct-unpack-aes256-header-split/archive.7z.002",
-      "size": 131158,
-      "blake3": "3a2c8df69f85cd4b8ea758520b6a1fb766ac21efc8531fd311badf1dce68bd5d",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
       "format": "7z-part",
       "source": {
         "kind": "generated",
@@ -440,8 +442,9 @@
     },
     {
       "path": "testdata/direct-unpack-aes256-header-split/archive.7z.003",
-      "size": 131158,
-      "blake3": "cd6d2ee0df669de7f53a9d6e48a38bd886ee1e848003016a7765ed33d2279952",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
       "format": "7z-part",
       "source": {
         "kind": "generated",
@@ -455,8 +458,9 @@
     },
     {
       "path": "testdata/direct-unpack-aes256-header/archive.7z",
-      "size": 393474,
-      "blake3": "d9d9b1257a37b27cbd9cd679bb683f6c045f10c22788f3a58a57fd9d85a1f0bb",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
       "format": "7z",
       "source": {
         "kind": "generated",
@@ -470,8 +474,9 @@
     },
     {
       "path": "testdata/direct-unpack-aes256-split/archive.7z.001",
-      "size": 131137,
-      "blake3": "c831ece2fcddeb3539bbcafa457ebb5f4c3d3464ab4eecb115d690b30aa28af4",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
       "format": "7z",
       "source": {
         "kind": "generated",
@@ -485,8 +490,9 @@
     },
     {
       "path": "testdata/direct-unpack-aes256-split/archive.7z.002",
-      "size": 131137,
-      "blake3": "9988d667a1a01fd75b695fb19e5f0a304cd8d25508c3ff74d0ca4daf69e24e86",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
       "format": "7z-part",
       "source": {
         "kind": "generated",
@@ -500,8 +506,9 @@
     },
     {
       "path": "testdata/direct-unpack-aes256-split/archive.7z.003",
-      "size": 131136,
-      "blake3": "5ac4fc9f846157183107d52f01673eb1ec0e0665284686a8b41e477adfccc34c",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
       "format": "7z-part",
       "source": {
         "kind": "generated",
@@ -515,8 +522,9 @@
     },
     {
       "path": "testdata/direct-unpack-aes256/archive.7z",
-      "size": 393410,
-      "blake3": "7bd875d64a20737de3a63b3cf0bfbb1836547bcc4a74df0ff57b0288a4d625ea",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
       "format": "7z",
       "source": {
         "kind": "generated",

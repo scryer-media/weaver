@@ -63,6 +63,9 @@ func Run(ctx context.Context, config Config) ([]Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := ValidateSaltedEntries(ledger, Recipes()); err != nil {
+		return nil, err
+	}
 	selected, err := selectRecipes(config.Slugs)
 	if err != nil {
 		return nil, err
@@ -350,6 +353,13 @@ func updateLedger(root string, ledger *corpus.Ledger, lock Lock, results []Resul
 		entry := &ledger.Files[index]
 		source, ok := provenance[entry.Path]
 		if !ok {
+			continue
+		}
+		if entry.Salted {
+			// Provenance still gets refreshed; the size and hash stay absent.
+			// Writing them would both re-pin bytes that cannot be pinned and
+			// move a file that must never move.
+			entry.Source = source
 			continue
 		}
 		digest, err := corpus.DigestFile(corpus.HostPath(root, entry.Path))

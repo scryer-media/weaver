@@ -32,6 +32,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/scryer-media/weaver/e2e/internal/corpus"
 	"github.com/scryer-media/weaver/e2e/internal/fixturegen"
 )
 
@@ -183,6 +184,19 @@ func printRecipes(root string) error {
 		return recipes[left].Slug < recipes[right].Slug
 	})
 	family := ""
+	saltedSlugs := map[string]bool{}
+	if ledger, _, err := corpus.LoadLedger(root); err == nil {
+		for _, file := range ledger.Files {
+			if !file.Salted {
+				continue
+			}
+			if slug, ok := strings.CutPrefix(file.Path, "testdata/"); ok {
+				if slug, _, ok := strings.Cut(slug, "/"); ok {
+					saltedSlugs[slug] = true
+				}
+			}
+		}
+	}
 	for _, recipe := range recipes {
 		if recipe.Family != family {
 			family = recipe.Family
@@ -191,6 +205,10 @@ func printRecipes(root string) error {
 		reproducible := "shape"
 		if recipe.ByteReproducible {
 			reproducible = "bytes"
+		} else if saltedSlugs[recipe.Slug] {
+			// Weaker than "shape": not merely unpinned bytes, but bytes that
+			// *cannot* be pinned, verified by presence alone.
+			reproducible = "salted"
 		}
 		fmt.Printf("  %-46s %-6s %s\n", recipe.Slug, reproducible, recipe.Notes)
 	}
