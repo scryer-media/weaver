@@ -1192,9 +1192,20 @@ impl Pipeline {
             let Ok(paths) = self.sevenz_set_part_paths(job_id, &set_name) else {
                 continue;
             };
-            let mut all_complete = true;
+            let mut unsettled: Vec<String> = Vec::new();
             for (index, path) in paths.iter().enumerate() {
-                match self.direct_unpack_known_part_len(job_id, path) {
+                // No more bytes are coming for this job, so whatever is on disk
+                // is this part's final content. The assembly's own view is
+                // preferred where it has one; where it does not — a set that
+                // armed on the very last part's completion, which is when its
+                // topology first existed, can reach here before every file has
+                // been reconciled — the file's length on disk is just as final
+                // and just as true. Only a part with no file at all is
+                // genuinely incomplete.
+                let len = self
+                    .direct_unpack_known_part_len(job_id, path)
+                    .or_else(|| std::fs::metadata(path).ok().map(|meta| meta.len()));
+                match len {
                     Some(len) => {
                         if let Some(armed) =
                             self.direct_unpack.armed.get(&(job_id, set_name.clone()))
@@ -1204,10 +1215,24 @@ impl Pipeline {
                             armed.coverage.mark_part_complete(index);
                         }
                     }
-                    None => all_complete = false,
+                    None => unsettled.push(format!(
+                        "{} (part {index})",
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("<unnamed>")
+                    )),
                 }
             }
-            if !all_complete {
+            if !unsettled.is_empty() {
+                // Name them. A set killed at the end of its download used to say
+                // only that something was incomplete, which is the least useful
+                // half of what it knew.
+                warn!(
+                    job_id = job_id.0,
+                    set_name,
+                    unsettled = %unsettled.join(", "),
+                    "direct unpack has parts with no bytes at all after the download ended"
+                );
                 self.direct_unpack_abort_set(
                     job_id,
                     &set_name,
@@ -1397,7 +1422,9 @@ impl Pipeline {
                     .record_demotion(DemotionReason::RepairRewrote);
                 info!(
                     job_id = job_id.0,
-                    set_name, "repair rewrote a chased set; its outcome is tainted"
+                    set_name,
+                    reason = DemotionReason::RepairRewrote.as_str(),
+                    "direct unpack demoted — repair rewrote a chased set; its outcome is tainted"
                 );
             }
             return;
@@ -1417,11 +1444,17 @@ impl Pipeline {
             self.direct_unpack
                 .latched
                 .insert(key.clone(), DemotionReason::RepairRewrote.as_str());
+            // "direct unpack demoted" is the canonical phrase, and `reason` the
+            // canonical field: they are the only external evidence a demotion
+            // ever produced, and a demotion logged in any other words is one
+            // nothing downstream can see. This arm used to describe itself
+            // instead, so a correct taint read as a missing one.
             info!(
                 job_id = job_id.0,
                 set_name,
+                reason = DemotionReason::RepairRewrote.as_str(),
                 elapsed_ms = armed.started_at.elapsed().as_millis() as u64,
-                "repair rewrote a set being chased; the chase is aborted"
+                "direct unpack demoted — repair rewrote a set being chased; the chase is aborted"
             );
             self.direct_unpack.draining.push((key, armed));
         }
@@ -1509,11 +1542,34 @@ impl Pipeline {
     /// Whether the recovery set positively vouches for every byte this set's
     /// chase has consumed.
     fn direct_unpack_set_is_vouched(&self, job_id: JobId, set_name: &str) -> bool {
-        let Ok(paths) = self.sevenz_set_part_paths(job_id, set_name) else {
-            return false;
+        // Every `false` below names itself. This decision is the difference
+        // between a chase surviving a repair and being thrown away, it fires
+        // once per repaired set, and its inputs are spread across the topology,
+        // the assembly and the PAR2 runtime — so an unexplained refusal is a
+        // gate run spent bisecting. It is a per-set decision on a cold path;
+        // the logging costs nothing that matters.
+        let refuse = |reason: &str, part: Option<usize>| {
+            debug!(
+                job_id = job_id.0,
+                set_name, part, reason, "direct unpack cannot vouch this set against the repair"
+            );
+            false
+        };
+
+        let paths = match self.sevenz_set_part_paths(job_id, set_name) {
+            Ok(paths) => paths,
+            Err(error) => {
+                debug!(
+                    job_id = job_id.0,
+                    set_name,
+                    error = %error,
+                    "direct unpack cannot vouch this set against the repair"
+                );
+                return false;
+            }
         };
         if paths.is_empty() {
-            return false;
+            return refuse("the set resolved to no part paths", None);
         }
         let key = (job_id, set_name.to_string());
         let coverage = self
@@ -1528,16 +1584,27 @@ impl Pipeline {
 
         for (index, path) in paths.iter().enumerate() {
             let Some(file_id) = self.direct_unpack_file_id_for_part(job_id, path) else {
-                return false;
+                return refuse(
+                    "no job file matches this part's current filename",
+                    Some(index),
+                );
             };
             let Some(intact_prefix) = self.in_stream_intact_prefix(file_id) else {
-                return false;
+                return refuse(
+                    "the recovery set does not bind this part, so nothing vouches for it",
+                    Some(index),
+                );
             };
             let consumed = match &coverage {
                 Some(coverage) => coverage.consumed_high_water(index),
                 None => match self.direct_unpack_known_part_len(job_id, path) {
                     Some(len) => len,
-                    None => return false,
+                    None => {
+                        return refuse(
+                            "a finished chase read this part but its final length is unknown",
+                            Some(index),
+                        );
+                    }
                 },
             };
             if consumed > intact_prefix {
