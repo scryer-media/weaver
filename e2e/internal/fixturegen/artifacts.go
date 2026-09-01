@@ -313,6 +313,14 @@ func Artifacts() map[string]Artifact {
 	}
 
 	add(Artifact{
+		Name:       "direct-unpack-repair-source",
+		Files:      []string{"archive.7z"},
+		Toolchains: []string{SevenZipToolchain},
+		Notes:      "An 8 MiB PPMd 7z over derived bytes: the repair-resume fixture's source, sized and coded so decoding it outlasts downloading it.",
+		Build:      BuildDirectUnpackRepairSource,
+	})
+
+	add(Artifact{
 		Name: "par2-heavy-set",
 		Files: []string{"archive.rar", "archive.rar.par2", "archive.rar.vol00+01.par2", "archive.rar.vol01+02.par2",
 			"archive.rar.vol03+04.par2", "archive.rar.vol07+08.par2", "archive.rar.vol15+15.par2"},

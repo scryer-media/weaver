@@ -408,10 +408,14 @@ fn a_damage_cap_holds_the_frontier_below_the_damaged_byte() {
     // Everything up to the watermark is servable while nothing is known damaged.
     assert_eq!(coverage.readable_at(0, 0).expect("readable"), 80_000);
 
-    // The recovery set reports damage at 40_000: the frontier stops there even
-    // though the download has committed far past it.
+    // The recovery set reports damage at 40_000 and vouches for everything
+    // below it: the frontier stops there even though the download has committed
+    // far past it. The cap also gates the set, which is why the vouched prefix
+    // has to arrive with it — production computes both from the same verdicts.
     coverage.cap_at_damage(0, 40_000);
+    coverage.note_vouched_prefix(0, 40_000);
     assert!(coverage.has_damage_cap());
+    assert!(coverage.is_gated(), "damage gates the set");
     assert_eq!(coverage.readable_at(0, 0).expect("readable"), 40_000);
     assert_eq!(coverage.readable_at(0, 39_999).expect("readable"), 1);
 }
@@ -422,6 +426,7 @@ fn a_damage_cap_only_ever_lowers_the_frontier() {
     coverage.set_total_len(100_000);
     coverage.advance_watermark(0, 90_000);
 
+    coverage.note_vouched_prefix(0, 90_000);
     coverage.cap_at_damage(0, 50_000);
     // A later, higher damage report does not make the earlier one wrong.
     coverage.cap_at_damage(0, 70_000);
@@ -442,6 +447,7 @@ fn a_capped_part_parks_rather_than_reporting_end_of_part() {
     coverage.note_part_len(0, 60_000);
     coverage.advance_watermark(0, 60_000);
     coverage.cap_at_damage(0, 20_000);
+    coverage.note_vouched_prefix(0, 20_000);
     coverage.mark_part_complete(0);
 
     let paths = fixture.paths.clone();
@@ -522,6 +528,7 @@ fn abort_unblocks_a_reader_parked_under_a_damage_cap() {
     // Damage known: the frontier stops at 10_000 even though the part is
     // complete and every byte is on disk.
     coverage.cap_at_damage(0, 10_000);
+    coverage.note_vouched_prefix(0, 10_000);
 
     let paths = fixture.paths.clone();
     let reader_coverage = std::sync::Arc::clone(&coverage);
@@ -613,8 +620,10 @@ fn a_parked_chase_resumes_over_repaired_bytes_and_reads_the_whole_stream() {
     coverage.note_part_len(0, 80_000);
     coverage.advance_watermark(0, 80_000);
     coverage.mark_part_complete(0);
-    // The grid reports damage at 40_000, so the chase is held below it.
+    // The grid reports damage at 40_000 and vouches for the run below it, so
+    // the chase is held exactly there.
     coverage.cap_at_damage(0, 40_000);
+    coverage.note_vouched_prefix(0, 40_000);
 
     let paths = fixture.paths.clone();
     let reader_coverage = std::sync::Arc::clone(&coverage);
@@ -644,5 +653,221 @@ fn a_parked_chase_resumes_over_repaired_bytes_and_reads_the_whole_stream() {
         worker.join().expect("reader thread"),
         repaired,
         "the resumed chase must deliver the repaired bytes end to end"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gate-on-first-damage
+// ---------------------------------------------------------------------------
+
+/// A clean set pays nothing for gating: no verdict, no gate, and the frontier
+/// is exactly the download's own.
+#[test]
+fn an_ungated_set_serves_everything_the_download_committed() {
+    let coverage = SetCoverage::new(1);
+    coverage.set_total_len(100_000);
+    coverage.advance_watermark(0, 80_000);
+
+    assert!(!coverage.is_gated());
+    assert_eq!(coverage.readable_at(0, 0).expect("readable"), 80_000);
+    // A vouched prefix nobody asked for changes nothing while ungated.
+    coverage.note_vouched_prefix(0, 1_024);
+    assert_eq!(coverage.readable_at(0, 0).expect("readable"), 80_000);
+}
+
+/// Damage anywhere gates the whole set — including the parts the chase has not
+/// reached, which is the point: their unverified bytes stop being served before
+/// the chase can race into them.
+#[test]
+fn damage_in_one_part_gates_every_other_part() {
+    let coverage = SetCoverage::new(3);
+    coverage.set_total_len(300_000);
+    for index in 0..3 {
+        coverage.advance_watermark(index, 100_000);
+    }
+    assert_eq!(coverage.readable_at(2, 0).expect("readable"), 100_000);
+
+    // Damage lands in part 0. Part 2 is untouched by it and entirely committed,
+    // but nothing has vouched for it, so it now serves nothing new.
+    coverage.cap_at_damage(0, 40_000);
+    coverage.note_vouched_prefix(0, 40_000);
+
+    assert!(coverage.is_gated());
+    assert_eq!(
+        coverage.readable_at(0, 0).expect("readable"),
+        40_000,
+        "the damaged part serves its vouched run"
+    );
+    // Part 2 is asserted through its state rather than by reading it: with
+    // nothing vouched its frontier is zero, so any read there parks, and a test
+    // that called one would hang rather than fail.
+    assert_eq!(
+        coverage.part_progress(2).expect("in range").vouched_prefix,
+        None,
+        "an untouched part has vouched for nothing and so serves nothing new"
+    );
+}
+
+/// A prefix banked while the set was still clean pays out when it gates. A
+/// part that completes before the first damage lands gets no later refresh —
+/// its commits are over — so the prefix noted at its completion is the only
+/// evidence it will ever have, and it must keep the part serving fully.
+#[test]
+fn a_prefix_banked_before_gating_serves_fully_once_the_set_gates() {
+    let coverage = SetCoverage::new(2);
+    coverage.set_total_len(200_000);
+
+    // Part 0 completes clean while the set is ungated; its full length is
+    // vouched at completion, exactly as the wiring does.
+    coverage.advance_watermark(0, 100_000);
+    coverage.note_part_len(0, 100_000);
+    coverage.mark_part_complete(0);
+    coverage.note_vouched_prefix(0, 100_000);
+    assert!(!coverage.is_gated());
+
+    // Damage then lands in part 1 and gates the set.
+    coverage.advance_watermark(1, 100_000);
+    coverage.cap_at_damage(1, 30_000);
+    coverage.note_vouched_prefix(1, 30_000);
+    assert!(coverage.is_gated());
+
+    // The clean, complete, fully vouched part still serves to its end — and
+    // reports end-of-part there rather than parking.
+    assert_eq!(coverage.readable_at(0, 0).expect("readable"), 100_000);
+    assert_eq!(coverage.readable_at(0, 100_000).expect("readable"), 0);
+}
+
+/// A gated part serves exactly its vouched prefix, and grows with it.
+#[test]
+fn a_gated_part_serves_its_vouched_prefix_and_grows_with_it() {
+    let coverage = SetCoverage::new(2);
+    coverage.set_total_len(200_000);
+    coverage.advance_watermark(0, 100_000);
+    coverage.advance_watermark(1, 100_000);
+    coverage.cap_at_damage(1, 50_000);
+    coverage.note_vouched_prefix(1, 50_000);
+
+    // Part 0 is fully committed but unvouched, so its frontier is zero and a
+    // read there would park. Claims arrive for it, a block at a time.
+    assert_eq!(
+        coverage.part_progress(0).expect("in range").vouched_prefix,
+        None
+    );
+    coverage.note_vouched_prefix(0, 65_536);
+    assert_eq!(coverage.readable_at(0, 0).expect("readable"), 65_536);
+    coverage.note_vouched_prefix(0, 100_000);
+    assert_eq!(coverage.readable_at(0, 0).expect("readable"), 100_000);
+
+    // Monotone: a stale, lower claim cannot retract a proved prefix.
+    coverage.note_vouched_prefix(0, 1_000);
+    assert_eq!(coverage.readable_at(0, 0).expect("readable"), 100_000);
+}
+
+/// A complete part whose blocks are all Intact serves fully even while gated —
+/// the tail probe has to keep working on an undamaged last part.
+#[test]
+fn a_fully_vouched_complete_part_serves_to_its_end_while_gated() {
+    let coverage = SetCoverage::new(2);
+    coverage.set_total_len(150_000);
+    coverage.advance_watermark(0, 50_000);
+    coverage.cap_at_damage(0, 10_000);
+    coverage.note_vouched_prefix(0, 10_000);
+
+    coverage.advance_watermark(1, 100_000);
+    coverage.note_part_len(1, 100_000);
+    coverage.mark_part_complete(1);
+    coverage.note_vouched_prefix(1, 100_000);
+
+    assert!(coverage.is_gated());
+    assert_eq!(coverage.readable_at(1, 0).expect("readable"), 100_000);
+    // And it reports end-of-part rather than parking, because nothing holds it.
+    assert_eq!(coverage.readable_at(1, 100_000).expect("readable"), 0);
+}
+
+/// A gated part that is complete but only partly vouched must PARK at its
+/// vouched edge, not report end-of-part — the rest is what repair will rewrite.
+#[test]
+fn a_gated_complete_but_unvouched_part_parks_at_its_edge() {
+    let fixture = split_fixture(payload(60_000, 91), &[]);
+    let coverage = std::sync::Arc::new(SetCoverage::new(1));
+    coverage.set_total_len(60_000);
+    coverage.note_part_len(0, 60_000);
+    coverage.advance_watermark(0, 60_000);
+    coverage.mark_part_complete(0);
+    coverage.cap_at_damage(0, 30_000);
+    coverage.note_vouched_prefix(0, 30_000);
+
+    let paths = fixture.paths.clone();
+    let reader_coverage = std::sync::Arc::clone(&coverage);
+    let worker = thread::spawn(move || {
+        let mut reader = GatedSplitReader::open(&paths, reader_coverage).expect("open reader");
+        reader
+            .seek(SeekFrom::Start(30_000))
+            .expect("seek to the edge");
+        let mut buf = [0u8; 256];
+        reader.read_exact(&mut buf).map(|()| buf)
+    });
+
+    thread::sleep(SETTLE);
+    assert!(
+        coverage.park_count() > 0,
+        "a complete-but-unvouched part must park at its vouched edge"
+    );
+
+    coverage.release_after_repair(0, 60_000);
+    let read = worker.join().expect("reader thread").expect("read");
+    assert_eq!(read.as_slice(), &fixture.bytes[30_000..30_256]);
+}
+
+/// Release lifts gating with the caps: post-repair bytes are verified by the
+/// repair itself, so the vouched prefixes have nothing left to say.
+#[test]
+fn releasing_after_repair_lifts_gating_as_well_as_the_cap() {
+    let coverage = SetCoverage::new(1);
+    coverage.set_total_len(50_000);
+    coverage.advance_watermark(0, 30_000);
+    coverage.cap_at_damage(0, 10_000);
+    coverage.note_vouched_prefix(0, 10_000);
+    assert!(coverage.is_gated());
+
+    coverage.release_after_repair(0, 50_000);
+
+    assert!(!coverage.is_gated(), "repair verified what it wrote");
+    assert!(!coverage.has_damage_cap());
+    assert_eq!(coverage.readable_at(0, 0).expect("readable"), 50_000);
+}
+
+/// A gated chase parked on evidence that never arrives must stay reachable by
+/// abort — otherwise the blocking thread waits for ever.
+#[test]
+fn abort_unblocks_a_reader_parked_under_the_gate() {
+    let fixture = split_fixture(payload(50_000, 93), &[]);
+    let coverage = std::sync::Arc::new(SetCoverage::new(1));
+    coverage.set_total_len(50_000);
+    coverage.note_part_len(0, 50_000);
+    coverage.advance_watermark(0, 50_000);
+    coverage.mark_part_complete(0);
+    // Gated with nothing vouched: the frontier is zero and no claim is coming.
+    coverage.cap_at_damage(0, 0);
+
+    let paths = fixture.paths.clone();
+    let reader_coverage = std::sync::Arc::clone(&coverage);
+    let worker = thread::spawn(move || {
+        let mut reader = GatedSplitReader::open(&paths, reader_coverage).expect("open reader");
+        let mut buf = [0u8; 128];
+        reader
+            .read_exact(&mut buf)
+            .expect_err("aborted under the gate")
+    });
+
+    thread::sleep(SETTLE);
+    assert!(coverage.park_count() > 0, "the reader must be parked");
+
+    coverage.abort("gated chase stalled: no vouching evidence after repair");
+
+    let error = worker.join().expect("reader thread");
+    assert!(
+        error.to_string().contains("gated chase stalled"),
+        "a gated park must be reachable by abort: {error}"
     );
 }

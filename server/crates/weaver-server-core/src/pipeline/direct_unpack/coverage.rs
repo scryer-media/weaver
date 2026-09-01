@@ -47,6 +47,14 @@ pub struct PartProgress {
     /// `None` until damage is known, which is why this costs a clean job
     /// nothing: no damage, no cap, and the frontier stays the download's own.
     pub damage_cap: Option<u64>,
+    /// How far the recovery set has positively vouched for this part, as a
+    /// contiguous run of Intact blocks from its start.
+    ///
+    /// Only consulted once the set is gated. `None` means the grid has claimed
+    /// nothing here, which under gating serves nothing new — unclaimed is not
+    /// the same as intact, and a set already known to carry damage does not get
+    /// the benefit of the doubt about the parts nobody has checked.
+    pub vouched_prefix: Option<u64>,
 }
 
 /// Where an archive offset sits relative to one part.
@@ -67,16 +75,44 @@ pub enum PositionInPart {
 impl PartProgress {
     /// How far a reader may go: the committed frontier, held back to just
     /// below any known damage.
-    fn servable(&self) -> u64 {
-        match self.damage_cap {
-            Some(cap) => self.watermark.min(cap),
-            None => self.watermark,
+    fn servable(&self, gated: bool) -> u64 {
+        let mut frontier = self.watermark;
+        if let Some(cap) = self.damage_cap {
+            frontier = frontier.min(cap);
         }
+        if gated {
+            // Once the set is known to carry damage, only what the recovery set
+            // has actually vouched for may be served. A part it has not claimed
+            // contributes nothing, so the chase parks there rather than racing
+            // ahead into bytes a later verdict might condemn.
+            frontier = frontier.min(self.vouched_prefix.unwrap_or(0));
+        }
+        frontier
+    }
+
+    /// Whether something other than the download is holding this part's
+    /// frontier back, so a complete part is not yet at its end.
+    fn held_back(&self, gated: bool) -> bool {
+        if self.damage_cap.is_some() {
+            return true;
+        }
+        if !gated {
+            return false;
+        }
+        let settled = self.len.unwrap_or(self.watermark);
+        self.servable(true) < settled
     }
 }
 
 #[derive(Debug)]
 struct CoverageState {
+    /// Set the moment the first Damaged verdict lands anywhere in this set.
+    ///
+    /// Before that the frontier is exactly what it always was — a clean job
+    /// never reads this field's consequences, which is the whole point. After
+    /// it, unverified bytes stop being served, so damage in a part the chase
+    /// has not reached yet is parked rather than raced.
+    gated: bool,
     parts: Vec<PartProgress>,
     /// Authoritative archive length, derived from the signature header.
     total_len: Option<u64>,
@@ -103,6 +139,7 @@ impl SetCoverage {
     pub fn new(part_count: usize) -> Self {
         Self {
             state: Mutex::new(CoverageState {
+                gated: false,
                 parts: vec![PartProgress::default(); part_count],
                 total_len: None,
                 aborted: None,
@@ -254,6 +291,35 @@ impl SetCoverage {
             .unwrap_or(0)
     }
 
+    /// Whether the set is serving only vouched bytes.
+    ///
+    /// Flipped by the first Damaged verdict anywhere in the set, inside
+    /// [`Self::cap_at_damage`]. It is one way — a set known to carry damage
+    /// does not become trustworthy again because a later block happened to
+    /// check out — until repair rewrites it and
+    /// [`Self::release_after_repair`] lifts it.
+    pub fn is_gated(&self) -> bool {
+        self.lock().gated
+    }
+
+    /// Record how far the recovery set vouches for a part.
+    ///
+    /// Monotone upward: claims accumulate as articles land, and a prefix that
+    /// has been proved does not become unproved.
+    pub fn note_vouched_prefix(&self, index: usize, prefix: u64) {
+        let mut state = self.lock();
+        let Some(part) = state.parts.get_mut(index) else {
+            debug_assert!(false, "part index {index} out of range");
+            return;
+        };
+        if part.vouched_prefix.is_some_and(|current| prefix <= current) {
+            return;
+        }
+        part.vouched_prefix = Some(prefix);
+        drop(state);
+        self.advanced.notify_all();
+    }
+
     /// Hold a part's servable frontier below a byte the recovery data says is
     /// damaged.
     ///
@@ -275,6 +341,10 @@ impl SetCoverage {
             return;
         }
         part.damage_cap = Some(capped);
+        // The first damage anywhere in the set is what flips it gated: from
+        // here nothing unvouched is served, so damage in a part the chase has
+        // not reached is parked instead of raced.
+        state.gated = true;
         drop(state);
         // A cap can only ever *lower* the frontier, so nobody is unblocked by
         // it — but a reader parked inside the newly-capped range has to be
@@ -322,12 +392,16 @@ impl SetCoverage {
         }
 
         part.damage_cap = None;
+        part.vouched_prefix = None;
         part.len = Some(len);
         // Exactly `len`, never `max`: a shrunk part's old watermark describes
         // bytes the repaired file does not have, and leaving it would send the
         // reader off the end.
         part.watermark = len;
         part.complete = true;
+        // Repair verified what it wrote, so the gate has nothing left to add:
+        // the bytes on disk are now the recovery set's own answer.
+        state.gated = false;
         Self::reconcile_total_when_settled(&mut state);
         drop(state);
         self.advanced.notify_all();
@@ -428,7 +502,7 @@ impl SetCoverage {
             if part.len.is_some_and(|len| offset >= len) {
                 return Ok(0);
             }
-            let servable = part.servable();
+            let servable = part.servable(state.gated);
             if offset < servable {
                 return Ok(servable - offset);
             }
@@ -436,7 +510,7 @@ impl SetCoverage {
             // reader is concerned, however complete the download believes it
             // is: repair is still to come, and the bytes above the cap are
             // exactly the ones it will rewrite.
-            if part.complete && part.damage_cap.is_none() {
+            if part.complete && !part.held_back(state.gated) {
                 return Ok(0);
             }
             state = self.park(state);
@@ -463,7 +537,7 @@ impl SetCoverage {
             }
             let part = Self::part_at(&state, index)?;
 
-            let servable = part.servable();
+            let servable = part.servable(state.gated);
             if offset < servable {
                 return Ok(PositionInPart::Inside {
                     available: servable - offset,
@@ -475,13 +549,13 @@ impl SetCoverage {
                 }
                 // Inside the declared length but past the watermark: the bytes
                 // are still coming, unless the part has stopped growing.
-                if part.complete && part.damage_cap.is_none() {
+                if part.complete && !part.held_back(state.gated) {
                     return Err(io::Error::other(format!(
                         "part {index} stopped at {} bytes, short of its declared length {len}",
                         part.watermark
                     )));
                 }
-            } else if part.complete && part.damage_cap.is_none() {
+            } else if part.complete && !part.held_back(state.gated) {
                 // A complete part's length is its watermark, so this offset is
                 // past the end of it.
                 return Ok(PositionInPart::Beyond {
