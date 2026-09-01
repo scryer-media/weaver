@@ -35,8 +35,13 @@ type fullPhaseContext struct {
 	RuntimePortsFile string
 	RuntimePorts     runtimePortState
 	LogTail          *lineTail
-	Cleaned          bool
-	cleanMu          sync.Mutex
+	// SeedBootstrap marks the throwaway runtime that *creates* the pre-seeded
+	// NNTP images. It runs against the base article store by definition —
+	// seeding is what puts the corpus into an image — so it is the one context
+	// that must never be pinned to one.
+	SeedBootstrap bool
+	Cleaned       bool
+	cleanMu       sync.Mutex
 }
 
 type fullPhaseDefinition struct {
@@ -1010,18 +1015,19 @@ func prepareFullPreseededRuntimes(
 		if err != nil {
 			return fmt.Errorf("prepare cache image identity for %s: %w", profile, err)
 		}
-		// Pin what this run captured. The identity is a fingerprint over the
-		// corpus files, and anything that rewrites one of them between here and
-		// phase launch would otherwise make the phase recompute a different
-		// name, find no such image, and quietly fall back to the base store —
-		// serving articles that do not match the NZBs it is about to run.
-		recordPreseededImageSet(profile, set)
-
 		fixturesRoot := filepath.Join(tempRoot, "preseeded", profile, "fixtures")
 		if set.ready() {
 			if err := restoreSeededNZBBundle(set.Primary, fixturesRoot); err != nil {
 				return fmt.Errorf("restore pre-seeded NZBs for %s: %w", profile, err)
 			}
+			// Pin only images that exist. The identity is a fingerprint over the
+			// corpus files, and anything that rewrites one of them between here
+			// and phase launch would otherwise make the phase recompute a
+			// different name, find no such image, and quietly fall back to the
+			// base store — serving articles that do not match the NZBs it is
+			// about to run. Recording before this point would pin a name that
+			// was never built, which is a promise nothing can keep.
+			recordPreseededImageSet(profile, set)
 			dashboard.updateSeed("pre-seeded "+profile, progressEvent{
 				Kind:    "seed_done",
 				Current: len(slugs),
@@ -1058,6 +1064,8 @@ func prepareFullPreseededRuntimes(
 				dashboard.setSeedDetail("fail", "pre-seed "+profile+": "+err.Error())
 				return fmt.Errorf("capture NNTP images for %s: %w", profile, err)
 			}
+			// Captured: now the pin names something that exists.
+			recordPreseededImageSet(profile, set)
 			if err := cleanupFullPhaseContext(bootstrap); err != nil {
 				return fmt.Errorf("clean up pre-seed runtime for %s: %w", profile, err)
 			}
@@ -1098,6 +1106,7 @@ func newFullPreseedBootstrap(tempRoot, profile string, source *fullPhaseContext,
 		RuntimePorts:     source.RuntimePorts,
 		LogTail:          &lineTail{limit: 120},
 		ExtraEnv:         source.ExtraEnv,
+		SeedBootstrap:    true,
 	}
 	if err := saveRuntimePortState(bootstrap.RuntimePortsFile, bootstrap.RuntimePorts); err != nil {
 		return nil, fmt.Errorf("write pre-seed runtime ports for %s: %w", profile, err)
@@ -1358,7 +1367,11 @@ func (p *fullPhaseContext) env() map[string]string {
 	if seedJobs, ok := fullSeedJobsOverride(); ok {
 		env["E2E_SEED_JOBS"] = seedJobs
 	}
-	if nntpSeedImageCacheEnabled() && strings.TrimSpace(p.SeedProfile) != "" {
+	// The seeding bootstrap is deliberately exempt: it runs against the base
+	// article store because seeding is what bakes the corpus into an image, so
+	// pinning it to a pre-seeded one would either fail loudly on a cold cache
+	// or seed into an image that already claims to be seeded.
+	if nntpSeedImageCacheEnabled() && strings.TrimSpace(p.SeedProfile) != "" && !p.SeedBootstrap {
 		if set, ok := preseededImageSet(p.SeedProfile); ok {
 			// Captured this run: the phase must use exactly that store. A miss
 			// here means the image vanished or its identity moved underneath

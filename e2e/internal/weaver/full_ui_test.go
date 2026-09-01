@@ -698,3 +698,87 @@ func TestFullPhasesHaveIsolatedPortsAndProfiles(t *testing.T) {
 		}
 	}
 }
+
+// The seeding bootstrap runs against the base article store — seeding is what
+// bakes the corpus into an image — so building its environment must never take
+// the pinned-image branch. Getting this wrong is not a wrong image: it is a
+// `log.Fatalf` seconds into a cold run, which is how it escaped the first time.
+func TestSeedBootstrapEnvIsExemptFromTheImagePin(t *testing.T) {
+	profile := "seed-bootstrap-exemption"
+	set := nntpSeedImageSet{
+		Profile:     profile,
+		Fingerprint: "deadbeef",
+		Primary:     "weaver-e2e-nntp:does-not-exist-primary",
+		Backup:      "weaver-e2e-nntp:does-not-exist-backup",
+	}
+	// A pin naming images that do not exist is exactly the cold-cache shape the
+	// loud failure is for. The bootstrap must not reach it.
+	recordPreseededImageSet(profile, set)
+	t.Cleanup(func() {
+		preseededImageSetsMu.Lock()
+		delete(preseededImageSets, profile)
+		preseededImageSetsMu.Unlock()
+	})
+
+	bootstrap := &fullPhaseContext{
+		Command:          "seed-all",
+		Project:          "test-project-preseed",
+		SeedProfile:      profile,
+		FixturesDir:      "/tmp/fixtures",
+		RunDir:           "/tmp/run",
+		RuntimePortsFile: "/tmp/runtime-ports.json",
+		SeedBootstrap:    true,
+	}
+
+	env := bootstrap.env()
+
+	if got, ok := env["E2E_NNTP_IMAGE"]; ok {
+		t.Fatalf("seeding bootstrap must not be pinned to a pre-seeded image, got %q", got)
+	}
+	if got, ok := env["E2E_NNTP2_IMAGE"]; ok {
+		t.Fatalf("seeding bootstrap must not be pinned to a backup image, got %q", got)
+	}
+}
+
+// The other half of the same ordering rule: nothing is recorded until the
+// images exist, so an unrecorded profile must reach the recompute branch rather
+// than fail against a pin that was never built.
+//
+// The assertion is that `env()` *returns*. The failure mode being guarded
+// against is `log.Fatalf`, which takes the process with it — so arriving at the
+// line after the call is the whole proof, and there is nothing further to
+// compare.
+//
+// Deliberately no assertion about which image the recompute chose. That branch
+// consults the real docker store: on a machine holding corpus images for the
+// current fingerprint — the normal state between runs — `ready()` is true and
+// pinning the image is exactly the cross-run cache hit worth keeping. Asserting
+// its absence would pass on a cold machine and fail on a warm one.
+func TestUnrecordedProfileFallsThroughToRecompute(t *testing.T) {
+	// A real profile name: resolving an unknown one is itself fatal, so the
+	// thing under test has to be "recorded or not", not "valid or not".
+	profile := "chaos"
+	if _, ok := preseededImageSet(profile); ok {
+		t.Fatalf("profile %q should not be recorded", profile)
+	}
+
+	phase := &fullPhaseContext{
+		Command:          "test-all",
+		Project:          "test-project",
+		SeedProfile:      profile,
+		FixturesDir:      "/tmp/fixtures",
+		RunDir:           "/tmp/run",
+		RuntimePortsFile: "/tmp/runtime-ports.json",
+	}
+
+	env := phase.env()
+
+	// Whatever the store held, the two image names travel together: the
+	// recompute branch sets both or neither, and half a pin would point the
+	// primary and backup at different corpora.
+	_, primary := env["E2E_NNTP_IMAGE"]
+	_, backup := env["E2E_NNTP2_IMAGE"]
+	if primary != backup {
+		t.Fatalf("image env must be set as a pair, got primary=%v backup=%v", primary, backup)
+	}
+}
