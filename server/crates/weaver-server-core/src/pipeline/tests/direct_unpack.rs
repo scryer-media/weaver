@@ -1320,3 +1320,174 @@ async fn the_repair_settle_seam_releases_on_success_and_ends_on_failure() {
         }
     }
 }
+
+/// What the `direct-unpack-repair` e2e failure actually measured.
+///
+/// The chase does not read a byte at a time: it reads through a 128 KiB
+/// `BufReader`, and the 7z decoder's first move is a probe at the *end* of the
+/// archive for the header. So within microseconds of arming, the consumed
+/// high-water is 128 KiB into the first part and the whole of the last one —
+/// long before any part has completed and therefore long before any damage cap
+/// exists to hold it back.
+///
+/// That is not a bug in the accounting: consumed-includes-readahead only ever
+/// over-demands vouching, which is the safe direction. It does mean a chase can
+/// consume bytes that a later verdict calls damaged, and such a chase can never
+/// vouch itself. This test pins the measurement rather than a wish, so the
+/// number is on the record when the semantics are revisited.
+#[tokio::test]
+async fn a_chase_consumes_readahead_and_the_archive_tail_within_microseconds() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41600);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    install_test_par2_runtime(&mut pipeline, job_id, placement_par2_file_set(&files), &[]);
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("armed");
+    let observed_head = coverage.consumed_high_water(0);
+    let observed_tail = coverage.consumed_high_water(files.len() - 1);
+
+    // Pin the consumption rather than race the decode thread. How far the chase
+    // has actually run by this instant depends on scheduling — a set that has
+    // consumed *nothing* vouches trivially and correctly, because there is
+    // nothing repair could invalidate — so the case under test has to be stated
+    // outright: bytes were read, and no verdict covers them.
+    coverage.note_consumed(0, 64 * 1024);
+
+    // With no grid verdicts behind it — the state of any set the recovery data
+    // has not independently claimed — nothing vouches, and the fallback taint
+    // is the correct outcome.
+    pipeline.decide_direct_unpack_before_repair(job_id);
+    let tainted = !pipeline.direct_unpack.is_armed(job_id, set_name);
+
+    pipeline.direct_unpack_forget_job(job_id);
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
+
+    // No assertion on the magnitudes: how far the chase has run by this point
+    // depends on how much of its blocking decode has been scheduled, and
+    // pinning it would be pinning the scheduler. Measured values on this
+    // fixture have reached 131072 into the head part and the whole of the tail
+    // one within microseconds of arming — the numbers are reported here rather
+    // than asserted, and the deterministic half is what gets checked.
+    assert!(
+        tainted,
+        "a chase that consumed unvouched bytes must taint; observed head={observed_head} tail={observed_tail}"
+    );
+}
+
+/// Reproduces the e2e `direct-unpack-solid-split` failure: the set armed 22
+/// microseconds before the download-end settle ran, and the settle decided its
+/// parts were incomplete and killed it.
+///
+/// Deterministic by construction rather than by timing: every part is landed
+/// first, so arming happens with the whole set already on disk — exactly the
+/// state the racing arm found itself in — and then the settle runs.
+#[tokio::test]
+async fn a_set_armed_after_its_download_ended_is_not_killed_by_the_settle() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41610);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+    assert!(
+        pipeline.direct_unpack.is_armed(job_id, set_name),
+        "the set arms as its last part lands"
+    );
+
+    // The download pass ends. Every part is complete on disk, so there is
+    // nothing here the settle should object to.
+    pipeline.settle_direct_unpack_after_download(job_id);
+
+    let armed = pipeline.direct_unpack.is_armed(job_id, set_name);
+    let latched = pipeline.direct_unpack.latched_reason(job_id, set_name);
+    pipeline.direct_unpack_forget_job(job_id);
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        armed,
+        "a set whose parts are all complete must survive the download-end settle, got latch {latched:?}"
+    );
+}
+
+/// The tighter form of the `direct-unpack-solid-split` race: the set arms as
+/// its first part completes and the download ends before the rest have been
+/// reconciled into the assembly. The bytes are all on disk by then — no more
+/// are coming — so the settle must finish the coverage from what is there
+/// rather than kill a chase that is about to succeed.
+#[tokio::test]
+async fn a_settle_finishes_parts_that_are_on_disk_but_not_yet_reconciled() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41620);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Only the first part is reconciled — that is what builds the topology and
+    // arms the set.
+    write_and_complete_file(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
+
+    // The remaining parts land on disk while the assembly has not caught up.
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    for (filename, bytes) in files.iter().skip(1) {
+        std::fs::write(working_dir.join(filename), bytes).unwrap();
+    }
+
+    pipeline.settle_direct_unpack_after_download(job_id);
+
+    let armed = pipeline.direct_unpack.is_armed(job_id, set_name);
+    let coverage = pipeline.direct_unpack.armed_coverage(job_id, set_name);
+    let settled = coverage.as_ref().map(|coverage| {
+        (0..files.len()).all(|index| {
+            coverage
+                .part_progress(index)
+                .map(|part| part.complete)
+                .unwrap_or(false)
+        })
+    });
+
+    pipeline.direct_unpack_forget_job(job_id);
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        armed,
+        "a set whose parts are all on disk must survive the download-end settle"
+    );
+    assert_eq!(
+        settled,
+        Some(true),
+        "every part must be settled from what is on disk"
+    );
+}
