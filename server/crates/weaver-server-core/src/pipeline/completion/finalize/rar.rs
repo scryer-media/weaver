@@ -19,6 +19,9 @@ pub(crate) enum ArchiveSetRetirement {
     /// Live file identities still classify into the set, so its names remain
     /// this job's own answer for those bytes.
     StillReferenced,
+    /// The set's topology is not a RAR one, so nothing this function can measure
+    /// says anything about whether it is in use. Refused rather than retired.
+    NotRar,
     /// The set was actually torn down through
     /// [`Pipeline::clear_archive_set_for_source_retry`].
     Retired,
@@ -153,6 +156,24 @@ impl Pipeline {
         set_name: &str,
     ) -> ArchiveSetRetirement {
         let set_key = (job_id, set_name.to_string());
+
+        // This function's whole vocabulary is RAR: `busy` reads `rar_sets`, and
+        // `still_referenced` below counts only files classified `RarVolume`. A
+        // non-RAR topology can satisfy neither, so it would fall through both
+        // tests and be torn down — not because anything decided it was
+        // finished, but because nothing here can express the idea that it is
+        // still in use. That is a category error, and it is how every 7z
+        // topology in a job was being deleted on each PAR2 registration.
+        if let Some(archive_type) = self
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.assembly.archive_topology_for(set_name))
+            .map(|topology| topology.archive_type)
+            && !matches!(archive_type, crate::jobs::assembly::ArchiveType::Rar)
+        {
+            return ArchiveSetRetirement::NotRar;
+        }
+
         let busy = self
             .rar_sets
             .get(&set_key)

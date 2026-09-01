@@ -2981,6 +2981,28 @@ pub struct Pipeline {
     pub(super) extraction_limits: Arc<ExtractionLimits>,
     /// One decoder-memory allowance shared by every extraction job.
     pub(super) process_memory_budget: Arc<ProcessMemoryBudget>,
+    /// The post-processing pool again, for direct-unpack chases only.
+    ///
+    /// A chase runs its decode inside `install`, which occupies one worker
+    /// thread for as long as the closure runs — and a chase's closure parks,
+    /// sometimes for the whole of a download and a repair. Sharing `pp_pool`
+    /// meant enough parked chases exhausted the post-processing pool and no
+    /// extraction of any kind could start. Chases contend only with each other
+    /// here.
+    pub(super) chase_pool: Arc<rayon::ThreadPool>,
+    /// The same allowance again, for direct-unpack chases only.
+    ///
+    /// A chase takes its permit before it opens the archive and holds it until
+    /// it returns — across every park the gated reader does waiting on the
+    /// download it is chasing. Drawing that from the shared pool meant one
+    /// parked chase stopped every other 7z extraction in the process, including
+    /// the conventional extractions that were the job's actual critical path.
+    ///
+    /// Chases share this pool with each other, so at most one chase holds
+    /// decoder memory at a time no matter how many are armed. The cost is that
+    /// worst-case decoder memory is now two allowances rather than one: one
+    /// speculative chase plus one real extraction.
+    pub(super) direct_unpack_process_memory: Arc<ProcessMemoryBudget>,
     /// One shared output budget per job, retained across nested extraction layers.
     pub(super) extraction_budgets: HashMap<JobId, Arc<JobExtractionBudget>>,
     /// A job's normalized unacceptable-extension policy is fixed at its first

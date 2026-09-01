@@ -73,6 +73,10 @@ pub enum RefusalReason {
     LengthOverflow,
     /// The chase could not get a staging directory or an extraction budget.
     BudgetUnavailable,
+    /// Every chase worker is already occupied. Admitting another would arm a
+    /// chase that cannot start, and extraction awaits a started chase without a
+    /// deadline.
+    NoChaseCapacity,
 }
 
 impl RefusalReason {
@@ -84,9 +88,14 @@ impl RefusalReason {
             Self::EndHeaderTooLarge => "end_header_too_large",
             Self::LengthOverflow => "length_overflow",
             Self::BudgetUnavailable => "budget_unavailable",
+            Self::NoChaseCapacity => "no_chase_capacity",
         }
     }
 }
+
+/// How long a worker may keep running after its set was aborted before the drain
+/// reap says so. Generous: a decode that is mid-member finishes on its own.
+const DRAINING_WORKER_WARN_AFTER: Duration = Duration::from_secs(30);
 
 /// Which half of the end-of-download settle is running.
 ///
@@ -194,6 +203,7 @@ pub struct DirectUnpackCounters {
     pub refused_end_header_too_large: u64,
     pub refused_length_overflow: u64,
     pub refused_budget_unavailable: u64,
+    pub refused_no_chase_capacity: u64,
     pub completed: u64,
     pub demoted_download_ended: u64,
     pub demoted_part_unreadable: u64,
@@ -230,6 +240,7 @@ impl DirectUnpackCounters {
             RefusalReason::EndHeaderTooLarge => self.refused_end_header_too_large += 1,
             RefusalReason::LengthOverflow => self.refused_length_overflow += 1,
             RefusalReason::BudgetUnavailable => self.refused_budget_unavailable += 1,
+            RefusalReason::NoChaseCapacity => self.refused_no_chase_capacity += 1,
         }
     }
 
@@ -252,6 +263,11 @@ struct ArmedSet {
     staging_dir: PathBuf,
     handle: tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>>,
     started_at: Instant,
+    /// When this set was aborted, for the zombie check in the drain reap.
+    aborted_at: Option<Instant>,
+    /// Whether the zombie warning has already been emitted for this worker, so
+    /// a worker that never exits says so once rather than every loop turn.
+    zombie_announced: bool,
     /// The chase's own byte counters, detached from the job's phase display.
     /// Consumption copies these into the real phase so the Extracting bar shows
     /// the work that actually happened, attributed exactly once.
@@ -265,6 +281,37 @@ pub(in crate::pipeline) struct PendingChase {
         tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>>,
     pub(in crate::pipeline) staging_dir: PathBuf,
     pub(in crate::pipeline) counters: Arc<crate::jobs::PhaseCounters>,
+    /// The set's coverage, so the awaiting side can end the chase if it does not
+    /// finish in time rather than waiting on it forever.
+    pub(in crate::pipeline) coverage: Arc<SetCoverage>,
+    pub(in crate::pipeline) set_name: String,
+}
+
+/// How long consumption waits for a chase that has not finished.
+///
+/// Minutes, not seconds: every part is complete by the time this is reached, so
+/// the chase is finishing at disk speed, and a legitimate park through a large
+/// repair is normal. This is not a performance bound — it is the difference
+/// between a wedged job and a warning line, because the await used to have no
+/// deadline at all and a chase that never exits made extraction never return.
+pub(in crate::pipeline) const PENDING_CHASE_DEADLINE: Duration = Duration::from_secs(300);
+
+/// The deadline actually applied, so a test can drive the timeout path without
+/// waiting five minutes for it. Production always reads
+/// [`PENDING_CHASE_DEADLINE`].
+#[cfg(test)]
+pub(in crate::pipeline) static PENDING_CHASE_DEADLINE_OVERRIDE: std::sync::Mutex<Option<Duration>> =
+    std::sync::Mutex::new(None);
+
+pub(in crate::pipeline) fn pending_chase_deadline() -> Duration {
+    #[cfg(test)]
+    if let Some(override_value) = *PENDING_CHASE_DEADLINE_OVERRIDE
+        .lock()
+        .expect("pending chase deadline override poisoned")
+    {
+        return override_value;
+    }
+    PENDING_CHASE_DEADLINE
 }
 
 /// What extraction should do about a set's chase.
@@ -355,6 +402,24 @@ impl DirectUnpackRuntime {
     #[cfg(test)]
     pub(crate) fn counters(&self) -> DirectUnpackCounters {
         self.counters
+    }
+
+    /// How many chase workers are actually spoken for.
+    ///
+    /// Not `armed.len()`. An aborted set leaves `armed` immediately and moves to
+    /// `draining`, but its worker keeps its `chase_pool` slot until it actually
+    /// returns — and a worker still queued inside `install` cannot even see the
+    /// abort, because the abort only pokes a coverage the closure has not
+    /// touched yet. Counting `armed` alone made those workers invisible and let
+    /// new sets arm past true capacity, which is how the pool filled with
+    /// chases that could never start.
+    fn occupied_chase_workers(&self) -> usize {
+        let draining = self
+            .draining
+            .iter()
+            .filter(|(_, armed)| !armed.handle.is_finished())
+            .count();
+        self.armed.len() + draining
     }
 
     /// Whether the commit hook has nothing at all to do: nothing being chased,
@@ -473,6 +538,31 @@ impl Pipeline {
             self.latch_direct_unpack_refusal(job_id, set_name, RefusalReason::LengthOverflow);
             return;
         };
+
+        // Admission control, and it is a liveness requirement rather than a
+        // tuning knob. A chase occupies one `chase_pool` worker for its whole
+        // life, parks included, so arming more chases than there are workers
+        // means some are armed but never start — and extraction awaits a
+        // still-running chase (`ChaseDisposition::Pending`) with no deadline.
+        // Refusing here costs one overlap; admitting would risk the wedge.
+        //
+        // Counted but deliberately NOT latched: capacity is a fact about this
+        // instant, not about the archive, and a set refused now must be free to
+        // arm later when a worker frees up.
+        let occupied = self.direct_unpack.occupied_chase_workers();
+        if occupied >= self.chase_pool.current_num_threads() {
+            debug!(
+                job_id = job_id.0,
+                set_name,
+                occupied,
+                workers = self.chase_pool.current_num_threads(),
+                "direct unpack has no free chase worker; not arming this set yet"
+            );
+            self.direct_unpack
+                .counters
+                .record_refusal(RefusalReason::NoChaseCapacity);
+            return;
+        }
 
         let output_dir = self.direct_unpack_staging_dir(job_id, set_name);
         if let Err(error) = std::fs::create_dir_all(&output_dir) {
@@ -602,6 +692,8 @@ impl Pipeline {
         self.direct_unpack.armed.insert(
             (job_id, set_name.to_string()),
             ArmedSet {
+                aborted_at: None,
+                zombie_announced: false,
                 coverage,
                 staging_dir: output_dir,
                 handle,
@@ -919,7 +1011,10 @@ impl Pipeline {
 
         crate::pipeline::extraction::JobExtractionBudget::new_with_process_memory(
             Arc::clone(&self.extraction_limits),
-            Arc::clone(&self.process_memory_budget),
+            // The chase's own pool, never the shared one: this permit is held
+            // across every park, and a parked chase must not be able to stop
+            // the extractions that are actually on a job's critical path.
+            Arc::clone(&self.direct_unpack_process_memory),
             staging.to_path_buf(),
             declared_archive_bytes,
             initial_entries,
@@ -991,37 +1086,95 @@ impl Pipeline {
         password: Option<String>,
         counters: Arc<crate::jobs::PhaseCounters>,
     ) -> tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>> {
-        let pp_pool = self.pp_pool.clone();
+        // The chase's own pool, never the shared post-processing one: `install`
+        // holds a worker for as long as the closure runs, and this closure parks.
+        let pp_pool = self.chase_pool.clone();
         tokio::task::spawn_blocking(move || {
+            // Between here and the line below sits `install`, which queues
+            // behind occupied workers with no logging, no timeout, and no
+            // sensitivity to this set's abort — the closure has not touched the
+            // coverage yet, so aborting the coverage cannot reach it. A chase
+            // that never logged "worker started" was never dispatched; one that
+            // logged it and never logged "worker exited" is inside the decode.
+            // Three e2e rounds could not tell those apart.
+            let queued_at = Instant::now();
+            let log_job = job_id;
+            let log_set = set_name.clone();
             pp_pool.install(move || {
-                let _memory_permit = budget.reserve_memory_wait(budget.max_memory_bytes())?;
+                info!(
+                    job_id = log_job.0,
+                    set_name = %log_set,
+                    queued_ms = queued_at.elapsed().as_millis() as u64,
+                    "direct unpack worker started"
+                );
+                let started_at = Instant::now();
+                let outcome = (|| {
+                    // The whole configured decoder allowance, held from here until
+                    // this closure returns — which for a chase means across every
+                    // park the gated reader does while waiting on the download.
+                    //
+                    // That is only safe because `budget` draws from the chase-only
+                    // `ProcessMemoryBudget`. While chases drew from the shared one,
+                    // a single parked chase held 100% of the process allowance and
+                    // every other 7z extraction blocked behind it with no deadline.
+                    // `a_parked_chase_does_not_block_another_jobs_extraction` is the
+                    // regression test, and the wait itself now says so at warn after
+                    // 30 seconds.
+                    //
+                    // RESIDUAL: chases still contend with each other, for this pool
+                    // and for `chase_pool`'s worker threads. A parked chase can
+                    // therefore stop another chase from starting at all — see the
+                    // WP11 report's note on admission control.
+                    let _memory_permit = budget.reserve_memory_wait(budget.max_memory_bytes())?;
 
-                let pw = match password {
-                    Some(ref value) => sevenz_rust2::Password::new(value),
-                    None => sevenz_rust2::Password::empty(),
-                };
+                    let pw = match password {
+                        Some(ref value) => sevenz_rust2::Password::new(value),
+                        None => sevenz_rust2::Password::empty(),
+                    };
 
-                // The chase is invisible: its member events go to a channel
-                // with no receivers, and its byte counters are its own rather
-                // than the job's, so neither the phase display nor the event
-                // stream learns that a decode is running mid-download.
-                let (silent_events, _) = tokio::sync::broadcast::channel(1);
-                let context = SevenZipExtractionContext {
-                    job_id,
-                    set_name,
-                    output_dir,
-                    root,
-                    budget: Arc::clone(&budget),
-                    password: pw,
-                    event_tx: silent_events,
-                    phase_counters: counters,
-                };
+                    // The chase is invisible: its member events go to a channel
+                    // with no receivers, and its byte counters are its own rather
+                    // than the job's, so neither the phase display nor the event
+                    // stream learns that a decode is running mid-download.
+                    let (silent_events, _) = tokio::sync::broadcast::channel(1);
+                    let context = SevenZipExtractionContext {
+                        job_id,
+                        set_name,
+                        output_dir,
+                        root,
+                        budget: Arc::clone(&budget),
+                        password: pw,
+                        event_tx: silent_events,
+                        phase_counters: counters,
+                    };
 
-                extract_7z_stream(&context, || {
-                    GatedSplitReader::open(&paths, Arc::clone(&coverage))
-                        .map(|reader| std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader))
-                        .map_err(|error| format!("failed to open 7z direct-unpack reader: {error}"))
-                })
+                    extract_7z_stream(&context, || {
+                        GatedSplitReader::open(&paths, Arc::clone(&coverage))
+                            .map(|reader| {
+                                std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader)
+                            })
+                            .map_err(|error| {
+                                format!("failed to open 7z direct-unpack reader: {error}")
+                            })
+                    })
+                })();
+                match &outcome {
+                    Ok(members) => info!(
+                        job_id = log_job.0,
+                        set_name = %log_set,
+                        members = members.extracted.len(),
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "direct unpack worker exited"
+                    ),
+                    Err(error) => info!(
+                        job_id = log_job.0,
+                        set_name = %log_set,
+                        error = %error,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "direct unpack worker exited"
+                    ),
+                }
+                outcome
             })
         })
     }
@@ -1138,6 +1291,12 @@ impl Pipeline {
 
         // Wake the worker before anything else: it is parked on the coverage,
         // and a join that happened first would hang here instead of there.
+        //
+        // This only reaches a worker that has *started* and touched the
+        // coverage. One still queued inside `chase_pool.install` cannot see it,
+        // which is why the drain reap times the abort and complains.
+        let mut armed = armed;
+        armed.aborted_at = Some(Instant::now());
         armed.coverage.abort(reason.to_string());
 
         self.direct_unpack.counters.record_demotion(demotion);
@@ -1274,16 +1433,36 @@ impl Pipeline {
     /// The strict half of the settle: parts the assembly still cannot describe
     /// are never going to be described, so their chases end by name.
     ///
-    /// Runs from the completion check, which is scheduled by the same call that
-    /// runs the lenient pass and re-runs on every later check. By then the
-    /// decode queue has drained, so a part with no assembly length here has no
-    /// commit in flight to wait for. Idempotent: a set whose parts all settled
-    /// finds nothing to do, and a set that was aborted is no longer armed.
+    /// Runs from the completion check. It ends a chase, so it may only run when
+    /// the download is *currently* finished — and that takes two conditions,
+    /// because neither is sufficient alone.
+    ///
+    /// `download_settled` says a download pass has drained at least once. That
+    /// is a historical fact, not a present one: `maybe_finish_download_pass`
+    /// fires at *every* pass boundary, and a job with 60 MB still to fetch
+    /// crosses several. Gating on it alone let a completion check milliseconds
+    /// later end a chase mid-download, which is exactly what happened to two
+    /// jobs 5 ms and 14 ms after they armed.
+    ///
+    /// So it is paired with the pipeline's own "is anything still moving for
+    /// this job" predicate, which counts queued work, in-flight downloads,
+    /// in-flight decodes, delayed retries and released-but-unprocessed results.
+    /// Only when the stamp is set *and* nothing is in flight is a part without
+    /// an assembly length genuinely one that will never have one. Finding work
+    /// in flight also drops the stamp, so a job that went back to fetching has
+    /// to earn it again from a later drain.
     pub(in crate::pipeline) fn settle_direct_unpack_at_completion(&mut self, job_id: JobId) {
-        // Only for a job whose download has actually drained. A completion check
-        // fires for plenty of other reasons, and a part the assembly cannot
-        // describe mid-download is simply a part that has not finished yet.
         if !self.direct_unpack.download_settled.contains(&job_id) {
+            return;
+        }
+        if self.job_has_pending_download_pipeline_work(job_id) {
+            // The stamp is stale: this job is fetching or decoding again. Drop
+            // it rather than merely declining, so the strict pass has to be
+            // re-earned by a drain that is still true when it is next observed.
+            // Clearing here rather than at each of the twenty-odd sites that
+            // queue download work is deliberate — this is the only caller, and
+            // it evaluates both facts at the same instant.
+            self.direct_unpack.download_settled.remove(&job_id);
             return;
         }
         self.settle_direct_unpack_parts(job_id, SettlePass::Strict);
@@ -1302,8 +1481,22 @@ impl Pipeline {
             .collect();
 
         for set_name in sets {
-            let Ok(paths) = self.sevenz_set_part_paths(job_id, &set_name) else {
-                continue;
+            let paths = match self.sevenz_set_part_paths(job_id, &set_name) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    // A chase whose set cannot be resolved is settling nothing
+                    // and will keep settling nothing. Skipping in silence is how
+                    // a job whose topology had been deleted underneath it looked
+                    // identical to one with nothing to do.
+                    warn!(
+                        job_id = job_id.0,
+                        set_name,
+                        error = %error,
+                        pass = if pass == SettlePass::Strict { "strict" } else { "lenient" },
+                        "direct unpack cannot resolve this set's parts to settle them"
+                    );
+                    continue;
+                }
             };
             let mut unsettled: Vec<String> = Vec::new();
             for (index, path) in paths.iter().enumerate() {
@@ -1371,11 +1564,34 @@ impl Pipeline {
         // almost immediately, and their staging has to go.
         if !self.direct_unpack.draining.is_empty() {
             let mut still_running = Vec::new();
-            for (key, armed) in std::mem::take(&mut self.direct_unpack.draining) {
+            for (key, mut armed) in std::mem::take(&mut self.direct_unpack.draining) {
                 if armed.handle.is_finished() {
                     let _ = armed.handle.await;
                     self.remove_direct_unpack_staging(&key, &armed.staging_dir);
                 } else {
+                    // A worker that outlives its own abort is a zombie: it still
+                    // holds a chase worker, its staging directory is never
+                    // removed, and nothing else in the pipeline will notice.
+                    // Round 9 had one survive seven minutes in silence. Say so,
+                    // once, naming what it is.
+                    if !armed.zombie_announced
+                        && armed
+                            .aborted_at
+                            .is_some_and(|at| at.elapsed() >= DRAINING_WORKER_WARN_AFTER)
+                    {
+                        armed.zombie_announced = true;
+                        warn!(
+                            job_id = key.0.0,
+                            set_name = %key.1,
+                            elapsed_ms = armed.started_at.elapsed().as_millis() as u64,
+                            aborted_ms_ago = armed
+                                .aborted_at
+                                .map(|at| at.elapsed().as_millis() as u64)
+                                .unwrap_or(0),
+                            "direct unpack worker has not exited since it was aborted; \
+                             it is still holding a chase worker"
+                        );
+                    }
                     still_running.push((key, armed));
                 }
             }
@@ -1524,6 +1740,8 @@ impl Pipeline {
             handle: armed.handle,
             staging_dir: armed.staging_dir,
             counters: armed.counters,
+            coverage: armed.coverage,
+            set_name: set_name.to_string(),
         })
     }
 

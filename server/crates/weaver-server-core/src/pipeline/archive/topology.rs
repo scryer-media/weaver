@@ -1878,8 +1878,22 @@ impl Pipeline {
         if let Err(e) = self.db.delete_archive_headers(job_id, set_name) {
             error!(job_id = job_id.0, set_name, error = %e, "failed to delete cached RAR headers");
         }
-        if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.assembly.archive_topologies_mut().remove(set_name);
+        if let Some(state) = self.jobs.get_mut(&job_id)
+            && let Some(topology) = state.assembly.archive_topologies_mut().remove(set_name)
+        {
+            // Removing a topology throws away the only description of how a
+            // set's volumes map to its members, and everything downstream —
+            // extraction, the direct-unpack chase, the settle passes — then
+            // reports only that the set does not exist. It was silent, and a bug
+            // that deleted every 7z topology on every PAR2 registration went
+            // unnoticed for two gate rounds because of it. Say so.
+            info!(
+                job_id = job_id.0,
+                set_name,
+                archive_type = ?topology.archive_type,
+                volumes = topology.volume_map.len(),
+                "archive topology removed — the RAR snapshot for this set was cleared"
+            );
         }
     }
 

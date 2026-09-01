@@ -434,11 +434,10 @@ async fn an_out_of_order_tail_does_not_inflate_the_seeded_watermark() {
     // Shut the chase down before asserting: its worker is parked on this
     // coverage, and a panic with a parked blocking task would hang the
     // runtime's drop rather than fail the test.
-    pipeline.direct_unpack_forget_job(job_id);
-    for _ in 0..600 {
-        pipeline.reap_direct_unpack().await;
-        tokio::task::yield_now().await;
-    }
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
 
     assert_eq!(
         seeded.watermark, floor,
@@ -542,8 +541,21 @@ async fn a_download_that_ends_with_a_part_missing_aborts_the_chase_at_the_strict
         "the lenient pass must not end a chase on parts whose commits could still be in flight"
     );
 
-    // Decode has drained by the time the completion check runs. Nothing is
-    // coming for those parts.
+    // The strict pass declines while the job still has queued work, so a
+    // completion check taken mid-download cannot end anything.
+    pipeline.settle_direct_unpack_at_completion(job_id);
+    assert!(
+        pipeline.direct_unpack.is_armed(job_id, set_name),
+        "and the strict pass must decline while download work is still queued"
+    );
+
+    // Now the queue is genuinely empty and decode has drained. Nothing is coming
+    // for those parts, and this is the pass that says so.
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+    }
+    pipeline.settle_direct_unpack_after_download(job_id);
     pipeline.settle_direct_unpack_at_completion(job_id);
 
     assert!(
@@ -1003,11 +1015,10 @@ async fn arming_pulls_the_tail_window_forward_in_a_deep_queue() {
     // The rest of the set never arrives, so the worker is parked. Shut it down
     // before asserting: a panic with a parked blocking task hangs the runtime's
     // drop instead of failing the test.
-    pipeline.direct_unpack_forget_job(job_id);
-    for _ in 0..600 {
-        pipeline.reap_direct_unpack().await;
-        tokio::task::yield_now().await;
-    }
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
 
     assert!(armed, "the set should have armed once its header landed");
     assert_eq!(
@@ -1080,11 +1091,10 @@ async fn a_single_7z_arms_from_its_first_32_bytes() {
         "the header's declared total is the archive's real length"
     );
 
-    pipeline.direct_unpack_forget_job(job_id);
-    for _ in 0..600 {
-        pipeline.reap_direct_unpack().await;
-        tokio::task::yield_now().await;
-    }
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
 /// The header's declared total is taken on trust while the file is still
@@ -1129,11 +1139,10 @@ async fn a_single_7z_whose_length_contradicts_its_header_aborts() {
         "unexpected abort reason: {reason}"
     );
 
-    pipeline.direct_unpack_forget_job(job_id);
-    for _ in 0..600 {
-        pipeline.reap_direct_unpack().await;
-        tokio::task::yield_now().await;
-    }
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
 /// The commit hook is on the download's hot path, so a job that carries no
@@ -1407,11 +1416,10 @@ async fn a_chase_consumes_readahead_and_the_archive_tail_within_microseconds() {
     pipeline.decide_direct_unpack_before_repair(job_id, None);
     let tainted = !pipeline.direct_unpack.is_armed(job_id, set_name);
 
-    pipeline.direct_unpack_forget_job(job_id);
-    for _ in 0..600 {
-        pipeline.reap_direct_unpack().await;
-        tokio::task::yield_now().await;
-    }
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
 
     // No assertion on the magnitudes: how far the chase has run by this point
     // depends on how much of its blocking decode has been scheduled, and
@@ -1458,11 +1466,10 @@ async fn a_set_armed_after_its_download_ended_is_not_killed_by_the_settle() {
 
     let armed = pipeline.direct_unpack.is_armed(job_id, set_name);
     let latched = pipeline.direct_unpack.latched_reason(job_id, set_name);
-    pipeline.direct_unpack_forget_job(job_id);
-    for _ in 0..600 {
-        pipeline.reap_direct_unpack().await;
-        tokio::task::yield_now().await;
-    }
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
 
     assert!(
         armed,
@@ -1540,11 +1547,10 @@ async fn a_settle_that_races_a_flush_leaves_the_part_for_its_commit() {
         "nothing here is a demotion"
     );
 
-    pipeline.direct_unpack_forget_job(job_id);
-    for _ in 0..600 {
-        pipeline.reap_direct_unpack().await;
-        tokio::task::yield_now().await;
-    }
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
 /// The `direct-unpack-solid-split` abort: the settle ran 1ms after arming, while
@@ -1599,11 +1605,10 @@ async fn a_settle_before_a_parts_file_exists_does_not_end_the_chase() {
         "the strict pass must be a no-op once every part has settled"
     );
 
-    pipeline.direct_unpack_forget_job(job_id);
-    for _ in 0..600 {
-        pipeline.reap_direct_unpack().await;
-        tokio::task::yield_now().await;
-    }
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
 /// A successful repair outcome, for driving the settle seam directly.
@@ -1836,11 +1841,10 @@ async fn a_chase_inside_a_populated_grids_intact_prefix_is_vouched() {
         "a chase inside the vouched prefix must be parked through the repair, not tainted"
     );
 
-    pipeline.direct_unpack_forget_job(job_id);
-    for _ in 0..600 {
-        pipeline.reap_direct_unpack().await;
-        tokio::task::yield_now().await;
-    }
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
 /// The round-8 failure, reproduced.
@@ -1907,11 +1911,10 @@ async fn a_chase_over_a_part_whose_grid_never_formed_cannot_be_vouched() {
         "and it is booked as a repair-rewrote taint"
     );
 
-    pipeline.direct_unpack_forget_job(job_id);
-    for _ in 0..600 {
-        pipeline.reap_direct_unpack().await;
-        tokio::task::yield_now().await;
-    }
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
 /// One analysis verdict per part, as the analysis pass would report it.
@@ -1999,11 +2002,10 @@ async fn a_part_with_no_grid_is_vouched_by_the_analysis_file_verdict() {
         "and nothing is tainted"
     );
 
-    pipeline.direct_unpack_forget_job(job_id);
-    for _ in 0..600 {
-        pipeline.reap_direct_unpack().await;
-        tokio::task::yield_now().await;
-    }
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
 /// The fallback must never vouch a file the repair intends to rewrite.
@@ -2059,11 +2061,10 @@ async fn the_analysis_fallback_refuses_a_part_the_repair_will_rewrite() {
             "the fallback must refuse a part whose analysis status is {damaged_status:?}"
         );
 
-        pipeline.direct_unpack_forget_job(job_id);
-        for _ in 0..600 {
-            pipeline.reap_direct_unpack().await;
-            tokio::task::yield_now().await;
-        }
+        // Join every worker before the test returns. Dropping the runtime with a
+        // blocking task still live blocks forever, and a chase parked on a
+        // coverage nothing will advance is exactly that.
+        pipeline.direct_unpack_shutdown("test teardown").await;
     }
 }
 
@@ -2104,9 +2105,610 @@ async fn an_unclassified_part_is_not_vouched_by_the_fallback() {
         "silence from the analysis is not a verdict"
     );
 
-    pipeline.direct_unpack_forget_job(job_id);
-    for _ in 0..600 {
-        pipeline.reap_direct_unpack().await;
-        tokio::task::yield_now().await;
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+// ---------------------------------------------------------------------------
+// The topology eraser
+//
+// PAR2 identity application used to delete every non-RAR topology in a job. The
+// search for a file's "old RAR set name" fell through to a map built from ALL
+// archive topologies, so a 7z volume answered with its own 7z set; that set was
+// then marked stale and swept by a retirement path whose every test is
+// RAR-shaped, so it could neither be busy nor referenced, and was torn down.
+// File completions rebuilt it, which is why this only killed the jobs whose
+// last topology-building event came before the last PAR2 registration.
+// ---------------------------------------------------------------------------
+
+/// A 7z split set whose parts are described by a real recovery set, with the
+/// topology built and the PAR2 runtime installed.
+async fn sevenz_job_with_par2_and_topology(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    set_name: &str,
+) -> Vec<(String, Vec<u8>)> {
+    let files = sevenz_fixture_bytes(set_name);
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(pipeline, job_id, spec).await;
+
+    let described: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let par2_set = build_repairable_par2_set_for_files(&described, VOUCH_SLICE, 4);
+    install_test_par2_runtime(pipeline, job_id, par2_set, &[]);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(pipeline, job_id, file_index as u32, filename, bytes).await;
     }
+    files
+}
+
+fn has_topology(pipeline: &Pipeline, job_id: JobId, set_name: &str) -> bool {
+    pipeline
+        .jobs
+        .get(&job_id)
+        .and_then(|state| state.assembly.archive_topology_for(set_name))
+        .is_some()
+}
+
+/// Applying PAR2 identity must not delete a 7z topology — not on the first
+/// application, and not on a second one that rebinds nothing at all.
+///
+/// The second call is the one that mattered in production: the stale-set
+/// bookkeeping ran above the "nothing changed, skip this file" check, so every
+/// registration swept sets no rebind had touched, with the rebind counter at
+/// zero and nothing logged.
+#[tokio::test]
+async fn applying_par2_identity_does_not_erase_a_7z_topology() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41900);
+    let set_name = "generated_split_store_plain.7z";
+
+    sevenz_job_with_par2_and_topology(&mut pipeline, job_id, set_name).await;
+    assert!(
+        has_topology(&pipeline, job_id, set_name),
+        "the fixture must start with a 7z topology"
+    );
+
+    pipeline.retry_par2_authoritative_identity(job_id).await;
+    assert!(
+        has_topology(&pipeline, job_id, set_name),
+        "the first PAR2 identity application must not delete the 7z topology"
+    );
+
+    // Nothing left to rebind. This pass used to sweep anyway.
+    pipeline.retry_par2_authoritative_identity(job_id).await;
+    assert!(
+        has_topology(&pipeline, job_id, set_name),
+        "an identity application that rebinds nothing must not delete anything"
+    );
+
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// The deterministic kill sequence, end to end.
+///
+/// Every data file completes — which is the last thing that would have rebuilt
+/// the topology — and only then does more recovery metadata register. In the
+/// gate run that ordering came from targeted recovery downloads arriving after
+/// the last data volume, and it killed both repair scenarios every time: the
+/// chase could no longer resolve its own part paths, so the repair decision
+/// refused with "no topology for set", 7 ms after the merge.
+#[tokio::test]
+async fn a_late_par2_registration_leaves_the_chase_able_to_resolve_its_parts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41910);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_job_with_par2_and_topology(&mut pipeline, job_id, set_name).await;
+    assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
+
+    // The late registration: recovery metadata applied after the last data
+    // file has already completed, with nothing left to rebuild the topology.
+    pipeline.retry_par2_authoritative_identity(job_id).await;
+
+    assert!(
+        has_topology(&pipeline, job_id, set_name),
+        "the topology must survive a registration that lands after the data does"
+    );
+    assert!(
+        pipeline.sevenz_set_part_paths(job_id, set_name).is_ok(),
+        "and the chase must still be able to resolve its parts"
+    );
+
+    // The repair decision now has something to reason about. With every part
+    // verified complete it parks rather than refusing.
+    let par2_set = pipeline.par2_set(job_id).expect("installed").clone();
+    let statuses: Vec<(&str, par2_rs::verify::FileStatus)> = files
+        .iter()
+        .map(|(name, _)| (name.as_str(), par2_rs::verify::FileStatus::Complete))
+        .collect();
+    let verification = analysis_verification(&par2_set, &statuses);
+    pipeline.decide_direct_unpack_before_repair(job_id, Some(&verification));
+
+    assert!(
+        pipeline.direct_unpack.is_armed(job_id, set_name),
+        "the chase must park through the repair, not be refused for a missing topology"
+    );
+
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// Queue one piece of ordinary download work, so the job reads as still fetching.
+fn queue_download_work(pipeline: &mut Pipeline, job_id: JobId, message_id: &str) {
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.download_queue.push(DownloadWork {
+        segment_id: SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number: 1,
+        },
+        message_id: MessageId::new(message_id),
+        groups: vec!["alt.binaries.test".to_string()],
+        priority: 0,
+        byte_estimate: 128,
+        retry_count: 0,
+        is_recovery: false,
+        completion_critical: false,
+        exclude_servers: Vec::new(),
+        avoid_server: None,
+    });
+}
+
+/// A drained download *pass* is not a drained download.
+///
+/// `maybe_finish_download_pass` fires at every pass boundary, and a job with
+/// tens of megabytes still queued crosses several. Stamping "settled" there and
+/// then letting the next completion check act on the stamp is how two chases
+/// were ended 5 ms and 14 ms after arming, mid-download, with all their volumes
+/// still to come.
+#[tokio::test]
+async fn the_strict_settle_ignores_a_stamp_left_by_an_earlier_pass_boundary() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41950);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // An early pass boundary stamps the job as settled.
+    pipeline.settle_direct_unpack_after_download(job_id);
+
+    // The download is nowhere near over: more work queues, and the set arms as
+    // its first part lands.
+    queue_download_work(&mut pipeline, job_id, "still-coming-1@example.invalid");
+    write_and_complete_file(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
+
+    pipeline.settle_direct_unpack_at_completion(job_id);
+
+    assert!(
+        pipeline.direct_unpack.is_armed(job_id, set_name),
+        "a stale stamp must not let the strict pass end a chase mid-download"
+    );
+
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// The 10127 shape: the set arms after an earlier pass boundary, and the rest of
+/// its parts arrive normally. Nothing here is an error, so nothing must die.
+#[tokio::test]
+async fn a_set_armed_after_an_early_pass_boundary_survives_and_settles() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41960);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    pipeline.settle_direct_unpack_after_download(job_id);
+    queue_download_work(&mut pipeline, job_id, "more-volumes@example.invalid");
+
+    write_and_complete_file(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
+    pipeline.settle_direct_unpack_at_completion(job_id);
+    assert!(
+        pipeline.direct_unpack.is_armed(job_id, set_name),
+        "the chase must survive a completion check taken mid-download"
+    );
+
+    // The remaining volumes land, and the queue drains for real.
+    for (file_index, (filename, bytes)) in files.iter().enumerate().skip(1) {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+    }
+    pipeline.settle_direct_unpack_after_download(job_id);
+    pipeline.settle_direct_unpack_at_completion(job_id);
+
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("the chase must still be armed after a genuine drain");
+    assert!(
+        (0..files.len()).all(|index| coverage
+            .part_progress(index)
+            .is_ok_and(|part| part.complete)),
+        "and every part must have settled"
+    );
+
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// A single-file 7z chase, driven all the way to an outcome.
+///
+/// This shape was untested: `a_single_7z_arms_from_its_first_32_bytes` proves
+/// the arming and stops there, and every other end-to-end chase test uses a
+/// split set. In the round-9 gate run every single-file 7z scenario timed out,
+/// and no chase of any shape ever logged a completion — so "does a single-file
+/// chase finish at all" had no answer in-process either way.
+///
+/// It drips the archive the way the download does — append, then publish the
+/// new watermark — and then completes the file, which is the only thing that
+/// tells the coverage the part is finished.
+#[tokio::test]
+async fn a_single_7z_chase_runs_to_an_outcome() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41970);
+    let set_name = "silver_horizon.7z";
+
+    let archive = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sevenz/generated_bcj2_silver_horizon.7z"),
+    )
+    .unwrap();
+    let files = vec![(set_name.to_string(), archive.clone())];
+    let spec = rar_job_spec("Silver Horizon", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    let path = working_dir.join(set_name);
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    // Arm from the header, exactly as the commit path does.
+    std::fs::write(&path, &archive[..64 * 1024]).unwrap();
+    pipeline.direct_unpack_note_commit(file_id, set_name, 64 * 1024, false);
+    assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
+
+    // The rest of the bytes arrive by appending, never by rewriting: a chase is
+    // reading this file, and a truncate-and-rewrite would pull committed bytes
+    // out from under it.
+    {
+        use std::io::Write;
+        let mut handle = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        handle.write_all(&archive[64 * 1024..]).unwrap();
+        handle.flush().unwrap();
+    }
+    pipeline.direct_unpack_note_commit(file_id, set_name, archive.len() as u64, false);
+    complete_already_written_file(&mut pipeline, job_id, 0, archive.len()).await;
+
+    reap_until_outcome(&mut pipeline, job_id, set_name).await;
+
+    let outcome = pipeline
+        .direct_unpack
+        .outcome(job_id, set_name)
+        .expect("the chase must produce an outcome");
+    assert!(
+        outcome.result.is_ok(),
+        "a single-file chase over an intact archive must succeed: {:?}",
+        outcome.result.as_ref().err()
+    );
+}
+
+/// The round-9 wedge: a parked chase must not stop other jobs' extraction.
+///
+/// Both the chase and conventional 7z extraction reserve
+/// `budget.max_memory_bytes()`, and that is also the limit of the
+/// `ProcessMemoryBudget` they draw from — so one permit is the whole pool. The
+/// chase takes it before it opens the archive and holds it until it returns,
+/// across every park the gated reader does while waiting on the download.
+///
+/// While chases drew from the *shared* pool, a chase whose download never
+/// finished never released it and no other 7z work in the process could start.
+/// In the gate run 39 chases armed and not one ever logged a completion; every
+/// 7z scenario after the first wedge timed out in batch-sized groups, and
+/// completions burst the moment the harness cancelled the jobs holding the pool.
+///
+/// Chases now have their own pool, so this is bounded: a parked chase can starve
+/// other *chases*, which are speculative, but never the extractions on a job's
+/// critical path. This test drives exactly that — an independent, fully
+/// downloaded job finishing while another job's chase sits parked forever.
+#[tokio::test]
+async fn a_parked_chase_does_not_block_another_jobs_extraction() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let set_name = "silver_horizon.7z";
+
+    let archive = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sevenz/generated_bcj2_silver_horizon.7z"),
+    )
+    .unwrap();
+
+    // Job A arms and then stops receiving bytes: its chase parks inside the
+    // decoder, holding the permit.
+    let parked_job = JobId(41980);
+    let files = vec![(set_name.to_string(), archive.clone())];
+    insert_active_job(
+        &mut pipeline,
+        parked_job,
+        rar_job_spec("Silver Horizon Parked", &files),
+    )
+    .await;
+    let parked_dir = pipeline.jobs.get(&parked_job).unwrap().working_dir.clone();
+    std::fs::write(parked_dir.join(set_name), &archive[..64 * 1024]).unwrap();
+    pipeline.direct_unpack_note_commit(
+        NzbFileId {
+            job_id: parked_job,
+            file_index: 0,
+        },
+        set_name,
+        64 * 1024,
+        false,
+    );
+    assert!(pipeline.direct_unpack.is_armed(parked_job, set_name));
+
+    // Job B has every byte it needs and nothing to wait for.
+    let ready_job = JobId(41981);
+    insert_active_job(
+        &mut pipeline,
+        ready_job,
+        rar_job_spec("Silver Horizon Ready", &files),
+    )
+    .await;
+    let ready_dir = pipeline.jobs.get(&ready_job).unwrap().working_dir.clone();
+    std::fs::write(ready_dir.join(set_name), &archive).unwrap();
+    pipeline.direct_unpack_note_commit(
+        NzbFileId {
+            job_id: ready_job,
+            file_index: 0,
+        },
+        set_name,
+        archive.len() as u64,
+        false,
+    );
+    complete_already_written_file(&mut pipeline, ready_job, 0, archive.len()).await;
+
+    // Job B's own chase is demoted, exactly as the two wedged jobs in the gate
+    // run were: they aborted, reported "extraction ready", and then produced
+    // nothing at all. Conventional extraction is now job B's critical path, and
+    // it must not be waiting on another job's parked chase for decoder memory.
+    pipeline.direct_unpack_abort_set(
+        ready_job,
+        set_name,
+        "test demotes this chase to force the conventional path",
+        crate::pipeline::direct_unpack::wiring::AbortLatch::Permanent,
+        crate::pipeline::direct_unpack::wiring::DemotionReason::DownloadEnded,
+    );
+
+    pipeline.extract_7z_set(ready_job, set_name).await.unwrap();
+    let done = next_extraction_done(&mut pipeline).await;
+    let ExtractionDone::FullSet { result, .. } = done else {
+        panic!("expected a full-set extraction result");
+    };
+    let outcome = result.expect("conventional extraction must not wait on a parked chase");
+    assert_eq!(outcome.extracted.len(), 1);
+
+    // And the parked chase really is still parked, holding its own permit: the
+    // property under test is isolation, not that the holder went away.
+    assert!(
+        pipeline.direct_unpack.is_armed(parked_job, set_name),
+        "the parked chase must still be holding its permit"
+    );
+    assert!(
+        pipeline
+            .direct_unpack
+            .outcome(parked_job, set_name)
+            .is_none(),
+        "and must still not have produced an outcome"
+    );
+
+    // Join every worker before the test returns. Dropping the runtime with a
+    // blocking task still live blocks forever, and a chase parked on a
+    // coverage nothing will advance is exactly that.
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// Admission is capped at the number of chase workers.
+///
+/// A chase occupies one `chase_pool` worker for its entire life, parks included.
+/// Arming more chases than there are workers produces chases that are armed but
+/// never start — and extraction awaits a still-running chase with no deadline,
+/// so those become wedges rather than merely slow overlaps.
+///
+/// The refusal is counted but not latched: having no free worker right now says
+/// nothing about the archive, so the set must be free to arm later.
+#[tokio::test]
+async fn arming_stops_at_the_number_of_chase_workers() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let set_name = "silver_horizon.7z";
+    let workers = pipeline.chase_pool.current_num_threads();
+
+    let archive = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sevenz/generated_bcj2_silver_horizon.7z"),
+    )
+    .unwrap();
+    let files = vec![(set_name.to_string(), archive.clone())];
+
+    // Arm one more job than there are workers, none of them ever completing.
+    let mut jobs = Vec::new();
+    for index in 0..=workers {
+        let job_id = JobId(42000 + index as u64);
+        jobs.push(job_id);
+        insert_active_job(
+            &mut pipeline,
+            job_id,
+            rar_job_spec("Silver Horizon Capacity", &files),
+        )
+        .await;
+        let dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+        std::fs::write(dir.join(set_name), &archive[..64 * 1024]).unwrap();
+        pipeline.direct_unpack_note_commit(
+            NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            set_name,
+            64 * 1024,
+            false,
+        );
+    }
+
+    let armed = jobs
+        .iter()
+        .filter(|job_id| pipeline.direct_unpack.is_armed(**job_id, set_name))
+        .count();
+    assert_eq!(
+        armed, workers,
+        "exactly as many chases as there are workers may be armed"
+    );
+
+    // Aborting a set moves it out of `armed` but its worker keeps its
+    // `chase_pool` slot until it actually returns — and one still queued inside
+    // `install` cannot even see the abort, because the abort only pokes a
+    // coverage that closure has not touched. Counting `armed` alone made those
+    // workers invisible and let new sets arm past true capacity, which is how
+    // the pool filled with chases that could never start.
+    let first = jobs[0];
+    pipeline.direct_unpack_abort_set(
+        first,
+        set_name,
+        "test moves this chase into draining",
+        crate::pipeline::direct_unpack::wiring::AbortLatch::Permanent,
+        crate::pipeline::direct_unpack::wiring::DemotionReason::DownloadEnded,
+    );
+    assert!(!pipeline.direct_unpack.is_armed(first, set_name));
+
+    let over_the_line = *jobs.last().unwrap();
+    pipeline.direct_unpack_note_commit(
+        NzbFileId {
+            job_id: over_the_line,
+            file_index: 0,
+        },
+        set_name,
+        64 * 1024,
+        false,
+    );
+    assert!(
+        !pipeline.direct_unpack.is_armed(over_the_line, set_name),
+        "a draining worker still occupies its slot, so nothing new may arm"
+    );
+    assert_eq!(
+        pipeline.direct_unpack.counters().refused_no_chase_capacity,
+        2,
+        "refused by name both before and after the abort"
+    );
+    let last = *jobs.last().unwrap();
+    assert_eq!(
+        pipeline.direct_unpack.latched_reason(last, set_name),
+        None,
+        "a capacity refusal must not latch: it says nothing about the archive"
+    );
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// Consumption must not wait forever on a chase that never finishes.
+///
+/// A chase can be handed to extraction still running — normally it is finishing
+/// at disk speed, because every part is complete by then. But "normally" is not
+/// a guarantee: a worker still queued behind occupied chase workers cannot even
+/// see its own set's abort, because the abort only pokes a coverage that
+/// closure has not touched yet. The await used to have no deadline, so such a
+/// chase left extraction never returning, the job in Extracting forever, and a
+/// global extraction slot held until the job was cancelled.
+///
+/// Here the chase is parked on a coverage nothing will ever advance. The
+/// deadline must fire, abort the coverage, and let conventional extraction
+/// produce the members.
+#[tokio::test]
+async fn consumption_gives_up_on_a_chase_that_never_finishes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(42100);
+    let set_name = "generated_split_store_plain.7z";
+
+    *crate::pipeline::direct_unpack::wiring::PENDING_CHASE_DEADLINE_OVERRIDE
+        .lock()
+        .unwrap() = Some(std::time::Duration::from_millis(250));
+
+    let files = sevenz_fixture_bytes(set_name);
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Arm on the first part, then land the rest on disk WITHOUT telling the
+    // coverage: the chase parks at part 1's boundary and never returns, while
+    // the conventional path has a whole archive to read.
+    write_and_complete_file(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("armed");
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    for (filename, bytes) in files.iter().skip(1) {
+        std::fs::write(working_dir.join(filename), bytes).unwrap();
+    }
+
+    pipeline.extract_7z_set(job_id, set_name).await.unwrap();
+    let done = next_extraction_done(&mut pipeline).await;
+    let ExtractionDone::FullSet { result, .. } = done else {
+        panic!("expected a full-set extraction result");
+    };
+    let outcome = result.expect("conventional extraction must finish after the deadline");
+    assert_eq!(outcome.extracted.len(), 1);
+
+    let reason = coverage
+        .abort_reason()
+        .expect("the deadline must end the chase's coverage");
+    assert!(
+        reason.contains("consumption deadline"),
+        "and say why: {reason}"
+    );
+
+    *crate::pipeline::direct_unpack::wiring::PENDING_CHASE_DEADLINE_OVERRIDE
+        .lock()
+        .unwrap() = None;
 }

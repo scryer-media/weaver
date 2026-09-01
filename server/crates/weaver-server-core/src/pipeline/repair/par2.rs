@@ -464,10 +464,24 @@ impl Pipeline {
             })
             .collect();
         let working_dir = state.working_dir.clone();
+        // RAR topologies only. This map is the last fallback in the search for a
+        // file's *old RAR set name*, and everything downstream of that name —
+        // staleness, the retirement sweep at the end of this function — speaks
+        // only RAR. A 7z volume that found its own 7z set here was answering a
+        // question about RAR with a fact about 7z, and the set it named was then
+        // swept away as a stale RAR set: every PAR2 registration silently
+        // deleted every non-RAR topology in the job, and only the next file
+        // completion rebuilding it hid that.
         let old_set_by_topology_filename: HashMap<String, String> = state
             .assembly
             .archive_topologies()
             .iter()
+            .filter(|(_, topology)| {
+                matches!(
+                    topology.archive_type,
+                    crate::jobs::assembly::ArchiveType::Rar
+                )
+            })
             .flat_map(|(set_name, topology)| {
                 topology
                     .volume_map
@@ -607,6 +621,25 @@ impl Pipeline {
                 )
                 .then(|| classification.set_name.clone())
             });
+            let mut rebound_identity = identity.clone();
+            if canonical_is_current {
+                rebound_identity.current_filename = canonical_filename.clone();
+            }
+            rebound_identity.canonical_filename = Some(canonical_filename.clone());
+            rebound_identity.classification = classification;
+            rebound_identity.classification_source = FileIdentitySource::Par2;
+            let classification_changed = rebound_identity.classification != identity.classification;
+            if rebound_identity == identity {
+                continue;
+            }
+
+            // Staleness is bookkeeping *about a rebind*, so it belongs after the
+            // check for whether one happened. It used to run above the `continue`
+            // and therefore fired on every identity application, including the
+            // overwhelming majority that come out byte-identical and change
+            // nothing — which meant the retirement sweep at the end of this
+            // function ran against sets no rebind had touched, with `rebound`
+            // still zero and nothing logged.
             if canonical_is_current && let Some(set_name) = old_rar_set_name.as_ref() {
                 let set_changed = old_rar_set_name != new_rar_set_name;
                 if filename_changed || set_changed {
@@ -622,17 +655,6 @@ impl Pipeline {
                 }
             }
 
-            let mut rebound_identity = identity.clone();
-            if canonical_is_current {
-                rebound_identity.current_filename = canonical_filename.clone();
-            }
-            rebound_identity.canonical_filename = Some(canonical_filename.clone());
-            rebound_identity.classification = classification;
-            rebound_identity.classification_source = FileIdentitySource::Par2;
-            let classification_changed = rebound_identity.classification != identity.classification;
-            if rebound_identity == identity {
-                continue;
-            }
             self.set_file_identity(job_id, rebound_identity)?;
             reserve_download_filename(&canonical_filename, &mut occupied_filenames);
 
