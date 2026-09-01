@@ -351,6 +351,47 @@ fn unique_par2_binding_candidate(candidates: &[par2_rs::FileId]) -> Option<par2_
     Some(*candidate)
 }
 
+/// The lowest byte offset covered by a block the recovery set found damaged.
+///
+/// Split out so the damage floor and the intact prefix can be read from one
+/// verdict map rather than two.
+fn damage_floor_from_verdicts(
+    verdicts: &std::collections::BTreeMap<u32, crate::pipeline::integrity::BlockVerdict>,
+    slice_size: u64,
+) -> Option<u64> {
+    verdicts
+        .iter()
+        .filter(|(_, verdict)| matches!(verdict, crate::pipeline::integrity::BlockVerdict::Damaged))
+        .filter_map(|(&index, _)| u64::from(index).checked_mul(slice_size))
+        .min()
+}
+
+/// The contiguous run of Intact blocks from block zero, in bytes.
+///
+/// Only blocks the grid actually claimed *and* found Intact count, and only
+/// while they are consecutive from zero: a block the grid never claimed stops
+/// the run, because unverified is not the same as intact. An arithmetic
+/// overflow ends the run for the same reason — a prefix that cannot be
+/// represented has not been proved.
+fn intact_prefix_from_verdicts(
+    verdicts: &std::collections::BTreeMap<u32, crate::pipeline::integrity::BlockVerdict>,
+    slice_size: u64,
+) -> u64 {
+    let mut prefix = 0u64;
+    for index in 0.. {
+        match verdicts.get(&index) {
+            Some(crate::pipeline::integrity::BlockVerdict::Intact { .. }) => {
+                match prefix.checked_add(slice_size) {
+                    Some(next) => prefix = next,
+                    None => break,
+                }
+            }
+            _ => break,
+        }
+    }
+    prefix
+}
+
 /// The one recovery-set description a pipeline file unambiguously identifies.
 #[derive(Debug, Clone)]
 pub(crate) struct Par2FileBinding {
@@ -1300,23 +1341,33 @@ impl Pipeline {
         (!verdicts.is_empty()).then_some(verdicts)
     }
 
-    /// The lowest byte offset of a block the recovery set says is damaged.
+    /// Both in-stream facts a chased part needs, from a single verdict build.
     ///
-    /// Derived from the same in-stream grid the settle path uses, so it costs
-    /// no extra reads: the verdicts were accumulated as articles landed.
-    /// `None` when nothing is known to be damaged, which is every clean file.
-    pub(crate) fn in_stream_damage_floor(&self, file_id: NzbFileId) -> Option<u64> {
+    /// The damage floor and the intact prefix are read together on every commit
+    /// of a gated part, and each derives from the same `verdicts_against` map.
+    /// Asking for them separately built that map twice per commit; this builds
+    /// it once. `None` means the file has no binding or no parsed set, which is
+    /// the same "nothing vouches for this" the individual accessors report.
+    ///
+    /// The build itself remains O(closed blocks) per call, and the map is
+    /// rebuilt rather than cached because the grid is still accumulating — a
+    /// cached answer is exactly the stale one the gate must not act on. So the
+    /// honest bound over a gated part's life is O(articles x blocks). It is
+    /// paid only by sets already known to carry damage.
+    pub(crate) fn in_stream_chase_evidence(
+        &self,
+        file_id: NzbFileId,
+    ) -> Option<(Option<u64>, u64)> {
         let binding = self.resolve_par2_file_binding(file_id)?;
         let set = self.par2_set_for(file_id.job_id, binding.recovery_set_id)?;
         let slice = set.slice_size;
-        self.block_crcs
-            .verdicts_against(file_id, set, binding.par2_file_id)
-            .iter()
-            .filter(|(_, verdict)| {
-                matches!(verdict, crate::pipeline::integrity::BlockVerdict::Damaged)
-            })
-            .filter_map(|(&index, _)| u64::from(index).checked_mul(slice))
-            .min()
+        let verdicts = self
+            .block_crcs
+            .verdicts_against(file_id, set, binding.par2_file_id);
+        Some((
+            damage_floor_from_verdicts(&verdicts, slice),
+            intact_prefix_from_verdicts(&verdicts, slice),
+        ))
     }
 
     /// How many bytes from the start of a file the recovery set has positively
@@ -1338,20 +1389,12 @@ impl Pipeline {
         let binding = self.resolve_par2_file_binding(file_id)?;
         let set = self.par2_set_for(file_id.job_id, binding.recovery_set_id)?;
         let slice = set.slice_size;
-        let verdicts = self
-            .block_crcs
-            .verdicts_against(file_id, set, binding.par2_file_id);
-
-        let mut prefix = 0u64;
-        for index in 0.. {
-            match verdicts.get(&index) {
-                Some(crate::pipeline::integrity::BlockVerdict::Intact { .. }) => {
-                    prefix = prefix.checked_add(slice)?;
-                }
-                _ => break,
-            }
-        }
-        Some(prefix)
+        Some(intact_prefix_from_verdicts(
+            &self
+                .block_crcs
+                .verdicts_against(file_id, set, binding.par2_file_id),
+            slice,
+        ))
     }
 
     /// A completed file's PAR2 identity, provable from the in-stream dual-CRC

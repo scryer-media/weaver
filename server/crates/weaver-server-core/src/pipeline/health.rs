@@ -407,6 +407,7 @@ impl Pipeline {
             job_id,
             "job failed",
             crate::pipeline::direct_unpack::wiring::AbortLatch::Permanent,
+            crate::pipeline::direct_unpack::wiring::DemotionReason::DownloadEnded,
         );
 
         let (staging_dir, released_repair, released_extract) =
