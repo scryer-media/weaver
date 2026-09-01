@@ -703,6 +703,15 @@ func TestFullPhasesHaveIsolatedPortsAndProfiles(t *testing.T) {
 // bakes the corpus into an image — so building its environment must never take
 // the pinned-image branch. Getting this wrong is not a wrong image: it is a
 // `log.Fatalf` seconds into a cold run, which is how it escaped the first time.
+//
+// It must still get the overlay flag, though, and that is the *second* thing
+// this test exists for. The flag drives the preseeded-nntp compose overlay,
+// whose `volumes: !override` keeps articles in the container layer instead of a
+// /data volume — without it the capture commit refuses, having nothing but an
+// empty store to bake. Exempting the bootstrap from the whole block rather than
+// from the pin alone cost a run that died at 3m56s with "primary NNTP cache
+// source still mounts /data"; asserting the flag here would have made that a
+// red test instead.
 func TestSeedBootstrapEnvIsExemptFromTheImagePin(t *testing.T) {
 	profile := "seed-bootstrap-exemption"
 	set := nntpSeedImageSet{
@@ -737,6 +746,11 @@ func TestSeedBootstrapEnvIsExemptFromTheImagePin(t *testing.T) {
 	}
 	if got, ok := env["E2E_NNTP2_IMAGE"]; ok {
 		t.Fatalf("seeding bootstrap must not be pinned to a backup image, got %q", got)
+	}
+	if got := env[nntpSeedImageActiveEnv]; got != "1" {
+		t.Fatalf(
+			"seeding bootstrap needs the preseeded-nntp overlay or its capture commit bakes an empty store; %s=%q",
+			nntpSeedImageActiveEnv, got)
 	}
 }
 

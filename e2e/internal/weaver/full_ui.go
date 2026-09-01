@@ -1367,12 +1367,20 @@ func (p *fullPhaseContext) env() map[string]string {
 	if seedJobs, ok := fullSeedJobsOverride(); ok {
 		env["E2E_SEED_JOBS"] = seedJobs
 	}
-	// The seeding bootstrap is deliberately exempt: it runs against the base
-	// article store because seeding is what bakes the corpus into an image, so
-	// pinning it to a pre-seeded one would either fail loudly on a cold cache
-	// or seed into an image that already claims to be seeded.
-	if nntpSeedImageCacheEnabled() && strings.TrimSpace(p.SeedProfile) != "" && !p.SeedBootstrap {
-		if set, ok := preseededImageSet(p.SeedProfile); ok {
+	// Two different things live behind this flag, and the seeding bootstrap
+	// wants one of them but not the other: the preseeded-nntp compose overlay,
+	// yes; the image pin, never.
+	if nntpSeedImageCacheEnabled() && strings.TrimSpace(p.SeedProfile) != "" {
+		if p.SeedBootstrap {
+			// Seeding runs against the base article store — baking the corpus
+			// into an image is the thing it is here to do — but it still needs
+			// the overlay, whose `volumes: !override` drops the /data named
+			// volume so articles land in the container layer. Without that the
+			// capture commit has nothing to commit: `commitSeedImageCacheFromContainers`
+			// sees a /data mount and refuses rather than bake an empty store.
+			// So the overlay flag is shared; the pin below is not.
+			env[nntpSeedImageActiveEnv] = "1"
+		} else if set, ok := preseededImageSet(p.SeedProfile); ok {
 			// Captured this run: the phase must use exactly that store. A miss
 			// here means the image vanished or its identity moved underneath
 			// us, and running anyway would serve the wrong articles to every
