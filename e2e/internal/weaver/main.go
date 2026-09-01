@@ -1110,6 +1110,7 @@ var canonicalFixtureSlugs = []string{
 	"direct-unpack-aes256",
 	"direct-unpack-aes256-header",
 	"direct-unpack-aes256-header-split",
+	"direct-unpack-aes256-repair",
 	"direct-unpack-aes256-split",
 	"direct-unpack-bcj-lzma2",
 	"direct-unpack-bcj-lzma2-split",
@@ -1147,6 +1148,7 @@ var canonicalFixtureSlugs = []string{
 	// (see assertDirectStoreEngagement). Each is store-method and non-solid;
 	// archives direct-store is right to refuse are the rest of this corpus.
 	"direct-store-encrypted",
+	"direct-store-encrypted-par2-repair",
 	"direct-store-multi-member",
 	"direct-store-multivolume",
 	"direct-store-par2-repair",

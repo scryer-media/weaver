@@ -1,0 +1,20 @@
+{
+  "slug": "direct-unpack-aes256-repair",
+  "title": "Silver.Horizon.AES256.Repair.Split.2024.720p.WEB.x264-WEAVER",
+  "description": "Split AES256 .7z (3 volumes, data encrypted, headers readable) with PAR2 parity over the ciphertext and a damaged second volume. Repair rewrites encrypted bytes on disk; the password only matters downstream, when extraction decodes the repaired volumes. Whichever way the repair decision lands for the chase, the decrypted member digest proves the repaired bytes are the posted bytes.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "silver_horizon.mkv": "779fad2c06e827cf1cd4a6793a655a1504119962c8ebfdc0b35d1eab2d84327a"
+  },
+  "password": "e2e-test-password",
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "runtimeAssertions": {
+    "directUnpack": {
+      "requireArmed": true
+    }
+  },
+  "segment_size": 8192
+}
