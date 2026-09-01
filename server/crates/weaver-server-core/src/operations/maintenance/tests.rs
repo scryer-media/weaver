@@ -18,6 +18,44 @@ fn touch_until_after(path: &Path, older_than: SystemTime) -> SystemTime {
     panic!("failed to advance file mtime for {}", path.display());
 }
 
+/// Direct unpack stages outside the conventional tree, so nothing in the job
+/// lifecycle deletes it after a crash. The sweep treats it exactly like the
+/// conventional staging root: keyed by job id, removed when the job is gone.
+#[test]
+fn staging_cleanup_removes_orphaned_direct_unpack_dirs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join(".weaver-direct-unpack");
+    let active = root.join("20").join("silver_horizon.7z");
+    let orphan = root.join("21").join("silver_horizon.7z");
+    let not_a_job = root.join("scratch");
+    std::fs::create_dir_all(&active).unwrap();
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::create_dir_all(&not_a_job).unwrap();
+    std::fs::write(active.join("member.bin"), b"active").unwrap();
+    std::fs::write(orphan.join("member.bin"), b"orphan").unwrap();
+    std::fs::write(not_a_job.join("member.bin"), b"kept").unwrap();
+
+    let active_ids = HashSet::from([20_u64]);
+    let report = cleanup_stale_staging_dirs_at(
+        temp.path(),
+        &active_ids,
+        Duration::ZERO,
+        SystemTime::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+
+    assert_eq!(report.removed_count, 1);
+    assert!(
+        active.exists(),
+        "an active job's chase staging must survive"
+    );
+    assert!(!root.join("21").exists(), "the orphan must be removed");
+    assert!(
+        not_a_job.exists(),
+        "a non-numeric entry is not a job dir and is left alone"
+    );
+}
+
 #[test]
 fn staging_cleanup_removes_only_inactive_expired_dirs() {
     let temp = tempfile::tempdir().unwrap();

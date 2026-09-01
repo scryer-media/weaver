@@ -541,6 +541,13 @@ impl Pipeline {
                         new_path.display()
                     )
                 })?;
+                // The one rename that fires *during* the download pass, so it
+                // is the only PAR2 site that can move a part while a chase is
+                // still reading it rather than after.
+                if let Some(name) = old_path.file_name().and_then(|name| name.to_str()) {
+                    let name = name.to_string();
+                    self.taint_direct_unpack_for_file(job_id, &name);
+                }
                 true
             } else {
                 false

@@ -710,6 +710,11 @@ impl Pipeline {
         let plan = plan.clone();
         let normalization_map = Self::placement_normalization_map(&plan);
         let normalized_files = Self::placement_touched_files(&plan);
+        // Renames and swaps move the bytes a chase is reading out from under
+        // it, under names it never saw.
+        for name in &normalized_files {
+            self.taint_direct_unpack_for_file(job_id, name);
+        }
         let plan_for_apply = plan.clone();
         let moved = tokio::task::spawn_blocking(move || {
             par2_rs::apply_placement_plan(&working_dir, &plan_for_apply)
@@ -1698,6 +1703,13 @@ impl Pipeline {
         }
 
         for retry_file in &retry_files {
+            // The file is about to be deleted and downloaded again, so any
+            // chase over it is reading bytes that are being withdrawn.
+            self.direct_unpack_abort_sets_containing(
+                job_id,
+                &retry_file.filename,
+                "archive source deleted for re-download",
+            );
             let path = working_dir.join(&retry_file.filename);
             match std::fs::remove_file(&path) {
                 Ok(()) => {}

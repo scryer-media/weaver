@@ -36,6 +36,21 @@ pub struct PartProgress {
     pub complete: bool,
 }
 
+/// Where an archive offset sits relative to one part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionInPart {
+    /// Inside this part, with `available` committed bytes readable from it.
+    Inside {
+        /// Bytes readable from the offset before the frontier.
+        available: u64,
+    },
+    /// Past this part's end; the next part starts `len` bytes in.
+    Beyond {
+        /// This part's final length.
+        len: u64,
+    },
+}
+
 #[derive(Debug)]
 struct CoverageState {
     parts: Vec<PartProgress>,
@@ -256,6 +271,54 @@ impl SetCoverage {
             }
             if part.complete {
                 return Ok(0);
+            }
+            state = self.park(state);
+        }
+    }
+
+    /// Where an offset sits relative to one part.
+    ///
+    /// The mapping walk asks this instead of asking for a length, because a
+    /// length is more than it needs: to place an offset inside a part it is
+    /// enough that the part's committed watermark has passed it. That matters
+    /// for the part currently downloading, whose final length nobody knows yet
+    /// — without this the reader could only ever consume *finished* parts, and
+    /// the overlap direct unpack exists for would stop at every part boundary.
+    ///
+    /// Parks only when the offset is at or beyond the watermark and the part
+    /// might still grow: either more bytes arrive (and it is inside) or the
+    /// part ends (and it is beyond).
+    pub fn resolve_position(&self, index: usize, offset: u64) -> io::Result<PositionInPart> {
+        let mut state = self.lock();
+        loop {
+            if let Some(reason) = &state.aborted {
+                return Err(io::Error::other(reason.clone()));
+            }
+            let part = Self::part_at(&state, index)?;
+
+            if offset < part.watermark {
+                return Ok(PositionInPart::Inside {
+                    available: part.watermark - offset,
+                });
+            }
+            if let Some(len) = part.len {
+                if offset >= len {
+                    return Ok(PositionInPart::Beyond { len });
+                }
+                // Inside the declared length but past the watermark: the bytes
+                // are still coming, unless the part has stopped growing.
+                if part.complete {
+                    return Err(io::Error::other(format!(
+                        "part {index} stopped at {} bytes, short of its declared length {len}",
+                        part.watermark
+                    )));
+                }
+            } else if part.complete {
+                // A complete part's length is its watermark, so this offset is
+                // past the end of it.
+                return Ok(PositionInPart::Beyond {
+                    len: part.watermark,
+                });
             }
             state = self.park(state);
         }

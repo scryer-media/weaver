@@ -647,3 +647,60 @@ fn extraction_keeps_up_with_a_drip_fed_download() {
         "a drip-fed extraction should have parked at least once"
     );
 }
+
+/// BCJ2, measured on an archive the official 7-Zip console binary wrote.
+///
+/// This is the one chain the writer used above cannot produce — sevenz-rust2
+/// decodes BCJ2 but cannot encode it — so the fixture is checked in rather than
+/// built in-process, and it is oracle-produced for the same reason every other
+/// e2e 7z fixture is.
+///
+/// BCJ2 is the interesting case because it is the only *multi-input* coder in
+/// the format: it splits its data across four pack streams that the decoder
+/// reads through concurrent cursors. Whether those cursors interleave — and so
+/// whether a chase can follow one — is not something to assume in either
+/// direction, which is why it is measured here.
+///
+/// The reader is correct regardless: the parts are on disk and any access
+/// pattern is servable. Only the overlap is at stake.
+#[test]
+fn bcj2_read_pattern_is_measured_not_assumed() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/sevenz/generated_bcj2_silver_horizon.7z");
+    let archive = std::fs::read(&path).expect("the checked-in BCJ2 fixture");
+
+    let (recording, reads) = RecordingReader::new(io::Cursor::new(archive.clone()));
+    let extracted = extract_members(recording, Password::empty());
+    assert_eq!(
+        extracted.len(),
+        1,
+        "the BCJ2 fixture must decode through weaver's reader"
+    );
+
+    let reads = reads.lock().expect("read log").clone();
+    let stats = measure(&archive, &reads);
+    let sweep = stats.sweep();
+
+    println!(
+        "\nbcj2: archive {} reads {} packed {} runs {} max_back {} sweep {}..={}",
+        archive.len(),
+        stats.total_reads,
+        stats.payload_reads,
+        stats.runs.len(),
+        stats.max_backward,
+        sweep.first,
+        sweep.last
+    );
+    for (index, run) in stats.runs.iter().enumerate() {
+        println!(
+            "    run {index}: {}..={} over {} reads",
+            run.first, run.last, run.reads
+        );
+    }
+
+    // No assertion on the shape: the point of this test is the measurement, and
+    // pinning a shape here would only record today's decoder. What it does
+    // assert is the property the whole design rests on — that BCJ2 decodes
+    // correctly through the same reader, whatever order it asks for bytes in.
+    assert!(stats.payload_reads > 0, "BCJ2 read the packed region");
+}

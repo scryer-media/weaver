@@ -2493,6 +2493,11 @@ impl Pipeline {
             let renamed_successfully = match runtime_fs::rename_no_overwrite(old, &new) {
                 Ok(()) => {
                     outcome.renamed += 1;
+                    // The path a chase holds for this part has just gone.
+                    if let Some(name) = old.file_name().and_then(|name| name.to_str()) {
+                        let name = name.to_string();
+                        self.taint_direct_unpack_for_file(job_id, &name);
+                    }
                     if correct_name == requested_correct_name
                         && let Some(descriptions) =
                             descriptions_by_name.get(&requested_correct_name)
@@ -2611,6 +2616,12 @@ impl Pipeline {
     ) -> Result<par2_rs::Par2RepairOutcome, String> {
         let set_id = par2_set.recovery_set_id;
         if repair {
+            // The repairer is about to rewrite damaged sources in place. Any
+            // chase that already read them is describing bytes that will not
+            // survive this call, and par2-rs reports what it rewrote as its own
+            // file ids rather than as weaver filenames — so the whole job's
+            // chases are tainted rather than guessing which sets were touched.
+            self.taint_direct_unpack_job(job_id);
             // What the directory held before the repairer touched it, so the
             // artefacts it leaves behind can be named afterwards by difference
             // rather than by guessing at a backup-suffix convention that lives
@@ -6031,6 +6042,13 @@ impl Pipeline {
             let Some(topology) = state.assembly.remove_archive_topology(&file.filename) else {
                 continue;
             };
+            // The parts this set was chasing are about to be deleted from disk.
+            self.direct_unpack_abort_set(
+                job_id,
+                &file.filename,
+                "split topology retired by its recovery data",
+                crate::pipeline::direct_unpack::wiring::AbortLatch::Permanent,
+            );
             let parts: HashSet<String> = topology.volume_map.keys().cloned().collect();
             info!(
                 job_id = job_id.0,

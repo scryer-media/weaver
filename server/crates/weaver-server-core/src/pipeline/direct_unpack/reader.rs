@@ -26,7 +26,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::coverage::SetCoverage;
+use super::coverage::{PositionInPart, SetCoverage};
 
 /// One part file, opened on first use.
 #[derive(Debug)]
@@ -113,44 +113,51 @@ impl GatedSplitReader {
         Ok(total)
     }
 
-    fn part_len(&mut self, index: usize) -> io::Result<u64> {
-        if let Some(len) = self.parts[index].len {
-            return Ok(len);
-        }
-        let len = self.coverage.part_len(index)?;
-        self.parts[index].len = Some(len);
-        Ok(len)
-    }
-
-    /// Map an archive offset onto a part and an offset within it.
+    /// Map an archive offset onto a part, the offset within it, and how many
+    /// committed bytes follow.
     ///
-    /// Parks on any part length it needs and does not have: where part `k`
-    /// starts is not knowable until every part before it has declared a length.
-    /// `Ok(None)` means the offset is at or past the end of the last part.
-    fn locate(&mut self, position: u64) -> io::Result<Option<(usize, u64)>> {
+    /// Walks the parts accumulating their lengths. Only parts the offset lies
+    /// *past* need a settled length; the part the offset lands in needs only a
+    /// watermark that has reached it, which is what lets the reader stream into
+    /// a part that is still downloading. `Ok(None)` means the offset is at or
+    /// past the end of the last part.
+    fn locate(&mut self, position: u64) -> io::Result<Option<(usize, u64, u64)>> {
         let total = self.total_len()?;
         let mut start = 0u64;
 
         for index in 0..self.parts.len() {
-            let len = self.part_len(index)?;
-            let end = start.checked_add(len).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("part lengths overflow the archive offset space at part {index}"),
-                )
-            })?;
-            if end > total {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "parts through {index} span {end} bytes, past the declared archive length {total}"
-                    ),
-                ));
+            let local = position - start;
+            // A length already learned is final, so the walk can skip the lock.
+            let resolved = match self.parts[index].len {
+                Some(len) if local >= len => PositionInPart::Beyond { len },
+                _ => self.coverage.resolve_position(index, local)?,
+            };
+
+            match resolved {
+                PositionInPart::Inside { available } => {
+                    return Ok(Some((index, local, available)));
+                }
+                PositionInPart::Beyond { len } => {
+                    self.parts[index].len = Some(len);
+                    let end = start.checked_add(len).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "part lengths overflow the archive offset space at part {index}"
+                            ),
+                        )
+                    })?;
+                    if end > total {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "parts through {index} span {end} bytes, past the declared archive length {total}"
+                            ),
+                        ));
+                    }
+                    start = end;
+                }
             }
-            if position < end {
-                return Ok(Some((index, position - start)));
-            }
-            start = end;
         }
 
         Ok(None)
@@ -179,19 +186,16 @@ impl Read for GatedSplitReader {
             return Ok(0);
         }
 
-        let Some((index, local)) = self.locate(self.position)? else {
+        // Parks inside `locate` until the download has carried the target part
+        // past this offset, or the part ends and the walk moves on.
+        let Some((index, local, available)) = self.locate(self.position)? else {
             return Ok(0);
         };
 
-        // Parks here until the download has carried this part past `local`.
-        let available = self.coverage.readable_at(index, local)?;
-        if available == 0 {
-            let progress = self.coverage.part_progress(index)?;
-            return Err(io::Error::other(format!(
-                "part {index} finished at {} bytes, short of its declared length {:?}",
-                progress.watermark, progress.len
-            )));
-        }
+        // `locate` only ever reports `Inside` with at least one byte behind the
+        // watermark; a part that ends at this offset comes back as `Beyond` and
+        // the walk moves on. A short part is caught in `resolve_position`.
+        debug_assert!(available > 0, "locate returned an empty readable window");
 
         let remaining = total - self.position;
         let wanted = buf

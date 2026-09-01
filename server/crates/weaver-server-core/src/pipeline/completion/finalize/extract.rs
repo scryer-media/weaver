@@ -1396,7 +1396,103 @@ impl Pipeline {
         let set_name_for_channel = set_name.to_string();
         let pp_pool = self.pp_pool.clone();
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
+
+        // Whatever the chase left behind. Taken here, on the orchestrator, but
+        // resolved inside the spawned task below — a chase that is still
+        // running must never be awaited on this loop.
+        let disposition = self.take_direct_unpack_disposition(job_id, set_name);
+        let staging_for_install = output_dir.clone();
+        let phase_counters_for_install = Arc::clone(&phase_counters);
+
         tokio::task::spawn(async move {
+            // Resolve the chase first: if it produced usable members there is
+            // no reason to decode the archive a second time.
+            let chase = match disposition {
+                crate::pipeline::direct_unpack::wiring::ChaseDisposition::Ready(outcome) => {
+                    Some((*outcome).into_installable())
+                }
+                crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(pending) => {
+                    // Every part is complete by now, so this is finishing at
+                    // disk speed rather than at download speed.
+                    match pending.handle.await {
+                        Ok(Ok(outcome)) => Some((
+                            outcome,
+                            pending.staging_dir,
+                            pending.counters.total_bytes.load(Ordering::Relaxed),
+                            pending.counters.completed_bytes.load(Ordering::Relaxed),
+                        )),
+                        Ok(Err(error)) => {
+                            tracing::debug!(
+                                job_id = job_id.0,
+                                error = %error,
+                                "chase failed at consumption; extracting conventionally"
+                            );
+                            let _ = std::fs::remove_dir_all(&pending.staging_dir);
+                            None
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                job_id = job_id.0,
+                                error = %error,
+                                "chase worker panicked; extracting conventionally"
+                            );
+                            let _ = std::fs::remove_dir_all(&pending.staging_dir);
+                            None
+                        }
+                    }
+                }
+                crate::pipeline::direct_unpack::wiring::ChaseDisposition::None => None,
+            };
+
+            if let Some((outcome, chase_staging, total_bytes, completed_bytes)) = chase {
+                let install = tokio::task::spawn_blocking(move || {
+                    crate::pipeline::direct_unpack::wiring::install_chased_members(
+                        &chase_staging,
+                        &staging_for_install,
+                    )
+                })
+                .await;
+
+                match install {
+                    Ok(Ok(())) => {
+                        // The decode already happened; the phase never saw it.
+                        // Attribute it once, here, so the Extracting bar
+                        // reports real bytes instead of a zero-byte lie.
+                        phase_counters_for_install
+                            .total_bytes
+                            .fetch_add(total_bytes, Ordering::Relaxed);
+                        phase_counters_for_install
+                            .completed_bytes
+                            .fetch_add(completed_bytes, Ordering::Relaxed);
+                        tracing::info!(
+                            job_id = job_id.0,
+                            set_name = %set_name_for_channel,
+                            members = outcome.extracted.len(),
+                            total_bytes,
+                            "installed direct-unpack members instead of re-extracting"
+                        );
+                        let _ = extract_done_tx
+                            .send(ExtractionDone::FullSet {
+                                job_id,
+                                set_name: set_name_for_channel,
+                                result: Ok(outcome),
+                            })
+                            .await;
+                        return;
+                    }
+                    Ok(Err(error)) => tracing::warn!(
+                        job_id = job_id.0,
+                        error = %error,
+                        "failed to install chased members; extracting conventionally"
+                    ),
+                    Err(error) => tracing::warn!(
+                        job_id = job_id.0,
+                        error = %error,
+                        "install task panicked; extracting conventionally"
+                    ),
+                }
+            }
+
             let result = tokio::task::spawn_blocking(move || {
                 pp_pool.install(move || {
                     let _task_permit = task_permit;

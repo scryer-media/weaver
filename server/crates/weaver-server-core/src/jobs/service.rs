@@ -908,8 +908,32 @@ impl Pipeline {
                 file_spec.role,
                 weaver_model::files::FileRole::Unknown
                     | weaver_model::files::FileRole::SplitFile { .. }
+                    | weaver_model::files::FileRole::SevenZipArchive
+                    | weaver_model::files::FileRole::SevenZipSplit { .. }
             )
             .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
+            .flatten();
+
+            // A 7z part's LAST segment joins the head wave, for the same reason
+            // and with the same caveat.
+            //
+            // Direct unpack cannot list an archive until it has the end header,
+            // which sits at the very end of the last part — so until those
+            // bytes land the chase is parked and the overlap it exists for has
+            // not started. One extra segment per part is a cheap way to unblock
+            // it. Planned at queue birth rather than reprioritized later
+            // because a reprioritization only reaches work still queued, and on
+            // a fast job the tail is leased before the chase is even armed.
+            //
+            // Purely an overlap optimization: boosting the wrong segment costs
+            // a little latency and nothing else, and the gated reader is
+            // correct whatever order the bytes arrive in.
+            let tail_segment = matches!(
+                file_spec.role,
+                weaver_model::files::FileRole::SevenZipArchive
+                    | weaver_model::files::FileRole::SevenZipSplit { .. }
+            )
+            .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).max())
             .flatten();
 
             for seg in &file_spec.segments {
@@ -917,11 +941,12 @@ impl Pipeline {
                     file_id,
                     segment_number: seg.ordinal,
                 };
-                let priority = if head_segment == Some(seg.ordinal) {
-                    2
-                } else {
-                    priority
-                };
+                let priority =
+                    if head_segment == Some(seg.ordinal) || tail_segment == Some(seg.ordinal) {
+                        2
+                    } else {
+                        priority
+                    };
                 if skip.contains(&segment_id) {
                     let _ = file_assembly.commit_segment(seg.ordinal, seg.bytes);
                 } else {
@@ -1162,6 +1187,9 @@ impl Pipeline {
         }
 
         self.delete_failed_history_entry(job_id).await;
+        // Reprocess replaces the assembly and file identities wholesale, so a
+        // chase describing the old ones has to go with them.
+        self.direct_unpack_forget_job(job_id);
         self.reset_failed_job_runtime(job_id).await;
 
         if !self.job_order.contains(&job_id) {

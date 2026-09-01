@@ -243,6 +243,10 @@ impl Pipeline {
             > 0;
 
         if in_flight == 0 && !has_remaining_work {
+            // No more bytes are coming for this job. A chase whose parts all
+            // finished runs on to the end; one still missing a part would park
+            // forever, so it is ended here.
+            self.settle_direct_unpack_after_download(job_id);
             self.emit_download_finished_if_active(job_id);
             self.schedule_job_completion_check(job_id);
         }

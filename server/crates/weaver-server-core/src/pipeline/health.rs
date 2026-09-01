@@ -397,6 +397,16 @@ impl Pipeline {
         error: &str,
         preserve_staging: bool,
     ) -> (bool, bool) {
+        // Hooked here rather than at the terminal purge: when post-processing
+        // scripts are configured the purge is deferred until they finish, and
+        // by then this function has already emptied the download queues and
+        // taken the staging directory. A chase must not outlive that.
+        self.direct_unpack_abort_job(
+            job_id,
+            "job failed",
+            crate::pipeline::direct_unpack::wiring::AbortLatch::Permanent,
+        );
+
         let (staging_dir, released_repair, released_extract) =
             if let Some(state) = self.jobs.get_mut(&job_id) {
                 let released_repair = matches!(state.status, JobStatus::Repairing);

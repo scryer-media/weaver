@@ -39,6 +39,15 @@
 //! fixture to settle. It decodes correctly through this reader either way — the
 //! only question is how much overlap it gives up.
 
+//! # Known limitation: a pause discards the chase
+//!
+//! Pausing a job aborts its chases rather than suspending them, because a pause
+//! has no schedule and a parked chase holds a blocking thread for as long as it
+//! lasts. The set re-arms when a later part completes after the resume, so the
+//! cost is the decode done so far, not correctness. If pauses turn out to be
+//! common on jobs large enough to chase, the fix is a quiesce-and-resume
+//! barrier of the kind direct-store keeps, not a longer park.
+//!
 //! # Admission, when the controller arrives
 //!
 //! The controller that decides whether a set may be chased does not exist yet
@@ -68,8 +77,9 @@ pub mod coverage;
 pub mod reader;
 pub mod settings;
 pub mod start_header;
+pub(crate) mod wiring;
 
-pub use coverage::{PartProgress, SetCoverage};
+pub use coverage::{PartProgress, PositionInPart, SetCoverage};
 pub use reader::GatedSplitReader;
 pub use settings::{DIRECT_UNPACK_ENV, DirectUnpackGate, DirectUnpackSettings};
 pub use start_header::{StartHeader, StartHeaderError};

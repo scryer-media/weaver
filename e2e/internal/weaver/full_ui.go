@@ -69,8 +69,8 @@ var fullPhaseDefinitions = []fullPhaseDefinition{
 	// and `assertDirectStoreEngagement` asserts from weaver's own counters that
 	// those sets really did route — the only external evidence available, since
 	// direct output is byte-identical to the conventional path.
-	{name: "Functional SQLite", command: "test-all", slug: "functional-sqlite", seedProfile: "functional", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1", "WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
-	{name: "Functional Postgres", command: "test-all", slug: "functional-postgres", seedProfile: "functional", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1", "WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
+	{name: "Functional SQLite", command: "test-all", slug: "functional-sqlite", seedProfile: "functional", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1", "WEAVER_DIRECT_UNPACK": "1", "WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
+	{name: "Functional Postgres", command: "test-all", slug: "functional-postgres", seedProfile: "functional", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1", "WEAVER_DIRECT_UNPACK": "1", "WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
 	{name: "NNTP Chaos", command: "chaos-test", slug: "nntp-chaos", seedProfile: "chaos", datastore: weaverDatastoreSQLite},
 	{name: "TCP Chaos", command: "tcp-chaos", slug: "tcp-chaos", seedProfile: "tcp-chaos", datastore: weaverDatastoreSQLite},
 	{name: "Container Restart", command: "container-restart", slug: "container-restart", skipSeed: true, datastore: weaverDatastoreSQLite},

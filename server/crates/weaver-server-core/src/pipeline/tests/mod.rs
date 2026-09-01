@@ -47,6 +47,7 @@ mod archive_topology;
 mod core;
 mod decode_and_files;
 mod direct_store;
+mod direct_unpack;
 mod download_dispatch;
 mod health_probe;
 mod par2_completion;

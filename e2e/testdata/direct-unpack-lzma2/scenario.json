@@ -1,0 +1,10 @@
+{
+  "slug": "direct-unpack-lzma2",
+  "title": "Silver.Horizon.LZMA2.2024.720p.WEB.x264-WEAVER",
+  "description": "Single .7z, LZMA2. LZMA2, the chain most real 7z posts use. A single .7z has no topology until the whole file lands, so this asserts the ordinary conventional outcome.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "silver_horizon.mkv": "5a2e23cc7140ebf76bb53aa6b00338b7e935a0f039dd3a1d234f8087963c059a"
+  }
+}
