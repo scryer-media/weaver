@@ -84,8 +84,12 @@ var fullPhaseDefinitions = []fullPhaseDefinition{
 	{name: "Product Behavior Gate", command: "release-gate", slug: "product-behavior", skipSeed: true, datastore: weaverDatastoreSQLite},
 }
 
+// functionalFullPhase selects the fast iteration loop: the SQLite functional
+// phase alone. Postgres is deliberately excluded — it runs the same corpus
+// against the slower datastore, which the full gate still covers; this filter
+// exists so `task functional` answers "did the product break" in one phase.
 func functionalFullPhase(def fullPhaseDefinition) bool {
-	return def.seedProfile == "functional"
+	return def.slug == "functional-sqlite"
 }
 
 // fullPhaseFixtureProfiles is what the selected phases will seed: each seeding

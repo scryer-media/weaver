@@ -283,7 +283,9 @@ func TestFullPhaseContextsIncludeContainerAndManagedRestarts(t *testing.T) {
 	}
 }
 
-func TestFunctionalFullPhaseContextsOnlyRunFunctionalDatastores(t *testing.T) {
+// The functional filter is the fast iteration loop: SQLite alone, Postgres
+// deliberately left to the full gate.
+func TestFunctionalFullPhaseContextsRunOnlyFunctionalSQLite(t *testing.T) {
 	tempRoot := t.TempDir()
 	phases, err := newFullPhaseContextsFor(tempRoot, functionalFullPhase)
 	if err != nil {
@@ -311,7 +313,6 @@ func TestFunctionalFullPhaseContextsOnlyRunFunctionalDatastores(t *testing.T) {
 
 	want := []phaseKey{
 		{name: "Functional SQLite", command: "test-all", seedProfile: "functional", datastore: "sqlite"},
-		{name: "Functional Postgres", command: "test-all", seedProfile: "functional", datastore: "postgres"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("expected %d functional phases, got %d: %#v", len(want), len(got), got)
