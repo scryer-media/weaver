@@ -18,7 +18,7 @@ use crate::response::{is_multiline_status, parse_response};
 use crate::tls::{NntpTransport, TransportReadStats};
 use crate::transfer::{
     ActiveTransferBudget, BodyTransferAccounting, QuotaRejection, ServerTransferControl,
-    active_transfer_read_timeout, active_transfer_timeout,
+    active_transfer_read_timeout_at, active_transfer_timeout,
 };
 use crate::types::{ArticleId, Capabilities, MultiLineResponse, Response};
 
@@ -30,9 +30,13 @@ pub struct BodyStreamStats {
     pub throttle_wait: Duration,
 }
 
-fn ensure_active_transfer_budget(budget: Option<&ActiveTransferBudget>) -> Result<()> {
+/// The budget check against a clock reading the read turn already took.
+fn ensure_active_transfer_budget_at(
+    budget: Option<&ActiveTransferBudget>,
+    now: Instant,
+) -> Result<()> {
     if let Some(budget) = budget
-        && budget.remaining().is_zero()
+        && budget.remaining_at(now).is_zero()
     {
         return Err(active_transfer_timeout(budget));
     }
@@ -1161,19 +1165,27 @@ impl NntpConnection {
                 };
                 let payload_bytes = self.codec.last_multiline_payload_bytes();
                 add_cpu_delta(&mut stats.raw_decode_cpu, cpu_started);
+                // One clock read per turn: the budget check and the read
+                // timeout derived below both key off it; only an actual
+                // throttle wait refreshes it.
+                let mut now = Instant::now();
                 match decoded? {
                     Some(StreamChunk::Data(data)) => {
                         stats.bytes += data.len() as u64;
-                        if let Err(error) = ensure_active_transfer_budget(budget.as_deref()) {
+                        if let Err(error) = ensure_active_transfer_budget_at(budget.as_deref(), now)
+                        {
                             self.charge_active_body_without_wait(payload_bytes);
                             return Err(error);
                         }
                         let waited = self.charge_active_body(payload_bytes).await;
-                        stats.throttle_wait = stats.throttle_wait.saturating_add(waited);
-                        if let Some(budget) = budget.as_deref_mut() {
-                            budget.exclude_wait(waited);
+                        if !waited.is_zero() {
+                            stats.throttle_wait = stats.throttle_wait.saturating_add(waited);
+                            if let Some(budget) = budget.as_deref_mut() {
+                                budget.exclude_wait(waited);
+                            }
+                            now = Instant::now();
+                            ensure_active_transfer_budget_at(budget.as_deref(), now)?;
                         }
-                        ensure_active_transfer_budget(budget.as_deref())?;
                         if let Err(err) = on_chunk(&data) {
                             self.poisoned = true;
                             self.current_group = None;
@@ -1183,14 +1195,14 @@ impl NntpConnection {
                         continue;
                     }
                     Some(StreamChunk::End) => {
-                        ensure_active_transfer_budget(budget.as_deref())?;
+                        ensure_active_transfer_budget_at(budget.as_deref(), now)?;
                         return Ok::<BodyStreamStats, NntpError>(stats);
                     }
                     None => {}
                 }
 
                 let (read_timeout, active_timeout) =
-                    active_transfer_read_timeout(timeout, budget.as_deref())?;
+                    active_transfer_read_timeout_at(now, timeout, budget.as_deref())?;
                 if profile_cpu {
                     let (read_result, read_cpu) = tokio::time::timeout(
                         read_timeout,
@@ -1397,16 +1409,23 @@ impl NntpConnection {
                 let payload_delta = decoder
                     .body_payload_bytes_consumed()
                     .saturating_sub(payload_before);
-                if let Err(error) = ensure_active_transfer_budget(budget.as_deref()) {
+                // One clock read per turn: the budget check and the read
+                // timeout derived below both key off it; only an actual
+                // throttle wait refreshes it.
+                let mut now = Instant::now();
+                if let Err(error) = ensure_active_transfer_budget_at(budget.as_deref(), now) {
                     self.charge_active_body_without_wait(payload_delta as usize);
                     return Err(error.into());
                 }
                 let waited = self.charge_active_body(payload_delta as usize).await;
-                throttle_wait = throttle_wait.saturating_add(waited);
-                if let Some(budget) = budget.as_deref_mut() {
-                    budget.exclude_wait(waited);
+                if !waited.is_zero() {
+                    throttle_wait = throttle_wait.saturating_add(waited);
+                    if let Some(budget) = budget.as_deref_mut() {
+                        budget.exclude_wait(waited);
+                    }
+                    now = Instant::now();
+                    ensure_active_transfer_budget_at(budget.as_deref(), now)?;
                 }
-                ensure_active_transfer_budget(budget.as_deref())?;
                 match decoded? {
                     Some(mut article) => {
                         let chunks = std::mem::take(&mut article.chunks);
@@ -1449,7 +1468,7 @@ impl NntpConnection {
                 }
 
                 let (read_timeout, active_timeout) =
-                    active_transfer_read_timeout(timeout, budget.as_deref())?;
+                    active_transfer_read_timeout_at(now, timeout, budget.as_deref())?;
                 if profile_cpu {
                     let (read_result, read_cpu) = tokio::time::timeout(
                         read_timeout,

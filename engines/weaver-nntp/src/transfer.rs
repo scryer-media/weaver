@@ -66,29 +66,51 @@ pub struct ServerTransferSnapshot {
 }
 
 /// Per-BODY elapsed-time budget that excludes deliberate local rate-limit waits.
+///
+/// Kept as a deadline (`started + limit + excluded wait`) rather than as an
+/// elapsed-time subtraction, so a check is one clock read and a compare, and
+/// the read loop can share that clock read between the budget check and the
+/// read timeout it derives next. SABnzbd keeps the same shape: a deadline per
+/// response, moved when the response makes progress, not re-read per socket
+/// read.
 #[derive(Debug)]
 pub(crate) struct ActiveTransferBudget {
     started: Instant,
     limit: Duration,
     excluded_wait: Duration,
+    deadline: Instant,
 }
+
+/// Far enough that an unrepresentable deadline never expires within the life
+/// of a connection, while staying well inside `Instant`'s range.
+const UNBOUNDED_DEADLINE: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
 impl ActiveTransferBudget {
     pub(crate) fn new(limit: Duration) -> Self {
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(limit)
+            .unwrap_or_else(|| started + UNBOUNDED_DEADLINE);
         Self {
-            started: Instant::now(),
+            started,
             limit,
             excluded_wait: Duration::ZERO,
+            deadline,
         }
     }
 
     pub(crate) fn exclude_wait(&mut self, waited: Duration) {
         self.excluded_wait = self.excluded_wait.saturating_add(waited);
+        self.deadline = self.deadline.checked_add(waited).unwrap_or(self.deadline);
     }
 
     pub(crate) fn remaining(&self) -> Duration {
-        self.limit
-            .saturating_sub(self.started.elapsed().saturating_sub(self.excluded_wait))
+        self.remaining_at(Instant::now())
+    }
+
+    /// Budget left as of a clock reading the caller already took.
+    pub(crate) fn remaining_at(&self, now: Instant) -> Duration {
+        self.deadline.saturating_duration_since(now)
     }
 
     pub(crate) fn limit(&self) -> Duration {
@@ -104,10 +126,20 @@ pub(crate) fn active_transfer_read_timeout(
     command_timeout: Duration,
     budget: Option<&ActiveTransferBudget>,
 ) -> crate::error::Result<(Duration, bool)> {
+    active_transfer_read_timeout_at(Instant::now(), command_timeout, budget)
+}
+
+/// [`active_transfer_read_timeout`] against a clock reading the caller took
+/// for its budget check, so a read turn costs one clock read, not two.
+pub(crate) fn active_transfer_read_timeout_at(
+    now: Instant,
+    command_timeout: Duration,
+    budget: Option<&ActiveTransferBudget>,
+) -> crate::error::Result<(Duration, bool)> {
     let Some(budget) = budget else {
         return Ok((command_timeout, false));
     };
-    let remaining = budget.remaining();
+    let remaining = budget.remaining_at(now);
     if remaining.is_zero() {
         return Err(active_transfer_timeout(budget));
     }
@@ -1059,6 +1091,50 @@ mod tests {
             active_transfer_read_timeout(command_timeout, Some(&expired)),
             Err(NntpError::SoftTimeout(0))
         ));
+    }
+
+    /// The deadline is the budget: excluded waits push it out, and a check
+    /// against a caller-supplied clock reading agrees with the arithmetic.
+    #[test]
+    fn active_transfer_budget_deadline_moves_with_excluded_waits() {
+        let mut budget = ActiveTransferBudget::new(Duration::from_secs(10));
+        let started = budget.started;
+        assert_eq!(budget.remaining_at(started), Duration::from_secs(10));
+        assert_eq!(
+            budget.remaining_at(started + Duration::from_secs(4)),
+            Duration::from_secs(6)
+        );
+
+        budget.exclude_wait(Duration::from_secs(3));
+        assert_eq!(
+            budget.remaining_at(started + Duration::from_secs(12)),
+            Duration::from_secs(1)
+        );
+        assert!(
+            budget
+                .remaining_at(started + Duration::from_secs(13))
+                .is_zero()
+        );
+        assert!(matches!(
+            active_transfer_read_timeout_at(
+                started + Duration::from_secs(13),
+                Duration::from_secs(60),
+                Some(&budget)
+            ),
+            Err(NntpError::SoftTimeout(10))
+        ));
+        assert_eq!(
+            active_transfer_read_timeout_at(
+                started + Duration::from_secs(12),
+                Duration::from_secs(60),
+                Some(&budget)
+            )
+            .unwrap(),
+            (Duration::from_secs(1), true)
+        );
+
+        let unbounded = ActiveTransferBudget::new(Duration::MAX);
+        assert!(!unbounded.remaining().is_zero());
     }
 
     fn quota(limit_bytes: u64, generation: u64) -> ServerTransferConfig {
