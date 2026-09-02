@@ -49,10 +49,6 @@ impl BandwidthCapWindow {
         self.period.end
     }
 
-    fn contains(&self, now: &DateTime<Local>) -> bool {
-        self.period.contains(now)
-    }
-
     /// Instant containment on epoch seconds: the per-article path asks this
     /// question several times per article and must not resolve a calendar
     /// to answer it.
