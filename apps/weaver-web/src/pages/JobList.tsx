@@ -87,6 +87,7 @@ import {
   useExtractionVisibility,
 } from "@/lib/hooks/use-extraction-visibility";
 import { useDebouncedStatuses } from "@/lib/hooks/use-debounced-status";
+import { useIsMobile } from "@/lib/hooks/use-mobile";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
@@ -664,6 +665,7 @@ export function JobList() {
   const [pendingJobUpdates, setPendingJobUpdates] = useState<Record<number, PendingQueueJobUpdate>>({});
   const [savingQueueFields, setSavingQueueFields] = useState<Record<string, boolean>>({});
   const [queueLayout, setQueueLayout] = useState<QueueLayout>("table");
+  const showQueueCards = useIsMobile(1280);
 
   const isPaused = useLivePaused();
   const downloadBlock = useLiveDownloadBlock();
@@ -1320,8 +1322,8 @@ export function JobList() {
           <QueueNameCell jobId={row.original.id} displayName={row.original.displayName} />
         ),
         meta: {
-          headerClassName: "h-7 w-[34%] px-2 text-left",
-          cellClassName: "w-[34%] px-2 py-1.5 text-left align-middle",
+          headerClassName: "h-7 min-w-80 px-2 text-left",
+          cellClassName: "min-w-80 px-2 py-1.5 text-left align-middle",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1343,8 +1345,8 @@ export function JobList() {
           />
         ),
         meta: {
-          headerClassName: "h-7 w-[104px] px-2 text-center",
-          cellClassName: "w-[104px] px-2 py-1.5 text-center align-middle",
+          headerClassName: "hidden h-7 w-[104px] px-2 text-center min-[1600px]:table-cell",
+          cellClassName: "hidden w-[104px] px-2 py-1.5 text-center min-[1600px]:table-cell",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1369,8 +1371,8 @@ export function JobList() {
           />
         ),
         meta: {
-          headerClassName: "h-7 w-[124px] px-2 text-center",
-          cellClassName: "w-[124px] px-2 py-1.5 text-center align-middle",
+          headerClassName: "hidden h-7 w-[124px] px-2 text-center lg:table-cell",
+          cellClassName: "hidden w-[124px] px-2 py-1.5 text-center align-middle lg:table-cell",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1423,8 +1425,9 @@ export function JobList() {
           />
         ),
         meta: {
-          headerClassName: "h-7 w-[188px] px-2 text-center",
-          cellClassName: "w-[188px] px-2 py-1.5 text-center align-middle",
+          headerClassName: "h-7 w-[94px] px-2 text-center min-[1440px]:w-[188px]",
+          cellClassName:
+            "w-[94px] px-2 py-1.5 text-center align-middle min-[1440px]:w-[188px]",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1435,8 +1438,8 @@ export function JobList() {
           <QueueEtaCell jobId={row.original.id} override={row.original.etaOverride} />
         ),
         meta: {
-          headerClassName: "h-7 w-[96px] px-2 text-center",
-          cellClassName: "w-[96px] px-2 py-1.5 text-center align-middle",
+          headerClassName: "hidden h-7 w-[96px] px-2 text-center min-[1440px]:table-cell",
+          cellClassName: "hidden w-[96px] px-2 py-1.5 text-center align-middle min-[1440px]:table-cell",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1451,8 +1454,8 @@ export function JobList() {
         ),
         cell: ({ row }) => <QueueSizeCell totalBytes={row.original.totalBytes} />,
         meta: {
-          headerClassName: "h-7 w-[132px] px-2 text-center",
-          cellClassName: "w-[132px] px-2 py-1.5 text-center align-middle",
+          headerClassName: "hidden h-7 w-[132px] px-2 text-center min-[1440px]:table-cell",
+          cellClassName: "hidden w-[132px] px-2 py-1.5 text-center align-middle min-[1440px]:table-cell",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1815,7 +1818,9 @@ export function JobList() {
                   setPageIndex(0);
                 }}
                 searchPlaceholder={t("jobs.searchPlaceholder")}
-                centerContainerClassName="min-h-10"
+                centerContainerClassName={
+                  selectedIds.length > 0 || !showQueueCards ? "min-h-10" : "!hidden"
+                }
                 centerContent={selectedIds.length > 0 ? (
                   <div className="inline-flex h-10 min-w-0 items-center justify-center gap-1.5 rounded-md border border-border/70 bg-muted/20 px-2">
                     <span className="shrink-0 px-1 text-xs font-medium text-muted-foreground">
@@ -1882,6 +1887,7 @@ export function JobList() {
               >
                 <SegmentedControl
                   size="sm"
+                  className="hidden lg:inline-flex"
                   ariaLabel={t("queue.layoutTable")}
                   value={queueLayout}
                   onValueChange={setQueueLayout}
@@ -2145,44 +2151,48 @@ export function JobList() {
             </div>
 
             <QueueEtaProvider jobs={jobs}>
-              {queueLayout === "table" ? (
-              <DataTable
-                table={queueTable}
-                tableClassName="table-fixed"
-                wrapperClassName="max-h-[70vh]"
-                rowClassName={queueRowClassName}
-                virtualization={queueTableVirtualization}
-                emptyState={queueEmptyState}
-              />
-            ) : queueTable.getRowModel().rows.length === 0 ? (
+              {queueLayout === "table" && !showQueueCards ? (
+                <DataTable
+                  table={queueTable}
+                  tableClassName="table-auto"
+                  wrapperClassName="max-h-[70vh]"
+                  rowClassName={queueRowClassName}
+                  virtualization={queueTableVirtualization}
+                  emptyState={queueEmptyState}
+                />
+              ) : queueTable.getRowModel().rows.length === 0 ? (
               queueEmptyState
             ) : (
-              <div className="max-h-[70vh] overflow-y-auto border-t border-border">
+              <div className="max-h-[70vh] overflow-y-auto border-t border-border max-xl:space-y-3 max-xl:border-t-0 max-xl:px-4 max-xl:pb-4">
                 {queueTable.getRowModel().rows.map((row) => {
                   const job = row.original;
                   return (
                     <div
                       key={row.id}
                       data-state={row.getIsSelected() ? "selected" : undefined}
-                      className="group/row flex items-center gap-3 border-b border-border px-6 py-2.5 transition-colors last:border-0 hover:bg-accent/20 data-[state=selected]:bg-primary/[0.06]"
+                      className="group/row flex items-center gap-3 border-border px-6 py-2.5 transition-colors hover:bg-accent/20 data-[state=selected]:bg-primary/[0.06] xl:border-b xl:last:border-0 max-xl:grid max-xl:grid-cols-[auto_minmax(0,1fr)_auto] max-xl:gap-x-3 max-xl:gap-y-3 max-xl:rounded-2xl max-xl:border max-xl:border-border/80 max-xl:bg-background/70 max-xl:px-5 max-xl:py-4 max-xl:shadow-[0_16px_32px_-24px_rgba(8,18,36,0.7)]"
                     >
-                      <div data-row-click-ignore="true" className="shrink-0">
+                      <div
+                        data-row-click-ignore="true"
+                        className="shrink-0 max-xl:row-span-4 max-xl:-ml-1 max-xl:self-center"
+                      >
                         <Checkbox
+                          className="max-xl:size-6"
                           checked={row.getIsSelected()}
                           onCheckedChange={(value) => row.toggleSelected(value === true)}
                         />
                       </div>
-                      <QueueCompactStatusDots job={job} />
-                      <div className="min-w-0 flex-[1.6]">
+                      <div className="flex min-w-0 flex-[1.6] items-center gap-2 max-xl:col-span-2">
+                        <QueueCompactStatusDots job={job} />
                         <Link
                           to={`/jobs/${job.id}`}
                           title={job.displayName}
-                          className="block truncate text-[13px] font-medium text-foreground"
+                          className="block min-w-0 flex-1 truncate text-[13px] font-medium text-foreground"
                         >
                           {job.displayName}
                         </Link>
                       </div>
-                      <div className="hidden min-w-[130px] flex-1 sm:block">
+                      <div className="hidden min-w-[130px] flex-1 max-xl:col-span-2 max-xl:col-start-2 max-xl:min-w-0 max-xl:pt-1 max-xl:block sm:block">
                         <JobPhaseProgressBars
                           compact
                           phaseProgress={job.phaseProgress}
@@ -2190,17 +2200,62 @@ export function JobList() {
                           status={job.status}
                         />
                       </div>
-                      <QueueEtaCell
-                        jobId={job.id}
-                        override={job.etaOverride}
-                        className="hidden w-16 shrink-0 text-right text-[12px] md:block"
-                      />
-                      <span className="w-16 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground">
-                        {formatBytes(job.totalBytes)}
-                      </span>
                       <div
                         data-row-click-ignore="true"
-                        className="flex shrink-0 items-center gap-1 opacity-40 transition-opacity group-hover/row:opacity-100"
+                        className="hidden max-xl:col-span-2 max-xl:col-start-2 max-xl:flex max-xl:flex-wrap max-xl:items-center max-xl:gap-3 max-xl:border-t max-xl:border-border/70 max-xl:pt-3"
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="text-[11px] font-medium text-muted-foreground">
+                            {t("table.priority")}
+                          </span>
+                          <QueueCellSelect
+                            jobId={job.id}
+                            value={job.priorityValue}
+                            options={prioritySelectOptions}
+                            ariaLabel={`${t("upload.priorityLabel")} ${job.displayName}`}
+                            disabled={Boolean(savingQueueFields[`${job.id}:priority`])}
+                            onValueChange={handlePrioritySelectValueChange}
+                            className="w-[108px]"
+                          />
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[11px] font-medium text-muted-foreground">
+                            {t("table.category")}
+                          </span>
+                          <QueueCellSelect
+                            jobId={job.id}
+                            value={job.categoryValue ?? NO_CATEGORY_SELECT_VALUE}
+                            options={categorySelectOptions}
+                            ariaLabel={`${t("table.category")} ${job.displayName}`}
+                            disabled={Boolean(savingQueueFields[`${job.id}:category`])}
+                            onValueChange={handleCategorySelectValueChange}
+                            className="w-[136px]"
+                          />
+                        </div>
+                      </div>
+                      <div className="contents max-xl:col-start-2 max-xl:flex max-xl:items-center max-xl:gap-4">
+                        <div className="flex items-center gap-1.5 xl:contents">
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/70 xl:hidden">
+                            {t("table.eta")}
+                          </span>
+                          <QueueEtaCell
+                            jobId={job.id}
+                            override={job.etaOverride}
+                            className="w-16 shrink-0 text-right text-[12px] max-xl:w-auto max-xl:text-left"
+                          />
+                        </div>
+                        <div className="flex items-center gap-1.5 xl:contents">
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/70 xl:hidden">
+                            {t("table.size")}
+                          </span>
+                          <span className="w-16 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground max-xl:w-auto max-xl:text-left">
+                            {formatBytes(job.totalBytes)}
+                          </span>
+                        </div>
+                      </div>
+                      <div
+                        data-row-click-ignore="true"
+                        className="flex shrink-0 items-center gap-1 opacity-40 transition-opacity group-hover/row:opacity-100 max-xl:col-start-3 max-xl:justify-self-end max-xl:opacity-100"
                       >
                         {job.status === "PAUSED" ? (
                           <Button

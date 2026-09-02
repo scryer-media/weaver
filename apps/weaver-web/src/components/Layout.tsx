@@ -361,7 +361,7 @@ export function Layout() {
     >
       <div className="flex h-screen overflow-hidden bg-background text-foreground">
         {/* Desktop sidebar */}
-        <aside className="hidden w-52 shrink-0 flex-col border-r border-border bg-card/40 backdrop-blur-md md:flex lg:w-[248px]">
+        <aside className="hidden w-52 shrink-0 flex-col border-r border-border bg-card/40 backdrop-blur-md min-[1600px]:flex min-[1600px]:w-[248px]">
           <div className="flex items-start justify-between border-b border-border px-5 py-5">
             <Link to="/" className="min-w-0">
               <div className="font-space-grotesk text-[22px] font-bold leading-none tracking-tight text-foreground">
@@ -455,7 +455,7 @@ export function Layout() {
 
         {/* Main column */}
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
-          <header className="flex flex-none items-center gap-3 border-b border-border bg-card/50 px-4 py-3 backdrop-blur md:hidden">
+          <header className="flex flex-none items-center gap-3 border-b border-border bg-card/50 px-4 py-3 backdrop-blur min-[1600px]:hidden">
             <button
               type="button"
               onClick={() => setMobileNavOpen(true)}
@@ -471,7 +471,7 @@ export function Layout() {
           </header>
 
           <div className="flex-1 overflow-y-auto">
-            <div className="mx-auto w-full max-w-[1600px] px-4 py-5 sm:px-6 lg:px-8 lg:py-8">
+            <div className="mx-auto w-full max-w-[2080px] px-4 py-5 sm:px-6 lg:px-8 lg:py-8">
               <RoutedOutlet />
             </div>
           </div>
