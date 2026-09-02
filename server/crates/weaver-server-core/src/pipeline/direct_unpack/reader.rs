@@ -35,6 +35,11 @@ struct Part {
     /// Opened lazily: a later part often does not exist on disk yet when the
     /// reader is built, and opening it eagerly would fail the whole set.
     file: Option<File>,
+    /// The coverage's rewrite count for this part when `file` was opened.
+    /// Repair installs a new file at the path rather than writing into the
+    /// old one, so a handle from before a repair reads the file that was moved
+    /// aside; when the count moves on, the path is opened again.
+    opened_rewritten: u64,
     /// Cached part length. A declared length never changes, so one lookup is
     /// enough and the mapping walk stays off the shared lock.
     len: Option<u64>,
@@ -84,6 +89,7 @@ impl GatedSplitReader {
                 .map(|path| Part {
                     path: path.as_ref().to_path_buf(),
                     file: None,
+                    opened_rewritten: 0,
                     len: None,
                 })
                 .collect(),
@@ -120,8 +126,9 @@ impl GatedSplitReader {
     /// *past* need a settled length; the part the offset lands in needs only a
     /// watermark that has reached it, which is what lets the reader stream into
     /// a part that is still downloading. `Ok(None)` means the offset is at or
-    /// past the end of the last part.
-    fn locate(&mut self, position: u64) -> io::Result<Option<(usize, u64, u64)>> {
+    /// past the end of the last part. The last element is the part's rewrite
+    /// count from the same answer, for [`Self::file_for`].
+    fn locate(&mut self, position: u64) -> io::Result<Option<(usize, u64, u64, u64)>> {
         let total = self.total_len()?;
         let mut start = 0u64;
 
@@ -134,8 +141,11 @@ impl GatedSplitReader {
             };
 
             match resolved {
-                PositionInPart::Inside { available } => {
-                    return Ok(Some((index, local, available)));
+                PositionInPart::Inside {
+                    available,
+                    rewritten,
+                } => {
+                    return Ok(Some((index, local, available, rewritten)));
                 }
                 PositionInPart::Beyond { len } => {
                     self.parts[index].len = Some(len);
@@ -163,15 +173,26 @@ impl GatedSplitReader {
         Ok(None)
     }
 
-    fn file_for(&mut self, index: usize) -> io::Result<&mut File> {
-        if self.parts[index].file.is_none() {
-            let file = File::open(&self.parts[index].path)?;
-            self.parts[index].file = Some(file);
+    /// The open handle for a part: opened on first use, and opened again after
+    /// every repair of it.
+    ///
+    /// `rewritten` is the coverage's count for this part from the same
+    /// `resolve_position` answer that placed the read, so the handle is judged
+    /// against the moment the bytes it is about to serve were placed, never
+    /// against a later or earlier one.
+    fn file_for(&mut self, index: usize, rewritten: u64) -> io::Result<&mut File> {
+        let part = &mut self.parts[index];
+        if part.file.is_some() && part.opened_rewritten != rewritten {
+            // The path leads to the repaired file now; the handle still leads
+            // to the damaged one that was moved aside.
+            part.file = None;
         }
-        Ok(self.parts[index]
-            .file
-            .as_mut()
-            .expect("just opened the part file"))
+        if part.file.is_none() {
+            let file = File::open(&part.path)?;
+            part.file = Some(file);
+            part.opened_rewritten = rewritten;
+        }
+        Ok(part.file.as_mut().expect("just opened the part file"))
     }
 }
 
@@ -188,7 +209,7 @@ impl Read for GatedSplitReader {
 
         // Parks inside `locate` until the download has carried the target part
         // past this offset, or the part ends and the walk moves on.
-        let Some((index, local, available)) = self.locate(self.position)? else {
+        let Some((index, local, available, rewritten)) = self.locate(self.position)? else {
             return Ok(0);
         };
 
@@ -202,7 +223,7 @@ impl Read for GatedSplitReader {
             .len()
             .min(available.min(remaining).try_into().unwrap_or(usize::MAX));
 
-        let file = self.file_for(index)?;
+        let file = self.file_for(index, rewritten)?;
         file.seek(SeekFrom::Start(local))?;
         let read = file.read(&mut buf[..wanted])?;
         self.position += read as u64;
