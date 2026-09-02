@@ -75,7 +75,6 @@ pub struct ServerTransferSnapshot {
 /// read.
 #[derive(Debug)]
 pub(crate) struct ActiveTransferBudget {
-    started: Instant,
     limit: Duration,
     excluded_wait: Duration,
     deadline: Instant,
@@ -92,7 +91,6 @@ impl ActiveTransferBudget {
             .checked_add(limit)
             .unwrap_or_else(|| started + UNBOUNDED_DEADLINE);
         Self {
-            started,
             limit,
             excluded_wait: Duration::ZERO,
             deadline,
@@ -1098,7 +1096,7 @@ mod tests {
     #[test]
     fn active_transfer_budget_deadline_moves_with_excluded_waits() {
         let mut budget = ActiveTransferBudget::new(Duration::from_secs(10));
-        let started = budget.started;
+        let started = budget.deadline - Duration::from_secs(10);
         assert_eq!(budget.remaining_at(started), Duration::from_secs(10));
         assert_eq!(
             budget.remaining_at(started + Duration::from_secs(4)),
