@@ -1105,6 +1105,44 @@ impl DownloadError {
     pub(super) fn from_nntp(error: weaver_nntp::NntpError) -> Self {
         Self::Fetch(DownloadFailure::from_nntp(error))
     }
+
+    /// Whether this failure left the NNTP connection in a known-good state:
+    /// the server's response was read to completion and the socket can carry
+    /// the next BODY.
+    ///
+    /// `ArticleNotFound` (430) is a complete, bodyless server answer — it says
+    /// nothing about the connection. Treating it as a transport fault used to
+    /// QUIT the TLS session, abandon the rest of the leased batch, and block
+    /// the server's pipelining proof, all because one article lives on another
+    /// provider. `ServerQuota` / `Unrequested` are local policy outcomes where
+    /// no BODY was ever issued, so they are clean for the same reason (they
+    /// still park the lane, just without discarding it).
+    ///
+    /// Decode failures stay dirty: the yEnc decoder can fail on a body the
+    /// transport never finished delivering.
+    pub(super) fn leaves_connection_clean(&self) -> bool {
+        match self {
+            Self::Fetch(failure) => matches!(
+                failure.kind,
+                DownloadFailureKind::ArticleNotFound
+                    | DownloadFailureKind::ServerQuota
+                    | DownloadFailureKind::Unrequested
+            ),
+            Self::Decode { .. } => false,
+        }
+    }
+}
+
+/// Whether a download outcome leaves the lane's connection reusable.
+///
+/// See [`DownloadError::leaves_connection_clean`].
+pub(super) fn download_outcome_keeps_connection(
+    data: &std::result::Result<DownloadPayload, DownloadError>,
+) -> bool {
+    match data {
+        Ok(_) => true,
+        Err(error) => error.leaves_connection_clean(),
+    }
 }
 
 /// Successful download payload waiting for decode scheduling.

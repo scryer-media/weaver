@@ -389,15 +389,10 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 batch_works.push(work);
             }
 
-            // Borrow the ids rather than formatting a `String` per BODY: the
-            // work items own them as shared `Arc<str>`s already.
-            let message_id_handles = batch_works
-                .iter()
-                .map(|work| work.message_id.clone())
-                .collect::<Vec<_>>();
+            let message_id_handles = lease_message_id_wire_forms(&batch_works);
             let message_ids = message_id_handles
                 .iter()
-                .map(|message_id| &*message_id.0)
+                .map(String::as_str)
                 .collect::<Vec<&str>>();
             let total = batch_works.len();
             let mut completed = 0usize;
@@ -446,7 +441,8 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                                         | DownloadFailureKind::Unrequested
                                 )
                         );
-                        batch_clean_for_refill &= result.data.is_ok() || policy_outcome;
+                        batch_clean_for_refill &=
+                            download_outcome_keeps_connection(&result.data);
                         policy_blocked_for_refill |= policy_outcome;
                         results.push(result);
                     }
@@ -501,7 +497,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                                 )
                         );
                         batch_clean_for_refill &=
-                            (result.data.is_ok() || policy_outcome) && meta.batch_clean;
+                            download_outcome_keeps_connection(&result.data) && meta.batch_clean;
                         policy_blocked_for_refill |= policy_outcome;
                         results.push(result);
                     }
@@ -781,17 +777,12 @@ fn result_from_trace(
     let completion_critical = work.completion_critical;
     let (data, attempts, source_server_idx) =
         Pipeline::download_data_from_decoded_trace(segment_id, trace);
-    let policy_outcome = matches!(
-        &data,
-        Err(DownloadError::Fetch(failure))
-            if matches!(
-                failure.kind,
-                DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
-            )
-    );
-    if !policy_outcome {
-        observation.batch_clean &= data.is_ok();
-        observation.connection_discarded |= data.is_err();
+    // Only outcomes that actually damaged the transport dirty the batch. A
+    // 430 and the local quota/unrequested policy outcomes all leave the
+    // socket exactly where the next BODY expects it.
+    if !download_outcome_keeps_connection(&data) {
+        observation.batch_clean = false;
+        observation.connection_discarded = true;
     }
     DownloadResult {
         segment_id,
@@ -877,6 +868,28 @@ mod tests {
     }
 
     #[test]
+    fn leased_message_ids_are_bracketed_for_the_wire() {
+        // Both lanes build their BODY arguments here. `DownloadWork` stores
+        // the bare id, and a bare BODY argument is an article-*number*
+        // reference that every real provider answers with 430.
+        let works = [tail_work(1, 0), tail_work(2, 0)];
+
+        let wire = lease_message_id_wire_forms(&works);
+
+        assert_eq!(
+            wire,
+            vec![
+                "<tail-1@example.invalid>".to_string(),
+                "<tail-2@example.invalid>".to_string(),
+            ]
+        );
+        assert!(
+            !works[0].message_id.0.starts_with('<'),
+            "the stored id is bare, which is exactly why the wire form is needed"
+        );
+    }
+
+    #[test]
     fn owned_hot_lane_yield_returns_unrequested_tail_without_retry() {
         let mut pending_works = VecDeque::from([tail_work(2, 4), tail_work(3, 7)]);
 
@@ -900,6 +913,103 @@ mod tests {
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].segment_id.segment_number, 4);
         assert_eq!(tail[1].segment_id.segment_number, 5);
+    }
+
+    /// A 430 must not tear down the owned lane.
+    ///
+    /// The article-not-found answer is a complete, bodyless server response:
+    /// the socket is exactly where the next BODY expects it. Marking it dirty
+    /// used to QUIT the TLS session, drop the rest of the leased batch as
+    /// Unrequested, and block the server's pipelining proof — all because one
+    /// article lives on another provider.
+    #[test]
+    fn owned_article_not_found_keeps_the_lane_and_the_batch_clean() {
+        let result = result_from_trace(
+            tail_work(9, 0),
+            0,
+            weaver_nntp::client::DecodedBodyTrace {
+                attempts: vec![weaver_nntp::client::FetchAttemptTrace {
+                    server_idx: 0,
+                    remote_ip: None,
+                    elapsed: Duration::from_millis(3),
+                    outcome: weaver_nntp::client::FetchAttemptOutcome::NotFound,
+                    error: Some("article not found".to_string()),
+                }],
+                result: Err(weaver_nntp::client::DecodedBodyError::Nntp(
+                    weaver_nntp::NntpError::NoSuchArticle {
+                        message_id: "<tail-9@example.invalid>".to_string(),
+                    },
+                )),
+            },
+            DownloadLaneObservation {
+                server_idx: Some(0),
+                mode: DownloadLaneMode::PipelineDepth4,
+                supports_pipelining: true,
+                rtt: None,
+                batch_complete: true,
+                batch_clean: true,
+                batch_response_count: 4,
+                unresolved_count: 0,
+                connection_discarded: false,
+            },
+            false,
+            &[],
+        );
+
+        // The work item itself still fails, so the completion path excludes
+        // this server and retries the article elsewhere.
+        assert!(matches!(
+            result.data,
+            Err(DownloadError::Fetch(DownloadFailure {
+                kind: DownloadFailureKind::ArticleNotFound,
+                ..
+            }))
+        ));
+        // …but the lane keeps its cached connection and keeps refilling.
+        let observation = result.lane_observation.unwrap();
+        assert!(observation.batch_clean);
+        assert!(!observation.connection_discarded);
+        assert!(download_outcome_keeps_connection(&result.data));
+
+        // A clean batch never blocks the server's pipelining proof.
+        let mut proof = crate::pipeline::download::transport::ServerPipelineProof::default();
+        let transition = proof.note_pipeline_batch(
+            Instant::now(),
+            DownloadLaneMode::PipelineDepth4,
+            observation.batch_clean,
+            observation.batch_response_count,
+        );
+        assert!(!matches!(
+            transition,
+            Some(crate::pipeline::download::transport::ServerPipelineState::PipelineBlocked)
+        ));
+
+        // The rest of the leased batch is still requested, not handed back.
+        let mut pending_works = VecDeque::from([tail_work(10, 0), tail_work(11, 0)]);
+        assert!(take_unrequested_tail(&mut pending_works, true, false, false).is_empty());
+        assert_eq!(pending_works.len(), 2);
+    }
+
+    /// Transport faults must stay dirty. Only the "fully consumed response"
+    /// outcomes are allowed to keep the connection.
+    #[test]
+    fn owned_transport_and_decode_failures_still_discard_the_connection() {
+        for data in [
+            Err::<DownloadPayload, _>(DownloadError::Fetch(DownloadFailure::new(
+                DownloadFailureKind::EstablishedTransport,
+                "connection closed mid-body",
+            ))),
+            Err(DownloadError::Decode {
+                raw_size: 128,
+                error: "crc mismatch".to_string(),
+                crc_mismatch: true,
+            }),
+        ] {
+            assert!(
+                !download_outcome_keeps_connection(&data),
+                "a possibly mid-body socket must not be reused"
+            );
+        }
     }
 
     #[test]

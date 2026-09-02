@@ -545,14 +545,10 @@ impl Pipeline {
                         batch_works.push(work);
                     }
 
-                    let message_id_handles: Vec<crate::jobs::ids::MessageId> = batch_works
-                        .iter()
-                        .map(|work| work.message_id.clone())
-                        .collect();
-                    let message_ids: Vec<&str> = message_id_handles
-                        .iter()
-                        .map(|message_id| &*message_id.0)
-                        .collect();
+                    let message_id_handles =
+                        crate::pipeline::download::lease_message_id_wire_forms(&batch_works);
+                    let message_ids: Vec<&str> =
+                        message_id_handles.iter().map(String::as_str).collect();
                     let total = batch_works.len();
                     let mut completed = 0usize;
                     let mut works_by_index: Vec<Option<DownloadWork>> =
@@ -587,7 +583,13 @@ impl Pipeline {
                                                 | DownloadFailureKind::Unrequested
                                         )
                                 );
-                                let batch_clean = data.is_ok() || policy_outcome;
+                                // A 430 is a complete server answer, not a
+                                // transport fault: it must not dirty the batch,
+                                // report a discarded connection, or end the
+                                // lease early. Kept in step with the owned
+                                // blocking lane.
+                                let batch_clean =
+                                    crate::pipeline::download_outcome_keeps_connection(&data);
                                 batch_clean_for_refill &= batch_clean;
                                 policy_blocked_for_refill |= policy_outcome;
                                 let observation = DownloadLaneObservation {

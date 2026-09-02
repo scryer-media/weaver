@@ -371,7 +371,7 @@ impl BlockingBodyLane {
                 closed_early = true;
             }
             let trace = self.trace_item(message_id, policy_elapsed, result);
-            batch_clean &= trace.result.is_ok();
+            batch_clean &= decoded_result_keeps_connection(&trace.result);
             let is_complete = closed_early || (idx + 1 == requested && quota_rejection.is_none());
             out.push((
                 idx,
@@ -744,30 +744,28 @@ impl BlockingNntpConnection {
         self.current_group.as_deref()
     }
 
-    /// Session setup for a server known to pipeline: MODE READER, AUTHINFO
-    /// USER, AUTHINFO PASS and the first GROUP leave in one flush and are
-    /// answered in order (RFC 4644). When the server authenticates on the
-    /// username alone (281) its answer to the surplus password is consumed
-    /// and ignored.
+    /// Session setup for a server known to pipeline. AUTHINFO goes first and
+    /// on its own: RFC 4643 forbids pipelining it, and a provider that
+    /// enforces that answers the whole batch with 480s or drops the
+    /// connection. MODE READER and the lane's first GROUP then leave in one
+    /// flush and are answered in order (RFC 4644).
     fn pipelined_session_setup(
         &mut self,
         config: &ServerConfig,
         initial_group: Option<&str>,
     ) -> Result<()> {
-        let credentials = match (&config.username, &config.password) {
-            (Some(user), Some(pass)) => Some((user.clone(), pass.clone())),
-            _ => None,
-        };
+        if let (Some(user), Some(pass)) = (&config.username, &config.password) {
+            let user = user.clone();
+            let pass = pass.clone();
+            self.authenticate(&user, &pass)?;
+            self.credentials = Some((user, pass));
+        }
+
         debug!(
-            auth = credentials.is_some(),
             group = initial_group.is_some(),
-            "sending pipelined blocking session setup"
+            "sending pipelined blocking MODE READER and GROUP"
         );
         self.write_command_frame(&Command::ModeReader)?;
-        if let Some((user, pass)) = &credentials {
-            self.write_command_frame(&Command::AuthInfoUser(user.clone()))?;
-            self.write_command_frame(&Command::AuthInfoPass(pass.clone()))?;
-        }
         if let Some(group) = initial_group {
             self.write_command_frame(&Command::Group(group.to_string()))?;
         }
@@ -776,28 +774,6 @@ impl BlockingNntpConnection {
         let mode_reader = self.read_response()?;
         if mode_reader.code.is_error() && mode_reader.code.raw() != 500 {
             warn!(code = mode_reader.code.raw(), "blocking MODE READER failed");
-        }
-
-        if let Some((user, pass)) = credentials {
-            let user_resp = self.read_response()?;
-            match user_resp.code.raw() {
-                281 => {
-                    let _ = self.read_response()?;
-                }
-                381 => {
-                    let pass_resp = self.read_response()?;
-                    match pass_resp.code.raw() {
-                        281 => {}
-                        481 => return Err(NntpError::AuthenticationFailed),
-                        482 => return Err(NntpError::AuthenticationRejected),
-                        _ => {
-                            return Err(NntpError::from_status(pass_resp.code, &pass_resp.message));
-                        }
-                    }
-                }
-                _ => return Err(NntpError::from_status(user_resp.code, &user_resp.message)),
-            }
-            self.credentials = Some((user, pass));
         }
 
         if let Some(group) = initial_group {
@@ -2134,6 +2110,28 @@ fn clone_nntp_error(error: &NntpError) -> NntpError {
     }
 }
 
+/// Whether a decoded BODY outcome left the connection fully consumed and
+/// reusable for the rest of the pipelined batch.
+///
+/// A 430 is a complete server response with no body to drain, so it neither
+/// desynchronises the response stream nor says anything about the socket. It
+/// must therefore not mark the batch dirty — doing so tore down the TLS
+/// session and permanently blocked the server's pipelining proof over a
+/// perfectly ordinary "this article lives on another provider".
+///
+/// Decode failures are deliberately *not* treated as clean here: the yEnc
+/// decoder can fail on a body the transport never finished delivering, and
+/// keeping a possibly mid-body socket is not worth the saved reconnect.
+fn decoded_result_keeps_connection(
+    result: &std::result::Result<DecodedBody, DecodedBodyError>,
+) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(DecodedBodyError::Nntp(error)) => error.is_article_not_found(),
+        Err(DecodedBodyError::Decode { .. }) => false,
+    }
+}
+
 fn is_transient(err: &NntpError) -> bool {
     matches!(
         err,
@@ -2501,9 +2499,11 @@ mod tests {
         .unwrap()
     }
 
-    /// A plain server that answers nothing until every expected setup line
-    /// has arrived, so a client that serialized the exchange would hang.
+    /// A plain server that answers each AUTHINFO line as it arrives, then
+    /// answers nothing until every pipelined line has arrived — so a client
+    /// that pipelined AUTHINFO, or serialized MODE READER and GROUP, fails.
     fn spawn_blocking_pipelined_setup_server(
+        auth: Vec<(&'static str, &'static [u8])>,
         expected: Vec<&'static str>,
         responses: &'static [u8],
     ) -> (u16, std::thread::JoinHandle<()>) {
@@ -2516,13 +2516,23 @@ mod tests {
                 .unwrap();
             socket.write_all(b"200 ready\r\n").unwrap();
             let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            for (prefix, response) in auth {
+                let mut line = String::new();
+                let read = reader.read_line(&mut line);
+                assert!(matches!(read, Ok(n) if n > 0), "expected {prefix:?}");
+                assert!(
+                    line.starts_with(prefix),
+                    "expected {prefix:?} but received {line:?}"
+                );
+                socket.write_all(response).unwrap();
+            }
             let mut lines = Vec::new();
             while lines.len() < expected.len() {
                 let mut line = String::new();
                 let read = reader.read_line(&mut line);
                 assert!(
                     matches!(read, Ok(n) if n > 0),
-                    "client did not pipeline its session setup; received {lines:?}"
+                    "client did not pipeline MODE READER and GROUP; received {lines:?}"
                 );
                 lines.push(line);
             }
@@ -2554,15 +2564,15 @@ mod tests {
     }
 
     #[test]
-    fn blocking_known_pipelining_servers_get_setup_and_group_in_one_write() {
+    fn blocking_known_pipelining_servers_authenticate_then_get_mode_reader_and_group_in_one_write()
+    {
         let (port, handle) = spawn_blocking_pipelined_setup_server(
             vec![
-                "MODE READER",
-                "AUTHINFO USER user",
-                "AUTHINFO PASS pass",
-                "GROUP alt.test",
+                ("AUTHINFO USER user", b"381 password\r\n"),
+                ("AUTHINFO PASS pass", b"281 welcome\r\n"),
             ],
-            b"200 reader\r\n381 password\r\n281 welcome\r\n211 1 1 1 alt.test\r\n",
+            vec!["MODE READER", "GROUP alt.test"],
+            b"200 reader\r\n211 1 1 1 alt.test\r\n",
         );
 
         let mut conn = BlockingNntpConnection::connect_with_ip_policy_for_group(
@@ -2583,8 +2593,12 @@ mod tests {
     #[test]
     fn blocking_pipelined_setup_maps_a_rejected_password() {
         let (port, handle) = spawn_blocking_pipelined_setup_server(
-            vec!["MODE READER", "AUTHINFO USER user", "AUTHINFO PASS pass"],
-            b"200 reader\r\n381 password\r\n481 bad password\r\n",
+            vec![
+                ("AUTHINFO USER user", b"381 password\r\n"),
+                ("AUTHINFO PASS pass", b"481 bad password\r\n"),
+            ],
+            vec![],
+            b"",
         );
 
         let result = BlockingNntpConnection::connect_with_ip_policy(

@@ -6749,6 +6749,99 @@ async fn owned_download_lane_capacity_failure_requeues_without_async_fallback() 
     assert_eq!(restored.retry_count, 0);
 }
 
+/// Health-mutex contention is not a tiering verdict. Before it had its own
+/// variant it arrived as `NoEligibleServer`, which sends the lease down the
+/// async-fallback arm and resets the owned lane pool — churning a healthy
+/// cached TLS lane over a microsecond-long lock collision.
+#[tokio::test]
+async fn owned_download_lane_selection_contention_requeues_without_async_fallback() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20027);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Owned Contention Requeue", "owned-contention.bin", &[1024]),
+    )
+    .await;
+    let work = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    let segment_id = work.segment_id;
+    let compatibility = DownloadBatchCompatibility::from_work(&work);
+    let lease = DownloadBatchLease {
+        job_id,
+        runtime_generation: pipeline.pool_generation,
+        lane_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: None,
+        server_modes: Vec::new(),
+        compatibility,
+        effective_exclude_servers: Vec::new(),
+        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+        works: vec![work],
+    };
+    pipeline
+        .reserve_bandwidth_for_dispatch(segment_id, 1024)
+        .unwrap();
+    pipeline.active_downloads = 1;
+    pipeline.active_download_connections = 1;
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline
+        .active_download_connections_by_job
+        .insert(job_id, 1);
+    pipeline
+        .active_downloads_by_file
+        .insert(segment_id.file_id, 1);
+    pipeline.note_download_lane_started(DownloadLaneMode::Sequential);
+
+    let resets_before = pipeline.owned_download_lane_pool.reset_calls();
+    let mut pending = VecDeque::new();
+    pipeline.handle_owned_download_lane_event(
+        OwnedDownloadLaneEvent::AcquireFailed {
+            lease,
+            error: weaver_nntp::client::BlockingBodyLaneAcquireError::SelectionContended,
+        },
+        &mut pending,
+    );
+
+    assert!(
+        pending.is_empty(),
+        "contention must not spawn an async fallback batch"
+    );
+    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.active_download_connections, 0);
+    assert_eq!(pipeline.active_downloads_by_job.get(&job_id), None);
+    assert_eq!(
+        pipeline.active_download_connections_by_job.get(&job_id),
+        None
+    );
+    assert_eq!(
+        pipeline.active_downloads_by_file.get(&segment_id.file_id),
+        None
+    );
+    assert_eq!(
+        pipeline.owned_download_lane_pool.reset_calls(),
+        resets_before,
+        "a contended selection must not tear down the owned lane pool"
+    );
+    let restored = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    assert_eq!(restored.segment_id, segment_id);
+    assert_eq!(
+        restored.retry_count, 0,
+        "contention must not consume a download retry"
+    );
+}
+
 #[test]
 fn hot_throughput_window_uses_fixed_two_second_bucketed_rate() {
     let now = Instant::now();

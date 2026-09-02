@@ -14,7 +14,7 @@ use tracing::{debug, trace, warn};
 
 use crate::connection::{NntpConnection, ServerConfig};
 use crate::error::{NntpError, Result};
-use crate::health::{HealthConfig, HealthTracker, ServerState};
+use crate::health::{DisableReason, HealthConfig, HealthTracker, ServerState};
 use crate::transfer::{ServerTransferControl, StableServerId};
 
 /// Identifies a specific server in the configuration.
@@ -983,15 +983,17 @@ impl NntpPool {
         let is_excluded = |server_idx: usize| {
             failure_excludes.contains(&server_idx) || retention_excludes.contains(&server_idx)
         };
-        let backfill_unlocked = self
-            .backfill
-            .iter()
-            .enumerate()
-            .filter(|(_, backfill)| !**backfill)
-            .all(|(server_idx, _)| is_excluded(server_idx));
         let now = Instant::now();
         let mut health = self.health.lock().await;
         health.check_reenable_all();
+        // Same ordering-side gate the try-order uses: an auth-disabled fill
+        // server counts as exhausted so the lane-unavailable arm sees
+        // backfill as eligible instead of waiting on a deadline that only the
+        // operator can resolve.
+        let excludes = (0..self.configs.len())
+            .filter(|idx| is_excluded(*idx))
+            .collect::<Vec<_>>();
+        let backfill_unlocked = self.fill_servers_exhausted_or_auth_disabled(&excludes, &health);
         let mut retry_after = None;
         for server_idx in 0..self.configs.len() {
             if is_excluded(server_idx)
@@ -1029,6 +1031,47 @@ impl NntpPool {
             .enumerate()
             .filter(|(_, backfill)| !**backfill)
             .all(|(idx, _)| exclude.contains(&idx))
+    }
+
+    /// The ordering-side backfill gate: every fill server is either excluded
+    /// for this request or disabled by health for a reason that will not
+    /// heal on its own (`DisableReason::AuthFailure`).
+    ///
+    /// A fill server with bad credentials re-disables on every probe, so it
+    /// never produces the 430 that would exclude it and otherwise pins an
+    /// article forever: the try-order skips the disabled server, the
+    /// remaining fill servers already 430'd, and backfill stays locked because
+    /// the disabled server is not in `exclude`. Counting an auth-disabled
+    /// server here lets the article spill to backfill instead of requeueing
+    /// against a deadline that only the operator can resolve.
+    ///
+    /// Every other health state deliberately does *not* count. `CoolingDown`
+    /// is a 5–10 s transport or capacity blip, and a `ConsecutiveFailures` /
+    /// `FailureRatio` disable is an outage that heals by itself; in both cases
+    /// waiting is far cheaper than spilling the whole queue onto a paid
+    /// backfill account, which is also how SABnzbd and NZBGet behave. Note
+    /// this is an *ordering* gate only — disabled servers must never enter a
+    /// request's exclude set, or exhaustion booking would declare the segment
+    /// missing before backfill was ever tried.
+    pub fn fill_servers_exhausted_or_auth_disabled(
+        &self,
+        exclude: &[usize],
+        health: &HealthTracker,
+    ) -> bool {
+        self.backfill
+            .iter()
+            .enumerate()
+            .filter(|(_, backfill)| !**backfill)
+            .all(|(idx, _)| {
+                exclude.contains(&idx)
+                    || matches!(
+                        health.server(idx).state(),
+                        ServerState::Disabled {
+                            reason: DisableReason::AuthFailure,
+                            ..
+                        }
+                    )
+            })
     }
 
     /// Access the health tracker for observability.
@@ -1893,6 +1936,91 @@ mod tests {
             pool.body_server_availability(&[], &[], 0).await,
             BodyServerAvailability::WaitingUntil(delay) if !delay.is_zero()
         ));
+    }
+
+    /// An auth-disabled fill server must make backfill reachable, or an
+    /// article the other fill servers do not have is pinned out of backfill
+    /// for as long as the bad credentials last. A short cooldown and a
+    /// consecutive-failure outage disable must not: both heal on their own.
+    #[tokio::test]
+    async fn body_availability_unlocks_backfill_only_for_auth_disabled_fill_servers() {
+        let fill_plus_backfill = || {
+            let mut config = test_pool_config(1);
+            config.servers.push(ServerPoolConfig {
+                server: ServerConfig {
+                    host: "backup.example.com".into(),
+                    ..Default::default()
+                },
+                stable_id: StableServerId(2),
+                max_connections: 1,
+                backfill: true,
+                ..ServerPoolConfig::default()
+            });
+            config
+        };
+        let disabled = NntpPool::new(fill_plus_backfill());
+        disabled.health().lock().await.record_failure(0, true);
+        assert_eq!(
+            disabled.body_server_availability(&[], &[], 0).await,
+            BodyServerAvailability::Eligible,
+            "the healthy backfill server must be visible past a disabled fill tier"
+        );
+        assert!(
+            disabled.fill_servers_exhausted_or_auth_disabled(&[], &*disabled.health().lock().await),
+            "the ordering gate itself must agree"
+        );
+        assert!(
+            !disabled.fill_servers_exhausted(&[]),
+            "the exclude-only gate must stay untouched: disabled servers are \
+             never put into a request exclude set"
+        );
+
+        let cooling = NntpPool::new(fill_plus_backfill());
+        cooling
+            .health()
+            .lock()
+            .await
+            .record_cooldown(0, crate::health::CooldownReason::Transport);
+        assert!(
+            matches!(
+                cooling.body_server_availability(&[], &[], 0).await,
+                BodyServerAvailability::WaitingUntil(delay) if !delay.is_zero()
+            ),
+            "a 5-10s cooldown must wait, not spill onto backfill"
+        );
+        assert!(
+            !cooling.fill_servers_exhausted_or_auth_disabled(&[], &*cooling.health().lock().await),
+            "CoolingDown must not open the backfill gate"
+        );
+
+        let outage = NntpPool::new(fill_plus_backfill());
+        {
+            let mut health = outage.health().lock().await;
+            for _ in 0..HealthConfig::default().disable_threshold {
+                health.record_failure(0, false);
+            }
+            assert!(
+                matches!(
+                    health.server(0).state(),
+                    ServerState::Disabled {
+                        reason: DisableReason::ConsecutiveFailures,
+                        ..
+                    }
+                ),
+                "test setup: server 0 must be outage-disabled"
+            );
+        }
+        assert!(
+            matches!(
+                outage.body_server_availability(&[], &[], 0).await,
+                BodyServerAvailability::WaitingUntil(delay) if !delay.is_zero()
+            ),
+            "an outage disable heals on its own and must wait, not spill onto backfill"
+        );
+        assert!(
+            !outage.fill_servers_exhausted_or_auth_disabled(&[], &*outage.health().lock().await),
+            "ConsecutiveFailures must not open the backfill gate"
+        );
     }
 
     #[tokio::test]

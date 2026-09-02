@@ -76,6 +76,17 @@ impl MessageId {
     pub fn new(id: &str) -> Self {
         Self(Arc::from(id))
     }
+
+    /// The RFC 3977 wire form, `<id>`.
+    ///
+    /// The stored `Arc<str>` is the *bare* id — the NZB parser strips the
+    /// angle brackets — so every NNTP command argument must go through this,
+    /// never through `&*message_id.0`. A bare argument is a legal article
+    /// *number* reference, which a server with a group selected answers with
+    /// 430 for every single article.
+    pub fn wire_form(&self) -> String {
+        self.to_string()
+    }
 }
 
 #[cfg(test)]

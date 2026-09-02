@@ -450,10 +450,11 @@ impl NntpConnection {
             conn.do_starttls().await?;
         }
 
-        // 4-5. Session setup. A server known to pipeline takes MODE READER,
-        // AUTHINFO USER/PASS and the lane's first GROUP in one write and
-        // answers in order, so four serialized round trips become one. A
-        // server of unknown or negative capability keeps the serial exchange.
+        // 4-5. Session setup. A server known to pipeline authenticates
+        // serially (AUTHINFO must not be pipelined, RFC 4643) and then takes
+        // MODE READER and the lane's first GROUP in one write, answered in
+        // order. A server of unknown or negative capability keeps the serial
+        // exchange throughout.
         if matches!(config.pipelining, PipeliningCapability::Known(true)) {
             conn.pipelined_session_setup(config, initial_group).await?;
         } else {
@@ -529,32 +530,26 @@ impl NntpConnection {
         Ok(())
     }
 
-    /// Session setup for a server known to pipeline: MODE READER, AUTHINFO
-    /// USER, AUTHINFO PASS and the first GROUP leave in one flush and are
-    /// answered in order (RFC 4644). The password is sent before the 381
-    /// arrives; when the server authenticates on the username alone (281)
-    /// its answer to the surplus password is consumed and ignored.
+    /// Session setup for a server known to pipeline. AUTHINFO goes first and
+    /// on its own: RFC 4643 forbids pipelining it, and a provider that
+    /// enforces that answers the whole batch with 480s or drops the
+    /// connection. MODE READER and the lane's first GROUP then leave in one
+    /// flush and are answered in order (RFC 4644).
     async fn pipelined_session_setup(
         &mut self,
         config: &ServerConfig,
         initial_group: Option<&str>,
     ) -> Result<()> {
-        let credentials = match (&config.username, &config.password) {
-            (Some(user), Some(pass)) => Some((user.clone(), pass.clone())),
-            _ => None,
-        };
+        if let (Some(user), Some(pass)) = (&config.username, &config.password) {
+            self.authenticate(user, pass).await?;
+            self.credentials = Some((user.clone(), pass.clone()));
+        }
+
         debug!(
-            auth = credentials.is_some(),
             group = initial_group.is_some(),
-            "sending pipelined session setup"
+            "sending pipelined MODE READER and GROUP"
         );
         self.write_command_frame(&Command::ModeReader).await?;
-        if let Some((user, pass)) = &credentials {
-            self.write_command_frame(&Command::AuthInfoUser(user.clone()))
-                .await?;
-            self.write_command_frame(&Command::AuthInfoPass(pass.clone()))
-                .await?;
-        }
         if let Some(group) = initial_group {
             self.write_command_frame(&Command::Group(group.to_string()))
                 .await?;
@@ -564,29 +559,6 @@ impl NntpConnection {
         let mode_reader = self.read_response().await?;
         if mode_reader.code.is_error() && mode_reader.code.raw() != 500 {
             warn!(code = mode_reader.code.raw(), "MODE READER failed");
-        }
-
-        if let Some((user, pass)) = credentials {
-            let user_resp = self.read_response().await?;
-            match user_resp.code.raw() {
-                281 => {
-                    debug!("authenticated with username only");
-                    let _ = self.read_response().await?;
-                }
-                381 => {
-                    let pass_resp = self.read_response().await?;
-                    match pass_resp.code.raw() {
-                        281 => debug!("authentication successful"),
-                        481 => return Err(NntpError::AuthenticationFailed),
-                        482 => return Err(NntpError::AuthenticationRejected),
-                        _ => {
-                            return Err(NntpError::from_status(pass_resp.code, &pass_resp.message));
-                        }
-                    }
-                }
-                _ => return Err(NntpError::from_status(user_resp.code, &user_resp.message)),
-            }
-            self.credentials = Some((user, pass));
         }
 
         if let Some(group) = initial_group {
@@ -2598,10 +2570,11 @@ mod tests {
         }
     }
 
-    /// A server that answers nothing until every expected setup line has
-    /// arrived, so a client that waited for each answer before sending the
-    /// next command would hang here instead of passing.
+    /// A server that answers each AUTHINFO line as it arrives, then answers
+    /// nothing until every pipelined line has arrived — so a client that
+    /// pipelined AUTHINFO, or serialized MODE READER and GROUP, fails here.
     async fn spawn_pipelined_setup_server(
+        auth: Vec<(&'static str, &'static [u8])>,
         expected: Vec<&'static str>,
         responses: &'static [u8],
     ) -> u16 {
@@ -2611,6 +2584,15 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.write_all(b"200 ready\r\n").await.unwrap();
             socket.flush().await.unwrap();
+            for (prefix, response) in auth {
+                let line = crate::test_support::read_command_line(&mut socket).await;
+                assert!(
+                    line.starts_with(prefix),
+                    "expected {prefix:?} but received {line:?}"
+                );
+                socket.write_all(response).await.unwrap();
+                socket.flush().await.unwrap();
+            }
             let mut lines = Vec::new();
             let wait = tokio::time::timeout(Duration::from_secs(2), async {
                 while lines.len() < expected.len() {
@@ -2620,7 +2602,7 @@ mod tests {
             .await;
             assert!(
                 wait.is_ok(),
-                "client did not pipeline its session setup; received {lines:?}"
+                "client did not pipeline MODE READER and GROUP; received {lines:?}"
             );
             for (line, prefix) in lines.iter().zip(&expected) {
                 assert!(
@@ -2646,15 +2628,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn known_pipelining_servers_get_mode_reader_auth_and_group_in_one_write() {
+    async fn known_pipelining_servers_authenticate_then_get_mode_reader_and_group_in_one_write() {
         let port = spawn_pipelined_setup_server(
             vec![
-                "MODE READER",
-                "AUTHINFO USER user",
-                "AUTHINFO PASS pass",
-                "GROUP alt.test",
+                ("AUTHINFO USER user", b"381 password\r\n"),
+                ("AUTHINFO PASS pass", b"281 welcome\r\n"),
             ],
-            b"200 reader\r\n381 password\r\n281 welcome\r\n211 1 1 1 alt.test\r\n",
+            vec!["MODE READER", "GROUP alt.test"],
+            b"200 reader\r\n211 1 1 1 alt.test\r\n",
         )
         .await;
 
@@ -2672,15 +2653,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipelined_setup_consumes_the_password_answer_after_281_on_user() {
+    async fn pipelined_setup_skips_the_password_after_281_on_user() {
+        // The next line the server reads after 281 must be MODE READER, not
+        // a surplus AUTHINFO PASS.
         let port = spawn_pipelined_setup_server(
-            vec![
-                "MODE READER",
-                "AUTHINFO USER user",
-                "AUTHINFO PASS pass",
-                "GROUP alt.test",
-            ],
-            b"200 reader\r\n281 welcome\r\n482 already authenticated\r\n211 1 1 1 alt.test\r\n",
+            vec![("AUTHINFO USER user", b"281 welcome\r\n")],
+            vec!["MODE READER", "GROUP alt.test"],
+            b"200 reader\r\n211 1 1 1 alt.test\r\n",
         )
         .await;
 
@@ -2699,8 +2678,12 @@ mod tests {
     #[tokio::test]
     async fn pipelined_setup_maps_a_rejected_password() {
         let port = spawn_pipelined_setup_server(
-            vec!["MODE READER", "AUTHINFO USER user", "AUTHINFO PASS pass"],
-            b"200 reader\r\n381 password\r\n481 bad password\r\n",
+            vec![
+                ("AUTHINFO USER user", b"381 password\r\n"),
+                ("AUTHINFO PASS pass", b"481 bad password\r\n"),
+            ],
+            vec![],
+            b"",
         )
         .await;
 
@@ -2719,12 +2702,11 @@ mod tests {
     async fn pipelined_setup_leaves_a_missing_group_unselected() {
         let port = spawn_pipelined_setup_server(
             vec![
-                "MODE READER",
-                "AUTHINFO USER user",
-                "AUTHINFO PASS pass",
-                "GROUP alt.gone",
+                ("AUTHINFO USER user", b"381 password\r\n"),
+                ("AUTHINFO PASS pass", b"281 welcome\r\n"),
             ],
-            b"200 reader\r\n381 password\r\n281 welcome\r\n411 no such group\r\n",
+            vec!["MODE READER", "GROUP alt.gone"],
+            b"200 reader\r\n411 no such group\r\n",
         )
         .await;
 

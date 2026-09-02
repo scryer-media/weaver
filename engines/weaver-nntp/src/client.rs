@@ -68,6 +68,12 @@ pub struct NntpClient {
     soft_timeout: Duration,
 }
 
+/// How many yielding `try_lock` attempts an owned-lane server selection makes
+/// on the shared health mutex before reporting contention. The critical
+/// sections behind that mutex are microseconds long, so a handful of retries
+/// absorbs ordinary collisions without ever blocking a worker thread.
+const BLOCKING_HEALTH_LOCK_SPINS: usize = 4;
+
 /// Why a synchronous owned BODY lane could not be acquired.
 ///
 /// Capacity outcomes are separated from server availability and transport
@@ -78,6 +84,11 @@ pub enum BlockingBodyLaneAcquireError {
     ProviderCapacity(NntpError),
     LocalCapacity,
     NoEligibleServer,
+    /// The health mutex was held elsewhere, so candidates could not be ranked.
+    /// This says nothing about server availability — the caller should hand
+    /// the work back to the scheduler and try again, not conclude that no
+    /// server can serve it.
+    SelectionContended,
     Other(NntpError),
 }
 
@@ -93,6 +104,14 @@ impl BlockingBodyLaneAcquireError {
     pub fn is_capacity_admission(&self) -> bool {
         matches!(self, Self::ProviderCapacity(_) | Self::LocalCapacity)
     }
+
+    /// Whether the leased work should be handed straight back to the scheduler
+    /// and retried on the owned fast path, rather than falling back to an
+    /// async lane. Capacity admission and selection contention are both
+    /// "ask again shortly", not verdicts about the servers.
+    pub fn should_requeue_owned_work(&self) -> bool {
+        self.is_capacity_admission() || matches!(self, Self::SelectionContended)
+    }
 }
 
 impl std::fmt::Display for BlockingBodyLaneAcquireError {
@@ -101,6 +120,9 @@ impl std::fmt::Display for BlockingBodyLaneAcquireError {
             Self::ProviderCapacity(error) | Self::Other(error) => error.fmt(formatter),
             Self::LocalCapacity => formatter.write_str("blocking BODY lane capacity is saturated"),
             Self::NoEligibleServer => formatter.write_str("no eligible blocking BODY server"),
+            Self::SelectionContended => {
+                formatter.write_str("blocking BODY server selection contended on server health")
+            }
         }
     }
 }
@@ -628,7 +650,7 @@ impl BodyLaneLease {
                 )
                 .await;
             stats.completed += 1;
-            batch_clean_so_far &= trace.result.is_ok();
+            batch_clean_so_far &= decoded_result_keeps_connection(&trace.result);
 
             if poisoned {
                 stats.connection_discarded = true;
@@ -2133,7 +2155,11 @@ impl NntpClient {
         exclude: &[usize],
         requested_body_bytes: u64,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
-        let selection = self.blocking_body_server_selection(exclude, requested_body_bytes);
+        let Some(selection) =
+            self.try_blocking_body_server_selection(exclude, requested_body_bytes)
+        else {
+            return Err(BlockingBodyLaneAcquireError::SelectionContended);
+        };
         if selection.eligible.is_empty() {
             return Err(match selection.quota_blocked {
                 Some(rejection) => {
@@ -2190,7 +2216,8 @@ impl NntpClient {
                             other_error = Some(error);
                         }
                         BlockingBodyLaneAcquireError::LocalCapacity
-                        | BlockingBodyLaneAcquireError::NoEligibleServer => unreachable!(),
+                        | BlockingBodyLaneAcquireError::NoEligibleServer
+                        | BlockingBodyLaneAcquireError::SelectionContended => unreachable!(),
                     }
                 }
             }
@@ -2249,22 +2276,39 @@ impl NntpClient {
         }
     }
 
-    fn blocking_body_server_selection(
+    /// Ranked owned-lane candidates, or `None` when the health mutex was held
+    /// by someone else for the whole (short) spin.
+    ///
+    /// The distinction matters: an empty selection means "no server can serve
+    /// this request", while contention means "ask again in a moment". Folding
+    /// the two together made every contended selection look like a permanent
+    /// tiering verdict and silently pushed the work off the owned fast path.
+    fn try_blocking_body_server_selection(
         &self,
         exclude: &[usize],
         requested_body_bytes: u64,
-    ) -> BodyServerSelection {
+    ) -> Option<BodyServerSelection> {
         let server_count = self.pool.server_count();
         let server_groups = self.pool.server_groups();
         let backfill_flags = self.pool.server_backfill_flags();
-        let backfill_unlocked = self.pool.fill_servers_exhausted(exclude);
-        let Ok(mut health) = self.pool.health().try_lock() else {
-            return BodyServerSelection {
-                eligible: Vec::new(),
-                quota_blocked: None,
-            };
-        };
+        // This runs on a blocking worker thread, so the tokio mutex cannot be
+        // awaited. The critical sections behind it are microseconds long, so a
+        // few yielding retries turn nearly every collision into a hit.
+        let mut health = None;
+        for attempt in 0..BLOCKING_HEALTH_LOCK_SPINS {
+            if let Ok(guard) = self.pool.health().try_lock() {
+                health = Some(guard);
+                break;
+            }
+            if attempt + 1 < BLOCKING_HEALTH_LOCK_SPINS {
+                std::thread::yield_now();
+            }
+        }
+        let mut health = health?;
         health.check_reenable_all();
+        let backfill_unlocked = self
+            .pool
+            .fill_servers_exhausted_or_auth_disabled(exclude, &health);
 
         let mut candidates = Vec::with_capacity(server_count);
         let mut quota_blocked = None;
@@ -2273,7 +2317,7 @@ impl NntpClient {
                 continue;
             }
             // Backfill servers only serve requests whose fill tier is
-            // exhausted; health never unlocks them (see build_server_order).
+            // exhausted or auth-disabled (see build_server_order).
             if backfill_flags[idx] && !backfill_unlocked {
                 continue;
             }
@@ -2314,10 +2358,25 @@ impl NntpClient {
             .into_iter()
             .map(|(_, _, _, _, idx)| ServerId(idx))
             .collect();
-        BodyServerSelection {
+        Some(BodyServerSelection {
             eligible,
             quota_blocked,
-        }
+        })
+    }
+
+    /// Contention-collapsing view of [`Self::try_blocking_body_server_selection`]
+    /// for callers that only ask "is anything available right now?" and
+    /// already treat an empty answer as "not now".
+    fn blocking_body_server_selection(
+        &self,
+        exclude: &[usize],
+        requested_body_bytes: u64,
+    ) -> BodyServerSelection {
+        self.try_blocking_body_server_selection(exclude, requested_body_bytes)
+            .unwrap_or(BodyServerSelection {
+                eligible: Vec::new(),
+                quota_blocked: None,
+            })
     }
 
     fn record_blocking_connect_failure(&self, server_idx: usize, error: &NntpError) {
@@ -2421,21 +2480,31 @@ impl NntpClient {
     ///
     /// Servers in `exclude` are skipped entirely. Disabled servers and
     /// short-lived cooldown servers are excluded so we don't waste time on
-    /// servers that are known to be failing right now — but health does NOT
-    /// unlock backfill: a cooling fill tier means the order is temporarily
-    /// empty and callers wait, rather than spilling ordinary work onto
-    /// backfill accounts. Within a priority group, immediately acquirable
+    /// servers that are known to be failing right now.
+    ///
+    /// A `CoolingDown` fill tier does NOT unlock backfill: those are 5–10 s
+    /// blips, so the order is temporarily empty and callers wait rather than
+    /// spilling ordinary work onto backfill accounts. Neither does an outage
+    /// disable (`ConsecutiveFailures` / `FailureRatio`): it heals on its own,
+    /// and spilling the whole queue onto a paid backfill account for a 30 s
+    /// primary blip is the wrong trade. An `AuthFailure` disable does unlock
+    /// it — a fill server that keeps failing authentication never produces
+    /// the 430 that would put it in `exclude`, so without this an article the
+    /// other fill servers do not have would be pinned out of backfill until
+    /// the operator fixes the credentials. Within a priority group, immediately acquirable
     /// servers are preferred over fully saturated peers.
     #[allow(clippy::needless_range_loop)]
     async fn build_server_order(&self, exclude: &[usize]) -> Vec<usize> {
         let server_count = self.pool.server_count();
         let server_groups = self.pool.server_groups();
         let backfill_flags = self.pool.server_backfill_flags();
-        let backfill_unlocked = self.pool.fill_servers_exhausted(exclude);
 
         // Check health to skip disabled servers.
         let mut health = self.pool.health().lock().await;
         health.check_reenable_all();
+        let backfill_unlocked = self
+            .pool
+            .fill_servers_exhausted_or_auth_disabled(exclude, &health);
 
         #[derive(Default)]
         struct GroupCandidates {
@@ -3076,6 +3145,23 @@ enum FetchKind {
     Body,
     Head,
     Article,
+}
+
+/// Whether a decoded BODY outcome left the connection fully consumed and
+/// reusable for the rest of the pipelined batch.
+///
+/// See the blocking lane's twin of this helper: a 430 is a complete server
+/// response with no body to drain, so it must not mark a batch dirty and
+/// block the server's pipelining proof. Decode failures stay dirty because
+/// the decoder can fail on a body the transport never finished delivering.
+fn decoded_result_keeps_connection(
+    result: &std::result::Result<DecodedBody, DecodedBodyError>,
+) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(DecodedBodyError::Nntp(error)) => error.is_article_not_found(),
+        Err(DecodedBodyError::Decode { .. }) => false,
+    }
 }
 
 /// Returns true if the error is transient and the request might succeed on retry.
@@ -4318,6 +4404,88 @@ mod tests {
         assert!(!empty_pool.all_normal_fill_servers_quota_blocked());
     }
 
+    /// A 430 in the middle of a pipelined batch must not dirty the batch.
+    ///
+    /// The article-not-found answer is a complete, bodyless response: the
+    /// reader stays in sync and the socket is reusable. Marking the batch dirty
+    /// made the caller discard the connection and permanently block the
+    /// server's pipelining proof, so a provider that legitimately does not
+    /// carry some articles could never be pipelined.
+    #[tokio::test]
+    async fn pipelined_article_not_found_keeps_the_batch_and_connection_clean() {
+        let port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"222 1 <one@miss-batch>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"430 No such article\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"222 3 <three@miss-batch>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
+            },
+        ])
+        .await;
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_server(port, 0)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(2),
+        });
+        let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
+        let message_ids = ["<one@miss-batch>", "<two@miss-batch>", "<three@miss-batch>"];
+        let mut seen = Vec::new();
+
+        let stats = lane
+            .fetch_decoded_pipeline_depth4_with_estimates(
+                &message_ids,
+                &[0, 0, 0],
+                |idx, trace, meta| {
+                    seen.push((idx, trace, meta));
+                    std::future::ready(())
+                },
+            )
+            .await;
+
+        assert_eq!(stats.requested, 3);
+        assert_eq!(stats.completed, 3);
+        assert_eq!(stats.unresolved, 0);
+        assert!(!stats.connection_discarded);
+        assert!(!stats.response_order_mismatch);
+
+        assert_eq!(seen[0].1.attempts[0].outcome, FetchAttemptOutcome::Success);
+        assert_eq!(seen[1].1.attempts[0].outcome, FetchAttemptOutcome::NotFound);
+        assert_eq!(seen[2].1.attempts[0].outcome, FetchAttemptOutcome::Success);
+        assert!(matches!(
+            &seen[1].1.result,
+            Err(DecodedBodyError::Nntp(NntpError::NoSuchArticle { .. }))
+        ));
+        // The two surrounding articles still decoded: the miss did not
+        // desynchronise the response stream.
+        assert!(seen[0].1.result.is_ok());
+        assert!(seen[2].1.result.is_ok());
+
+        for (idx, _, meta) in &seen {
+            assert!(meta.batch_clean, "item {idx} dirtied the batch on a 430");
+            assert!(!meta.connection_discarded, "item {idx} discarded the lane");
+        }
+        assert!(seen[2].2.batch_complete);
+        assert_eq!(seen[2].2.batch_response_count, 3);
+
+        lane.park();
+    }
+
     #[tokio::test]
     async fn quota_stopped_pipeline_reports_every_unissued_item_without_poisoning_lane() {
         let port = spawn_scripted_server(vec![
@@ -4592,6 +4760,161 @@ mod tests {
         assert!(
             order.is_empty(),
             "cooling fill tier must wait, not spill onto backfill: {order:?}"
+        );
+    }
+
+    /// A `Disabled` fill server never produces the 430 that would put it in
+    /// `exclude`, so backfill has to unlock on the health state instead.
+    /// Without this, an article the remaining fill servers do not have is
+    /// pinned out of backfill for as long as the auth failure lasts.
+    #[tokio::test]
+    async fn disabled_fill_server_unlocks_backfill() {
+        let client = tiered_client(&[false, false, true]);
+
+        // Server 0: auth failure => Disabled { AuthFailure }.
+        client.pool.health().lock().await.record_failure(0, true);
+
+        // Server 1: missed the article, so it is on the exclusion ladder.
+        let order = client.build_server_order(&[1]).await;
+        assert!(
+            order.contains(&2),
+            "an auth-disabled fill server must unlock backfill: {order:?}"
+        );
+        assert!(
+            !order.contains(&0),
+            "the disabled server itself must not be ordered: {order:?}"
+        );
+    }
+
+    /// An outage disable heals on its own; it must wait like a cooldown, not
+    /// spill the queue onto backfill.
+    #[tokio::test]
+    async fn outage_disabled_fill_server_keeps_backfill_locked_with_peers_excluded() {
+        let client = tiered_client(&[false, false, true]);
+        {
+            let mut health = client.pool.health().lock().await;
+            for _ in 0..crate::health::HealthConfig::default().disable_threshold {
+                health.record_failure(0, false);
+            }
+            assert!(matches!(
+                health.server(0).state(),
+                ServerState::Disabled {
+                    reason: crate::health::DisableReason::ConsecutiveFailures,
+                    ..
+                }
+            ));
+        }
+
+        let order = client.build_server_order(&[1]).await;
+        assert!(
+            order.is_empty(),
+            "a consecutive-failure disable is an outage, not a config error: {order:?}"
+        );
+        let selection = client.blocking_body_server_selection(&[1], 0);
+        assert!(
+            selection.eligible.is_empty(),
+            "owned lane must not spill an outage onto backfill: {:?}",
+            selection.eligible
+        );
+    }
+
+    #[tokio::test]
+    async fn cooling_fill_server_keeps_backfill_locked_with_peers_excluded() {
+        let client = tiered_client(&[false, false, true]);
+
+        client
+            .pool
+            .health()
+            .lock()
+            .await
+            .record_cooldown(0, CooldownReason::Transport);
+
+        let order = client.build_server_order(&[1]).await;
+        assert!(
+            !order.contains(&2),
+            "a 5-10s cooldown is a blip, not an outage: {order:?}"
+        );
+        assert!(
+            order.is_empty(),
+            "the caller waits for the cooling fill server instead: {order:?}"
+        );
+    }
+
+    /// The owned blocking lane runs the same tiering rule off a `try_lock`.
+    #[tokio::test]
+    async fn blocking_selection_unlocks_backfill_for_a_disabled_fill_server() {
+        let client = tiered_client(&[false, false, true]);
+
+        client.pool.health().lock().await.record_failure(0, true);
+
+        let selection = client.blocking_body_server_selection(&[1], 0);
+        assert_eq!(
+            selection.eligible,
+            vec![ServerId(2)],
+            "owned lane must reach backfill when the fill tier is disabled"
+        );
+
+        let cooling = tiered_client(&[false, false, true]);
+        cooling
+            .pool
+            .health()
+            .lock()
+            .await
+            .record_cooldown(0, CooldownReason::Transport);
+        let selection = cooling.blocking_body_server_selection(&[1], 0);
+        assert!(
+            selection.eligible.is_empty(),
+            "owned lane must not spill a cooldown onto backfill: {:?}",
+            selection.eligible
+        );
+    }
+
+    /// Contention is "ask again", not a tiering verdict: it must requeue on
+    /// the owned fast path without being mistaken for capacity admission.
+    #[test]
+    fn selection_contention_is_requeued_but_is_not_capacity_admission() {
+        let contended = BlockingBodyLaneAcquireError::SelectionContended;
+        assert!(!contended.is_capacity_admission());
+        assert!(contended.should_requeue_owned_work());
+
+        assert!(BlockingBodyLaneAcquireError::LocalCapacity.should_requeue_owned_work());
+        assert!(
+            BlockingBodyLaneAcquireError::ProviderCapacity(NntpError::TooManyConnections)
+                .should_requeue_owned_work()
+        );
+        assert!(!BlockingBodyLaneAcquireError::NoEligibleServer.should_requeue_owned_work());
+        assert!(
+            !BlockingBodyLaneAcquireError::Other(NntpError::PoolShutdown)
+                .should_requeue_owned_work()
+        );
+    }
+
+    /// A held health mutex used to surface as `NoEligibleServer`, which reads
+    /// as "no server can serve this" and pushed the work off the owned lane.
+    #[tokio::test]
+    async fn contended_health_mutex_reports_contention_not_an_empty_tier() {
+        let client = tiered_client(&[false]);
+        let health = client.pool.health().clone();
+        let guard = health.lock().await;
+
+        let Err(error) = client.try_acquire_blocking_body_lane_with_estimate(&[], &[], 0) else {
+            panic!("selection cannot rank candidates while health is held");
+        };
+        assert!(
+            matches!(error, BlockingBodyLaneAcquireError::SelectionContended),
+            "contention must not be reported as a tiering verdict: {error:?}"
+        );
+        assert!(error.should_requeue_owned_work());
+
+        drop(guard);
+        // With the lock free the same call reaches an ordinary tiering verdict
+        // again rather than contention.
+        let Err(error) = client.try_acquire_blocking_body_lane_with_estimate(&[], &[0], 0) else {
+            panic!("the only server is excluded, so no lane can be acquired");
+        };
+        assert!(
+            matches!(error, BlockingBodyLaneAcquireError::NoEligibleServer),
+            "an excluded tier is still an empty tier: {error:?}"
         );
     }
 
