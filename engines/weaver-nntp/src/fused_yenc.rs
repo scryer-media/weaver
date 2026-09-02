@@ -760,8 +760,27 @@ impl FusedYencArticleDecoder {
         }
     }
 
+    /// How much wire input the next decode call may take.
+    ///
+    /// The kernel needs one byte of spare capacity per input byte, so handing
+    /// it more input than the batch has room for makes it grow the batch.
+    /// With a header-sized reservation that growth is pure waste: the batch
+    /// was already sized for the whole part, and the doubling lands exactly on
+    /// the last chunk, whose decoded bytes fit the room that is left. So the
+    /// input is trimmed to the spare capacity first — the same policy as
+    /// sabctools ("prefer trimming the chunk over growing the buffer") — and
+    /// the batch grows only once the room is genuinely gone before the trailer,
+    /// which is a header that lied. An unreserved batch (no declared size) has
+    /// nothing exact to defend and keeps growing amortised as before.
     fn next_body_input_len(&self, available: usize) -> usize {
-        available.min(OUTPUT_BATCH_TARGET.saturating_sub(self.output.len()))
+        let batch_room = OUTPUT_BATCH_TARGET.saturating_sub(self.output.len());
+        let spare = self.output.capacity() - self.output.len();
+        let room = if self.output_reserved && spare > 0 {
+            spare.min(batch_room)
+        } else {
+            batch_room
+        };
+        available.min(room)
     }
 
     fn next_output_capacity(&self) -> usize {
