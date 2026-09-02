@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { WebSocketRoute } from "@playwright/test";
-import { expect, test, weaverRoute } from "./helpers";
+import { expect, openNavigation, test, weaverRoute } from "./helpers";
 import { introspectPublicMutationNames } from "./support/runtime-introspection";
 import { seedRuntimeHistory } from "./support/setup/runtime-history";
 
@@ -49,7 +49,8 @@ test("visible navigation routes are assigned to the Weaver coverage ledger", asy
   await page.goto(weaverRoute("/"));
   await expect(page.getByRole("main")).toBeVisible();
 
-  const navigationLinks = await page.getByRole("navigation").getByRole("link").all();
+  const navigation = await openNavigation(page);
+  const navigationLinks = await navigation.getByRole("link").all();
   const navigationHrefs = await Promise.all(
     navigationLinks.map((link) => link.getAttribute("href")),
   );

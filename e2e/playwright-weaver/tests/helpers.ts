@@ -141,6 +141,17 @@ export function weaverRoute(path: string): string {
   return `${configuredBasePath}${normalizedPath}` || "/";
 }
 
+export async function openNavigation(page: Page) {
+  const navigation = page.getByRole("navigation");
+  if (await navigation.isVisible()) return navigation;
+
+  const trigger = page.getByRole("button", { name: "Open navigation" });
+  await expect(trigger).toBeVisible();
+  await trigger.click();
+  await expect(navigation).toBeVisible();
+  return navigation;
+}
+
 async function ensureApiSession(request: APIRequestContext): Promise<void> {
   if (initializedApiSessions.has(request)) return;
   const response = await request.get(weaverRoute("/"));

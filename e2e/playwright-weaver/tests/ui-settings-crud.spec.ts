@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { expect, test } from "./helpers";
+import { expect, openNavigation, test } from "./helpers";
 
 const afterRestart = process.env.E2E_WEAVER_UI_STAGE === "after-restart";
 const persistedCategory = "e2e-product-category-persisted";
@@ -165,6 +165,7 @@ test("schedule rules support create, toggle, edit, and delete", async ({ cleanPa
 
 test("settings navigation owns every coverage-ledger route", async ({ cleanPage: page }) => {
   await page.goto("/settings/general");
+  const navigation = await openNavigation(page);
   const ledger = JSON.parse(
     readFileSync(resolve(process.cwd(), "coverage-ledger.v1.json"), "utf8"),
   ) as { routes: Array<{ path: string }> };
@@ -174,7 +175,7 @@ test("settings navigation owns every coverage-ledger route", async ({ cleanPage:
     .map((path) => path.slice("/settings/".length))
     .sort();
   const settingsRoutes = async () => {
-    const links = await page.getByRole("link").all();
+    const links = await navigation.getByRole("link").all();
     const hrefs = await Promise.all(links.map((link) => link.getAttribute("href")));
     return Array.from(
       new Set(
@@ -185,10 +186,8 @@ test("settings navigation owns every coverage-ledger route", async ({ cleanPage:
       ),
     ).sort();
   };
-  // The whole shell — sidebar included — is client-rendered, so `goto` can resolve
-  // with an empty `#root`; on postgres after a restart the cold connection pool
-  // widens that gap enough that a one-shot collection sees zero links. Polling the
-  // same deep equality keeps the assertion exact — a missing or extra route still
-  // fails, just on timeout, with the settled nav in the failure snapshot.
+  // The whole shell is client-rendered, so keep polling after opening whichever
+  // responsive navigation variant the current viewport exposes. The same deep
+  // equality keeps missing and extra routes exact.
   await expect.poll(settingsRoutes).toEqual(expected);
 });
