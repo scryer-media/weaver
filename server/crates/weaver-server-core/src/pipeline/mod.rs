@@ -267,7 +267,7 @@ pub(super) struct DownloadBatchCompatibility {
     pub(super) priority: u32,
     pub(super) is_recovery: bool,
     pub(super) completion_critical: bool,
-    pub(super) groups: Vec<String>,
+    pub(super) groups: std::sync::Arc<[String]>,
     pub(super) exclude_servers: Vec<usize>,
     /// Transport-rotation hint carried from [`DownloadWork::avoid_server`].
     /// Batched works share one effective exclude set, so works with different
@@ -291,7 +291,7 @@ impl DownloadBatchCompatibility {
         work.priority == self.priority
             && work.is_recovery == self.is_recovery
             && work.completion_critical == self.completion_critical
-            && work.groups == self.groups
+            && (std::sync::Arc::ptr_eq(&work.groups, &self.groups) || work.groups == self.groups)
             && work.exclude_servers == self.exclude_servers
             && work.avoid_server == self.avoid_server
     }

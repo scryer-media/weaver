@@ -1,13 +1,16 @@
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 
-use crate::jobs::ids::{MessageId, SegmentId};
+use crate::jobs::ids::{MessageId, NzbFileId, SegmentId};
 
 /// A work item representing a segment to download.
 pub struct DownloadWork {
     pub segment_id: SegmentId,
     pub message_id: MessageId,
-    pub groups: Vec<String>,
+    /// The file's newsgroups, shared by every segment of the file rather than
+    /// cloned per segment: a job's queue used to carry one `Vec<String>` per
+    /// article, and every lease and refill cloned it again.
+    pub groups: std::sync::Arc<[String]>,
     pub priority: u32,
     pub byte_estimate: u32,
     pub retry_count: u32,

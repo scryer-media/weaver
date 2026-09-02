@@ -3989,7 +3989,7 @@ impl Pipeline {
                         segment_number: segment.ordinal,
                     },
                     message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
-                    groups: file.groups.clone(),
+                    groups: std::sync::Arc::from(file.groups.as_slice()),
                     priority,
                     byte_estimate: segment.bytes,
                     retry_count: 0,

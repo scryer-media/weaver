@@ -2260,7 +2260,7 @@ fn queue_download_work(pipeline: &mut Pipeline, job_id: JobId, message_id: &str)
             segment_number: 1,
         },
         message_id: MessageId::new(message_id),
-        groups: vec!["alt.binaries.test".to_string()],
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
         priority: 0,
         byte_estimate: 128,
         retry_count: 0,

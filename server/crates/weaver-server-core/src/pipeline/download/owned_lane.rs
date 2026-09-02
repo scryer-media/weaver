@@ -32,7 +32,7 @@ enum OwnedLanePoolCommand {
 
 struct CachedOwnedLane {
     nntp: Arc<weaver_nntp::NntpClient>,
-    groups: Vec<String>,
+    groups: Arc<[String]>,
     lane: weaver_nntp::blocking::BlockingBodyLane,
 }
 
@@ -142,7 +142,8 @@ impl CachedOwnedLane {
     fn matches(&self, nntp: &Arc<weaver_nntp::NntpClient>, lease: &DownloadBatchLease) -> bool {
         let server = self.lane.server_id();
         if !Arc::ptr_eq(&self.nntp, nntp)
-            || self.groups != lease.compatibility.groups
+            || !(Arc::ptr_eq(&self.groups, &lease.compatibility.groups)
+                || self.groups == lease.compatibility.groups)
             || lease.effective_exclude_servers.contains(&server.0)
         {
             return false;
@@ -315,10 +316,16 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 batch_works.push(work);
             }
 
-            let message_ids = batch_works
+            // Borrow the ids rather than formatting a `String` per BODY: the
+            // work items own them as shared `Arc<str>`s already.
+            let message_id_handles = batch_works
                 .iter()
-                .map(|work| work.message_id.to_string())
+                .map(|work| work.message_id.clone())
                 .collect::<Vec<_>>();
+            let message_ids = message_id_handles
+                .iter()
+                .map(|message_id| &*message_id.0)
+                .collect::<Vec<&str>>();
             let total = batch_works.len();
             let mut completed = 0usize;
             let mut works_by_index = batch_works.into_iter().map(Some).collect::<Vec<_>>();
@@ -785,7 +792,7 @@ mod tests {
                 segment_number,
             },
             message_id: MessageId::new(&format!("tail-{segment_number}@example.invalid")),
-            groups: vec!["alt.binaries.test".to_string()],
+            groups: Arc::from(vec!["alt.binaries.test".to_string()]),
             priority: 3,
             byte_estimate: 1024,
             retry_count,

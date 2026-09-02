@@ -444,7 +444,7 @@ impl BodyLaneLease {
 
     pub async fn fetch_decoded_pipeline_depth2<F, Fut>(
         &mut self,
-        message_ids: &[String],
+        message_ids: &[&str],
         on_trace: F,
     ) -> BodyLaneBatchStats
     where
@@ -457,7 +457,7 @@ impl BodyLaneLease {
 
     pub async fn fetch_decoded_pipeline_depth2_with_estimates<F, Fut>(
         &mut self,
-        message_ids: &[String],
+        message_ids: &[&str],
         estimated_body_bytes: &[u64],
         on_trace: F,
     ) -> BodyLaneBatchStats
@@ -472,7 +472,7 @@ impl BodyLaneLease {
 
     pub async fn fetch_decoded_pipeline_depth4<F, Fut>(
         &mut self,
-        message_ids: &[String],
+        message_ids: &[&str],
         on_trace: F,
     ) -> BodyLaneBatchStats
     where
@@ -485,7 +485,7 @@ impl BodyLaneLease {
 
     pub async fn fetch_decoded_pipeline_depth4_with_estimates<F, Fut>(
         &mut self,
-        message_ids: &[String],
+        message_ids: &[&str],
         estimated_body_bytes: &[u64],
         on_trace: F,
     ) -> BodyLaneBatchStats
@@ -500,7 +500,7 @@ impl BodyLaneLease {
 
     async fn fetch_decoded_pipeline<F, Fut>(
         &mut self,
-        message_ids: &[String],
+        message_ids: &[&str],
         estimated_body_bytes: &[u64],
         max_depth: usize,
         mut on_trace: F,
@@ -1384,7 +1384,7 @@ impl NntpClient {
 
     pub async fn fetch_bodies_decoded_with_groups_prefer_excluding_traced(
         &self,
-        message_ids: &[String],
+        message_ids: &[&str],
         groups: &[String],
         exclude: &[usize],
     ) -> Vec<DecodedBodyTrace> {
@@ -1415,7 +1415,7 @@ impl NntpClient {
 
     pub async fn fetch_bodies_decoded_with_groups_prefer_excluding_traced_each<F, Fut>(
         &self,
-        message_ids: &[String],
+        message_ids: &[&str],
         groups: &[String],
         exclude: &[usize],
         mut on_trace: F,
@@ -1472,7 +1472,7 @@ impl NntpClient {
             let pending_now = std::mem::take(&mut pending);
             let pending_ids: Vec<String> = pending_now
                 .iter()
-                .map(|message_idx| message_ids[*message_idx].clone())
+                .map(|message_idx| message_ids[*message_idx].to_string())
                 .collect();
 
             let setup_deadline = TokioInstant::now() + self.soft_timeout;
@@ -3570,10 +3570,13 @@ mod tests {
         ];
         let mut callbacks = Vec::new();
         let stats = lane
-            .fetch_decoded_pipeline_depth2(&message_ids, |index, trace, meta| {
-                callbacks.push((index, trace, meta));
-                std::future::ready(())
-            })
+            .fetch_decoded_pipeline_depth2(
+                &message_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                |index, trace, meta| {
+                    callbacks.push((index, trace, meta));
+                    std::future::ready(())
+                },
+            )
             .await;
 
         assert_eq!(stats.offered, 2);
@@ -4345,7 +4348,7 @@ mod tests {
 
         let stats = lane
             .fetch_decoded_pipeline_depth4_with_estimates(
-                &message_ids,
+                &message_ids.iter().map(String::as_str).collect::<Vec<_>>(),
                 &estimates,
                 |idx, trace, meta| {
                     seen.push((idx, trace, meta));

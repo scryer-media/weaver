@@ -270,7 +270,7 @@ impl BlockingBodyLane {
 
     pub fn fetch_decoded_pipeline(
         &mut self,
-        message_ids: &[String],
+        message_ids: &[&str],
         max_depth: usize,
     ) -> Vec<(usize, DecodedBodyTrace, BodyLaneTraceMeta)> {
         self.fetch_decoded_pipeline_with_estimates(message_ids, &[], max_depth)
@@ -278,7 +278,7 @@ impl BlockingBodyLane {
 
     pub fn fetch_decoded_pipeline_with_estimates(
         &mut self,
-        message_ids: &[String],
+        message_ids: &[&str],
         estimated_body_bytes: &[u64],
         max_depth: usize,
     ) -> Vec<(usize, DecodedBodyTrace, BodyLaneTraceMeta)> {

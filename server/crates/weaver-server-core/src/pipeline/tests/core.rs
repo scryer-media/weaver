@@ -1090,7 +1090,7 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
     let make_work = || DownloadWork {
         segment_id,
         message_id: MessageId::new("stale-exclusion@example.com"),
-        groups: vec!["alt.binaries.test".to_string()],
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
         priority: 100,
         byte_estimate: 128,
         retry_count: 1,

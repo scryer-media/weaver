@@ -540,9 +540,13 @@ impl Pipeline {
                         batch_works.push(work);
                     }
 
-                    let message_ids: Vec<String> = batch_works
+                    let message_id_handles: Vec<crate::jobs::ids::MessageId> = batch_works
                         .iter()
-                        .map(|work| work.message_id.to_string())
+                        .map(|work| work.message_id.clone())
+                        .collect();
+                    let message_ids: Vec<&str> = message_id_handles
+                        .iter()
+                        .map(|message_id| &*message_id.0)
                         .collect();
                     let total = batch_works.len();
                     let mut completed = 0usize;

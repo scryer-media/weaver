@@ -939,6 +939,10 @@ impl Pipeline {
             .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).max())
             .flatten();
 
+            // One shared group list per file; every segment's work item holds
+            // a reference to it rather than its own copy.
+            let groups: std::sync::Arc<[String]> =
+                std::sync::Arc::from(file_spec.groups.as_slice());
             for seg in &file_spec.segments {
                 let segment_id = SegmentId {
                     file_id,
@@ -956,7 +960,7 @@ impl Pipeline {
                     target_queue.push(DownloadWork {
                         segment_id,
                         message_id: MessageId::new(&seg.message_id),
-                        groups: file_spec.groups.clone(),
+                        groups: std::sync::Arc::clone(&groups),
                         priority,
                         byte_estimate: seg.bytes,
                         retry_count: 0,

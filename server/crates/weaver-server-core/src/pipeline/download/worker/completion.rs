@@ -98,7 +98,7 @@ impl Pipeline {
         let work = DownloadWork {
             segment_id,
             message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-            groups: file_spec.groups.clone(),
+            groups: std::sync::Arc::from(file_spec.groups.as_slice()),
             priority: file_spec.role.download_priority(),
             byte_estimate: seg_spec.bytes,
             retry_count,
@@ -142,7 +142,7 @@ impl Pipeline {
         Some(DownloadWork {
             segment_id,
             message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-            groups: file_spec.groups.clone(),
+            groups: std::sync::Arc::from(file_spec.groups.as_slice()),
             priority: file_spec.role.download_priority(),
             byte_estimate: seg_spec.bytes,
             retry_count,
@@ -1054,7 +1054,7 @@ impl Pipeline {
                             let work = DownloadWork {
                                 segment_id: seg_id,
                                 message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-                                groups: file_spec.groups.clone(),
+                                groups: std::sync::Arc::from(file_spec.groups.as_slice()),
                                 priority,
                                 byte_estimate: seg_spec.bytes,
                                 retry_count: next_retry,

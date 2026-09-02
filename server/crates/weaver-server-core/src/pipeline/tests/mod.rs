@@ -2593,7 +2593,7 @@ fn rar_unlock_work(job_id: JobId, file_index: u32, priority: u32) -> DownloadWor
             segment_number: 0,
         },
         message_id: MessageId::new(&format!("rar-unlock-{job_id:?}-{file_index}@example.com")),
-        groups: vec!["alt.binaries.test".to_string()],
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
         priority,
         byte_estimate: 1024,
         retry_count: 0,

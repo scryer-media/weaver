@@ -12,7 +12,7 @@ fn make_work(job_id: u64, file_index: u32, seg: u32, priority: u32) -> DownloadW
             segment_number: seg,
         },
         message_id: MessageId::new(&format!("msg-{job_id}-{file_index}-{seg}@example.com")),
-        groups: vec!["alt.binaries.test".into()],
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
         priority,
         byte_estimate: 768_000,
         retry_count: 0,

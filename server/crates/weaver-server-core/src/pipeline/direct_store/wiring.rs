@@ -2649,7 +2649,7 @@ impl Pipeline {
                                     message_id: crate::jobs::ids::MessageId::new(
                                         &segment.message_id,
                                     ),
-                                    groups: file.groups.clone(),
+                                    groups: std::sync::Arc::from(file.groups.as_slice()),
                                     priority: file.role.download_priority(),
                                     byte_estimate: segment.bytes,
                                     retry_count: 0,
@@ -5776,9 +5776,13 @@ impl Pipeline {
     pub(crate) async fn poll_direct_store_barriers(&mut self) {
         let now = Instant::now();
         for job_id in self.direct_store.active_jobs() {
-            let due: Vec<(usize, super::barrier::BarrierTrigger)> = self
-                .direct_store
-                .sets_for(job_id)
+            // Polled once per orchestrator turn, so the common answer is
+            // "nothing due": decide that without allocating.
+            let sets = self.direct_store.sets_for(job_id);
+            if !sets.iter().any(|set| set.due(now).is_some()) {
+                continue;
+            }
+            let due: Vec<(usize, super::barrier::BarrierTrigger)> = sets
                 .iter()
                 .enumerate()
                 .filter_map(|(index, set)| set.due(now).map(|trigger| (index, trigger)))
@@ -7108,7 +7112,7 @@ impl Pipeline {
                     work.push(DownloadWork {
                         segment_id,
                         message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
-                        groups: file.groups.clone(),
+                        groups: std::sync::Arc::from(file.groups.as_slice()),
                         priority: file.role.download_priority(),
                         byte_estimate: segment.bytes,
                         retry_count: 0,
@@ -7201,7 +7205,7 @@ impl Pipeline {
                     work.push(DownloadWork {
                         segment_id,
                         message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
-                        groups: file.groups.clone(),
+                        groups: std::sync::Arc::from(file.groups.as_slice()),
                         priority: file.role.download_priority(),
                         byte_estimate: segment.bytes,
                         retry_count: 0,
