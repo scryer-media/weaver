@@ -39,6 +39,10 @@ type directStore struct {
 	format     RARFormat
 	volumeSize string
 	password   string
+	// headerPassword encrypts the headers as well (`-hp`), RAR5 only: the
+	// router proves a candidate against the archive's own check and keys the
+	// header walk from it. RAR4 header encryption is refused by design.
+	headerPassword string
 	// members maps the member path inside the archive to its payload size and
 	// PRNG seed.
 	members []directStoreMember
@@ -99,6 +103,22 @@ func DirectStoreRecipes() []Recipe {
 			writer: DirectStoreRAR5Writer, format: RAR5, volumeSize: "8m", password: DirectStorePassword,
 			members: []directStoreMember{{"quartz.harbor.s01e06.mkv", 12 << 20, "quartz-harbor"}},
 		},
+		{
+			slug: "direct-store-rar4-encrypted",
+			notes: "RAR4 `-p` across three volumes: member data encrypted under the header's 8-byte file salt, headers readable. " +
+				"The router derives RAR4 keys off that salt and routes the member as an encrypted store member exactly as it does for RAR5, " +
+				"so this is the RAR4 twin of direct-store-encrypted and demotes only if the RAR4 keying path regresses.",
+			writer: DirectStoreRAR4Writer, format: RAR4, volumeSize: "8m", password: DirectStorePassword,
+			members: []directStoreMember{{"basalt.meridian.s01e09.mkv", 16 << 20, "basalt-meridian"}},
+		},
+		{
+			slug: "direct-store-hp",
+			notes: "RAR5 `-hp`: headers and member data both encrypted. The router proves the job's password against the archive's own " +
+				"check before a header is decrypted, then keys the header walk from it and routes the stored member direct. " +
+				"The header-encrypted shape direct-store-encrypted deliberately leaves out.",
+			writer: DirectStoreRAR5Writer, format: RAR5, volumeSize: "8m", headerPassword: DirectStorePassword,
+			members: []directStoreMember{{"ivory.signal.s01e11.mkv", 12 << 20, "ivory-signal"}},
+		},
 	}
 
 	recipes := make([]Recipe, 0, len(sets)+1)
@@ -144,6 +164,29 @@ func DirectStoreRecipes() []Recipe {
 		members: []directStoreMember{{"obsidian.current.s01e08.mkv", 24 << 20, "obsidian-current"}},
 	}
 	recipes = append(recipes, encryptedRepair.recipe(directStorePar2))
+
+	// The same repair under RAR4 data encryption. Parity covers the posted
+	// bytes — RAR4 ciphertext — and the edge cipher blocks on either side of
+	// the hole are held exactly as they are for RAR5, so this is where a RAR4
+	// keying difference in the repair path would show.
+	rar4EncryptedRepair := directStore{
+		slug:   "direct-store-rar4-encrypted-par2-repair",
+		notes:  "Four stored RAR4 volumes with `-p` data encryption and PAR2 recovery at 20%. The scenario deletes the tail articles of an interior volume; repair rewrites RAR4 ciphertext in place while the clean volumes stay virtual.",
+		writer: DirectStoreRAR4Writer, format: RAR4, volumeSize: "8m", password: DirectStorePassword,
+		members: []directStoreMember{{"cobalt.lantern.s01e10.mkv", 24 << 20, "cobalt-lantern"}},
+	}
+	recipes = append(recipes, rar4EncryptedRepair.recipe(directStorePar2))
+
+	// And under encrypted headers: the header walk over the repaired volume
+	// runs keyed, and the recovery set describes volumes whose headers the
+	// conventional reader could not even name without the password.
+	hpRepair := directStore{
+		slug:   "direct-store-hp-par2-repair",
+		notes:  "Four stored RAR5 volumes with `-hp` header and data encryption and PAR2 recovery at 20%. The scenario deletes the tail articles of an interior volume; repair rewrites ciphertext in place under encrypted headers while the clean volumes stay virtual.",
+		writer: DirectStoreRAR5Writer, format: RAR5, volumeSize: "8m", headerPassword: DirectStorePassword,
+		members: []directStoreMember{{"umber.tideline.s01e12.mkv", 24 << 20, "umber-tideline"}},
+	}
+	recipes = append(recipes, hpRepair.recipe(directStorePar2))
 	return recipes
 }
 
@@ -160,7 +203,7 @@ func (set directStore) recipe(after func(context.Context, *Env) error) Recipe {
 			}
 			if err := env.RAR(ctx, RARSpec{
 				Toolchain: set.writer, Format: set.format, Archive: "archive.rar",
-				Method: "-m0", Password: set.password, VolumeSize: set.volumeSize,
+				Method: "-m0", Password: set.password, HeaderPassword: set.headerPassword, VolumeSize: set.volumeSize,
 				Extra: set.extra(), Members: members,
 			}); err != nil {
 				return err

@@ -1,0 +1,11 @@
+{
+  "slug": "direct-store-rar4-encrypted",
+  "title": "Basalt.Meridian.S01E09.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "RAR4 store-method set across three volumes with `-p` data encryption and readable headers. The router derives RAR4 keys off the header's file salt and routes the encrypted member direct; the output is byte-identical to the conventional path, so the direct-store counters are the witness.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "basalt.meridian.s01e09.mkv": "6fded83e313179c6a00b0b505a0805bc3dfe8b07712713c4ffc608cb85d5fa6e"
+  },
+  "password": "weaver-e2e-direct-password"
+}

@@ -137,7 +137,9 @@ func TestSaltedEntryMayNotCarryASizeOrDigest(t *testing.T) {
 // bytes.
 func saltedWriterPath(path string) bool {
 	return strings.Contains(path, "aes256") ||
-		strings.Contains(path, "direct-store-encrypted-par2-repair")
+		strings.Contains(path, "direct-store-encrypted-par2-repair") ||
+		strings.Contains(path, "direct-store-rar4-encrypted") ||
+		strings.Contains(path, "direct-store-hp")
 }
 
 func TestCommittedSaltedEntriesAreOnlyTheSaltedWriters(t *testing.T) {

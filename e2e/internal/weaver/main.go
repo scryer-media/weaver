@@ -1149,11 +1149,15 @@ var canonicalFixtureSlugs = []string{
 	// archives direct-store is right to refuse are the rest of this corpus.
 	"direct-store-encrypted",
 	"direct-store-encrypted-par2-repair",
+	"direct-store-hp",
+	"direct-store-hp-par2-repair",
 	"direct-store-multi-member",
 	"direct-store-multivolume",
 	"direct-store-par2-repair",
 	"direct-store-post-repair-queue-liveness",
 	"direct-store-rar4",
+	"direct-store-rar4-encrypted",
+	"direct-store-rar4-encrypted-par2-repair",
 	"direct-store-single",
 	"empty-rar",
 	"gzip-corrupted",
@@ -4161,7 +4165,7 @@ func assertDirectStoreEngagement(weaverURL string) error {
 // Archive sets in the canonical corpus built to route direct end to end. Kept
 // as a count rather than a list because the counters report finalized sets in
 // aggregate; par2-multi-set-archives contributes two independent sets.
-const directStoreArchiveSetCount = 8
+const directStoreArchiveSetCount = 12
 
 // Demotion reasons that mean direct-store REFUSED an archive it is designed not
 // to carry. Refusal is the correct outcome and says nothing about health.
