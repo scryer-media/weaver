@@ -123,7 +123,14 @@ impl HistorySubscription {
 
 fn raw_pipeline_event_stream(handle: SchedulerHandle) -> impl Stream<Item = PipelineEventGql> {
     // The raw stream is every event: job-level and per-article, which the
-    // pipeline publishes on separate channels.
+    // pipeline publishes on separate channels. Each channel keeps its own
+    // publication order; across the two there is none. A `SegmentCommitted`
+    // may surface after the `FileComplete` that followed it, and that is by
+    // design: the per-article stream is a trace, not a ledger. Nothing that
+    // derives state from this subscription may sequence a job-level event
+    // against a segment event, and no consumer of ours does — the queue
+    // subscriptions treat both channels as an opaque "something changed"
+    // trigger and reload a snapshot.
     let job_events = tokio_stream::wrappers::BroadcastStream::new(handle.subscribe_events());
     let segment_events =
         tokio_stream::wrappers::BroadcastStream::new(handle.subscribe_segment_events());
