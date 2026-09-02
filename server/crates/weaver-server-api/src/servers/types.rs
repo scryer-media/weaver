@@ -185,6 +185,10 @@ pub struct Server {
     pub download_quota: ServerDownloadQuota,
     pub tls_ca_cert: Option<String>,
     pub tls_name_mismatch_certificate_fingerprint: Option<String>,
+    /// IANA name of the TLS suite negotiated at the last successful save-time probe.
+    pub tls_cipher_suite: Option<String>,
+    /// Whether that server follows the client's cipher order (null when unknown).
+    pub tls_honors_client_cipher_order: Option<bool>,
 }
 
 impl Server {
@@ -209,7 +213,20 @@ impl Server {
             tls_name_mismatch_certificate_fingerprint: certificate_fingerprint(
                 s.tls_name_mismatch_certificate_der.as_deref(),
             ),
+            tls_cipher_suite: None,
+            tls_honors_client_cipher_order: None,
         }
+    }
+
+    pub fn with_tls_diagnostics(
+        mut self,
+        diagnostics: Option<&weaver_server_core::servers::ServerTlsDiagnostics>,
+    ) -> Self {
+        if let Some(diagnostics) = diagnostics {
+            self.tls_cipher_suite = Some(diagnostics.cipher_suite.clone());
+            self.tls_honors_client_cipher_order = diagnostics.honors_client_cipher_order;
+        }
+        self
     }
 }
 
@@ -237,6 +254,10 @@ pub struct ServerDetails {
     pub tls_ca_cert: Option<String>,
     pub tls_name_mismatch_certificate_der_base64: Option<String>,
     pub tls_name_mismatch_certificate_fingerprint: Option<String>,
+    /// IANA name of the TLS suite negotiated at the last successful save-time probe.
+    pub tls_cipher_suite: Option<String>,
+    /// Whether that server follows the client's cipher order (null when unknown).
+    pub tls_honors_client_cipher_order: Option<bool>,
 }
 
 impl ServerDetails {
@@ -266,7 +287,20 @@ impl ServerDetails {
             tls_name_mismatch_certificate_fingerprint: certificate_fingerprint(
                 s.tls_name_mismatch_certificate_der.as_deref(),
             ),
+            tls_cipher_suite: None,
+            tls_honors_client_cipher_order: None,
         }
+    }
+
+    pub fn with_tls_diagnostics(
+        mut self,
+        diagnostics: Option<&weaver_server_core::servers::ServerTlsDiagnostics>,
+    ) -> Self {
+        if let Some(diagnostics) = diagnostics {
+            self.tls_cipher_suite = Some(diagnostics.cipher_suite.clone());
+            self.tls_honors_client_cipher_order = diagnostics.honors_client_cipher_order;
+        }
+        self
     }
 }
 
@@ -317,6 +351,10 @@ pub struct TestConnectionResult {
     pub latency_ms: Option<u64>,
     pub supports_pipelining: bool,
     pub adoptable_tls_name_mismatch_certificate: Option<AdoptableTlsNameMismatchCertificate>,
+    /// IANA name of the negotiated TLS suite with weaver's CPU-preferred family offered first.
+    pub tls_cipher_suite: Option<String>,
+    /// Whether the server followed the client's cipher order (null when not determined).
+    pub tls_honors_client_cipher_order: Option<bool>,
 }
 
 impl From<weaver_server_core::servers::ServerConnectivityResult> for TestConnectionResult {
@@ -333,6 +371,8 @@ impl From<weaver_server_core::servers::ServerConnectivityResult> for TestConnect
                         .expect("certificate fingerprint exists for DER"),
                     der_base64: base64::engine::general_purpose::STANDARD.encode(der),
                 }),
+            tls_cipher_suite: result.tls_cipher_suite,
+            tls_honors_client_cipher_order: result.tls_honors_client_cipher_order,
         }
     }
 }

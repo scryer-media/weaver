@@ -180,6 +180,8 @@ const SERVER_FIELDS = `
     retentionDays
     maxDownloadSpeed
     tlsNameMismatchCertificateFingerprint
+    tlsCipherSuite
+    tlsHonorsClientCipherOrder
     downloadQuota {
       enabled
       period
@@ -214,6 +216,8 @@ const SERVER_DETAILS_FIELDS = `
     maxDownloadSpeed
     tlsNameMismatchCertificateDerBase64
     tlsNameMismatchCertificateFingerprint
+    tlsCipherSuite
+    tlsHonorsClientCipherOrder
     downloadQuota {
       enabled
       period
@@ -1078,6 +1082,8 @@ export const TEST_CONNECTION_MUTATION = gql`
       message
       latencyMs
       supportsPipelining
+      tlsCipherSuite
+      tlsHonorsClientCipherOrder
       adoptableTlsNameMismatchCertificate {
         derBase64
         sha256Fingerprint

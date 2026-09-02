@@ -71,12 +71,32 @@ type Server = {
   maxDownloadSpeed: number;
   downloadQuota: ServerDownloadQuota;
   tlsNameMismatchCertificateFingerprint?: string | null;
+  tlsCipherSuite?: string | null;
+  tlsHonorsClientCipherOrder?: boolean | null;
 };
 
 type ServerDetails = Server & {
   username: string | null;
   tlsNameMismatchCertificateDerBase64: string | null;
 };
+
+/** Shorten an IANA suite name for display: TLS_AES_128_GCM_SHA256 → AES-128-GCM. */
+function formatCipherSuite(suite: string): string {
+  return suite
+    .replace(/^TLS_(ECDHE_(RSA|ECDSA)_WITH_)?/, "")
+    .replace(/_SHA(256|384)$/, "")
+    .replace(/_/g, "-");
+}
+
+function describeCipherOrder(
+  honorsClientOrder: boolean | null | undefined,
+  t: (key: string) => string,
+): string {
+  if (honorsClientOrder == null) return "";
+  return honorsClientOrder
+    ? t("servers.tlsCipherClientOrder")
+    : t("servers.tlsCipherServerOrder");
+}
 
 type ServerFormValues = {
   host: string;
@@ -259,6 +279,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       derBase64: string;
       sha256Fingerprint: string;
     } | null;
+    tlsCipherSuite?: string | null;
+    tlsHonorsClientCipherOrder?: boolean | null;
   } | null>(null);
 
   useEffect(() => {
@@ -563,7 +585,20 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                       <TableCell data-testid="server-connections" className="tabular-nums">
                         {server.connections}
                       </TableCell>
-                      <TableCell>{server.tls ? t("label.enabled") : t("label.disabled")}</TableCell>
+                      <TableCell>
+                        <div>{server.tls ? t("label.enabled") : t("label.disabled")}</div>
+                        {server.tls && server.tlsCipherSuite ? (
+                          <div
+                            data-testid="server-tls-cipher"
+                            className="mt-1 font-mono text-[10px] text-muted-foreground"
+                          >
+                            {formatCipherSuite(server.tlsCipherSuite)}
+                            {server.tlsHonorsClientCipherOrder == null
+                              ? ""
+                              : ` · ${describeCipherOrder(server.tlsHonorsClientCipherOrder, t)}`}
+                          </div>
+                        ) : null}
+                      </TableCell>
                       <TableCell><ServerLimitsSummary server={server} /></TableCell>
                       <TableCell>{server.active ? t("label.enabled") : t("label.disabled")}</TableCell>
                       <TableCell>
@@ -691,6 +726,8 @@ function ServerFormCard({
       derBase64: string;
       sha256Fingerprint: string;
     } | null;
+    tlsCipherSuite?: string | null;
+    tlsHonorsClientCipherOrder?: boolean | null;
   } | null;
   onSave: (values: ServerFormValues) => Promise<void>;
   onTest: (values: ServerFormValues) => Promise<void>;
@@ -1178,7 +1215,15 @@ function ServerFormCard({
             )}
           >
             {testResult.success
-              ? `${t("servers.testSuccess")} (${testResult.latencyMs}ms${testResult.supportsPipelining ? ", pipelining supported" : ""})`
+              ? `${t("servers.testSuccess")} (${testResult.latencyMs}ms${testResult.supportsPipelining ? ", pipelining supported" : ""}${
+                  testResult.tlsCipherSuite
+                    ? `, ${formatCipherSuite(testResult.tlsCipherSuite)}${
+                        testResult.tlsHonorsClientCipherOrder == null
+                          ? ""
+                          : ` ${describeCipherOrder(testResult.tlsHonorsClientCipherOrder, t)}`
+                      }`
+                    : ""
+                })`
               : `${t("servers.testFailed")}: ${testResult.message}`}
             {!testResult.success && testResult.adoptableTlsNameMismatchCertificate ? (
               <div className="mt-3 flex flex-wrap items-center gap-3">

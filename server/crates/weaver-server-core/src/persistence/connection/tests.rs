@@ -2223,7 +2223,35 @@ async fn postgres_runtime_smoke_when_configured() {
         defaulted_server.download_quota,
         crate::servers::ServerDownloadQuotaConfig::default()
     );
+
+    let tls_diagnostics = crate::servers::ServerTlsDiagnostics {
+        server_id: 8,
+        cipher_suite: "TLS_AES_128_GCM_SHA256".to_string(),
+        honors_client_cipher_order: Some(true),
+        probed_at: chrono::DateTime::from_timestamp(1_700_000_321, 0).unwrap(),
+    };
+    db.upsert_server_tls_diagnostics(&tls_diagnostics).unwrap();
+    assert_eq!(
+        db.server_tls_diagnostics(8).unwrap(),
+        Some(tls_diagnostics.clone())
+    );
+    let reprobed = crate::servers::ServerTlsDiagnostics {
+        cipher_suite: "TLS_CHACHA20_POLY1305_SHA256".to_string(),
+        honors_client_cipher_order: None,
+        ..tls_diagnostics
+    };
+    db.upsert_server_tls_diagnostics(&reprobed).unwrap();
+    assert_eq!(
+        db.list_server_tls_diagnostics()
+            .unwrap()
+            .into_iter()
+            .filter(|diagnostics| diagnostics.server_id == 8)
+            .collect::<Vec<_>>(),
+        vec![reprobed]
+    );
     assert!(db.delete_server(8).unwrap());
+    assert_eq!(db.server_tls_diagnostics(8).unwrap(), None);
+    assert!(!db.delete_server_tls_diagnostics(8).unwrap());
 
     let rss_feed = RssFeedRow {
         id: 1,

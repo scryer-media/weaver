@@ -1967,6 +1967,14 @@ type Server {
 	downloadQuota: ServerDownloadQuota!
 	tlsCaCert: String
 	tlsNameMismatchCertificateFingerprint: String
+	"""
+	IANA name of the TLS suite negotiated at the last successful save-time probe.
+	"""
+	tlsCipherSuite: String
+	"""
+	Whether that server follows the client's cipher order (null when unknown).
+	"""
+	tlsHonorsClientCipherOrder: Boolean
 }
 
 type ServerDetails {
@@ -1986,6 +1994,14 @@ type ServerDetails {
 	tlsCaCert: String
 	tlsNameMismatchCertificateDerBase64: String
 	tlsNameMismatchCertificateFingerprint: String
+	"""
+	IANA name of the TLS suite negotiated at the last successful save-time probe.
+	"""
+	tlsCipherSuite: String
+	"""
+	Whether that server follows the client's cipher order (null when unknown).
+	"""
+	tlsHonorsClientCipherOrder: Boolean
 }
 
 type ServerDownloadQuota {
@@ -2321,6 +2337,14 @@ type TestConnectionResult {
 	latencyMs: Int
 	supportsPipelining: Boolean!
 	adoptableTlsNameMismatchCertificate: AdoptableTlsNameMismatchCertificate
+	"""
+	IANA name of the negotiated TLS suite with weaver's CPU-preferred family offered first.
+	"""
+	tlsCipherSuite: String
+	"""
+	Whether the server followed the client's cipher order (null when not determined).
+	"""
+	tlsHonorsClientCipherOrder: Boolean
 }
 
 enum TimelineSpanState {

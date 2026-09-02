@@ -5,6 +5,7 @@ pub mod queries;
 pub mod record;
 pub mod repository;
 pub mod service;
+pub mod tls_diagnostics;
 pub mod transfer_policy;
 pub mod usage;
 
@@ -13,4 +14,5 @@ pub use model::{
     MAX_PERSISTED_SERVER_DOWNLOAD_BYTES, ServerConfig, ServerDownloadQuotaConfig,
     ServerDownloadQuotaPeriod,
 };
+pub use tls_diagnostics::ServerTlsDiagnostics;
 pub use usage::ServerDownloadUsage;
