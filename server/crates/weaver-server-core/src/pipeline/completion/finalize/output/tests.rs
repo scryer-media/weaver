@@ -480,6 +480,28 @@ fn prepublication_scan_checks_both_delivery_roots() {
     assert!(staging.join("nested.exe").exists());
 }
 
+/// The Windows arm of the guard reads a raw attribute bit rather than asking
+/// `FileType`, so an inverted or mistyped mask would reject every ordinary
+/// delivery instead of just the redirecting ones. The Unix symlink tests
+/// cannot see that: this one runs on every platform.
+#[test]
+fn ordinary_files_and_directories_are_not_treated_as_links() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("payload.mkv");
+    let directory = temp.path().join("season one");
+    std::fs::write(&file, b"payload").unwrap();
+    std::fs::create_dir(&directory).unwrap();
+
+    for path in [&file, &directory] {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        assert!(
+            !metadata_is_link_or_reparse(&metadata),
+            "{} was refused as a link or reparse point",
+            path.display()
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn prepublication_scan_refuses_symlinked_directories() {

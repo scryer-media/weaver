@@ -121,7 +121,7 @@ fn scan_delivery_root(
             ));
         }
     };
-    if file_type_is_link_or_reparse(&root_metadata.file_type()) || !root_metadata.is_dir() {
+    if metadata_is_link_or_reparse(&root_metadata) || !root_metadata.is_dir() {
         return Err(format!("unsafe delivery root {}", root.display()));
     }
     let entries = std::fs::read_dir(root).map_err(|error| {
@@ -155,7 +155,7 @@ fn scan_delivery_root(
                     path.display()
                 )
             })?;
-            if file_type_is_link_or_reparse(&metadata.file_type()) {
+            if metadata_is_link_or_reparse(&metadata) {
                 return Err(format!(
                     "unsafe delivery link or reparse point at {}/{}",
                     source_name,
@@ -206,14 +206,21 @@ fn scan_delivery_root(
     Ok(true)
 }
 
-fn file_type_is_link_or_reparse(file_type: &std::fs::FileType) -> bool {
-    if file_type.is_symlink() {
+// Rejects symlinks and, on Windows, every other reparse point: junctions and
+// volume mount points redirect a traversal just as effectively as a symlink.
+// `FileType` cannot answer that on stable Rust — `is_reparse_point` is not in
+// std, and `FileTypeExt` only exposes the symlink-shaped reparse points — so
+// the check reads the raw attribute bit off the metadata each caller already
+// holds.
+fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
         return true;
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::FileTypeExt;
-        return file_type.is_reparse_point();
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
     }
     #[cfg(not(windows))]
     false
@@ -448,7 +455,7 @@ async fn run_move_to_claimed_destination(
             dest.display()
         ))
     })?;
-    if !dest_metadata.is_dir() || file_type_is_link_or_reparse(&dest_metadata.file_type()) {
+    if !dest_metadata.is_dir() || metadata_is_link_or_reparse(&dest_metadata) {
         return Err(MoveToCompleteFailure::Security(format!(
             "claimed complete destination changed before publication: {}",
             dest.display()

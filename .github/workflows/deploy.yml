@@ -2188,12 +2188,17 @@ jobs:
             --certificate-identity-regexp "$IDENTITY" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             artifacts/weaver-checksums.txt
-      - name: Attest Windows release artifacts
+      # GitHub-native attestations for the installer-shaped assets, on top of
+      # the SLSA provenance every asset already carries: `gh attestation
+      # verify <file> -R <repo>` works for the packages a desktop user
+      # downloads by hand.
+      - name: Attest installer release artifacts
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: |
             artifacts/weaver-windows-*.zip
             artifacts/weaver-windows-*.msi
+            artifacts/weaver-darwin-*.dmg
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
