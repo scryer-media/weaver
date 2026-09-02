@@ -55,6 +55,15 @@ pub struct PartProgress {
     /// the same as intact, and a set already known to carry damage does not get
     /// the benefit of the doubt about the parts nobody has checked.
     pub vouched_prefix: Option<u64>,
+    /// How many times repair has replaced this part's file on disk.
+    ///
+    /// Repair does not write into the damaged file: it moves that file aside
+    /// and installs the repaired one under the same name, so the path now
+    /// leads to a different inode. A reader holding the handle it opened
+    /// before the repair would keep reading the file that was moved aside —
+    /// the damaged bytes, right up to the moment they are deleted as a
+    /// leftover. This counter is how it learns to open the path again.
+    pub rewritten: u64,
 }
 
 /// Where an archive offset sits relative to one part.
@@ -64,6 +73,10 @@ pub enum PositionInPart {
     Inside {
         /// Bytes readable from the offset before the frontier.
         available: u64,
+        /// The part's [`PartProgress::rewritten`] count at the time of the
+        /// answer, so the reader can tell whether the file it has open is still
+        /// the one at the path.
+        rewritten: u64,
     },
     /// Past this part's end; the next part starts `len` bytes in.
     Beyond {
@@ -426,6 +439,9 @@ impl SetCoverage {
         // reader off the end.
         part.watermark = len;
         part.complete = true;
+        // The file at the path is a new one; a reader with the old one open
+        // must not resume over it.
+        part.rewritten += 1;
         // Repair verified what it wrote, so the gate has nothing left to add:
         // the bytes on disk are now the recovery set's own answer.
         state.gated = false;
@@ -568,6 +584,7 @@ impl SetCoverage {
             if offset < servable {
                 return Ok(PositionInPart::Inside {
                     available: servable - offset,
+                    rewritten: part.rewritten,
                 });
             }
             if let Some(len) = part.len {

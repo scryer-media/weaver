@@ -656,6 +656,70 @@ fn a_parked_chase_resumes_over_repaired_bytes_and_reads_the_whole_stream() {
     );
 }
 
+/// Repair does not write into the damaged file. It moves that file aside,
+/// installs the repaired one under the same name, and the moved-aside copy is
+/// deleted as a leftover once the repair is accepted. A chase that had the
+/// damaged part open when it parked must open the path again on resume, or it
+/// keeps reading the file that was moved aside — zeros included — and fails
+/// the member checksum a moment after the repair that was meant to save it.
+#[test]
+fn a_parked_chase_reopens_a_part_the_repair_replaced() {
+    let repaired = payload(160_000, 89);
+    let mut damaged = repaired.clone();
+    for byte in damaged[120_000..128_000].iter_mut() {
+        *byte = 0;
+    }
+    // Two parts, damage in the second: the chase reads the whole first part
+    // and 40_000 bytes of the second before it parks, so the second part's
+    // handle is open — and stale — when repair lands.
+    let fixture = split_fixture(damaged, &[80_000]);
+
+    let coverage = std::sync::Arc::new(SetCoverage::new(2));
+    coverage.set_total_len(160_000);
+    for (index, len) in fixture.part_lens.iter().enumerate() {
+        coverage.note_part_len(index, *len);
+        coverage.advance_watermark(index, *len);
+        coverage.mark_part_complete(index);
+    }
+    coverage.note_vouched_prefix(0, 80_000);
+    coverage.cap_at_damage(1, 40_000);
+    coverage.note_vouched_prefix(1, 40_000);
+
+    let paths = fixture.paths.clone();
+    let reader_coverage = std::sync::Arc::clone(&coverage);
+    let worker = thread::spawn(move || {
+        let mut reader = GatedSplitReader::open(&paths, reader_coverage).expect("open reader");
+        let mut read = Vec::new();
+        reader.read_to_end(&mut read).expect("read to end");
+        read
+    });
+
+    thread::sleep(SETTLE);
+    assert!(coverage.park_count() > 0, "the chase must park at the cap");
+    assert_eq!(
+        coverage.consumed_high_water(1),
+        40_000,
+        "the chase must have the damaged part open when repair lands"
+    );
+
+    // Install the way the repairer does: the damaged file is moved aside, the
+    // repaired one takes its name, and the leftover is purged on acceptance.
+    let target = fixture.paths[1].clone();
+    let moved_aside = target.with_extension("002.1");
+    std::fs::rename(&target, &moved_aside).expect("move the damaged part aside");
+    let staged = target.with_extension("002.repaired");
+    std::fs::write(&staged, &repaired[80_000..]).expect("write the repaired part");
+    std::fs::rename(&staged, &target).expect("install the repaired part");
+    std::fs::remove_file(&moved_aside).expect("purge the leftover");
+    coverage.release_after_repair(1, 80_000);
+
+    assert_eq!(
+        worker.join().expect("reader thread"),
+        repaired,
+        "the resumed chase must read the installed file, not the handle it held"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Gate-on-first-damage
 // ---------------------------------------------------------------------------
