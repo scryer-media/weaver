@@ -736,7 +736,13 @@ async fn changing_the_scripts_directory_pins_admitted_work_and_updates_future_jo
             .await
             .unwrap()
     });
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // Generous on purpose. What is under test is that the script *begins*
+    // before it is released, not how fast it begins: starting it means
+    // launching the supervisor, which is this very binary, and a macOS host
+    // that treats a freshly built binary as needing launch verification can
+    // spend several seconds in the loader before `main` runs. Five seconds
+    // was inside that window and made this fail on a loaded machine.
+    tokio::time::timeout(Duration::from_secs(60), async {
         while !first_working_directory.join("started").exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
