@@ -17,9 +17,12 @@ impl JobsSubscription {
     #[graphql(guard = "AdminGuard")]
     async fn job_updates(&self, ctx: &Context<'_>) -> Result<impl Stream<Item = JobsSnapshot>> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
-        let event_rx = handle.subscribe_events();
-
-        let event_stream = tokio_stream::wrappers::BroadcastStream::new(event_rx)
+        // Per-article events trigger a snapshot too (throttled below); they
+        // arrive on their own channel.
+        let event_stream = tokio_stream::wrappers::BroadcastStream::new(handle.subscribe_events())
+            .merge(tokio_stream::wrappers::BroadcastStream::new(
+                handle.subscribe_segment_events(),
+            ))
             .filter_map(|r| r.ok().map(|_| ()));
 
         // Tick every 2s as a heartbeat so speed/metrics stay fresh even when
@@ -62,9 +65,10 @@ impl JobsSubscription {
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
         let db = ctx.data::<Database>()?.clone();
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
-        let event_rx = handle.subscribe_events();
-
-        let event_stream = tokio_stream::wrappers::BroadcastStream::new(event_rx)
+        let event_stream = tokio_stream::wrappers::BroadcastStream::new(handle.subscribe_events())
+            .merge(tokio_stream::wrappers::BroadcastStream::new(
+                handle.subscribe_segment_events(),
+            ))
             .filter_map(|r| r.ok().map(|_| SnapshotTrigger::ItemsChanged));
         let heartbeat =
             tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(SNAPSHOT_HEARTBEAT))

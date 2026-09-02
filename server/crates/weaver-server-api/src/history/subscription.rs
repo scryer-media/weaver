@@ -48,8 +48,8 @@ impl HistorySubscription {
                     // Reload only on meaningful events for THIS job. `should_record_job_event`
                     // is the same predicate that gates the persisted event log the detail view
                     // reads, so it triggers exactly when the log or lifecycle changes while
-                    // excluding the high-frequency per-article/segment events (the broadcast
-                    // carries those too). Live progress is covered by the heartbeat. Uses the
+                    // excluding the lower-frequency file and phase events (the per-article
+                    // stream is a separate channel). Live progress is covered by the heartbeat. Uses the
                     // core job_id accessor (all variants, no allocation).
                     use weaver_server_core::events::publish::{
                         pipeline_job_id, should_record_job_event,
@@ -122,8 +122,13 @@ impl HistorySubscription {
 }
 
 fn raw_pipeline_event_stream(handle: SchedulerHandle) -> impl Stream<Item = PipelineEventGql> {
-    let rx = handle.subscribe_events();
-    tokio_stream::wrappers::BroadcastStream::new(rx)
+    // The raw stream is every event: job-level and per-article, which the
+    // pipeline publishes on separate channels.
+    let job_events = tokio_stream::wrappers::BroadcastStream::new(handle.subscribe_events());
+    let segment_events =
+        tokio_stream::wrappers::BroadcastStream::new(handle.subscribe_segment_events());
+    job_events
+        .merge(segment_events)
         .filter_map(|result| result.ok().map(|event| PipelineEventGql::from(&event)))
 }
 

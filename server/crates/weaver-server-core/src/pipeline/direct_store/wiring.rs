@@ -5523,9 +5523,7 @@ impl Pipeline {
             self.metrics
                 .segments_committed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let _ = self
-                .event_tx
-                .send(PipelineEvent::SegmentCommitted { segment_id });
+            self.send_segment_event(|| PipelineEvent::SegmentCommitted { segment_id });
         }
 
         // The dual-CRC grid, fed in **source-volume space** — the same

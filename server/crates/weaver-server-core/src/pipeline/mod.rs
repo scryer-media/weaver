@@ -2180,6 +2180,16 @@ impl DecodedChunk {
     }
 }
 
+impl Pipeline {
+    /// Publishes one per-article event on the segment stream rather than the
+    /// job-level broadcast, so the always-on job-level subscribers are not
+    /// woken several times per article to discard it. The event is built only
+    /// when someone is listening.
+    pub(crate) fn send_segment_event(&self, event: impl FnOnce() -> PipelineEvent) {
+        self.shared_state.publish_segment_event(event);
+    }
+}
+
 impl From<Vec<u8>> for DecodedChunk {
     fn from(value: Vec<u8>) -> Self {
         Self::Contiguous(value.into_boxed_slice())

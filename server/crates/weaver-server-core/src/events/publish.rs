@@ -5,10 +5,10 @@ use crate::events::model::PipelineEvent;
 ///
 /// Nothing that renders a queue item needs these. The item's progress comes
 /// from `PhaseProgressUpdated`, which the orchestrator samples on its metrics
-/// cadence, and its state from the job-level events. A consumer that reacts
-/// to every pipeline event by re-reading the job — the queue event replay
-/// producer does exactly that — pays a job lookup and an item snapshot per
-/// article for no change in what it publishes.
+/// cadence, and its state from the job-level events. These events travel on
+/// their own stream (`SchedulerHandle::subscribe_segment_events`), not the
+/// job-level broadcast; this predicate lets a consumer that merges both keep
+/// telling them apart.
 pub fn is_segment_event(event: &PipelineEvent) -> bool {
     matches!(
         event,

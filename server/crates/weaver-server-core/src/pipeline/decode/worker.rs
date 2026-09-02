@@ -1648,7 +1648,7 @@ impl Pipeline {
                 }
             }
 
-            let _ = self.event_tx.send(PipelineEvent::SegmentDecoded {
+            self.send_segment_event(|| PipelineEvent::SegmentDecoded {
                 segment_id,
                 decoded_size,
                 file_offset,
@@ -2766,9 +2766,7 @@ impl Pipeline {
                         .segments_committed
                         .fetch_add(1, Ordering::Relaxed);
 
-                    let _ = self
-                        .event_tx
-                        .send(PipelineEvent::SegmentCommitted { segment_id });
+                    self.send_segment_event(|| PipelineEvent::SegmentCommitted { segment_id });
                 }
 
                 // Ordering contract: this seam runs only after

@@ -107,12 +107,23 @@ pub struct SharedPipelineState {
     nntp_pool: Arc<RwLock<Option<Arc<weaver_nntp::pool::NntpPool>>>>,
     nntp_runtime_activation: Arc<RwLock<Option<NntpRuntimeActivation>>>,
     job_cancellations: JobCancellationRegistry,
+    /// The per-article stream (`ArticleDownloaded`, `SegmentDecoded`, ...),
+    /// kept off the job-level broadcast: a download emits several of these
+    /// per article, and every always-on job-level subscriber (event
+    /// persistence, the queue replay producer) was woken for each one only to
+    /// discard it. Nothing is even built here unless someone is listening.
+    segment_events: broadcast::Sender<PipelineEvent>,
 }
+
+/// Bounded like the job-level broadcast; a lagging listener drops articles,
+/// never the pipeline.
+const SEGMENT_EVENT_CAPACITY: usize = 1024;
 
 impl SharedPipelineState {
     pub fn new(metrics: Arc<PipelineMetrics>, initial_jobs: Vec<JobInfo>) -> Self {
         let metrics_snapshot = metrics.snapshot();
         let (job_revision, _) = tokio::sync::watch::channel(0);
+        let (segment_events, _) = broadcast::channel(SEGMENT_EVENT_CAPACITY);
         Self {
             jobs: Arc::new(RwLock::new(initial_jobs)),
             job_revision,
@@ -126,6 +137,20 @@ impl SharedPipelineState {
             nntp_pool: Arc::new(RwLock::new(None)),
             nntp_runtime_activation: Arc::new(RwLock::new(None)),
             job_cancellations: JobCancellationRegistry::default(),
+            segment_events,
+        }
+    }
+
+    /// Subscribe to the per-article event stream. Job-level events stay on
+    /// [`SchedulerHandle::subscribe_events`].
+    pub fn subscribe_segment_events(&self) -> broadcast::Receiver<PipelineEvent> {
+        self.segment_events.subscribe()
+    }
+
+    /// Publish one per-article event, building it only if a listener exists.
+    pub fn publish_segment_event(&self, event: impl FnOnce() -> PipelineEvent) {
+        if self.segment_events.receiver_count() > 0 {
+            let _ = self.segment_events.send(event());
         }
     }
 
@@ -1196,9 +1221,15 @@ impl SchedulerHandle {
         self.state.publish_jobs(jobs);
     }
 
-    /// Subscribe to pipeline events.
+    /// Subscribe to job-level pipeline events.
     pub fn subscribe_events(&self) -> broadcast::Receiver<PipelineEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Subscribe to the per-article event stream, which the job-level
+    /// broadcast does not carry.
+    pub fn subscribe_segment_events(&self) -> broadcast::Receiver<PipelineEvent> {
+        self.state.subscribe_segment_events()
     }
 
     /// Signal shutdown.
