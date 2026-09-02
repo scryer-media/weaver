@@ -89,6 +89,26 @@ pub struct DownloadQueue {
     /// Queued recovery items. Kept explicitly so scheduler admission checks
     /// stay O(1) even for jobs with very large article queues.
     recovery_work: usize,
+    /// Queued items per file, maintained on every push and removal. The RAR
+    /// unlock planner asks "does this file still have queued work" once per
+    /// volume; answering that by scanning the heaps made every replan cost
+    /// files times queued segments.
+    queued_by_file: HashMap<NzbFileId, u32>,
+    /// The file priority plan currently in force: `(priority, rank)` per
+    /// file, applied to every push of an unprotected item and re-applied to
+    /// the heaps only when the plan itself changes.
+    ///
+    /// A requeued retry used to lose its rank (a fresh push carries none) and
+    /// force a full heap rebuild to get it back. With the plan held here a
+    /// push lands at the right key immediately, so a retry never triggers a
+    /// rebuild and an unchanged plan is a no-op.
+    file_priority_plan: HashMap<NzbFileId, (u32, Option<u32>)>,
+    /// Items at or below this priority are never touched by the file plan.
+    file_priority_plan_protected: u32,
+    /// Set whenever queued keys are rewritten outside the plan (direct-store
+    /// volume binding, chase gating), so that re-installing an unchanged plan
+    /// still re-asserts it over those keys, as a rebuild always did.
+    file_priority_plan_stale: bool,
 }
 
 impl DownloadQueue {
@@ -99,10 +119,25 @@ impl DownloadQueue {
             next_sequence: 0,
             excluded_work: 0,
             recovery_work: 0,
+            queued_by_file: HashMap::new(),
+            file_priority_plan: HashMap::new(),
+            file_priority_plan_protected: 0,
+            file_priority_plan_stale: false,
         }
     }
 
     pub fn push(&mut self, work: DownloadWork) {
+        let mut work = work;
+        let mut rank = None;
+        if work.priority > self.file_priority_plan_protected
+            && let Some((priority, plan_rank)) = self
+                .file_priority_plan
+                .get(&work.segment_id.file_id)
+                .copied()
+        {
+            work.priority = priority;
+            rank = plan_rank;
+        }
         let priority = work.priority;
         let sequence = self.next_sequence;
         self.next_sequence += 1;
@@ -112,11 +147,15 @@ impl DownloadQueue {
         if work.is_recovery {
             self.recovery_work += 1;
         }
+        *self
+            .queued_by_file
+            .entry(work.segment_id.file_id)
+            .or_default() += 1;
         let completion_critical = work.completion_critical;
         let item = Reverse(PrioritizedWork {
             completion_rank: u8::from(!work.completion_critical),
             priority,
-            rank: None,
+            rank,
             sequence,
             work,
         });
@@ -177,6 +216,18 @@ impl DownloadQueue {
             .filter(|item| !item.0.work.exclude_servers.is_empty())
             .count();
         self.recovery_work = self.iter().filter(|item| item.0.work.is_recovery).count();
+        let mut queued_by_file = HashMap::new();
+        for item in self.iter() {
+            *queued_by_file
+                .entry(item.0.work.segment_id.file_id)
+                .or_default() += 1;
+        }
+        self.queued_by_file = queued_by_file;
+    }
+
+    /// Queued items for one file, in O(1).
+    pub fn queued_count_for_file(&self, file_id: NzbFileId) -> u32 {
+        self.queued_by_file.get(&file_id).copied().unwrap_or(0)
     }
 
     fn iter(&self) -> impl Iterator<Item = &Reverse<PrioritizedWork>> {
@@ -263,6 +314,12 @@ impl DownloadQueue {
         }
         if work.is_recovery {
             self.recovery_work = self.recovery_work.saturating_sub(1);
+        }
+        if let Some(count) = self.queued_by_file.get_mut(&work.segment_id.file_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.queued_by_file.remove(&work.segment_id.file_id);
+            }
         }
     }
 
@@ -355,11 +412,53 @@ impl DownloadQueue {
     pub fn drain_all(&mut self) -> Vec<DownloadWork> {
         self.excluded_work = 0;
         self.recovery_work = 0;
+        self.queued_by_file.clear();
         self.completion_critical_heap
             .drain()
             .chain(self.ordinary_heap.drain())
             .map(|Reverse(pw)| pw.work)
             .collect()
+    }
+
+    /// Installs a per-file `(priority, rank)` plan and applies it to the queued
+    /// work, leaving items at or below `protected` untouched. Returns how many
+    /// queued items changed key.
+    ///
+    /// The plan persists: every later push of an unprotected item for a planned
+    /// file lands at the planned key, so a requeued retry keeps its rank without
+    /// a rebuild. Re-installing an identical plan is a no-op — the heaps are
+    /// only drained and rebuilt when the plan differs from the one in force,
+    /// which is what keeps a burst of retry requeues from costing a rebuild
+    /// each.
+    pub fn install_file_priority_plan(
+        &mut self,
+        plan: HashMap<NzbFileId, (u32, Option<u32>)>,
+        protected: u32,
+    ) -> usize {
+        if !self.file_priority_plan_stale
+            && plan == self.file_priority_plan
+            && protected == self.file_priority_plan_protected
+        {
+            return 0;
+        }
+        self.file_priority_plan = plan;
+        self.file_priority_plan_protected = protected;
+        if self.file_priority_plan.is_empty() {
+            // Nothing to apply: queued items keep the keys they have, exactly
+            // as a rebuild with an empty plan would leave them.
+            return 0;
+        }
+        let protected = self.file_priority_plan_protected;
+        let plan = std::mem::take(&mut self.file_priority_plan);
+        let changed = self.reprioritize_matching_with_rank(|work| {
+            if work.priority <= protected {
+                return None;
+            }
+            plan.get(&work.segment_id.file_id).copied()
+        });
+        self.file_priority_plan = plan;
+        self.file_priority_plan_stale = false;
+        changed
     }
 
     /// Recompute priorities for selected queued work while preserving insertion
@@ -379,6 +478,7 @@ impl DownloadQueue {
         &mut self,
         mut priority_for: impl FnMut(&DownloadWork) -> Option<(u32, Option<u32>)>,
     ) -> usize {
+        self.file_priority_plan_stale = true;
         let mut changed = 0;
         for heap in [&mut self.completion_critical_heap, &mut self.ordinary_heap] {
             let items: Vec<_> = heap.drain().collect();
