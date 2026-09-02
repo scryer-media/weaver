@@ -4268,6 +4268,15 @@ impl Pipeline {
                     assembly_complete: true,
                     covered: set.volume_coverage(volume_index),
                     crcs: set.volume_crc_runs(volume_index),
+                    // The raw physical coverage, not the article-whole clip the
+                    // demotion sweep takes: PAR2 needs every slice it judged
+                    // valid to be in the scratch, and those reach to the placed
+                    // frontier, not to the last whole article. An encrypted
+                    // member's frontier before a hole is *always* inside the
+                    // last article — its final cipher block waits for the block
+                    // after it — so refusing that run would demote every
+                    // encrypted set the moment it needed a repair.
+                    partial_article: super::reconstruct::PartialArticle::CarryThrough,
                 },
             });
         }
@@ -6789,6 +6798,11 @@ impl Pipeline {
                     assembly_complete: file_asm.is_complete(),
                     covered: coverage,
                     crcs,
+                    // `coverage` is already clipped to whole articles, so this
+                    // never fires; it states that a floor is published over
+                    // what this sweep writes and nothing unverified may sit
+                    // under one.
+                    partial_article: super::reconstruct::PartialArticle::Refuse,
                 },
             ));
         }

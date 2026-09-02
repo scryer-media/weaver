@@ -651,6 +651,54 @@ impl CrcRuns {
         }
         Some(composed)
     }
+
+    /// The longest prefix of `[start, start + len)` the runs tile exactly, as
+    /// `(prefix_len, composed)`.
+    ///
+    /// `None` means no run starts at `start`, so not a byte of the range has a
+    /// reference. A zero-length prefix is a real answer: the run at `start` is
+    /// longer than the range, so the whole range is a proper prefix of one atom.
+    /// [`Self::compose`] is this with the prefix required to be the whole range.
+    pub(crate) fn compose_prefix(&self, start: u64, len: u64) -> Option<(u64, u32)> {
+        if len == 0 {
+            return None;
+        }
+        let end = start.checked_add(len)?;
+        let mut index = self
+            .runs
+            .partition_point(|(run_start, _, _)| *run_start < start);
+        let (first_start, _, _) = *self.runs.get(index)?;
+        if first_start != start {
+            return None;
+        }
+        let mut cursor = start;
+        let mut composed = 0u32;
+        while cursor < end {
+            let Some(&(run_start, run_len, run_crc)) = self.runs.get(index) else {
+                break;
+            };
+            if run_start != cursor {
+                break;
+            }
+            let run_end = run_start.checked_add(run_len)?;
+            if run_end > end {
+                break;
+            }
+            composed = par2_rs::checksum::Crc32CombineOp::new(run_len).combine(composed, run_crc);
+            cursor = run_end;
+            index += 1;
+        }
+        Some((cursor - start, composed))
+    }
+
+    /// The run that starts exactly at `offset`, as `(start, len)`.
+    pub(crate) fn run_starting_at(&self, offset: u64) -> Option<(u64, u64)> {
+        let index = self
+            .runs
+            .partition_point(|(run_start, _, _)| *run_start < offset);
+        let &(run_start, run_len, _) = self.runs.get(index)?;
+        (run_start == offset).then_some((run_start, run_len))
+    }
 }
 
 /// One staged run, in RAM or paged out to the set's holds scratch.
