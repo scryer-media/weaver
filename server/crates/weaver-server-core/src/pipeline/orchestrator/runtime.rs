@@ -27,6 +27,14 @@ impl Pipeline {
     /// Bound on how long `drain` waits to join detached fire-and-forget writes.
     const FIRE_AND_FORGET_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const DOWNLOAD_COMPLETION_DRAIN_LIMIT: usize = 128;
+    /// Released results processed per orchestrator turn before the turn's
+    /// dispatch pass, barrier poll and chase reap run again. One result per
+    /// turn made every lane batch of 64 articles cost 64 full dispatch passes
+    /// that, with the lanes refilling themselves, almost never had a
+    /// connection to fill. Sixteen bounds the added dispatch latency to the
+    /// time it takes to ingest sixteen results while dividing the pass count
+    /// by the same factor.
+    const DOWNLOAD_RESULTS_PER_TURN: usize = 16;
 
     /// Create a new pipeline.
     #[allow(clippy::too_many_arguments)]
@@ -989,9 +997,15 @@ impl Pipeline {
 
             self.drain_ready_lane_control_messages();
 
-            if let Some(result) = pending_download_results.pop_front() {
+            let mut processed_results = 0usize;
+            while processed_results < Self::DOWNLOAD_RESULTS_PER_TURN {
+                let Some(result) = pending_download_results.pop_front() else {
+                    break;
+                };
                 self.process_released_download_done(result).await;
-            } else {
+                processed_results += 1;
+            }
+            if processed_results == 0 {
                 tokio::select! {
                     cmd = self.cmd_rx.recv() => {
                         match cmd {
