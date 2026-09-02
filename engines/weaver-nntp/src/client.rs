@@ -1430,7 +1430,7 @@ impl NntpClient {
         if message_ids.len() == 1 {
             let trace = self
                 .fetch_body_decoded_with_groups_prefer_excluding_traced(
-                    &message_ids[0],
+                    message_ids[0],
                     groups,
                     exclude,
                 )
@@ -1493,7 +1493,7 @@ impl NntpClient {
                             .classify_decoded_batch_item(
                                 idx,
                                 None,
-                                &message_ids[message_idx],
+                                message_ids[message_idx],
                                 item,
                                 &mut attempts_by_index[message_idx],
                                 &mut last_errors[message_idx],
@@ -1540,7 +1540,7 @@ impl NntpClient {
                             .classify_decoded_batch_item(
                                 idx,
                                 remote_ip,
-                                &message_ids[message_idx],
+                                message_ids[message_idx],
                                 item,
                                 &mut attempts_by_index[message_idx],
                                 &mut last_errors[message_idx],
@@ -1580,7 +1580,7 @@ impl NntpClient {
                         .classify_decoded_batch_item(
                             idx,
                             remote_ip,
-                            &message_ids[message_idx],
+                            message_ids[message_idx],
                             item,
                             &mut attempts_by_index[message_idx],
                             &mut last_errors[message_idx],
@@ -1641,7 +1641,7 @@ impl NntpClient {
                         .classify_decoded_batch_item(
                             idx,
                             remote_ip,
-                            &message_ids[message_idx],
+                            message_ids[message_idx],
                             item,
                             &mut attempts_by_index[message_idx],
                             &mut last_errors[message_idx],
@@ -1674,7 +1674,7 @@ impl NntpClient {
                     .classify_decoded_batch_item(
                         idx,
                         remote_ip,
-                        &message_ids[message_idx],
+                        message_ids[message_idx],
                         item,
                         &mut attempts_by_index[message_idx],
                         &mut last_errors[message_idx],
@@ -1727,7 +1727,7 @@ impl NntpClient {
                     .classify_decoded_batch_item(
                         idx,
                         remote_ip,
-                        &message_ids[message_idx],
+                        message_ids[message_idx],
                         item,
                         &mut attempts_by_index[message_idx],
                         &mut last_errors[message_idx],
@@ -1769,7 +1769,7 @@ impl NntpClient {
                             .classify_decoded_batch_item(
                                 idx,
                                 remote_ip,
-                                &message_ids[unread_idx],
+                                message_ids[unread_idx],
                                 item,
                                 &mut attempts_by_index[unread_idx],
                                 &mut last_errors[unread_idx],
@@ -3564,7 +3564,7 @@ mod tests {
         let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
         assert!(lane.supports_pipelining());
         lane.set_checkpoint_plan(checkpoint_plan.clone());
-        let message_ids = vec![
+        let message_ids = [
             "<first@checkpoint.test>".to_string(),
             "<second@checkpoint.test>".to_string(),
         ];
@@ -4338,7 +4338,7 @@ mod tests {
             soft_timeout: Duration::from_secs(1),
         });
         let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
-        let message_ids = vec![
+        let message_ids = [
             String::from("<first@quota-tail>"),
             String::from("<blocked@quota-tail>"),
             String::from("<fits-after-refund@quota-tail>"),
