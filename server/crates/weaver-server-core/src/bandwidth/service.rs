@@ -52,6 +52,13 @@ impl BandwidthCapWindow {
     fn contains(&self, now: &DateTime<Local>) -> bool {
         self.period.contains(now)
     }
+
+    /// Instant containment on epoch seconds: the per-article path asks this
+    /// question several times per article and must not resolve a calendar
+    /// to answer it.
+    fn contains_unix_seconds(&self, now_secs: i64) -> bool {
+        self.period.start.timestamp() <= now_secs && now_secs < self.period.end.timestamp()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -67,6 +74,11 @@ pub(crate) struct BandwidthCapRuntime {
     /// window rolls over, or the policy changes.
     parked_on_cap: bool,
     last_pruned_bucket_epoch_minute: Option<i64>,
+    /// The `%Z` label for the block-state presentation, keyed by the epoch
+    /// hour it was resolved in. Timezone abbreviations only change on the
+    /// hour (DST transitions), and resolving one allocates and walks the tz
+    /// database, which the per-article refresh must not pay.
+    timezone_label: Option<(i64, String)>,
     pending_usage_by_minute: BTreeMap<i64, u64>,
     pending_usage_bytes: u64,
     pending_usage_started_at: Option<Instant>,
@@ -109,26 +121,36 @@ impl BandwidthCapRuntime {
     }
 
     pub(crate) fn update_for_now(&mut self, db: &crate::Database) -> Result<(), crate::StateError> {
-        // Always compute a window so the UI can show real usage even before
-        // the user configures a cap.  Fall back to a default monthly window.
-        let default_policy = Self::default_display_policy();
-        let policy = self.policy.as_ref().unwrap_or(&default_policy);
-
-        let now = crate::e2e_clock::local_now();
-        let next_window = compute_window(now, policy);
-        let should_reload = self.window.as_ref() != Some(&next_window);
-        if should_reload {
-            self.flush_pending_usage(db)?;
-            let start_minute = next_window.starts_at().timestamp().div_euclid(60);
-            let end_minute = next_window.ends_at().timestamp().div_euclid(60);
-            self.used_bytes = db.sum_bandwidth_usage_minutes(start_minute, end_minute)?;
-            self.window = Some(next_window);
-            self.reserved_bytes = 0;
-            self.parked_on_cap = false;
+        let now_secs = crate::e2e_clock::unix_seconds();
+        // The window is a calendar computation (local midnight, DST-resolved
+        // reset times); it is recomputed only when the clock has left the one
+        // in hand. Inside the window this is an integer compare, which is what
+        // the per-article refresh should cost. SABnzbd and NZBGet keep the
+        // same shape: a precomputed period end, compared per update.
+        let in_window = self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.contains_unix_seconds(now_secs));
+        if !in_window {
+            // Always compute a window so the UI can show real usage even before
+            // the user configures a cap.  Fall back to a default monthly window.
+            let default_policy = Self::default_display_policy();
+            let policy = self.policy.as_ref().unwrap_or(&default_policy);
+            let now = crate::e2e_clock::local_now();
+            let next_window = compute_window(now, policy);
+            if self.window.as_ref() != Some(&next_window) {
+                self.flush_pending_usage(db)?;
+                let start_minute = next_window.starts_at().timestamp().div_euclid(60);
+                let end_minute = next_window.ends_at().timestamp().div_euclid(60);
+                self.used_bytes = db.sum_bandwidth_usage_minutes(start_minute, end_minute)?;
+                self.window = Some(next_window);
+                self.reserved_bytes = 0;
+                self.parked_on_cap = false;
+            }
         }
+        self.refresh_timezone_label(now_secs);
 
-        let prune_cutoff =
-            now.timestamp().div_euclid(60) - BANDWIDTH_LEDGER_RETENTION_DAYS * 24 * 60;
+        let prune_cutoff = now_secs.div_euclid(60) - BANDWIDTH_LEDGER_RETENTION_DAYS * 24 * 60;
         if self.last_pruned_bucket_epoch_minute != Some(prune_cutoff) {
             db.prune_bandwidth_usage_before(prune_cutoff)?;
             self.last_pruned_bucket_epoch_minute = Some(prune_cutoff);
@@ -165,11 +187,11 @@ impl BandwidthCapRuntime {
         db: &crate::Database,
         payload_bytes: u64,
     ) -> Result<(), crate::StateError> {
-        let now = crate::e2e_clock::local_now();
-        let bucket_epoch_minute = now.timestamp().div_euclid(60);
+        let now_secs = crate::e2e_clock::unix_seconds();
+        let bucket_epoch_minute = now_secs.div_euclid(60);
         self.record_pending_usage(bucket_epoch_minute, payload_bytes);
         if let Some(window) = &self.window
-            && window.contains(&now)
+            && window.contains_unix_seconds(now_secs)
         {
             self.used_bytes = self.used_bytes.saturating_add(payload_bytes);
         } else {
@@ -232,16 +254,37 @@ impl BandwidthCapRuntime {
                 .is_some_and(|started| started.elapsed() >= interval)
     }
 
+    fn resolve_timezone_label() -> String {
+        let now = crate::e2e_clock::local_now();
+        let label = now.format("%Z").to_string();
+        if label.is_empty() {
+            now.offset().to_string()
+        } else {
+            label
+        }
+    }
+
+    fn refresh_timezone_label(&mut self, now_secs: i64) {
+        let hour = now_secs.div_euclid(3600);
+        if self
+            .timezone_label
+            .as_ref()
+            .is_none_or(|(at, _)| *at != hour)
+        {
+            self.timezone_label = Some((hour, Self::resolve_timezone_label()));
+        }
+    }
+
+    fn timezone_label(&self) -> String {
+        let hour = crate::e2e_clock::unix_seconds().div_euclid(3600);
+        match &self.timezone_label {
+            Some((at, label)) if *at == hour => label.clone(),
+            _ => Self::resolve_timezone_label(),
+        }
+    }
+
     pub(crate) fn to_download_block_state(&self, pause: GlobalPause) -> DownloadBlockState {
-        let timezone_name = {
-            let now = crate::e2e_clock::local_now();
-            let label = now.format("%Z").to_string();
-            if label.is_empty() {
-                now.offset().to_string()
-            } else {
-                label
-            }
-        };
+        let timezone_name = self.timezone_label();
 
         // A global pause outranks the cap. The origin of the pause is carried
         // explicitly so every block-state refresh reports the same kind:
@@ -463,13 +506,17 @@ impl Pipeline {
         }
     }
 
-    pub(crate) fn refresh_bandwidth_cap_window(&mut self) -> Result<(), SchedulerError> {
-        self.bandwidth_cap.update_for_now(&self.db)?;
+    fn publish_download_block(&mut self) {
         let mut block = self
             .bandwidth_cap
             .to_download_block_state(self.global_pause());
         block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
         self.shared_state.set_download_block(block);
+    }
+
+    pub(crate) fn refresh_bandwidth_cap_window(&mut self) -> Result<(), SchedulerError> {
+        self.bandwidth_cap.update_for_now(&self.db)?;
+        self.publish_download_block();
         Ok(())
     }
 
@@ -487,23 +534,20 @@ impl Pipeline {
         segment_id: crate::jobs::ids::SegmentId,
         estimate_bytes: u64,
     ) -> Result<bool, SchedulerError> {
-        self.refresh_bandwidth_cap_window()?;
-        if !self.bandwidth_cap.can_reserve(estimate_bytes) {
+        // One publication per dispatch, after the reservation decision: the
+        // pre-decision state would be overwritten on the next line anyway.
+        self.bandwidth_cap.update_for_now(&self.db)?;
+        let reserved = if self.bandwidth_cap.can_reserve(estimate_bytes) {
+            self.bandwidth_cap.reserve(estimate_bytes);
+            self.bandwidth_reservations
+                .insert(segment_id, estimate_bytes);
+            true
+        } else {
             self.bandwidth_cap.record_reservation_rejected();
-            self.shared_state.set_download_block(
-                self.bandwidth_cap
-                    .to_download_block_state(self.global_pause()),
-            );
-            return Ok(false);
-        }
-        self.bandwidth_cap.reserve(estimate_bytes);
-        self.bandwidth_reservations
-            .insert(segment_id, estimate_bytes);
-        self.shared_state.set_download_block(
-            self.bandwidth_cap
-                .to_download_block_state(self.global_pause()),
-        );
-        Ok(true)
+            false
+        };
+        self.publish_download_block();
+        Ok(reserved)
     }
 
     pub(crate) fn release_bandwidth_reservation(
@@ -523,21 +567,13 @@ impl Pipeline {
     ) -> Result<(), SchedulerError> {
         self.bandwidth_cap
             .record_download_bytes(&self.db, payload_bytes)?;
-        let mut block = self
-            .bandwidth_cap
-            .to_download_block_state(self.global_pause());
-        block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
-        self.shared_state.set_download_block(block);
+        self.publish_download_block();
         Ok(())
     }
 
     pub(crate) fn flush_download_bandwidth_usage(&mut self) -> Result<(), SchedulerError> {
         self.bandwidth_cap.flush_pending_usage(&self.db)?;
-        let mut block = self
-            .bandwidth_cap
-            .to_download_block_state(self.global_pause());
-        block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
-        self.shared_state.set_download_block(block);
+        self.publish_download_block();
         Ok(())
     }
 }
