@@ -1999,7 +1999,7 @@ pub(super) struct StreamedCompletedFileChecksum {
 pub(super) struct CompletedFileChecksumState {
     md5: Option<par2_rs::checksum::FileHashState>,
     crc32: u32,
-    crc32_combine_op: Option<(u64, par2_rs::checksum::Crc32CombineOp)>,
+    crc32_combine_op: Option<(u64, weaver_yenc::Crc32Combine)>,
     bytes_fed: u64,
     all_parts_crc_verified: bool,
 }
@@ -2084,7 +2084,7 @@ impl CompletedFileChecksumState {
         let _cpu_scope =
             crate::runtime::perf_probe::cpu_scope("download.file_hash.update.crc32_combine");
         if !matches!(self.crc32_combine_op.as_ref(), Some((cached_len, _)) if *cached_len == len) {
-            self.crc32_combine_op = Some((len, par2_rs::checksum::Crc32CombineOp::new(len)));
+            self.crc32_combine_op = Some((len, weaver_yenc::Crc32Combine::new(len)));
         }
         let op = &self
             .crc32_combine_op

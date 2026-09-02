@@ -33,9 +33,9 @@
 //! (see `weaver_yenc::segment`). This module assembles the segments tiling each
 //! block — which may come from several articles — into that block's CRC32, and
 //! compares it against the recovery set's IFSC entry. Segment composition uses
-//! [`par2_rs::checksum::Crc32CombineOp`], the same combine the pipeline's
-//! part-CRC to file-CRC composition already runs, so block CRCs and file CRCs
-//! are derived by one implementation.
+//! [`weaver_yenc::crc32_combine`], the same combine the decoder's checkpoint
+//! pass and the pipeline's part-CRC to file-CRC composition already run, so
+//! segment, block and file CRCs are derived by one implementation.
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
@@ -99,7 +99,7 @@ pub(crate) fn crc32_of_zeros(len: u64) -> u32 {
         if remaining & 1 == 1 {
             acc = Some(match acc {
                 Some((crc, acc_len)) => (
-                    par2_rs::checksum::Crc32CombineOp::new(unit_len).combine(crc, unit_crc),
+                    weaver_yenc::crc32_combine(crc, unit_crc, unit_len),
                     acc_len + unit_len,
                 ),
                 None => (unit_crc, unit_len),
@@ -107,7 +107,7 @@ pub(crate) fn crc32_of_zeros(len: u64) -> u32 {
         }
         remaining >>= 1;
         if remaining > 0 {
-            unit_crc = par2_rs::checksum::Crc32CombineOp::new(unit_len).combine(unit_crc, unit_crc);
+            unit_crc = weaver_yenc::crc32_combine(unit_crc, unit_crc, unit_len);
             unit_len *= 2;
         }
     }
@@ -130,9 +130,7 @@ fn fold_tiling(segments: &[Segment], start: u64, end: u64) -> Option<u32> {
             return None;
         }
         crc = Some(match crc {
-            Some(prefix) => {
-                par2_rs::checksum::Crc32CombineOp::new(segment.len).combine(prefix, segment.crc32)
-            }
+            Some(prefix) => weaver_yenc::crc32_combine(prefix, segment.crc32, segment.len),
             None => segment.crc32,
         });
         cursor = segment.end_offset();
@@ -267,8 +265,8 @@ impl GridAccumulator {
             && previous.end_offset() == Some(incoming.file_offset)
         {
             let previous = self.pending.remove(&offset)?;
-            incoming.crc32 = par2_rs::checksum::Crc32CombineOp::new(incoming.len)
-                .combine(previous.crc32, incoming.crc32);
+            incoming.crc32 =
+                weaver_yenc::crc32_combine(previous.crc32, incoming.crc32, incoming.len);
             incoming.file_offset = previous.file_offset;
             incoming.len = previous.len.checked_add(incoming.len)?;
             incoming.independently_covered &= previous.independently_covered;
@@ -283,8 +281,7 @@ impl GridAccumulator {
                 break;
             }
             self.pending.remove(&next.file_offset);
-            incoming.crc32 = par2_rs::checksum::Crc32CombineOp::new(next.len)
-                .combine(incoming.crc32, next.crc32);
+            incoming.crc32 = weaver_yenc::crc32_combine(incoming.crc32, next.crc32, next.len);
             incoming.len = incoming.len.checked_add(next.len)?;
             incoming.independently_covered &= next.independently_covered;
             removed += 1;
@@ -925,8 +922,7 @@ impl BlockCrcCollector {
             let padded = if padding == 0 {
                 derived.crc32
             } else {
-                par2_rs::checksum::Crc32CombineOp::new(padding)
-                    .combine(derived.crc32, crc32_of_zeros(padding))
+                weaver_yenc::crc32_combine(derived.crc32, crc32_of_zeros(padding), padding)
             };
             verdicts.insert(
                 block_index,

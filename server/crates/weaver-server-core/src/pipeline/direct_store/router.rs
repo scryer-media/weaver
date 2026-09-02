@@ -497,7 +497,7 @@ impl RoutedSpan {
 }
 
 /// (offset, len, crc32) runs over one contiguous logical space, composed on
-/// demand with [`par2_rs::checksum::Crc32CombineOp`].
+/// demand with [`weaver_yenc::crc32_combine`].
 ///
 /// The runs are kept exactly as they were fed — **never merged**. The first
 /// shape coalesced adjacent neighbours into one value, which answered "is this
@@ -645,7 +645,7 @@ impl CrcRuns {
             if run_end > end {
                 return None;
             }
-            composed = par2_rs::checksum::Crc32CombineOp::new(run_len).combine(composed, run_crc);
+            composed = weaver_yenc::crc32_combine(composed, run_crc, run_len);
             cursor = run_end;
             index += 1;
         }
@@ -684,7 +684,7 @@ impl CrcRuns {
             if run_end > end {
                 break;
             }
-            composed = par2_rs::checksum::Crc32CombineOp::new(run_len).combine(composed, run_crc);
+            composed = weaver_yenc::crc32_combine(composed, run_crc, run_len);
             cursor = run_end;
             index += 1;
         }
@@ -4993,7 +4993,7 @@ impl DirectSetRouter {
             let Some(value) = member.checked_parts.get(&(position as u32)).copied() else {
                 return Ok(());
             };
-            composed = par2_rs::checksum::Crc32CombineOp::new(*len).combine(composed, value);
+            composed = weaver_yenc::crc32_combine(composed, value, *len);
         }
         if composed != expected {
             return Err(self.fail(DemotionReason::MemberChecksumMismatch));

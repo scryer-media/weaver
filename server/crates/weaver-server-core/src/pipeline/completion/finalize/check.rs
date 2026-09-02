@@ -631,7 +631,7 @@ fn par2_description_padded_file_crc32(
     if checksums.len() < slice_count {
         return None;
     }
-    let combine = par2_rs::checksum::Crc32CombineOp::new(slice_size);
+    let combine = weaver_yenc::Crc32Combine::new(slice_size);
     let mut folded = checksums[0].crc32;
     for checksum in &checksums[1..slice_count] {
         // Every slice's IFSC CRC32 covers exactly `slice_size` bytes in the
@@ -655,9 +655,10 @@ fn pad_measured_file_crc32_to_slice_grid(
     if padding == 0 {
         return measured_crc32;
     }
-    par2_rs::checksum::Crc32CombineOp::new(padding).combine(
+    weaver_yenc::crc32_combine(
         measured_crc32,
         crate::pipeline::integrity::crc32_of_zeros(padding),
+        padding,
     )
 }
 

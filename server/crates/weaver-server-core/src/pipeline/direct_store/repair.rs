@@ -537,8 +537,7 @@ fn read_span_chunked(
             .min(READ_BACK_CHUNK_BYTES);
         file.read_exact(&mut buffer[..want])?;
         let chunk = &buffer[..want];
-        crc32 = par2_rs::checksum::Crc32CombineOp::new(want as u64)
-            .combine(crc32, par2_rs::checksum::crc32(chunk));
+        crc32 = weaver_yenc::crc32_combine(crc32, par2_rs::checksum::crc32(chunk), want as u64);
         chunks.push((cursor, Arc::from(chunk)));
         cursor = cursor.saturating_add(want as u64);
     }
