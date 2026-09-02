@@ -995,6 +995,26 @@ impl DirectSet {
             .unwrap_or_else(|| self.placed.get(&volume_index).cloned().unwrap_or_default())
     }
 
+    /// [`Self::volume_coverage`] plus the volume's holds: everything a
+    /// reconstruction sweep can read back in posted space.
+    ///
+    /// A hold is a posted byte too — staged, verified by its article's yEnc
+    /// CRC32, and simply not yet routed. The virtual volume serves holds from
+    /// staging ([`super::router::DirectSetRouter::held_runs`]), so a repair
+    /// sweep that only claimed the placed bytes would leave a hole exactly
+    /// where an encrypted member's edge block waits for a lost article, and
+    /// refuse a volume whose every posted byte is in hand. For the in-place
+    /// repair only: the demotion sweep hands the set to the conventional path,
+    /// which owns those holds as articles to re-place, and must not
+    /// materialize them.
+    pub(crate) fn volume_coverage_with_holds(&self, volume_index: u32) -> ByteRanges {
+        let mut coverage = self.volume_coverage(volume_index);
+        for (start, end) in self.router.held_ranges(volume_index) {
+            coverage.insert(start, end.saturating_sub(start));
+        }
+        coverage
+    }
+
     /// The physical ranges one volume's **envelope file** received.
     ///
     /// The provider needs this separately from [`Self::volume_coverage`]: an
@@ -1070,6 +1090,7 @@ impl DirectSet {
                 partials: std::sync::Arc::clone(&partials),
                 covered: self.volume_coverage(*volume_index),
                 envelope_covered: self.envelope_coverage(*volume_index),
+                held: std::sync::Arc::new(self.router.held_runs(*volume_index)),
                 len: *len,
                 ciphers: std::sync::Arc::clone(&ciphers),
             })
@@ -1136,6 +1157,8 @@ impl DirectSet {
                 partials: std::sync::Arc::clone(&partials),
                 covered: self.volume_coverage(*volume_index),
                 envelope_covered: self.envelope_coverage(*volume_index),
+                // A finalized set has routed everything; nothing is held.
+                held: std::sync::Arc::new(Vec::new()),
                 len: *len,
                 ciphers: std::sync::Arc::clone(&ciphers),
             })

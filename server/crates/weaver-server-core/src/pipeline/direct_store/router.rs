@@ -5697,6 +5697,42 @@ impl DirectSetRouter {
             .unwrap_or_default()
     }
 
+    /// The physical ranges of one volume that are staged but not yet routed:
+    /// the holds, without their bytes.
+    pub(crate) fn held_ranges(&self, volume_index: u32) -> Vec<(u64, u64)> {
+        self.staging
+            .get(&volume_index)
+            .map(|staging| staging.pending.ranges().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The holds of one volume with their bytes, as `(physical offset, bytes)`
+    /// runs in ascending order.
+    ///
+    /// Posted bytes, verbatim: an article's yEnc-verified payload waiting for
+    /// something before it can be routed — a header the walk has not reached,
+    /// or for an encrypted member the other half of a cipher block. A reader
+    /// that answers in posted space can serve them exactly as they are, which
+    /// is what lets a set carry a hole through a repair: the cipher block on
+    /// either side of a lost article is held precisely because its other half
+    /// is in the article that never came, and without these the volume reads
+    /// as if that block were missing too. Bounded by the holds budget, and in
+    /// practice by one article per member per gap.
+    pub(crate) fn held_runs(&self, volume_index: u32) -> Vec<(u64, std::sync::Arc<[u8]>)> {
+        let Some(staging) = self.staging.get(&volume_index) else {
+            return Vec::new();
+        };
+        staging
+            .pending
+            .ranges()
+            .iter()
+            .filter_map(|&(start, end)| {
+                let bytes = staging.slice(start, end - start, &self.scratch)?;
+                Some((start, std::sync::Arc::from(bytes)))
+            })
+            .collect()
+    }
+
     // There is deliberately no accessor for the router's own routed map. It
     // records what routing *emitted*, spans whose write later failed included,
     // and reading it as coverage is what let a demotion sweep try to read a

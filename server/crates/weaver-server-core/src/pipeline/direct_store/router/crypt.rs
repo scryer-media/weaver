@@ -1235,6 +1235,14 @@ impl MemberCrypt {
         self.decrypted.insert(start, len);
         self.checkpoints.insert(start + len, trailing);
         self.checkpoints.extend(strided);
+        // The run's own predecessor, under the offset it ends at — which is
+        // where the run starts. Without it a run that begins right after a
+        // hole has no seed of its own: the overlay's nearest checkpoint sits
+        // below the hole and chaining forward from it reads plaintext the hole
+        // never delivered, so the run refuses to re-encrypt at all.
+        if start > 0 {
+            self.checkpoints.insert(start, *preceding);
+        }
         self.prune_checkpoints();
         true
     }
@@ -1525,10 +1533,11 @@ impl MemberCrypt {
         self.checkpoints.retain(|offset, _| {
             let strided = offset.is_multiple_of(CHECKPOINT_STRIDE);
             runs.iter().any(|(start, end)| {
-                // A frontier checkpoint sits exactly at a run's end; a strided
-                // one sits inside a run, and the block it names must be inside
-                // it too — the block is `[offset - 16, offset)`.
-                if *offset == *end {
+                // A frontier checkpoint sits exactly at a run's end, a run's
+                // own predecessor exactly at its start; a strided one sits
+                // inside a run, and the block it names must be inside it too —
+                // the block is `[offset - 16, offset)`.
+                if *offset == *end || *offset == *start {
                     return true;
                 }
                 strided && *offset <= *end && offset.saturating_sub(AES_BLOCK) >= *start
@@ -1675,14 +1684,25 @@ mod tests {
         let mut bytes = vec![0u8; 32];
         assert!(crypt.decrypt_range(0, &[0u8; 16], &mut bytes));
         assert_eq!(crypt.checkpoints.keys().copied().collect::<Vec<_>>(), [32]);
-        // A gap keeps its own frontier.
+        // A run above a gap keeps its own frontier *and* its own predecessor:
+        // the second is what a re-encryption starting at 64 seeds from, since
+        // the only checkpoint below it sits on the far side of the gap.
         let mut bytes = vec![0u8; 16];
-        assert!(crypt.decrypt_range(64, &[0u8; 16], &mut bytes));
+        assert!(crypt.decrypt_range(64, &[7u8; 16], &mut bytes));
         assert_eq!(
             crypt.checkpoints.keys().copied().collect::<Vec<_>>(),
-            [32, 80]
+            [32, 64, 80]
         );
-        // Filling the gap merges the runs and retires the interior frontier.
+        let seed = crypt
+            .cipher_facts(96, &ByteRanges::new())
+            .expect("the cipher size is declared")
+            .seed(64);
+        assert_eq!(
+            seed.chain_start, 64,
+            "a run after a gap seeds at its own start"
+        );
+        assert_eq!(seed.preceding, [7u8; 16]);
+        // Filling the gap merges the runs and retires both interior entries.
         let mut bytes = vec![0u8; 32];
         assert!(crypt.decrypt_range(32, &[0u8; 16], &mut bytes));
         assert_eq!(crypt.checkpoints.keys().copied().collect::<Vec<_>>(), [80]);

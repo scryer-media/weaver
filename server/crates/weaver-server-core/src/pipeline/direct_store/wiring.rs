@@ -4266,7 +4266,10 @@ impl Pipeline {
                     // flag the sweep derives from this — and the pass only runs
                     // once the payload has settled anyway.
                     assembly_complete: true,
-                    covered: set.volume_coverage(volume_index),
+                    // Placed bytes and holds alike: the provider serves both,
+                    // and an encrypted member's held edge block is the byte
+                    // the composition needs to reach the article boundary.
+                    covered: set.volume_coverage_with_holds(volume_index),
                     crcs: set.volume_crc_runs(volume_index),
                     // The raw physical coverage, not the article-whole clip the
                     // demotion sweep takes: PAR2 needs every slice it judged
@@ -6769,6 +6772,12 @@ impl Pipeline {
             // filling a file with a hole where the rebuilt prefix should be.
             let filename = self.current_filename_for_file(job_id, file_asm);
             let received = file_asm.received_bytes();
+            // Placed bytes only, deliberately. The provider can serve holds
+            // too, but this sweep hands the set to the conventional path, whose
+            // decode handoff owns the article that was routing when demotion
+            // struck and whose targeted requeue owns every segment the atoms do
+            // not wholly back; a hold materialized here would be written twice
+            // and counted against a completion gate nothing then clears.
             let physical_coverage = set.volume_coverage(*volume_index);
             let crcs = set.volume_crc_runs(*volume_index);
             // Routing can demote after durably placing only part of the current

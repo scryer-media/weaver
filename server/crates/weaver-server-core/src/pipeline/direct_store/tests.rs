@@ -2906,6 +2906,7 @@ fn provider_fixture_with_extents(covered: ByteRanges, with_extents: bool) -> Pro
             ),
             covered,
             envelope_covered,
+            held: std::sync::Arc::new(Vec::new()),
             len: total as u64,
             // No encrypted member: the re-encrypting overlay is off, which is
             // the shape every assertion below was written against.
@@ -2924,6 +2925,62 @@ fn whole_volume_covered() -> ByteRanges {
             as u64,
     );
     covered
+}
+
+/// A hold is a posted byte too. The bytes a router could not route yet — an
+/// encrypted member's edge block waiting for the article on the other side of a
+/// hole — sit in staging, and the virtual volume serves them from there: read
+/// as posted, claimed as coverage, and composed against the article CRC like
+/// every placed byte around them.
+#[test]
+fn a_virtual_volume_serves_its_holds_as_posted_bytes() {
+    use std::io::Read;
+
+    // Member A's bytes 100..140 were never placed; they are held instead.
+    let total = whole_volume_covered().end();
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 100);
+    covered.insert(140, total - 140);
+    let mut fixture = provider_fixture(covered.clone());
+    let held: Arc<[u8]> = Arc::from(&fixture.conventional[100..140]);
+    fixture.volume.held = Arc::new(vec![(100u64, held)]);
+
+    assert_eq!(
+        fixture.volume.readable_prefix(),
+        Some(fixture.conventional.len() as u64),
+        "with the hold, the volume reads as one whole run from zero"
+    );
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let mut reader = provider.open(0).expect("volume 0 is registered");
+    let mut read = Vec::new();
+    reader
+        .read_to_end(&mut read)
+        .expect("the whole volume reads");
+    assert_eq!(
+        read, fixture.conventional,
+        "held bytes read back exactly as posted"
+    );
+
+    // And the sweep composes across them: the article holding the gap is whole
+    // again once the hold counts as covered.
+    let crcs = provider_article_crcs(&fixture.conventional);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+    let mut with_holds = covered;
+    with_holds.insert(100, 40);
+    let rebuilt = super::reconstruct::reconstruct_volumes(
+        &provider,
+        &[reconstruction_target(
+            &fixture,
+            path.clone(),
+            with_holds,
+            crcs,
+        )],
+        super::sparse::SparseMarking::Platform,
+    )
+    .expect("every article composes once the hold is in the coverage");
+    assert_eq!(rebuilt[0].contiguous, fixture.conventional.len() as u64);
+    assert_eq!(std::fs::read(&path).unwrap(), fixture.conventional);
 }
 
 #[test]
@@ -3263,6 +3320,7 @@ fn cipher_volume(
         partials: Arc::new([(0u32, partial)].into_iter().collect()),
         covered,
         envelope_covered: ByteRanges::new(),
+        held: Arc::new(Vec::new()),
         len: volume_len,
         ciphers: Arc::new([(0u32, facts)].into_iter().collect()),
     }
