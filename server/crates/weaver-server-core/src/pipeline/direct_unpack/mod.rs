@@ -74,6 +74,7 @@
 //!   end-header range would still leave that probe parked.
 
 pub mod coverage;
+pub(crate) mod decode_memory;
 pub mod reader;
 pub mod settings;
 pub mod start_header;

@@ -68,6 +68,132 @@ pub(in crate::pipeline) struct SevenZipExtractionContext {
     pub(in crate::pipeline) password: sevenz_rust2::Password,
     pub(in crate::pipeline) event_tx: broadcast::Sender<PipelineEvent>,
     pub(in crate::pipeline) phase_counters: Arc<PhaseCounters>,
+    pub(in crate::pipeline) decode_memory: SevenZipDecodeMemory,
+}
+
+/// Who accounts for decoder memory while [`extract_7z_stream`] runs.
+///
+/// The two callers want opposite things from the same body. Conventional
+/// extraction has every byte on disk and wants the fastest decode, so it takes
+/// the configured ceiling once and runs the multi-threaded decoder under it. A
+/// direct-unpack chase decodes at download speed and parks — for the tail
+/// before it can list anything, at the frontier between reads, and on a damage
+/// gate for as long as a repair takes — and a park under a whole-ceiling permit
+/// is a park that holds every other chase in the process.
+pub(in crate::pipeline) enum SevenZipDecodeMemory {
+    /// The caller holds one permit for the whole call and the body reserves
+    /// nothing. This is the conventional path, unchanged.
+    HeldByCaller,
+    /// The body reserves per pass, sized from the archive itself.
+    ///
+    /// The metadata pass holds only enough for the declared end header; the
+    /// decode pass holds what the archive's own coder properties say its
+    /// decoders need. The decode runs single-threaded: the multi-threaded
+    /// LZMA2 reader buffers a whole run of dependent chunks before it decodes
+    /// any of them, which for a stream without dictionary resets is the entire
+    /// block — a footprint that cannot be sized from the header and, worse
+    /// for a chase, a decode that would emit nothing until the whole block had
+    /// downloaded.
+    ReservedPerPass {
+        /// `next_header_size` from the signature header — the end header the
+        /// metadata pass buffers whole, and which the decode pass parses again.
+        end_header_bytes: u64,
+    },
+}
+
+/// What a chase holds over the declared end header while it lists the archive.
+///
+/// The end header itself is bounded against the ceiling before the chase is
+/// admitted. An *encoded* header is a packed stream of its own with a
+/// declared unpacked size the signature header does not carry, so this margin
+/// stands in for that decode; it is the same exposure the conventional path
+/// has under its ceiling permit, made explicit rather than removed.
+pub(in crate::pipeline) const CHASE_HEADER_PASS_ALLOWANCE_BYTES: u64 = 16 * 1024 * 1024;
+/// Everything the chase's decode pass holds beyond the decoders and the end
+/// header: the gated reader's buffer, a member's output writer, the CRC
+/// readers around each block.
+pub(in crate::pipeline) const CHASE_DECODE_ALLOWANCE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Bytes a chase reserves while it lists the archive.
+fn chase_header_pass_memory_bytes(end_header_bytes: u64) -> u64 {
+    end_header_bytes.saturating_add(CHASE_HEADER_PASS_ALLOWANCE_BYTES)
+}
+
+/// Bytes a chase reserves for its decode pass, from what the archive declares.
+///
+/// Never more than the ceiling: an archive whose decoders need more than the
+/// operator allows is one the conventional path already decodes under a
+/// ceiling-sized permit, and a chase reserving the same is no worse than the
+/// fallback it would otherwise become. An archive with a coder this cannot
+/// size takes the ceiling too, and says so.
+fn chase_decode_memory_bytes(
+    job_id: JobId,
+    set_name: &str,
+    archive: &sevenz_rust2::Archive,
+    end_header_bytes: u64,
+    ceiling: u64,
+) -> u64 {
+    let decoders =
+        match crate::pipeline::direct_unpack::decode_memory::decoder_memory_bytes(archive) {
+            Ok(bytes) => bytes,
+            Err(unsized_coder) => {
+                tracing::info!(
+                    job_id = job_id.0,
+                    set_name,
+                    coder = %unsized_coder,
+                    reserved_bytes = ceiling,
+                    "direct unpack cannot size this archive's decoders; reserving the whole ceiling"
+                );
+                return ceiling;
+            }
+        };
+    let wanted = decoders
+        .saturating_add(end_header_bytes)
+        .saturating_add(CHASE_DECODE_ALLOWANCE_BYTES);
+    if wanted > ceiling {
+        tracing::info!(
+            job_id = job_id.0,
+            set_name,
+            decoder_bytes = decoders,
+            wanted_bytes = wanted,
+            reserved_bytes = ceiling,
+            "direct unpack decoders need more than the ceiling; reserving the ceiling"
+        );
+        return ceiling;
+    }
+    tracing::debug!(
+        job_id = job_id.0,
+        set_name,
+        decoder_bytes = decoders,
+        reserved_bytes = wanted,
+        "direct unpack sized its decode reservation from the archive"
+    );
+    wanted
+}
+
+/// The chase's decode pass: the same entry walk as the library's helper, on
+/// one thread.
+///
+/// `extract_fn` receives the output directory where the helper would pass a
+/// per-entry destination; the shared extraction body validates every entry
+/// path through the extraction root and never reads that argument.
+fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
+    reader: R,
+    output_dir: &Path,
+    password: sevenz_rust2::Password,
+    mut extract_fn: impl FnMut(
+        &sevenz_rust2::ArchiveEntry,
+        &mut dyn std::io::Read,
+        &PathBuf,
+    ) -> Result<bool, sevenz_rust2::Error>,
+) -> Result<(), sevenz_rust2::Error> {
+    let mut archive_reader = sevenz_rust2::ArchiveReader::new(reader, password)?;
+    archive_reader.set_thread_count(1);
+    if !output_dir.exists() {
+        std::fs::create_dir_all(output_dir)?;
+    }
+    let destination = output_dir.to_path_buf();
+    archive_reader.for_each_entries(|entry, reader| extract_fn(entry, reader, &destination))
 }
 
 /// Decode one 7z set through `open_reader`, writing members under the context's
@@ -106,12 +232,23 @@ where
         password,
         event_tx,
         phase_counters,
+        decode_memory,
     } = context;
     let job_id = *job_id;
 
     // Metadata pass: every member's path and declared size is checked before
     // anything is created on disk.
-    let known_total = {
+    //
+    // A chase holds only a header-sized permit through this pass. On a gated
+    // reader the pass parks until the archive's tail arrives, and that park
+    // used to sit under the whole ceiling.
+    let (known_total, decode_reservation) = {
+        let _header_permit = match decode_memory {
+            SevenZipDecodeMemory::HeldByCaller => None,
+            SevenZipDecodeMemory::ReservedPerPass { end_header_bytes } => Some(
+                budget.reserve_memory_wait(chase_header_pass_memory_bytes(*end_header_bytes))?,
+            ),
+        };
         let reader = BudgetedReader::new(open_reader()?, Arc::clone(budget));
         let archive_reader = sevenz_rust2::ArchiveReader::new(reader, password.clone())
             .map_err(|e| format!("failed to read 7z archive: {e}"))?;
@@ -120,17 +257,40 @@ where
             root.validate_relative_path(entry.name())
                 .map_err(|error| budget.reject_unsafe_path(error))?;
         }
-        archive_reader
+        let known_total = archive_reader
             .archive()
             .files
             .iter()
             .filter(|entry| !entry.is_directory())
             .map(|entry| entry.size())
-            .sum::<u64>()
+            .sum::<u64>();
+        // Sized here, while the parsed archive is in hand; reserved below,
+        // once the header permit has been given back.
+        let decode_reservation = match decode_memory {
+            SevenZipDecodeMemory::HeldByCaller => None,
+            SevenZipDecodeMemory::ReservedPerPass { end_header_bytes } => {
+                Some(chase_decode_memory_bytes(
+                    job_id,
+                    set_name,
+                    archive_reader.archive(),
+                    *end_header_bytes,
+                    budget.max_memory_bytes(),
+                ))
+            }
+        };
+        (known_total, decode_reservation)
     };
     phase_counters
         .total_bytes
         .fetch_add(known_total, Ordering::Relaxed);
+
+    // Held from here to the end of the decode, parks included. A chase parked
+    // mid-block has its dictionary genuinely allocated, so the permit stays;
+    // what makes that harmless is its size — a dictionary, not a ceiling.
+    let _decode_permit = match decode_reservation {
+        Some(bytes) => Some(budget.reserve_memory_wait(bytes)?),
+        None => None,
+    };
 
     let mut extracted_members = Vec::new();
     let extracted_members_ref = &mut extracted_members;
@@ -201,13 +361,21 @@ where
     };
 
     let reader = BudgetedReader::new(open_reader()?, Arc::clone(budget));
-    sevenz_rust2::decompress_with_extract_fn_and_password(
-        reader,
-        output_dir,
-        password.clone(),
-        extract_fn,
-    )
-    .map_err(|e| format!("7z extraction failed: {e}"))?;
+    match decode_memory {
+        SevenZipDecodeMemory::HeldByCaller => {
+            sevenz_rust2::decompress_with_extract_fn_and_password(
+                reader,
+                output_dir,
+                password.clone(),
+                extract_fn,
+            )
+            .map_err(|e| format!("7z extraction failed: {e}"))?;
+        }
+        SevenZipDecodeMemory::ReservedPerPass { .. } => {
+            decode_7z_streaming(reader, output_dir, password.clone(), extract_fn)
+                .map_err(|e| format!("7z extraction failed: {e}"))?;
+        }
+    }
 
     Ok(FullSetExtractionOutcome {
         extracted: extracted_members,
@@ -1536,6 +1704,7 @@ impl Pipeline {
                         password: pw,
                         event_tx,
                         phase_counters,
+                        decode_memory: SevenZipDecodeMemory::HeldByCaller,
                     };
 
                     // A one-part set is a plain file; anything more is the

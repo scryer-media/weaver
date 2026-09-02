@@ -230,7 +230,7 @@ impl ProcessMemoryBudget {
     }
 
     #[cfg(test)]
-    fn reserved_bytes(&self) -> u64 {
+    pub(crate) fn reserved_bytes(&self) -> u64 {
         self.reserved.load(Ordering::Acquire)
     }
 }

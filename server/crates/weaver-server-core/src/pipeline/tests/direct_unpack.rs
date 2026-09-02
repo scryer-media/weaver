@@ -2564,6 +2564,29 @@ async fn arming_stops_at_the_number_of_chase_workers() {
     let set_name = "silver_horizon.7z";
     let workers = pipeline.chase_pool.current_num_threads();
 
+    // Hold every chase-pool thread for the length of the assertions, so each
+    // chase's closure stays queued inside `install`. A queued closure has not
+    // touched its coverage, so an abort cannot reach it and its worker cannot
+    // return — which is exactly the state the capacity count below is about.
+    // Without the hold, the aborted worker wakes off its coverage and races the
+    // next `note_commit` to the finish: if it unwinds first its slot frees, the
+    // over-the-line set arms, and the assertion fails.
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let release = Arc::new(std::sync::Barrier::new(workers + 1));
+    for _ in 0..workers {
+        let started_tx = started_tx.clone();
+        let release = Arc::clone(&release);
+        pipeline.chase_pool.spawn(move || {
+            started_tx.send(()).unwrap();
+            release.wait();
+        });
+    }
+    for _ in 0..workers {
+        started_rx
+            .recv()
+            .expect("every chase-pool thread reports that it is held");
+    }
+
     let archive = std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/sevenz/generated_bcj2_silver_horizon.7z"),
@@ -2646,6 +2669,10 @@ async fn arming_stops_at_the_number_of_chase_workers() {
         "a capacity refusal must not latch: it says nothing about the archive"
     );
 
+    // Let the queued closures run: the aborted one reads its coverage, sees the
+    // abort and returns; the live one parks in its header read until shutdown
+    // aborts it. Both must be able to finish or the join below never does.
+    release.wait();
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
@@ -2711,4 +2738,694 @@ async fn consumption_gives_up_on_a_chase_that_never_finishes() {
     *crate::pipeline::direct_unpack::wiring::PENDING_CHASE_DEADLINE_OVERRIDE
         .lock()
         .unwrap() = None;
+}
+
+// ---------------------------------------------------------------------------
+// Decoder memory: a chase reserves what its archive needs, when it needs it
+// ---------------------------------------------------------------------------
+
+/// An in-process LZMA2 archive with a known dictionary, so the reservation a
+/// chase takes for it can be computed and compared exactly.
+fn sized_lzma2_archive(dictionary: u32, members: &[(String, Vec<u8>)]) -> Vec<u8> {
+    use sevenz_rust2::encoder_options::Lzma2Options;
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter, EncoderConfiguration};
+
+    let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).expect("writer");
+    let mut options = Lzma2Options::from_level(5);
+    options.set_dictionary_size(dictionary);
+    writer.set_content_methods(vec![EncoderConfiguration::from(options)]);
+    for (name, bytes) in members {
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file(name),
+                Some(std::io::Cursor::new(bytes.clone())),
+            )
+            .expect("entry");
+    }
+    writer.finish().expect("finish").into_inner()
+}
+
+/// Deterministic member bytes that compress a little, so the packed stream is
+/// neither trivially small nor a copy of the input.
+fn sized_member(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|index| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            if index % 7 == 0 {
+                (state >> 24) as u8
+            } else {
+                b'a' + (index % 13) as u8
+            }
+        })
+        .collect()
+}
+
+/// Cut `archive` into parts on disk at `bounds`, returning the part paths.
+fn write_parts(dir: &std::path::Path, archive: &[u8], bounds: &[usize]) -> Vec<PathBuf> {
+    bounds
+        .windows(2)
+        .enumerate()
+        .map(|(index, window)| {
+            let path = dir.join(format!("silver_horizon.7z.{:03}", index + 1));
+            std::fs::write(&path, &archive[window[0]..window[1]]).expect("write part");
+            path
+        })
+        .collect()
+}
+
+/// A budget over `pool` with limits that do not depend on the machine the
+/// test runs on.
+fn chase_budget_over(
+    pool: &std::sync::Arc<crate::pipeline::extraction::ProcessMemoryBudget>,
+    staging: &std::path::Path,
+) -> std::sync::Arc<crate::pipeline::extraction::JobExtractionBudget> {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    let limits = crate::pipeline::extraction::ExtractionLimits {
+        max_job_bytes: 2048 * GIB,
+        max_member_bytes: 1024 * GIB,
+        max_entries: 100_000,
+        max_ratio: 100,
+        max_seconds: 43_200,
+        min_free_bytes: 1,
+        max_memory_bytes: GIB,
+    };
+    crate::pipeline::extraction::JobExtractionBudget::new_with_process_memory(
+        std::sync::Arc::new(limits),
+        std::sync::Arc::clone(pool),
+        staging.to_path_buf(),
+        1,
+        0,
+        0,
+        PipelineMetrics::new(),
+    )
+    .expect("budget")
+}
+
+/// Run the shared 7z extraction body the way a chase does, on its own thread.
+fn spawn_chase_extraction(
+    context: crate::pipeline::completion::finalize::extract::SevenZipExtractionContext,
+    paths: Vec<PathBuf>,
+    coverage: std::sync::Arc<crate::pipeline::direct_unpack::SetCoverage>,
+) -> std::thread::JoinHandle<Result<FullSetExtractionOutcome, String>> {
+    std::thread::spawn(move || {
+        crate::pipeline::completion::finalize::extract::extract_7z_stream(&context, || {
+            crate::pipeline::direct_unpack::GatedSplitReader::open(
+                &paths,
+                std::sync::Arc::clone(&coverage),
+            )
+            .map(|reader| std::io::BufReader::with_capacity(128 * 1024, reader))
+            .map_err(|error| format!("open: {error}"))
+        })
+    })
+}
+
+fn chase_context(
+    set_name: &str,
+    output_dir: PathBuf,
+    budget: std::sync::Arc<crate::pipeline::extraction::JobExtractionBudget>,
+    end_header_bytes: u64,
+) -> crate::pipeline::completion::finalize::extract::SevenZipExtractionContext {
+    use crate::pipeline::completion::finalize::extract::{
+        SevenZipDecodeMemory, SevenZipExtractionContext,
+    };
+    let (events, _) = tokio::sync::broadcast::channel(1);
+    SevenZipExtractionContext {
+        job_id: JobId(41995),
+        set_name: set_name.to_string(),
+        root: std::sync::Arc::new(
+            crate::pipeline::extraction::ExtractionRoot::open(&output_dir).expect("root"),
+        ),
+        output_dir,
+        budget,
+        password: sevenz_rust2::Password::empty(),
+        event_tx: events,
+        phase_counters: std::sync::Arc::new(crate::jobs::PhaseCounters::default()),
+        decode_memory: SevenZipDecodeMemory::ReservedPerPass { end_header_bytes },
+    }
+}
+
+async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+    for _ in 0..3_000 {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// A chase's decode pass holds its archive's decoders, not the ceiling.
+///
+/// Two chases over the same archive park mid-block with their permits held,
+/// and what the pool shows reserved is exactly two dictionaries plus the
+/// fixed allowances — a number small enough that both fit side by side in a
+/// pool that could not have held even one whole-ceiling reservation. When
+/// the parts they wait on land, both finish and every member matches.
+#[tokio::test]
+async fn a_chase_reserves_its_decoders_not_the_ceiling() {
+    use crate::pipeline::completion::finalize::extract::CHASE_DECODE_ALLOWANCE_BYTES;
+    use crate::pipeline::direct_unpack::SetCoverage;
+    use crate::pipeline::direct_unpack::start_header::StartHeader;
+    const MIB: u64 = 1024 * 1024;
+
+    let dictionary = 4u32 << 20;
+    let members = vec![
+        (
+            "silver_horizon/reel_01.bin".to_string(),
+            sized_member(768 * 1024, 11),
+        ),
+        (
+            "silver_horizon/reel_02.bin".to_string(),
+            sized_member(768 * 1024, 12),
+        ),
+    ];
+    let archive = sized_lzma2_archive(dictionary, &members);
+    let header = StartHeader::parse(&archive[..32]).expect("signature header");
+    let parsed = sevenz_rust2::ArchiveReader::new(
+        std::io::Cursor::new(archive.clone()),
+        sevenz_rust2::Password::empty(),
+    )
+    .expect("parse");
+    let decoders =
+        crate::pipeline::direct_unpack::decode_memory::decoder_memory_bytes(parsed.archive())
+            .expect("sized");
+    assert_eq!(decoders, u64::from(dictionary) + MIB, "one LZMA2 block");
+    let expected_each = decoders + header.next_header_size + CHASE_DECODE_ALLOWANCE_BYTES;
+
+    // Four parts. Part three is only half there, and its half is where the
+    // decode parks; every length is declared, so the listing pass can reach
+    // the tail without parking.
+    let dir = tempfile::tempdir().unwrap();
+    let quarter = archive.len() / 4;
+    let bounds = [0, quarter, 2 * quarter, 3 * quarter, archive.len()];
+    let paths = write_parts(dir.path(), &archive, &bounds);
+    let short_part = 2usize;
+    let short_len = (bounds[3] - bounds[2]) as u64;
+    let short_written = short_len / 2;
+    std::fs::write(
+        &paths[short_part],
+        &archive[bounds[2]..bounds[2] + short_written as usize],
+    )
+    .unwrap();
+
+    let coverage_for = || {
+        let coverage = std::sync::Arc::new(SetCoverage::new(paths.len()));
+        coverage.set_total_len(archive.len() as u64);
+        for (index, window) in bounds.windows(2).enumerate() {
+            let len = (window[1] - window[0]) as u64;
+            coverage.note_part_len(index, len);
+            if index == short_part {
+                coverage.advance_watermark(index, short_written);
+            } else {
+                coverage.advance_watermark(index, len);
+                coverage.mark_part_complete(index);
+            }
+        }
+        coverage
+    };
+
+    // A pool one whole-ceiling reservation could never fit in.
+    let pool = std::sync::Arc::new(crate::pipeline::extraction::ProcessMemoryBudget::new(
+        64 * MIB,
+    ));
+    assert!(
+        2 * expected_each < 64 * MIB,
+        "the two right-sized permits must fit"
+    );
+
+    let mut runs = Vec::new();
+    for index in 0..2 {
+        let staging = dir.path().join(format!("staging_{index}"));
+        std::fs::create_dir_all(&staging).unwrap();
+        let output = staging.join("out");
+        std::fs::create_dir_all(&output).unwrap();
+        let budget = chase_budget_over(&pool, &staging);
+        let coverage = coverage_for();
+        let context = chase_context(
+            "silver_horizon.7z",
+            output.clone(),
+            budget,
+            header.next_header_size,
+        );
+        let handle =
+            spawn_chase_extraction(context, paths.clone(), std::sync::Arc::clone(&coverage));
+        runs.push((coverage, handle, output));
+    }
+
+    wait_until(
+        || {
+            runs.iter()
+                .all(|(coverage, _, _)| coverage.park_count() > 0)
+        },
+        "both chases to park inside the decode",
+    )
+    .await;
+    assert_eq!(
+        pool.reserved_bytes(),
+        2 * expected_each,
+        "two parked chases hold two dictionaries plus allowances, nothing more"
+    );
+
+    // The missing half lands; both chases finish.
+    std::fs::write(&paths[short_part], &archive[bounds[2]..bounds[3]]).unwrap();
+    for (coverage, _, _) in &runs {
+        coverage.advance_watermark(short_part, short_len);
+        coverage.mark_part_complete(short_part);
+    }
+    for (_, handle, output) in runs {
+        let outcome = handle
+            .join()
+            .expect("no panic")
+            .expect("chase decode succeeds");
+        assert_eq!(outcome.extracted.len(), members.len());
+        for (name, bytes) in &members {
+            assert_eq!(&std::fs::read(output.join(name)).unwrap(), bytes, "{name}");
+        }
+    }
+    assert_eq!(pool.reserved_bytes(), 0, "every permit is returned");
+}
+
+/// While a chase lists the archive it holds a header-sized permit and nothing
+/// else — and that is the pass that parks for the tail, sometimes for most of
+/// a download.
+#[tokio::test]
+async fn a_chase_listing_the_archive_holds_a_header_sized_permit() {
+    use crate::pipeline::completion::finalize::extract::CHASE_HEADER_PASS_ALLOWANCE_BYTES;
+    use crate::pipeline::direct_unpack::SetCoverage;
+    use crate::pipeline::direct_unpack::start_header::StartHeader;
+    const MIB: u64 = 1024 * 1024;
+
+    let members = vec![(
+        "silver_horizon/reel_01.bin".to_string(),
+        sized_member(256 * 1024, 21),
+    )];
+    let archive = sized_lzma2_archive(1 << 20, &members);
+    let header = StartHeader::parse(&archive[..32]).expect("signature header");
+
+    // Two parts; only the first exists. The second's length is unknown, so
+    // the tail cannot be located and the listing pass parks.
+    let dir = tempfile::tempdir().unwrap();
+    let half = archive.len() / 2;
+    let paths = write_parts(dir.path(), &archive, &[0, half, archive.len()]);
+    std::fs::remove_file(&paths[1]).unwrap();
+    let coverage = std::sync::Arc::new(SetCoverage::new(2));
+    coverage.set_total_len(archive.len() as u64);
+    coverage.note_part_len(0, half as u64);
+    coverage.advance_watermark(0, half as u64);
+    coverage.mark_part_complete(0);
+
+    let pool = std::sync::Arc::new(crate::pipeline::extraction::ProcessMemoryBudget::new(
+        64 * MIB,
+    ));
+    let staging = dir.path().join("staging");
+    let output = staging.join("out");
+    std::fs::create_dir_all(&output).unwrap();
+    let budget = chase_budget_over(&pool, &staging);
+    let context = chase_context("silver_horizon.7z", output, budget, header.next_header_size);
+    let handle = spawn_chase_extraction(context, paths, std::sync::Arc::clone(&coverage));
+
+    wait_until(|| coverage.park_count() > 0, "the listing pass to park").await;
+    assert_eq!(
+        pool.reserved_bytes(),
+        header.next_header_size + CHASE_HEADER_PASS_ALLOWANCE_BYTES,
+        "the listing pass holds the end header plus its allowance"
+    );
+
+    coverage.abort("test ends the chase");
+    let result = handle.join().expect("no panic");
+    assert!(result.is_err(), "an aborted listing pass fails the chase");
+    assert_eq!(pool.reserved_bytes(), 0);
+}
+
+/// The round-10 wedge, at the controller: chases no longer single-file through
+/// the pool. Two jobs' chases park side by side in a pool that could not have
+/// held one whole-ceiling reservation, both still armed, neither failed.
+#[tokio::test]
+async fn parked_chases_share_the_decoder_memory_pool() {
+    const MIB: u64 = 1024 * 1024;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let pool = std::sync::Arc::new(crate::pipeline::extraction::ProcessMemoryBudget::new(
+        256 * MIB,
+    ));
+    pipeline.direct_unpack_process_memory = std::sync::Arc::clone(&pool);
+    let set_name = "silver_horizon.7z";
+
+    let archive = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sevenz/generated_bcj2_silver_horizon.7z"),
+    )
+    .unwrap();
+    let files = vec![(set_name.to_string(), archive.clone())];
+    let jobs = [
+        (JobId(41996), "Silver Horizon Parked One"),
+        (JobId(41997), "Silver Horizon Parked Two"),
+    ];
+    for (job_id, name) in jobs {
+        insert_active_job(&mut pipeline, job_id, rar_job_spec(name, &files)).await;
+        let dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+        std::fs::write(dir.join(set_name), &archive[..64 * 1024]).unwrap();
+        pipeline.direct_unpack_note_commit(
+            NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            set_name,
+            64 * 1024,
+            false,
+        );
+        assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
+    }
+
+    let coverages: Vec<_> = jobs
+        .iter()
+        .map(|(job_id, _)| {
+            pipeline
+                .direct_unpack
+                .armed_coverage(*job_id, set_name)
+                .expect("armed")
+        })
+        .collect();
+    wait_until(
+        || coverages.iter().all(|coverage| coverage.park_count() > 0),
+        "both chases to open their readers and park",
+    )
+    .await;
+
+    pipeline.reap_direct_unpack().await;
+    for (job_id, _) in jobs {
+        assert!(
+            pipeline.direct_unpack.is_armed(job_id, set_name),
+            "a parked chase must still be armed"
+        );
+        assert!(
+            pipeline.direct_unpack.outcome(job_id, set_name).is_none(),
+            "and must not have failed for want of the whole pool"
+        );
+    }
+    let reserved = pool.reserved_bytes();
+    assert!(reserved > 0, "parked chases hold something");
+    assert!(
+        reserved < 256 * MIB,
+        "two parked chases fit in a pool one ceiling would not: reserved {reserved}"
+    );
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// Finalize can see a chase that is gated on recovery-reported damage — and
+/// only while it is armed.
+#[tokio::test]
+async fn a_gated_chase_is_reported_to_finalize() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41998);
+    let other_job = JobId(41999);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Silver Horizon Gated", &files),
+    )
+    .await;
+    write_and_complete_file(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("armed");
+    assert!(pipeline.direct_unpack_gated_sets(job_id).is_empty());
+
+    coverage.cap_at_damage(files.len() - 1, 0);
+    assert!(coverage.is_gated());
+    assert_eq!(
+        pipeline.direct_unpack_gated_sets(job_id),
+        vec![set_name.to_string()]
+    );
+    assert!(
+        pipeline.direct_unpack_gated_sets(other_job).is_empty(),
+        "another job's sets are not this job's evidence"
+    );
+
+    pipeline.direct_unpack_abort_set(
+        job_id,
+        set_name,
+        "test ends the chase",
+        crate::pipeline::direct_unpack::wiring::AbortLatch::Permanent,
+        crate::pipeline::direct_unpack::wiring::DemotionReason::DownloadEnded,
+    );
+    assert!(
+        pipeline.direct_unpack_gated_sets(job_id).is_empty(),
+        "a draining set is no longer evidence: it will be decoded conventionally"
+    );
+
+    for _ in 0..600 {
+        pipeline.reap_direct_unpack().await;
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A split 7z job with a loaded, intact PAR2 set, its chase armed on part one
+/// and every other part landed afterwards. `gate` decides whether the chase is
+/// held on a damage cap before those parts arrive.
+///
+/// Returns the pipeline and the set name. The job's archive topology is a
+/// multi-volume 7z, so the clean-PAR2 integrity gate reads `StrongDecode` —
+/// the claim the gated chase has to be able to override.
+async fn split_7z_job_with_par2(
+    temp_dir: &tempfile::TempDir,
+    job_id: JobId,
+    gate: bool,
+) -> (Pipeline, &'static str) {
+    let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let set_name = "generated_split_store_plain.7z";
+    let parts = sevenz_fixture_bytes(set_name);
+    let index_filename = "silver_horizon.par2";
+    let recovery_filename = "silver_horizon.vol00+01.par2";
+    let slice_size = 65_536;
+    let described: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let par2_bytes = build_test_par2_index_for_files(&described, slice_size);
+    let recovery_bytes = vec![0xAA; 64];
+
+    let mut files = parts.clone();
+    files.push((index_filename.to_string(), par2_bytes.clone()));
+    files.push((recovery_filename.to_string(), recovery_bytes.clone()));
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Silver Horizon Gated Verify", &files),
+    )
+    .await;
+
+    // Part one lands and the chase arms off the topology it creates.
+    write_and_complete_file(&mut pipeline, job_id, 0, &parts[0].0, &parts[0].1).await;
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("armed on part one");
+    if gate {
+        // Recovery data reports damage in the last part: the chase will park
+        // there and stay parked until a repair releases it.
+        coverage.cap_at_damage(parts.len() - 1, 0);
+        assert!(coverage.is_gated());
+    }
+    for (file_index, (filename, bytes)) in parts.iter().enumerate().skip(1) {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+    let index_file = parts.len() as u32;
+    let recovery_file = index_file + 1;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        index_file,
+        index_filename,
+        &par2_bytes,
+    )
+    .await;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        recovery_file,
+        recovery_filename,
+        &recovery_bytes,
+    )
+    .await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set_for_files(&described, slice_size, 1),
+        &[
+            (index_file, index_filename, 0, false),
+            (recovery_file, recovery_filename, 1, true),
+        ],
+    );
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    (pipeline, set_name)
+}
+
+/// A chase gated on recovery-reported damage forces the authoritative PAR2
+/// pass, over the strong-decode claim that would otherwise skip it.
+///
+/// This is the seam that left a gated chase waiting out its whole deadline:
+/// finalize settled the set as clean on the strength of the archive type, no
+/// repair was ever summoned, and the chase sat on vouches that were never
+/// coming.
+#[tokio::test]
+async fn a_gated_chase_forces_the_authoritative_par2_pass() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(42000);
+    let (mut pipeline, set_name) = split_7z_job_with_par2(&temp_dir, job_id, true).await;
+    let mut verify_events = pipeline.event_tx.subscribe();
+    assert_eq!(
+        pipeline.direct_unpack_gated_sets(job_id),
+        vec![set_name.to_string()]
+    );
+
+    pipeline.check_job_completion(job_id).await;
+
+    assert_eq!(
+        drain_job_verification_started(&mut verify_events, job_id),
+        1,
+        "the authoritative pass must run while a chase is gated on damage"
+    );
+    // The pass read every part back and found them complete, which
+    // contradicts the gate: it is lifted, and nothing is left parked on a
+    // repair that will never come.
+    assert!(
+        pipeline.direct_unpack_gated_sets(job_id).is_empty(),
+        "a clean authoritative verdict lifts the gate it contradicts"
+    );
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "status = {:?}",
+        job_status_for_assert(&pipeline, job_id)
+    );
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// A clean verdict lifts only the gates it speaks for. A recovery set that
+/// does not describe the chased parts has nothing to say about them.
+#[tokio::test]
+async fn a_clean_verdict_for_another_set_leaves_the_gate_up() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(42002);
+    let set_name = "generated_split_store_plain.7z";
+    let parts = sevenz_fixture_bytes(set_name);
+    let unrelated_name = "silver_horizon_sample.mkv";
+    let unrelated_bytes: Vec<u8> = (0..4096u32).map(|value| (value % 253) as u8).collect();
+    let index_filename = "silver_horizon_sample.par2";
+    let recovery_filename = "silver_horizon_sample.vol00+01.par2";
+    let par2_bytes = build_test_par2_index_for_files(&[(unrelated_name, &unrelated_bytes)], 1024);
+    let recovery_bytes = vec![0xAA; 64];
+    let mut files = parts.clone();
+    files.push((unrelated_name.to_string(), unrelated_bytes.clone()));
+    files.push((index_filename.to_string(), par2_bytes.clone()));
+    files.push((recovery_filename.to_string(), recovery_bytes.clone()));
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Silver Horizon Other Set", &files),
+    )
+    .await;
+    write_and_complete_file(&mut pipeline, job_id, 0, &parts[0].0, &parts[0].1).await;
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("armed");
+    coverage.cap_at_damage(parts.len() - 1, 0);
+    for (file_index, (filename, bytes)) in parts.iter().enumerate().skip(1) {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+    let unrelated_file = parts.len() as u32;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        unrelated_file,
+        unrelated_name,
+        &unrelated_bytes,
+    )
+    .await;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        unrelated_file + 1,
+        index_filename,
+        &par2_bytes,
+    )
+    .await;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        unrelated_file + 2,
+        recovery_filename,
+        &recovery_bytes,
+    )
+    .await;
+    let par2_set =
+        build_repairable_par2_set_for_files(&[(unrelated_name, &unrelated_bytes)], 1024, 1);
+    let set_id = par2_set.recovery_set_id;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        par2_set,
+        &[
+            (unrelated_file + 1, index_filename, 0, false),
+            (unrelated_file + 2, recovery_filename, 1, true),
+        ],
+    );
+
+    pipeline.release_direct_unpack_after_clean_verification(job_id, set_id);
+    assert!(
+        coverage.is_gated(),
+        "a verdict about other files must not lift this set's gate"
+    );
+    assert_eq!(
+        pipeline.direct_unpack_gated_sets(job_id),
+        vec![set_name.to_string()]
+    );
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// The control: with nothing gated, the strong-decode skip stands exactly as
+/// it did — the new term is evidence-only, never a blanket veto for 7z jobs.
+#[tokio::test]
+async fn an_ungated_chase_leaves_the_strong_decode_skip_alone() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(42001);
+    let (mut pipeline, set_name) = split_7z_job_with_par2(&temp_dir, job_id, false).await;
+    let mut verify_events = pipeline.event_tx.subscribe();
+    reap_until_outcome(&mut pipeline, job_id, set_name).await;
+    assert!(pipeline.direct_unpack_gated_sets(job_id).is_empty());
+
+    pipeline.check_job_completion(job_id).await;
+
+    assert_eq!(
+        drain_job_verification_started(&mut verify_events, job_id),
+        0,
+        "an intact job with a clean chase takes the strong-decode skip"
+    );
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
 }

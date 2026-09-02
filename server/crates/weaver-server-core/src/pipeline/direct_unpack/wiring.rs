@@ -42,7 +42,7 @@ use crate::jobs::ids::JobId;
 use crate::pipeline::FullSetExtractionOutcome;
 use crate::pipeline::Pipeline;
 use crate::pipeline::completion::finalize::extract::{
-    SevenZipExtractionContext, extract_7z_stream,
+    SevenZipDecodeMemory, SevenZipExtractionContext, extract_7z_stream,
 };
 use crate::pipeline::extraction::ExtractionRoot;
 
@@ -682,6 +682,7 @@ impl Pipeline {
             budget,
             password,
             Arc::clone(&counters),
+            header.next_header_size,
         );
 
         self.direct_unpack
@@ -1085,6 +1086,7 @@ impl Pipeline {
         budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
         password: Option<String>,
         counters: Arc<crate::jobs::PhaseCounters>,
+        end_header_bytes: u64,
     ) -> tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>> {
         // The chase's own pool, never the shared post-processing one: `install`
         // holds a worker for as long as the closure runs, and this closure parks.
@@ -1108,25 +1110,24 @@ impl Pipeline {
                     "direct unpack worker started"
                 );
                 let started_at = Instant::now();
-                let outcome = (|| {
-                    // The whole configured decoder allowance, held from here until
-                    // this closure returns — which for a chase means across every
-                    // park the gated reader does while waiting on the download.
+                let outcome = {
+                    // No decoder-memory permit is taken here. The extraction body
+                    // reserves per pass — header-sized while it lists the archive,
+                    // decoder-sized while it decodes — from the chase-only
+                    // `ProcessMemoryBudget` that `budget` draws on.
                     //
-                    // That is only safe because `budget` draws from the chase-only
-                    // `ProcessMemoryBudget`. While chases drew from the shared one,
-                    // a single parked chase held 100% of the process allowance and
-                    // every other 7z extraction blocked behind it with no deadline.
-                    // `a_parked_chase_does_not_block_another_jobs_extraction` is the
-                    // regression test, and the wait itself now says so at warn after
-                    // 30 seconds.
+                    // This closure used to take the whole configured ceiling first
+                    // and hold it until it returned, across every park. With one
+                    // permit being the whole pool, every chase in the process
+                    // single-filed through it, and a chase parked on a damage gate
+                    // held the rest back for as long as its repair took — which,
+                    // when the repair was never summoned, was its entire
+                    // consumption deadline. `parked_chases_share_the_decoder_memory_pool`
+                    // is the regression test.
                     //
-                    // RESIDUAL: chases still contend with each other, for this pool
-                    // and for `chase_pool`'s worker threads. A parked chase can
-                    // therefore stop another chase from starting at all — see the
-                    // WP11 report's note on admission control.
-                    let _memory_permit = budget.reserve_memory_wait(budget.max_memory_bytes())?;
-
+                    // RESIDUAL: chases still contend for `chase_pool`'s worker
+                    // threads, and for the pool when their right-sized needs
+                    // genuinely exceed it. The 30-second wait warn names that.
                     let pw = match password {
                         Some(ref value) => sevenz_rust2::Password::new(value),
                         None => sevenz_rust2::Password::empty(),
@@ -1146,6 +1147,7 @@ impl Pipeline {
                         password: pw,
                         event_tx: silent_events,
                         phase_counters: counters,
+                        decode_memory: SevenZipDecodeMemory::ReservedPerPass { end_header_bytes },
                     };
 
                     extract_7z_stream(&context, || {
@@ -1157,7 +1159,7 @@ impl Pipeline {
                                 format!("failed to open 7z direct-unpack reader: {error}")
                             })
                     })
-                })();
+                };
                 match &outcome {
                     Ok(members) => info!(
                         job_id = log_job.0,
@@ -2081,6 +2083,30 @@ impl Pipeline {
             .is_some_and(|file| matches!(file.status, par2_rs::verify::FileStatus::Complete))
     }
 
+    /// The armed sets of `job_id` that are gated on recovery-reported damage.
+    ///
+    /// Finalize asks this before it lets a type-derived strong-decode claim
+    /// stand in for the authoritative PAR2 pass. A gated chase is parked on a
+    /// slice the recovery data has already called damaged, waiting for the
+    /// repair that pass would summon; skipping the pass on the strength of the
+    /// claim would leave it waiting for nothing.
+    ///
+    /// Only *armed* sets count. A draining set has been aborted and will be
+    /// materialized and decoded conventionally, where damage surfaces as a
+    /// failed extraction and takes the repair path finalize already has for
+    /// that.
+    pub(in crate::pipeline) fn direct_unpack_gated_sets(&self, job_id: JobId) -> Vec<String> {
+        if self.direct_unpack.armed.is_empty() {
+            return Vec::new();
+        }
+        self.direct_unpack
+            .armed
+            .iter()
+            .filter(|((armed_job, _), armed)| *armed_job == job_id && armed.coverage.is_gated())
+            .map(|((_, set_name), _)| set_name.clone())
+            .collect()
+    }
+
     /// Mark a set as parked through a repair, without going through the
     /// vouching decision. Lets a test exercise the release and failure paths
     /// without standing up a PAR2 binding and a populated grid.
@@ -2253,6 +2279,95 @@ impl Pipeline {
                 set_name, "repair finished; the parked chase resumes over the repaired bytes"
             );
             record_event("resumed_after_repair");
+        }
+    }
+
+    /// Lift the damage gates a clean verdict from `set_id` has contradicted.
+    ///
+    /// A chase gates on the in-stream grid's word that a slice is damaged. The
+    /// recovery set has now been verified clean — every file it describes
+    /// read back and matched, a whole-file statement stronger than any block
+    /// verdict — so the damage the gate was holding for is not there, and the
+    /// bytes under the cap are the verified ones. A gate left standing here
+    /// would park the chase on a repair that is never coming, and extraction
+    /// behind it with no deadline.
+    ///
+    /// Only sets whose every part this recovery set describes are released. A
+    /// verdict about one set's files says nothing about another's, and a gate
+    /// raised on evidence from a different set stays up until that set rules.
+    pub(in crate::pipeline) fn release_direct_unpack_after_clean_verification(
+        &mut self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) {
+        if self.direct_unpack.armed.is_empty() {
+            return;
+        }
+        let gated = self.direct_unpack_gated_sets(job_id);
+        if gated.is_empty() {
+            return;
+        }
+        let Some(par2_set) = self
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.set_runtime(set_id))
+            .and_then(|set_runtime| set_runtime.set.clone())
+        else {
+            return;
+        };
+        let described: HashSet<&str> = par2_set
+            .files
+            .values()
+            .flat_map(|description| {
+                [
+                    description.filename.as_str(),
+                    description.par2_name.as_str(),
+                ]
+            })
+            .collect();
+
+        for set_name in gated {
+            let Ok(paths) = self.sevenz_set_part_paths(job_id, &set_name) else {
+                continue;
+            };
+            let every_part_described = !paths.is_empty()
+                && paths.iter().all(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| described.contains(name))
+                });
+            if !every_part_described {
+                debug!(
+                    job_id = job_id.0,
+                    set_name,
+                    recovery_set_id = %set_id,
+                    "a clean verdict for a recovery set that does not describe every part leaves \
+                     this gate up"
+                );
+                continue;
+            }
+            let Some(armed) = self.direct_unpack.armed.get(&(job_id, set_name.clone())) else {
+                continue;
+            };
+            let coverage = Arc::clone(&armed.coverage);
+            for (index, path) in paths.iter().enumerate() {
+                match std::fs::metadata(path) {
+                    Ok(meta) => coverage.release_after_repair(index, meta.len()),
+                    Err(error) => {
+                        coverage.abort(format!(
+                            "part {index} is unreadable after verification: {error}"
+                        ));
+                        break;
+                    }
+                }
+            }
+            info!(
+                job_id = job_id.0,
+                set_name,
+                recovery_set_id = %set_id,
+                "recovery data verified this set clean; the damage gate its chase was parked on \
+                 is lifted"
+            );
+            record_event("released_after_clean_verification");
         }
     }
 

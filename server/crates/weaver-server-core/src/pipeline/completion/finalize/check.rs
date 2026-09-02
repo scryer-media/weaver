@@ -3526,6 +3526,13 @@ impl Pipeline {
         } = reason
         {
             log_clean_par2_verification_source(job_id, set_id, slice_size, verification_mode);
+            // A chase gated on this set's damage evidence has just been
+            // contradicted by a verdict that read the files. Every mode but
+            // the strong-decode claim did read them — and that claim cannot
+            // reach here while a chase is gated, so the guard is documentary.
+            if !matches!(verification_mode, CleanPar2VerificationMode::StrongDecode) {
+                self.release_direct_unpack_after_clean_verification(job_id, set_id);
+            }
         }
         SetGateOutcome::Settled
     }
@@ -6974,16 +6981,34 @@ impl Pipeline {
         let archive_extraction_applicable = self.extraction_readiness_for_job(job_id)
             != ExtractionReadiness::NotApplicable
             || only_rar_archives;
+        // A direct-unpack chase gated on damage is evidence already in hand:
+        // the recovery data has named a slice of this archive as wrong, and
+        // the chase is parked on that slice waiting for repair. `StrongDecode`
+        // above is a claim about the archive *type* — that a clean extraction
+        // would prove integrity — and a claim cannot stand against evidence.
+        // If it did, the skip below would settle the set as clean, no repair
+        // would ever be summoned, and the chase would wait out its whole
+        // consumption deadline on vouches that were never coming.
+        let direct_unpack_gated_sets = self.direct_unpack_gated_sets(job_id);
+        let authoritative_par2_verification_owed = rar_par2_repair_ready
+            || has_crc_failures
+            || (has_incomplete_data_files && download_pipeline_exhausted)
+            || rar_waiting_for_missing_volumes
+            || matches!(current_status, JobStatus::Repairing)
+            || matches!(
+                clean_par2_integrity_gate,
+                CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None
+            );
         let authoritative_par2_verification_needed = par2_validation_needed
-            && (rar_par2_repair_ready
-                || has_crc_failures
-                || (has_incomplete_data_files && download_pipeline_exhausted)
-                || rar_waiting_for_missing_volumes
-                || matches!(current_status, JobStatus::Repairing)
-                || matches!(
-                    clean_par2_integrity_gate,
-                    CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None
-                ));
+            && (authoritative_par2_verification_owed || !direct_unpack_gated_sets.is_empty());
+        if authoritative_par2_verification_needed && !authoritative_par2_verification_owed {
+            info!(
+                job_id = job_id.0,
+                gated_sets = ?direct_unpack_gated_sets,
+                "a gated direct unpack chase forces the authoritative PAR2 pass — recovery data \
+                 reported damage, so the clean strong-decode verdict cannot stand"
+            );
+        }
         // Shared by every fast path that skips the authoritative pass, so the
         // live short-circuit can never fire where the quick path would be
         // refused.
