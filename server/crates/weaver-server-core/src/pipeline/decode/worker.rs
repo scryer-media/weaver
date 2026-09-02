@@ -2934,11 +2934,6 @@ impl Pipeline {
                         }
                     }
 
-                    // Queued behind the file's final write on its owner
-                    // thread, so the fd is released before verification,
-                    // repair, or the final move touch this path.
-                    crate::pipeline::release_cached_write_handle(file_path);
-
                     // The file's length is what makes its short final block
                     // closable: until now that block's extent was undecided.
                     // Blocks the grid could not claim in stream (including the
@@ -2962,6 +2957,7 @@ impl Pipeline {
                         Err(error) => {
                             if expected_file_crc.is_some() {
                                 warn!(file_id = %file_id, error = %error, "failed to verify yEnc whole-file CRC32");
+                                crate::pipeline::release_cached_write_handle(file_path);
                                 self.fail_job(
                                     job_id,
                                     format!("failed to verify yEnc whole-file CRC32 for {file_id}: {error}"),
@@ -2985,13 +2981,16 @@ impl Pipeline {
                             .schedule_file_crc_recovery(file_id, expected_crc, file_checksum.crc32)
                             .await
                         {
+                            // Recovery rewrites this file: its handle stays.
                             Ok(true) => return,
                             Ok(false) => {}
                             Err(error) => {
+                                crate::pipeline::release_cached_write_handle(file_path);
                                 self.fail_job(job_id, error);
                                 return;
                             }
                         }
+                        crate::pipeline::release_cached_write_handle(file_path);
                         self.fail_job(
                             job_id,
                             format!(
@@ -3120,6 +3119,16 @@ impl Pipeline {
                         stage_ms = stage_start.elapsed().as_millis() as u64,
                         "file-complete stage: refresh_archive_state_for_completed_file"
                     );
+                    // Released only now, after the archive probe above has
+                    // read the file: the last close of a freshly written file
+                    // is where the kernel flushes it, and a probe opened
+                    // during that flush waits on the vnode for the whole of
+                    // it. Every write landed before this seam ran, so the
+                    // probe reads complete bytes through the open handle.
+                    // Still queued behind the file's final write on its owner
+                    // thread, so the fd is gone before verification, repair,
+                    // or the final move touch this path.
+                    crate::pipeline::release_cached_write_handle(file_path);
                     stage_start = Instant::now();
                     self.retry_par2_authoritative_identity(job_id).await;
                     crate::runtime::perf_probe::record(

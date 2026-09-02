@@ -1645,12 +1645,18 @@ impl CloseHandleScope {
 
 impl DiskWriteOwnerPool {
     fn new() -> Self {
+        let (closer, closer_rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("weaver-disk-close".to_string())
+            .spawn(move || run_disk_handle_closer(closer_rx))
+            .expect("failed to spawn Weaver disk handle closer thread");
         let mut senders = Vec::with_capacity(DISK_WRITE_OWNER_THREADS);
         for index in 0..DISK_WRITE_OWNER_THREADS {
             let (tx, rx) = std::sync::mpsc::channel();
+            let closer = closer.clone();
             std::thread::Builder::new()
                 .name(format!("weaver-disk-wr-{index}"))
-                .spawn(move || run_disk_write_owner(rx))
+                .spawn(move || run_disk_write_owner(rx, closer))
                 .expect("failed to spawn Weaver disk write owner thread");
             senders.push(tx);
         }
@@ -1819,9 +1825,44 @@ struct CachedDiskWriteHandle {
     last_used: Instant,
 }
 
+/// Handles leaving an owner's cache, closed on the closer thread.
+///
+/// The last close of a freshly written file is where the kernel flushes its
+/// dirty pages (tens of milliseconds for a large file on macOS), and an owner
+/// thread serves every file that hashes to it. SABnzbd and NZBGet both take
+/// that flush on the thread that wrote, but neither shares a writer across
+/// files; here the owner hands the handle off instead, so a completed file's
+/// flush never queues behind another file's writes. The closer is FIFO, so an
+/// `ack` is sent only once every close queued before it — including earlier
+/// fire-and-forget releases of the same path — has actually happened, which is
+/// what a rename or delete waiting on the ack needs on Windows.
+struct HandleCloseRequest {
+    files: Vec<std::fs::File>,
+    ack: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+fn run_disk_handle_closer(rx: std::sync::mpsc::Receiver<HandleCloseRequest>) {
+    while let Ok(request) = rx.recv() {
+        let started = Instant::now();
+        let closed = request.files.len();
+        drop(request.files);
+        if closed > 0 {
+            crate::runtime::perf_probe::record(
+                "download.disk_write.handle_close",
+                started.elapsed(),
+            );
+        }
+        if let Some(ack) = request.ack {
+            let _ = ack.send(());
+        }
+    }
+}
+
 #[derive(Default)]
 struct DiskWriteHandleCache {
     entries: std::collections::HashMap<std::path::PathBuf, CachedDiskWriteHandle>,
+    /// The closer thread's queue. `None` closes inline (tests).
+    closer: Option<std::sync::mpsc::Sender<HandleCloseRequest>>,
 }
 
 impl DiskWriteHandleCache {
@@ -1853,11 +1894,24 @@ impl DiskWriteHandleCache {
     }
 
     fn discard(&mut self, path: &std::path::Path) {
-        self.entries.remove(path);
+        if let Some(entry) = self.entries.remove(path) {
+            self.close_files(vec![entry.file], None);
+        }
     }
 
-    fn close_matching(&mut self, scope: &CloseHandleScope) {
-        self.entries.retain(|path, _| !scope.matches(path));
+    /// Drop every handle `scope` matches. `ack` fires once they are closed,
+    /// and only after every close queued ahead of it.
+    fn close_matching(
+        &mut self,
+        scope: &CloseHandleScope,
+        ack: Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
+        let files = self
+            .entries
+            .extract_if(|path, _| scope.matches(path))
+            .map(|(_, entry)| entry.file)
+            .collect();
+        self.close_files(files, ack);
     }
 
     fn close_idle(&mut self, ttl: std::time::Duration) {
@@ -1865,8 +1919,38 @@ impl DiskWriteHandleCache {
             return;
         }
         let now = Instant::now();
-        self.entries
-            .retain(|_, entry| now.duration_since(entry.last_used) < ttl);
+        let files = self
+            .entries
+            .extract_if(|_, entry| now.duration_since(entry.last_used) >= ttl)
+            .map(|(_, entry)| entry.file)
+            .collect();
+        self.close_files(files, None);
+    }
+
+    /// Hand `files` to the closer thread, or close them here when there is
+    /// none. An empty request still travels when it carries an ack: the ack's
+    /// promise is that earlier closes of the path have landed, not that this
+    /// call found something to close.
+    fn close_files(
+        &self,
+        files: Vec<std::fs::File>,
+        ack: Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
+        if files.is_empty() && ack.is_none() {
+            return;
+        }
+        let request = HandleCloseRequest { files, ack };
+        let request = match &self.closer {
+            Some(closer) => match closer.send(request) {
+                Ok(()) => return,
+                Err(std::sync::mpsc::SendError(request)) => request,
+            },
+            None => request,
+        };
+        drop(request.files);
+        if let Some(ack) = request.ack {
+            let _ = ack.send(());
+        }
     }
 
     fn evict_to_cap(&mut self) {
@@ -1880,14 +1964,22 @@ impl DiskWriteHandleCache {
                 break;
             };
             crate::runtime::perf_probe::record_value("download.disk_write.handle_cache.evicted", 1);
-            self.entries.remove(&least_recent);
+            if let Some(entry) = self.entries.remove(&least_recent) {
+                self.close_files(vec![entry.file], None);
+            }
         }
     }
 }
 
-fn run_disk_write_owner(rx: std::sync::mpsc::Receiver<DiskWriteCommand>) {
+fn run_disk_write_owner(
+    rx: std::sync::mpsc::Receiver<DiskWriteCommand>,
+    closer: std::sync::mpsc::Sender<HandleCloseRequest>,
+) {
     crate::runtime::affinity::pin_current_thread_for_hot_download_path();
-    let mut handles = DiskWriteHandleCache::default();
+    let mut handles = DiskWriteHandleCache {
+        closer: Some(closer),
+        ..DiskWriteHandleCache::default()
+    };
     let mut last_sweep = Instant::now();
     loop {
         match rx.recv_timeout(DISK_WRITE_OWNER_SWEEP_INTERVAL) {
@@ -1920,10 +2012,7 @@ fn run_disk_write_owner(rx: std::sync::mpsc::Receiver<DiskWriteCommand>) {
                 let _ = response.send(result);
             }
             Ok(DiskWriteCommand::CloseHandles { scope, ack }) => {
-                handles.close_matching(&scope);
-                if let Some(ack) = ack {
-                    let _ = ack.send(());
-                }
+                handles.close_matching(&scope, ack);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2447,6 +2536,49 @@ mod disk_write_handle_cache_tests {
         assert!(cache.entries.contains_key(&newest));
     }
 
+    /// With a closer attached, a close leaves the owner's cache at once and
+    /// the ack fires from the closer only after the handle is really gone —
+    /// including an ack that found nothing left to close, which must still
+    /// queue behind the earlier fire-and-forget release of the same path.
+    #[test]
+    fn close_matching_hands_handles_to_the_closer_and_acks_after_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let (closer, closer_rx) = std::sync::mpsc::channel();
+        let mut cache = DiskWriteHandleCache {
+            closer: Some(closer),
+            ..DiskWriteHandleCache::default()
+        };
+        let path = temp.path().join("part.bin");
+        cache.open_or_reuse(&path).unwrap();
+
+        cache.close_matching(&CloseHandleScope::Path(path.clone()), None);
+        assert!(cache.entries.is_empty());
+        let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
+        cache.close_matching(&CloseHandleScope::Path(path.clone()), Some(ack));
+
+        let release = closer_rx.try_recv().unwrap();
+        assert_eq!(release.files.len(), 1);
+        assert!(release.ack.is_none());
+        let acked = closer_rx.try_recv().unwrap();
+        assert!(acked.files.is_empty());
+        assert!(acked.ack.is_some());
+        assert!(
+            ack_rx.try_recv().is_err(),
+            "ack fired before the closer closed anything"
+        );
+
+        let closer = std::thread::spawn(move || {
+            for request in [release, acked] {
+                drop(request.files);
+                if let Some(ack) = request.ack {
+                    let _ = ack.send(());
+                }
+            }
+        });
+        closer.join().unwrap();
+        assert!(ack_rx.try_recv().is_ok());
+    }
+
     #[test]
     fn close_matching_honors_path_and_prefix_scopes() {
         let temp = tempfile::tempdir().unwrap();
@@ -2463,11 +2595,11 @@ mod disk_write_handle_cache_tests {
             cache.open_or_reuse(path).unwrap();
         }
 
-        cache.close_matching(&CloseHandleScope::Prefix(job_a.clone()));
+        cache.close_matching(&CloseHandleScope::Prefix(job_a.clone()), None);
         assert_eq!(cache.entries.len(), 1);
         assert!(cache.entries.contains_key(&b1));
 
-        cache.close_matching(&CloseHandleScope::Path(b1.clone()));
+        cache.close_matching(&CloseHandleScope::Path(b1.clone()), None);
         assert!(cache.entries.is_empty());
     }
 
