@@ -1977,42 +1977,99 @@ fn write_segments_to_disk_blocking(
 
 fn write_segments_into_file(
     file: &mut std::fs::File,
-    segments: Vec<(u64, BufferedDecodedSegment)>,
+    mut segments: Vec<(u64, BufferedDecodedSegment)>,
 ) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
     use std::io::Seek;
 
-    let mut written = Vec::with_capacity(segments.len());
+    // A batch for one file is mostly a contiguous run of articles; each run
+    // is one seek and one vectored write, however many articles and decode
+    // batches it spans, instead of a write per batch of every article.
+    let mut slices: Vec<std::io::IoSlice<'_>> = Vec::new();
     let mut next_file_offset = None;
-    let mut remaining = segments.into_iter();
-    while let Some((offset, segment)) = remaining.next() {
-        let segment_len = segment.data.len_bytes() as u64;
-        if next_file_offset != Some(offset)
-            && let Err(source) = file.seek(std::io::SeekFrom::Start(offset))
-        {
-            let mut unwritten = Vec::with_capacity(1 + remaining.size_hint().0);
-            unwritten.push((offset, segment));
-            unwritten.extend(remaining);
-            return Err(SegmentWriteBatchError {
-                source,
-                written,
-                unwritten,
-            });
+    let mut completed = 0usize;
+    let failure = loop {
+        if completed == segments.len() {
+            return Ok(segments);
         }
-        if let Err(source) = segment.data.write_to(file) {
-            let mut unwritten = Vec::with_capacity(1 + remaining.size_hint().0);
-            unwritten.push((offset, segment));
-            unwritten.extend(remaining);
-            return Err(SegmentWriteBatchError {
-                source,
-                written,
-                unwritten,
-            });
+        let run_start = completed;
+        let run_offset = segments[run_start].0;
+        let mut run_end = run_start;
+        let mut run_len = 0u64;
+        while run_end < segments.len() && segments[run_end].0 == run_offset + run_len {
+            run_len += segments[run_end].1.data.len_bytes() as u64;
+            run_end += 1;
         }
-        next_file_offset = Some(offset + segment_len);
-        written.push((offset, segment));
-    }
 
-    Ok(written)
+        if next_file_offset != Some(run_offset)
+            && let Err(source) = file.seek(std::io::SeekFrom::Start(run_offset))
+        {
+            break source;
+        }
+        slices.clear();
+        for (_, segment) in &segments[run_start..run_end] {
+            segment.data.push_io_slices(&mut slices);
+        }
+        match write_all_vectored(file, &mut slices) {
+            Ok(()) => {
+                completed = run_end;
+                next_file_offset = Some(run_offset + run_len);
+            }
+            Err((source, written_bytes)) => {
+                // Every segment the written prefix covers whole is done; the
+                // one it cuts through is retried whole with the rest.
+                let mut covered = written_bytes;
+                for (_, segment) in &segments[run_start..run_end] {
+                    let len = segment.data.len_bytes();
+                    if covered < len {
+                        break;
+                    }
+                    covered -= len;
+                    completed += 1;
+                }
+                break source;
+            }
+        }
+    };
+
+    let unwritten = segments.split_off(completed);
+    Err(SegmentWriteBatchError {
+        source: failure,
+        written: segments,
+        unwritten,
+    })
+}
+
+/// Writes every slice in order, retrying short and interrupted writes. On
+/// failure, reports how many bytes landed before the error so the caller can
+/// account for the fully-written prefix.
+fn write_all_vectored(
+    file: &mut std::fs::File,
+    mut slices: &mut [std::io::IoSlice<'_>],
+) -> Result<(), (std::io::Error, usize)> {
+    use std::io::Write;
+
+    let mut written = 0usize;
+    std::io::IoSlice::advance_slices(&mut slices, 0);
+    while !slices.is_empty() {
+        match file.write_vectored(slices) {
+            Ok(0) => {
+                return Err((
+                    std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write whole buffer",
+                    ),
+                    written,
+                ));
+            }
+            Ok(n) => {
+                written += n;
+                std::io::IoSlice::advance_slices(&mut slices, n);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err((error, written)),
+        }
+    }
+    Ok(())
 }
 
 fn write_raw_batch_blocking(
@@ -2021,26 +2078,36 @@ fn write_raw_batch_blocking(
     writes: Vec<(u64, Vec<u8>)>,
     queued_at: Instant,
 ) -> std::io::Result<()> {
-    use std::io::{Seek, Write};
+    use std::io::Seek;
 
     crate::runtime::perf_probe::record(
         "download.disk_write.owner.queue_wait",
         Instant::now().duration_since(queued_at),
     );
     let file = handles.open_or_reuse(&path)?;
+    let mut slices: Vec<std::io::IoSlice<'_>> = Vec::new();
     let mut next_offset = None;
-    for (offset, bytes) in &writes {
-        if next_offset != Some(*offset)
-            && let Err(source) = file.seek(std::io::SeekFrom::Start(*offset))
+    let mut index = 0usize;
+    while index < writes.len() {
+        let run_offset = writes[index].0;
+        let mut run_len = 0u64;
+        slices.clear();
+        while index < writes.len() && writes[index].0 == run_offset + run_len {
+            slices.push(std::io::IoSlice::new(&writes[index].1));
+            run_len += writes[index].1.len() as u64;
+            index += 1;
+        }
+        if next_offset != Some(run_offset)
+            && let Err(source) = file.seek(std::io::SeekFrom::Start(run_offset))
         {
             handles.discard(&path);
             return Err(source);
         }
-        if let Err(source) = file.write_all(bytes) {
+        if let Err((source, _)) = write_all_vectored(file, &mut slices) {
             handles.discard(&path);
             return Err(source);
         }
-        next_offset = Some(offset + bytes.len() as u64);
+        next_offset = Some(run_offset + run_len);
     }
     Ok(())
 }
@@ -2274,6 +2341,39 @@ mod disk_write_handle_cache_tests {
         assert_eq!(cache.entries.len(), 1);
 
         assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
+    }
+
+    /// Contiguous articles, multi-batch ones included, land through one
+    /// vectored write per run; a gap starts a new run at its own offset.
+    #[test]
+    fn contiguous_runs_and_gaps_write_the_exact_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("part.bin");
+        let mut cache = DiskWriteHandleCache::default();
+
+        let mut batched = segment(b"cdef");
+        batched.data = DecodedChunk::from(vec![
+            b"cd".to_vec().into_boxed_slice(),
+            b"ef".to_vec().into_boxed_slice(),
+        ]);
+
+        let written = write_segments_to_disk_blocking(
+            &mut cache,
+            path.clone(),
+            vec![
+                (0, segment(b"ab")),
+                (2, batched),
+                (6, segment(b"gh")),
+                (10, segment(b"kl")),
+                (12, segment(b"mn")),
+            ],
+            Instant::now(),
+        )
+        .map_err(|error| error.source)
+        .unwrap();
+
+        assert_eq!(written.len(), 5);
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcdefgh\0\0klmn");
     }
 
     #[test]

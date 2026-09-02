@@ -2167,6 +2167,17 @@ impl DecodedChunk {
             }
         }
     }
+
+    /// Appends this chunk's slices, in order, for a vectored write that
+    /// covers several contiguous chunks with one syscall.
+    pub(super) fn push_io_slices<'a>(&'a self, out: &mut Vec<std::io::IoSlice<'a>>) {
+        match self {
+            Self::Contiguous(bytes) => out.push(std::io::IoSlice::new(bytes)),
+            Self::Batches { chunks, .. } => {
+                out.extend(chunks.iter().map(|chunk| std::io::IoSlice::new(chunk)));
+            }
+        }
+    }
 }
 
 impl From<Vec<u8>> for DecodedChunk {
