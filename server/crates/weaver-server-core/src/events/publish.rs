@@ -1,5 +1,29 @@
 use crate::events::model::PipelineEvent;
 
+/// Whether an event describes one article or segment rather than a job or
+/// file: the per-article stream a download emits several of per article.
+///
+/// Nothing that renders a queue item needs these. The item's progress comes
+/// from `PhaseProgressUpdated`, which the orchestrator samples on its metrics
+/// cadence, and its state from the job-level events. A consumer that reacts
+/// to every pipeline event by re-reading the job — the queue event replay
+/// producer does exactly that — pays a job lookup and an item snapshot per
+/// article for no change in what it publishes.
+pub fn is_segment_event(event: &PipelineEvent) -> bool {
+    matches!(
+        event,
+        PipelineEvent::ArticleDownloaded { .. }
+            | PipelineEvent::ServerAttempt { .. }
+            | PipelineEvent::ArticleNotFound { .. }
+            | PipelineEvent::SegmentQueued { .. }
+            | PipelineEvent::SegmentDecoded { .. }
+            | PipelineEvent::SegmentDecodeFailed { .. }
+            | PipelineEvent::SegmentCommitted { .. }
+            | PipelineEvent::SegmentRetryScheduled { .. }
+            | PipelineEvent::SegmentFailedPermanent { .. }
+    )
+}
+
 pub fn should_record_job_event(event: &PipelineEvent) -> bool {
     !matches!(
         event,
