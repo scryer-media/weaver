@@ -447,9 +447,10 @@ impl NntpPool {
         &self,
         idx: usize,
         excluded_ips: &[IpAddr],
+        initial_group: Option<&str>,
     ) -> Result<NntpConnection> {
         match self
-            .connect_server_excluding_untracked(idx, excluded_ips)
+            .connect_server_excluding_untracked(idx, excluded_ips, initial_group)
             .await
         {
             Ok(connection) => Ok(connection),
@@ -469,20 +470,36 @@ impl NntpPool {
         &self,
         idx: usize,
         excluded_ips: &[IpAddr],
+        initial_group: Option<&str>,
     ) -> Result<NntpConnection> {
         let mut exclusions = self.retired_ips_for_server(idx).await;
         exclusions.extend(excluded_ips.iter().copied());
         exclusions.sort_unstable();
         exclusions.dedup();
         let offset = self.next_connect_offset(idx);
-        let mut connection =
-            NntpConnection::connect_with_ip_policy(&self.configs[idx], &exclusions, offset).await?;
+        let mut connection = NntpConnection::connect_with_ip_policy_for_group(
+            &self.configs[idx],
+            &exclusions,
+            offset,
+            initial_group,
+        )
+        .await?;
         connection.set_transfer_control(self.transfer_controls[idx].clone());
         Ok(connection)
     }
 
     /// Acquire a connection from a specific server.
     pub async fn acquire(&self, server: ServerId) -> Result<PooledConnection> {
+        self.acquire_for_group(server, None).await
+    }
+
+    /// Acquire a connection; a fresh connection to a pipelining server
+    /// selects `initial_group` inside its session-setup write.
+    pub async fn acquire_for_group(
+        &self,
+        server: ServerId,
+        initial_group: Option<&str>,
+    ) -> Result<PooledConnection> {
         if self.shutdown.is_cancelled() {
             return Err(NntpError::PoolShutdown);
         }
@@ -505,7 +522,15 @@ impl NntpPool {
             return Err(NntpError::PoolExhausted);
         }
 
-        self.acquire_with_permit(idx, Some(permit)).await
+        self.acquire_with_permit(idx, Some(permit), initial_group)
+            .await
+    }
+
+    /// Whether a normal (in-cap) lease could be taken right now without
+    /// waiting on the server's connection semaphore.
+    pub fn has_available_permit(&self, server: ServerId) -> bool {
+        let idx = server.0;
+        idx < self.semaphores.len() && self.semaphores[idx].available_permits() > 0
     }
 
     /// Acquire an explicit over-max connection from a specific server.
@@ -519,6 +544,18 @@ impl NntpPool {
         server: ServerId,
         excluded_ips: &[IpAddr],
     ) -> Result<PooledConnection> {
+        self.acquire_extra_excluding_for_group(server, excluded_ips, None)
+            .await
+    }
+
+    /// Over-max acquire whose fresh connection selects `initial_group` in
+    /// its session-setup write on a pipelining server.
+    pub async fn acquire_extra_excluding_for_group(
+        &self,
+        server: ServerId,
+        excluded_ips: &[IpAddr],
+        initial_group: Option<&str>,
+    ) -> Result<PooledConnection> {
         if self.shutdown.is_cancelled() {
             return Err(NntpError::PoolShutdown);
         }
@@ -531,7 +568,7 @@ impl NntpPool {
             return Err(NntpError::PoolExhausted);
         }
 
-        self.acquire_fresh_with_permit(idx, None, excluded_ips)
+        self.acquire_fresh_with_permit(idx, None, excluded_ips, initial_group)
             .await
     }
 
@@ -540,6 +577,7 @@ impl NntpPool {
         &self,
         idx: usize,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        initial_group: Option<&str>,
     ) -> Result<PooledConnection> {
         // Try to get a healthy idle connection, with stale-check loop.
         let conn = loop {
@@ -556,11 +594,13 @@ impl NntpPool {
                         match c.ping().await {
                             Ok(()) => break c,
                             Err(e) => {
-                                trace!(server = idx, error = %e, "stale ping failed, draining all idle");
-                                // If one connection is dead, all are likely dead
-                                // (network interface change). Drain everything so
-                                // the loop falls through to create a fresh connection.
-                                self.drain_all_idle().await;
+                                trace!(server = idx, error = %e, "stale ping failed, draining this server's idle");
+                                // A dead idle connection usually means its
+                                // siblings on the same server died with it
+                                // (provider-side idle reaping). Other servers
+                                // keep their warm sockets; the loop falls
+                                // through to create a fresh connection here.
+                                self.drain_idle_for(idx).await;
                                 continue;
                             }
                         }
@@ -588,7 +628,7 @@ impl NntpPool {
                     }
 
                     debug!(server = idx, "creating new connection");
-                    match self.connect_server_excluding(idx, &[]).await {
+                    match self.connect_server_excluding(idx, &[], initial_group).await {
                         Ok(c) => {
                             // Clear the failure timestamp on success.
                             let mut last_failure = self.last_connect_failure[idx].lock().await;
@@ -627,6 +667,7 @@ impl NntpPool {
         idx: usize,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
         excluded_ips: &[IpAddr],
+        initial_group: Option<&str>,
     ) -> Result<PooledConnection> {
         {
             let last_failure = self.last_connect_failure[idx].lock().await;
@@ -641,7 +682,10 @@ impl NntpPool {
         }
 
         debug!(server = idx, "creating fresh over-max connection");
-        let conn = match self.connect_server_excluding(idx, excluded_ips).await {
+        let conn = match self
+            .connect_server_excluding(idx, excluded_ips, initial_group)
+            .await
+        {
             Ok(conn) => {
                 let mut last_failure = self.last_connect_failure[idx].lock().await;
                 *last_failure = None;
@@ -692,7 +736,7 @@ impl NntpPool {
                     if !self.adaptive_connections[*idx].admits_normal(active_after_acquire) {
                         continue;
                     }
-                    match self.acquire_with_permit(*idx, Some(permit)).await {
+                    match self.acquire_with_permit(*idx, Some(permit), None).await {
                         Ok(conn) => return Ok(conn),
                         Err(e) => {
                             if matches!(e, NntpError::TooManyConnections) {
@@ -796,6 +840,27 @@ impl NntpPool {
             warn!(
                 count = total,
                 "drained all idle connections (suspected network change)"
+            );
+        }
+    }
+
+    /// Drop the idle connections of one server after one of its sockets
+    /// failed. A single dead socket says nothing about other providers, so
+    /// their warm idle connections are left alone.
+    pub async fn drain_idle_for(&self, idx: usize) {
+        let Some(pool) = self.pools.get(idx) else {
+            return;
+        };
+        let count = {
+            let mut p = pool.lock().await;
+            let count = p.idle.len();
+            p.idle.clear();
+            count
+        };
+        if count > 0 {
+            debug!(
+                server = idx,
+                count, "drained this server's idle connections after a socket failure"
             );
         }
     }
@@ -1056,7 +1121,7 @@ impl NntpPool {
 
         let connect_result = tokio::select! {
             _ = self.shutdown.cancelled() => Err(NntpError::PoolShutdown),
-            result = self.connect_server_excluding_untracked(idx, &[]) => result,
+            result = self.connect_server_excluding_untracked(idx, &[], None) => result,
         };
         let outcome = match connect_result {
             Ok(connection) if !self.shutdown.is_cancelled() => {

@@ -971,10 +971,15 @@ impl NntpClient {
         excluded_ips: &[IpAddr],
     ) -> Result<BodyLaneLease> {
         let deadline = TokioInstant::now() + self.soft_timeout;
+        // A fresh connection to a pipelining server selects the first
+        // candidate group inside its session-setup write; `try_select_group`
+        // then short-circuits on it and only walks further on a miss.
+        let initial_group = groups.first().map(String::as_str);
         let mut conn = if extra {
             match tokio::time::timeout_at(
                 deadline,
-                self.pool.acquire_extra_excluding(server, excluded_ips),
+                self.pool
+                    .acquire_extra_excluding_for_group(server, excluded_ips, initial_group),
             )
             .await
             {
@@ -982,7 +987,15 @@ impl NntpClient {
                 Err(_) => return Err(self.soft_timeout_error()),
             }
         } else {
-            self.acquire_before_deadline(server, deadline).await?
+            match tokio::time::timeout_at(
+                deadline,
+                self.pool.acquire_for_group(server, initial_group),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err(self.soft_timeout_error()),
+            }
         };
 
         match tokio::time::timeout_at(deadline, Self::try_select_group(&mut conn, groups)).await {
@@ -2368,8 +2381,16 @@ impl NntpClient {
     async fn discard_connection_error(&self, server_idx: usize, conn: PooledConnection) {
         let age = conn.created_at().elapsed();
         conn.discard();
-        self.pool.drain_all_idle().await;
+        // Only this server's idle sockets are suspect; other providers keep
+        // their warm connections.
+        self.pool.drain_idle_for(server_idx).await;
         self.record_premature_death_if_needed(server_idx, age).await;
+    }
+
+    /// Whether `server` could hand out a normal lease right now without
+    /// waiting on its connection semaphore.
+    pub fn has_available_permit(&self, server: ServerId) -> bool {
+        self.pool.has_available_permit(server)
     }
 
     async fn acquire_before_deadline(

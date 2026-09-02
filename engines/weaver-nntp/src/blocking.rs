@@ -33,9 +33,9 @@ use crate::fused_yenc::{
 use crate::pool::{BlockingConnectionPermit, ServerId};
 use crate::response::parse_response;
 use crate::tls::{
-    NntpTlsBackend, RustlsSession, TLS_READ_BUFFER, TransportReadStats,
+    NntpTlsBackend, RustlsSession, TLS_READ_BUFFER, TlsCipherPreference, TransportReadStats,
     build_tls_config_with_name_mismatch_certificate, make_server_name,
-    selected_blocking_tls_backend,
+    selected_blocking_tls_backend, tls_backend_for_preference,
 };
 use crate::transfer::{
     ActiveTransferBudget, BodyTransferAccounting, ServerTransferControl, StableServerId,
@@ -174,8 +174,14 @@ impl BlockingBodyLane {
                 "stable server id does not match transfer control".to_string(),
             ));
         }
-        let mut conn =
-            BlockingNntpConnection::connect_with_ip_policy(config, excluded_ips, address_offset)?;
+        // On a pipelining server the first candidate group rides in the
+        // session-setup write; `select_group` then short-circuits on it.
+        let mut conn = BlockingNntpConnection::connect_with_ip_policy_for_group(
+            config,
+            excluded_ips,
+            address_offset,
+            groups.first().map(String::as_str),
+        )?;
         conn.set_transfer_control(transfer_control);
         for group in groups {
             match conn.select_group(group) {
@@ -560,7 +566,25 @@ impl BlockingNntpConnection {
         excluded_ips: &[IpAddr],
         address_offset: usize,
     ) -> Result<Self> {
-        Self::connect_with_ip_policy_with_backend(config, excluded_ips, address_offset, None)
+        Self::connect_with_ip_policy_for_group(config, excluded_ips, address_offset, None)
+    }
+
+    /// Connect and, on a server known to pipeline, select `initial_group`
+    /// inside the session-setup write. An unselectable group is not an
+    /// error here; the lane walks its candidate list afterwards.
+    pub fn connect_with_ip_policy_for_group(
+        config: &ServerConfig,
+        excluded_ips: &[IpAddr],
+        address_offset: usize,
+        initial_group: Option<&str>,
+    ) -> Result<Self> {
+        Self::connect_with_ip_policy_with_backend(
+            config,
+            excluded_ips,
+            address_offset,
+            None,
+            initial_group,
+        )
     }
 
     /// `backend_override` bypasses env/platform backend selection; tests use
@@ -570,6 +594,7 @@ impl BlockingNntpConnection {
         excluded_ips: &[IpAddr],
         address_offset: usize,
         backend_override: Option<NntpTlsBackend>,
+        initial_group: Option<&str>,
     ) -> Result<Self> {
         if config.starttls {
             return Err(NntpError::MalformedResponse(
@@ -589,7 +614,13 @@ impl BlockingNntpConnection {
                     tcp.set_write_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
                         .map_err(NntpError::Io)?;
                     let remote_addr = tcp.peer_addr().unwrap_or(addr);
-                    return Self::from_tcp(config, tcp, remote_addr, backend_override);
+                    return Self::from_tcp(
+                        config,
+                        tcp,
+                        remote_addr,
+                        backend_override,
+                        initial_group,
+                    );
                 }
                 Err(error) => last_error = Some(error),
             }
@@ -605,6 +636,7 @@ impl BlockingNntpConnection {
         tcp: TcpStream,
         remote_addr: SocketAddr,
         backend_override: Option<NntpTlsBackend>,
+        initial_group: Option<&str>,
     ) -> Result<Self> {
         let transport = if config.tls {
             let backend = if config.tls_name_mismatch_certificate_der.is_some() {
@@ -612,7 +644,10 @@ impl BlockingNntpConnection {
             } else {
                 match backend_override {
                     Some(backend) => backend,
-                    None => selected_blocking_tls_backend()?,
+                    None => tls_backend_for_preference(
+                        selected_blocking_tls_backend()?,
+                        config.tls_cipher_preference,
+                    ),
                 }
             };
             match backend {
@@ -622,6 +657,7 @@ impl BlockingNntpConnection {
                         &config.host,
                         config.tls_ca_cert.as_deref(),
                         config.tls_name_mismatch_certificate_der.as_deref(),
+                        config.tls_cipher_preference,
                         config.command_timeout.max(MIN_TIMEOUT),
                     )?))
                 }
@@ -669,15 +705,22 @@ impl BlockingNntpConnection {
             _ => return Err(NntpError::unexpected(greeting.code, &greeting.message)),
         }
 
-        let resp = conn.send_command(&Command::ModeReader)?;
-        if resp.code.is_error() && resp.code.raw() != 500 {
-            warn!(code = resp.code.raw(), "blocking MODE READER failed");
-        }
-        if let (Some(user), Some(pass)) = (&config.username, &config.password) {
-            let user = user.clone();
-            let pass = pass.clone();
-            conn.authenticate(&user, &pass)?;
-            conn.credentials = Some((user, pass));
+        if matches!(
+            config.pipelining,
+            crate::connection::PipeliningCapability::Known(true)
+        ) {
+            conn.pipelined_session_setup(config, initial_group)?;
+        } else {
+            let resp = conn.send_command(&Command::ModeReader)?;
+            if resp.code.is_error() && resp.code.raw() != 500 {
+                warn!(code = resp.code.raw(), "blocking MODE READER failed");
+            }
+            if let (Some(user), Some(pass)) = (&config.username, &config.password) {
+                let user = user.clone();
+                let pass = pass.clone();
+                conn.authenticate(&user, &pass)?;
+                conn.credentials = Some((user, pass));
+            }
         }
         if matches!(
             config.pipelining,
@@ -695,6 +738,80 @@ impl BlockingNntpConnection {
 
     pub fn capabilities(&self) -> &Capabilities {
         &self.capabilities
+    }
+
+    pub fn current_group(&self) -> Option<&str> {
+        self.current_group.as_deref()
+    }
+
+    /// Session setup for a server known to pipeline: MODE READER, AUTHINFO
+    /// USER, AUTHINFO PASS and the first GROUP leave in one flush and are
+    /// answered in order (RFC 4644). When the server authenticates on the
+    /// username alone (281) its answer to the surplus password is consumed
+    /// and ignored.
+    fn pipelined_session_setup(
+        &mut self,
+        config: &ServerConfig,
+        initial_group: Option<&str>,
+    ) -> Result<()> {
+        let credentials = match (&config.username, &config.password) {
+            (Some(user), Some(pass)) => Some((user.clone(), pass.clone())),
+            _ => None,
+        };
+        debug!(
+            auth = credentials.is_some(),
+            group = initial_group.is_some(),
+            "sending pipelined blocking session setup"
+        );
+        self.write_command_frame(&Command::ModeReader)?;
+        if let Some((user, pass)) = &credentials {
+            self.write_command_frame(&Command::AuthInfoUser(user.clone()))?;
+            self.write_command_frame(&Command::AuthInfoPass(pass.clone()))?;
+        }
+        if let Some(group) = initial_group {
+            self.write_command_frame(&Command::Group(group.to_string()))?;
+        }
+        self.flush_commands()?;
+
+        let mode_reader = self.read_response()?;
+        if mode_reader.code.is_error() && mode_reader.code.raw() != 500 {
+            warn!(code = mode_reader.code.raw(), "blocking MODE READER failed");
+        }
+
+        if let Some((user, pass)) = credentials {
+            let user_resp = self.read_response()?;
+            match user_resp.code.raw() {
+                281 => {
+                    let _ = self.read_response()?;
+                }
+                381 => {
+                    let pass_resp = self.read_response()?;
+                    match pass_resp.code.raw() {
+                        281 => {}
+                        481 => return Err(NntpError::AuthenticationFailed),
+                        482 => return Err(NntpError::AuthenticationRejected),
+                        _ => {
+                            return Err(NntpError::from_status(pass_resp.code, &pass_resp.message));
+                        }
+                    }
+                }
+                _ => return Err(NntpError::from_status(user_resp.code, &user_resp.message)),
+            }
+            self.credentials = Some((user, pass));
+        }
+
+        if let Some(group) = initial_group {
+            let group_resp = self.read_response()?;
+            if group_resp.code.is_error() {
+                debug!(
+                    code = group_resp.code.raw(),
+                    group, "pipelined blocking GROUP not selected"
+                );
+            } else {
+                self.current_group = Some(group.to_string());
+            }
+        }
+        Ok(())
     }
 
     pub fn stats(&self) -> BlockingLaneStats {
@@ -1383,6 +1500,7 @@ impl BlockingManualTlsStream {
         host: &str,
         ca_cert_path: Option<&std::path::Path>,
         adopted_name_mismatch_certificate_der: Option<&[u8]>,
+        cipher_preference: TlsCipherPreference,
         timeout: Duration,
     ) -> Result<Self> {
         tcp.set_read_timeout(Some(timeout)).map_err(NntpError::Io)?;
@@ -1393,6 +1511,7 @@ impl BlockingManualTlsStream {
         let config = build_tls_config_with_name_mismatch_certificate(
             ca_cert_path,
             adopted_name_mismatch_certificate_der,
+            cipher_preference,
         )?;
         let server_name = make_server_name(host)?;
         let session = RustlsSession::new(config, server_name)?;
@@ -2293,6 +2412,7 @@ mod tests {
             tls_ca_cert: Some(ca_path.clone()),
             tls_name_mismatch_certificate_der: None,
             pipelining: crate::connection::PipeliningCapability::Probe,
+            tls_cipher_preference: TlsCipherPreference::Auto,
         };
         (config, handle, ca_path)
     }
@@ -2371,8 +2491,116 @@ mod tests {
         config: &ServerConfig,
         backend: NntpTlsBackend,
     ) -> BlockingNntpConnection {
-        BlockingNntpConnection::connect_with_ip_policy_with_backend(config, &[], 0, Some(backend))
-            .unwrap()
+        BlockingNntpConnection::connect_with_ip_policy_with_backend(
+            config,
+            &[],
+            0,
+            Some(backend),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A plain server that answers nothing until every expected setup line
+    /// has arrived, so a client that serialized the exchange would hang.
+    fn spawn_blocking_pipelined_setup_server(
+        expected: Vec<&'static str>,
+        responses: &'static [u8],
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            socket.write_all(b"200 ready\r\n").unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut lines = Vec::new();
+            while lines.len() < expected.len() {
+                let mut line = String::new();
+                let read = reader.read_line(&mut line);
+                assert!(
+                    matches!(read, Ok(n) if n > 0),
+                    "client did not pipeline its session setup; received {lines:?}"
+                );
+                lines.push(line);
+            }
+            for (line, prefix) in lines.iter().zip(&expected) {
+                assert!(
+                    line.starts_with(prefix),
+                    "expected {prefix:?} but received {line:?}"
+                );
+            }
+            socket.write_all(responses).unwrap();
+            let mut quit = String::new();
+            let _ = reader.read_line(&mut quit);
+        });
+        (port, handle)
+    }
+
+    fn blocking_pipelined_setup_config(port: u16) -> ServerConfig {
+        ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            username: Some("user".into()),
+            password: Some("pass".into()),
+            pipelining: crate::connection::PipeliningCapability::Known(true),
+            connect_timeout: Duration::from_secs(1),
+            command_timeout: Duration::from_secs(1),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn blocking_known_pipelining_servers_get_setup_and_group_in_one_write() {
+        let (port, handle) = spawn_blocking_pipelined_setup_server(
+            vec![
+                "MODE READER",
+                "AUTHINFO USER user",
+                "AUTHINFO PASS pass",
+                "GROUP alt.test",
+            ],
+            b"200 reader\r\n381 password\r\n281 welcome\r\n211 1 1 1 alt.test\r\n",
+        );
+
+        let mut conn = BlockingNntpConnection::connect_with_ip_policy_for_group(
+            &blocking_pipelined_setup_config(port),
+            &[],
+            0,
+            Some("alt.test"),
+        )
+        .unwrap();
+
+        assert_eq!(conn.current_group(), Some("alt.test"));
+        // The lane's own selection short-circuits on the pipelined group.
+        conn.select_group("alt.test").unwrap();
+        drop(conn);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn blocking_pipelined_setup_maps_a_rejected_password() {
+        let (port, handle) = spawn_blocking_pipelined_setup_server(
+            vec!["MODE READER", "AUTHINFO USER user", "AUTHINFO PASS pass"],
+            b"200 reader\r\n381 password\r\n481 bad password\r\n",
+        );
+
+        let result = BlockingNntpConnection::connect_with_ip_policy(
+            &blocking_pipelined_setup_config(port),
+            &[],
+            0,
+        );
+
+        let Err(error) = result else {
+            panic!("expected a rejected password");
+        };
+        assert!(
+            matches!(error, NntpError::AuthenticationFailed),
+            "{error:?}"
+        );
+        handle.join().unwrap();
     }
 
     fn tls_lane_reads_single_body_response(backend: NntpTlsBackend) {
@@ -3054,6 +3282,7 @@ mod tests {
             "localhost",
             Some(&ca_path),
             None,
+            TlsCipherPreference::Auto,
             Duration::from_secs(5),
         )
         .expect("blocking rustls connect");

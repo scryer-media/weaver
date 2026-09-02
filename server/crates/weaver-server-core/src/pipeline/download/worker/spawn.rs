@@ -381,9 +381,11 @@ impl Pipeline {
         }
 
         // Owned and async lanes share the same provider permits. Idle owned
-        // workers retain their connections for reuse, so release those caches
-        // before an async-only lease (notably PAR2 recovery) tries to acquire.
-        self.owned_download_lane_pool.reset();
+        // workers keep their connections (and permits) cached; when this
+        // async-only lease (notably PAR2 recovery) meets a server with no
+        // permit left, it reclaims exactly one idle owned lane on that server
+        // rather than parking the whole owned fleet and reconnecting it all.
+        let owned_lane_release = self.owned_download_lane_pool.release_handle();
 
         let nntp = Arc::clone(&self.nntp);
         let tx = self.download_done_tx.clone();
@@ -421,6 +423,9 @@ impl Pipeline {
                 None
             };
             for server in selection.eligible {
+                if !nntp.has_available_permit(server) {
+                    owned_lane_release.release_idle_permit(server.0);
+                }
                 match nntp
                     .acquire_body_lane(server, &lease.compatibility.groups)
                     .await

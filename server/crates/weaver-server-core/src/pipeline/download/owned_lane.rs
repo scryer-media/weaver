@@ -10,10 +10,52 @@ use tokio::sync::{mpsc, oneshot};
 const HOT_SHARE_YIELD_CHECK_ARTICLES: usize = 4;
 
 pub(crate) struct OwnedDownloadLanePool {
-    senders: Vec<std_mpsc::Sender<OwnedLanePoolCommand>>,
+    workers: Vec<OwnedLaneWorkerHandle>,
+    release: OwnedLaneReleaseHandle,
     next: AtomicUsize,
     #[cfg(test)]
     reset_calls: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct OwnedLaneWorkerHandle {
+    sender: std_mpsc::Sender<OwnedLanePoolCommand>,
+    /// `server_idx + 1` while the worker sits idle holding a cached lane,
+    /// and with it one of that server's connection permits; 0 otherwise.
+    idle_server: Arc<AtomicUsize>,
+}
+
+/// Cloneable view of the owned-lane pool that async lanes use to reclaim
+/// exactly one idle owned lane's permit from a specific server, instead of
+/// parking the whole fleet on every async lease.
+#[derive(Clone)]
+pub(crate) struct OwnedLaneReleaseHandle {
+    workers: Arc<std::sync::Mutex<Vec<OwnedLaneWorkerHandle>>>,
+}
+
+impl OwnedLaneReleaseHandle {
+    /// Park one owned lane that is idle on `server_idx` so its permit
+    /// returns to the pool. Returns whether such a lane was found; when
+    /// none is, every permit is held by a lane that is actually working
+    /// and the caller simply waits on the semaphore as before.
+    pub(crate) fn release_idle_permit(&self, server_idx: usize) -> bool {
+        let marker = server_idx + 1;
+        let workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for worker in workers.iter() {
+            if worker
+                .idle_server
+                .compare_exchange(marker, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let _ = worker.sender.send(OwnedLanePoolCommand::Reset);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 struct OwnedLaneRun {
@@ -39,7 +81,10 @@ struct CachedOwnedLane {
 impl OwnedDownloadLanePool {
     pub(crate) fn new(worker_count: usize) -> Self {
         let mut pool = Self {
-            senders: Vec::new(),
+            workers: Vec::new(),
+            release: OwnedLaneReleaseHandle {
+                workers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            },
             next: AtomicUsize::new(0),
             #[cfg(test)]
             reset_calls: AtomicUsize::new(0),
@@ -50,16 +95,30 @@ impl OwnedDownloadLanePool {
 
     pub(crate) fn resize(&mut self, worker_count: usize) {
         let worker_count = worker_count.max(1);
-        while self.senders.len() < worker_count {
-            let index = self.senders.len();
-            self.senders.push(spawn_owned_lane_worker(index));
+        while self.workers.len() < worker_count {
+            let index = self.workers.len();
+            let idle_server = Arc::new(AtomicUsize::new(0));
+            let sender = spawn_owned_lane_worker(index, Arc::clone(&idle_server));
+            self.workers.push(OwnedLaneWorkerHandle {
+                sender,
+                idle_server,
+            });
         }
-        self.senders.truncate(worker_count);
+        self.workers.truncate(worker_count);
+        *self
+            .release
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.workers.clone();
+    }
+
+    pub(crate) fn release_handle(&self) -> OwnedLaneReleaseHandle {
+        self.release.clone()
     }
 
     #[cfg(test)]
     pub(crate) fn worker_count(&self) -> usize {
-        self.senders.len()
+        self.workers.len()
     }
 
     #[cfg(test)]
@@ -70,8 +129,8 @@ impl OwnedDownloadLanePool {
     pub(crate) fn reset(&self) {
         #[cfg(test)]
         self.reset_calls.fetch_add(1, Ordering::Relaxed);
-        for sender in &self.senders {
-            let _ = sender.send(OwnedLanePoolCommand::Reset);
+        for worker in &self.workers {
+            let _ = worker.sender.send(OwnedLanePoolCommand::Reset);
         }
     }
 
@@ -88,7 +147,7 @@ impl OwnedDownloadLanePool {
         hot_share_yield_signal: Arc<HotShareYieldSignal>,
         initial_lease: DownloadBatchLease,
     ) -> Result<(), DownloadBatchLease> {
-        if self.senders.is_empty() {
+        if self.workers.is_empty() {
             return Err(initial_lease);
         }
         let command = OwnedLanePoolCommand::Run(Box::new(OwnedLaneRun {
@@ -99,8 +158,9 @@ impl OwnedDownloadLanePool {
             hot_share_yield_signal,
             initial_lease,
         }));
-        let sender_index = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
-        self.senders[sender_index]
+        let sender_index = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+        self.workers[sender_index]
+            .sender
             .send(command)
             .map_err(|error| match error.0 {
                 OwnedLanePoolCommand::Run(run) => run.initial_lease,
@@ -111,30 +171,43 @@ impl OwnedDownloadLanePool {
     }
 }
 
-fn spawn_owned_lane_worker(index: usize) -> std_mpsc::Sender<OwnedLanePoolCommand> {
+fn spawn_owned_lane_worker(
+    index: usize,
+    idle_server: Arc<AtomicUsize>,
+) -> std_mpsc::Sender<OwnedLanePoolCommand> {
     let (tx, rx) = std_mpsc::channel();
     std::thread::Builder::new()
         .name(format!("weaver-nntp-lane-{index}"))
         .spawn(move || {
             crate::runtime::affinity::pin_current_thread_for_hot_download_path();
-            run_owned_lane_worker(rx);
+            run_owned_lane_worker(rx, idle_server);
         })
         .expect("failed to spawn owned blocking NNTP lane");
     tx
 }
 
-fn run_owned_lane_worker(rx: std_mpsc::Receiver<OwnedLanePoolCommand>) {
+fn run_owned_lane_worker(
+    rx: std_mpsc::Receiver<OwnedLanePoolCommand>,
+    idle_server: Arc<AtomicUsize>,
+) {
     let mut cached_lane = None;
     while let Ok(command) = rx.recv() {
         match command {
             OwnedLanePoolCommand::Run(run) => {
+                idle_server.store(0, Ordering::Release);
                 run_owned_blocking_download_lane(&mut cached_lane, *run);
+                let marker = cached_lane
+                    .as_ref()
+                    .map_or(0, |cached: &CachedOwnedLane| cached.lane.server_id().0 + 1);
+                idle_server.store(marker, Ordering::Release);
             }
             OwnedLanePoolCommand::Reset => {
+                idle_server.store(0, Ordering::Release);
                 park_cached_lane(&mut cached_lane);
             }
         }
     }
+    idle_server.store(0, Ordering::Release);
     park_cached_lane(&mut cached_lane);
 }
 
@@ -930,5 +1003,45 @@ mod tests {
             true,
             &alternate_fill
         ));
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    #[test]
+    fn release_idle_permit_claims_only_a_worker_idle_on_that_server() {
+        let pool = OwnedDownloadLanePool::new(3);
+        let handle = pool.release_handle();
+        // Worker 1 sits idle holding a cached lane (and permit) on server 2.
+        pool.workers[1].idle_server.store(3, Ordering::Release);
+
+        assert!(!handle.release_idle_permit(0));
+        assert!(!handle.release_idle_permit(1));
+        assert!(handle.release_idle_permit(2));
+        assert_eq!(pool.workers[1].idle_server.load(Ordering::Acquire), 0);
+        // The permit was claimed once; a second reclaim finds nothing idle.
+        assert!(!handle.release_idle_permit(2));
+    }
+
+    #[test]
+    fn release_handle_tracks_pool_resizes() {
+        let mut pool = OwnedDownloadLanePool::new(1);
+        let handle = pool.release_handle();
+        pool.resize(4);
+        pool.workers[3].idle_server.store(1, Ordering::Release);
+
+        assert!(handle.release_idle_permit(0));
+
+        pool.resize(2);
+        assert_eq!(
+            handle
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            2
+        );
     }
 }

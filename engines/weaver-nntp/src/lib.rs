@@ -69,4 +69,5 @@ pub use health::{CooldownReason, HealthConfig, HealthTracker, ServerHealth, Serv
 pub use pool::{
     CapacityProbeOutcome, NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig,
 };
+pub use tls::TlsCipherPreference;
 pub use types::{ArticleId, Capabilities, MultiLineResponse, Response, StatusCode};

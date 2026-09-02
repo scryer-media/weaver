@@ -843,7 +843,7 @@ async fn par2_metadata_bootstrap_does_not_hold_payload_for_late_indexless_discov
 }
 
 #[tokio::test]
-async fn recovery_async_handoff_resets_owned_lane_caches() {
+async fn recovery_async_handoff_keeps_owned_lane_caches() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let work = DownloadWork {
@@ -881,8 +881,8 @@ async fn recovery_async_handoff_resets_owned_lane_caches() {
     pipeline.spawn_download_batch(lease);
     assert_eq!(
         pipeline.owned_download_lane_pool.reset_calls(),
-        1,
-        "async-only recovery must release permits retained by idle owned lanes"
+        0,
+        "async-only recovery reclaims idle owned permits per starved server instead of resetting the owned fleet"
     );
 }
 

@@ -277,6 +277,8 @@ pub struct ServerConfig {
     pub tls_name_mismatch_certificate_der: Option<Vec<u8>>,
     /// Source of the PIPELINING capability for this connection.
     pub pipelining: PipeliningCapability,
+    /// Which AEAD family the TLS ClientHello offers first.
+    pub tls_cipher_preference: crate::tls::TlsCipherPreference,
 }
 
 impl Default for ServerConfig {
@@ -294,6 +296,7 @@ impl Default for ServerConfig {
             tls_ca_cert: None,
             tls_name_mismatch_certificate_der: None,
             pipelining: PipeliningCapability::Probe,
+            tls_cipher_preference: crate::tls::TlsCipherPreference::Auto,
         }
     }
 }
@@ -326,6 +329,8 @@ pub struct NntpConnection {
     tls_ca_cert: Option<std::path::PathBuf>,
     /// Optional adopted leaf certificate, kept for STARTTLS upgrades.
     tls_name_mismatch_certificate_der: Option<Vec<u8>>,
+    /// Cipher family order, kept for STARTTLS upgrades.
+    tls_cipher_preference: crate::tls::TlsCipherPreference,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
     /// Immutable geometry the next decoded article's CRC pass checkpoints at.
@@ -345,17 +350,22 @@ impl NntpConnection {
 
     /// Connect to an NNTP server, perform TLS negotiation and authentication.
     pub async fn connect(config: &ServerConfig) -> Result<Self> {
-        Self::connect_with_ip_policy(config, &[], 0).await
+        Self::connect_with_ip_policy_for_group(config, &[], 0, None).await
     }
 
-    pub(crate) async fn connect_with_ip_policy(
+    /// Connect and, on servers known to pipeline, select `initial_group` in
+    /// the same write as the session setup so a BODY lane starts with no
+    /// extra round trip. An unselectable group is not an error here: the
+    /// lane walks its candidate list afterwards.
+    pub(crate) async fn connect_with_ip_policy_for_group(
         config: &ServerConfig,
         excluded_ips: &[IpAddr],
         address_offset: usize,
+        initial_group: Option<&str>,
     ) -> Result<Self> {
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT);
         let result = tokio::time::timeout(connect_timeout, async {
-            Self::connect_inner(config, excluded_ips, address_offset).await
+            Self::connect_inner(config, excluded_ips, address_offset, initial_group).await
         })
         .await;
 
@@ -369,6 +379,7 @@ impl NntpConnection {
         config: &ServerConfig,
         excluded_ips: &[IpAddr],
         address_offset: usize,
+        initial_group: Option<&str>,
     ) -> Result<Self> {
         debug!(host = %config.host, port = config.port, tls = config.tls, "connecting to NNTP server");
 
@@ -379,6 +390,7 @@ impl NntpConnection {
                 config.port,
                 config.tls_ca_cert.as_deref(),
                 config.tls_name_mismatch_certificate_der.as_deref(),
+                config.tls_cipher_preference,
                 excluded_ips,
                 address_offset,
             )
@@ -416,6 +428,7 @@ impl NntpConnection {
             credentials: None,
             tls_ca_cert: config.tls_ca_cert.clone(),
             tls_name_mismatch_certificate_der: config.tls_name_mismatch_certificate_der.clone(),
+            tls_cipher_preference: config.tls_cipher_preference,
             transfer_control: None,
             body_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
@@ -437,18 +450,25 @@ impl NntpConnection {
             conn.do_starttls().await?;
         }
 
-        // 4. MODE READER is safe to issue even when unsupported, and avoids a
-        // capability round trip on every pooled runtime connection.
-        debug!("sending MODE READER");
-        let resp = conn.send_command(&Command::ModeReader).await?;
-        if resp.code.is_error() && resp.code.raw() != 500 {
-            warn!(code = resp.code.raw(), "MODE READER failed");
-        }
+        // 4-5. Session setup. A server known to pipeline takes MODE READER,
+        // AUTHINFO USER/PASS and the lane's first GROUP in one write and
+        // answers in order, so four serialized round trips become one. A
+        // server of unknown or negative capability keeps the serial exchange.
+        if matches!(config.pipelining, PipeliningCapability::Known(true)) {
+            conn.pipelined_session_setup(config, initial_group).await?;
+        } else {
+            // MODE READER is safe to issue even when unsupported, and avoids
+            // a capability round trip on every pooled runtime connection.
+            debug!("sending MODE READER");
+            let resp = conn.send_command(&Command::ModeReader).await?;
+            if resp.code.is_error() && resp.code.raw() != 500 {
+                warn!(code = resp.code.raw(), "MODE READER failed");
+            }
 
-        // 5. Authenticate if credentials provided
-        if let (Some(user), Some(pass)) = (&config.username, &config.password) {
-            conn.authenticate(user, pass).await?;
-            conn.credentials = Some((user.clone(), pass.clone()));
+            if let (Some(user), Some(pass)) = (&config.username, &config.password) {
+                conn.authenticate(user, pass).await?;
+                conn.credentials = Some((user.clone(), pass.clone()));
+            }
         }
 
         // 6. Validation uses exactly one post-auth capability exchange.
@@ -476,6 +496,7 @@ impl NntpConnection {
             &self.host,
             self.tls_ca_cert.as_deref(),
             self.tls_name_mismatch_certificate_der.as_deref(),
+            self.tls_cipher_preference,
         )
         .await
         {
@@ -504,6 +525,80 @@ impl NntpConnection {
             trace!(caps = ?self.capabilities, "parsed capabilities");
         } else {
             debug!(code = resp.code.raw(), "CAPABILITIES not supported");
+        }
+        Ok(())
+    }
+
+    /// Session setup for a server known to pipeline: MODE READER, AUTHINFO
+    /// USER, AUTHINFO PASS and the first GROUP leave in one flush and are
+    /// answered in order (RFC 4644). The password is sent before the 381
+    /// arrives; when the server authenticates on the username alone (281)
+    /// its answer to the surplus password is consumed and ignored.
+    async fn pipelined_session_setup(
+        &mut self,
+        config: &ServerConfig,
+        initial_group: Option<&str>,
+    ) -> Result<()> {
+        let credentials = match (&config.username, &config.password) {
+            (Some(user), Some(pass)) => Some((user.clone(), pass.clone())),
+            _ => None,
+        };
+        debug!(
+            auth = credentials.is_some(),
+            group = initial_group.is_some(),
+            "sending pipelined session setup"
+        );
+        self.write_command_frame(&Command::ModeReader).await?;
+        if let Some((user, pass)) = &credentials {
+            self.write_command_frame(&Command::AuthInfoUser(user.clone()))
+                .await?;
+            self.write_command_frame(&Command::AuthInfoPass(pass.clone()))
+                .await?;
+        }
+        if let Some(group) = initial_group {
+            self.write_command_frame(&Command::Group(group.to_string()))
+                .await?;
+        }
+        self.flush_commands().await?;
+
+        let mode_reader = self.read_response().await?;
+        if mode_reader.code.is_error() && mode_reader.code.raw() != 500 {
+            warn!(code = mode_reader.code.raw(), "MODE READER failed");
+        }
+
+        if let Some((user, pass)) = credentials {
+            let user_resp = self.read_response().await?;
+            match user_resp.code.raw() {
+                281 => {
+                    debug!("authenticated with username only");
+                    let _ = self.read_response().await?;
+                }
+                381 => {
+                    let pass_resp = self.read_response().await?;
+                    match pass_resp.code.raw() {
+                        281 => debug!("authentication successful"),
+                        481 => return Err(NntpError::AuthenticationFailed),
+                        482 => return Err(NntpError::AuthenticationRejected),
+                        _ => {
+                            return Err(NntpError::from_status(pass_resp.code, &pass_resp.message));
+                        }
+                    }
+                }
+                _ => return Err(NntpError::from_status(user_resp.code, &user_resp.message)),
+            }
+            self.credentials = Some((user, pass));
+        }
+
+        if let Some(group) = initial_group {
+            let group_resp = self.read_response().await?;
+            if group_resp.code.is_error() {
+                debug!(
+                    code = group_resp.code.raw(),
+                    group, "pipelined GROUP not selected"
+                );
+            } else {
+                self.current_group = Some(group.to_string());
+            }
         }
         Ok(())
     }
@@ -1695,6 +1790,13 @@ impl NntpConnection {
         &self.capabilities
     }
 
+    /// IANA name of the negotiated TLS cipher suite, if the transport is TLS.
+    pub fn negotiated_cipher_suite(&self) -> Option<String> {
+        self.transport
+            .as_ref()
+            .and_then(NntpTransport::negotiated_cipher_suite)
+    }
+
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
     }
@@ -1876,6 +1978,7 @@ mod tests {
             credentials: None,
             tls_ca_cert: None,
             tls_name_mismatch_certificate_der: None,
+            tls_cipher_preference: crate::tls::TlsCipherPreference::Auto,
             transfer_control: None,
             body_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
@@ -2493,6 +2596,149 @@ mod tests {
             command_timeout: Duration::from_millis(100),
             ..Default::default()
         }
+    }
+
+    /// A server that answers nothing until every expected setup line has
+    /// arrived, so a client that waited for each answer before sending the
+    /// next command would hang here instead of passing.
+    async fn spawn_pipelined_setup_server(
+        expected: Vec<&'static str>,
+        responses: &'static [u8],
+    ) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"200 ready\r\n").await.unwrap();
+            socket.flush().await.unwrap();
+            let mut lines = Vec::new();
+            let wait = tokio::time::timeout(Duration::from_secs(2), async {
+                while lines.len() < expected.len() {
+                    lines.push(crate::test_support::read_command_line(&mut socket).await);
+                }
+            })
+            .await;
+            assert!(
+                wait.is_ok(),
+                "client did not pipeline its session setup; received {lines:?}"
+            );
+            for (line, prefix) in lines.iter().zip(&expected) {
+                assert!(
+                    line.starts_with(prefix),
+                    "expected {prefix:?} but received {line:?}"
+                );
+            }
+            socket.write_all(responses).await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        port
+    }
+
+    fn pipelined_setup_config(port: u16) -> ServerConfig {
+        ServerConfig {
+            username: Some("user".into()),
+            password: Some("pass".into()),
+            pipelining: PipeliningCapability::Known(true),
+            command_timeout: Duration::from_secs(1),
+            ..scripted_plain_config(port)
+        }
+    }
+
+    #[tokio::test]
+    async fn known_pipelining_servers_get_mode_reader_auth_and_group_in_one_write() {
+        let port = spawn_pipelined_setup_server(
+            vec![
+                "MODE READER",
+                "AUTHINFO USER user",
+                "AUTHINFO PASS pass",
+                "GROUP alt.test",
+            ],
+            b"200 reader\r\n381 password\r\n281 welcome\r\n211 1 1 1 alt.test\r\n",
+        )
+        .await;
+
+        let conn = NntpConnection::connect_with_ip_policy_for_group(
+            &pipelined_setup_config(port),
+            &[],
+            0,
+            Some("alt.test"),
+        )
+        .await
+        .unwrap();
+
+        assert!(conn.is_healthy());
+        assert_eq!(conn.current_group(), Some("alt.test"));
+    }
+
+    #[tokio::test]
+    async fn pipelined_setup_consumes_the_password_answer_after_281_on_user() {
+        let port = spawn_pipelined_setup_server(
+            vec![
+                "MODE READER",
+                "AUTHINFO USER user",
+                "AUTHINFO PASS pass",
+                "GROUP alt.test",
+            ],
+            b"200 reader\r\n281 welcome\r\n482 already authenticated\r\n211 1 1 1 alt.test\r\n",
+        )
+        .await;
+
+        let conn = NntpConnection::connect_with_ip_policy_for_group(
+            &pipelined_setup_config(port),
+            &[],
+            0,
+            Some("alt.test"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(conn.current_group(), Some("alt.test"));
+    }
+
+    #[tokio::test]
+    async fn pipelined_setup_maps_a_rejected_password() {
+        let port = spawn_pipelined_setup_server(
+            vec!["MODE READER", "AUTHINFO USER user", "AUTHINFO PASS pass"],
+            b"200 reader\r\n381 password\r\n481 bad password\r\n",
+        )
+        .await;
+
+        let result = NntpConnection::connect(&pipelined_setup_config(port)).await;
+
+        let Err(error) = result else {
+            panic!("expected a rejected password");
+        };
+        assert!(
+            matches!(error, NntpError::AuthenticationFailed),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipelined_setup_leaves_a_missing_group_unselected() {
+        let port = spawn_pipelined_setup_server(
+            vec![
+                "MODE READER",
+                "AUTHINFO USER user",
+                "AUTHINFO PASS pass",
+                "GROUP alt.gone",
+            ],
+            b"200 reader\r\n381 password\r\n281 welcome\r\n411 no such group\r\n",
+        )
+        .await;
+
+        let conn = NntpConnection::connect_with_ip_policy_for_group(
+            &pipelined_setup_config(port),
+            &[],
+            0,
+            Some("alt.gone"),
+        )
+        .await
+        .unwrap();
+
+        assert!(conn.is_healthy());
+        assert_eq!(conn.current_group(), None);
     }
 
     fn leaked_response(bytes: Vec<u8>) -> &'static [u8] {
