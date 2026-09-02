@@ -32,7 +32,7 @@ pub mod simd;
 pub mod types;
 
 // Convenience re-exports.
-pub use crc::crc32_combine;
+pub use crc::{Crc32Combine, crc32_combine};
 pub use decode::{
     DecodeOptions, DecodeState, DecodedArticle, RapidyencDecodeEnd, RapidyencDecodeProgress,
     RapidyencDecodeState, StreamingArticleDecoder, decode, decode_body,

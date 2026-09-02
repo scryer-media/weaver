@@ -118,34 +118,123 @@ impl Crc32 {
 /// given `crc_a` over `A`, `crc_b` over `B` and `len_b == B.len()`, returns the
 /// CRC32 of `A || B`.
 ///
-/// This forwards to `crc-fast`'s `checksum_combine`, the CRC32 combine that
-/// already ships inside this crate's existing dependency set (Mark Adler's
-/// generalized GF(2) zeros-operator, the same math as the
-/// `par2_rs::checksum::Crc32CombineOp` used by the server pipeline's
-/// part-CRC -> file-CRC composition). No combine is implemented here; the
-/// two are pinned bit-identical for every `len_b >= 1` by
-/// `combine_matches_par2_rs_combine_op` in `tests/segment_combine.rs`.
+/// The combine is the polynomial identity `crc(A || B) = crc(A) * x^(8*len_b) ^ crc(B)`
+/// over GF(2)[x] mod the CRC polynomial, evaluated the way zlib's
+/// `crc32_combine` does since 1.2.12: `x^(8*len_b) mod P` comes from a table
+/// of `x^(2^n) mod P` and a square-and-multiply over the bits of `len_b`, and
+/// the final step is one polynomial multiply of that power by `crc_a`. That is
+/// a few hundred single-word operations per call. The generalized 32x32 (or
+/// 64x64) GF(2) zeros-operator construction in `crc-fast` and
+/// `par2_rs::checksum::Crc32CombineOp` computes the same thing by matrix
+/// squaring, at roughly forty times the cost, which mattered once every
+/// article cut and every checkpoint segment paid it.
 ///
-/// `len_b == 0` is the identity: the CRC32 of an empty range is 0, so
-/// `crc32_combine(a, 0, 0) == a`. (`Crc32CombineOp` short-circuits to `a` for
-/// any `crc_b` at that length, which agrees on every well-formed input and
-/// differs only on a zero-length record carrying a non-zero CRC — malformed,
-/// and unreachable from [`crate::segment::SegmentedCrc32`], which never emits
-/// zero-length segments.)
+/// Bit-identical to `crc_fast::checksum_combine` for every `len_b >= 1`
+/// (`combine_matches_crc_fast` below) and to `Crc32CombineOp`
+/// (`combine_matches_par2_rs_combine_op` in `tests/segment_combine.rs`).
 ///
-/// The free function is used deliberately in preference to
-/// `crc_fast::Digest::combine`: the latter derives `len_b` from the digest's
-/// internal byte counter, which is not valid for a [`Crc32`] that has taken the
-/// folding path (see the type-level note above). Lengths are always passed
-/// explicitly here.
+/// `len_b == 0` is the identity on well-formed input: `x^0` is 1, so the
+/// result is `crc_a ^ crc_b`, and the CRC32 of an empty range is 0, hence
+/// `crc32_combine(a, 0, 0) == a`. This keeps `crc-fast`'s xor semantics
+/// rather than `Crc32CombineOp`'s short-circuit to `a` for any `crc_b` at that
+/// length; the two differ only on a zero-length record carrying a non-zero
+/// CRC — malformed, and unreachable from [`crate::segment::SegmentedCrc32`],
+/// which never emits zero-length segments — and the divergence is pinned by
+/// `zero_length_combine_agrees_on_well_formed_input_only`.
+///
+/// Repeated combines over ranges of one length should build a
+/// [`Crc32Combine`] once and reuse it; that skips the square-and-multiply.
 #[inline]
 pub fn crc32_combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32 {
-    crc_fast::checksum_combine(
-        crc_fast::CrcAlgorithm::Crc32IsoHdlc,
-        u64::from(crc_a),
-        u64::from(crc_b),
-        len_b,
-    ) as u32
+    Crc32Combine::new(len_b).combine(crc_a, crc_b)
+}
+
+/// The reflected CRC-32/ISO-HDLC polynomial.
+const CRC32_POLY_REFLECTED: u32 = 0xEDB8_8320;
+
+/// `x^(2^n) mod P` for `n` in `0..32`, in the reflected representation where
+/// `x^0` is bit 31. The table wraps at 32 because `P` is irreducible over
+/// GF(2), so `x^(2^32) == x` and the powers repeat.
+static X2N_TABLE: [u32; 32] = build_x2n_table();
+
+const fn build_x2n_table() -> [u32; 32] {
+    let mut table = [0u32; 32];
+    table[0] = 1 << 30; // x^1
+    let mut n = 1;
+    while n < 32 {
+        table[n] = multmodp(table[n - 1], table[n - 1]);
+        n += 1;
+    }
+    table
+}
+
+/// Product of two polynomials modulo `P`, reflected representation.
+#[inline]
+const fn multmodp(a: u32, b: u32) -> u32 {
+    if a == 0 {
+        return 0;
+    }
+    let mut m = 1u32 << 31;
+    let mut p = 0u32;
+    let mut b = b;
+    loop {
+        if a & m != 0 {
+            p ^= b;
+            if a & (m - 1) == 0 {
+                break;
+            }
+        }
+        m >>= 1;
+        b = if b & 1 != 0 {
+            (b >> 1) ^ CRC32_POLY_REFLECTED
+        } else {
+            b >> 1
+        };
+    }
+    p
+}
+
+/// `x^(n * 2^k) mod P`.
+#[inline]
+const fn x2nmodp(mut n: u64, mut k: u32) -> u32 {
+    let mut p = 1u32 << 31; // x^0
+    while n != 0 {
+        if n & 1 != 0 {
+            p = multmodp(X2N_TABLE[(k & 31) as usize], p);
+        }
+        n >>= 1;
+        k += 1;
+    }
+    p
+}
+
+/// A CRC32 combine operator for a fixed suffix length: `x^(8*len_b) mod P`,
+/// computed once, so that combining is a single polynomial multiply.
+///
+/// Segment cuts on a fixed checkpoint stride, and articles of one poster's
+/// size, combine ranges of the same length over and over; building the
+/// operator once per length is what keeps those at tens of nanoseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Crc32Combine {
+    /// `x^(8*len_b) mod P`; `x^0` for a zero-length suffix.
+    power: u32,
+}
+
+impl Crc32Combine {
+    /// Build the operator for a suffix of `len_b` bytes.
+    #[inline]
+    pub const fn new(len_b: u64) -> Self {
+        Self {
+            power: x2nmodp(len_b, 3),
+        }
+    }
+
+    /// CRC32 of `A || B` from `crc_a` over `A` and `crc_b` over the suffix
+    /// `B` this operator was built for.
+    #[inline]
+    pub const fn combine(&self, crc_a: u32, crc_b: u32) -> u32 {
+        multmodp(self.power, crc_a) ^ crc_b
+    }
 }
 
 impl Default for Crc32 {
@@ -371,6 +460,116 @@ mod x86_vpclmul {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn combine_matches_crc_fast() {
+        // xorshift64* stream, deterministic.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        };
+        let mut lengths: Vec<u64> = vec![
+            1,
+            2,
+            3,
+            4,
+            7,
+            8,
+            9,
+            31,
+            32,
+            33,
+            255,
+            256,
+            4095,
+            4096,
+            768_000,
+            1 << 20,
+            (1 << 32) - 1,
+            1 << 32,
+            (1 << 32) + 1,
+            1 << 40,
+            u64::MAX >> 1,
+            u64::MAX,
+        ];
+        lengths.extend((0..256).map(|_| 1 + next() % (1 << 26)));
+        lengths.extend((0..64).map(|_| 1 + next() % (1 << 48)));
+        for len_b in lengths {
+            let op = super::Crc32Combine::new(len_b);
+            for _ in 0..16 {
+                let crc_a = next() as u32;
+                let crc_b = next() as u32;
+                let expected = crc_fast::checksum_combine(
+                    crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+                    u64::from(crc_a),
+                    u64::from(crc_b),
+                    len_b,
+                ) as u32;
+                assert_eq!(
+                    super::crc32_combine(crc_a, crc_b, len_b),
+                    expected,
+                    "len_b={len_b}"
+                );
+                assert_eq!(op.combine(crc_a, crc_b), expected, "op len_b={len_b}");
+            }
+        }
+    }
+
+    #[test]
+    fn combine_over_real_bytes_matches_a_single_pass() {
+        let data: Vec<u8> = (0..300_007u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let whole = crc_fast::crc32_iso_hdlc(&data);
+        for split in [
+            0usize,
+            1,
+            2,
+            3,
+            64,
+            4096,
+            65_535,
+            150_000,
+            data.len() - 1,
+            data.len(),
+        ] {
+            let (a, b) = data.split_at(split);
+            let combined = super::crc32_combine(
+                crc_fast::crc32_iso_hdlc(a),
+                crc_fast::crc32_iso_hdlc(b),
+                b.len() as u64,
+            );
+            assert_eq!(combined, whole, "split={split}");
+        }
+    }
+
+    #[test]
+    fn zero_length_suffix_is_the_identity() {
+        assert_eq!(super::crc32_combine(0xdead_beef, 0, 0), 0xdead_beef);
+        assert_eq!(
+            super::Crc32Combine::new(0).combine(0x1234_5678, 0),
+            0x1234_5678
+        );
+        // crc-fast's xor semantics on a malformed zero-length record, kept.
+        assert_eq!(
+            super::crc32_combine(0xdead_beef, 0x11, 0),
+            0xdead_beef ^ 0x11
+        );
+    }
+
+    #[test]
+    fn x2n_table_starts_at_x_and_squares() {
+        assert_eq!(super::X2N_TABLE[0], 1 << 30);
+        // x^2 = x * x.
+        assert_eq!(super::X2N_TABLE[1], super::multmodp(1 << 30, 1 << 30));
+        // x^0 is the multiplicative identity.
+        assert_eq!(super::multmodp(1 << 31, 0xabcd_ef01), 0xabcd_ef01);
+        // Combining an eight-byte suffix uses x^64 = X2N_TABLE[6].
+        assert_eq!(super::x2nmodp(8, 3), super::X2N_TABLE[6]);
+    }
+
     use super::*;
 
     #[test]

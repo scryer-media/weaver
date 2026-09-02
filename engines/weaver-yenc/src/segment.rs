@@ -52,7 +52,7 @@
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use crate::crc::{Crc32, crc32_combine};
+use crate::crc::{Crc32, Crc32Combine, crc32_combine};
 
 /// Maximum number of distinct PAR2 slice grids admitted to one checkpoint
 /// plan. Keeping this small bounds both boundary selection and the work a
@@ -261,6 +261,10 @@ pub struct SegmentedCrc32 {
     /// arithmetic failure. The final result is one coarse article segment.
     collapsed: bool,
     collapse_reason: Option<CheckpointCollapseReason>,
+    /// The combine operator for the last cut's segment length. Segments on a
+    /// checkpoint stride all have the stride's length, so the operator is
+    /// built once per stride rather than once per cut.
+    combine_memo: Option<(u64, Crc32Combine)>,
 }
 
 impl SegmentedCrc32 {
@@ -326,6 +330,21 @@ impl SegmentedCrc32 {
             total_len: 0,
             collapsed: collapse_reason.is_some(),
             collapse_reason,
+            combine_memo: None,
+        }
+    }
+
+    /// The combine operator for a closed segment of `len` bytes, reusing the
+    /// last one when the length repeats.
+    #[inline]
+    fn combine_for(&mut self, len: u64) -> Crc32Combine {
+        match self.combine_memo {
+            Some((memo_len, op)) if memo_len == len => op,
+            _ => {
+                let op = Crc32Combine::new(len);
+                self.combine_memo = Some((len, op));
+                op
+            }
         }
     }
 
@@ -487,7 +506,7 @@ impl SegmentedCrc32 {
             len,
             crc32,
         });
-        self.closed_crc = crc32_combine(self.closed_crc, crc32, len);
+        self.closed_crc = self.combine_for(len).combine(self.closed_crc, crc32);
         self.closed_len = self.total_len;
         self.open_offset = self.cursor;
         if let CheckpointPlan::Single(size) = self.checkpoint_plan {
@@ -658,11 +677,20 @@ fn next_boundary_after(offset: u64, block_size: NonZeroU64) -> Option<u64> {
 pub fn combine_contiguous(segments: &[Segment]) -> Option<Segment> {
     let (first, rest) = segments.split_first()?;
     let mut folded = *first;
+    let mut memo: Option<(u64, Crc32Combine)> = None;
     for segment in rest {
         if segment.file_offset != folded.end_offset() {
             return None;
         }
-        folded.crc32 = crc32_combine(folded.crc32, segment.crc32, segment.len);
+        let op = match memo {
+            Some((len, op)) if len == segment.len => op,
+            _ => {
+                let op = Crc32Combine::new(segment.len);
+                memo = Some((segment.len, op));
+                op
+            }
+        };
+        folded.crc32 = op.combine(folded.crc32, segment.crc32);
         folded.len += segment.len;
     }
     Some(folded)
