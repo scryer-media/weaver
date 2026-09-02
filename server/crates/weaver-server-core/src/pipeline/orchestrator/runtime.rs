@@ -1888,6 +1888,7 @@ impl DiskWriteHandleCache {
 fn run_disk_write_owner(rx: std::sync::mpsc::Receiver<DiskWriteCommand>) {
     crate::runtime::affinity::pin_current_thread_for_hot_download_path();
     let mut handles = DiskWriteHandleCache::default();
+    let mut last_sweep = Instant::now();
     loop {
         match rx.recv_timeout(DISK_WRITE_OWNER_SWEEP_INTERVAL) {
             Ok(DiskWriteCommand::Batch {
@@ -1927,7 +1928,13 @@ fn run_disk_write_owner(rx: std::sync::mpsc::Receiver<DiskWriteCommand>) {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        handles.close_idle(DISK_WRITE_HANDLE_IDLE_TTL);
+        // The idle sweep is a 30 s backstop, not per-batch bookkeeping: a busy
+        // owner walks its handles once per sweep interval, an idle one on the
+        // receive timeout, instead of after every command it serves.
+        if last_sweep.elapsed() >= DISK_WRITE_OWNER_SWEEP_INTERVAL {
+            handles.close_idle(DISK_WRITE_HANDLE_IDLE_TTL);
+            last_sweep = Instant::now();
+        }
     }
 }
 
