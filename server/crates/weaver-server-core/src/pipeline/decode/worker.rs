@@ -623,13 +623,21 @@ impl Pipeline {
         }
 
         let ranges = self.deferred_file_hash_ranges.get(&file_id);
+        // Building a combine operator is a 32x32 GF(2) matrix exponentiation,
+        // and nearly every deferred range of a file has the same length (the
+        // poster's article size). Cache the operator per length so a file with
+        // thousands of out-of-order articles builds a handful, not thousands.
+        let mut combine_ops: std::collections::HashMap<usize, par2_rs::checksum::Crc32CombineOp> =
+            std::collections::HashMap::new();
         while bytes_fed < total_bytes {
             let range = ranges.and_then(|ranges| ranges.get(&bytes_fed))?;
             let len = range.len as u64;
             if len == 0 {
                 return None;
             }
-            let op = par2_rs::checksum::Crc32CombineOp::new(len);
+            let op = combine_ops
+                .entry(range.len)
+                .or_insert_with(|| par2_rs::checksum::Crc32CombineOp::new(len));
             crc32 = op.combine(crc32, range.part_crc);
             all_parts_crc_verified &= range.part_crc_verified;
             bytes_fed = bytes_fed.checked_add(len)?;
