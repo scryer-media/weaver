@@ -3,8 +3,8 @@ use std::time::Duration;
 use bytes::{Buf, BytesMut};
 use thiserror::Error;
 use weaver_yenc::{
-    CheckpointPlan, DecodeResult, DecodeState, RapidyencDecodeEnd, YencError, YencMetadata,
-    decode_body_chunk_until_control, finish_streaming_result, header,
+    CheckpointPlan, DecodeResult, DecodeState, RapidyencDecodeEnd, RapidyencDecodeProgress,
+    YencError, YencMetadata, decode_body_chunk_until_control, finish_streaming_result, header,
 };
 
 use crate::error::NntpError;
@@ -16,6 +16,11 @@ use crate::uu::{self, UuDecoder, UuOutcome};
 const MAX_CONTROL_LINE: usize = 16 * 1024;
 const MAX_ARTICLE_RESERVE: usize = 16 * 1024 * 1024;
 const OUTPUT_BATCH_TARGET: usize = 512 * 1024;
+/// Wire bytes handed to the kernel once a sized batch is full. The truthful
+/// continuation is the trailer, which produces nothing, so the probe only has
+/// to be long enough to reach `=y`; a header that lied fills the probe with
+/// data instead and the batch grows from there.
+const TAIL_PROBE_INPUT: usize = 256;
 /// How many bytes of leading junk may precede `=ybegin` before the article is
 /// declared header-less. Bounded so a 222 response whose body never contains a
 /// yEnc header cannot make the header scan run for the whole article.
@@ -191,6 +196,9 @@ pub struct FusedYencArticleStats {
     pub nntp_terminator_bytes: u64,
     pub leftover_bytes_after_terminator: u64,
     pub buffer_compactions: u64,
+    /// Times the output batch grew past its reservation: a header that lied,
+    /// or an unreserved article growing amortised. Zero for a truthful header.
+    pub output_grow_events: u64,
     pub transport_read: TransportReadStats,
     pub read_poll_cpu: Duration,
     pub fused_decode_cpu: Duration,
@@ -238,6 +246,12 @@ pub struct FusedYencArticleDecoder {
     output: Vec<u8>,
     output_chunks: Vec<Box<[u8]>>,
     output_reserved: bool,
+    /// The batch was sized from a declared length, so a full batch means the
+    /// trailer is next and the kernel must not grow it to find that out.
+    output_sized: bool,
+    /// Where a full sized batch's next input decodes; empty for a truthful
+    /// header, the lie's first bytes otherwise.
+    tail_scratch: Vec<u8>,
     profile_cpu: bool,
     checkpoint_plan: CheckpointPlan,
     stats: FusedYencArticleStats,
@@ -257,6 +271,8 @@ impl FusedYencArticleDecoder {
             output: Vec::new(),
             output_chunks: Vec::new(),
             output_reserved: false,
+            output_sized: false,
+            tail_scratch: Vec::new(),
             profile_cpu: false,
             checkpoint_plan: CheckpointPlan::None,
             stats: FusedYencArticleStats::default(),
@@ -494,11 +510,20 @@ impl FusedYencArticleDecoder {
         }
 
         self.stats.decode_calls += 1;
-        let progress = decode_body_chunk_until_control(
-            &mut self.decode_state,
-            &src[..input_len],
-            &mut self.output,
-        )?;
+        let progress = if self.sized_batch_is_full() {
+            self.decode_body_tail(&src[..input_len])?
+        } else {
+            let capacity = self.output.capacity();
+            let progress = decode_body_chunk_until_control(
+                &mut self.decode_state,
+                &src[..input_len],
+                &mut self.output,
+            )?;
+            if self.output.capacity() != capacity {
+                self.stats.output_grow_events += 1;
+            }
+            progress
+        };
         self.advance_src(src, progress.source_consumed);
         self.flush_ready_output();
 
@@ -737,6 +762,7 @@ impl FusedYencArticleDecoder {
         }
 
         self.output.reserve_exact(reserve - self.output.capacity());
+        self.output_sized = true;
     }
 
     fn flush_output(&mut self) {
@@ -768,19 +794,49 @@ impl FusedYencArticleDecoder {
     /// was already sized for the whole part, and the doubling lands exactly on
     /// the last chunk, whose decoded bytes fit the room that is left. So the
     /// input is trimmed to the spare capacity first — the same policy as
-    /// sabctools ("prefer trimming the chunk over growing the buffer") — and
-    /// the batch grows only once the room is genuinely gone before the trailer,
-    /// which is a header that lied. An unreserved batch (no declared size) has
-    /// nothing exact to defend and keeps growing amortised as before.
+    /// sabctools ("prefer trimming the chunk over growing the buffer"). Once a
+    /// sized batch is full the only truthful continuation is the trailer, so
+    /// the input is trimmed to a short probe that decodes through scratch (see
+    /// [`Self::decode_body_tail`]) rather than doubling a finished batch to
+    /// consume two bytes of line ending. An unreserved batch (no declared
+    /// size) has nothing exact to defend and keeps growing amortised as before.
     fn next_body_input_len(&self, available: usize) -> usize {
         let batch_room = OUTPUT_BATCH_TARGET.saturating_sub(self.output.len());
         let spare = self.output.capacity() - self.output.len();
-        let room = if self.output_reserved && spare > 0 {
+        let room = if self.sized_batch_is_full() {
+            batch_room.min(TAIL_PROBE_INPUT)
+        } else if self.output_reserved && spare > 0 {
             spare.min(batch_room)
         } else {
             batch_room
         };
         available.min(room)
+    }
+
+    /// A batch sized from the header with no room left: the declared bytes are
+    /// all decoded, and whatever comes next is either the trailer or a lie.
+    fn sized_batch_is_full(&self) -> bool {
+        self.output_sized && self.output.capacity() == self.output.len()
+    }
+
+    /// Decode past a full sized batch without growing it.
+    ///
+    /// The kernel reserves one output byte per input byte before it looks at
+    /// the input, so feeding it the trailer through the batch doubles the
+    /// batch (and a later shrink reallocates it back) to write nothing. The
+    /// probe decodes into a small scratch instead; bytes that do come out are
+    /// a header that understated the part, and they are appended so the batch
+    /// grows amortised exactly as an unreserved one would.
+    fn decode_body_tail(&mut self, input: &[u8]) -> Result<RapidyencDecodeProgress> {
+        self.tail_scratch.clear();
+        let progress =
+            decode_body_chunk_until_control(&mut self.decode_state, input, &mut self.tail_scratch)?;
+        if !self.tail_scratch.is_empty() {
+            self.stats.output_grow_events += 1;
+            self.output.extend_from_slice(&self.tail_scratch);
+            self.tail_scratch.clear();
+        }
+        Ok(progress)
     }
 
     fn next_output_capacity(&self) -> usize {
@@ -1597,6 +1653,86 @@ mod tests {
                 decoder.output.capacity()
             );
         }
+    }
+
+    // ── E20: a sized batch is allocated once ─────────────────────────────
+
+    /// A truthful header's batch is sized once and never touched again: not
+    /// mid-article, and not on the finishing call that consumes the trailer,
+    /// where the kernel's own reserve used to double it for nothing.
+    #[test]
+    fn fused_never_grows_a_sized_batch_for_a_truthful_header() {
+        for size in [37usize, 4096, 100 * 1024 + 7, OUTPUT_BATCH_TARGET + 999] {
+            let original: Vec<u8> = (0..size).map(|idx| (idx % 251) as u8).collect();
+            let mut article = Vec::new();
+            encode(&original, &mut article, 128, "exact.bin").unwrap();
+            let article = dot_stuff_lines(&article);
+            let transcript = transcript(&article, b"223 next\r\n");
+            let batch_cap = size.min(OUTPUT_BATCH_TARGET);
+
+            for chunk_len in [1usize, 1024, 16 * 1024, usize::MAX] {
+                let mut decoder = FusedYencArticleDecoder::new();
+                let mut src = BytesMut::new();
+                let mut finished = None;
+                for chunk in transcript.chunks(chunk_len.min(transcript.len())) {
+                    src.extend_from_slice(chunk);
+                    finished = decoder.decode_available(&mut src).unwrap();
+                    if finished.is_some() {
+                        break;
+                    }
+                    assert!(
+                        decoder.output.capacity() <= batch_cap,
+                        "size={size} chunk={chunk_len}: batch grew to {}",
+                        decoder.output.capacity()
+                    );
+                }
+                let finished = finished.expect("fused decoder did not finish");
+                assert_eq!(
+                    finished.stats.output_grow_events, 0,
+                    "size={size} chunk={chunk_len}"
+                );
+                assert_eq!(
+                    finished.to_data(),
+                    original,
+                    "size={size} chunk={chunk_len}"
+                );
+            }
+        }
+    }
+
+    /// A header that understates its part fills the sized batch early. The
+    /// tail probe must carry the extra bytes into the batch (growing it, and
+    /// saying so) rather than losing them, so the size check sees the truth.
+    #[test]
+    fn fused_grows_past_a_sized_batch_only_when_the_header_lied() {
+        let original: Vec<u8> = (0..5000usize).map(|idx| (idx % 251) as u8).collect();
+        let mut article = Vec::new();
+        encode(&original, &mut article, 128, "short.bin").unwrap();
+        let declared = article
+            .windows(b"size=5000".len())
+            .position(|window| window == b"size=5000")
+            .expect("encoder declared a size");
+        let mut lying = article;
+        lying[declared..declared + b"size=5000".len()].copy_from_slice(b"size=4000");
+        let transcript = transcript(&dot_stuff_lines(&lying), b"223 next\r\n");
+
+        let mut decoder = FusedYencArticleDecoder::new();
+        let mut src = BytesMut::from(transcript.as_slice());
+        let err = decoder.decode_available(&mut src).unwrap_err();
+        // `expected` is the lie and `actual` the trailer's truth: had the tail
+        // probe dropped bytes, the earlier check of decoded length against the
+        // trailer would have failed first, with 5000 as `expected`.
+        assert!(
+            matches!(
+                err,
+                FusedYencError::Yenc(YencError::SizeMismatch {
+                    expected: 4000,
+                    actual: 5000
+                })
+            ),
+            "unexpected error {err}"
+        );
+        assert!(decoder.stats.output_grow_events >= 1);
     }
 
     // ── E12: decoded batches are delivered as they are produced ──────────
