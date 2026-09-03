@@ -1384,7 +1384,7 @@ async fn download_lanes_send_bracketed_message_ids_on_the_wire() {
     let spec = segmented_job_spec(
         "Silver Horizon Wire Frame",
         "wire-frame.bin",
-        &vec![payload.len() as u32; TOTAL_SEGMENTS],
+        &[payload.len() as u32; TOTAL_SEGMENTS],
     );
 
     harness
