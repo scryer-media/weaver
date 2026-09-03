@@ -116,11 +116,7 @@ async fn spawn_capacity_limited_body_server(
                                 .strip_prefix('<')
                                 .and_then(|rest| rest.strip_suffix('>'))
                             else {
-                                if writer
-                                    .write_all(b"430 No such article\r\n")
-                                    .await
-                                    .is_err()
-                                {
+                                if writer.write_all(b"430 No such article\r\n").await.is_err() {
                                     break;
                                 }
                                 continue;

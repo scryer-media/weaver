@@ -441,8 +441,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                                         | DownloadFailureKind::Unrequested
                                 )
                         );
-                        batch_clean_for_refill &=
-                            download_outcome_keeps_connection(&result.data);
+                        batch_clean_for_refill &= download_outcome_keeps_connection(&result.data);
                         policy_blocked_for_refill |= policy_outcome;
                         results.push(result);
                     }
