@@ -129,24 +129,68 @@ pub(crate) fn wait_for_server(port: u16, timeout: Duration) -> bool {
 /// mounted, so the wrapper would open a window on an error page. Asking for
 /// the document itself is the only readiness signal that means what the user
 /// is about to see is there.
+///
+/// A `200` is not enough either. The wrapper owns a fixed port, and anything
+/// else on the machine can be listening on it; accepting whatever answers
+/// would skip starting the bundled server and load a stranger's page into the
+/// window. The document has to be one of Weaver's.
 pub(crate) fn server_ready(port: u16) -> bool {
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
-    if stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
+    probe_port(port) == PortProbe::Weaver
+}
+
+/// What one probe of the wrapper's port found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PortProbe {
+    /// Nothing answered: the port is free, or a server is still starting. The
+    /// server binds its listener before it serves, so a connection accepted in
+    /// that window simply gets no response and lands here too.
+    NotAnswering,
+    /// Something answered, and it was not Weaver's entry page.
+    Foreign,
+    /// Weaver's entry page came back.
+    Weaver,
+}
+
+pub(crate) fn probe_port(port: u16) -> PortProbe {
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
+    );
+    match http_exchange(port, request.as_bytes(), READY_PROBE_TIMEOUT) {
+        None => PortProbe::NotAnswering,
+        Some(response) if is_weaver_document(&response) => PortProbe::Weaver,
+        Some(_) => PortProbe::Foreign,
+    }
+}
+
+/// How long one readiness probe waits on the socket. Short: the probe runs on
+/// a timer while the splash screen is up, and a server that takes longer than
+/// this to hand over its entry page is not ready.
+const READY_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Whether a response to `GET /` is Weaver's entry page rather than some other
+/// program's.
+///
+/// Every document the server answers `/` with — the SPA shell, the login page,
+/// the setup wizard, and the pages that tell an unadmitted browser why it is
+/// not getting in — is titled with the product name, and the server's own
+/// tests pin those titles. The title is the one thing all of them share that a
+/// listener which merely happens to be on the port would not produce.
+pub(crate) fn is_weaver_document(response: &HttpResponse) -> bool {
+    if response.status != 200 {
         return false;
     }
-    let mut response = [0u8; 128];
-    let Ok(read) = stream.read(&mut response) else {
+    let Ok(body) = std::str::from_utf8(&response.body) else {
         return false;
     };
-    response[..read].starts_with(b"HTTP/1.1 200") || response[..read].starts_with(b"HTTP/1.0 200")
+    html_title(body).is_some_and(|title| title.contains("Weaver"))
+}
+
+/// The text of the first `<title>` element, if the document has one.
+fn html_title(html: &str) -> Option<&str> {
+    let lower = html.to_ascii_lowercase();
+    let start = lower.find("<title>")? + "<title>".len();
+    let end = lower[start..].find("</title>")? + start;
+    Some(html[start..end].trim())
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +303,7 @@ fn fetch_session_cookie(port: u16) -> Option<String> {
     let request = format!(
         "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
     );
-    let response = http_exchange(port, request.as_bytes())?;
+    let response = http_exchange(port, request.as_bytes(), QUEUE_FETCH_TIMEOUT)?;
     set_cookie_value(&response.headers, SESSION_COOKIE)
 }
 
@@ -279,18 +323,18 @@ fn post_graphql(port: u16, cookie: Option<&str>) -> Option<HttpResponse> {
     }
     request.push_str("\r\n");
     request.push_str(&body);
-    http_exchange(port, request.as_bytes())
+    http_exchange(port, request.as_bytes(), QUEUE_FETCH_TIMEOUT)
 }
 
 /// One request and one response on a connection the server closes.
 ///
 /// `Connection: close` is what makes reading to EOF a complete response, so
 /// this needs no keep-alive framing of its own.
-fn http_exchange(port: u16, request: &[u8]) -> Option<HttpResponse> {
+fn http_exchange(port: u16, request: &[u8], timeout: Duration) -> Option<HttpResponse> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&address, QUEUE_FETCH_TIMEOUT).ok()?;
-    stream.set_read_timeout(Some(QUEUE_FETCH_TIMEOUT)).ok()?;
-    stream.set_write_timeout(Some(QUEUE_FETCH_TIMEOUT)).ok()?;
+    let mut stream = TcpStream::connect_timeout(&address, timeout).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
     stream.write_all(request).ok()?;
 
     let mut raw = Vec::new();
@@ -642,8 +686,17 @@ impl ServerSupervisor {
     /// here — but it is also why a caller that has just torn the server down
     /// must wait for the old process to disappear first.
     pub(crate) fn start(&mut self) -> Result<(), String> {
-        if server_ready(self.port) {
-            return Ok(());
+        match probe_port(self.port) {
+            PortProbe::Weaver => return Ok(()),
+            // Spawning a server here would only make it fail to bind, and the
+            // user would be told Weaver timed out rather than what is wrong.
+            PortProbe::Foreign => {
+                return Err(format!(
+                    "port {} is already in use by a program that is not Weaver; stop it, or run `weaver serve --port {}` yourself",
+                    self.port, self.port
+                ));
+            }
+            PortProbe::NotAnswering => {}
         }
         if let Some(child) = self.server.as_mut() {
             match child.try_wait() {
@@ -853,10 +906,10 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        PopoverContent, QueueRow, SMOKE_BODY, SMOKE_RESPONSE, app_origin, app_url, decode_chunked,
-        desktop_profile_dir_from, format_bytes, format_speed, http_origin,
-        opens_in_external_browser, parse_http_response, popover_content_from_graphql, row_detail,
-        set_cookie_value,
+        HttpResponse, PopoverContent, QueueRow, SMOKE_BODY, SMOKE_RESPONSE, app_origin, app_url,
+        decode_chunked, desktop_profile_dir_from, format_bytes, format_speed, http_origin,
+        is_weaver_document, opens_in_external_browser, parse_http_response,
+        popover_content_from_graphql, row_detail, set_cookie_value,
     };
 
     #[test]
@@ -946,6 +999,51 @@ mod tests {
             headers.contains(&format!("Content-Length: {}", SMOKE_BODY.len())),
             "declared length must match the body: {headers}"
         );
+    }
+
+    fn document(status: u16, body: &str) -> HttpResponse {
+        HttpResponse {
+            status,
+            headers: vec![("content-type".to_string(), "text/html".to_string())],
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn every_page_the_server_answers_the_root_with_counts_as_ready() {
+        for body in [
+            "<!doctype html><html><head><title>Weaver</title></head><body></body></html>",
+            "<!doctype html><html><head>\n<title>Weaver - Login</title>\n</head></html>",
+            "<html><head><TITLE>Set up Weaver</TITLE></head></html>",
+        ] {
+            assert!(is_weaver_document(&document(200, body)), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_stranger_on_the_port_is_not_a_ready_server() {
+        // Another local program answering 200 must not be mistaken for Weaver,
+        // or the wrapper would skip starting its own server and show its page.
+        assert!(!is_weaver_document(&document(
+            200,
+            "<html><head><title>Grafana</title></head><body></body></html>"
+        )));
+        assert!(!is_weaver_document(&document(200, "{\"status\":\"ok\"}")));
+        assert!(!is_weaver_document(&document(200, "")));
+    }
+
+    #[test]
+    fn a_weaver_page_that_is_not_a_200_is_not_ready_yet() {
+        assert!(!is_weaver_document(&document(
+            503,
+            "<html><head><title>Weaver</title></head></html>"
+        )));
+    }
+
+    #[test]
+    fn the_smoke_document_is_a_weaver_page() {
+        let response = parse_http_response(SMOKE_RESPONSE.as_bytes()).unwrap();
+        assert!(is_weaver_document(&response));
     }
 
     // -- the queue snapshot the popover shows --------------------------------
