@@ -148,6 +148,25 @@ impl NntpError {
         }
     }
 
+    /// Whether this error is the server's "I do not have that article"
+    /// answer (430/423, or the message-id-carrying form the lanes rewrite it
+    /// into).
+    ///
+    /// A not-found answer is a *complete* server response: the status line was
+    /// read in full and no multiline body follows, so the connection is still
+    /// in a known-good state and the next pipelined BODY response is exactly
+    /// where the reader expects it. Callers use this to keep a lane and its
+    /// pipelining proof alive across an article that simply is not on this
+    /// server.
+    pub fn is_article_not_found(&self) -> bool {
+        matches!(
+            self,
+            NntpError::ArticleNotFound
+                | NntpError::NoSuchArticle { .. }
+                | NntpError::NoArticleWithNumber
+        )
+    }
+
     /// Create an `UnexpectedResponse` from a status code and message.
     pub fn unexpected(code: StatusCode, message: impl Into<String>) -> Self {
         NntpError::UnexpectedResponse {

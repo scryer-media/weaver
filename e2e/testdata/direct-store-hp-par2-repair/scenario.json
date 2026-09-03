@@ -1,0 +1,18 @@
+{
+  "slug": "direct-store-hp-par2-repair",
+  "title": "Umber.Tideline.S01E12.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "RAR5 store-method set with `-hp` header and data encryption and PAR2 recovery, damaged by deleting the tail articles of an interior volume. The repair rewrites ciphertext in place under encrypted headers while the set keeps routing direct, and the member must decrypt exactly afterwards.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "umber.tideline.s01e12.mkv": "1eb162bb44962ba081617d34a6d15a4faa8dbe55b5a2fa36cbb76ca27168a876"
+  },
+  "password": "weaver-e2e-direct-password",
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "deleteSubjectContains": [
+    "archive.part2.rar"
+  ],
+  "deleteSubjectTailArticles": 3
+}

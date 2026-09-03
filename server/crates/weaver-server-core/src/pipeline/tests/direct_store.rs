@@ -10356,29 +10356,22 @@ async fn a_lost_article_inside_a_member_repairs_and_reconfirms_the_volume() {
 }
 
 #[tokio::test]
-async fn a_lost_article_inside_an_encrypted_member_demotes_instead_of_repairing() {
+async fn a_lost_article_inside_an_encrypted_member_repairs_and_reconfirms_the_volume() {
     // The encrypted twin of `a_lost_article_inside_a_member_repairs_and_
-    // reconfirms_the_volume`, whose absence let this hide for so long. It pins
-    // a **known limit**, not the behaviour anyone wants.
+    // reconfirms_the_volume`, with the same assertions. It used to pin a known
+    // limit instead: the cipher block straddling the hole's edge is held —
+    // its other half is in the article that never came — so the volume's
+    // placed run stopped just short of an article boundary, the sweep had no
+    // composed reference for it, materialization was refused, and the set
+    // demoted for a hole PAR2 could have filled.
     //
-    // The plaintext twin above repairs the hole in place and never demotes. The
-    // same shape over an encrypted set cannot, and it fails over roughly eight
-    // bytes: the cipher block straddling the hole's edge is held, because its
-    // other half is in the article that never came, so the volume's covered run
-    // stops just short of an article boundary. `CrcRuns::compose` composes a
-    // reference only for a range that starts *and ends* on one — deliberately,
-    // since this sweep reads an overlay of sparse files where a source answering
-    // with zeros yields bytes that look like data and pass nothing — so the run
-    // is `UnverifiableRun`, materialization is refused, and the repair with it.
-    //
-    // The user still gets correct bytes: the set demotes, refetches, and the
-    // conventional path extracts. What it costs is the whole set, for a hole
-    // PAR2 could have filled. The plan's Risks section records the fix (let
-    // reconstruction take those held bytes as posted *cipher* straight from
-    // staging — materialization rebuilds posted bytes, not plaintext, so they
-    // never needed decrypting). **When that lands this test should fail**, and
-    // the right response is to rewrite it against the plaintext twin's
-    // assertions rather than to relax it.
+    // Two things closed that. The virtual volume now serves holds straight
+    // from staging as the posted bytes they are, so the edge blocks on both
+    // sides of the hole read back and the composition reaches the article
+    // boundary. And a decrypted run files its own CBC predecessor as a
+    // checkpoint, so the run that begins right after the hole re-encrypts
+    // from its own start instead of chaining through plaintext the hole never
+    // delivered.
     let member_name = "Silver.Horizon.S01E25.mkv";
     let password = "moonlit-harbour";
     let payload: Vec<u8> = (0..3000u32).map(|index| (index % 223) as u8).collect();
@@ -10414,39 +10407,44 @@ async fn a_lost_article_inside_an_encrypted_member_demotes_instead_of_repairing(
     )
     .await;
 
-    // Non-vacuity: the conventional path really does repair this hole, so the
-    // direct path's failure is about the direct path and not the fixture.
     assert_eq!(
         conventional.member.as_deref(),
         Some(payload.as_slice()),
-        "the gate-off reference must repair the lost article; status={:?}",
+        "the gate-off reference must repair the lost article and extract the \
+         member; status={:?}",
         conventional.status
     );
-    // The limit, stated as behaviour.
-    assert!(
-        direct.sets.contains("Demoted"),
-        "an encrypted set is expected to demote on a lost article until the \
-         reconstruction fix lands; if this now repairs in place, rewrite this \
-         test against the plaintext twin. sets = {}",
+    assert_eq!(
+        direct.member.as_deref(),
+        conventional.member.as_deref(),
+        "an encrypted direct set must repair a hole in a member's packed range in \
+         place and produce the gate-off bytes; sets = {}",
         direct.sets
     );
-    // What this test deliberately does **not** assert, because the harness
-    // cannot establish it either way: that the demoted set still delivers the
-    // member. It does not, here — `direct.member` is `None` against the
-    // conventional path's full payload — but the lost article is permanently
-    // gone and there is no server, so the refetch a demotion schedules can never
-    // be answered. The conventional run recovers only because it wrote real
-    // volume files as articles arrived, giving PAR2 something on disk to repair.
-    //
-    // So this either costs a refetch (the reviewer's reading) or costs the
-    // member outright (what the harness shows), and telling those apart needs a
-    // fixture that models a refetch which can actually succeed. **That is the
-    // open question**, and it is the reason the plan's Risks entry now carries
-    // the real mechanism instead of the CBC one.
     assert!(
-        direct.member.is_none() || direct.member.as_deref() == conventional.member.as_deref(),
-        "a demoted encrypted set must either deliver the conventional bytes or \
-         nothing at all — never different bytes; sets = {}",
+        !direct.sets.contains("Demoted"),
+        "and it must not demote to do it, got {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.finalized, 1,
+        "a volume whose end record arrived only in the repaired bytes must still \
+         confirm, or the set could never finalize; sets = {}",
+        direct.sets
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "no volume file, repaired or otherwise"
+    );
+    assert_eq!(
+        direct.materialized, 1,
+        "only the volume that lost an article materializes"
+    );
+    assert_eq!(direct.repair_scratch_left, 0);
+    assert!(
+        matches!(direct.status, Some(JobStatus::Complete)),
+        "the job must complete, got {:?} with sets {}",
+        direct.status,
         direct.sets
     );
 }

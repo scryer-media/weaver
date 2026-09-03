@@ -36,6 +36,13 @@ impl Pipeline {
     pub(in crate::pipeline) fn clear_rar_unlock_priorities(&mut self, job_id: JobId) {
         self.rar_unlock_priority_dirty_jobs.remove(&job_id);
         self.rar_unlock_boosted_files.remove(&job_id);
+        // Queued items keep the keys they have; only future pushes stop being
+        // boosted, which is what clearing always meant.
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state
+                .download_queue
+                .install_file_priority_plan(HashMap::new(), RAR_UNLOCK_PROTECTED_PRIORITY);
+        }
     }
 
     pub(in crate::pipeline) fn rar_unlock_requeued_work_is_relevant(
@@ -87,18 +94,17 @@ impl Pipeline {
         };
         let updates = plan.updates;
         let boosted_files = plan.boosted_files;
+        // The plan is installed rather than applied: the queue keeps it, lands
+        // every later push at the planned key, and only rebuilds its heaps
+        // when the plan actually changed. A retry requeue of a boosted volume
+        // therefore costs a push, not a replan.
         let changed = self
             .jobs
             .get_mut(&job_id)
             .map(|state| {
                 state
                     .download_queue
-                    .reprioritize_matching_with_rank(|work| {
-                        if work.priority <= RAR_UNLOCK_PROTECTED_PRIORITY {
-                            return None;
-                        }
-                        updates.get(&work.segment_id.file_id).copied()
-                    })
+                    .install_file_priority_plan(updates, RAR_UNLOCK_PROTECTED_PRIORITY)
             })
             .unwrap_or(0);
 
@@ -158,10 +164,7 @@ impl Pipeline {
                 completed_volume_files.insert(key);
                 continue;
             }
-            let queued = state
-                .download_queue
-                .count_matching(|work| work.segment_id.file_id == file_id)
-                > 0;
+            let queued = state.download_queue.queued_count_for_file(file_id) > 0;
             let active = self.active_downloads_by_file.contains_key(&file_id);
             if !queued && !active {
                 continue;

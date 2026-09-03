@@ -1,15 +1,49 @@
 use super::*;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use super::deobfuscate::{self, DeliveryNamingPlan, SrrdbInputs};
 use crate::jobs::working_dir::{WORKING_DIR_MARKER, mark_weaver_owned_output_dir};
+use crate::post_processing::model::PostProcessingSettings;
 use crate::runtime::{file_cache, fs as runtime_fs};
 
+fn record_member_crc32_value(
+    by_path: &mut HashMap<String, u32>,
+    ambiguous_paths: &mut HashSet<String>,
+    member_name: &str,
+    crc32: u32,
+) {
+    let Ok(relative_path) =
+        crate::pipeline::direct_store::plan::DirectSetPlan::destination_relative_name(member_name)
+    else {
+        return;
+    };
+    let key = relative_path.to_ascii_lowercase();
+    if ambiguous_paths.contains(&key) {
+        return;
+    }
+    match by_path.get(&key).copied() {
+        None => {
+            by_path.insert(key, crc32);
+        }
+        Some(existing) if existing == crc32 => {}
+        Some(_) => {
+            by_path.remove(&key);
+            ambiguous_paths.insert(key);
+        }
+    }
+}
+
 /// Folds one volume's member headers into the checksum map. A member spanning
-/// volumes states its checksum on the header that ends it, so later volumes
-/// overwrite earlier `None`s naturally by only writing what they know.
-fn record_member_crc32(by_name: &mut HashMap<String, u32>, facts: &unrar_rs::RarVolumeFacts) {
+/// volumes states its checksum on the header that ends it, so earlier volumes
+/// simply contribute nothing. Conflicting checksums for the same normalized
+/// delivery path make that path unusable instead of picking an iteration-order
+/// winner.
+fn record_member_crc32(
+    by_path: &mut HashMap<String, u32>,
+    ambiguous_paths: &mut HashSet<String>,
+    facts: &unrar_rs::RarVolumeFacts,
+) {
     for member in &facts.members {
         if member.is_directory {
             continue;
@@ -17,13 +51,179 @@ fn record_member_crc32(by_name: &mut HashMap<String, u32>, facts: &unrar_rs::Rar
         let Some(crc32) = member.data_crc32 else {
             continue;
         };
-        let name = member
-            .name
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(&member.name);
-        by_name.insert(name.to_ascii_lowercase(), crc32);
+        record_member_crc32_value(by_path, ambiguous_paths, &member.name, crc32);
     }
+}
+
+#[derive(Debug)]
+struct UnacceptableExtensionMatch {
+    relative_path: String,
+    pattern: String,
+}
+
+#[derive(Debug, Default)]
+struct DeliverySourceValidation {
+    total_bytes: u64,
+    root_entry_bytes: HashMap<PathBuf, u64>,
+}
+
+enum DeliveryPolicySource {
+    Persisted(crate::Database),
+    #[cfg(test)]
+    Fixed(PostProcessingSettings),
+}
+
+/// Inspect exactly the entries the final move can publish, without following
+/// links. This one iterative walk both enforces the extension policy and
+/// supplies the byte totals used by move progress.
+fn validate_delivery_sources(
+    working_dir: &Path,
+    staging_dir: Option<&Path>,
+    settings: &PostProcessingSettings,
+) -> Result<DeliverySourceValidation, String> {
+    let mut validation = DeliverySourceValidation::default();
+    let mut source_exists = false;
+    if let Some(staging_dir) = staging_dir {
+        source_exists |= scan_delivery_root(
+            staging_dir,
+            "staging",
+            &[".weaver-chunks"],
+            settings,
+            &mut validation,
+        )?;
+    }
+    source_exists |= scan_delivery_root(
+        working_dir,
+        "working",
+        &[".weaver-chunks", ".weaver-staging", WORKING_DIR_MARKER],
+        settings,
+        &mut validation,
+    )?;
+    source_exists
+        .then_some(validation)
+        .ok_or_else(|| format!("no delivery source exists at {}", working_dir.display()))
+}
+
+fn scan_delivery_root(
+    root: &Path,
+    source_name: &str,
+    ignored_entries: &[&str],
+    settings: &PostProcessingSettings,
+    validation: &mut DeliverySourceValidation,
+) -> Result<bool, String> {
+    let root_metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "could not inspect delivery root {}: {error}",
+                root.display()
+            ));
+        }
+    };
+    if metadata_is_link_or_reparse(&root_metadata) || !root_metadata.is_dir() {
+        return Err(format!("unsafe delivery root {}", root.display()));
+    }
+    let entries = std::fs::read_dir(root).map_err(|error| {
+        format!(
+            "could not inspect delivery root {}: {error}",
+            root.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not inspect delivery root {}: {error}",
+                root.display()
+            )
+        })?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| ignored_entries.contains(&name))
+        {
+            continue;
+        }
+        let entry_path = entry.path();
+        let entry_name = entry.file_name();
+        let mut entry_bytes = 0u64;
+        let mut stack = vec![(entry_path.clone(), PathBuf::from(&entry_name))];
+        while let Some((path, relative_path)) = stack.pop() {
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                format!(
+                    "could not inspect delivery entry {}: {error}",
+                    path.display()
+                )
+            })?;
+            if metadata_is_link_or_reparse(&metadata) {
+                return Err(format!(
+                    "unsafe delivery link or reparse point at {}/{}",
+                    source_name,
+                    relative_path.display()
+                ));
+            }
+            if metadata.is_dir() {
+                let children = std::fs::read_dir(&path).map_err(|error| {
+                    format!(
+                        "could not inspect delivery directory {}: {error}",
+                        path.display()
+                    )
+                })?;
+                for child in children {
+                    let child = child.map_err(|error| {
+                        format!(
+                            "could not inspect delivery directory {}: {error}",
+                            path.display()
+                        )
+                    })?;
+                    stack.push((child.path(), relative_path.join(child.file_name())));
+                }
+                continue;
+            }
+            if !metadata.is_file() {
+                return Err(format!(
+                    "unsupported delivery entry at {}/{}",
+                    source_name,
+                    relative_path.display()
+                ));
+            }
+            let filename = path.file_name().unwrap_or_default().to_string_lossy();
+            if let Some(pattern) = settings.unacceptable_extension_match(&filename) {
+                let rejection = UnacceptableExtensionMatch {
+                    relative_path: format!("{source_name}/{}", relative_path.display()),
+                    pattern: pattern.to_string(),
+                };
+                return Err(format!(
+                    "unacceptable extension '{}' matched '{}' before publication",
+                    rejection.pattern, rejection.relative_path
+                ));
+            }
+            entry_bytes = entry_bytes.saturating_add(metadata.len());
+            validation.total_bytes = validation.total_bytes.saturating_add(metadata.len());
+        }
+        validation.root_entry_bytes.insert(entry_path, entry_bytes);
+    }
+    Ok(true)
+}
+
+// Rejects symlinks and, on Windows, every other reparse point: junctions and
+// volume mount points redirect a traversal just as effectively as a symlink.
+// `FileType` cannot answer that on stable Rust — `is_reparse_point` is not in
+// std, and `FileTypeExt` only exposes the symlink-shaped reparse points — so
+// the check reads the raw attribute bit off the metadata each caller already
+// holds.
+fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn move_path_with_copy_fallback(
@@ -122,11 +322,13 @@ fn rename_path_for_publication(
 fn move_path_with_safe_rename_or_copy_fallback(
     src: &std::path::Path,
     dst: &std::path::Path,
+    source_bytes: u64,
     phase_counters: Arc<PhaseCounters>,
 ) -> Result<(), (std::io::Error, std::io::Error)> {
     move_path_with_safe_rename_or_copy_fallback_using(
         src,
         dst,
+        source_bytes,
         phase_counters,
         rename_path_for_publication,
         move_path_with_copy_fallback,
@@ -136,6 +338,7 @@ fn move_path_with_safe_rename_or_copy_fallback(
 fn move_path_with_safe_rename_or_copy_fallback_using<R, C>(
     src: &std::path::Path,
     dst: &std::path::Path,
+    source_bytes: u64,
     phase_counters: Arc<PhaseCounters>,
     rename: R,
     copy: C,
@@ -144,13 +347,12 @@ where
     R: FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
     C: FnOnce(&std::path::Path, &std::path::Path, &PhaseCounters) -> std::io::Result<()>,
 {
-    let path_bytes = path_regular_file_bytes(src).unwrap_or(0);
     match rename(src, dst) {
         Ok(()) => {
-            if path_bytes > 0 {
+            if source_bytes > 0 {
                 phase_counters
                     .completed_bytes
-                    .fetch_add(path_bytes, Ordering::Relaxed);
+                    .fetch_add(source_bytes, Ordering::Relaxed);
             }
             Ok(())
         }
@@ -164,25 +366,6 @@ where
     }
 }
 
-fn path_regular_file_bytes(path: &std::path::Path) -> std::io::Result<u64> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        return Ok(0);
-    }
-    if metadata.is_file() {
-        return Ok(metadata.len());
-    }
-    if !metadata.is_dir() {
-        return Ok(0);
-    }
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        total = total.saturating_add(path_regular_file_bytes(&entry.path())?);
-    }
-    Ok(total)
-}
-
 async fn run_move_to_complete(
     job_id: JobId,
     working_dir: PathBuf,
@@ -190,7 +373,37 @@ async fn run_move_to_complete(
     dest: PathBuf,
     phase_counters: Arc<PhaseCounters>,
     naming: Option<DeliveryNamingPlan>,
-) -> Result<MoveToCompleteResult, String> {
+    policy_source: DeliveryPolicySource,
+) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
+    let claimed_dest = dest.clone();
+    let result = run_move_to_claimed_destination(
+        job_id,
+        working_dir,
+        staging_dir,
+        dest,
+        phase_counters,
+        naming,
+        policy_source,
+    )
+    .await;
+    if result.is_err() {
+        // The actor exclusively created this directory before launching the
+        // worker. Remove the abandoned claim only when it is still empty;
+        // partial output is deliberately retained for diagnosis and retry.
+        let _ = tokio::fs::remove_dir(&claimed_dest).await;
+    }
+    result
+}
+
+async fn run_move_to_claimed_destination(
+    job_id: JobId,
+    working_dir: PathBuf,
+    staging_dir: Option<PathBuf>,
+    dest: PathBuf,
+    phase_counters: Arc<PhaseCounters>,
+    naming: Option<DeliveryNamingPlan>,
+    policy_source: DeliveryPolicySource,
+) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
     // Every cached disk write handle under either of the job's roots must be
     // closed before its files are renamed or moved. The staging root is not
     // only extraction output any more: direct-store writes member payload
@@ -200,36 +413,75 @@ async fn run_move_to_complete(
         crate::pipeline::close_cached_write_handles_under(staging).await;
     }
 
-    // Verify at least one source directory exists before creating
-    // the destination, so a missing source doesn't leave behind an
-    // empty complete dir.
-    let staging_exists = staging_dir.as_ref().is_some_and(|s| s.exists());
-    let working_exists = working_dir.exists();
-    if !staging_exists && !working_exists {
-        return Err(format!(
-            "failed to read working directory {} for move: No such file or directory (os error 2)",
-            working_dir.display()
-        ));
-    }
-
-    let total_bytes = {
+    let policy = match policy_source {
+        DeliveryPolicySource::Persisted(database) => {
+            tokio::task::spawn_blocking(move || database.post_processing_settings())
+                .await
+                .map_err(|error| {
+                    MoveToCompleteFailure::Security(format!(
+                        "could not load unacceptable extension policy: {error}"
+                    ))
+                })?
+                .map_err(|error| {
+                    MoveToCompleteFailure::Security(format!(
+                        "could not load unacceptable extension policy: {error}"
+                    ))
+                })?
+        }
+        #[cfg(test)]
+        DeliveryPolicySource::Fixed(policy) => policy,
+    };
+    let validation = {
         let working_dir = working_dir.clone();
         let staging_dir = staging_dir.clone();
         tokio::task::spawn_blocking(move || {
-            move_sources_regular_file_bytes(&working_dir, staging_dir.as_deref())
+            validate_delivery_sources(&working_dir, staging_dir.as_deref(), &policy)
         })
         .await
-        .unwrap_or(0)
+        .map_err(|error| {
+            MoveToCompleteFailure::Security(format!(
+                "delivery security scan worker failed: {error}"
+            ))
+        })?
+        .map_err(MoveToCompleteFailure::Security)?
     };
     phase_counters
         .total_bytes
-        .store(total_bytes, Ordering::Relaxed);
+        .store(validation.total_bytes, Ordering::Relaxed);
 
-    if let Err(error) = tokio::fs::create_dir_all(&dest).await {
-        return Err(format!(
-            "failed to create complete directory {}: {error}",
+    let dest_metadata = tokio::fs::symlink_metadata(&dest).await.map_err(|error| {
+        MoveToCompleteFailure::Operational(format!(
+            "could not inspect claimed complete directory {}: {error}",
             dest.display()
-        ));
+        ))
+    })?;
+    if !dest_metadata.is_dir() || metadata_is_link_or_reparse(&dest_metadata) {
+        return Err(MoveToCompleteFailure::Security(format!(
+            "claimed complete destination changed before publication: {}",
+            dest.display()
+        )));
+    }
+    let mut existing_entries = tokio::fs::read_dir(&dest).await.map_err(|error| {
+        MoveToCompleteFailure::Operational(format!(
+            "could not inspect claimed complete directory {}: {error}",
+            dest.display()
+        ))
+    })?;
+    if existing_entries
+        .next_entry()
+        .await
+        .map_err(|error| {
+            MoveToCompleteFailure::Operational(format!(
+                "could not inspect claimed complete directory {}: {error}",
+                dest.display()
+            ))
+        })?
+        .is_some()
+    {
+        return Err(MoveToCompleteFailure::Security(format!(
+            "claimed complete directory was populated before publication: {}",
+            dest.display()
+        )));
     }
 
     let mut moved = 0u32;
@@ -256,11 +508,17 @@ async fn run_move_to_complete(
             }
             let src = entry.path();
             let dst = dest.join(&file_name);
+            let source_bytes = validation.root_entry_bytes.get(&src).copied().unwrap_or(0);
             let src_fb = src.clone();
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
             match tokio::task::spawn_blocking(move || {
-                move_path_with_safe_rename_or_copy_fallback(&src_fb, &dst_fb, counters)
+                move_path_with_safe_rename_or_copy_fallback(
+                    &src_fb,
+                    &dst_fb,
+                    source_bytes,
+                    counters,
+                )
             })
             .await
             {
@@ -300,11 +558,17 @@ async fn run_move_to_complete(
             if dst.exists() && !runtime_fs::paths_equivalent_for_placement(&src, &dst) {
                 continue;
             }
+            let source_bytes = validation.root_entry_bytes.get(&src).copied().unwrap_or(0);
             let src_fb = src.clone();
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
             match tokio::task::spawn_blocking(move || {
-                move_path_with_safe_rename_or_copy_fallback(&src_fb, &dst_fb, counters)
+                move_path_with_safe_rename_or_copy_fallback(
+                    &src_fb,
+                    &dst_fb,
+                    source_bytes,
+                    counters,
+                )
             })
             .await
             {
@@ -334,12 +598,12 @@ async fn run_move_to_complete(
         for failure in &failures {
             warn!(job_id = job_id.0, error = %failure, "failed to move entry to complete directory");
         }
-        return Err(format!(
+        return Err(MoveToCompleteFailure::Operational(format!(
             "failed to move {} entr{} to complete directory: {}",
             failures.len(),
             if failures.len() == 1 { "y" } else { "ies" },
             failures[0]
-        ));
+        )));
     }
 
     // Both delivery routes have landed in `dest` and nothing else will be added
@@ -410,42 +674,55 @@ async fn run_move_to_complete(
     })
 }
 
-fn move_sources_regular_file_bytes(
-    working_dir: &std::path::Path,
-    staging_dir: Option<&std::path::Path>,
-) -> u64 {
-    let mut total = 0u64;
-    if let Some(staging) = staging_dir
-        && let Ok(entries) = std::fs::read_dir(staging)
-    {
-        for entry in entries.flatten() {
-            if entry.file_name() == ".weaver-chunks" {
-                continue;
-            }
-            total = total.saturating_add(path_regular_file_bytes(&entry.path()).unwrap_or(0));
-        }
-    }
-    if let Ok(entries) = std::fs::read_dir(working_dir) {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            if file_name == ".weaver-chunks"
-                || file_name == ".weaver-staging"
-                || file_name == WORKING_DIR_MARKER
-            {
-                continue;
-            }
-            total = total.saturating_add(path_regular_file_bytes(&entry.path()).unwrap_or(0));
-        }
-    }
-    total
-}
-
 fn complete_parent_for_category(
     complete_dir: &std::path::Path,
     categories: &[crate::categories::CategoryConfig],
     category: Option<&str>,
 ) -> Result<PathBuf, String> {
     crate::categories::completion_parent(complete_dir, categories, category)
+}
+
+fn complete_destination_candidate(
+    parent: &Path,
+    dir_name: &str,
+    job_id: JobId,
+    attempt: u32,
+) -> PathBuf {
+    match attempt {
+        0 => parent.join(dir_name),
+        1 => parent.join(weaver_model::files::path_component_with_suffix(
+            dir_name,
+            &format!(".#{}", job_id.0),
+        )),
+        _ => parent.join(weaver_model::files::path_component_with_suffix(
+            dir_name,
+            &format!(".#{}.{}", job_id.0, attempt - 1),
+        )),
+    }
+}
+
+async fn claim_complete_destination_path(
+    parent: &Path,
+    dir_name: &str,
+    job_id: JobId,
+    reserved: &HashSet<PathBuf>,
+) -> std::io::Result<PathBuf> {
+    tokio::fs::create_dir_all(parent).await?;
+
+    let mut attempt = 0u32;
+    loop {
+        let candidate = complete_destination_candidate(parent, dir_name, job_id, attempt);
+        if !reserved.contains(&candidate) {
+            match tokio::fs::create_dir(&candidate).await {
+                Ok(()) => return Ok(candidate),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        attempt = attempt.checked_add(1).ok_or_else(|| {
+            std::io::Error::other("exhausted complete-directory collision suffixes")
+        })?;
+    }
 }
 
 #[cfg(test)]
@@ -500,15 +777,7 @@ mod category_destination_tests {
 }
 
 impl Pipeline {
-    fn complete_destination_is_reserved(&self, job_id: JobId, candidate: &std::path::Path) -> bool {
-        self.reserved_complete_destinations
-            .iter()
-            .any(|(reserved_job_id, reserved_path)| {
-                *reserved_job_id != job_id && reserved_path == candidate
-            })
-    }
-
-    async fn compute_complete_destination(
+    async fn claim_complete_destination(
         &self,
         job_id: JobId,
         job_name: &str,
@@ -519,34 +788,20 @@ impl Pipeline {
             let cfg = self.config.read().await;
             complete_parent_for_category(&self.complete_dir, &cfg.categories, category)?
         };
-        let base_dest = parent.join(&dir_name);
-
-        if !base_dest.exists() && !self.complete_destination_is_reserved(job_id, &base_dest) {
-            return Ok(base_dest);
-        }
-
-        let parent = base_dest
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let suffixed = parent.join(weaver_model::files::path_component_with_suffix(
-            &dir_name,
-            &format!(".#{}", job_id.0),
-        ));
-        if !suffixed.exists() && !self.complete_destination_is_reserved(job_id, &suffixed) {
-            return Ok(suffixed);
-        }
-
-        let mut attempt = 1u32;
-        loop {
-            let candidate = parent.join(weaver_model::files::path_component_with_suffix(
-                &dir_name,
-                &format!(".#{}.{}", job_id.0, attempt),
-            ));
-            if !candidate.exists() && !self.complete_destination_is_reserved(job_id, &candidate) {
-                return Ok(candidate);
-            }
-            attempt += 1;
-        }
+        let reserved: HashSet<PathBuf> = self
+            .reserved_complete_destinations
+            .iter()
+            .filter(|(reserved_job_id, _)| **reserved_job_id != job_id)
+            .map(|(_, path)| path.clone())
+            .collect();
+        claim_complete_destination_path(&parent, &dir_name, job_id, &reserved)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to reserve a complete directory under {}: {error}",
+                    parent.display()
+                )
+            })
     }
 
     /// Resolves everything the delivery rename pass needs, on this task, before
@@ -571,20 +826,15 @@ impl Pipeline {
         if !enabled {
             return None;
         }
-        // The environment has the last word on the outbound rung — see
-        // [`deobfuscate::SRRDB_LOOKUP_ENV`] for why consent lives there until
-        // the settings UI can ask for it in words.
-        let srrdb_enabled = deobfuscate::srrdb_lookup_enabled_now(srrdb_from_config);
-
         // The checksum map is only ever read by the lookup, so an operator who
         // never opted in never pays for gathering it.
-        let srrdb = srrdb_enabled.then(|| SrrdbInputs {
+        let srrdb = srrdb_from_config.then(|| SrrdbInputs {
             base_url: deobfuscate::SRRDB_API_BASE.to_string(),
-            crc32_by_member_name: HashMap::new(),
+            crc32_by_member_path: HashMap::new(),
         });
         let srrdb = match srrdb {
             Some(mut inputs) => {
-                inputs.crc32_by_member_name = self.member_crc32_by_name(job_id).await;
+                inputs.crc32_by_member_path = self.member_crc32_by_path(job_id).await;
                 Some(inputs)
             }
             None => None,
@@ -596,8 +846,8 @@ impl Pipeline {
         })
     }
 
-    /// The CRC32 each archive header stated for its member, keyed by the
-    /// member's filename lowercased.
+    /// The CRC32 each archive header stated for its member, keyed by its
+    /// normalized, lowercased delivery-relative path.
     ///
     /// Read from two places because the two delivery routes keep the same facts
     /// in different homes: extraction keeps a set's parsed headers in memory
@@ -605,14 +855,15 @@ impl Pipeline {
     /// them to the durable facts table. Reading both makes the map route-blind.
     /// A member the headers never stated a checksum for is simply absent, and
     /// the lookup falls back to the job name for it.
-    async fn member_crc32_by_name(&self, job_id: JobId) -> HashMap<String, u32> {
-        let mut by_name = HashMap::new();
+    async fn member_crc32_by_path(&self, job_id: JobId) -> HashMap<String, u32> {
+        let mut by_path = HashMap::new();
+        let mut ambiguous_paths = HashSet::new();
         for ((set_job_id, _), state) in &self.rar_sets {
             if *set_job_id != job_id {
                 continue;
             }
             for facts in state.facts.values() {
-                record_member_crc32(&mut by_name, facts);
+                record_member_crc32(&mut by_path, &mut ambiguous_paths, facts);
             }
         }
 
@@ -625,7 +876,7 @@ impl Pipeline {
                     for (_, blob) in volumes {
                         if let Ok(facts) = rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob)
                         {
-                            record_member_crc32(&mut by_name, &facts);
+                            record_member_crc32(&mut by_path, &mut ambiguous_paths, &facts);
                         }
                     }
                 }
@@ -636,7 +887,7 @@ impl Pipeline {
                 "could not read persisted volume facts for the release-index lookup"
             ),
         }
-        by_name
+        by_path
     }
 
     /// Move extracted/completed files from the intermediate working directory
@@ -676,18 +927,13 @@ impl Pipeline {
             )
         };
 
-        if let Some(staging) = staging_dir.as_deref() {
-            let budget = self.extraction_budget(job_id, staging)?;
-            ExtractionRoot::open(staging)?.scan_no_links(&budget)?;
-        }
-
         self.phase_end(job_id, JobPhase::Extracting);
         self.phase_end(job_id, JobPhase::Repairing);
         let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
         self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
 
         let dest = self
-            .compute_complete_destination(job_id, &job_name, category.as_deref())
+            .claim_complete_destination(job_id, &job_name, category.as_deref())
             .await?;
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());
@@ -699,6 +945,7 @@ impl Pipeline {
         self.publish_snapshot();
 
         let naming = self.delivery_naming_plan(job_id, &job_name).await;
+        let policy_source = DeliveryPolicySource::Persisted(self.db.clone());
 
         let move_done_tx = self.move_done_tx.clone();
         info!(
@@ -715,6 +962,7 @@ impl Pipeline {
                 dest.clone(),
                 phase_counters,
                 naming,
+                policy_source,
             )
             .await;
             match &result {
@@ -783,7 +1031,10 @@ impl Pipeline {
                 );
                 self.start_terminal_post_processing(job_id);
             }
-            Err(error) => self.fail_job(job_id, error),
+            Err(MoveToCompleteFailure::Security(error)) => {
+                self.fail_delivery_security_check(job_id, error);
+            }
+            Err(MoveToCompleteFailure::Operational(error)) => self.fail_job(job_id, error),
         }
     }
 

@@ -15,6 +15,13 @@ fn capacity_test_client(port: u16, connections: usize) -> NntpClient {
     ))
 }
 
+/// A fake provider that is deliberately **strict** about the BODY argument.
+///
+/// Per RFC 3977 §6.2 a message-id argument must be enclosed in angle brackets;
+/// an unbracketed argument is an article-number reference, which real providers
+/// answer with 430 for every article. A lenient harness hid exactly that
+/// regression, so this one answers 430 for anything unbracketed and records the
+/// raw command lines so tests can assert on the wire frame directly.
 async fn spawn_capacity_limited_body_server(
     connection_limit: usize,
     payload: Vec<u8>,
@@ -23,6 +30,7 @@ async fn spawn_capacity_limited_body_server(
     u16,
     Arc<AtomicBool>,
     Arc<AtomicUsize>,
+    Arc<std::sync::Mutex<Vec<String>>>,
     tokio::task::JoinHandle<()>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -32,6 +40,8 @@ async fn spawn_capacity_limited_body_server(
     let port = listener.local_addr().unwrap().port();
     let fast_bodies = Arc::new(AtomicBool::new(false));
     let active_connections = Arc::new(AtomicUsize::new(0));
+    let body_commands: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut encoded = Vec::new();
     weaver_yenc::encode(&payload, &mut encoded, 128, "capacity-recovery.bin").unwrap();
     let header_end = encoded
@@ -55,6 +65,7 @@ async fn spawn_capacity_limited_body_server(
 
     let fast_bodies_for_server = Arc::clone(&fast_bodies);
     let active_for_server = Arc::clone(&active_connections);
+    let body_commands_for_server = Arc::clone(&body_commands);
     let server = tokio::spawn(async move {
         loop {
             let (socket, _) = listener.accept().await.unwrap();
@@ -63,6 +74,7 @@ async fn spawn_capacity_limited_body_server(
             let fast_bodies = Arc::clone(&fast_bodies_for_server);
             let encoded_body = Arc::clone(&encoded_body);
             let part_crc = Arc::clone(&part_crc);
+            let body_commands = Arc::clone(&body_commands_for_server);
             tokio::spawn(async move {
                 let (reader, mut writer) = socket.into_split();
                 if active > connection_limit {
@@ -90,11 +102,29 @@ async fn spawn_capacity_limited_body_server(
                             {
                                 break;
                             }
-                        } else if line.starts_with("BODY ") {
+                        } else if let Some(argument) = line.strip_prefix("BODY ") {
+                            body_commands
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .push(line.clone());
+                            // Strict, like a real provider: only the bracketed
+                            // message-id form names an article. An unbracketed
+                            // argument is an article-number reference into the
+                            // selected group, which answers 430.
+                            let Some(message_id) = argument
+                                .trim()
+                                .strip_prefix('<')
+                                .and_then(|rest| rest.strip_suffix('>'))
+                            else {
+                                if writer.write_all(b"430 No such article\r\n").await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            };
                             if !fast_bodies.load(Ordering::Acquire) {
                                 tokio::time::sleep(Duration::from_millis(500)).await;
                             }
-                            let part_index = line
+                            let part_index = message_id
                                 .split("segment-")
                                 .nth(1)
                                 .and_then(|suffix| suffix.split('@').next())
@@ -129,7 +159,7 @@ async fn spawn_capacity_limited_body_server(
         }
     });
 
-    (port, fast_bodies, active_connections, server)
+    (port, fast_bodies, active_connections, body_commands, server)
 }
 
 #[tokio::test]
@@ -346,7 +376,7 @@ async fn submit_nzb_persists_zstd_and_creates_active_job() {
 async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_change() {
     const TOTAL_SEGMENTS: usize = 1_000;
     let payload = vec![b'A'; 1024];
-    let (port, fast_bodies, active_connections, server) =
+    let (port, fast_bodies, active_connections, _body_commands, server) =
         spawn_capacity_limited_body_server(20, payload.clone(), TOTAL_SEGMENTS).await;
     let initial_client = capacity_test_client(port, 80);
     let old_pool = Arc::clone(initial_client.pool());
@@ -587,11 +617,77 @@ async fn failed_final_move_marks_job_failed_instead_of_complete() {
     let JobStatus::Failed { error } = &status else {
         unreachable!();
     };
-    assert!(error.contains("failed to read working directory"));
+    assert!(error.contains("no delivery source exists"));
     assert!(
         !complete_dir
             .join(crate::jobs::working_dir::sanitize_dirname(job_name))
             .exists()
+    );
+}
+
+#[tokio::test]
+async fn unacceptable_extension_rejection_never_starts_a_final_move_or_scripts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10069);
+    let job_name = "Rejected Before Publication";
+    pipeline
+        .db
+        .save_post_processing_settings(&crate::post_processing::model::PostProcessingSettings {
+            execution_enabled: true,
+            unacceptable_extensions: vec!["exe".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    pipeline
+        .db
+        .save_post_processing_script_lists(&crate::post_processing::model::ScriptLists {
+            global: crate::post_processing::model::ScriptList::new(vec![
+                crate::post_processing::model::ScriptListEntry::new(
+                    crate::post_processing::model::ScriptName::new("sentinel.sh").unwrap(),
+                ),
+            ])
+            .unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let working_dir = intermediate_dir.join("rejected-before-publication");
+    tokio::fs::create_dir_all(working_dir.join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::write(working_dir.join("nested/payload.EXE"), b"rejected")
+        .await
+        .unwrap();
+    pipeline.jobs.insert(
+        job_id,
+        minimal_job_state(job_id, job_name, working_dir.clone()),
+    );
+
+    pipeline.start_move_to_complete(job_id).await.unwrap();
+
+    settle_inflight_moves(&mut pipeline).await;
+    assert!(pipeline.inflight_terminal_post_processing.is_empty());
+    assert!(
+        !complete_dir
+            .join(crate::jobs::working_dir::sanitize_dirname(job_name))
+            .exists()
+    );
+    let status = job_status_for_assert(&pipeline, job_id).unwrap();
+    let JobStatus::Failed { error } = status else {
+        panic!("unacceptable extension must fail the job");
+    };
+    assert!(error.contains("unacceptable extension 'exe'"));
+    assert!(
+        pipeline
+            .db
+            .job_post_processing_summary(job_id.0)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        working_dir.exists(),
+        "the rejected source was never published"
     );
 }
 
@@ -1024,7 +1120,7 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
     let make_work = || DownloadWork {
         segment_id,
         message_id: MessageId::new("stale-exclusion@example.com"),
-        groups: vec!["alt.binaries.test".to_string()],
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
         priority: 100,
         byte_estimate: 128,
         retry_count: 1,
@@ -1265,4 +1361,74 @@ async fn restored_post_processing_that_already_finished_archives_as_complete() {
             .map(|job| &job.status),
         Some(JobStatus::Complete)
     ));
+}
+
+/// The wire frame regression guard: BODY must carry the **bracketed**
+/// message-id.
+///
+/// `DownloadWork::message_id` stores the bare id (the NZB parser strips the
+/// brackets), so a lane that borrows it directly emits `BODY segment-0@…`.
+/// That is a legal article-*number* reference, and every real provider answers
+/// 430 to it — a total, silent download failure. The fake provider here is
+/// strict about brackets, so this test fails outright on a regression.
+#[tokio::test]
+async fn download_lanes_send_bracketed_message_ids_on_the_wire() {
+    const TOTAL_SEGMENTS: usize = 4;
+    let payload = vec![b'Z'; 1024];
+    let (port, fast_bodies, _active_connections, body_commands, server) =
+        spawn_capacity_limited_body_server(8, payload.clone(), TOTAL_SEGMENTS).await;
+    fast_bodies.store(true, Ordering::Release);
+
+    let harness = TestHarness::new_with_nntp(capacity_test_client(port, 4), 4).await;
+    let job_id = JobId(80_021);
+    let spec = segmented_job_spec(
+        "Silver Horizon Wire Frame",
+        "wire-frame.bin",
+        &[payload.len() as u32; TOTAL_SEGMENTS],
+    );
+
+    harness
+        .handle
+        .add_job(job_id, spec, PathBuf::from("wire-frame.nzb"), Vec::new())
+        .await
+        .unwrap();
+
+    let completed = wait_until(Duration::from_secs(30), || {
+        harness
+            .handle
+            .get_job(job_id)
+            .is_ok_and(|job| matches!(job.status, JobStatus::Complete))
+    })
+    .await;
+    assert!(
+        completed.is_ok(),
+        "job did not complete against a bracket-strict provider: job={:?}",
+        harness.handle.get_job(job_id)
+    );
+
+    let commands = body_commands
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert!(
+        !commands.is_empty(),
+        "provider recorded no BODY commands at all"
+    );
+    for command in &commands {
+        let argument = command.strip_prefix("BODY ").unwrap();
+        assert!(
+            argument.starts_with('<') && argument.ends_with('>'),
+            "BODY argument must be a bracketed message-id, got {command:?}"
+        );
+        assert!(
+            argument.contains("segment-") && argument.contains("@example.com"),
+            "unexpected BODY argument {command:?}"
+        );
+    }
+
+    let metrics = harness.handle.get_live_metrics();
+    assert_eq!(metrics.download_failures_article_not_found, 0);
+
+    harness.shutdown().await;
+    server.abort();
 }

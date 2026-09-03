@@ -42,6 +42,13 @@ Instead of the traditional sequential approach (download everything, then repair
 
 All installation instructions can be found on the [Weaver docs website](https://www.scryer.media/weaver/docs/installation/)
 
+On macOS the desktop build ships as `weaver-darwin-<arch>.dmg`: open it and drag
+Weaver to Applications. Release images are signed, but notarization is not part
+of every release, so the first launch may need a one-time right-click → **Open**
+to get past Gatekeeper; afterwards it opens normally. The
+`weaver-darwin-<arch>-portable.tar.gz` archive remains the choice for headless
+and service installs.
+
 ## Docker
 
 ### Unraid
@@ -102,6 +109,14 @@ For an unattended first start, configure `WEAVER_BOOTSTRAP_LOGIN_USERNAME` and
 exactly one of `WEAVER_BOOTSTRAP_LOGIN_PASSWORD` or
 `WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE`. Bootstrap credentials are used only
 when no login is already stored; they never overwrite an existing login.
+
+RSS feeds may use local, private, link-local, or container-network addresses
+by default. Feed Basic Auth credentials are sent only to requests whose scheme,
+host, and effective port exactly match the configured feed URL; redirected or
+item requests to another origin never receive them. Set
+`WEAVER_RSS_ALLOW_PRIVATE_NETWORK=false` to limit RSS fetching to public
+egress. Decompressed RSS feed bodies are capped at 16 MiB; the separate NZB
+response limit remains configurable with `WEAVER_NZB_DECOMPRESSED_LIMIT_BYTES`.
 
 ## API
 

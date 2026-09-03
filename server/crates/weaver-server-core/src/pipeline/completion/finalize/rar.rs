@@ -19,6 +19,9 @@ pub(crate) enum ArchiveSetRetirement {
     /// Live file identities still classify into the set, so its names remain
     /// this job's own answer for those bytes.
     StillReferenced,
+    /// The set's topology is not a RAR one, so nothing this function can measure
+    /// says anything about whether it is in use. Refused rather than retired.
+    NotRar,
     /// The set was actually torn down through
     /// [`Pipeline::clear_archive_set_for_source_retry`].
     Retired,
@@ -153,6 +156,24 @@ impl Pipeline {
         set_name: &str,
     ) -> ArchiveSetRetirement {
         let set_key = (job_id, set_name.to_string());
+
+        // This function's whole vocabulary is RAR: `busy` reads `rar_sets`, and
+        // `still_referenced` below counts only files classified `RarVolume`. A
+        // non-RAR topology can satisfy neither, so it would fall through both
+        // tests and be torn down — not because anything decided it was
+        // finished, but because nothing here can express the idea that it is
+        // still in use. That is a category error, and it is how every 7z
+        // topology in a job was being deleted on each PAR2 registration.
+        if let Some(archive_type) = self
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.assembly.archive_topology_for(set_name))
+            .map(|topology| topology.archive_type)
+            && !matches!(archive_type, crate::jobs::assembly::ArchiveType::Rar)
+        {
+            return ArchiveSetRetirement::NotRar;
+        }
+
         let busy = self
             .rar_sets
             .get(&set_key)
@@ -710,6 +731,11 @@ impl Pipeline {
         let plan = plan.clone();
         let normalization_map = Self::placement_normalization_map(&plan);
         let normalized_files = Self::placement_touched_files(&plan);
+        // Renames and swaps move the bytes a chase is reading out from under
+        // it, under names it never saw.
+        for name in &normalized_files {
+            self.taint_direct_unpack_for_file(job_id, name);
+        }
         let plan_for_apply = plan.clone();
         let moved = tokio::task::spawn_blocking(move || {
             par2_rs::apply_placement_plan(&working_dir, &plan_for_apply)
@@ -1624,7 +1650,7 @@ impl Pipeline {
                                 segment_number: segment.ordinal,
                             },
                             message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
-                            groups: file.groups.clone(),
+                            groups: std::sync::Arc::from(file.groups.as_slice()),
                             priority: file.role.download_priority(),
                             byte_estimate: segment.bytes,
                             retry_count: 0,
@@ -1698,6 +1724,13 @@ impl Pipeline {
         }
 
         for retry_file in &retry_files {
+            // The file is about to be deleted and downloaded again, so any
+            // chase over it is reading bytes that are being withdrawn.
+            self.direct_unpack_abort_sets_containing(
+                job_id,
+                &retry_file.filename,
+                "archive source deleted for re-download",
+            );
             let path = working_dir.join(&retry_file.filename);
             match std::fs::remove_file(&path) {
                 Ok(()) => {}

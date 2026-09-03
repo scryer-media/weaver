@@ -49,6 +49,17 @@
 //! rare: it composes a reference for any sub-range that starts and ends on an
 //! article boundary, so a held tail or a volume that stops mid-download still
 //! verifies the prefix it does have.
+//!
+//! The one exception is a run that stops **inside** an article, and it is only
+//! an exception for the repair scratch. The composition can vouch for such a
+//! run up to its last article boundary and no further; the remainder is a
+//! proper prefix of one article whose bytes passed the yEnc part CRC32 on the
+//! way in. The demotion sweep refuses it all the same, because it publishes a
+//! floor. The in-place repair sweep carries it through, because nothing
+//! publishes a floor over the scratch, PAR2 has already judged every slice of
+//! it and rewrites the ones that failed, and the bytes past the boundary are
+//! exactly the valid slices the repair needs as input — see
+//! [`PartialArticle`].
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -90,6 +101,35 @@ pub(crate) struct VolumeReconstruction {
     /// length looked up a key that was never inserted and silently lost its
     /// reference value (nit).
     pub(crate) crcs: CrcRuns,
+    /// What to do with a covered run that stops inside an article.
+    pub(crate) partial_article: PartialArticle,
+}
+
+/// What the sweep does with a covered run that stops **inside** an article.
+///
+/// The composition is article-shaped, so it vouches for a run only up to the
+/// last article boundary the run reaches. What lies past that boundary is a
+/// proper prefix of one article: bytes that passed the yEnc part CRC32 on the
+/// way in and were placed, whose article was not placed whole. An encrypted
+/// member leaves exactly this shape before every hole — its final cipher block
+/// cannot be decrypted until the block after it arrives, so the placed frontier
+/// stops at the block floor inside the last article — and a routing that
+/// demotes mid-article leaves it too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartialArticle {
+    /// Refuse the run as [`ReconstructionFailure::UnverifiableRun`]. The
+    /// demotion sweep's policy: a floor is published over what it writes, and
+    /// a floor must not cover bytes the composition did not check.
+    Refuse,
+    /// Verify the run up to its last article boundary, then write the
+    /// remainder with no reference. The repair scratch's policy: nothing
+    /// publishes a floor over the scratch, PAR2 has already judged every slice
+    /// of it against its own checksums and rewrites the ones that failed, and
+    /// refusing would demote a set whose repair needs exactly those bytes as
+    /// input. The remainder is bounded by one article and must be a prefix of
+    /// an article the composition knows: a run that starts off a boundary, or
+    /// that reaches into bytes no article ever covered, is refused as before.
+    CarryThrough,
 }
 
 /// What one volume's sweep produced.
@@ -297,79 +337,95 @@ fn reconstruct_volume(
         // Composed against the range the sweep is about to read — clipped end
         // included — so a clamp can never lose the reference value the way a
         // pre-resolved lookup key did. A range with no reference is refused
-        // before a byte of it is written.
-        let Some(reference) = volume.crcs.compose(start, end - start) else {
-            return Err(ReconstructionFailure::UnverifiableRun {
-                volume_index: volume.volume_index,
-                offset: start,
-            });
+        // before a byte of it is written — unless the run merely stops inside
+        // an article and the caller carries that shape through, in which case
+        // the reference covers the run up to its last article boundary.
+        let (verified_end, reference) = match volume.crcs.compose(start, end - start) {
+            Some(reference) => (end, reference),
+            None => match volume.partial_article {
+                PartialArticle::Refuse => {
+                    return Err(ReconstructionFailure::UnverifiableRun {
+                        volume_index: volume.volume_index,
+                        offset: start,
+                    });
+                }
+                PartialArticle::CarryThrough => {
+                    let Some((prefix_len, reference)) =
+                        volume.crcs.compose_prefix(start, end - start)
+                    else {
+                        return Err(ReconstructionFailure::UnverifiableRun {
+                            volume_index: volume.volume_index,
+                            offset: start,
+                        });
+                    };
+                    let verified_end = start.saturating_add(prefix_len);
+                    // The remainder must be a proper prefix of one article the
+                    // composition knows. Anything else — a gap in the
+                    // composition, a remainder spanning two articles — is bytes
+                    // no article record accounts for.
+                    let inside_one_article = volume.crcs.run_starting_at(verified_end).is_some_and(
+                        |(article_start, article_len)| {
+                            article_start.saturating_add(article_len) > end
+                        },
+                    );
+                    if !inside_one_article {
+                        return Err(ReconstructionFailure::UnverifiableRun {
+                            volume_index: volume.volume_index,
+                            offset: verified_end,
+                        });
+                    }
+                    (verified_end, reference)
+                }
+            },
         };
-        reader.seek(SeekFrom::Start(start)).map_err(|error| {
-            ReconstructionFailure::WriteFailed {
-                volume_index: volume.volume_index,
-                error: error.to_string(),
-            }
-        })?;
-        file.seek(SeekFrom::Start(start))
-            .map_err(|error| ReconstructionFailure::WriteFailed {
-                volume_index: volume.volume_index,
-                error: error.to_string(),
-            })?;
-
-        let mut run_crc = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
-        let mut cursor = start;
-        while cursor < end {
-            let want = ((end - cursor) as usize).min(buffer.len());
-            let read = match reader.read(&mut buffer[..want]) {
-                Ok(0) => {
-                    return Err(ReconstructionFailure::MissingBytes {
-                        volume_index: volume.volume_index,
-                        offset: cursor,
-                    });
-                }
-                Ok(read) => read,
-                Err(error) if is_hole(&error) => {
-                    return Err(ReconstructionFailure::MissingBytes {
-                        volume_index: volume.volume_index,
-                        offset: cursor,
-                    });
-                }
-                Err(error) => {
-                    return Err(ReconstructionFailure::WriteFailed {
-                        volume_index: volume.volume_index,
-                        error: error.to_string(),
-                    });
-                }
-            };
-            let chunk = &buffer[..read];
-            file.write_all(chunk)
-                .map_err(|error| ReconstructionFailure::WriteFailed {
-                    volume_index: volume.volume_index,
-                    error: error.to_string(),
-                })?;
-            run_crc.update(chunk);
-            // The MD5 is only meaningful for a volume that comes out whole, and
-            // a whole volume is exactly one run from zero — so feeding every run
-            // and only *using* the digest on the complete path costs nothing and
-            // cannot silently hash a gapped file.
-            md5.update(chunk);
-            cursor = cursor.saturating_add(read as u64);
-            written_total = written_total.saturating_add(read as u64);
-        }
 
         // Verify every reconstructed covered range. The composition is over
         // yEnc part CRC32s in source space, so it checks the bytes that came
         // back off the partials and envelope against what the wire delivered —
         // end to end, through both hops.
-        if run_crc.finalize() as u32 != reference {
-            return Err(ReconstructionFailure::ChecksumMismatch {
-                volume_index: volume.volume_index,
-                offset: start,
-            });
+        if verified_end > start {
+            let run_crc = copy_run(
+                &mut reader,
+                &mut file,
+                volume.volume_index,
+                start,
+                verified_end,
+                &mut buffer,
+                &mut md5,
+                &mut written_total,
+            )?;
+            if run_crc != reference {
+                return Err(ReconstructionFailure::ChecksumMismatch {
+                    volume_index: volume.volume_index,
+                    offset: start,
+                });
+            }
+            if start == contiguous {
+                contiguous = verified_end;
+            }
         }
 
-        if start == contiguous {
-            contiguous = end;
+        // The carried remainder: the placed prefix of the article the run stops
+        // inside. Written, hashed into the MD5 for the accounting's sake, and
+        // never part of the contiguous floor.
+        if verified_end < end {
+            tracing::debug!(
+                volume_index = volume.volume_index,
+                offset = verified_end,
+                len = end - verified_end,
+                "reconstruction carried a run that stops inside an article through with no \
+                 composed reference; PAR2 judges those bytes slice by slice"
+            );
+            copy_run(
+                &mut reader,
+                &mut file,
+                volume.volume_index,
+                verified_end,
+                end,
+                &mut buffer,
+                &mut md5,
+                &mut written_total,
+            )?;
         }
     }
 
@@ -392,6 +448,76 @@ fn reconstruct_volume(
         complete,
         md5: complete.then(|| md5.finalize()),
     })
+}
+
+/// Copies `[start, end)` of the volume from the provider into the file and
+/// returns the CRC32 of what it copied. Every byte must be there: a short read
+/// or a hole is [`ReconstructionFailure::MissingBytes`] at the byte it stopped
+/// on.
+#[allow(clippy::too_many_arguments)]
+fn copy_run<R: Read + Seek, W: Write + Seek>(
+    reader: &mut R,
+    file: &mut W,
+    volume_index: u32,
+    start: u64,
+    end: u64,
+    buffer: &mut [u8],
+    md5: &mut par2_rs::checksum::FileHashState,
+    written_total: &mut u64,
+) -> Result<u32, ReconstructionFailure> {
+    reader
+        .seek(SeekFrom::Start(start))
+        .map_err(|error| ReconstructionFailure::WriteFailed {
+            volume_index,
+            error: error.to_string(),
+        })?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| ReconstructionFailure::WriteFailed {
+            volume_index,
+            error: error.to_string(),
+        })?;
+
+    let mut run_crc = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    let mut cursor = start;
+    while cursor < end {
+        let want = ((end - cursor) as usize).min(buffer.len());
+        let read = match reader.read(&mut buffer[..want]) {
+            Ok(0) => {
+                return Err(ReconstructionFailure::MissingBytes {
+                    volume_index,
+                    offset: cursor,
+                });
+            }
+            Ok(read) => read,
+            Err(error) if is_hole(&error) => {
+                return Err(ReconstructionFailure::MissingBytes {
+                    volume_index,
+                    offset: cursor,
+                });
+            }
+            Err(error) => {
+                return Err(ReconstructionFailure::WriteFailed {
+                    volume_index,
+                    error: error.to_string(),
+                });
+            }
+        };
+        let chunk = &buffer[..read];
+        file.write_all(chunk)
+            .map_err(|error| ReconstructionFailure::WriteFailed {
+                volume_index,
+                error: error.to_string(),
+            })?;
+        run_crc.update(chunk);
+        // The MD5 is only meaningful for a volume that comes out whole, and a
+        // whole volume is exactly one run from zero — so feeding every run and
+        // only *using* the digest on the complete path costs nothing and cannot
+        // silently hash a gapped file.
+        md5.update(chunk);
+        cursor = cursor.saturating_add(read as u64);
+        *written_total = written_total.saturating_add(read as u64);
+    }
+    Ok(run_crc.finalize() as u32)
 }
 
 /// The articles of one volume a reconstruction materializes, and the

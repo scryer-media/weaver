@@ -4,6 +4,11 @@ use super::*;
 async fn pump_decode_queue_releases_bytes_for_inactive_job() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    assert_eq!(
+        pipeline.uu_spool_root,
+        temp_dir.path().join("intermediate").join(".uu-park")
+    );
+    assert!(!temp_dir.path().join("data/.uu-park").exists());
     let job_id = JobId(20027);
     insert_active_job(
         &mut pipeline,
@@ -2837,6 +2842,22 @@ async fn uu_segments_park_until_their_prefix_arrives() {
         Some(2),
         "both later parts must be waiting on their prefix"
     );
+    assert_eq!(pipeline.write_buffered_bytes, 750);
+    assert_eq!(pipeline.write_buffered_segments, 2);
+    assert_eq!(
+        pipeline
+            .metrics
+            .write_buffered_bytes
+            .load(Ordering::Relaxed),
+        750
+    );
+    assert_eq!(
+        pipeline.metrics.write_pending_bytes.load(Ordering::Relaxed),
+        750
+    );
+    assert_eq!(pipeline.uu_spooled_bytes, 0);
+    assert_eq!(pipeline.uu_spooled_segments, 0);
+    assert_eq!(pipeline.uu_parked_segments, 2);
 
     submit_uu_segment(&mut pipeline, file_id, 0, &parts[0], false, false).await;
 
@@ -2844,6 +2865,469 @@ async fn uu_segments_park_until_their_prefix_arrives() {
         .await
         .unwrap();
     assert_eq!(written, parts.concat());
+    assert_eq!(pipeline.write_buffered_bytes, 0);
+    assert_eq!(pipeline.uu_spooled_bytes, 0);
+    assert_eq!(pipeline.uu_parked_segments, 0);
+    assert_eq!(
+        pipeline.metrics.write_pending_bytes.load(Ordering::Relaxed),
+        0
+    );
+    assert!(!pipeline.uu_spool_root.join(job_id.0.to_string()).exists());
+}
+
+#[tokio::test]
+async fn uu_spills_reassemble_before_obfuscated_sfv_verification() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.write_backlog_budget_bytes = 1;
+
+    let job_id = JobId(20169);
+    let payload_filename = "silver-horizon.bin";
+    let listing_filename = "oBfU5CaTeD-0001";
+    let parts = [vec![b'a'; 80], vec![b'b'; 90], vec![b'c'; 100]];
+    let payload = parts.concat();
+    let listing = format!(
+        "{payload_filename} {:08x}\n",
+        par2_rs::checksum::crc32(&payload)
+    );
+    let declared_sizes = parts
+        .iter()
+        .map(|part| (part.len() as f64 * 1.38).ceil() as u32)
+        .collect::<Vec<_>>();
+    let mut spec = standalone_job_spec(
+        "UU Spill Then Obfuscated SFV",
+        &[
+            (payload_filename.to_string(), declared_sizes[0]),
+            (listing_filename.to_string(), listing.len() as u32),
+        ],
+    );
+    let payload_file = &mut spec.files[0];
+    payload_file.segments.clear();
+    for (index, bytes) in declared_sizes.iter().enumerate() {
+        payload_file.segments.push(segment_spec! {
+            number: index as u32,
+            bytes: *bytes,
+            message_id: format!("uu-sfv-{index}@example.com"),
+        });
+    }
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let payload_file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_uu_segment_named(
+        &mut pipeline,
+        payload_file_id,
+        2,
+        &parts[2],
+        false,
+        true,
+        payload_filename,
+    )
+    .await;
+    submit_uu_segment_named(
+        &mut pipeline,
+        payload_file_id,
+        1,
+        &parts[1],
+        false,
+        false,
+        payload_filename,
+    )
+    .await;
+
+    let first_spool = match pipeline
+        .uu_files
+        .get(&payload_file_id)
+        .and_then(|uu| uu.parked.get(&1))
+    {
+        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        _ => panic!("part 1 must spill while the prefix is missing"),
+    };
+    let second_spool = match pipeline
+        .uu_files
+        .get(&payload_file_id)
+        .and_then(|uu| uu.parked.get(&2))
+    {
+        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        _ => panic!("part 2 must spill while the prefix is missing"),
+    };
+    assert_eq!(std::fs::read(&first_spool).unwrap(), parts[1]);
+    assert_eq!(std::fs::read(&second_spool).unwrap(), parts[2]);
+    assert_eq!(pipeline.uu_spooled_bytes, parts[1].len() + parts[2].len());
+    assert_eq!(pipeline.uu_spooled_segments, 2);
+
+    submit_uu_segment_named(
+        &mut pipeline,
+        payload_file_id,
+        0,
+        &parts[0],
+        false,
+        false,
+        payload_filename,
+    )
+    .await;
+    assert_eq!(
+        tokio::fs::read(working_dir.join(payload_filename))
+            .await
+            .unwrap(),
+        payload
+    );
+    assert_eq!(pipeline.uu_spooled_bytes, 0);
+    assert_eq!(pipeline.uu_spooled_segments, 0);
+
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        1,
+        listing_filename,
+        listing.as_bytes(),
+    )
+    .await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.download_queue = DownloadQueue::new();
+    state.recovery_queue = DownloadQueue::new();
+    state.status = JobStatus::Downloading;
+    state.refresh_runtime_lanes_from_status();
+
+    pipeline.check_job_completion(job_id).await;
+
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "reassembled UU payload must pass its obfuscated SFV listing"
+    );
+    assert_eq!(pipeline.sfv_verify_read_splits, vec![(0usize, 1usize)]);
+    assert!(pipeline.jobs_with_verification_outcome.contains(&job_id));
+}
+
+#[tokio::test]
+async fn uu_park_spills_after_resident_budget_and_drains_in_order() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    // The comparison is strict: part 2 stays resident, then part 1 spills.
+    pipeline.write_backlog_budget_bytes = 600;
+    let job_id = JobId(20170);
+    let parts: Vec<Vec<u8>> = vec![vec![b'a'; 500], vec![b'b'; 450], vec![b'c'; 300]];
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        uu_job_spec(&parts.iter().map(|part| part.len()).collect::<Vec<_>>()),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_uu_segment(&mut pipeline, file_id, 2, &parts[2], false, true).await;
+    submit_uu_segment(&mut pipeline, file_id, 1, &parts[1], false, false).await;
+
+    let parked = pipeline.uu_files.get(&file_id).expect("UU park");
+    assert!(matches!(
+        parked.parked.get(&2),
+        Some(UuParkedEntry::Memory(_))
+    ));
+    assert!(matches!(
+        parked.parked.get(&1),
+        Some(UuParkedEntry::Spilled { .. })
+    ));
+    assert_eq!(pipeline.write_buffered_bytes, parts[2].len());
+    assert_eq!(pipeline.uu_spooled_bytes, parts[1].len());
+    assert_eq!(pipeline.uu_spooled_segments, 1);
+    assert_eq!(pipeline.uu_parked_segments, 2);
+    assert_eq!(
+        pipeline.metrics.write_pending_bytes.load(Ordering::Relaxed),
+        (parts[1].len() + parts[2].len()) as u64
+    );
+
+    // Spooling affects pacing but cannot turn disk bytes into a hard resident
+    // stall, so the missing prefix remains eligible for dispatch.
+    pipeline.refresh_download_pressure();
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Soft.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::Write.as_code()
+    );
+
+    submit_uu_segment(&mut pipeline, file_id, 0, &parts[0], false, false).await;
+    let written = tokio::fs::read(working_dir.join("silver-horizon.bin"))
+        .await
+        .unwrap();
+    assert_eq!(written, parts.concat());
+    assert_eq!(pipeline.write_buffered_bytes, 0);
+    assert_eq!(pipeline.uu_spooled_bytes, 0);
+    assert_eq!(pipeline.uu_spooled_segments, 0);
+    assert_eq!(pipeline.uu_parked_segments, 0);
+    assert!(!pipeline.uu_spool_root.join(job_id.0.to_string()).exists());
+    assert_eq!(
+        pipeline.metrics.write_pending_bytes.load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn uu_park_admission_requeues_ahead_parts_at_byte_segment_and_disk_limits() {
+    let parts: Vec<Vec<u8>> = vec![vec![b'a'; 80], vec![b'b'; 90]];
+    for (case, max_bytes, max_segments, available_bytes) in [
+        ("byte", parts[1].len() - 1, usize::MAX, u64::MAX),
+        ("segment", usize::MAX, 0, u64::MAX),
+        ("disk", usize::MAX, usize::MAX, 0),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.write_backlog_budget_bytes = 1;
+        pipeline.uu_spool_max_bytes = max_bytes;
+        pipeline.uu_spool_max_segments = max_segments;
+        pipeline.uu_spool_available_bytes_for_test = Some(Some(available_bytes));
+        let job_id = JobId(20180 + u64::from(case == "segment") + 2 * u64::from(case == "disk"));
+        insert_active_job(
+            &mut pipeline,
+            job_id,
+            uu_job_spec(&parts.iter().map(|part| part.len()).collect::<Vec<_>>()),
+        )
+        .await;
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+
+        submit_uu_segment(&mut pipeline, file_id, 1, &parts[1], false, true).await;
+
+        assert_eq!(
+            pipeline.uu_files.get(&file_id).map(|uu| uu.parked.len()),
+            Some(0),
+            "{case} admission cap must not retain the ahead part"
+        );
+        assert_eq!(pipeline.uu_spooled_bytes, 0, "{case}");
+        assert_eq!(pipeline.uu_spooled_segments, 0, "{case}");
+        assert_eq!(pipeline.uu_parked_segments, 0, "{case}");
+        assert!(
+            !pipeline.uu_spool_root.join(job_id.0.to_string()).exists(),
+            "{case} admission cap must not create a spool directory"
+        );
+    }
+}
+
+#[tokio::test]
+async fn uu_spilled_replacement_and_displacement_remove_old_files() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.write_backlog_budget_bytes = 1;
+    pipeline.write_buf_max_pending = 2;
+    let job_id = JobId(20171);
+    let parts: Vec<Vec<u8>> = vec![vec![b'a'; 100], vec![b'b'; 110], vec![b'c'; 120]];
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        uu_job_spec(&parts.iter().map(|part| part.len()).collect::<Vec<_>>()),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_uu_segment(&mut pipeline, file_id, 2, &parts[2], false, true).await;
+    submit_uu_segment(&mut pipeline, file_id, 1, &parts[1], false, false).await;
+    let replaced_path = match pipeline
+        .uu_files
+        .get(&file_id)
+        .and_then(|uu| uu.parked.get(&1))
+    {
+        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        _ => panic!("expected spilled ordinal 1"),
+    };
+
+    // Same ahead-of-cursor ordinal replaces its old spill entry without
+    // double-charging the spool ledger.
+    submit_uu_segment(&mut pipeline, file_id, 1, &parts[1], false, false).await;
+    assert!(
+        !replaced_path.exists(),
+        "replacement must unlink the old spool"
+    );
+    assert_eq!(pipeline.uu_spooled_bytes, parts[1].len() + parts[2].len());
+    assert_eq!(pipeline.uu_spooled_segments, 2);
+    let retained_path = match pipeline
+        .uu_files
+        .get(&file_id)
+        .and_then(|uu| uu.parked.get(&1))
+    {
+        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        _ => panic!("expected replacement spool"),
+    };
+    pipeline.clear_job_write_backlog(job_id);
+    assert!(
+        !retained_path.exists(),
+        "teardown must remove UU spool files"
+    );
+    assert_eq!(pipeline.uu_spooled_bytes, 0);
+    assert_eq!(pipeline.uu_spooled_segments, 0);
+
+    // Lower the bound in an independent job. Parking ordinal 1 after ordinal
+    // 2 evicts the farthest entry and removes its TempPath immediately.
+    pipeline.write_buf_max_pending = 1;
+    let displaced_job_id = JobId(20172);
+    insert_active_job(
+        &mut pipeline,
+        displaced_job_id,
+        uu_job_spec(&parts.iter().map(|part| part.len()).collect::<Vec<_>>()),
+    )
+    .await;
+    let displaced_file_id = NzbFileId {
+        job_id: displaced_job_id,
+        file_index: 0,
+    };
+    submit_uu_segment(&mut pipeline, displaced_file_id, 2, &parts[2], false, true).await;
+    let farthest_path = match pipeline
+        .uu_files
+        .get(&displaced_file_id)
+        .and_then(|uu| uu.parked.get(&2))
+    {
+        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        _ => panic!("expected spilled ordinal 2"),
+    };
+    submit_uu_segment(&mut pipeline, displaced_file_id, 1, &parts[1], false, false).await;
+    assert!(
+        !farthest_path.exists(),
+        "displacement must unlink the farthest spool"
+    );
+    assert!(matches!(
+        pipeline
+            .uu_files
+            .get(&displaced_file_id)
+            .and_then(|uu| uu.parked.get(&1)),
+        Some(UuParkedEntry::Spilled { .. })
+    ));
+    assert_eq!(pipeline.uu_spooled_bytes, parts[1].len());
+    assert_eq!(pipeline.uu_spooled_segments, 1);
+    pipeline.clear_job_write_backlog(displaced_job_id);
+    assert_eq!(pipeline.uu_spooled_bytes, 0);
+    assert_eq!(pipeline.uu_spooled_segments, 0);
+    assert!(
+        !pipeline
+            .uu_spool_root
+            .join(displaced_job_id.0.to_string())
+            .exists()
+    );
+    assert_eq!(
+        pipeline.metrics.write_pending_bytes.load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[test]
+fn uu_spool_startup_cleanup_stays_inside_reserved_root() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let spool_root = temp_dir.path().join("intermediate").join(".uu-park");
+    let stale_job = spool_root.join("20173");
+    std::fs::create_dir_all(&stale_job).unwrap();
+    std::fs::write(stale_job.join("part-stale"), b"stale").unwrap();
+    std::fs::write(spool_root.join("orphan"), b"stale").unwrap();
+    let outside = temp_dir.path().join("outside");
+    std::fs::write(&outside, b"keep").unwrap();
+
+    clear_stale_uu_park_root(&spool_root).unwrap();
+
+    assert_eq!(std::fs::read_dir(&spool_root).unwrap().count(), 0);
+    assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+}
+
+#[tokio::test]
+async fn uu_missing_spool_file_fails_job_without_leaking_accounting() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.write_backlog_budget_bytes = 1;
+    let job_id = JobId(20174);
+    let parts: Vec<Vec<u8>> = vec![vec![b'a'; 80], vec![b'b'; 90]];
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        uu_job_spec(&parts.iter().map(|part| part.len()).collect::<Vec<_>>()),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_uu_segment(&mut pipeline, file_id, 1, &parts[1], false, true).await;
+    let spool_path = match pipeline
+        .uu_files
+        .get(&file_id)
+        .and_then(|uu| uu.parked.get(&1))
+    {
+        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        _ => panic!("expected a spilled UU part"),
+    };
+    std::fs::remove_file(&spool_path).unwrap();
+
+    submit_uu_segment(&mut pipeline, file_id, 0, &parts[0], false, false).await;
+
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert_eq!(pipeline.uu_spooled_bytes, 0);
+    assert_eq!(pipeline.uu_spooled_segments, 0);
+    assert_eq!(
+        pipeline.metrics.write_pending_bytes.load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn uu_job_teardown_releases_only_its_parked_resident_bytes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let parts: Vec<Vec<u8>> = vec![vec![b'a'; 80], vec![b'b'; 90]];
+    let first_job = JobId(20175);
+    let second_job = JobId(20176);
+    for job_id in [first_job, second_job] {
+        insert_active_job(
+            &mut pipeline,
+            job_id,
+            uu_job_spec(&parts.iter().map(|part| part.len()).collect::<Vec<_>>()),
+        )
+        .await;
+        submit_uu_segment(
+            &mut pipeline,
+            NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            1,
+            &parts[1],
+            false,
+            true,
+        )
+        .await;
+    }
+
+    assert_eq!(pipeline.write_buffered_bytes, parts[1].len() * 2);
+    pipeline.clear_job_write_backlog(first_job);
+    assert_eq!(pipeline.write_buffered_bytes, parts[1].len());
+    assert_eq!(
+        pipeline
+            .metrics
+            .write_buffered_bytes
+            .load(Ordering::Relaxed),
+        parts[1].len() as u64
+    );
+    pipeline.clear_job_write_backlog(second_job);
+    assert_eq!(pipeline.write_buffered_bytes, 0);
 }
 
 #[tokio::test]

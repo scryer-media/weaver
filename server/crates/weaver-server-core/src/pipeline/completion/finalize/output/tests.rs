@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn member_crc_map_preserves_paths_and_rejects_conflicting_values() {
+    let mut by_path = HashMap::new();
+    let mut ambiguous_paths = HashSet::new();
+
+    record_member_crc32_value(
+        &mut by_path,
+        &mut ambiguous_paths,
+        "disc-one\\payload.mkv",
+        0x1111_1111,
+    );
+    record_member_crc32_value(
+        &mut by_path,
+        &mut ambiguous_paths,
+        "disc-two/payload.mkv",
+        0x2222_2222,
+    );
+
+    assert_eq!(by_path["disc-one/payload.mkv"], 0x1111_1111);
+    assert_eq!(by_path["disc-two/payload.mkv"], 0x2222_2222);
+
+    record_member_crc32_value(
+        &mut by_path,
+        &mut ambiguous_paths,
+        "disc-one/payload.mkv",
+        0x3333_3333,
+    );
+    record_member_crc32_value(
+        &mut by_path,
+        &mut ambiguous_paths,
+        "disc-one/payload.mkv",
+        0x1111_1111,
+    );
+
+    assert!(!by_path.contains_key("disc-one/payload.mkv"));
+    assert!(ambiguous_paths.contains("disc-one/payload.mkv"));
+    assert_eq!(by_path["disc-two/payload.mkv"], 0x2222_2222);
+}
+
+#[test]
 fn safe_move_uses_rename_without_copy_on_the_same_filesystem() {
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("source.bin");
@@ -13,6 +52,7 @@ fn safe_move_uses_rename_without_copy_on_the_same_filesystem() {
     move_path_with_safe_rename_or_copy_fallback_using(
         &src,
         &dst,
+        b"renamed payload".len() as u64,
         Arc::clone(&counters),
         |src, dst| {
             rename_calls.set(rename_calls.get() + 1);
@@ -47,6 +87,7 @@ fn same_filesystem_directory_publication_renames_without_copy() {
     move_path_with_safe_rename_or_copy_fallback_using(
         &src,
         &dst,
+        b"renamed payload".len() as u64,
         Arc::new(PhaseCounters::default()),
         rename_path_for_publication,
         |_, _, _| {
@@ -77,6 +118,7 @@ fn safe_move_uses_exactly_one_copy_after_cross_device_rename_failure() {
     move_path_with_safe_rename_or_copy_fallback_using(
         &src,
         &dst,
+        b"copied payload".len() as u64,
         Arc::clone(&counters),
         |_, _| {
             rename_calls.set(rename_calls.get() + 1);
@@ -114,6 +156,7 @@ fn safe_move_does_not_copy_after_an_unrelated_rename_failure() {
     let error = move_path_with_safe_rename_or_copy_fallback_using(
         &src,
         &dst,
+        b"unmoved payload".len() as u64,
         counters,
         |_, _| {
             Err(std::io::Error::new(
@@ -192,6 +235,26 @@ fn copy_cleanup_does_not_remove_replaced_parent_destination() {
 }
 
 #[tokio::test]
+async fn destination_claim_skips_a_directory_populated_by_another_process() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("complete");
+    let occupied = parent.join("release");
+    std::fs::create_dir_all(&occupied).unwrap();
+    std::fs::write(occupied.join("blocked.exe"), b"existing payload").unwrap();
+
+    let claimed = claim_complete_destination_path(&parent, "release", JobId(42), &HashSet::new())
+        .await
+        .unwrap();
+
+    assert_eq!(claimed, parent.join("release.#42"));
+    assert_eq!(
+        std::fs::read(occupied.join("blocked.exe")).unwrap(),
+        b"existing payload"
+    );
+    assert!(std::fs::read_dir(claimed).unwrap().next().is_none());
+}
+
+#[tokio::test]
 async fn final_move_does_not_overwrite_existing_destination_file() {
     let temp = tempfile::tempdir().unwrap();
     let working = temp.path().join("working");
@@ -212,6 +275,7 @@ async fn final_move_does_not_overwrite_existing_destination_file() {
         dest,
         Arc::new(PhaseCounters::default()),
         None,
+        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
     )
     .await
     {
@@ -219,7 +283,7 @@ async fn final_move_does_not_overwrite_existing_destination_file() {
         Err(error) => error,
     };
 
-    assert!(error.contains("destination already exists"));
+    assert!(error.to_string().contains("populated before publication"));
     assert_eq!(std::fs::read(&src).unwrap(), b"new payload");
     assert_eq!(std::fs::read(&dst).unwrap(), b"existing payload");
 }
@@ -295,7 +359,7 @@ fn copy_fallback_preserves_nested_symlink_entries() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn final_move_preserves_symlink_entries() {
+async fn final_move_refuses_symlink_entries_and_releases_its_empty_destination_claim() {
     let temp = tempfile::tempdir().unwrap();
     let working = temp.path().join("working");
     let staging = temp.path().join("staging");
@@ -303,6 +367,7 @@ async fn final_move_preserves_symlink_entries() {
     let target = temp.path().join("target.bin");
     std::fs::create_dir_all(&working).unwrap();
     std::fs::create_dir_all(&staging).unwrap();
+    std::fs::create_dir(&dest).unwrap();
     std::fs::write(&target, b"target payload").unwrap();
     std::os::unix::fs::symlink(&target, staging.join("linked.bin")).unwrap();
 
@@ -313,19 +378,13 @@ async fn final_move_preserves_symlink_entries() {
         dest.clone(),
         Arc::new(PhaseCounters::default()),
         None,
+        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
     )
     .await
-    .unwrap();
+    .unwrap_err();
 
-    assert_eq!(result.moved_entries, 1);
-    let placed = dest.join("linked.bin");
-    assert!(
-        std::fs::symlink_metadata(&placed)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert_eq!(std::fs::read_link(placed).unwrap(), target);
+    assert!(result.to_string().contains("link or reparse point"));
+    assert!(!dest.exists());
 }
 
 /// The seam the rename pass runs at has to see both delivery routes as one set.
@@ -340,6 +399,7 @@ async fn the_rename_pass_sees_staging_and_working_output_as_one_delivery() {
     let dest = temp.path().join("complete");
     std::fs::create_dir_all(&working).unwrap();
     std::fs::create_dir_all(&staging).unwrap();
+    std::fs::create_dir(&dest).unwrap();
 
     // The payload arrives by the direct-store route...
     let payload = std::fs::File::create(staging.join("Yb5drZSkNi20UCMkb.mkv")).unwrap();
@@ -357,6 +417,7 @@ async fn the_rename_pass_sees_staging_and_working_output_as_one_delivery() {
             job_display_name: "Silver Horizon 2024".to_string(),
             srrdb: None,
         }),
+        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
     )
     .await
     .unwrap();
@@ -376,6 +437,7 @@ async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
     let working = temp.path().join("working");
     let dest = temp.path().join("complete");
     std::fs::create_dir_all(&working).unwrap();
+    std::fs::create_dir(&dest).unwrap();
     let payload = std::fs::File::create(working.join("Yb5drZSkNi20UCMkb.mkv")).unwrap();
     payload.set_len(64 * 1024 * 1024).unwrap();
 
@@ -386,10 +448,113 @@ async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
         dest.clone(),
         Arc::new(PhaseCounters::default()),
         None,
+        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
     )
     .await
     .unwrap();
 
     assert_eq!(result.renamed_members, 0);
     assert!(dest.join("Yb5drZSkNi20UCMkb.mkv").is_file());
+}
+
+#[test]
+fn prepublication_scan_checks_both_delivery_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let staging = temp.path().join("staging");
+    std::fs::create_dir_all(working.join("nested")).unwrap();
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(working.join("safe.mkv"), b"safe").unwrap();
+    std::fs::write(staging.join("nested.exe"), b"rejected").unwrap();
+
+    let settings = PostProcessingSettings {
+        unacceptable_extensions: vec!["EXE".into()],
+        ..PostProcessingSettings::default()
+    }
+    .normalized()
+    .unwrap();
+    let error = validate_delivery_sources(&working, Some(&staging), &settings).unwrap_err();
+
+    assert!(error.contains("unacceptable extension 'exe' matched 'staging/nested.exe'"));
+    assert!(working.join("safe.mkv").exists());
+    assert!(staging.join("nested.exe").exists());
+}
+
+/// The Windows arm of the guard reads a raw attribute bit rather than asking
+/// `FileType`, so an inverted or mistyped mask would reject every ordinary
+/// delivery instead of just the redirecting ones. The Unix symlink tests
+/// cannot see that: this one runs on every platform.
+#[test]
+fn ordinary_files_and_directories_are_not_treated_as_links() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("payload.mkv");
+    let directory = temp.path().join("season one");
+    std::fs::write(&file, b"payload").unwrap();
+    std::fs::create_dir(&directory).unwrap();
+
+    for path in [&file, &directory] {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        assert!(
+            !metadata_is_link_or_reparse(&metadata),
+            "{} was refused as a link or reparse point",
+            path.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn prepublication_scan_refuses_symlinked_directories() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&working).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("payload.exe"), b"rejected if followed").unwrap();
+    symlink(&outside, working.join("linked")).unwrap();
+
+    let settings = PostProcessingSettings {
+        unacceptable_extensions: vec!["exe".into()],
+        ..PostProcessingSettings::default()
+    };
+
+    let error = validate_delivery_sources(&working, None, &settings).unwrap_err();
+    assert!(error.contains("link or reparse point"));
+}
+
+#[test]
+fn prepublication_scan_counts_sparse_files_without_reading_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    std::fs::create_dir_all(&working).unwrap();
+    let payload = std::fs::File::create(working.join("payload.mkv")).unwrap();
+    payload.set_len(200 * 1024 * 1024 * 1024).unwrap();
+
+    let validation =
+        validate_delivery_sources(&working, None, &PostProcessingSettings::default()).unwrap();
+
+    assert_eq!(validation.total_bytes, 200 * 1024 * 1024 * 1024);
+    assert_eq!(
+        validation.root_entry_bytes[&working.join("payload.mkv")],
+        200 * 1024 * 1024 * 1024
+    );
+}
+
+#[test]
+fn prepublication_scan_handles_deep_output_trees_iteratively() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let mut nested = working.clone();
+    for _ in 0..128 {
+        nested.push("nested");
+    }
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("payload.mkv"), b"safe").unwrap();
+
+    let validation =
+        validate_delivery_sources(&working, None, &PostProcessingSettings::default()).unwrap();
+
+    assert_eq!(validation.total_bytes, 4);
 }

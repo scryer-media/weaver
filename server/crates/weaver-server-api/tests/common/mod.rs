@@ -211,6 +211,7 @@ impl TestHarness {
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             direct_store: None,
+            direct_unpack: None,
             delivery_naming: None,
             metrics: Default::default(),
             config_path: None,
@@ -759,7 +760,23 @@ fn spawn_test_scheduler(
                     jobs.insert(job_id, state);
                     let _ = reply.send(Ok(()));
                 }
-                SchedulerCommand::DeleteHistory { job_id, reply, .. } => {
+                SchedulerCommand::DeleteHistory {
+                    job_id,
+                    delete_files,
+                    reply,
+                } => {
+                    if delete_files
+                        && let Some(output_dir) = db
+                            .get_job_history(job_id.0)
+                            .expect("failed to load history row from test db")
+                            .and_then(|row| row.output_dir)
+                    {
+                        let output_dir = PathBuf::from(output_dir);
+                        if output_dir.exists() {
+                            std::fs::remove_dir_all(&output_dir)
+                                .expect("failed to remove test history output directory");
+                        }
+                    }
                     jobs.remove(&job_id);
                     db.delete_job_history(job_id.0)
                         .expect("failed to delete history row from test db");

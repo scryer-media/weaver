@@ -6,9 +6,11 @@ use std::time::Instant;
 
 use super::*;
 use crate::pipeline::direct_store::wiring::{DirectFileTarget, DirectRouteOutcome};
+use tempfile::Builder;
 
 const MAX_DEFERRED_FILE_HASH_DATA_BYTES: usize = 128 * 1024 * 1024;
 const OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS: usize = 16;
+const UU_SPOOL_FILE_PREFIX: &str = "part-";
 
 #[derive(Clone, Copy, Debug)]
 enum SegmentHashMode {
@@ -46,6 +48,20 @@ enum UuPlacement {
     /// The cursor already shifted past this ordinal after it was booked failed,
     /// so its bytes have no home and never will. Dropped terminally.
     Stale,
+}
+
+fn prepare_uu_spool_dir(path: &std::path::Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(io::Error::other(format!(
+                "UU spool directory is not a directory: {}",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::create_dir_all(path),
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Debug)]
@@ -607,13 +623,20 @@ impl Pipeline {
         }
 
         let ranges = self.deferred_file_hash_ranges.get(&file_id);
+        // Nearly every deferred range of a file has the same length (the
+        // poster's article size), so keep one combine operator per length and
+        // fold each range with a single polynomial multiply.
+        let mut combine_ops: std::collections::HashMap<usize, weaver_yenc::Crc32Combine> =
+            std::collections::HashMap::new();
         while bytes_fed < total_bytes {
             let range = ranges.and_then(|ranges| ranges.get(&bytes_fed))?;
             let len = range.len as u64;
             if len == 0 {
                 return None;
             }
-            let op = par2_rs::checksum::Crc32CombineOp::new(len);
+            let op = combine_ops
+                .entry(range.len)
+                .or_insert_with(|| weaver_yenc::Crc32Combine::new(len));
             crc32 = op.combine(crc32, range.part_crc);
             all_parts_crc_verified &= range.part_crc_verified;
             bytes_fed = bytes_fed.checked_add(len)?;
@@ -873,7 +896,7 @@ impl Pipeline {
                 DownloadWork {
                     segment_id,
                     message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-                    groups: file_spec.groups.clone(),
+                    groups: std::sync::Arc::from(file_spec.groups.as_slice()),
                     priority: file_spec.role.download_priority(),
                     byte_estimate: seg_spec.bytes,
                     retry_count: 0,
@@ -1226,7 +1249,7 @@ impl Pipeline {
                 let work = DownloadWork {
                     segment_id,
                     message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-                    groups: file_spec.groups.clone(),
+                    groups: std::sync::Arc::from(file_spec.groups.as_slice()),
                     priority: file_spec.role.download_priority(),
                     byte_estimate: seg_spec.bytes,
                     retry_count: 0,
@@ -1292,7 +1315,17 @@ impl Pipeline {
         if !is_uu {
             return;
         }
-        while let Some((segment_number, data)) = self.take_next_ready_uu_segment(file_id) {
+        loop {
+            let next = match self.take_next_ready_uu_segment(file_id).await {
+                Ok(next) => next,
+                Err(error) => {
+                    self.fail_job_for_disk_write(error, "UU spool read failed");
+                    return;
+                }
+            };
+            let Some((segment_number, data)) = next else {
+                break;
+            };
             let released = DecodeResult {
                 segment_id: SegmentId {
                     file_id,
@@ -1427,8 +1460,16 @@ impl Pipeline {
                         // bound must be re-fetched: its bytes are gone, and the
                         // download layer already counts it as delivered.
                         drop(_cpu_scope);
-                        let displaced =
-                            self.park_uu_segment(file_id, segment_id.segment_number, data);
+                        let displaced = match self
+                            .park_uu_segment(file_id, segment_id.segment_number, data)
+                            .await
+                        {
+                            Ok(displaced) => displaced,
+                            Err(error) => {
+                                self.fail_job_for_disk_write(error, "UU spool write failed");
+                                return;
+                            }
+                        };
                         for ordinal in displaced {
                             self.requeue_displaced_uu_segment(SegmentId {
                                 file_id,
@@ -1607,7 +1648,7 @@ impl Pipeline {
                 }
             }
 
-            let _ = self.event_tx.send(PipelineEvent::SegmentDecoded {
+            self.send_segment_event(|| PipelineEvent::SegmentDecoded {
                 segment_id,
                 decoded_size,
                 file_offset,
@@ -2013,30 +2054,119 @@ impl Pipeline {
     /// considers that segment finished; without a fresh fetch its data exists
     /// nowhere, and the cursor would wedge permanently the moment it reached
     /// that ordinal.
-    #[must_use]
-    fn park_uu_segment(
+    async fn spill_uu_segment(
+        &self,
+        file_id: NzbFileId,
+        data: DecodedChunk,
+    ) -> Result<UuParkedEntry, SegmentWriteError> {
+        let decoded_bytes = data.len_bytes();
+        let spool_dir = self.uu_spool_root.join(file_id.job_id.0.to_string());
+        let entry = tokio::task::spawn_blocking(move || {
+            prepare_uu_spool_dir(&spool_dir)?;
+            // tempfile creates its file with owner-only permissions. Keep the
+            // TempPath alive in the park so every removal unlinks it.
+            let mut file = Builder::new()
+                .prefix(UU_SPOOL_FILE_PREFIX)
+                .tempfile_in(&spool_dir)?;
+            data.write_to(file.as_file_mut())?;
+            // This is a transient reorder spool, not crash-durable storage.
+            // `into_temp_path` closes the completed file before publishing
+            // it to the park; readers therefore only observe a full write
+            // without serializing every ahead-of-cursor segment on `sync_all`.
+            Ok::<_, io::Error>(UuParkedEntry::Spilled {
+                path: file.into_temp_path(),
+                decoded_bytes,
+            })
+        })
+        .await
+        .map_err(|error| {
+            SegmentWriteError::new(
+                file_id,
+                io::Error::other(format!("UU spool task failed: {error}")),
+            )
+        })?
+        .map_err(|error| SegmentWriteError::new(file_id, error))?;
+        Ok(entry)
+    }
+
+    fn release_uu_parked_entry(&mut self, job_id: JobId, entry: UuParkedEntry) {
+        match entry {
+            UuParkedEntry::Memory(data) => self.release_write_buffered(data.len_bytes(), 1),
+            UuParkedEntry::Spilled {
+                path,
+                decoded_bytes,
+            } => {
+                self.release_uu_spooled(decoded_bytes, 1);
+                drop(path);
+                remove_empty_uu_park_dir(&self.uu_spool_root, job_id);
+            }
+        }
+        self.release_uu_parked_segment();
+    }
+
+    /// Store an ahead-of-cursor part after its memory-or-disk form has been
+    /// fully prepared. Memory is charged only after insertion succeeds; disk
+    /// spill writes complete before their entry becomes visible to the cursor.
+    async fn park_uu_segment(
         &mut self,
         file_id: NzbFileId,
         segment_number: u32,
         data: DecodedChunk,
-    ) -> Vec<u32> {
+    ) -> Result<Vec<u32>, SegmentWriteError> {
         let max_pending = self.write_buf_max_pending;
-        let Some(uu) = self.uu_files.get_mut(&file_id) else {
-            return Vec::new();
+        let decoded_bytes = data.len_bytes();
+        let projected_resident = self.write_buffered_bytes.saturating_add(decoded_bytes);
+        let spills = projected_resident >= self.write_backlog_budget_bytes;
+        if self.uu_spool_admission_capped(0)
+            || (spills && self.uu_spool_admission_capped(decoded_bytes))
+        {
+            // The part is already decoded, but holding it would exceed the
+            // aggregate cache cap or consume the intermediate filesystem's
+            // reserved free space. Requeue without retry burn, exactly like a
+            // per-file farthest-part displacement.
+            return Ok(vec![segment_number]);
+        }
+        let entry = if spills {
+            self.spill_uu_segment(file_id, data).await?
+        } else {
+            UuParkedEntry::Memory(data)
         };
-        uu.parked.insert(segment_number, data);
+        let inserted_spilled = entry.is_spilled();
+        let inserted_bytes = entry.decoded_bytes();
+        let Some(uu) = self.uu_files.get_mut(&file_id) else {
+            return Ok(Vec::new());
+        };
 
+        let replacement = uu.parked.insert(segment_number, entry);
         let mut displaced = Vec::new();
+        let mut displaced_entries = Vec::new();
         while uu.parked.len() > max_pending {
             // Displace from the far end: those parts are the furthest from the
             // cursor, so re-fetching them is the least urgent work.
             let Some(highest) = uu.parked.keys().next_back().copied() else {
                 break;
             };
-            uu.parked.remove(&highest);
+            let entry = uu
+                .parked
+                .remove(&highest)
+                .expect("UU park contained its selected farthest ordinal");
             displaced.push(highest);
+            displaced_entries.push(entry);
         }
-        displaced
+
+        if inserted_spilled {
+            self.note_uu_spooled(inserted_bytes, 1);
+        } else {
+            self.note_write_buffered(inserted_bytes, 1);
+        }
+        self.note_uu_parked_segment();
+        if let Some(entry) = replacement {
+            self.release_uu_parked_entry(file_id.job_id, entry);
+        }
+        for entry in displaced_entries {
+            self.release_uu_parked_entry(file_id.job_id, entry);
+        }
+        Ok(displaced)
     }
 
     /// Return a uuencode segment to the download queue because of park
@@ -2103,7 +2233,7 @@ impl Pipeline {
         let work = DownloadWork {
             segment_id,
             message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-            groups: file_spec.groups.clone(),
+            groups: std::sync::Arc::from(file_spec.groups.as_slice()),
             priority: file_spec.role.download_priority(),
             byte_estimate: seg_spec.bytes,
             retry_count: 0,
@@ -2132,10 +2262,75 @@ impl Pipeline {
     /// which advances the cursor again and so makes the call after it the one
     /// that finds the next part. That keeps a single place where a segment is
     /// placed, written and accounted for, however long the released run is.
-    fn take_next_ready_uu_segment(&mut self, file_id: NzbFileId) -> Option<(u32, DecodedChunk)> {
-        let uu = self.uu_files.get_mut(&file_id)?;
-        let index = uu.next_index;
-        uu.parked.remove(&index).map(|data| (index, data))
+    async fn take_next_ready_uu_segment(
+        &mut self,
+        file_id: NzbFileId,
+    ) -> Result<Option<(u32, DecodedChunk)>, SegmentWriteError> {
+        let next = self.uu_files.get_mut(&file_id).and_then(|uu| {
+            let index = uu.next_index;
+            uu.parked.remove(&index).map(|entry| (index, entry))
+        });
+        let Some((index, entry)) = next else {
+            return Ok(None);
+        };
+
+        match entry {
+            UuParkedEntry::Memory(data) => {
+                self.release_write_buffered(data.len_bytes(), 1);
+                self.release_uu_parked_segment();
+                Ok(Some((index, data)))
+            }
+            UuParkedEntry::Spilled {
+                path,
+                decoded_bytes,
+            } => {
+                // The entry left the disk park before its read starts. Its
+                // recorded decoded length, rather than file metadata, bounds
+                // allocation and validates the entire spool contents.
+                self.release_uu_spooled(decoded_bytes, 1);
+                self.release_uu_parked_segment();
+                let read_result = tokio::task::spawn_blocking(move || {
+                    let read_result = (|| -> io::Result<DecodedChunk> {
+                        let mut file = File::open(&path)?;
+                        let mut bytes = Vec::new();
+                        bytes.try_reserve_exact(decoded_bytes).map_err(|error| {
+                            io::Error::other(format!(
+                                "failed to reserve {decoded_bytes} bytes for UU spool read: {error}"
+                            ))
+                        })?;
+                        bytes.resize(decoded_bytes, 0);
+                        file.read_exact(&mut bytes)?;
+                        let mut extra = [0u8; 1];
+                        if file.read(&mut extra)? != 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "UU spool file contains more bytes than recorded",
+                            ));
+                        }
+                        Ok(bytes.into())
+                    })();
+                    // Always remove the transient file, including after a
+                    // truncated, oversized, or missing-file read failure.
+                    let remove_result = path.close();
+                    match (read_result, remove_result) {
+                        (Err(error), _) => Err(error),
+                        (Ok(_), Err(error)) => Err(error),
+                        (Ok(data), Ok(())) => Ok(data),
+                    }
+                })
+                .await;
+                remove_empty_uu_park_dir(&self.uu_spool_root, file_id.job_id);
+                let data = read_result
+                    .map_err(|error| {
+                        SegmentWriteError::new(
+                            file_id,
+                            io::Error::other(format!("UU spool read task failed: {error}")),
+                        )
+                    })?
+                    .map_err(|error| SegmentWriteError::new(file_id, error))?;
+                Ok(Some((index, data)))
+            }
+        }
     }
 
     /// Close out a uuencode file's sequential state and report its condition.
@@ -2167,20 +2362,56 @@ impl Pipeline {
     fn finish_uu_file(&mut self, file_id: NzbFileId) -> Option<String> {
         self.uu_park_requeues
             .retain(|segment_id, _| segment_id.file_id != file_id);
-        let uu = self.uu_files.get_mut(&file_id)?;
-        uu.parked.clear();
-        let filename = uu.filename.clone();
-        if uu.finished {
+        let (
+            filename,
+            finished,
+            damaged,
+            saw_end,
+            memory_bytes,
+            memory_segments,
+            spooled_bytes,
+            spooled_segments,
+        ) = {
+            let uu = self.uu_files.get_mut(&file_id)?;
+            let spooled_segments = uu.parked_spooled_segments();
+            let memory_segments = uu.parked.len().saturating_sub(spooled_segments);
+            let memory_bytes = uu.parked_memory_bytes();
+            let spooled_bytes = uu.parked_spooled_bytes();
+            uu.parked.clear();
+            (
+                uu.filename.clone(),
+                uu.finished,
+                uu.damaged,
+                uu.saw_end,
+                memory_bytes,
+                memory_segments,
+                spooled_bytes,
+                spooled_segments,
+            )
+        };
+        if memory_bytes > 0 || memory_segments > 0 {
+            self.release_write_buffered(memory_bytes, memory_segments);
+        }
+        if spooled_bytes > 0 || spooled_segments > 0 {
+            self.release_uu_spooled(spooled_bytes, spooled_segments);
+        }
+        for _ in 0..memory_segments.saturating_add(spooled_segments) {
+            self.release_uu_parked_segment();
+        }
+        remove_empty_uu_park_dir(&self.uu_spool_root, file_id.job_id);
+        if finished {
             // A duplicate arrival re-runs the completion branch; the condition
             // was reported the first time through.
             return filename;
         }
-        uu.finished = true;
-        if uu.damaged || !uu.saw_end {
+        if let Some(uu) = self.uu_files.get_mut(&file_id) {
+            uu.finished = true;
+        }
+        if damaged || !saw_end {
             warn!(
                 file_id = %file_id,
-                decode_damage = uu.damaged,
-                missing_end_marker = !uu.saw_end,
+                decode_damage = damaged,
+                missing_end_marker = !saw_end,
                 "uuencode file completed in a damaged state; PAR2 is the authority on recovery"
             );
         }
@@ -2279,6 +2510,11 @@ impl Pipeline {
             return Err(SegmentWriteError::new(file_id, source));
         }
         self.note_file_progress_floor(file_id, contiguous_end_after_ready, false);
+        // The write syscalls above returned, so bytes `0..contiguous_end` are
+        // on disk and a direct-unpack chase may read them. Costs one `is_empty`
+        // when nothing is being chased, which is the overwhelmingly common
+        // case and the reason this is a call rather than a check inlined here.
+        self.direct_unpack_note_commit(file_id, &filename, contiguous_end_after_ready, false);
         // Hot-path safe: `write_start.elapsed()` is the single clock read this
         // path already performs for the `disk_write_latency_us` gauge, and the
         // histogram observes exactly that same span so the two agree. The
@@ -2530,9 +2766,7 @@ impl Pipeline {
                         .segments_committed
                         .fetch_add(1, Ordering::Relaxed);
 
-                    let _ = self
-                        .event_tx
-                        .send(PipelineEvent::SegmentCommitted { segment_id });
+                    self.send_segment_event(|| PipelineEvent::SegmentCommitted { segment_id });
                 }
 
                 // Ordering contract: this seam runs only after
@@ -2700,11 +2934,6 @@ impl Pipeline {
                         }
                     }
 
-                    // Queued behind the file's final write on its owner
-                    // thread, so the fd is released before verification,
-                    // repair, or the final move touch this path.
-                    crate::pipeline::release_cached_write_handle(file_path);
-
                     // The file's length is what makes its short final block
                     // closable: until now that block's extent was undecided.
                     // Blocks the grid could not claim in stream (including the
@@ -2728,6 +2957,7 @@ impl Pipeline {
                         Err(error) => {
                             if expected_file_crc.is_some() {
                                 warn!(file_id = %file_id, error = %error, "failed to verify yEnc whole-file CRC32");
+                                crate::pipeline::release_cached_write_handle(file_path);
                                 self.fail_job(
                                     job_id,
                                     format!("failed to verify yEnc whole-file CRC32 for {file_id}: {error}"),
@@ -2751,13 +2981,16 @@ impl Pipeline {
                             .schedule_file_crc_recovery(file_id, expected_crc, file_checksum.crc32)
                             .await
                         {
+                            // Recovery rewrites this file: its handle stays.
                             Ok(true) => return,
                             Ok(false) => {}
                             Err(error) => {
+                                crate::pipeline::release_cached_write_handle(file_path);
                                 self.fail_job(job_id, error);
                                 return;
                             }
                         }
+                        crate::pipeline::release_cached_write_handle(file_path);
                         self.fail_job(
                             job_id,
                             format!(
@@ -2886,6 +3119,16 @@ impl Pipeline {
                         stage_ms = stage_start.elapsed().as_millis() as u64,
                         "file-complete stage: refresh_archive_state_for_completed_file"
                     );
+                    // Released only now, after the archive probe above has
+                    // read the file: the last close of a freshly written file
+                    // is where the kernel flushes it, and a probe opened
+                    // during that flush waits on the vnode for the whole of
+                    // it. Every write landed before this seam ran, so the
+                    // probe reads complete bytes through the open handle.
+                    // Still queued behind the file's final write on its owner
+                    // thread, so the fd is gone before verification, repair,
+                    // or the final move touch this path.
+                    crate::pipeline::release_cached_write_handle(file_path);
                     stage_start = Instant::now();
                     self.retry_par2_authoritative_identity(job_id).await;
                     crate::runtime::perf_probe::record(

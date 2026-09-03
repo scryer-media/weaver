@@ -13,7 +13,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.6"
+version = "0.10.0"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -75,7 +75,7 @@ filetime = { version = "0.2.29", default-features = false }
 memmap2 = { version = "0.9", default-features = false }
 zstd = { version = "0.13", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-sevenz-rust2 = { version = "0.22", default-features = false, features = ["aes256", "brotli", "bzip2", "deflate", "ppmd", "util", "zstd"] }
+sevenz-rust2 = { version = "0.22", default-features = false, features = ["aes256", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "zstd"] }
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
 regex = { version = "1.13", default-features = false, features = ["std", "perf", "unicode"] }
@@ -113,12 +113,12 @@ windows-sys = { version = "0.61", default-features = false }
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 par2-rs = { version = "0.8", default-features = false, features = ["native-crypto"] }
-# 0.6 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
+# 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x
-# collapsed to 0. (0.5.1 through 0.5.4 additionally decode some filtered RAR5
-# members to the wrong bytes.)
-unrar-rs = { version = "0.6.0", default-features = false, features = ["crypto-aws-lc"] }
+# collapsed to 0. It also avoids reserving a member's declared expanded size
+# before extraction establishes how much output is actually available.
+unrar-rs = { version = "0.7.0", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]

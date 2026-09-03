@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use cap_fs_ext::DirExt;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
+use tracing::{info, warn};
 
 use crate::operations::disk::disk_space;
 use crate::operations::metrics::PipelineMetrics;
@@ -87,6 +88,7 @@ pub(crate) enum ExtractionRejectionReason {
     Deadline,
     Memory,
     DiskReserve,
+    ContentPolicy,
 }
 
 impl ExtractionRejectionReason {
@@ -101,6 +103,7 @@ impl ExtractionRejectionReason {
             Self::Deadline => "deadline",
             Self::Memory => "memory",
             Self::DiskReserve => "disk_reserve",
+            Self::ContentPolicy => "content_policy",
         }
     }
 }
@@ -134,9 +137,108 @@ struct ActiveState {
     writers: u64,
 }
 
+/// How long an extraction may wait for process-wide decoder memory before it
+/// says so. Generous: a legitimate queue behind a large archive is normal, and
+/// this is meant to catch a hold that is not going to end, not to narrate
+/// ordinary contention.
+const PROCESS_MEMORY_WAIT_WARN_AFTER: Duration = Duration::from_secs(30);
+
+/// Decoder-window bytes reserved by every extraction job in this pipeline.
+///
+/// Decoder dictionaries are allocated inside third-party codecs, outside the
+/// ordinary output budgets. Keep one charge for the whole process so several
+/// jobs cannot each consume the configured memory allowance concurrently.
+///
+/// The limit is `ExtractionLimits::max_memory_bytes` — the same number a 7z
+/// extraction reserves in full — so 7z extractions are serialised across the
+/// whole process, and a holder that blocks blocks all of them. See
+/// `one_full_ceiling_reservation_serialises_every_job_in_the_process`.
+#[derive(Debug)]
+pub(crate) struct ProcessMemoryBudget {
+    limit: u64,
+    reserved: AtomicU64,
+    idle: Mutex<()>,
+    released: Condvar,
+}
+
+impl ProcessMemoryBudget {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            reserved: AtomicU64::new(0),
+            idle: Mutex::new(()),
+            released: Condvar::new(),
+        }
+    }
+
+    fn reserve_wait<F>(
+        self: &Arc<Self>,
+        bytes: u64,
+        mut check_active: F,
+    ) -> Result<ProcessMemoryPermit, String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        if bytes > self.limit {
+            return Err(format!(
+                "decoder requires {bytes} bytes, process limit is {}",
+                self.limit
+            ));
+        }
+
+        let mut wait_guard = self.idle.lock().expect("process memory state poisoned");
+        let started = Instant::now();
+        let mut announced = false;
+        loop {
+            check_active()?;
+            if reserve_atomic(&self.reserved, bytes, self.limit).is_ok() {
+                if announced {
+                    info!(
+                        requested_bytes = bytes,
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "extraction memory reservation granted after waiting"
+                    );
+                }
+                return Ok(ProcessMemoryPermit {
+                    budget: Arc::clone(self),
+                    bytes,
+                });
+            }
+            // This wait has no deadline, by design: the holder will finish. But
+            // an extraction that reserves the whole process allowance and then
+            // blocks — a direct-unpack chase parked on its download, say — holds
+            // every other extraction in the process behind it, and until now it
+            // did so in complete silence for as long as it took. Say what is
+            // being waited for, once, so a stalled pipeline names its own cause.
+            if !announced && started.elapsed() >= PROCESS_MEMORY_WAIT_WARN_AFTER {
+                announced = true;
+                warn!(
+                    requested_bytes = bytes,
+                    reserved_bytes = self.reserved.load(Ordering::Acquire),
+                    limit_bytes = self.limit,
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "extraction is still waiting for process-wide decoder memory; \
+                     another extraction is holding it"
+                );
+            }
+            let (guard, _) = self
+                .released
+                .wait_timeout(wait_guard, Duration::from_millis(250))
+                .expect("process memory state poisoned");
+            wait_guard = guard;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        self.reserved.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct JobExtractionBudget {
     limits: Arc<ExtractionLimits>,
+    process_memory: Arc<ProcessMemoryBudget>,
     root_path: PathBuf,
     ratio_limit_bytes: u64,
     effective_job_limit_bytes: u64,
@@ -161,6 +263,27 @@ impl JobExtractionBudget {
         initial_bytes: u64,
         metrics: Arc<PipelineMetrics>,
     ) -> Result<Arc<Self>, String> {
+        let process_memory = Arc::new(ProcessMemoryBudget::new(limits.max_memory_bytes));
+        Self::new_with_process_memory(
+            limits,
+            process_memory,
+            root_path,
+            declared_archive_bytes,
+            initial_entries,
+            initial_bytes,
+            metrics,
+        )
+    }
+
+    pub(crate) fn new_with_process_memory(
+        limits: Arc<ExtractionLimits>,
+        process_memory: Arc<ProcessMemoryBudget>,
+        root_path: PathBuf,
+        declared_archive_bytes: u64,
+        initial_entries: u64,
+        initial_bytes: u64,
+        metrics: Arc<PipelineMetrics>,
+    ) -> Result<Arc<Self>, String> {
         let ratio_limit_bytes = declared_archive_bytes
             .saturating_mul(limits.max_ratio)
             .max(GIB);
@@ -171,6 +294,7 @@ impl JobExtractionBudget {
             .unwrap_or(0);
         let budget = Arc::new(Self {
             limits,
+            process_memory,
             root_path,
             ratio_limit_bytes,
             effective_job_limit_bytes,
@@ -274,13 +398,48 @@ impl JobExtractionBudget {
             .active
             .lock()
             .expect("extraction active state poisoned");
+        let started = Instant::now();
+        let mut announced = false;
         loop {
             self.check_active().map_err(|error| error.to_string())?;
             if reserve_atomic(&self.memory_reserved, bytes, self.limits.max_memory_bytes).is_ok() {
+                if announced {
+                    info!(
+                        requested_bytes = bytes,
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "job decoder memory granted after waiting"
+                    );
+                }
+                let process_memory = self
+                    .process_memory
+                    .reserve_wait(bytes, || {
+                        self.check_active().map_err(|error| error.to_string())
+                    })
+                    .map_err(|error| {
+                        self.memory_reserved.fetch_sub(bytes, Ordering::AcqRel);
+                        self.idle.notify_all();
+                        self.reject(ExtractionRejectionReason::Memory, error)
+                            .to_string()
+                    })?;
                 return Ok(MemoryPermit {
                     budget: Arc::clone(self),
+                    _process_memory: process_memory,
                     bytes,
                 });
+            }
+            // The per-job stage had no wait announcement at all, only the
+            // process-wide one below it — so a job whose own budget was
+            // exhausted by a concurrent decoder waited here in the same silence
+            // the process stage used to.
+            if !announced && started.elapsed() >= PROCESS_MEMORY_WAIT_WARN_AFTER {
+                announced = true;
+                warn!(
+                    requested_bytes = bytes,
+                    reserved_bytes = self.memory_reserved.load(Ordering::Acquire),
+                    limit_bytes = self.limits.max_memory_bytes,
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "extraction is still waiting for this job's decoder memory"
+                );
             }
             let (guard, _) = self
                 .idle
@@ -332,6 +491,14 @@ impl JobExtractionBudget {
 
     pub(crate) fn reject_unsupported_entry(&self, detail: impl Into<String>) -> String {
         self.reject(ExtractionRejectionReason::UnsupportedEntry, detail.into())
+            .to_string()
+    }
+
+    /// Reject material that policy must not permit to reach publication. This
+    /// shares the extraction budget's cancellation signal so sibling workers
+    /// stop at their next checkpoint.
+    pub(crate) fn reject_content_policy(&self, detail: impl Into<String>) -> String {
+        self.reject(ExtractionRejectionReason::ContentPolicy, detail.into())
             .to_string()
     }
 
@@ -568,6 +735,7 @@ impl Drop for TaskPermit {
 #[derive(Debug)]
 pub(crate) struct MemoryPermit {
     budget: Arc<JobExtractionBudget>,
+    _process_memory: ProcessMemoryPermit,
     bytes: u64,
 }
 
@@ -577,6 +745,19 @@ impl Drop for MemoryPermit {
             .memory_reserved
             .fetch_sub(self.bytes, Ordering::AcqRel);
         self.budget.idle.notify_all();
+    }
+}
+
+#[derive(Debug)]
+struct ProcessMemoryPermit {
+    budget: Arc<ProcessMemoryBudget>,
+    bytes: u64,
+}
+
+impl Drop for ProcessMemoryPermit {
+    fn drop(&mut self) {
+        self.budget.reserved.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.budget.released.notify_all();
     }
 }
 
@@ -623,14 +804,6 @@ impl<W> BudgetedWriter<W> {
             budget,
             member_written: 0,
         }
-    }
-
-    /// The wrapped handle, for operations that act on the file itself rather
-    /// than on its contents — preallocation, for one. Reading and writing
-    /// still go through the budgeted `Write` impl, which is where the byte
-    /// accounting lives.
-    pub(crate) fn get_ref(&self) -> &W {
-        &self.inner
     }
 }
 
@@ -1241,6 +1414,110 @@ mod tests {
     }
 
     #[test]
+    fn decoder_memory_is_shared_across_job_budgets() {
+        let temp = tempfile::tempdir().unwrap();
+        let limits = Arc::new(ExtractionLimits {
+            max_memory_bytes: 8 * GIB,
+            ..(*limits()).clone()
+        });
+        let process_memory = Arc::new(ProcessMemoryBudget::new(8 * GIB));
+        let first_budget = JobExtractionBudget::new_with_process_memory(
+            Arc::clone(&limits),
+            Arc::clone(&process_memory),
+            temp.path().to_path_buf(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+        let second_budget = JobExtractionBudget::new_with_process_memory(
+            limits,
+            Arc::clone(&process_memory),
+            temp.path().to_path_buf(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+
+        let first = first_budget.reserve_memory_wait(6 * GIB).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _second = second_budget.reserve_memory_wait(4 * GIB).unwrap();
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(process_memory.reserved_bytes(), 6 * GIB);
+        assert!(!waiter.is_finished());
+
+        drop(first);
+        waiter.join().unwrap();
+        assert_eq!(process_memory.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn cancelled_job_leaves_shared_memory_wait_before_holder_releases() {
+        let temp = tempfile::tempdir().unwrap();
+        let limits = Arc::new(ExtractionLimits {
+            max_memory_bytes: 8 * GIB,
+            ..(*limits()).clone()
+        });
+        let process_memory = Arc::new(ProcessMemoryBudget::new(8 * GIB));
+        let holder_budget = JobExtractionBudget::new_with_process_memory(
+            Arc::clone(&limits),
+            Arc::clone(&process_memory),
+            temp.path().to_path_buf(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+        let waiting_budget = JobExtractionBudget::new_with_process_memory(
+            limits,
+            Arc::clone(&process_memory),
+            temp.path().to_path_buf(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+
+        let holder = holder_budget.reserve_memory_wait(6 * GIB).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiting_budget_for_thread = Arc::clone(&waiting_budget);
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = waiting_budget_for_thread
+                .reserve_memory_wait(4 * GIB)
+                .map(|_| ());
+            let _ = done_tx.send(result);
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(process_memory.reserved_bytes(), 6 * GIB);
+        assert!(!waiter.is_finished());
+
+        waiting_budget.cancel();
+
+        let error = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled job should leave the shared-memory wait")
+            .unwrap_err();
+        assert!(error.contains("job extraction was cancelled"));
+        assert_eq!(process_memory.reserved_bytes(), 6 * GIB);
+
+        waiter.join().unwrap();
+        drop(holder);
+        assert_eq!(process_memory.reserved_bytes(), 0);
+    }
+
+    #[test]
     fn budgeted_reader_enforces_deadline_before_returning_input() {
         let temp = tempfile::tempdir().unwrap();
         let budget = JobExtractionBudget::new(
@@ -1308,5 +1585,74 @@ mod tests {
         let error = ExtractionRoot::open(&job_root).unwrap_err();
         assert!(error.contains("without following links"));
         assert!(outside.path().exists());
+    }
+
+    /// Two jobs, one process-wide decoder-memory pool, and the reservation every
+    /// 7z extraction actually makes.
+    ///
+    /// `ProcessMemoryBudget` is constructed with `limits.max_memory_bytes` — the
+    /// same number a 7z extraction passes to `reserve_memory_wait` — so one
+    /// extraction holding its reservation holds *all* of it, and every other 7z
+    /// extraction in the process blocks until that one lets go. The wait has no
+    /// deadline, so "until it lets go" is unbounded: a direct-unpack chase that
+    /// takes this permit and then parks on a download it is chasing stops every
+    /// other extraction in the pipeline for as long as it is parked.
+    ///
+    /// This test states the property rather than asserting it is wrong; the
+    /// serialisation is deliberate (decoder dictionaries are allocated outside
+    /// the ordinary budgets). What it pins is the blast radius, so a change to
+    /// either number has to come here and say so.
+    #[test]
+    fn one_full_ceiling_reservation_serialises_every_job_in_the_process() {
+        let shared = Arc::new(ProcessMemoryBudget::new(limits().max_memory_bytes));
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let budget_for = |dir: &tempfile::TempDir| {
+            JobExtractionBudget::new_with_process_memory(
+                Arc::new((*limits()).clone()),
+                Arc::clone(&shared),
+                dir.path().to_path_buf(),
+                1,
+                0,
+                0,
+                PipelineMetrics::new(),
+            )
+            .unwrap()
+        };
+        let first = budget_for(&first_dir);
+        let second = budget_for(&second_dir);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "these are separate jobs with separate per-job budgets"
+        );
+
+        // What both the chase and conventional 7z extraction reserve.
+        let held = first.reserve_memory_wait(first.max_memory_bytes()).unwrap();
+        assert_eq!(shared.reserved_bytes(), limits().max_memory_bytes);
+
+        let blocked = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&blocked);
+        let waiter_budget = Arc::clone(&second);
+        let waiter = std::thread::spawn(move || {
+            let permit = waiter_budget
+                .reserve_memory_wait(waiter_budget.max_memory_bytes())
+                .unwrap();
+            observed.store(true, Ordering::Release);
+            drop(permit);
+        });
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !blocked.load(Ordering::Acquire),
+            "a second job cannot get decoder memory while the first holds the whole pool"
+        );
+
+        drop(held);
+        waiter.join().unwrap();
+        assert!(
+            blocked.load(Ordering::Acquire),
+            "and it proceeds the moment the holder releases"
+        );
+        assert_eq!(shared.reserved_bytes(), 0);
     }
 }

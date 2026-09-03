@@ -26,6 +26,15 @@ const (
 // far enough into the file that the container header still parses and the
 // failure surfaces as a checksum mismatch rather than an unreadable archive.
 const (
+	// Volumes every direct-unpack split fixture is cut into. Three is enough
+	// that a chase has parts still arriving while it decodes the ones already
+	// down, and a fixed count keeps the ledger contract writable.
+	DirectUnpackVolumes = 3
+
+	// The repair fixture is cut into more, larger volumes so the damage can sit
+	// beyond anything the chase reads early. See the invariant on its recipe.
+	DirectUnpackRepairVolumes = 6
+
 	CorruptOffset = 10 << 20
 	CorruptLength = 1 << 20
 	TruncateBytes = 1 << 20
@@ -676,6 +685,204 @@ func Recipes() []Recipe {
 			zeroOutput("archive.7z.002", 5<<20, CorruptLength),
 			truncateOutput("archive.7z.003", TruncateBytes),
 		),
+	})
+
+	// ------------------------------------------- direct-unpack codec matrix
+	//
+	// Two scenarios per coder chain: the whole archive, and the same bytes cut
+	// into volumes. A 7z volume set is a plain byte split, so the split variant
+	// costs one Go pass and stays byte-identical to the single file — which is
+	// what makes "same content, both shapes" cheap enough to do for every codec.
+	//
+	// The split shape is the one direct unpack can actually overlap; a single
+	// `.7z` has no topology until the whole file has landed, so its scenarios
+	// assert the ordinary conventional outcome.
+	for _, codec := range sevenZipCodecMatrix() {
+		artifact := "direct-unpack-" + codec.Slug
+		add(Recipe{
+			Slug: "direct-unpack-" + codec.Slug, Family: "direct-unpack",
+			ByteReproducible: !codec.SaltsItsOwnKey,
+			Notes:            codec.Notes,
+			Build:            publish(artifact, "archive.7z"),
+			ExpectedOutputs:  codec.ExpectedOutputs(),
+		})
+		add(Recipe{
+			Slug: "direct-unpack-" + codec.Slug + "-split", Family: "direct-unpack",
+			ByteReproducible: !codec.SaltsItsOwnKey,
+			Notes:            codec.Notes + " Cut into volumes so the chase has parts still arriving while it decodes.",
+			Build:            splitSevenZipIntoParts(artifact, DirectUnpackVolumes),
+			ExpectedOutputs:  codec.ExpectedOutputs(),
+		})
+	}
+
+	// The repair-resume fixture, and the one scenario whose geometry is load
+	// bearing rather than incidental.
+	//
+	// THE INVARIANT IT DEPENDS ON. The chase reads through a 128 KiB
+	// `BufReader`, so its read position never runs more than 128 KiB ahead of
+	// its decode position, and the decoder's one out-of-order move is a probe
+	// at the archive's tail for the end header. Everything else is a single
+	// forward sweep. So: put the damage far enough in that neither the
+	// readahead from part 0 nor the tail probe can reach it before the recovery
+	// data has had its say, and the chase is guaranteed to be parked at the
+	// damage rather than racing it.
+	//
+	// The numbers that make that true here:
+	//   - 8 MiB of derived, incompressible payload under PPMd, the slowest
+	//     decoder in the matrix. Decoding parts 0-3 takes orders of magnitude
+	//     longer than downloading the whole set from a container on the same
+	//     host, so gating engages long before the chase approaches part 4.
+	//   - Six volumes of about 1.4 MiB. Part 0's readahead reaches 128 KiB;
+	//     the tail probe touches part 5. Neither comes near part 4.
+	//   - Damage in part 4's SECOND 64 KiB block, so part 4 still has a vouched
+	//     first block to serve and the cap has somewhere to sit.
+	//   - 64 KiB PAR2 slices against 8 KiB articles (the scenario pins
+	//     `segment_size`), so every article lies wholly inside one block and
+	//     the in-stream grid can actually claim them. Straddled articles claim
+	//     nothing, which is what the `-unvouched` fixture below is for.
+	//
+	// If any of those move, the scenario stops testing repair-resume and starts
+	// testing whichever race replaced it.
+	//
+	// Note that the park here no longer rests on the grid alone. Parts 0-3 are
+	// vouched by the analysis pass's file-level verdicts whether or not their
+	// articles beat the recovery set's own registration, so the scenario is
+	// deterministic from two independent directions: the grid gates part 4, and
+	// the file verdicts vouch everything the chase actually read.
+	add(Recipe{
+		Slug: "direct-unpack-repair", Family: "direct-unpack", ByteReproducible: true,
+		Notes: "An 8 MiB PPMd 7z in six volumes with parity, damaged in the second block of the fifth volume, so the chase gates on the damage and parks there rather than consuming it.",
+		Build: sequence(
+			splitSevenZipIntoParts("direct-unpack-repair-source", DirectUnpackRepairVolumes),
+			par2(PAR2Spec{
+				Base: "archive.7z.par2", SliceSize: 65536, RecoveryBlocks: 16,
+				Sources: []string{
+					"archive.7z.001", "archive.7z.002", "archive.7z.003",
+					"archive.7z.004", "archive.7z.005", "archive.7z.006",
+				},
+			}),
+			zeroOutput("archive.7z.005", 65536, 65536),
+		),
+		ExpectedOutputs: func(_ context.Context, env *Env) (map[string]string, error) {
+			payload := env.StagePath(sevenZipSingleMember)
+			if err := DirectUnpackRepairPayload(payload); err != nil {
+				return nil, err
+			}
+			return map[string]string{sevenZipSingleMember: payload}, nil
+		},
+	})
+
+	// The counterpart to `direct-unpack-repair`: the same source, the same
+	// volumes and the same damage, but with a slice size the harness's default
+	// 750 KiB articles straddle. No article ever lies wholly inside a block, so
+	// no block is ever independently claimed, so no grid exists at all — and
+	// with no grid there is no Damaged verdict, which means this set never
+	// gates.
+	//
+	// That makes it the proof of the OTHER vouching source. The chase runs free
+	// and reads whatever it can; at repair-decision time the in-stream evidence
+	// vouches for precisely nothing, and the only thing standing between the
+	// chase and the bin is the analysis pass's own file-level verdict on each
+	// part. It has to park and resume on that alone.
+	//
+	// THE INVARIANT IT DEPENDS ON. Because nothing gates it, this fixture cannot
+	// rely on a cap to hold the chase back — it needs the decode to be slower
+	// than the decision, which is the same bound its sibling uses:
+	//   - The same 8 MiB PPMd source artifact in six ~1.4 MiB volumes. PPMd
+	//     measures about 9 MB/s over this archive, so reaching part 4's damage
+	//     at roughly 5.5 MiB in takes on the order of 600 ms, while the local
+	//     download, the PAR2 analysis and the repair decision all land in tens
+	//     of milliseconds.
+	//   - So at the decision the chase has consumed a few hundred KiB of part 0
+	//     — a file the analysis verifies Complete, hence vouched by the
+	//     fallback — plus the tail probe in part 5, also Complete. Part 4, the
+	//     damaged one, has been consumed to zero bytes and vouches trivially.
+	//   - 16 KiB slices against the default 750 KiB articles. This is the whole
+	//     premise; pinning `segment_size` in the scenario would close blocks and
+	//     turn this back into its sibling.
+	//   - Damage in the same place as the sibling, so the two differ in exactly
+	//     one variable: whether a grid exists.
+	//
+	// It used to be a three-volume LZMA2 archive damaged in part 1, asserting a
+	// `repair_rewrote` taint. That was a race, not a test: with no gating, the
+	// decision (~14 ms) was competing with an LZMA2 decoder reaching the zeroed
+	// bytes about 131 KB in, and it won twice by scheduler grace. The taint path
+	// keeps its coverage in the unit and pipeline suites, where it can be made
+	// deterministic.
+	add(Recipe{
+		Slug: "direct-unpack-repair-unvouched", Family: "direct-unpack", ByteReproducible: true,
+		Notes: "The same 8 MiB PPMd six-volume archive and damage as direct-unpack-repair, but with 16 KiB parity slices the default article size straddles: no block closes, no grid forms, nothing gates, and the chase must be vouched through the repair by the analysis pass's file-level verdicts alone.",
+		Build: sequence(
+			splitSevenZipIntoParts("direct-unpack-repair-source", DirectUnpackRepairVolumes),
+			par2(PAR2Spec{
+				Base: "archive.7z.par2", SliceSize: 16384, RecoveryBlocks: 16,
+				Sources: []string{
+					"archive.7z.001", "archive.7z.002", "archive.7z.003",
+					"archive.7z.004", "archive.7z.005", "archive.7z.006",
+				},
+			}),
+			zeroOutput("archive.7z.005", 65536, 65536),
+		),
+		ExpectedOutputs: func(_ context.Context, env *Env) (map[string]string, error) {
+			payload := env.StagePath(sevenZipSingleMember)
+			if err := DirectUnpackRepairPayload(payload); err != nil {
+				return nil, err
+			}
+			return map[string]string{sevenZipSingleMember: payload}, nil
+		},
+	})
+
+	// Repair and encryption together. PAR2 covers the archive bytes as posted
+	// — the AES ciphertext — so repair rewrites ciphertext on disk and the
+	// password only matters downstream, when extraction decodes the repaired
+	// volumes. The chase reads the damaged ciphertext like any other bytes, so
+	// whichever way the repair decision lands (resume or taint), the decrypted
+	// member digest is the proof the repaired bytes are the posted bytes.
+	// Salted, like every AES fixture: the archive draws a fresh salt per
+	// build and the parity is computed over that build's ciphertext.
+	add(Recipe{
+		Slug: "direct-unpack-aes256-repair", Family: "direct-unpack",
+		Notes: "A three-volume AES256 7z (data encrypted, headers readable) with parity over the ciphertext and a damaged second volume, so PAR2 repair rewrites encrypted bytes and extraction with the password must still produce the member exactly.",
+		Build: sequence(
+			splitSevenZipIntoParts("direct-unpack-aes256", DirectUnpackVolumes),
+			par2(PAR2Spec{
+				Base: "archive.7z.par2", SliceSize: 65536, RecoveryBlocks: 16,
+				Sources: []string{"archive.7z.001", "archive.7z.002", "archive.7z.003"},
+			}),
+			zeroOutput("archive.7z.002", 65536, 16384),
+		),
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			// The member inside the ciphertext is the deterministic payload the
+			// aes256 artifact was built over; re-deriving it is exact even
+			// though the archive bytes never are.
+			_ = ctx
+			payload := env.StagePath(sevenZipSingleMember)
+			if err := deterministicPayload(payload, sevenZipMatrixPayloadBytes, 1); err != nil {
+				return nil, err
+			}
+			return map[string]string{sevenZipSingleMember: payload}, nil
+		},
+	})
+
+	// The same three volumes again under their own slug, for the restart
+	// phase. A separate slug rather than reusing the codec-matrix one because
+	// the two want opposite assertions: the functional run demands the chase
+	// was consumed, and a restart mid-chase deliberately kills it.
+	add(Recipe{
+		Slug: "direct-unpack-restart", Family: "direct-unpack", ByteReproducible: true,
+		Notes: "A three-volume LZMA2 7z for the restart phase: weaver is restarted mid-download, so the chase dies with the process and has to re-arm from the persisted progress floor.",
+		Build: splitSevenZipIntoParts("direct-unpack-lzma2", DirectUnpackVolumes),
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			// These volumes carry the member the lzma2 artifact was built over,
+			// and that payload is a pure function of its seed — so re-deriving
+			// it here is exact.
+			_ = ctx
+			payload := env.StagePath(sevenZipSingleMember)
+			if err := deterministicPayload(payload, sevenZipMatrixPayloadBytes, 1); err != nil {
+				return nil, err
+			}
+			return map[string]string{sevenZipSingleMember: payload}, nil
+		},
 	})
 
 	// -------------------------------------------------------- obfuscation
@@ -1816,6 +2023,32 @@ func splitSevenZip(artifact string) func(context.Context, *Env) error {
 			return err
 		}
 		_, err = SplitFile(source, 30<<20, func(index int) string {
+			return env.OutputPath(fmt.Sprintf("archive.7z.%03d", index+1))
+		})
+		return err
+	}
+}
+
+// splitSevenZipIntoParts cuts a published 7z into exactly `parts` volumes.
+//
+// Size-based, like the corpus's other splits, would make the volume count a
+// function of how well each codec happened to compress the clip — and the
+// ledger names the files a recipe must produce, so a count that moves with the
+// coder is a contract that cannot be written down. Fixing the count instead
+// makes every codec's split shape identical, which is also what makes them
+// comparable.
+func splitSevenZipIntoParts(artifact string, parts int64) func(context.Context, *Env) error {
+	return func(ctx context.Context, env *Env) error {
+		source, err := env.ArtifactPath(ctx, artifact)
+		if err != nil {
+			return err
+		}
+		info, err := os.Stat(source)
+		if err != nil {
+			return err
+		}
+		chunk := (info.Size() + parts - 1) / parts
+		_, err = SplitFile(source, chunk, func(index int) string {
 			return env.OutputPath(fmt.Sprintf("archive.7z.%03d", index+1))
 		})
 		return err

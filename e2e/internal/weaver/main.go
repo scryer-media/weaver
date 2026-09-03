@@ -77,6 +77,7 @@ type ScenarioRuntimeAssertions struct {
 	FileIdentityRewrite *ScenarioFileIdentityRewriteAssertion `json:"fileIdentityRewrite,omitempty"`
 	Par2CleanSettlement *ScenarioPar2CleanSettlementAssertion `json:"par2CleanSettlement,omitempty"`
 	DirectStore         *ScenarioDirectStoreAssertion         `json:"directStore,omitempty"`
+	DirectUnpack        *ScenarioDirectUnpackAssertion        `json:"directUnpack,omitempty"`
 	QueueLiveness       *ScenarioQueueLivenessAssertion       `json:"queueLiveness,omitempty"`
 }
 
@@ -99,6 +100,31 @@ type ScenarioDirectStoreAssertion struct {
 	ExpectedDemotionReason           string `json:"expectedDemotionReason"`
 	RequireRoutedByteMaterialization bool   `json:"requireRoutedByteMaterialization"`
 	ForbidVolumeRefetch              bool   `json:"forbidVolumeRefetch"`
+}
+
+// ScenarioDirectUnpackAssertion pins what the 7z direct-unpack chase did, read
+// from weaver's own log lines — the harness has no metrics surface, and the
+// chase is otherwise invisible by design: a consumed chase and a conventional
+// extraction deliver byte-identical output.
+//
+// The positive fields are only evaluated in a phase that ran with the gate on;
+// ForbidAnyActivity is only evaluated in a phase that ran with it off, so one
+// scenario proves engagement where the feature is enabled and darkness where it
+// is not.
+type ScenarioDirectUnpackAssertion struct {
+	// RequireArmed demands the set was admitted to a chase.
+	RequireArmed bool `json:"requireArmed,omitempty"`
+	// RequireConsumed demands its members were installed rather than the
+	// archive being decoded a second time.
+	RequireConsumed bool `json:"requireConsumed,omitempty"`
+	// ExpectedDemotionReason demands a demotion carrying this reason.
+	ExpectedDemotionReason string `json:"expectedDemotionReason,omitempty"`
+	// RequireRearmAfterRestart demands the set armed at least twice, which is
+	// what a restart mid-chase looks like: the pre-restart chase dies with the
+	// process, and the resumed download re-arms from the persisted floor.
+	RequireRearmAfterRestart bool `json:"requireRearmAfterRestart,omitempty"`
+	// ForbidAnyActivity demands the feature left no trace at all.
+	ForbidAnyActivity bool `json:"forbidAnyActivity,omitempty"`
 }
 
 // ScenarioQueueLivenessAssertion holds an unrelated fixture which must finish
@@ -127,6 +153,13 @@ func (s *Scenario) directStoreAssertion() *ScenarioDirectStoreAssertion {
 		return nil
 	}
 	return s.RuntimeAssertions.DirectStore
+}
+
+func (s *Scenario) directUnpackAssertion() *ScenarioDirectUnpackAssertion {
+	if s == nil || s.RuntimeAssertions == nil {
+		return nil
+	}
+	return s.RuntimeAssertions.DirectUnpack
 }
 
 func (s *Scenario) queueLivenessAssertion() *ScenarioQueueLivenessAssertion {
@@ -1070,6 +1103,39 @@ func testdataDir() string {
 }
 
 var canonicalFixtureSlugs = []string{
+	// The 7z direct-unpack codec matrix: every coder chain the pinned 7-Zip
+	// writes and weaver decodes, in both shapes. The split variants are the
+	// ones a chase can overlap; the single .7z ones have no topology until
+	// the whole file lands and assert the ordinary conventional outcome.
+	"direct-unpack-aes256",
+	"direct-unpack-aes256-header",
+	"direct-unpack-aes256-header-split",
+	"direct-unpack-aes256-repair",
+	"direct-unpack-aes256-split",
+	"direct-unpack-bcj-lzma2",
+	"direct-unpack-bcj-lzma2-split",
+	"direct-unpack-bcj2",
+	"direct-unpack-bcj2-split",
+	"direct-unpack-bzip2",
+	"direct-unpack-bzip2-split",
+	"direct-unpack-copy",
+	"direct-unpack-copy-split",
+	"direct-unpack-deflate",
+	"direct-unpack-deflate-split",
+	"direct-unpack-delta-lzma2",
+	"direct-unpack-delta-lzma2-split",
+	"direct-unpack-lzma",
+	"direct-unpack-lzma-split",
+	"direct-unpack-lzma2",
+	"direct-unpack-lzma2-split",
+	"direct-unpack-nonsolid",
+	"direct-unpack-nonsolid-split",
+	"direct-unpack-ppmd",
+	"direct-unpack-ppmd-split",
+	"direct-unpack-repair",
+	"direct-unpack-repair-unvouched",
+	"direct-unpack-solid",
+	"direct-unpack-solid-split",
 	"7z-encrypted",
 	"brotli-single",
 	"bzip2-single",
@@ -1082,11 +1148,16 @@ var canonicalFixtureSlugs = []string{
 	// (see assertDirectStoreEngagement). Each is store-method and non-solid;
 	// archives direct-store is right to refuse are the rest of this corpus.
 	"direct-store-encrypted",
+	"direct-store-encrypted-par2-repair",
+	"direct-store-hp",
+	"direct-store-hp-par2-repair",
 	"direct-store-multi-member",
 	"direct-store-multivolume",
 	"direct-store-par2-repair",
 	"direct-store-post-repair-queue-liveness",
 	"direct-store-rar4",
+	"direct-store-rar4-encrypted",
+	"direct-store-rar4-encrypted-par2-repair",
 	"direct-store-single",
 	"empty-rar",
 	"gzip-corrupted",
@@ -1240,6 +1311,7 @@ var chaosSeedFixtureSlugs = append(
 
 var restartFixtureSlugs = []string{
 	"direct-store-par2-alias-restart",
+	"direct-unpack-restart",
 	"par2-heavy-damage",
 	"par2-heavy-damage-a",
 	"par2-small-repair",
@@ -2162,7 +2234,7 @@ func runNyuuPost(
 			"exec",
 			"-T",
 			"nyuu",
-			"nyuu",
+			"/opt/nyuu/node_modules/.bin/nyuu",
 		),
 		"-h", host, "-P", port, "--ssl=false",
 		"-u", nntpUsername(),
@@ -4093,7 +4165,7 @@ func assertDirectStoreEngagement(weaverURL string) error {
 // Archive sets in the canonical corpus built to route direct end to end. Kept
 // as a count rather than a list because the counters report finalized sets in
 // aggregate; par2-multi-set-archives contributes two independent sets.
-const directStoreArchiveSetCount = 8
+const directStoreArchiveSetCount = 12
 
 // Demotion reasons that mean direct-store REFUSED an archive it is designed not
 // to carry. Refusal is the correct outcome and says nothing about health.
@@ -4272,6 +4344,18 @@ func directDemotionReason(line string) string {
 // harness can read the same switch the product read.
 func directStoreEnabledForPhase() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("WEAVER_RAR_DIRECT_STORE"))) {
+	case "1", "true", "on", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+// directUnpackEnabledForPhase reports whether this harness process was launched
+// with the 7z direct-unpack gate on, the same way directStoreEnabledForPhase
+// does: the phase's extraEnv reaches weaver and this process alike.
+func directUnpackEnabledForPhase() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("WEAVER_DIRECT_UNPACK"))) {
 	case "1", "true", "on", "yes":
 		return true
 	default:

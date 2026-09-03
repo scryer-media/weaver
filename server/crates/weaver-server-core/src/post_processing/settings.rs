@@ -16,7 +16,7 @@ use super::model::{
     ScriptListEntry, ScriptLists, ScriptName, ScriptResult, SecretOptionValue,
 };
 use crate::persistence::encryption::{decrypt_value, encrypt_value};
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::persistence::{Database, StateError};
 
 /// v2 deliberately starts from defaults: the 0.9 model runs every enabled script
@@ -232,8 +232,72 @@ impl Database {
         &self,
         settings: &PostProcessingSettings,
     ) -> Result<(), StateError> {
-        settings.validate().map_err(state_err)?;
-        self.set_setting(SETTINGS_KEY, &to_json(settings)?)
+        let settings = settings.clone().normalized().map_err(state_err)?;
+        self.set_setting(SETTINGS_KEY, &to_json(&settings)?)
+    }
+
+    /// Save a full settings update while optionally retaining the extension
+    /// policy already stored in the settings document. The read, merge, and
+    /// write share one transaction so an omitted GraphQL field cannot erase a
+    /// concurrent extension-policy update.
+    pub fn save_post_processing_settings_preserving_extensions(
+        &self,
+        settings: PostProcessingSettings,
+        preserve_extensions: bool,
+    ) -> Result<PostProcessingSettings, StateError> {
+        let datastore = self.datastore();
+        let default_settings = to_json(&PostProcessingSettings::default())?;
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(
+                &datastore,
+                "save_post_processing_settings_preserving_extensions",
+                |tx| {
+                    let default_settings = default_settings.clone();
+                    let settings = settings.clone();
+                    Box::pin(async move {
+                        tx.execute(
+                            "INSERT INTO settings (key, value) VALUES ({}, {})\n                             ON CONFLICT(key) DO NOTHING",
+                            &[
+                                SqlArg::Text(SETTINGS_KEY.to_string()),
+                                SqlArg::Text(default_settings),
+                            ],
+                        )
+                        .await?;
+                        let select_sql = match tx {
+                            SqlTx::Postgres(_) => {
+                                "SELECT value FROM settings WHERE key = {} FOR UPDATE"
+                            }
+                            SqlTx::Sqlite(_) => "SELECT value FROM settings WHERE key = {}",
+                        };
+                        let stored = tx
+                            .fetch_optional(select_sql, &[SqlArg::Text(SETTINGS_KEY.to_string())])
+                            .await?
+                            .ok_or_else(|| {
+                                StateError::Database(
+                                    "post-processing settings disappeared during update".into(),
+                                )
+                            })?
+                            .text("value")?;
+                        let mut settings = settings;
+                        if preserve_extensions {
+                            settings.unacceptable_extensions =
+                                from_json::<PostProcessingSettings>(&stored)?.unacceptable_extensions;
+                        }
+                        let settings = settings.normalized().map_err(state_err)?;
+                        tx.execute(
+                            "INSERT INTO settings (key, value) VALUES ({}, {})\n                             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            &[
+                                SqlArg::Text(SETTINGS_KEY.to_string()),
+                                SqlArg::Text(to_json(&settings)?),
+                            ],
+                        )
+                        .await?;
+                        Ok(settings)
+                    })
+                },
+            )
+            .await
+        })
     }
 
     pub fn post_processing_script_lists(&self) -> Result<ScriptLists, StateError> {

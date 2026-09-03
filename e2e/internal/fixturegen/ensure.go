@@ -62,6 +62,9 @@ type EnsureReport struct {
 	// Byte-reproducible families regenerate to identical digests and leave
 	// the ledger as it was.
 	LedgerChanged bool
+	// Salted counts the wanted paths verified by presence alone, because their
+	// writer draws a salt and their bytes cannot be pinned.
+	Salted []string
 }
 
 // Ensure makes every selected fixture present, in this order: whatever is
@@ -85,6 +88,9 @@ func Ensure(ctx context.Context, config EnsureConfig) (EnsureReport, error) {
 
 	ledger, _, err := corpus.LoadLedger(config.Root)
 	if err != nil {
+		return report, err
+	}
+	if err := ValidateSaltedEntries(ledger, Recipes()); err != nil {
 		return report, err
 	}
 	profiles, err := corpus.LoadProfiles(config.Root)
@@ -154,6 +160,40 @@ func Ensure(ctx context.Context, config EnsureConfig) (EnsureReport, error) {
 		}
 		report.Fetched = difference(beforeFetch, missing)
 	}
+	for _, p := range wanted {
+		if entry, ok := ledger.Entry(p); ok && entry.Salted {
+			report.Salted = append(report.Salted, p)
+		}
+	}
+	sort.Strings(report.Salted)
+	if len(report.Salted) > 0 {
+		logf("%d salted path(s) are verified by presence only; their writer draws a salt and their bytes cannot be pinned",
+			len(report.Salted))
+	}
+
+	// Presence is the whole check for a salted path's *bytes*, but not for what
+	// produced them. A salted scenario built from an artifact that has since
+	// changed is as stale as a hashed one whose digest moved — and nothing
+	// about its bytes can say so, because they were never pinned. The stamp
+	// can, so a salted scenario whose stamp no longer matches is put back on
+	// the missing list and rebuilt.
+	saltedStale := saltedSlugsNeedingRebuild(config.Root, report.Salted, identityCache(config.Root))
+	if len(saltedStale) > 0 {
+		logf("%d salted scenario(s) were built from artifacts that have since changed and will be rebuilt: %s",
+			len(saltedStale), strings.Join(saltedStale, ", "))
+		stale := make(map[string]struct{}, len(saltedStale))
+		for _, slug := range saltedStale {
+			stale[slug] = struct{}{}
+		}
+		for _, path := range report.Salted {
+			if slug, ok := slugOfPath(path); ok {
+				if _, isStale := stale[slug]; isStale && !containsPath(missing, path) {
+					missing = append(missing, path)
+				}
+			}
+		}
+		sort.Strings(missing)
+	}
 	if report.FetchSkipped != "" {
 		logf("published corpus not used: %s", report.FetchSkipped)
 	}
@@ -173,10 +213,17 @@ func Ensure(ctx context.Context, config EnsureConfig) (EnsureReport, error) {
 		return report, err
 	}
 	results, err := Run(ctx, Config{
-		Root:         config.Root,
-		Slugs:        slugs,
-		Workers:      config.Workers,
-		UpdateLedger: true,
+		Root:    config.Root,
+		Slugs:   slugs,
+		Workers: config.Workers,
+		// Seeding regenerates fixtures to *match* the committed ledger, never
+		// to redefine it. Refreshing digests here would turn a reproducibility
+		// defect into a silent corpus fork: the bytes on disk would stop being
+		// the bytes the ledger describes, and every consumer keyed on the
+		// ledger — the NNTP seed fingerprint above all — would quietly move
+		// with them. Writing the ledger is `cmd/fixturegen`'s job, on an
+		// explicit generation run.
+		UpdateLedger: false,
 		Verbose:      config.Verbose,
 		Log:          config.Log,
 	})
@@ -190,28 +237,43 @@ func Ensure(ctx context.Context, config EnsureConfig) (EnsureReport, error) {
 	}
 	sort.Strings(report.GeneratedSlugs)
 
-	// The ledger was rewritten for what was generated; re-read it and require
-	// the tree to agree with it, digest and all.
+	// The ledger must not have moved: generation ran with UpdateLedger off, so
+	// anything here is a bug worth shouting about rather than absorbing.
 	ledgerAfter, err := os.ReadFile(corpus.HostPath(config.Root, corpus.LedgerFile))
 	if err != nil {
 		return report, err
 	}
 	report.LedgerChanged = string(ledgerBefore) != string(ledgerAfter)
 	if report.LedgerChanged {
-		logf("note: the generated fixtures are a local corpus revision — %s now carries their refreshed digests and differs from any published manifest", corpus.LedgerFile)
+		return report, fmt.Errorf("%s was rewritten during seeding; seeding must never redefine the corpus", corpus.LedgerFile)
 	}
-	ledger, _, err = corpus.LoadLedger(config.Root)
-	if err != nil {
-		return report, err
-	}
+
 	still, err := missingPaths(config.Root, ledger, wanted, true)
 	if err != nil {
 		return report, err
 	}
 	report.Generated = difference(missing, still)
 	if len(still) > 0 {
+		// Tell the two cases apart. A path that is simply absent is a
+		// generation failure; a path that exists but hashes differently is a
+		// *reproducibility* failure, and saying so is the difference between
+		// one named defect and a hundred downstream health errors.
+		var absent, mismatched []string
+		for _, p := range still {
+			if _, err := os.Stat(corpus.HostPath(config.Root, p)); err == nil {
+				mismatched = append(mismatched, p)
+			} else {
+				absent = append(absent, p)
+			}
+		}
+		if len(mismatched) > 0 {
+			return report, fmt.Errorf(
+				"%d fixture(s) regenerated to different bytes than %s records — generation is not reproducible on this machine, "+
+					"so the corpus cannot be rebuilt from recipes here; fetch the published corpus instead:\n  %s",
+				len(mismatched), corpus.LedgerFile, strings.Join(mismatched, "\n  "))
+		}
 		return report, fmt.Errorf("%d fixture path(s) are still missing after generation:\n  %s",
-			len(still), strings.Join(still, "\n  "))
+			len(absent), strings.Join(absent, "\n  "))
 	}
 	return report, nil
 }
@@ -260,7 +322,18 @@ func missingPaths(root string, ledger *corpus.Ledger, wanted []string, digest bo
 		}
 		host := corpus.HostPath(root, p)
 		info, err := os.Stat(host)
-		if err != nil || !info.Mode().IsRegular() || info.Size() != entry.Size {
+		if err != nil || !info.Mode().IsRegular() {
+			missing = append(missing, p)
+			continue
+		}
+		if entry.Salted {
+			// Present is the whole test. A salted fixture's bytes differ on
+			// every machine that generates them, so there is nothing to compare
+			// a size or a digest against — and comparing anyway is exactly how
+			// a locally-generated one would be declared "missing" forever.
+			continue
+		}
+		if info.Size() != entry.Size {
 			missing = append(missing, p)
 			continue
 		}

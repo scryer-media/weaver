@@ -7,6 +7,13 @@ pub struct ServerConnectivityResult {
     pub latency_ms: Option<u64>,
     pub supports_pipelining: bool,
     pub adoptable_tls_name_mismatch_certificate_der: Option<Vec<u8>>,
+    /// IANA name of the TLS suite negotiated with weaver's CPU-preferred
+    /// cipher family offered first; `None` for plaintext or failed probes.
+    pub tls_cipher_suite: Option<String>,
+    /// Whether a second handshake offering the opposite family first
+    /// landed on a different suite, i.e. the server follows client order.
+    /// `None` when the second handshake could not be completed.
+    pub tls_honors_client_cipher_order: Option<bool>,
 }
 
 pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivityResult {
@@ -29,6 +36,8 @@ pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivit
             latency_ms: None,
             supports_pipelining: false,
             adoptable_tls_name_mismatch_certificate_der: Some(certificate_der),
+            tls_cipher_suite: None,
+            tls_honors_client_cipher_order: None,
         };
     }
 
@@ -48,13 +57,20 @@ pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivit
         Ok(mut conn) => {
             let latency = start.elapsed().as_millis() as u64;
             let pipelining = conn.capabilities().supports_pipelining();
+            let tls_cipher_suite = conn.negotiated_cipher_suite();
             let _ = conn.quit().await;
+            let tls_honors_client_cipher_order = match tls_cipher_suite.as_deref() {
+                Some(suite) => probe_cipher_order_honoured(&nntp_config, suite, pipelining).await,
+                None => None,
+            };
             ServerConnectivityResult {
                 success: true,
                 message: "Connected successfully".to_string(),
                 latency_ms: Some(latency),
                 supports_pipelining: pipelining,
                 adoptable_tls_name_mismatch_certificate_der: None,
+                tls_cipher_suite,
+                tls_honors_client_cipher_order,
             }
         }
         Err(error) => {
@@ -76,9 +92,32 @@ pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivit
                 latency_ms: None,
                 supports_pipelining: false,
                 adoptable_tls_name_mismatch_certificate_der,
+                tls_cipher_suite: None,
+                tls_honors_client_cipher_order: None,
             }
         }
     }
+}
+
+/// Reconnect once offering the opposite AEAD family first. A server that
+/// follows the client's order then lands on a different suite; a server
+/// with a fixed order of its own answers with the same suite again. The
+/// answer is recorded so the operator can see whether the CPU-derived
+/// preference actually decides which suite carries this server's traffic.
+async fn probe_cipher_order_honoured(
+    base: &weaver_nntp::ServerConfig,
+    negotiated: &str,
+    supports_pipelining: bool,
+) -> Option<bool> {
+    let config = weaver_nntp::ServerConfig {
+        tls_cipher_preference: weaver_nntp::TlsCipherPreference::opposing(negotiated),
+        pipelining: weaver_nntp::PipeliningCapability::Known(supports_pipelining),
+        ..base.clone()
+    };
+    let mut conn = weaver_nntp::NntpConnection::connect(&config).await.ok()?;
+    let opposing = conn.negotiated_cipher_suite();
+    let _ = conn.quit().await;
+    opposing.map(|suite| suite != negotiated)
 }
 
 fn user_facing_connection_error(error: &weaver_nntp::NntpError) -> String {

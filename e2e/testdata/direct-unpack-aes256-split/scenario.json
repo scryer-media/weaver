@@ -1,0 +1,10 @@
+{
+  "slug": "direct-unpack-aes256-split",
+  "title": "Silver.Horizon.AES256.Split.2024.720p.WEB.x264-WEAVER",
+  "description": "Split .7z (3 volumes), AES256. member data encrypted, headers readable. Direct unpack can overlap this shape.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+  },
+  "password": "e2e-test-password"
+}

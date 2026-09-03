@@ -88,6 +88,7 @@ pub struct HistoryDeleteOperationRow {
     pub id: u64,
     pub state: AsyncOperationState,
     pub delete_files: bool,
+    pub file_delete_authorized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +124,8 @@ pub struct HistoryDeleteOperationSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryDeleteOperationPayload {
     pub delete_files: bool,
+    #[serde(default)]
+    pub file_delete_authorized: bool,
 }
 
 #[derive(Debug)]
@@ -208,8 +211,12 @@ fn id_chunk_size(bind_budget: usize, fixed_binds: usize) -> usize {
     bind_budget.saturating_sub(fixed_binds).max(1)
 }
 
-fn payload_json(delete_files: bool) -> Result<String, StateError> {
-    serde_json::to_string(&HistoryDeleteOperationPayload { delete_files }).map_err(db_err)
+fn payload_json(delete_files: bool, file_delete_authorized: bool) -> Result<String, StateError> {
+    serde_json::to_string(&HistoryDeleteOperationPayload {
+        delete_files,
+        file_delete_authorized,
+    })
+    .map_err(db_err)
 }
 
 fn parse_payload(raw: &str) -> Result<HistoryDeleteOperationPayload, StateError> {
@@ -290,8 +297,9 @@ async fn insert_history_delete_operation_tx(
     tx: &mut SqlTx<'_>,
     ids: &[u64],
     delete_files: bool,
+    file_delete_authorized: bool,
 ) -> Result<u64, StateError> {
-    let payload_json = payload_json(delete_files)?;
+    let payload_json = payload_json(delete_files, file_delete_authorized)?;
     let now = epoch_ms_now();
 
     let row = tx
@@ -472,6 +480,7 @@ impl Database {
         &self,
         ids: &[u64],
         delete_files: bool,
+        file_delete_authorized: bool,
     ) -> Result<u64, HistoryDeleteOperationInsertError> {
         let ids = dedupe_ids(ids);
         if ids.is_empty() {
@@ -492,8 +501,13 @@ impl Database {
                         return Ok(Err(HistoryDeleteOperationInsertError::LockedTargets));
                     }
 
-                    let operation_id =
-                        insert_history_delete_operation_tx(tx, &ids, delete_files).await?;
+                    let operation_id = insert_history_delete_operation_tx(
+                        tx,
+                        &ids,
+                        delete_files,
+                        file_delete_authorized,
+                    )
+                    .await?;
                     Ok(Ok(operation_id))
                 })
             })
@@ -504,6 +518,7 @@ impl Database {
     pub fn insert_all_history_delete_operation(
         &self,
         delete_files: bool,
+        file_delete_authorized: bool,
     ) -> Result<(u64, Vec<u64>), HistoryDeleteOperationInsertError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -521,8 +536,13 @@ impl Database {
                             return Ok(Err(HistoryDeleteOperationInsertError::LockedTargets));
                         }
 
-                        let operation_id =
-                            insert_history_delete_operation_tx(tx, &ids, delete_files).await?;
+                        let operation_id = insert_history_delete_operation_tx(
+                            tx,
+                            &ids,
+                            delete_files,
+                            file_delete_authorized,
+                        )
+                        .await?;
                         Ok(Ok((operation_id, ids)))
                     })
                 },
@@ -634,7 +654,7 @@ impl Database {
                         return Ok(None);
                     };
                     let operation_id = row.i64("id")? as u64;
-                    let delete_files = parse_payload(&row.text("payload_json")?)?.delete_files;
+                    let payload = parse_payload(&row.text("payload_json")?)?;
 
                     let updated = tx
                         .execute(
@@ -658,7 +678,8 @@ impl Database {
                     Ok(Some(HistoryDeleteOperationRow {
                         id: operation_id,
                         state: AsyncOperationState::Running,
-                        delete_files,
+                        delete_files: payload.delete_files,
+                        file_delete_authorized: payload.file_delete_authorized,
                     }))
                 })
             })
@@ -724,6 +745,33 @@ impl Database {
                     SqlArg::I64(operation_id as i64),
                     SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
                     SqlArg::I64(target_id as i64),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    pub fn fail_pending_history_delete_operation_targets(
+        &self,
+        operation_id: u64,
+        error_message: &str,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let error_message = error_message.to_string();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE async_operation_targets
+                 SET state = 'failed',
+                     error_message = {}
+                 WHERE operation_id = {}
+                   AND target_kind = {}
+                   AND state IN ('queued', 'running')",
+                &[
+                    SqlArg::Text(error_message),
+                    SqlArg::I64(operation_id as i64),
+                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
                 ],
             )
             .await?;
@@ -924,12 +972,79 @@ mod tests {
     }
 
     #[test]
+    fn legacy_history_delete_payload_defaults_file_delete_authorization_to_false() {
+        let payload: HistoryDeleteOperationPayload =
+            serde_json::from_str(r#"{"delete_files":true}"#).unwrap();
+
+        assert!(payload.delete_files);
+        assert!(!payload.file_delete_authorized);
+    }
+
+    #[test]
+    fn unproven_file_delete_fails_remaining_targets_without_removing_history() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_job_history(&history(10, 100)).unwrap();
+        db.insert_job_history(&history(11, 101)).unwrap();
+        let operation_id = db
+            .insert_history_delete_operation(&[10, 11], true, false)
+            .unwrap();
+
+        let claimed = db.next_history_delete_operation().unwrap().unwrap();
+        assert!(claimed.delete_files);
+        assert!(!claimed.file_delete_authorized);
+        db.mark_history_delete_target_state(
+            operation_id,
+            10,
+            AsyncOperationTargetState::Completed,
+            None,
+        )
+        .unwrap();
+        db.fail_pending_history_delete_operation_targets(
+            operation_id,
+            "file deletion was not authorized; resubmit with an admin-scoped caller",
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.finalize_history_delete_operation(operation_id).unwrap(),
+            AsyncOperationState::CompletedWithErrors
+        );
+        let states = db.list_history_delete_row_states(&[10, 11]).unwrap();
+        assert!(!states.contains_key(&10));
+        assert_eq!(states[&11].state, AsyncOperationTargetState::Failed);
+        assert_eq!(
+            states[&11].error_message.as_deref(),
+            Some("file deletion was not authorized; resubmit with an admin-scoped caller")
+        );
+        assert!(db.get_job_history(10).unwrap().is_some());
+        assert!(db.get_job_history(11).unwrap().is_some());
+    }
+
+    #[test]
+    fn authorized_file_delete_marker_survives_restart_recovery() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_job_history(&history(10, 100)).unwrap();
+        db.insert_history_delete_operation(&[10], true, true)
+            .unwrap();
+
+        let claimed = db.next_history_delete_operation().unwrap().unwrap();
+        assert!(claimed.file_delete_authorized);
+        db.recover_running_history_delete_operations().unwrap();
+
+        let recovered = db.next_history_delete_operation().unwrap().unwrap();
+        assert!(recovered.delete_files);
+        assert!(recovered.file_delete_authorized);
+    }
+
+    #[test]
     fn insert_history_delete_operation_creates_targets_and_locked_states() {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_history(&history(10, 100)).unwrap();
         db.insert_job_history(&history(11, 101)).unwrap();
 
-        let operation_id = db.insert_history_delete_operation(&[10, 11], true).unwrap();
+        let operation_id = db
+            .insert_history_delete_operation(&[10, 11], true, true)
+            .unwrap();
         let states = db.list_history_delete_row_states(&[10, 11]).unwrap();
         assert_eq!(states.len(), 2);
         assert_eq!(states[&10].operation_id, operation_id);
@@ -948,7 +1063,7 @@ mod tests {
         db.insert_job_history(&history(10, 100)).unwrap();
         db.insert_job_history(&history(11, 101)).unwrap();
         let operation_id = db
-            .insert_history_delete_operation(&[10, 11], false)
+            .insert_history_delete_operation(&[10, 11], false, false)
             .unwrap();
 
         db.mark_history_delete_target_state(
@@ -980,7 +1095,9 @@ mod tests {
     fn locked_target_lookup_ignores_failed_operations() {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_history(&history(10, 100)).unwrap();
-        let operation_id = db.insert_history_delete_operation(&[10], false).unwrap();
+        let operation_id = db
+            .insert_history_delete_operation(&[10], false, false)
+            .unwrap();
         db.mark_history_delete_target_state(
             operation_id,
             10,
@@ -998,9 +1115,12 @@ mod tests {
     fn insert_history_delete_operation_rejects_locked_targets() {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_history(&history(10, 100)).unwrap();
-        db.insert_history_delete_operation(&[10], false).unwrap();
+        db.insert_history_delete_operation(&[10], false, false)
+            .unwrap();
 
-        let error = db.insert_history_delete_operation(&[10], true).unwrap_err();
+        let error = db
+            .insert_history_delete_operation(&[10], true, true)
+            .unwrap_err();
         assert!(matches!(
             error,
             HistoryDeleteOperationInsertError::LockedTargets
@@ -1011,7 +1131,9 @@ mod tests {
     fn next_history_delete_operation_claims_only_once_until_recovered() {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_history(&history(10, 100)).unwrap();
-        let operation_id = db.insert_history_delete_operation(&[10], false).unwrap();
+        let operation_id = db
+            .insert_history_delete_operation(&[10], false, false)
+            .unwrap();
 
         let claimed = db.next_history_delete_operation().unwrap().unwrap();
         assert_eq!(claimed.id, operation_id);
@@ -1039,7 +1161,7 @@ mod tests {
         db.insert_job_history(&history(10, 100)).unwrap();
         db.insert_job_history(&history(11, 100)).unwrap();
         let operation_id = db
-            .insert_history_delete_operation(&[10, 11], false)
+            .insert_history_delete_operation(&[10, 11], false, false)
             .unwrap();
 
         let claimed = db.next_history_delete_operation().unwrap().unwrap();
@@ -1083,7 +1205,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (operation_id, ids) = db.insert_all_history_delete_operation(true).unwrap();
+        let (operation_id, ids) = db.insert_all_history_delete_operation(true, true).unwrap();
         assert_eq!(ids.len() as u64, CHUNKED_ID_COUNT);
 
         // Every id became exactly one queued, locked target across all chunks.
@@ -1133,7 +1255,8 @@ mod tests {
             db.insert_job_history(&history(job_id, 1_000 + job_id as i64))
                 .unwrap();
         }
-        db.insert_all_history_delete_operation(false).unwrap();
+        db.insert_all_history_delete_operation(false, false)
+            .unwrap();
 
         let query_ids: Vec<u64> = (1..=CHUNKED_ID_COUNT).collect();
         let locked = db
@@ -1146,7 +1269,7 @@ mod tests {
         // A fresh insert over the same (now locked) rows must be rejected, which
         // exercises the chunked count_existing/count_locked paths in the tx.
         let error = db
-            .insert_history_delete_operation(&query_ids, true)
+            .insert_history_delete_operation(&query_ids, true, true)
             .unwrap_err();
         assert!(matches!(
             error,

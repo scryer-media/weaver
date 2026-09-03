@@ -24,7 +24,7 @@ async fn settings_are_admin_only_and_execution_is_off_by_default() {
 
     let response = harness
         .execute(
-            "{ postProcessingSettings { scriptDirectory executionEnabled concurrency terminationGraceSeconds strictSecurityRefusesExecution lists { global { script } } } }",
+            "{ postProcessingSettings { scriptDirectory executionEnabled concurrency terminationGraceSeconds unacceptableExtensions strictSecurityRefusesExecution lists { global { script } } } }",
         )
         .await;
     assert_no_errors(&response);
@@ -33,6 +33,7 @@ async fn settings_are_admin_only_and_execution_is_off_by_default() {
     assert_eq!(settings["executionEnabled"], false);
     assert_eq!(settings["concurrency"], 1);
     assert_eq!(settings["terminationGraceSeconds"], 10);
+    assert_eq!(settings["unacceptableExtensions"], serde_json::json!([]));
     assert_eq!(settings["strictSecurityRefusesExecution"], false);
     assert_eq!(settings["lists"]["global"].as_array().unwrap().len(), 0);
 }
@@ -86,7 +87,7 @@ async fn scripts_directory_is_admin_owned_and_clears_assignments_when_changed() 
 }
 
 #[tokio::test]
-async fn settings_round_trip_and_reject_an_out_of_range_concurrency() {
+async fn settings_round_trip_preserves_omitted_extensions_and_rejects_invalid_updates() {
     let harness = TestHarness::new().await;
     let response = harness
         .execute(
@@ -97,11 +98,13 @@ async fn settings_round_trip_and_reject_an_out_of_range_concurrency() {
                 concurrency: 2
                 terminationGraceSeconds: 15
                 pythonInterpreter: "/usr/bin/python3"
+                unacceptableExtensions: ["EXE", "r??"]
               }) {
                 executionEnabled
                 concurrency
                 terminationGraceSeconds
                 pythonInterpreter
+                unacceptableExtensions
               }
             }
             "#,
@@ -113,6 +116,25 @@ async fn settings_round_trip_and_reject_an_out_of_range_concurrency() {
     assert_eq!(settings["concurrency"], 2);
     assert_eq!(settings["terminationGraceSeconds"], 15);
     assert_eq!(settings["pythonInterpreter"], "/usr/bin/python3");
+    assert_eq!(
+        settings["unacceptableExtensions"],
+        serde_json::json!(["exe", "r??"])
+    );
+
+    let omitted = harness
+        .execute(
+            r#"mutation { setPostProcessingSettings(input: {
+                executionEnabled: true
+                concurrency: 3
+                terminationGraceSeconds: 20
+            }) { concurrency unacceptableExtensions } }"#,
+        )
+        .await;
+    assert_no_errors(&omitted);
+    assert_eq!(
+        response_data(&omitted)["setPostProcessingSettings"]["unacceptableExtensions"],
+        serde_json::json!(["exe", "r??"])
+    );
 
     let rejected = harness
         .execute(
@@ -124,6 +146,55 @@ async fn settings_round_trip_and_reject_an_out_of_range_concurrency() {
         )
         .await;
     assert_has_errors(&rejected);
+
+    let invalid_pattern = harness
+        .execute(
+            r#"mutation { setPostProcessingSettings(input: {
+                executionEnabled: false
+                concurrency: 1
+                terminationGraceSeconds: 10
+                unacceptableExtensions: [".exe"]
+            }) { unacceptableExtensions } }"#,
+        )
+        .await;
+    assert_has_errors(&invalid_pattern);
+
+    let null_policy = harness
+        .execute(
+            r#"mutation { setPostProcessingSettings(input: {
+                executionEnabled: true
+                concurrency: 3
+                terminationGraceSeconds: 20
+                unacceptableExtensions: null
+            }) { unacceptableExtensions } }"#,
+        )
+        .await;
+    assert_has_errors(&null_policy);
+
+    let persisted = harness
+        .execute("{ postProcessingSettings { unacceptableExtensions } }")
+        .await;
+    assert_no_errors(&persisted);
+    assert_eq!(
+        response_data(&persisted)["postProcessingSettings"]["unacceptableExtensions"],
+        serde_json::json!(["exe", "r??"])
+    );
+
+    let disabled = harness
+        .execute(
+            r#"mutation { setPostProcessingSettings(input: {
+                executionEnabled: true
+                concurrency: 3
+                terminationGraceSeconds: 20
+                unacceptableExtensions: []
+            }) { unacceptableExtensions } }"#,
+        )
+        .await;
+    assert_no_errors(&disabled);
+    assert_eq!(
+        response_data(&disabled)["setPostProcessingSettings"]["unacceptableExtensions"],
+        serde_json::json!([])
+    );
 }
 
 #[tokio::test]

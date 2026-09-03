@@ -306,6 +306,17 @@ impl Pipeline {
         }
     }
 
+    /// Reject untrusted delivery content or an incomplete security check
+    /// without exposing the working tree to terminal scripts or publication.
+    pub(super) fn fail_delivery_security_check(&mut self, job_id: JobId, error: String) {
+        if let Some(budget) = self.extraction_budgets.get(&job_id) {
+            budget.reject_content_policy(error.clone());
+        }
+        let (released_repair, released_extract) =
+            self.prepare_failed_job_runtime(job_id, &error, false);
+        self.finish_failed_job(job_id, error, released_repair, released_extract);
+    }
+
     /// Mark a job as failed and purge its queued segments.
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
         // Terminal transition: a job dying without a recovery set never had a
@@ -388,6 +399,17 @@ impl Pipeline {
         error: &str,
         preserve_staging: bool,
     ) -> (bool, bool) {
+        // Hooked here rather than at the terminal purge: when post-processing
+        // scripts are configured the purge is deferred until they finish, and
+        // by then this function has already emptied the download queues and
+        // taken the staging directory. A chase must not outlive that.
+        self.direct_unpack_abort_job(
+            job_id,
+            "job failed",
+            crate::pipeline::direct_unpack::wiring::AbortLatch::Permanent,
+            crate::pipeline::direct_unpack::wiring::DemotionReason::DownloadEnded,
+        );
+
         let (staging_dir, released_repair, released_extract) =
             if let Some(state) = self.jobs.get_mut(&job_id) {
                 let released_repair = matches!(state.status, JobStatus::Repairing);
@@ -416,6 +438,9 @@ impl Pipeline {
         } else {
             self.extraction_budgets.remove(&job_id)
         };
+        if !preserve_staging {
+            self.unacceptable_extension_policies.remove(&job_id);
+        }
         if released_repair {
             self.metrics.repair_active.fetch_sub(1, Ordering::Relaxed);
         }
@@ -447,10 +472,6 @@ impl Pipeline {
         self.pending_concat.remove(&job_id);
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);
-        self.pending_released_download_results_by_job
-            .remove(&job_id);
-        self.pending_released_download_result_bytes_by_job
-            .remove(&job_id);
         self.active_downloads_by_job.remove(&job_id);
         self.active_download_connections_by_job.remove(&job_id);
         self.active_completion_critical_connections_by_job

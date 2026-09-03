@@ -68,6 +68,7 @@ type Settings = {
   pythonInterpreter?: string | null;
   powershellInterpreter?: string | null;
   batchInterpreter?: string | null;
+  unacceptableExtensions: string[];
   strictSecurityRefusesExecution: boolean;
   lists: ScriptLists;
 };
@@ -85,6 +86,7 @@ type SettingsDraft = {
   pythonInterpreter: string;
   powershellInterpreter: string;
   batchInterpreter: string;
+  unacceptableExtensions: string;
 };
 
 function settingsDraft(settings: Settings): SettingsDraft {
@@ -95,6 +97,7 @@ function settingsDraft(settings: Settings): SettingsDraft {
     pythonInterpreter: settings.pythonInterpreter ?? "",
     powershellInterpreter: settings.powershellInterpreter ?? "",
     batchInterpreter: settings.batchInterpreter ?? "",
+    unacceptableExtensions: settings.unacceptableExtensions.join(", "),
   };
 }
 
@@ -192,6 +195,10 @@ export function PostProcessingSettingsPage() {
         pythonInterpreter: next.pythonInterpreter.trim() || null,
         powershellInterpreter: next.powershellInterpreter.trim() || null,
         batchInterpreter: next.batchInterpreter.trim() || null,
+        unacceptableExtensions: next.unacceptableExtensions
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean),
       },
     });
     setNotice(result.error ? result.error.message : "Post-processing settings saved.");
@@ -343,6 +350,35 @@ export function PostProcessingSettingsPage() {
               Refresh scripts
             </Button>
           </div>
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="Unacceptable extensions"
+        description="Matching files fail before Weaver publishes the job to the complete directory. Weaver waits for a trustworthy output name; obfuscated posted filenames alone never trigger this policy."
+      >
+        <div className="space-y-3">
+          <div className="space-y-2">
+            <Label htmlFor="pp-unacceptable-extensions">Extension patterns</Label>
+            <Input
+              id="pp-unacceptable-extensions"
+              aria-label="Unacceptable extension patterns"
+              placeholder="exe, cmd, r??"
+              value={draft?.unacceptableExtensions ?? ""}
+              onChange={(event) =>
+                setDraft((current) =>
+                  current ? { ...current, unacceptableExtensions: event.target.value } : current,
+                )
+              }
+            />
+          </div>
+          <p className="text-sm text-muted-foreground">
+            Comma-separated extension tokens. Matching is case-insensitive and supports * and ?;
+            use exe or zip*, not .exe or full file paths. Leave blank to disable filtering.
+          </p>
+          <Button disabled={!draft || fetching} onClick={() => draft && void persistSettings(draft)}>
+            Save extension policy
+          </Button>
         </div>
       </SectionCard>
 

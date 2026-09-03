@@ -9,8 +9,10 @@ use crate::auth::AdminGuard;
 use crate::observability::{
     persist_then_update_config, spawn_blocking_db, with_timed_config_read, with_timed_config_write,
 };
+use crate::servers::query::load_tls_diagnostics_by_server;
 use crate::servers::types::{Server, ServerInput, TestConnectionResult};
 use crate::system::runtime::rebuild_nntp_from_config;
+use weaver_server_core::servers::{ServerConnectivityResult, ServerTlsDiagnostics};
 use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::{Database, SchedulerHandle};
 
@@ -35,7 +37,7 @@ impl ServersMutation {
         let normalized =
             NormalizedServerInput::from_input(input, None).map_err(async_graphql::Error::new)?;
 
-        let validated_capabilities = validate_server_before_save(&normalized).await?;
+        let probe = validate_server_before_save(&normalized).await?;
 
         let id = {
             let db = db.clone();
@@ -46,7 +48,9 @@ impl ServersMutation {
         };
 
         let mut server = normalized.as_runtime_server_config(id);
-        server.supports_pipelining = validated_capabilities.unwrap_or(false);
+        server.supports_pipelining = probe
+            .as_ref()
+            .is_some_and(|result| result.supports_pipelining);
 
         let added = {
             let persisted_server = server.clone();
@@ -78,11 +82,13 @@ impl ServersMutation {
             .await?
         };
 
+        let tls_diagnostics = persist_tls_diagnostics(db, id, probe.as_ref()).await?;
         info!(id, "server added");
 
         activate_nntp_runtime("add_server", id, config, handle).await?;
         let snapshot = policy.snapshot(added.id);
-        Ok(Server::from_config(&added, snapshot.as_ref()))
+        Ok(Server::from_config(&added, snapshot.as_ref())
+            .with_tls_diagnostics(tls_diagnostics.as_ref()))
     }
     /// Update an existing NNTP server by ID.
     #[graphql(guard = "AdminGuard")]
@@ -112,9 +118,13 @@ impl ServersMutation {
         let normalized = NormalizedServerInput::from_input(input, Some(&existing))
             .map_err(async_graphql::Error::new)?;
 
-        let validated_capabilities = validate_server_before_save(&normalized).await?;
+        let probe = validate_server_before_save(&normalized).await?;
         let mut server = normalized.as_runtime_server_config(id);
-        server.supports_pipelining = validated_capabilities.unwrap_or(existing.supports_pipelining);
+        server.supports_pipelining = probe
+            .as_ref()
+            .map_or(existing.supports_pipelining, |result| {
+                result.supports_pipelining
+            });
 
         {
             let db = db.clone();
@@ -137,11 +147,13 @@ impl ServersMutation {
             })
             .await;
 
+        let tls_diagnostics = persist_tls_diagnostics(db, id, probe.as_ref()).await?;
         info!(id, "server updated");
 
         activate_nntp_runtime("update_server", id, config, handle).await?;
         let snapshot = policy.snapshot(updated.id);
-        Ok(Server::from_config(&updated, snapshot.as_ref()))
+        Ok(Server::from_config(&updated, snapshot.as_ref())
+            .with_tls_diagnostics(tls_diagnostics.as_ref()))
     }
     /// Remove an NNTP server by ID.
     #[graphql(guard = "AdminGuard")]
@@ -197,9 +209,13 @@ impl ServersMutation {
             .into_iter()
             .map(|snapshot| (snapshot.server_id, snapshot))
             .collect::<std::collections::HashMap<_, _>>();
+        let tls_diagnostics = load_tls_diagnostics_by_server(db).await?;
         Ok(remaining
             .iter()
-            .map(|server| Server::from_config(server, snapshots.get(&server.id)))
+            .map(|server| {
+                Server::from_config(server, snapshots.get(&server.id))
+                    .with_tls_diagnostics(tls_diagnostics.get(&server.id))
+            })
             .collect())
     }
     /// Reset this server's quota baseline without clearing lifetime usage.
@@ -210,6 +226,7 @@ impl ServersMutation {
         id: u32,
     ) -> Result<Server> {
         let config = ctx.data::<SharedConfig>()?;
+        let db = ctx.data::<Database>()?;
         let policy = ctx
             .data::<std::sync::Arc<
                 weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
@@ -233,7 +250,9 @@ impl ServersMutation {
             move || policy.reset_usage(id),
         )
         .await?;
-        Ok(Server::from_config(&server, Some(&snapshot)))
+        let tls_diagnostics = persist_tls_diagnostics(db, id, None).await?;
+        Ok(Server::from_config(&server, Some(&snapshot))
+            .with_tls_diagnostics(tls_diagnostics.as_ref()))
     }
     /// Test a saved NNTP server using its decrypted persisted credentials.
     #[graphql(guard = "AdminGuard")]
@@ -278,6 +297,8 @@ impl ServersMutation {
                     latency_ms: None,
                     supports_pipelining: false,
                     adoptable_tls_name_mismatch_certificate: None,
+                    tls_cipher_suite: None,
+                    tls_honors_client_cipher_order: None,
                 });
             }
         };
@@ -405,7 +426,11 @@ impl NormalizedServerInput {
     }
 }
 
-async fn validate_server_before_save(input: &NormalizedServerInput) -> Result<Option<bool>> {
+/// Probe an active server before it is saved. `None` means the server is
+/// inactive and no probe ran, so previously learned facts are kept.
+async fn validate_server_before_save(
+    input: &NormalizedServerInput,
+) -> Result<Option<ServerConnectivityResult>> {
     if !input.active {
         return Ok(None);
     }
@@ -414,12 +439,54 @@ async fn validate_server_before_save(input: &NormalizedServerInput) -> Result<Op
         weaver_server_core::servers::probe_server_connection(&input.as_runtime_server_config(0))
             .await;
     if result.success {
-        Ok(Some(result.supports_pipelining))
+        Ok(Some(result))
     } else {
         Err(async_graphql::Error::new(format!(
             "server connection test failed: {}",
             result.message
         )))
+    }
+}
+
+/// Record what the save-time probe learned about this server's TLS suite.
+/// A TLS probe upserts the row, a plaintext probe clears it, and no probe
+/// (inactive server) leaves the stored facts untouched and returns them.
+async fn persist_tls_diagnostics(
+    db: &Database,
+    server_id: u32,
+    probe: Option<&ServerConnectivityResult>,
+) -> Result<Option<ServerTlsDiagnostics>> {
+    let db = db.clone();
+    match probe {
+        Some(result) => match result.tls_cipher_suite.clone() {
+            Some(cipher_suite) => {
+                let diagnostics = ServerTlsDiagnostics {
+                    server_id,
+                    cipher_suite,
+                    honors_client_cipher_order: result.tls_honors_client_cipher_order,
+                    probed_at: chrono::Utc::now(),
+                };
+                let persisted = diagnostics.clone();
+                spawn_blocking_db("servers.mutation.tls_diagnostics.persist", move || {
+                    db.upsert_server_tls_diagnostics(&persisted)
+                })
+                .await?;
+                Ok(Some(diagnostics))
+            }
+            None => {
+                spawn_blocking_db("servers.mutation.tls_diagnostics.clear", move || {
+                    db.delete_server_tls_diagnostics(server_id)
+                })
+                .await?;
+                Ok(None)
+            }
+        },
+        None => Ok(
+            spawn_blocking_db("servers.mutation.tls_diagnostics.load", move || {
+                db.server_tls_diagnostics(server_id)
+            })
+            .await?,
+        ),
     }
 }
 
@@ -496,6 +563,7 @@ mod tests {
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             direct_store: None,
+            direct_unpack: None,
             delivery_naming: None,
             metrics: Default::default(),
             config_path: None,

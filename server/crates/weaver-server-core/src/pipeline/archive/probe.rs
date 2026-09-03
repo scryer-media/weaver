@@ -127,6 +127,17 @@ impl Pipeline {
         // refers to. Binding reads source and canonical aliases live.
         if filename_changed {
             self.invalidate_par2_session_for_identity_rebind(job_id);
+            // A direct-unpack chase holds its parts by path and reopens them
+            // lazily, so a rename would surface later as an unexplained
+            // not-found deep inside the decoder. End it here, where the change
+            // is known.
+            if let Some(previous) = previous.as_ref() {
+                self.direct_unpack_abort_sets_containing(
+                    job_id,
+                    &previous.current_filename,
+                    "archive part renamed",
+                );
+            }
         }
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.file_identities.insert(identity.file_index, identity);
@@ -206,6 +217,10 @@ impl Pipeline {
             | FileRole::XzArchive
             | FileRole::TarXzArchive => {
                 self.try_update_7z_topology(job_id, file_id);
+                // Retried on every part completion rather than attempted once:
+                // the topology may only just have appeared, and the first
+                // part's opening bytes may only just have landed.
+                self.try_arm_direct_unpack_for_file(job_id, file_id);
             }
             _ => {}
         }

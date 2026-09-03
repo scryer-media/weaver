@@ -38,6 +38,18 @@ pub fn utc_now() -> DateTime<Utc> {
     local_now().with_timezone(&Utc)
 }
 
+/// Seconds since the Unix epoch on the same clock as [`local_now`], without
+/// resolving the local timezone. Per-article accounting only buckets and
+/// compares instants; it never needs a calendar.
+pub fn unix_seconds() -> i64 {
+    match clock_config() {
+        ClockConfig::System => Utc::now().timestamp(),
+        ClockConfig::File(path) => read_clock(path)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .timestamp(),
+    }
+}
+
 pub fn validate() -> Result<(), String> {
     match clock_config() {
         ClockConfig::System => Ok(()),

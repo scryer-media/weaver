@@ -47,6 +47,7 @@ mod archive_topology;
 mod core;
 mod decode_and_files;
 mod direct_store;
+mod direct_unpack;
 mod download_dispatch;
 mod health_probe;
 mod par2_completion;
@@ -103,6 +104,7 @@ impl TestHarness {
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
+            direct_unpack: None,
             // Pinned off rather than left at the shipped default, so an
             // extraction fixture whose member happens to be called
             // `sample.mkv` keeps asserting extraction instead of asserting the
@@ -405,6 +407,7 @@ async fn new_direct_pipeline_at_roots(
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store,
+        direct_unpack: None,
         // Pinned off for the same reason as the harness above: an extraction
         // fixture must not start asserting the delivery-naming policy.
         delivery_naming: Some(crate::settings::DeliveryNamingOverrides {
@@ -1743,6 +1746,10 @@ async fn insert_active_job_with_persisted_nzb_named(
         .unwrap();
     let (assembly, download_queue, recovery_queue) =
         Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
+    // Mirror admission: `add_job` registers a job's bare `.7z` files as
+    // direct-unpack arming candidates, and this harness hand-builds the state
+    // `add_job` would otherwise have produced.
+    pipeline.register_direct_unpack_singles(job_id, &spec);
     let par2_bytes = spec.par2_bytes();
     pipeline.jobs.insert(
         job_id,
@@ -2586,7 +2593,7 @@ fn rar_unlock_work(job_id: JobId, file_index: u32, priority: u32) -> DownloadWor
             segment_number: 0,
         },
         message_id: MessageId::new(&format!("rar-unlock-{job_id:?}-{file_index}@example.com")),
-        groups: vec!["alt.binaries.test".to_string()],
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
         priority,
         byte_estimate: 1024,
         retry_count: 0,

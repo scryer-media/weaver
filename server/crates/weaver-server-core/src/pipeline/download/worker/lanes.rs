@@ -650,7 +650,11 @@ impl Pipeline {
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.owned_lane.event");
         match event {
             OwnedDownloadLaneEvent::AcquireFailed { lease, error } => {
-                if error.is_capacity_admission() {
+                // Capacity admission and health-mutex contention are both
+                // "ask again shortly": the work goes back to the scheduler on
+                // the owned fast path instead of being demoted to an async
+                // lane on what is not a verdict about the servers at all.
+                if error.should_requeue_owned_work() {
                     let DownloadBatchLease {
                         job_id,
                         lane_mode,
@@ -663,7 +667,7 @@ impl Pipeline {
                         job_id = job_id.0,
                         works = works.len(),
                         error = %error,
-                        "owned blocking lane capacity unavailable; returning work to scheduler"
+                        "owned blocking lane unavailable now; returning work to scheduler"
                     );
                     crate::runtime::perf_probe::record_value(
                         "download.owned_lane.acquire_failed_capacity_requeue",

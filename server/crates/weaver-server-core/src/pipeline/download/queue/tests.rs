@@ -12,7 +12,7 @@ fn make_work(job_id: u64, file_index: u32, seg: u32, priority: u32) -> DownloadW
             segment_number: seg,
         },
         message_id: MessageId::new(&format!("msg-{job_id}-{file_index}-{seg}@example.com")),
-        groups: vec!["alt.binaries.test".into()],
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
         priority,
         byte_estimate: 768_000,
         retry_count: 0,
@@ -368,4 +368,107 @@ fn mixed_priorities() {
     assert_eq!(items[1].priority, 1); // First RAR
     assert_eq!(items[2].priority, 11); // Second RAR
     assert_eq!(items[3].priority, 1000); // PAR2 recovery
+}
+
+fn plan(entries: &[(u32, u32, Option<u32>)]) -> HashMap<NzbFileId, (u32, Option<u32>)> {
+    entries
+        .iter()
+        .map(|(file_index, priority, rank)| {
+            (
+                NzbFileId {
+                    job_id: JobId(1),
+                    file_index: *file_index,
+                },
+                (*priority, *rank),
+            )
+        })
+        .collect()
+}
+
+fn pop_files(q: &mut DownloadQueue) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    while let Some(work) = q.pop() {
+        out.push((work.segment_id.file_id.file_index, work.priority));
+    }
+    out
+}
+
+#[test]
+fn file_priority_plan_applies_to_queued_work_and_to_later_pushes() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 0, 0, 10));
+    q.push(make_work(1, 1, 0, 10));
+    q.push(make_work(1, 2, 0, 1)); // at or below the protected band: untouched
+
+    let changed = q.install_file_priority_plan(plan(&[(1, 3, Some(0)), (2, 3, Some(0))]), 2);
+    assert_eq!(changed, 1, "only the unprotected planned file changes key");
+
+    // A push after the plan lands at the planned key without a rebuild.
+    q.push(make_work(1, 1, 1, 10));
+    assert_eq!(
+        pop_files(&mut q),
+        vec![(2, 1), (1, 3), (1, 3), (0, 10)],
+        "protected item first, then both planned items ahead of the unplanned one"
+    );
+}
+
+#[test]
+fn reinstalling_an_identical_plan_is_a_no_op_until_keys_are_rewritten_elsewhere() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 0, 0, 10));
+    q.push(make_work(1, 1, 0, 10));
+    assert_eq!(q.install_file_priority_plan(plan(&[(1, 3, Some(0))]), 2), 1);
+    assert_eq!(q.install_file_priority_plan(plan(&[(1, 3, Some(0))]), 2), 0);
+
+    // Direct-store style rewrite of the same file's key: the next install of
+    // the unchanged plan re-asserts it, exactly as a rebuild used to.
+    let rewritten =
+        q.reprioritize_matching(|work| (work.segment_id.file_id.file_index == 1).then_some(11));
+    assert_eq!(rewritten, 1);
+    assert_eq!(q.install_file_priority_plan(plan(&[(1, 3, Some(0))]), 2), 1);
+    assert_eq!(pop_files(&mut q), vec![(1, 3), (0, 10)]);
+}
+
+#[test]
+fn a_requeued_retry_keeps_its_planned_rank_without_a_rebuild() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 0, 0, 10));
+    q.push(make_work(1, 1, 0, 10));
+    q.install_file_priority_plan(plan(&[(0, 3, Some(1)), (1, 3, Some(0))]), 2);
+    let planned_order = pop_files(&mut q);
+    assert_eq!(planned_order.len(), 2);
+
+    // Requeue in the opposite order: the plan, not push order, decides.
+    q.push(make_work(1, 0, 0, 10));
+    q.push(make_work(1, 1, 0, 10));
+    assert_eq!(pop_files(&mut q), planned_order);
+}
+
+#[test]
+fn queued_count_per_file_tracks_push_pop_removal_and_drain() {
+    let mut q = DownloadQueue::new();
+    let file0 = NzbFileId {
+        job_id: JobId(1),
+        file_index: 0,
+    };
+    let file1 = NzbFileId {
+        job_id: JobId(1),
+        file_index: 1,
+    };
+    q.push(make_work(1, 0, 0, 10));
+    q.push(make_work(1, 0, 1, 10));
+    q.push(make_work(1, 1, 0, 10));
+    assert_eq!(q.queued_count_for_file(file0), 2);
+    assert_eq!(q.queued_count_for_file(file1), 1);
+
+    q.pop();
+    assert_eq!(
+        q.queued_count_for_file(file0) + q.queued_count_for_file(file1),
+        2
+    );
+
+    let drained = q.drain_all();
+    assert_eq!(drained.len(), 2);
+    assert_eq!(q.queued_count_for_file(file0), 0);
+    assert_eq!(q.queued_count_for_file(file1), 0);
 }

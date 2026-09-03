@@ -290,6 +290,36 @@ func Artifacts() map[string]Artifact {
 		},
 	})
 
+	// ------------------------------------------- direct-unpack codec matrix
+	//
+	// One 7z per coder chain the pinned 7-Zip can WRITE and weaver can DECODE.
+	// Built over the short clip rather than the 1080p one: these exercise decode
+	// paths, not volume, and PPMd or BZip2 over 85 MiB of video would cost
+	// minutes apiece for nothing.
+	//
+	// Deflate64 is deliberately absent — 7-Zip writes it, weaver has no decoder
+	// arm for it. Zstd, Brotli and LZ4 are absent because the official 7-Zip
+	// console binary cannot write them at all; weaver decodes all three, and
+	// their coverage stays in the in-process matrix in
+	// `pipeline::direct_unpack::read_pattern_tests`.
+	for _, codec := range sevenZipCodecMatrix() {
+		add(Artifact{
+			Name:       "direct-unpack-" + codec.Slug,
+			Files:      []string{"archive.7z"},
+			Toolchains: []string{SevenZipToolchain, VideoToolchain},
+			Notes:      codec.Notes,
+			Build:      codec.Build,
+		})
+	}
+
+	add(Artifact{
+		Name:       "direct-unpack-repair-source",
+		Files:      []string{"archive.7z"},
+		Toolchains: []string{SevenZipToolchain},
+		Notes:      "An 8 MiB PPMd 7z over derived bytes: the repair-resume fixture's source, sized and coded so decoding it outlasts downloading it.",
+		Build:      BuildDirectUnpackRepairSource,
+	})
+
 	add(Artifact{
 		Name: "par2-heavy-set",
 		Files: []string{"archive.rar", "archive.rar.par2", "archive.rar.vol00+01.par2", "archive.rar.vol01+02.par2",

@@ -2,6 +2,33 @@ use bytes::{Bytes, BytesMut};
 
 use crate::types::ArticleId;
 
+/// Write an article identifier as its wire argument.
+///
+/// RFC 3977 requires a message-id argument to be the *bracketed* form. An
+/// unbracketed argument is a legal article *number* reference instead, so a
+/// server that has a group selected answers 430 for every article rather than
+/// rejecting the command — a silent, total download failure. Callers construct
+/// `ArticleId::MessageId` from many places (some of which strip the brackets
+/// during NZB parsing), so the encoder is the one place that can guarantee the
+/// frame is right. Bracketing here is idempotent: an already-bracketed id is
+/// written verbatim.
+fn encode_article_id(buf: &mut BytesMut, id: &ArticleId) {
+    match id {
+        ArticleId::MessageId(message_id) => {
+            if message_id.starts_with('<') && message_id.ends_with('>') {
+                buf.extend_from_slice(message_id.as_bytes());
+            } else {
+                buf.extend_from_slice(b"<");
+                buf.extend_from_slice(message_id.as_bytes());
+                buf.extend_from_slice(b">");
+            }
+        }
+        ArticleId::Number(number) => {
+            buf.extend_from_slice(number.to_string().as_bytes());
+        }
+    }
+}
+
 /// An NNTP command to be sent to the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -39,19 +66,19 @@ impl Command {
         match self {
             Command::Article(id) => {
                 buf.extend_from_slice(b"ARTICLE ");
-                buf.extend_from_slice(id.to_string().as_bytes());
+                encode_article_id(&mut buf, id);
             }
             Command::Body(id) => {
                 buf.extend_from_slice(b"BODY ");
-                buf.extend_from_slice(id.to_string().as_bytes());
+                encode_article_id(&mut buf, id);
             }
             Command::Head(id) => {
                 buf.extend_from_slice(b"HEAD ");
-                buf.extend_from_slice(id.to_string().as_bytes());
+                encode_article_id(&mut buf, id);
             }
             Command::Stat(id) => {
                 buf.extend_from_slice(b"STAT ");
-                buf.extend_from_slice(id.to_string().as_bytes());
+                encode_article_id(&mut buf, id);
             }
             Command::Group(name) => {
                 buf.extend_from_slice(b"GROUP ");
@@ -102,6 +129,35 @@ mod tests {
     fn encode_body_message_id() {
         let cmd = Command::Body(ArticleId::MessageId("<test@example.com>".into()));
         assert_eq!(cmd.encode().as_ref(), b"BODY <test@example.com>\r\n");
+    }
+
+    #[test]
+    fn encode_brackets_a_bare_message_id() {
+        // An unbracketed argument is a legal article-number reference, so a
+        // server with a group selected answers 430 instead of erroring — the
+        // encoder must never emit one.
+        let cmd = Command::Body(ArticleId::MessageId("test@example.com".into()));
+        assert_eq!(cmd.encode().as_ref(), b"BODY <test@example.com>\r\n");
+    }
+
+    #[test]
+    fn encode_bracketing_is_idempotent_across_id_commands() {
+        for (bare, bracketed) in [
+            (
+                Command::Article(ArticleId::MessageId("a@b".into())),
+                Command::Article(ArticleId::MessageId("<a@b>".into())),
+            ),
+            (
+                Command::Head(ArticleId::MessageId("a@b".into())),
+                Command::Head(ArticleId::MessageId("<a@b>".into())),
+            ),
+            (
+                Command::Stat(ArticleId::MessageId("a@b".into())),
+                Command::Stat(ArticleId::MessageId("<a@b>".into())),
+            ),
+        ] {
+            assert_eq!(bare.encode(), bracketed.encode());
+        }
     }
 
     #[test]

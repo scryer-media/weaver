@@ -67,7 +67,7 @@ pub(crate) enum NestedExtractionDecision {
 pub(crate) mod check;
 pub(crate) mod claims;
 pub(crate) mod deobfuscate;
-mod extract;
+pub(in crate::pipeline) mod extract;
 mod nested;
 mod output;
 pub(crate) mod rar;

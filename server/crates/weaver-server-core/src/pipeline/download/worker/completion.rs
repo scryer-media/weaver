@@ -98,7 +98,7 @@ impl Pipeline {
         let work = DownloadWork {
             segment_id,
             message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-            groups: file_spec.groups.clone(),
+            groups: std::sync::Arc::from(file_spec.groups.as_slice()),
             priority: file_spec.role.download_priority(),
             byte_estimate: seg_spec.bytes,
             retry_count,
@@ -142,7 +142,7 @@ impl Pipeline {
         Some(DownloadWork {
             segment_id,
             message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-            groups: file_spec.groups.clone(),
+            groups: std::sync::Arc::from(file_spec.groups.as_slice()),
             priority: file_spec.role.download_priority(),
             byte_estimate: seg_spec.bytes,
             retry_count,
@@ -404,15 +404,17 @@ impl Pipeline {
     }
 
     pub(crate) fn note_released_download_result_pending(&mut self, job_id: JobId, bytes: u64) {
-        *self
+        let pending = self
             .pending_released_download_results_by_job
             .entry(job_id)
-            .or_insert(0) += 1;
+            .or_insert(0);
+        *pending = pending.saturating_add(1);
         if bytes != 0 {
-            *self
+            let pending_bytes = self
                 .pending_released_download_result_bytes_by_job
                 .entry(job_id)
-                .or_insert(0) += bytes;
+                .or_insert(0);
+            *pending_bytes = pending_bytes.saturating_add(bytes);
         }
     }
 
@@ -568,7 +570,7 @@ impl Pipeline {
                         crate::events::model::ServerAttemptOutcome::PermanentFailure
                     }
                 };
-                let _ = self.event_tx.send(PipelineEvent::ServerAttempt {
+                self.send_segment_event(|| PipelineEvent::ServerAttempt {
                     segment_id: result.segment_id,
                     server_id: crate::ServerId(attempt.server_idx as u16),
                     attempt: (attempt_index as u32) + 1,
@@ -600,7 +602,7 @@ impl Pipeline {
 
                 // (Per-job byte tracking moved to handle_decode_done to use decoded size.)
 
-                let _ = self.event_tx.send(PipelineEvent::ArticleDownloaded {
+                self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
                     segment_id: result.segment_id,
                     raw_size,
                 });
@@ -627,7 +629,7 @@ impl Pipeline {
                     self.metrics
                         .segments_downloaded
                         .fetch_add(1, Ordering::Relaxed);
-                    let _ = self.event_tx.send(PipelineEvent::ArticleDownloaded {
+                    self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
                         segment_id: result.segment_id,
                         raw_size,
                     });
@@ -659,7 +661,7 @@ impl Pipeline {
                 }
                 self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
 
-                let _ = self.event_tx.send(PipelineEvent::ArticleDownloaded {
+                self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
                     segment_id: result.segment_id,
                     raw_size: raw_size_for_event,
                 });
@@ -811,7 +813,7 @@ impl Pipeline {
                         self.metrics
                             .articles_not_found
                             .fetch_add(1, Ordering::Relaxed);
-                        let _ = self.event_tx.send(PipelineEvent::ArticleNotFound {
+                        self.send_segment_event(|| PipelineEvent::ArticleNotFound {
                             segment_id: result.segment_id,
                         });
                         self.book_failed_segment(result.segment_id);
@@ -1011,7 +1013,7 @@ impl Pipeline {
                     self.metrics
                         .articles_not_found
                         .fetch_add(1, Ordering::Relaxed);
-                    let _ = self.event_tx.send(PipelineEvent::ArticleNotFound {
+                    self.send_segment_event(|| PipelineEvent::ArticleNotFound {
                         segment_id: result.segment_id,
                     });
                     self.book_failed_segment(result.segment_id);
@@ -1052,7 +1054,7 @@ impl Pipeline {
                             let work = DownloadWork {
                                 segment_id: seg_id,
                                 message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-                                groups: file_spec.groups.clone(),
+                                groups: std::sync::Arc::from(file_spec.groups.as_slice()),
                                 priority,
                                 byte_estimate: seg_spec.bytes,
                                 retry_count: next_retry,

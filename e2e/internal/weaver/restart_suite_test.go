@@ -122,6 +122,29 @@ func TestCapturePar2AliasStateReportsSplitOwnershipAndMissingVolumes(t *testing.
 	}
 }
 
+func TestDirectStorePartialFromSnapshotMatchesJobRootAndFileSet(t *testing.T) {
+	const expectedPath = ".weaver-staging/10000/amber.trail.s01e02.mkv.f0.direct.partial"
+	snapshot := restartFilesystemSnapshot{
+		Complete: []restartTreeEntry{
+			{Path: ".weaver-staging/10000/tmp/nested.f0.direct.partial", Size: 1},
+			{Path: ".weaver-staging/10000/other.f1.direct.partial", Size: 2},
+			{Path: ".weaver-staging/10001/other-job.f0.direct.partial", Size: 3},
+			{Path: expectedPath, Size: 24 << 20},
+		},
+	}
+
+	path, size, ok := directStorePartialFromSnapshot(snapshot, 10000, 0)
+	if !ok {
+		t.Fatal("expected direct-store partial to be found")
+	}
+	if path != expectedPath || size != 24<<20 {
+		t.Fatalf("unexpected direct-store partial: path=%q size=%d", path, size)
+	}
+	if _, _, ok := directStorePartialFromSnapshot(snapshot, 10000, 2); ok {
+		t.Fatal("unexpected match for absent direct-store file set")
+	}
+}
+
 func TestNormalizeRestartDBStatusHandlesLegacyAndRestoreLogForms(t *testing.T) {
 	cases := map[string]string{
 		"queued_repair":  "QUEUED_REPAIR",

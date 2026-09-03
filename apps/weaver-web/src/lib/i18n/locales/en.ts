@@ -327,6 +327,8 @@ const en: LocaleDictionary = {
   "servers.testing": "Testing...",
   "servers.testSuccess": "Connected",
   "servers.testFailed": "Connection failed",
+  "servers.tlsCipherClientOrder": "weaver picks cipher",
+  "servers.tlsCipherServerOrder": "server picks cipher",
   "servers.limits": "Limits",
   "servers.downloadLimits": "Download limits",
   "servers.downloadLimitsDescription": "Apply an aggregate speed limit and hard BODY-byte quota to this server across all connections.",

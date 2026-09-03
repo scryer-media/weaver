@@ -1,4 +1,4 @@
-use async_graphql::{Enum, InputObject, SimpleObject};
+use async_graphql::{Enum, InputObject, MaybeUndefined, SimpleObject};
 use weaver_server_core::post_processing::listing::{DiscoveredScript, ScriptProblem};
 use weaver_server_core::post_processing::model::{
     OptionName, OptionValue, PostProcessingSettings, ResolvedOption, ScriptAdapter, ScriptList,
@@ -19,6 +19,7 @@ pub struct PostProcessingSettingsGql {
     pub python_interpreter: Option<String>,
     pub powershell_interpreter: Option<String>,
     pub batch_interpreter: Option<String>,
+    pub unacceptable_extensions: Vec<String>,
     /// True when `WEAVER_STRICT_SECURITY` refuses script execution outright.
     pub strict_security_refuses_execution: bool,
     /// Global default list plus every per-category override.
@@ -40,6 +41,7 @@ impl PostProcessingSettingsGql {
             python_interpreter: value.python_interpreter,
             powershell_interpreter: value.powershell_interpreter,
             batch_interpreter: value.batch_interpreter,
+            unacceptable_extensions: value.unacceptable_extensions,
             strict_security_refuses_execution: strict_security,
             lists: lists.into(),
         }
@@ -54,19 +56,9 @@ pub struct PostProcessingSettingsInput {
     pub python_interpreter: Option<String>,
     pub powershell_interpreter: Option<String>,
     pub batch_interpreter: Option<String>,
-}
-
-impl From<PostProcessingSettingsInput> for PostProcessingSettings {
-    fn from(value: PostProcessingSettingsInput) -> Self {
-        Self {
-            execution_enabled: value.execution_enabled,
-            concurrency: value.concurrency,
-            termination_grace_seconds: value.termination_grace_seconds,
-            python_interpreter: value.python_interpreter,
-            powershell_interpreter: value.powershell_interpreter,
-            batch_interpreter: value.batch_interpreter,
-        }
-    }
+    /// Omission preserves the existing policy; a supplied empty list disables
+    /// it. `null` is deliberately distinguishable and refused by the mutation.
+    pub unacceptable_extensions: MaybeUndefined<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Enum)]

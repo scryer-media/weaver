@@ -1,7 +1,7 @@
 use std::io::{self, Cursor, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 #[cfg(not(windows))]
@@ -22,8 +22,8 @@ use tokio_rustls::rustls::client::{
 };
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{
-    CertificateError, ClientConfig, ClientConnection, DigitallySignedStruct, Error as RustlsError,
-    RootCertStore, SignatureScheme,
+    CertificateError, CipherSuite, ClientConfig, ClientConnection, DigitallySignedStruct,
+    Error as RustlsError, RootCertStore, SignatureScheme, SupportedCipherSuite,
 };
 
 use crate::error::NntpError;
@@ -303,6 +303,16 @@ async fn read_s2n_available_into(
     match *inner {}
 }
 
+#[cfg(not(windows))]
+fn s2n_negotiated_cipher_suite(inner: &S2nTransportStream) -> Option<String> {
+    inner.as_ref().cipher_suite().ok().map(str::to_string)
+}
+
+#[cfg(windows)]
+fn s2n_negotiated_cipher_suite(inner: &S2nTransportStream) -> Option<String> {
+    match *inner {}
+}
+
 pub struct ManualTlsStream {
     tcp: TcpStream,
     session: RustlsSession,
@@ -325,6 +335,12 @@ impl RustlsSession {
         Ok(Self {
             tls: ClientConnection::new(config, server_name)?,
         })
+    }
+
+    pub(crate) fn negotiated_cipher_suite(&self) -> Option<String> {
+        self.tls
+            .negotiated_cipher_suite()
+            .map(|suite| iana_cipher_suite_name(suite.suite()))
     }
 
     pub(crate) fn is_handshaking(&self) -> bool {
@@ -367,6 +383,21 @@ impl NntpTransport {
             | NntpTransport::Tls { remote_addr, .. }
             | NntpTransport::ManualTls { remote_addr, .. }
             | NntpTransport::S2nTls { remote_addr, .. } => *remote_addr,
+        }
+    }
+
+    /// IANA name of the negotiated TLS cipher suite, when this transport is
+    /// TLS and the handshake has completed.
+    pub fn negotiated_cipher_suite(&self) -> Option<String> {
+        match self {
+            NntpTransport::Plain { .. } => None,
+            NntpTransport::Tls { inner, .. } => inner
+                .get_ref()
+                .1
+                .negotiated_cipher_suite()
+                .map(|suite| iana_cipher_suite_name(suite.suite())),
+            NntpTransport::ManualTls { inner, .. } => inner.session.negotiated_cipher_suite(),
+            NntpTransport::S2nTls { inner, .. } => s2n_negotiated_cipher_suite(inner),
         }
     }
 
@@ -828,8 +859,147 @@ impl AsyncWrite for NntpTransport {
 
 /// Build a `rustls` `ClientConfig` using Mozilla root certificates,
 /// optionally augmented with a custom CA certificate from a PEM file.
-pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>, NntpError> {
-    build_tls_config_with_name_mismatch_policy(ca_cert_path, None)
+/// Which AEAD family the TLS ClientHello offers first.
+///
+/// The fastest suite is a property of the local CPU, not of the upstream.
+/// With hardware AES (AES-NI/VAES, ARMv8 crypto extensions) AES-128-GCM beats
+/// AES-256-GCM by four rounds and both beat ChaCha20-Poly1305 several times
+/// over; without it ChaCha20 wins. Servers may still impose their own order,
+/// which the save-time probe records per server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlsCipherPreference {
+    /// Resolve from the local CPU once per process.
+    #[default]
+    Auto,
+    /// AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305.
+    AesFirst,
+    /// ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM.
+    ChaChaFirst,
+}
+
+impl TlsCipherPreference {
+    /// The concrete order this preference produces on this machine.
+    pub fn resolve(self) -> Self {
+        match self {
+            Self::Auto => {
+                if cpu_has_aes_acceleration() {
+                    Self::AesFirst
+                } else {
+                    Self::ChaChaFirst
+                }
+            }
+            explicit => explicit,
+        }
+    }
+
+    /// The explicit preference whose first family differs from an already
+    /// negotiated suite, so a second handshake reveals whether the server
+    /// follows the client's order.
+    pub fn opposing(negotiated_suite: &str) -> Self {
+        if negotiated_suite.contains("CHACHA20") {
+            Self::AesFirst
+        } else {
+            Self::ChaChaFirst
+        }
+    }
+
+    fn family_rank(self, family: CipherFamily) -> u8 {
+        match (self.resolve(), family) {
+            (Self::ChaChaFirst, CipherFamily::ChaCha20) => 0,
+            (Self::ChaChaFirst, CipherFamily::Aes128Gcm) => 1,
+            (Self::ChaChaFirst, CipherFamily::Aes256Gcm) => 2,
+            (_, CipherFamily::Aes128Gcm) => 0,
+            (_, CipherFamily::Aes256Gcm) => 1,
+            (_, CipherFamily::ChaCha20) => 2,
+            (_, CipherFamily::Other) => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CipherFamily {
+    Aes128Gcm,
+    Aes256Gcm,
+    ChaCha20,
+    Other,
+}
+
+fn cipher_family(suite: CipherSuite) -> CipherFamily {
+    let name = format!("{suite:?}");
+    if name.contains("AES_128_GCM") {
+        CipherFamily::Aes128Gcm
+    } else if name.contains("AES_256_GCM") {
+        CipherFamily::Aes256Gcm
+    } else if name.contains("CHACHA20") {
+        CipherFamily::ChaCha20
+    } else {
+        CipherFamily::Other
+    }
+}
+
+/// IANA-style suite name shared by both TLS backends (`TLS_AES_128_GCM_SHA256`).
+pub(crate) fn iana_cipher_suite_name(suite: CipherSuite) -> String {
+    let name = format!("{suite:?}");
+    match name.strip_prefix("TLS13_") {
+        Some(rest) => format!("TLS_{rest}"),
+        None => name,
+    }
+}
+
+/// Whether this CPU accelerates AES (detected once per process).
+pub fn cpu_has_aes_acceleration() -> bool {
+    static DETECTED: OnceLock<bool> = OnceLock::new();
+    *DETECTED.get_or_init(detect_cpu_aes_acceleration)
+}
+
+fn detect_cpu_aes_acceleration() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("aes")
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("aes")
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+/// Stable-sort the provider's suites so the ClientHello leads with the
+/// preferred family. TLS 1.3 suites stay ahead of TLS 1.2 suites; rustls only
+/// ever considers the suites of the negotiated protocol version.
+fn order_cipher_suites(suites: &mut [SupportedCipherSuite], preference: TlsCipherPreference) {
+    suites.sort_by_key(|suite| {
+        let version_rank = u8::from(suite.tls13().is_none());
+        (
+            version_rank,
+            preference.family_rank(cipher_family(suite.suite())),
+        )
+    });
+}
+
+/// s2n security policies carry a fixed suite order (AES-128-GCM first), so a
+/// preference that resolves to anything else runs on rustls, which orders its
+/// ClientHello freely.
+pub(crate) fn tls_backend_for_preference(
+    backend: NntpTlsBackend,
+    preference: TlsCipherPreference,
+) -> NntpTlsBackend {
+    #[cfg(not(windows))]
+    if backend == NntpTlsBackend::S2n && preference.resolve() != TlsCipherPreference::AesFirst {
+        return NntpTlsBackend::ManualRustls;
+    }
+    let _ = preference;
+    backend
+}
+
+pub fn build_tls_config(
+    ca_cert_path: Option<&Path>,
+    cipher_preference: TlsCipherPreference,
+) -> Result<Arc<ClientConfig>, NntpError> {
+    build_tls_config_with_name_mismatch_policy(ca_cert_path, None, cipher_preference)
 }
 
 /// Build a TLS config that may accept one explicitly adopted leaf certificate
@@ -837,11 +1007,13 @@ pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>
 pub fn build_tls_config_with_name_mismatch_certificate(
     ca_cert_path: Option<&Path>,
     adopted_name_mismatch_certificate_der: Option<&[u8]>,
+    cipher_preference: TlsCipherPreference,
 ) -> Result<Arc<ClientConfig>, NntpError> {
     build_tls_config_with_name_mismatch_policy(
         ca_cert_path,
         adopted_name_mismatch_certificate_der
             .map(|der| NameMismatchCertificatePolicy::Adopted(der.to_vec())),
+        cipher_preference,
     )
 }
 
@@ -852,12 +1024,14 @@ fn build_tls_config_with_name_mismatch_capture(
     build_tls_config_with_name_mismatch_policy(
         ca_cert_path,
         Some(NameMismatchCertificatePolicy::Capture(captured_leaf_der)),
+        TlsCipherPreference::Auto,
     )
 }
 
 fn build_tls_config_with_name_mismatch_policy(
     ca_cert_path: Option<&Path>,
     policy: Option<NameMismatchCertificatePolicy>,
+    cipher_preference: TlsCipherPreference,
 ) -> Result<Arc<ClientConfig>, NntpError> {
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -883,7 +1057,9 @@ fn build_tls_config_with_name_mismatch_policy(
         }
     }
 
-    let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+    let mut provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+    order_cipher_suites(&mut provider.cipher_suites, cipher_preference);
+    let provider = Arc::new(provider);
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .expect("aws-lc-rs supports Rustls safe default protocol versions");
@@ -1181,7 +1357,16 @@ pub async fn connect_tls(
     port: u16,
     ca_cert_path: Option<&Path>,
 ) -> Result<NntpTransport, NntpError> {
-    connect_tls_with_ip_policy(host, port, ca_cert_path, None, &[], 0).await
+    connect_tls_with_ip_policy(
+        host,
+        port,
+        ca_cert_path,
+        None,
+        TlsCipherPreference::Auto,
+        &[],
+        0,
+    )
+    .await
 }
 
 pub async fn connect_tls_with_ip_policy(
@@ -1189,6 +1374,7 @@ pub async fn connect_tls_with_ip_policy(
     port: u16,
     ca_cert_path: Option<&Path>,
     adopted_name_mismatch_certificate_der: Option<&[u8]>,
+    cipher_preference: TlsCipherPreference,
     excluded_ips: &[IpAddr],
     address_offset: usize,
 ) -> Result<NntpTransport, NntpError> {
@@ -1197,13 +1383,14 @@ pub async fn connect_tls_with_ip_policy(
     let backend = if adopted_name_mismatch_certificate_der.is_some() {
         NntpTlsBackend::ManualRustls
     } else {
-        selected_tls_backend()?
+        tls_backend_for_preference(selected_tls_backend()?, cipher_preference)
     };
     match backend {
         NntpTlsBackend::ManualRustls => {
             let tls_config = build_tls_config_with_name_mismatch_certificate(
                 ca_cert_path,
                 adopted_name_mismatch_certificate_der,
+                cipher_preference,
             )?;
             let server_name = make_server_name(host)?;
             let manual_tls = ManualTlsStream::connect(tcp, tls_config, server_name).await?;
@@ -1252,6 +1439,7 @@ pub async fn upgrade_starttls(
     host: &str,
     ca_cert_path: Option<&Path>,
     adopted_name_mismatch_certificate_der: Option<&[u8]>,
+    cipher_preference: TlsCipherPreference,
 ) -> Result<NntpTransport, NntpError> {
     let (tcp, remote_addr) = match transport {
         NntpTransport::Plain { inner, remote_addr } => (inner, remote_addr),
@@ -1267,13 +1455,14 @@ pub async fn upgrade_starttls(
     let backend = if adopted_name_mismatch_certificate_der.is_some() {
         NntpTlsBackend::ManualRustls
     } else {
-        selected_tls_backend()?
+        tls_backend_for_preference(selected_tls_backend()?, cipher_preference)
     };
     match backend {
         NntpTlsBackend::ManualRustls => {
             let tls_config = build_tls_config_with_name_mismatch_certificate(
                 ca_cert_path,
                 adopted_name_mismatch_certificate_der,
+                cipher_preference,
             )?;
             let server_name = make_server_name(host)?;
             let manual_tls = ManualTlsStream::connect(tcp, tls_config, server_name).await?;
@@ -1297,6 +1486,106 @@ pub async fn upgrade_starttls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn family_order(preference: TlsCipherPreference) -> Vec<CipherFamily> {
+        let mut suites = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().cipher_suites;
+        order_cipher_suites(&mut suites, preference);
+        suites
+            .iter()
+            .map(|suite| cipher_family(suite.suite()))
+            .collect()
+    }
+
+    #[test]
+    fn aes_first_preference_offers_aes_128_gcm_before_chacha() {
+        let order = family_order(TlsCipherPreference::AesFirst);
+        let aes128 = order
+            .iter()
+            .position(|family| matches!(family, CipherFamily::Aes128Gcm))
+            .unwrap();
+        let aes256 = order
+            .iter()
+            .position(|family| matches!(family, CipherFamily::Aes256Gcm))
+            .unwrap();
+        let chacha = order
+            .iter()
+            .position(|family| matches!(family, CipherFamily::ChaCha20))
+            .unwrap();
+        assert!(aes128 < aes256, "{order:?}");
+        assert!(aes256 < chacha, "{order:?}");
+    }
+
+    #[test]
+    fn chacha_first_preference_offers_chacha_before_aes() {
+        let order = family_order(TlsCipherPreference::ChaChaFirst);
+        let chacha = order
+            .iter()
+            .position(|family| matches!(family, CipherFamily::ChaCha20))
+            .unwrap();
+        let aes128 = order
+            .iter()
+            .position(|family| matches!(family, CipherFamily::Aes128Gcm))
+            .unwrap();
+        assert!(chacha < aes128, "{order:?}");
+    }
+
+    #[test]
+    fn cipher_ordering_keeps_tls13_suites_ahead_of_tls12() {
+        for preference in [
+            TlsCipherPreference::AesFirst,
+            TlsCipherPreference::ChaChaFirst,
+        ] {
+            let mut suites =
+                tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().cipher_suites;
+            order_cipher_suites(&mut suites, preference);
+            let first_tls12 = suites
+                .iter()
+                .position(|suite| suite.tls13().is_none())
+                .unwrap_or(suites.len());
+            assert!(
+                suites[first_tls12..]
+                    .iter()
+                    .all(|suite| suite.tls13().is_none()),
+                "TLS 1.2 suites interleaved with TLS 1.3 under {preference:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_preference_resolves_to_a_concrete_order() {
+        assert_ne!(
+            TlsCipherPreference::Auto.resolve(),
+            TlsCipherPreference::Auto
+        );
+        assert_eq!(
+            TlsCipherPreference::AesFirst.resolve(),
+            TlsCipherPreference::AesFirst
+        );
+    }
+
+    #[test]
+    fn opposing_preference_flips_the_negotiated_family() {
+        assert_eq!(
+            TlsCipherPreference::opposing("TLS_CHACHA20_POLY1305_SHA256"),
+            TlsCipherPreference::AesFirst
+        );
+        assert_eq!(
+            TlsCipherPreference::opposing("TLS_AES_128_GCM_SHA256"),
+            TlsCipherPreference::ChaChaFirst
+        );
+    }
+
+    #[test]
+    fn iana_names_drop_the_rustls_tls13_prefix() {
+        assert_eq!(
+            iana_cipher_suite_name(CipherSuite::TLS13_AES_128_GCM_SHA256),
+            "TLS_AES_128_GCM_SHA256"
+        );
+        assert_eq!(
+            iana_cipher_suite_name(CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384),
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+        );
+    }
     use std::sync::Arc;
     #[cfg(not(windows))]
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -100,6 +100,150 @@
       }
     },
     {
+      "path": "testdata/direct-store-encrypted-par2-repair/archive.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par2-repair/archive.part1.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par2-repair/archive.part2.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par2-repair/archive.part3.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par2-repair/archive.part4.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par2-repair/archive.vol000+100.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par2-repair/archive.vol100+100.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par2-repair/archive.vol200+100.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par2-repair/archive.vol300+100.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
       "path": "testdata/direct-store-encrypted/archive.part1.rar",
       "size": 8388608,
       "blake3": "9c9b9c1e5aaa0c81a762e244b54d6685667dfb2ca9ff57450e1d09b72ec9e461",
@@ -117,6 +261,180 @@
       "path": "testdata/direct-store-encrypted/archive.part2.rar",
       "size": 4194571,
       "blake3": "3afa35f17c434bdb8fdc114e9a9e289c8740a6b461a67712fdc780e1782b84ef",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par2-repair/archive.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par2-repair/archive.part1.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par2-repair/archive.part2.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par2-repair/archive.part3.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par2-repair/archive.part4.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par2-repair/archive.vol000+100.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par2-repair/archive.vol100+100.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par2-repair/archive.vol200+100.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par2-repair/archive.vol300+100.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp/archive.part1.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp/archive.part2.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
       "format": "rar5",
       "source": {
         "kind": "generated",
@@ -353,6 +671,195 @@
       }
     },
     {
+      "path": "testdata/direct-store-rar4-encrypted-par2-repair/archive.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-4.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-rar4-encrypted-par2-repair/archive.part1.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar4",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-4.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-rar4-encrypted-par2-repair/archive.part2.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar4",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-4.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-rar4-encrypted-par2-repair/archive.part3.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar4",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-4.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-rar4-encrypted-par2-repair/archive.part4.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar4",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-4.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-rar4-encrypted-par2-repair/archive.vol000+100.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-4.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-rar4-encrypted-par2-repair/archive.vol100+100.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-4.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-rar4-encrypted-par2-repair/archive.vol200+100.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-4.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-rar4-encrypted-par2-repair/archive.vol300+100.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-4.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-rar4-encrypted/archive.part1.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar4",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-4.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-rar4-encrypted/archive.part2.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar4",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-4.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-rar4-encrypted/archive.part3.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar4",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-4.20"
+        ]
+      }
+    },
+    {
       "path": "testdata/direct-store-rar4/archive.part1.rar",
       "size": 8388608,
       "blake3": "47c0c3d1dce9451cc1f684c20cbd3846322b1f315b81b9c6862f5b4846b21ecd",
@@ -405,6 +912,1352 @@
         "toolchains": [
           "go-fixture-bytes",
           "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-header-split/archive.7z.001",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-header-split/archive.7z.002",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-header-split/archive.7z.003",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-header/archive.7z",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-repair/archive.7z.001",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-repair/archive.7z.002",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-repair/archive.7z.003",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-repair/archive.7z.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-repair/archive.7z.vol00+1.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-repair/archive.7z.vol01+2.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-repair/archive.7z.vol03+4.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-repair/archive.7z.vol07+8.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-repair/archive.7z.vol15+1.par2",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-split/archive.7z.001",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-split/archive.7z.002",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256-split/archive.7z.003",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-aes256/archive.7z",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-bcj-lzma2-split/archive.7z.001",
+      "size": 131125,
+      "blake3": "dae330f13873a6104605d08f573f1b926caa66db831365657f5de85c9c6a9335",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-bcj-lzma2-split/archive.7z.002",
+      "size": 131125,
+      "blake3": "b5469859cc089f39aae9e6589447e139201102bb2022b63f828688f23da2c564",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-bcj-lzma2-split/archive.7z.003",
+      "size": 131124,
+      "blake3": "ae4945de1b0c95171bd77885983d68bcbe330a7a2dcc01c68e4e473465e944a4",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-bcj-lzma2/archive.7z",
+      "size": 393374,
+      "blake3": "dd41d1dda56fb968cd9b42b4387593f7998752295b5bffcd143dec12f884639f",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-bcj2-split/archive.7z.001",
+      "size": 131199,
+      "blake3": "a930c9ad9bc11bb70421db69fa38b1f5b31180900c036854fdfe1cc78c80c066",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-bcj2-split/archive.7z.002",
+      "size": 131199,
+      "blake3": "ecd21b82494ebe714ec7687a2360d591ce3b9c78f133926d385f81227b3c78dd",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-bcj2-split/archive.7z.003",
+      "size": 131197,
+      "blake3": "bb7ec1d2bea4ff3ebde6182a7df17c7e6f418805472e696319c3203af45c9303",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-bcj2/archive.7z",
+      "size": 393595,
+      "blake3": "fd051350a1efa280be65bc7f42c1fe09490ae422a41fd45206f5ba1b986bc48a",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-bzip2-split/archive.7z.001",
+      "size": 132173,
+      "blake3": "a65978b60e24d1e3ed5c672ecdcafbec737ca24d07beb4eb95fd5c3ae4c2a7e9",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-bzip2-split/archive.7z.002",
+      "size": 132173,
+      "blake3": "61752adb2202b0ddba4112a11ce92aacf8230f18b66f0710b08aa0917a4ebf20",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-bzip2-split/archive.7z.003",
+      "size": 132173,
+      "blake3": "1d60cf4004fc261c9baee02f3bcbcfab9121d370f658bdc1cc66440784e532a1",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-bzip2/archive.7z",
+      "size": 396519,
+      "blake3": "81a812b82135bcf1b1b69d886708b25a6c0923241f998d8324d95b28b798d7fc",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-copy-split/archive.7z.001",
+      "size": 131116,
+      "blake3": "96760e134a587f2035488d318fa51beac08bb0a0c95fa14d48743f9c1a0b18e3",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-copy-split/archive.7z.002",
+      "size": 131116,
+      "blake3": "e33997e5a5bb2e1d4a22abc4a26ab29dd5b51c996646a6ac3ee2a2df6922e8fe",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-copy-split/archive.7z.003",
+      "size": 131114,
+      "blake3": "663219d465d005e7cbe41d6c8f0a026f622fd1c15753be28cc508676ba3947cb",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-copy/archive.7z",
+      "size": 393346,
+      "blake3": "8e9d3ab931bcb278c3307084a2f67c9d930a33204598f9a7c27acbe795dca0b5",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-deflate-split/archive.7z.001",
+      "size": 131174,
+      "blake3": "6f2479c98b6e35a8ea7f62f05343fd5c045765952eb8d761c43e5d386fff64ec",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-deflate-split/archive.7z.002",
+      "size": 131174,
+      "blake3": "50c24b37c5f84aefa33039c333db386fcdf1b3587462a5bc7a71e2bf75f3d558",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-deflate-split/archive.7z.003",
+      "size": 131173,
+      "blake3": "d2230af82ba94628e23cefc73de10f780883fb69361524e22728d118cab02e06",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-deflate/archive.7z",
+      "size": 393521,
+      "blake3": "2cbae31246266c6839cfdd779f87b8a07f023cb05f7eeef5f9e5a66f69a9d2a9",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-delta-lzma2-split/archive.7z.001",
+      "size": 131130,
+      "blake3": "893952832b048a8748c111d340d203d09a498ac20a3686984a3676a1af378b9e",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-delta-lzma2-split/archive.7z.002",
+      "size": 131130,
+      "blake3": "eb30f2ef5624b474a0d645033346fa20d2b008f28e75a306a3d4fe2f02e5c76e",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-delta-lzma2-split/archive.7z.003",
+      "size": 131130,
+      "blake3": "29f9fc8ec7a02b7adb6034f58c2350f46bbf7c466ddbbadb89f2496381a70a51",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-delta-lzma2/archive.7z",
+      "size": 393390,
+      "blake3": "8164b73edc2a2d511e1d83f4d2670fd61a1c56a19ddfbddcabc29af7081a6d2a",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-lzma-split/archive.7z.001",
+      "size": 132997,
+      "blake3": "424720729093e65c9cb4a0b223cefcba998e66d9325fc97101165cc32f984deb",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-lzma-split/archive.7z.002",
+      "size": 132997,
+      "blake3": "9d05fd9ba800aa35135e98fb3f12509c6a817af8e34b814664a62388a33ffff0",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-lzma-split/archive.7z.003",
+      "size": 132995,
+      "blake3": "a28b3f523cfb616f2f8544de3869c613a30cc7d3ec81ca9ea3bc0af0d71cc8bc",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-lzma/archive.7z",
+      "size": 398989,
+      "blake3": "604ff3da95622eaa0dd21d7cbf94cc9c58ffef04bd25647a8e0913031baf871c",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-lzma2-split/archive.7z.001",
+      "size": 131125,
+      "blake3": "355742f5fe0550fde090f337cdd11406d3b095c575894391ad2da95ad40b1a83",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-lzma2-split/archive.7z.002",
+      "size": 131125,
+      "blake3": "1926ded1fdc0477449f7620da2fcbfa443cdb16874a6017e06ae376393124f85",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-lzma2-split/archive.7z.003",
+      "size": 131124,
+      "blake3": "e42a7d338d329ea1bb2155171581522d0f14fa9332731afaab15b485a5391ed8",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-lzma2/archive.7z",
+      "size": 393374,
+      "blake3": "2e0bbe78f2135298856c41586cf7329c64b0a8947612d7064f6bff4dbaef25c0",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-nonsolid-split/archive.7z.001",
+      "size": 393306,
+      "blake3": "06ede7eb14aa13fa9024b00c863ccb69991514f5e46a3a5c9612e74c308eb193",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-nonsolid-split/archive.7z.002",
+      "size": 393306,
+      "blake3": "bc013d74fd5281f266d50d7ab0eccafb86d369694831897f8d7508050bdf6491",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-nonsolid-split/archive.7z.003",
+      "size": 393306,
+      "blake3": "4b8a5499532635dee77adbfb003907ea500b8e2c6485c0f658c099f3b3b4c174",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-nonsolid/archive.7z",
+      "size": 1179918,
+      "blake3": "a2235bab13cdc61c5539240d81ca1a8c888bae97a7368cb20cb118078e3e4719",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-ppmd-split/archive.7z.001",
+      "size": 134004,
+      "blake3": "038d31eb6844a1d5c040310b77ac60e9274125818647059cfc9ad28633834921",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-ppmd-split/archive.7z.002",
+      "size": 134004,
+      "blake3": "b6d47a3f96a491d45b6953f42da8e5f52f6c2fadddd7f23dbf652ccabedd5482",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-ppmd-split/archive.7z.003",
+      "size": 134003,
+      "blake3": "fb922c3fe8a79e582e9ed1f1bf70649519d097ffcd97e4b06205741cade87f29",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-ppmd/archive.7z",
+      "size": 402011,
+      "blake3": "a144bf2ac9e502a7ddb995f6216c4ba30e4fb4bf2f3d00f3d9d0e4e23b7617ef",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.001",
+      "size": 1428487,
+      "blake3": "6b3337f879b5fcba13eb7dc188bfa546a94e8214d10b04835c46f6411db73784",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.002",
+      "size": 1428487,
+      "blake3": "aec2f1a04d3227bb5d929b117831837c04d44970f1672d38bcb7f40c43229e48",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.003",
+      "size": 1428487,
+      "blake3": "6e27080a439d3d12c26aeb1b6da37d81a69f45610b04e927f05cbbc737e97384",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.004",
+      "size": 1428487,
+      "blake3": "095ea56a7ad18bd069bb47c912567af8943d083393cf482a557bd18a0b57a5e8",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.005",
+      "size": 1428487,
+      "blake3": "b655a29b117cc9454214c73e65e8bf195595df7a71e0d80eec0b33461920694e",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.006",
+      "size": 1428487,
+      "blake3": "39143f9a11083df54ff5980b0106a885ac31b6b7b4a60caf3d179538d72d67cd",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.par2",
+      "size": 12136,
+      "blake3": "84b3d6a2765da311a252453aa20eeab018ad9d9d8789ee364321ce4dea7b4927",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.vol00+1.par2",
+      "size": 28588,
+      "blake3": "97875810435ca71af46d1db6b3b6b4138ea7c92a0125a8520d74b1873db95869",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.vol01+2.par2",
+      "size": 57068,
+      "blake3": "064cf9de0afe70f788ebe22c921959a926f869a7f5b1a4a4a6d3187fa543d644",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.vol03+4.par2",
+      "size": 102000,
+      "blake3": "afabc5640299eecaafec654b50f519b877c72d1a566a1a46c7b71650ca17bc46",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.vol07+8.par2",
+      "size": 179836,
+      "blake3": "e41348d3c18db487ea37cc2cda2b4f229c2b6aaf7d9113d5ca0351bcf8585874",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair-unvouched/archive.7z.vol15+1.par2",
+      "size": 28588,
+      "blake3": "1404b7f1fc4bfd337c67a7a1e7b234c6d30609e2f6da695f02249d653f17f4cc",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair/archive.7z.001",
+      "size": 1428487,
+      "blake3": "6b3337f879b5fcba13eb7dc188bfa546a94e8214d10b04835c46f6411db73784",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair/archive.7z.002",
+      "size": 1428487,
+      "blake3": "aec2f1a04d3227bb5d929b117831837c04d44970f1672d38bcb7f40c43229e48",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair/archive.7z.003",
+      "size": 1428487,
+      "blake3": "6e27080a439d3d12c26aeb1b6da37d81a69f45610b04e927f05cbbc737e97384",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair/archive.7z.004",
+      "size": 1428487,
+      "blake3": "095ea56a7ad18bd069bb47c912567af8943d083393cf482a557bd18a0b57a5e8",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair/archive.7z.005",
+      "size": 1428487,
+      "blake3": "b655a29b117cc9454214c73e65e8bf195595df7a71e0d80eec0b33461920694e",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair/archive.7z.006",
+      "size": 1428487,
+      "blake3": "39143f9a11083df54ff5980b0106a885ac31b6b7b4a60caf3d179538d72d67cd",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair/archive.7z.par2",
+      "size": 4216,
+      "blake3": "f9c0391652f6df3a0b7d8b5001b58e346d06e91f50163ab5a67d28816c659e49",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair/archive.7z.vol00+1.par2",
+      "size": 69820,
+      "blake3": "56fece1d8b8553d60caf7fdebc7f9678c56a2c05723faf02bee828aacbb691b5",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair/archive.7z.vol01+2.par2",
+      "size": 139532,
+      "blake3": "c71cc6a6538f8c01ec00d3c9fbef3baaa4cedb48db6e236b0e0313989c99c2cd",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair/archive.7z.vol03+4.par2",
+      "size": 274848,
+      "blake3": "01f064ea7aea3aafb11882b4a28794eb8388f26ca3d533fcdddd19f59384c40e",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair/archive.7z.vol07+8.par2",
+      "size": 541372,
+      "blake3": "fb85de3866f0d056cc11f128abc7f0b12da02908069877b4af984dce1b7720ec",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-repair/archive.7z.vol15+1.par2",
+      "size": 69820,
+      "blake3": "ddd2364764389461bbe5c566bf60cf699e4be00a7db8a9b9bb1e0c1af1812115",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-restart/archive.7z.001",
+      "size": 131125,
+      "blake3": "355742f5fe0550fde090f337cdd11406d3b095c575894391ad2da95ad40b1a83",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-restart/archive.7z.002",
+      "size": 131125,
+      "blake3": "1926ded1fdc0477449f7620da2fcbfa443cdb16874a6017e06ae376393124f85",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-restart/archive.7z.003",
+      "size": 131124,
+      "blake3": "e42a7d338d329ea1bb2155171581522d0f14fa9332731afaab15b485a5391ed8",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-solid-split/archive.7z.001",
+      "size": 393304,
+      "blake3": "1520cd81ada49a1e87a15a13d8f346fc9c65db7fceef34f0eb85f71ca8aaf14b",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-solid-split/archive.7z.002",
+      "size": 393304,
+      "blake3": "ff4b5b718bb342eda458d0d1c4f2da24e001c6c2a72d0ecb8f152a056ad3cee5",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-solid-split/archive.7z.003",
+      "size": 393304,
+      "blake3": "90743fadd6b1598b7b9df3a707db19d00d8eadb41d470c4a03198ddb5e1e1b4c",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-unpack-solid/archive.7z",
+      "size": 1179912,
+      "blake3": "ec4007ea6d4119a8f3fe61a0bb5d4c2394664dca918edcbd5c88f22f5456661e",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "sevenzip-26.02"
         ]
       }
     },

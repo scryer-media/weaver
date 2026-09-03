@@ -98,6 +98,15 @@ struct StagingCleanupReport {
     removed_bytes: u64,
 }
 
+/// Per-job roots swept for directories whose job is gone.
+///
+/// Direct unpack stages its members outside the conventional tree so a demotion
+/// can delete them without the conventional extractor ever seeing them — which
+/// also means nothing in the job lifecycle deletes them after a crash. Both
+/// roots are keyed by job id and orphan the same way, so they sweep the same
+/// way.
+const SWEPT_STAGING_ROOTS: [&str; 2] = [".weaver-staging", ".weaver-direct-unpack"];
+
 fn cleanup_stale_staging_dirs(
     complete_dir: &Path,
     active_job_ids: &HashSet<u64>,
@@ -112,9 +121,23 @@ fn cleanup_stale_staging_dirs_at(
     ttl: Duration,
     now: SystemTime,
 ) -> io::Result<StagingCleanupReport> {
-    let staging_root = complete_dir.join(".weaver-staging");
     let mut report = StagingCleanupReport::default();
-    let entries = match fs::read_dir(&staging_root) {
+    for root in SWEPT_STAGING_ROOTS {
+        let one = cleanup_stale_staging_root(&complete_dir.join(root), active_job_ids, ttl, now)?;
+        report.removed_count += one.removed_count;
+        report.removed_bytes = report.removed_bytes.saturating_add(one.removed_bytes);
+    }
+    Ok(report)
+}
+
+fn cleanup_stale_staging_root(
+    staging_root: &Path,
+    active_job_ids: &HashSet<u64>,
+    ttl: Duration,
+    now: SystemTime,
+) -> io::Result<StagingCleanupReport> {
+    let mut report = StagingCleanupReport::default();
+    let entries = match fs::read_dir(staging_root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(report),
         Err(error) => return Err(error),

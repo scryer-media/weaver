@@ -497,7 +497,7 @@ impl RoutedSpan {
 }
 
 /// (offset, len, crc32) runs over one contiguous logical space, composed on
-/// demand with [`par2_rs::checksum::Crc32CombineOp`].
+/// demand with [`weaver_yenc::crc32_combine`].
 ///
 /// The runs are kept exactly as they were fed — **never merged**. The first
 /// shape coalesced adjacent neighbours into one value, which answered "is this
@@ -645,11 +645,59 @@ impl CrcRuns {
             if run_end > end {
                 return None;
             }
-            composed = par2_rs::checksum::Crc32CombineOp::new(run_len).combine(composed, run_crc);
+            composed = weaver_yenc::crc32_combine(composed, run_crc, run_len);
             cursor = run_end;
             index += 1;
         }
         Some(composed)
+    }
+
+    /// The longest prefix of `[start, start + len)` the runs tile exactly, as
+    /// `(prefix_len, composed)`.
+    ///
+    /// `None` means no run starts at `start`, so not a byte of the range has a
+    /// reference. A zero-length prefix is a real answer: the run at `start` is
+    /// longer than the range, so the whole range is a proper prefix of one atom.
+    /// [`Self::compose`] is this with the prefix required to be the whole range.
+    pub(crate) fn compose_prefix(&self, start: u64, len: u64) -> Option<(u64, u32)> {
+        if len == 0 {
+            return None;
+        }
+        let end = start.checked_add(len)?;
+        let mut index = self
+            .runs
+            .partition_point(|(run_start, _, _)| *run_start < start);
+        let (first_start, _, _) = *self.runs.get(index)?;
+        if first_start != start {
+            return None;
+        }
+        let mut cursor = start;
+        let mut composed = 0u32;
+        while cursor < end {
+            let Some(&(run_start, run_len, run_crc)) = self.runs.get(index) else {
+                break;
+            };
+            if run_start != cursor {
+                break;
+            }
+            let run_end = run_start.checked_add(run_len)?;
+            if run_end > end {
+                break;
+            }
+            composed = weaver_yenc::crc32_combine(composed, run_crc, run_len);
+            cursor = run_end;
+            index += 1;
+        }
+        Some((cursor - start, composed))
+    }
+
+    /// The run that starts exactly at `offset`, as `(start, len)`.
+    pub(crate) fn run_starting_at(&self, offset: u64) -> Option<(u64, u64)> {
+        let index = self
+            .runs
+            .partition_point(|(run_start, _, _)| *run_start < offset);
+        let &(run_start, run_len, _) = self.runs.get(index)?;
+        (run_start == offset).then_some((run_start, run_len))
     }
 }
 
@@ -4945,7 +4993,7 @@ impl DirectSetRouter {
             let Some(value) = member.checked_parts.get(&(position as u32)).copied() else {
                 return Ok(());
             };
-            composed = par2_rs::checksum::Crc32CombineOp::new(*len).combine(composed, value);
+            composed = weaver_yenc::crc32_combine(composed, value, *len);
         }
         if composed != expected {
             return Err(self.fail(DemotionReason::MemberChecksumMismatch));
@@ -5647,6 +5695,42 @@ impl DirectSetRouter {
             .get(&volume_index)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The physical ranges of one volume that are staged but not yet routed:
+    /// the holds, without their bytes.
+    pub(crate) fn held_ranges(&self, volume_index: u32) -> Vec<(u64, u64)> {
+        self.staging
+            .get(&volume_index)
+            .map(|staging| staging.pending.ranges().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The holds of one volume with their bytes, as `(physical offset, bytes)`
+    /// runs in ascending order.
+    ///
+    /// Posted bytes, verbatim: an article's yEnc-verified payload waiting for
+    /// something before it can be routed — a header the walk has not reached,
+    /// or for an encrypted member the other half of a cipher block. A reader
+    /// that answers in posted space can serve them exactly as they are, which
+    /// is what lets a set carry a hole through a repair: the cipher block on
+    /// either side of a lost article is held precisely because its other half
+    /// is in the article that never came, and without these the volume reads
+    /// as if that block were missing too. Bounded by the holds budget, and in
+    /// practice by one article per member per gap.
+    pub(crate) fn held_runs(&self, volume_index: u32) -> Vec<(u64, std::sync::Arc<[u8]>)> {
+        let Some(staging) = self.staging.get(&volume_index) else {
+            return Vec::new();
+        };
+        staging
+            .pending
+            .ranges()
+            .iter()
+            .filter_map(|&(start, end)| {
+                let bytes = staging.slice(start, end - start, &self.scratch)?;
+                Some((start, std::sync::Arc::from(bytes)))
+            })
+            .collect()
     }
 
     // There is deliberately no accessor for the router's own routed map. It

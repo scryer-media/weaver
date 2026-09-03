@@ -1,15 +1,19 @@
 use super::*;
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
+use flate2::{Compression, write::GzEncoder};
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{RwLock, mpsc};
 
 use crate::security::RuntimeSecurityConfig;
@@ -391,10 +395,337 @@ async fn background_due_sync_skips_when_manual_sync_is_active() {
     server_task.abort();
 }
 
+#[derive(Clone)]
+struct AuthOriginState {
+    require_auth: bool,
+    redirect_to: Arc<StdMutex<Option<String>>>,
+    requests: Arc<AtomicUsize>,
+    authorized_requests: Arc<AtomicUsize>,
+}
+
+impl AuthOriginState {
+    fn new(require_auth: bool) -> Self {
+        Self {
+            require_auth,
+            redirect_to: Arc::new(StdMutex::new(None)),
+            requests: Arc::new(AtomicUsize::new(0)),
+            authorized_requests: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+async fn auth_origin_resource(
+    State(state): State<AuthOriginState>,
+    headers: HeaderMap,
+) -> Response {
+    state.requests.fetch_add(1, Ordering::SeqCst);
+    if auth_ok(&headers) {
+        state.authorized_requests.fetch_add(1, Ordering::SeqCst);
+    }
+    if state.require_auth && !auth_ok(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn auth_origin_redirect(
+    State(state): State<AuthOriginState>,
+    headers: HeaderMap,
+) -> Response {
+    state.requests.fetch_add(1, Ordering::SeqCst);
+    if auth_ok(&headers) {
+        state.authorized_requests.fetch_add(1, Ordering::SeqCst);
+    }
+    if state.require_auth && !auth_ok(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let redirect_to = state.redirect_to.lock().unwrap().clone().unwrap();
+    Redirect::temporary(&redirect_to).into_response()
+}
+
+async fn start_auth_origin_server(state: AuthOriginState) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/resource", get(auth_origin_resource))
+        .route("/redirect", get(auth_origin_redirect))
+        .with_state(state);
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), task)
+}
+
+fn basic_auth_feed(url: String) -> RssFeedRow {
+    RssFeedRow {
+        id: 1,
+        name: "Basic Auth Feed".to_string(),
+        url,
+        enabled: true,
+        poll_interval_secs: 900,
+        username: Some("user".to_string()),
+        password: Some("pass".to_string()),
+        default_category: None,
+        default_metadata: vec![],
+        etag: None,
+        last_modified: None,
+        last_polled_at: None,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+    }
+}
+
+#[tokio::test]
+async fn rss_private_network_hardening_rejects_loopback_feed() {
+    let temp = TempDir::new().unwrap();
+    let mut security = RuntimeSecurityConfig::default();
+    security.rss_allow_private_network = false;
+    let service = build_service_with_security(
+        temp.path(),
+        Database::open(&temp.path().join("rss-private-disabled.sqlite")).unwrap(),
+        Arc::new(StdMutex::new(Vec::new())),
+        security,
+    );
+
+    assert!(
+        service
+            .fetch_feed_response(&basic_auth_feed(
+                "http://127.0.0.1:8080/feed.xml".to_string()
+            ))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn rss_basic_auth_is_sent_to_same_origin_feed_and_item_requests() {
+    let temp = TempDir::new().unwrap();
+    let state = AuthOriginState::new(true);
+    let (base_url, server_task) = start_auth_origin_server(state.clone()).await;
+    let service = build_service(
+        temp.path(),
+        Database::open(&temp.path().join("rss-auth-origin.sqlite")).unwrap(),
+        Arc::new(StdMutex::new(Vec::new())),
+    );
+    let feed = basic_auth_feed(format!("{base_url}/resource"));
+
+    service.fetch_feed_response(&feed).await.unwrap();
+    service
+        .send_rss_request(&feed, &format!("{base_url}/resource?item=1"), false)
+        .await
+        .unwrap();
+
+    assert_eq!(state.requests.load(Ordering::SeqCst), 2);
+    assert_eq!(state.authorized_requests.load(Ordering::SeqCst), 2);
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn rss_basic_auth_is_not_sent_to_cross_origin_items() {
+    let temp = TempDir::new().unwrap();
+    let feed_state = AuthOriginState::new(true);
+    let item_state = AuthOriginState::new(false);
+    let (feed_url, feed_task) = start_auth_origin_server(feed_state.clone()).await;
+    let (item_url, item_task) = start_auth_origin_server(item_state.clone()).await;
+    let service = build_service(
+        temp.path(),
+        Database::open(&temp.path().join("rss-cross-origin.sqlite")).unwrap(),
+        Arc::new(StdMutex::new(Vec::new())),
+    );
+    let feed = basic_auth_feed(format!("{feed_url}/resource"));
+
+    service.fetch_feed_response(&feed).await.unwrap();
+    service
+        .send_rss_request(&feed, &format!("{item_url}/resource"), false)
+        .await
+        .unwrap();
+
+    assert_eq!(feed_state.authorized_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(item_state.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(item_state.authorized_requests.load(Ordering::SeqCst), 0);
+    feed_task.abort();
+    item_task.abort();
+}
+
+#[tokio::test]
+async fn rss_basic_auth_follows_same_origin_redirects_and_strips_cross_origin_redirects() {
+    let temp = TempDir::new().unwrap();
+    let same_origin_state = AuthOriginState::new(true);
+    let (same_origin_url, same_origin_task) =
+        start_auth_origin_server(same_origin_state.clone()).await;
+    *same_origin_state.redirect_to.lock().unwrap() = Some(format!("{same_origin_url}/resource"));
+    let service = build_service(
+        temp.path(),
+        Database::open(&temp.path().join("rss-redirect-origin.sqlite")).unwrap(),
+        Arc::new(StdMutex::new(Vec::new())),
+    );
+    let feed = basic_auth_feed(format!("{same_origin_url}/resource"));
+
+    service
+        .send_rss_request(&feed, &format!("{same_origin_url}/redirect"), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        same_origin_state.authorized_requests.load(Ordering::SeqCst),
+        2
+    );
+
+    let cross_origin_state = AuthOriginState::new(false);
+    let (cross_origin_url, cross_origin_task) =
+        start_auth_origin_server(cross_origin_state.clone()).await;
+    *same_origin_state.redirect_to.lock().unwrap() = Some(format!("{cross_origin_url}/resource"));
+
+    service
+        .send_rss_request(&feed, &format!("{same_origin_url}/redirect"), false)
+        .await
+        .unwrap();
+    assert_eq!(cross_origin_state.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        cross_origin_state
+            .authorized_requests
+            .load(Ordering::SeqCst),
+        0
+    );
+    same_origin_task.abort();
+    cross_origin_task.abort();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OversizedFeedBodyMode {
+    Declared,
+    Chunked,
+    Gzip,
+}
+
+#[derive(Clone)]
+struct OversizedFeedBodyState {
+    body: Arc<Vec<u8>>,
+    mode: OversizedFeedBodyMode,
+    requests: Arc<AtomicUsize>,
+}
+
+async fn oversized_feed_handler(State(state): State<OversizedFeedBodyState>) -> Response {
+    state.requests.fetch_add(1, Ordering::SeqCst);
+    let mut response = Response::new(Body::from(state.body.as_ref().clone()));
+    match state.mode {
+        OversizedFeedBodyMode::Declared => {
+            response.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&state.body.len().to_string()).unwrap(),
+            );
+        }
+        OversizedFeedBodyMode::Chunked => unreachable!("chunked feeds use a raw HTTP fixture"),
+        OversizedFeedBodyMode::Gzip => {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        }
+    }
+    response
+}
+
+async fn start_chunked_feed_server(
+    body: Vec<u8>,
+    requests: Arc<AtomicUsize>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).await.unwrap();
+        requests.fetch_add(1, Ordering::SeqCst);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await
+            .unwrap();
+        for chunk in body.chunks(64 * 1024) {
+            socket
+                .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
+                .await
+                .unwrap();
+            socket.write_all(chunk).await.unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+        }
+        socket.write_all(b"0\r\n\r\n").await.unwrap();
+    });
+    (format!("http://{address}"), task)
+}
+
+async fn assert_oversized_feed_is_rejected(mode: OversizedFeedBodyMode) {
+    let temp = TempDir::new().unwrap();
+    let expanded = vec![b'x'; MAX_RSS_FEED_BODY_BYTES as usize + 1];
+    let body = match mode {
+        OversizedFeedBodyMode::Gzip => {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&expanded).unwrap();
+            encoder.finish().unwrap()
+        }
+        OversizedFeedBodyMode::Declared | OversizedFeedBodyMode::Chunked => expanded,
+    };
+    let requests = Arc::new(AtomicUsize::new(0));
+    let (base_url, server_task) = if matches!(mode, OversizedFeedBodyMode::Chunked) {
+        start_chunked_feed_server(body, requests.clone()).await
+    } else {
+        let state = OversizedFeedBodyState {
+            body: Arc::new(body),
+            mode,
+            requests: requests.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/feed", get(oversized_feed_handler))
+            .with_state(state);
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), server_task)
+    };
+
+    let db = Database::open(&temp.path().join("oversized-rss.sqlite")).unwrap();
+    let mut feed = basic_auth_feed(format!("{base_url}/feed"));
+    feed.username = None;
+    feed.password = None;
+    db.insert_rss_feed(&feed).unwrap();
+    let report = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())))
+        .run_all_sync()
+        .await
+        .unwrap();
+
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(report.items_fetched, 0);
+    assert_eq!(report.items_submitted, 0);
+    assert_eq!(report.errors.len(), 1);
+    assert!(
+        report.errors[0].contains("response exceeds"),
+        "unexpected poll error for {mode:?}: {:?}",
+        report.errors,
+    );
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn rss_feed_body_limit_rejects_declared_chunked_and_compressed_bodies() {
+    assert_oversized_feed_is_rejected(OversizedFeedBodyMode::Declared).await;
+    assert_oversized_feed_is_rejected(OversizedFeedBodyMode::Chunked).await;
+    assert_oversized_feed_is_rejected(OversizedFeedBodyMode::Gzip).await;
+}
+
 fn build_service(
     data_dir: &Path,
     db: Database,
     submissions: Arc<StdMutex<Vec<CapturedSubmission>>>,
+) -> RssService {
+    build_service_with_security(data_dir, db, submissions, RuntimeSecurityConfig::default())
+}
+
+fn build_service_with_security(
+    data_dir: &Path,
+    db: Database,
+    submissions: Arc<StdMutex<Vec<CapturedSubmission>>>,
+    security: RuntimeSecurityConfig,
 ) -> RssService {
     let config = Arc::new(RwLock::new(Config {
         data_dir: data_dir.display().to_string(),
@@ -412,17 +743,14 @@ fn build_service(
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
+        direct_unpack: None,
         delivery_naming: None,
         metrics: Default::default(),
         config_path: None,
     }));
     let handle = test_scheduler_handle(submissions);
     crate::ingest::init_job_counter(20_000);
-    RssService::new_with_security(handle, config, db, {
-        let mut security = RuntimeSecurityConfig::default();
-        security.rss_allow_private_network = true;
-        security
-    })
+    RssService::new_with_security(handle, config, db, security)
 }
 
 fn test_scheduler_handle(submissions: Arc<StdMutex<Vec<CapturedSubmission>>>) -> SchedulerHandle {

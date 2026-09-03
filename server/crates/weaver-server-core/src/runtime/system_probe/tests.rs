@@ -1,4 +1,82 @@
 use super::*;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[test]
+fn startup_and_extraction_memory_consumers_share_cached_process_facts() {
+    let cache = OnceLock::new();
+    let memory_probes = AtomicUsize::new(0);
+    let cgroup_probes = AtomicUsize::new(0);
+
+    let facts = cached_process_memory_facts(
+        &cache,
+        || {
+            memory_probes.fetch_add(1, Ordering::Relaxed);
+            Some((16_u64 << 30, 8_u64 << 30))
+        },
+        || {
+            cgroup_probes.fetch_add(1, Ordering::Relaxed);
+            Some(6_u64 << 30)
+        },
+    );
+    let profile = memory_profile_from_facts(facts);
+    let effective_total = facts
+        .memory_bytes
+        .map(|(total, _)| total.min(facts.cgroup_limit.unwrap_or(total)));
+
+    let same_facts = cached_process_memory_facts(
+        &cache,
+        || panic!("memory detection must be cached"),
+        || panic!("cgroup detection must be cached"),
+    );
+
+    assert!(std::ptr::eq(facts, same_facts));
+    assert_eq!(profile.total_bytes, 16_u64 << 30);
+    assert_eq!(profile.cgroup_limit, Some(6_u64 << 30));
+    assert_eq!(effective_total, Some(6_u64 << 30));
+    assert_eq!(memory_probes.load(Ordering::Relaxed), 1);
+    assert_eq!(cgroup_probes.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn nested_cgroup_v2_memory_limits_include_systemd_ancestors() {
+    let limit = cgroup_memory_limit_from(
+        "0::/system.slice/weaver.service\n",
+        "29 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+        |path| match path.to_str() {
+            Some("/sys/fs/cgroup/system.slice/weaver.service/memory.max") => {
+                Some((3_u64 << 30).to_string())
+            }
+            Some("/sys/fs/cgroup/system.slice/memory.max") => Some((2_u64 << 30).to_string()),
+            Some("/sys/fs/cgroup/memory.max") => Some("max".to_string()),
+            _ => None,
+        },
+    );
+
+    assert_eq!(limit, Some(2_u64 << 30));
+}
+
+#[test]
+fn cgroup_v1_memory_limit_ignores_unlimited_ancestors() {
+    let limit = cgroup_memory_limit_from(
+        "5:cpu,memory:/docker/worker/task\n",
+        "33 23 0:30 / /sys/fs/cgroup/memory rw,memory - cgroup cgroup rw,memory\n",
+        |path| match path.to_str() {
+            Some("/sys/fs/cgroup/memory/docker/worker/task/memory.limit_in_bytes") => {
+                Some((6_u64 << 30).to_string())
+            }
+            Some("/sys/fs/cgroup/memory/docker/worker/memory.limit_in_bytes") => {
+                Some((1_u64 << 30).to_string())
+            }
+            Some("/sys/fs/cgroup/memory/memory.limit_in_bytes") => {
+                Some("9223372036854771712".to_string())
+            }
+            _ => None,
+        },
+    );
+
+    assert_eq!(limit, Some(1_u64 << 30));
+}
 
 #[test]
 fn parse_filesystem_types() {

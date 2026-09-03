@@ -2154,6 +2154,7 @@ fn settings_resolve_reads_the_config_table() {
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: crate::jobs::DuplicatePolicy::default(),
         direct_store: None,
+        direct_unpack: None,
         delivery_naming: None,
         metrics: Default::default(),
         config_path: None,
@@ -2905,6 +2906,7 @@ fn provider_fixture_with_extents(covered: ByteRanges, with_extents: bool) -> Pro
             ),
             covered,
             envelope_covered,
+            held: std::sync::Arc::new(Vec::new()),
             len: total as u64,
             // No encrypted member: the re-encrypting overlay is off, which is
             // the shape every assertion below was written against.
@@ -2923,6 +2925,62 @@ fn whole_volume_covered() -> ByteRanges {
             as u64,
     );
     covered
+}
+
+/// A hold is a posted byte too. The bytes a router could not route yet — an
+/// encrypted member's edge block waiting for the article on the other side of a
+/// hole — sit in staging, and the virtual volume serves them from there: read
+/// as posted, claimed as coverage, and composed against the article CRC like
+/// every placed byte around them.
+#[test]
+fn a_virtual_volume_serves_its_holds_as_posted_bytes() {
+    use std::io::Read;
+
+    // Member A's bytes 100..140 were never placed; they are held instead.
+    let total = whole_volume_covered().end();
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 100);
+    covered.insert(140, total - 140);
+    let mut fixture = provider_fixture(covered.clone());
+    let held: Arc<[u8]> = Arc::from(&fixture.conventional[100..140]);
+    fixture.volume.held = Arc::new(vec![(100u64, held)]);
+
+    assert_eq!(
+        fixture.volume.readable_prefix(),
+        Some(fixture.conventional.len() as u64),
+        "with the hold, the volume reads as one whole run from zero"
+    );
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let mut reader = provider.open(0).expect("volume 0 is registered");
+    let mut read = Vec::new();
+    reader
+        .read_to_end(&mut read)
+        .expect("the whole volume reads");
+    assert_eq!(
+        read, fixture.conventional,
+        "held bytes read back exactly as posted"
+    );
+
+    // And the sweep composes across them: the article holding the gap is whole
+    // again once the hold counts as covered.
+    let crcs = provider_article_crcs(&fixture.conventional);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+    let mut with_holds = covered;
+    with_holds.insert(100, 40);
+    let rebuilt = super::reconstruct::reconstruct_volumes(
+        &provider,
+        &[reconstruction_target(
+            &fixture,
+            path.clone(),
+            with_holds,
+            crcs,
+        )],
+        super::sparse::SparseMarking::Platform,
+    )
+    .expect("every article composes once the hold is in the coverage");
+    assert_eq!(rebuilt[0].contiguous, fixture.conventional.len() as u64);
+    assert_eq!(std::fs::read(&path).unwrap(), fixture.conventional);
 }
 
 #[test]
@@ -3262,6 +3320,7 @@ fn cipher_volume(
         partials: Arc::new([(0u32, partial)].into_iter().collect()),
         covered,
         envelope_covered: ByteRanges::new(),
+        held: Arc::new(Vec::new()),
         len: volume_len,
         ciphers: Arc::new([(0u32, facts)].into_iter().collect()),
     }
@@ -3535,7 +3594,21 @@ fn reconstruction_target(
         assembly_complete: false,
         covered,
         crcs,
+        partial_article: super::reconstruct::PartialArticle::Refuse,
     }
+}
+
+/// [`reconstruction_target`] with the repair scratch's policy for a run that
+/// stops inside an article.
+fn repair_scratch_target(
+    fixture: &ProviderFixture,
+    path: std::path::PathBuf,
+    covered: ByteRanges,
+    crcs: CrcRuns,
+) -> super::reconstruct::VolumeReconstruction {
+    let mut target = reconstruction_target(fixture, path, covered, crcs);
+    target.partial_article = super::reconstruct::PartialArticle::CarryThrough;
+    target
 }
 
 #[test]
@@ -3634,6 +3707,140 @@ fn a_covered_run_with_no_composed_reference_refuses_to_be_rebuilt() {
         !path.exists(),
         "a refused reconstruction leaves nothing for the refetch to write around"
     );
+}
+
+/// The repair scratch carries a run that stops inside an article through: the
+/// composition vouches for it up to the last article boundary, and the placed
+/// prefix of the article it stops inside is written after that with no
+/// reference. An encrypted member's frontier before a hole is always this shape
+/// — its final cipher block waits for the block after it — and PAR2 needs the
+/// slices it judged valid there as repair input, so refusing the run demoted
+/// every encrypted set the moment it needed a repair.
+#[test]
+fn a_repair_scratch_carries_a_run_that_stops_inside_an_article() {
+    let fixture = provider_fixture(whole_volume_covered());
+    let crcs = provider_article_crcs(&fixture.conventional);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    // Two whole articles and half of a third.
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 250);
+
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let rebuilt = super::reconstruct::reconstruct_volumes(
+        &provider,
+        &[repair_scratch_target(&fixture, path.clone(), covered, crcs)],
+        super::sparse::SparseMarking::Platform,
+    )
+    .expect("the whole articles verify and the partial one is carried through");
+
+    assert_eq!(
+        rebuilt[0].contiguous, 200,
+        "the floor stops at the last article boundary the composition vouched for"
+    );
+    assert!(!rebuilt[0].complete);
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(
+        &written[..250],
+        &fixture.conventional[..250],
+        "every placed byte is in the scratch, the carried prefix included"
+    );
+    assert!(
+        written[250..].iter().all(|byte| *byte == 0),
+        "nothing past the placed frontier is invented"
+    );
+}
+
+/// The carried remainder is exactly one article's placed prefix: a run that
+/// starts off a boundary, or reaches past the article the composition knows,
+/// is bytes no article record accounts for and is refused as before.
+#[test]
+fn a_carried_remainder_must_be_the_prefix_of_one_known_article() {
+    let fixture = provider_fixture(whole_volume_covered());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+
+    // Starts inside an article: nothing composes from 50.
+    let mut off_boundary = ByteRanges::new();
+    off_boundary.insert(50, 200);
+    let failure = super::reconstruct::reconstruct_volumes(
+        &provider,
+        &[repair_scratch_target(
+            &fixture,
+            path.clone(),
+            off_boundary,
+            provider_article_crcs(&fixture.conventional),
+        )],
+        super::sparse::SparseMarking::Platform,
+    )
+    .expect_err("a run that starts off an article boundary has no reference at all");
+    assert_eq!(
+        failure,
+        super::reconstruct::ReconstructionFailure::UnverifiableRun {
+            volume_index: 0,
+            offset: 50,
+        }
+    );
+
+    // The composition knows the first two articles only, and the run reaches
+    // into a third no record accounts for.
+    let mut into_the_unknown = ByteRanges::new();
+    into_the_unknown.insert(0, 250);
+    let failure = super::reconstruct::reconstruct_volumes(
+        &provider,
+        &[repair_scratch_target(
+            &fixture,
+            path.clone(),
+            into_the_unknown,
+            provider_article_crcs(&fixture.conventional[..200]),
+        )],
+        super::sparse::SparseMarking::Platform,
+    )
+    .expect_err("a remainder past the last known article is not a prefix of one");
+    assert_eq!(
+        failure,
+        super::reconstruct::ReconstructionFailure::UnverifiableRun {
+            volume_index: 0,
+            offset: 200,
+        }
+    );
+    assert!(
+        !path.exists(),
+        "a refused reconstruction leaves nothing behind"
+    );
+}
+
+/// Carrying the remainder does not loosen the check on what comes before it:
+/// the whole articles of the run are still verified against the composition.
+#[test]
+fn a_carried_remainder_still_verifies_the_articles_before_it() {
+    let fixture = provider_fixture(whole_volume_covered());
+    let mut corrupted = fixture.conventional.clone();
+    corrupted[PROVIDER_HEADER + 10] ^= 0xFF;
+    let crcs = provider_article_crcs(&corrupted);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 250);
+
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let failure = super::reconstruct::reconstruct_volumes(
+        &provider,
+        &[repair_scratch_target(&fixture, path.clone(), covered, crcs)],
+        super::sparse::SparseMarking::Platform,
+    )
+    .expect_err("the verified head still has to match its reference");
+    assert_eq!(
+        failure,
+        super::reconstruct::ReconstructionFailure::ChecksumMismatch {
+            volume_index: 0,
+            offset: 0,
+        }
+    );
+    assert!(!path.exists());
 }
 
 #[test]

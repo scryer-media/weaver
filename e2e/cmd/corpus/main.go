@@ -489,6 +489,9 @@ func ensureCommand(ctx context.Context, args []string) error {
 	})
 	fmt.Printf("ensure: %d wanted, %d present, %d fetched, %d generated",
 		len(report.Wanted), len(report.Present), len(report.Fetched), len(report.Generated))
+	if len(report.Salted) > 0 {
+		fmt.Printf(", %d salted (presence only)", len(report.Salted))
+	}
 	if len(report.GeneratedSlugs) > 0 {
 		fmt.Printf(" (%s)", strings.Join(report.GeneratedSlugs, ", "))
 	}

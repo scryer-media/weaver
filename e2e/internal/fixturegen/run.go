@@ -63,6 +63,9 @@ func Run(ctx context.Context, config Config) ([]Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := ValidateSaltedEntries(ledger, Recipes()); err != nil {
+		return nil, err
+	}
 	selected, err := selectRecipes(config.Slugs)
 	if err != nil {
 		return nil, err
@@ -78,7 +81,8 @@ func Run(ctx context.Context, config Config) ([]Result, error) {
 		return nil, nil
 	}
 
-	cache := NewArtifactCache(filepath.Join(config.Root, "target", "fixturegen", "artifacts"), Artifacts())
+	cache := NewArtifactCache(filepath.Join(config.Root, "target", "fixturegen", "artifacts"), Artifacts()).
+		WithBuildIdentity(lock, config.Root)
 	docker := &Docker{Root: config.Root, Verbose: config.Verbose}
 	workRoot := filepath.Join(config.Root, "target", "fixturegen", "work")
 	if err := os.MkdirAll(workRoot, 0o755); err != nil {
@@ -181,8 +185,12 @@ func generate(
 	}
 
 	// A preview run into --out has no scenario.json to keep in step; the
-	// digests are only rewritten where the scenarios actually live.
-	if recipe.ExpectedOutputs != nil && config.Out == "" {
+	// digests are only rewritten where the scenarios actually live — and only
+	// on a run that is allowed to redefine the corpus. A seeding run
+	// regenerates fixtures to match what is committed, so rewriting a
+	// scenario's expected digests there would paper over exactly the drift the
+	// digests exist to catch.
+	if recipe.ExpectedOutputs != nil && config.Out == "" && config.UpdateLedger {
 		digests, err := recipe.ExpectedOutputs(ctx, env)
 		if err != nil {
 			return Result{}, err
@@ -199,6 +207,13 @@ func generate(
 		if err := RewriteScenarioDigests(scenario, rendered); err != nil {
 			return Result{}, err
 		}
+	}
+	// Record what this was built from. A salted scenario is accepted on
+	// presence alone, so without this a stale artifact underneath one would
+	// never be noticed; with it, a changed artifact identity rebuilds the
+	// scenario the same way a changed digest rebuilds a hashed one.
+	if err := writeScenarioStamp(config.Root, recipe.Slug, env.UsedArtifacts()); err != nil {
+		return Result{}, err
 	}
 	if err := os.RemoveAll(work); err != nil {
 		return Result{}, err
@@ -346,6 +361,13 @@ func updateLedger(root string, ledger *corpus.Ledger, lock Lock, results []Resul
 		entry := &ledger.Files[index]
 		source, ok := provenance[entry.Path]
 		if !ok {
+			continue
+		}
+		if entry.Salted {
+			// Provenance still gets refreshed; the size and hash stay absent.
+			// Writing them would both re-pin bytes that cannot be pinned and
+			// move a file that must never move.
+			entry.Source = source
 			continue
 		}
 		digest, err := corpus.DigestFile(corpus.HostPath(root, entry.Path))

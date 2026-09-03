@@ -5,6 +5,7 @@ mod capacity;
 mod completion;
 mod decode;
 mod direct_store;
+pub mod direct_unpack;
 pub mod download;
 mod extraction;
 mod health;
@@ -22,7 +23,7 @@ use orchestrator::{is_terminal_status, write_segment_to_disk, write_segments_to_
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -43,6 +44,7 @@ use crate::jobs::assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
 use crate::jobs::{JobPhase, JobPhaseProgress, PhaseAttemptCounters, PhaseCounters};
+use crate::post_processing::model::PostProcessingSettings;
 use crate::runtime::buffers::{BufferHandle, BufferPool};
 use crate::runtime::system_profile::SystemProfile;
 use crate::{
@@ -59,7 +61,9 @@ use self::archive::rar_state::{RarDerivedPlan, RarSetState};
 use self::download::{
     DownloadLaneMode, DownloadLaneRuntimeState, JobTransportProfile, LaneParkReason,
 };
-use self::extraction::{ExtractionLimits, ExtractionRoot, JobExtractionBudget};
+use self::extraction::{
+    ExtractionLimits, ExtractionRoot, JobExtractionBudget, ProcessMemoryBudget,
+};
 
 /// Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
@@ -263,7 +267,7 @@ pub(super) struct DownloadBatchCompatibility {
     pub(super) priority: u32,
     pub(super) is_recovery: bool,
     pub(super) completion_critical: bool,
-    pub(super) groups: Vec<String>,
+    pub(super) groups: std::sync::Arc<[String]>,
     pub(super) exclude_servers: Vec<usize>,
     /// Transport-rotation hint carried from [`DownloadWork::avoid_server`].
     /// Batched works share one effective exclude set, so works with different
@@ -287,7 +291,7 @@ impl DownloadBatchCompatibility {
         work.priority == self.priority
             && work.is_recovery == self.is_recovery
             && work.completion_critical == self.completion_critical
-            && work.groups == self.groups
+            && (std::sync::Arc::ptr_eq(&work.groups, &self.groups) || work.groups == self.groups)
             && work.exclude_servers == self.exclude_servers
             && work.avoid_server == self.avoid_server
     }
@@ -1101,6 +1105,44 @@ impl DownloadError {
     pub(super) fn from_nntp(error: weaver_nntp::NntpError) -> Self {
         Self::Fetch(DownloadFailure::from_nntp(error))
     }
+
+    /// Whether this failure left the NNTP connection in a known-good state:
+    /// the server's response was read to completion and the socket can carry
+    /// the next BODY.
+    ///
+    /// `ArticleNotFound` (430) is a complete, bodyless server answer — it says
+    /// nothing about the connection. Treating it as a transport fault used to
+    /// QUIT the TLS session, abandon the rest of the leased batch, and block
+    /// the server's pipelining proof, all because one article lives on another
+    /// provider. `ServerQuota` / `Unrequested` are local policy outcomes where
+    /// no BODY was ever issued, so they are clean for the same reason (they
+    /// still park the lane, just without discarding it).
+    ///
+    /// Decode failures stay dirty: the yEnc decoder can fail on a body the
+    /// transport never finished delivering.
+    pub(super) fn leaves_connection_clean(&self) -> bool {
+        match self {
+            Self::Fetch(failure) => matches!(
+                failure.kind,
+                DownloadFailureKind::ArticleNotFound
+                    | DownloadFailureKind::ServerQuota
+                    | DownloadFailureKind::Unrequested
+            ),
+            Self::Decode { .. } => false,
+        }
+    }
+}
+
+/// Whether a download outcome leaves the lane's connection reusable.
+///
+/// See [`DownloadError::leaves_connection_clean`].
+pub(super) fn download_outcome_keeps_connection(
+    data: &std::result::Result<DownloadPayload, DownloadError>,
+) -> bool {
+    match data {
+        Ok(_) => true,
+        Err(error) => error.leaves_connection_clean(),
+    }
 }
 
 /// Successful download payload waiting for decode scheduling.
@@ -1647,16 +1689,33 @@ pub(super) enum ExtractionDone {
     },
 }
 
+#[derive(Debug)]
 pub(super) struct MoveToCompleteResult {
     pub(super) moved_entries: u32,
     /// Delivered files the deobfuscation pass renamed on the way out.
     pub(super) renamed_members: u32,
 }
 
+/// A final-move refusal that must never enter terminal post-processing versus
+/// an ordinary move failure, whose legacy script handling remains intact.
+#[derive(Debug)]
+pub(super) enum MoveToCompleteFailure {
+    Security(String),
+    Operational(String),
+}
+
+impl std::fmt::Display for MoveToCompleteFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Security(message) | Self::Operational(message) => formatter.write_str(message),
+        }
+    }
+}
+
 pub(super) struct MoveToCompleteDone {
     pub(super) job_id: JobId,
     pub(super) dest: PathBuf,
-    pub(super) result: Result<MoveToCompleteResult, String>,
+    pub(super) result: Result<MoveToCompleteResult, MoveToCompleteFailure>,
 }
 
 pub(super) enum TerminalPostProcessingEvent {
@@ -1724,12 +1783,88 @@ impl SegmentEncoding {
     }
 }
 
+/// Storage for a uuencode part waiting for its prefix.
+///
+/// Disk-backed entries retain their trusted decoded length alongside the
+/// temporary path. The spool file's metadata is never used for allocation or
+/// validation when the part is released.
+enum UuParkedEntry {
+    Memory(DecodedChunk),
+    Spilled {
+        path: tempfile::TempPath,
+        decoded_bytes: usize,
+    },
+}
+
+impl UuParkedEntry {
+    fn decoded_bytes(&self) -> usize {
+        match self {
+            Self::Memory(chunk) => chunk.len_bytes(),
+            Self::Spilled { decoded_bytes, .. } => *decoded_bytes,
+        }
+    }
+
+    fn is_spilled(&self) -> bool {
+        matches!(self, Self::Spilled { .. })
+    }
+}
+
+/// Remove every stale child of the transient UU spool root without following
+/// links outside it. UU assembly checkpoints are not restored after restart.
+pub(super) fn clear_stale_uu_park_root(root: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(std::io::Error::other(format!(
+                "UU spool root is not a directory: {}",
+                root.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(root)?;
+        }
+        Err(error) => return Err(error),
+    }
+
+    for child in std::fs::read_dir(root)? {
+        let child = child?;
+        let path = child.path();
+        let file_type = child.file_type()?;
+        if file_type.is_dir() {
+            std::fs::remove_dir_all(path)?;
+        } else {
+            // This removes a symlink itself rather than its target.
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove a job's spool directory once its final transient file is gone.
+///
+/// An occupied directory belongs to another still-parked part, and a missing
+/// one means a prior cleanup already won the race; neither is an error.
+pub(super) fn remove_empty_uu_park_dir(root: &Path, job_id: JobId) {
+    let path = root.join(job_id.0.to_string());
+    if let Err(error) = std::fs::remove_dir(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+        && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
+    {
+        warn!(
+            job_id = job_id.0,
+            path = %path.display(),
+            error = %error,
+            "failed to remove empty UU spool directory"
+        );
+    }
+}
+
 /// Sequential-assembly state for one uuencode file.
 ///
 /// A uuencode part's position is the cumulative *decoded* length of every part
 /// before it, which is only knowable once that whole prefix has arrived. So
 /// assembly is strictly sequential: a part that arrives early has to wait, and
-/// it has to wait in memory, because there is no offset to write it to yet.
+/// it has to wait until its prefix provides an offset.
 /// That is the structural difference from yEnc, whose out-of-order parts can be
 /// persisted immediately at the offset their own header declares.
 #[derive(Default)]
@@ -1742,7 +1877,7 @@ pub(super) struct UuFileAssembly {
     ///
     /// Bounded by the same per-file limit the write reorder buffer uses; see
     /// the admission check at the placement seam for what happens on overflow.
-    pub(super) parked: BTreeMap<u32, DecodedChunk>,
+    parked: BTreeMap<u32, UuParkedEntry>,
     /// A part decoded with damage, or a gap was closed by shifting later parts
     /// down over a part that never arrived.
     pub(super) damaged: bool,
@@ -1770,9 +1905,29 @@ pub(super) struct UuFileAssembly {
 }
 
 impl UuFileAssembly {
-    /// Bytes currently held for parts waiting on their prefix.
-    pub(super) fn parked_bytes(&self) -> usize {
-        self.parked.values().map(|chunk| chunk.len_bytes()).sum()
+    /// Resident bytes held for parts waiting on their prefix.
+    pub(super) fn parked_memory_bytes(&self) -> usize {
+        self.parked
+            .values()
+            .filter(|entry| !entry.is_spilled())
+            .map(UuParkedEntry::decoded_bytes)
+            .sum()
+    }
+
+    /// Disk-backed bytes held for parts waiting on their prefix.
+    pub(super) fn parked_spooled_bytes(&self) -> usize {
+        self.parked
+            .values()
+            .filter(|entry| entry.is_spilled())
+            .map(UuParkedEntry::decoded_bytes)
+            .sum()
+    }
+
+    pub(super) fn parked_spooled_segments(&self) -> usize {
+        self.parked
+            .values()
+            .filter(|entry| entry.is_spilled())
+            .count()
     }
 }
 
@@ -1882,7 +2037,7 @@ pub(super) struct StreamedCompletedFileChecksum {
 pub(super) struct CompletedFileChecksumState {
     md5: Option<par2_rs::checksum::FileHashState>,
     crc32: u32,
-    crc32_combine_op: Option<(u64, par2_rs::checksum::Crc32CombineOp)>,
+    crc32_combine_op: Option<(u64, weaver_yenc::Crc32Combine)>,
     bytes_fed: u64,
     all_parts_crc_verified: bool,
 }
@@ -1967,7 +2122,7 @@ impl CompletedFileChecksumState {
         let _cpu_scope =
             crate::runtime::perf_probe::cpu_scope("download.file_hash.update.crc32_combine");
         if !matches!(self.crc32_combine_op.as_ref(), Some((cached_len, _)) if *cached_len == len) {
-            self.crc32_combine_op = Some((len, par2_rs::checksum::Crc32CombineOp::new(len)));
+            self.crc32_combine_op = Some((len, weaver_yenc::Crc32Combine::new(len)));
         }
         let op = &self
             .crc32_combine_op
@@ -2049,6 +2204,27 @@ impl DecodedChunk {
                 Ok(())
             }
         }
+    }
+
+    /// Appends this chunk's slices, in order, for a vectored write that
+    /// covers several contiguous chunks with one syscall.
+    pub(super) fn push_io_slices<'a>(&'a self, out: &mut Vec<std::io::IoSlice<'a>>) {
+        match self {
+            Self::Contiguous(bytes) => out.push(std::io::IoSlice::new(bytes)),
+            Self::Batches { chunks, .. } => {
+                out.extend(chunks.iter().map(|chunk| std::io::IoSlice::new(chunk)));
+            }
+        }
+    }
+}
+
+impl Pipeline {
+    /// Publishes one per-article event on the segment stream rather than the
+    /// job-level broadcast, so the always-on job-level subscribers are not
+    /// woken several times per article to discard it. The event is built only
+    /// when someone is listening.
+    pub(crate) fn send_segment_event(&self, event: impl FnOnce() -> PipelineEvent) {
+        self.shared_state.publish_segment_event(event);
     }
 }
 
@@ -2679,6 +2855,30 @@ pub struct Pipeline {
     pub(super) write_buffered_bytes: usize,
     /// Current in-memory decoded segment count retained for sequential write ordering.
     pub(super) write_buffered_segments: usize,
+    /// Disk-backed uuencode parts waiting for their missing prefix.
+    pub(super) uu_spooled_bytes: usize,
+    /// Disk-backed uuencode segment count waiting for their missing prefix.
+    pub(super) uu_spooled_segments: usize,
+    /// Every UU part held ahead of its cursor, regardless of storage form.
+    ///
+    /// This bounds map and temporary-path overhead even when decoded bytes are
+    /// tiny.
+    pub(super) uu_parked_segments: usize,
+    /// Reserved transient spool root below the configured intermediate directory.
+    pub(super) uu_spool_root: PathBuf,
+    /// Aggregate disk-backed UU byte admission limit.
+    pub(super) uu_spool_max_bytes: usize,
+    /// Aggregate ahead-of-cursor UU entry admission limit.
+    pub(super) uu_spool_max_segments: usize,
+    /// Free space preserved on the intermediate filesystem while spilling UU.
+    pub(super) uu_spool_min_free_bytes: u64,
+    /// Most recent free-space sample for the spool filesystem.
+    pub(super) uu_spool_last_free_space_check: Option<Instant>,
+    /// Cached available bytes for the spool filesystem; `None` means unknown.
+    pub(super) uu_spool_available_bytes: Option<u64>,
+    #[cfg(test)]
+    /// Test-only free-space result; `Some(None)` exercises a failed probe.
+    pub(super) uu_spool_available_bytes_for_test: Option<Option<u64>>,
     /// Per-file write reorder buffers for decoded segments waiting on write order.
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
     /// The first [`PAR2_HASH_16K_BYTES`] decoded bytes of each file, anchored at
@@ -2709,6 +2909,9 @@ pub struct Pipeline {
     /// Direct-store routing state: admitted archive sets, their routers and
     /// their coverage barriers. Inert while the gate is off.
     pub(super) direct_store: direct_store::wiring::DirectStoreRuntime,
+    /// Direct-unpack state: 7z sets being decoded while they download. Inert
+    /// while the gate is off.
+    pub(super) direct_unpack: direct_unpack::wiring::DirectUnpackRuntime,
     /// RAR members already extracted per job (for incremental RAR extraction).
     pub(super) extracted_members: HashMap<JobId, HashSet<String>>,
     /// Archives whose extraction has completed successfully (by archive name).
@@ -2835,8 +3038,35 @@ pub struct Pipeline {
     pub(super) pp_pool: Arc<rayon::ThreadPool>,
     /// Environment-derived, always-on extraction ceilings.
     pub(super) extraction_limits: Arc<ExtractionLimits>,
+    /// One decoder-memory allowance shared by every extraction job.
+    pub(super) process_memory_budget: Arc<ProcessMemoryBudget>,
+    /// The post-processing pool again, for direct-unpack chases only.
+    ///
+    /// A chase runs its decode inside `install`, which occupies one worker
+    /// thread for as long as the closure runs — and a chase's closure parks,
+    /// sometimes for the whole of a download and a repair. Sharing `pp_pool`
+    /// meant enough parked chases exhausted the post-processing pool and no
+    /// extraction of any kind could start. Chases contend only with each other
+    /// here.
+    pub(super) chase_pool: Arc<rayon::ThreadPool>,
+    /// The same allowance again, for direct-unpack chases only.
+    ///
+    /// A chase takes its permit before it opens the archive and holds it until
+    /// it returns — across every park the gated reader does waiting on the
+    /// download it is chasing. Drawing that from the shared pool meant one
+    /// parked chase stopped every other 7z extraction in the process, including
+    /// the conventional extractions that were the job's actual critical path.
+    ///
+    /// Chases share this pool with each other, so at most one chase holds
+    /// decoder memory at a time no matter how many are armed. The cost is that
+    /// worst-case decoder memory is now two allowances rather than one: one
+    /// speculative chase plus one real extraction.
+    pub(super) direct_unpack_process_memory: Arc<ProcessMemoryBudget>,
     /// One shared output budget per job, retained across nested extraction layers.
     pub(super) extraction_budgets: HashMap<JobId, Arc<JobExtractionBudget>>,
+    /// A job's normalized unacceptable-extension policy is fixed at its first
+    /// archive extraction and reused by every subsequent RAR set and retry.
+    pub(super) unacceptable_extension_policies: HashMap<JobId, Arc<PostProcessingSettings>>,
 }
 
 #[cfg(test)]

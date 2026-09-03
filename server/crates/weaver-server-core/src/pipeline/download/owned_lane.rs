@@ -10,10 +10,52 @@ use tokio::sync::{mpsc, oneshot};
 const HOT_SHARE_YIELD_CHECK_ARTICLES: usize = 4;
 
 pub(crate) struct OwnedDownloadLanePool {
-    senders: Vec<std_mpsc::Sender<OwnedLanePoolCommand>>,
+    workers: Vec<OwnedLaneWorkerHandle>,
+    release: OwnedLaneReleaseHandle,
     next: AtomicUsize,
     #[cfg(test)]
     reset_calls: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct OwnedLaneWorkerHandle {
+    sender: std_mpsc::Sender<OwnedLanePoolCommand>,
+    /// `server_idx + 1` while the worker sits idle holding a cached lane,
+    /// and with it one of that server's connection permits; 0 otherwise.
+    idle_server: Arc<AtomicUsize>,
+}
+
+/// Cloneable view of the owned-lane pool that async lanes use to reclaim
+/// exactly one idle owned lane's permit from a specific server, instead of
+/// parking the whole fleet on every async lease.
+#[derive(Clone)]
+pub(crate) struct OwnedLaneReleaseHandle {
+    workers: Arc<std::sync::Mutex<Vec<OwnedLaneWorkerHandle>>>,
+}
+
+impl OwnedLaneReleaseHandle {
+    /// Park one owned lane that is idle on `server_idx` so its permit
+    /// returns to the pool. Returns whether such a lane was found; when
+    /// none is, every permit is held by a lane that is actually working
+    /// and the caller simply waits on the semaphore as before.
+    pub(crate) fn release_idle_permit(&self, server_idx: usize) -> bool {
+        let marker = server_idx + 1;
+        let workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for worker in workers.iter() {
+            if worker
+                .idle_server
+                .compare_exchange(marker, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let _ = worker.sender.send(OwnedLanePoolCommand::Reset);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 struct OwnedLaneRun {
@@ -32,14 +74,17 @@ enum OwnedLanePoolCommand {
 
 struct CachedOwnedLane {
     nntp: Arc<weaver_nntp::NntpClient>,
-    groups: Vec<String>,
+    groups: Arc<[String]>,
     lane: weaver_nntp::blocking::BlockingBodyLane,
 }
 
 impl OwnedDownloadLanePool {
     pub(crate) fn new(worker_count: usize) -> Self {
         let mut pool = Self {
-            senders: Vec::new(),
+            workers: Vec::new(),
+            release: OwnedLaneReleaseHandle {
+                workers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            },
             next: AtomicUsize::new(0),
             #[cfg(test)]
             reset_calls: AtomicUsize::new(0),
@@ -50,16 +95,30 @@ impl OwnedDownloadLanePool {
 
     pub(crate) fn resize(&mut self, worker_count: usize) {
         let worker_count = worker_count.max(1);
-        while self.senders.len() < worker_count {
-            let index = self.senders.len();
-            self.senders.push(spawn_owned_lane_worker(index));
+        while self.workers.len() < worker_count {
+            let index = self.workers.len();
+            let idle_server = Arc::new(AtomicUsize::new(0));
+            let sender = spawn_owned_lane_worker(index, Arc::clone(&idle_server));
+            self.workers.push(OwnedLaneWorkerHandle {
+                sender,
+                idle_server,
+            });
         }
-        self.senders.truncate(worker_count);
+        self.workers.truncate(worker_count);
+        *self
+            .release
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.workers.clone();
+    }
+
+    pub(crate) fn release_handle(&self) -> OwnedLaneReleaseHandle {
+        self.release.clone()
     }
 
     #[cfg(test)]
     pub(crate) fn worker_count(&self) -> usize {
-        self.senders.len()
+        self.workers.len()
     }
 
     #[cfg(test)]
@@ -70,8 +129,8 @@ impl OwnedDownloadLanePool {
     pub(crate) fn reset(&self) {
         #[cfg(test)]
         self.reset_calls.fetch_add(1, Ordering::Relaxed);
-        for sender in &self.senders {
-            let _ = sender.send(OwnedLanePoolCommand::Reset);
+        for worker in &self.workers {
+            let _ = worker.sender.send(OwnedLanePoolCommand::Reset);
         }
     }
 
@@ -88,7 +147,7 @@ impl OwnedDownloadLanePool {
         hot_share_yield_signal: Arc<HotShareYieldSignal>,
         initial_lease: DownloadBatchLease,
     ) -> Result<(), DownloadBatchLease> {
-        if self.senders.is_empty() {
+        if self.workers.is_empty() {
             return Err(initial_lease);
         }
         let command = OwnedLanePoolCommand::Run(Box::new(OwnedLaneRun {
@@ -99,8 +158,9 @@ impl OwnedDownloadLanePool {
             hot_share_yield_signal,
             initial_lease,
         }));
-        let sender_index = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
-        self.senders[sender_index]
+        let sender_index = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+        self.workers[sender_index]
+            .sender
             .send(command)
             .map_err(|error| match error.0 {
                 OwnedLanePoolCommand::Run(run) => run.initial_lease,
@@ -111,30 +171,43 @@ impl OwnedDownloadLanePool {
     }
 }
 
-fn spawn_owned_lane_worker(index: usize) -> std_mpsc::Sender<OwnedLanePoolCommand> {
+fn spawn_owned_lane_worker(
+    index: usize,
+    idle_server: Arc<AtomicUsize>,
+) -> std_mpsc::Sender<OwnedLanePoolCommand> {
     let (tx, rx) = std_mpsc::channel();
     std::thread::Builder::new()
         .name(format!("weaver-nntp-lane-{index}"))
         .spawn(move || {
             crate::runtime::affinity::pin_current_thread_for_hot_download_path();
-            run_owned_lane_worker(rx);
+            run_owned_lane_worker(rx, idle_server);
         })
         .expect("failed to spawn owned blocking NNTP lane");
     tx
 }
 
-fn run_owned_lane_worker(rx: std_mpsc::Receiver<OwnedLanePoolCommand>) {
+fn run_owned_lane_worker(
+    rx: std_mpsc::Receiver<OwnedLanePoolCommand>,
+    idle_server: Arc<AtomicUsize>,
+) {
     let mut cached_lane = None;
     while let Ok(command) = rx.recv() {
         match command {
             OwnedLanePoolCommand::Run(run) => {
+                idle_server.store(0, Ordering::Release);
                 run_owned_blocking_download_lane(&mut cached_lane, *run);
+                let marker = cached_lane
+                    .as_ref()
+                    .map_or(0, |cached: &CachedOwnedLane| cached.lane.server_id().0 + 1);
+                idle_server.store(marker, Ordering::Release);
             }
             OwnedLanePoolCommand::Reset => {
+                idle_server.store(0, Ordering::Release);
                 park_cached_lane(&mut cached_lane);
             }
         }
     }
+    idle_server.store(0, Ordering::Release);
     park_cached_lane(&mut cached_lane);
 }
 
@@ -142,7 +215,8 @@ impl CachedOwnedLane {
     fn matches(&self, nntp: &Arc<weaver_nntp::NntpClient>, lease: &DownloadBatchLease) -> bool {
         let server = self.lane.server_id();
         if !Arc::ptr_eq(&self.nntp, nntp)
-            || self.groups != lease.compatibility.groups
+            || !(Arc::ptr_eq(&self.groups, &lease.compatibility.groups)
+                || self.groups == lease.compatibility.groups)
             || lease.effective_exclude_servers.contains(&server.0)
         {
             return false;
@@ -315,10 +389,11 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 batch_works.push(work);
             }
 
-            let message_ids = batch_works
+            let message_id_handles = lease_message_id_wire_forms(&batch_works);
+            let message_ids = message_id_handles
                 .iter()
-                .map(|work| work.message_id.to_string())
-                .collect::<Vec<_>>();
+                .map(String::as_str)
+                .collect::<Vec<&str>>();
             let total = batch_works.len();
             let mut completed = 0usize;
             let mut works_by_index = batch_works.into_iter().map(Some).collect::<Vec<_>>();
@@ -366,7 +441,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                                         | DownloadFailureKind::Unrequested
                                 )
                         );
-                        batch_clean_for_refill &= result.data.is_ok() || policy_outcome;
+                        batch_clean_for_refill &= download_outcome_keeps_connection(&result.data);
                         policy_blocked_for_refill |= policy_outcome;
                         results.push(result);
                     }
@@ -421,7 +496,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                                 )
                         );
                         batch_clean_for_refill &=
-                            (result.data.is_ok() || policy_outcome) && meta.batch_clean;
+                            download_outcome_keeps_connection(&result.data) && meta.batch_clean;
                         policy_blocked_for_refill |= policy_outcome;
                         results.push(result);
                     }
@@ -701,17 +776,12 @@ fn result_from_trace(
     let completion_critical = work.completion_critical;
     let (data, attempts, source_server_idx) =
         Pipeline::download_data_from_decoded_trace(segment_id, trace);
-    let policy_outcome = matches!(
-        &data,
-        Err(DownloadError::Fetch(failure))
-            if matches!(
-                failure.kind,
-                DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
-            )
-    );
-    if !policy_outcome {
-        observation.batch_clean &= data.is_ok();
-        observation.connection_discarded |= data.is_err();
+    // Only outcomes that actually damaged the transport dirty the batch. A
+    // 430 and the local quota/unrequested policy outcomes all leave the
+    // socket exactly where the next BODY expects it.
+    if !download_outcome_keeps_connection(&data) {
+        observation.batch_clean = false;
+        observation.connection_discarded = true;
     }
     DownloadResult {
         segment_id,
@@ -785,7 +855,7 @@ mod tests {
                 segment_number,
             },
             message_id: MessageId::new(&format!("tail-{segment_number}@example.invalid")),
-            groups: vec!["alt.binaries.test".to_string()],
+            groups: Arc::from(vec!["alt.binaries.test".to_string()]),
             priority: 3,
             byte_estimate: 1024,
             retry_count,
@@ -794,6 +864,28 @@ mod tests {
             exclude_servers: Vec::new(),
             avoid_server: None,
         }
+    }
+
+    #[test]
+    fn leased_message_ids_are_bracketed_for_the_wire() {
+        // Both lanes build their BODY arguments here. `DownloadWork` stores
+        // the bare id, and a bare BODY argument is an article-*number*
+        // reference that every real provider answers with 430.
+        let works = [tail_work(1, 0), tail_work(2, 0)];
+
+        let wire = lease_message_id_wire_forms(&works);
+
+        assert_eq!(
+            wire,
+            vec![
+                "<tail-1@example.invalid>".to_string(),
+                "<tail-2@example.invalid>".to_string(),
+            ]
+        );
+        assert!(
+            !works[0].message_id.0.starts_with('<'),
+            "the stored id is bare, which is exactly why the wire form is needed"
+        );
     }
 
     #[test]
@@ -820,6 +912,103 @@ mod tests {
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].segment_id.segment_number, 4);
         assert_eq!(tail[1].segment_id.segment_number, 5);
+    }
+
+    /// A 430 must not tear down the owned lane.
+    ///
+    /// The article-not-found answer is a complete, bodyless server response:
+    /// the socket is exactly where the next BODY expects it. Marking it dirty
+    /// used to QUIT the TLS session, drop the rest of the leased batch as
+    /// Unrequested, and block the server's pipelining proof — all because one
+    /// article lives on another provider.
+    #[test]
+    fn owned_article_not_found_keeps_the_lane_and_the_batch_clean() {
+        let result = result_from_trace(
+            tail_work(9, 0),
+            0,
+            weaver_nntp::client::DecodedBodyTrace {
+                attempts: vec![weaver_nntp::client::FetchAttemptTrace {
+                    server_idx: 0,
+                    remote_ip: None,
+                    elapsed: Duration::from_millis(3),
+                    outcome: weaver_nntp::client::FetchAttemptOutcome::NotFound,
+                    error: Some("article not found".to_string()),
+                }],
+                result: Err(weaver_nntp::client::DecodedBodyError::Nntp(
+                    weaver_nntp::NntpError::NoSuchArticle {
+                        message_id: "<tail-9@example.invalid>".to_string(),
+                    },
+                )),
+            },
+            DownloadLaneObservation {
+                server_idx: Some(0),
+                mode: DownloadLaneMode::PipelineDepth4,
+                supports_pipelining: true,
+                rtt: None,
+                batch_complete: true,
+                batch_clean: true,
+                batch_response_count: 4,
+                unresolved_count: 0,
+                connection_discarded: false,
+            },
+            false,
+            &[],
+        );
+
+        // The work item itself still fails, so the completion path excludes
+        // this server and retries the article elsewhere.
+        assert!(matches!(
+            result.data,
+            Err(DownloadError::Fetch(DownloadFailure {
+                kind: DownloadFailureKind::ArticleNotFound,
+                ..
+            }))
+        ));
+        // …but the lane keeps its cached connection and keeps refilling.
+        let observation = result.lane_observation.unwrap();
+        assert!(observation.batch_clean);
+        assert!(!observation.connection_discarded);
+        assert!(download_outcome_keeps_connection(&result.data));
+
+        // A clean batch never blocks the server's pipelining proof.
+        let mut proof = crate::pipeline::download::transport::ServerPipelineProof::default();
+        let transition = proof.note_pipeline_batch(
+            Instant::now(),
+            DownloadLaneMode::PipelineDepth4,
+            observation.batch_clean,
+            observation.batch_response_count,
+        );
+        assert!(!matches!(
+            transition,
+            Some(crate::pipeline::download::transport::ServerPipelineState::PipelineBlocked)
+        ));
+
+        // The rest of the leased batch is still requested, not handed back.
+        let mut pending_works = VecDeque::from([tail_work(10, 0), tail_work(11, 0)]);
+        assert!(take_unrequested_tail(&mut pending_works, true, false, false).is_empty());
+        assert_eq!(pending_works.len(), 2);
+    }
+
+    /// Transport faults must stay dirty. Only the "fully consumed response"
+    /// outcomes are allowed to keep the connection.
+    #[test]
+    fn owned_transport_and_decode_failures_still_discard_the_connection() {
+        for data in [
+            Err::<DownloadPayload, _>(DownloadError::Fetch(DownloadFailure::new(
+                DownloadFailureKind::EstablishedTransport,
+                "connection closed mid-body",
+            ))),
+            Err(DownloadError::Decode {
+                raw_size: 128,
+                error: "crc mismatch".to_string(),
+                crc_mismatch: true,
+            }),
+        ] {
+            assert!(
+                !download_outcome_keeps_connection(&data),
+                "a possibly mid-body socket must not be reused"
+            );
+        }
     }
 
     #[test]
@@ -923,5 +1112,45 @@ mod tests {
             true,
             &alternate_fill
         ));
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    #[test]
+    fn release_idle_permit_claims_only_a_worker_idle_on_that_server() {
+        let pool = OwnedDownloadLanePool::new(3);
+        let handle = pool.release_handle();
+        // Worker 1 sits idle holding a cached lane (and permit) on server 2.
+        pool.workers[1].idle_server.store(3, Ordering::Release);
+
+        assert!(!handle.release_idle_permit(0));
+        assert!(!handle.release_idle_permit(1));
+        assert!(handle.release_idle_permit(2));
+        assert_eq!(pool.workers[1].idle_server.load(Ordering::Acquire), 0);
+        // The permit was claimed once; a second reclaim finds nothing idle.
+        assert!(!handle.release_idle_permit(2));
+    }
+
+    #[test]
+    fn release_handle_tracks_pool_resizes() {
+        let mut pool = OwnedDownloadLanePool::new(1);
+        let handle = pool.release_handle();
+        pool.resize(4);
+        pool.workers[3].idle_server.store(1, Ordering::Release);
+
+        assert!(handle.release_idle_permit(0));
+
+        pool.resize(2);
+        assert_eq!(
+            handle
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            2
+        );
     }
 }

@@ -330,3 +330,19 @@ func VerifyPin(ctx context.Context, source, want string) error {
 	}
 	return nil
 }
+
+// Pin is the immutable identity of a toolchain: the archive digest it installs
+// from, or its image when it has none. Used in the artifact cache key so a
+// toolchain bump invalidates everything built with the old one.
+func (lock Lock) Pin(id string) string {
+	toolchain, err := lock.Find(id)
+	if err != nil {
+		// A go writer, or an id the lock does not carry. Its own version lives
+		// in the id itself (`go-klauspost-zstd@v1.19.2`), so the id is the pin.
+		return id
+	}
+	if toolchain.SHA256 != "" {
+		return toolchain.SHA256
+	}
+	return toolchain.Image
+}

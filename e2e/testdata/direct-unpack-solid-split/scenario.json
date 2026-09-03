@@ -1,0 +1,18 @@
+{
+  "slug": "direct-unpack-solid-split",
+  "title": "Silver.Horizon.Solid.Split.2024.720p.WEB.x264-WEAVER",
+  "description": "Split .7z (3 volumes), Solid. three members in one solid LZMA2 block. Direct unpack can overlap this shape.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "silver_horizon_part1.mkv": "779fad2c06e827cf1cd4a6793a655a1504119962c8ebfdc0b35d1eab2d84327a",
+    "silver_horizon_part2.mkv": "26da180308fbd02e0179eecbfc6ef3dd2046e3a5c6fe902bf6871b48c92d842d",
+    "silver_horizon_part3.mkv": "26da180308fbd02e0179eecbfc6ef3dd2046e3a5c6fe902bf6871b48c92d842d"
+  },
+  "runtimeAssertions": {
+    "directUnpack": {
+      "requireArmed": true,
+      "requireConsumed": true
+    }
+  }
+}

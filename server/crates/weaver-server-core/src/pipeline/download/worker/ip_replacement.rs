@@ -133,7 +133,7 @@ impl Pipeline {
         &self,
         job_id: JobId,
         server_idx: usize,
-    ) -> Option<Vec<String>> {
+    ) -> Option<std::sync::Arc<[String]>> {
         self.jobs.get(&job_id).and_then(|state| {
             state
                 .download_queue
@@ -188,7 +188,7 @@ impl Pipeline {
         &self,
         job_id: JobId,
         candidate: IpReplacementCandidate,
-        groups: Vec<String>,
+        groups: std::sync::Arc<[String]>,
     ) {
         let nntp = Arc::clone(&self.nntp);
         let trial_tx = self.ip_replacement_trial_tx.clone();

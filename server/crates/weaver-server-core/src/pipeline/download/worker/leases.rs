@@ -208,8 +208,29 @@ impl Pipeline {
         bootstrap_files: Option<&[u32]>,
         compatibility: Option<&DownloadBatchCompatibility>,
         selection: DownloadWorkSelection,
+        uu_cursor_ordinals: Option<&HashMap<NzbFileId, u32>>,
     ) -> Option<DownloadWork> {
         if bootstrap_files.is_none() {
+            if let Some(uu_cursor_ordinals) = uu_cursor_ordinals {
+                return self.jobs.get_mut(&job_id).and_then(|state| {
+                    let matches = |work: &DownloadWork| {
+                        compatibility.is_none_or(|compatibility| compatibility.matches(work))
+                            && selection.matches(work)
+                            && Self::uu_work_closes_cursor(uu_cursor_ordinals, work)
+                    };
+                    match selection {
+                        DownloadWorkSelection::Any => {
+                            state.download_queue.pop_first_matching(matches)
+                        }
+                        DownloadWorkSelection::CompletionCritical => state
+                            .download_queue
+                            .pop_first_matching_in_class(true, matches),
+                        DownloadWorkSelection::NonCritical => state
+                            .download_queue
+                            .pop_first_matching_in_class(false, matches),
+                    }
+                });
+            }
             if selection == DownloadWorkSelection::Any {
                 return self.pop_download_work_for_batch(job_id, compatibility);
             }
@@ -228,6 +249,8 @@ impl Pipeline {
                     .is_none_or(|files| files.contains(&work.segment_id.file_id.file_index))
                     && compatibility.is_none_or(|compatibility| compatibility.matches(work))
                     && selection.matches(work)
+                    && uu_cursor_ordinals
+                        .is_none_or(|cursors| Self::uu_work_closes_cursor(cursors, work))
             };
             match selection {
                 DownloadWorkSelection::Any => state.download_queue.pop_first_matching(matches),
@@ -248,11 +271,15 @@ impl Pipeline {
         selection: DownloadWorkSelection,
     ) -> Result<Option<DownloadBatchLease>, DispatchAttempt> {
         let par2_metadata_bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
+        let uu_cursor_ordinals = pressure
+            .uu_spool_admission_capped
+            .then(|| self.uu_spool_cursor_ordinals());
         let Some(first) = self.pop_download_work_for_par2_bootstrap(
             job_id,
             par2_metadata_bootstrap_files.as_deref(),
             None,
             selection,
+            uu_cursor_ordinals.as_ref(),
         ) else {
             return Ok(None);
         };
@@ -329,6 +356,9 @@ impl Pipeline {
         pressure: DownloadPressure,
     ) -> Result<Option<DownloadBatchLease>, DispatchAttempt> {
         let par2_metadata_bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
+        let uu_cursor_ordinals = pressure
+            .uu_spool_admission_capped
+            .then(|| self.uu_spool_cursor_ordinals());
         let lane_mode = self.choose_download_lane_mode(
             job_id,
             compatibility.is_recovery,
@@ -344,6 +374,7 @@ impl Pipeline {
             par2_metadata_bootstrap_files.as_deref(),
             Some(&compatibility),
             selection,
+            uu_cursor_ordinals.as_ref(),
         ) else {
             return Ok(None);
         };
@@ -369,12 +400,16 @@ impl Pipeline {
         job_id: JobId,
         server_idx: usize,
     ) -> Result<Option<DownloadBatchLease>, DispatchAttempt> {
+        if self.refresh_download_pressure().uu_spool_admission_capped {
+            return Ok(None);
+        }
         let par2_metadata_bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
         let Some(first) = self.pop_download_work_for_par2_bootstrap(
             job_id,
             par2_metadata_bootstrap_files.as_deref(),
             None,
             DownloadWorkSelection::NonCritical,
+            None,
         ) else {
             return Ok(None);
         };
@@ -423,6 +458,7 @@ impl Pipeline {
                 par2_metadata_bootstrap_files.as_deref(),
                 Some(&compatibility),
                 DownloadWorkSelection::NonCritical,
+                None,
             ) else {
                 break;
             };
@@ -503,6 +539,7 @@ impl Pipeline {
                 par2_metadata_bootstrap_files,
                 Some(&compatibility),
                 selection,
+                None,
             ) else {
                 break;
             };
@@ -565,6 +602,9 @@ impl Pipeline {
         refill: bool,
         article_bytes: u32,
     ) -> usize {
+        if pressure.uu_spool_admission_capped {
+            return 1;
+        }
         if self.hot_dispatch_job == Some(job_id) {
             match pressure.state {
                 DownloadPressureState::Clear => {

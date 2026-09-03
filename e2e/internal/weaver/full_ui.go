@@ -35,8 +35,13 @@ type fullPhaseContext struct {
 	RuntimePortsFile string
 	RuntimePorts     runtimePortState
 	LogTail          *lineTail
-	Cleaned          bool
-	cleanMu          sync.Mutex
+	// SeedBootstrap marks the throwaway runtime that *creates* the pre-seeded
+	// NNTP images. It runs against the base article store by definition —
+	// seeding is what puts the corpus into an image — so it is the one context
+	// that must never be pinned to one.
+	SeedBootstrap bool
+	Cleaned       bool
+	cleanMu       sync.Mutex
 }
 
 type fullPhaseDefinition struct {
@@ -69,18 +74,22 @@ var fullPhaseDefinitions = []fullPhaseDefinition{
 	// and `assertDirectStoreEngagement` asserts from weaver's own counters that
 	// those sets really did route — the only external evidence available, since
 	// direct output is byte-identical to the conventional path.
-	{name: "Functional SQLite", command: "test-all", slug: "functional-sqlite", seedProfile: "functional", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1", "WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
-	{name: "Functional Postgres", command: "test-all", slug: "functional-postgres", seedProfile: "functional", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1", "WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
+	{name: "Functional SQLite", command: "test-all", slug: "functional-sqlite", seedProfile: "functional", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1", "WEAVER_DIRECT_UNPACK": "1", "WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
+	{name: "Functional Postgres", command: "test-all", slug: "functional-postgres", seedProfile: "functional", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1", "WEAVER_DIRECT_UNPACK": "1", "WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
 	{name: "NNTP Chaos", command: "chaos-test", slug: "nntp-chaos", seedProfile: "chaos", datastore: weaverDatastoreSQLite},
 	{name: "TCP Chaos", command: "tcp-chaos", slug: "tcp-chaos", seedProfile: "tcp-chaos", datastore: weaverDatastoreSQLite},
 	{name: "Container Restart", command: "container-restart", slug: "container-restart", skipSeed: true, datastore: weaverDatastoreSQLite},
-	{name: "Restart SQLite", command: "restart-all", slug: "restart-sqlite", seedProfile: "restart", datastore: weaverDatastoreSQLite},
-	{name: "Restart Postgres", command: "restart-all", slug: "restart-postgres", seedProfile: "restart", datastore: weaverDatastorePostgres},
+	{name: "Restart SQLite", command: "restart-all", slug: "restart-sqlite", seedProfile: "restart", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_DIRECT_UNPACK": "1"}},
+	{name: "Restart Postgres", command: "restart-all", slug: "restart-postgres", seedProfile: "restart", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_DIRECT_UNPACK": "1"}},
 	{name: "Product Behavior Gate", command: "release-gate", slug: "product-behavior", skipSeed: true, datastore: weaverDatastoreSQLite},
 }
 
+// functionalFullPhase selects the fast iteration loop: the SQLite functional
+// phase alone. Postgres is deliberately excluded — it runs the same corpus
+// against the slower datastore, which the full gate still covers; this filter
+// exists so `task functional` answers "did the product break" in one phase.
 func functionalFullPhase(def fullPhaseDefinition) bool {
-	return def.seedProfile == "functional"
+	return def.slug == "functional-sqlite"
 }
 
 // fullPhaseFixtureProfiles is what the selected phases will seed: each seeding
@@ -1010,12 +1019,19 @@ func prepareFullPreseededRuntimes(
 		if err != nil {
 			return fmt.Errorf("prepare cache image identity for %s: %w", profile, err)
 		}
-
 		fixturesRoot := filepath.Join(tempRoot, "preseeded", profile, "fixtures")
 		if set.ready() {
 			if err := restoreSeededNZBBundle(set.Primary, fixturesRoot); err != nil {
 				return fmt.Errorf("restore pre-seeded NZBs for %s: %w", profile, err)
 			}
+			// Pin only images that exist. The identity is a fingerprint over the
+			// corpus files, and anything that rewrites one of them between here
+			// and phase launch would otherwise make the phase recompute a
+			// different name, find no such image, and quietly fall back to the
+			// base store — serving articles that do not match the NZBs it is
+			// about to run. Recording before this point would pin a name that
+			// was never built, which is a promise nothing can keep.
+			recordPreseededImageSet(profile, set)
 			dashboard.updateSeed("pre-seeded "+profile, progressEvent{
 				Kind:    "seed_done",
 				Current: len(slugs),
@@ -1052,6 +1068,8 @@ func prepareFullPreseededRuntimes(
 				dashboard.setSeedDetail("fail", "pre-seed "+profile+": "+err.Error())
 				return fmt.Errorf("capture NNTP images for %s: %w", profile, err)
 			}
+			// Captured: now the pin names something that exists.
+			recordPreseededImageSet(profile, set)
 			if err := cleanupFullPhaseContext(bootstrap); err != nil {
 				return fmt.Errorf("clean up pre-seed runtime for %s: %w", profile, err)
 			}
@@ -1092,6 +1110,7 @@ func newFullPreseedBootstrap(tempRoot, profile string, source *fullPhaseContext,
 		RuntimePorts:     source.RuntimePorts,
 		LogTail:          &lineTail{limit: 120},
 		ExtraEnv:         source.ExtraEnv,
+		SeedBootstrap:    true,
 	}
 	if err := saveRuntimePortState(bootstrap.RuntimePortsFile, bootstrap.RuntimePorts); err != nil {
 		return nil, fmt.Errorf("write pre-seed runtime ports for %s: %w", profile, err)
@@ -1352,8 +1371,33 @@ func (p *fullPhaseContext) env() map[string]string {
 	if seedJobs, ok := fullSeedJobsOverride(); ok {
 		env["E2E_SEED_JOBS"] = seedJobs
 	}
+	// Two different things live behind this flag, and the seeding bootstrap
+	// wants one of them but not the other: the preseeded-nntp compose overlay,
+	// yes; the image pin, never.
 	if nntpSeedImageCacheEnabled() && strings.TrimSpace(p.SeedProfile) != "" {
-		if set, err := nntpSeedImageSetForProfile(p.SeedProfile, fixtureSlugsForSeedProfile(p.SeedProfile)); err == nil {
+		if p.SeedBootstrap {
+			// Seeding runs against the base article store — baking the corpus
+			// into an image is the thing it is here to do — but it still needs
+			// the overlay, whose `volumes: !override` drops the /data named
+			// volume so articles land in the container layer. Without that the
+			// capture commit has nothing to commit: `commitSeedImageCacheFromContainers`
+			// sees a /data mount and refuses rather than bake an empty store.
+			// So the overlay flag is shared; the pin below is not.
+			env[nntpSeedImageActiveEnv] = "1"
+		} else if set, ok := preseededImageSet(p.SeedProfile); ok {
+			// Captured this run: the phase must use exactly that store. A miss
+			// here means the image vanished or its identity moved underneath
+			// us, and running anyway would serve the wrong articles to every
+			// scenario — which looks like a product regression rather than the
+			// harness fault it is.
+			if !set.ready() {
+				log.Fatalf(
+					"pre-seeded NNTP images for profile %q are gone at phase launch (%s / %s); "+
+						"refusing to fall back to the base store, which does not carry this run's corpus",
+					p.SeedProfile, set.Primary, set.Backup)
+			}
+			set.applyToPhaseEnv(env, true)
+		} else if set, err := nntpSeedImageSetForProfile(p.SeedProfile, fixtureSlugsForSeedProfile(p.SeedProfile)); err == nil {
 			set.applyToPhaseEnv(env, set.ready())
 		}
 	}

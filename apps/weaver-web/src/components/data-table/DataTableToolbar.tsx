@@ -34,8 +34,15 @@ export function DataTableToolbar({
   children,
 }: DataTableToolbarProps) {
   return (
-    <div className={cn("flex flex-col gap-3 lg:grid lg:grid-cols-[auto_minmax(0,1fr)_auto] lg:items-center lg:gap-4", className)}>
-      <div className={cn("relative w-full sm:max-w-[260px]", searchContainerClassName)}>
+    <div
+      className={cn(
+        "flex flex-col gap-3 min-[560px]:grid min-[560px]:grid-cols-[auto_minmax(0,1fr)] min-[560px]:items-center min-[560px]:gap-4 xl:grid-cols-[auto_minmax(0,1fr)_auto]",
+        className,
+      )}
+    >
+      <div
+        className={cn("relative w-full min-[560px]:max-w-[260px]", searchContainerClassName)}
+      >
         <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
         <Input
           className={cn("h-9 rounded-inner pl-8", searchInputClassName)}
@@ -48,14 +55,8 @@ export function DataTableToolbar({
         />
       </div>
       <div
-        className={cn("flex items-center justify-center lg:hidden", centerContainerClassName)}
-        aria-hidden={centerContent ? undefined : true}
-      >
-        {centerContent}
-      </div>
-      <div
         className={cn(
-          "hidden min-w-0 items-center justify-center lg:flex",
+          "flex items-center justify-center min-[560px]:col-span-2 xl:hidden",
           centerContainerClassName,
         )}
         aria-hidden={centerContent ? undefined : true}
@@ -64,7 +65,16 @@ export function DataTableToolbar({
       </div>
       <div
         className={cn(
-          "flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end lg:justify-self-end",
+          "hidden min-w-0 items-center justify-center xl:flex",
+          centerContainerClassName,
+        )}
+        aria-hidden={centerContent ? undefined : true}
+      >
+        {centerContent}
+      </div>
+      <div
+        className={cn(
+          "flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end min-[560px]:col-start-2 min-[560px]:row-start-1 min-[560px]:justify-self-end xl:col-start-auto xl:row-start-auto",
           actionsClassName,
         )}
       >

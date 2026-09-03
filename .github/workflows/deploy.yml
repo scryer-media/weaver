@@ -76,21 +76,43 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+    outputs:
+      release_tag: ${{ steps.release_identity.outputs.release_tag }}
+      version: ${{ steps.release_identity.outputs.version }}
     steps:
       - name: Checkout release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+      - name: Validate canonical stable release tag
+        id: release_identity
+        shell: bash
+        run: bash .github/scripts/validate-release-tag.sh
       - name: Verify trusted tag and release-branch ancestry
+        env:
+          RELEASE_TAG: ${{ steps.release_identity.outputs.release_tag }}
+          VERSION: ${{ steps.release_identity.outputs.version }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#weaver-v}"
-          release_branch="release-${version}"
+          release_branch="release-${VERSION}"
           git config gpg.format ssh
           git config gpg.ssh.allowedSignersFile "$GITHUB_WORKSPACE/.github/release-signing-allowed-signers"
-          git verify-tag "$GITHUB_REF_NAME"
+          git verify-tag "$RELEASE_TAG"
           git fetch --no-tags origin "refs/heads/${release_branch}:refs/remotes/origin/${release_branch}"
-          git merge-base --is-ancestor "${GITHUB_REF_NAME}^{commit}" "origin/${release_branch}"
+          git merge-base --is-ancestor "${RELEASE_TAG}^{commit}" "origin/${release_branch}"
+
+  workflow-contract:
+    name: workflow-contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Test release tag validator fixtures
+        shell: bash
+        run: bash .github/scripts/test-validate-release-tag.sh
+      - name: Check release workflow contract
+        shell: bash
+        run: bash .github/scripts/check-deploy-workflow-contract.sh
 
   # ── Parallel lint / check jobs (no dependencies) ─────────────────────────
 
@@ -728,15 +750,31 @@ jobs:
             export CC="clang"
             export CXX="clang++"
           fi
-          cargo build -p weaver --release --locked --target x86_64-apple-darwin
+          cargo build -p weaver --bins --release --locked --target x86_64-apple-darwin
       - name: Verify native libraries are statically bundled
         run: |
-          BINARY="target/x86_64-apple-darwin/release/weaver"
-          otool -L "$BINARY" | tee weaver-darwin-x86_64-portable-native-linkage.txt
+          : > weaver-darwin-x86_64-portable-native-linkage.txt
+          for BINARY in weaver weaver-tray; do
+            otool -L "target/x86_64-apple-darwin/release/$BINARY" \
+              | tee -a weaver-darwin-x86_64-portable-native-linkage.txt
+          done
           if grep -Eiq 'liblzma|aws[-_]?lc|libcrypto' weaver-darwin-x86_64-portable-native-linkage.txt; then
             echo "release binary dynamically links a bundled native library" >&2
             exit 1
           fi
+      # There is deliberately no WebKit smoke test in this job: the runners
+      # are Apple silicon, so an x86_64 weaver-tray would have to launch WebKit
+      # under Rosetta. The wrapper source is identical across the two targets,
+      # so the arm64 job's run is what proves the wiring.
+      - name: Assemble Weaver.app
+        run: |
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "weaver"))')"
+          packaging/macos/build-app.sh \
+            --version "$version" \
+            --weaver target/x86_64-apple-darwin/release/weaver \
+            --tray target/x86_64-apple-darwin/release/weaver-tray \
+            --output dist/app
       - name: Codesign binary
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         env:
@@ -754,19 +792,111 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/x86_64-apple-darwin/release/weaver
           codesign --verify --verbose target/x86_64-apple-darwin/release/weaver
+          # The bundle carries its own copies, made before the signature above,
+          # so each executable is signed where it will actually be shipped and
+          # the bundle is sealed around them last. Hardened runtime and a secure
+          # timestamp are preconditions for notarization; they cost nothing when
+          # the image ships unnotarized.
+          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --options runtime --timestamp --force dist/app/Weaver.app/Contents/MacOS/weaver
+          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --options runtime --timestamp --force dist/app/Weaver.app/Contents/MacOS/weaver-tray
+          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --options runtime --timestamp --force dist/app/Weaver.app
+          codesign --verify --deep --verbose dist/app/Weaver.app
           rm /tmp/cert.p12
-          security delete-keychain "$KEYCHAIN"
       - name: Package tarball
         run: |
           mkdir -p dist/package
           cp target/x86_64-apple-darwin/release/weaver dist/package/weaver
           tar -czf weaver-darwin-x86_64-portable.tar.gz -C dist/package .
           test -f weaver-darwin-x86_64-portable.tar.gz
+      # Built from dist/app as it stands, so on a tag build the image wraps the
+      # already-signed bundle. Re-signing anything after this point would break
+      # the seal the image carries.
+      - name: Build disk image
+        run: |
+          set -euo pipefail
+          packaging/macos/build-dmg.sh \
+            --app dist/app/Weaver.app \
+            --output weaver-darwin-x86_64.dmg
+      - name: Codesign disk image
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        run: |
+          set -euo pipefail
+          security unlock-keychain -p "ci-ephemeral" build.keychain-db
+          codesign --sign "Scryer Media Signing" --timestamp --force weaver-darwin-x86_64.dmg
+          codesign --verify --verbose weaver-darwin-x86_64.dmg
+      # Optional lane. It needs an App Store Connect API key published as
+      # APPLE_NOTARY_KEY (base64 of the .p8), APPLE_NOTARY_KEY_ID and
+      # APPLE_NOTARY_ISSUER. Without them the release still ships a signed but
+      # unnotarized image, which Gatekeeper opens after a one-time
+      # right-click -> Open.
+      - name: Notarize disk image
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        env:
+          NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          # The secrets context is not readable from a step `if:`, so the
+          # absent-secret no-op has to be decided here.
+          if [ -z "$NOTARY_KEY" ] || [ -z "$NOTARY_KEY_ID" ] || [ -z "$NOTARY_ISSUER" ]; then
+            echo "notary key not configured; shipping the image unnotarized"
+            exit 0
+          fi
+          key_file="$(mktemp)"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s' "$NOTARY_KEY" | base64 --decode > "$key_file"
+          xcrun notarytool submit weaver-darwin-x86_64.dmg \
+            --key "$key_file" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER" \
+            --wait
+          xcrun stapler staple weaver-darwin-x86_64.dmg
+          xcrun stapler validate weaver-darwin-x86_64.dmg
+      - name: Remove signing keychain
+        if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        run: security delete-keychain build.keychain-db || true
+      # Mounting is the only check that sees what a user sees: the layout is
+      # baked into a .DS_Store the build wrote, not into any file list. The
+      # bundle inside is x86_64, so nothing here executes it.
+      - name: Validate disk image
+        env:
+          SIGNED: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        run: |
+          set -euo pipefail
+          mount_point="$(mktemp -d)/weaver"
+          mkdir -p "$mount_point"
+          trap 'hdiutil detach "$mount_point" >/dev/null 2>&1 || true' EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" weaver-darwin-x86_64.dmg
+          test -d "$mount_point/Weaver.app"
+          test "$(readlink "$mount_point/Applications")" = "/Applications"
+          test -f "$mount_point/.background.tiff"
+          test -f "$mount_point/.VolumeIcon.icns"
+          test -f "$mount_point/.DS_Store"
+          test -x "$mount_point/Weaver.app/Contents/MacOS/weaver-tray"
+          if [ "$SIGNED" = "true" ]; then
+            codesign --verify --deep --verbose "$mount_point/Weaver.app"
+          fi
+      - name: Install Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      # The release-provenance job runs on Linux and cannot mount a UDZO image,
+      # so the bundle's SBOM is produced here, from the staged tree the image
+      # was built out of.
+      - name: Generate bundle SBOM
+        run: |
+          set -euo pipefail
+          "${{ steps.syft.outputs.cmd }}" "dir:dist/app/Weaver.app" \
+            -o "spdx-json=weaver-darwin-x86_64.spdx.json"
+          test -s weaver-darwin-x86_64.spdx.json
       - name: Upload release package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: weaver-darwin-x86_64-portable-${{ github.run_id }}
-          path: weaver-darwin-x86_64-portable.tar.gz
+          path: |
+            weaver-darwin-x86_64-portable.tar.gz
+            weaver-darwin-x86_64.dmg
+            weaver-darwin-x86_64.spdx.json
           if-no-files-found: error
           retention-days: 14
       - name: Show trusted tag sccache stats
@@ -836,15 +966,34 @@ jobs:
             export CC="clang"
             export CXX="clang++"
           fi
-          cargo build -p weaver --release --locked --target aarch64-apple-darwin
+          cargo build -p weaver --bins --release --locked --target aarch64-apple-darwin
       - name: Verify native libraries are statically bundled
         run: |
-          BINARY="target/aarch64-apple-darwin/release/weaver"
-          otool -L "$BINARY" | tee weaver-darwin-arm64-portable-native-linkage.txt
+          : > weaver-darwin-arm64-portable-native-linkage.txt
+          for BINARY in weaver weaver-tray; do
+            otool -L "target/aarch64-apple-darwin/release/$BINARY" \
+              | tee -a weaver-darwin-arm64-portable-native-linkage.txt
+          done
           if grep -Eiq 'liblzma|aws[-_]?lc|libcrypto' weaver-darwin-arm64-portable-native-linkage.txt; then
             echo "release binary dynamically links a bundled native library" >&2
             exit 1
           fi
+      # Proves the wrapper can create a WKWebView and load a real document
+      # over the loopback interface, without Weaver itself being involved.
+      # This is the native-architecture job, so it is where the check runs.
+      - name: Smoke test WebKit wrapper
+        run: |
+          target/aarch64-apple-darwin/release/weaver-tray --webview-smoke \
+            2>&1 | tee weaver-darwin-arm64-webview-smoke.log
+      - name: Assemble Weaver.app
+        run: |
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "weaver"))')"
+          packaging/macos/build-app.sh \
+            --version "$version" \
+            --weaver target/aarch64-apple-darwin/release/weaver \
+            --tray target/aarch64-apple-darwin/release/weaver-tray \
+            --output dist/app
       - name: Codesign binary
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         env:
@@ -862,19 +1011,111 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/aarch64-apple-darwin/release/weaver
           codesign --verify --verbose target/aarch64-apple-darwin/release/weaver
+          # The bundle carries its own copies, made before the signature above,
+          # so each executable is signed where it will actually be shipped and
+          # the bundle is sealed around them last. Hardened runtime and a secure
+          # timestamp are preconditions for notarization; they cost nothing when
+          # the image ships unnotarized.
+          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --options runtime --timestamp --force dist/app/Weaver.app/Contents/MacOS/weaver
+          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --options runtime --timestamp --force dist/app/Weaver.app/Contents/MacOS/weaver-tray
+          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --options runtime --timestamp --force dist/app/Weaver.app
+          codesign --verify --deep --verbose dist/app/Weaver.app
           rm /tmp/cert.p12
-          security delete-keychain "$KEYCHAIN"
       - name: Package tarball
         run: |
           mkdir -p dist/package
           cp target/aarch64-apple-darwin/release/weaver dist/package/weaver
           tar -czf weaver-darwin-arm64-portable.tar.gz -C dist/package .
           test -f weaver-darwin-arm64-portable.tar.gz
+      # Built from dist/app as it stands, so on a tag build the image wraps the
+      # already-signed bundle. Re-signing anything after this point would break
+      # the seal the image carries.
+      - name: Build disk image
+        run: |
+          set -euo pipefail
+          packaging/macos/build-dmg.sh \
+            --app dist/app/Weaver.app \
+            --output weaver-darwin-arm64.dmg
+      - name: Codesign disk image
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        run: |
+          set -euo pipefail
+          security unlock-keychain -p "ci-ephemeral" build.keychain-db
+          codesign --sign "Scryer Media Signing" --timestamp --force weaver-darwin-arm64.dmg
+          codesign --verify --verbose weaver-darwin-arm64.dmg
+      # Optional lane. It needs an App Store Connect API key published as
+      # APPLE_NOTARY_KEY (base64 of the .p8), APPLE_NOTARY_KEY_ID and
+      # APPLE_NOTARY_ISSUER. Without them the release still ships a signed but
+      # unnotarized image, which Gatekeeper opens after a one-time
+      # right-click -> Open.
+      - name: Notarize disk image
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        env:
+          NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          # The secrets context is not readable from a step `if:`, so the
+          # absent-secret no-op has to be decided here.
+          if [ -z "$NOTARY_KEY" ] || [ -z "$NOTARY_KEY_ID" ] || [ -z "$NOTARY_ISSUER" ]; then
+            echo "notary key not configured; shipping the image unnotarized"
+            exit 0
+          fi
+          key_file="$(mktemp)"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s' "$NOTARY_KEY" | base64 --decode > "$key_file"
+          xcrun notarytool submit weaver-darwin-arm64.dmg \
+            --key "$key_file" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER" \
+            --wait
+          xcrun stapler staple weaver-darwin-arm64.dmg
+          xcrun stapler validate weaver-darwin-arm64.dmg
+      - name: Remove signing keychain
+        if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        run: security delete-keychain build.keychain-db || true
+      # Mounting is the only check that sees what a user sees: the layout is
+      # baked into a .DS_Store the build wrote, not into any file list.
+      - name: Validate disk image
+        env:
+          SIGNED: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        run: |
+          set -euo pipefail
+          mount_point="$(mktemp -d)/weaver"
+          mkdir -p "$mount_point"
+          trap 'hdiutil detach "$mount_point" >/dev/null 2>&1 || true' EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" weaver-darwin-arm64.dmg
+          test -d "$mount_point/Weaver.app"
+          test "$(readlink "$mount_point/Applications")" = "/Applications"
+          test -f "$mount_point/.background.tiff"
+          test -f "$mount_point/.VolumeIcon.icns"
+          test -f "$mount_point/.DS_Store"
+          "$mount_point/Weaver.app/Contents/MacOS/weaver-tray" --version
+          if [ "$SIGNED" = "true" ]; then
+            codesign --verify --deep --verbose "$mount_point/Weaver.app"
+          fi
+      - name: Install Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      # The release-provenance job runs on Linux and cannot mount a UDZO image,
+      # so the bundle's SBOM is produced here, from the staged tree the image
+      # was built out of.
+      - name: Generate bundle SBOM
+        run: |
+          set -euo pipefail
+          "${{ steps.syft.outputs.cmd }}" "dir:dist/app/Weaver.app" \
+            -o "spdx-json=weaver-darwin-arm64.spdx.json"
+          test -s weaver-darwin-arm64.spdx.json
       - name: Upload release package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: weaver-darwin-arm64-portable-${{ github.run_id }}
-          path: weaver-darwin-arm64-portable.tar.gz
+          path: |
+            weaver-darwin-arm64-portable.tar.gz
+            weaver-darwin-arm64.dmg
+            weaver-darwin-arm64.spdx.json
+            weaver-darwin-arm64-webview-smoke.log
           if-no-files-found: error
           retention-days: 14
       - name: Show trusted tag sccache stats
@@ -1045,7 +1286,6 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "target\x86_64-pc-windows-msvc\release\weaver.exe"
           $out = "weaver-windows-x86_64-dependencies.txt"
           $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
           if (-not $dumpbin) {
@@ -1061,13 +1301,18 @@ jobs:
           if (-not $dumpbin) {
             throw "dumpbin.exe was not found; cannot verify Windows runtime dependencies"
           }
-          & $dumpbin /dependents $exe 2>&1 | Tee-Object -FilePath $out
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
+          Remove-Item $out -ErrorAction SilentlyContinue
+          # weaver-tray.exe must link the WebView2 loader statically: a
+          # WebView2Loader.dll import would mean the MSI ships a broken tray.
+          foreach ($exe in @("target\x86_64-pc-windows-msvc\release\weaver.exe", "target\x86_64-pc-windows-msvc\release\weaver-tray.exe")) {
+            & $dumpbin /dependents $exe 2>&1 | Tee-Object -Append -FilePath $out
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
           }
           $dependents = Get-Content $out -Raw
-          if ($dependents -match '(?i)\b(?:vcruntime|msvcp)\d*[^\\/\s]*\.dll\b|aws[-_]?lc|\blibcrypto[^\s]*\.dll\b|\bcrypto\.dll\b') {
-            throw "Windows package depends on an external native runtime or crypto DLL"
+          if ($dependents -match '(?i)\b(?:vcruntime|msvcp)\d*[^\\/\s]*\.dll\b|aws[-_]?lc|\blibcrypto[^\s]*\.dll\b|\bcrypto\.dll\b|webview2loader') {
+            throw "Windows package depends on an external native runtime, crypto, or loader DLL"
           }
       - name: Smoke test release binary startup
         shell: pwsh
@@ -1151,6 +1396,57 @@ jobs:
               "Weaver startup log was not created at $logFile" | Set-Content $artifactLog
             }
           }
+      # The wrapper hosts WebView2, so the runtime it needs is a build-time
+      # dependency of this check even though nothing links against it. The
+      # printed result only reaches the log when stdout is redirected — the
+      # wrapper is a GUI-subsystem binary — so the exit code is the gate.
+      - name: Smoke test WebView2 wrapper
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target\x86_64-pc-windows-msvc\release\weaver-tray.exe"
+          $log = "weaver-windows-x86_64-webview-smoke.log"
+
+          $runtimeKeys = @(
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+            "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+            "HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+          )
+          $installed = $false
+          foreach ($key in $runtimeKeys) {
+            if (Test-Path $key) {
+              $installed = $true
+              break
+            }
+          }
+
+          if (-not $installed) {
+            Write-Host "WebView2 Evergreen runtime not found; installing it"
+            $wingetInstalled = $false
+            if (Get-Command winget -ErrorAction SilentlyContinue) {
+              try {
+                winget install --id Microsoft.EdgeWebView2Runtime --exact --silent `
+                  --accept-package-agreements --accept-source-agreements
+                if ($LASTEXITCODE -eq 0) { $wingetInstalled = $true }
+              } catch {
+                Write-Warning "winget could not install the WebView2 runtime: $($_.Exception.Message)"
+              }
+            }
+            if (-not $wingetInstalled) {
+              Invoke-WebRequest "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile MicrosoftEdgeWebview2Setup.exe
+              $installer = Start-Process -FilePath .\MicrosoftEdgeWebview2Setup.exe `
+                -ArgumentList "/silent","/install" -PassThru -Wait
+              if ($installer.ExitCode -ne 0) {
+                throw "the WebView2 runtime installer exited with $($installer.ExitCode)"
+              }
+            }
+          }
+
+          & $exe --webview-smoke 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) {
+            if (Test-Path $log) { Get-Content $log }
+            throw "weaver-tray --webview-smoke failed with exit code $LASTEXITCODE"
+          }
       - name: Package unsigned ZIP and MSI
         shell: pwsh
         run: |
@@ -1200,6 +1496,7 @@ jobs:
             weaver-windows-x86_64-build.log
             weaver-windows-x86_64-dependencies.txt
             weaver-windows-x86_64-startup.log
+            weaver-windows-x86_64-webview-smoke.log
             weaver-windows-x86_64-defender-scan.log
             weaver-windows-x86_64-attachment-services.log
             weaver-windows-x86_64-noarg-startup.log
@@ -1338,7 +1635,6 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "target\aarch64-pc-windows-msvc\release\weaver.exe"
           $out = "weaver-windows-arm64-dependencies.txt"
           $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
           if (-not $dumpbin) {
@@ -1354,13 +1650,18 @@ jobs:
           if (-not $dumpbin) {
             throw "dumpbin.exe was not found; cannot verify Windows runtime dependencies"
           }
-          & $dumpbin /dependents $exe 2>&1 | Tee-Object -FilePath $out
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
+          Remove-Item $out -ErrorAction SilentlyContinue
+          # weaver-tray.exe must link the WebView2 loader statically: a
+          # WebView2Loader.dll import would mean the MSI ships a broken tray.
+          foreach ($exe in @("target\aarch64-pc-windows-msvc\release\weaver.exe", "target\aarch64-pc-windows-msvc\release\weaver-tray.exe")) {
+            & $dumpbin /dependents $exe 2>&1 | Tee-Object -Append -FilePath $out
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
           }
           $dependents = Get-Content $out -Raw
-          if ($dependents -match '(?i)\b(?:vcruntime|msvcp)\d*[^\\/\s]*\.dll\b|aws[-_]?lc|\blibcrypto[^\s]*\.dll\b|\bcrypto\.dll\b') {
-            throw "Windows package depends on an external native runtime or crypto DLL"
+          if ($dependents -match '(?i)\b(?:vcruntime|msvcp)\d*[^\\/\s]*\.dll\b|aws[-_]?lc|\blibcrypto[^\s]*\.dll\b|\bcrypto\.dll\b|webview2loader') {
+            throw "Windows package depends on an external native runtime, crypto, or loader DLL"
           }
       - name: Smoke test release binary startup
         shell: pwsh
@@ -1444,6 +1745,57 @@ jobs:
               "Weaver startup log was not created at $logFile" | Set-Content $artifactLog
             }
           }
+      # The wrapper hosts WebView2, so the runtime it needs is a build-time
+      # dependency of this check even though nothing links against it. The
+      # printed result only reaches the log when stdout is redirected — the
+      # wrapper is a GUI-subsystem binary — so the exit code is the gate.
+      - name: Smoke test WebView2 wrapper
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target\aarch64-pc-windows-msvc\release\weaver-tray.exe"
+          $log = "weaver-windows-arm64-webview-smoke.log"
+
+          $runtimeKeys = @(
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+            "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+            "HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+          )
+          $installed = $false
+          foreach ($key in $runtimeKeys) {
+            if (Test-Path $key) {
+              $installed = $true
+              break
+            }
+          }
+
+          if (-not $installed) {
+            Write-Host "WebView2 Evergreen runtime not found; installing it"
+            $wingetInstalled = $false
+            if (Get-Command winget -ErrorAction SilentlyContinue) {
+              try {
+                winget install --id Microsoft.EdgeWebView2Runtime --exact --silent `
+                  --accept-package-agreements --accept-source-agreements
+                if ($LASTEXITCODE -eq 0) { $wingetInstalled = $true }
+              } catch {
+                Write-Warning "winget could not install the WebView2 runtime: $($_.Exception.Message)"
+              }
+            }
+            if (-not $wingetInstalled) {
+              Invoke-WebRequest "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile MicrosoftEdgeWebview2Setup.exe
+              $installer = Start-Process -FilePath .\MicrosoftEdgeWebview2Setup.exe `
+                -ArgumentList "/silent","/install" -PassThru -Wait
+              if ($installer.ExitCode -ne 0) {
+                throw "the WebView2 runtime installer exited with $($installer.ExitCode)"
+              }
+            }
+          }
+
+          & $exe --webview-smoke 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) {
+            if (Test-Path $log) { Get-Content $log }
+            throw "weaver-tray --webview-smoke failed with exit code $LASTEXITCODE"
+          }
       - name: Package unsigned ZIP and MSI
         shell: pwsh
         run: |
@@ -1493,6 +1845,7 @@ jobs:
             weaver-windows-arm64-build.log
             weaver-windows-arm64-dependencies.txt
             weaver-windows-arm64-startup.log
+            weaver-windows-arm64-webview-smoke.log
             weaver-windows-arm64-defender-scan.log
             weaver-windows-arm64-attachment-services.log
             weaver-windows-arm64-noarg-startup.log
@@ -1646,8 +1999,9 @@ jobs:
         id: tags
         env:
           IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/weaver
+          VERSION: ${{ needs.verify-release-tag.outputs.version }}
         run: |
-          VERSION="${GITHUB_REF_NAME#weaver-v}"
+          set -euo pipefail
           SHORT_SHA=$(printf '%s' "$GITHUB_SHA" | cut -c1-7)
           {
             echo "base<<EOF"
@@ -1685,7 +2039,7 @@ jobs:
   generate-container-provenance:
     name: generate-container-provenance
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-    needs: [docker-publish]
+    needs: [verify-release-tag, docker-publish]
     permissions:
       actions: read
       contents: read
@@ -1705,7 +2059,7 @@ jobs:
     name: verify-container-release
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
     runs-on: ubuntu-24.04
-    needs: [docker-publish, generate-container-provenance]
+    needs: [verify-release-tag, docker-publish, generate-container-provenance]
     permissions:
       id-token: write
       packages: read
@@ -1757,6 +2111,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs:
+      - verify-release-tag
       - rust-fmt
       - rust-clippy
       - rust-audit
@@ -1803,11 +2158,13 @@ jobs:
       - name: Verify release provenance and sign checksums
         env:
           IDENTITY: ^https://github.com/${{ github.repository }}/.github/workflows/deploy.yml@refs/tags/weaver-v.*$
+          RELEASE_TAG: ${{ needs.verify-release-tag.outputs.release_tag }}
         run: |
           set -euo pipefail
-          mapfile -t release_assets < <(find artifacts -maxdepth 1 -type f \( -name 'weaver-*.tar.gz' -o -name 'weaver-*.zip' -o -name 'weaver-*.msi' -o -name 'weaver-*.spdx.json' \) -printf '%f\n' | sort)
-          if [ "${#release_assets[@]}" -ne 16 ]; then
-            echo "expected 16 release assets under artifacts/, found ${#release_assets[@]}:" >&2
+          # 7 archives + 2 msi + 2 dmg + 9 SBOMs.
+          mapfile -t release_assets < <(find artifacts -maxdepth 1 -type f \( -name 'weaver-*.tar.gz' -o -name 'weaver-*.zip' -o -name 'weaver-*.msi' -o -name 'weaver-*.dmg' -o -name 'weaver-*.spdx.json' \) -printf '%f\n' | sort)
+          if [ "${#release_assets[@]}" -ne 20 ]; then
+            echo "expected 20 release assets under artifacts/, found ${#release_assets[@]}:" >&2
             printf '  %s\n' "${release_assets[@]}" >&2
             exit 1
           fi
@@ -1815,7 +2172,7 @@ jobs:
             slsa-verifier verify-artifact "artifacts/${asset}" \
               --provenance-path artifacts/weaver-provenance.intoto.jsonl \
               --source-uri "github.com/${GITHUB_REPOSITORY}" \
-              --source-tag "${GITHUB_REF_NAME}"
+              --source-tag "$RELEASE_TAG"
           done
           (
             cd artifacts
@@ -1831,38 +2188,45 @@ jobs:
             --certificate-identity-regexp "$IDENTITY" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             artifacts/weaver-checksums.txt
-      - name: Attest Windows release artifacts
+      # GitHub-native attestations for the installer-shaped assets, on top of
+      # the SLSA provenance every asset already carries: `gh attestation
+      # verify <file> -R <repo>` works for the packages a desktop user
+      # downloads by hand.
+      - name: Attest installer release artifacts
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: |
             artifacts/weaver-windows-*.zip
             artifacts/weaver-windows-*.msi
+            artifacts/weaver-darwin-*.dmg
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.verify-release-tag.outputs.release_tag }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_TAG" \
             --generate-notes \
             artifacts/weaver-*.tar.gz \
             artifacts/weaver-*.zip \
             artifacts/weaver-*.msi \
             artifacts/weaver-*.msi.json \
+            artifacts/weaver-*.dmg \
             artifacts/weaver-*.spdx.json \
             artifacts/weaver-checksums.txt \
             artifacts/weaver-checksums.txt.sigstore.json \
             artifacts/weaver-provenance.intoto.jsonl
       - name: Update Homebrew tap
         env:
-          TAP_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+          VERSION: ${{ needs.verify-release-tag.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#weaver-v}"
+          set -euo pipefail
           LINUX_X86_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-linux-x86_64-portable.tar.gz | cut -d ' ' -f1)
           LINUX_ARM_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-linux-arm64-portable.tar.gz | cut -d ' ' -f1)
           DARWIN_X86_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-darwin-x86_64-portable.tar.gz | cut -d ' ' -f1)
           DARWIN_ARM_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-darwin-arm64-portable.tar.gz | cut -d ' ' -f1)
-          REPO="${{ github.repository }}"
 
           mkdir -p formula
           cat > formula/weaver-usenet.rb << FORMULA
@@ -1908,10 +2272,10 @@ jobs:
 
           class WeaverUsenet < Formula
             desc "Unified Usenet binary downloader, repair, and extraction engine"
-            homepage "https://github.com/${REPO}"
+            homepage "https://github.com/${REPOSITORY}"
             version "${VERSION}"
             license "MIT"
-            RELEASE_REPO = "${REPO}"
+            RELEASE_REPO = "${REPOSITORY}"
             RELEASE_VERSION = "${VERSION}"
             CHECKSUMS = {
               "weaver-linux-x86_64-portable.tar.gz" => "${LINUX_X86_PORTABLE_SHA}",
@@ -2002,6 +2366,7 @@ jobs:
           sed -i 's/^          //' formula/weaver-usenet.rb
       - name: Smoke test Homebrew asset selection
         run: |
+          set -euo pipefail
           ruby <<'RUBY'
           source = File.read("formula/weaver-usenet.rb")
           helper_source = source.split(/^class WeaverUsenet < Formula$/).first
@@ -2050,16 +2415,17 @@ jobs:
           RUBY
       - name: Publish Homebrew tap update
         env:
-          TAP_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+          GH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+          VERSION: ${{ needs.verify-release-tag.outputs.version }}
         run: |
-          if [ -z "$TAP_TOKEN" ]; then
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
             echo "TAP_PUSH_TOKEN not set; skipping tap update."
             exit 0
           fi
-          VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#weaver-v}"
 
-          git clone "https://${TAP_TOKEN}@github.com/scryer-media/homebrew-weaver.git" tap-repo
+          gh auth setup-git
+          git clone --depth 1 https://github.com/scryer-media/homebrew-weaver.git tap-repo
           mkdir -p tap-repo/Formula
           cp formula/weaver-usenet.rb tap-repo/Formula/weaver-usenet.rb
           cd tap-repo
@@ -2076,7 +2442,7 @@ jobs:
   marketing-site-rebuild:
     name: marketing-site-rebuild
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-    needs: [github-release]
+    needs: [verify-release-tag, github-release]
     runs-on: ubuntu-24.04
     continue-on-error: true
     permissions:
@@ -2084,23 +2450,20 @@ jobs:
     steps:
       - name: Trigger marketing site rebuild
         env:
-          WEB_TOKEN: ${{ secrets.WEB_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.WEB_DISPATCH_TOKEN }}
         run: |
-          if [ -z "$WEB_TOKEN" ]; then
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
             echo "WEB_DISPATCH_TOKEN not set; skipping site rebuild."
             exit 0
           fi
-          git clone "https://${WEB_TOKEN}@github.com/scryer-media/web.git" web-repo
-          cd web-repo
-          git config user.name "github-actions[bot]"
-          git config user.email "133935777+NZBMan@users.noreply.github.com"
-          git commit --allow-empty -m "rebuild: ${{ github.ref_name }}"
-          git push origin HEAD:main
+          gh api --method POST repos/scryer-media/web/dispatches \
+            -f event_type=release-published
 
   winget-published-install:
     name: winget-published-install
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-    needs: [github-release]
+    needs: [verify-release-tag, github-release]
     runs-on: windows-2025-vs2026
     timeout-minutes: 20
     permissions:
@@ -2116,14 +2479,15 @@ jobs:
 
       - name: Install the published x64 MSI through WinGet
         shell: pwsh
+        env:
+          VERSION: ${{ needs.verify-release-tag.outputs.version }}
         run: |
           $manifestRoot = ".\\winget-manifests"
           New-Item -ItemType Directory -Force -Path $manifestRoot | Out-Null
           tar -xzf winget-submission/weaver-winget-manifests.tar.gz -C $manifestRoot
-          $version = "${{ github.ref_name }}".Replace("weaver-v", "")
           .\.github\scripts\validate-published-winget-install.ps1 `
             -ManifestRoot $manifestRoot `
-            -ExpectedVersion $version
+            -ExpectedVersion $env:VERSION
 
   winget-submit:
     name: winget-submit
@@ -2131,7 +2495,7 @@ jobs:
     # the org-level WINGET_TOKEN secret authenticates the PR, so this job
     # runs on every release tag rather than being gated behind a variable.
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-    needs: [github-release, winget-published-install]
+    needs: [verify-release-tag, github-release, winget-published-install]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -2147,6 +2511,7 @@ jobs:
       - name: Submit WinGet manifest pull request
         env:
           GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          VERSION: ${{ needs.verify-release-tag.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -2154,8 +2519,6 @@ jobs:
             echo "WINGET_TOKEN is required to submit the WinGet manifest pull request." >&2
             exit 1
           fi
-
-          VERSION="${GITHUB_REF_NAME#weaver-v}"
           BRANCH="scryer-media-weaver-${VERSION}"
           ARCHIVE="${GITHUB_WORKSPACE}/winget-submission/weaver-winget-manifests.tar.gz"
           STAGING_DIR="$(mktemp -d)"
@@ -2229,10 +2592,14 @@ jobs:
     name: winget-prep
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    needs: [rust-package-windows-x86_64, rust-package-windows-arm64]
+    needs: [verify-release-tag, rust-package-windows-x86_64, rust-package-windows-arm64]
     permissions:
       contents: read
     if: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'weaver-v') }}
+    env:
+      RELEASE_TAG: ${{ needs.verify-release-tag.outputs.release_tag }}
+      VERSION: ${{ needs.verify-release-tag.outputs.version }}
+      REPOSITORY: ${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -2249,24 +2616,16 @@ jobs:
           pattern: weaver-windows-*-${{ github.run_id }}
           merge-multiple: true
 
-      - name: Resolve WinGet metadata
-        id: winget_meta
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#weaver-v}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "release_date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
-
       - name: Generate WinGet manifests
         shell: bash
         run: |
           set -euo pipefail
+          RELEASE_DATE="$(date -u +%F)"
           cargo xtask ci winget \
-            --version "${{ steps.winget_meta.outputs.version }}" \
-            --tag "${{ github.ref_name }}" \
-            --repository "${{ github.repository }}" \
-            --release-date "${{ steps.winget_meta.outputs.release_date }}" \
+            --version "$VERSION" \
+            --tag "$RELEASE_TAG" \
+            --repository "$REPOSITORY" \
+            --release-date "$RELEASE_DATE" \
             --artifacts-dir release-artifacts \
             --output-dir winget-manifests
 
@@ -2321,6 +2680,16 @@ jobs:
           test "${#archives[@]}" -eq 7
           mapfile -t msi_packages < <(find artifacts -maxdepth 1 -type f -name 'weaver-*.msi' -printf '%f\n' | sort)
           test "${#msi_packages[@]}" -eq 2
+          # The disk images arrive finished: syft cannot read a UDZO image
+          # without mounting it, and this runner is Linux. The darwin jobs ship
+          # the matching bundle SBOMs alongside them instead. They are subjects
+          # here, but they are not copied into release-inputs — they already
+          # reach github-release inside the darwin package artifacts, and a
+          # second copy would collide in the merged flat directory.
+          mapfile -t disk_images < <(find artifacts -maxdepth 1 -type f -name 'weaver-*.dmg' -printf '%f\n' | sort)
+          test "${#disk_images[@]}" -eq 2
+          mapfile -t bundle_sboms < <(find artifacts -maxdepth 1 -type f -name 'weaver-darwin-*.spdx.json' -printf '%f\n' | sort)
+          test "${#bundle_sboms[@]}" -eq 2
           for archive in "${archives[@]}"; do
             "${{ steps.syft.outputs.cmd }}" "file:artifacts/${archive}" \
               -o "spdx-json=release-inputs/${archive%.*}.spdx.json"
@@ -2332,11 +2701,18 @@ jobs:
             for package in "${msi_packages[@]}"; do
               sha256sum "artifacts/${package}"
             done
+            for image in "${disk_images[@]}"; do
+              sha256sum "artifacts/${image}"
+            done
+            for sbom in "${bundle_sboms[@]}"; do
+              sha256sum "artifacts/${sbom}"
+            done
             find release-inputs -maxdepth 1 -type f -printf '%f\n' | sort | while read -r asset; do
               sha256sum "release-inputs/${asset}"
             done
           } | sed -e 's#artifacts/##' -e 's#release-inputs/##' > slsa-subjects.txt
-          test "$(wc -l < slsa-subjects.txt)" -eq 16
+          # 7 archives + 2 msi + 2 dmg + 2 darwin bundle SBOMs + 7 archive SBOMs.
+          test "$(wc -l < slsa-subjects.txt)" -eq 20
           cp slsa-subjects.txt release-inputs/
       # Upload a single directory so the artifact root is flat, like every
       # other release artifact: a multi-path upload keys off the workspace

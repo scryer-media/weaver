@@ -169,6 +169,19 @@ pub(crate) struct VirtualVolume {
     /// envelope write ever claimed reads as a hole no matter what the extent
     /// list says.
     pub(crate) envelope_covered: ByteRanges,
+    /// The volume's holds: staged bytes no destination has taken yet, as
+    /// `(physical offset, bytes)` runs in ascending order, disjoint from
+    /// everything `covered` claims.
+    ///
+    /// Posted bytes verbatim, and a source in their own right. An encrypted
+    /// member holds the cipher block on either side of a lost article — its
+    /// other half is in the article that never came — and a read that could
+    /// answer only from what was *placed* reported those bytes as a hole, so a
+    /// volume whose every posted byte was in hand read as damaged at exactly
+    /// the offsets a repair needed as input. Shared rather than owned because
+    /// a set's volumes are assembled per provider, and a provider is assembled
+    /// per pass.
+    pub(crate) held: Arc<Vec<(u64, Arc<[u8]>)>>,
     /// Logical length of the volume: what a `SeekFrom::End` means and where
     /// reads stop returning bytes.
     pub(crate) len: u64,
@@ -240,9 +253,15 @@ impl VirtualVolume {
         for &(start, end) in self.envelope_covered.ranges() {
             sources.insert(start, end.saturating_sub(start));
         }
+        // A hold is both claimed and sourced by the bytes it carries.
+        let mut claimed = self.covered.clone();
+        for (start, bytes) in self.held.iter() {
+            sources.insert(*start, bytes.len() as u64);
+            claimed.insert(*start, bytes.len() as u64);
+        }
 
         let mut readable = Vec::new();
-        for &(start, end) in self.covered.ranges() {
+        for &(start, end) in claimed.ranges() {
             let end = end.min(self.len);
             if end <= start {
                 continue;
@@ -359,6 +378,9 @@ enum Source {
     Member { member_id: u32, offset: u64 },
     /// The envelope file, at the same physical offset.
     Envelope { offset: u64 },
+    /// The `index`th held run, `offset` bytes into it: posted bytes still in
+    /// staging, served as they are.
+    Held { index: usize, offset: u64 },
 }
 
 /// A seekable reader over one virtual volume.
@@ -467,6 +489,15 @@ impl VirtualVolumeReader {
     /// `None` means `position` is a hole — either nothing was placed there, or
     /// something was and no source on disk backs it.
     fn run_end(&self, position: u64) -> Option<u64> {
+        // A hold answers for itself: it is not in the coverage map, because
+        // nothing placed it, and it needs no file, because it carries its bytes.
+        if let Some((_, start, bytes)) = self.held_at(position) {
+            return Some(
+                start
+                    .saturating_add(bytes.len() as u64)
+                    .min(self.volume.len),
+            );
+        }
         let covered_end = covered_run_end(&self.volume.covered, position)?;
 
         let (source_end, boundary) = match self.extent_at(position) {
@@ -500,7 +531,24 @@ impl VirtualVolumeReader {
         )
     }
 
+    /// The held run containing `position`, as `(index, start, bytes)`.
+    fn held_at(&self, position: u64) -> Option<(usize, u64, &Arc<[u8]>)> {
+        let index = self
+            .volume
+            .held
+            .partition_point(|(start, _)| *start <= position)
+            .checked_sub(1)?;
+        let (start, bytes) = &self.volume.held[index];
+        (position < start.saturating_add(bytes.len() as u64)).then_some((index, *start, bytes))
+    }
+
     fn source_at(&self, position: u64) -> Source {
+        if let Some((index, start, _)) = self.held_at(position) {
+            return Source::Held {
+                index,
+                offset: position - start,
+            };
+        }
         match self.extent_at(position) {
             Some(extent) => Source::Member {
                 member_id: extent.member_id,
@@ -538,6 +586,13 @@ impl VirtualVolumeReader {
                     return self.read_member_cipher(member_id, offset, out);
                 }
                 self.read_member_plain(member_id, offset, out)
+            }
+            Source::Held { index, offset } => {
+                let bytes = &self.volume.held[index].1;
+                let from = (offset as usize).min(bytes.len());
+                let take = out.len().min(bytes.len() - from);
+                out[..take].copy_from_slice(&bytes[from..from + take]);
+                Ok(take)
             }
             Source::Envelope { offset } => {
                 if self.envelope_handle.is_none() {

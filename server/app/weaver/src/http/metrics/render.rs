@@ -388,6 +388,13 @@ fn render_queues(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         &[],
         snapshot.write_buffered_segments as u64,
     );
+    out.sample(&f::WRITE_PENDING_BYTES, &[], snapshot.write_pending_bytes);
+    out.sample(&f::UU_SPOOLED_BYTES, &[], snapshot.uu_spooled_bytes);
+    out.sample(
+        &f::UU_SPOOLED_SEGMENTS,
+        &[],
+        snapshot.uu_spooled_segments as u64,
+    );
     out.sample(
         &f::DECODE_SOFT_LIMIT,
         &[],

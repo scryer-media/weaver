@@ -119,19 +119,10 @@ func TestWeaverReleaseFlowRegistryIsUniqueAndSelectable(t *testing.T) {
 	}
 }
 
-func TestWeaverIngressPrivateNetworkOverrideIsFlowScoped(t *testing.T) {
+func TestWeaverIngressFlowUsesDefaultPrivateRSSAccess(t *testing.T) {
 	const key = "WEAVER_RSS_ALLOW_PRIVATE_NETWORK"
-	for _, spec := range weaverReleaseFlowSpecs {
-		value, configured := spec.Env[key]
-		if spec.Name == "ui-ingress-automation" {
-			if !configured || value != "true" {
-				t.Fatalf("%s %s = %q, want true", spec.Name, key, value)
-			}
-			continue
-		}
-		if configured {
-			t.Fatalf("%s unexpectedly configures %s", spec.Name, key)
-		}
+	if value, configured := ingressReleaseFlow().Env[key]; configured {
+		t.Fatalf("ui-ingress-automation unexpectedly overrides %s with %q", key, value)
 	}
 }
 
@@ -536,14 +527,14 @@ func TestWeaverCoverageLedgerOwnersAreRegistered(t *testing.T) {
 	}
 }
 
-func TestWeaverComposeKeepsPrivateRSSDisabledByDefault(t *testing.T) {
+func TestWeaverComposeAllowsPrivateRSSByDefault(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(weaverE2ETestRoot(t), "docker-compose.yml"))
 	if err != nil {
 		t.Fatalf("read docker compose file: %v", err)
 	}
-	const mapping = `WEAVER_RSS_ALLOW_PRIVATE_NETWORK: "${WEAVER_RSS_ALLOW_PRIVATE_NETWORK:-false}"`
+	const mapping = `WEAVER_RSS_ALLOW_PRIVATE_NETWORK: "${WEAVER_RSS_ALLOW_PRIVATE_NETWORK:-true}"`
 	if !strings.Contains(string(body), mapping) {
-		t.Fatalf("Weaver Compose RSS private-network mapping is missing secure default %q", mapping)
+		t.Fatalf("Weaver Compose RSS private-network mapping is missing default %q", mapping)
 	}
 }
 

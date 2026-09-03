@@ -351,6 +351,47 @@ fn unique_par2_binding_candidate(candidates: &[par2_rs::FileId]) -> Option<par2_
     Some(*candidate)
 }
 
+/// The lowest byte offset covered by a block the recovery set found damaged.
+///
+/// Split out so the damage floor and the intact prefix can be read from one
+/// verdict map rather than two.
+fn damage_floor_from_verdicts(
+    verdicts: &std::collections::BTreeMap<u32, crate::pipeline::integrity::BlockVerdict>,
+    slice_size: u64,
+) -> Option<u64> {
+    verdicts
+        .iter()
+        .filter(|(_, verdict)| matches!(verdict, crate::pipeline::integrity::BlockVerdict::Damaged))
+        .filter_map(|(&index, _)| u64::from(index).checked_mul(slice_size))
+        .min()
+}
+
+/// The contiguous run of Intact blocks from block zero, in bytes.
+///
+/// Only blocks the grid actually claimed *and* found Intact count, and only
+/// while they are consecutive from zero: a block the grid never claimed stops
+/// the run, because unverified is not the same as intact. An arithmetic
+/// overflow ends the run for the same reason — a prefix that cannot be
+/// represented has not been proved.
+fn intact_prefix_from_verdicts(
+    verdicts: &std::collections::BTreeMap<u32, crate::pipeline::integrity::BlockVerdict>,
+    slice_size: u64,
+) -> u64 {
+    let mut prefix = 0u64;
+    for index in 0.. {
+        match verdicts.get(&index) {
+            Some(crate::pipeline::integrity::BlockVerdict::Intact { .. }) => {
+                match prefix.checked_add(slice_size) {
+                    Some(next) => prefix = next,
+                    None => break,
+                }
+            }
+            _ => break,
+        }
+    }
+    prefix
+}
+
 /// The one recovery-set description a pipeline file unambiguously identifies.
 #[derive(Debug, Clone)]
 pub(crate) struct Par2FileBinding {
@@ -423,10 +464,24 @@ impl Pipeline {
             })
             .collect();
         let working_dir = state.working_dir.clone();
+        // RAR topologies only. This map is the last fallback in the search for a
+        // file's *old RAR set name*, and everything downstream of that name —
+        // staleness, the retirement sweep at the end of this function — speaks
+        // only RAR. A 7z volume that found its own 7z set here was answering a
+        // question about RAR with a fact about 7z, and the set it named was then
+        // swept away as a stale RAR set: every PAR2 registration silently
+        // deleted every non-RAR topology in the job, and only the next file
+        // completion rebuilding it hid that.
         let old_set_by_topology_filename: HashMap<String, String> = state
             .assembly
             .archive_topologies()
             .iter()
+            .filter(|(_, topology)| {
+                matches!(
+                    topology.archive_type,
+                    crate::jobs::assembly::ArchiveType::Rar
+                )
+            })
             .flat_map(|(set_name, topology)| {
                 topology
                     .volume_map
@@ -541,6 +596,13 @@ impl Pipeline {
                         new_path.display()
                     )
                 })?;
+                // The one rename that fires *during* the download pass, so it
+                // is the only PAR2 site that can move a part while a chase is
+                // still reading it rather than after.
+                if let Some(name) = old_path.file_name().and_then(|name| name.to_str()) {
+                    let name = name.to_string();
+                    self.taint_direct_unpack_for_file(job_id, &name);
+                }
                 true
             } else {
                 false
@@ -559,6 +621,25 @@ impl Pipeline {
                 )
                 .then(|| classification.set_name.clone())
             });
+            let mut rebound_identity = identity.clone();
+            if canonical_is_current {
+                rebound_identity.current_filename = canonical_filename.clone();
+            }
+            rebound_identity.canonical_filename = Some(canonical_filename.clone());
+            rebound_identity.classification = classification;
+            rebound_identity.classification_source = FileIdentitySource::Par2;
+            let classification_changed = rebound_identity.classification != identity.classification;
+            if rebound_identity == identity {
+                continue;
+            }
+
+            // Staleness is bookkeeping *about a rebind*, so it belongs after the
+            // check for whether one happened. It used to run above the `continue`
+            // and therefore fired on every identity application, including the
+            // overwhelming majority that come out byte-identical and change
+            // nothing — which meant the retirement sweep at the end of this
+            // function ran against sets no rebind had touched, with `rebound`
+            // still zero and nothing logged.
             if canonical_is_current && let Some(set_name) = old_rar_set_name.as_ref() {
                 let set_changed = old_rar_set_name != new_rar_set_name;
                 if filename_changed || set_changed {
@@ -574,17 +655,6 @@ impl Pipeline {
                 }
             }
 
-            let mut rebound_identity = identity.clone();
-            if canonical_is_current {
-                rebound_identity.current_filename = canonical_filename.clone();
-            }
-            rebound_identity.canonical_filename = Some(canonical_filename.clone());
-            rebound_identity.classification = classification;
-            rebound_identity.classification_source = FileIdentitySource::Par2;
-            let classification_changed = rebound_identity.classification != identity.classification;
-            if rebound_identity == identity {
-                continue;
-            }
             self.set_file_identity(job_id, rebound_identity)?;
             reserve_download_filename(&canonical_filename, &mut occupied_filenames);
 
@@ -1291,6 +1361,62 @@ impl Pipeline {
             .block_crcs
             .verdicts_against(file_id, set, binding.par2_file_id);
         (!verdicts.is_empty()).then_some(verdicts)
+    }
+
+    /// Both in-stream facts a chased part needs, from a single verdict build.
+    ///
+    /// The damage floor and the intact prefix are read together on every commit
+    /// of a gated part, and each derives from the same `verdicts_against` map.
+    /// Asking for them separately built that map twice per commit; this builds
+    /// it once. `None` means the file has no binding or no parsed set, which is
+    /// the same "nothing vouches for this" the individual accessors report.
+    ///
+    /// The build itself remains O(closed blocks) per call, and the map is
+    /// rebuilt rather than cached because the grid is still accumulating — a
+    /// cached answer is exactly the stale one the gate must not act on. So the
+    /// honest bound over a gated part's life is O(articles x blocks). It is
+    /// paid only by sets already known to carry damage.
+    pub(crate) fn in_stream_chase_evidence(
+        &self,
+        file_id: NzbFileId,
+    ) -> Option<(Option<u64>, u64)> {
+        let binding = self.resolve_par2_file_binding(file_id)?;
+        let set = self.par2_set_for(file_id.job_id, binding.recovery_set_id)?;
+        let slice = set.slice_size;
+        let verdicts = self
+            .block_crcs
+            .verdicts_against(file_id, set, binding.par2_file_id);
+        Some((
+            damage_floor_from_verdicts(&verdicts, slice),
+            intact_prefix_from_verdicts(&verdicts, slice),
+        ))
+    }
+
+    /// How many bytes from the start of a file the recovery set has positively
+    /// vouched for, as a contiguous run.
+    ///
+    /// Only blocks the grid actually claimed *and* found Intact count, and only
+    /// while they are consecutive from block zero. A block the grid never
+    /// claimed — `NoReference`, or simply absent because no article closed it —
+    /// stops the run: unverified is not the same as intact, and this number is
+    /// used to decide that repair cannot touch what the decoder already read.
+    ///
+    /// The basis is CRC32, from PAR2's IFSC. A block whose CRC32 matches but
+    /// whose MD5 does not would be rewritten by repair below this line, and the
+    /// chase would keep a decode of the pre-repair bytes. Downstream 7z entry
+    /// CRCs catch that for entries that carry one; entries without a CRC carry
+    /// the residual. Stated rather than defended against: closing it means
+    /// hashing the prefix, which is the read this whole path exists to avoid.
+    pub(crate) fn in_stream_intact_prefix(&self, file_id: NzbFileId) -> Option<u64> {
+        let binding = self.resolve_par2_file_binding(file_id)?;
+        let set = self.par2_set_for(file_id.job_id, binding.recovery_set_id)?;
+        let slice = set.slice_size;
+        Some(intact_prefix_from_verdicts(
+            &self
+                .block_crcs
+                .verdicts_against(file_id, set, binding.par2_file_id),
+            slice,
+        ))
     }
 
     /// A completed file's PAR2 identity, provable from the in-stream dual-CRC
@@ -3863,7 +3989,7 @@ impl Pipeline {
                         segment_number: segment.ordinal,
                     },
                     message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
-                    groups: file.groups.clone(),
+                    groups: std::sync::Arc::from(file.groups.as_slice()),
                     priority,
                     byte_estimate: segment.bytes,
                     retry_count: 0,

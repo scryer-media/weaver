@@ -20,6 +20,7 @@ pub enum PostProcessingValidationError {
     DuplicateSectionName,
     DuplicateScriptName,
     InvalidPolicy,
+    InvalidUnacceptableExtension,
 }
 
 impl fmt::Display for PostProcessingValidationError {
@@ -33,6 +34,9 @@ impl fmt::Display for PostProcessingValidationError {
             Self::DuplicateSectionName => "duplicate script section name".to_string(),
             Self::DuplicateScriptName => "duplicate script name in list".to_string(),
             Self::InvalidPolicy => "invalid post-processing policy".to_string(),
+            Self::InvalidUnacceptableExtension => {
+                "invalid unacceptable extension pattern".to_string()
+            }
         };
         f.write_str(&message)
     }
@@ -891,6 +895,10 @@ pub struct PostProcessingSettings {
     pub python_interpreter: Option<String>,
     pub powershell_interpreter: Option<String>,
     pub batch_interpreter: Option<String>,
+    /// Extension-token patterns that reject a job only after Weaver has a
+    /// trustworthy output name. An empty list disables the policy.
+    #[serde(default)]
+    pub unacceptable_extensions: Vec<String>,
 }
 
 impl Default for PostProcessingSettings {
@@ -902,17 +910,69 @@ impl Default for PostProcessingSettings {
             python_interpreter: None,
             powershell_interpreter: None,
             batch_interpreter: None,
+            unacceptable_extensions: Vec::new(),
         }
     }
 }
 
 impl PostProcessingSettings {
+    /// Return a canonical settings value suitable for persistence.
+    pub fn normalized(mut self) -> Result<Self, PostProcessingValidationError> {
+        self.unacceptable_extensions = self
+            .unacceptable_extensions
+            .into_iter()
+            .map(|entry| normalize_unacceptable_extension(&entry))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.unacceptable_extensions.sort();
+        self.unacceptable_extensions.dedup();
+        if self.unacceptable_extensions.len() > 64 {
+            return Err(PostProcessingValidationError::InvalidUnacceptableExtension);
+        }
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<(), PostProcessingValidationError> {
         if !(1..=8).contains(&self.concurrency) || self.termination_grace_seconds == 0 {
             return Err(PostProcessingValidationError::InvalidPolicy);
         }
+        if self.unacceptable_extensions.len() > 64
+            || self.unacceptable_extensions.iter().any(|entry| {
+                normalize_unacceptable_extension(entry).as_deref() != Ok(entry.as_str())
+            })
+        {
+            return Err(PostProcessingValidationError::InvalidUnacceptableExtension);
+        }
         Ok(())
     }
+
+    /// Return the matching configured extension-token pattern for `filename`.
+    /// Paths and leading-dot files without a basename are not treated as having
+    /// an extension, matching SABnzbd's extension semantics.
+    pub fn unacceptable_extension_match<'a>(&'a self, filename: &str) -> Option<&'a str> {
+        let basename = filename.rsplit(['/', '\\']).next()?;
+        let (stem, extension) = basename.rsplit_once('.')?;
+        if stem.is_empty() || extension.is_empty() {
+            return None;
+        }
+        self.unacceptable_extensions
+            .iter()
+            .find(|pattern| crate::runtime::glob::glob_match_ci(pattern, extension))
+            .map(String::as_str)
+    }
+}
+
+fn normalize_unacceptable_extension(value: &str) -> Result<String, PostProcessingValidationError> {
+    let value = value.trim();
+    let valid = !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('.')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b'*' | b'?')
+        });
+    valid
+        .then(|| value.to_ascii_lowercase())
+        .ok_or(PostProcessingValidationError::InvalidUnacceptableExtension)
 }
 
 /// Job-level rollup of every script that ran.

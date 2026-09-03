@@ -34,3 +34,9 @@ harness = false
 name = "rapidyenc_parity"
 path = "benches/rapidyenc_parity.rs"
 harness = false
+
+
+[[bench]]
+name = "crc_combine"
+path = "benches/crc_combine.rs"
+harness = false

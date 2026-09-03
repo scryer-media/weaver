@@ -667,6 +667,9 @@ impl Pipeline {
             .as_secs();
         let (assembly, download_queue, recovery_queue) =
             Self::build_job_assembly(job_id, &spec, &HashSet::new());
+        // A bare `.7z` has no topology to wait for, so it arms off its opening
+        // bytes instead — which means the commit path has to know it is coming.
+        self.register_direct_unpack_singles(job_id, &spec);
         let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
         let initial_file_identities = file_identities.values().cloned().collect::<Vec<_>>();
         let (initial_status, initial_download_state, initial_post_state, initial_run_state) =
@@ -908,27 +911,56 @@ impl Pipeline {
                 file_spec.role,
                 weaver_model::files::FileRole::Unknown
                     | weaver_model::files::FileRole::SplitFile { .. }
+                    | weaver_model::files::FileRole::SevenZipArchive
+                    | weaver_model::files::FileRole::SevenZipSplit { .. }
             )
             .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
             .flatten();
 
+            // A 7z part's LAST segment joins the head wave, for the same reason
+            // and with the same caveat.
+            //
+            // Direct unpack cannot list an archive until it has the end header,
+            // which sits at the very end of the last part — so until those
+            // bytes land the chase is parked and the overlap it exists for has
+            // not started. One extra segment per part is a cheap way to unblock
+            // it. Planned at queue birth rather than reprioritized later
+            // because a reprioritization only reaches work still queued, and on
+            // a fast job the tail is leased before the chase is even armed.
+            //
+            // Purely an overlap optimization: boosting the wrong segment costs
+            // a little latency and nothing else, and the gated reader is
+            // correct whatever order the bytes arrive in.
+            let tail_segment = matches!(
+                file_spec.role,
+                weaver_model::files::FileRole::SevenZipArchive
+                    | weaver_model::files::FileRole::SevenZipSplit { .. }
+            )
+            .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).max())
+            .flatten();
+
+            // One shared group list per file; every segment's work item holds
+            // a reference to it rather than its own copy.
+            let groups: std::sync::Arc<[String]> =
+                std::sync::Arc::from(file_spec.groups.as_slice());
             for seg in &file_spec.segments {
                 let segment_id = SegmentId {
                     file_id,
                     segment_number: seg.ordinal,
                 };
-                let priority = if head_segment == Some(seg.ordinal) {
-                    2
-                } else {
-                    priority
-                };
+                let priority =
+                    if head_segment == Some(seg.ordinal) || tail_segment == Some(seg.ordinal) {
+                        2
+                    } else {
+                        priority
+                    };
                 if skip.contains(&segment_id) {
                     let _ = file_assembly.commit_segment(seg.ordinal, seg.bytes);
                 } else {
                     target_queue.push(DownloadWork {
                         segment_id,
                         message_id: MessageId::new(&seg.message_id),
-                        groups: file_spec.groups.clone(),
+                        groups: std::sync::Arc::clone(&groups),
                         priority,
                         byte_estimate: seg.bytes,
                         retry_count: 0,
@@ -1162,6 +1194,9 @@ impl Pipeline {
         }
 
         self.delete_failed_history_entry(job_id).await;
+        // Reprocess replaces the assembly and file identities wholesale, so a
+        // chase describing the old ones has to go with them.
+        self.direct_unpack_forget_job(job_id);
         self.reset_failed_job_runtime(job_id).await;
 
         if !self.job_order.contains(&job_id) {
@@ -1486,6 +1521,9 @@ impl Pipeline {
         }
         let (assembly, download_queue, recovery_queue) =
             Self::build_job_assembly(job_id, &spec, &restore_skip_plan.skip);
+        // A restored job resumes mid-download; its unsplit archives are still
+        // candidates, and their persisted floor is what they will arm from.
+        self.register_direct_unpack_singles(job_id, &spec);
         let status = Self::normalize_restored_status(status, &download_queue, &recovery_queue);
 
         let skip_ref = &restore_skip_plan.skip;

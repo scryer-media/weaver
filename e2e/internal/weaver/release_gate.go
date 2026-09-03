@@ -148,7 +148,6 @@ func behaviorReleaseFlow(name string, timeout time.Duration) weaverReleaseFlowSp
 func ingressReleaseFlow() weaverReleaseFlowSpec {
 	spec := browserReleaseFlow("ui-ingress-automation", 10*time.Minute)
 	spec.Services = append(spec.Services, "rss-fixture")
-	spec.Env = map[string]string{"WEAVER_RSS_ALLOW_PRIVATE_NETWORK": "true"}
 	return spec
 }
 

@@ -2649,7 +2649,7 @@ impl Pipeline {
                                     message_id: crate::jobs::ids::MessageId::new(
                                         &segment.message_id,
                                     ),
-                                    groups: file.groups.clone(),
+                                    groups: std::sync::Arc::from(file.groups.as_slice()),
                                     priority: file.role.download_priority(),
                                     byte_estimate: segment.bytes,
                                     retry_count: 0,
@@ -4266,8 +4266,20 @@ impl Pipeline {
                     // flag the sweep derives from this — and the pass only runs
                     // once the payload has settled anyway.
                     assembly_complete: true,
-                    covered: set.volume_coverage(volume_index),
+                    // Placed bytes and holds alike: the provider serves both,
+                    // and an encrypted member's held edge block is the byte
+                    // the composition needs to reach the article boundary.
+                    covered: set.volume_coverage_with_holds(volume_index),
                     crcs: set.volume_crc_runs(volume_index),
+                    // The raw physical coverage, not the article-whole clip the
+                    // demotion sweep takes: PAR2 needs every slice it judged
+                    // valid to be in the scratch, and those reach to the placed
+                    // frontier, not to the last whole article. An encrypted
+                    // member's frontier before a hole is *always* inside the
+                    // last article — its final cipher block waits for the block
+                    // after it — so refusing that run would demote every
+                    // encrypted set the moment it needed a repair.
+                    partial_article: super::reconstruct::PartialArticle::CarryThrough,
                 },
             });
         }
@@ -5511,9 +5523,7 @@ impl Pipeline {
             self.metrics
                 .segments_committed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let _ = self
-                .event_tx
-                .send(PipelineEvent::SegmentCommitted { segment_id });
+            self.send_segment_event(|| PipelineEvent::SegmentCommitted { segment_id });
         }
 
         // The dual-CRC grid, fed in **source-volume space** — the same
@@ -5764,9 +5774,13 @@ impl Pipeline {
     pub(crate) async fn poll_direct_store_barriers(&mut self) {
         let now = Instant::now();
         for job_id in self.direct_store.active_jobs() {
-            let due: Vec<(usize, super::barrier::BarrierTrigger)> = self
-                .direct_store
-                .sets_for(job_id)
+            // Polled once per orchestrator turn, so the common answer is
+            // "nothing due": decide that without allocating.
+            let sets = self.direct_store.sets_for(job_id);
+            if !sets.iter().any(|set| set.due(now).is_some()) {
+                continue;
+            }
+            let due: Vec<(usize, super::barrier::BarrierTrigger)> = sets
                 .iter()
                 .enumerate()
                 .filter_map(|(index, set)| set.due(now).map(|trigger| (index, trigger)))
@@ -6307,14 +6321,23 @@ impl Pipeline {
         job_id: JobId,
         set_index: usize,
     ) -> Result<Vec<String>, String> {
-        let Some(set) = self.direct_store.set(job_id, set_index) else {
-            return Ok(Vec::new());
+        let (set_name, names) = {
+            let Some(set) = self.direct_store.set(job_id, set_index) else {
+                return Ok(Vec::new());
+            };
+            (
+                set.set_name().to_string(),
+                set.router.tolerated_member_names(),
+            )
         };
-        let names = set.router.tolerated_member_names();
         if names.is_empty() {
             return Ok(Vec::new());
         }
-        let set_name = set.set_name().to_string();
+        let staging = self.extraction_staging_dir(job_id);
+        let extraction_budget = self.extraction_budget(job_id, &staging)?;
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return Ok(Vec::new());
+        };
         // An `-hp` set's virtual volumes are as header-encrypted as
         // the posted ones, so this extraction cannot even *open* the archive
         // without the key the router proved — and for a `-p` set a tolerated
@@ -6405,17 +6428,7 @@ impl Pipeline {
             .copied()
             .filter(|volume_index| *volume_index != first_volume)
             .collect();
-
-        for (_, destination) in &targets {
-            if let Some(parent) = destination.parent()
-                && let Err(error) = tokio::fs::create_dir_all(parent).await
-            {
-                return Err(format!(
-                    "failed to create {} for a tolerated member: {error}",
-                    parent.display()
-                ));
-            }
-        }
+        let extraction_memory_limit = self.extraction_limits.max_memory_bytes;
 
         let extracted = tokio::task::spawn_blocking(move || {
             let reader = provider
@@ -6429,7 +6442,11 @@ impl Pipeline {
             // The same decode ceilings the incremental extractor applies. A
             // tolerated member is small by budget, but the *declared* dictionary
             // in a hostile header is not bounded by anything the budget checks.
-            crate::pipeline::extraction::apply_server_rar_limits(&mut archive);
+            let max_dict_bytes =
+                crate::pipeline::extraction::apply_server_rar_limits_with_memory_limit(
+                    &mut archive,
+                    extraction_memory_limit,
+                );
             for volume_index in other_volumes {
                 let Some(reader) = provider.open(volume_index) else {
                     continue;
@@ -6439,6 +6456,26 @@ impl Pipeline {
                     .map_err(|error| {
                         format!("failed to add virtual volume {volume_index}: {error}")
                     })?;
+            }
+            crate::pipeline::extraction::ensure_rar_dictionary_within_limit(
+                &archive,
+                max_dict_bytes,
+            )
+            .map_err(|error| format!("RAR dictionary admission failed: {error}"))?;
+            let _memory_permit = extraction_budget
+                .reserve_memory_wait(crate::pipeline::extraction::rar_decoder_memory_bytes(
+                    &archive,
+                ))
+                .map_err(|error| format!("RAR decoder memory admission failed: {error}"))?;
+            for (_, destination) in &targets {
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        format!(
+                            "failed to create {} for a tolerated member: {error}",
+                            parent.display()
+                        )
+                    })?;
+                }
             }
             let options = unrar_rs::ExtractOptions {
                 verify: true,
@@ -6737,6 +6774,12 @@ impl Pipeline {
             // filling a file with a hole where the rebuilt prefix should be.
             let filename = self.current_filename_for_file(job_id, file_asm);
             let received = file_asm.received_bytes();
+            // Placed bytes only, deliberately. The provider can serve holds
+            // too, but this sweep hands the set to the conventional path, whose
+            // decode handoff owns the article that was routing when demotion
+            // struck and whose targeted requeue owns every segment the atoms do
+            // not wholly back; a hold materialized here would be written twice
+            // and counted against a completion gate nothing then clears.
             let physical_coverage = set.volume_coverage(*volume_index);
             let crcs = set.volume_crc_runs(*volume_index);
             // Routing can demote after durably placing only part of the current
@@ -6766,6 +6809,11 @@ impl Pipeline {
                     assembly_complete: file_asm.is_complete(),
                     covered: coverage,
                     crcs,
+                    // `coverage` is already clipped to whole articles, so this
+                    // never fires; it states that a floor is published over
+                    // what this sweep writes and nothing unverified may sit
+                    // under one.
+                    partial_article: super::reconstruct::PartialArticle::Refuse,
                 },
             ));
         }
@@ -7062,7 +7110,7 @@ impl Pipeline {
                     work.push(DownloadWork {
                         segment_id,
                         message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
-                        groups: file.groups.clone(),
+                        groups: std::sync::Arc::from(file.groups.as_slice()),
                         priority: file.role.download_priority(),
                         byte_estimate: segment.bytes,
                         retry_count: 0,
@@ -7155,7 +7203,7 @@ impl Pipeline {
                     work.push(DownloadWork {
                         segment_id,
                         message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
-                        groups: file.groups.clone(),
+                        groups: std::sync::Arc::from(file.groups.as_slice()),
                         priority: file.role.download_priority(),
                         byte_estimate: segment.bytes,
                         retry_count: 0,

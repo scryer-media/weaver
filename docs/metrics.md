@@ -402,6 +402,9 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_pipeline_recovery_queue_depth` | gauge | — | Recovery queue depth. |
 | `weaver_pipeline_write_buffered_bytes` | gauge | — | Buffered write bytes. |
 | `weaver_pipeline_write_buffered_segments` | gauge | — | Buffered write segments. |
+| `weaver_pipeline_write_pending_bytes` | gauge | — | Total pending write bytes, including UU spool files. |
+| `weaver_pipeline_uu_spooled_bytes` | gauge | — | Disk-backed UU bytes waiting for their missing prefix. |
+| `weaver_pipeline_uu_spooled_segments` | gauge | — | Disk-backed UU segments waiting for their missing prefix. |
 | `weaver_pipeline_decode_pressure_soft_limit_bytes` | gauge | — | Decode soft pressure limit in bytes. |
 | `weaver_pipeline_decode_pressure_hard_limit_bytes` | gauge | — | Decode hard pressure limit in bytes. |
 | `weaver_pipeline_write_pressure_soft_limit_bytes` | gauge | — | Write soft pressure limit in bytes. |

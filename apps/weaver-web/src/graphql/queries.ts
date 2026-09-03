@@ -180,6 +180,8 @@ const SERVER_FIELDS = `
     retentionDays
     maxDownloadSpeed
     tlsNameMismatchCertificateFingerprint
+    tlsCipherSuite
+    tlsHonorsClientCipherOrder
     downloadQuota {
       enabled
       period
@@ -214,6 +216,8 @@ const SERVER_DETAILS_FIELDS = `
     maxDownloadSpeed
     tlsNameMismatchCertificateDerBase64
     tlsNameMismatchCertificateFingerprint
+    tlsCipherSuite
+    tlsHonorsClientCipherOrder
     downloadQuota {
       enabled
       period
@@ -296,6 +300,7 @@ const GENERAL_SETTINGS_FIELDS = `
     maxDownloadSpeed
     maxRetries
     ipReplacementTrialExtraConnections
+    enableSrrdbLookup
     duplicatePolicy {
       strictActiveOrSuccess
       strictFailedOrCancelled
@@ -1077,6 +1082,8 @@ export const TEST_CONNECTION_MUTATION = gql`
       message
       latencyMs
       supportsPipelining
+      tlsCipherSuite
+      tlsHonorsClientCipherOrder
       adoptableTlsNameMismatchCertificate {
         derBase64
         sha256Fingerprint
@@ -1504,6 +1511,7 @@ const POST_PROCESSING_SETTINGS_FIELDS = gql`
     pythonInterpreter
     powershellInterpreter
     batchInterpreter
+    unacceptableExtensions
     strictSecurityRefusesExecution
     lists {
       global {

@@ -70,10 +70,117 @@ mimalloc = { version = "0.1.52", default-features = false }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
+  "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
+  # `CreateMutexW` and `RegCreateKeyExW` take `SECURITY_ATTRIBUTES`, whose type
+  # this feature defines. Another crate in the graph currently enables it too,
+  # but this crate must not compile only by that accident of feature
+  # unification.
+  "Win32_Security",
   "Win32_System_LibraryLoader",
   "Win32_System_Registry",
     "Win32_System_Threading",
+    # `WM_MOUSELEAVE`, which the tray flyout tracks the pointer with. The
+    # message is defined beside the common controls that first raised it, not
+    # beside the `TrackMouseEvent` that asks for it.
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    # `TrackMouseEvent` itself, and the `GetKeyState`/`VK_CONTROL` the Ctrl+W
+    # accelerator reads.
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+] }
+# The desktop wrapper's embedded browser. webview2-com-sys vendors
+# WebView2LoaderStatic.lib and links it statically, so weaver-tray.exe gains no
+# DLL dependency and the packaged file list is unchanged.
+webview2-com = "0.39"
+windows = { version = "0.62", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+] }
+
+# The macOS desktop wrapper. Every objc2 crate gates each class behind its own
+# feature, so these lists are exactly the classes and protocols the wrapper
+# names.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+block2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSBundle",
+    "NSData",
+    "NSDate",
+    "NSDictionary",
+    "NSDistributedNotificationCenter",
+    "NSEnumerator",
+    "NSGeometry",
+    "NSNotification",
+    "NSObjCRuntime",
+    "NSRunLoop",
+    "NSString",
+    "NSThread",
+    "NSTimer",
+    "NSURL",
+    "NSURLRequest",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-core-foundation",
+    "NSAccessibilityProtocols",
+    "NSAlert",
+    "NSAppearance",
+    "NSApplication",
+    "NSBitmapImageRep",
+    "NSButton",
+    "NSCell",
+    "NSColor",
+    "NSControl",
+    "NSEvent",
+    "NSFont",
+    "NSGraphics",
+    "NSImage",
+    "NSImageRep",
+    "NSLayoutAnchor",
+    "NSLayoutConstraint",
+    "NSMenu",
+    "NSMenuItem",
+    "NSOpenPanel",
+    "NSPanel",
+    "NSParagraphStyle",
+    "NSPopover",
+    "NSProgressIndicator",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSSavePanel",
+    "NSScreen",
+    "NSStackView",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSTextField",
+    "NSTrackingArea",
+    "NSUserInterfaceLayout",
+    "NSView",
+    "NSViewController",
+    "NSWindow",
+    "NSWorkspace",
+] }
+objc2-web-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-app-kit",
+    "objc2-core-foundation",
+    "WKFrameInfo",
+    "WKNavigation",
+    "WKNavigationAction",
+    "WKNavigationDelegate",
+    "WKNavigationResponse",
+    "WKOpenPanelParameters",
+    "WKUIDelegate",
+    "WKWebView",
+    "WKWebViewConfiguration",
+    "WKWindowFeatures",
 ] }

@@ -41,6 +41,7 @@ type GeneralSettings = {
   maxDownloadSpeed: number;
   maxRetries: number;
   ipReplacementTrialExtraConnections: number;
+  enableSrrdbLookup: boolean;
   duplicatePolicy: DuplicatePolicy;
 };
 
@@ -95,6 +96,7 @@ export function GeneralSettingsPage() {
   const [cleanup, setCleanup] = useState(true);
   const [maxRetries, setMaxRetries] = useState(3);
   const [ipReplacementBurst, setIpReplacementBurst] = useState(false);
+  const [srrdbLookup, setSrrdbLookup] = useState(false);
   const [duplicatePolicySaveStatus, setDuplicatePolicySaveStatus] = useState<
     "idle" | "saved" | "error"
   >("idle");
@@ -116,6 +118,7 @@ export function GeneralSettingsPage() {
     setCleanup(settings.cleanupAfterExtract ?? true);
     setMaxRetries(settings.maxRetries ?? 3);
     setIpReplacementBurst((settings.ipReplacementTrialExtraConnections ?? 0) > 0);
+    setSrrdbLookup(settings.enableSrrdbLookup ?? false);
   }, [settings]);
 
   useEffect(() => {
@@ -238,6 +241,24 @@ export function GeneralSettingsPage() {
       toast.success(t("settings.saved"), { id: "general-settings-save" });
     } else if (result.error) {
       toast.error(result.error.message ?? "Unable to save settings.", {
+        id: "general-settings-save",
+      });
+    }
+  };
+
+  const updateSrrdbLookup = async (enabled: boolean) => {
+    const previous = srrdbLookup;
+    setSrrdbLookup(enabled);
+    const result = await updateSettings({
+      input: { enableSrrdbLookup: enabled },
+    });
+
+    if (result.data?.updateSettings) {
+      applyUpdatedSettings(result.data.updateSettings);
+      toast.success(t("settings.saved"), { id: "general-settings-save" });
+    } else {
+      setSrrdbLookup(previous);
+      toast.error(result.error?.message ?? "Unable to save settings.", {
         id: "general-settings-save",
       });
     }
@@ -426,6 +447,19 @@ export function GeneralSettingsPage() {
                     checked={ipReplacementBurst}
                     onCheckedChange={(enabled) => void updateIpReplacementBurst(enabled)}
                     aria-label={t("settings.ipReplacementTrialExtraConnections")}
+                    disabled={updateState.fetching}
+                  />
+                </div>
+              </SettingField>
+              <SettingField
+                label="Use SRRDB release lookup"
+                description="For obfuscated archive members, send only their CRC32 checksum to the public SRRDB index to find a release name. Disabled by default."
+              >
+                <div className="flex flex-wrap items-center gap-3">
+                  <Switch
+                    checked={srrdbLookup}
+                    onCheckedChange={(enabled) => void updateSrrdbLookup(enabled)}
+                    aria-label="Use SRRDB release lookup"
                     disabled={updateState.fetching}
                   />
                 </div>

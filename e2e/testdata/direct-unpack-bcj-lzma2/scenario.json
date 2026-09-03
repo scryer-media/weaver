@@ -1,0 +1,10 @@
+{
+  "slug": "direct-unpack-bcj-lzma2",
+  "title": "Silver.Horizon.BCJ.LZMA2.2024.720p.WEB.x264-WEAVER",
+  "description": "Single .7z, BCJ+LZMA2. the x86 branch filter ahead of LZMA2. A single .7z arms from its signature header as a one-part set; this scenario asserts completion and content only.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "silver_horizon.mkv": "779fad2c06e827cf1cd4a6793a655a1504119962c8ebfdc0b35d1eab2d84327a"
+  }
+}

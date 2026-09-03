@@ -1,0 +1,17 @@
+{
+  "slug": "direct-unpack-lzma2-split",
+  "title": "Silver.Horizon.LZMA2.Split.2024.720p.WEB.x264-WEAVER",
+  "description": "Split .7z (3 volumes), LZMA2. LZMA2, the chain most real 7z posts use. Direct unpack can overlap this shape.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "silver_horizon.mkv": "779fad2c06e827cf1cd4a6793a655a1504119962c8ebfdc0b35d1eab2d84327a"
+  },
+  "runtimeAssertions": {
+    "directUnpack": {
+      "requireArmed": true,
+      "requireConsumed": true,
+      "forbidAnyActivity": true
+    }
+  }
+}

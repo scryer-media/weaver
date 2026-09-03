@@ -14,7 +14,7 @@ use tracing::{debug, trace, warn};
 
 use crate::connection::{NntpConnection, ServerConfig};
 use crate::error::{NntpError, Result};
-use crate::health::{HealthConfig, HealthTracker, ServerState};
+use crate::health::{DisableReason, HealthConfig, HealthTracker, ServerState};
 use crate::transfer::{ServerTransferControl, StableServerId};
 
 /// Identifies a specific server in the configuration.
@@ -447,9 +447,10 @@ impl NntpPool {
         &self,
         idx: usize,
         excluded_ips: &[IpAddr],
+        initial_group: Option<&str>,
     ) -> Result<NntpConnection> {
         match self
-            .connect_server_excluding_untracked(idx, excluded_ips)
+            .connect_server_excluding_untracked(idx, excluded_ips, initial_group)
             .await
         {
             Ok(connection) => Ok(connection),
@@ -469,20 +470,36 @@ impl NntpPool {
         &self,
         idx: usize,
         excluded_ips: &[IpAddr],
+        initial_group: Option<&str>,
     ) -> Result<NntpConnection> {
         let mut exclusions = self.retired_ips_for_server(idx).await;
         exclusions.extend(excluded_ips.iter().copied());
         exclusions.sort_unstable();
         exclusions.dedup();
         let offset = self.next_connect_offset(idx);
-        let mut connection =
-            NntpConnection::connect_with_ip_policy(&self.configs[idx], &exclusions, offset).await?;
+        let mut connection = NntpConnection::connect_with_ip_policy_for_group(
+            &self.configs[idx],
+            &exclusions,
+            offset,
+            initial_group,
+        )
+        .await?;
         connection.set_transfer_control(self.transfer_controls[idx].clone());
         Ok(connection)
     }
 
     /// Acquire a connection from a specific server.
     pub async fn acquire(&self, server: ServerId) -> Result<PooledConnection> {
+        self.acquire_for_group(server, None).await
+    }
+
+    /// Acquire a connection; a fresh connection to a pipelining server
+    /// selects `initial_group` inside its session-setup write.
+    pub async fn acquire_for_group(
+        &self,
+        server: ServerId,
+        initial_group: Option<&str>,
+    ) -> Result<PooledConnection> {
         if self.shutdown.is_cancelled() {
             return Err(NntpError::PoolShutdown);
         }
@@ -505,7 +522,15 @@ impl NntpPool {
             return Err(NntpError::PoolExhausted);
         }
 
-        self.acquire_with_permit(idx, Some(permit)).await
+        self.acquire_with_permit(idx, Some(permit), initial_group)
+            .await
+    }
+
+    /// Whether a normal (in-cap) lease could be taken right now without
+    /// waiting on the server's connection semaphore.
+    pub fn has_available_permit(&self, server: ServerId) -> bool {
+        let idx = server.0;
+        idx < self.semaphores.len() && self.semaphores[idx].available_permits() > 0
     }
 
     /// Acquire an explicit over-max connection from a specific server.
@@ -519,6 +544,18 @@ impl NntpPool {
         server: ServerId,
         excluded_ips: &[IpAddr],
     ) -> Result<PooledConnection> {
+        self.acquire_extra_excluding_for_group(server, excluded_ips, None)
+            .await
+    }
+
+    /// Over-max acquire whose fresh connection selects `initial_group` in
+    /// its session-setup write on a pipelining server.
+    pub async fn acquire_extra_excluding_for_group(
+        &self,
+        server: ServerId,
+        excluded_ips: &[IpAddr],
+        initial_group: Option<&str>,
+    ) -> Result<PooledConnection> {
         if self.shutdown.is_cancelled() {
             return Err(NntpError::PoolShutdown);
         }
@@ -531,7 +568,7 @@ impl NntpPool {
             return Err(NntpError::PoolExhausted);
         }
 
-        self.acquire_fresh_with_permit(idx, None, excluded_ips)
+        self.acquire_fresh_with_permit(idx, None, excluded_ips, initial_group)
             .await
     }
 
@@ -540,6 +577,7 @@ impl NntpPool {
         &self,
         idx: usize,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        initial_group: Option<&str>,
     ) -> Result<PooledConnection> {
         // Try to get a healthy idle connection, with stale-check loop.
         let conn = loop {
@@ -556,11 +594,13 @@ impl NntpPool {
                         match c.ping().await {
                             Ok(()) => break c,
                             Err(e) => {
-                                trace!(server = idx, error = %e, "stale ping failed, draining all idle");
-                                // If one connection is dead, all are likely dead
-                                // (network interface change). Drain everything so
-                                // the loop falls through to create a fresh connection.
-                                self.drain_all_idle().await;
+                                trace!(server = idx, error = %e, "stale ping failed, draining this server's idle");
+                                // A dead idle connection usually means its
+                                // siblings on the same server died with it
+                                // (provider-side idle reaping). Other servers
+                                // keep their warm sockets; the loop falls
+                                // through to create a fresh connection here.
+                                self.drain_idle_for(idx).await;
                                 continue;
                             }
                         }
@@ -588,7 +628,7 @@ impl NntpPool {
                     }
 
                     debug!(server = idx, "creating new connection");
-                    match self.connect_server_excluding(idx, &[]).await {
+                    match self.connect_server_excluding(idx, &[], initial_group).await {
                         Ok(c) => {
                             // Clear the failure timestamp on success.
                             let mut last_failure = self.last_connect_failure[idx].lock().await;
@@ -627,6 +667,7 @@ impl NntpPool {
         idx: usize,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
         excluded_ips: &[IpAddr],
+        initial_group: Option<&str>,
     ) -> Result<PooledConnection> {
         {
             let last_failure = self.last_connect_failure[idx].lock().await;
@@ -641,7 +682,10 @@ impl NntpPool {
         }
 
         debug!(server = idx, "creating fresh over-max connection");
-        let conn = match self.connect_server_excluding(idx, excluded_ips).await {
+        let conn = match self
+            .connect_server_excluding(idx, excluded_ips, initial_group)
+            .await
+        {
             Ok(conn) => {
                 let mut last_failure = self.last_connect_failure[idx].lock().await;
                 *last_failure = None;
@@ -692,7 +736,7 @@ impl NntpPool {
                     if !self.adaptive_connections[*idx].admits_normal(active_after_acquire) {
                         continue;
                     }
-                    match self.acquire_with_permit(*idx, Some(permit)).await {
+                    match self.acquire_with_permit(*idx, Some(permit), None).await {
                         Ok(conn) => return Ok(conn),
                         Err(e) => {
                             if matches!(e, NntpError::TooManyConnections) {
@@ -796,6 +840,27 @@ impl NntpPool {
             warn!(
                 count = total,
                 "drained all idle connections (suspected network change)"
+            );
+        }
+    }
+
+    /// Drop the idle connections of one server after one of its sockets
+    /// failed. A single dead socket says nothing about other providers, so
+    /// their warm idle connections are left alone.
+    pub async fn drain_idle_for(&self, idx: usize) {
+        let Some(pool) = self.pools.get(idx) else {
+            return;
+        };
+        let count = {
+            let mut p = pool.lock().await;
+            let count = p.idle.len();
+            p.idle.clear();
+            count
+        };
+        if count > 0 {
+            debug!(
+                server = idx,
+                count, "drained this server's idle connections after a socket failure"
             );
         }
     }
@@ -918,15 +983,17 @@ impl NntpPool {
         let is_excluded = |server_idx: usize| {
             failure_excludes.contains(&server_idx) || retention_excludes.contains(&server_idx)
         };
-        let backfill_unlocked = self
-            .backfill
-            .iter()
-            .enumerate()
-            .filter(|(_, backfill)| !**backfill)
-            .all(|(server_idx, _)| is_excluded(server_idx));
         let now = Instant::now();
         let mut health = self.health.lock().await;
         health.check_reenable_all();
+        // Same ordering-side gate the try-order uses: an auth-disabled fill
+        // server counts as exhausted so the lane-unavailable arm sees
+        // backfill as eligible instead of waiting on a deadline that only the
+        // operator can resolve.
+        let excludes = (0..self.configs.len())
+            .filter(|idx| is_excluded(*idx))
+            .collect::<Vec<_>>();
+        let backfill_unlocked = self.fill_servers_exhausted_or_auth_disabled(&excludes, &health);
         let mut retry_after = None;
         for server_idx in 0..self.configs.len() {
             if is_excluded(server_idx)
@@ -964,6 +1031,47 @@ impl NntpPool {
             .enumerate()
             .filter(|(_, backfill)| !**backfill)
             .all(|(idx, _)| exclude.contains(&idx))
+    }
+
+    /// The ordering-side backfill gate: every fill server is either excluded
+    /// for this request or disabled by health for a reason that will not
+    /// heal on its own (`DisableReason::AuthFailure`).
+    ///
+    /// A fill server with bad credentials re-disables on every probe, so it
+    /// never produces the 430 that would exclude it and otherwise pins an
+    /// article forever: the try-order skips the disabled server, the
+    /// remaining fill servers already 430'd, and backfill stays locked because
+    /// the disabled server is not in `exclude`. Counting an auth-disabled
+    /// server here lets the article spill to backfill instead of requeueing
+    /// against a deadline that only the operator can resolve.
+    ///
+    /// Every other health state deliberately does *not* count. `CoolingDown`
+    /// is a 5–10 s transport or capacity blip, and a `ConsecutiveFailures` /
+    /// `FailureRatio` disable is an outage that heals by itself; in both cases
+    /// waiting is far cheaper than spilling the whole queue onto a paid
+    /// backfill account, which is also how SABnzbd and NZBGet behave. Note
+    /// this is an *ordering* gate only — disabled servers must never enter a
+    /// request's exclude set, or exhaustion booking would declare the segment
+    /// missing before backfill was ever tried.
+    pub fn fill_servers_exhausted_or_auth_disabled(
+        &self,
+        exclude: &[usize],
+        health: &HealthTracker,
+    ) -> bool {
+        self.backfill
+            .iter()
+            .enumerate()
+            .filter(|(_, backfill)| !**backfill)
+            .all(|(idx, _)| {
+                exclude.contains(&idx)
+                    || matches!(
+                        health.server(idx).state(),
+                        ServerState::Disabled {
+                            reason: DisableReason::AuthFailure,
+                            ..
+                        }
+                    )
+            })
     }
 
     /// Access the health tracker for observability.
@@ -1056,7 +1164,7 @@ impl NntpPool {
 
         let connect_result = tokio::select! {
             _ = self.shutdown.cancelled() => Err(NntpError::PoolShutdown),
-            result = self.connect_server_excluding_untracked(idx, &[]) => result,
+            result = self.connect_server_excluding_untracked(idx, &[], None) => result,
         };
         let outcome = match connect_result {
             Ok(connection) if !self.shutdown.is_cancelled() => {
@@ -1828,6 +1936,91 @@ mod tests {
             pool.body_server_availability(&[], &[], 0).await,
             BodyServerAvailability::WaitingUntil(delay) if !delay.is_zero()
         ));
+    }
+
+    /// An auth-disabled fill server must make backfill reachable, or an
+    /// article the other fill servers do not have is pinned out of backfill
+    /// for as long as the bad credentials last. A short cooldown and a
+    /// consecutive-failure outage disable must not: both heal on their own.
+    #[tokio::test]
+    async fn body_availability_unlocks_backfill_only_for_auth_disabled_fill_servers() {
+        let fill_plus_backfill = || {
+            let mut config = test_pool_config(1);
+            config.servers.push(ServerPoolConfig {
+                server: ServerConfig {
+                    host: "backup.example.com".into(),
+                    ..Default::default()
+                },
+                stable_id: StableServerId(2),
+                max_connections: 1,
+                backfill: true,
+                ..ServerPoolConfig::default()
+            });
+            config
+        };
+        let disabled = NntpPool::new(fill_plus_backfill());
+        disabled.health().lock().await.record_failure(0, true);
+        assert_eq!(
+            disabled.body_server_availability(&[], &[], 0).await,
+            BodyServerAvailability::Eligible,
+            "the healthy backfill server must be visible past a disabled fill tier"
+        );
+        assert!(
+            disabled.fill_servers_exhausted_or_auth_disabled(&[], &*disabled.health().lock().await),
+            "the ordering gate itself must agree"
+        );
+        assert!(
+            !disabled.fill_servers_exhausted(&[]),
+            "the exclude-only gate must stay untouched: disabled servers are \
+             never put into a request exclude set"
+        );
+
+        let cooling = NntpPool::new(fill_plus_backfill());
+        cooling
+            .health()
+            .lock()
+            .await
+            .record_cooldown(0, crate::health::CooldownReason::Transport);
+        assert!(
+            matches!(
+                cooling.body_server_availability(&[], &[], 0).await,
+                BodyServerAvailability::WaitingUntil(delay) if !delay.is_zero()
+            ),
+            "a 5-10s cooldown must wait, not spill onto backfill"
+        );
+        assert!(
+            !cooling.fill_servers_exhausted_or_auth_disabled(&[], &*cooling.health().lock().await),
+            "CoolingDown must not open the backfill gate"
+        );
+
+        let outage = NntpPool::new(fill_plus_backfill());
+        {
+            let mut health = outage.health().lock().await;
+            for _ in 0..HealthConfig::default().disable_threshold {
+                health.record_failure(0, false);
+            }
+            assert!(
+                matches!(
+                    health.server(0).state(),
+                    ServerState::Disabled {
+                        reason: DisableReason::ConsecutiveFailures,
+                        ..
+                    }
+                ),
+                "test setup: server 0 must be outage-disabled"
+            );
+        }
+        assert!(
+            matches!(
+                outage.body_server_availability(&[], &[], 0).await,
+                BodyServerAvailability::WaitingUntil(delay) if !delay.is_zero()
+            ),
+            "an outage disable heals on its own and must wait, not spill onto backfill"
+        );
+        assert!(
+            !outage.fill_servers_exhausted_or_auth_disabled(&[], &*outage.health().lock().await),
+            "ConsecutiveFailures must not open the backfill gate"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,18 @@
+{
+  "slug": "direct-store-rar4-encrypted-par2-repair",
+  "title": "Cobalt.Lantern.S01E10.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "RAR4 store-method set with `-p` data encryption and PAR2 recovery, damaged by deleting the tail articles of an interior volume. Parity covers the archive bytes as posted - RAR4 ciphertext - so the repair rewrites ciphertext in place while the set keeps routing direct, and the member must decrypt exactly afterwards.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "cobalt.lantern.s01e10.mkv": "e874abcc638847072b3396d6931c1c0b85f02fef6c68bf0403730fb1e3204e89"
+  },
+  "password": "weaver-e2e-direct-password",
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "deleteSubjectContains": [
+    "archive.part2.rar"
+  ],
+  "deleteSubjectTailArticles": 3
+}

@@ -6916,7 +6916,7 @@ async fn missing_middle_rar_volume_enters_authoritative_par2_repair() {
                 segment_number: 0,
             },
             message_id: MessageId::new("missing-middle-recovery@example.com"),
-            groups: vec!["alt.binaries.test".to_string()],
+            groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
             priority: 1000,
             byte_estimate: 64,
             retry_count: 0,
@@ -8329,7 +8329,7 @@ async fn incomplete_download_with_active_extraction_defers_instead_of_failing() 
                 segment_number: 1,
             },
             message_id: MessageId::new("active-extract-payload-1@example.com"),
-            groups: vec!["alt.binaries.test".to_string()],
+            groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
             priority: 0,
             byte_estimate: 128,
             retry_count: 0,
@@ -8969,7 +8969,7 @@ async fn rar_unlock_dirty_priorities_apply_before_lane_refill() {
             priority: 3,
             is_recovery: false,
             completion_critical: false,
-            groups: vec!["alt.binaries.test".to_string()],
+            groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
             exclude_servers: Vec::new(),
             avoid_server: None,
         },
@@ -9027,7 +9027,7 @@ async fn rar_unlock_retry_requeue_marks_rar_volume_dirty_only() {
             segment_number: 0,
         },
         message_id: MessageId::new("rar-unlock-non-rar-retry@example.com"),
-        groups: vec!["alt.binaries.test".to_string()],
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
         priority: FileRole::Standalone.download_priority(),
         byte_estimate: 1024,
         retry_count: 1,
@@ -9339,6 +9339,58 @@ async fn extracting_rar_restart_with_failed_member_enters_repair_or_relaunches()
         let done = next_extraction_done(&mut pipeline).await;
         pipeline.handle_extraction_done(done).await;
     }
+}
+
+#[tokio::test]
+async fn unacceptable_rar_member_is_rejected_before_extraction() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31203);
+    let mut files = build_multifile_multivolume_rar_set();
+    for (_, bytes) in &mut files {
+        if let Some(offset) = bytes
+            .windows(b"E01.mkv".len())
+            .position(|window| window == b"E01.mkv")
+        {
+            bytes[offset..offset + b"E01.mkv".len()].copy_from_slice(b"E01.exe");
+        }
+    }
+    pipeline
+        .db
+        .save_post_processing_settings(&crate::post_processing::model::PostProcessingSettings {
+            unacceptable_extensions: vec!["exe".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    let spec = rar_job_spec("RAR Header Rejection", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    assert_eq!(pipeline.extract_rar_set(job_id, "show").await.unwrap(), 0);
+    let done = next_extraction_done(&mut pipeline).await;
+    pipeline.handle_extraction_done(done).await;
+    assert!(
+        pipeline
+            .inflight_extractions
+            .get(&job_id)
+            .is_none_or(|sets| !sets.contains("show"))
+    );
+    let status = job_status_for_assert(&pipeline, job_id).unwrap();
+    let JobStatus::Failed { error } = status else {
+        panic!("a confirmed RAR member extension must fail the job");
+    };
+    assert!(error.contains("RAR member 'E01.exe' before extraction"));
+    assert!(
+        !complete_dir
+            .join(crate::jobs::working_dir::sanitize_dirname(
+                "RAR Header Rejection"
+            ))
+            .exists()
+    );
 }
 
 #[tokio::test]

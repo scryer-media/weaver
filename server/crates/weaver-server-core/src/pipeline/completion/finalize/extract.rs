@@ -54,6 +54,336 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
+/// Everything the 7z extraction body needs apart from the archive bytes.
+///
+/// Bundled rather than passed loose because the body is now shared: the
+/// conventional path and the direct-unpack chase differ only in the reader they
+/// hand it, and a struct keeps that the single visible difference.
+pub(in crate::pipeline) struct SevenZipExtractionContext {
+    pub(in crate::pipeline) job_id: JobId,
+    pub(in crate::pipeline) set_name: String,
+    pub(in crate::pipeline) output_dir: PathBuf,
+    pub(in crate::pipeline) root: Arc<ExtractionRoot>,
+    pub(in crate::pipeline) budget: Arc<JobExtractionBudget>,
+    pub(in crate::pipeline) password: sevenz_rust2::Password,
+    pub(in crate::pipeline) event_tx: broadcast::Sender<PipelineEvent>,
+    pub(in crate::pipeline) phase_counters: Arc<PhaseCounters>,
+    pub(in crate::pipeline) decode_memory: SevenZipDecodeMemory,
+}
+
+/// Who accounts for decoder memory while [`extract_7z_stream`] runs.
+///
+/// The two callers want opposite things from the same body. Conventional
+/// extraction has every byte on disk and wants the fastest decode, so it takes
+/// the configured ceiling once and runs the multi-threaded decoder under it. A
+/// direct-unpack chase decodes at download speed and parks — for the tail
+/// before it can list anything, at the frontier between reads, and on a damage
+/// gate for as long as a repair takes — and a park under a whole-ceiling permit
+/// is a park that holds every other chase in the process.
+pub(in crate::pipeline) enum SevenZipDecodeMemory {
+    /// The caller holds one permit for the whole call and the body reserves
+    /// nothing. This is the conventional path, unchanged.
+    HeldByCaller,
+    /// The body reserves per pass, sized from the archive itself.
+    ///
+    /// The metadata pass holds only enough for the declared end header; the
+    /// decode pass holds what the archive's own coder properties say its
+    /// decoders need. The decode runs single-threaded: the multi-threaded
+    /// LZMA2 reader buffers a whole run of dependent chunks before it decodes
+    /// any of them, which for a stream without dictionary resets is the entire
+    /// block — a footprint that cannot be sized from the header and, worse
+    /// for a chase, a decode that would emit nothing until the whole block had
+    /// downloaded.
+    ReservedPerPass {
+        /// `next_header_size` from the signature header — the end header the
+        /// metadata pass buffers whole, and which the decode pass parses again.
+        end_header_bytes: u64,
+    },
+}
+
+/// What a chase holds over the declared end header while it lists the archive.
+///
+/// The end header itself is bounded against the ceiling before the chase is
+/// admitted. An *encoded* header is a packed stream of its own with a
+/// declared unpacked size the signature header does not carry, so this margin
+/// stands in for that decode; it is the same exposure the conventional path
+/// has under its ceiling permit, made explicit rather than removed.
+pub(in crate::pipeline) const CHASE_HEADER_PASS_ALLOWANCE_BYTES: u64 = 16 * 1024 * 1024;
+/// Everything the chase's decode pass holds beyond the decoders and the end
+/// header: the gated reader's buffer, a member's output writer, the CRC
+/// readers around each block.
+pub(in crate::pipeline) const CHASE_DECODE_ALLOWANCE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Bytes a chase reserves while it lists the archive.
+fn chase_header_pass_memory_bytes(end_header_bytes: u64) -> u64 {
+    end_header_bytes.saturating_add(CHASE_HEADER_PASS_ALLOWANCE_BYTES)
+}
+
+/// Bytes a chase reserves for its decode pass, from what the archive declares.
+///
+/// Never more than the ceiling: an archive whose decoders need more than the
+/// operator allows is one the conventional path already decodes under a
+/// ceiling-sized permit, and a chase reserving the same is no worse than the
+/// fallback it would otherwise become. An archive with a coder this cannot
+/// size takes the ceiling too, and says so.
+fn chase_decode_memory_bytes(
+    job_id: JobId,
+    set_name: &str,
+    archive: &sevenz_rust2::Archive,
+    end_header_bytes: u64,
+    ceiling: u64,
+) -> u64 {
+    let decoders =
+        match crate::pipeline::direct_unpack::decode_memory::decoder_memory_bytes(archive) {
+            Ok(bytes) => bytes,
+            Err(unsized_coder) => {
+                tracing::info!(
+                    job_id = job_id.0,
+                    set_name,
+                    coder = %unsized_coder,
+                    reserved_bytes = ceiling,
+                    "direct unpack cannot size this archive's decoders; reserving the whole ceiling"
+                );
+                return ceiling;
+            }
+        };
+    let wanted = decoders
+        .saturating_add(end_header_bytes)
+        .saturating_add(CHASE_DECODE_ALLOWANCE_BYTES);
+    if wanted > ceiling {
+        tracing::info!(
+            job_id = job_id.0,
+            set_name,
+            decoder_bytes = decoders,
+            wanted_bytes = wanted,
+            reserved_bytes = ceiling,
+            "direct unpack decoders need more than the ceiling; reserving the ceiling"
+        );
+        return ceiling;
+    }
+    tracing::debug!(
+        job_id = job_id.0,
+        set_name,
+        decoder_bytes = decoders,
+        reserved_bytes = wanted,
+        "direct unpack sized its decode reservation from the archive"
+    );
+    wanted
+}
+
+/// The chase's decode pass: the same entry walk as the library's helper, on
+/// one thread.
+///
+/// `extract_fn` receives the output directory where the helper would pass a
+/// per-entry destination; the shared extraction body validates every entry
+/// path through the extraction root and never reads that argument.
+fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
+    reader: R,
+    output_dir: &Path,
+    password: sevenz_rust2::Password,
+    mut extract_fn: impl FnMut(
+        &sevenz_rust2::ArchiveEntry,
+        &mut dyn std::io::Read,
+        &PathBuf,
+    ) -> Result<bool, sevenz_rust2::Error>,
+) -> Result<(), sevenz_rust2::Error> {
+    let mut archive_reader = sevenz_rust2::ArchiveReader::new(reader, password)?;
+    archive_reader.set_thread_count(1);
+    if !output_dir.exists() {
+        std::fs::create_dir_all(output_dir)?;
+    }
+    let destination = output_dir.to_path_buf();
+    archive_reader.for_each_entries(|entry, reader| extract_fn(entry, reader, &destination))
+}
+
+/// Decode one 7z set through `open_reader`, writing members under the context's
+/// extraction root.
+///
+/// # Why a factory and not a reader
+///
+/// The archive is opened twice: once to read the entry table and validate every
+/// member's path and size before a single byte is written, and once to extract.
+/// `ArchiveReader::new` consumes its reader, so the second pass needs a fresh
+/// one. `open_reader` therefore produces a new reader per pass, and owns the
+/// wording of its own open failures — which is what keeps the conventional
+/// path's error strings unchanged.
+///
+/// # What a reader may be
+///
+/// Callers may wrap the archive in a [`std::io::BufReader`], and direct unpack
+/// will: a gated reader returns short reads at the download frontier, and
+/// buffering absorbs those. Nothing here may assume unbuffered access or keep
+/// its own idea of the stream position — position is whatever the reader says
+/// it is, and every seek goes through the reader rather than around it.
+pub(in crate::pipeline) fn extract_7z_stream<R, F>(
+    context: &SevenZipExtractionContext,
+    mut open_reader: F,
+) -> Result<FullSetExtractionOutcome, String>
+where
+    R: std::io::Read + std::io::Seek + Send,
+    F: FnMut() -> Result<R, String>,
+{
+    let SevenZipExtractionContext {
+        job_id,
+        set_name,
+        output_dir,
+        root,
+        budget,
+        password,
+        event_tx,
+        phase_counters,
+        decode_memory,
+    } = context;
+    let job_id = *job_id;
+
+    // Metadata pass: every member's path and declared size is checked before
+    // anything is created on disk.
+    //
+    // A chase holds only a header-sized permit through this pass. On a gated
+    // reader the pass parks until the archive's tail arrives, and that park
+    // used to sit under the whole ceiling.
+    let (known_total, decode_reservation) = {
+        let _header_permit = match decode_memory {
+            SevenZipDecodeMemory::HeldByCaller => None,
+            SevenZipDecodeMemory::ReservedPerPass { end_header_bytes } => Some(
+                budget.reserve_memory_wait(chase_header_pass_memory_bytes(*end_header_bytes))?,
+            ),
+        };
+        let reader = BudgetedReader::new(open_reader()?, Arc::clone(budget));
+        let archive_reader = sevenz_rust2::ArchiveReader::new(reader, password.clone())
+            .map_err(|e| format!("failed to read 7z archive: {e}"))?;
+        for entry in &archive_reader.archive().files {
+            budget.check_member_metadata(entry.name(), entry.size())?;
+            root.validate_relative_path(entry.name())
+                .map_err(|error| budget.reject_unsafe_path(error))?;
+        }
+        let known_total = archive_reader
+            .archive()
+            .files
+            .iter()
+            .filter(|entry| !entry.is_directory())
+            .map(|entry| entry.size())
+            .sum::<u64>();
+        // Sized here, while the parsed archive is in hand; reserved below,
+        // once the header permit has been given back.
+        let decode_reservation = match decode_memory {
+            SevenZipDecodeMemory::HeldByCaller => None,
+            SevenZipDecodeMemory::ReservedPerPass { end_header_bytes } => {
+                Some(chase_decode_memory_bytes(
+                    job_id,
+                    set_name,
+                    archive_reader.archive(),
+                    *end_header_bytes,
+                    budget.max_memory_bytes(),
+                ))
+            }
+        };
+        (known_total, decode_reservation)
+    };
+    phase_counters
+        .total_bytes
+        .fetch_add(known_total, Ordering::Relaxed);
+
+    // Held from here to the end of the decode, parks included. A chase parked
+    // mid-block has its dictionary genuinely allocated, so the permit stays;
+    // what makes that harmless is its size — a dictionary, not a ceiling.
+    let _decode_permit = match decode_reservation {
+        Some(bytes) => Some(budget.reserve_memory_wait(bytes)?),
+        None => None,
+    };
+
+    let mut extracted_members = Vec::new();
+    let extracted_members_ref = &mut extracted_members;
+    let event_tx_ref = event_tx;
+    let root_ref = root;
+    let budget_ref = budget;
+
+    let extract_fn = |entry: &sevenz_rust2::ArchiveEntry,
+                      reader: &mut dyn std::io::Read,
+                      _dest: &PathBuf|
+     -> Result<bool, sevenz_rust2::Error> {
+        let safe_path = root_ref
+            .validate_relative_path(entry.name())
+            .map_err(|error| std::io::Error::other(budget_ref.reject_unsafe_path(error)))?;
+        budget_ref
+            .check_member_metadata(entry.name(), entry.size())
+            .map_err(std::io::Error::other)?;
+        if entry.is_directory() {
+            root_ref
+                .create_dir(&safe_path, budget_ref)
+                .map_err(std::io::Error::other)?;
+            return Ok(true);
+        }
+
+        let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberStarted {
+            job_id,
+            set_name: set_name.clone(),
+            member: entry.name().to_string(),
+        });
+
+        let file = root_ref
+            .create_file(&safe_path, budget_ref)
+            .map_err(std::io::Error::other)?;
+        let attempt = Arc::new(PhaseAttemptCounters::new(Arc::clone(phase_counters)));
+        let mut file = CountingWriter::new(file, Arc::clone(&attempt));
+        let bytes_written = match std::io::copy(reader, &mut file) {
+            Ok(bytes) => {
+                attempt.commit();
+                bytes
+            }
+            Err(error) => {
+                attempt.rollback();
+                return Err(error.into());
+            }
+        };
+
+        tracing::info!(
+            job_id = job_id.0,
+            member = entry.name(),
+            bytes_written,
+            total_bytes = entry.size(),
+            "member extracted"
+        );
+        let _ = event_tx_ref.send(PipelineEvent::ExtractionProgress {
+            job_id,
+            member: entry.name().to_string(),
+            bytes_written,
+            total_bytes: entry.size(),
+        });
+        let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberFinished {
+            job_id,
+            set_name: set_name.clone(),
+            member: entry.name().to_string(),
+        });
+
+        extracted_members_ref.push(entry.name().to_string());
+        Ok(true)
+    };
+
+    let reader = BudgetedReader::new(open_reader()?, Arc::clone(budget));
+    match decode_memory {
+        SevenZipDecodeMemory::HeldByCaller => {
+            sevenz_rust2::decompress_with_extract_fn_and_password(
+                reader,
+                output_dir,
+                password.clone(),
+                extract_fn,
+            )
+            .map_err(|e| format!("7z extraction failed: {e}"))?;
+        }
+        SevenZipDecodeMemory::ReservedPerPass { .. } => {
+            decode_7z_streaming(reader, output_dir, password.clone(), extract_fn)
+                .map_err(|e| format!("7z extraction failed: {e}"))?;
+        }
+    }
+
+    Ok(FullSetExtractionOutcome {
+        extracted: extracted_members,
+        failed: Vec::new(),
+        selected_password: None,
+    })
+}
+
 fn validate_zip_entry_path(raw_name: &str) -> Result<PathBuf, String> {
     validate_archive_entry_path(raw_name, "zip")
 }
@@ -748,6 +1078,37 @@ fn extract_split(
 }
 
 impl Pipeline {
+    pub(in crate::pipeline) fn blocked_rar_member(
+        archive: &unrar_rs::RarArchive,
+        policy: &crate::post_processing::model::PostProcessingSettings,
+    ) -> Option<(String, String)> {
+        archive.metadata().members.iter().find_map(|member| {
+            (!member.is_directory)
+                .then(|| policy.unacceptable_extension_match(&member.name))
+                .flatten()
+                .map(|pattern| (member.name.clone(), pattern.to_string()))
+        })
+    }
+
+    pub(crate) async fn unacceptable_extension_policy_snapshot(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<Arc<crate::post_processing::model::PostProcessingSettings>, String> {
+        if let Some(policy) = self.unacceptable_extension_policies.get(&job_id) {
+            return Ok(Arc::clone(policy));
+        }
+        let policy = Arc::new(
+            self.db_blocking(|db| db.post_processing_settings())
+                .await
+                .map_err(|error| {
+                    format!("could not load unacceptable extension policy: {error}")
+                })?,
+        );
+        self.unacceptable_extension_policies
+            .insert(job_id, Arc::clone(&policy));
+        Ok(policy)
+    }
+
     pub(crate) async fn extract_rar_set(
         &mut self,
         job_id: JobId,
@@ -794,7 +1155,12 @@ impl Pipeline {
                 }
                 // Something is reading the set; the task below rules on it, as
                 // it did before this guard existed.
-                ArchiveSetRetirement::Busy => {}
+                //
+                // `NotRar` joins it: this whole retirement path reasons in RAR
+                // terms, and a set it cannot describe must not be torn down by
+                // it. Falling through leaves the decision where it was before
+                // the guard existed, which is the conservative direction.
+                ArchiveSetRetirement::Busy | ArchiveSetRetirement::NotRar => {}
                 ArchiveSetRetirement::StillReferenced => {
                     // A claimed name with no runtime entry of its own is the
                     // shape retirement cannot reach and extraction cannot use:
@@ -873,6 +1239,10 @@ impl Pipeline {
         let event_tx = self.event_tx.clone();
         let output_dir = self.extraction_staging_dir(job_id);
         let budget = self.extraction_budget(job_id, &output_dir)?;
+        let policy = self
+            .unacceptable_extension_policy_snapshot(job_id)
+            .await
+            .map_err(|error| budget.reject_content_policy(error))?;
         let root = Arc::new(ExtractionRoot::open(&output_dir)?);
         let task_permit = budget.task_permit_for_root(root)?;
         let set_name_for_result = set_name_owned.clone();
@@ -913,6 +1283,11 @@ impl Pipeline {
                         budget: Some(Arc::clone(&budget)),
                     },
                 )?;
+                if let Some((member, pattern)) = Self::blocked_rar_member(&selection.archive, &policy) {
+                    return Err(budget.reject_content_policy(format!(
+                        "unacceptable extension '{pattern}' matched RAR member '{member}' before extraction"
+                    )));
+                }
                 let _memory_permit =
                     budget.reserve_memory_wait(selection.decoder_memory_bytes)?;
                 let mut archive = selection.archive;
@@ -1101,39 +1476,52 @@ impl Pipeline {
         spawned
     }
 
+    /// The part files of a 7z set, in archive order.
+    ///
+    /// Ordered by the topology's volume map, which is what makes the
+    /// concatenation of these files the archive stream. Direct unpack needs the
+    /// identical list in the identical order — it reads the same bytes through
+    /// a gated view — so the ordering lives here rather than being rebuilt at
+    /// each call site.
+    pub(in crate::pipeline) fn sevenz_set_part_paths(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Result<Vec<PathBuf>, String> {
+        let state = self
+            .jobs
+            .get(&job_id)
+            .ok_or_else(|| format!("job {job_id:?} not found"))?;
+        let topo = state
+            .assembly
+            .archive_topology_for(set_name)
+            .ok_or_else(|| format!("no topology for set '{set_name}'"))?;
+
+        // Collect files belonging to this set using the topology's volume_map.
+        let set_filenames: std::collections::HashSet<&str> =
+            topo.volume_map.keys().map(|s| s.as_str()).collect();
+        let mut parts: Vec<(u32, PathBuf)> = Vec::new();
+
+        for file_asm in state.assembly.files() {
+            let current_filename = self.current_filename_for_file(job_id, file_asm);
+            if set_filenames.contains(current_filename.as_str()) {
+                let vol = topo.volume_map.get(&current_filename).copied().unwrap_or(0);
+                if let Some(path) = self.resolve_job_input_path(job_id, &current_filename) {
+                    parts.push((vol, path));
+                }
+            }
+        }
+        parts.sort_by_key(|(n, _)| *n);
+        Ok(parts.into_iter().map(|(_, p)| p).collect())
+    }
+
     /// Extract a single 7z archive set. Only collects files belonging to the named set.
     pub(crate) async fn extract_7z_set(
         &mut self,
         job_id: JobId,
         set_name: &str,
     ) -> Result<u32, String> {
-        let file_paths = {
-            let state = self
-                .jobs
-                .get(&job_id)
-                .ok_or_else(|| format!("job {job_id:?} not found"))?;
-            let topo = state
-                .assembly
-                .archive_topology_for(set_name)
-                .ok_or_else(|| format!("no topology for set '{set_name}'"))?;
-
-            // Collect files belonging to this set using the topology's volume_map.
-            let set_filenames: std::collections::HashSet<&str> =
-                topo.volume_map.keys().map(|s| s.as_str()).collect();
-            let mut parts: Vec<(u32, PathBuf)> = Vec::new();
-
-            for file_asm in state.assembly.files() {
-                let current_filename = self.current_filename_for_file(job_id, file_asm);
-                if set_filenames.contains(current_filename.as_str()) {
-                    let vol = topo.volume_map.get(&current_filename).copied().unwrap_or(0);
-                    if let Some(path) = self.resolve_job_input_path(job_id, &current_filename) {
-                        parts.push((vol, path));
-                    }
-                }
-            }
-            parts.sort_by_key(|(n, _)| *n);
-            parts.into_iter().map(|(_, p)| p).collect::<Vec<PathBuf>>()
-        };
+        let file_paths = self.sevenz_set_part_paths(job_id, set_name)?;
         let password = self.primary_archive_password_for_job(job_id);
 
         let output_dir = self.extraction_staging_dir(job_id);
@@ -1147,7 +1535,147 @@ impl Pipeline {
         let set_name_for_channel = set_name.to_string();
         let pp_pool = self.pp_pool.clone();
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
+
+        // Whatever the chase left behind. Taken here, on the orchestrator, but
+        // resolved inside the spawned task below — a chase that is still
+        // running must never be awaited on this loop.
+        let disposition = self.take_direct_unpack_disposition(job_id, set_name);
+        let staging_for_install = output_dir.clone();
+        let phase_counters_for_install = Arc::clone(&phase_counters);
+
         tokio::task::spawn(async move {
+            // Resolve the chase first: if it produced usable members there is
+            // no reason to decode the archive a second time.
+            let chase = match disposition {
+                crate::pipeline::direct_unpack::wiring::ChaseDisposition::Ready(outcome) => {
+                    Some((*outcome).into_installable())
+                }
+                crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(pending) => {
+                    // Every part is complete by now, so this is finishing at
+                    // disk speed rather than at download speed — but "should
+                    // finish quickly" is not a guarantee, and this await used to
+                    // have no deadline. A chase that never exits (one still
+                    // queued behind occupied chase workers, say, which cannot
+                    // even see its own abort) made extraction never return, left
+                    // the job in Extracting forever, and held a global
+                    // extraction slot until the job was cancelled. That is the
+                    // whole shape of the round-9 slow tail.
+                    //
+                    // On the deadline: end the chase's coverage so its worker
+                    // has something to fail on if it is inside the reader, say
+                    // so loudly, and extract conventionally. One warning line
+                    // and a working job, instead of a wedge.
+                    let deadline = tokio::time::sleep(
+                        crate::pipeline::direct_unpack::wiring::pending_chase_deadline(),
+                    );
+                    tokio::pin!(deadline);
+                    let mut handle = pending.handle;
+                    let joined = tokio::select! {
+                        joined = &mut handle => Some(joined),
+                        _ = &mut deadline => None,
+                    };
+                    match joined {
+                        // The deadline won. End the chase's coverage so a worker
+                        // inside the reader has something to fail on, drop its
+                        // staging, and fall through to conventional extraction
+                        // below — which is the whole point: the job finishes.
+                        None => {
+                            tracing::warn!(
+                                job_id = job_id.0,
+                                set_name = %pending.set_name,
+                                waited_s =
+                                    crate::pipeline::direct_unpack::wiring::pending_chase_deadline()
+                                        .as_secs(),
+                                "chase did not finish within the consumption deadline; \
+                                 ending it and extracting conventionally"
+                            );
+                            pending
+                                .coverage
+                                .abort("chase exceeded the consumption deadline");
+                            handle.abort();
+                            let _ = std::fs::remove_dir_all(&pending.staging_dir);
+                            None
+                        }
+                        Some(joined) => match joined {
+                            Ok(Ok(outcome)) => Some((
+                                outcome,
+                                pending.staging_dir,
+                                pending.counters.total_bytes.load(Ordering::Relaxed),
+                                pending.counters.completed_bytes.load(Ordering::Relaxed),
+                            )),
+                            Ok(Err(error)) => {
+                                tracing::debug!(
+                                    job_id = job_id.0,
+                                    error = %error,
+                                    "chase failed at consumption; extracting conventionally"
+                                );
+                                let _ = std::fs::remove_dir_all(&pending.staging_dir);
+                                None
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    job_id = job_id.0,
+                                    error = %error,
+                                    "chase worker panicked; extracting conventionally"
+                                );
+                                let _ = std::fs::remove_dir_all(&pending.staging_dir);
+                                None
+                            }
+                        },
+                    }
+                }
+                crate::pipeline::direct_unpack::wiring::ChaseDisposition::None => None,
+            };
+
+            if let Some((outcome, chase_staging, total_bytes, completed_bytes)) = chase {
+                let install = tokio::task::spawn_blocking(move || {
+                    crate::pipeline::direct_unpack::wiring::install_chased_members(
+                        &chase_staging,
+                        &staging_for_install,
+                    )
+                })
+                .await;
+
+                match install {
+                    Ok(Ok(())) => {
+                        // The decode already happened; the phase never saw it.
+                        // Attribute it once, here, so the Extracting bar
+                        // reports real bytes instead of a zero-byte lie.
+                        phase_counters_for_install
+                            .total_bytes
+                            .fetch_add(total_bytes, Ordering::Relaxed);
+                        phase_counters_for_install
+                            .completed_bytes
+                            .fetch_add(completed_bytes, Ordering::Relaxed);
+                        tracing::info!(
+                            job_id = job_id.0,
+                            set_name = %set_name_for_channel,
+                            members = outcome.extracted.len(),
+                            total_bytes,
+                            "installed direct-unpack members instead of re-extracting"
+                        );
+                        let _ = extract_done_tx
+                            .send(ExtractionDone::FullSet {
+                                job_id,
+                                set_name: set_name_for_channel,
+                                result: Ok(outcome),
+                            })
+                            .await;
+                        return;
+                    }
+                    Ok(Err(error)) => tracing::warn!(
+                        job_id = job_id.0,
+                        error = %error,
+                        "failed to install chased members; extracting conventionally"
+                    ),
+                    Err(error) => tracing::warn!(
+                        job_id = job_id.0,
+                        error = %error,
+                        "install task panicked; extracting conventionally"
+                    ),
+                }
+            }
+
             let result = tokio::task::spawn_blocking(move || {
                 pp_pool.install(move || {
                     let _task_permit = task_permit;
@@ -1166,153 +1694,35 @@ impl Pipeline {
                     } else {
                         sevenz_rust2::Password::empty()
                     };
-                    let known_total = if file_paths.len() == 1 {
-                        let file = std::fs::File::open(&file_paths[0])
-                            .map_err(|e| format!("failed to open 7z file: {e}"))?;
-                        let file = BudgetedReader::new(file, Arc::clone(&budget));
-                        let archive_reader = sevenz_rust2::ArchiveReader::new(file, pw.clone())
-                            .map_err(|e| format!("failed to read 7z archive: {e}"))?;
-                        for entry in &archive_reader.archive().files {
-                            budget.check_member_metadata(entry.name(), entry.size())?;
-                            root.validate_relative_path(entry.name())
-                                .map_err(|error| budget.reject_unsafe_path(error))?;
-                        }
-                        archive_reader
-                            .archive()
-                            .files
-                            .iter()
-                            .filter(|entry| !entry.is_directory())
-                            .map(|entry| entry.size())
-                            .sum::<u64>()
-                    } else {
-                        let reader = crate::pipeline::archive::split_reader::SplitFileReader::open(
-                            &file_paths,
-                        )
-                        .map_err(|e| format!("failed to open 7z split files: {e}"))?;
-                        let reader = BudgetedReader::new(reader, Arc::clone(&budget));
-                        let archive_reader =
-                            sevenz_rust2::ArchiveReader::new(reader, pw.clone())
-                                .map_err(|e| format!("failed to read 7z archive: {e}"))?;
-                        for entry in &archive_reader.archive().files {
-                            budget.check_member_metadata(entry.name(), entry.size())?;
-                            root.validate_relative_path(entry.name())
-                                .map_err(|error| budget.reject_unsafe_path(error))?;
-                        }
-                        archive_reader
-                            .archive()
-                            .files
-                            .iter()
-                            .filter(|entry| !entry.is_directory())
-                            .map(|entry| entry.size())
-                            .sum::<u64>()
-                    };
-                    phase_counters
-                        .total_bytes
-                        .fetch_add(known_total, Ordering::Relaxed);
 
-                    let mut extracted_members = Vec::new();
-                    let extracted_members_ref = &mut extracted_members;
-                    let event_tx_ref = &event_tx;
-                    let root_ref = &root;
-                    let budget_ref = &budget;
-
-                    let extract_fn = |entry: &sevenz_rust2::ArchiveEntry,
-                                      reader: &mut dyn std::io::Read,
-                                      _dest: &PathBuf|
-                     -> Result<bool, sevenz_rust2::Error> {
-                        let safe_path =
-                            root_ref
-                                .validate_relative_path(entry.name())
-                                .map_err(|error| {
-                                    std::io::Error::other(budget_ref.reject_unsafe_path(error))
-                                })?;
-                        budget_ref
-                            .check_member_metadata(entry.name(), entry.size())
-                            .map_err(std::io::Error::other)?;
-                        if entry.is_directory() {
-                            root_ref
-                                .create_dir(&safe_path, budget_ref)
-                                .map_err(std::io::Error::other)?;
-                            return Ok(true);
-                        }
-
-                        let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberStarted {
-                            job_id,
-                            set_name: set_name_owned.clone(),
-                            member: entry.name().to_string(),
-                        });
-
-                        let file = root_ref
-                            .create_file(&safe_path, budget_ref)
-                            .map_err(std::io::Error::other)?;
-                        let attempt =
-                            Arc::new(PhaseAttemptCounters::new(Arc::clone(&phase_counters)));
-                        let mut file = CountingWriter::new(file, Arc::clone(&attempt));
-                        let bytes_written = match std::io::copy(reader, &mut file) {
-                            Ok(bytes) => {
-                                attempt.commit();
-                                bytes
-                            }
-                            Err(error) => {
-                                attempt.rollback();
-                                return Err(error.into());
-                            }
-                        };
-
-                        tracing::info!(
-                            job_id = job_id.0,
-                            member = entry.name(),
-                            bytes_written,
-                            total_bytes = entry.size(),
-                            "member extracted"
-                        );
-                        let _ = event_tx_ref.send(PipelineEvent::ExtractionProgress {
-                            job_id,
-                            member: entry.name().to_string(),
-                            bytes_written,
-                            total_bytes: entry.size(),
-                        });
-                        let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberFinished {
-                            job_id,
-                            set_name: set_name_owned.clone(),
-                            member: entry.name().to_string(),
-                        });
-
-                        extracted_members_ref.push(entry.name().to_string());
-                        Ok(true)
+                    let context = SevenZipExtractionContext {
+                        job_id,
+                        set_name: set_name_owned,
+                        output_dir,
+                        root,
+                        budget,
+                        password: pw,
+                        event_tx,
+                        phase_counters,
+                        decode_memory: SevenZipDecodeMemory::HeldByCaller,
                     };
 
+                    // A one-part set is a plain file; anything more is the
+                    // concatenation of its parts. That is the only difference
+                    // between the two conventional paths.
                     if file_paths.len() == 1 {
-                        let file = std::fs::File::open(&file_paths[0])
-                            .map_err(|e| format!("failed to open 7z file: {e}"))?;
-                        let file = BudgetedReader::new(file, Arc::clone(&budget));
-                        sevenz_rust2::decompress_with_extract_fn_and_password(
-                            file,
-                            &output_dir,
-                            pw,
-                            extract_fn,
-                        )
-                        .map_err(|e| format!("7z extraction failed: {e}"))?;
+                        extract_7z_stream(&context, || {
+                            std::fs::File::open(&file_paths[0])
+                                .map_err(|e| format!("failed to open 7z file: {e}"))
+                        })
                     } else {
-                        let reader = crate::pipeline::archive::split_reader::SplitFileReader::open(
-                            &file_paths,
-                        )
-                        .map_err(|e| format!("failed to open 7z split files: {e}"))?;
-                        let reader = BudgetedReader::new(reader, Arc::clone(&budget));
-                        sevenz_rust2::decompress_with_extract_fn_and_password(
-                            reader,
-                            &output_dir,
-                            pw,
-                            extract_fn,
-                        )
-                        .map_err(|e| format!("7z extraction failed: {e}"))?;
+                        extract_7z_stream(&context, || {
+                            crate::pipeline::archive::split_reader::SplitFileReader::open(
+                                &file_paths,
+                            )
+                            .map_err(|e| format!("failed to open 7z split files: {e}"))
+                        })
                     }
-
-                    Ok(FullSetExtractionOutcome {
-                        extracted: extracted_members,
-                        failed: Vec::new(),
-                        selected_password: None,
-                    })
                 })
             })
             .await;

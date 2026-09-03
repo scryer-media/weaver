@@ -5,7 +5,8 @@ use crate::rss::model::{
     parse_feed_items, unix_now_secs,
 };
 use crate::rss::service::{
-    DueSyncOutcome, RssFeedSyncReport, RssService, RssServiceError, RssSyncReport,
+    DueSyncOutcome, MAX_RSS_FEED_BODY_BYTES, RssFeedSyncReport, RssService, RssServiceError,
+    RssSyncReport, read_response_with_limit,
 };
 use crate::{RssFeedRow, RssRuleAction};
 
@@ -220,10 +221,9 @@ impl RssService {
             .and_then(|value| value.to_str().ok())
             .map(str::to_string)
             .or_else(|| feed.last_modified.clone());
-        let body = response
-            .bytes()
+        let body = read_response_with_limit(response, MAX_RSS_FEED_BODY_BYTES)
             .await
-            .map_err(|e| RssServiceError::Http(e.to_string()))?;
+            .map_err(RssServiceError::Http)?;
         let items = parse_feed_items(&body).map_err(RssServiceError::Parse)?;
 
         let rules = self

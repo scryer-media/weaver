@@ -631,7 +631,7 @@ fn par2_description_padded_file_crc32(
     if checksums.len() < slice_count {
         return None;
     }
-    let combine = par2_rs::checksum::Crc32CombineOp::new(slice_size);
+    let combine = weaver_yenc::Crc32Combine::new(slice_size);
     let mut folded = checksums[0].crc32;
     for checksum in &checksums[1..slice_count] {
         // Every slice's IFSC CRC32 covers exactly `slice_size` bytes in the
@@ -655,9 +655,10 @@ fn pad_measured_file_crc32_to_slice_grid(
     if padding == 0 {
         return measured_crc32;
     }
-    par2_rs::checksum::Crc32CombineOp::new(padding).combine(
+    weaver_yenc::crc32_combine(
         measured_crc32,
         crate::pipeline::integrity::crc32_of_zeros(padding),
+        padding,
     )
 }
 
@@ -2493,6 +2494,11 @@ impl Pipeline {
             let renamed_successfully = match runtime_fs::rename_no_overwrite(old, &new) {
                 Ok(()) => {
                     outcome.renamed += 1;
+                    // The path a chase holds for this part has just gone.
+                    if let Some(name) = old.file_name().and_then(|name| name.to_str()) {
+                        let name = name.to_string();
+                        self.taint_direct_unpack_for_file(job_id, &name);
+                    }
                     if correct_name == requested_correct_name
                         && let Some(descriptions) =
                             descriptions_by_name.get(&requested_correct_name)
@@ -2602,15 +2608,35 @@ impl Pipeline {
         outcome
     }
 
+    /// `verification` is the analysis result that led here, and is the
+    /// file-level half of the direct-unpack vouching evidence. `None` for a
+    /// preview run, which rewrites nothing and so parks nothing.
     async fn run_par2_repairer(
         &mut self,
         job_id: JobId,
         par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
         repair: bool,
+        verification: Option<&par2_rs::VerificationResult>,
     ) -> Result<par2_rs::Par2RepairOutcome, String> {
         let set_id = par2_set.recovery_set_id;
         if repair {
+            // The repairer is about to rewrite damaged sources in place. A
+            // chase that consumed only bytes the recovery set positively found
+            // Intact is safe to leave parked through that — repair cannot
+            // rewrite what it has already read — and resumes afterwards over
+            // the repaired file. Anything else is tainted, exactly as it was
+            // before: par2-rs reports what it rewrote as its own file ids
+            // rather than as weaver filenames, so an unvouched chase gets no
+            // benefit of the doubt.
+            // INVARIANT: every exit from this function below this line must
+            // settle the sets this leaves parked, via
+            // `settle_direct_unpack_after_repair`. A set parked through a
+            // repair is held under a damage cap that only that call lifts, and
+            // a chase left under one waits on a frontier nothing will advance —
+            // silently, until the job is torn down. If you add an early return
+            // below, settle first.
+            self.decide_direct_unpack_before_repair(job_id, verification);
             // What the directory held before the repairer touched it, so the
             // artefacts it leaves behind can be named afterwards by difference
             // rather than by guessing at a backup-suffix convention that lives
@@ -2721,7 +2747,9 @@ impl Pipeline {
                     if repair {
                         self.phase_end(job_id, JobPhase::Repairing);
                     }
-                    return Err(error);
+                    let outcome = Err(error);
+                    self.settle_direct_unpack_after_repair(job_id, repair, &outcome);
+                    return outcome;
                 }
             };
             // Analysis reads the live grid here. Repair uses the local
@@ -2803,7 +2831,9 @@ impl Pipeline {
                             "filesystem PAR2 repair exhausted file descriptors; the bounded retry lacks a complete source map"
                         );
                         self.phase_end(job_id, JobPhase::Repairing);
-                        return Err(error.message);
+                        let outcome = Err(error.message);
+                        self.settle_direct_unpack_after_repair(job_id, repair, &outcome);
+                        return outcome;
                     }
                     warn!(
                         job_id = job_id.0,
@@ -2850,6 +2880,7 @@ impl Pipeline {
             if repair {
                 self.phase_end(job_id, JobPhase::Repairing);
             }
+            self.settle_direct_unpack_after_repair(job_id, repair, &retained_outcome);
             return retained_outcome;
         }
 
@@ -2936,10 +2967,20 @@ impl Pipeline {
                 {
                     set_runtime.scan_carry = scan_carry;
                 }
-                Ok(outcome)
+                let outcome = Ok(outcome);
+                self.settle_direct_unpack_after_repair(job_id, repair, &outcome);
+                outcome
             }
-            Ok(Err(error)) => Err(error),
-            Err(error) => Err(format!("repair task panicked: {error}")),
+            Ok(Err(error)) => {
+                let outcome = Err(error);
+                self.settle_direct_unpack_after_repair(job_id, repair, &outcome);
+                outcome
+            }
+            Err(error) => {
+                let outcome = Err(format!("repair task panicked: {error}"));
+                self.settle_direct_unpack_after_repair(job_id, repair, &outcome);
+                outcome
+            }
         }
     }
 
@@ -2970,7 +3011,7 @@ impl Pipeline {
         info!(job_id = job_id.0, "par2 damaged-path analysis started");
 
         let outcome_result = self
-            .run_par2_repairer(job_id, par2_set, working_dir, false)
+            .run_par2_repairer(job_id, par2_set, working_dir, false, None)
             .await;
 
         self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
@@ -3486,6 +3527,13 @@ impl Pipeline {
         } = reason
         {
             log_clean_par2_verification_source(job_id, set_id, slice_size, verification_mode);
+            // A chase gated on this set's damage evidence has just been
+            // contradicted by a verdict that read the files. Every mode but
+            // the strong-decode claim did read them — and that claim cannot
+            // reach here while a chase is gated, so the guard is documentary.
+            if !matches!(verification_mode, CleanPar2VerificationMode::StrongDecode) {
+                self.release_direct_unpack_after_clean_verification(job_id, set_id);
+            }
         }
         SetGateOutcome::Settled
     }
@@ -6031,6 +6079,14 @@ impl Pipeline {
             let Some(topology) = state.assembly.remove_archive_topology(&file.filename) else {
                 continue;
             };
+            // The parts this set was chasing are about to be deleted from disk.
+            self.direct_unpack_abort_set(
+                job_id,
+                &file.filename,
+                "split topology retired by its recovery data",
+                crate::pipeline::direct_unpack::wiring::AbortLatch::Permanent,
+                crate::pipeline::direct_unpack::wiring::DemotionReason::DownloadEnded,
+            );
             let parts: HashSet<String> = topology.volume_map.keys().cloned().collect();
             info!(
                 job_id = job_id.0,
@@ -6733,6 +6789,15 @@ impl Pipeline {
             return;
         }
 
+        // The strict half of the direct-unpack settle. The lenient half ran when
+        // the download drained, but decode results for the last articles are
+        // processed after that point, so it deliberately left any part the
+        // assembly could not yet describe alone. By here those commits have
+        // landed, so a part still without a length is one that will never have
+        // one — and its chase ends by name instead of parking forever.
+        // Idempotent: later completion checks find nothing left to settle.
+        self.settle_direct_unpack_at_completion(job_id);
+
         self.reapply_promoted_recovery_queue(job_id);
         // Restored jobs retain completed bytes but not the bounded decode
         // prefix cache. Inspect a single header here, never during startup,
@@ -6917,16 +6982,34 @@ impl Pipeline {
         let archive_extraction_applicable = self.extraction_readiness_for_job(job_id)
             != ExtractionReadiness::NotApplicable
             || only_rar_archives;
+        // A direct-unpack chase gated on damage is evidence already in hand:
+        // the recovery data has named a slice of this archive as wrong, and
+        // the chase is parked on that slice waiting for repair. `StrongDecode`
+        // above is a claim about the archive *type* — that a clean extraction
+        // would prove integrity — and a claim cannot stand against evidence.
+        // If it did, the skip below would settle the set as clean, no repair
+        // would ever be summoned, and the chase would wait out its whole
+        // consumption deadline on vouches that were never coming.
+        let direct_unpack_gated_sets = self.direct_unpack_gated_sets(job_id);
+        let authoritative_par2_verification_owed = rar_par2_repair_ready
+            || has_crc_failures
+            || (has_incomplete_data_files && download_pipeline_exhausted)
+            || rar_waiting_for_missing_volumes
+            || matches!(current_status, JobStatus::Repairing)
+            || matches!(
+                clean_par2_integrity_gate,
+                CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None
+            );
         let authoritative_par2_verification_needed = par2_validation_needed
-            && (rar_par2_repair_ready
-                || has_crc_failures
-                || (has_incomplete_data_files && download_pipeline_exhausted)
-                || rar_waiting_for_missing_volumes
-                || matches!(current_status, JobStatus::Repairing)
-                || matches!(
-                    clean_par2_integrity_gate,
-                    CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None
-                ));
+            && (authoritative_par2_verification_owed || !direct_unpack_gated_sets.is_empty());
+        if authoritative_par2_verification_needed && !authoritative_par2_verification_owed {
+            info!(
+                job_id = job_id.0,
+                gated_sets = ?direct_unpack_gated_sets,
+                "a gated direct unpack chase forces the authoritative PAR2 pass — recovery data \
+                 reported damage, so the clean strong-decode verdict cannot stand"
+            );
+        }
         // Shared by every fast path that skips the authoritative pass, so the
         // live short-circuit can never fire where the quick path would be
         // refused.
@@ -7930,7 +8013,13 @@ impl Pipeline {
                     }
 
                     match self
-                        .run_par2_repairer(job_id, Arc::clone(&par2_set), working_dir.clone(), true)
+                        .run_par2_repairer(
+                            job_id,
+                            Arc::clone(&par2_set),
+                            working_dir.clone(),
+                            true,
+                            Some(verification),
+                        )
                         .await
                     {
                         Ok(outcome) => {
@@ -8368,6 +8457,7 @@ impl Pipeline {
                             Arc::clone(&par2_set),
                             working_dir.clone(),
                             false,
+                            None,
                         )
                         .await
                     {
@@ -8475,7 +8565,13 @@ impl Pipeline {
                     }
 
                     match self
-                        .run_par2_repairer(job_id, Arc::clone(&par2_set), working_dir.clone(), true)
+                        .run_par2_repairer(
+                            job_id,
+                            Arc::clone(&par2_set),
+                            working_dir.clone(),
+                            true,
+                            Some(&verification),
+                        )
                         .await
                     {
                         Ok(outcome) => {

@@ -18,7 +18,7 @@ use crate::response::{is_multiline_status, parse_response};
 use crate::tls::{NntpTransport, TransportReadStats};
 use crate::transfer::{
     ActiveTransferBudget, BodyTransferAccounting, QuotaRejection, ServerTransferControl,
-    active_transfer_read_timeout, active_transfer_timeout,
+    active_transfer_read_timeout_at, active_transfer_timeout,
 };
 use crate::types::{ArticleId, Capabilities, MultiLineResponse, Response};
 
@@ -30,9 +30,13 @@ pub struct BodyStreamStats {
     pub throttle_wait: Duration,
 }
 
-fn ensure_active_transfer_budget(budget: Option<&ActiveTransferBudget>) -> Result<()> {
+/// The budget check against a clock reading the read turn already took.
+fn ensure_active_transfer_budget_at(
+    budget: Option<&ActiveTransferBudget>,
+    now: Instant,
+) -> Result<()> {
     if let Some(budget) = budget
-        && budget.remaining().is_zero()
+        && budget.remaining_at(now).is_zero()
     {
         return Err(active_transfer_timeout(budget));
     }
@@ -273,6 +277,8 @@ pub struct ServerConfig {
     pub tls_name_mismatch_certificate_der: Option<Vec<u8>>,
     /// Source of the PIPELINING capability for this connection.
     pub pipelining: PipeliningCapability,
+    /// Which AEAD family the TLS ClientHello offers first.
+    pub tls_cipher_preference: crate::tls::TlsCipherPreference,
 }
 
 impl Default for ServerConfig {
@@ -290,6 +296,7 @@ impl Default for ServerConfig {
             tls_ca_cert: None,
             tls_name_mismatch_certificate_der: None,
             pipelining: PipeliningCapability::Probe,
+            tls_cipher_preference: crate::tls::TlsCipherPreference::Auto,
         }
     }
 }
@@ -322,6 +329,8 @@ pub struct NntpConnection {
     tls_ca_cert: Option<std::path::PathBuf>,
     /// Optional adopted leaf certificate, kept for STARTTLS upgrades.
     tls_name_mismatch_certificate_der: Option<Vec<u8>>,
+    /// Cipher family order, kept for STARTTLS upgrades.
+    tls_cipher_preference: crate::tls::TlsCipherPreference,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
     /// Immutable geometry the next decoded article's CRC pass checkpoints at.
@@ -341,17 +350,22 @@ impl NntpConnection {
 
     /// Connect to an NNTP server, perform TLS negotiation and authentication.
     pub async fn connect(config: &ServerConfig) -> Result<Self> {
-        Self::connect_with_ip_policy(config, &[], 0).await
+        Self::connect_with_ip_policy_for_group(config, &[], 0, None).await
     }
 
-    pub(crate) async fn connect_with_ip_policy(
+    /// Connect and, on servers known to pipeline, select `initial_group` in
+    /// the same write as the session setup so a BODY lane starts with no
+    /// extra round trip. An unselectable group is not an error here: the
+    /// lane walks its candidate list afterwards.
+    pub(crate) async fn connect_with_ip_policy_for_group(
         config: &ServerConfig,
         excluded_ips: &[IpAddr],
         address_offset: usize,
+        initial_group: Option<&str>,
     ) -> Result<Self> {
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT);
         let result = tokio::time::timeout(connect_timeout, async {
-            Self::connect_inner(config, excluded_ips, address_offset).await
+            Self::connect_inner(config, excluded_ips, address_offset, initial_group).await
         })
         .await;
 
@@ -365,6 +379,7 @@ impl NntpConnection {
         config: &ServerConfig,
         excluded_ips: &[IpAddr],
         address_offset: usize,
+        initial_group: Option<&str>,
     ) -> Result<Self> {
         debug!(host = %config.host, port = config.port, tls = config.tls, "connecting to NNTP server");
 
@@ -375,6 +390,7 @@ impl NntpConnection {
                 config.port,
                 config.tls_ca_cert.as_deref(),
                 config.tls_name_mismatch_certificate_der.as_deref(),
+                config.tls_cipher_preference,
                 excluded_ips,
                 address_offset,
             )
@@ -412,6 +428,7 @@ impl NntpConnection {
             credentials: None,
             tls_ca_cert: config.tls_ca_cert.clone(),
             tls_name_mismatch_certificate_der: config.tls_name_mismatch_certificate_der.clone(),
+            tls_cipher_preference: config.tls_cipher_preference,
             transfer_control: None,
             body_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
@@ -433,18 +450,26 @@ impl NntpConnection {
             conn.do_starttls().await?;
         }
 
-        // 4. MODE READER is safe to issue even when unsupported, and avoids a
-        // capability round trip on every pooled runtime connection.
-        debug!("sending MODE READER");
-        let resp = conn.send_command(&Command::ModeReader).await?;
-        if resp.code.is_error() && resp.code.raw() != 500 {
-            warn!(code = resp.code.raw(), "MODE READER failed");
-        }
+        // 4-5. Session setup. A server known to pipeline authenticates
+        // serially (AUTHINFO must not be pipelined, RFC 4643) and then takes
+        // MODE READER and the lane's first GROUP in one write, answered in
+        // order. A server of unknown or negative capability keeps the serial
+        // exchange throughout.
+        if matches!(config.pipelining, PipeliningCapability::Known(true)) {
+            conn.pipelined_session_setup(config, initial_group).await?;
+        } else {
+            // MODE READER is safe to issue even when unsupported, and avoids
+            // a capability round trip on every pooled runtime connection.
+            debug!("sending MODE READER");
+            let resp = conn.send_command(&Command::ModeReader).await?;
+            if resp.code.is_error() && resp.code.raw() != 500 {
+                warn!(code = resp.code.raw(), "MODE READER failed");
+            }
 
-        // 5. Authenticate if credentials provided
-        if let (Some(user), Some(pass)) = (&config.username, &config.password) {
-            conn.authenticate(user, pass).await?;
-            conn.credentials = Some((user.clone(), pass.clone()));
+            if let (Some(user), Some(pass)) = (&config.username, &config.password) {
+                conn.authenticate(user, pass).await?;
+                conn.credentials = Some((user.clone(), pass.clone()));
+            }
         }
 
         // 6. Validation uses exactly one post-auth capability exchange.
@@ -472,6 +497,7 @@ impl NntpConnection {
             &self.host,
             self.tls_ca_cert.as_deref(),
             self.tls_name_mismatch_certificate_der.as_deref(),
+            self.tls_cipher_preference,
         )
         .await
         {
@@ -500,6 +526,51 @@ impl NntpConnection {
             trace!(caps = ?self.capabilities, "parsed capabilities");
         } else {
             debug!(code = resp.code.raw(), "CAPABILITIES not supported");
+        }
+        Ok(())
+    }
+
+    /// Session setup for a server known to pipeline. AUTHINFO goes first and
+    /// on its own: RFC 4643 forbids pipelining it, and a provider that
+    /// enforces that answers the whole batch with 480s or drops the
+    /// connection. MODE READER and the lane's first GROUP then leave in one
+    /// flush and are answered in order (RFC 4644).
+    async fn pipelined_session_setup(
+        &mut self,
+        config: &ServerConfig,
+        initial_group: Option<&str>,
+    ) -> Result<()> {
+        if let (Some(user), Some(pass)) = (&config.username, &config.password) {
+            self.authenticate(user, pass).await?;
+            self.credentials = Some((user.clone(), pass.clone()));
+        }
+
+        debug!(
+            group = initial_group.is_some(),
+            "sending pipelined MODE READER and GROUP"
+        );
+        self.write_command_frame(&Command::ModeReader).await?;
+        if let Some(group) = initial_group {
+            self.write_command_frame(&Command::Group(group.to_string()))
+                .await?;
+        }
+        self.flush_commands().await?;
+
+        let mode_reader = self.read_response().await?;
+        if mode_reader.code.is_error() && mode_reader.code.raw() != 500 {
+            warn!(code = mode_reader.code.raw(), "MODE READER failed");
+        }
+
+        if let Some(group) = initial_group {
+            let group_resp = self.read_response().await?;
+            if group_resp.code.is_error() {
+                debug!(
+                    code = group_resp.code.raw(),
+                    group, "pipelined GROUP not selected"
+                );
+            } else {
+                self.current_group = Some(group.to_string());
+            }
         }
         Ok(())
     }
@@ -1161,19 +1232,27 @@ impl NntpConnection {
                 };
                 let payload_bytes = self.codec.last_multiline_payload_bytes();
                 add_cpu_delta(&mut stats.raw_decode_cpu, cpu_started);
+                // One clock read per turn: the budget check and the read
+                // timeout derived below both key off it; only an actual
+                // throttle wait refreshes it.
+                let mut now = Instant::now();
                 match decoded? {
                     Some(StreamChunk::Data(data)) => {
                         stats.bytes += data.len() as u64;
-                        if let Err(error) = ensure_active_transfer_budget(budget.as_deref()) {
+                        if let Err(error) = ensure_active_transfer_budget_at(budget.as_deref(), now)
+                        {
                             self.charge_active_body_without_wait(payload_bytes);
                             return Err(error);
                         }
                         let waited = self.charge_active_body(payload_bytes).await;
-                        stats.throttle_wait = stats.throttle_wait.saturating_add(waited);
-                        if let Some(budget) = budget.as_deref_mut() {
-                            budget.exclude_wait(waited);
+                        if !waited.is_zero() {
+                            stats.throttle_wait = stats.throttle_wait.saturating_add(waited);
+                            if let Some(budget) = budget.as_deref_mut() {
+                                budget.exclude_wait(waited);
+                            }
+                            now = Instant::now();
+                            ensure_active_transfer_budget_at(budget.as_deref(), now)?;
                         }
-                        ensure_active_transfer_budget(budget.as_deref())?;
                         if let Err(err) = on_chunk(&data) {
                             self.poisoned = true;
                             self.current_group = None;
@@ -1183,14 +1262,14 @@ impl NntpConnection {
                         continue;
                     }
                     Some(StreamChunk::End) => {
-                        ensure_active_transfer_budget(budget.as_deref())?;
+                        ensure_active_transfer_budget_at(budget.as_deref(), now)?;
                         return Ok::<BodyStreamStats, NntpError>(stats);
                     }
                     None => {}
                 }
 
                 let (read_timeout, active_timeout) =
-                    active_transfer_read_timeout(timeout, budget.as_deref())?;
+                    active_transfer_read_timeout_at(now, timeout, budget.as_deref())?;
                 if profile_cpu {
                     let (read_result, read_cpu) = tokio::time::timeout(
                         read_timeout,
@@ -1397,16 +1476,23 @@ impl NntpConnection {
                 let payload_delta = decoder
                     .body_payload_bytes_consumed()
                     .saturating_sub(payload_before);
-                if let Err(error) = ensure_active_transfer_budget(budget.as_deref()) {
+                // One clock read per turn: the budget check and the read
+                // timeout derived below both key off it; only an actual
+                // throttle wait refreshes it.
+                let mut now = Instant::now();
+                if let Err(error) = ensure_active_transfer_budget_at(budget.as_deref(), now) {
                     self.charge_active_body_without_wait(payload_delta as usize);
                     return Err(error.into());
                 }
                 let waited = self.charge_active_body(payload_delta as usize).await;
-                throttle_wait = throttle_wait.saturating_add(waited);
-                if let Some(budget) = budget.as_deref_mut() {
-                    budget.exclude_wait(waited);
+                if !waited.is_zero() {
+                    throttle_wait = throttle_wait.saturating_add(waited);
+                    if let Some(budget) = budget.as_deref_mut() {
+                        budget.exclude_wait(waited);
+                    }
+                    now = Instant::now();
+                    ensure_active_transfer_budget_at(budget.as_deref(), now)?;
                 }
-                ensure_active_transfer_budget(budget.as_deref())?;
                 match decoded? {
                     Some(mut article) => {
                         let chunks = std::mem::take(&mut article.chunks);
@@ -1449,7 +1535,7 @@ impl NntpConnection {
                 }
 
                 let (read_timeout, active_timeout) =
-                    active_transfer_read_timeout(timeout, budget.as_deref())?;
+                    active_transfer_read_timeout_at(now, timeout, budget.as_deref())?;
                 if profile_cpu {
                     let (read_result, read_cpu) = tokio::time::timeout(
                         read_timeout,
@@ -1676,6 +1762,13 @@ impl NntpConnection {
         &self.capabilities
     }
 
+    /// IANA name of the negotiated TLS cipher suite, if the transport is TLS.
+    pub fn negotiated_cipher_suite(&self) -> Option<String> {
+        self.transport
+            .as_ref()
+            .and_then(NntpTransport::negotiated_cipher_suite)
+    }
+
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
     }
@@ -1857,6 +1950,7 @@ mod tests {
             credentials: None,
             tls_ca_cert: None,
             tls_name_mismatch_certificate_der: None,
+            tls_cipher_preference: crate::tls::TlsCipherPreference::Auto,
             transfer_control: None,
             body_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
@@ -2474,6 +2568,159 @@ mod tests {
             command_timeout: Duration::from_millis(100),
             ..Default::default()
         }
+    }
+
+    /// A server that answers each AUTHINFO line as it arrives, then answers
+    /// nothing until every pipelined line has arrived — so a client that
+    /// pipelined AUTHINFO, or serialized MODE READER and GROUP, fails here.
+    async fn spawn_pipelined_setup_server(
+        auth: Vec<(&'static str, &'static [u8])>,
+        expected: Vec<&'static str>,
+        responses: &'static [u8],
+    ) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"200 ready\r\n").await.unwrap();
+            socket.flush().await.unwrap();
+            for (prefix, response) in auth {
+                let line = crate::test_support::read_command_line(&mut socket).await;
+                assert!(
+                    line.starts_with(prefix),
+                    "expected {prefix:?} but received {line:?}"
+                );
+                socket.write_all(response).await.unwrap();
+                socket.flush().await.unwrap();
+            }
+            let mut lines = Vec::new();
+            let wait = tokio::time::timeout(Duration::from_secs(2), async {
+                while lines.len() < expected.len() {
+                    lines.push(crate::test_support::read_command_line(&mut socket).await);
+                }
+            })
+            .await;
+            assert!(
+                wait.is_ok(),
+                "client did not pipeline MODE READER and GROUP; received {lines:?}"
+            );
+            for (line, prefix) in lines.iter().zip(&expected) {
+                assert!(
+                    line.starts_with(prefix),
+                    "expected {prefix:?} but received {line:?}"
+                );
+            }
+            socket.write_all(responses).await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        port
+    }
+
+    fn pipelined_setup_config(port: u16) -> ServerConfig {
+        ServerConfig {
+            username: Some("user".into()),
+            password: Some("pass".into()),
+            pipelining: PipeliningCapability::Known(true),
+            command_timeout: Duration::from_secs(1),
+            ..scripted_plain_config(port)
+        }
+    }
+
+    #[tokio::test]
+    async fn known_pipelining_servers_authenticate_then_get_mode_reader_and_group_in_one_write() {
+        let port = spawn_pipelined_setup_server(
+            vec![
+                ("AUTHINFO USER user", b"381 password\r\n"),
+                ("AUTHINFO PASS pass", b"281 welcome\r\n"),
+            ],
+            vec!["MODE READER", "GROUP alt.test"],
+            b"200 reader\r\n211 1 1 1 alt.test\r\n",
+        )
+        .await;
+
+        let conn = NntpConnection::connect_with_ip_policy_for_group(
+            &pipelined_setup_config(port),
+            &[],
+            0,
+            Some("alt.test"),
+        )
+        .await
+        .unwrap();
+
+        assert!(conn.is_healthy());
+        assert_eq!(conn.current_group(), Some("alt.test"));
+    }
+
+    #[tokio::test]
+    async fn pipelined_setup_skips_the_password_after_281_on_user() {
+        // The next line the server reads after 281 must be MODE READER, not
+        // a surplus AUTHINFO PASS.
+        let port = spawn_pipelined_setup_server(
+            vec![("AUTHINFO USER user", b"281 welcome\r\n")],
+            vec!["MODE READER", "GROUP alt.test"],
+            b"200 reader\r\n211 1 1 1 alt.test\r\n",
+        )
+        .await;
+
+        let conn = NntpConnection::connect_with_ip_policy_for_group(
+            &pipelined_setup_config(port),
+            &[],
+            0,
+            Some("alt.test"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(conn.current_group(), Some("alt.test"));
+    }
+
+    #[tokio::test]
+    async fn pipelined_setup_maps_a_rejected_password() {
+        let port = spawn_pipelined_setup_server(
+            vec![
+                ("AUTHINFO USER user", b"381 password\r\n"),
+                ("AUTHINFO PASS pass", b"481 bad password\r\n"),
+            ],
+            vec![],
+            b"",
+        )
+        .await;
+
+        let result = NntpConnection::connect(&pipelined_setup_config(port)).await;
+
+        let Err(error) = result else {
+            panic!("expected a rejected password");
+        };
+        assert!(
+            matches!(error, NntpError::AuthenticationFailed),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipelined_setup_leaves_a_missing_group_unselected() {
+        let port = spawn_pipelined_setup_server(
+            vec![
+                ("AUTHINFO USER user", b"381 password\r\n"),
+                ("AUTHINFO PASS pass", b"281 welcome\r\n"),
+            ],
+            vec!["MODE READER", "GROUP alt.gone"],
+            b"200 reader\r\n411 no such group\r\n",
+        )
+        .await;
+
+        let conn = NntpConnection::connect_with_ip_policy_for_group(
+            &pipelined_setup_config(port),
+            &[],
+            0,
+            Some("alt.gone"),
+        )
+        .await
+        .unwrap();
+
+        assert!(conn.is_healthy());
+        assert_eq!(conn.current_group(), None);
     }
 
     fn leaked_response(bytes: Vec<u8>) -> &'static [u8] {

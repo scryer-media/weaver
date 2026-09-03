@@ -15,20 +15,165 @@
 
 use super::*;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+
+use tokio::io::AsyncReadExt;
 
 /// Ceiling on the decoded size of a file this module will read as a checksum
 /// listing. A real `.sfv` is a few kilobytes; anything past this is a
 /// misclassified payload file and reading it would cost more than the
 /// verification is worth.
 const MAX_SFV_BYTES: u64 = 1024 * 1024;
+/// Per-job ceiling for obfuscated files that can be sampled as possible SFV
+/// listings. Named `.sfv` files bypass this discovery arm.
+const MAX_OBFUSCATED_SFV_PROBES: usize = 1024;
+/// A release can split its checksums across several listings, but more than a
+/// handful is not useful evidence and makes completion work unbounded.
+const MAX_SFV_LISTINGS_PER_JOB: usize = 16;
+/// Aggregate listing bytes accepted for one job. This remains independent of
+/// the per-listing ceiling so future changes cannot accidentally unbound the
+/// total work.
+const MAX_SFV_LISTING_BYTES_PER_JOB: u64 = 16 * 1024 * 1024;
+
+/// SABnzbd's bounded probe length for identifying an obfuscated SFV file.
+const SFV_PROBE_BYTES: u64 = 10_000;
+
+/// SABnzbd stops inspecting after this many valid entries: that is enough
+/// evidence that the sampled text is an SFV listing, without making malformed
+/// content later in a long sample relevant to the decision.
+const SFV_PROBE_CONFIDENCE_ENTRIES: usize = 10;
 
 /// Read buffer for the disk arm. Matches the completed-file re-read in the
 /// decode worker, which streams the same shape of file for the same reason.
 const SFV_READ_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Result of reading an SFV listing with its hard content ceiling.
+enum SfvListingRead {
+    Contents(Vec<u8>),
+    Oversized,
+}
+
+#[derive(Debug, Default)]
+struct SfvScanBudget {
+    probes: usize,
+    listings: usize,
+    listing_bytes: u64,
+    probes_exhausted: bool,
+    listings_exhausted: bool,
+    listing_bytes_exhausted: bool,
+}
+
+impl SfvScanBudget {
+    fn take_probe(&mut self) -> bool {
+        if self.probes == MAX_OBFUSCATED_SFV_PROBES {
+            self.probes_exhausted = true;
+            return false;
+        }
+        self.probes += 1;
+        true
+    }
+
+    fn take_listing(&mut self) -> bool {
+        if self.listings == MAX_SFV_LISTINGS_PER_JOB {
+            self.listings_exhausted = true;
+            return false;
+        }
+        self.listings += 1;
+        true
+    }
+
+    fn listing_read_limit(&self) -> Option<u64> {
+        let remaining = MAX_SFV_LISTING_BYTES_PER_JOB.saturating_sub(self.listing_bytes);
+        (remaining != 0).then_some(remaining.min(MAX_SFV_BYTES))
+    }
+
+    fn record_listing_bytes(&mut self, bytes: u64) -> bool {
+        let remaining = MAX_SFV_LISTING_BYTES_PER_JOB.saturating_sub(self.listing_bytes);
+        if bytes > remaining {
+            self.listing_bytes_exhausted = true;
+            return false;
+        }
+        self.listing_bytes = self.listing_bytes.saturating_add(bytes);
+        true
+    }
+
+    fn exhausted(&self) -> bool {
+        self.probes_exhausted || self.listings_exhausted || self.listing_bytes_exhausted
+    }
+}
+
+/// Read just enough of an arbitrary completed file to conservatively identify
+/// an obfuscated SFV listing. The `take` limit, rather than metadata, is the
+/// authoritative bound.
+async fn read_sfv_probe(path: &Path) -> std::io::Result<Vec<u8>> {
+    let file = tokio::fs::File::open(path).await?;
+    let mut reader = file.take(SFV_PROBE_BYTES);
+    let mut contents = Vec::new();
+    reader.read_to_end(&mut contents).await?;
+    Ok(contents)
+}
+
+/// Read a selected listing without ever consuming more than one byte past the
+/// accepted maximum. That extra byte distinguishes an exact-limit listing from
+/// an oversized candidate without trusting the assembly's byte accounting.
+async fn read_sfv_listing(path: &Path, max_bytes: u64) -> std::io::Result<SfvListingRead> {
+    let file = tokio::fs::File::open(path).await?;
+    let mut reader = file.take(max_bytes.saturating_add(1));
+    let mut contents = Vec::new();
+    reader.read_to_end(&mut contents).await?;
+    if contents.len() as u64 > max_bytes {
+        Ok(SfvListingRead::Oversized)
+    } else {
+        Ok(SfvListingRead::Contents(contents))
+    }
+}
+
+/// The byte allowlist SABnzbd applies before trying to interpret a probe as
+/// text: selected ASCII controls plus printable and extended text bytes, but
+/// never DEL or binary controls.
+fn is_sab_text_byte(byte: u8) -> bool {
+    matches!(byte, 7 | 8 | 9 | 10 | 12 | 13 | 27) || (byte >= b' ' && byte != 0x7f)
+}
+
+/// SABnzbd's deliberately conservative SFV signature. This is only a
+/// discovery check; selected candidates are still parsed by `SfvCatalog`.
+fn looks_like_sfv_probe(bytes: &[u8]) -> bool {
+    if bytes.iter().any(|byte| !is_sab_text_byte(*byte)) {
+        return false;
+    }
+    let Ok(contents) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+
+    let mut valid_entries = 0usize;
+    for raw_line in contents.split('\n') {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with(';') {
+            continue;
+        }
+        // `is_sfv_file` in SABnzbd requires literal spaces before an exactly
+        // eight-digit hexadecimal CRC32; tabs and abbreviated CRCs do not
+        // identify an otherwise obfuscated file as a listing.
+        let Some((name, checksum)) = line.rsplit_once(' ') else {
+            return false;
+        };
+        if name.trim().is_empty()
+            || checksum.len() != 8
+            || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return false;
+        }
+        valid_entries += 1;
+        if valid_entries == SFV_PROBE_CONFIDENCE_ENTRIES {
+            return true;
+        }
+    }
+
+    valid_entries > 0
+}
 
 /// The union of one job's `.sfv` listings, keyed by lower-cased basename.
 ///
@@ -49,11 +194,29 @@ pub(super) struct SfvCatalog {
     /// `name checksum` pair. Counted rather than rejected: a stray line in a
     /// listing says nothing about the files the rest of it names.
     unparsable_lines: usize,
+    /// Well-formed entries whose basenames are not present in this job. They
+    /// are evidence about another release, so count them without retaining
+    /// their keys in the catalog.
+    unrelated_entries: usize,
 }
 
 impl SfvCatalog {
+    #[cfg(test)]
     pub(super) fn parse(contents: &str) -> Self {
         let mut catalog = Self::default();
+        catalog.extend_with_filter(contents, |_| true);
+        catalog
+    }
+
+    fn extend_for_completed_files(
+        &mut self,
+        contents: &str,
+        completed_basenames: &HashSet<String>,
+    ) {
+        self.extend_with_filter(contents, |basename| completed_basenames.contains(basename));
+    }
+
+    fn extend_with_filter(&mut self, contents: &str, mut retain_entry: impl FnMut(&str) -> bool) {
         // A listing written on Windows commonly carries a UTF-8 BOM, which
         // would otherwise become part of the first entry's name.
         let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
@@ -69,7 +232,7 @@ impl SfvCatalog {
                 continue;
             }
             let Some((name, checksum)) = line.rsplit_once(char::is_whitespace) else {
-                catalog.unparsable_lines += 1;
+                self.unparsable_lines = self.unparsable_lines.saturating_add(1);
                 continue;
             };
             let name = name.trim_end();
@@ -82,32 +245,31 @@ impl SfvCatalog {
                 || checksum.len() > 8
                 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
             {
-                catalog.unparsable_lines += 1;
+                self.unparsable_lines = self.unparsable_lines.saturating_add(1);
                 continue;
             }
             let Ok(crc32) = u32::from_str_radix(checksum, 16) else {
-                catalog.unparsable_lines += 1;
+                self.unparsable_lines = self.unparsable_lines.saturating_add(1);
                 continue;
             };
             let basename = sfv_basename(name);
             if basename.is_empty() {
-                catalog.unparsable_lines += 1;
+                self.unparsable_lines += 1;
                 continue;
             }
-            insert_entry(
-                &mut catalog.entries,
-                &mut catalog.conflicting,
-                basename,
-                crc32,
-            );
+            if !retain_entry(&basename) {
+                self.unrelated_entries = self.unrelated_entries.saturating_add(1);
+                continue;
+            }
+            insert_entry(&mut self.entries, &mut self.conflicting, basename, crc32);
         }
-        catalog
     }
 
     /// Fold another listing in. A job may post several `.sfv` files covering
     /// different parts of the release; disagreement *between* listings is the
     /// same contradiction as disagreement inside one and is withdrawn the same
     /// way.
+    #[cfg(test)]
     pub(super) fn merge(&mut self, other: Self) {
         for (basename, crc32) in other.entries {
             insert_entry(&mut self.entries, &mut self.conflicting, basename, crc32);
@@ -117,6 +279,9 @@ impl SfvCatalog {
             self.conflicting.insert(basename);
         }
         self.unparsable_lines = self.unparsable_lines.saturating_add(other.unparsable_lines);
+        self.unrelated_entries = self
+            .unrelated_entries
+            .saturating_add(other.unrelated_entries);
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -195,10 +360,19 @@ fn stream_crc32(path: &Path) -> std::io::Result<u32> {
 }
 
 /// One completed job file, as the SFV arm needs it.
+#[derive(Clone)]
 struct SfvJobFile {
     file_id: NzbFileId,
     filename: String,
     decoded_bytes: u64,
+}
+
+fn sort_obfuscated_sfv_candidates(candidates: &mut [SfvJobFile]) {
+    candidates.sort_by(|left, right| {
+        left.decoded_bytes
+            .cmp(&right.decoded_bytes)
+            .then_with(|| left.filename.cmp(&right.filename))
+    });
 }
 
 impl Pipeline {
@@ -244,7 +418,7 @@ impl Pipeline {
         }
 
         let state = self.jobs.get(&job_id)?;
-        let mut listings: Vec<SfvJobFile> = Vec::new();
+        let mut named_listings: Vec<SfvJobFile> = Vec::new();
         let mut by_basename: HashMap<String, Option<NzbFileId>> = HashMap::new();
         let mut completed_files: Vec<SfvJobFile> = Vec::new();
         for file in state.assembly.files() {
@@ -257,7 +431,7 @@ impl Pipeline {
             // ENCODED figure and must never be compared against bytes on disk.
             let decoded_bytes = file.received_bytes();
             if filename.to_ascii_lowercase().ends_with(".sfv") {
-                listings.push(SfvJobFile {
+                named_listings.push(SfvJobFile {
                     file_id,
                     filename: filename.clone(),
                     decoded_bytes,
@@ -281,35 +455,125 @@ impl Pipeline {
             });
         }
 
-        if listings.is_empty() {
-            return None;
+        let completed_basenames: HashSet<String> = by_basename.keys().cloned().collect();
+        let mut budget = SfvScanBudget::default();
+        let mut listings: Vec<SfvJobFile> = Vec::new();
+        // A genuine `.sfv` name is unambiguous and wins over heuristic
+        // discovery. Only when the job has none do we inspect completed files
+        // that are plausibly small enough to be listings; the probe itself
+        // still supplies the hard I/O bound.
+        if named_listings.is_empty() {
+            let mut candidates = completed_files
+                .iter()
+                .filter(|file| file.decoded_bytes <= MAX_SFV_BYTES)
+                .cloned()
+                .collect::<Vec<_>>();
+            sort_obfuscated_sfv_candidates(&mut candidates);
+            let candidate_count = candidates.len();
+            for (index, candidate) in candidates.into_iter().enumerate() {
+                if !budget.take_probe() {
+                    break;
+                }
+                let Some(path) = self.resolve_job_input_path(job_id, &candidate.filename) else {
+                    continue;
+                };
+                match read_sfv_probe(&path).await {
+                    Ok(contents) if looks_like_sfv_probe(&contents) => {
+                        if !budget.take_listing() {
+                            break;
+                        }
+                        debug!(
+                            job_id = job_id.0,
+                            file = %candidate.filename,
+                            "detected obfuscated SFV listing"
+                        );
+                        listings.push(candidate);
+                        if budget.listings == MAX_SFV_LISTINGS_PER_JOB
+                            && index + 1 < candidate_count
+                        {
+                            budget.listings_exhausted = true;
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(
+                        job_id = job_id.0,
+                        file = %candidate.filename,
+                        error = %error,
+                        "failed to probe completed file for an obfuscated SFV listing"
+                    ),
+                }
+            }
+        } else {
+            named_listings.sort_by(|left, right| {
+                left.filename
+                    .cmp(&right.filename)
+                    .then_with(|| left.decoded_bytes.cmp(&right.decoded_bytes))
+            });
+            for listing in named_listings {
+                if !budget.take_listing() {
+                    break;
+                }
+                listings.push(listing);
+            }
         }
 
         let mut catalog = SfvCatalog::default();
         for listing in &listings {
-            if listing.decoded_bytes > MAX_SFV_BYTES {
-                warn!(
-                    job_id = job_id.0,
-                    file = %listing.filename,
-                    bytes = listing.decoded_bytes,
-                    "skipping oversized .sfv file"
-                );
-                continue;
-            }
+            let Some(max_bytes) = budget.listing_read_limit() else {
+                budget.listing_bytes_exhausted = true;
+                break;
+            };
             let Some(path) = self.resolve_job_input_path(job_id, &listing.filename) else {
                 continue;
             };
-            match tokio::fs::read(&path).await {
-                Ok(bytes) => {
-                    catalog.merge(SfvCatalog::parse(&String::from_utf8_lossy(&bytes)));
+            match read_sfv_listing(&path, max_bytes).await {
+                Ok(SfvListingRead::Contents(bytes)) => {
+                    if !budget.record_listing_bytes(bytes.len() as u64) {
+                        break;
+                    }
+                    catalog.extend_for_completed_files(
+                        &String::from_utf8_lossy(&bytes),
+                        &completed_basenames,
+                    );
                 }
+                Ok(SfvListingRead::Oversized) if max_bytes < MAX_SFV_BYTES => {
+                    budget.listing_bytes_exhausted = true;
+                    break;
+                }
+                Ok(SfvListingRead::Oversized) => warn!(
+                    job_id = job_id.0,
+                    file = %listing.filename,
+                    limit = MAX_SFV_BYTES,
+                    "skipping oversized SFV listing"
+                ),
                 Err(error) => warn!(
                     job_id = job_id.0,
                     file = %listing.filename,
                     error = %error,
-                    "failed to read .sfv listing"
+                    "failed to read SFV listing"
                 ),
             }
+        }
+
+        if budget.exhausted() {
+            warn!(
+                job_id = job_id.0,
+                probes = budget.probes,
+                probe_limit = MAX_OBFUSCATED_SFV_PROBES,
+                listings = budget.listings,
+                listing_limit = MAX_SFV_LISTINGS_PER_JOB,
+                listing_bytes = budget.listing_bytes,
+                listing_bytes_limit = MAX_SFV_LISTING_BYTES_PER_JOB,
+                probes_exhausted = budget.probes_exhausted,
+                listings_exhausted = budget.listings_exhausted,
+                listing_bytes_exhausted = budget.listing_bytes_exhausted,
+                "SFV discovery budget exhausted; verifying entries collected so far"
+            );
+        }
+
+        if listings.is_empty() {
+            return None;
         }
 
         for basename in &catalog.conflicting {
@@ -324,6 +588,13 @@ impl Pipeline {
                 job_id = job_id.0,
                 lines = catalog.unparsable_lines,
                 "ignored unparsable .sfv lines"
+            );
+        }
+        if catalog.unrelated_entries > 0 {
+            debug!(
+                job_id = job_id.0,
+                entries = catalog.unrelated_entries,
+                "ignored SFV entries unrelated to completed job files"
             );
         }
         if catalog.is_empty() {
@@ -598,6 +869,92 @@ mod tests {
             .collect()
     }
 
+    fn sfv_job_file(filename: &str, decoded_bytes: u64, file_index: u32) -> SfvJobFile {
+        SfvJobFile {
+            file_id: NzbFileId {
+                job_id: JobId(1),
+                file_index,
+            },
+            filename: filename.to_string(),
+            decoded_bytes,
+        }
+    }
+
+    #[test]
+    fn sfv_scan_budget_bounds_obfuscated_probes_and_selected_listings() {
+        let mut probe_budget = SfvScanBudget::default();
+        for _ in 0..MAX_OBFUSCATED_SFV_PROBES {
+            assert!(probe_budget.take_probe());
+        }
+        assert!(!probe_budget.take_probe());
+        assert_eq!(probe_budget.probes, 1_024);
+        assert!(probe_budget.probes_exhausted);
+
+        let mut listing_budget = SfvScanBudget::default();
+        for _ in 0..MAX_SFV_LISTINGS_PER_JOB {
+            assert!(listing_budget.take_listing());
+        }
+        assert!(!listing_budget.take_listing());
+        assert_eq!(listing_budget.listings, 16);
+        assert!(listing_budget.listings_exhausted);
+    }
+
+    #[test]
+    fn sfv_scan_budget_accepts_exact_aggregate_content_limit_and_rejects_overage() {
+        let mut exact = SfvScanBudget::default();
+        assert!(exact.record_listing_bytes(MAX_SFV_LISTING_BYTES_PER_JOB));
+        assert_eq!(exact.listing_read_limit(), None);
+
+        let mut over = SfvScanBudget::default();
+        assert!(!over.record_listing_bytes(MAX_SFV_LISTING_BYTES_PER_JOB + 1));
+        assert_eq!(over.listing_bytes, 0);
+        assert!(over.listing_bytes_exhausted);
+    }
+
+    #[test]
+    fn obfuscated_sfv_candidates_sort_by_decoded_size_then_filename() {
+        let mut candidates = vec![
+            sfv_job_file("zeta", 200, 0),
+            sfv_job_file("beta", 100, 1),
+            sfv_job_file("alpha", 100, 2),
+        ];
+
+        sort_obfuscated_sfv_candidates(&mut candidates);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "zeta"]
+        );
+    }
+
+    #[test]
+    fn incremental_catalog_filters_unrelated_entries_and_unions_split_listings() {
+        let completed_basenames = HashSet::from([
+            "release.part01.rar".to_string(),
+            "release.part02.rar".to_string(),
+        ]);
+        let mut catalog = SfvCatalog::default();
+
+        catalog.extend_for_completed_files(
+            "release.part01.rar 1a2b3c4d\nunrelated.bin deadbeef\nmalformed\n",
+            &completed_basenames,
+        );
+        catalog.extend_for_completed_files("release.part02.rar 01020304\n", &completed_basenames);
+
+        assert_eq!(
+            entries(&catalog),
+            vec![
+                ("release.part01.rar".to_string(), 0x1a2b_3c4d),
+                ("release.part02.rar".to_string(), 0x0102_0304),
+            ]
+        );
+        assert_eq!(catalog.unrelated_entries, 1);
+        assert_eq!(catalog.unparsable_lines, 1);
+    }
+
     #[test]
     fn comments_and_blank_lines_are_ignored() {
         let catalog = SfvCatalog::parse(
@@ -735,6 +1092,117 @@ mod tests {
         assert_eq!(
             entries(&catalog),
             vec![("silver.horizon.part01.rar".to_string(), 0x1a2b_3c4d)]
+        );
+    }
+
+    #[test]
+    fn an_obfuscated_probe_requires_sabnzbd_s_conservative_signature() {
+        assert!(looks_like_sfv_probe(
+            b"; Generated by a checksum tool\n\nSilver Horizon.bin 1a2b3c4d\n"
+        ));
+
+        for sample in [
+            b"Silver Horizon.bin 1a2b3c4d\n\0".as_slice(),
+            b"; comments only\n\n".as_slice(),
+            b"Silver Horizon.bin 1a2b3c4\n".as_slice(),
+            b"Silver Horizon.bin\n".as_slice(),
+            b"Silver Horizon.bin\t1a2b3c4d\n".as_slice(),
+            b"Silver Horizon.bin 1a2b3c4d\nnot an SFV line\n".as_slice(),
+        ] {
+            assert!(
+                !looks_like_sfv_probe(sample),
+                "sample must not be discovered as an SFV: {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ten_valid_probe_entries_are_confident_even_with_later_text() {
+        let mut sample = String::new();
+        for index in 0..SFV_PROBE_CONFIDENCE_ENTRIES {
+            sample.push_str(&format!("release.part{index:02}.rar 1a2b3c4d\n"));
+        }
+        sample.push_str("a later malformed line is outside the confidence cutoff\n");
+
+        assert!(looks_like_sfv_probe(sample.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn bounded_sfv_readers_enforce_the_probe_and_listing_ceilings() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let probe_path = temp_dir.path().join("probe-after-limit");
+        let probe_prefix = ";".repeat(SFV_PROBE_BYTES as usize);
+        tokio::fs::write(
+            &probe_path,
+            format!("{probe_prefix}\nrelease.part01.rar 1a2b3c4d\n"),
+        )
+        .await
+        .unwrap();
+        let probe = read_sfv_probe(&probe_path).await.unwrap();
+        assert_eq!(probe.len(), SFV_PROBE_BYTES as usize);
+        assert!(
+            !looks_like_sfv_probe(&probe),
+            "the valid entry begins beyond the probe ceiling"
+        );
+
+        let listing_path = temp_dir.path().join("listing-boundary");
+        tokio::fs::write(&listing_path, vec![b';'; MAX_SFV_BYTES as usize])
+            .await
+            .unwrap();
+        match read_sfv_listing(&listing_path, MAX_SFV_BYTES)
+            .await
+            .unwrap()
+        {
+            SfvListingRead::Contents(contents) => {
+                assert_eq!(contents.len(), MAX_SFV_BYTES as usize)
+            }
+            SfvListingRead::Oversized => panic!("an exact-limit listing must be accepted"),
+        }
+
+        tokio::fs::write(&listing_path, vec![b';'; MAX_SFV_BYTES as usize + 1])
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_sfv_listing(&listing_path, MAX_SFV_BYTES)
+                .await
+                .unwrap(),
+            SfvListingRead::Oversized
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_sparse_obfuscated_candidate_is_probed_but_rejected_as_an_oversized_listing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let sparse_path = temp_dir.path().join("obfuscated-listing");
+        let mut prefix = String::new();
+        for index in 0..SFV_PROBE_CONFIDENCE_ENTRIES {
+            prefix.push_str(&format!("release.part{index:02}.rar 1a2b3c4d\n"));
+        }
+        // Fill the sampled range with a semicolon comment. The logical extent
+        // after it remains a sparse hole, so the probe never sees binary zeros.
+        prefix.push(';');
+        prefix.extend(std::iter::repeat_n(
+            'x',
+            SFV_PROBE_BYTES as usize - prefix.len(),
+        ));
+        assert_eq!(prefix.len(), SFV_PROBE_BYTES as usize);
+        std::fs::write(&sparse_path, prefix).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&sparse_path)
+            .unwrap()
+            .set_len(MAX_SFV_BYTES + 1)
+            .unwrap();
+
+        let probe = read_sfv_probe(&sparse_path).await.unwrap();
+        assert!(looks_like_sfv_probe(&probe));
+        assert!(matches!(
+            read_sfv_listing(&sparse_path, MAX_SFV_BYTES).await.unwrap(),
+            SfvListingRead::Oversized
+        ));
+        assert_eq!(
+            std::fs::metadata(&sparse_path).unwrap().len(),
+            MAX_SFV_BYTES + 1
         );
     }
 }

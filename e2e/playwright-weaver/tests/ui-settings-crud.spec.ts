@@ -1,17 +1,20 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { expect, test } from "./helpers";
+import { expect, openNavigation, test } from "./helpers";
 
 const afterRestart = process.env.E2E_WEAVER_UI_STAGE === "after-restart";
 const persistedCategory = "e2e-product-category-persisted";
 const persistedSchedule = "e2e-off-peak-persisted";
 
-test("general speed and bandwidth-cap settings persist through browser controls", async ({ cleanPage: page }) => {
+test("general speed, SRRDB lookup, and bandwidth-cap settings persist through browser controls", async ({ cleanPage: page }) => {
   await page.goto("/settings/general");
   const speed = page.getByRole("slider", { name: "Speed Limit" });
+  const srrdbLookup = page.getByRole("switch", { name: "Use SRRDB release lookup" });
   await expect(speed).toBeVisible();
+  await expect(srrdbLookup).toBeVisible();
   if (afterRestart) {
     await expect(speed).toHaveValue(String(8 * 1024 * 1024));
+    await expect(srrdbLookup).toBeChecked();
     await page.goto("/settings/bandwidth");
     await expect(page.getByRole("spinbutton", { name: "Billing Day" })).toHaveValue("17");
     return;
@@ -25,6 +28,11 @@ test("general speed and bandwidth-cap settings persist through browser controls"
   await expect(page.getByText("Saved", { exact: true })).toBeVisible();
   await page.reload();
   await expect(speed).toHaveValue(String(8 * 1024 * 1024));
+  await expect(srrdbLookup).not.toBeChecked();
+  await srrdbLookup.click();
+  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await page.reload();
+  await expect(srrdbLookup).toBeChecked();
 
   await page.goto("/settings/bandwidth");
   const monthlyDay = page.getByRole("spinbutton", { name: "Billing Day" });
@@ -157,6 +165,7 @@ test("schedule rules support create, toggle, edit, and delete", async ({ cleanPa
 
 test("settings navigation owns every coverage-ledger route", async ({ cleanPage: page }) => {
   await page.goto("/settings/general");
+  const navigation = await openNavigation(page);
   const ledger = JSON.parse(
     readFileSync(resolve(process.cwd(), "coverage-ledger.v1.json"), "utf8"),
   ) as { routes: Array<{ path: string }> };
@@ -166,7 +175,7 @@ test("settings navigation owns every coverage-ledger route", async ({ cleanPage:
     .map((path) => path.slice("/settings/".length))
     .sort();
   const settingsRoutes = async () => {
-    const links = await page.getByRole("link").all();
+    const links = await navigation.getByRole("link").all();
     const hrefs = await Promise.all(links.map((link) => link.getAttribute("href")));
     return Array.from(
       new Set(
@@ -177,10 +186,8 @@ test("settings navigation owns every coverage-ledger route", async ({ cleanPage:
       ),
     ).sort();
   };
-  // The whole shell — sidebar included — is client-rendered, so `goto` can resolve
-  // with an empty `#root`; on postgres after a restart the cold connection pool
-  // widens that gap enough that a one-shot collection sees zero links. Polling the
-  // same deep equality keeps the assertion exact — a missing or extra route still
-  // fails, just on timeout, with the settled nav in the failure snapshot.
+  // The whole shell is client-rendered, so keep polling after opening whichever
+  // responsive navigation variant the current viewport exposes. The same deep
+  // equality keeps missing and extra routes exact.
   await expect.poll(settingsRoutes).toEqual(expected);
 });

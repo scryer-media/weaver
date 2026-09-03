@@ -27,8 +27,23 @@ type Generator struct {
 }
 
 // FileEntry is one fixture: where it lives, what it is, and where it came from.
+//
+// A **salted** entry is the exception to all of that. Some writers draw a random
+// salt or IV for every archive they produce — 7-Zip's AES chains do, with no
+// switch to fix them — so those bytes differ on every machine that generates
+// them and there is no digest to pin. Such an entry carries no hash and no
+// size, and its committed form therefore never moves: `sources.json` is itself
+// a fingerprint input, and an entry that changed on each run would move the
+// fingerprint with it.
+//
+// The cost is real and deliberate: a salted fixture is verified by *presence*
+// only, never by content. It is an escape hatch, and [`Ledger.Validate`] keeps
+// it narrow — see the byte-reproducibility guard in the generator.
 type FileEntry struct {
-	Path   string `json:"path"`
+	Path string `json:"path"`
+	// Salted marks an entry whose bytes cannot be pinned. Size and BLAKE3 must
+	// both be empty when it is set.
+	Salted bool   `json:"salted,omitempty"`
 	Size   int64  `json:"size"`
 	BLAKE3 string `json:"blake3"`
 	Format string `json:"format,omitempty"`
@@ -105,7 +120,17 @@ func (ledger *Ledger) Validate(lock ToolchainLock) error {
 		if file.Size < 0 {
 			problem("file %s: negative size", file.Path)
 		}
-		if !IsDigest(file.BLAKE3) {
+		if file.Salted {
+			// Nothing about a salted entry may move, or the ledger stops being
+			// a stable fingerprint input. Carrying a hash or a size would also
+			// invite a reader to compare against them.
+			if file.BLAKE3 != "" {
+				problem("file %s: salted entries carry no blake3, got %q", file.Path, file.BLAKE3)
+			}
+			if file.Size != 0 {
+				problem("file %s: salted entries carry no size, got %d", file.Path, file.Size)
+			}
+		} else if !IsDigest(file.BLAKE3) {
 			problem("file %s: blake3 %q is not a lowercase 64-hex digest", file.Path, file.BLAKE3)
 		}
 		switch file.Source.Kind {

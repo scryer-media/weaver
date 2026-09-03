@@ -1943,6 +1943,22 @@ func stagingMemberFromSnapshot(snapshot restartFilesystemSnapshot, jobID int, pa
 	return "", "", 0, false
 }
 
+func directStorePartialFromSnapshot(snapshot restartFilesystemSnapshot, jobID, fileSet int) (string, int64, bool) {
+	prefix := fmt.Sprintf(".weaver-staging/%d/", jobID)
+	suffix := fmt.Sprintf(".f%d.direct.partial", fileSet)
+	for _, entry := range snapshot.Complete {
+		if !strings.HasPrefix(entry.Path, prefix) {
+			continue
+		}
+		relativePath := strings.TrimPrefix(entry.Path, prefix)
+		if strings.Contains(relativePath, "/") || !strings.HasSuffix(relativePath, suffix) {
+			continue
+		}
+		return entry.Path, entry.Size, true
+	}
+	return "", 0, false
+}
+
 func completeSnapshotContainsMember(snapshot restartFilesystemSnapshot, memberName string) bool {
 	for _, entry := range snapshot.Complete {
 		if strings.HasPrefix(entry.Path, ".weaver-staging/") {
@@ -2767,7 +2783,7 @@ func runDirectStorePar2AliasClaimantCompletesAfterRestart(ctx *restartCaseContex
 	canonical := append([]string(nil), aliasState.CanonicalFilenames...)
 	sort.Strings(current)
 	sort.Strings(canonical)
-	_, stagedPath, stagedSize, staged := stagingMemberFromSnapshot(preFS, jobID, true)
+	stagedPath, stagedSize, staged := directStorePartialFromSnapshot(preFS, jobID, 0)
 	exactFailureShape := aliasState.IdentityCount == 4 &&
 		aliasState.AliasClaimants == 4 &&
 		len(aliasState.ClassificationSets) == 1 &&

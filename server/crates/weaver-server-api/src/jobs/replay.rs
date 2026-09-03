@@ -11,7 +11,7 @@ use crate::jobs::types::{
 };
 use weaver_server_core::SchedulerHandle;
 use weaver_server_core::events::model::PipelineEvent;
-use weaver_server_core::events::publish::pipeline_job_id;
+use weaver_server_core::events::publish::{is_segment_event, pipeline_job_id};
 use weaver_server_core::settings::SharedConfig;
 
 const QUEUE_EVENT_REPLAY_CAPACITY: usize = 2048;
@@ -276,6 +276,14 @@ async fn queue_event_records_from_pipeline_event(
     config: &SharedConfig,
     caches: &mut QueueEventCaches,
 ) -> Vec<PersistedQueueEvent> {
+    // Per-article events carry nothing a queue item shows. Answering them
+    // meant a job lookup, an item snapshot and three signature compares per
+    // article, several times per article, to publish nothing new: the
+    // progress a queue item displays arrives on the phase-progress cadence.
+    if is_segment_event(event) {
+        return Vec::new();
+    }
+
     let occurred_at_ms = chrono::Utc::now().timestamp_millis();
     let mut queue_events = Vec::new();
 
@@ -516,6 +524,7 @@ mod tests {
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             direct_store: None,
+            direct_unpack: None,
             delivery_naming: None,
             metrics: Default::default(),
             config_path: None,
