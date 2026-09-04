@@ -24,6 +24,11 @@ downloaded data and run artifacts are ignored by git and never committed.
 - [Quickstart](#quickstart)
 - [Repository layout](#repository-layout)
 - [The fixture matrix](#the-fixture-matrix)
+  - [The 7z lane](#the-7z-lane)
+  - [The Blu-ray disc topology](#the-blu-ray-disc-topology)
+  - [Repair profiles](#repair-profiles)
+  - [Posting order](#posting-order)
+  - [Pinned 7-Zip writer](#pinned-7-zip-writer)
 - [Step by step](#step-by-step)
   - [1. Generate fixtures](#1-generate-fixtures)
   - [2. Build the NNTP server image](#2-build-the-nntp-server-image)
@@ -32,7 +37,9 @@ downloaded data and run artifacts are ignored by git and never committed.
   - [5. Write a plan](#5-write-a-plan)
   - [6. Run the sequential suite](#6-run-the-sequential-suite)
   - [7. Summarize](#7-summarize)
+- [Pre-seeded NNTP corpus image](#pre-seeded-nntp-corpus-image)
 - [Native macOS and Windows lanes](#native-macos-and-windows-lanes)
+- [Storage profiles (local vs throttled NFS)](#storage-profiles-local-vs-throttled-nfs)
 - [What is measured](#what-is-measured)
 - [TLS policy](#tls-policy)
 - [What this does not claim](#what-this-does-not-claim)
@@ -97,15 +104,17 @@ lists every subcommand; `-h` on any of them prints its options.
 
 | Path | What it is |
 | --- | --- |
-| `cmd/fixturegen` | Generates the RAR / PAR2 / recovery-volume fixtures on the pinned toolchain images |
-| `cmd/nntpbench` | The controller: `image build`, `seed`, `server-env`, `plan`, `sequential`, `queue-transition`, `run`, `summarize`, `preflight`, `verify-output` |
+| `cmd/fixturegen` | Generates the RAR / 7z / PAR2 / recovery-volume fixtures on the pinned toolchain images |
+| `cmd/nntpbench` | The controller: `image build`, `seed`, `seed-image`, `server-env`, `storage-env`, `plan`, `sequential`, `queue-transition`, `run`, `summarize`, `preflight`, `verify-output`, `delete-output` |
 | `cmd/clientadapter` | Docker lane: starts one fresh, digest-pinned client container per run and drives its public API |
 | `cmd/nativeadapter` | macOS / Windows lane: launches one fresh native client process per run |
 | `cmd/nntpshaper` | Transparent TCP proxy that meters the server's egress under an exclusive run lease |
 | `configs/adapters*.example.json` | Digest-pinned client catalogs for the Docker, macOS and Windows lanes — copy, then edit |
 | `configs/clients/baseline.json` | The cross-client configuration baseline every rendered config is derived from |
 | `configs/server/compose-shaper.example.yml` | The server + shaper topology |
-| `docker/` | Dockerfiles for the pinned RARLAB writers, `par2cmdline-turbo`, Nyuu and the shaper |
+| `configs/server/compose-nfs.example.yml` | The throttled NFS export used by the `nfs-*` storage profiles |
+| `configs/server/compose-seeded.example.yml` | Overlay that starts the NNTP server from a pre-seeded corpus image |
+| `docker/` | Dockerfiles for the pinned RARLAB writers, the official 7-Zip build, `par2cmdline-turbo`, Nyuu, the shaper and the throttled NFS server |
 | `fixtures/matrix.json`, `fixtures/corpus.json` | The declared fixture matrix and corpus description |
 | `internal/` | The Go packages behind the commands |
 
@@ -113,55 +122,173 @@ lists every subcommand; `-h` on any of them prints its options.
 
 The corpus is a compatibility and repair coverage set, not a model of what is
 posted to Usenet. Ordinary cases contain one 150 MiB synthetic video file split
-into 32 MiB RAR volumes; one multi-input case contains four 48 MiB videos.
+into 32 MiB archive volumes; one multi-input case contains four 48 MiB videos.
 Together they cover the RARLAB writer eras and their archive families across:
 
 | Axis | Values |
 | --- | --- |
-| Writer era | RAR 3.93, 4.20, 5.00, 6.24, 7.23 (official RARLAB Linux releases, SHA-256 verified in the image build) |
-| Archive lane | legacy RAR4 (3.93 / 4.20 writers) or RAR5 (5.00 / 6.24 / 7.23 writers, explicit `-ma5`) |
+| Writer era | RAR 3.93, 4.20, 5.00, 6.24, 7.23 and 7-Zip 26.02 (official upstream Linux releases, SHA-256 verified in the image build) |
+| Archive format | legacy RAR4 (3.93 / 4.20 writers), RAR5 (5.00 / 6.24 / 7.23 writers, explicit `-ma5`), or 7z (official 7-Zip build) |
 | Compression | store (`-m0`) or release-style normal compression (`-m5`, solid where declared, maximum dictionary, RAR5 quick-open disabled) |
 | Solidity | non-solid, solid |
 | Encryption | none, data encryption, encrypted headers |
 | Input data | incompressible, moderately compressible |
 
 That yields 18 clean RAR fixtures. `writer_era` is deliberately separate from
-`rar_format`: RAR 6 and 7 are writer releases, not new on-disk formats.
+`archive_format`: RAR 6 and 7 are writer releases, not new on-disk formats.
 
-One `bluray-disc` fixture exercises a disc-shaped topology — a 5 GiB
-`BDMV/STREAM/00000.m2ts`, four small menu streams and 508 tiny metadata
-members in one solid RAR5 archive. `--bluray-large-file-bytes`,
-`--bluray-small-file-count` and `--bluray-small-file-bytes` scale it down for
-smoke runs without changing what it represents. It is synthetic; it is not a
+### The 7z lane
+
+`archive_format` also takes `7z`, written by the official 7-Zip console build
+(see [Pinned 7-Zip writer](#pinned-7-zip-writer)). A set that uses it names the
+writer with `archive_writer`; `generator_toolchain` still names the RARLAB
+image, which supplies the FFmpeg payload renderer for every lane. Three clean
+7z fixtures and two 7z repair fixtures are in the corpus:
+
+| Axis | 7z values |
+| --- | --- |
+| Compression | store (`-mx0 -m0=Copy`) or LZMA2 at the writer default (`-mx5`) |
+| Solidity | `-ms=off` / `-ms=on` |
+| Encryption | none, data (`-p`), encrypted headers (`-p` with `-mhe=on`) |
+| Volumes | `-v<volume_size>`, so members are `fixture.7z.001`, `.002`, … |
+
+`rar-recovery-volume-*` is rejected at matrix validation for a 7z set: RAR
+recovery volumes are a RAR container feature, and pairing them with 7z is an
+authoring mistake, not a generation-time surprise. PAR2 works over a 7z volume
+set exactly as it does over a RAR one.
+
+Verification differs by lane because the writers differ. RAR fixtures are
+tested with RARLAB's own `rar t`. 7z fixtures are *extracted* with the pinned
+`7zz` and every extracted member is checked against the payload's BLAKE3
+digest, because 7-Zip's own test does not prove the extracted bytes match the
+oracle.
+
+### The Blu-ray disc topology
+
+Two `bluray-disc` fixtures exercise a disc-shaped topology in non-solid RAR5,
+one stored and one normally compressed: a 5 GiB `BDMV/STREAM/00000.m2ts`, eight
+96 MiB menu/extra streams, four small menu streams and 508 tiny metadata
+members, split into 50 MiB volumes and posted in `scattered` NZB order. The
+store and normal pair is the point: a stored disc archive is byte-identical to
+its members on the wire, a compressed one is not, and the two make that
+difference measurable on the same topology.
+
+`--bluray-large-file-bytes`, `--bluray-medium-file-bytes`,
+`--bluray-medium-file-count`, `--bluray-small-file-count` and
+`--bluray-small-file-bytes` scale it down for smoke runs without changing what
+it represents. The small-file numbering runs `BDMV/` first and `CERTIFICATE/`
+last, so a reduced `--bluray-small-file-count` writes a `BDMV`-only disc and
+the archiver is handed only the roots that exist. It is synthetic; it is not a
 Blu-ray image and not a claim about typical posts.
 
-Four repair fixtures add deterministic damage without duplicating the clean
+### Repair profiles
+
+Nine repair fixtures add deterministic damage without duplicating the clean
 cases:
 
 | Profile | Posted repair material | Deliberate fault |
 | --- | --- | --- |
 | `par2-light` | PAR2 at 10 % redundancy | 128 deterministic byte flips in one non-leading volume |
-| `par2-heavy` | PAR2 at 35 % redundancy | one complete non-leading volume absent |
+| `par2-heavy` | PAR2 at 35 % redundancy | one complete non-leading volume absent from the NZB |
+| `par2-heavy-withheld` | PAR2 at 35 % redundancy | one non-leading volume listed in the NZB but never posted |
 | `rar-recovery-volume-light` | one RAR recovery volume | one non-leading volume absent |
 | `rar-recovery-volume-heavy` | two RAR recovery volumes | two non-leading volumes absent |
 
-PAR2 material comes from the pinned `par2cmdline-turbo` 1.4.0 image. Before a
-repair fixture is accepted the generator copies its posted input aside,
-performs the declared repair with the pinned PAR2 or RARLAB tool, and
-RARLAB-tests the reconstructed archive against the payload oracle. Only the
-damaged input is kept.
+`par2-heavy` and `par2-heavy-withheld` describe the same missing data from two
+different client viewpoints. Under `par2-heavy` the NZB never mentions the
+volume, so the client knows from the start that it must repair. Under
+`par2-heavy-withheld` the NZB lists the volume with article identifiers that
+were never posted, so the client requests every article and is refused — which
+is what an incomplete post looks like on a real server. The withheld volume's
+bytes stay on disk in the fixture so the repair target is still auditable; the
+manifest records them under `withheld_files` and the fault as
+`kind: "withheld-volume"`.
 
-RAR bytes are only ever written by RARLAB's own `rar`; add an older writer
-only when an official, source-locked RARLAB release exists for it. Nothing
-here pulls historical binaries from mirrors.
+PAR2 material comes from the pinned `par2cmdline-turbo` 1.4.0 image. Before a
+repair fixture is accepted the generator copies its posted input aside —
+excluding any withheld volume, so the repair genuinely exercises the recovery
+capacity — performs the declared repair with the pinned PAR2 or RARLAB tool,
+and checks the reconstructed archive against the payload oracle with the
+writer's own reader. Only the damaged input is kept.
+
+RAR bytes are only ever written by RARLAB's own `rar` and 7z bytes only by the
+official 7-Zip build; add an older writer only when an official, source-locked
+release exists for it. Nothing here pulls historical binaries from mirrors, and
+no distribution fork stands in for an upstream writer.
+
+### Posting order
+
+`nzb_order` is a fixture-level axis with two values:
+
+| Value | Meaning |
+| --- | --- |
+| `sequential` (default) | Files appear in the NZB in sorted volume order, with repair material trailing |
+| `scattered` | Files appear in a deterministic pseudo-random permutation, with repair material interleaved among the volumes |
+
+Real posts do not always arrive in volume order, and a client that schedules
+work by what the archive needs behaves differently from one that follows the
+NZB. `sequential` alone cannot tell those apart, because it hands every client
+the convenient order for free. `scattered` removes that gift without
+introducing run-to-run noise: no volume is guaranteed to arrive first, and the
+first repair file always precedes the last archive volume.
+
+The permutation is a function of the fixture id alone, so a corpus regenerated
+or reseeded on another host produces the same order. The seed is the first
+eight bytes of `sha256(fixture id)`, and the shuffle is an explicit
+Fisher-Yates over SplitMix64 rather than a standard-library shuffle, because
+the standard library makes no promise that its algorithms stay byte-stable
+across Go releases and a published corpus has to reproduce its order years
+later. A degenerate draw — one that still leads with the first volume, or still
+leaves every repair file behind every volume — is redrawn deterministically,
+and the accepted seed is recorded.
+
+The manifest records `nzb_order`, `nzb_order_seed` and the complete
+`nzb_file_order`. After the poster runs, the harness parses the emitted NZB and
+asserts its `<file>` order matches that list, failing the seed loudly if it
+does not: posting order is a measured axis, so a silent reordering would
+invalidate every run over the fixture.
+
+### Pinned 7-Zip writer
+
+`docker/sevenzip/` builds the official 7-Zip Linux console binary from
+`7-zip.org` into an image, verifying the archive against the SHA-256 in
+`docker/sevenzip/toolchain.json` before installing it. The toolchain file is
+the single source of the version, URL, digest and image tag, and it is copied
+into every generated fixture's manifest as `archive_writer_toolchain`, so a
+fixture states which writer produced it.
+
+Distribution `p7zip` forks are deliberately not used: they are a different
+codebase with a different container writer, so a fixture written by one is not
+evidence about the other. The base image is the same digest-pinned Debian the
+RARLAB and PAR2 images use.
+
+```bash
+docker build -f docker/sevenzip/Dockerfile \
+  --build-arg SEVENZIP_URL=https://www.7-zip.org/a/7z2602-linux-x64.tar.xz \
+  --build-arg SEVENZIP_SHA256=41aaba7b1235304ab5aa0624530c67ae829496cd29e875925271efdccc28c03e \
+  --tag weaver-nntp-bench-7zip:26.02 docker/sevenzip
+```
+
+`fixturegen` builds it automatically when a selected fixture needs it.
+
+The writer image is generation-side only. On the client side, NZBGet unpacks
+7z through an external tool rather than a built-in decoder, so its rendered
+config names one explicitly: `SevenZipCmd=/usr/bin/7zz` in the pinned
+LinuxServer image, which ships an official 7-Zip build at that path, and
+`SevenZipCmd=7z` for a native install, which resolves through the operator's
+own PATH. Leaving it unset would let a 7z fixture fail as an NZBGet
+configuration gap rather than measure anything. The setting is NZBGet-specific
+and the SABnzbd and Weaver renders deliberately carry nothing equivalent, so
+the added key cannot shift what the other two clients do.
 
 ## Step by step
 
 ### 1. Generate fixtures
 
-`fixturegen` builds and runs the pinned RARLAB / PAR2 images itself, and
-`--direct-mkv` uses the same image for its deterministic FFmpeg payload, so
-Docker is required for every invocation.
+`fixturegen` builds and runs the pinned RARLAB / PAR2 / 7-Zip images itself
+(only the ones the selected fixtures need), and `--direct-mkv` uses the RARLAB
+image for its deterministic FFmpeg payload, so Docker is required for every
+invocation.
 
 ```bash
 go run ./cmd/fixturegen --list
@@ -169,23 +296,30 @@ go run ./cmd/fixturegen --list
 # One benchmark-sized movie case (150 MiB payload by default).
 go run ./cmd/fixturegen --fixture rar5-7-headers-normal-solid-headers-compressible --output /scratch/fixtures
 
+# A 7z case, written by the pinned official 7-Zip build.
+go run ./cmd/fixturegen --fixture sevenzip-store-store-nonsolid-none-incompressible --output /scratch/fixtures
+
 # The disc topology at smoke scale.
-go run ./cmd/fixturegen --fixture rar5-7-bluray-normal-solid-none-incompressible \
-  --bluray-large-file-bytes 256MiB --bluray-small-file-count 64 --bluray-small-file-bytes 32KiB \
+go run ./cmd/fixturegen --fixture rar5-7-bluray-store-nonsolid-none-incompressible \
+  --bluray-large-file-bytes 256MiB \
+  --bluray-medium-file-bytes 16MiB --bluray-medium-file-count 2 \
+  --bluray-small-file-count 64 --bluray-small-file-bytes 32KiB \
   --output /scratch/fixtures
 
 # The raw-download fixture the queue-transition benchmark uses.
 go run ./cmd/fixturegen --direct-mkv --output /scratch/fixtures
 ```
 
-Every fixture directory contains `archive/` — the exact bytes to post: RAR
+Every fixture directory contains `archive/` — the exact bytes to post: archive
 volumes plus any PAR2 or `.rev` files, with deliberately missing volumes absent
-but their pre-damage digests kept — and `fixture-manifest.json` with the RAR
-flags, the toolchain that wrote it, the repair profile, BLAKE3 digests of the
-source and posted files, and the extracted-output oracle. The source payload
-is deleted once RARLAB has tested the archive; the manifest is enough to verify
-client output. The generator refuses to overwrite an existing fixture directory
-so the data behind a published result cannot be replaced silently.
+but their pre-damage digests kept — and `fixture-manifest.json` with the writer
+flags, the toolchain that rendered the payload, the toolchain that wrote the
+container, the repair profile, the posting order and its seed, any withheld
+volumes, BLAKE3 digests of the source and posted files, and the
+extracted-output oracle. The source payload is deleted once the writer's own
+reader has verified the archive; the manifest is enough to verify client
+output. The generator refuses to overwrite an existing fixture directory so the
+data behind a published result cannot be replaced silently.
 
 ### 2. Build the NNTP server image
 
@@ -273,6 +407,9 @@ does not build on arm64 Alpine; Docker emulates it on Apple Silicon. Posting is
 corpus setup, never a metric. It uses plaintext port 119 once; the same
 persisted articles are then downloaded over 119 and implicit-TLS 563.
 
+Reposting an unchanged corpus every time is pure overhead. See
+[Pre-seeded NNTP corpus image](#pre-seeded-nntp-corpus-image) for caching it.
+
 ### 5. Write a plan
 
 ```bash
@@ -295,11 +432,20 @@ profiles keep the full client-by-packaging matrix for every
 | NZBGet | digest-pinned image, JSON-RPC | native executable, JSON-RPC | native executable, JSON-RPC |
 
 `--profile stock` and `--profile equivalent-throughput` are reported
-separately; neither is a fallback for the other. `archive_toolchain` is a
+separately; neither is a fallback for the other. The profiles differ only for
+SABnzbd (`direct_unpack`) and NZBGet (`DirectWrite` + `DirectUnpack`); Weaver
+is rendered with `WEAVER_DIRECT_UNPACK=on` in both, because that is its
+shipping default and the benchmark measures the product as shipped, so the
+Weaver column is the same run configuration under either profile.
+`archive_toolchain` is a
 first-class plan, adapter, config and result field: `vanilla` is the stock
 benchmark, and the optional `rarpar` Docker lanes (see below) are never pooled
 with it. `--targets docker-linux` writes a Docker-only plan; otherwise the plan
 carries all three targets and each host runs only its own.
+`--storage-profile` and `--nfs-link` add the storage stratum described in
+[Storage profiles](#storage-profiles-local-vs-throttled-nfs); the default is
+`local` and a default plan is byte-for-byte what it was apart from the new
+`storage_profile` field.
 
 ### 6. Run the sequential suite
 
@@ -381,12 +527,89 @@ go run ./cmd/nntpbench summarize \
 
 Only verified, passed sequential artifacts are admitted. Clients are paired
 inside the same randomized repetition block, stratified by fixture, profile,
-target, transport / TLS validation, archive toolchain and server link. Each
+target, transport / TLS validation, archive toolchain, server link and
+storage profile. Each
 stratum reports the raw medians and coefficients of variation, the paired
 geometric-mean ratio and a deterministic 10 000-resample bootstrap 95 %
 interval on the log ratio. There is no outlier deletion and no pooled score. A
 missing, failed or unverified run, an incomplete pair, fewer than 20 complete
 blocks, or terminal-observation uncertainty above 1 % fails the summary closed.
+So does an artifact root that mixes storage profiles: a local run and an NFS
+run answer different questions and are summarized separately, never pooled.
+
+## Pre-seeded NNTP corpus image
+
+Posting the corpus is setup, not measurement, but it is slow and it is
+identical every time the fixtures have not changed. `nntpbench seed-image`
+bakes an already-seeded article store into a local Docker image so later runs
+start from it instead of reposting.
+
+A cache hit has to mean the server holds exactly the articles the fixtures on
+disk describe, so the image is keyed by a fingerprint over:
+
+- the format string `nntp-bench-seed-image-v1`, which is bumped whenever the
+  input set or its framing changes;
+- every fixture's `fixture-manifest.json` (which already carries a BLAKE3
+  digest of every posted byte, so this stays fast on a large corpus);
+- the seed parameters that decide what an article is called or how large it
+  is: the seed run id, the raw segment size, the newsgroup, and the poster's
+  message-id scheme;
+- the NNTP server image tag *and* its local image id, so a rebuilt server with
+  the same tag is a miss rather than a silent hit.
+
+The image is tagged `weaver-nntp-bench:corpus-<first 12 hex>` and carries the
+full fingerprint, the corpus-manifest digest, the seed run id and the
+generation time as labels. Status and restore check the labels, not the tag,
+so a tag collision cannot be mistaken for a match.
+
+```bash
+# After a normal `nntpbench seed` pass over the corpus, with the stack up:
+go run ./cmd/nntpbench seed-image status \
+  --fixtures-root /scratch/fixtures --run-id seed-2026-09-04 \
+  --compose-project usenet-bench
+
+go run ./cmd/nntpbench seed-image capture \
+  --fixtures-root /scratch/fixtures --run-id seed-2026-09-04 \
+  --compose-project usenet-bench \
+  --provenance /scratch/runs/nntp-seed-provenance.json
+```
+
+`status` always prints a reason, hit or miss — no local image, a different
+fingerprint format, a corpus fingerprint that does not match the fixtures on
+disk — so a miss is diagnosable rather than mysterious.
+
+To start the stack from a captured image, restore the baked NZBs and layer the
+seeded Compose override on top of the shaper topology. `restore` refuses an
+image whose fingerprint does not match the fixtures on disk, and refuses to
+overwrite a local NZB that differs from the baked one:
+
+```bash
+export NNTP_SEED_IMAGE=$(go run ./cmd/nntpbench seed-image status \
+  --fixtures-root /scratch/fixtures --run-id seed-2026-09-04 \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["fingerprint"]["tag"])')
+
+go run ./cmd/nntpbench seed-image restore \
+  --fixtures-root /scratch/fixtures --run-id seed-2026-09-04 \
+  --provenance /scratch/runs/nntp-seed-provenance.json
+
+docker compose \
+  -f configs/server/compose-shaper.example.yml \
+  -f configs/server/compose-seeded.example.yml \
+  up -d
+```
+
+Docker `commit` cannot see a named volume's contents, so capture stages the
+article store out of the running container with `docker cp` and rebuilds it as
+a Docker build context. The seeded override therefore also drops the
+`nntp-data` volume mount — it would shadow the baked `/data/articles` — while
+keeping `nntp-certs`, since TLS material is generated per stack and is not part
+of the cached corpus. That override needs Docker Compose v2.24 or newer for
+`volumes: !override`.
+
+Whether a run's server was pre-seeded or seeded live belongs to the corpus and
+the NNTP server, not to any client under test, so it is recorded in the seed
+provenance JSON (`preseeded`, the image tag and the fingerprint) rather than in
+a client-run stratum.
 
 ## Native macOS and Windows lanes
 
@@ -437,11 +660,199 @@ Notes for the native catalogs:
   no Keychain prompt is waited on. Both lanes render `WEAVER_STARTUP_IOPS=50000`
   so Weaver's startup disk probe never runs inside the measured process (an
   operator value already in the environment is preserved and recorded).
+- Both lanes also pin Weaver's trusted-network list (`WEAVER_TRUSTED_CIDRS`:
+  loopback for the native lane, the whole address space for the Docker lane,
+  whose peer is the bridge gateway of the private benchmark network). Weaver
+  0.10 otherwise offers a first-run wizard instead of an anonymous session and
+  refuses the adapter's GraphQL calls; pinning the list settles that policy at
+  startup with no wizard and no bootstrap login.
 - Copy the immutable plan and the generated fixture / NZB directories to each
   native host; do not regenerate the corpus per OS. The fixture manifest and
   output hashes are the cross-host equivalence check.
 - Native Instruments / ETW traces are useful attribution artifacts, not a
   cross-product CPU metric; keep them apart from the benchmark JSON.
+
+## Storage profiles (local vs throttled NFS)
+
+Completion behaviour over slow network storage is a different measurement, not
+a variant of the local one. A client that assembles directly into its final
+location and one that assembles locally and then copies look identical on fast
+local disk and diverge sharply over a NAS link, so the benchmark runs twice:
+once with the client's directories on the host's own disk, and once with them
+on an export whose link is throttled to a declared rate and fixed delay.
+
+`storage_profile` is a first-class stratum. It travels from the plan into the
+queue input, the adapter configuration, the adapter result, the run artifact
+and the summarizer's comparison key, and every field is re-validated at each
+hop. `local` is the default and the published headline.
+
+| `--storage-profile` | Intermediate directory | Completion directory |
+| --- | --- | --- |
+| `local` (default) | host disk | host disk |
+| `nfs-complete` | host disk | throttled NFS export |
+| `nfs-all` | throttled NFS export | throttled NFS export |
+
+An `nfs-*` profile must name its link with `--nfs-link`. The named links are
+fixed and never change silently:
+
+| `--nfs-link` | Rate | Burst | Round trip |
+| --- | --- | --- | --- |
+| `nas-100mbit` | 100 Mbit/s | 128 KiB | 1000 µs (500 µs each way) |
+| `nas-1gbit` | 1 Gbit/s | 1 MiB | 1000 µs (500 µs each way) |
+| `nas-2.5gbit` | 2.5 Gbit/s | 2 MiB | 1000 µs (500 µs each way) |
+
+The delay is a fixed one-way `netem` delay with zero jitter in each direction,
+so the observed round trip is the declared one and a repeat of the same plan is
+shaped identically.
+
+### Bringing up the export
+
+```bash
+# 1. The link the plan will declare, written once as an immutable env file.
+go run ./cmd/nntpbench storage-env \
+  --storage-profile nfs-complete --nfs-link nas-1gbit --output /scratch/runs/storage.env
+
+# 2. Build the image and start the export on its own network. Run compose from
+#    the repository, as with the shaper stack: the example file's build context
+#    is relative to it.
+docker build -f docker/nfs-server/Dockerfile -t weaver-nntp-bench-nfs:dev .
+docker compose --env-file /scratch/runs/storage.env \
+  -p bench -f configs/server/compose-nfs.example.yml up -d
+
+# 3. Plan and run against it. The helper binary is the harness's own, built for
+#    the container's platform; the controller mounts it into a helper container
+#    that takes the NFS server's export volume directly, to verify and empty the
+#    export from the server's side of the link.
+GOOS=linux GOARCH=amd64 go build -o /scratch/bin/nntpbench-linux ./cmd/nntpbench
+
+go run ./cmd/nntpbench plan \
+  --fixtures rar5-7-headers-normal-solid-headers-compressible \
+  --targets docker-linux --storage-profile nfs-complete --nfs-link nas-1gbit \
+  --repetitions 20 --seed 20260802 --output /scratch/runs/plan-nfs.json
+
+go run ./cmd/nntpbench sequential \
+  --plan /scratch/runs/plan-nfs.json --adapters /scratch/runs/adapters.json \
+  --target docker-linux --fixtures-root /scratch/fixtures \
+  --artifacts /scratch/runs/artifacts-nfs \
+  --nfs-container bench-nfs-1 --nfs-network bench_benchmark_storage \
+  --nfs-helper-image weaver-nntp-bench-nfs:dev \
+  --nfs-verify-binary /scratch/bin/nntpbench-linux
+```
+
+`--nfs-container` and `--nfs-network` are the container and network names
+Docker actually created (Compose prefixes both with the project name). The
+export is never published on a port.
+
+### What the harness owns
+
+The controller, not the client, owns the storage for a run. Per run it takes an
+exclusive lease on the NFS server, creates an empty export subdirectory,
+creates the Docker `local` volumes (`type=nfs`, `o=addr=…,<mount options>`,
+`device=:/<run>/complete`), and hands the adapter nothing but the volume names.
+The client sees the same two container paths under every profile, so no product
+can tell which storage lane it is running in. After the timed window the
+volumes are removed, the export subdirectory is deleted and the lease is
+released; a failure to clean up is reported rather than swallowed.
+
+Output verification stays outside the timed window and stays the harness's own:
+the controller cannot read the export without a host-side root mount, so it runs
+its own `verify-output` inside a helper container
+(`verification_strategy: helper_container_server_side_harness_verify_output`).
+That helper does not mount the export over NFS. It attaches the NFS server's own
+export volume with `--volumes-from <container>:ro` and reads
+`/export/<run>/complete` on the server's local filesystem, so a multi-gibibyte
+output is never pulled back through the shaped link — which on a 100 Mbit/s
+profile would add minutes of wall clock and server load to every run. Deletion
+works the same way, with the volume attached read-write.
+
+That server-side view is complete because of NFS close-to-open semantics: the
+harness reads the export only after the client has reported terminal status and
+closed its files, and closing flushes the client's writes to the server. A local
+reader on the server then sees the server's own page cache, so no `sync` is
+needed. The `--volumes-from` helper carries no benchmark network at all, so it
+cannot reach the export any other way. Only the negotiated-mount evidence still
+goes over NFS: a throwaway helper mounts the run's volume and reads
+`/proc/mounts`, which moves no output bytes.
+
+### Attestation
+
+Every NFS run carries a `storage_attestation` alongside the shaper snapshots,
+and a run that cannot prove its link is refused rather than published. It
+records, before and after the measured window:
+
+- `tc -s qdisc show` for the interface and, when the ifb redirect is in use, for
+  the ifb device — with the raw output kept beside the parsed values.
+- `/proc/net/rpc/nfsd`, for the server's own read and written byte counters.
+- The negotiated client mount line from `/proc/mounts`, the server's
+  `exportfs -v` output, the container's kernel release and the shaper
+  environment it was given.
+
+It then asserts that the live `tc` rate and delay match the declared profile
+(within the 1 % tc prints to), that the shaper did not change mid-run, that both
+qdiscs moved a non-zero number of bytes, that the server moved at least 1 MiB,
+that the mount negotiated NFSv4.1, and that the same exclusive lease was held
+from start to finish. `nntpbench run` prints a one-line summary per suite.
+
+The client-to-server direction has two possible mechanisms. Linux cannot shape
+ingress directly, so the container mirrors it to an `ifb` device and applies the
+same `tbf` + `netem` pair there. Where the host kernel has no `ifb` module it
+falls back to `tc … ingress police`, which enforces the rate by dropping rather
+than queueing and cannot add delay. Which mechanism ran is recorded in the
+attestation, and the delay assertion is replaced by an assertion of zero delay,
+so a policed run can never be read as a delayed one.
+
+### Verifying on a Linux bench host
+
+The unit tests cover the wiring with fakes, and one opt-in test drives a real
+server. Before publishing storage numbers from a new host, confirm in order:
+
+1. `docker build -f docker/nfs-server/Dockerfile -t weaver-nntp-bench-nfs:dev .`
+2. The export is a Docker volume, not the container overlay — the entrypoint
+   refuses the overlay by name if it is not.
+3. The container log says `ingress via ifb-tbf+netem`. If it says
+   `ingress-police`, the host kernel has no `ifb` module (`modprobe ifb`), and
+   the client-to-server direction is dropping instead of queueing.
+4. `docker exec <container> tc -s qdisc show dev eth0` shows a root `tbf` at the
+   declared rate with a `netem` child at half the declared round trip, and
+   `… dev ifb-nfs` shows the same pair.
+5. `docker exec <container> /usr/local/bin/nntpbench-nfs-control health` exits
+   zero, and `/proc/fs/nfsd/versions` shows `+4.1`.
+6. The live session test passes end to end:
+
+   ```bash
+   NNTPBENCH_NFS_CONTAINER=<container> NNTPBENCH_NFS_NETWORK=<network> \
+     NNTPBENCH_NFS_VERIFY_BINARY=/scratch/bin/nntpbench-linux \
+     go test ./internal/benchmark -run LiveServer -v
+   ```
+
+   It takes the lease, mounts the export, moves bytes through it, validates the
+   attestation and asserts that nothing is left behind. It is skipped when those
+   variables are unset, so it never runs in an ordinary `go test ./...`.
+7. `docker volume ls` and `docker ps -a` are unchanged after a suite: the
+   session removes its own volumes, export subdirectory and lease.
+
+### Limitations
+
+- **Linux hosts only, in practice.** The image needs a host kernel with `nfsd`
+  and runs privileged; the export must be a Docker volume, because no kernel NFS
+  server can export the container's overlay filesystem. Docker Desktop's VM will
+  usually run the server but has no `ifb` module, so it silently takes the
+  policing fallback: usable for wiring checks, not for published numbers.
+- A userspace server (NFS-Ganesha) would remove the privileged kernel
+  dependency. It is not implemented here; the kernel server is what a NAS
+  actually runs, and swapping it would change what is being measured.
+- **`cpu_time` excludes NFS client kernel time for the `nfs` profiles.** The
+  mount is performed by the host kernel on behalf of the Docker daemon, so the
+  client container's cgroup counter does not see it. The caveat is copied into
+  every NFS attestation; do not compare `cpu_time` across storage profiles.
+- The native macOS and Windows lanes are `local` only. Mounting an export there
+  would need the operator's own kernel to mount it as root, so a plan that pairs
+  an `nfs-*` profile with a native target is refused when it is written.
+- `queue-transition` is `local` only for the same reason its verifier walks the
+  whole output tree: it is a duplicate-instance check, not a storage
+  measurement.
+- One run at a time. The server's lease is exclusive, and a second controller
+  gets a refusal rather than a quietly shared link.
 
 ## What is measured
 
@@ -470,12 +881,21 @@ Per run the artifact records:
   fresh-container creation to terminal (cold startup included, the Go
   controller excluded). Native lanes: the launched process's user + system time
   (`client_process` scope), never promoted to a whole-tree value. Do not divide
-  this cold-scope counter by the narrower primary wall clock.
+  this cold-scope counter by the narrower primary wall clock. Under the `nfs`
+  storage profiles this counter excludes NFS client kernel time, which the host
+  kernel spends outside the client's cgroup; the caveat is recorded in every
+  NFS attestation.
 - `instructions_retired` — Docker lane on native Linux: cgroup-scoped
   `perf stat -a -G … -e instructions` over the same interval, raw output kept as
   `config/perf-instructions.txt`. Where `perf` cannot attach (Docker Desktop,
   most macOS setups) and on native lanes it is recorded as `unavailable` with a
   reason — never as zero, never omitted.
+
+- `storage_profile` — where the client's intermediate and completion
+  directories lived, with the link's fixed rate, burst and round trip. It is a
+  stratum, not an annotation: `local` and `nfs-*` results are never pooled, and
+  an NFS artifact without a valid `storage_attestation` is refused by the
+  summarizer.
 
 Every counter carries its scope, collector and collector version, so results
 compare like for like instead of treating an unavailable hardware counter as a

@@ -132,6 +132,7 @@ func summaryTestArtifact(client benchmark.Client, repetition int, measurement in
 		TransportLabel:   "plaintext",
 		Profile:          benchmark.ProfileStock,
 		ServerLink:       benchmark.DefaultServerLinkProfile(),
+		StorageProfile:   benchmark.DefaultStorageProfile(),
 		Repetition:       repetition,
 	}
 	adapterJob := benchmark.QueueJobResult{
@@ -140,13 +141,13 @@ func summaryTestArtifact(client benchmark.Client, repetition int, measurement in
 		TerminalObservationUncertainty:  measurement / 200,
 	}
 	return benchmark.QueueArtifact{
-		SchemaVersion:  6,
+		SchemaVersion:  7,
 		SuiteID:        run.ID,
 		SubmissionMode: benchmark.SubmissionModeSequential,
 		Runs:           []benchmark.Run{run},
 		Status:         "passed",
 		AdapterResult: &benchmark.QueueAdapterResult{
-			SchemaVersion:            5,
+			SchemaVersion:            6,
 			SuiteID:                  run.ID,
 			SubmissionMode:           benchmark.SubmissionModeSequential,
 			Client:                   run.Client,
@@ -157,6 +158,7 @@ func summaryTestArtifact(client benchmark.Client, repetition int, measurement in
 			TLSValidation:            run.TLSValidation,
 			TransportLabel:           run.TransportLabel,
 			ServerLink:               run.ServerLink,
+			StorageProfile:           run.StorageProfile,
 			Jobs:                     []benchmark.QueueJobResult{adapterJob},
 			ClientIdentity:           "sha256:test-" + string(run.Client),
 			ClientVersion:            "test",

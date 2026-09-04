@@ -26,6 +26,20 @@ type Toolchain struct {
 	Binary   string `json:"binary"`
 }
 
+// SevenZipToolchain pins the official 7-Zip Linux console release used to
+// write the 7z fixture lane. Distribution p7zip forks are deliberately not
+// used: they are a different codebase with a different container writer.
+type SevenZipToolchain struct {
+	SchemaVersion int    `json:"schema_version"`
+	ID            string `json:"id"`
+	Image         string `json:"image"`
+	Platform      string `json:"platform"`
+	URL           string `json:"url"`
+	SHA256        string `json:"sha256"`
+	Binary        string `json:"binary"`
+	Version       string `json:"version"`
+}
+
 // PAR2Toolchain pins the open-source parity generator used only while
 // materializing repair fixtures. It is not a benchmarked client dependency.
 type PAR2Toolchain struct {
@@ -75,6 +89,57 @@ func LoadPAR2Toolchain(path string) (PAR2Toolchain, error) {
 		return PAR2Toolchain{}, err
 	}
 	return toolchain, nil
+}
+
+func LoadSevenZipToolchain(path string) (SevenZipToolchain, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return SevenZipToolchain{}, fmt.Errorf("read 7-Zip toolchain %s: %w", path, err)
+	}
+	var toolchain SevenZipToolchain
+	if err := json.Unmarshal(contents, &toolchain); err != nil {
+		return SevenZipToolchain{}, fmt.Errorf("decode 7-Zip toolchain %s: %w", path, err)
+	}
+	if err := toolchain.Validate(); err != nil {
+		return SevenZipToolchain{}, err
+	}
+	return toolchain, nil
+}
+
+func (t SevenZipToolchain) Validate() error {
+	if t.SchemaVersion != 1 {
+		return fmt.Errorf("7-Zip toolchain %q has unsupported schema version %d", t.ID, t.SchemaVersion)
+	}
+	if strings.TrimSpace(t.ID) == "" || strings.TrimSpace(t.Image) == "" || strings.TrimSpace(t.Platform) == "" {
+		return fmt.Errorf("7-Zip toolchain must include id, image, and platform")
+	}
+	if strings.TrimSpace(t.Version) == "" {
+		return fmt.Errorf("7-Zip toolchain %q must declare the upstream version it installs", t.ID)
+	}
+	binary := strings.TrimSpace(t.Binary)
+	if binary == "" || binary == "." || binary == ".." || strings.ContainsAny(binary, "/\\") {
+		return fmt.Errorf("7-Zip toolchain %q has invalid binary %q", t.ID, t.Binary)
+	}
+	parsed, err := url.Parse(t.URL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return fmt.Errorf("7-Zip toolchain %q must use an https URL", t.ID)
+	}
+	if len(t.SHA256) != 64 || strings.Trim(t.SHA256, "0123456789abcdefABCDEF") != "" {
+		return fmt.Errorf("7-Zip toolchain %q has invalid SHA-256", t.ID)
+	}
+	return nil
+}
+
+func (t SevenZipToolchain) ManifestID() fixture.ToolchainID {
+	return fixture.ToolchainID{
+		ID:       t.ID,
+		Image:    t.Image,
+		URL:      t.URL,
+		SHA256:   t.SHA256,
+		Platform: t.Platform,
+		Binary:   t.Binary,
+		Version:  t.Version,
+	}
 }
 
 func (t PAR2Toolchain) Validate() error {

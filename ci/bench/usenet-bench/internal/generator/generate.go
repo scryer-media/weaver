@@ -28,6 +28,8 @@ const (
 	defaultBytesPerFile            int64 = 150 << 20
 	defaultMultiVolumeBytesPerFile int64 = 48 << 20
 	defaultBluRayLargeFile         int64 = 5 << 30
+	defaultBluRayMediumFile        int64 = 96 << 20
+	defaultBluRayMediumFileCount         = 8
 	defaultBluRaySmallFile         int64 = 128 << 10
 	defaultBluRaySmallFileCount          = 512
 	defaultGenerationWorkers             = 4
@@ -41,11 +43,15 @@ type Config struct {
 	DockerfilePath          string
 	PAR2ToolchainPath       string
 	PAR2DockerfilePath      string
+	SevenZipToolchainPath   string
+	SevenZipDockerfilePath  string
 	OutputDir               string
 	DockerBinary            string
 	BytesPerFile            int64
 	MultiVolumeBytesPerFile int64
 	BluRayLargeFileBytes    int64
+	BluRayMediumFileBytes   int64
+	BluRayMediumFileCount   int
 	BluRaySmallFileBytes    int64
 	BluRaySmallFileCount    int
 	Workers                 int
@@ -69,6 +75,12 @@ func (c Config) withDefaults() Config {
 	if c.PAR2DockerfilePath == "" {
 		c.PAR2DockerfilePath = "docker/par2/Dockerfile"
 	}
+	if c.SevenZipToolchainPath == "" {
+		c.SevenZipToolchainPath = "docker/sevenzip/toolchain.json"
+	}
+	if c.SevenZipDockerfilePath == "" {
+		c.SevenZipDockerfilePath = "docker/sevenzip/Dockerfile"
+	}
 	if c.OutputDir == "" {
 		c.OutputDir = "generated"
 	}
@@ -83,6 +95,12 @@ func (c Config) withDefaults() Config {
 	}
 	if c.BluRayLargeFileBytes == 0 {
 		c.BluRayLargeFileBytes = defaultBluRayLargeFile
+	}
+	if c.BluRayMediumFileBytes == 0 {
+		c.BluRayMediumFileBytes = defaultBluRayMediumFile
+	}
+	if c.BluRayMediumFileCount == 0 {
+		c.BluRayMediumFileCount = defaultBluRayMediumFileCount
 	}
 	if c.BluRaySmallFileBytes == 0 {
 		c.BluRaySmallFileBytes = defaultBluRaySmallFile
@@ -102,6 +120,9 @@ func (c Config) Validate() error {
 	}
 	if c.BluRayLargeFileBytes <= 0 || c.BluRaySmallFileBytes <= 0 || c.BluRaySmallFileCount < 1 {
 		return fmt.Errorf("Blu-ray layout sizes and file count must be positive")
+	}
+	if c.BluRayMediumFileBytes <= 0 || c.BluRayMediumFileCount < 1 {
+		return fmt.Errorf("Blu-ray extra-stream size and count must be positive")
 	}
 	if c.Workers < 1 {
 		return fmt.Errorf("generator workers must be positive")
@@ -144,6 +165,19 @@ func Generate(ctx context.Context, config Config) ([]fixture.GeneratedManifest, 
 			}
 		}
 		par2Toolchain = &loaded
+	}
+	var sevenZipToolchain *SevenZipToolchain
+	if selectedCasesRequireSevenZip(cases, config.CaseIDs) {
+		loaded, err := LoadSevenZipToolchain(config.SevenZipToolchainPath)
+		if err != nil {
+			return nil, err
+		}
+		if config.BuildImages {
+			if err := buildSevenZipImage(ctx, config, loaded); err != nil {
+				return nil, err
+			}
+		}
+		sevenZipToolchain = &loaded
 	}
 
 	if err := os.MkdirAll(config.OutputDir, 0o755); err != nil {
@@ -194,7 +228,7 @@ func Generate(ctx context.Context, config Config) ([]fixture.GeneratedManifest, 
 	worker := func() {
 		defer workerGroup.Done()
 		for job := range queue {
-			manifest, err := generateCase(workCtx, config, job.archiveCase, job.toolchain, par2Toolchain)
+			manifest, err := generateCase(workCtx, config, job.archiveCase, job.toolchain, par2Toolchain, sevenZipToolchain)
 			if err != nil {
 				select {
 				case errs <- fmt.Errorf("generate fixture %q: %w", job.archiveCase.ID, err):
@@ -244,7 +278,14 @@ func buildImage(ctx context.Context, config Config, toolchain Toolchain) error {
 	return nil
 }
 
-func generateCase(ctx context.Context, config Config, archiveCase fixture.ArchiveCase, toolchain Toolchain, par2Toolchain *PAR2Toolchain) (fixture.GeneratedManifest, error) {
+func generateCase(
+	ctx context.Context,
+	config Config,
+	archiveCase fixture.ArchiveCase,
+	toolchain Toolchain,
+	par2Toolchain *PAR2Toolchain,
+	sevenZipToolchain *SevenZipToolchain,
+) (fixture.GeneratedManifest, error) {
 	caseDir, err := filepath.Abs(filepath.Join(config.OutputDir, archiveCase.ID))
 	if err != nil {
 		return fixture.GeneratedManifest{}, fmt.Errorf("resolve fixture directory: %w", err)
@@ -267,43 +308,83 @@ func generateCase(ctx context.Context, config Config, archiveCase fixture.Archiv
 	if err != nil {
 		return fixture.GeneratedManifest{}, fmt.Errorf("write fixture %q payload: %w", archiveCase.ID, err)
 	}
-	args, err := archiveCase.RARArgs(filepath.ToSlash(filepath.Join("archive", "fixture.rar")), inputs)
-	if err != nil {
-		return fixture.GeneratedManifest{}, err
-	}
-	if err := runRAR(ctx, config.DockerBinary, toolchain, caseDir, args...); err != nil {
-		return fixture.GeneratedManifest{}, fmt.Errorf("create fixture %q: %w", archiveCase.ID, err)
+	if archiveCase.ArchiveFormat == fixture.SevenZip {
+		if sevenZipToolchain == nil {
+			return fixture.GeneratedManifest{}, fmt.Errorf("fixture %q requires the pinned 7-Zip toolchain", archiveCase.ID)
+		}
+		if err := createSevenZipArchive(ctx, config, archiveCase, *sevenZipToolchain, caseDir, inputs); err != nil {
+			return fixture.GeneratedManifest{}, err
+		}
+	} else {
+		args, err := archiveCase.RARArgs(filepath.ToSlash(filepath.Join("archive", "fixture.rar")), inputs)
+		if err != nil {
+			return fixture.GeneratedManifest{}, err
+		}
+		if err := runRAR(ctx, config.DockerBinary, toolchain, caseDir, args...); err != nil {
+			return fixture.GeneratedManifest{}, fmt.Errorf("create fixture %q: %w", archiveCase.ID, err)
+		}
 	}
 
-	archives, firstVolume, err := digestArchiveFiles(archiveDir, caseDir)
+	archives, firstVolume, err := digestArchiveFiles(archiveDir, caseDir, archiveCase.ArchiveFormat)
 	if err != nil {
 		return fixture.GeneratedManifest{}, fmt.Errorf("inspect fixture %q archive: %w", archiveCase.ID, err)
 	}
 	if requiresMultiVolumeArchive(archiveCase) && len(archives) < 2 {
 		return fixture.GeneratedManifest{}, fmt.Errorf("fixture %q did not create a multi-volume archive; increase bytes per file or reduce volume size", archiveCase.ID)
 	}
-	testArgs := []string{"t", "-idq", "-y"}
-	if archiveCase.RequiresPassword() {
-		testArgs = append(testArgs, "-p"+fixture.FixturePassword)
+	if archiveCase.ArchiveFormat == fixture.SevenZip {
+		// 7-Zip's own extraction against the payload digests is the oracle
+		// for this lane, exactly as RARLAB's test is for the RAR lanes.
+		if err := verifySevenZipArchive(ctx, config, archiveCase, *sevenZipToolchain, caseDir, firstVolume, expected); err != nil {
+			return fixture.GeneratedManifest{}, fmt.Errorf("verify fixture %q with 7-Zip: %w", archiveCase.ID, err)
+		}
+	} else {
+		testArgs := []string{"t", "-idq", "-y"}
+		if archiveCase.RequiresPassword() {
+			testArgs = append(testArgs, "-p"+fixture.FixturePassword)
+		}
+		testArgs = append(testArgs, filepath.ToSlash(firstVolume))
+		if err := runRAR(ctx, config.DockerBinary, toolchain, caseDir, testArgs...); err != nil {
+			return fixture.GeneratedManifest{}, fmt.Errorf("verify fixture %q with RARLAB: %w", archiveCase.ID, err)
+		}
 	}
-	testArgs = append(testArgs, filepath.ToSlash(firstVolume))
-	if err := runRAR(ctx, config.DockerBinary, toolchain, caseDir, testArgs...); err != nil {
-		return fixture.GeneratedManifest{}, fmt.Errorf("verify fixture %q with RARLAB: %w", archiveCase.ID, err)
-	}
-	repair, postedFiles, err := applyRepairProfile(ctx, config, archiveCase, toolchain, par2Toolchain, caseDir, archives, firstVolume)
+	repair, postedFiles, withheld, err := applyRepairProfile(ctx, repairInputs{
+		Config:            config,
+		Case:              archiveCase,
+		RARToolchain:      toolchain,
+		PAR2Toolchain:     par2Toolchain,
+		SevenZipToolchain: sevenZipToolchain,
+		CaseDir:           caseDir,
+		SourceArchives:    archives,
+		FirstVolume:       firstVolume,
+		ExpectedFiles:     expected,
+	})
 	if err != nil {
 		return fixture.GeneratedManifest{}, fmt.Errorf("apply repair profile to fixture %q: %w", archiveCase.ID, err)
 	}
 
+	archiveWriter := toolchain.ManifestID()
+	if archiveCase.ArchiveFormat == fixture.SevenZip {
+		archiveWriter = sevenZipToolchain.ManifestID()
+	}
 	manifest := fixture.GeneratedManifest{
-		SchemaVersion:      5,
-		Case:               archiveCase,
-		Toolchain:          toolchain.ManifestID(),
-		PayloadRecipe:      recipe,
-		ExpectedFiles:      expected,
-		SourceArchiveFiles: archives,
-		ArchiveFiles:       postedFiles,
-		Repair:             repair,
+		SchemaVersion:          fixture.GeneratedManifestSchemaVersion,
+		Case:                   archiveCase,
+		Toolchain:              toolchain.ManifestID(),
+		ArchiveWriterToolchain: archiveWriter,
+		PayloadRecipe:          recipe,
+		ExpectedFiles:          expected,
+		SourceArchiveFiles:     archives,
+		ArchiveFiles:           postedFiles,
+		WithheldFiles:          withheld,
+		Repair:                 repair,
+	}
+	if manifest.NZBFileOrder, manifest.NZBOrderSeed, err = fixture.OrderedNZBFiles(
+		archiveCase.NZBOrder,
+		archiveCase.ID,
+		postedPathList(manifest.PostedFiles()),
+	); err != nil {
+		return fixture.GeneratedManifest{}, err
 	}
 	if err := writeManifest(filepath.Join(caseDir, "fixture-manifest.json"), manifest); err != nil {
 		return fixture.GeneratedManifest{}, err
@@ -420,18 +501,46 @@ func writeBluRayDiscPayloadFiles(ctx context.Context, dir, caseDir string, archi
 		}
 		digests = append(digests, digest)
 	}
+	// The extra streams are the menu, trailer and bonus-feature members a real
+	// disc folder carries: too big to be metadata, far smaller than the main
+	// feature. One is rendered and copied, so the mix costs one encode.
+	var mediumStream fixture.FileDigest
+	for index := 1; index <= config.BluRayMediumFileCount; index++ {
+		relative := bluRayMediumPath(index)
+		if mediumStream.Path == "" {
+			digest, err := renderVideo(ctx, config, toolchain, caseDir, filepath.ToSlash(filepath.Join("input", relative)), archiveCase.Payload, config.BluRayMediumFileBytes, 20_001)
+			if err != nil {
+				return nil, nil, fixture.PayloadRecipe{}, err
+			}
+			mediumStream = fixture.FileDigest{Path: relative, Size: digest.Size, BLAKE3: digest.BLAKE3}
+		} else if err := copyVideoFile(filepath.Join(dir, filepath.FromSlash(mediumStream.Path)), filepath.Join(dir, filepath.FromSlash(relative))); err != nil {
+			return nil, nil, fixture.PayloadRecipe{}, err
+		}
+		digest := mediumStream
+		digest.Path = relative
+		digests = append(digests, digest)
+	}
 	largeRelative := "BDMV/STREAM/00000.m2ts"
 	largeDigest, err := renderVideo(ctx, config, toolchain, caseDir, filepath.ToSlash(filepath.Join("input", largeRelative)), archiveCase.Payload, config.BluRayLargeFileBytes, 1)
 	if err != nil {
 		return nil, nil, fixture.PayloadRecipe{}, err
 	}
 	digests = append(digests, fixture.FileDigest{Path: largeRelative, Size: largeDigest.Size, BLAKE3: largeDigest.BLAKE3})
-	return digests, bluRayArchiveInputRoots(), fixture.PayloadRecipe{
-		Layout:         fixture.BluRayDiscPayloadLayout,
-		LargeFileBytes: config.BluRayLargeFileBytes,
-		SmallFileCount: config.BluRaySmallFileCount,
-		SmallFileBytes: config.BluRaySmallFileBytes,
+	return digests, presentBluRayInputRoots(digests), fixture.PayloadRecipe{
+		Layout:          fixture.BluRayDiscPayloadLayout,
+		LargeFileBytes:  config.BluRayLargeFileBytes,
+		MediumFileCount: config.BluRayMediumFileCount,
+		MediumFileBytes: config.BluRayMediumFileBytes,
+		SmallFileCount:  config.BluRaySmallFileCount,
+		SmallFileBytes:  config.BluRaySmallFileBytes,
 	}, nil
+}
+
+// bluRayMediumPath numbers the extra streams from 00101 so they cannot
+// collide with the main feature at 00000 or the small menu streams at
+// 00001-00004.
+func bluRayMediumPath(index int) string {
+	return fmt.Sprintf("BDMV/STREAM/%05d.m2ts", 100+index)
 }
 
 // bluRayArchiveInputRoots preserves the archive's disc tree. RAR's -ep1
@@ -440,6 +549,26 @@ func writeBluRayDiscPayloadFiles(ctx context.Context, dir, caseDir string, archi
 // file to its basename and make duplicate legitimate member names collide.
 func bluRayArchiveInputRoots() []string {
 	return []string{"input/BDMV", "input/CERTIFICATE"}
+}
+
+// presentBluRayInputRoots keeps only the roots the payload actually wrote.
+// The CERTIFICATE members sit at the tail of the small-file numbering, so a
+// reduced-size local run asks for fewer files than the full disc and never
+// creates that directory; naming it anyway makes the archiver fail on a path
+// that does not exist. Root order is preserved so the archive member order
+// stays stable for a given file count.
+func presentBluRayInputRoots(digests []fixture.FileDigest) []string {
+	roots := make([]string, 0, 2)
+	for _, root := range bluRayArchiveInputRoots() {
+		prefix := strings.TrimPrefix(root, "input/") + "/"
+		for _, digest := range digests {
+			if strings.HasPrefix(digest.Path, prefix) {
+				roots = append(roots, root)
+				break
+			}
+		}
+	}
+	return roots
 }
 
 func bluRaySmallPath(index int) string {
@@ -593,7 +722,11 @@ func writeModeratelyCompressible(writer io.Writer, size int64, stream uint64) er
 	return nil
 }
 
-func digestArchiveFiles(archiveDir, caseDir string) ([]fixture.FileDigest, string, error) {
+// digestArchiveFiles collects the archive volumes the writer produced, in the
+// order a client would read them. RAR volumes all carry the .rar suffix;
+// 7-Zip multi-volume members are fixture.7z.001, .002, ... so they are matched
+// by name prefix and sort into numeric order on their zero-padded suffix.
+func digestArchiveFiles(archiveDir, caseDir string, format fixture.ArchiveFormat) ([]fixture.FileDigest, string, error) {
 	var paths []string
 	if err := filepath.WalkDir(archiveDir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
@@ -602,7 +735,7 @@ func digestArchiveFiles(archiveDir, caseDir string) ([]fixture.FileDigest, strin
 		if entry.IsDir() {
 			return nil
 		}
-		if strings.EqualFold(filepath.Ext(entry.Name()), ".rar") {
+		if isArchiveVolume(entry.Name(), format) {
 			paths = append(paths, path)
 		}
 		return nil
@@ -611,7 +744,7 @@ func digestArchiveFiles(archiveDir, caseDir string) ([]fixture.FileDigest, strin
 	}
 	sort.Strings(paths)
 	if len(paths) == 0 {
-		return nil, "", fmt.Errorf("RARLAB did not produce a .rar file")
+		return nil, "", fmt.Errorf("the pinned %s writer did not produce an archive volume", format)
 	}
 	digests := make([]fixture.FileDigest, 0, len(paths))
 	for _, path := range paths {
@@ -638,6 +771,21 @@ func digestArchiveFiles(archiveDir, caseDir string) ([]fixture.FileDigest, strin
 		return nil, "", err
 	}
 	return digests, first, nil
+}
+
+func isArchiveVolume(name string, format fixture.ArchiveFormat) bool {
+	if format == fixture.SevenZip {
+		return strings.HasPrefix(name, sevenZipArchiveName)
+	}
+	return strings.EqualFold(filepath.Ext(name), ".rar")
+}
+
+func postedPathList(files []fixture.FileDigest) []string {
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		paths = append(paths, file.Path)
+	}
+	return paths
 }
 
 func hashFile(path string) (string, error) {

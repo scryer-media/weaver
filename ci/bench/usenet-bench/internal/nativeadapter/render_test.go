@@ -32,6 +32,12 @@ func TestWeaverRenderUsesServiceLaunchAndStockExtractionDefault(t *testing.T) {
 	if !strings.Contains(string(spec.Content), "WEAVER_STARTUP_IOPS=50000\n") {
 		t.Fatalf("native Weaver environment lacks the Docker-parity startup IOPS pin (probe skip):\n%s", spec.Content)
 	}
+	if !strings.Contains(string(spec.Content), "WEAVER_TRUSTED_CIDRS=127.0.0.0/8,::1/128\n") {
+		t.Fatalf("native Weaver environment must pin loopback as trusted so the launcher is admitted without the first-run wizard:\n%s", spec.Content)
+	}
+	if !strings.Contains(string(spec.Content), "WEAVER_DIRECT_UNPACK=on\n") {
+		t.Fatalf("native Weaver environment must render direct unpack on (the shipping default) in every profile:\n%s", spec.Content)
+	}
 }
 
 func TestWeaverRenderMirrorsDockerOperatorOverridesIntoTheAuditRecord(t *testing.T) {
@@ -200,6 +206,7 @@ func TestNativeSequentialQueueResultHasCompleteHonestTiming(t *testing.T) {
 		TLSValidation:            benchmark.TLSNotApplicable,
 		TransportLabel:           "plaintext",
 		ServerLink:               benchmark.DefaultServerLinkProfile(),
+		StorageProfile:           benchmark.DefaultStorageProfile(),
 		QueueStartedAt:           started,
 		QueueCompletedAt:         observed,
 		StatusPollIntervalNanos:  int64(10 * time.Millisecond),
@@ -258,6 +265,7 @@ func testConfig(client benchmark.Client) Config {
 		TransportLabel:   "plaintext",
 		TLSValidation:    benchmark.TLSNotApplicable,
 		ServerLink:       benchmark.DefaultServerLinkProfile(),
+		StorageProfile:   benchmark.DefaultStorageProfile(),
 		FixtureDir:       root,
 		NZBPath:          filepath.Join(root, "fixture.nzb"),
 		OutputDir:        filepath.Join(root, "complete"),

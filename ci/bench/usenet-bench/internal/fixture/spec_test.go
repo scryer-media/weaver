@@ -7,12 +7,12 @@ import (
 
 func TestExpandCoversEveryAxis(t *testing.T) {
 	matrix := Matrix{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Sets: []FixtureSet{{
 			ID:                 "modern-rar5",
 			WriterEra:          "RAR 5.x-7.x compatibility",
 			GeneratorToolchain: "rarlab-7.23",
-			RARFormat:          RAR5,
+			ArchiveFormat:      RAR5,
 			Compressions:       []Compression{Store, Normal},
 			Solid:              []bool{false, true},
 			Encryptions:        []Encryption{NoEncryption, DataEncryption, HeaderEncryption},
@@ -39,12 +39,12 @@ func TestExpandCoversEveryAxis(t *testing.T) {
 
 func TestRARArgsAreExplicit(t *testing.T) {
 	c := ArchiveCase{
-		ID:          "case",
-		RARFormat:   RAR5,
-		Compression: Normal,
-		Solid:       true,
-		Encryption:  HeaderEncryption,
-		VolumeSize:  "32m",
+		ID:            "case",
+		ArchiveFormat: RAR5,
+		Compression:   Normal,
+		Solid:         true,
+		Encryption:    HeaderEncryption,
+		VolumeSize:    "32m",
 	}
 	args, err := c.RARArgs("archive/fixture.rar", []string{"input/one.bin", "input/two.bin"})
 	if err != nil {
@@ -60,12 +60,12 @@ func TestRARArgsAreExplicit(t *testing.T) {
 
 func TestRAR4ReleaseCompressionUsesItsMaximumDictionary(t *testing.T) {
 	c := ArchiveCase{
-		ID:          "rar4-release",
-		RARFormat:   RAR4,
-		Compression: Normal,
-		Solid:       true,
-		Encryption:  NoEncryption,
-		VolumeSize:  "32m",
+		ID:            "rar4-release",
+		ArchiveFormat: RAR4,
+		Compression:   Normal,
+		Solid:         true,
+		Encryption:    NoEncryption,
+		VolumeSize:    "32m",
 	}
 	args, err := c.RARArgs("archive/fixture.rar", []string{"input/one.bin"})
 	if err != nil {
@@ -84,12 +84,12 @@ func TestRAR4ReleaseCompressionUsesItsMaximumDictionary(t *testing.T) {
 
 func TestLegacyRAR4ArgsUseTheLockedWriterDefault(t *testing.T) {
 	c := ArchiveCase{
-		ID:          "legacy-case",
-		RARFormat:   RAR4,
-		Compression: Store,
-		Solid:       false,
-		Encryption:  DataEncryption,
-		VolumeSize:  "32m",
+		ID:            "legacy-case",
+		ArchiveFormat: RAR4,
+		Compression:   Store,
+		Solid:         false,
+		Encryption:    DataEncryption,
+		VolumeSize:    "32m",
 	}
 	args, err := c.RARArgs("archive/fixture.rar", []string{"input/one.bin"})
 	if err != nil {
@@ -107,11 +107,11 @@ func TestLegacyRAR4ArgsUseTheLockedWriterDefault(t *testing.T) {
 }
 
 func TestBluRayLayoutDoesNotRequireUniformFileCount(t *testing.T) {
-	matrix := Matrix{SchemaVersion: 1, Sets: []FixtureSet{{
+	matrix := Matrix{SchemaVersion: 2, Sets: []FixtureSet{{
 		ID:                 "modern-rar5-bluray",
 		WriterEra:          "RAR 5.x-7.x compatibility",
 		GeneratorToolchain: "rarlab-7.23",
-		RARFormat:          RAR5,
+		ArchiveFormat:      RAR5,
 		Compressions:       []Compression{Normal},
 		Solid:              []bool{true},
 		Encryptions:        []Encryption{NoEncryption},
@@ -132,11 +132,11 @@ func TestBluRayLayoutDoesNotRequireUniformFileCount(t *testing.T) {
 }
 
 func TestRepairProfilesAreExplicitFixtureCases(t *testing.T) {
-	matrix := Matrix{SchemaVersion: 1, Sets: []FixtureSet{{
+	matrix := Matrix{SchemaVersion: 2, Sets: []FixtureSet{{
 		ID:                 "repair-rar5",
 		WriterEra:          "RAR 7.23",
 		GeneratorToolchain: "rarlab-7.23",
-		RARFormat:          RAR5,
+		ArchiveFormat:      RAR5,
 		Compressions:       []Compression{Normal},
 		Solid:              []bool{true},
 		Encryptions:        []Encryption{NoEncryption},

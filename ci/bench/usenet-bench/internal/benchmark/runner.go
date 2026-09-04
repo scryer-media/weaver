@@ -45,6 +45,7 @@ type AdapterResult struct {
 	TLSValidation            TLSValidation     `json:"tls_validation"`
 	TransportLabel           string            `json:"transport_label"`
 	ServerLink               ServerLinkProfile `json:"server_link"`
+	StorageProfile           StorageProfile    `json:"storage_profile"`
 	QueuedAt                 time.Time         `json:"queued_at"`
 	FirstArticleAt           *time.Time        `json:"first_article_at,omitempty"`
 	CompletionAt             time.Time         `json:"completion_at"`
@@ -65,6 +66,11 @@ type RunConfig struct {
 	TLSPort          string
 	TLSCAFile        string
 	ShaperControlURL string
+	DockerBinary     string
+	NFSContainer     string
+	NFSNetwork       string
+	NFSHelperImage   string
+	NFSVerifyBinary  string
 	NNTPUsername     string
 	NNTPPassword     string
 	Connections      int
@@ -81,6 +87,7 @@ type RunArtifact struct {
 	ShaperBefore                     *ShaperSnapshot       `json:"shaper_before,omitempty"`
 	ShaperAfter                      *ShaperSnapshot       `json:"shaper_after,omitempty"`
 	ShaperDownstreamBytes            uint64                `json:"shaper_downstream_bytes,omitempty"`
+	StorageAttestation               *StorageAttestation   `json:"storage_attestation,omitempty"`
 	Verification                     *OutputVerification   `json:"verification,omitempty"`
 	VerificationWallClockNanoseconds int64                 `json:"verification_wall_clock_nanoseconds,omitempty"`
 	UsableOutputAt                   *time.Time            `json:"usable_output_at,omitempty"`
@@ -201,6 +208,12 @@ func (c RunConfig) withDefaults() RunConfig {
 	if c.Connections == 0 {
 		c.Connections = 8
 	}
+	if c.DockerBinary == "" {
+		c.DockerBinary = "docker"
+	}
+	if c.NFSHelperImage == "" {
+		c.NFSHelperImage = DefaultNFSImage
+	}
 	if c.Profile == "" {
 		c.Profile = c.Plan.Profile
 	}
@@ -253,7 +266,53 @@ func (c RunConfig) Validate() error {
 	if planNeedsVerifiedTLS(c.Plan) && c.TLSCAFile == "" {
 		return fmt.Errorf("TLS CA file is required because the plan contains CA-verified TLS runs")
 	}
-	return nil
+	return c.validateStorage()
+}
+
+// validateStorage refuses an NFS plan the host cannot honour. The mount is
+// created by the Docker daemon on a Linux host and attested through the NFS
+// container, so an NFS plan on any other target, or without a reachable
+// container, is an operator error and never a silent fallback to local disk.
+func (c RunConfig) validateStorage() error {
+	profile := c.Plan.StorageProfile
+	if err := profile.Validate(); err != nil {
+		return err
+	}
+	if !profile.usesNFS() {
+		if c.NFSContainer != "" || c.NFSVerifyBinary != "" {
+			return fmt.Errorf("NFS server settings were supplied for a %q storage plan", profile.ID)
+		}
+		return nil
+	}
+	if c.Target != DockerLinux {
+		return fmt.Errorf("storage profile %q is only supported on the %s target, not %q", profile.ID, DockerLinux, c.Target)
+	}
+	return c.storageOptions().validate()
+}
+
+func (c RunConfig) storageOptions() StorageOptions {
+	return StorageOptions{
+		Profile:      c.Plan.StorageProfile,
+		DockerBinary: c.DockerBinary,
+		Container:    c.NFSContainer,
+		Network:      c.NFSNetwork,
+		HelperImage:  c.NFSHelperImage,
+		VerifyBinary: c.NFSVerifyBinary,
+	}
+}
+
+// openOutputStore returns the completion-directory store for one run together
+// with the storage session that must be closed afterwards. The local profile
+// has no session, so a local run stays exactly the run it always was.
+func openOutputStore(ctx context.Context, config RunConfig, id, outputDir string) (OutputStore, *StorageSession, error) {
+	if !config.Plan.StorageProfile.usesNFS() {
+		return NewLocalOutputStore(outputDir), nil, nil
+	}
+	session, err := OpenStorageSession(ctx, config.storageOptions(), id)
+	if err != nil {
+		return nil, nil, err
+	}
+	return session, session, nil
 }
 
 func planNeedsVerifiedTLS(plan Plan) bool {
@@ -266,7 +325,7 @@ func planNeedsVerifiedTLS(plan Plan) bool {
 }
 
 func executeRun(parent context.Context, config RunConfig, run Run) (artifact RunArtifact) {
-	artifact = RunArtifact{SchemaVersion: 6, Run: run, Status: "failed"}
+	artifact = RunArtifact{SchemaVersion: 7, Run: run, Status: "failed"}
 	runDir := filepath.Join(config.ArtifactRoot, run.ID)
 	if err := os.Mkdir(runDir, 0o755); err != nil {
 		artifact.Error = fmt.Sprintf("create isolated run directory: %v", err)
@@ -307,6 +366,19 @@ func executeRun(parent context.Context, config RunConfig, run Run) (artifact Run
 		artifact.Error = fmt.Sprintf("adapter catalog has no entry for %s/%s/%s", run.Client, run.ArchiveToolchain, run.ExecutionTarget)
 		return artifact
 	}
+	store, storage, err := openOutputStore(parent, config, run.ID, outputDir)
+	if err != nil {
+		artifact.Error = err.Error()
+		return artifact
+	}
+	if storage != nil {
+		defer func() {
+			if closeErr := storage.Close(context.WithoutCancel(parent)); closeErr != nil {
+				appendArtifactError(&artifact.Error, "close storage session: "+closeErr.Error())
+				artifact.Status = "failed"
+			}
+		}()
+	}
 	resultPath := filepath.Join(runDir, "adapter-result.json")
 	logPath := filepath.Join(runDir, "adapter.log")
 	if config.ShaperControlURL != "" {
@@ -335,7 +407,7 @@ func executeRun(parent context.Context, config RunConfig, run Run) (artifact Run
 		}
 		artifact.ShaperBefore = &shaperBefore
 	}
-	if err := invokeAdapter(parent, config, run, adapter, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath); err != nil {
+	if err := invokeAdapter(parent, config, run, adapter, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath, store.Environment()); err != nil {
 		artifact.Error = err.Error()
 		return artifact
 	}
@@ -370,10 +442,18 @@ func executeRun(parent context.Context, config RunConfig, run Run) (artifact Run
 		artifact.ShaperAfter = &shaperAfter
 		artifact.ShaperDownstreamBytes = delivered
 	}
+	if storage != nil {
+		attestation, storageErr := storage.Finish(parent)
+		if storageErr != nil {
+			artifact.Error = storageErr.Error()
+			return artifact
+		}
+		artifact.StorageAttestation = &attestation
+	}
 	artifact.AdapterResult = &result
 	artifact.WallClockNanoseconds = result.CompletionAt.Sub(result.QueuedAt).Nanoseconds()
 	verificationStartedAt := time.Now()
-	verification, err := VerifyOutput(fixtureDir, outputDir)
+	verification, err := store.Verify(parent, fixtureDir)
 	artifact.VerificationWallClockNanoseconds = time.Since(verificationStartedAt).Nanoseconds()
 	if err != nil {
 		artifact.Error = err.Error()
@@ -382,7 +462,7 @@ func executeRun(parent context.Context, config RunConfig, run Run) (artifact Run
 	verifiedAt := time.Now()
 	artifact.Verification = &verification
 	artifact.UsableOutputAt = &verifiedAt
-	if err := DeleteOutputFiles(outputDir); err != nil {
+	if err := store.Delete(parent); err != nil {
 		artifact.Error = fmt.Sprintf("delete verified output: %v", err)
 		return artifact
 	}
@@ -390,12 +470,22 @@ func executeRun(parent context.Context, config RunConfig, run Run) (artifact Run
 	return artifact
 }
 
-func invokeAdapter(parent context.Context, config RunConfig, run Run, adapter Adapter, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath string) error {
-	return invokeAdapterWithExtraEnvironment(parent, config, run, adapter, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath, nil)
+func invokeAdapter(parent context.Context, config RunConfig, run Run, adapter Adapter, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath string, storageEnvironment []string) error {
+	return invokeAdapterWithExtraEnvironment(parent, config, run, adapter, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath, storageEnvironment)
 }
 
-func invokeQueueAdapter(parent context.Context, config RunConfig, run Run, adapter Adapter, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath, queuePath string) error {
-	return invokeAdapterWithExtraEnvironment(parent, config, run, adapter, filepath.Dir(nzbPath), nzbPath, archivePassword, outputDir, configDir, resultPath, logPath, []string{"BENCH_QUEUE_PATH=" + queuePath})
+func invokeQueueAdapter(parent context.Context, config RunConfig, run Run, adapter Adapter, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath, queuePath string, storageEnvironment []string) error {
+	extra := append([]string{"BENCH_QUEUE_PATH=" + queuePath}, storageEnvironment...)
+	return invokeAdapterWithExtraEnvironment(parent, config, run, adapter, filepath.Dir(nzbPath), nzbPath, archivePassword, outputDir, configDir, resultPath, logPath, extra)
+}
+
+// appendArtifactError keeps a deferred cleanup failure visible without hiding
+// the failure that actually ended the run.
+func appendArtifactError(target *string, message string) {
+	if *target != "" {
+		*target += "; "
+	}
+	*target += message
 }
 
 func invokeAdapterWithExtraEnvironment(parent context.Context, config RunConfig, run Run, adapter Adapter, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath string, extraEnvironment []string) error {
@@ -455,7 +545,19 @@ func adapterEnvironment(config RunConfig, run Run, fixtureDir, nzbPath, archiveP
 		"BENCH_SERVER_LINK_SCOPE=" + run.ServerLink.Scope,
 		"BENCH_SERVER_EGRESS_BITS_PER_SECOND=" + strconv.FormatUint(run.ServerLink.EgressBitsPerSecond, 10),
 		"BENCH_SERVER_EGRESS_BURST_BYTES=" + strconv.FormatUint(run.ServerLink.BurstBytes, 10),
+		"BENCH_STORAGE_PROFILE=" + encodeStorageProfile(run.StorageProfile),
 	}
+}
+
+// encodeStorageProfile passes the plan's exact storage contract to the adapter
+// as one value. The adapter echoes it back in its result, so a lane that
+// rendered a different storage layout than the plan declared cannot validate.
+func encodeStorageProfile(profile StorageProfile) string {
+	contents, err := json.Marshal(profile)
+	if err != nil {
+		return ""
+	}
+	return string(contents)
 }
 
 func fixtureArchivePassword(fixtureDir string) (string, error) {
@@ -493,7 +595,7 @@ func loadAdapterResult(path string) (AdapterResult, error) {
 }
 
 func (r AdapterResult) ValidateFor(run Run) error {
-	if r.SchemaVersion != 5 || r.RunID != run.ID || r.Client != run.Client || r.ArchiveToolchain != run.ArchiveToolchain || r.ExecutionTarget != run.ExecutionTarget || r.Transport != run.Transport || r.TLSValidation != run.TLSValidation || r.TransportLabel != run.TransportLabel || r.ServerLink != run.ServerLink {
+	if r.SchemaVersion != 6 || r.RunID != run.ID || r.Client != run.Client || r.ArchiveToolchain != run.ArchiveToolchain || r.ExecutionTarget != run.ExecutionTarget || r.Transport != run.Transport || r.TLSValidation != run.TLSValidation || r.TransportLabel != run.TransportLabel || r.ServerLink != run.ServerLink || r.StorageProfile != run.StorageProfile {
 		return fmt.Errorf("adapter result does not match planned run %s", run.ID)
 	}
 	if r.QueuedAt.IsZero() || r.CompletionAt.IsZero() || r.CompletionAt.Before(r.QueuedAt) {

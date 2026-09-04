@@ -96,6 +96,7 @@ type QueueAdapterResult struct {
 	TLSValidation            TLSValidation     `json:"tls_validation"`
 	TransportLabel           string            `json:"transport_label"`
 	ServerLink               ServerLinkProfile `json:"server_link"`
+	StorageProfile           StorageProfile    `json:"storage_profile"`
 	QueueStartedAt           time.Time         `json:"queue_started_at"`
 	QueueCompletedAt         time.Time         `json:"queue_completed_at"`
 	StatusPollIntervalNanos  int64             `json:"status_poll_interval_nanoseconds"`
@@ -137,6 +138,7 @@ type QueueArtifact struct {
 	ShaperBefore                 *ShaperSnapshot     `json:"shaper_before,omitempty"`
 	ShaperAfter                  *ShaperSnapshot     `json:"shaper_after,omitempty"`
 	ShaperDownstreamBytes        uint64              `json:"shaper_downstream_bytes,omitempty"`
+	StorageAttestation           *StorageAttestation `json:"storage_attestation,omitempty"`
 	Jobs                         []QueueJobArtifact  `json:"jobs,omitempty"`
 	QueueWallClockNanoseconds    int64               `json:"queue_wall_clock_nanoseconds,omitempty"`
 	VerifiedWallClockNanoseconds int64               `json:"verified_wall_clock_nanoseconds,omitempty"`
@@ -191,6 +193,9 @@ func executeQueuePlan(ctx context.Context, config RunConfig, mode SubmissionMode
 	}
 	if err := os.MkdirAll(config.ArtifactRoot, 0o755); err != nil {
 		return nil, fmt.Errorf("create artifact root: %w", err)
+	}
+	if config.Plan.StorageProfile.usesNFS() && mode == SubmissionModeQueueDrain {
+		return nil, fmt.Errorf("storage profile %q is not supported by queue-transition; its duplicate-instance verifier requires a locally walkable output tree", config.Plan.StorageProfile.ID)
 	}
 	var suites []queueSuite
 	if mode == SubmissionModeQueueDrain {
@@ -365,7 +370,7 @@ func verifyQueueTransitionOutputs(fixtureDir, outputDir string, copies int) ([]O
 }
 
 func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuite, mode SubmissionMode) (artifact QueueArtifact) {
-	artifact = QueueArtifact{SchemaVersion: 6, SuiteID: suite.ID, SubmissionMode: mode, Runs: append([]Run(nil), suite.Runs...), Status: "failed"}
+	artifact = QueueArtifact{SchemaVersion: 7, SuiteID: suite.ID, SubmissionMode: mode, Runs: append([]Run(nil), suite.Runs...), Status: "failed"}
 	suiteDir := filepath.Join(config.ArtifactRoot, suite.ID)
 	if err := os.Mkdir(suiteDir, 0o755); err != nil {
 		artifact.Error = fmt.Sprintf("create queue suite directory: %v", err)
@@ -384,14 +389,27 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 		artifact.Error = fmt.Sprintf("create queue client config directory: %v", err)
 		return artifact
 	}
+	store, storage, err := openOutputStore(parent, config, suite.ID, outputDir)
+	if err != nil {
+		artifact.Error = err.Error()
+		return artifact
+	}
+	if storage != nil {
+		defer func() {
+			if closeErr := storage.Close(context.WithoutCancel(parent)); closeErr != nil {
+				appendArtifactError(&artifact.Error, "close storage session: "+closeErr.Error())
+				artifact.Status = "failed"
+			}
+		}()
+	}
 	input := QueueInput{SchemaVersion: 3, SuiteID: suite.ID, SubmissionMode: mode, Jobs: make([]QueueInputJob, 0, len(suite.Runs))}
 	manifests := make(map[string]fixture.GeneratedManifest, len(suite.Runs))
 	fixtureDirs := make(map[string]string, len(suite.Runs))
 	for index, run := range suite.Runs {
 		fixtureDir := filepath.Join(config.FixtureRoot, run.FixtureID)
-		manifest, err := fixture.LoadGeneratedManifest(filepath.Join(fixtureDir, "fixture-manifest.json"))
-		if err != nil {
-			artifact.Error = err.Error()
+		manifest, manifestErr := fixture.LoadGeneratedManifest(filepath.Join(fixtureDir, "fixture-manifest.json"))
+		if manifestErr != nil {
+			artifact.Error = manifestErr.Error()
 			return artifact
 		}
 		nzbPath, err := fixtureNZBPath(fixtureDir, run.FixtureID)
@@ -452,7 +470,7 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 	}
 	resultPath := filepath.Join(suiteDir, "adapter-result.json")
 	logPath := filepath.Join(suiteDir, "adapter.log")
-	if err := invokeQueueAdapter(parent, config, first, adapter, input.Jobs[0].NZBPath, input.Jobs[0].ArchivePassword, outputDir, configDir, resultPath, logPath, inputPath); err != nil {
+	if err := invokeQueueAdapter(parent, config, first, adapter, input.Jobs[0].NZBPath, input.Jobs[0].ArchivePassword, outputDir, configDir, resultPath, logPath, inputPath, store.Environment()); err != nil {
 		artifact.Error = err.Error()
 		return artifact
 	}
@@ -486,6 +504,14 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 		}
 		artifact.ShaperAfter = &shaperAfter
 		artifact.ShaperDownstreamBytes = delivered
+	}
+	if storage != nil {
+		attestation, storageErr := storage.Finish(parent)
+		if storageErr != nil {
+			artifact.Error = storageErr.Error()
+			return artifact
+		}
+		artifact.StorageAttestation = &attestation
 	}
 	artifact.AdapterResult = &result
 	artifact.QueueWallClockNanoseconds = result.QueueCompletedAt.Sub(result.QueueStartedAt).Nanoseconds()
@@ -531,7 +557,7 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 			continue
 		}
 		verificationStartedAt := time.Now()
-		verification, err := VerifyOutput(fixtureDirs[run.ID], outputDir)
+		verification, err := store.Verify(parent, fixtureDirs[run.ID])
 		jobArtifact.VerificationWallClockNanoseconds = time.Since(verificationStartedAt).Nanoseconds()
 		if err != nil {
 			jobArtifact.Outcome = "dnf"
@@ -556,7 +582,7 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 	if len(jobFailures) > 0 {
 		jobFailureError = fmt.Sprintf("%d queue job(s) did not finish: %s", len(jobFailures), strings.Join(jobFailures, "; "))
 	}
-	if err := DeleteOutputFiles(outputDir); err != nil {
+	if err := store.Delete(parent); err != nil {
 		artifact.Error = jobFailureError
 		if artifact.Error != "" {
 			artifact.Error += "; "
@@ -577,11 +603,11 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 }
 
 func (r QueueAdapterResult) ValidateFor(suite queueSuite, mode SubmissionMode) error {
-	if r.SchemaVersion != 5 || r.SuiteID != suite.ID || r.SubmissionMode != mode || len(suite.Runs) == 0 {
+	if r.SchemaVersion != 6 || r.SuiteID != suite.ID || r.SubmissionMode != mode || len(suite.Runs) == 0 {
 		return fmt.Errorf("queue adapter result does not match suite %s", suite.ID)
 	}
 	first := suite.Runs[0]
-	if r.Client != first.Client || r.ArchiveToolchain != first.ArchiveToolchain || r.ExecutionTarget != first.ExecutionTarget || r.Transport != first.Transport || r.TLSValidation != first.TLSValidation || r.TransportLabel != first.TransportLabel || r.ServerLink != first.ServerLink {
+	if r.Client != first.Client || r.ArchiveToolchain != first.ArchiveToolchain || r.ExecutionTarget != first.ExecutionTarget || r.Transport != first.Transport || r.TLSValidation != first.TLSValidation || r.TransportLabel != first.TransportLabel || r.ServerLink != first.ServerLink || r.StorageProfile != first.StorageProfile {
 		return fmt.Errorf("queue adapter result does not match suite %s metadata", suite.ID)
 	}
 	if r.QueueStartedAt.IsZero() || r.QueueCompletedAt.IsZero() || r.QueueCompletedAt.Before(r.QueueStartedAt) {

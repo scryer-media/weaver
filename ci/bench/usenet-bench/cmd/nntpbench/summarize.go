@@ -34,6 +34,13 @@ type comparisonStratum struct {
 	ServerLinkID     string                     `json:"server_link_id"`
 	ServerEgressBPS  uint64                     `json:"server_egress_bits_per_second"`
 	ServerBurstBytes uint64                     `json:"server_burst_bytes"`
+	// StorageProfileID and its link join the stratum key. A local run and an
+	// NFS run measure different questions, so they are never pooled — the same
+	// rule that keeps transports and toolchains apart.
+	StorageProfileID string `json:"storage_profile_id"`
+	StorageNFSLinkID string `json:"storage_nfs_link_id"`
+	StorageLinkBPS   uint64 `json:"storage_link_bits_per_second"`
+	StorageRTTMicros uint64 `json:"storage_rtt_micros"`
 }
 
 type stratifiedComparison struct {
@@ -99,6 +106,31 @@ func summarize(args []string) error {
 		return err
 	}
 	return printJSON(report)
+}
+
+// validateSummaryStorageEvidence fails a summary closed when a published NFS
+// run cannot prove its shaped link, and when a local run carries storage
+// evidence it should never have had.
+func validateSummaryStorageEvidence(artifact benchmark.QueueArtifact, profile benchmark.StorageProfile) error {
+	if err := profile.Validate(); err != nil {
+		return fmt.Errorf("sequential artifact %s has an invalid storage profile: %w", artifact.SuiteID, err)
+	}
+	if profile.Kind == benchmark.StorageLocal {
+		if artifact.StorageAttestation != nil {
+			return fmt.Errorf("local-storage artifact %s unexpectedly carries an NFS attestation", artifact.SuiteID)
+		}
+		return nil
+	}
+	if artifact.StorageAttestation == nil {
+		return fmt.Errorf("storage-shaped artifact %s lacks its NFS attestation", artifact.SuiteID)
+	}
+	if artifact.StorageAttestation.Profile != profile {
+		return fmt.Errorf("storage attestation for %s does not describe the planned storage profile", artifact.SuiteID)
+	}
+	if err := artifact.StorageAttestation.Validate(); err != nil {
+		return fmt.Errorf("storage-shaped artifact %s: %w", artifact.SuiteID, err)
+	}
+	return nil
 }
 
 func parseSingleClient(value string) (benchmark.Client, error) {
@@ -217,15 +249,20 @@ func loadSummaryExecutionContext(root string) (map[string]benchmark.Run, error) 
 func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate benchmark.Client, minimumBlocks int, seed int64, resamples int) (summaryReport, error) {
 	groups := make(map[comparisonStratum]map[int]*comparisonBlock)
 	identities := make(map[summaryProductKey]summaryProductIdentity)
+	// One summary describes one storage stratum. Local and NFS runs answer
+	// different questions, so a directory holding both is an operator mistake
+	// and is refused rather than silently split into two comparisons that look
+	// like one report.
+	var storageProfile *benchmark.StorageProfile
 	for _, artifact := range artifacts {
-		if artifact.SchemaVersion != 6 {
-			return summaryReport{}, fmt.Errorf("summary input %s uses queue artifact schema %d, want 6", artifact.SuiteID, artifact.SchemaVersion)
+		if artifact.SchemaVersion != 7 {
+			return summaryReport{}, fmt.Errorf("summary input %s uses queue artifact schema %d, want 7", artifact.SuiteID, artifact.SchemaVersion)
 		}
 		if artifact.Status != "passed" || artifact.SubmissionMode != benchmark.SubmissionModeSequential {
 			return summaryReport{}, fmt.Errorf("summary input contains a non-passed sequential artifact %s", artifact.SuiteID)
 		}
-		if artifact.AdapterResult == nil || artifact.AdapterResult.SchemaVersion != 5 {
-			return summaryReport{}, fmt.Errorf("sequential artifact %s lacks queue adapter result schema 5", artifact.SuiteID)
+		if artifact.AdapterResult == nil || artifact.AdapterResult.SchemaVersion != 6 {
+			return summaryReport{}, fmt.Errorf("sequential artifact %s lacks queue adapter result schema 6", artifact.SuiteID)
 		}
 		if len(artifact.Jobs) != 1 {
 			return summaryReport{}, fmt.Errorf("sequential artifact %s contains %d jobs, want exactly one", artifact.SuiteID, len(artifact.Jobs))
@@ -234,7 +271,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 		if len(artifact.Runs) != 1 || artifact.Runs[0].ID != job.Run.ID || artifact.AdapterResult.SuiteID != artifact.SuiteID || len(artifact.AdapterResult.Jobs) != 1 || artifact.AdapterResult.Jobs[0].RunID != job.Run.ID || !reflect.DeepEqual(artifact.AdapterResult.Jobs[0], job.AdapterResult) {
 			return summaryReport{}, fmt.Errorf("sequential artifact %s has inconsistent run or adapter-result identity", artifact.SuiteID)
 		}
-		if artifact.AdapterResult.Client != job.Run.Client || artifact.AdapterResult.ArchiveToolchain != job.Run.ArchiveToolchain || artifact.AdapterResult.ExecutionTarget != job.Run.ExecutionTarget || artifact.AdapterResult.Transport != job.Run.Transport || artifact.AdapterResult.TLSValidation != job.Run.TLSValidation || artifact.AdapterResult.TransportLabel != job.Run.TransportLabel || artifact.AdapterResult.ServerLink != job.Run.ServerLink {
+		if artifact.AdapterResult.Client != job.Run.Client || artifact.AdapterResult.ArchiveToolchain != job.Run.ArchiveToolchain || artifact.AdapterResult.ExecutionTarget != job.Run.ExecutionTarget || artifact.AdapterResult.Transport != job.Run.Transport || artifact.AdapterResult.TLSValidation != job.Run.TLSValidation || artifact.AdapterResult.TransportLabel != job.Run.TransportLabel || artifact.AdapterResult.ServerLink != job.Run.ServerLink || artifact.AdapterResult.StorageProfile != job.Run.StorageProfile {
 			return summaryReport{}, fmt.Errorf("sequential artifact %s has adapter metadata inconsistent with its planned run", artifact.SuiteID)
 		}
 		if job.Run.ServerLink.EgressBitsPerSecond > 0 {
@@ -254,6 +291,16 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 			if delivered == 0 || delivered != artifact.ShaperDownstreamBytes {
 				return summaryReport{}, fmt.Errorf("shaped sequential artifact %s has invalid shaper byte evidence", artifact.SuiteID)
 			}
+		}
+		if err := validateSummaryStorageEvidence(artifact, job.Run.StorageProfile); err != nil {
+			return summaryReport{}, err
+		}
+		if storageProfile == nil {
+			profile := job.Run.StorageProfile
+			storageProfile = &profile
+		} else if *storageProfile != job.Run.StorageProfile {
+			return summaryReport{}, fmt.Errorf("summary inputs mix storage profiles %q and %q; summarize each storage profile separately",
+				storageProfile.ID, job.Run.StorageProfile.ID)
 		}
 		if job.Run.Client != baseline && job.Run.Client != candidate {
 			continue
@@ -275,6 +322,10 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 			ServerLinkID:     job.Run.ServerLink.ID,
 			ServerEgressBPS:  job.Run.ServerLink.EgressBitsPerSecond,
 			ServerBurstBytes: job.Run.ServerLink.BurstBytes,
+			StorageProfileID: job.Run.StorageProfile.ID,
+			StorageNFSLinkID: job.Run.StorageProfile.NFSLinkID,
+			StorageLinkBPS:   job.Run.StorageProfile.LinkBitsPerSecond,
+			StorageRTTMicros: job.Run.StorageProfile.RTTMicros,
 		}
 		if len(artifact.AdapterResult.RenderedConfigSHA256) != 64 {
 			return summaryReport{}, fmt.Errorf("sequential artifact %s lacks a rendered-config SHA-256", artifact.SuiteID)

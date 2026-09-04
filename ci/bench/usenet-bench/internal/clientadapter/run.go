@@ -101,7 +101,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}
 	result := benchmark.AdapterResult{
-		SchemaVersion:            5,
+		SchemaVersion:            6,
 		RunID:                    cfg.RunID,
 		Client:                   cfg.Client,
 		ArchiveToolchain:         cfg.ArchiveToolchain,
@@ -111,6 +111,7 @@ func Run(ctx context.Context, cfg Config) error {
 		TLSValidation:            cfg.TLSValidation,
 		TransportLabel:           cfg.TransportLabel,
 		ServerLink:               cfg.ServerLink,
+		StorageProfile:           cfg.StorageProfile,
 		QueuedAt:                 queuedAt,
 		CompletionAt:             completionAt,
 		ClientIdentity:           cfg.Image,
@@ -130,6 +131,7 @@ func Run(ctx context.Context, cfg Config) error {
 		TLSValidation:    cfg.TLSValidation,
 		TransportLabel:   cfg.TransportLabel,
 		ServerLink:       cfg.ServerLink,
+		StorageProfile:   cfg.StorageProfile,
 	}); err != nil {
 		return fmt.Errorf("validate adapter result: %w", err)
 	}
@@ -208,7 +210,15 @@ func validateWeaverCLIReport(report weaverCLITerminalReport) error {
 }
 
 func writeProductFiles(cfg Config, spec ProductSpec) error {
-	directories := []string{cfg.ConfigDir, cfg.OutputDir, filepath.Join(cfg.ConfigDir, "incomplete")}
+	// The completion and intermediate directories may live on an NFS volume
+	// the controller created; only the host-side ones are created here.
+	directories := []string{cfg.ConfigDir}
+	if cfg.CompleteVolume == "" {
+		directories = append(directories, cfg.OutputDir)
+	}
+	if cfg.IncompleteVolume == "" {
+		directories = append(directories, filepath.Join(cfg.ConfigDir, "incomplete"))
+	}
 	if cfg.Client == benchmark.NZBGet {
 		// NZBGet requires its queue and working directories to exist at
 		// startup; native and Docker runs must receive the same clean layout.

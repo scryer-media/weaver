@@ -21,8 +21,7 @@ func selectedCasesRequirePAR2(cases []fixture.ArchiveCase, selected map[string]b
 		if len(selected) > 0 && !selected[archiveCase.ID] {
 			continue
 		}
-		switch archiveCase.RepairProfile {
-		case fixture.PAR2LightRepairProfile, fixture.PAR2HeavyRepairProfile:
+		if archiveCase.RepairProfile.UsesPAR2() {
 			return true
 		}
 	}
@@ -44,60 +43,85 @@ func buildPAR2Image(ctx context.Context, config Config, toolchain PAR2Toolchain)
 	return nil
 }
 
-func applyRepairProfile(
-	ctx context.Context,
-	config Config,
-	archiveCase fixture.ArchiveCase,
-	rarToolchain Toolchain,
-	par2Toolchain *PAR2Toolchain,
-	caseDir string,
-	sourceArchives []fixture.FileDigest,
-	firstVolume string,
-) (fixture.RepairDetails, []fixture.FileDigest, error) {
+// repairInputs is everything a repair profile needs. It is a struct because
+// the 7z lane added a second writer toolchain and the extraction oracle, and a
+// nine-argument positional call is easy to transpose silently.
+type repairInputs struct {
+	Config            Config
+	Case              fixture.ArchiveCase
+	RARToolchain      Toolchain
+	PAR2Toolchain     *PAR2Toolchain
+	SevenZipToolchain *SevenZipToolchain
+	CaseDir           string
+	SourceArchives    []fixture.FileDigest
+	FirstVolume       string
+	ExpectedFiles     []fixture.FileDigest
+}
+
+// applyRepairProfile injects the declared fault and returns the repair
+// metadata, the files that are actually posted, and the files that are listed
+// in the NZB but deliberately never posted.
+func applyRepairProfile(ctx context.Context, in repairInputs) (fixture.RepairDetails, []fixture.FileDigest, []fixture.FileDigest, error) {
+	config := in.Config
+	archiveCase := in.Case
+	caseDir := in.CaseDir
 	profile := archiveCase.RepairProfile
 	if profile == "" {
 		profile = fixture.CleanRepairProfile
 	}
 	details := fixture.RepairDetails{Profile: profile}
+	var withheld []fixture.FileDigest
 
 	switch profile {
 	case fixture.CleanRepairProfile:
 		posted, err := digestPostedFiles(filepath.Join(caseDir, "archive"), caseDir)
-		return details, posted, err
-	case fixture.PAR2LightRepairProfile, fixture.PAR2HeavyRepairProfile:
-		if par2Toolchain == nil {
-			return fixture.RepairDetails{}, nil, fmt.Errorf("PAR2 repair fixture requires a PAR2 toolchain")
+		return details, posted, nil, err
+	case fixture.PAR2LightRepairProfile, fixture.PAR2HeavyRepairProfile, fixture.PAR2HeavyWithheldProfile:
+		if in.PAR2Toolchain == nil {
+			return fixture.RepairDetails{}, nil, nil, fmt.Errorf("PAR2 repair fixture requires a PAR2 toolchain")
 		}
 		redundancy, missingVolumes := par2RepairParameters(profile)
-		if err := createPAR2(ctx, config.DockerBinary, *par2Toolchain, caseDir, sourceArchives, redundancy); err != nil {
-			return fixture.RepairDetails{}, nil, err
+		if err := createPAR2(ctx, config.DockerBinary, *in.PAR2Toolchain, caseDir, in.SourceArchives, redundancy); err != nil {
+			return fixture.RepairDetails{}, nil, nil, err
 		}
 		details.PAR2RedundancyPercent = redundancy
 		if missingVolumes == 0 {
-			targets, err := repairTargets(sourceArchives, 1)
+			targets, err := repairTargets(in.SourceArchives, 1)
 			if err != nil {
-				return fixture.RepairDetails{}, nil, err
+				return fixture.RepairDetails{}, nil, nil, err
 			}
 			fault, err := flipArchiveBytes(caseDir, targets[0])
 			if err != nil {
-				return fixture.RepairDetails{}, nil, err
+				return fixture.RepairDetails{}, nil, nil, err
 			}
 			details.Corruptions = []fixture.CorruptionDetail{fault}
 		} else {
-			targets, err := repairTargets(sourceArchives, missingVolumes)
+			targets, err := repairTargets(in.SourceArchives, missingVolumes)
 			if err != nil {
-				return fixture.RepairDetails{}, nil, err
+				return fixture.RepairDetails{}, nil, nil, err
 			}
-			faults, err := removeArchiveFiles(caseDir, targets)
-			if err != nil {
-				return fixture.RepairDetails{}, nil, err
+			if profile == fixture.PAR2HeavyWithheldProfile {
+				faults, held, err := withholdArchiveFiles(caseDir, targets)
+				if err != nil {
+					return fixture.RepairDetails{}, nil, nil, err
+				}
+				details.Corruptions = faults
+				withheld = held
+			} else {
+				faults, err := removeArchiveFiles(caseDir, targets)
+				if err != nil {
+					return fixture.RepairDetails{}, nil, nil, err
+				}
+				details.Corruptions = faults
 			}
-			details.Corruptions = faults
 		}
-		if err := verifyPAR2Repair(ctx, config.DockerBinary, *par2Toolchain, rarToolchain, archiveCase, caseDir, firstVolume); err != nil {
-			return fixture.RepairDetails{}, nil, err
+		if err := verifyPAR2Repair(ctx, in, withheld); err != nil {
+			return fixture.RepairDetails{}, nil, nil, err
 		}
 	case fixture.RARRecoveryVolumeLightProfile, fixture.RARRecoveryVolumeHeavyProfile:
+		if archiveCase.ArchiveFormat == fixture.SevenZip {
+			return fixture.RepairDetails{}, nil, nil, fmt.Errorf("repair profile %q is a RAR container feature", profile)
+		}
 		recoveryVolumes := 1
 		if profile == fixture.RARRecoveryVolumeHeavyProfile {
 			recoveryVolumes = 2
@@ -106,42 +130,66 @@ func applyRepairProfile(
 		if archiveCase.RequiresPassword() {
 			recoveryArgs = append(recoveryArgs, "-p"+fixture.FixturePassword)
 		}
-		recoveryArgs = append(recoveryArgs, firstVolume)
-		if err := runRAR(ctx, config.DockerBinary, rarToolchain, caseDir, recoveryArgs...); err != nil {
-			return fixture.RepairDetails{}, nil, fmt.Errorf("create %d RAR recovery volumes: %w", recoveryVolumes, err)
+		recoveryArgs = append(recoveryArgs, in.FirstVolume)
+		if err := runRAR(ctx, config.DockerBinary, in.RARToolchain, caseDir, recoveryArgs...); err != nil {
+			return fixture.RepairDetails{}, nil, nil, fmt.Errorf("create %d RAR recovery volumes: %w", recoveryVolumes, err)
 		}
-		targets, err := repairTargets(sourceArchives, recoveryVolumes)
+		targets, err := repairTargets(in.SourceArchives, recoveryVolumes)
 		if err != nil {
-			return fixture.RepairDetails{}, nil, err
+			return fixture.RepairDetails{}, nil, nil, err
 		}
 		faults, err := removeArchiveFiles(caseDir, targets)
 		if err != nil {
-			return fixture.RepairDetails{}, nil, err
+			return fixture.RepairDetails{}, nil, nil, err
 		}
 		details.RARRecoveryVolumes = recoveryVolumes
 		details.Corruptions = faults
-		if err := verifyRARRecoveryVolumes(ctx, config.DockerBinary, rarToolchain, archiveCase, caseDir, firstVolume); err != nil {
-			return fixture.RepairDetails{}, nil, err
+		if err := verifyRARRecoveryVolumes(ctx, config.DockerBinary, in.RARToolchain, archiveCase, caseDir, in.FirstVolume); err != nil {
+			return fixture.RepairDetails{}, nil, nil, err
 		}
 	default:
-		return fixture.RepairDetails{}, nil, fmt.Errorf("unsupported repair profile %q", profile)
+		return fixture.RepairDetails{}, nil, nil, fmt.Errorf("unsupported repair profile %q", profile)
 	}
 
 	posted, err := digestPostedFiles(filepath.Join(caseDir, "archive"), caseDir)
 	if err != nil {
-		return fixture.RepairDetails{}, nil, err
+		return fixture.RepairDetails{}, nil, nil, err
 	}
-	return details, posted, nil
+	posted = excludeWithheld(posted, withheld)
+	return details, posted, withheld, nil
 }
 
 func par2RepairParameters(profile fixture.RepairProfile) (redundancy, missingVolumes int) {
-	if profile == fixture.PAR2HeavyRepairProfile {
+	switch profile {
+	case fixture.PAR2HeavyRepairProfile, fixture.PAR2HeavyWithheldProfile:
 		// A 150 MiB movie split into 32 MiB volumes has five volumes. Two
 		// missing volumes exceed 35% recovery capacity, so heavy repair is
 		// one complete missing volume; light repair remains a byte flip.
 		return 35, 1
+	default:
+		return 10, 0
 	}
-	return 10, 0
+}
+
+// excludeWithheld removes the withheld volumes from the posted set. Their
+// bytes stay on disk so the PAR2 target remains auditable and so the seeder
+// can size their NZB entries, but they are never handed to the poster.
+func excludeWithheld(posted, withheld []fixture.FileDigest) []fixture.FileDigest {
+	if len(withheld) == 0 {
+		return posted
+	}
+	held := make(map[string]bool, len(withheld))
+	for _, file := range withheld {
+		held[file.Path] = true
+	}
+	kept := make([]fixture.FileDigest, 0, len(posted))
+	for _, file := range posted {
+		if held[file.Path] {
+			continue
+		}
+		kept = append(kept, file)
+	}
+	return kept
 }
 
 func createPAR2(ctx context.Context, dockerBinary string, toolchain PAR2Toolchain, caseDir string, sources []fixture.FileDigest, redundancy int) error {
@@ -223,23 +271,52 @@ func removeArchiveFiles(caseDir string, targets []fixture.FileDigest) ([]fixture
 	return faults, nil
 }
 
-func verifyPAR2Repair(ctx context.Context, dockerBinary string, par2Toolchain PAR2Toolchain, rarToolchain Toolchain, archiveCase fixture.ArchiveCase, caseDir, firstVolume string) error {
-	verifyDir, err := copyArchiveForRepairVerification(caseDir)
+// withholdArchiveFiles marks volumes as posted-but-never-sent. Unlike
+// removeArchiveFiles it keeps the bytes on disk: the seeder needs the volume's
+// size to write its NZB entry, and the retained file keeps the repair target
+// independently auditable. A client sees exactly the same thing either way —
+// the volume never arrives — but a withheld volume is still requested, and
+// every one of its articles is refused, which is what a real short post does.
+func withholdArchiveFiles(caseDir string, targets []fixture.FileDigest) ([]fixture.CorruptionDetail, []fixture.FileDigest, error) {
+	faults := make([]fixture.CorruptionDetail, 0, len(targets))
+	withheld := make([]fixture.FileDigest, 0, len(targets))
+	for _, target := range targets {
+		path := filepath.Join(caseDir, filepath.FromSlash(target.Path))
+		if _, err := os.Stat(path); err != nil {
+			return nil, nil, fmt.Errorf("withhold archive volume %s: %w", target.Path, err)
+		}
+		faults = append(faults, fixture.CorruptionDetail{Kind: "withheld-volume", Path: target.Path})
+		withheld = append(withheld, target)
+	}
+	return faults, withheld, nil
+}
+
+func verifyPAR2Repair(ctx context.Context, in repairInputs, withheld []fixture.FileDigest) error {
+	verifyDir, err := copyArchiveForRepairVerification(in.CaseDir, withheld)
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(verifyDir)
-	if err := runPAR2(ctx, dockerBinary, par2Toolchain, verifyDir, "repair", "-q", "archive/fixture.par2"); err != nil {
+	if err := runPAR2(ctx, in.Config.DockerBinary, *in.PAR2Toolchain, verifyDir, "repair", "-q", "archive/fixture.par2"); err != nil {
 		return fmt.Errorf("PAR2 repair verification: %w", err)
 	}
-	if err := testRARArchive(ctx, dockerBinary, rarToolchain, archiveCase, verifyDir, firstVolume); err != nil {
+	if in.Case.ArchiveFormat == fixture.SevenZip {
+		if in.SevenZipToolchain == nil {
+			return fmt.Errorf("7z repair verification requires the pinned 7-Zip toolchain")
+		}
+		if err := verifySevenZipArchive(ctx, in.Config, in.Case, *in.SevenZipToolchain, verifyDir, in.FirstVolume, in.ExpectedFiles); err != nil {
+			return fmt.Errorf("verify PAR2-repaired 7z archive: %w", err)
+		}
+		return nil
+	}
+	if err := testRARArchive(ctx, in.Config.DockerBinary, in.RARToolchain, in.Case, verifyDir, in.FirstVolume); err != nil {
 		return fmt.Errorf("verify PAR2-repaired RAR archive: %w", err)
 	}
 	return nil
 }
 
 func verifyRARRecoveryVolumes(ctx context.Context, dockerBinary string, toolchain Toolchain, archiveCase fixture.ArchiveCase, caseDir, firstVolume string) error {
-	verifyDir, err := copyArchiveForRepairVerification(caseDir)
+	verifyDir, err := copyArchiveForRepairVerification(caseDir, nil)
 	if err != nil {
 		return err
 	}
@@ -267,24 +344,35 @@ func testRARArchive(ctx context.Context, dockerBinary string, toolchain Toolchai
 	return runRAR(ctx, dockerBinary, toolchain, caseDir, args...)
 }
 
-func copyArchiveForRepairVerification(caseDir string) (string, error) {
+// copyArchiveForRepairVerification stages exactly what a client would receive.
+// Withheld volumes stay on disk in the fixture but are never posted, so they
+// are excluded here: repairing a set that still contains them would prove
+// nothing about the declared fault.
+func copyArchiveForRepairVerification(caseDir string, withheld []fixture.FileDigest) (string, error) {
 	verifyDir := filepath.Join(caseDir, "repair-verification")
 	if err := os.Mkdir(verifyDir, 0o755); err != nil {
 		return "", fmt.Errorf("create repair verification directory: %w", err)
 	}
+	skip := make(map[string]bool, len(withheld))
+	for _, file := range withheld {
+		skip[filepath.Join(caseDir, filepath.FromSlash(file.Path))] = true
+	}
 	archiveSource := filepath.Join(caseDir, "archive")
 	archiveDestination := filepath.Join(verifyDir, "archive")
-	if err := copyDirectory(archiveSource, archiveDestination); err != nil {
+	if err := copyDirectory(archiveSource, archiveDestination, skip); err != nil {
 		_ = os.RemoveAll(verifyDir)
 		return "", err
 	}
 	return verifyDir, nil
 }
 
-func copyDirectory(source, destination string) error {
+func copyDirectory(source, destination string, skip map[string]bool) error {
 	return filepath.WalkDir(source, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if skip[path] {
+			return nil
 		}
 		relative, err := filepath.Rel(source, path)
 		if err != nil {

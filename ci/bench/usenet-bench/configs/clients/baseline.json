@@ -41,10 +41,10 @@
   },
   "profiles": {
     "stock": {
-      "description": "Co-primary profile: required NNTP, path, unpack, repair, and control settings only. SABnzbd direct_unpack is disabled; NZBGet DirectWrite and DirectUnpack are disabled; Weaver uses its normal download/extraction pipeline through its public service API."
+      "description": "Co-primary profile: required NNTP, path, unpack, repair, and control settings only. SABnzbd direct_unpack is disabled; NZBGet DirectWrite and DirectUnpack are disabled; Weaver runs as shipped (direct unpack on, its product default) through its public service API."
     },
     "equivalent-throughput": {
-      "description": "Co-primary profile: enables SABnzbd direct_unpack and NZBGet DirectWrite plus DirectUnpack. Weaver uses the same normal pipeline because it has no separate benchmark-only direct-path toggle. Every effective setting is rendered into the artifact; no fixture-specific exception is allowed."
+      "description": "Co-primary profile: enables SABnzbd direct_unpack and NZBGet DirectWrite plus DirectUnpack. Weaver runs as shipped (direct unpack on, its product default) in this profile too, so the Weaver column is identical across both profiles by construction. Every effective setting is rendered into the artifact; no fixture-specific exception is allowed."
     }
   },
   "transports": {

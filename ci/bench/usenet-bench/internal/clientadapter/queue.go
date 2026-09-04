@@ -94,7 +94,7 @@ func runQueue(ctx context.Context, cfg Config) error {
 	}
 	metricsCollected = true
 	result := benchmark.QueueAdapterResult{
-		SchemaVersion:            5,
+		SchemaVersion:            6,
 		SuiteID:                  input.SuiteID,
 		SubmissionMode:           input.SubmissionMode,
 		Client:                   cfg.Client,
@@ -105,6 +105,7 @@ func runQueue(ctx context.Context, cfg Config) error {
 		TLSValidation:            cfg.TLSValidation,
 		TransportLabel:           cfg.TransportLabel,
 		ServerLink:               cfg.ServerLink,
+		StorageProfile:           cfg.StorageProfile,
 		QueueStartedAt:           queueStartedAt,
 		QueueCompletedAt:         queueCompletedAt,
 		StatusPollIntervalNanos:  cfg.PollInterval.Nanoseconds(),

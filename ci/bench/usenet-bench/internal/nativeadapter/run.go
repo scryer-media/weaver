@@ -92,7 +92,7 @@ func runSingle(ctx context.Context, cfg Config) (nativeRun, error) {
 		return nativeRun{}, err
 	}
 	result := benchmark.AdapterResult{
-		SchemaVersion:            5,
+		SchemaVersion:            6,
 		RunID:                    cfg.RunID,
 		Client:                   cfg.Client,
 		ArchiveToolchain:         cfg.ArchiveToolchain,
@@ -102,6 +102,7 @@ func runSingle(ctx context.Context, cfg Config) (nativeRun, error) {
 		TLSValidation:            cfg.TLSValidation,
 		TransportLabel:           cfg.TransportLabel,
 		ServerLink:               cfg.ServerLink,
+		StorageProfile:           cfg.StorageProfile,
 		QueuedAt:                 queueTiming.AcceptedAt,
 		CompletionAt:             completion.ObservedAt,
 		ClientIdentity:           identity,
@@ -121,6 +122,7 @@ func runSingle(ctx context.Context, cfg Config) (nativeRun, error) {
 		TLSValidation:    cfg.TLSValidation,
 		TransportLabel:   cfg.TransportLabel,
 		ServerLink:       cfg.ServerLink,
+		StorageProfile:   cfg.StorageProfile,
 	}); err != nil {
 		return nativeRun{}, fmt.Errorf("validate adapter result: %w", err)
 	}
@@ -179,7 +181,7 @@ func runSequentialQueue(ctx context.Context, cfg Config) error {
 		jobs = append(jobs, job)
 	}
 	result := benchmark.QueueAdapterResult{
-		SchemaVersion:            5,
+		SchemaVersion:            6,
 		SuiteID:                  input.SuiteID,
 		SubmissionMode:           input.SubmissionMode,
 		Client:                   cfg.Client,
@@ -190,6 +192,7 @@ func runSequentialQueue(ctx context.Context, cfg Config) error {
 		TLSValidation:            cfg.TLSValidation,
 		TransportLabel:           cfg.TransportLabel,
 		ServerLink:               cfg.ServerLink,
+		StorageProfile:           cfg.StorageProfile,
 		QueueStartedAt:           queueStartedAt,
 		QueueCompletedAt:         queueCompletedAt,
 		StatusPollIntervalNanos:  cfg.PollInterval.Nanoseconds(),

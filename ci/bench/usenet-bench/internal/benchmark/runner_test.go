@@ -37,7 +37,7 @@ func TestAdapterResultMustMatchTLSPlanMetadata(t *testing.T) {
 	run := plan.Runs[0]
 	now := time.Now().UTC()
 	result := AdapterResult{
-		SchemaVersion:            5,
+		SchemaVersion:            6,
 		RunID:                    run.ID,
 		Client:                   run.Client,
 		ArchiveToolchain:         run.ArchiveToolchain,
@@ -47,6 +47,7 @@ func TestAdapterResultMustMatchTLSPlanMetadata(t *testing.T) {
 		TLSValidation:            TLSCAVerified,
 		TransportLabel:           "tls-ca-verified",
 		ServerLink:               run.ServerLink,
+		StorageProfile:           run.StorageProfile,
 		QueuedAt:                 now,
 		CompletionAt:             now.Add(time.Second),
 		ClientIdentity:           "sha256:test",
@@ -76,7 +77,7 @@ func TestAdapterResultRequiresExplicitResourceCounterOutcomes(t *testing.T) {
 	run := plan.Runs[0]
 	now := time.Now().UTC()
 	result := AdapterResult{
-		SchemaVersion:            5,
+		SchemaVersion:            6,
 		RunID:                    run.ID,
 		Client:                   run.Client,
 		ArchiveToolchain:         run.ArchiveToolchain,
@@ -86,6 +87,7 @@ func TestAdapterResultRequiresExplicitResourceCounterOutcomes(t *testing.T) {
 		TLSValidation:            run.TLSValidation,
 		TransportLabel:           run.TransportLabel,
 		ServerLink:               run.ServerLink,
+		StorageProfile:           run.StorageProfile,
 		QueuedAt:                 now,
 		CompletionAt:             now.Add(time.Second),
 		ClientIdentity:           "sha256:test",
