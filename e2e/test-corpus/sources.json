@@ -860,6 +860,48 @@
       }
     },
     {
+      "path": "testdata/direct-store-quick-open/archive.part1.rar",
+      "size": 0,
+      "blake3": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-quick-open/archive.part2.rar",
+      "size": 0,
+      "blake3": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-quick-open/archive.part3.rar",
+      "size": 0,
+      "blake3": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
       "path": "testdata/direct-store-rar4/archive.part1.rar",
       "size": 8388608,
       "blake3": "47c0c3d1dce9451cc1f684c20cbd3846322b1f315b81b9c6862f5b4846b21ecd",

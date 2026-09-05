@@ -162,8 +162,14 @@ type FixtureSet struct {
 	PayloadLayout  PayloadLayout   `json:"payload_layout,omitempty"`
 	RepairProfiles []RepairProfile `json:"repair_profiles,omitempty"`
 	NZBOrder       NZBOrder        `json:"nzb_order,omitempty"`
-	FileCount      int             `json:"file_count"`
-	VolumeSize     string          `json:"volume_size"`
+	// QuickOpen keeps the RAR5 writer's quick-open records. The matrix
+	// suppresses them by default (`-qo-`), so a set that carries them is a
+	// deliberate lane for the readers that consult them: clients that
+	// cross-check the quick-open copy of the file headers against the
+	// physical header walk only exercise that path on this shape.
+	QuickOpen  bool   `json:"quick_open,omitempty"`
+	FileCount  int    `json:"file_count"`
+	VolumeSize string `json:"volume_size"`
 }
 
 // ArchiveCase is one materialized archive fixture.
@@ -181,6 +187,7 @@ type ArchiveCase struct {
 	PayloadLayout      PayloadLayout `json:"payload_layout"`
 	RepairProfile      RepairProfile `json:"repair_profile"`
 	NZBOrder           NZBOrder      `json:"nzb_order"`
+	QuickOpen          bool          `json:"quick_open,omitempty"`
 	FileCount          int           `json:"file_count"`
 	VolumeSize         string        `json:"volume_size"`
 }
@@ -272,6 +279,7 @@ func (m Matrix) Expand() ([]ArchiveCase, error) {
 								PayloadLayout:      layout,
 								RepairProfile:      profile,
 								NZBOrder:           order,
+								QuickOpen:          set.QuickOpen,
 								FileCount:          set.FileCount,
 								VolumeSize:         set.VolumeSize,
 							})
@@ -299,6 +307,11 @@ func (s FixtureSet) validate() error {
 	}
 	if s.NZBOrder != "" && !s.NZBOrder.Valid() {
 		return fmt.Errorf("fixture set %q has unsupported nzb_order %q", s.ID, s.NZBOrder)
+	}
+	// Quick-open records are a RAR5 container feature; the legacy writers
+	// reject the switch and 7-Zip has no equivalent.
+	if s.QuickOpen && s.ArchiveFormat != RAR5 {
+		return fmt.Errorf("fixture set %q cannot set quick_open: quick-open records are RAR5-only", s.ID)
 	}
 	if len(s.Compressions) == 0 || len(s.Solid) == 0 || len(s.Encryptions) == 0 || len(s.Payloads) == 0 {
 		return fmt.Errorf("fixture set %q must specify every matrix axis", s.ID)
@@ -369,9 +382,17 @@ func (c ArchiveCase) RARArgs(archive string, inputs []string) ([]string, error) 
 		// The source-locked 3.x and 4.x writers predate the -ma selector;
 		// their default archive format is the explicitly selected legacy lane.
 	case RAR5:
-		// Quick-open data speeds listing, but adds bytes to every upload and
-		// is not needed by the download/extract clients under test.
-		args = append(args, "-ma5", "-qo-")
+		args = append(args, "-ma5")
+		if c.QuickOpen {
+			// -qo+ writes a quick-open record for every file header, not
+			// just the ones the writer's size heuristic would pick, so the
+			// lane is deterministic about carrying them.
+			args = append(args, "-qo+")
+		} else {
+			// Quick-open data speeds listing, but adds bytes to every upload
+			// and is not needed by the download/extract clients under test.
+			args = append(args, "-qo-")
+		}
 	default:
 		return nil, fmt.Errorf("fixture %q has unsupported archive_format %q", c.ID, c.ArchiveFormat)
 	}
