@@ -9,7 +9,7 @@
 #
 # The base is digest-pinned; the Debian packages are the distribution's own, as
 # in every other image here.
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 RUN set -eux; \
     apt-get update; \
