@@ -639,6 +639,9 @@ async fn health_probe_in_flight_does_not_delay_recovery_promotion() {
     assert!(pipeline.pending_completion_checks.contains(&job_id));
 
     pipeline.check_job_completion(job_id).await;
+    // The damaged-path read is detached; the promotion it asks for happens when
+    // its verdict lands back on the pipeline task.
+    settle_par2_analysis_work(&mut pipeline).await;
     assert!(
         pipeline
             .jobs

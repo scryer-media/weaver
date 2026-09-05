@@ -6273,6 +6273,9 @@ async fn generic_par2_repair_requeues_extraction_for_7z_and_gzip_payloads() {
         );
 
         pipeline.check_job_completion(job_id).await;
+        // The repair the analysis decides only happens once the detached read's
+        // verdict lands, and the post-repair check is scheduled from there.
+        settle_par2_analysis_work(&mut pipeline).await;
 
         let queued_job = pipeline
             .pending_completion_checks
@@ -6388,6 +6391,9 @@ async fn par2_rebuilds_a_split_7z_part_the_nzb_never_carried_and_extraction_foll
         assert!(!working_dir.join(&withheld_name).exists());
 
         pipeline.check_job_completion(job_id).await;
+        // The damaged-path read runs on a blocking worker; the repair it
+        // decides is only reached once that verdict lands.
+        settle_par2_analysis_work(&mut pipeline).await;
 
         assert_eq!(
             pipeline.par2_repairer_execute_calls, 1,
@@ -6600,6 +6606,9 @@ async fn a_split_7z_short_of_a_part_the_nzb_never_carried_is_not_settled_clean_b
         }
 
         pipeline.check_job_completion(job_id).await;
+        // The damaged-path read runs on a blocking worker; the repair it
+        // decides is only reached once that verdict lands.
+        settle_par2_analysis_work(&mut pipeline).await;
 
         assert_eq!(
             pipeline.par2_repairer_execute_calls,
@@ -9786,6 +9795,8 @@ async fn extracting_rar_restart_with_failed_member_enters_repair_or_relaunches()
 
     pipeline.pending_completion_checks.clear();
     pipeline.check_job_completion(job_id).await;
+    // The move into repair is decided by the detached damaged-path read.
+    settle_par2_analysis_work(&mut pipeline).await;
 
     let active_workers = pipeline
         .rar_sets

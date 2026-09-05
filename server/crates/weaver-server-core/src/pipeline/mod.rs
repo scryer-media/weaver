@@ -1532,6 +1532,14 @@ pub(super) struct Par2SetRuntime {
     /// against per-file stat fingerprints and re-checks bytes before any
     /// mutating request, so a stale stash costs nothing but the seed.
     pub(super) scan_carry: Option<std::sync::Arc<par2_rs::ScanCarry>>,
+    /// The extra-scan exclusion list the stashed carry was produced under.
+    ///
+    /// A carry is a complete account of the tree only for a pass that was
+    /// allowed to look at the same files, and its locations may name a file
+    /// that has since become excluded — bytes the next pass has just been told
+    /// belong to something else. So the stash is seeded only when the current
+    /// exclusion list matches this one, and discarded otherwise.
+    pub(super) scan_carry_exclusions: Vec<std::path::PathBuf>,
     /// Completed files whose current identity/checksum evidence was admitted
     /// to the retained session.
     pub(super) session_evidence_file_ids: HashSet<NzbFileId>,
@@ -1630,6 +1638,36 @@ pub(super) struct DirectToleratedWorkDone {
     pub(super) work_id: u64,
     pub(super) set_index: usize,
     pub(super) result: Result<direct_store::wiring::ToleratedExtraction, String>,
+}
+
+/// One recovery set's filesystem damaged-path analysis, detached from the actor.
+///
+/// The analysis is a whole-directory authoritative read: it hashes every
+/// described file and rolling-scans whatever else the directory holds. Awaited
+/// inline it held the pipeline task for its entire duration — seconds on a
+/// small job, minutes on a multi-set release — during which no other job's
+/// articles were dispatched, no decode result was processed, and no newly
+/// submitted NZB was even parsed. Everything the read needs is snapshotted at
+/// submission (including the retained session, which travels with the ticket
+/// and comes back with the done message); the actor keeps only this fence and
+/// picks the verdict up when the completion check re-enters.
+///
+/// One ticket per job. The set it belongs to is part of the fence because a
+/// verdict describes one recovery set's files by path, and a job that re-binds
+/// its files while the read is running must not repair on what the read saw.
+pub(super) struct Par2AnalysisWork {
+    pub(super) work_id: u64,
+    pub(super) recovery_set_id: par2_rs::RecoverySetId,
+    /// When the ticket was handed to the detached task, so the completion
+    /// handler can report how long the read actually took.
+    pub(super) submitted_at: std::time::Instant,
+}
+
+pub(super) struct Par2AnalysisWorkDone {
+    pub(super) job_id: JobId,
+    pub(super) work_id: u64,
+    pub(super) recovery_set_id: par2_rs::RecoverySetId,
+    pub(super) outcome: completion::finalize::check::Par2AnalysisTicketOutcome,
 }
 
 /// One demoted set's reconstruction sweep, detached from the actor.
@@ -2933,6 +2971,25 @@ pub struct Pipeline {
     >,
     pub(super) direct_tolerated_done_tx: mpsc::Sender<DirectToleratedWorkDone>,
     pub(super) direct_tolerated_done_rx: mpsc::Receiver<DirectToleratedWorkDone>,
+    /// Monotonic fence for the detached PAR2 damaged-path analysis tickets.
+    pub(super) next_par2_analysis_work_id: u64,
+    /// At most one damaged-path analysis runs per job. While the entry is
+    /// present the completion check refuses to judge the job: the verdict it
+    /// would judge on is exactly what the ticket is computing.
+    pub(super) par2_analysis_in_flight: HashMap<JobId, Par2AnalysisWork>,
+    /// A finished analysis waiting for the completion check that submitted it,
+    /// keyed by job and tagged with the recovery set it describes. A pass that
+    /// finds a result tagged for another set puts it back rather than reading
+    /// another set's verdict as its own.
+    pub(super) par2_analysis_results: HashMap<
+        JobId,
+        (
+            par2_rs::RecoverySetId,
+            Result<par2_rs::Par2RepairOutcome, String>,
+        ),
+    >,
+    pub(super) par2_analysis_done_tx: mpsc::Sender<Par2AnalysisWorkDone>,
+    pub(super) par2_analysis_done_rx: mpsc::Receiver<Par2AnalysisWorkDone>,
     /// Monotonic fence for demotion sweeps detached from the actor.
     pub(super) next_direct_demotion_work_id: u64,
     /// The demotion sweeps a job has outstanding, keyed by the set each one
