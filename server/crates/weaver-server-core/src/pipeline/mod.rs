@@ -1574,6 +1574,27 @@ pub(super) struct DirectPostRepairWorkDone {
     pub(super) result: Result<par2_rs::VerificationResult, String>,
 }
 
+/// One direct set's tolerated-member extraction, detached from the actor.
+///
+/// The tolerance no longer caps a member's size, so the decode it runs at
+/// finalization can be as long as any conventional extraction — and it reads
+/// the set's virtual volumes, which is disk I/O the pipeline task must not sit
+/// on. The virtual provider, the targets and the budget are snapshotted at
+/// submission; the actor keeps only this fence and picks the result up on the
+/// next finalization pass, exactly the way [`DirectPostRepairWork`] does.
+pub(super) struct DirectToleratedWork {
+    pub(super) work_id: u64,
+    pub(super) set_index: usize,
+    pub(super) submitted_at: std::time::Instant,
+}
+
+pub(super) struct DirectToleratedWorkDone {
+    pub(super) job_id: JobId,
+    pub(super) work_id: u64,
+    pub(super) set_index: usize,
+    pub(super) result: Result<direct_store::wiring::ToleratedExtraction, String>,
+}
+
 /// The pre-repair verdict and the repair's own write set, carried across a
 /// direct-store repair so the post-repair read-back can be selective instead
 /// of re-reading the whole recovery set.
@@ -2803,6 +2824,23 @@ pub struct Pipeline {
     /// recovery set. Cleared once consumed, on demotion, and by
     /// [`Pipeline::clear_par2_runtime_state`] — see [`DirectPostRepairCarry`].
     pub(super) direct_post_repair_carry: HashMap<JobId, DirectPostRepairCarry>,
+    /// Monotonic fence for direct tolerated-extraction tickets detached from
+    /// the actor.
+    pub(super) next_direct_tolerated_work_id: u64,
+    /// At most one tolerated extraction runs for a job; a second ready set of
+    /// the same job waits for the first to finalize.
+    pub(super) direct_tolerated_in_flight: HashMap<JobId, DirectToleratedWork>,
+    /// Finished tolerated extractions awaiting the finalization pass that
+    /// submitted them, keyed by job and tagged with the set they belong to.
+    pub(super) direct_tolerated_results: HashMap<
+        JobId,
+        (
+            usize,
+            Result<direct_store::wiring::ToleratedExtraction, String>,
+        ),
+    >,
+    pub(super) direct_tolerated_done_tx: mpsc::Sender<DirectToleratedWorkDone>,
+    pub(super) direct_tolerated_done_rx: mpsc::Receiver<DirectToleratedWorkDone>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
     /// Whether the active global pause came from a bandwidth schedule rather

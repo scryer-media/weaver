@@ -86,11 +86,26 @@ pub(crate) const DEFAULT_HOLDS_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 /// one fixed ceiling for its lifetime.
 pub(crate) const HOLDS_SCRATCH_CEILING_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// How much of a migrated member one envelope span carries. The migration is
-/// bounded by the member's own packed size, so this only bounds the
+/// How much of a migrated member one envelope span carries. The whole
+/// migration is bounded by [`MIGRATION_CEILING_BYTES`], so this only bounds the
 /// *individual* allocation and lets the write fan out across the disk owner
 /// threads the way ordinary routing does.
 const MIGRATION_SPAN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most routed bytes one member migration may move back into the
+/// envelopes.
+///
+/// A migration reads every extent the adopted member routed into its
+/// `.direct.partial` and parks them in memory as [`RoutedSpan`]s until the
+/// entry point on the stack drains them, so the member's whole routed size is
+/// read synchronously on the parsing task and held at once. The tolerance
+/// itself no longer caps a member's size — a compressed member is ineligible
+/// from its first header, so it is never adopted and never migrates — but an
+/// adopted BLAKE2sp-only member that resolves ineligible at chain close can be
+/// as large as the set, and moving it would hold that much memory on the hot
+/// path. Over this, the member keeps the answer it had before migration
+/// existed: its own ineligibility demotes the set.
+pub(crate) const MIGRATION_CEILING_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How much genuine **prefix** — contiguous coverage from offset zero, the
 /// only bytes the header walk can consume — a volume may accumulate without a
@@ -1849,6 +1864,9 @@ pub(crate) struct DirectSetRouter {
     /// coverage barrier and syncs the envelope before publishing a floor — the
     /// same treatment every other envelope byte gets.
     migrated: Vec<RoutedSpan>,
+    /// [`MIGRATION_CEILING_BYTES`], as a field so a test can lower it below
+    /// what a fixture-sized member routes.
+    migration_ceiling_bytes: u64,
     /// Destinations a migration deleted, waiting to be retired from the coverage
     /// barrier: `(member id, working-directory-relative partial)`.
     ///
@@ -1957,6 +1975,7 @@ impl DirectSetRouter {
             member_ids: HashMap::new(),
             next_member_id: 0,
             routed_extents: BTreeMap::new(),
+            migration_ceiling_bytes: MIGRATION_CEILING_BYTES,
             member_order: Vec::new(),
             member_order_stale: false,
             holds_budget: DEFAULT_HOLDS_BUDGET_BYTES,
@@ -4082,6 +4101,13 @@ impl DirectSetRouter {
     ///   expansion is refused by the budget rather than by a second, weaker
     ///   ceiling that also happened to demote healthy sets.
     ///
+    /// One bound on *bytes moved* does remain, and it is not a tolerance rule:
+    /// an adopted member that turns ineligible at chain close is **migrated**
+    /// out of its partial and into the envelopes, and that move reads the
+    /// member's routed bytes into memory on the parsing task. A member with
+    /// more than [`MIGRATION_CEILING_BYTES`] routed demotes on its own reason
+    /// instead, which is the answer it had before migration existed.
+    ///
     /// What is *not* answered here is tail latency: the tolerated decode still
     /// runs once, at finalization, rather than incrementally as chains close.
     /// See [`Self::tolerated_members`].
@@ -4173,10 +4199,32 @@ impl DirectSetRouter {
             // a store set.
             return Err(self.fail(DemotionReason::MemberIneligible(first_tolerated.into())));
         }
+        // Checked over every migrating member before any is moved: the ceiling
+        // is a demotion, and a member that cannot ride the tolerance must not
+        // have been half-moved to find that out.
+        for (member_id, reason) in &migrating {
+            if self.routed_bytes_of(*member_id) > self.migration_ceiling_bytes {
+                return Err(self.fail(DemotionReason::MemberIneligible((*reason).into())));
+            }
+        }
         for (member_id, reason) in migrating {
             self.migrate_member_to_envelope(member_id, reason)?;
         }
         Ok(())
+    }
+
+    /// Bytes the router has routed into one member's partial so far.
+    fn routed_bytes_of(&self, member_id: u32) -> u64 {
+        self.routed_extents
+            .values()
+            .flatten()
+            .filter(|extent| extent.member_id == member_id)
+            .fold(0u64, |total, extent| total.saturating_add(extent.len))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_migration_ceiling_bytes(&mut self, bytes: u64) {
+        self.migration_ceiling_bytes = bytes;
     }
 
     /// Moves an already-adopted member's routed bytes out of its
@@ -4244,8 +4292,9 @@ impl DirectSetRouter {
 
         // Every extent the member ever had bytes written for, by volume, in
         // physical order within each — so the envelope is written the way it is
-        // laid out. The whole move is bounded by the tolerance's packed ceiling;
-        // `MIGRATION_SPAN_BYTES` bounds each individual allocation inside it.
+        // laid out. The whole move is bounded by `MIGRATION_CEILING_BYTES`,
+        // which the caller checked before moving anything; `MIGRATION_SPAN_BYTES`
+        // bounds each individual allocation inside it.
         let extents: Vec<(u32, MemberExtent)> = self
             .routed_extents
             .iter()

@@ -60,7 +60,7 @@ use crate::jobs::assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::pipeline::{
     BufferedDecodedSegment, DecodedChunk, DirectPostRepairCarry, DirectPostRepairWork,
-    DirectPostRepairWorkDone, Pipeline,
+    DirectPostRepairWorkDone, DirectToleratedWork, DirectToleratedWorkDone, Pipeline,
 };
 
 /// Read chunk for the restart gate re-arm. Matches the reconstruction sweep's:
@@ -605,7 +605,7 @@ struct ToleratedTarget {
 /// What the tolerance produced: the member names, and the directory entries
 /// whose metadata still has to be restored.
 #[derive(Debug, Default)]
-struct ToleratedExtraction {
+pub(crate) struct ToleratedExtraction {
     /// Raw header names produced, for `extracted_members`. Directory entries
     /// are in here too — the conventional extractor reports one the same way,
     /// and a name in neither list is a name completion cannot account for.
@@ -6237,12 +6237,17 @@ impl Pipeline {
         // destinations, which is derived from the layout and not from the
         // filesystem. It still has to run before the envelopes are deleted.
         let tolerated_directories = match self.extract_tolerated_members(job_id, set_index).await {
-            Ok(extracted) => {
+            Ok(Some(extracted)) => {
                 for name in extracted.members {
                     self.record_direct_extracted(job_id, name);
                 }
                 extracted.directories
             }
+            // Detached to a blocking worker. The set stays routed, gated and
+            // uncommitted; the ticket's completion re-enters
+            // `finalize_ready_direct_sets`, which reaches here again with the
+            // result parked and takes it.
+            Ok(None) => return,
             Err(error) => {
                 warn!(
                     job_id = job_id.0,
@@ -6619,24 +6624,75 @@ impl Pipeline {
     /// members runs after this call. The [`unrar_rs::MemberInfo`] is carried
     /// back to [`Self::finalize_direct_set`] instead, which applies it once
     /// every member is at its destination.
+    ///
+    /// **Off the pipeline task.** The tolerance no longer caps a member's size,
+    /// so this decode can run as long as a conventional extraction of the same
+    /// bytes, and it reads the virtual volumes off disk. The first call for a
+    /// set snapshots everything the decode needs and hands it to a blocking
+    /// worker as a [`DirectToleratedWork`] ticket, returning `Ok(None)`; the
+    /// ticket's completion re-enters [`Self::finalize_ready_direct_sets`], and
+    /// the call that finds its result parked returns `Ok(Some(_))`. One ticket
+    /// per job: a sibling set that is ready at the same time waits its turn,
+    /// which is the same serialization the commit loop imposes anyway.
     async fn extract_tolerated_members(
         &mut self,
         job_id: JobId,
         set_index: usize,
-    ) -> Result<ToleratedExtraction, String> {
+    ) -> Result<Option<ToleratedExtraction>, String> {
         let (set_name, names) = {
             let Some(set) = self.direct_store.set(job_id, set_index) else {
-                return Ok(ToleratedExtraction::default());
+                return Ok(Some(ToleratedExtraction::default()));
             };
             (set.set_name().to_string(), set.router.tolerated_members())
         };
         if names.is_empty() {
-            return Ok(ToleratedExtraction::default());
+            return Ok(Some(ToleratedExtraction::default()));
+        }
+        // A finished ticket for this set: the pass that submitted it is this
+        // one, re-entered by the ticket's completion.
+        if let Some((result_set_index, result)) = self.direct_tolerated_results.remove(&job_id) {
+            if result_set_index == set_index {
+                self.direct_tolerated_in_flight.remove(&job_id);
+                let extracted = result?;
+                crate::runtime::perf_probe::record(
+                    "direct_store.tolerated_members_extracted",
+                    std::time::Duration::from_nanos(1),
+                );
+                if !extracted.directories.is_empty() {
+                    crate::runtime::perf_probe::record_value(
+                        "direct_store.tolerated_directories",
+                        extracted.directories.len() as u64,
+                    );
+                }
+                info!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    members = extracted.members.len(),
+                    directories = extracted.directories.len(),
+                    "extracted tolerated members from the virtual volumes"
+                );
+                return Ok(Some(extracted));
+            }
+            self.direct_tolerated_results
+                .insert(job_id, (result_set_index, result));
+        }
+        if let Some(in_flight) = self.direct_tolerated_in_flight.get(&job_id) {
+            // This set's own ticket still running, or a sibling set's whose
+            // result is parked for a pass that has not reached it yet. Either
+            // way this pass waits; the completion that lands re-enters it.
+            debug!(
+                job_id = job_id.0,
+                set_index,
+                in_flight_set_index = in_flight.set_index,
+                work_id = in_flight.work_id,
+                "a direct tolerated extraction is already in flight for this job; waiting"
+            );
+            return Ok(None);
         }
         let staging = self.extraction_staging_dir(job_id);
         let extraction_budget = self.extraction_budget(job_id, &staging)?;
         let Some(set) = self.direct_store.set(job_id, set_index) else {
-            return Ok(ToleratedExtraction::default());
+            return Ok(Some(ToleratedExtraction::default()));
         };
         // An `-hp` set's virtual volumes are as header-encrypted as
         // the posted ones, so this extraction cannot even *open* the archive
@@ -6753,133 +6809,202 @@ impl Pipeline {
         let extraction_memory_limit = self.extraction_limits.max_memory_bytes;
         let extraction_root = staging.clone();
 
-        let extracted = tokio::task::spawn_blocking(move || {
-            let reader = provider
-                .open(first_volume)
-                .ok_or_else(|| format!("virtual volume {first_volume} is not registered"))?;
-            let mut archive = match password.as_deref() {
-                Some(password) => unrar_rs::RarArchive::open_with_password(reader, password),
-                None => unrar_rs::RarArchive::open(reader),
-            }
-            .map_err(|error| format!("failed to open the virtual archive: {error}"))?;
-            // The same decode ceilings the incremental extractor applies.
-            // Nothing about a tolerated member bounds the *declared* dictionary
-            // in a hostile header, so the same admission runs here.
-            let max_dict_bytes =
-                crate::pipeline::extraction::apply_server_rar_limits_with_memory_limit(
-                    &mut archive,
-                    extraction_memory_limit,
-                );
-            for volume_index in other_volumes {
-                let Some(reader) = provider.open(volume_index) else {
-                    continue;
-                };
-                archive
-                    .add_volume(volume_index as usize, Box::new(reader))
-                    .map_err(|error| {
-                        format!("failed to add virtual volume {volume_index}: {error}")
-                    })?;
-            }
-            crate::pipeline::extraction::ensure_rar_dictionary_within_limit(
-                &archive,
-                max_dict_bytes,
-            )
-            .map_err(|error| format!("RAR dictionary admission failed: {error}"))?;
-            let _memory_permit = extraction_budget
-                .reserve_memory_wait(crate::pipeline::extraction::rar_decoder_memory_bytes(
-                    &archive,
-                ))
-                .map_err(|error| format!("RAR decoder memory admission failed: {error}"))?;
-            let options = unrar_rs::ExtractOptions {
-                verify: true,
-                password: password.clone(),
-                restore_owners: false,
-            };
-            // Every target goes through the sandboxed root now, files included,
-            // so it is opened unconditionally. It used to be opened only for a
-            // set with a directory entry, and the file arm wrote through a bare
-            // `File::create` with `create_dir_all` parents: that skipped the
-            // path validator, the entry accounting, and — the reason it can no
-            // longer stand — the *byte* budget. While the tolerance carried at
-            // most 256 MiB of declared unpacked size, an unbudgeted write was
-            // bounded by that ceiling; with the ceiling gone, the only thing
-            // that may bound a tolerated decode is the same
-            // `JobExtractionBudget` the conventional extractor writes through.
-            let root = crate::pipeline::extraction::ExtractionRoot::open(&extraction_root)?;
-            let mut produced = Vec::with_capacity(targets.len());
-            let mut directories = Vec::new();
-            for target in &targets {
-                let name = &target.name;
-                let index = archive
-                    .find_member(name)
-                    .ok_or_else(|| format!("tolerated member '{name}' is not in the archive"))?;
-                if target.is_directory {
-                    // The conventional extractor's own directory arm, byte for
-                    // byte: create through the sandboxed root under the
-                    // extraction budget, tolerating a directory that is already
-                    // there — the routed members' parents were created when
-                    // their `.direct.partial`s were prepared, so on an ordinary
-                    // folder-tree set every one of these already exists.
-                    root.create_dir(&target.relative, &extraction_budget)?;
-                    let info = archive.member_info(index).ok_or_else(|| {
-                        format!("tolerated directory '{name}' has no member metadata")
-                    })?;
-                    directories.push((info.clone(), target.destination.clone()));
-                    produced.push(name.clone());
-                    continue;
-                }
-                // Budgeted, and through the same root the directory arm uses:
-                // `create_file` validates the relative path, creates the
-                // parents as archive entries, and hands back a writer that
-                // charges every byte against the job's member, job-total and
-                // free-space limits. A rejection fails the tolerated extraction,
-                // which demotes the set to a conventional extraction that will
-                // meet the very same budget.
-                let mut file = root.create_file(&target.relative, &extraction_budget)?;
-                // The provider is the set's, keyed by the set's own volume
-                // indices, which is what the entry asks for — a member
-                // starting in volume 3 requests volume 3.
-                let written = crate::pipeline::extraction::rar_entry_via(
-                    &mut archive,
-                    index,
-                    &provider,
-                    &options,
-                )
-                .and_then(|entry| entry.copy_to(&mut file))
-                .map_err(|error| format!("failed to extract '{name}': {error}"))?;
-                // The tolerated half of the byte account: everything else a
-                // direct set produces is counted at the router as
-                // `direct_store.bytes.member`. Read against it to see how much
-                // of a mixed set the tolerance is carrying.
-                crate::runtime::perf_probe::record_value("direct_store.bytes.tolerated", written);
-                produced.push(name.clone());
-            }
-            Ok::<ToleratedExtraction, String>(ToleratedExtraction {
-                members: produced,
-                directories,
-            })
-        })
-        .await
-        .map_err(|error| format!("tolerated extraction task panicked: {error}"))??;
-
-        crate::runtime::perf_probe::record(
-            "direct_store.tolerated_members_extracted",
-            std::time::Duration::from_nanos(1),
+        self.next_direct_tolerated_work_id = self.next_direct_tolerated_work_id.wrapping_add(1);
+        let work_id = self.next_direct_tolerated_work_id;
+        self.direct_tolerated_in_flight.insert(
+            job_id,
+            DirectToleratedWork {
+                work_id,
+                set_index,
+                submitted_at: Instant::now(),
+            },
         );
-        if !extracted.directories.is_empty() {
-            crate::runtime::perf_probe::record_value(
-                "direct_store.tolerated_directories",
-                extracted.directories.len() as u64,
-            );
-        }
         info!(
             job_id = job_id.0,
             set_name = %set_name,
-            members = extracted.members.len(),
-            directories = extracted.directories.len(),
-            "extracted tolerated small members from the virtual volumes"
+            work_id,
+            members = targets.len(),
+            "submitting a direct tolerated-extraction ticket"
         );
-        Ok(extracted)
+        let done_tx = self.direct_tolerated_done_tx.clone();
+        tokio::spawn(async move {
+            let joined = tokio::task::spawn_blocking(move || {
+                let reader = provider
+                    .open(first_volume)
+                    .ok_or_else(|| format!("virtual volume {first_volume} is not registered"))?;
+                let mut archive = match password.as_deref() {
+                    Some(password) => unrar_rs::RarArchive::open_with_password(reader, password),
+                    None => unrar_rs::RarArchive::open(reader),
+                }
+                .map_err(|error| format!("failed to open the virtual archive: {error}"))?;
+                // The same decode ceilings the incremental extractor applies.
+                // Nothing about a tolerated member bounds the *declared* dictionary
+                // in a hostile header, so the same admission runs here.
+                let max_dict_bytes =
+                    crate::pipeline::extraction::apply_server_rar_limits_with_memory_limit(
+                        &mut archive,
+                        extraction_memory_limit,
+                    );
+                for volume_index in other_volumes {
+                    let Some(reader) = provider.open(volume_index) else {
+                        continue;
+                    };
+                    archive
+                        .add_volume(volume_index as usize, Box::new(reader))
+                        .map_err(|error| {
+                            format!("failed to add virtual volume {volume_index}: {error}")
+                        })?;
+                }
+                crate::pipeline::extraction::ensure_rar_dictionary_within_limit(
+                    &archive,
+                    max_dict_bytes,
+                )
+                .map_err(|error| format!("RAR dictionary admission failed: {error}"))?;
+                let _memory_permit = extraction_budget
+                    .reserve_memory_wait(crate::pipeline::extraction::rar_decoder_memory_bytes(
+                        &archive,
+                    ))
+                    .map_err(|error| format!("RAR decoder memory admission failed: {error}"))?;
+                let options = unrar_rs::ExtractOptions {
+                    verify: true,
+                    password: password.clone(),
+                    restore_owners: false,
+                };
+                // Every target goes through the sandboxed root now, files included,
+                // so it is opened unconditionally. It used to be opened only for a
+                // set with a directory entry, and the file arm wrote through a bare
+                // `File::create` with `create_dir_all` parents: that skipped the
+                // path validator, the entry accounting, and — the reason it can no
+                // longer stand — the *byte* budget. While the tolerance carried at
+                // most 256 MiB of declared unpacked size, an unbudgeted write was
+                // bounded by that ceiling; with the ceiling gone, the only thing
+                // that may bound a tolerated decode is the same
+                // `JobExtractionBudget` the conventional extractor writes through.
+                let root = crate::pipeline::extraction::ExtractionRoot::open(&extraction_root)?;
+                let mut produced = Vec::with_capacity(targets.len());
+                let mut directories = Vec::new();
+                for target in &targets {
+                    let name = &target.name;
+                    let index = archive.find_member(name).ok_or_else(|| {
+                        format!("tolerated member '{name}' is not in the archive")
+                    })?;
+                    if target.is_directory {
+                        // The conventional extractor's own directory arm, byte for
+                        // byte: create through the sandboxed root under the
+                        // extraction budget, tolerating a directory that is already
+                        // there — the routed members' parents were created when
+                        // their `.direct.partial`s were prepared, so on an ordinary
+                        // folder-tree set every one of these already exists.
+                        root.create_dir(&target.relative, &extraction_budget)?;
+                        let info = archive.member_info(index).ok_or_else(|| {
+                            format!("tolerated directory '{name}' has no member metadata")
+                        })?;
+                        directories.push((info.clone(), target.destination.clone()));
+                        produced.push(name.clone());
+                        continue;
+                    }
+                    // Budgeted, and through the same root the directory arm uses:
+                    // `create_file` validates the relative path, creates the
+                    // parents as archive entries, and hands back a writer that
+                    // charges every byte against the job's member, job-total and
+                    // free-space limits. A rejection fails the tolerated extraction,
+                    // which demotes the set to a conventional extraction that will
+                    // meet the very same budget.
+                    let mut file = root.create_file(&target.relative, &extraction_budget)?;
+                    // The provider is the set's, keyed by the set's own volume
+                    // indices, which is what the entry asks for — a member
+                    // starting in volume 3 requests volume 3.
+                    let written = crate::pipeline::extraction::rar_entry_via(
+                        &mut archive,
+                        index,
+                        &provider,
+                        &options,
+                    )
+                    .and_then(|entry| entry.copy_to(&mut file))
+                    .map_err(|error| format!("failed to extract '{name}': {error}"))?;
+                    // The tolerated half of the byte account: everything else a
+                    // direct set produces is counted at the router as
+                    // `direct_store.bytes.member`. Read against it to see how much
+                    // of a mixed set the tolerance is carrying.
+                    crate::runtime::perf_probe::record_value(
+                        "direct_store.bytes.tolerated",
+                        written,
+                    );
+                    produced.push(name.clone());
+                }
+                Ok::<ToleratedExtraction, String>(ToleratedExtraction {
+                    members: produced,
+                    directories,
+                })
+            })
+            .await;
+            let result = joined
+                .map_err(|error| format!("tolerated extraction task panicked: {error}"))
+                .and_then(|result| result);
+            let _ = done_tx
+                .send(DirectToleratedWorkDone {
+                    job_id,
+                    work_id,
+                    set_index,
+                    result,
+                })
+                .await;
+        });
+        Ok(None)
+    }
+
+    /// The tolerated-extraction ticket's completion, on the pipeline task.
+    ///
+    /// Parks the result for the finalization pass and re-enters that pass at
+    /// once: the set the ticket belongs to is ready and waiting on nothing but
+    /// this, and the completion check will not judge the job while the ticket
+    /// is outstanding. A ticket the demotion or job-teardown seams already
+    /// forgot is discarded by the fence.
+    pub(in crate::pipeline) async fn handle_direct_tolerated_done(
+        &mut self,
+        done: DirectToleratedWorkDone,
+    ) {
+        let Some(in_flight) = self.direct_tolerated_in_flight.get(&done.job_id) else {
+            return;
+        };
+        if in_flight.work_id != done.work_id || in_flight.set_index != done.set_index {
+            debug!(
+                job_id = done.job_id.0,
+                work_id = done.work_id,
+                "discarding a stale direct tolerated-extraction ticket"
+            );
+            return;
+        }
+        let elapsed = in_flight.submitted_at.elapsed();
+        let outcome = match &done.result {
+            Ok(_) => "extracted",
+            Err(_) => "error",
+        };
+        info!(
+            job_id = done.job_id.0,
+            work_id = done.work_id,
+            set_index = done.set_index,
+            elapsed_ms = elapsed.as_millis() as u64,
+            outcome,
+            "direct tolerated-extraction ticket completed"
+        );
+        crate::runtime::perf_probe::record("direct_store.tolerated_extract", elapsed);
+        if !self.jobs.contains_key(&done.job_id) {
+            self.direct_tolerated_in_flight.remove(&done.job_id);
+            return;
+        }
+        self.direct_tolerated_results
+            .insert(done.job_id, (done.set_index, done.result));
+        self.finalize_ready_direct_sets(done.job_id).await;
+        self.schedule_job_completion_check(done.job_id);
+    }
+
+    /// Forgets a job's tolerated-extraction ticket and any parked result. The
+    /// detached worker keeps running to its end; its done message then finds
+    /// no taker and is discarded by the fence.
+    pub(crate) fn forget_direct_tolerated_work(&mut self, job_id: JobId) {
+        self.direct_tolerated_in_flight.remove(&job_id);
+        self.direct_tolerated_results.remove(&job_id);
     }
 
     /// Abandons direct output for a set and hands its volumes back (the
@@ -6948,6 +7073,11 @@ impl Pipeline {
         self.direct_post_repair_carry.remove(&job_id);
         self.direct_post_repair_in_flight.remove(&job_id);
         self.direct_post_repair_results.remove(&job_id);
+        // Likewise a tolerated extraction: it was reading the virtual volumes
+        // this demotion is about to reconstruct and delete, and the members it
+        // produced are the conventional extractor's to overwrite now.
+        self.direct_tolerated_in_flight.remove(&job_id);
+        self.direct_tolerated_results.remove(&job_id);
         if reason == DemotionReason::HoldsScratchCeiling {
             debug!(
                 job_id = job_id.0,

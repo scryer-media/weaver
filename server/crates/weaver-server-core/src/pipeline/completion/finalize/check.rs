@@ -7084,6 +7084,14 @@ impl Pipeline {
         // once per completion check, because this is where the job's PAR2 state
         // is settled; `mark_par2_verified` covers the verdict case.
         self.finalize_ready_direct_sets(job_id).await;
+        // A tolerated extraction detached from that pass. Its set is
+        // byte-complete and gate-passed but not committed — neither finalized
+        // nor a conventional archive — and nothing below may judge the job
+        // until it is one or the other. The ticket's completion re-enters the
+        // finalization pass and schedules this check again.
+        if self.direct_tolerated_in_flight.contains_key(&job_id) {
+            return;
+        }
 
         if let Some(message) = self.aggregate_par2_failure_message(job_id) {
             self.fail_job(job_id, message);

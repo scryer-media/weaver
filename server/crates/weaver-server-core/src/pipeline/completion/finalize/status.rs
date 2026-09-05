@@ -200,6 +200,7 @@ impl Pipeline {
         }
         if self.job_has_pending_download_pipeline_work(job_id)
             || self.direct_post_repair_in_flight.contains_key(&job_id)
+            || self.direct_tolerated_in_flight.contains_key(&job_id)
             || self.pending_completion_checks.contains(&job_id)
         {
             return;

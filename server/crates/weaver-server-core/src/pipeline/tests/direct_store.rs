@@ -661,6 +661,9 @@ async fn run_direct_store_routing_only(
     for (file_index, segment_number) in arrivals {
         submit_volume_article(&mut pipeline, job_id, volumes, *file_index, *segment_number).await;
     }
+    // A set with tolerated members finalizes through a detached extraction
+    // ticket; the shape is only final once that ticket has been taken.
+    settle_direct_post_repair_work(&mut pipeline).await;
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     (shape, working_dir)
 }
@@ -5517,6 +5520,77 @@ async fn a_migration_that_cannot_read_its_partial_demotes_cleanly() {
     assert_volumes_are_never_fabricated(&working_dir, &volumes);
 }
 
+/// The one size bound the tolerance still has is not the tolerance's: an
+/// adopted member that resolves ineligible at chain close is moved into the
+/// envelope through memory, and a move over `MIGRATION_CEILING_BYTES` is
+/// refused before a byte of it is read. The member then demotes on its own
+/// reason, which is the answer it had before migration existed.
+#[tokio::test]
+async fn a_migration_over_its_ceiling_demotes_on_the_members_own_reason() {
+    let store_name = "Silver.Horizon.S01E55.mkv";
+    let extra_name = "Silver.Horizon.S01E55.nfo";
+    let store_payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+    let extra_payload: Vec<u8> = (0..200u32).map(|index| (index % 97) as u8).collect();
+    let volumes = store_set_with_extra_member(
+        store_name,
+        &store_payload,
+        extra_name,
+        &extra_payload,
+        4,
+        ToleranceExtra::Blake2OnlySplit,
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41096);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // The same route as `a_split_blake2_only_member_over_the_old_budget_migrates_and_finalizes`
+    // up to the closing volume, which is the positive control: under the
+    // default ceiling this exact member migrates and the set finalizes.
+    let last = volumes.len() as u32 - 1;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if file_index == last {
+            continue;
+        }
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    let partial = direct_partial(&temp_dir, job_id, extra_name);
+    assert!(
+        std::fs::metadata(&partial).is_ok_and(|metadata| metadata.len() > 0),
+        "non-vacuity: the member must really have been adopted and routed before the \
+         migration is asked to move its bytes"
+    );
+    // Zero: every routed byte is over it, so the refusal is exercised by the
+    // very move the sibling test performs.
+    pipeline
+        .direct_store
+        .set_mut(job_id, 0)
+        .expect("the set is routing")
+        .router
+        .set_migration_ceiling_bytes(0);
+
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if file_index != last {
+            continue;
+        }
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(MemberIneligible(Blake2OnlyNoCrc32))"),
+        "a member over the migration ceiling must demote on its own ineligibility, not on \
+         the ceiling, got {shape}"
+    );
+    // Refused before anything moved, so the demotion sweep reconstructs from a
+    // partial that still holds every routed byte — and writes nothing it does
+    // not have.
+    assert_volumes_are_never_fabricated(&working_dir, &volumes);
+}
+
 /// The set's final router shape after every article of every volume.
 async fn tolerance_shape(job_id: JobId, volumes: &[(String, Vec<u8>)]) -> String {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -5952,6 +6026,9 @@ async fn a_folder_tree_store_set_finalizes_direct_with_its_directories_restored(
             );
         }
     }
+    // The directory entries are tolerated members, extracted through a
+    // detached ticket the set finalizes behind.
+    settle_direct_post_repair_work(&mut pipeline).await;
 
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
