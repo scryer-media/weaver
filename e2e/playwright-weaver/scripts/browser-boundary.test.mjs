@@ -48,6 +48,19 @@ test("allows browser actions and visible assertions", () => {
   assert.deepEqual(auditBrowserSpec("ui-settings.spec.ts", source), []);
 });
 
+test("allows the visible-navigation helper beside the fixtures", () => {
+  const source = `
+    import { expect, openNavigation, test, weaverRoute } from "./helpers";
+    test("browser behavior", async ({ cleanPage: page }) => {
+      await page.goto(weaverRoute("/"));
+      const navigation = await openNavigation(page);
+      await navigation.getByRole("link", { name: "Settings" }).click();
+      await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
+    });
+  `;
+  assert.deepEqual(auditBrowserSpec("ui-settings.spec.ts", source), []);
+});
+
 test("allows request only through a sanctioned narrow helper", () => {
   const source = `
     import { expect, test } from "./helpers";
