@@ -23,13 +23,17 @@ type summaryReport struct {
 	Comparisons   []stratifiedComparison `json:"comparisons"`
 }
 
+// comparisonStratum is the pairing key. Transport is part of it; how each
+// client validated TLS is not, because that is a per-client property of the
+// run (SABnzbd cannot verify the harness CA and is labelled tls-unverified)
+// and keying on it would leave every SABnzbd TLS block unpaired. Each
+// client's validation and label are carried on the comparison instead, so a
+// reader sees what was compared without the pairing depending on it.
 type comparisonStratum struct {
 	FixtureID        string                     `json:"fixture_id"`
 	Profile          string                     `json:"profile"`
 	ExecutionTarget  benchmark.ExecutionTarget  `json:"execution_target"`
 	Transport        benchmark.Transport        `json:"transport"`
-	TLSValidation    benchmark.TLSValidation    `json:"tls_validation"`
-	TransportLabel   string                     `json:"transport_label"`
 	ArchiveToolchain benchmark.ArchiveToolchain `json:"archive_toolchain"`
 	ServerLinkID     string                     `json:"server_link_id"`
 	ServerEgressBPS  uint64                     `json:"server_egress_bits_per_second"`
@@ -44,8 +48,17 @@ type comparisonStratum struct {
 }
 
 type stratifiedComparison struct {
-	Stratum    comparisonStratum `json:"stratum"`
-	Completion completionCounts  `json:"completion"`
+	Stratum comparisonStratum `json:"stratum"`
+	// TransportPolicies records, per observed client, how it validated TLS in
+	// this stratum. Plaintext strata carry not_applicable. A client the plan
+	// excluded on this fixture has no observation and so no entry here; its
+	// exclusion appears under ClientExclusions.
+	TransportPolicies []clientTransportPolicy `json:"transport_policies"`
+	// ClientExclusions lists the plan's exclusions of the baseline or the
+	// candidate on this fixture: blocks the plan chose not to run, counted
+	// under Completion as that client not finishing, with the reason why.
+	ClientExclusions []benchmark.ClientExclusion `json:"client_exclusions,omitempty"`
+	Completion       completionCounts            `json:"completion"`
 	// Summary is absent when the stratum has fewer complete pairs than the
 	// minimum because one client did not finish; ComparisonWithheld then says
 	// so. A client that cannot finish a fixture is a result in itself, and
@@ -63,6 +76,17 @@ type completionCounts struct {
 	PairedBlocks          int `json:"paired_blocks"`
 	BaselineDidNotFinish  int `json:"baseline_did_not_finish"`
 	CandidateDidNotFinish int `json:"candidate_did_not_finish"`
+	// BaselineExcluded and CandidateExcluded are the part of the did-not-finish
+	// counts that the plan recorded instead of running: a client excluded on
+	// the fixture is counted as not finishing every block, by declaration.
+	BaselineExcluded  int `json:"baseline_excluded"`
+	CandidateExcluded int `json:"candidate_excluded"`
+}
+
+type clientTransportPolicy struct {
+	Client         benchmark.Client        `json:"client"`
+	TLSValidation  benchmark.TLSValidation `json:"tls_validation"`
+	TransportLabel string                  `json:"transport_label"`
 }
 
 type comparisonBlock struct {
@@ -82,15 +106,26 @@ type summaryProductIdentity struct {
 	ClientVersion            string
 	ArchiveToolchainIdentity string
 	RenderedConfigSHA256     string
+	TLSValidation            benchmark.TLSValidation
+	TransportLabel           string
+}
+
+// summaryExecutionContext is what the summarizer takes from an artifact
+// root's immutable execution manifest and snapshotted plan.
+type summaryExecutionContext struct {
+	Command     string
+	PlannedRuns map[string]benchmark.Run
+	Exclusions  []benchmark.ClientExclusion
 }
 
 func summarize(args []string) error {
 	flags := flag.NewFlagSet("summarize", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	var artifactRoot, baselineName, candidateName string
+	var artifactRoot, baselineName, candidateName, mode string
 	var minimumBlocks, resamples int
 	var seed int64
 	flags.StringVar(&artifactRoot, "artifacts", "", "benchmark artifact root containing sequential queue.json files")
+	flags.StringVar(&mode, "mode", "sequential", "sequential (paired per-fixture comparison) or queue-drain (per-lane drain wall clock of a queue-transition root; --baseline and --candidate are not used)")
 	flags.StringVar(&baselineName, "baseline", "", "baseline client: weaver, sabnzbd, or nzbget")
 	flags.StringVar(&candidateName, "candidate", "", "candidate client: weaver, sabnzbd, or nzbget")
 	flags.IntVar(&minimumBlocks, "minimum-blocks", 20, "minimum complete paired randomized blocks per stratum")
@@ -99,9 +134,23 @@ func summarize(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if mode == "queue-drain" {
+		if artifactRoot == "" {
+			return fmt.Errorf("--artifacts is required")
+		}
+		report, err := loadQueueDrainReport(artifactRoot)
+		if err != nil {
+			return err
+		}
+		return printJSON(report)
+	}
+	if mode != "sequential" {
+		return fmt.Errorf("--mode must be sequential or queue-drain, got %q", mode)
+	}
 	if artifactRoot == "" || baselineName == "" || candidateName == "" {
 		return fmt.Errorf("--artifacts, --baseline, and --candidate are required")
 	}
+
 	if minimumBlocks < 2 {
 		return fmt.Errorf("--minimum-blocks must be at least 2")
 	}
@@ -116,15 +165,41 @@ func summarize(args []string) error {
 	if baseline == candidate {
 		return fmt.Errorf("baseline and candidate clients must differ")
 	}
-	artifacts, err := loadSequentialArtifacts(artifactRoot)
+	artifacts, exclusions, err := loadSequentialArtifacts(artifactRoot)
 	if err != nil {
 		return err
 	}
-	report, err := buildSummaryReport(artifacts, baseline, candidate, minimumBlocks, seed, resamples)
+	report, err := buildSummaryReport(artifacts, exclusions, baseline, candidate, minimumBlocks, seed, resamples)
 	if err != nil {
 		return err
 	}
 	return printJSON(report)
+}
+
+// validateSummaryShaperEvidence fails a summary closed when a run on a shaped
+// server link cannot prove, from the shaper's own before/after counters, that
+// the link was in force and carried the bytes the artifact claims.
+func validateSummaryShaperEvidence(artifact benchmark.QueueArtifact, link benchmark.ServerLinkProfile) error {
+	if link.EgressBitsPerSecond == 0 {
+		return nil
+	}
+	if artifact.ShaperBefore == nil || artifact.ShaperAfter == nil {
+		return fmt.Errorf("shaped artifact %s lacks shaper attestations", artifact.SuiteID)
+	}
+	if err := artifact.ShaperBefore.ValidateFor(link); err != nil {
+		return fmt.Errorf("shaped artifact %s before snapshot: %w", artifact.SuiteID, err)
+	}
+	if err := artifact.ShaperAfter.ValidateFor(link); err != nil {
+		return fmt.Errorf("shaped artifact %s after snapshot: %w", artifact.SuiteID, err)
+	}
+	delivered, err := benchmark.ValidateShaperSnapshotPair(*artifact.ShaperBefore, *artifact.ShaperAfter)
+	if err != nil {
+		return fmt.Errorf("shaped artifact %s snapshot pair: %w", artifact.SuiteID, err)
+	}
+	if delivered == 0 || delivered != artifact.ShaperDownstreamBytes {
+		return fmt.Errorf("shaped artifact %s has invalid shaper byte evidence", artifact.SuiteID)
+	}
+	return nil
 }
 
 // validateSummaryStorageEvidence fails a summary closed when a published NFS
@@ -163,11 +238,12 @@ func parseSingleClient(value string) (benchmark.Client, error) {
 	return clients[0], nil
 }
 
-func loadSequentialArtifacts(root string) ([]benchmark.QueueArtifact, error) {
-	plannedRuns, err := loadSummaryExecutionContext(root)
+func loadSequentialArtifacts(root string) ([]benchmark.QueueArtifact, []benchmark.ClientExclusion, error) {
+	execution, err := loadSummaryExecutionContext(root, "sequential")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	plannedRuns := execution.PlannedRuns
 	var artifacts []benchmark.QueueArtifact
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -199,12 +275,12 @@ func loadSequentialArtifacts(root string) ([]benchmark.QueueArtifact, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(artifacts) == 0 {
-		return nil, fmt.Errorf("artifact root %s contains no passed sequential queue artifacts", root)
+		return nil, nil, fmt.Errorf("artifact root %s contains no passed sequential queue artifacts", root)
 	}
-	return artifacts, nil
+	return artifacts, execution.Exclusions, nil
 }
 
 // summarizableSequentialStatus admits the two statuses that describe a client
@@ -215,51 +291,58 @@ func summarizableSequentialStatus(status string) bool {
 	return status == "passed" || status == "completed_with_dnf"
 }
 
-func loadSummaryExecutionContext(root string) (map[string]benchmark.Run, error) {
+// loadSummaryExecutionContext binds an artifact root to the command that
+// produced it, its snapshotted plan and its adapter catalog, refusing a root
+// whose snapshots no longer match the immutable manifest.
+func loadSummaryExecutionContext(root, command string) (summaryExecutionContext, error) {
 	manifestPath := filepath.Join(root, "execution-manifest.json")
 	contents, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return nil, fmt.Errorf("read summary execution manifest: %w", err)
+		return summaryExecutionContext{}, fmt.Errorf("read summary execution manifest: %w", err)
 	}
 	var manifest executionManifest
 	decoder := json.NewDecoder(strings.NewReader(string(contents)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&manifest); err != nil {
-		return nil, fmt.Errorf("decode summary execution manifest: %w", err)
+		return summaryExecutionContext{}, fmt.Errorf("decode summary execution manifest: %w", err)
 	}
-	if manifest.SchemaVersion != 1 || manifest.Command != "sequential" || manifest.ExecutionTarget == "" || manifest.Profile == "" || len(manifest.ExecutableSHA256) != 64 {
-		return nil, fmt.Errorf("summary execution manifest has unsupported or incomplete provenance")
+	if manifest.SchemaVersion != 1 || manifest.ExecutionTarget == "" || manifest.Profile == "" || len(manifest.ExecutableSHA256) != 64 {
+		return summaryExecutionContext{}, fmt.Errorf("summary execution manifest has unsupported or incomplete provenance")
+	}
+	if manifest.Command != command {
+		return summaryExecutionContext{}, fmt.Errorf("summary execution manifest was written by %q, want %q", manifest.Command, command)
 	}
 	if manifest.PlanSnapshotPath != "plan.snapshot.json" || manifest.AdapterSnapshot != "adapter-catalog.snapshot.json" {
-		return nil, fmt.Errorf("summary execution manifest uses unexpected snapshot paths")
+		return summaryExecutionContext{}, fmt.Errorf("summary execution manifest uses unexpected snapshot paths")
 	}
+
 	planSnapshot := filepath.Join(root, manifest.PlanSnapshotPath)
 	adapterSnapshot := filepath.Join(root, manifest.AdapterSnapshot)
 	planDigest, err := sha256File(planSnapshot)
 	if err != nil {
-		return nil, fmt.Errorf("hash snapshotted plan: %w", err)
+		return summaryExecutionContext{}, fmt.Errorf("hash snapshotted plan: %w", err)
 	}
 	adapterDigest, err := sha256File(adapterSnapshot)
 	if err != nil {
-		return nil, fmt.Errorf("hash snapshotted adapter catalog: %w", err)
+		return summaryExecutionContext{}, fmt.Errorf("hash snapshotted adapter catalog: %w", err)
 	}
 	if planDigest != manifest.PlanSHA256 || adapterDigest != manifest.AdapterSHA256 {
-		return nil, fmt.Errorf("summary execution snapshot digest does not match immutable manifest")
+		return summaryExecutionContext{}, fmt.Errorf("summary execution snapshot digest does not match immutable manifest")
 	}
 	planned, err := benchmark.LoadPlan(planSnapshot)
 	if err != nil {
-		return nil, fmt.Errorf("load snapshotted plan: %w", err)
+		return summaryExecutionContext{}, fmt.Errorf("load snapshotted plan: %w", err)
 	}
 	target := benchmark.ExecutionTarget(manifest.ExecutionTarget)
 	if planned.Profile != manifest.Profile {
-		return nil, fmt.Errorf("execution manifest profile %q does not match snapshotted plan %q", manifest.Profile, planned.Profile)
+		return summaryExecutionContext{}, fmt.Errorf("execution manifest profile %q does not match snapshotted plan %q", manifest.Profile, planned.Profile)
 	}
 	catalog, err := benchmark.LoadAdapterCatalog(adapterSnapshot)
 	if err != nil {
-		return nil, fmt.Errorf("load snapshotted adapter catalog: %w", err)
+		return summaryExecutionContext{}, fmt.Errorf("load snapshotted adapter catalog: %w", err)
 	}
 	if err := catalog.ValidateFor(planned, target); err != nil {
-		return nil, fmt.Errorf("validate snapshotted adapter catalog: %w", err)
+		return summaryExecutionContext{}, fmt.Errorf("validate snapshotted adapter catalog: %w", err)
 	}
 	plannedRuns := make(map[string]benchmark.Run)
 	for _, run := range planned.Runs {
@@ -268,12 +351,12 @@ func loadSummaryExecutionContext(root string) (map[string]benchmark.Run, error) 
 		}
 	}
 	if len(plannedRuns) == 0 {
-		return nil, fmt.Errorf("snapshotted plan has no runs for execution target %q", target)
+		return summaryExecutionContext{}, fmt.Errorf("snapshotted plan has no runs for execution target %q", target)
 	}
-	return plannedRuns, nil
+	return summaryExecutionContext{Command: manifest.Command, PlannedRuns: plannedRuns, Exclusions: planned.ClientExclusions}, nil
 }
 
-func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate benchmark.Client, minimumBlocks int, seed int64, resamples int) (summaryReport, error) {
+func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchmark.ClientExclusion, baseline, candidate benchmark.Client, minimumBlocks int, seed int64, resamples int) (summaryReport, error) {
 	groups := make(map[comparisonStratum]map[int]*comparisonBlock)
 	identities := make(map[summaryProductKey]summaryProductIdentity)
 	// One summary describes one storage stratum. Local and NFS runs answer
@@ -301,23 +384,8 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 		if artifact.AdapterResult.Client != job.Run.Client || artifact.AdapterResult.ArchiveToolchain != job.Run.ArchiveToolchain || artifact.AdapterResult.ExecutionTarget != job.Run.ExecutionTarget || artifact.AdapterResult.Transport != job.Run.Transport || artifact.AdapterResult.TLSValidation != job.Run.TLSValidation || artifact.AdapterResult.TransportLabel != job.Run.TransportLabel || artifact.AdapterResult.ServerLink != job.Run.ServerLink || artifact.AdapterResult.StorageProfile != job.Run.StorageProfile {
 			return summaryReport{}, fmt.Errorf("sequential artifact %s has adapter metadata inconsistent with its planned run", artifact.SuiteID)
 		}
-		if job.Run.ServerLink.EgressBitsPerSecond > 0 {
-			if artifact.ShaperBefore == nil || artifact.ShaperAfter == nil {
-				return summaryReport{}, fmt.Errorf("shaped sequential artifact %s lacks shaper attestations", artifact.SuiteID)
-			}
-			if err := artifact.ShaperBefore.ValidateFor(job.Run.ServerLink); err != nil {
-				return summaryReport{}, fmt.Errorf("shaped sequential artifact %s before snapshot: %w", artifact.SuiteID, err)
-			}
-			if err := artifact.ShaperAfter.ValidateFor(job.Run.ServerLink); err != nil {
-				return summaryReport{}, fmt.Errorf("shaped sequential artifact %s after snapshot: %w", artifact.SuiteID, err)
-			}
-			delivered, err := benchmark.ValidateShaperSnapshotPair(*artifact.ShaperBefore, *artifact.ShaperAfter)
-			if err != nil {
-				return summaryReport{}, fmt.Errorf("shaped sequential artifact %s snapshot pair: %w", artifact.SuiteID, err)
-			}
-			if delivered == 0 || delivered != artifact.ShaperDownstreamBytes {
-				return summaryReport{}, fmt.Errorf("shaped sequential artifact %s has invalid shaper byte evidence", artifact.SuiteID)
-			}
+		if err := validateSummaryShaperEvidence(artifact, job.Run.ServerLink); err != nil {
+			return summaryReport{}, err
 		}
 		if err := validateSummaryStorageEvidence(artifact, job.Run.StorageProfile); err != nil {
 			return summaryReport{}, err
@@ -350,8 +418,6 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 			Profile:          job.Run.Profile,
 			ExecutionTarget:  job.Run.ExecutionTarget,
 			Transport:        job.Run.Transport,
-			TLSValidation:    job.Run.TLSValidation,
-			TransportLabel:   job.Run.TransportLabel,
 			ArchiveToolchain: job.Run.ArchiveToolchain,
 			ServerLinkID:     job.Run.ServerLink.ID,
 			ServerEgressBPS:  job.Run.ServerLink.EgressBitsPerSecond,
@@ -370,12 +436,14 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 			ClientVersion:            artifact.AdapterResult.ClientVersion,
 			ArchiveToolchainIdentity: artifact.AdapterResult.ArchiveToolchainIdentity,
 			RenderedConfigSHA256:     artifact.AdapterResult.RenderedConfigSHA256,
+			TLSValidation:            job.Run.TLSValidation,
+			TransportLabel:           job.Run.TransportLabel,
 		}
 		if identity.ClientIdentity == "" || identity.ClientVersion == "" || identity.ArchiveToolchainIdentity == "" {
 			return summaryReport{}, fmt.Errorf("sequential artifact %s lacks product identity evidence", artifact.SuiteID)
 		}
 		if previous, ok := identities[productKey]; ok && previous != identity {
-			return summaryReport{}, fmt.Errorf("product identity changed within stratum %+v for client %s", stratum, job.Run.Client)
+			return summaryReport{}, fmt.Errorf("product identity or TLS policy changed within stratum %+v for client %s", stratum, job.Run.Client)
 		}
 		identities[productKey] = identity
 		blocks := groups[stratum]
@@ -416,7 +484,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 	}
 	sort.Slice(strata, func(left, right int) bool { return fmt.Sprint(strata[left]) < fmt.Sprint(strata[right]) })
 	report := summaryReport{
-		SchemaVersion: 2,
+		SchemaVersion: 3,
 		Metric:        benchmark.PrimaryMetric,
 		Baseline:      baseline,
 		Candidate:     candidate,
@@ -432,8 +500,21 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 		sort.Ints(repetitions)
 		samples := make([]benchmark.PairedSample, 0, len(repetitions))
 		completion := completionCounts{BlocksObserved: len(repetitions)}
+		// A client the plan excluded on this fixture has no artifact in any
+		// block. Every block then counts as that client not finishing, by the
+		// plan's own record rather than by observation.
+		baselineExclusion, baselineExcluded := benchmark.ClientExclusionFor(exclusions, baseline, stratum.FixtureID)
+		candidateExclusion, candidateExcluded := benchmark.ClientExclusionFor(exclusions, candidate, stratum.FixtureID)
 		for _, repetition := range repetitions {
 			block := blocks[repetition]
+			if block.baseline == nil && !block.baselineDNF && baselineExcluded {
+				block.baselineDNF = true
+				completion.BaselineExcluded++
+			}
+			if block.candidate == nil && !block.candidateDNF && candidateExcluded {
+				block.candidateDNF = true
+				completion.CandidateExcluded++
+			}
 			if block.baselineDNF {
 				completion.BaselineDidNotFinish++
 			}
@@ -453,15 +534,27 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 		}
 		completion.PairedBlocks = len(samples)
 		comparison := stratifiedComparison{Stratum: stratum, Completion: completion}
+		for _, client := range []benchmark.Client{baseline, candidate} {
+			if identity, ok := identities[summaryProductKey{Stratum: stratum, Client: client}]; ok {
+				comparison.TransportPolicies = append(comparison.TransportPolicies, clientTransportPolicy{Client: client, TLSValidation: identity.TLSValidation, TransportLabel: identity.TransportLabel})
+			}
+		}
+		if baselineExcluded {
+			comparison.ClientExclusions = append(comparison.ClientExclusions, baselineExclusion)
+		}
+		if candidateExcluded {
+			comparison.ClientExclusions = append(comparison.ClientExclusions, candidateExclusion)
+		}
 		if len(samples) < minimumBlocks {
 			if completion.BaselineDidNotFinish == 0 && completion.CandidateDidNotFinish == 0 {
 				return summaryReport{}, fmt.Errorf("stratum %+v has %d complete blocks, want at least %d", stratum, len(samples), minimumBlocks)
 			}
-			comparison.ComparisonWithheld = fmt.Sprintf("%d paired blocks, want at least %d: %s did not finish %d of %d blocks, %s did not finish %d of %d",
-				len(samples), minimumBlocks, baseline, completion.BaselineDidNotFinish, completion.BlocksObserved, candidate, completion.CandidateDidNotFinish, completion.BlocksObserved)
+			comparison.ComparisonWithheld = fmt.Sprintf("%d paired blocks, want at least %d: %s did not finish %d of %d blocks (%d excluded by the plan), %s did not finish %d of %d (%d excluded by the plan)",
+				len(samples), minimumBlocks, baseline, completion.BaselineDidNotFinish, completion.BlocksObserved, completion.BaselineExcluded, candidate, completion.CandidateDidNotFinish, completion.BlocksObserved, completion.CandidateExcluded)
 			report.Comparisons = append(report.Comparisons, comparison)
 			continue
 		}
+
 		summary, err := benchmark.SummarizePaired(samples, seed, resamples)
 		if err != nil {
 			return summaryReport{}, fmt.Errorf("summarize stratum %+v: %w", stratum, err)

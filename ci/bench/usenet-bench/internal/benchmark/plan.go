@@ -71,6 +71,31 @@ type PlanOptions struct {
 	StorageProfile    StorageProfile
 	Repetitions       int
 	Seed              int64
+	// ClientExclusions removes one client from the lanes of one fixture, with
+	// the reason recorded in the plan. A client that deterministically cannot
+	// finish a fixture is a known result, not a measurement worth repeating;
+	// the summarizer counts each excluded block as that client not finishing
+	// and reports the reason, so the outcome still appears in the comparison.
+	ClientExclusions []ClientExclusion
+}
+
+// ClientExclusion is one (client, fixture) pair a plan deliberately does not
+// run. The reason is mandatory: an exclusion without one is indistinguishable
+// from a plan that quietly dropped a lane.
+type ClientExclusion struct {
+	Client    Client `json:"client"`
+	FixtureID string `json:"fixture_id"`
+	Reason    string `json:"reason"`
+}
+
+// ClientExclusionFor returns the recorded exclusion for a client on a fixture.
+func ClientExclusionFor(exclusions []ClientExclusion, client Client, fixtureID string) (ClientExclusion, bool) {
+	for _, exclusion := range exclusions {
+		if exclusion.Client == client && exclusion.FixtureID == fixtureID {
+			return exclusion, true
+		}
+	}
+	return ClientExclusion{}, false
 }
 
 // Plan is deliberately timestamp-free. A saved plan is the authoritative
@@ -88,6 +113,7 @@ type Plan struct {
 	ServerLink        ServerLinkProfile  `json:"server_link"`
 	StorageProfile    StorageProfile     `json:"storage_profile"`
 	Repetitions       int                `json:"repetitions"`
+	ClientExclusions  []ClientExclusion  `json:"client_exclusions,omitempty"`
 	Runs              []Run              `json:"runs"`
 }
 
@@ -146,6 +172,7 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 		ServerLink:        options.ServerLink,
 		StorageProfile:    options.StorageProfile,
 		Repetitions:       options.Repetitions,
+		ClientExclusions:  append([]ClientExclusion(nil), options.ClientExclusions...),
 	}
 	type round struct {
 		fixtureID  string
@@ -169,6 +196,9 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 		lanes := benchmarkLanes(options.Clients, options.ArchiveToolchains, benchmarkRound.target)
 		random.Shuffle(len(lanes), func(i, j int) { lanes[i], lanes[j] = lanes[j], lanes[i] })
 		for _, lane := range lanes {
+			if _, excluded := ClientExclusionFor(options.ClientExclusions, lane.client, benchmarkRound.fixtureID); excluded {
+				continue
+			}
 			profile := clientProfileFor(options.ClientProfiles, lane.client)
 			validation := TLSNotApplicable
 			transportLabel := string(Plaintext)
@@ -218,14 +248,21 @@ func (p Plan) Validate() error {
 		StorageProfile:    p.StorageProfile,
 		Repetitions:       p.Repetitions,
 		Seed:              p.Seed,
+		ClientExclusions:  p.ClientExclusions,
 	}); err != nil {
 		return err
 	}
 	expected := 0
 	for _, target := range p.ExecutionTargets {
-		expected += len(benchmarkLanes(p.Clients, p.ArchiveToolchains, target))
+		for _, lane := range benchmarkLanes(p.Clients, p.ArchiveToolchains, target) {
+			for _, fixtureID := range p.FixtureIDs {
+				if _, excluded := ClientExclusionFor(p.ClientExclusions, lane.client, fixtureID); !excluded {
+					expected++
+				}
+			}
+		}
 	}
-	expected *= len(p.FixtureIDs) * len(p.Transports) * p.Repetitions
+	expected *= len(p.Transports) * p.Repetitions
 	if len(p.Runs) != expected {
 		return fmt.Errorf("benchmark plan contains %d runs, expected %d", len(p.Runs), expected)
 	}
@@ -261,6 +298,9 @@ func (p Plan) Validate() error {
 		}
 		if !fixtures[run.FixtureID] || !clients[run.Client] || !transports[run.Transport] {
 			return fmt.Errorf("benchmark plan run %s has a fixture, client, or transport outside the declared plan", run.ID)
+		}
+		if _, excluded := ClientExclusionFor(p.ClientExclusions, run.Client, run.FixtureID); excluded {
+			return fmt.Errorf("benchmark plan run %s schedules %s on %s, which the plan excludes", run.ID, run.Client, run.FixtureID)
 		}
 		if !archiveToolchainAllowed(run.Client, run.ArchiveToolchain, run.ExecutionTarget) {
 			return fmt.Errorf("benchmark plan run %s has unsupported %s toolchain for %s on %s", run.ID, run.ArchiveToolchain, run.Client, run.ExecutionTarget)
@@ -351,6 +391,9 @@ func validateOptions(options PlanOptions) error {
 		return fmt.Errorf("transports must be unique")
 	}
 	if err := validateClientProfiles(options.Clients, options.ClientProfiles); err != nil {
+		return err
+	}
+	if err := validateClientExclusions(options); err != nil {
 		return err
 	}
 	for _, client := range options.Clients {
@@ -454,7 +497,55 @@ func validateClientProfiles(clients []Client, profiles []ClientProfile) error {
 	return nil
 }
 
+// validateClientExclusions requires every exclusion to name a declared client
+// and fixture with a reason, to appear once, and to leave at least one client
+// on every fixture so no fixture silently drops out of the plan.
+func validateClientExclusions(options PlanOptions) error {
+	seen := map[ClientExclusion]bool{}
+	excludedPerFixture := map[string]int{}
+	for _, exclusion := range options.ClientExclusions {
+		if strings.TrimSpace(exclusion.Reason) == "" {
+			return fmt.Errorf("client exclusion of %s on %s needs a reason", exclusion.Client, exclusion.FixtureID)
+		}
+		if !containsClient(options.Clients, exclusion.Client) {
+			return fmt.Errorf("client exclusion names undeclared client %q", exclusion.Client)
+		}
+		if !containsString(options.FixtureIDs, exclusion.FixtureID) {
+			return fmt.Errorf("client exclusion names undeclared fixture %q", exclusion.FixtureID)
+		}
+		key := ClientExclusion{Client: exclusion.Client, FixtureID: exclusion.FixtureID}
+		if seen[key] {
+			return fmt.Errorf("client exclusion of %s on %s is repeated", exclusion.Client, exclusion.FixtureID)
+		}
+		seen[key] = true
+		excludedPerFixture[exclusion.FixtureID]++
+		if excludedPerFixture[exclusion.FixtureID] >= len(options.Clients) {
+			return fmt.Errorf("fixture %s excludes every client", exclusion.FixtureID)
+		}
+	}
+	return nil
+}
+
+func containsClient(clients []Client, client Client) bool {
+	for _, candidate := range clients {
+		if candidate == client {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
 func clientProfileFor(profiles []ClientProfile, client Client) ClientProfile {
+
 	for _, profile := range profiles {
 		if profile.Client == client {
 			return profile

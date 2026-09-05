@@ -25,7 +25,12 @@ const (
 	SubmissionModeQueueDrain SubmissionMode = "queue-drain"
 )
 
+// QueueTransitionMinimumCopies is the smallest queue a drain measurement
+// accepts; a single copy is a sequential run, not a queue.
+const QueueTransitionMinimumCopies = 2
+
 func (mode SubmissionMode) Valid() bool {
+
 	return mode == SubmissionModeQueued || mode == SubmissionModeSequential || mode == SubmissionModeQueueDrain
 }
 
@@ -189,8 +194,9 @@ func ExecuteSequentialPlan(ctx context.Context, config RunConfig) ([]QueueArtifa
 	return executeQueuePlan(ctx, config, SubmissionModeSequential)
 }
 
-// ExecuteQueueTransitionPlan queues exactly twenty copies of one direct
-// fixture per client lane and reports only the queue-drain wall clock.
+// ExecuteQueueTransitionPlan queues every planned repetition of one direct
+// fixture per client lane as one burst and reports only the queue-drain wall
+// clock. The plan's repetition count is the number of copies in the queue.
 func ExecuteQueueTransitionPlan(ctx context.Context, config RunConfig) ([]QueueArtifact, error) {
 	return executeQueuePlan(ctx, config, SubmissionModeQueueDrain)
 }
@@ -222,28 +228,63 @@ func executeQueuePlan(ctx context.Context, config RunConfig, mode SubmissionMode
 		}
 	}
 	artifacts := make([]QueueArtifact, 0, len(suites))
-	var failures []string
+	var failures, didNotFinish []string
 	for _, suite := range suites {
 		artifact := executeQueueSuite(ctx, config, suite, mode)
 		artifacts = append(artifacts, artifact)
-		if queueArtifactFailed(artifact) {
+		switch {
+		case queueArtifactHarnessFailed(artifact):
 			failures = append(failures, fmt.Sprintf("%s: %s", suite.ID, artifact.Error))
+		case queueArtifactFailed(artifact):
+			didNotFinish = append(didNotFinish, fmt.Sprintf("%s: %s", suite.ID, artifact.Error))
 		}
 	}
 	if len(failures) > 0 {
 		return artifacts, fmt.Errorf("%d benchmark queue suite(s) failed: %s", len(failures), strings.Join(failures, "; "))
 	}
+	if len(didNotFinish) > 0 {
+		return artifacts, &ClientDidNotFinishError{Suites: didNotFinish}
+	}
 	return artifacts, nil
 }
 
+// ClientDidNotFinishError is returned when every suite ran to a client
+// outcome but at least one client did not finish. It is a result, recorded in
+// the artifacts, not a harness failure: the controller still exits non-zero
+// so nobody mistakes the pass for clean, but with its own exit status so a
+// chained run can tell it apart from a suite the harness could not execute.
+type ClientDidNotFinishError struct {
+	Suites []string
+}
+
+func (e *ClientDidNotFinishError) Error() string {
+	return fmt.Sprintf("%d benchmark queue suite(s) completed with a client that did not finish: %s", len(e.Suites), strings.Join(e.Suites, "; "))
+}
+
+// ExitStatusClientDidNotFinish is the controller's exit status when the run
+// completed and a client did not finish; harness failures exit 1.
+const ExitStatusClientDidNotFinish = 2
+
+// queueArtifactFailed reports whether an artifact must fail the top-level
+// command: anything short of a verified pass does, a client's did-not-finish
+// included. queueArtifactHarnessFailed narrows that to suites the harness
+// itself could not carry to a client outcome.
 func queueArtifactFailed(artifact QueueArtifact) bool {
 	return artifact.Status != "passed"
+}
+
+func queueArtifactHarnessFailed(artifact QueueArtifact) bool {
+	return artifact.Status != "passed" && artifact.Status != "completed_with_dnf"
 }
 
 func queueTransitionSuites(plan Plan, target ExecutionTarget) ([]queueSuite, error) {
 	if len(plan.FixtureIDs) != 1 {
 		return nil, fmt.Errorf("queue-transition requires exactly one fixture, got %d", len(plan.FixtureIDs))
 	}
+	if plan.Repetitions < QueueTransitionMinimumCopies {
+		return nil, fmt.Errorf("queue-transition requires at least %d planned repetitions (queue copies), got %d", QueueTransitionMinimumCopies, plan.Repetitions)
+	}
+
 	type lane struct {
 		client    Client
 		toolchain ArchiveToolchain
@@ -270,8 +311,8 @@ func queueTransitionSuites(plan Plan, target ExecutionTarget) ([]queueSuite, err
 		suites[index].Runs = append(suites[index].Runs, run)
 	}
 	for _, suite := range suites {
-		if len(suite.Runs) != 20 {
-			return nil, fmt.Errorf("%s has %d jobs; queue-transition requires exactly 20", suite.ID, len(suite.Runs))
+		if len(suite.Runs) != plan.Repetitions {
+			return nil, fmt.Errorf("%s has %d jobs; queue-transition requires one per planned repetition (%d)", suite.ID, len(suite.Runs), plan.Repetitions)
 		}
 	}
 	return suites, nil
