@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
 )
@@ -275,7 +276,7 @@ func TestBuildSummaryReportPairsContainerCPUTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.SchemaVersion != 4 {
+	if report.SchemaVersion != 5 {
 		t.Fatalf("schema version %d, want 4", report.SchemaVersion)
 	}
 	cpu := report.Comparisons[0].CPUTime
@@ -478,4 +479,107 @@ func summaryTestArtifactWithCPU(client benchmark.Client, repetition int, measure
 	artifact.AdapterResult.Jobs[0].ResourceMetrics = metrics
 	artifact.Jobs[0].AdapterResult.ResourceMetrics = metrics
 	return artifact
+}
+
+// summaryTestShapedArtifact puts a finished run behind the 1 Gbit shaper with a
+// consistent before/after snapshot pair delivering `downstream` bytes, and a
+// schema-3 article census when `census` is non-nil.
+func summaryTestShapedArtifact(client benchmark.Client, repetition int, measurement int64, downstream uint64, census *benchmark.ShaperArticleCensus) benchmark.QueueArtifact {
+	artifact := summaryTestArtifact(client, repetition, measurement)
+	shaped := benchmark.ServerLinkProfile{ID: benchmark.Link1Gbit, EgressBitsPerSecond: 1_000_000_000, BurstBytes: 1_048_576}
+	artifact.Runs[0].ServerLink = shaped
+	artifact.Jobs[0].Run.ServerLink = shaped
+	artifact.AdapterResult.ServerLink = shaped
+	acquired := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	source := "172.18.0.9"
+	before := benchmark.ShaperSnapshot{
+		SchemaVersion: 2, Status: "ok", StartedAt: acquired.Add(-time.Hour),
+		ConfiguredEgressBitsPerSecond: shaped.EgressBitsPerSecond, ConfiguredBurstBytes: shaped.BurstBytes,
+		DownstreamConnections: 40, DownstreamBytes: 9_000, DownstreamSourceConnections: map[string]uint64{source: 40}, DownstreamSourceBytes: map[string]uint64{source: 9_000},
+		ExecutionLeaseID: strings.Repeat("a", 64), ExecutionLeaseAcquiredAt: &acquired,
+		Build: benchmark.ShaperBuildIdentity{ExecutableSHA256: strings.Repeat("0", 64), Version: "test"},
+	}
+	after := before
+	after.DownstreamConnections += 8
+	after.DownstreamBytes += downstream
+	after.DownstreamSourceConnections = map[string]uint64{source: 48}
+	after.DownstreamSourceBytes = map[string]uint64{source: 9_000 + downstream}
+	if census != nil {
+		before.SchemaVersion, after.SchemaVersion = 3, 3
+		before.ArticleRequests, before.RepeatedArticleRequests = 500, 3
+		after.ArticleRequests = before.ArticleRequests + census.ArticleRequests
+		after.RepeatedArticleRequests = before.RepeatedArticleRequests + census.RepeatedArticleRequests
+		after.DistinctArticleRequests = census.DistinctArticleRequests
+	}
+	artifact.ShaperBefore = &before
+	artifact.ShaperAfter = &after
+	artifact.ShaperDownstreamBytes = downstream
+	artifact.ShaperArticleCensus = census
+	return artifact
+}
+
+func TestBuildSummaryReportRecordsTransferEvidence(t *testing.T) {
+	// SABnzbd pulls the same bytes every block with no repeats; weaver pulls
+	// more on one block and the census attributes it to repeated requests.
+	artifacts := []benchmark.QueueArtifact{
+		summaryTestShapedArtifact(benchmark.SABnzbd, 1, 100, 6_000_000, &benchmark.ShaperArticleCensus{ArticleRequests: 125, DistinctArticleRequests: 125}),
+		summaryTestShapedArtifact(benchmark.SABnzbd, 2, 101, 6_000_003, &benchmark.ShaperArticleCensus{ArticleRequests: 125, DistinctArticleRequests: 125}),
+		summaryTestShapedArtifact(benchmark.Weaver, 1, 50, 6_000_010, &benchmark.ShaperArticleCensus{ArticleRequests: 125, DistinctArticleRequests: 125}),
+		summaryTestShapedArtifact(benchmark.Weaver, 2, 51, 6_900_000, &benchmark.ShaperArticleCensus{ArticleRequests: 140, DistinctArticleRequests: 125, RepeatedArticleRequests: 15}),
+	}
+	report, err := buildSummaryReport(artifacts, nil, benchmark.SABnzbd, benchmark.Weaver, 2, 17, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Comparisons) != 1 {
+		t.Fatalf("comparisons=%d, want 1", len(report.Comparisons))
+	}
+	transfer := report.Comparisons[0].Transfer
+	if len(transfer) != 2 || transfer[0].Client != benchmark.SABnzbd || transfer[1].Client != benchmark.Weaver {
+		t.Fatalf("transfer=%+v, want baseline then candidate", transfer)
+	}
+	sab, weaver := transfer[0], transfer[1]
+	if sab.FinishedBlocks != 2 || sab.DownstreamBytesMin != 6_000_000 || sab.DownstreamBytesMedian != 6_000_003 || sab.DownstreamBytesMax != 6_000_003 {
+		t.Fatalf("sabnzbd transfer=%+v", sab)
+	}
+	if sab.ArticleCensus == nil || sab.ArticleCensus.Blocks != 2 || sab.ArticleCensus.ArticleRequests != 250 || sab.ArticleCensus.DistinctArticleRequests != 250 || sab.ArticleCensus.RepeatedArticleRequests != 0 {
+		t.Fatalf("sabnzbd census=%+v", sab.ArticleCensus)
+	}
+	if weaver.DownstreamBytesMin != 6_000_010 || weaver.DownstreamBytesMax != 6_900_000 || weaver.ArticleCensus == nil || weaver.ArticleCensus.RepeatedArticleRequests != 15 || weaver.ArticleCensus.ArticleRequests != 265 {
+		t.Fatalf("weaver transfer=%+v census=%+v", weaver, weaver.ArticleCensus)
+	}
+}
+
+func TestBuildSummaryReportTransferEvidenceWithoutCensus(t *testing.T) {
+	// A schema-2 shaper: bytes are reported, the census is absent rather than
+	// zero, and a client that did not finish contributes no bytes.
+	artifacts := []benchmark.QueueArtifact{
+		summaryTestShapedArtifact(benchmark.SABnzbd, 1, 100, 6_000_000, nil),
+		summaryTestShapedArtifact(benchmark.SABnzbd, 2, 101, 6_000_000, nil),
+		summaryTestShapedArtifact(benchmark.Weaver, 1, 50, 6_000_010, nil),
+		summaryTestShapedArtifact(benchmark.Weaver, 2, 51, 6_000_020, nil),
+	}
+	report, err := buildSummaryReport(artifacts, nil, benchmark.SABnzbd, benchmark.Weaver, 2, 17, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer := report.Comparisons[0].Transfer
+	if len(transfer) != 2 || transfer[0].ArticleCensus != nil || transfer[1].ArticleCensus != nil {
+		t.Fatalf("transfer=%+v, want two entries without a census", transfer)
+	}
+	if transfer[1].DownstreamBytesMedian != 6_000_020 {
+		t.Fatalf("weaver median=%d, want the upper of two (6000020)", transfer[1].DownstreamBytesMedian)
+	}
+	// Unshaped runs carry no transfer evidence at all.
+	plain := []benchmark.QueueArtifact{
+		summaryTestArtifact(benchmark.SABnzbd, 1, 100), summaryTestArtifact(benchmark.SABnzbd, 2, 101),
+		summaryTestArtifact(benchmark.Weaver, 1, 50), summaryTestArtifact(benchmark.Weaver, 2, 51),
+	}
+	report, err = buildSummaryReport(plain, nil, benchmark.SABnzbd, benchmark.Weaver, 2, 17, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Comparisons[0].Transfer != nil {
+		t.Fatalf("unshaped transfer=%+v, want none", report.Comparisons[0].Transfer)
+	}
 }

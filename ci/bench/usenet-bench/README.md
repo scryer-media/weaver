@@ -381,6 +381,19 @@ benchmark host or network namespace with no other NNTP clients is a
 publication prerequisite; the lease and source counters enforce the boundary
 between cooperating runs and detect every differently sourced connection.
 
+The shaper also keeps a census of the client's own command stream: every
+command line the client sent upstream, tallied by verb, and for
+`ARTICLE`/`BODY`/`HEAD`/`STAT` the message-ids it named. Acquiring the lease
+resets the set of ids seen, so the post-run snapshot's
+`distinct_article_requests` is the run's own, while `article_requests` and
+`repeated_article_requests` are cumulative and bracketed like the byte
+counters. The run artifact records the delta as `shaper_article_census`.
+Downstream bytes are what the shaper wrote into the client's sockets —
+application bytes, not wire bytes — so a client whose bytes exceed the NZB's
+article bytes either asked for articles twice (repeats > 0) or read past what
+it asked for (repeats = 0). A schema-2 shaper carries no census and the field
+is absent.
+
 By default the topology publishes the shaper only on `127.0.0.1`. For a remote
 native lane set `NNTP_PUBLIC_BIND_ADDR` to a specific LAN address, firewall it
 to the benchmark host, and give the certificate a stable DNS SAN (for example
@@ -617,6 +630,16 @@ quantities), when a client's counter source changes inside one stratum, or
 when fewer than two blocks pair; pairing fewer blocks than `--minimum-blocks`
 is stated under `caveats` rather than withheld. The NFS profiles' CPU
 accounting caveat is carried under `caveats` too.
+
+Each stratum also carries `transfer`: per client, over its finished shaped
+blocks, the minimum, median and maximum `shaper_downstream_bytes` and, when the
+shaper counted commands, the summed `article_census` (blocks covered, article
+requests, distinct message-ids, repeated requests). It is evidence rather than
+a comparison — no ratio, no gate — and it is what makes a client that finishes
+fast by pulling more than the NZB carries visible next to its wall clock. A
+deterministic client lands within a few bytes of itself from block to block;
+a spread is a finding, and the census says whether the excess was requested
+twice or read past.
 
 ## Pre-seeded NNTP corpus image
 
@@ -967,6 +990,11 @@ Per run the artifact records:
   kernel spends outside the client's cgroup; the caveat is recorded in every
   NFS attestation. `summarize` pairs this counter per stratum as `cpu_time`
   (see [7. Summarize](#7-summarize)).
+- `shaper_downstream_bytes` and `shaper_article_census` — shaped runs: the
+  application bytes the shaper wrote to the client and, with a schema-3
+  shaper, how many article requests the client sent, how many distinct
+  message-ids they named and how many repeated one already requested in the
+  run. `summarize` reports them per stratum as `transfer`.
 - `instructions_retired` — Docker lane on native Linux: cgroup-scoped
   `perf stat -a -G … -e instructions` over the same interval, raw output kept as
   `config/perf-instructions.txt`. Where `perf` cannot attach (Docker Desktop,

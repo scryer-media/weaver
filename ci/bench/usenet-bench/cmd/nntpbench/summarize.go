@@ -72,6 +72,45 @@ type stratifiedComparison struct {
 	// never fails the report closed; a counter the lane could not collect is
 	// reported as such and the comparison withheld.
 	CPUTime cpuTimeComparison `json:"cpu_time"`
+	// Transfer is evidence, not a comparison: what each client pulled through
+	// the shaper on its finished blocks, next to how many articles it asked
+	// for. A client that finishes fast by fetching more than the NZB carries
+	// is visible here beside its wall clock, and the census says whether the
+	// excess was asked for twice or simply read past. Absent for clients
+	// without a shaped run in the stratum.
+	Transfer []clientTransferEvidence `json:"transfer,omitempty"`
+}
+
+// clientTransferEvidence summarises one client's shaped, finished runs in a
+// stratum. Downstream bytes are what the shaper wrote into the client's
+// sockets — application bytes, so kernel retransmits never inflate them; a
+// deterministic client lands within a few bytes of itself block to block, and
+// a spread between min and max is itself a finding.
+type clientTransferEvidence struct {
+	Client                benchmark.Client `json:"client"`
+	FinishedBlocks        int              `json:"finished_blocks"`
+	DownstreamBytesMin    uint64           `json:"shaper_downstream_bytes_min"`
+	DownstreamBytesMedian uint64           `json:"shaper_downstream_bytes_median"`
+	DownstreamBytesMax    uint64           `json:"shaper_downstream_bytes_max"`
+	// ArticleCensus is present when the shaper counted the client's command
+	// lines (attestation schema 3); it sums over the blocks it covers.
+	ArticleCensus *transferArticleCensus `json:"article_census,omitempty"`
+}
+
+type transferArticleCensus struct {
+	Blocks                  int    `json:"blocks"`
+	ArticleRequests         uint64 `json:"article_requests"`
+	DistinctArticleRequests uint64 `json:"distinct_article_requests"`
+	RepeatedArticleRequests uint64 `json:"repeated_article_requests"`
+}
+
+// transferAccount accumulates one client's shaped finished runs in a stratum.
+type transferAccount struct {
+	bytes    []uint64
+	census   int
+	requests uint64
+	distinct uint64
+	repeated uint64
 }
 
 // cpuTimeComparison pairs `cpu_time_nanoseconds` inside the stratum's blocks.
@@ -455,6 +494,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 	identities := make(map[summaryProductKey]summaryProductIdentity)
 	cpuAccounts := make(map[summaryProductKey]*cpuAccount)
 	cpuCaveats := make(map[comparisonStratum]map[string]bool)
+	transfers := make(map[summaryProductKey]*transferAccount)
 	// One summary describes one storage stratum. Local and NFS runs answer
 	// different questions, so a directory holding both is an operator mistake
 	// and is refused rather than silently split into two comparisons that look
@@ -578,6 +618,22 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 				}
 				caveats[artifact.StorageAttestation.CPUAccountingCaveat] = true
 			}
+			// Bytes ride along with finished shaped runs only: a run that did
+			// not finish pulled some unknown fraction of the job.
+			if artifact.ShaperDownstreamBytes > 0 {
+				account := transfers[productKey]
+				if account == nil {
+					account = &transferAccount{}
+					transfers[productKey] = account
+				}
+				account.bytes = append(account.bytes, artifact.ShaperDownstreamBytes)
+				if census := artifact.ShaperArticleCensus; census != nil {
+					account.census++
+					account.requests += census.ArticleRequests
+					account.distinct += census.DistinctArticleRequests
+					account.repeated += census.RepeatedArticleRequests
+				}
+			}
 		}
 		if job.Run.Client == baseline {
 			if block.baseline != nil || block.baselineDNF {
@@ -608,7 +664,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 	}
 	sort.Slice(strata, func(left, right int) bool { return fmt.Sprint(strata[left]) < fmt.Sprint(strata[right]) })
 	report := summaryReport{
-		SchemaVersion: 4,
+		SchemaVersion: 5,
 		Metric:        benchmark.PrimaryMetric,
 		Baseline:      baseline,
 		Candidate:     candidate,
@@ -674,6 +730,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 			return summaryReport{}, fmt.Errorf("summarize CPU time for stratum %+v: %w", stratum, err)
 		}
 		comparison.CPUTime = cpuTime
+		comparison.Transfer = buildTransferEvidence(stratum, transfers, baseline, candidate)
 		if len(samples) < minimumBlocks {
 			if completion.BaselineDidNotFinish == 0 && completion.CandidateDidNotFinish == 0 {
 				return summaryReport{}, fmt.Errorf("stratum %+v has %d complete blocks, want at least %d", stratum, len(samples), minimumBlocks)
@@ -695,6 +752,37 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 		return summaryReport{}, fmt.Errorf("no strata contain either requested client")
 	}
 	return report, nil
+}
+
+// buildTransferEvidence reports each client's shaped downstream bytes and
+// article census over its finished blocks, baseline first.
+func buildTransferEvidence(stratum comparisonStratum, transfers map[summaryProductKey]*transferAccount, baseline, candidate benchmark.Client) []clientTransferEvidence {
+	var evidence []clientTransferEvidence
+	for _, client := range []benchmark.Client{baseline, candidate} {
+		account := transfers[summaryProductKey{Stratum: stratum, Client: client}]
+		if account == nil || len(account.bytes) == 0 {
+			continue
+		}
+		sorted := append([]uint64(nil), account.bytes...)
+		sort.Slice(sorted, func(left, right int) bool { return sorted[left] < sorted[right] })
+		entry := clientTransferEvidence{
+			Client:                client,
+			FinishedBlocks:        len(sorted),
+			DownstreamBytesMin:    sorted[0],
+			DownstreamBytesMedian: sorted[len(sorted)/2],
+			DownstreamBytesMax:    sorted[len(sorted)-1],
+		}
+		if account.census > 0 {
+			entry.ArticleCensus = &transferArticleCensus{
+				Blocks:                  account.census,
+				ArticleRequests:         account.requests,
+				DistinctArticleRequests: account.distinct,
+				RepeatedArticleRequests: account.repeated,
+			}
+		}
+		evidence = append(evidence, entry)
+	}
+	return evidence
 }
 
 // buildCPUTimeComparison pairs the two clients' CPU counters over a stratum's
