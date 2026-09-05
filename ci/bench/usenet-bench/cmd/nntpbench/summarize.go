@@ -65,7 +65,54 @@ type stratifiedComparison struct {
 	// hiding the whole run behind it would hide that result.
 	Summary            *benchmark.PairedSummary `json:"summary,omitempty"`
 	ComparisonWithheld string                   `json:"comparison_withheld,omitempty"`
+	// CPUTime is the secondary comparison: each client's CPU time over the
+	// same paired blocks, so a client that finishes in the same wall clock by
+	// spending more cores — or by delegating the work to child processes —
+	// shows the difference. It is never pooled with the timing summary and
+	// never fails the report closed; a counter the lane could not collect is
+	// reported as such and the comparison withheld.
+	CPUTime cpuTimeComparison `json:"cpu_time"`
 }
+
+// cpuTimeComparison pairs `cpu_time_nanoseconds` inside the stratum's blocks.
+//
+// The counter's scope is whole-container in the Docker lane (the container
+// cgroup, so every helper the client spawns — unrar, par2, 7z — is charged to
+// it) and whole-process in the native lanes. Those are different quantities:
+// the comparison is withheld unless both clients were measured at the same
+// scope, and the scope, collector and collector version each client's numbers
+// came from are stated beside the result.
+type cpuTimeComparison struct {
+	Metric     string                `json:"metric"`
+	Accounting []clientCPUAccounting `json:"accounting"`
+	// PairedBlocks counts the blocks both clients finished *and* both
+	// counters were measured in; a block either counter is unavailable in is
+	// dropped from this comparison and counted under its client's accounting.
+	PairedBlocks int `json:"paired_blocks"`
+	// Caveats carries the storage attestation's CPU accounting caveat when the
+	// stratum ran on an NFS profile (the counter excludes the NFS client
+	// kernel time the host spends outside the container's cgroup) and a note
+	// when fewer blocks than the run's minimum were paired. The ratio is
+	// candidate over baseline like the timing summary: below 1 means the
+	// candidate spent less CPU.
+	Caveats            []string                 `json:"caveats,omitempty"`
+	Summary            *benchmark.PairedSummary `json:"summary,omitempty"`
+	ComparisonWithheld string                   `json:"comparison_withheld,omitempty"`
+}
+
+// clientCPUAccounting says where one client's CPU numbers in a stratum came
+// from and how many blocks had none.
+type clientCPUAccounting struct {
+	Client             benchmark.Client `json:"client"`
+	Scope              string           `json:"scope,omitempty"`
+	Collector          string           `json:"collector,omitempty"`
+	CollectorVersion   string           `json:"collector_version,omitempty"`
+	MeasuredBlocks     int              `json:"measured_blocks"`
+	UnavailableBlocks  int              `json:"unavailable_blocks"`
+	UnavailableReasons []string         `json:"unavailable_reasons,omitempty"`
+}
+
+const cpuTimeMetric = "cpu_time_nanoseconds"
 
 // completionCounts records, per stratum, how many randomized blocks each
 // client finished. Blocks where either client did not finish (a terminal
@@ -94,6 +141,53 @@ type comparisonBlock struct {
 	candidate    *float64
 	baselineDNF  bool
 	candidateDNF bool
+	// baselineCPU and candidateCPU are the measured `cpu_time_nanoseconds`
+	// of the same two runs, nil when the lane recorded the counter as
+	// unavailable.
+	baselineCPU  *float64
+	candidateCPU *float64
+}
+
+// cpuProvenance is one client's CPU counter source inside a stratum.
+type cpuProvenance struct {
+	Scope            string
+	Collector        string
+	CollectorVersion string
+}
+
+// cpuAccount accumulates one client's CPU counter evidence over a stratum.
+type cpuAccount struct {
+	measured    map[cpuProvenance]int
+	unavailable int
+	reasons     map[string]bool
+}
+
+func newCPUAccount() *cpuAccount {
+	return &cpuAccount{measured: make(map[cpuProvenance]int), reasons: make(map[string]bool)}
+}
+
+// cpuObservation reads a finished run's CPU counter. A run whose lane
+// recorded no resource metrics at all, or a measured counter of zero (which
+// the paired ratio cannot take a logarithm of), is an unavailable
+// observation with a stated reason, never a zero.
+func cpuObservation(metrics *benchmark.ResourceMetrics) (*float64, cpuProvenance, string) {
+	if metrics == nil {
+		return nil, cpuProvenance{}, "resource metrics not recorded for this run"
+	}
+	counter := metrics.CPUTimeNanoseconds
+	provenance := cpuProvenance{Scope: counter.Scope, Collector: counter.Collector, CollectorVersion: counter.CollectorVersion}
+	if counter.Status != benchmark.CounterMeasured || counter.Value == nil {
+		reason := strings.TrimSpace(counter.Reason)
+		if reason == "" {
+			reason = "cpu_time_nanoseconds unavailable without a recorded reason"
+		}
+		return nil, provenance, reason
+	}
+	if *counter.Value == 0 {
+		return nil, provenance, "cpu_time_nanoseconds measured as zero"
+	}
+	value := float64(*counter.Value)
+	return &value, provenance, ""
 }
 
 type summaryProductKey struct {
@@ -359,6 +453,8 @@ func loadSummaryExecutionContext(root, command string) (summaryExecutionContext,
 func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchmark.ClientExclusion, baseline, candidate benchmark.Client, minimumBlocks int, seed int64, resamples int) (summaryReport, error) {
 	groups := make(map[comparisonStratum]map[int]*comparisonBlock)
 	identities := make(map[summaryProductKey]summaryProductIdentity)
+	cpuAccounts := make(map[summaryProductKey]*cpuAccount)
+	cpuCaveats := make(map[comparisonStratum]map[string]bool)
 	// One summary describes one storage stratum. Local and NFS runs answer
 	// different questions, so a directory holding both is an operator mistake
 	// and is refused rather than silently split into two comparisons that look
@@ -457,6 +553,32 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 			blocks[job.Run.Repetition] = block
 		}
 		measurement := float64(job.AdapterResult.SubmissionToTerminalNanoseconds)
+		// The CPU counter rides along with a finished run only: a run that
+		// did not finish has no wall clock to pair either.
+		var cpuValue *float64
+		if !didNotFinish {
+			value, provenance, reason := cpuObservation(job.AdapterResult.ResourceMetrics)
+			account := cpuAccounts[productKey]
+			if account == nil {
+				account = newCPUAccount()
+				cpuAccounts[productKey] = account
+			}
+			if value != nil {
+				account.measured[provenance]++
+			} else {
+				account.unavailable++
+				account.reasons[reason] = true
+			}
+			cpuValue = value
+			if artifact.StorageAttestation != nil && artifact.StorageAttestation.CPUAccountingCaveat != "" {
+				caveats := cpuCaveats[stratum]
+				if caveats == nil {
+					caveats = make(map[string]bool)
+					cpuCaveats[stratum] = caveats
+				}
+				caveats[artifact.StorageAttestation.CPUAccountingCaveat] = true
+			}
+		}
 		if job.Run.Client == baseline {
 			if block.baseline != nil || block.baselineDNF {
 				return summaryReport{}, fmt.Errorf("duplicate baseline observation for %+v repetition %d", stratum, job.Run.Repetition)
@@ -465,6 +587,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 				block.baselineDNF = true
 			} else {
 				block.baseline = &measurement
+				block.baselineCPU = cpuValue
 			}
 		} else {
 			if block.candidate != nil || block.candidateDNF {
@@ -474,6 +597,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 				block.candidateDNF = true
 			} else {
 				block.candidate = &measurement
+				block.candidateCPU = cpuValue
 			}
 		}
 	}
@@ -484,7 +608,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 	}
 	sort.Slice(strata, func(left, right int) bool { return fmt.Sprint(strata[left]) < fmt.Sprint(strata[right]) })
 	report := summaryReport{
-		SchemaVersion: 3,
+		SchemaVersion: 4,
 		Metric:        benchmark.PrimaryMetric,
 		Baseline:      baseline,
 		Candidate:     candidate,
@@ -545,6 +669,11 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 		if candidateExcluded {
 			comparison.ClientExclusions = append(comparison.ClientExclusions, candidateExclusion)
 		}
+		cpuTime, err := buildCPUTimeComparison(stratum, blocks, repetitions, cpuAccounts, cpuCaveats[stratum], baseline, candidate, minimumBlocks, seed, resamples)
+		if err != nil {
+			return summaryReport{}, fmt.Errorf("summarize CPU time for stratum %+v: %w", stratum, err)
+		}
+		comparison.CPUTime = cpuTime
 		if len(samples) < minimumBlocks {
 			if completion.BaselineDidNotFinish == 0 && completion.CandidateDidNotFinish == 0 {
 				return summaryReport{}, fmt.Errorf("stratum %+v has %d complete blocks, want at least %d", stratum, len(samples), minimumBlocks)
@@ -566,4 +695,89 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 		return summaryReport{}, fmt.Errorf("no strata contain either requested client")
 	}
 	return report, nil
+}
+
+// buildCPUTimeComparison pairs the two clients' CPU counters over a stratum's
+// blocks. It withholds rather than fails: the counter is secondary evidence,
+// and a lane that could not collect it has already said so in the artifact.
+func buildCPUTimeComparison(stratum comparisonStratum, blocks map[int]*comparisonBlock, repetitions []int, accounts map[summaryProductKey]*cpuAccount, caveats map[string]bool, baseline, candidate benchmark.Client, minimumBlocks int, seed int64, resamples int) (cpuTimeComparison, error) {
+	comparison := cpuTimeComparison{Metric: cpuTimeMetric}
+	for caveat := range caveats {
+		comparison.Caveats = append(comparison.Caveats, caveat)
+	}
+	sort.Strings(comparison.Caveats)
+
+	var withheld []string
+	scopes := make(map[benchmark.Client]string)
+	for _, client := range []benchmark.Client{baseline, candidate} {
+		accounting := clientCPUAccounting{Client: client}
+		if account := accounts[summaryProductKey{Stratum: stratum, Client: client}]; account != nil {
+			accounting.UnavailableBlocks = account.unavailable
+			for reason := range account.reasons {
+				accounting.UnavailableReasons = append(accounting.UnavailableReasons, reason)
+			}
+			sort.Strings(accounting.UnavailableReasons)
+			provenances := make([]cpuProvenance, 0, len(account.measured))
+			for provenance, count := range account.measured {
+				provenances = append(provenances, provenance)
+				accounting.MeasuredBlocks += count
+			}
+			sort.Slice(provenances, func(left, right int) bool { return fmt.Sprint(provenances[left]) < fmt.Sprint(provenances[right]) })
+			if len(provenances) > 0 {
+				first := provenances[0]
+				accounting.Scope, accounting.Collector, accounting.CollectorVersion = first.Scope, first.Collector, first.CollectorVersion
+			}
+			// One source per client per stratum, like the product identity:
+			// two collectors inside one stratum are two measurements wearing
+			// one label.
+			if len(provenances) > 1 {
+				withheld = append(withheld, fmt.Sprintf("%s CPU accounting source changed within the stratum", client))
+			}
+			if accounting.MeasuredBlocks == 0 {
+				withheld = append(withheld, fmt.Sprintf("%s has no measured CPU time in this stratum", client))
+			}
+		} else {
+			withheld = append(withheld, fmt.Sprintf("%s finished no block in this stratum", client))
+		}
+		scopes[client] = accounting.Scope
+		comparison.Accounting = append(comparison.Accounting, accounting)
+	}
+	if scopes[baseline] != "" && scopes[candidate] != "" && scopes[baseline] != scopes[candidate] {
+		withheld = append(withheld, fmt.Sprintf("scopes differ: %s measured %s, %s measured %s; a process counter and a container counter are different quantities",
+			baseline, scopes[baseline], candidate, scopes[candidate]))
+	}
+
+	samples := make([]benchmark.PairedSample, 0, len(repetitions))
+	for _, repetition := range repetitions {
+		block := blocks[repetition]
+		if block.baselineCPU == nil || block.candidateCPU == nil {
+			continue
+		}
+		samples = append(samples, benchmark.PairedSample{Baseline: *block.baselineCPU, Candidate: *block.candidateCPU})
+	}
+	comparison.PairedBlocks = len(samples)
+	if len(withheld) > 0 {
+		comparison.ComparisonWithheld = strings.Join(withheld, "; ")
+		return comparison, nil
+	}
+	// The counter is secondary evidence with its own accounting, so a lane
+	// that lost it on a few blocks does not lose the comparison: the paired
+	// summary needs two blocks, and falling short of the run's minimum is
+	// stated as a caveat rather than withheld.
+	if len(samples) < 2 {
+		comparison.ComparisonWithheld = fmt.Sprintf("%d paired CPU blocks, need at least 2: %s measured %d and had %d unavailable, %s measured %d and had %d unavailable",
+			len(samples),
+			baseline, comparison.Accounting[0].MeasuredBlocks, comparison.Accounting[0].UnavailableBlocks,
+			candidate, comparison.Accounting[1].MeasuredBlocks, comparison.Accounting[1].UnavailableBlocks)
+		return comparison, nil
+	}
+	if len(samples) < minimumBlocks {
+		comparison.Caveats = append(comparison.Caveats, fmt.Sprintf("%d paired CPU blocks is below the run's minimum of %d; the interval is indicative, not a gate", len(samples), minimumBlocks))
+	}
+	summary, err := benchmark.SummarizePaired(samples, seed, resamples)
+	if err != nil {
+		return cpuTimeComparison{}, err
+	}
+	comparison.Summary = &summary
+	return comparison, nil
 }
