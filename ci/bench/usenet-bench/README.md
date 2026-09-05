@@ -600,6 +600,24 @@ run or 100 ms, whichever is larger) still fails the summary closed.
 So does an artifact root that mixes storage profiles: a local run and an NFS
 run answer different questions and are summarized separately, never pooled.
 
+Each stratum also carries a `cpu_time` comparison: the two clients'
+`cpu_time_nanoseconds` paired over the same blocks, with the same medians,
+geometric-mean ratio (candidate over baseline; below 1 means the candidate
+spent less CPU) and bootstrap interval. In the Docker lane that counter is the
+whole container's cgroup, so a client that hands its work to `unrar`, `par2`
+or `7z` is charged for them exactly as a client that does the work in-process
+is charged for its own threads; that is the point of the comparison. It is
+secondary evidence and never fails the summary closed. `accounting` states,
+per client, the counter's scope, collector and collector version and how many
+blocks had no measured counter, with the lane's recorded reasons; a block
+where either counter is unavailable is dropped from the CPU pairing only. The
+comparison is withheld when the two clients were measured at different scopes
+(a `client_process` counter and a `client_container` counter are different
+quantities), when a client's counter source changes inside one stratum, or
+when fewer than two blocks pair; pairing fewer blocks than `--minimum-blocks`
+is stated under `caveats` rather than withheld. The NFS profiles' CPU
+accounting caveat is carried under `caveats` too.
+
 ## Pre-seeded NNTP corpus image
 
 Posting the corpus is setup, not measurement, but it is slow and it is
@@ -947,7 +965,8 @@ Per run the artifact records:
   this cold-scope counter by the narrower primary wall clock. Under the `nfs`
   storage profiles this counter excludes NFS client kernel time, which the host
   kernel spends outside the client's cgroup; the caveat is recorded in every
-  NFS attestation.
+  NFS attestation. `summarize` pairs this counter per stratum as `cpu_time`
+  (see [7. Summarize](#7-summarize)).
 - `instructions_retired` — Docker lane on native Linux: cgroup-scoped
   `perf stat -a -G … -e instructions` over the same interval, raw output kept as
   `config/perf-instructions.txt`. Where `perf` cannot attach (Docker Desktop,

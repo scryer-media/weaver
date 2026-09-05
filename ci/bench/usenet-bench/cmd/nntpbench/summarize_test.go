@@ -263,6 +263,141 @@ func mustRead(t *testing.T, path string) []byte {
 // summaryTestDidNotFinishArtifact mirrors what the controller writes when the
 // client reaches a terminal failure: status completed_with_dnf, job outcome
 // dnf with its error, no verification and no measurement.
+func TestBuildSummaryReportPairsContainerCPUTime(t *testing.T) {
+	artifacts := make([]benchmark.QueueArtifact, 0, 40)
+	for repetition := 1; repetition <= 20; repetition++ {
+		artifacts = append(artifacts,
+			summaryTestArtifactWithCPU(benchmark.Weaver, repetition, int64(100+repetition), "client_container", 400_000_000),
+			summaryTestArtifactWithCPU(benchmark.SABnzbd, repetition, int64(80+repetition), "client_container", 2_000_000_000),
+		)
+	}
+	report, err := buildSummaryReport(artifacts, nil, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.SchemaVersion != 4 {
+		t.Fatalf("schema version %d, want 4", report.SchemaVersion)
+	}
+	cpu := report.Comparisons[0].CPUTime
+	if cpu.Metric != "cpu_time_nanoseconds" || cpu.ComparisonWithheld != "" || cpu.Summary == nil {
+		t.Fatalf("cpu comparison not summarized: %#v", cpu)
+	}
+	if cpu.PairedBlocks != 20 || cpu.Summary.Count != 20 {
+		t.Fatalf("cpu paired %d/%d blocks, want 20", cpu.PairedBlocks, cpu.Summary.Count)
+	}
+	// Candidate over baseline, like the timing summary: SABnzbd's 2 s over
+	// weaver's 400 ms.
+	if ratio := cpu.Summary.GeometricMeanRatio; ratio < 4.99 || ratio > 5.01 {
+		t.Fatalf("cpu geometric mean ratio %v, want 5", ratio)
+	}
+	if len(cpu.Accounting) != 2 {
+		t.Fatalf("accounting %#v", cpu.Accounting)
+	}
+	for _, accounting := range cpu.Accounting {
+		if accounting.Scope != "client_container" || accounting.Collector != "cgroup-v2-cpu.stat" || accounting.MeasuredBlocks != 20 || accounting.UnavailableBlocks != 0 {
+			t.Fatalf("accounting for %s: %#v", accounting.Client, accounting)
+		}
+	}
+}
+
+func TestBuildSummaryReportWithholdsCPUTimeAcrossScopes(t *testing.T) {
+	artifacts := make([]benchmark.QueueArtifact, 0, 40)
+	for repetition := 1; repetition <= 20; repetition++ {
+		artifacts = append(artifacts,
+			summaryTestArtifactWithCPU(benchmark.Weaver, repetition, int64(100+repetition), "client_process", 400_000_000),
+			summaryTestArtifactWithCPU(benchmark.SABnzbd, repetition, int64(80+repetition), "client_container", 2_000_000_000),
+		)
+	}
+	report, err := buildSummaryReport(artifacts, nil, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Comparisons[0].Summary == nil {
+		t.Fatal("timing summary must not depend on the CPU comparison")
+	}
+	cpu := report.Comparisons[0].CPUTime
+	if cpu.Summary != nil || !strings.Contains(cpu.ComparisonWithheld, "scopes differ") {
+		t.Fatalf("cpu comparison across scopes was not withheld: %#v", cpu)
+	}
+	if cpu.PairedBlocks != 20 {
+		t.Fatalf("paired blocks %d, want 20 even when withheld", cpu.PairedBlocks)
+	}
+}
+
+func TestBuildSummaryReportSkipsUnavailableCPUBlocks(t *testing.T) {
+	artifacts := make([]benchmark.QueueArtifact, 0, 40)
+	for repetition := 1; repetition <= 20; repetition++ {
+		artifacts = append(artifacts, summaryTestArtifactWithCPU(benchmark.Weaver, repetition, int64(100+repetition), "client_container", 400_000_000))
+		if repetition <= 3 {
+			// The lane recorded the counter as unavailable for three runs.
+			artifacts = append(artifacts, summaryTestArtifact(benchmark.SABnzbd, repetition, int64(80+repetition)))
+		} else {
+			artifacts = append(artifacts, summaryTestArtifactWithCPU(benchmark.SABnzbd, repetition, int64(80+repetition), "client_container", 2_000_000_000))
+		}
+	}
+	report, err := buildSummaryReport(artifacts, nil, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Comparisons[0].Summary == nil || report.Comparisons[0].Summary.Count != 20 {
+		t.Fatal("timing summary must still pair all 20 blocks")
+	}
+	cpu := report.Comparisons[0].CPUTime
+	if cpu.PairedBlocks != 17 || cpu.Summary == nil || cpu.Summary.Count != 17 || cpu.ComparisonWithheld != "" {
+		t.Fatalf("cpu comparison should pair the 17 measured blocks: %#v", cpu)
+	}
+	if cpu.Accounting[1].MeasuredBlocks != 17 || cpu.Accounting[1].UnavailableBlocks != 3 || len(cpu.Accounting[1].UnavailableReasons) != 1 {
+		t.Fatalf("candidate accounting: %#v", cpu.Accounting[1])
+	}
+	// Short of the run's minimum the comparison stays, with the shortfall stated.
+	if len(cpu.Caveats) != 1 || !strings.Contains(cpu.Caveats[0], "17 paired CPU blocks is below the run's minimum of 20") {
+		t.Fatalf("cpu caveats: %#v", cpu.Caveats)
+	}
+
+	// With a single measured pair there is nothing to summarize; that is
+	// withheld, never failed, and the timing summary is untouched.
+	for index := range artifacts {
+		if artifacts[index].Runs[0].Client == benchmark.SABnzbd && artifacts[index].Runs[0].Repetition != 20 {
+			artifacts[index].AdapterResult.Jobs[0].ResourceMetrics = nil
+			artifacts[index].Jobs[0].AdapterResult.ResourceMetrics = nil
+		}
+	}
+	report, err = buildSummaryReport(artifacts, nil, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Comparisons[0].Summary == nil {
+		t.Fatal("timing summary must not depend on the CPU comparison")
+	}
+	cpu = report.Comparisons[0].CPUTime
+	if cpu.Summary != nil || cpu.PairedBlocks != 1 || !strings.Contains(cpu.ComparisonWithheld, "1 paired CPU blocks, need at least 2") {
+		t.Fatalf("cpu comparison with one pair was not withheld: %#v", cpu)
+	}
+}
+
+func TestBuildSummaryReportWithholdsCPUTimeWithoutResourceMetrics(t *testing.T) {
+	artifacts := make([]benchmark.QueueArtifact, 0, 40)
+	for repetition := 1; repetition <= 20; repetition++ {
+		artifacts = append(artifacts,
+			summaryTestArtifact(benchmark.Weaver, repetition, int64(100+repetition)),
+			summaryTestArtifact(benchmark.SABnzbd, repetition, int64(80+repetition)),
+		)
+	}
+	report, err := buildSummaryReport(artifacts, nil, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cpu := report.Comparisons[0].CPUTime
+	if cpu.Summary != nil || cpu.PairedBlocks != 0 || !strings.Contains(cpu.ComparisonWithheld, "no measured CPU time") {
+		t.Fatalf("cpu comparison without resource metrics was not withheld: %#v", cpu)
+	}
+	for _, accounting := range cpu.Accounting {
+		if accounting.UnavailableBlocks != 20 || len(accounting.UnavailableReasons) != 1 {
+			t.Fatalf("accounting for %s: %#v", accounting.Client, accounting)
+		}
+	}
+}
+
 func summaryTestDidNotFinishArtifact(client benchmark.Client, repetition int) benchmark.QueueArtifact {
 	artifact := summaryTestArtifact(client, repetition, 0)
 	artifact.Status = "completed_with_dnf"
@@ -327,4 +462,20 @@ func summaryTestArtifact(client benchmark.Client, repetition int, measurement in
 			AdapterResult: adapterJob,
 		}},
 	}
+}
+
+// summaryTestArtifactWithCPU is summaryTestArtifact with a measured CPU
+// counter at the given scope, the way the Docker lane (`client_container`)
+// and the native lanes (`client_process`) record it.
+func summaryTestArtifactWithCPU(client benchmark.Client, repetition int, measurement int64, scope string, cpuNanoseconds uint64) benchmark.QueueArtifact {
+	artifact := summaryTestArtifact(client, repetition, measurement)
+	metrics := &benchmark.ResourceMetrics{
+		CPUTimeNanoseconds:  benchmark.MeasuredMeasurement(scope, "cgroup-v2-cpu.stat", "test", cpuNanoseconds),
+		InstructionsRetired: benchmark.UnavailableMeasurement(scope, "none", "test", "not collected in tests"),
+	}
+	// The artifact carries the adapter result twice (top level and inside
+	// the job) and the summarizer requires both copies to agree.
+	artifact.AdapterResult.Jobs[0].ResourceMetrics = metrics
+	artifact.Jobs[0].AdapterResult.ResourceMetrics = metrics
+	return artifact
 }
