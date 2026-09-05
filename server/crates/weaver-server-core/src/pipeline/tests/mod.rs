@@ -959,6 +959,7 @@ fn dummy_rar_volume_facts(volume_number: u32) -> unrar_rs::RarVolumeFacts {
         has_authenticity_verification: false,
         has_locator: false,
         quick_open_offset: None,
+        headers_from_quick_open: false,
         recovery_record_offset: None,
         original_name: None,
         original_name_raw: None,

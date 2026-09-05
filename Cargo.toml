@@ -126,7 +126,7 @@ par2-rs = { version = "0.9", default-features = false, features = ["native-crypt
 # the `ExtractOptions` weaver still carries. 0.9 also poisons a solid archive
 # whose member failed mid-decode instead of reusing the misaligned dictionary,
 # and 0.9.1 restores `-hp` (header-encrypted) RAR5 sets from `.rev` volumes.
-unrar-rs = { version = "0.9.1", default-features = false, features = ["crypto-aws-lc"] }
+unrar-rs = { version = "0.10.1", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]
