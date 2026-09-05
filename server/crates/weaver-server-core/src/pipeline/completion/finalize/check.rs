@@ -6343,7 +6343,12 @@ impl Pipeline {
             let volume_number = match role {
                 weaver_model::files::FileRole::RarVolume { volume_number } => volume_number,
                 weaver_model::files::FileRole::SevenZipSplit { number } => {
-                    if self.adopt_verified_par2_sevenz_part(job_id, &file.filename, &role, number)? {
+                    if self.adopt_verified_par2_sevenz_part(
+                        job_id,
+                        &file.filename,
+                        &role,
+                        number,
+                    )? {
                         registration.sevenz_parts += 1;
                     }
                     continue;

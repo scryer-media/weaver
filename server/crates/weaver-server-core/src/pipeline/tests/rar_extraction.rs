@@ -6602,7 +6602,8 @@ async fn a_split_7z_short_of_a_part_the_nzb_never_carried_is_not_settled_clean_b
         pipeline.check_job_completion(job_id).await;
 
         assert_eq!(
-            pipeline.par2_repairer_execute_calls, 1,
+            pipeline.par2_repairer_execute_calls,
+            1,
             "withheld part {withheld}: the absent part routes the job to a PAR2 repair; {}",
             debug_job_state(&pipeline, job_id)
         );
@@ -6622,8 +6623,18 @@ fn build_case_colliding_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     let first = b"first-of-two-names-for-one-path";
     let second = b"second-of-two-names-for-one-path";
     let members = [
-        ("CERTIFICATE/BACKUP/id.bdmv", &first[..], &first[..12], &first[12..]),
-        ("CERTIFICATE/backup/id.bdmv", &second[..], &second[..12], &second[12..]),
+        (
+            "CERTIFICATE/BACKUP/id.bdmv",
+            &first[..],
+            &first[..12],
+            &first[12..],
+        ),
+        (
+            "CERTIFICATE/backup/id.bdmv",
+            &second[..],
+            &second[..12],
+            &second[12..],
+        ),
     ];
     let mut volumes = Vec::new();
     for (member_index, (name, whole, head, tail)) in members.iter().enumerate() {
@@ -6634,7 +6645,11 @@ fn build_case_colliding_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
         let mut open = Vec::new();
         open.extend_from_slice(&TEST_RAR5_SIG);
         open.extend_from_slice(&build_test_rar_main_header(
-            if open_volume == 0 { 0x0001 } else { 0x0001 | 0x0002 },
+            if open_volume == 0 {
+                0x0001
+            } else {
+                0x0001 | 0x0002
+            },
             (open_volume > 0).then_some(open_volume as u64),
         ));
         open.extend_from_slice(&build_test_rar_file_header(
