@@ -8830,8 +8830,15 @@ async fn no_par2_retry_clears_detected_archive_identity_before_redownload() {
     );
 }
 
+/// A probe that is still in flight when the last segment settles must not hold
+/// the completion checkpoint.
+///
+/// The probe estimates a release's health from a sample while bytes are still
+/// arriving. Once the download pass ends, the job's own terminal states are the
+/// answer, and waiting on the probe only postpones the checkpoint — and PAR2
+/// recovery promotion with it — for the probe's whole soft timeout.
 #[tokio::test]
-async fn probe_completion_requeues_completion_check_if_downloads_finished_while_checking() {
+async fn drained_download_pass_retires_the_probe_instead_of_waiting_for_it() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30024);
@@ -8854,12 +8861,24 @@ async fn probe_completion_requeues_completion_check_if_downloads_finished_while_
     }
 
     pipeline.maybe_finish_download_pass(job_id);
-    assert!(pipeline.pending_completion_checks.is_empty());
 
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert!(!state.health_probing, "the probe should have been retired");
+        assert!(matches!(state.status, JobStatus::Downloading));
+    }
+    assert!(
+        pipeline.pending_completion_checks.contains(&job_id),
+        "the checkpoint must not wait for the probe once the pass has drained"
+    );
+
+    // The abandoned round lands late; it must change nothing.
+    pipeline.pending_completion_checks.clear();
     pipeline.handle_probe_update(ProbeUpdate {
         job_id,
+        probe_round: 0,
         total: 1,
-        missed: 0,
+        missed: 1,
         done: true,
         inconclusive: false,
     });
@@ -8867,7 +8886,14 @@ async fn probe_completion_requeues_completion_check_if_downloads_finished_while_
     let state = pipeline.jobs.get(&job_id).unwrap();
     assert!(!state.health_probing);
     assert!(matches!(state.status, JobStatus::Downloading));
-    assert!(pipeline.pending_completion_checks.contains(&job_id));
+    assert_eq!(
+        state.probe_projected_failed_bytes, 0,
+        "a retired round must not project damage onto a settled ledger"
+    );
+    assert!(
+        pipeline.pending_completion_checks.is_empty(),
+        "a retired round must not re-drive the checkpoint"
+    );
 }
 
 #[tokio::test]

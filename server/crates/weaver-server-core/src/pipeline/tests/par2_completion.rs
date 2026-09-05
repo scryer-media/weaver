@@ -4192,6 +4192,7 @@ async fn probe_projection_uses_only_payload_bytes() {
     pipeline.activate_health_probes(job_id);
     pipeline.handle_probe_update(ProbeUpdate {
         job_id,
+        probe_round: 0,
         total: 2,
         missed: 1,
         done: true,

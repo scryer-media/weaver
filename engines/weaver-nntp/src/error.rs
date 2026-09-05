@@ -112,8 +112,22 @@ pub enum NntpError {
     PoolShutdown,
 
     /// An article fetch exceeded the soft timeout, triggering failover to the next server.
+    ///
+    /// This is a *live connection* condition: the command was sent (or the
+    /// socket was already ours) and the reply never arrived in time, so the
+    /// server is implicated.
     #[error("article fetch soft timeout ({0}s)")]
     SoftTimeout(u64),
+
+    /// No pooled connection became available before the caller's deadline.
+    ///
+    /// Nothing was ever sent to the server: the request never got past our own
+    /// connection semaphore. This is a local capacity condition (every lane is
+    /// leased, or the adaptive limit is saturated), never a server fault, so it
+    /// must not cool the server down or advance its failure counters — see
+    /// `cooldown_reason` and `record_transient_server_failure` in `client.rs`.
+    #[error("no connection available within {0}s")]
+    AcquireTimeout(u64),
 
     /// A per-server BODY quota rejected admission before the command was sent.
     /// This is scheduler policy, never a server health failure.
