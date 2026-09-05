@@ -47,15 +47,32 @@ impl<W> CountingWriter<W> {
 /// epoch on it would be an invention. Only the modification time is required
 /// for a stamp — that is the one every tool records and the one the user
 /// sees; the access time rides along when present.
-fn sevenz_entry_times(entry: &sevenz_rust2::ArchiveEntry) -> Option<std::fs::FileTimes> {
+fn sevenz_entry_times(entry: &sevenz_rust2::ArchiveEntry) -> Option<SevenZipEntryTimes> {
     if !entry.has_last_modified_date {
         return None;
     }
-    let mut times = std::fs::FileTimes::new().set_modified(entry.last_modified_date().into());
-    if entry.has_access_date {
-        times = times.set_accessed(entry.access_date().into());
+    Some(SevenZipEntryTimes {
+        modified: entry.last_modified_date().into(),
+        accessed: entry.has_access_date.then(|| entry.access_date().into()),
+    })
+}
+
+/// The times a 7z entry recorded, kept apart so they can be stamped either
+/// through an open file handle or, for a directory, by name from its root.
+#[derive(Clone, Copy)]
+struct SevenZipEntryTimes {
+    modified: std::time::SystemTime,
+    accessed: Option<std::time::SystemTime>,
+}
+
+impl SevenZipEntryTimes {
+    fn file_times(self) -> std::fs::FileTimes {
+        let mut times = std::fs::FileTimes::new().set_modified(self.modified);
+        if let Some(accessed) = self.accessed {
+            times = times.set_accessed(accessed);
+        }
+        times
     }
-    Some(times)
 }
 
 impl<W: Write> Write for CountingWriter<W> {
@@ -318,7 +335,7 @@ where
     let extracted_members_ref = &mut extracted_members;
     // Directory times are stamped after the decode, once nothing more will
     // be created inside them.
-    let mut directory_times: Vec<(PathBuf, std::fs::FileTimes)> = Vec::new();
+    let mut directory_times: Vec<(PathBuf, SevenZipEntryTimes)> = Vec::new();
     let directory_times_ref = &mut directory_times;
     let event_tx_ref = event_tx;
     let root_ref = root;
@@ -382,7 +399,7 @@ where
         // The stamp is metadata, not payload: a filesystem that refuses it
         // has still received every byte, so the member stays extracted.
         if let Some(times) = sevenz_entry_times(entry)
-            && let Err(error) = file.get_ref().set_times(times)
+            && let Err(error) = file.get_ref().set_times(times.file_times())
         {
             tracing::debug!(
                 job_id = job_id.0,
@@ -435,7 +452,7 @@ where
     // Deepest directories first: a directory's own stamp is the last thing
     // to touch it, and nothing below it is touched afterwards.
     for (relative, times) in directory_times.into_iter().rev() {
-        if let Err(error) = root.set_dir_times(&relative, times) {
+        if let Err(error) = root.set_dir_times(&relative, times.modified, times.accessed) {
             tracing::debug!(
                 job_id = job_id.0,
                 directory = %relative.display(),

@@ -1995,6 +1995,17 @@ mod tests {
         Continue,
     }
 
+    /// Ciphertext read from the socket that rustls has not consumed yet. It
+    /// outlives a single handshake or drain call: a socket read routinely
+    /// ends inside a TLS record, and that record's head must still sit in
+    /// front of whatever the next read appends. Starting the next call from
+    /// an empty buffer hands rustls the tail of a record as if it were the
+    /// start of one, and it reports an invalid content type.
+    struct UnbufferedInput {
+        buf: Vec<u8>,
+        len: usize,
+    }
+
     fn feed_manual_tls(
         tls: &mut ClientConnection,
         ciphertext: &[u8],
@@ -2203,7 +2214,12 @@ mod tests {
     async fn connect_unbuffered_rustls_client(
         addr: SocketAddr,
         client_config: Arc<ClientConfig>,
-    ) -> (TcpStream, UnbufferedClientConnection, UnbufferedRustlsStats) {
+    ) -> (
+        TcpStream,
+        UnbufferedClientConnection,
+        UnbufferedRustlsStats,
+        UnbufferedInput,
+    ) {
         let mut tcp = TcpStream::connect(addr).await.unwrap();
         let server_name = ServerName::try_from("localhost").unwrap();
         let mut tls = UnbufferedClientConnection::new(client_config, server_name).unwrap();
@@ -2240,31 +2256,34 @@ mod tests {
             }
         }
 
-        (tcp, tls, stats)
+        let input = UnbufferedInput {
+            buf: input,
+            len: input_len,
+        };
+        (tcp, tls, stats, input)
     }
 
     async fn unbuffered_rustls_try_drain_ready_plaintext(
         tcp: &mut TcpStream,
         tls: &mut UnbufferedClientConnection,
+        input: &mut UnbufferedInput,
         output: &mut Vec<u8>,
         stats: &mut UnbufferedRustlsStats,
     ) -> io::Result<(usize, usize, usize)> {
-        let mut input = vec![0u8; TLS_TEST_BUFFER_BYTES];
-        let mut input_len = 0usize;
         let mut socket_reads = 0usize;
         let mut tls_bytes = 0usize;
 
         tcp.readable().await?;
         loop {
-            if input_len == input.len() {
-                input.resize(input.len() * 2, 0);
+            if input.len == input.buf.len() {
+                input.buf.resize(input.buf.len() * 2, 0);
             }
-            match tcp.try_read(&mut input[input_len..]) {
+            match tcp.try_read(&mut input.buf[input.len..]) {
                 Ok(0) => break,
                 Ok(n) => {
                     socket_reads += 1;
                     tls_bytes += n;
-                    input_len += n;
+                    input.len += n;
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) => return Err(err),
@@ -2272,7 +2291,7 @@ mod tests {
         }
 
         loop {
-            match process_unbuffered_tls_once(tls, &mut input, &mut input_len, output, stats)? {
+            match process_unbuffered_tls_once(tls, &mut input.buf, &mut input.len, output, stats)? {
                 UnbufferedStep::NeedRead | UnbufferedStep::ReadyToWrite => break,
                 UnbufferedStep::Send(bytes) => {
                     tcp.write_all(&bytes).await?;
@@ -2363,7 +2382,7 @@ mod tests {
     async fn unbuffered_rustls_bulk_drain_probe() {
         let (client_config, server_config) = test_tls_configs();
         let (addr, flushed_rx) = spawn_tls_drain_server(server_config).await;
-        let (mut tcp, mut tls, mut stats) =
+        let (mut tcp, mut tls, mut stats, mut input) =
             connect_unbuffered_rustls_client(addr, client_config).await;
         let handshake_stats = stats;
         stats = UnbufferedRustlsStats::default();
@@ -2382,6 +2401,7 @@ mod tests {
                 unbuffered_rustls_try_drain_ready_plaintext(
                     &mut tcp,
                     &mut tls,
+                    &mut input,
                     &mut output,
                     &mut stats,
                 )
@@ -2421,7 +2441,7 @@ mod tests {
     async fn unbuffered_rustls_first_ready_pass_probe() {
         let (client_config, server_config) = test_tls_configs();
         let (addr, flushed_rx) = spawn_tls_drain_server(server_config).await;
-        let (mut tcp, mut tls, mut stats) =
+        let (mut tcp, mut tls, mut stats, mut input) =
             connect_unbuffered_rustls_client(addr, client_config).await;
         let handshake_stats = stats;
         stats = UnbufferedRustlsStats::default();
@@ -2433,6 +2453,7 @@ mod tests {
             unbuffered_rustls_try_drain_ready_plaintext(
                 &mut tcp,
                 &mut tls,
+                &mut input,
                 &mut output,
                 &mut stats,
             )

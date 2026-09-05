@@ -3,9 +3,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use cap_fs_ext::DirExt;
+use cap_fs_ext::{DirExt, SystemTimeSpec};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use tracing::{info, warn};
@@ -985,15 +985,24 @@ impl ExtractionRoot {
     /// been written: each file created under a directory moves that
     /// directory's modification time, so a stamp taken any earlier is undone
     /// by the next member.
+    ///
+    /// The stamp goes through this root by name, not through a handle opened
+    /// on the directory itself: on Linux the capability layer opens
+    /// directories with `O_PATH`, and `futimens` refuses such a handle with
+    /// `EBADF`, so a stamp through it is dropped without a trace. Naming the
+    /// entry from its parent works everywhere, and not following a symlink
+    /// means a link swapped in under the directory's name is stamped itself,
+    /// never its target.
     pub(crate) fn set_dir_times(
         &self,
         relative: &Path,
-        times: std::fs::FileTimes,
+        modified: SystemTime,
+        accessed: Option<SystemTime>,
     ) -> io::Result<()> {
+        let absolute =
+            |time: SystemTime| SystemTimeSpec::Absolute(cap_std::time::SystemTime::from_std(time));
         self.dir
-            .open_dir(relative)?
-            .into_std_file()
-            .set_times(times)
+            .set_symlink_times(relative, accessed.map(absolute), Some(absolute(modified)))
     }
 
     pub(crate) fn create_file(
