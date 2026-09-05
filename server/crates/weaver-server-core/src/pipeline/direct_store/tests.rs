@@ -4587,6 +4587,7 @@ fn volume_facts(
         has_authenticity_verification: false,
         has_locator: false,
         quick_open_offset: None,
+        headers_from_quick_open: false,
         recovery_record_offset: None,
         original_name: None,
         original_name_raw: None,

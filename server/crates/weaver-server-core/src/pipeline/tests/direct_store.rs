@@ -280,6 +280,101 @@ fn quick_open_store_set_shaped(
     ]
 }
 
+/// A two-volume stored set whose **last** volume holds two members — the tail
+/// of one split across both volumes, then a second one whole — under a locator
+/// and an honest, end-record-closed `QO` cache past the end header.
+///
+/// Also returns the physical offset of the second member's file header, so a
+/// test can place that header inside an article that has not arrived while the
+/// article carrying the cache has.
+fn quick_open_two_member_store_set(
+    split_name: &str,
+    split_payload: &[u8],
+    whole_name: &str,
+    whole_payload: &[u8],
+) -> (Vec<(String, Vec<u8>)>, u64) {
+    let split_crc = checksum::crc32(split_payload);
+    let split = split_payload.len() / 2;
+
+    let mut first = Vec::new();
+    first.extend_from_slice(&TEST_RAR5_SIG);
+    first.extend_from_slice(&build_test_rar_main_header(0x0001, None));
+    first.extend_from_slice(&build_test_rar_file_header(
+        split_name,
+        0x0010,
+        split as u64,
+        split_payload.len() as u64,
+        Some(checksum::crc32(&split_payload[..split])),
+    ));
+    first.extend_from_slice(&split_payload[..split]);
+    first.extend_from_slice(&build_test_rar_end_header(true));
+
+    let main = {
+        let mut type_body = Vec::new();
+        type_body.extend_from_slice(&encode_test_rar_vint(0x0001 | 0x0002));
+        type_body.extend_from_slice(&encode_test_rar_vint(1));
+        build_test_rar_header(
+            1,
+            0,
+            &type_body,
+            &build_test_rar_locator_extra(QOPEN_OFFSET - TEST_RAR5_SIG.len() as u64),
+        )
+    };
+    let split_header = build_test_rar_file_header(
+        split_name,
+        0x0008,
+        (split_payload.len() - split) as u64,
+        split_payload.len() as u64,
+        Some(split_crc),
+    );
+    let whole_header = build_test_rar_file_header(
+        whole_name,
+        0,
+        whole_payload.len() as u64,
+        whole_payload.len() as u64,
+        Some(checksum::crc32(whole_payload)),
+    );
+    let split_header_offset = (TEST_RAR5_SIG.len() + main.len()) as u64;
+    let whole_header_offset =
+        split_header_offset + split_header.len() as u64 + (split_payload.len() - split) as u64;
+
+    let mut second = Vec::new();
+    second.extend_from_slice(&TEST_RAR5_SIG);
+    second.extend_from_slice(&main);
+    second.extend_from_slice(&split_header);
+    second.extend_from_slice(&split_payload[split..]);
+    second.extend_from_slice(&whole_header);
+    second.extend_from_slice(whole_payload);
+    second.extend_from_slice(&build_test_rar_end_header(false));
+    assert!(
+        second.len() as u64 <= QOPEN_OFFSET,
+        "the physical headers must end before the QO block"
+    );
+    second.resize(QOPEN_OFFSET as usize, 0);
+
+    let mut records = build_test_rar_qopen_record(QOPEN_OFFSET, split_header_offset, &split_header);
+    records.extend_from_slice(&build_test_rar_qopen_record(
+        QOPEN_OFFSET,
+        whole_header_offset,
+        &whole_header,
+    ));
+    records.extend_from_slice(&build_test_rar_qopen_record(
+        QOPEN_OFFSET,
+        QOPEN_OFFSET - 32,
+        &build_test_rar_end_header(false),
+    ));
+    second.extend_from_slice(&build_test_rar_service_header("QO", records.len() as u64));
+    second.extend_from_slice(&records);
+
+    (
+        vec![
+            ("silver.horizon.part01.rar".to_string(), first),
+            ("silver.horizon.part02.rar".to_string(), second),
+        ],
+        whole_header_offset,
+    )
+}
+
 /// The member names the library reports for a volume under its **default**
 /// options, which consult the Quick Open cache.
 fn library_default_member_names(volume: &[u8]) -> Vec<String> {
@@ -310,9 +405,14 @@ async fn a_forged_quick_open_member_never_reaches_the_router() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let arrivals = in_order_arrivals(volumes.len());
-    let (shape, _working_dir) =
-        run_direct_store_routing_only(&temp_dir, JobId(41101), &volumes, &arrivals).await;
+    let (shape, walks) =
+        run_direct_store_routing_only_counting_walks(&temp_dir, JobId(41101), &volumes, &arrivals)
+            .await;
 
+    assert!(
+        walks >= 1,
+        "the adopted cache must have been cross-examined by a physical walk, got {walks}"
+    );
     assert!(
         shape.contains("Demoted(QuickOpenMismatch)"),
         "a volume whose headers disagree with its physical walk must leave direct mode \
@@ -340,11 +440,19 @@ async fn an_honest_quick_open_cache_still_routes() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let arrivals = in_order_arrivals(volumes.len());
-    let (shape, _) =
-        run_direct_store_routing_only(&temp_dir, JobId(41102), &volumes, &arrivals).await;
+    let (shape, walks) =
+        run_direct_store_routing_only_counting_walks(&temp_dir, JobId(41102), &volumes, &arrivals)
+            .await;
     assert!(
         !shape.contains("Demoted"),
         "the cross-check must refuse a *disagreement*, not the presence of a cache, got {shape}"
+    );
+    // At least one: the last volume is parsed when its last article lands and
+    // again on its completion notice, and each parse that adopts the cache pays
+    // for its own walk.
+    assert!(
+        walks >= 1,
+        "an adopted cache is still cross-examined: agreement is proven, not assumed"
     );
 }
 
@@ -373,12 +481,18 @@ async fn a_rar_shaped_quick_open_cache_is_ignored_and_still_routes() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let arrivals = in_order_arrivals(volumes.len());
-    let (shape, _working_dir) =
-        run_direct_store_routing_only(&temp_dir, JobId(41103), &volumes, &arrivals).await;
+    let (shape, walks) =
+        run_direct_store_routing_only_counting_walks(&temp_dir, JobId(41103), &volumes, &arrivals)
+            .await;
 
     assert!(
         !shape.contains("Demoted"),
         "a locator whose cache the library never adopted is not a disagreement, got {shape}"
+    );
+    assert_eq!(
+        walks, 0,
+        "a cache the library rejected already came from a physical walk; the cross-check \
+         must not pay for a second one"
     );
     assert!(
         !direct_partial(&temp_dir, JobId(41103), forged_name).exists(),
@@ -394,6 +508,90 @@ async fn a_rar_shaped_quick_open_cache_is_ignored_and_still_routes() {
         routed, payload,
         "routing must complete over the physically walked layout"
     );
+}
+
+#[tokio::test]
+async fn an_honest_quick_open_cache_waits_for_a_hole_the_walk_cannot_cross() {
+    // The cache sits at the tail of the volume, so it can be staged — end
+    // record and all — while a file header in the middle is still in flight.
+    // The library adopts the cache; the physical walk stops at the hole with
+    // one member fewer. Before this was told apart from a forged entry, an
+    // honest `-qo` set demoted on nothing but article arrival order.
+    let split_name = "Silver.Horizon.S01E64.mkv";
+    let whole_name = "Silver.Horizon.S01E64.srt";
+    let split_payload: Vec<u8> = (0..500u32).map(|index| (index % 251) as u8).collect();
+    let whole_payload: Vec<u8> = (0..40u32).map(|index| (index % 13) as u8).collect();
+    let (volumes, whole_header_offset) =
+        quick_open_two_member_store_set(split_name, &split_payload, whole_name, &whole_payload);
+    assert_eq!(
+        library_default_member_names(&volumes[1].1),
+        vec![split_name.to_string(), whole_name.to_string()],
+        "the cache is honest: it reports exactly the two physical members"
+    );
+
+    // Three articles per volume: the second member's header lies in the
+    // middle one, the cache in the last.
+    const ARTICLES: usize = 3;
+    let second_len = volumes[1].1.len();
+    let (middle_start, middle_end) = article_extent(second_len, 1, ARTICLES);
+    assert!(
+        (middle_start as u64..middle_end as u64).contains(&whole_header_offset),
+        "the fixture must put the second header inside the middle article \
+         ({middle_start}..{middle_end}), got {whole_header_offset}"
+    );
+    assert!(
+        article_extent(second_len, 2, ARTICLES).0 as u64 <= QOPEN_OFFSET,
+        "the fixture must put the QO block inside the last article"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41104);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, ARTICLES);
+    let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for segment_number in 0..ARTICLES as u32 {
+        submit_volume_article_of(&mut pipeline, job_id, &volumes, 0, segment_number, ARTICLES)
+            .await;
+    }
+    // The last volume's tail — end record and cache — lands before its middle.
+    submit_volume_article_of(&mut pipeline, job_id, &volumes, 1, 0, ARTICLES).await;
+    submit_volume_article_of(&mut pipeline, job_id, &volumes, 1, 2, ARTICLES).await;
+    let walks_before_the_hole_filled = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the set is still routing")
+        .router
+        .quick_open_walks();
+    assert!(
+        walks_before_the_hole_filled >= 1,
+        "the staged tail let the library adopt the cache, so a walk must have run"
+    );
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        !shape.contains("Demoted"),
+        "a walk that stopped at a hole is not a disagreement, got {shape}"
+    );
+    assert!(
+        !direct_partial(&temp_dir, job_id, whole_name).exists()
+            && !payload_root(&temp_dir, job_id).join(whole_name).exists(),
+        "nothing may be adopted for a member only the cache has described so far"
+    );
+
+    submit_volume_article_of(&mut pipeline, job_id, &volumes, 1, 1, ARTICLES).await;
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        !shape.contains("Demoted"),
+        "once the hole is filled the walk agrees with the cache, got {shape}"
+    );
+    for (name, payload) in [(split_name, &split_payload), (whole_name, &whole_payload)] {
+        let routed = std::fs::read(payload_root(&temp_dir, job_id).join(name))
+            .unwrap_or_else(|error| panic!("{name} routed and committed: {error}"));
+        assert_eq!(
+            &routed, payload,
+            "{name} must route byte-exact over the physical layout"
+        );
+    }
 }
 
 /// The decoded extent of one article, for a volume cut into `articles` equal
@@ -663,6 +861,32 @@ async fn run_direct_store_routing_only(
     }
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     (shape, working_dir)
+}
+
+/// [`run_direct_store_routing_only`], also reporting how many Quick Open
+/// cross-check walks the job's first set ran while routing.
+async fn run_direct_store_routing_only_counting_walks(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    arrivals: &[(u32, u32)],
+) -> (String, u64) {
+    let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+
+    let spec = direct_store_job_spec("Silver Horizon", volumes);
+    let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in arrivals {
+        submit_volume_article(&mut pipeline, job_id, volumes, *file_index, *segment_number).await;
+    }
+    let walks = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the set stays registered after routing")
+        .router
+        .quick_open_walks();
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    (shape, walks)
 }
 
 #[tokio::test]

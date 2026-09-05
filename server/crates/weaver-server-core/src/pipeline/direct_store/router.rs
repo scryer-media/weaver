@@ -1770,6 +1770,10 @@ pub(crate) struct DirectSetRouter {
     /// set that held from one that never had to.
     #[cfg(test)]
     blocks_held: u64,
+    /// How many Quick Open cross-check walks this set has run, so a test can
+    /// prove a cache the library never adopted does not cost a second parse.
+    #[cfg(test)]
+    quick_open_walks: u64,
     /// Does the job that owns this set carry PAR2 at all?
     ///
     /// The one fact that turns a part-checksum mismatch from a verdict into a
@@ -1848,6 +1852,8 @@ impl DirectSetRouter {
             member_ciphers_builds: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             blocks_held: 0,
+            #[cfg(test)]
+            quick_open_walks: 0,
             par2_available: false,
             damaged_volumes: std::collections::BTreeSet::new(),
             repair_rerouted: false,
@@ -1929,6 +1935,12 @@ impl DirectSetRouter {
     #[cfg(test)]
     pub(crate) fn blocks_held(&self) -> u64 {
         self.blocks_held
+    }
+
+    /// Quick Open cross-check walks run so far. Test-only; see the field.
+    #[cfg(test)]
+    pub(crate) fn quick_open_walks(&self) -> u64 {
+        self.quick_open_walks
     }
 
     /// Whether the set would still take a job password.
@@ -3292,8 +3304,8 @@ impl DirectSetRouter {
     ///
     /// Nothing is discarded while unkeyed. The volume's articles stage exactly
     /// as they do for any volume whose prefix has not yet yielded a header —
-    /// holds in RAM, paged to the holds scratch under budget pressure (plan
-    /// 135) — and the retry reads the same staged image. The only thing the
+    /// holds in RAM, paged to the holds scratch under budget pressure — and the
+    /// retry reads the same staged image. The only thing the
     /// named refusal changes is *when* the set stops waiting: a named refusal
     /// at the first parse instead of [`DemotionReason::UnparsableVolume`] after
     /// [`MAX_HEADER_PREFIX_BYTES`] of staging per volume.
@@ -3402,7 +3414,11 @@ impl DirectSetRouter {
         // Before anything is adopted: the library may have answered this parse
         // out of the archive's Quick Open cache, which is not authoritative and
         // is craftable. Nothing may enter the layout on that evidence.
-        self.refuse_quick_open_derived_facts(volume_index, &facts, source)?;
+        if self.refuse_quick_open_derived_facts(volume_index, &facts, source)?
+            == QuickOpenCrossCheck::Inconclusive
+        {
+            return Ok(());
+        }
 
         // For an identity-admitted set only: the volume's own headers get a
         // vote on the binding. A fingerprint match placed this file at
@@ -3612,10 +3628,12 @@ impl DirectSetRouter {
     /// adopts it, `sync_members` gives it a destination and the drain routes
     /// payload into it — all on cache evidence alone.
     ///
-    /// So the cache is cross-examined. Only a parse that could have used it pays
-    /// for this: `quick_open_offset` is `Some` exactly when a RAR5 main header
-    /// carried a locator naming one, which is the sole path into
-    /// `try_parse_quick_open_headers`. The walk that answers is the same one the
+    /// So the cache is cross-examined. Only a parse that actually **used** it pays
+    /// for this: `headers_from_quick_open` is the library's own account that every
+    /// header in `facts` came out of the `QO` cache rather than a physical walk.
+    /// A locator alone is not enough — real archivers write a cache the reader
+    /// rejects (no cached end record), and the members then already come from
+    /// the walk this method would repeat. The walk that answers is the same one the
     /// library would have fallen back to — `allow_quick_open: false`, over the
     /// very image the claim came from — and its file headers must match the
     /// claim's members one for one on identity, extent and split flags.
@@ -3624,23 +3642,55 @@ impl DirectSetRouter {
     /// they open a real volume file that PAR2 and the whole-file hashes have
     /// already vouched for, and they are not choosing destinations for bytes off
     /// the wire.
+    ///
+    /// Three answers, not two: a walk over an image that is still arriving can
+    /// stop at a hole before it reaches a header the cache already described,
+    /// and that is [`QuickOpenCrossCheck::Inconclusive`] — wait, adopt nothing —
+    /// rather than a refusal. See the body for why.
     fn refuse_quick_open_derived_facts(
         &mut self,
         volume_index: u32,
         facts: &RarVolumeFacts,
         source: VolumeImage,
-    ) -> Result<(), DemotionReason> {
-        if facts.quick_open_offset.is_none() {
-            return Ok(());
+    ) -> Result<QuickOpenCrossCheck, DemotionReason> {
+        if !facts.headers_from_quick_open {
+            return Ok(QuickOpenCrossCheck::Physical);
+        }
+        #[cfg(test)]
+        {
+            self.quick_open_walks = self.quick_open_walks.saturating_add(1);
         }
         let claimed: Vec<MemberIdentity> = facts.members.iter().map(MemberIdentity::of).collect();
         let physical = self.physical_member_identities(volume_index, source);
-        // A physical walk that will not run at all is a refusal, not a pass: the
-        // whole point is that nothing enters the layout without it.
-        if physical.as_deref() != Some(claimed.as_slice()) {
-            return Err(self.fail(DemotionReason::QuickOpenMismatch));
+        if physical.as_deref() == Some(claimed.as_slice()) {
+            return Ok(QuickOpenCrossCheck::Agreed);
         }
-        Ok(())
+        // The cache sits at the tail of the volume, so a staged image can hold
+        // it — and the end record that makes the library adopt it — while a
+        // file header in the middle of the volume is still in flight. The walk
+        // then stops at that hole (the sparse image answers a hole as a clean
+        // end of file) with the headers before it and nothing after, and the
+        // cache, which described the whole volume, looks like it claimed more.
+        // That is a walk that could not see enough yet, not a disagreement:
+        // nothing is adopted, and the next article re-parses exactly as it does
+        // for a prefix too short to hold a header. Only a walk over a
+        // **complete** image can refuse — and there, a walk that will not run
+        // at all is a refusal, not a pass: the whole point is that nothing
+        // enters the layout without it.
+        let image_complete = match source {
+            VolumeImage::Envelope => true,
+            VolumeImage::Staged => self
+                .staging
+                .get(&volume_index)
+                .is_some_and(|staging| staging.source_complete),
+        };
+        let walk_stopped_short = physical
+            .as_deref()
+            .is_none_or(|walked| walked.len() < claimed.len() && claimed.starts_with(walked));
+        if !image_complete && walk_stopped_short {
+            return Ok(QuickOpenCrossCheck::Inconclusive);
+        }
+        Err(self.fail(DemotionReason::QuickOpenMismatch))
     }
 
     /// The file headers a **physical** walk of one volume's image finds, with
@@ -6102,6 +6152,20 @@ fn slice_len(slice: &MappedSlice) -> u64 {
         | MappedSlice::Envelope { len }
         | MappedSlice::Unroutable { len } => *len,
     }
+}
+
+/// What [`DirectSetRouter::refuse_quick_open_derived_facts`] concluded about
+/// one parse's facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuickOpenCrossCheck {
+    /// The facts never came from the cache; no walk was needed.
+    Physical,
+    /// The facts came from the cache and the physical walk agrees with them.
+    Agreed,
+    /// The facts came from the cache, the physical walk stopped short of them
+    /// at a hole in an image that is still arriving, and nothing may be adopted
+    /// until more of the volume is staged.
+    Inconclusive,
 }
 
 /// Which reader one volume's headers are parsed out of.
