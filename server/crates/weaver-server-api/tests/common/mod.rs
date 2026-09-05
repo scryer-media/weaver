@@ -606,6 +606,7 @@ fn spawn_test_scheduler(
                         staging_dir: None,
                         category_bytes: None,
                         restored_download_floor_bytes: 0,
+                        downloaded_wire_bytes: 0,
                     };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
                         job_id,
@@ -756,6 +757,7 @@ fn spawn_test_scheduler(
                         staging_dir: None,
                         category_bytes: None,
                         restored_download_floor_bytes: 0,
+                        downloaded_wire_bytes: 0,
                     };
                     jobs.insert(job_id, state);
                     let _ = reply.send(Ok(()));

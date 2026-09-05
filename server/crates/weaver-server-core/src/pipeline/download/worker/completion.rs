@@ -600,7 +600,7 @@ impl Pipeline {
                     .segments_downloaded
                     .fetch_add(1, Ordering::Relaxed);
 
-                // (Per-job byte tracking moved to handle_decode_done to use decoded size.)
+                self.note_job_wire_bytes(result.segment_id, raw_size_bytes);
 
                 self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
                     segment_id: result.segment_id,
@@ -629,6 +629,7 @@ impl Pipeline {
                     self.metrics
                         .segments_downloaded
                         .fetch_add(1, Ordering::Relaxed);
+                    self.note_job_wire_bytes(result.segment_id, raw_size_bytes);
                     self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
                         segment_id: result.segment_id,
                         raw_size,
@@ -656,6 +657,7 @@ impl Pipeline {
                 self.metrics
                     .segments_downloaded
                     .fetch_add(1, Ordering::Relaxed);
+                self.note_job_wire_bytes(result.segment_id, raw_size);
                 if crc_mismatch {
                     self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
                 }

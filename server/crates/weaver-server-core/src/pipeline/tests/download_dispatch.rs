@@ -7795,9 +7795,9 @@ async fn list_jobs_queues_inactive_downloads_and_rewarms_their_phase_rate() {
             .phase_progress
             .get_mut(&(job_id, JobPhase::Downloading))
             .expect("download phase should exist");
-        runtime.ema_bps = Some(1_024.0);
         runtime.first_sample_at = Some(std::time::Instant::now() - Duration::from_secs(10));
-        runtime.last_sample = Some((std::time::Instant::now() - Duration::from_secs(1), 64));
+        runtime.rate.update(std::time::Instant::now(), 64);
+        assert!(runtime.rate.has_samples());
     }
 
     pipeline.active_downloads_by_job.remove(&job_id);
@@ -7816,9 +7816,8 @@ async fn list_jobs_queues_inactive_downloads_and_rewarms_their_phase_rate() {
         .phase_progress
         .get(&(job_id, JobPhase::Downloading))
         .expect("download phase should remain registered");
-    assert!(runtime.ema_bps.is_none());
+    assert!(!runtime.rate.has_samples());
     assert!(runtime.first_sample_at.is_none());
-    assert!(runtime.last_sample.is_none());
 
     pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline.sample_phase_progress();
@@ -7834,6 +7833,93 @@ async fn list_jobs_queues_inactive_downloads_and_rewarms_their_phase_rate() {
     assert_eq!(active_info.phase_progress.len(), 1);
     assert_eq!(active_info.phase_progress[0].phase, JobPhase::Downloading);
     assert!(active_info.phase_progress[0].rate_bps.is_none());
+}
+
+#[tokio::test]
+async fn download_phase_rate_matches_the_global_speed_gauge() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    let job_id = JobId(20010);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Wire Rate", &[("payload.bin".to_string(), 1_024)]),
+    )
+    .await;
+    pipeline.phase_begin(job_id, JobPhase::Downloading, Some(1_024));
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    // One tick: both estimators take their first sample together. The gauge
+    // already sampled once when the pipeline was built, which would start its
+    // window early and skew the comparison, so it is emptied first.
+    pipeline.metrics.reset_speed_tracker();
+    pipeline.sample_phase_progress();
+    pipeline.shared_state.refresh_metrics_snapshot();
+
+    // Decoded bytes move the bar but never the rate: the row's rate must
+    // integrate the same wire bytes the nav counter does.
+    pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = 512;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    pipeline.sample_phase_progress();
+    pipeline.shared_state.refresh_metrics_snapshot();
+    let info = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|info| info.job_id == job_id)
+        .expect("job should be listed");
+    assert_eq!(info.phase_progress.len(), 1);
+    assert_eq!(info.phase_progress[0].completed_bytes, 512);
+    assert!(info.phase_progress[0].rate_bps.is_none());
+    assert_eq!(
+        pipeline
+            .shared_state
+            .metrics_snapshot()
+            .current_download_speed,
+        0
+    );
+
+    // The same wire bytes land on both counters; the next tick must publish
+    // the same number on the row and the gauge.
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .downloaded_wire_bytes = 30_000;
+    pipeline
+        .metrics
+        .bytes_downloaded
+        .fetch_add(30_000, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    pipeline.sample_phase_progress();
+    pipeline.shared_state.refresh_metrics_snapshot();
+    let info = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|info| info.job_id == job_id)
+        .expect("job should be listed");
+    let row = info.phase_progress[0]
+        .rate_bps
+        .expect("wire bytes should produce a rate");
+    let gauge = pipeline
+        .shared_state
+        .metrics_snapshot()
+        .current_download_speed;
+    assert!(gauge > 0, "gauge should be live");
+    let tolerance = (gauge as f64 * 0.02).max(2.0);
+    assert!(
+        (row as f64 - gauge as f64).abs() <= tolerance,
+        "row rate {row} should match gauge {gauge} within {tolerance}"
+    );
+    assert_eq!(info.phase_progress[0].completed_bytes, 512);
 }
 
 #[tokio::test]
@@ -8130,6 +8216,14 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
             .get(&job_id)
             .map(|state| state.downloaded_bytes),
         Some(payload.len() as u64)
+    );
+    // Wire bytes are credited to the job in lockstep with the global counter.
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .map(|state| state.downloaded_wire_bytes),
+        Some(raw_size)
     );
     let provenance = pipeline
         .unverified_segments

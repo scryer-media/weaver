@@ -216,8 +216,11 @@ impl SpilloverDecision {
 /// Holds a ring buffer of `(timestamp, cumulative)` samples and smooths the
 /// window's raw rate with a 1 s half-life EMA, so the published value follows
 /// pipeline ticks without showing every short-lived burst. Not hot-path code:
-/// it is advanced once per 100 ms metrics tick under the tracker mutex.
-struct RateSeries {
+/// it is advanced once per 100 ms metrics tick under the tracker mutex, and
+/// once per active job phase on that same tick, so a job's displayed rate and
+/// the global gauge are one estimator over one window and can be compared.
+#[derive(Debug)]
+pub(crate) struct RateSeries {
     /// Ring buffer of (timestamp, cumulative value) samples.
     samples: Vec<(Instant, u64)>,
     /// Next write position in the ring buffer.
@@ -229,7 +232,7 @@ struct RateSeries {
 }
 
 impl RateSeries {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             samples: Vec::with_capacity(SPEED_WINDOW_SAMPLES),
             pos: 0,
@@ -238,8 +241,14 @@ impl RateSeries {
         }
     }
 
+    /// Whether any sample has been recorded since construction.
+    #[cfg(test)]
+    pub(crate) fn has_samples(&self) -> bool {
+        !self.samples.is_empty()
+    }
+
     /// Record a sample and recompute the smoothed rate.
-    fn update(&mut self, now: Instant, cumulative: u64) -> f64 {
+    pub(crate) fn update(&mut self, now: Instant, cumulative: u64) -> f64 {
         if self.samples.len() < SPEED_WINDOW_SAMPLES {
             self.samples.push((now, cumulative));
         } else {
@@ -1094,6 +1103,13 @@ impl PipelineMetrics {
         let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
         let rates = self.speed_tracker.lock().unwrap().last();
         self.snapshot_with_speed(bytes_downloaded, rates)
+    }
+
+    /// Forget every rate sample, so a test can start the global window at a
+    /// known tick instead of at whatever moment the metrics were constructed.
+    #[cfg(test)]
+    pub(crate) fn reset_speed_tracker(&self) {
+        *self.speed_tracker.lock().unwrap() = SpeedTracker::new();
     }
 }
 
