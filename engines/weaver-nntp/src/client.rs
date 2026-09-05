@@ -1006,7 +1006,7 @@ impl NntpClient {
             .await
             {
                 Ok(result) => result?,
-                Err(_) => return Err(self.soft_timeout_error()),
+                Err(_) => return Err(self.acquire_timeout_error()),
             }
         } else {
             match tokio::time::timeout_at(
@@ -1016,7 +1016,7 @@ impl NntpClient {
             .await
             {
                 Ok(result) => result?,
-                Err(_) => return Err(self.soft_timeout_error()),
+                Err(_) => return Err(self.acquire_timeout_error()),
             }
         };
 
@@ -2419,7 +2419,12 @@ impl NntpClient {
     async fn record_transient_server_failure(&self, server_idx: usize, error: &NntpError) {
         if !matches!(
             error,
-            NntpError::TooManyConnections | NntpError::PoolExhausted | NntpError::PoolShutdown
+            NntpError::TooManyConnections
+                | NntpError::PoolExhausted
+                | NntpError::PoolShutdown
+                // Local capacity: we never reached the server, so this must
+                // not walk it toward Degraded/Disabled.
+                | NntpError::AcquireTimeout(_)
         ) {
             self.record_server_failure(server_idx, false).await;
         }
@@ -2459,7 +2464,9 @@ impl NntpClient {
     ) -> Result<PooledConnection> {
         match tokio::time::timeout_at(deadline, self.pool.acquire(server)).await {
             Ok(result) => result,
-            Err(_) => Err(self.soft_timeout_error()),
+            // Nothing was sent: we never got a socket. This is our own
+            // capacity, not the server's health.
+            Err(_) => Err(self.acquire_timeout_error()),
         }
     }
 
@@ -2472,6 +2479,13 @@ impl NntpClient {
 
     fn soft_timeout_error(&self) -> NntpError {
         NntpError::SoftTimeout(self.soft_timeout.as_secs())
+    }
+
+    /// The acquire-side twin of [`Self::soft_timeout_error`], for deadlines
+    /// that expire while we are still queued behind our own connection
+    /// semaphore.
+    fn acquire_timeout_error(&self) -> NntpError {
+        NntpError::AcquireTimeout(self.soft_timeout.as_secs())
     }
 
     /// Build the server try-order, exhausting lower-priority fill groups
@@ -2979,6 +2993,10 @@ impl NntpClient {
                 let duration = *duration;
                 Box::new(move || NntpError::SoftTimeout(duration))
             }
+            NntpError::AcquireTimeout(duration) => {
+                let duration = *duration;
+                Box::new(move || NntpError::AcquireTimeout(duration))
+            }
             _ if is_transient(error) => Box::new(|| NntpError::ConnectionClosed),
             _ => {
                 let message = error.to_string();
@@ -3178,6 +3196,7 @@ fn is_transient(err: &NntpError) -> bool {
             | NntpError::TooManyConnections
             | NntpError::PoolExhausted
             | NntpError::SoftTimeout(_)
+            | NntpError::AcquireTimeout(_)
     )
 }
 
@@ -3197,6 +3216,11 @@ fn cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
         | NntpError::SoftTimeout(_) => Some(CooldownReason::Transport),
         NntpError::TooManyConnections => None,
         NntpError::PoolExhausted => None,
+        // Never obtaining a connection is our own capacity, not the server's
+        // health: nothing was sent, so the server said nothing wrong. Cooling
+        // it here strands every download behind a 10 s transient cooldown when
+        // only one server is configured.
+        NntpError::AcquireTimeout(_) => None,
         _ => None,
     }
 }
@@ -3960,11 +3984,113 @@ mod tests {
         );
 
         client
+            .record_transient_server_failure(0, &NntpError::AcquireTimeout(15))
+            .await;
+        assert_eq!(
+            client.pool().health().lock().await.server(0).failure_count,
+            0
+        );
+
+        client
             .record_transient_server_failure(0, &NntpError::SoftTimeout(15))
             .await;
         assert_eq!(
             client.pool().health().lock().await.server(0).failure_count,
             1
+        );
+    }
+
+    fn single_permit_server(port: u16) -> ServerPoolConfig {
+        let mut server = scripted_server(port, 0);
+        server.max_connections = 1;
+        server
+    }
+
+    fn probing_client(server: ServerPoolConfig) -> NntpClient {
+        NntpClient::new(NntpClientConfig {
+            servers: vec![server],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_millis(200),
+        })
+    }
+
+    const READER_CAPABILITIES: &[u8] = b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n";
+
+    /// A STAT batch that never got a connection must leave the server alone.
+    ///
+    /// The deadline expired while the request was still queued behind our own
+    /// connection semaphore, so nothing ever reached the server. Cooling it
+    /// down here stalls every download behind a transient cooldown when only
+    /// one server is configured.
+    #[tokio::test]
+    async fn stat_batch_that_never_got_a_connection_leaves_the_server_healthy() {
+        let port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: READER_CAPABILITIES,
+            },
+        ])
+        .await;
+
+        let client = probing_client(single_permit_server(port));
+
+        // Occupy the server's only permit, the way an idle owned download lane
+        // holds its cached connection after a job's queue drains.
+        let held = client.pool().acquire(ServerId(0)).await.unwrap();
+
+        let error = client
+            .stat_many(&["<probe@silver.horizon>"])
+            .await
+            .expect_err("no permit was free, so the batch cannot conclude");
+        assert!(matches!(error, NntpError::AcquireTimeout(_)), "{error:?}");
+
+        {
+            let health = client.pool().health().lock().await;
+            assert_eq!(health.server(0).state(), &ServerState::Healthy);
+            assert_eq!(health.server(0).failure_count, 0);
+        }
+        drop(held);
+    }
+
+    /// A soft timeout on a live connection is still a transport failure: the
+    /// command went out and the reply never came, so the server is implicated
+    /// and keeps its cooldown.
+    #[tokio::test]
+    async fn stat_batch_that_stalls_mid_command_still_cools_the_server_down() {
+        let port = spawn_shared_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: READER_CAPABILITIES,
+                },
+            ],
+            // Keep the socket open but silent so the STAT reply never arrives.
+            Duration::from_secs(3),
+        )
+        .await;
+
+        let client = probing_client(single_permit_server(port));
+
+        let error = client
+            .stat_many(&["<probe@silver.horizon>"])
+            .await
+            .expect_err("the server never answered the STAT");
+        assert!(matches!(error, NntpError::SoftTimeout(_)), "{error:?}");
+
+        let health = client.pool().health().lock().await;
+        assert!(
+            matches!(health.server(0).state(), ServerState::CoolingDown { .. }),
+            "{:?}",
+            health.server(0).state()
         );
     }
 
@@ -4123,6 +4249,22 @@ mod tests {
         assert_eq!(
             cooldown_reason(&NntpError::Timeout),
             Some(CooldownReason::Transport)
+        );
+    }
+
+    /// Failing to obtain a connection is local capacity, not a server fault:
+    /// it is still retryable, but it must never cool the server down, and it
+    /// carries no connection to discard.
+    #[test]
+    fn acquire_timeout_is_capacity_not_transport() {
+        assert!(is_transient(&NntpError::AcquireTimeout(15)));
+        assert!(is_retryable_stat_error(&NntpError::AcquireTimeout(15)));
+        assert!(!is_connection_error(&NntpError::AcquireTimeout(15)));
+        assert_eq!(cooldown_reason(&NntpError::AcquireTimeout(15)), None);
+        assert_eq!(stat_cooldown_reason(&NntpError::AcquireTimeout(15)), None);
+        assert_eq!(
+            NntpError::AcquireTimeout(15).to_string(),
+            "no connection available within 15s"
         );
     }
 

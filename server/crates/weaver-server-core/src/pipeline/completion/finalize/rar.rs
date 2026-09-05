@@ -842,6 +842,12 @@ impl Pipeline {
         // Placement changes paths, not the bytes still owned by each
         // NzbFileId. Binding and archive identity are refreshed below; raw
         // grid evidence remains valid for every set.
+        //
+        // A parked damaged-path verdict is the exception: it names files by the
+        // path each carried when it was reached, and the post-repair read-back
+        // stands on those names. Moved files invalidate it, so the next pass
+        // analyses the directory it is actually looking at.
+        self.clear_pending_par2_repairs_for_job(job_id);
 
         info!(
             job_id = job_id.0,

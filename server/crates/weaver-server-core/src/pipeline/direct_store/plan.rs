@@ -139,6 +139,28 @@ pub(crate) struct DirectSetPlan {
     pub(crate) destination_dir: PathBuf,
 }
 
+/// Does this NZB carry PAR2 at all?
+///
+/// Asked of the spec rather than of a parsed PAR2 index on purpose: the one
+/// caller that needs it — the part-checksum gate deciding whether a damaged
+/// volume is a question or a verdict — is on the routing path, where an index
+/// that arrives with the rest of the job may not have been read yet. The NZB
+/// names its PAR2 files from the moment the job exists.
+///
+/// Index files count. An index alone carries no recovery block and cannot
+/// repair anything, so it looks like the wrong answer — but the two shapes are
+/// indistinguishable this early (a fixture's whole recovery set can sit in one
+/// file named like an index, and a real job's recovery volumes are promoted
+/// only once damage is known), and the cost of counting it is one PAR2 pass:
+/// the verdict arrives, nothing can act on it, and the set demotes under the
+/// routing gate's own reason. Refusing it here instead would demote sets that
+/// PAR2 could have repaired.
+pub(crate) fn spec_carries_par2(spec: &JobSpec) -> bool {
+    spec.files
+        .iter()
+        .any(|file| matches!(file.role, FileRole::Par2 { .. }))
+}
+
 impl DirectSetPlan {
     /// Every RAR set the spec declares, admitted or refused.
     pub(crate) fn discover(

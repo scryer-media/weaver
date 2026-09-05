@@ -22,19 +22,25 @@ type ShaperBuildIdentity struct {
 }
 
 type ShaperSnapshot struct {
-	SchemaVersion                 int                 `json:"schema_version"`
-	Status                        string              `json:"status"`
-	StartedAt                     time.Time           `json:"started_at"`
-	ConfiguredEgressBitsPerSecond uint64              `json:"configured_egress_bits_per_second"`
-	ConfiguredBurstBytes          uint64              `json:"configured_burst_bytes"`
-	DownstreamConnections         uint64              `json:"downstream_connections"`
-	ActiveDownstreamConnections   int64               `json:"active_downstream_connections"`
-	DownstreamBytes               uint64              `json:"downstream_bytes"`
-	DownstreamSourceConnections   map[string]uint64   `json:"downstream_source_connections"`
-	DownstreamSourceBytes         map[string]uint64   `json:"downstream_source_bytes"`
-	ExecutionLeaseID              string              `json:"execution_lease_id,omitempty"`
-	ExecutionLeaseAcquiredAt      *time.Time          `json:"execution_lease_acquired_at,omitempty"`
-	Build                         ShaperBuildIdentity `json:"build"`
+	SchemaVersion                 int               `json:"schema_version"`
+	Status                        string            `json:"status"`
+	StartedAt                     time.Time         `json:"started_at"`
+	ConfiguredEgressBitsPerSecond uint64            `json:"configured_egress_bits_per_second"`
+	ConfiguredBurstBytes          uint64            `json:"configured_burst_bytes"`
+	DownstreamConnections         uint64            `json:"downstream_connections"`
+	ActiveDownstreamConnections   int64             `json:"active_downstream_connections"`
+	DownstreamBytes               uint64            `json:"downstream_bytes"`
+	DownstreamSourceConnections   map[string]uint64 `json:"downstream_source_connections"`
+	DownstreamSourceBytes         map[string]uint64 `json:"downstream_source_bytes"`
+	// The command census (attestation schema 3). A schema-2 shaper leaves them
+	// zero and the artifact carries no census.
+	DownstreamCommands       map[string]uint64   `json:"downstream_commands,omitempty"`
+	ArticleRequests          uint64              `json:"article_requests,omitempty"`
+	RepeatedArticleRequests  uint64              `json:"repeated_article_requests,omitempty"`
+	DistinctArticleRequests  uint64              `json:"distinct_article_requests,omitempty"`
+	ExecutionLeaseID         string              `json:"execution_lease_id,omitempty"`
+	ExecutionLeaseAcquiredAt *time.Time          `json:"execution_lease_acquired_at,omitempty"`
+	Build                    ShaperBuildIdentity `json:"build"`
 }
 
 func NewShaperExecutionLeaseID() (string, error) {
@@ -159,8 +165,51 @@ func FetchShaperSnapshot(ctx context.Context, client *http.Client, controlURL st
 	return snapshot, nil
 }
 
+// ShaperArticleCensus is what one measured run asked the server for, from the
+// shaper's count of the client's own command lines: how many article requests
+// (ARTICLE/BODY/HEAD/STAT) it sent, how many named a distinct message-id, and
+// how many repeated a message-id already requested in the same run. Downstream
+// bytes above the NZB's article bytes with zero repeats is a client reading
+// more than it asked for; with repeats it is the client asking twice.
+type ShaperArticleCensus struct {
+	ArticleRequests         uint64 `json:"article_requests"`
+	DistinctArticleRequests uint64 `json:"distinct_article_requests"`
+	RepeatedArticleRequests uint64 `json:"repeated_article_requests"`
+}
+
+// HasArticleCensus reports whether the shaper that produced this snapshot
+// counted commands at all.
+func (s ShaperSnapshot) HasArticleCensus() bool {
+	return s.SchemaVersion >= 3
+}
+
+// ShaperArticleCensusFor brackets one run between a lease-acquisition snapshot
+// and the post-run snapshot. It returns nil for a schema-2 shaper. The lease
+// acquisition reset the distinct set, so the after snapshot's distinct count
+// is the run's own.
+func ShaperArticleCensusFor(before, after ShaperSnapshot) (*ShaperArticleCensus, error) {
+	if !before.HasArticleCensus() || !after.HasArticleCensus() {
+		return nil, nil
+	}
+	if before.DistinctArticleRequests != 0 {
+		return nil, fmt.Errorf("shaper lease snapshot already counts %d distinct articles; the census was not reset for this run", before.DistinctArticleRequests)
+	}
+	if after.ArticleRequests < before.ArticleRequests || after.RepeatedArticleRequests < before.RepeatedArticleRequests {
+		return nil, fmt.Errorf("shaper command census moved backwards during the measured run")
+	}
+	census := &ShaperArticleCensus{
+		ArticleRequests:         after.ArticleRequests - before.ArticleRequests,
+		DistinctArticleRequests: after.DistinctArticleRequests,
+		RepeatedArticleRequests: after.RepeatedArticleRequests - before.RepeatedArticleRequests,
+	}
+	if census.DistinctArticleRequests+census.RepeatedArticleRequests > census.ArticleRequests {
+		return nil, fmt.Errorf("shaper command census is inconsistent: %d distinct + %d repeated exceeds %d article requests", census.DistinctArticleRequests, census.RepeatedArticleRequests, census.ArticleRequests)
+	}
+	return census, nil
+}
+
 func (s ShaperSnapshot) ValidateFor(link ServerLinkProfile) error {
-	if s.SchemaVersion != 2 || s.Status != "ok" || s.StartedAt.IsZero() {
+	if (s.SchemaVersion != 2 && s.SchemaVersion != 3) || s.Status != "ok" || s.StartedAt.IsZero() {
 		return fmt.Errorf("shaper attestation has unsupported schema, status, or start time")
 	}
 	if s.ConfiguredEgressBitsPerSecond != link.EgressBitsPerSecond || s.ConfiguredBurstBytes != link.BurstBytes {

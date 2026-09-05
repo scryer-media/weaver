@@ -375,3 +375,135 @@ async fn a_single_set_keeps_its_binding_grid_and_rename_behavior() {
         rename_payload
     );
 }
+
+#[tokio::test]
+async fn analysing_one_set_does_not_offer_the_other_sets_volume_as_an_extra() {
+    // Two recovery sets share one working directory, each describing its own
+    // volume. When this set's damaged-path analysis looks for extras, the
+    // volume the *other* set describes must not be a candidate: the scan can
+    // only ever confirm zero blocks against it, and the price of finding that
+    // out is a rolling read of the whole file. A file no set claims stays a
+    // candidate — finding those is the entire point of the extra scan.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30931);
+    let own_volume = "silver.horizon.part1.rar";
+    let foreign_volume = "ivory.meadow.part1.rar";
+    let unclaimed = "a3f19c40.bin";
+    let own_bytes = fixture_bytes(41, 128);
+    let foreign_bytes = fixture_bytes(43, 128);
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Silver Horizon And Ivory Meadow",
+            &[
+                (own_volume.to_string(), own_bytes.len() as u32),
+                (foreign_volume.to_string(), foreign_bytes.len() as u32),
+                (unclaimed.to_string(), 128),
+            ],
+        ),
+    )
+    .await;
+    let served =
+        build_repairable_par2_set_for_files(&[(own_volume, own_bytes.as_slice())], SLICE_SIZE, 1);
+    let served_id = served.recovery_set_id;
+    let other = build_repairable_par2_set_for_files(
+        &[(foreign_volume, foreign_bytes.as_slice())],
+        SLICE_SIZE,
+        1,
+    );
+    install_two_parsed_sets(&mut pipeline, job_id, served, other);
+
+    let exclusions = pipeline.par2_extra_scan_exclusions(job_id, served_id);
+
+    assert!(
+        exclusions.contains(&working_dir.join(foreign_volume)),
+        "the other set's volume must be kept out of this set's extra scan, got {exclusions:?}"
+    );
+    assert!(
+        !exclusions.contains(&working_dir.join(own_volume)),
+        "this set's own source is a canonical candidate, never an exclusion, got {exclusions:?}"
+    );
+    assert!(
+        !exclusions.contains(&working_dir.join(unclaimed)),
+        "a file no set describes must stay discoverable, got {exclusions:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_complete_volume_of_a_foreign_rar_set_is_kept_out_of_the_extra_scan() {
+    // The binding half of the exclusion only reaches files a recovery set
+    // describes by name or content. A second RAR set's volumes can be complete
+    // on disk with no PAR2 binding at all — obfuscated names, or a set whose
+    // own PAR2 has not been parsed yet — and those are exactly the multi-
+    // gigabyte files the rolling scan would grind through. Set membership
+    // stands in for the binding: a *complete* volume of a RAR set this
+    // recovery set does not describe belongs to somebody else.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30932);
+    let own_volume = "silver.horizon.part1.rar";
+    let foreign_volume = "ivory.meadow.part1.rar";
+    let own_bytes = fixture_bytes(47, 128);
+    let foreign_bytes = fixture_bytes(53, 128);
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Silver Horizon Beside An Unbound Set",
+            &[
+                (own_volume.to_string(), own_bytes.len() as u32),
+                (foreign_volume.to_string(), foreign_bytes.len() as u32),
+            ],
+        ),
+    )
+    .await;
+    let served =
+        build_repairable_par2_set_for_files(&[(own_volume, own_bytes.as_slice())], SLICE_SIZE, 1);
+    let served_id = served.recovery_set_id;
+    install_test_par2_runtime(&mut pipeline, job_id, served, &[]);
+    for (file_index, filename, set_name) in [
+        (0u32, own_volume, "silver.horizon"),
+        (1, foreign_volume, "ivory.meadow"),
+    ] {
+        pipeline
+            .set_file_identity(
+                job_id,
+                crate::jobs::record::ActiveFileIdentity {
+                    file_index,
+                    source_filename: filename.to_string(),
+                    current_filename: filename.to_string(),
+                    canonical_filename: Some(filename.to_string()),
+                    classification: Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                        kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
+                        set_name: set_name.to_string(),
+                        volume_index: Some(0),
+                    }),
+                    classification_source: crate::jobs::record::FileIdentitySource::Par2,
+                },
+            )
+            .unwrap();
+    }
+
+    // Incomplete, so still worth looking at: a partially written volume is
+    // where a stray block can genuinely turn up.
+    assert!(
+        !pipeline
+            .par2_extra_scan_exclusions(job_id, served_id)
+            .contains(&working_dir.join(foreign_volume)),
+        "an incomplete foreign volume stays a candidate"
+    );
+
+    write_and_complete_file(&mut pipeline, job_id, 1, foreign_volume, &foreign_bytes).await;
+
+    let exclusions = pipeline.par2_extra_scan_exclusions(job_id, served_id);
+    assert!(
+        exclusions.contains(&working_dir.join(foreign_volume)),
+        "a complete volume of a foreign RAR set must be excluded, got {exclusions:?}"
+    );
+    assert!(
+        !exclusions.contains(&working_dir.join(own_volume)),
+        "the analysed set's own RAR set is never excluded, got {exclusions:?}"
+    );
+}

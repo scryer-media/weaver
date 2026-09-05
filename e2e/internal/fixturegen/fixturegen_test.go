@@ -268,6 +268,21 @@ func TestDirectStoreShapeConstraints(t *testing.T) {
 	if got := (directStore{format: RAR4}).extra(); len(got) != 0 {
 		t.Errorf("RAR4 direct-store sets must pass no -qo-, got %v", got)
 	}
+	// The quick-open set is the one RAR5 shape that keeps the records, and it
+	// asks for one on every header rather than leaving it to the writer's
+	// size heuristic.
+	if got := (directStore{format: RAR5, quickOpen: true}).extra(); !equal(got, []string{"-qo+"}) {
+		t.Errorf("the quick-open direct-store set should request a record for every header, got %v", got)
+	}
+	var quickOpen int
+	for _, recipe := range DirectStoreRecipes() {
+		if recipe.Slug == "direct-store-quick-open" {
+			quickOpen++
+		}
+	}
+	if quickOpen != 1 {
+		t.Errorf("direct-store-quick-open recipe count = %d, want 1", quickOpen)
+	}
 }
 
 func TestZipCryptoMatchesTheSpecifiedCipher(t *testing.T) {

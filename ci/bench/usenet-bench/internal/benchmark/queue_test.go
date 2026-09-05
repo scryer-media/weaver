@@ -1,6 +1,8 @@
 package benchmark
 
 import (
+	"errors"
+
 	"fmt"
 	"os"
 	"path/filepath"
@@ -64,34 +66,49 @@ func TestQueueInputRejectsInvalidSubmissionMode(t *testing.T) {
 	}
 }
 
-func TestQueueTransitionGroupsTwentyDuplicatesIntoOneLane(t *testing.T) {
-	plan, err := BuildPlan(PlanOptions{
+func TestQueueTransitionGroupsPlannedRepetitionsIntoOneLane(t *testing.T) {
+	for _, copies := range []int{20, 10} {
+		plan, err := BuildPlan(PlanOptions{
+			FixtureIDs:  []string{"direct-mkv-200mb"},
+			Clients:     []Client{Weaver, SABnzbd, NZBGet},
+			Transports:  []Transport{Plaintext, TLS},
+			Targets:     []ExecutionTarget{DockerLinux},
+			Repetitions: copies,
+			Seed:        17,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		suites, err := queueTransitionSuites(plan, DockerLinux)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := 10; len(suites) != want {
+			t.Fatalf("queue transition suite count = %d, want %d", len(suites), want)
+		}
+		for _, suite := range suites {
+			if got := len(suite.Runs); got != copies {
+				t.Fatalf("%s contains %d jobs, want %d", suite.ID, got, copies)
+			}
+			for _, run := range suite.Runs {
+				if run.FixtureID != "direct-mkv-200mb" {
+					t.Fatalf("%s includes fixture %s", suite.ID, run.FixtureID)
+				}
+			}
+		}
+	}
+	single, err := BuildPlan(PlanOptions{
 		FixtureIDs:  []string{"direct-mkv-200mb"},
-		Clients:     []Client{Weaver, SABnzbd, NZBGet},
-		Transports:  []Transport{Plaintext, TLS},
+		Clients:     []Client{Weaver},
+		Transports:  []Transport{Plaintext},
 		Targets:     []ExecutionTarget{DockerLinux},
-		Repetitions: 20,
-		Seed:        17,
+		Repetitions: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	suites, err := queueTransitionSuites(plan, DockerLinux)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := 10; len(suites) != want {
-		t.Fatalf("queue transition suite count = %d, want %d", len(suites), want)
-	}
-	for _, suite := range suites {
-		if got := len(suite.Runs); got != 20 {
-			t.Fatalf("%s contains %d jobs, want 20", suite.ID, got)
-		}
-		for _, run := range suite.Runs {
-			if run.FixtureID != "direct-mkv-200mb" {
-				t.Fatalf("%s includes fixture %s", suite.ID, run.FixtureID)
-			}
-		}
+	if _, err := queueTransitionSuites(single, DockerLinux); err == nil {
+		t.Fatal("queue-transition accepted a one-copy plan, which is a sequential run, not a queue")
 	}
 }
 
@@ -308,6 +325,20 @@ func TestQueueArtifactDNFFailsTopLevelExecution(t *testing.T) {
 	}
 	if queueArtifactFailed(QueueArtifact{Status: "passed"}) {
 		t.Fatal("passed artifact must not fail the top-level command")
+	}
+	// A client that did not finish is a recorded result, not a harness
+	// failure; the two must stay distinguishable so a chained run can carry
+	// on past the former and stop on the latter.
+	if queueArtifactHarnessFailed(QueueArtifact{Status: "completed_with_dnf"}) {
+		t.Fatal("completed_with_dnf is a client outcome, not a harness failure")
+	}
+	if !queueArtifactHarnessFailed(QueueArtifact{Status: "failed"}) {
+		t.Fatal("failed must count as a harness failure")
+	}
+	var err error = &ClientDidNotFinishError{Suites: []string{"sequential-0001: 1 queue job(s) did not finish"}}
+	var didNotFinish *ClientDidNotFinishError
+	if !errors.As(err, &didNotFinish) || len(didNotFinish.Suites) != 1 || ExitStatusClientDidNotFinish == 1 || ExitStatusClientDidNotFinish == 0 {
+		t.Fatalf("did-not-finish error is not distinguishable from a harness failure: %v", err)
 	}
 }
 

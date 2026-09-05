@@ -3,9 +3,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use cap_fs_ext::DirExt;
+use cap_fs_ext::{DirExt, SystemTimeSpec};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use tracing::{info, warn};
@@ -835,6 +835,26 @@ impl BudgetedWriter<cap_std::fs::File> {
     pub(crate) fn sync_all(&self) -> io::Result<()> {
         self.inner.sync_all()
     }
+
+    /// Stamp the archive's recorded times on the finished output.
+    ///
+    /// Called after the last byte is written: the write itself moves the
+    /// modification time, so stamping earlier is stamping nothing.
+    pub(crate) fn set_times(&self, times: std::fs::FileTimes) -> io::Result<()> {
+        // The capability file has no time setter of its own; a duplicated
+        // handle hands the same open file to std, which does.
+        #[cfg(unix)]
+        let file = {
+            use std::os::fd::AsFd;
+            std::fs::File::from(self.inner.as_fd().try_clone_to_owned()?)
+        };
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::io::AsHandle;
+            std::fs::File::from(self.inner.as_handle().try_clone_to_owned()?)
+        };
+        file.set_times(times)
+    }
 }
 
 impl<W> Drop for BudgetedWriter<W> {
@@ -957,6 +977,32 @@ impl ExtractionRoot {
                 relative.display()
             )),
         }
+    }
+
+    /// Stamp the archive's recorded times on a directory this root created.
+    ///
+    /// Directories take their times last, after every member inside them has
+    /// been written: each file created under a directory moves that
+    /// directory's modification time, so a stamp taken any earlier is undone
+    /// by the next member.
+    ///
+    /// The stamp goes through this root by name, not through a handle opened
+    /// on the directory itself: on Linux the capability layer opens
+    /// directories with `O_PATH`, and `futimens` refuses such a handle with
+    /// `EBADF`, so a stamp through it is dropped without a trace. Naming the
+    /// entry from its parent works everywhere, and not following a symlink
+    /// means a link swapped in under the directory's name is stamped itself,
+    /// never its target.
+    pub(crate) fn set_dir_times(
+        &self,
+        relative: &Path,
+        modified: SystemTime,
+        accessed: Option<SystemTime>,
+    ) -> io::Result<()> {
+        let absolute =
+            |time: SystemTime| SystemTimeSpec::Absolute(cap_std::time::SystemTime::from_std(time));
+        self.dir
+            .set_symlink_times(relative, accessed.map(absolute), Some(absolute(modified)))
     }
 
     pub(crate) fn create_file(

@@ -2450,6 +2450,9 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
 
     let queued_job = pipeline.pending_completion_checks.pop_front().unwrap();
     pipeline.check_job_completion(queued_job).await;
+    // The analysis this flush arms is a detached read; the recovery promotion
+    // it asks for is applied when the verdict lands.
+    settle_par2_analysis_work(&mut pipeline).await;
 
     assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
     let state = pipeline.jobs.get(&job_id).unwrap();

@@ -619,22 +619,9 @@ version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
- "aws-lc-sys 0.45.0",
+ "aws-lc-sys",
  "untrusted 0.7.1",
  "zeroize",
-]
-
-[[package]]
-name = "aws-lc-sys"
-version = "0.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09fae7be8bb3174e05c6afdb34199e6dc0c7c04ba9fa237b1967adfbde27483"
-dependencies = [
- "cc",
- "cmake",
- "dunce",
- "fs_extra",
- "pkg-config",
 ]
 
 [[package]]
@@ -1325,9 +1312,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-deque"
-version = "0.8.7"
+version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
+checksum = "622f3fc73690be383c7214310406f28a90e6edeadc3cea882f9d71e495b9711a"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
@@ -1335,27 +1322,27 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.20"
+version = "0.9.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
 dependencies = [
  "crossbeam-utils",
 ]
 
 [[package]]
 name = "crossbeam-queue"
-version = "0.3.13"
+version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "803d13fb3b09d88be9f4dbc29062c66b19bf7170867ceb746d2a8689bf6c7a26"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
 dependencies = [
  "crossbeam-utils",
 ]
 
 [[package]]
 name = "crossbeam-utils"
-version = "0.8.22"
+version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crunchy"
@@ -2513,9 +2500,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.14.1"
+version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07aa2048142242915a31d35844fb311e0e53fcca590c3a0a40dcf1b841fa09eb"
+checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
@@ -3301,11 +3288,11 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "886fc3580c754f2515f7d1af48baeab0e29957fa513c550bdf3ad3c5e43e0d63"
+checksum = "8380fcb1f1ffb23c8c94f43457aaf1ec3442ed7b9caf8efca091268421e58919"
 dependencies = [
- "aws-lc-sys 0.44.0",
+ "aws-lc-sys",
  "bytes",
  "cap-std",
  "crc-fast",
@@ -3394,9 +3381,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pest"
-version = "2.9.0"
+version = "2.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a07a60cc7a4d00c91f95c685609d1d2f79050e6804b70ebedd7650f0b839bcf"
+checksum = "6d45aeb61b4bf818e12d4205f2466f8c4748f85f4fce0146d1c03d69d753f0ad"
 dependencies = [
  "memchr",
  "ucd-trie",
@@ -5362,12 +5349,12 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.9.1"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d325c756f14bc69ccbdbd53fcf89dfcef166e0360aa5ef698146af571a23727f"
+checksum = "3e5b4b91813b2c122baf13c66e8a2c297abe17de6b350d91130c2974f7ec9111"
 dependencies = [
  "aws-lc-rs",
- "aws-lc-sys 0.45.0",
+ "aws-lc-sys",
  "blake2s_simd",
  "crc-fast",
  "filetime",
@@ -5563,7 +5550,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.10.0"
+version = "0.10.2"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -5618,14 +5605,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.10.0"
+version = "0.10.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.10.0"
+version = "0.10.2"
 dependencies = [
  "bytes",
  "criterion",
@@ -5651,7 +5638,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.10.0"
+version = "0.10.2"
 dependencies = [
  "quick-xml",
  "serde",
@@ -5662,7 +5649,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.10.0"
+version = "0.10.2"
 dependencies = [
  "aes-gcm 0.11.1",
  "age",
@@ -5700,7 +5687,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.10.0"
+version = "0.10.2"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -5765,7 +5752,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.10.0"
+version = "0.10.2"
 dependencies = [
  "cc",
  "crc-fast",

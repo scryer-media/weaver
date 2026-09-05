@@ -1018,9 +1018,12 @@ impl DownloadFailure {
         use weaver_nntp::NntpError;
 
         match error {
-            NntpError::PoolExhausted | NntpError::PoolShutdown | NntpError::TooManyConnections => {
-                Some(DownloadFailureKind::CapacityUnavailable)
-            }
+            NntpError::PoolExhausted
+            | NntpError::PoolShutdown
+            | NntpError::TooManyConnections
+            // Never got a socket before the deadline: local lane capacity, not
+            // a transport fault of the server.
+            | NntpError::AcquireTimeout(_) => Some(DownloadFailureKind::CapacityUnavailable),
             NntpError::AuthenticationFailed
             | NntpError::AuthenticationRejected
             | NntpError::AuthenticationRequired
@@ -1156,6 +1159,10 @@ pub(super) struct PendingDecodeWork {
 /// Progress update from a health probe task.
 pub(super) struct ProbeUpdate {
     pub(super) job_id: JobId,
+    /// The probe round this result belongs to, as handed to the probe task by
+    /// `activate_health_probes`. A result whose round the job is no longer
+    /// waiting on is dropped.
+    pub(super) probe_round: u32,
     /// Total probes attempted so far.
     pub(super) total: usize,
     /// Number of missing articles found so far.
@@ -1525,6 +1532,14 @@ pub(super) struct Par2SetRuntime {
     /// against per-file stat fingerprints and re-checks bytes before any
     /// mutating request, so a stale stash costs nothing but the seed.
     pub(super) scan_carry: Option<std::sync::Arc<par2_rs::ScanCarry>>,
+    /// The extra-scan exclusion list the stashed carry was produced under.
+    ///
+    /// A carry is a complete account of the tree only for a pass that was
+    /// allowed to look at the same files, and its locations may name a file
+    /// that has since become excluded — bytes the next pass has just been told
+    /// belong to something else. So the stash is seeded only when the current
+    /// exclusion list matches this one, and discarded otherwise.
+    pub(super) scan_carry_exclusions: Vec<std::path::PathBuf>,
     /// Completed files whose current identity/checksum evidence was admitted
     /// to the retained session.
     pub(super) session_evidence_file_ids: HashSet<NzbFileId>,
@@ -1535,6 +1550,43 @@ pub(super) struct Par2SetRuntime {
     /// re-reading the whole recovery set on every lap forever. Reset wherever
     /// a verdict is taken or reopened.
     pub(super) post_verdict_reconcile_attempts: u32,
+    /// The damaged-path verdict this set parked on while its targeted recovery
+    /// downloaded, so the entry that finds the recovery landed can repair on it
+    /// instead of paying for the same authoritative read again.
+    ///
+    /// In-memory only, and deliberately so: a restart has no analysis to stand
+    /// on and takes the ordinary path.
+    pub(super) pending_repair: Option<PendingPar2Repair>,
+}
+
+/// A "repair required" verdict held across the wait for targeted recovery.
+///
+/// The analysis that produced it read every damaged file and named every
+/// damaged slice. Recovery arriving afterwards cannot change any of that — a
+/// recovery volume carries no source bytes — so the only number the next pass
+/// would learn is how much recovery is now available, which the repair pass
+/// computes from the merged set itself. Holding the verdict is what lets that
+/// pass be the repair rather than a second read of the same files.
+///
+/// The identity fields are the guard: the verdict describes *this* recovery set
+/// over *these* described files at *this* slice size, and is refused the moment
+/// any of them moves. It says nothing about the bytes on disk, and does not
+/// need to — par2-rs re-proves every repair input against its own scan-time
+/// fingerprints and falls back to a fresh scan when one has drifted, so a
+/// verdict trusted here can cost a re-read but never a wrong repair.
+pub(super) struct PendingPar2Repair {
+    pub(super) recovery_set_id: par2_rs::RecoverySetId,
+    pub(super) slice_size: u64,
+    /// Files the set described when the verdict was reached. A metadata merge
+    /// that adds or drops a description invalidates the verdict.
+    pub(super) described_file_ids: Vec<par2_rs::FileId>,
+    /// Recovery blocks the repair needs, and the damage it answers.
+    pub(super) blocks_needed: u32,
+    pub(super) damaged: u32,
+    /// The analysis result the repair pass is owed: it decides what the repair
+    /// is allowed to leave parked, and which files the post-repair read-back
+    /// has to re-read rather than carry.
+    pub(super) verification: par2_rs::VerificationResult,
 }
 
 /// A positive authoritative binding whose PAR2 slice CRCs make streamed MD5
@@ -1565,6 +1617,93 @@ pub(super) struct DirectPostRepairWorkDone {
     pub(super) work_id: u64,
     pub(super) recovery_set_id: par2_rs::RecoverySetId,
     pub(super) result: Result<par2_rs::VerificationResult, String>,
+}
+
+/// One direct set's tolerated-member extraction, detached from the actor.
+///
+/// The tolerance no longer caps a member's size, so the decode it runs at
+/// finalization can be as long as any conventional extraction — and it reads
+/// the set's virtual volumes, which is disk I/O the pipeline task must not sit
+/// on. The virtual provider, the targets and the budget are snapshotted at
+/// submission; the actor keeps only this fence and picks the result up on the
+/// next finalization pass, exactly the way [`DirectPostRepairWork`] does.
+pub(super) struct DirectToleratedWork {
+    pub(super) work_id: u64,
+    pub(super) set_index: usize,
+    pub(super) submitted_at: std::time::Instant,
+}
+
+pub(super) struct DirectToleratedWorkDone {
+    pub(super) job_id: JobId,
+    pub(super) work_id: u64,
+    pub(super) set_index: usize,
+    pub(super) result: Result<direct_store::wiring::ToleratedExtraction, String>,
+}
+
+/// One recovery set's filesystem damaged-path analysis, detached from the actor.
+///
+/// The analysis is a whole-directory authoritative read: it hashes every
+/// described file and rolling-scans whatever else the directory holds. Awaited
+/// inline it held the pipeline task for its entire duration — seconds on a
+/// small job, minutes on a multi-set release — during which no other job's
+/// articles were dispatched, no decode result was processed, and no newly
+/// submitted NZB was even parsed. Everything the read needs is snapshotted at
+/// submission (including the retained session, which travels with the ticket
+/// and comes back with the done message); the actor keeps only this fence and
+/// picks the verdict up when the completion check re-enters.
+///
+/// One ticket per job. The set it belongs to is part of the fence because a
+/// verdict describes one recovery set's files by path, and a job that re-binds
+/// its files while the read is running must not repair on what the read saw.
+pub(super) struct Par2AnalysisWork {
+    pub(super) work_id: u64,
+    pub(super) recovery_set_id: par2_rs::RecoverySetId,
+    /// When the ticket was handed to the detached task, so the completion
+    /// handler can report how long the read actually took.
+    pub(super) submitted_at: std::time::Instant,
+}
+
+pub(super) struct Par2AnalysisWorkDone {
+    pub(super) job_id: JobId,
+    pub(super) work_id: u64,
+    pub(super) recovery_set_id: par2_rs::RecoverySetId,
+    pub(super) outcome: completion::finalize::check::Par2AnalysisTicketOutcome,
+}
+
+/// One demoted set's reconstruction sweep, detached from the actor.
+///
+/// The sweep reads every volume of the set out of the overlay and writes it to
+/// disk: on a large archive that is gigabytes of I/O, and it used to run inside
+/// the demotion — which the actor reaches from the decode of the very article
+/// that triggered it, so the job's every other article waited behind a
+/// materialization it had nothing to do with. Everything the sweep needs is
+/// snapshotted at submission and everything the *reconciliation* needs travels
+/// with the ticket, so the actor keeps only this fence and applies the durable
+/// bookkeeping when the ticket lands.
+///
+/// One ticket per demoted set rather than per job: a job can demote two sets,
+/// and neither may wait on the other's I/O.
+pub(super) struct DirectDemotionWork {
+    pub(super) work_id: u64,
+    pub(super) submitted_at: std::time::Instant,
+    /// The reconciliation's half of the snapshot — the volume targets, their
+    /// article geometry, and the articles the decode seam took ownership of at
+    /// the demotion instant. Owned by the ticket and moved out with it when it
+    /// lands.
+    pub(super) plan: direct_store::wiring::DemotedSweepPlan,
+}
+
+pub(super) struct DirectDemotionWorkDone {
+    pub(super) job_id: JobId,
+    pub(super) work_id: u64,
+    pub(super) set_index: usize,
+    /// One outcome per volume, in the order the plan's targets name them.
+    ///
+    /// Carried as one batch rather than streamed per volume: the volumes are
+    /// judged independently inside the sweep, but the durable bookkeeping is
+    /// not independent — the set's coverage row may only be retired once
+    /// *every* volume's floor is committed, and there is one row for the set.
+    pub(super) rebuilt: Vec<direct_store::reconstruct::ReconstructedVolume>,
 }
 
 /// The pre-repair verdict and the repair's own write set, carried across a
@@ -2654,6 +2793,25 @@ pub struct Pipeline {
     /// and a perf probe; a test needs it as a number it can bound.
     #[cfg(test)]
     pub(super) par2_authoritative_bytes_read: Vec<u64>,
+    /// Retained PAR2 sessions this pipeline has opened. One session per set for
+    /// a whole verify/repair ladder is the point of retaining them at all, and
+    /// this is the only number that says whether a ladder actually got one.
+    #[cfg(test)]
+    pub(super) par2_session_opens: usize,
+    /// The largest `source_scan_passes` any retained session has reported.
+    /// Together with [`Self::par2_session_opens`] this bounds how many times a
+    /// ladder read its sources: one open reporting one pass is one read.
+    #[cfg(test)]
+    pub(super) par2_session_source_scan_passes: u32,
+    /// Landed recovery volumes merged into a retained session rather than
+    /// rebuilding it, which is what keeps a parked analysis alive across the
+    /// wait for targeted recovery.
+    #[cfg(test)]
+    pub(super) par2_session_recovery_merges: usize,
+    /// Repairs that ran on a parked damaged-path verdict instead of analysing
+    /// the set again.
+    #[cfg(test)]
+    pub(super) par2_repairs_from_parked_verdict: usize,
     /// Forces the retained-session gate on or off for a test, so a
     /// differential can run both arms without mutating a process-global
     /// environment variable while other tests are running.
@@ -2796,6 +2954,51 @@ pub struct Pipeline {
     /// recovery set. Cleared once consumed, on demotion, and by
     /// [`Pipeline::clear_par2_runtime_state`] — see [`DirectPostRepairCarry`].
     pub(super) direct_post_repair_carry: HashMap<JobId, DirectPostRepairCarry>,
+    /// Monotonic fence for direct tolerated-extraction tickets detached from
+    /// the actor.
+    pub(super) next_direct_tolerated_work_id: u64,
+    /// At most one tolerated extraction runs for a job; a second ready set of
+    /// the same job waits for the first to finalize.
+    pub(super) direct_tolerated_in_flight: HashMap<JobId, DirectToleratedWork>,
+    /// Finished tolerated extractions awaiting the finalization pass that
+    /// submitted them, keyed by job and tagged with the set they belong to.
+    pub(super) direct_tolerated_results: HashMap<
+        JobId,
+        (
+            usize,
+            Result<direct_store::wiring::ToleratedExtraction, String>,
+        ),
+    >,
+    pub(super) direct_tolerated_done_tx: mpsc::Sender<DirectToleratedWorkDone>,
+    pub(super) direct_tolerated_done_rx: mpsc::Receiver<DirectToleratedWorkDone>,
+    /// Monotonic fence for the detached PAR2 damaged-path analysis tickets.
+    pub(super) next_par2_analysis_work_id: u64,
+    /// At most one damaged-path analysis runs per job. While the entry is
+    /// present the completion check refuses to judge the job: the verdict it
+    /// would judge on is exactly what the ticket is computing.
+    pub(super) par2_analysis_in_flight: HashMap<JobId, Par2AnalysisWork>,
+    /// A finished analysis waiting for the completion check that submitted it,
+    /// keyed by job and tagged with the recovery set it describes. A pass that
+    /// finds a result tagged for another set puts it back rather than reading
+    /// another set's verdict as its own.
+    pub(super) par2_analysis_results: HashMap<
+        JobId,
+        (
+            par2_rs::RecoverySetId,
+            Result<par2_rs::Par2RepairOutcome, String>,
+        ),
+    >,
+    pub(super) par2_analysis_done_tx: mpsc::Sender<Par2AnalysisWorkDone>,
+    pub(super) par2_analysis_done_rx: mpsc::Receiver<Par2AnalysisWorkDone>,
+    /// Monotonic fence for demotion sweeps detached from the actor.
+    pub(super) next_direct_demotion_work_id: u64,
+    /// The demotion sweeps a job has outstanding, keyed by the set each one
+    /// belongs to. Keyed by job at the top so the completion gate — which must
+    /// not judge a job whose volumes are still materializing — answers in one
+    /// lookup.
+    pub(super) direct_demotion_in_flight: HashMap<JobId, HashMap<usize, DirectDemotionWork>>,
+    pub(super) direct_demotion_done_tx: mpsc::Sender<DirectDemotionWorkDone>,
+    pub(super) direct_demotion_done_rx: mpsc::Receiver<DirectDemotionWorkDone>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
     /// Whether the active global pause came from a bandwidth schedule rather
@@ -2958,6 +3161,26 @@ pub struct Pipeline {
     /// Prevents immediate retry during download; cleared after PAR2 repair so
     /// the post-repair extraction path can re-extract them.
     pub(super) failed_extractions: HashMap<JobId, HashSet<String>>,
+    /// Archive sets whose source bytes are already known to be wrong, before
+    /// any recovery set has ruled — keyed by job, holding the set names for
+    /// telemetry.
+    ///
+    /// Read by `archive_extraction_held_for_known_damage`. The two things it
+    /// buys are the same fact seen from opposite ends: extraction must not
+    /// open a set that is known damaged, and the authoritative PAR2 pass must
+    /// not be skipped for it on a *type* claim (a stored RAR set's
+    /// `StrongDecode`, whose whole premise is that nothing yet contradicts a
+    /// clean decode). Both of those need evidence rather than a demotion
+    /// label, so this is recorded by the fact — see
+    /// `DemotionReason::is_source_damage` — and any future seam that learns a
+    /// volume's bytes are wrong records here instead of growing a second,
+    /// near-identical predicate.
+    ///
+    /// Job-keyed on purpose: the verdicts that release it (`par2_verified`,
+    /// `par2_bypassed`) are job-scoped too, so a per-set record would have to
+    /// be released by a job-scoped answer anyway. Cleared with them in
+    /// `clear_job_extraction_runtime`.
+    pub(super) known_damaged_archive_sets: HashMap<JobId, HashSet<String>>,
     /// Filenames eagerly deleted per job after CRC-verified extraction.
     /// Used to distinguish truly-missing files from intentionally-deleted ones
     /// during PAR2 verification.

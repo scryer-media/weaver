@@ -43,6 +43,12 @@ type directStore struct {
 	// router proves a candidate against the archive's own check and keys the
 	// header walk from it. RAR4 header encryption is refused by design.
 	headerPassword string
+	// quickOpen keeps the RAR5 writer's quick-open records (`-qo+`), one per
+	// file header. Every other RAR5 set suppresses them, so this is the only
+	// shape on which the router's quick-open cross-check — the copy of the
+	// headers behind the main header against the physical header walk — has
+	// anything to compare.
+	quickOpen bool
 	// members maps the member path inside the archive to its payload size and
 	// PRNG seed.
 	members []directStoreMember
@@ -54,13 +60,17 @@ type directStoreMember struct {
 	seed string
 }
 
-// extra adds `-qo-` — no quick-open record — on the RAR5 writer only. The 4.x
+// extra controls the quick-open record on the RAR5 writer only: `-qo-` (none)
+// by default, `-qo+` (one per file header) for the quick-open set. The 4.x
 // writer predates the switch and rejects it.
 func (set directStore) extra() []string {
-	if set.format == RAR5 {
-		return []string{"-qo-"}
+	if set.format != RAR5 {
+		return nil
 	}
-	return nil
+	if set.quickOpen {
+		return []string{"-qo+"}
+	}
+	return []string{"-qo-"}
 }
 
 // DirectStoreRecipes ports the direct-store generator, including the parity
@@ -78,6 +88,14 @@ func DirectStoreRecipes() []Recipe {
 			notes:  "One member spread over 8 MiB volumes, so the router's per-volume mapping has to agree with a member that crosses boundaries.",
 			writer: DirectStoreRAR5Writer, format: RAR5, volumeSize: "8m",
 			members: []directStoreMember{{"amber.trail.s01e02.mkv", 24 << 20, "amber-trail"}},
+		},
+		{
+			slug: "direct-store-quick-open",
+			notes: "RAR5 with the writer's quick-open records kept (`-qo+`) across three 8 MiB volumes. Every other RAR5 set passes `-qo-`, " +
+				"so this is the only shape on which the router's quick-open cross-check has a second copy of the file headers to compare " +
+				"against the physical header walk; a demotion here means that cross-check, not the routing, regressed.",
+			writer: DirectStoreRAR5Writer, format: RAR5, volumeSize: "8m", quickOpen: true,
+			members: []directStoreMember{{"cobalt.lantern.s01e07.mkv", 20 << 20, "cobalt-lantern"}},
 		},
 		{
 			slug: "direct-store-rar4",

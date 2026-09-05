@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -68,6 +69,10 @@ func main() {
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "nntpbench:", err)
+		var didNotFinish *benchmark.ClientDidNotFinishError
+		if errors.As(err, &didNotFinish) {
+			os.Exit(benchmark.ExitStatusClientDidNotFinish)
+		}
 		os.Exit(1)
 	}
 }
@@ -127,7 +132,9 @@ func plan(args []string) error {
 	var repetitions int
 	var seed int64
 	var serverEgressBPS, serverBurstBytes uint64
+	var exclusions clientExclusionFlags
 	flags.StringVar(&fixturesCSV, "fixtures", "", "comma-separated generated fixture ids")
+	flags.Var(&exclusions, "exclude-client", "repeatable; client:fixture-id:reason — do not run this client on this fixture; the summary records every excluded block as that client not finishing, with the reason")
 	flags.StringVar(&corpusPath, "corpus", "fixtures/corpus.json", "declared corpus JSON used when --fixtures is omitted")
 	flags.StringVar(&clientsCSV, "clients", "weaver,sabnzbd,nzbget", "comma-separated clients")
 	flags.StringVar(&archiveToolchainsCSV, "archive-toolchains", "vanilla", "comma-separated archive toolchains; rarpar remains available only by explicit opt-in")
@@ -194,6 +201,7 @@ func plan(args []string) error {
 		StorageProfile:    storage,
 		Repetitions:       repetitions,
 		Seed:              seed,
+		ClientExclusions:  exclusions,
 	})
 	if err != nil {
 		return err
@@ -451,7 +459,34 @@ func execute(args []string, command string) error {
 	return runErr
 }
 
+// clientExclusionFlags parses repeated --exclude-client values of the form
+// client:fixture-id:reason. Fixture ids never contain a colon; the reason is
+// everything after the second one and may.
+type clientExclusionFlags []benchmark.ClientExclusion
+
+func (f *clientExclusionFlags) String() string {
+	parts := make([]string, 0, len(*f))
+	for _, exclusion := range *f {
+		parts = append(parts, fmt.Sprintf("%s:%s:%s", exclusion.Client, exclusion.FixtureID, exclusion.Reason))
+	}
+	return strings.Join(parts, ",")
+}
+
+func (f *clientExclusionFlags) Set(value string) error {
+	parts := strings.SplitN(value, ":", 3)
+	if len(parts) != 3 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" || strings.TrimSpace(parts[2]) == "" {
+		return fmt.Errorf("--exclude-client wants client:fixture-id:reason, got %q", value)
+	}
+	client, err := parseSingleClient(parts[0])
+	if err != nil {
+		return fmt.Errorf("--exclude-client %q: %w", value, err)
+	}
+	*f = append(*f, benchmark.ClientExclusion{Client: client, FixtureID: strings.TrimSpace(parts[1]), Reason: strings.TrimSpace(parts[2])})
+	return nil
+}
+
 func splitCSV(value string) []string {
+
 	var values []string
 	for _, part := range strings.Split(value, ",") {
 		if part = strings.TrimSpace(part); part != "" {

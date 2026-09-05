@@ -58,6 +58,59 @@ func TestRARArgsAreExplicit(t *testing.T) {
 	}
 }
 
+func TestQuickOpenLaneKeepsTheRAR5QuickOpenRecords(t *testing.T) {
+	c := ArchiveCase{
+		ID:            "quick-open-case",
+		ArchiveFormat: RAR5,
+		Compression:   Store,
+		Solid:         false,
+		Encryption:    NoEncryption,
+		VolumeSize:    "32m",
+		QuickOpen:     true,
+	}
+	args, err := c.RARArgs("archive/fixture.rar", []string{"input/one.bin"})
+	if err != nil {
+		t.Fatalf("RARArgs() error = %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "-qo-") {
+		t.Fatalf("quick-open lane must not suppress the records: %q", joined)
+	}
+	if !strings.Contains(joined, "-ma5 -qo+") {
+		t.Fatalf("quick-open lane must request a record for every header: %q", joined)
+	}
+}
+
+func TestQuickOpenIsRejectedOutsideRAR5(t *testing.T) {
+	for _, format := range []ArchiveFormat{RAR4, SevenZip} {
+		set := FixtureSet{
+			ID: "quick-open-" + string(format), WriterEra: "era", GeneratorToolchain: "toolchain",
+			ArchiveFormat: format, Compressions: []Compression{Store}, Solid: []bool{false},
+			Encryptions: []Encryption{NoEncryption}, Payloads: []PayloadKind{IncompressiblePayload},
+			FileCount: 1, VolumeSize: "32m", QuickOpen: true,
+		}
+		if err := set.validate(); err == nil || !strings.Contains(err.Error(), "quick_open") {
+			t.Errorf("%s set with quick_open validated, want a quick_open error, got %v", format, err)
+		}
+	}
+}
+
+func TestExpandCarriesQuickOpenOntoEveryCase(t *testing.T) {
+	matrix := Matrix{SchemaVersion: 2, Sets: []FixtureSet{{
+		ID: "rar5-7-quickopen", WriterEra: "RAR 7.23", GeneratorToolchain: "rarlab-7.23",
+		ArchiveFormat: RAR5, Compressions: []Compression{Store}, Solid: []bool{false},
+		Encryptions: []Encryption{NoEncryption}, Payloads: []PayloadKind{IncompressiblePayload},
+		FileCount: 4, VolumeSize: "32m", QuickOpen: true,
+	}}}
+	cases, err := matrix.Expand()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cases) != 1 || !cases[0].QuickOpen || cases[0].ID != "rar5-7-quickopen-store-nonsolid-none-incompressible" {
+		t.Fatalf("Expand() = %+v, want one quick-open case", cases)
+	}
+}
+
 func TestRAR4ReleaseCompressionUsesItsMaximumDictionary(t *testing.T) {
 	c := ArchiveCase{
 		ID:            "rar4-release",

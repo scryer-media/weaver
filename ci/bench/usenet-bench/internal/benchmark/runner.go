@@ -79,20 +79,23 @@ type RunConfig struct {
 }
 
 type RunArtifact struct {
-	SchemaVersion                    int                   `json:"schema_version"`
-	Run                              Run                   `json:"run"`
-	Repair                           fixture.RepairDetails `json:"repair"`
-	Status                           string                `json:"status"`
-	AdapterResult                    *AdapterResult        `json:"adapter_result,omitempty"`
-	ShaperBefore                     *ShaperSnapshot       `json:"shaper_before,omitempty"`
-	ShaperAfter                      *ShaperSnapshot       `json:"shaper_after,omitempty"`
-	ShaperDownstreamBytes            uint64                `json:"shaper_downstream_bytes,omitempty"`
-	StorageAttestation               *StorageAttestation   `json:"storage_attestation,omitempty"`
-	Verification                     *OutputVerification   `json:"verification,omitempty"`
-	VerificationWallClockNanoseconds int64                 `json:"verification_wall_clock_nanoseconds,omitempty"`
-	UsableOutputAt                   *time.Time            `json:"usable_output_at,omitempty"`
-	WallClockNanoseconds             int64                 `json:"wall_clock_nanoseconds,omitempty"`
-	Error                            string                `json:"error,omitempty"`
+	SchemaVersion         int                   `json:"schema_version"`
+	Run                   Run                   `json:"run"`
+	Repair                fixture.RepairDetails `json:"repair"`
+	Status                string                `json:"status"`
+	AdapterResult         *AdapterResult        `json:"adapter_result,omitempty"`
+	ShaperBefore          *ShaperSnapshot       `json:"shaper_before,omitempty"`
+	ShaperAfter           *ShaperSnapshot       `json:"shaper_after,omitempty"`
+	ShaperDownstreamBytes uint64                `json:"shaper_downstream_bytes,omitempty"`
+	// ShaperArticleCensus is present when the shaper counted the client's
+	// command lines (attestation schema 3).
+	ShaperArticleCensus              *ShaperArticleCensus `json:"shaper_article_census,omitempty"`
+	StorageAttestation               *StorageAttestation  `json:"storage_attestation,omitempty"`
+	Verification                     *OutputVerification  `json:"verification,omitempty"`
+	VerificationWallClockNanoseconds int64                `json:"verification_wall_clock_nanoseconds,omitempty"`
+	UsableOutputAt                   *time.Time           `json:"usable_output_at,omitempty"`
+	WallClockNanoseconds             int64                `json:"wall_clock_nanoseconds,omitempty"`
+	Error                            string               `json:"error,omitempty"`
 }
 
 func LoadAdapterCatalog(path string) (AdapterCatalog, error) {
@@ -439,8 +442,14 @@ func executeRun(parent context.Context, config RunConfig, run Run) (artifact Run
 			artifact.Error = "shaper reported zero downstream bytes for the measured client run"
 			return artifact
 		}
+		census, err := ShaperArticleCensusFor(*artifact.ShaperBefore, shaperAfter)
+		if err != nil {
+			artifact.Error = err.Error()
+			return artifact
+		}
 		artifact.ShaperAfter = &shaperAfter
 		artifact.ShaperDownstreamBytes = delivered
+		artifact.ShaperArticleCensus = census
 	}
 	if storage != nil {
 		attestation, storageErr := storage.Finish(parent)

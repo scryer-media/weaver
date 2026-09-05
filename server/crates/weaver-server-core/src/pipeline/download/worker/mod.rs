@@ -246,6 +246,12 @@ impl Pipeline {
             // No more bytes are coming for this job. A chase whose parts all
             // finished runs on to the end; one still missing a part would park
             // forever, so it is ended here.
+            //
+            // A health probe still in flight is in the same position: its
+            // estimate has been overtaken by the job's own terminal states, and
+            // leaving it running only holds the job in `Checking` — and the
+            // completion checkpoint with it — until the probe times out.
+            self.retire_health_probe_if_download_pipeline_drained(job_id);
             self.settle_direct_unpack_after_download(job_id);
             self.emit_download_finished_if_active(job_id);
             self.schedule_job_completion_check(job_id);

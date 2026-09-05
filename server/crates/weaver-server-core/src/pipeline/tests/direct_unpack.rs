@@ -3297,6 +3297,10 @@ async fn a_gated_chase_forces_the_authoritative_par2_pass() {
     );
 
     pipeline.check_job_completion(job_id).await;
+    // The authoritative pass is a detached read; its verdict arrives as a
+    // message the orchestrator would service, and only then can it speak to
+    // the gate.
+    settle_par2_analysis_work(&mut pipeline).await;
 
     assert_eq!(
         drain_job_verification_started(&mut verify_events, job_id),

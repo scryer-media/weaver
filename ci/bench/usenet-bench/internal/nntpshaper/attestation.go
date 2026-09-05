@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const attestationSchemaVersion = 2
+const attestationSchemaVersion = 3
 
 // BuildIdentity carries the immutable executable digest and optional build and
 // image metadata emitted with every control response.
@@ -45,9 +45,22 @@ type Snapshot struct {
 	DownstreamBytes               uint64            `json:"downstream_bytes"`
 	DownstreamSourceConnections   map[string]uint64 `json:"downstream_source_connections"`
 	DownstreamSourceBytes         map[string]uint64 `json:"downstream_source_bytes"`
-	ExecutionLeaseID              string            `json:"execution_lease_id,omitempty"`
-	ExecutionLeaseAcquiredAt      *time.Time        `json:"execution_lease_acquired_at,omitempty"`
-	Build                         BuildIdentity     `json:"build"`
+	// DownstreamCommands tallies every command line clients sent upstream, by
+	// verb, since the process started.
+	DownstreamCommands map[string]uint64 `json:"downstream_commands"`
+	// ArticleRequests counts ARTICLE/BODY/HEAD/STAT commands since the process
+	// started; RepeatedArticleRequests counts those whose message-id had
+	// already been requested during the same execution lease, and
+	// DistinctArticleRequests is the number of message-ids seen during the
+	// current lease. Both cumulative counters are monotonic, so a before/after
+	// pair brackets one run the way the byte counters do; the distinct count
+	// resets when a lease is acquired.
+	ArticleRequests          uint64        `json:"article_requests"`
+	RepeatedArticleRequests  uint64        `json:"repeated_article_requests"`
+	DistinctArticleRequests  uint64        `json:"distinct_article_requests"`
+	ExecutionLeaseID         string        `json:"execution_lease_id,omitempty"`
+	ExecutionLeaseAcquiredAt *time.Time    `json:"execution_lease_acquired_at,omitempty"`
+	Build                    BuildIdentity `json:"build"`
 }
 
 // Attestation tracks downstream delivery with atomics and serves immutable
@@ -61,6 +74,11 @@ type Attestation struct {
 	sourcesMu                   sync.Mutex
 	downstreamSourceConnections map[string]uint64
 	downstreamSourceBytes       map[string]uint64
+	commandsMu                  sync.Mutex
+	downstreamCommands          map[string]uint64
+	articleRequests             uint64
+	repeatedArticleRequests     uint64
+	leaseArticles               map[string]struct{}
 	executionLeaseID            string
 	executionLeaseAcquiredAt    time.Time
 	executionLeaseSource        string
@@ -101,6 +119,8 @@ func NewAttestation(config AttestationConfig) *Attestation {
 		config:                      config,
 		downstreamSourceConnections: make(map[string]uint64),
 		downstreamSourceBytes:       make(map[string]uint64),
+		downstreamCommands:          make(map[string]uint64),
+		leaseArticles:               make(map[string]struct{}),
 	}
 }
 
@@ -144,6 +164,9 @@ func (a *Attestation) AcquireExecutionLease(leaseID string) error {
 	a.executionLeaseID = leaseID
 	a.executionLeaseAcquiredAt = time.Now().UTC()
 	a.executionLeaseSource = ""
+	a.commandsMu.Lock()
+	a.leaseArticles = make(map[string]struct{})
+	a.commandsMu.Unlock()
 	return nil
 }
 
@@ -172,7 +195,36 @@ func (a *Attestation) AddDownstreamBytes(source string, n int) {
 	}
 }
 
+// ObserveCommand records one command line a client sent upstream. Article
+// requests are keyed by message-id within the current execution lease so a
+// repeat — the same article asked for twice in one measured run — is counted
+// wherever the second request arrives, on the same connection or another.
+func (a *Attestation) ObserveCommand(verb, argument string) {
+	a.commandsMu.Lock()
+	defer a.commandsMu.Unlock()
+	a.downstreamCommands[verb]++
+	if !articleVerbs[verb] {
+		return
+	}
+	a.articleRequests++
+	id := normalizeMessageID(argument)
+	if id == "" {
+		return
+	}
+	if _, seen := a.leaseArticles[id]; seen {
+		a.repeatedArticleRequests++
+		return
+	}
+	a.leaseArticles[id] = struct{}{}
+}
+
 func (a *Attestation) Snapshot() Snapshot {
+	a.commandsMu.Lock()
+	commands := cloneCounters(a.downstreamCommands)
+	articleRequests := a.articleRequests
+	repeatedArticleRequests := a.repeatedArticleRequests
+	distinctArticles := uint64(len(a.leaseArticles))
+	a.commandsMu.Unlock()
 	a.sourcesMu.Lock()
 	sourceConnections := cloneCounters(a.downstreamSourceConnections)
 	sourceBytes := cloneCounters(a.downstreamSourceBytes)
@@ -194,6 +246,10 @@ func (a *Attestation) Snapshot() Snapshot {
 		DownstreamBytes:               a.downstreamBytes.Load(),
 		DownstreamSourceConnections:   sourceConnections,
 		DownstreamSourceBytes:         sourceBytes,
+		DownstreamCommands:            commands,
+		ArticleRequests:               articleRequests,
+		RepeatedArticleRequests:       repeatedArticleRequests,
+		DistinctArticleRequests:       distinctArticles,
 		ExecutionLeaseID:              leaseID,
 		ExecutionLeaseAcquiredAt:      leaseAcquiredAtPointer,
 		Build:                         a.config.Build,

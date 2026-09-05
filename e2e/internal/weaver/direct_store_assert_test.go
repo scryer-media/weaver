@@ -33,6 +33,29 @@ func TestDirectDemotionAttribution(t *testing.T) {
 	if !byDesignDirectRefusals["member_directory"] {
 		t.Fatal("a directory member is a by-design refusal, not a failure")
 	}
+	// A refused destination over a truthful image: the conventional extractor
+	// applies the same path validator and the same collision rule and fails
+	// the archive the same way, so the demotion is the product working.
+	for _, reason := range []string{"colliding_destinations", "unsafe_destination"} {
+		if !byDesignDirectRefusals[reason] {
+			t.Fatalf("%s is a refused destination, not a carry failure", reason)
+		}
+	}
+}
+
+// The collision is discovered at header time, so it arrives on the same log
+// line shape every other reason does and must be filtered out before the
+// unexpected-demotion tally sees it.
+func TestCollidingDestinationsIsNotAnUnexpectedDemotion(t *testing.T) {
+	line := `WARN direct-store set demoted job_id=10103 set_name=archive ` +
+		`reason="colliding_destinations" volumes=virtual`
+	reason := directDemotionReason(line)
+	if reason != "colliding_destinations" {
+		t.Fatalf("reason = %q", reason)
+	}
+	if !byDesignDirectRefusals[reason] {
+		t.Fatalf("%s must be allowlisted", reason)
+	}
 }
 
 func TestDirectStoreJobNamesParsesColouredLog(t *testing.T) {

@@ -714,3 +714,117 @@ fn zip64_archive_from_7z_is_readable() {
     assert!(out_dir.join("entry_35000.txt").exists());
     assert!(out_dir.join("entry_69999.txt").exists());
 }
+
+/// A 7z archive carrying the metadata 7-Zip records and the extractor used to
+/// ignore: per-entry times on a directory, a file and an empty file, and an
+/// anti-item — an update archive's deletion marker for a path that must not
+/// exist after extraction.
+fn sevenz_archive_with_times_and_anti_item(
+    directory_time: std::time::SystemTime,
+    file_time: std::time::SystemTime,
+    access_time: std::time::SystemTime,
+) -> Vec<u8> {
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter, NtTime};
+
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+
+    let mut directory = ArchiveEntry::new_directory("Silver.Horizon");
+    directory.has_last_modified_date = true;
+    directory.last_modified_date = NtTime::try_from(directory_time).expect("directory time");
+    writer
+        .push_archive_entry(directory, None::<Cursor<Vec<u8>>>)
+        .expect("directory entry");
+
+    let mut episode = ArchiveEntry::new_file("Silver.Horizon/episode.txt");
+    episode.has_last_modified_date = true;
+    episode.last_modified_date = NtTime::try_from(file_time).expect("file time");
+    episode.has_access_date = true;
+    episode.access_date = NtTime::try_from(access_time).expect("access time");
+    writer
+        .push_archive_entry(episode, Some(Cursor::new(b"silver horizon".to_vec())))
+        .expect("file entry");
+
+    let mut empty = ArchiveEntry::new_file("Silver.Horizon/empty.txt");
+    empty.has_last_modified_date = true;
+    empty.last_modified_date = NtTime::try_from(file_time).expect("file time");
+    writer
+        .push_archive_entry(empty, None::<Cursor<Vec<u8>>>)
+        .expect("empty entry");
+
+    let mut stale = ArchiveEntry::new_file("Silver.Horizon/stale.txt");
+    stale.is_anti_item = true;
+    writer
+        .push_archive_entry(stale, None::<Cursor<Vec<u8>>>)
+        .expect("anti-item entry");
+
+    writer.finish().expect("finish").into_inner()
+}
+
+#[test]
+fn sevenzip_extraction_restores_entry_times_and_skips_anti_items() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let tmp = TempDir::new().unwrap();
+    let archive_path = tmp.path().join("silver_horizon.7z");
+    let out_dir = tmp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    // Whole seconds, so no filesystem's time resolution can round them.
+    let directory_time = UNIX_EPOCH + Duration::from_secs(1_588_561_321);
+    let file_time = UNIX_EPOCH + Duration::from_secs(1_623_053_350);
+    let access_time = UNIX_EPOCH + Duration::from_secs(1_623_139_750);
+    fs::write(
+        &archive_path,
+        sevenz_archive_with_times_and_anti_item(directory_time, file_time, access_time),
+    )
+    .unwrap();
+
+    let (root, budget) = test_extraction_security(&out_dir);
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
+    let context = SevenZipExtractionContext {
+        job_id: JobId(41812),
+        set_name: "silver_horizon.7z".to_string(),
+        output_dir: out_dir.clone(),
+        root: Arc::new(root),
+        budget,
+        password: sevenz_rust2::Password::empty(),
+        event_tx,
+        phase_counters: Arc::new(PhaseCounters::default()),
+        decode_memory: SevenZipDecodeMemory::HeldByCaller,
+    };
+    let outcome = extract_7z_stream(&context, || {
+        fs::File::open(&archive_path).map_err(|error| error.to_string())
+    })
+    .expect("7z extraction");
+
+    assert_eq!(
+        outcome.extracted,
+        vec![
+            "Silver.Horizon/episode.txt".to_string(),
+            "Silver.Horizon/empty.txt".to_string(),
+        ],
+        "the anti-item is neither extracted nor reported as a member"
+    );
+    assert!(
+        !out_dir.join("Silver.Horizon/stale.txt").exists(),
+        "an anti-item marks a deletion and must not become an output"
+    );
+
+    // Metadata before content: reading the file would move its access time.
+    let episode = fs::metadata(out_dir.join("Silver.Horizon/episode.txt")).unwrap();
+    assert_eq!(episode.modified().unwrap(), file_time);
+    assert_eq!(episode.accessed().unwrap(), access_time);
+    assert_eq!(
+        fs::read(out_dir.join("Silver.Horizon/episode.txt")).unwrap(),
+        b"silver horizon"
+    );
+
+    let empty = fs::metadata(out_dir.join("Silver.Horizon/empty.txt")).unwrap();
+    assert_eq!(empty.len(), 0);
+    assert_eq!(empty.modified().unwrap(), file_time);
+
+    // The directory is stamped after its members were written into it.
+    let directory = fs::metadata(out_dir.join("Silver.Horizon")).unwrap();
+    assert!(directory.is_dir());
+    assert_eq!(directory.modified().unwrap(), directory_time);
+}

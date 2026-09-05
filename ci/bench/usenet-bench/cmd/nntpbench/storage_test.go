@@ -101,7 +101,7 @@ func storageSummarySet(t *testing.T, profile benchmark.StorageProfile) []benchma
 
 func TestSummaryStratumCarriesTheStorageProfile(t *testing.T) {
 	profile := nfsStorageProfile(t)
-	report, err := buildSummaryReport(storageSummarySet(t, profile), benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000)
+	report, err := buildSummaryReport(storageSummarySet(t, profile), nil, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestSummaryNeverPoolsLocalAndShapedStorage(t *testing.T) {
 	local := storageSummarySet(t, benchmark.DefaultStorageProfile())
 	shaped := storageSummarySet(t, nfsStorageProfile(t))
 	mixed := append(append([]benchmark.QueueArtifact{}, local...), shaped...)
-	_, err := buildSummaryReport(mixed, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000)
+	_, err := buildSummaryReport(mixed, nil, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000)
 	if err == nil {
 		t.Fatal("local and shaped-storage runs must never be summarized together")
 	}
@@ -135,13 +135,13 @@ func TestSummaryRequiresStorageEvidenceThatMatchesThePlan(t *testing.T) {
 
 	missing := storageSummarySet(t, profile)
 	missing[0].StorageAttestation = nil
-	if _, err := buildSummaryReport(missing, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000); err == nil {
+	if _, err := buildSummaryReport(missing, nil, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000); err == nil {
 		t.Fatal("a shaped-storage artifact without its attestation must not be summarized")
 	}
 
 	unexpected := storageSummarySet(t, benchmark.DefaultStorageProfile())
 	unexpected[0].StorageAttestation = storageAttestationFor(profile)
-	if _, err := buildSummaryReport(unexpected, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000); err == nil {
+	if _, err := buildSummaryReport(unexpected, nil, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000); err == nil {
 		t.Fatal("a local artifact carrying storage evidence must be refused")
 	}
 
@@ -151,14 +151,14 @@ func TestSummaryRequiresStorageEvidenceThatMatchesThePlan(t *testing.T) {
 	}
 	mismatched := storageSummarySet(t, profile)
 	mismatched[0].StorageAttestation = storageAttestationFor(other)
-	if _, err := buildSummaryReport(mismatched, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000); err == nil {
+	if _, err := buildSummaryReport(mismatched, nil, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000); err == nil {
 		t.Fatal("an attestation describing a different link must be refused")
 	}
 
 	unproven := storageSummarySet(t, profile)
 	unproven[0].StorageAttestation.After.IngressBytes = unproven[0].StorageAttestation.Before.IngressBytes
 	unproven[0].StorageAttestation.IngressBytes = 0
-	if _, err := buildSummaryReport(unproven, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000); err == nil {
+	if _, err := buildSummaryReport(unproven, nil, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000); err == nil {
 		t.Fatal("an attestation whose qdiscs saw no client traffic must be refused")
 	}
 }

@@ -437,7 +437,9 @@ fn extract_7z_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput, 
                       reader: &mut dyn Read,
                       _dest: &PathBuf|
      -> Result<bool, sevenz_rust2::Error> {
-        if entry.is_directory() {
+        // An anti-item is a deletion marker with no data; read as a member it
+        // would be an empty NZB.
+        if entry.is_directory() || entry.is_anti_item() {
             return Ok(true);
         }
         let safe_path = match validate_archive_entry_path(entry.name(), "7z") {

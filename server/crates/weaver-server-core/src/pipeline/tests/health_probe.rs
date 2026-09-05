@@ -140,6 +140,7 @@ async fn probe_activation_keeps_queues_live_and_completion_clears_health_probing
 
     pipeline.handle_probe_update(ProbeUpdate {
         job_id,
+        probe_round: 0,
         total: 1,
         missed: 0,
         done: true,
@@ -212,6 +213,7 @@ async fn probe_completion_inconclusive_restores_queues_without_health_damage() {
     pipeline.activate_health_probes(job_id);
     pipeline.handle_probe_update(ProbeUpdate {
         job_id,
+        probe_round: 0,
         total: 0,
         missed: 0,
         done: true,
@@ -248,6 +250,7 @@ async fn inconclusive_final_probe_still_enforces_critical_health() {
     pipeline.activate_health_probes(job_id);
     pipeline.handle_probe_update(ProbeUpdate {
         job_id,
+        probe_round: 0,
         total: 0,
         missed: 0,
         done: true,
@@ -295,6 +298,7 @@ async fn probe_completion_does_not_immediately_reenter_checking() {
     pipeline.activate_health_probes(job_id);
     pipeline.handle_probe_update(ProbeUpdate {
         job_id,
+        probe_round: 0,
         total: 1,
         missed: 0,
         done: true,
@@ -368,6 +372,7 @@ async fn clean_probe_waits_for_material_new_damage_before_rearming() {
     pipeline.activate_health_probes(job_id);
     pipeline.handle_probe_update(ProbeUpdate {
         job_id,
+        probe_round: 0,
         total: 10,
         missed: 0,
         done: true,
@@ -462,6 +467,7 @@ async fn missed_probe_rearms_on_next_failed_byte() {
     pipeline.activate_health_probes(job_id);
     pipeline.handle_probe_update(ProbeUpdate {
         job_id,
+        probe_round: 0,
         total: 10,
         missed: 1,
         done: true,
@@ -495,4 +501,215 @@ async fn missed_probe_rearms_on_next_failed_byte() {
     let state = pipeline.jobs.get(&job_id).unwrap();
     assert!(state.health_probing);
     assert!(matches!(state.status, JobStatus::Checking));
+}
+
+/// A probe still in flight must not postpone PAR2 recovery promotion.
+///
+/// A volume the poster never uploaded leaves the job with nothing more to
+/// download and a probe running against a soft timeout. The completion
+/// checkpoint is what promotes the recovery blocks that repair the hole, and
+/// counting the probe as pending pipeline work held that promotion — and every
+/// second of repair and extraction behind it — until the probe gave up.
+#[tokio::test]
+async fn health_probe_in_flight_does_not_delay_recovery_promotion() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30311);
+    let payload_filename = "silver.horizon.mkv";
+    let index_filename = "silver.horizon.par2";
+    let recovery_filename = "silver.horizon.vol00+01.par2";
+    let original_payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let mut damaged_payload = original_payload.clone();
+    for byte in &mut damaged_payload[64..128] {
+        *byte = 0;
+    }
+    let par2_bytes = build_test_par2_index(payload_filename, &original_payload, 64);
+    let spec = JobSpec {
+        name: "Withheld Volume Probe Overlap".to_string(),
+        password: None,
+        total_bytes: original_payload.len() as u64 + par2_bytes.len() as u64 + 64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "probe-overlap-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "probe-overlap-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "probe-overlap-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: recovery_filename.to_string(),
+                role: FileRole::from_filename(recovery_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "probe-overlap-volume@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 0, payload_filename, &damaged_payload).await;
+    write_and_complete_file(&mut pipeline, job_id, 1, index_filename, &par2_bytes).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.recovery_queue.push(DownloadWork {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 2,
+                },
+                segment_number: 0,
+            },
+            message_id: MessageId::new("probe-overlap-volume@example.com"),
+            groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+            priority: 1000,
+            byte_estimate: 64,
+            retry_count: 0,
+            is_recovery: true,
+            completion_critical: false,
+            exclude_servers: Vec::new(),
+            avoid_server: None,
+        });
+    }
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &original_payload, 64, 0),
+        &[
+            (1, index_filename, 0, false),
+            (2, recovery_filename, 1, false),
+        ],
+    );
+
+    pipeline.activate_health_probes(job_id);
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert!(state.health_probing);
+        assert!(matches!(state.status, JobStatus::Checking));
+    }
+
+    // The probe holds the checkpoint shut while the job is still downloading.
+    pipeline.check_job_completion(job_id).await;
+    assert!(
+        !pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .download_queue
+            .has_recovery_work()
+    );
+
+    // The last segment settles. The probe has nothing left to say, so it is
+    // retired rather than waited on.
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.maybe_finish_download_pass(job_id);
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert!(!state.health_probing);
+        assert!(matches!(state.status, JobStatus::Downloading));
+    }
+    assert!(pipeline.pending_completion_checks.contains(&job_id));
+
+    pipeline.check_job_completion(job_id).await;
+    // The damaged-path read is detached; the promotion it asks for happens when
+    // its verdict lands back on the pipeline task.
+    settle_par2_analysis_work(&mut pipeline).await;
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .download_queue
+            .has_recovery_work(),
+        "recovery must be promoted without waiting for the probe to time out"
+    );
+}
+
+/// Retiring the probe must not leave an unrecoverable job parked.
+///
+/// Before the probe was retired at drain time, a job with no recovery data and
+/// articles it could never fetch reached its failure through the probe's own
+/// verdict. With the probe retired instead, the completion checkpoint has to
+/// carry that verdict on its own: the pass is over, files are still short, and
+/// nothing can repair them.
+#[tokio::test]
+async fn a_retired_probe_still_lets_an_unrecoverable_job_fail() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30312);
+    let spec = standalone_job_spec(
+        "Retired Probe Unrecoverable",
+        &[
+            ("silver-horizon-a.bin".to_string(), 100),
+            ("silver-horizon-b.bin".to_string(), 100),
+            ("silver-horizon-c.bin".to_string(), 100),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.failed_bytes = 200;
+    }
+    pipeline.activate_health_probes(job_id);
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert!(state.health_probing);
+        assert!(matches!(state.status, JobStatus::Checking));
+    }
+
+    // Every article the job could try has reached a terminal state.
+    pipeline.active_download_passes.insert(job_id);
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.maybe_finish_download_pass(job_id);
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert!(!state.health_probing, "the probe should have been retired");
+    }
+    assert!(pipeline.pending_completion_checks.contains(&job_id));
+
+    pipeline.check_job_completion(job_id).await;
+
+    let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {
+        panic!(
+            "an unrecoverable job must fail once the probe is retired: {}",
+            debug_job_state(&pipeline, job_id)
+        );
+    };
+    assert!(
+        error.contains("no PAR2 metadata is available for repair"),
+        "{error}"
+    );
 }

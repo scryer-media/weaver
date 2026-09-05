@@ -217,6 +217,7 @@ impl Pipeline {
     pub(super) fn handle_probe_update(&mut self, update: ProbeUpdate) {
         let ProbeUpdate {
             job_id,
+            probe_round,
             total,
             missed,
             done,
@@ -228,6 +229,20 @@ impl Pipeline {
                 return;
             }
         } else {
+            return;
+        }
+
+        // Only the round this job is still waiting on may act. A retired round
+        // (see `retire_health_probe_if_download_pipeline_drained`) or one
+        // superseded by a later activation must not fold a stale projection
+        // into an already-settled ledger, fail a job whose real terminal states
+        // are in, or shove the status back to `Downloading` after the
+        // checkpoint has moved the job on. `health_probe_round` is incremented
+        // past `probe_round` when that round was armed.
+        let is_live_round = self.jobs.get(&job_id).is_some_and(|state| {
+            state.health_probing && state.health_probe_round == probe_round.wrapping_add(1)
+        });
+        if !is_live_round {
             return;
         }
 
@@ -304,6 +319,65 @@ impl Pipeline {
                 self.schedule_job_completion_check(job_id);
             }
         }
+    }
+
+    /// Retire an in-flight health probe once the job has nothing left to
+    /// download but the probe itself.
+    ///
+    /// A probe is an *early* estimate: it samples the release while segments
+    /// are still arriving so an entirely missing release can be abandoned
+    /// before a gigabyte proves it. Once the queue has drained and every
+    /// segment has reached a terminal state the job holds the real answer the
+    /// probe was approximating, and all an in-flight probe can still do is hold
+    /// the job in `Checking` — which gates the completion checkpoint, and with
+    /// it PAR2 recovery promotion — until its own soft timeout expires. A
+    /// volume that was never posted spent 15 s of dead air exactly there.
+    ///
+    /// The round is abandoned rather than awaited: `handle_probe_update` drops
+    /// a result whose round the job is no longer waiting on, so a late probe
+    /// cannot re-apply a projection, fail a settled job, or push the status
+    /// back to `Downloading` behind the checkpoint.
+    ///
+    /// Held segments (the decode breaker's, not the probe's) still count as
+    /// work, so a job parking any is left alone.
+    pub(crate) fn retire_health_probe_if_download_pipeline_drained(
+        &mut self,
+        job_id: JobId,
+    ) -> bool {
+        let probing = self.jobs.get(&job_id).is_some_and(|state| {
+            state.health_probing
+                && state.held_segments.is_empty()
+                && !matches!(state.status, JobStatus::Failed { .. } | JobStatus::Complete)
+        });
+        if !probing || self.job_has_pending_download_work_beyond_health_probe(job_id) {
+            return false;
+        }
+
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return false;
+        };
+        // Re-arm as if the round had come back clean: the ledger already says
+        // what the sample would have, so an immediate re-arm would only put
+        // the job straight back into `Checking`.
+        state.last_health_probe_failed_bytes = Self::health_decision_failed_bytes(state);
+        state.next_health_probe_failed_bytes =
+            Self::next_health_probe_failed_bytes(state, 0, false);
+        state.health_probing = false;
+        let was_checking = matches!(state.status, JobStatus::Checking);
+
+        info!(
+            job_id = job_id.0,
+            "retiring health probe — every segment already reached a terminal state"
+        );
+
+        if was_checking {
+            self.transition_postprocessing_status(
+                job_id,
+                JobStatus::Downloading,
+                Some("downloading"),
+            );
+        }
+        true
     }
 
     /// Reject untrusted delivery content or an incomplete security check
@@ -590,6 +664,15 @@ impl Pipeline {
         let probe_count = probes.len();
         let nntp = Arc::clone(&self.nntp);
         let probe_tx = self.probe_result_tx.clone();
+        // A probe STAT waits on the same per-server connection semaphore as
+        // the download lanes, and an owned lane that has run out of work keeps
+        // its connection — and its permit — cached. Once a job's queue drains
+        // every permit can sit parked on an idle lane, and the STAT then waits
+        // out its entire soft timeout and aborts the probe as inconclusive.
+        // Reclaim one idle owned permit per saturated server first, exactly as
+        // an async download batch does before acquiring its lane.
+        let owned_lane_release = self.owned_download_lane_pool.release_handle();
+        let probe_server_count = self.nntp.pool().server_count();
 
         info!(
             job_id = job_id.0,
@@ -619,12 +702,19 @@ impl Pipeline {
             for batch in probes.chunks(BATCH_SIZE) {
                 let msg_ids: Vec<&str> = batch.iter().map(|mid| mid.as_str()).collect();
 
+                for server_idx in 0..probe_server_count {
+                    if !nntp.has_available_permit(weaver_nntp::pool::ServerId(server_idx)) {
+                        owned_lane_release.release_idle_permit(server_idx);
+                    }
+                }
+
                 let results = nntp.confirm_exists_for_probe(&msg_ids).await;
                 if results.inconclusive {
                     warn!("health probe: confirmation batch inconclusive, aborting probe");
                     let _ = probe_tx
                         .send(ProbeUpdate {
                             job_id,
+                            probe_round,
                             total: checked,
                             missed,
                             done: true,
@@ -647,6 +737,7 @@ impl Pipeline {
                     let _ = probe_tx
                         .send(ProbeUpdate {
                             job_id,
+                            probe_round,
                             total: checked,
                             missed,
                             done: false,
@@ -665,6 +756,7 @@ impl Pipeline {
             let _ = probe_tx
                 .send(ProbeUpdate {
                     job_id,
+                    probe_round,
                     total: probe_count,
                     missed,
                     done: true,

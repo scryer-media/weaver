@@ -34,6 +34,45 @@ impl<W> CountingWriter<W> {
     fn new(inner: W, attempt: Arc<PhaseAttemptCounters>) -> Self {
         Self { inner, attempt }
     }
+
+    fn get_ref(&self) -> &W {
+        &self.inner
+    }
+}
+
+/// The times a 7z entry recorded, as a stamp for its output.
+///
+/// 7z stores each time behind its own presence bit; an entry written by a
+/// tool that recorded none has no times to restore, and stamping the 1601
+/// epoch on it would be an invention. Only the modification time is required
+/// for a stamp — that is the one every tool records and the one the user
+/// sees; the access time rides along when present.
+fn sevenz_entry_times(entry: &sevenz_rust2::ArchiveEntry) -> Option<SevenZipEntryTimes> {
+    if !entry.has_last_modified_date {
+        return None;
+    }
+    Some(SevenZipEntryTimes {
+        modified: entry.last_modified_date().into(),
+        accessed: entry.has_access_date.then(|| entry.access_date().into()),
+    })
+}
+
+/// The times a 7z entry recorded, kept apart so they can be stamped either
+/// through an open file handle or, for a directory, by name from its root.
+#[derive(Clone, Copy)]
+struct SevenZipEntryTimes {
+    modified: std::time::SystemTime,
+    accessed: Option<std::time::SystemTime>,
+}
+
+impl SevenZipEntryTimes {
+    fn file_times(self) -> std::fs::FileTimes {
+        let mut times = std::fs::FileTimes::new().set_modified(self.modified);
+        if let Some(accessed) = self.accessed {
+            times = times.set_accessed(accessed);
+        }
+        times
+    }
 }
 
 impl<W: Write> Write for CountingWriter<W> {
@@ -294,6 +333,10 @@ where
 
     let mut extracted_members = Vec::new();
     let extracted_members_ref = &mut extracted_members;
+    // Directory times are stamped after the decode, once nothing more will
+    // be created inside them.
+    let mut directory_times: Vec<(PathBuf, SevenZipEntryTimes)> = Vec::new();
+    let directory_times_ref = &mut directory_times;
     let event_tx_ref = event_tx;
     let root_ref = root;
     let budget_ref = budget;
@@ -305,6 +348,20 @@ where
         let safe_path = root_ref
             .validate_relative_path(entry.name())
             .map_err(|error| std::io::Error::other(budget_ref.reject_unsafe_path(error)))?;
+        // An anti-item is an update archive's deletion marker: it names a
+        // path that must not exist once the update is applied, and carries
+        // no data. Extraction creates nothing for it — an empty file or
+        // directory under that name would be the opposite of what the
+        // archive says — and deleting is an update operation this path
+        // does not perform.
+        if entry.is_anti_item() {
+            tracing::debug!(
+                job_id = job_id.0,
+                member = entry.name(),
+                "7z anti-item skipped: it marks a deletion, not a member"
+            );
+            return Ok(true);
+        }
         budget_ref
             .check_member_metadata(entry.name(), entry.size())
             .map_err(std::io::Error::other)?;
@@ -312,6 +369,9 @@ where
             root_ref
                 .create_dir(&safe_path, budget_ref)
                 .map_err(std::io::Error::other)?;
+            if let Some(times) = sevenz_entry_times(entry) {
+                directory_times_ref.push((safe_path, times));
+            }
             return Ok(true);
         }
 
@@ -336,6 +396,18 @@ where
                 return Err(error.into());
             }
         };
+        // The stamp is metadata, not payload: a filesystem that refuses it
+        // has still received every byte, so the member stays extracted.
+        if let Some(times) = sevenz_entry_times(entry)
+            && let Err(error) = file.get_ref().set_times(times.file_times())
+        {
+            tracing::debug!(
+                job_id = job_id.0,
+                member = entry.name(),
+                %error,
+                "7z member times not restored"
+            );
+        }
 
         tracing::info!(
             job_id = job_id.0,
@@ -374,6 +446,19 @@ where
         SevenZipDecodeMemory::ReservedPerPass { .. } => {
             decode_7z_streaming(reader, output_dir, password.clone(), extract_fn)
                 .map_err(|e| format!("7z extraction failed: {e}"))?;
+        }
+    }
+
+    // Deepest directories first: a directory's own stamp is the last thing
+    // to touch it, and nothing below it is touched afterwards.
+    for (relative, times) in directory_times.into_iter().rev() {
+        if let Err(error) = root.set_dir_times(&relative, times.modified, times.accessed) {
+            tracing::debug!(
+                job_id = job_id.0,
+                directory = %relative.display(),
+                %error,
+                "7z directory times not restored"
+            );
         }
     }
 

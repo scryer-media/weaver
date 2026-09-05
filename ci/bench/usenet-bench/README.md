@@ -129,7 +129,7 @@ Together they cover the RARLAB writer eras and their archive families across:
 | --- | --- |
 | Writer era | RAR 3.93, 4.20, 5.00, 6.24, 7.23 and 7-Zip 26.02 (official upstream Linux releases, SHA-256 verified in the image build) |
 | Archive format | legacy RAR4 (3.93 / 4.20 writers), RAR5 (5.00 / 6.24 / 7.23 writers, explicit `-ma5`), or 7z (official 7-Zip build) |
-| Compression | store (`-m0`) or release-style normal compression (`-m5`, solid where declared, maximum dictionary, RAR5 quick-open disabled) |
+| Compression | store (`-m0`) or release-style normal compression (`-m5`, solid where declared, maximum dictionary, RAR5 quick-open disabled except on the `rar5-7-quickopen` set, which keeps a quick-open record for every header) |
 | Solidity | non-solid, solid |
 | Encryption | none, data encryption, encrypted headers |
 | Input data | incompressible, moderately compressible |
@@ -381,6 +381,19 @@ benchmark host or network namespace with no other NNTP clients is a
 publication prerequisite; the lease and source counters enforce the boundary
 between cooperating runs and detect every differently sourced connection.
 
+The shaper also keeps a census of the client's own command stream: every
+command line the client sent upstream, tallied by verb, and for
+`ARTICLE`/`BODY`/`HEAD`/`STAT` the message-ids it named. Acquiring the lease
+resets the set of ids seen, so the post-run snapshot's
+`distinct_article_requests` is the run's own, while `article_requests` and
+`repeated_article_requests` are cumulative and bracketed like the byte
+counters. The run artifact records the delta as `shaper_article_census`.
+Downstream bytes are what the shaper wrote into the client's sockets —
+application bytes, not wire bytes — so a client whose bytes exceed the NZB's
+article bytes either asked for articles twice (repeats > 0) or read past what
+it asked for (repeats = 0). A schema-2 shaper carries no census and the field
+is absent.
+
 By default the topology publishes the shaper only on `127.0.0.1`. For a remote
 native lane set `NNTP_PUBLIC_BIND_ADDR` to a specific LAN address, firewall it
 to the benchmark host, and give the certificate a stable DNS SAN (for example
@@ -453,6 +466,18 @@ carries all three targets and each host runs only its own.
 `local` and a default plan is byte-for-byte what it was apart from the new
 `storage_profile` field.
 
+`--exclude-client client:fixture-id:reason` (repeatable) leaves one client out
+of one fixture's blocks, with the reason persisted in the plan under
+`client_exclusions`. It exists for the client that deterministically cannot
+finish a fixture — SABnzbd on the RAR recovery-volume (`.rev`) fixtures, which
+it does not use — where re-running the failure every block costs time and
+teaches nothing. The outcome is not dropped: the summarizer counts every
+excluded block as that client not finishing (`baseline_excluded` /
+`candidate_excluded` inside `completion`), reports the reason under the
+comparison's `client_exclusions`, and withholds the paired comparison exactly
+as it would after observed failures. A plan that excludes every client from a
+fixture, names an undeclared client or fixture, or omits the reason is refused.
+
 ### 6. Run the sequential suite
 
 This is the primary measurement. Every persisted run gets fresh client state
@@ -485,6 +510,14 @@ immutable `execution-manifest.json`, plan and catalog snapshots with SHA-256
 digests, the harness-executable digest, a host fingerprint and secret-redacted
 arguments. Use a new artifact root per invocation; nothing is overwritten.
 
+The controller's exit status separates the two ways a pass can end short of
+clean. `0`: every suite passed with verified output. `2`: every suite ran to a
+client outcome, but at least one client did not finish (`completed_with_dnf`
+artifacts) — a recorded result the summarizer admits, not a reason to stop a
+chain of runs. `1`: at least one suite `failed` on the harness side (the
+adapter could not run, an attestation was missing, an artifact could not be
+written), and that root is not publishable until the cause is fixed.
+
 `CLIENT_JOB_TIMEOUT` / `NATIVE_JOB_TIMEOUT` default to `20m` and bound how long
 a submitted job may run without reaching a terminal state. A Docker-lane job
 that exceeds it is recorded with terminal status `timed_out` and the client's
@@ -508,8 +541,13 @@ selection bias against the slower API, not a precision gain.
 Two other modes exist and are labelled apart from the headline:
 
 - `queue-transition` — generate and seed `direct-mkv-200mb`, plan **only** that
-  fixture with 20 runs per lane, and measure first-submission-to-last-terminal
-  wall clock across forced duplicates. It reports no per-job scores.
+  fixture, and measure first-submission-to-last-verified-output wall clock
+  across forced duplicates: the plan's `--repetitions` is the number of copies
+  queued per client lane (at least 2; the original design point was 20). It
+  reports no per-job scores. `summarize --mode queue-drain --artifacts <root>`
+  binds each lane to the snapshotted plan and prints its drain wall clock,
+  copies, product identity and TLS label; a lane with a copy that did not
+  finish is listed with its recorded failure and no time.
 - `run` — a cold, one-NZB diagnostic. Never the headline result.
 
 Independent output verification is also available on its own:
@@ -551,22 +589,57 @@ Only sequential artifacts that describe a client outcome are admitted:
 `passed` (verified output) and `completed_with_dnf` (the client reached a
 terminal failure, or its output failed neutral verification). Clients are
 paired inside the same randomized repetition block, stratified by fixture,
-profile, target, transport / TLS validation, archive toolchain, server link
-and storage profile. Each stratum reports how many blocks each client
+profile, target, transport, archive toolchain, server link and storage
+profile. How each client validated TLS is a property of that client's run, not
+of the block — SABnzbd's TLS runs are `tls-unverified` while the others are
+`tls-ca-verified` — so it is not part of the pairing key; the comparison
+carries each client's validation and label under `transport_policies`, and a
+client whose policy changes inside one stratum is refused as two products
+pooled. Each stratum reports how many blocks each client
 finished, then, over the blocks both clients finished, the raw medians and
 coefficients of variation, the paired geometric-mean ratio and a deterministic
 10 000-resample bootstrap 95 % interval on the log ratio. There is no outlier
 deletion and no pooled score. A block where one client did not finish is
 excluded from the timing comparison and counted under `completion`; a client
 that cannot finish a fixture is a result, and it must not hide the rest of the
-run. When the failures leave a stratum with fewer than the minimum paired
-blocks, that stratum keeps its counts and its comparison is withheld with a
-stated reason. A harness-side `failed` suite, a missing or unverified run, an
+run. A client the plan excluded on a fixture (`--exclude-client`) is counted
+the same way, as not finishing every block, with the plan's reason reported
+under `client_exclusions`. When the failures leave a stratum with fewer than
+the minimum paired blocks, that stratum keeps its counts and its comparison is
+withheld with a stated reason. A harness-side `failed` suite, a missing or unverified run, an
 incomplete pair with no recorded failure, fewer than 20 paired blocks for any
 other reason, or terminal-observation uncertainty above its limit (1 % of the
 run or 100 ms, whichever is larger) still fails the summary closed.
 So does an artifact root that mixes storage profiles: a local run and an NFS
 run answer different questions and are summarized separately, never pooled.
+
+Each stratum also carries a `cpu_time` comparison: the two clients'
+`cpu_time_nanoseconds` paired over the same blocks, with the same medians,
+geometric-mean ratio (candidate over baseline; below 1 means the candidate
+spent less CPU) and bootstrap interval. In the Docker lane that counter is the
+whole container's cgroup, so a client that hands its work to `unrar`, `par2`
+or `7z` is charged for them exactly as a client that does the work in-process
+is charged for its own threads; that is the point of the comparison. It is
+secondary evidence and never fails the summary closed. `accounting` states,
+per client, the counter's scope, collector and collector version and how many
+blocks had no measured counter, with the lane's recorded reasons; a block
+where either counter is unavailable is dropped from the CPU pairing only. The
+comparison is withheld when the two clients were measured at different scopes
+(a `client_process` counter and a `client_container` counter are different
+quantities), when a client's counter source changes inside one stratum, or
+when fewer than two blocks pair; pairing fewer blocks than `--minimum-blocks`
+is stated under `caveats` rather than withheld. The NFS profiles' CPU
+accounting caveat is carried under `caveats` too.
+
+Each stratum also carries `transfer`: per client, over its finished shaped
+blocks, the minimum, median and maximum `shaper_downstream_bytes` and, when the
+shaper counted commands, the summed `article_census` (blocks covered, article
+requests, distinct message-ids, repeated requests). It is evidence rather than
+a comparison — no ratio, no gate — and it is what makes a client that finishes
+fast by pulling more than the NZB carries visible next to its wall clock. A
+deterministic client lands within a few bytes of itself from block to block;
+a spread is a finding, and the census says whether the excess was requested
+twice or read past.
 
 ## Pre-seeded NNTP corpus image
 
@@ -915,7 +988,13 @@ Per run the artifact records:
   this cold-scope counter by the narrower primary wall clock. Under the `nfs`
   storage profiles this counter excludes NFS client kernel time, which the host
   kernel spends outside the client's cgroup; the caveat is recorded in every
-  NFS attestation.
+  NFS attestation. `summarize` pairs this counter per stratum as `cpu_time`
+  (see [7. Summarize](#7-summarize)).
+- `shaper_downstream_bytes` and `shaper_article_census` — shaped runs: the
+  application bytes the shaper wrote to the client and, with a schema-3
+  shaper, how many article requests the client sent, how many distinct
+  message-ids they named and how many repeated one already requested in the
+  run. `summarize` reports them per stratum as `transfer`.
 - `instructions_retired` — Docker lane on native Linux: cgroup-scoped
   `perf stat -a -G … -e instructions` over the same interval, raw output kept as
   `config/perf-instructions.txt`. Where `perf` cannot attach (Docker Desktop,
@@ -944,7 +1023,11 @@ this harness, so its TLS adapter uses `ssl=1` with `ssl_verify=0` and its
 results are labelled **`tls-unverified`**, never `tls-ca-verified`. This is
 confined to the isolated benchmark network and measures encrypted transport,
 not authenticated TLS; the setting appears in every rendered SABnzbd config and
-result artifact.
+result artifact. The label is reported on every comparison that includes
+SABnzbd, but it is not part of the summarizer's pairing key: a `tls` block
+pairs SABnzbd's `tls-unverified` run with Weaver's `tls-ca-verified` one, and
+the report says so rather than leaving the pair unformed.
+
 
 See [`configs/clients/baseline.json`](configs/clients/baseline.json) for the
 cross-client baseline and

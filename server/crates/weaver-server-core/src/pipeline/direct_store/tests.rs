@@ -32,6 +32,27 @@ use super::{ByteRanges, DirectStoreGate, parse_enabled};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, SegmentSpec};
 
+/// The reconstruction sweep as its single-volume callers read it: `Ok` when
+/// every volume rebuilt, `Err(first failure)` when one did not.
+///
+/// [`super::reconstruct::reconstruct_volumes`] itself reports per volume now —
+/// a refused volume comes back with `contiguous: 0` and its own `failure`, and
+/// its siblings keep their bytes. Every test below drives exactly one volume,
+/// where the two shapes say the same thing; the per-volume behaviour has its
+/// own test in `pipeline::tests::direct_store`.
+fn sweep_volumes(
+    provider: &super::provider::HybridVolumeProvider,
+    plans: &[super::reconstruct::VolumeReconstruction],
+    sparse: super::sparse::SparseMarking,
+) -> Result<Vec<super::reconstruct::ReconstructedVolume>, super::reconstruct::ReconstructionFailure>
+{
+    let rebuilt = super::reconstruct::reconstruct_volumes(provider, plans, sparse);
+    match rebuilt.iter().find_map(|volume| volume.failure.clone()) {
+        Some(failure) => Err(failure),
+        None => Ok(rebuilt),
+    }
+}
+
 const JOB: JobId = JobId(7701);
 const SET: &str = "Silver.Horizon.S01E04";
 const PLAN_DIGEST: [u8; 32] = [0xA5; 32];
@@ -2968,7 +2989,7 @@ fn a_virtual_volume_serves_its_holds_as_posted_bytes() {
     let path = dir.path().join("silver.horizon.part01.rar");
     let mut with_holds = covered;
     with_holds.insert(100, 40);
-    let rebuilt = super::reconstruct::reconstruct_volumes(
+    let rebuilt = sweep_volumes(
         &provider,
         &[reconstruction_target(
             &fixture,
@@ -3629,7 +3650,7 @@ fn a_partially_covered_volume_is_rebuilt_and_verified_run_by_run() {
     covered.insert(300, 100);
 
     let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
-    let rebuilt = super::reconstruct::reconstruct_volumes(
+    let rebuilt = sweep_volumes(
         &provider,
         &[reconstruction_target(
             &fixture,
@@ -3675,37 +3696,59 @@ fn materialized_segments_above_a_hole_stay_committed_without_advancing_the_floor
 }
 
 #[test]
-fn a_covered_run_with_no_composed_reference_refuses_to_be_rebuilt() {
+fn a_covered_run_with_no_composed_reference_refuses_only_the_articles_it_covers() {
     // "Verify where available" is the wrong default for a sweep that reads
-    // through sparse files. A run with no reference value is refused, and the
-    // fallback refetches — which is always correct — rather than putting bytes
-    // nothing checked under a published floor.
+    // through sparse files: a chunk with no reference value is refused rather
+    // than put under a published floor.
+    //
+    // The refusal is charged to that chunk alone. A covered range is a *merged*
+    // run — on a real volume it is every article the coverage ever abutted — so
+    // charging it to the range would mean one unclosable frontier costing every
+    // article below it. That frontier is exactly the shape a demotion catching a
+    // volume mid-download produces, which is why it must cost the frontier and
+    // nothing else.
     let fixture = provider_fixture(whole_volume_covered());
     let crcs = provider_article_crcs(&fixture.conventional);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("silver.horizon.part01.rar");
 
-    // Ends inside an article, so no composition can vouch for it.
+    // Two whole articles and then a frontier that stops inside a third, which no
+    // composition can vouch for.
     let mut covered = ByteRanges::new();
     covered.insert(0, 250);
 
     let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
-    let failure = super::reconstruct::reconstruct_volumes(
+    let rebuilt = super::reconstruct::reconstruct_volumes(
         &provider,
         &[reconstruction_target(&fixture, path.clone(), covered, crcs)],
         super::sparse::SparseMarking::Platform,
-    )
-    .expect_err("a run with no reference must not be written");
+    );
     assert_eq!(
-        failure,
-        super::reconstruct::ReconstructionFailure::UnverifiableRun {
+        rebuilt[0].failure,
+        Some(super::reconstruct::ReconstructionFailure::UnverifiableRun {
             volume_index: 0,
-            offset: 0,
-        }
+            offset: 200,
+        }),
+        "the refusal names the frontier, not the start of the merged run"
+    );
+    assert_eq!(
+        rebuilt[0].verified.ranges(),
+        &[(0, 200)],
+        "the two whole articles below the frontier are still vouched for"
+    );
+    assert_eq!(rebuilt[0].contiguous, 200);
+    assert!(!rebuilt[0].complete);
+
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(
+        &written[..200],
+        &fixture.conventional[..200],
+        "the verified articles are byte-exact"
     );
     assert!(
-        !path.exists(),
-        "a refused reconstruction leaves nothing for the refetch to write around"
+        written[200..250].iter().all(|byte| *byte == 0),
+        "the refused frontier is left as a hole for the refetch rather than bytes \
+         nothing checked"
     );
 }
 
@@ -3728,7 +3771,7 @@ fn a_repair_scratch_carries_a_run_that_stops_inside_an_article() {
     covered.insert(0, 250);
 
     let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
-    let rebuilt = super::reconstruct::reconstruct_volumes(
+    let rebuilt = sweep_volumes(
         &provider,
         &[repair_scratch_target(&fixture, path.clone(), covered, crcs)],
         super::sparse::SparseMarking::Platform,
@@ -3765,7 +3808,7 @@ fn a_carried_remainder_must_be_the_prefix_of_one_known_article() {
     // Starts inside an article: nothing composes from 50.
     let mut off_boundary = ByteRanges::new();
     off_boundary.insert(50, 200);
-    let failure = super::reconstruct::reconstruct_volumes(
+    let failure = sweep_volumes(
         &provider,
         &[repair_scratch_target(
             &fixture,
@@ -3788,7 +3831,7 @@ fn a_carried_remainder_must_be_the_prefix_of_one_known_article() {
     // into a third no record accounts for.
     let mut into_the_unknown = ByteRanges::new();
     into_the_unknown.insert(0, 250);
-    let failure = super::reconstruct::reconstruct_volumes(
+    let failure = sweep_volumes(
         &provider,
         &[repair_scratch_target(
             &fixture,
@@ -3806,9 +3849,13 @@ fn a_carried_remainder_must_be_the_prefix_of_one_known_article() {
             offset: 200,
         }
     );
+    // The two articles the composition does know were verified and written on
+    // the way to that refusal; only the remainder past them is left as a hole.
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(&written[..200], &fixture.conventional[..200]);
     assert!(
-        !path.exists(),
-        "a refused reconstruction leaves nothing behind"
+        written[200..].iter().all(|byte| *byte == 0),
+        "a refused remainder leaves a hole rather than bytes no article record accounts for"
     );
 }
 
@@ -3827,7 +3874,7 @@ fn a_carried_remainder_still_verifies_the_articles_before_it() {
     covered.insert(0, 250);
 
     let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
-    let failure = super::reconstruct::reconstruct_volumes(
+    let failure = sweep_volumes(
         &provider,
         &[repair_scratch_target(&fixture, path.clone(), covered, crcs)],
         super::sparse::SparseMarking::Platform,
@@ -3840,7 +3887,10 @@ fn a_carried_remainder_still_verifies_the_articles_before_it() {
             offset: 0,
         }
     );
-    assert!(!path.exists());
+    // The bytes the sweep read before the reference disagreed are on disk. They
+    // are harmless because they are not in `verified`: every article over them
+    // is refetched and overwritten, and no floor is published across them.
+    assert!(path.exists());
 }
 
 #[test]
@@ -3856,7 +3906,7 @@ fn a_rebuilt_run_that_fails_its_reference_falls_back_to_refetching() {
     let path = dir.path().join("silver.horizon.part01.rar");
 
     let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
-    let failure = super::reconstruct::reconstruct_volumes(
+    let rebuilt = super::reconstruct::reconstruct_volumes(
         &provider,
         &[reconstruction_target(
             &fixture,
@@ -3865,16 +3915,34 @@ fn a_rebuilt_run_that_fails_its_reference_falls_back_to_refetching() {
             crcs,
         )],
         super::sparse::SparseMarking::Platform,
-    )
-    .expect_err("a run that disagrees with its composed CRC32 must not be trusted");
+    );
     assert!(matches!(
-        failure,
-        super::reconstruct::ReconstructionFailure::ChecksumMismatch {
-            volume_index: 0,
-            ..
-        }
+        rebuilt[0].failure,
+        Some(
+            super::reconstruct::ReconstructionFailure::ChecksumMismatch {
+                volume_index: 0,
+                ..
+            }
+        )
     ));
-    assert!(!path.exists());
+    // The corrupted byte is in the volume's first article, and the cost is that
+    // article. `verified` is the only claim the caller may act on, so what
+    // matters is that it does not name the disagreeing range — and that it does
+    // still name the articles beside it, which is the difference between one
+    // article off the wire and the whole volume.
+    assert!(
+        !rebuilt[0].verified.missing(0, 100).is_empty(),
+        "an article that disagrees with its composed CRC32 must not be trusted"
+    );
+    assert!(
+        rebuilt[0].verified.missing(100, 460).is_empty(),
+        "every article the corruption does not touch is still vouched for"
+    );
+    assert_eq!(
+        rebuilt[0].contiguous, 0,
+        "no floor may be published over a volume whose first article is refused"
+    );
+    assert!(!rebuilt[0].complete);
 }
 
 #[test]
@@ -3889,7 +3957,7 @@ fn a_rebuild_truncates_a_stale_file_already_sitting_at_the_volumes_path() {
     std::fs::write(&path, vec![0xEEu8; fixture.conventional.len() + 4096]).unwrap();
 
     let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
-    super::reconstruct::reconstruct_volumes(
+    sweep_volumes(
         &provider,
         &[reconstruction_target(
             &fixture,
@@ -4587,6 +4655,7 @@ fn volume_facts(
         has_authenticity_verification: false,
         has_locator: false,
         quick_open_offset: None,
+        headers_from_quick_open: false,
         recovery_record_offset: None,
         original_name: None,
         original_name_raw: None,
@@ -5928,5 +5997,219 @@ fn a_rar4_member_name_records_under_the_path_it_was_written_to() {
         super::plan::DirectSetPlan::destination_relative_name("work/sample.mkv")
             .expect("a RAR5 member path resolves"),
         "work/sample.mkv"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The member tolerance's kind gate
+// ---------------------------------------------------------------------------
+
+/// Every `IneligibilityReason` classified once, exhaustively, so adding a
+/// variant to the library lands here as a decision rather than as a silent
+/// default.
+///
+/// Size is deliberately absent from the inputs: the tolerance carries a shape
+/// it can stream-extract whatever that member weighs, and refuses a shape it
+/// cannot however small it is. The sizes below are the ones the retired
+/// `min(64 MiB, 1% of packed archive bytes)` / 256 MiB ceilings would have
+/// demoted on, and none of them changes an answer.
+#[test]
+fn the_member_tolerance_gates_on_shape_and_never_on_size() {
+    use super::router::member_shape_is_tolerable;
+    use unrar_rs::{IneligibilityReason, MalformedReason};
+
+    let huge = 8 * 1024 * 1024 * 1024u64;
+    for (reason, tolerable, why) in [
+        (
+            IneligibilityReason::Compressed {
+                packed_bytes: Some(1),
+                unpacked_bytes: Some(1),
+                totals_final: true,
+            },
+            true,
+            "a compressed member is an unencrypted, non-solid, per-member regular file",
+        ),
+        (
+            IneligibilityReason::Compressed {
+                packed_bytes: Some(huge),
+                unpacked_bytes: Some(huge),
+                totals_final: true,
+            },
+            true,
+            "size is not an input: an 8 GiB compressed member rides the same tolerance",
+        ),
+        (
+            IneligibilityReason::Compressed {
+                packed_bytes: None,
+                unpacked_bytes: None,
+                totals_final: false,
+            },
+            true,
+            "an open chain with no declared totals is still a compressed regular file",
+        ),
+        (
+            IneligibilityReason::Blake2OnlyNoCrc32,
+            true,
+            "out-of-order routing cannot verify it, but the streaming decode checks \
+             BLAKE2sp natively",
+        ),
+        (
+            IneligibilityReason::Directory,
+            true,
+            "a dataless header finalization creates through the extraction root",
+        ),
+        (
+            IneligibilityReason::Solid,
+            false,
+            "decodable only against its whole solid run, which means decoding the \
+             stored members direct routing carried away",
+        ),
+        (
+            IneligibilityReason::Redirection,
+            false,
+            "a link has to be created, not decoded, and the tolerated writer path \
+             does not create links",
+        ),
+        (
+            IneligibilityReason::NoChecksum,
+            false,
+            "nothing would check the bytes the decode produced",
+        ),
+        (
+            IneligibilityReason::Encrypted,
+            false,
+            "encryption direct-store cannot route at all; a routable encrypted store \
+             member never reaches this predicate",
+        ),
+        (
+            IneligibilityReason::MalformedChain(MalformedReason::ContinuationInFirstVolume),
+            false,
+            "the layout does not agree with itself about where the member's parts are",
+        ),
+    ] {
+        assert_eq!(
+            member_shape_is_tolerable(reason),
+            tolerable,
+            "{reason:?} must be {}: {why}",
+            if tolerable { "tolerable" } else { "refused" }
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What a demoted set's consumers need under it
+// ---------------------------------------------------------------------------
+
+/// Every [`DemotionReason`] classified once, exhaustively, into "the virtual
+/// volumes are still a truthful image" and "real files are required".
+///
+/// The list is written out variant by variant rather than derived, because
+/// deriving it is exactly the mistake: a reason added later must arrive here as
+/// a decision. `metric()` is the exhaustiveness witness — a new variant fails to
+/// compile there, and the count assertion below fails if one is added to the
+/// enum without being added to this table.
+#[test]
+fn every_demotion_reason_states_what_its_consumers_need() {
+    use super::router::crypt::{CryptRefusal, HeaderCryptRefusal};
+    use super::router::{MemberIneligibility, VolumeDemand};
+
+    let virtual_volumes = [
+        // Member shape is a fact about a member, never about the image.
+        DemotionReason::MemberIneligible(MemberIneligibility::Compressed),
+        DemotionReason::MemberIneligible(MemberIneligibility::Encrypted),
+        DemotionReason::MemberIneligible(MemberIneligibility::Solid),
+        DemotionReason::MemberIneligible(MemberIneligibility::Directory),
+        DemotionReason::MemberIneligible(MemberIneligibility::Redirection),
+        DemotionReason::MemberIneligible(MemberIneligibility::Blake2OnlyNoCrc32),
+        DemotionReason::MemberIneligible(MemberIneligibility::NoChecksum),
+        DemotionReason::MemberIneligible(MemberIneligibility::MalformedChain),
+        // Key material, not layout: the conventional extractor asks a wider
+        // candidate list, and it can ask it of the overlay.
+        DemotionReason::EncryptedMemberRefused(CryptRefusal::NoPassword),
+        DemotionReason::EncryptedMemberRefused(CryptRefusal::WrongPassword),
+        DemotionReason::EncryptedMemberRefused(CryptRefusal::Unkeyable),
+        // Staged, unrouted bytes ran out of room. The layout and the placed
+        // bytes are untouched.
+        DemotionReason::HoldsBudgetExceeded,
+        DemotionReason::HoldsScratchFailed,
+        DemotionReason::HoldsScratchCeiling,
+        // A refused *destination*, over a truthful image.
+        DemotionReason::UnsafeDestination,
+        DemotionReason::CollidingDestinations,
+    ];
+    let real_files = [
+        // Sealed headers: there is no layout to overlay.
+        DemotionReason::HeaderEncryptedRefused(HeaderCryptRefusal::NoPassword),
+        DemotionReason::HeaderEncryptedRefused(HeaderCryptRefusal::NoVerifiedCandidate),
+        DemotionReason::HeaderEncryptedRefused(HeaderCryptRefusal::Unverifiable),
+        DemotionReason::HeaderEncryptedRefused(HeaderCryptRefusal::Rar4Headers),
+        DemotionReason::HeaderEncryptedRefused(HeaderCryptRefusal::Unkeyable),
+        // The layout cannot be read as describing this archive.
+        DemotionReason::EncryptedFactsDisagree,
+        DemotionReason::ConflictingVolumeFacts,
+        DemotionReason::QuickOpenMismatch,
+        DemotionReason::FormatMismatch,
+        DemotionReason::UnparsableVolume,
+        DemotionReason::UnsupportedFormat,
+        DemotionReason::IdentityVolumeMismatch,
+        // The overlay cannot answer for a range it claims.
+        DemotionReason::EncryptedPostedBytesUnavailable,
+        DemotionReason::UnconfirmedRestoredVolume,
+        DemotionReason::RestartRearmUnplaceable,
+        DemotionReason::RestartRereadFailed,
+        DemotionReason::RepairRerouteFailed,
+        DemotionReason::RepairGapUnreadable,
+        DemotionReason::UuencodedSourceVolume,
+        DemotionReason::IdentityRosterUnfillable,
+        // The bytes are provably not what was posted.
+        DemotionReason::PartChecksumMismatch,
+        DemotionReason::MemberChecksumMismatch,
+        DemotionReason::VolumeCrcMismatch,
+        // The consumer that runs next is filesystem-bound, or has already
+        // failed against this exact image.
+        DemotionReason::Par2Damaged,
+        DemotionReason::Par2Unbindable,
+        DemotionReason::ToleratedExtractionFailed,
+        // The overlay's own files are what is failing, or are half renamed
+        // away.
+        DemotionReason::DestinationWriteFailed,
+        DemotionReason::SparseMarkFailed,
+        DemotionReason::FinalizationFailed,
+    ];
+
+    for reason in virtual_volumes {
+        assert_eq!(
+            reason.volume_demand(),
+            VolumeDemand::Virtual,
+            "{reason} must be servable from the set's own virtual volumes"
+        );
+    }
+    for reason in real_files {
+        assert_eq!(
+            reason.volume_demand(),
+            VolumeDemand::Real,
+            "{reason} must materialize real volume files"
+        );
+    }
+
+    // Every reason is classified exactly once, and every metric label is
+    // distinct — so a variant added to the enum but not to this table shows up
+    // as a missing label rather than as a silent pass.
+    let mut labels: Vec<&'static str> = virtual_volumes
+        .iter()
+        .chain(real_files.iter())
+        .map(|reason| reason.metric())
+        .collect();
+    let total = labels.len();
+    labels.sort_unstable();
+    labels.dedup();
+    assert_eq!(
+        labels.len(),
+        total,
+        "two demotion reasons in this table share a metric label"
+    );
+    assert_eq!(
+        total, 45,
+        "a demotion reason was added or retired; classify it above and update this count"
     );
 }
