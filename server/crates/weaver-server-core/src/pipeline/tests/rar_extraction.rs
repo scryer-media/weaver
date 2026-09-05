@@ -6453,6 +6453,146 @@ async fn par2_rebuilds_a_split_7z_part_the_nzb_never_carried_and_extraction_foll
     }
 }
 
+/// A four-volume set whose two file members sanitize to one destination
+/// on a case-folding filesystem: `CERTIFICATE/BACKUP/id.bdmv` and
+/// `CERTIFICATE/backup/id.bdmv`.
+fn build_case_colliding_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
+    let first = b"first-of-two-names-for-one-path";
+    let second = b"second-of-two-names-for-one-path";
+    let members = [
+        ("CERTIFICATE/BACKUP/id.bdmv", &first[..], &first[..12], &first[12..]),
+        ("CERTIFICATE/backup/id.bdmv", &second[..], &second[..12], &second[12..]),
+    ];
+    let mut volumes = Vec::new();
+    for (member_index, (name, whole, head, tail)) in members.iter().enumerate() {
+        let crc = checksum::crc32(whole);
+        let open_volume = member_index * 2;
+        let close_volume = open_volume + 1;
+
+        let mut open = Vec::new();
+        open.extend_from_slice(&TEST_RAR5_SIG);
+        open.extend_from_slice(&build_test_rar_main_header(
+            if open_volume == 0 { 0x0001 } else { 0x0001 | 0x0002 },
+            (open_volume > 0).then_some(open_volume as u64),
+        ));
+        open.extend_from_slice(&build_test_rar_file_header(
+            name,
+            0x0010,
+            head.len() as u64,
+            whole.len() as u64,
+            None,
+        ));
+        open.extend_from_slice(head);
+        open.extend_from_slice(&build_test_rar_end_header(true));
+        volumes.push((format!("show.part{:02}.rar", open_volume + 1), open));
+
+        let last = member_index + 1 == members.len();
+        let mut close = Vec::new();
+        close.extend_from_slice(&TEST_RAR5_SIG);
+        close.extend_from_slice(&build_test_rar_main_header(
+            0x0001 | 0x0002,
+            Some(close_volume as u64),
+        ));
+        close.extend_from_slice(&build_test_rar_file_header(
+            name,
+            0x0008,
+            tail.len() as u64,
+            whole.len() as u64,
+            Some(crc),
+        ));
+        close.extend_from_slice(tail);
+        close.extend_from_slice(&build_test_rar_end_header(!last));
+        volumes.push((format!("show.part{:02}.rar", close_volume + 1), close));
+    }
+    volumes
+}
+
+/// Two file members that sanitize to one destination are refused at open, and
+/// that refusal has to end the job — not send it round again.
+///
+/// The refusal is raised by `ensure_unique_sanitized_rar_member_paths` before
+/// any member is extracted, so the batch worker's error is the archive's
+/// structure, not a member's bytes. Nothing about a retry can change it: no
+/// re-download, no PAR2 verdict, no header refresh. Left classified as an
+/// ordinary member failure, a job with no PAR2 set re-scheduled the same
+/// members straight back into the same open — `set_failed_extraction_member`
+/// only latches a member out while PAR2 still owes a verdict — and spun
+/// extract/refuse/re-schedule as fast as the worker pool allowed.
+#[tokio::test]
+async fn colliding_member_paths_fail_the_job_instead_of_respinning_extraction() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30086);
+    let files = build_case_colliding_multivolume_rar_set();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Silver Horizon Colliding Members", &files),
+    )
+    .await;
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+
+    pipeline.check_job_completion(job_id).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 6).await;
+
+    let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {
+        panic!(
+            "a colliding archive must fail the job\n{}",
+            debug_job_state(&pipeline, job_id)
+        );
+    };
+    assert!(
+        error.contains("colliding sanitized member path"),
+        "the failure names the collision: {error}"
+    );
+    // The first name reaches the disk before the second is even visible:
+    // it becomes extractable once two volumes are down, and an archive opened
+    // at that point has one started member and nothing to collide with. The
+    // second name is what the open refuses, every time.
+    assert!(
+        pipeline
+            .extracted_members
+            .get(&job_id)
+            .is_none_or(|members| !members.contains("CERTIFICATE/backup/id.bdmv")),
+        "the refused member must never have been extracted"
+    );
+}
+
+/// The terminal classification is keyed on the exact prefixes the open-time
+/// checks produce. Anything a retry or a repair could still turn around —
+/// a member CRC, a stale topology, FD pressure, a member whose *name* merely
+/// contains one of the phrases — stays on its existing path.
+#[test]
+fn terminal_archive_structure_classification_matches_only_open_time_refusals() {
+    assert!(Pipeline::is_terminal_archive_structure_error(
+        "RAR archive contains colliding sanitized member path: CERTIFICATE/backup/id.bdmv"
+    ));
+    assert!(Pipeline::is_terminal_archive_structure_error(
+        "unsafe RAR member path: ../escape.mkv"
+    ));
+
+    for error in [
+        "checksum mismatch for member show.mkv",
+        "crc mismatch extracting show.mkv",
+        "member not found in archive: show.mkv",
+        "RAR volume show.part02.rar unavailable",
+        "no on-disk rar volumes for set show",
+        "Too many open files (os error 24)",
+        "failed to extract member colliding sanitized member path.mkv",
+        "failed to extract member unsafe RAR member path.mkv",
+        "",
+    ] {
+        assert!(
+            !Pipeline::is_terminal_archive_structure_error(error),
+            "must stay non-terminal: {error:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn no_par2_retry_reclassifies_obfuscated_rar_redownload_as_7z() {
     let temp_dir = tempfile::tempdir().unwrap();
