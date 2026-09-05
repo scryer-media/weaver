@@ -165,6 +165,19 @@ fn scan_completed_par2_packet_groups(path: &Path) -> par2_rs::Result<Vec<ParsedP
     Ok(groups)
 }
 
+/// Everything a packet merge can add to a set: descriptions, slice checksums,
+/// recovery slices and the creator. Two identical readings across a merge mean
+/// the merge inserted nothing, so anything already built from the set — a
+/// retained repair session above all — still describes it exactly.
+fn par2_set_merge_shape(set: &Par2FileSet) -> (usize, usize, usize, bool) {
+    (
+        set.files.len(),
+        set.slice_checksums.len(),
+        set.recovery_slices.len(),
+        set.creator.is_some(),
+    )
+}
+
 fn par2_recovery_packet_size(slice_size: u64) -> u64 {
     let raw = slice_size.saturating_add(PAR2_RECOVERY_PACKET_OVERHEAD);
     let rem = raw % PAR2_PACKET_ALIGNMENT;
@@ -1879,6 +1892,91 @@ impl Pipeline {
         self.enforce_par2_retained_session_budget((job_id, set_id));
     }
 
+    /// Teach the retained session about a recovery volume that just landed,
+    /// instead of throwing the session away for being a set behind.
+    ///
+    /// Only for a set holding a parked damaged-path verdict — the one shape
+    /// where the session is carrying an analysis the job is about to repair on,
+    /// and where losing it means reading every damaged file a second time.
+    /// Everything else keeps the eviction: it is free, and a session rebuilt
+    /// from the merged set is always correct.
+    ///
+    /// par2-rs draws the same distinction internally. Recovery-only packets
+    /// leave the source scan standing, so the repair's analysis re-uses it and
+    /// reads nothing; a volume that turns out to carry *new* descriptions
+    /// rebuilds the source map and costs the scan anyway, which is the right
+    /// answer because the protected file set itself changed.
+    ///
+    /// Returns whether the session may stand. `false` means the caller must
+    /// evict, which is also what every refusal below leaves behind: the session
+    /// has already been taken out of the runtime by then.
+    async fn merge_recovery_into_retained_par2_session(
+        &mut self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+        volume_path: std::path::PathBuf,
+    ) -> bool {
+        if !self.has_pending_par2_repair(job_id, set_id) {
+            return false;
+        }
+        let Some(set_runtime) = self
+            .par2_runtime
+            .get_mut(&job_id)
+            .and_then(|runtime| runtime.set_runtime_mut(set_id))
+        else {
+            return false;
+        };
+        let Some(session) = set_runtime.session.take() else {
+            return false;
+        };
+        // An access-backed session serves volumes that have no path, and this
+        // merge names one. A direct set reaching here is demoted before any
+        // repair anyway, so there is nothing to preserve.
+        if session.is_access_backed() {
+            return false;
+        }
+        let merged = tokio::task::spawn_blocking(move || {
+            let mut session = session;
+            let result = session.merge_recovery_paths([volume_path]);
+            (session, result)
+        })
+        .await;
+        match merged {
+            Ok((session, Ok(result))) => {
+                debug!(
+                    job_id = job_id.0,
+                    recovery_set_id = %set_id,
+                    recovery_blocks_merged = result.new_recovery_slices,
+                    "merged a landed recovery volume into the retained PAR2 session"
+                );
+                #[cfg(test)]
+                {
+                    self.par2_session_recovery_merges += 1;
+                }
+                self.restore_par2_repair_session(job_id, set_id, session);
+                true
+            }
+            Ok((_, Err(error))) => {
+                debug!(
+                    job_id = job_id.0,
+                    recovery_set_id = %set_id,
+                    error = %error,
+                    "retained PAR2 session refused a landed recovery volume; rebuilding it"
+                );
+                false
+            }
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    recovery_set_id = %set_id,
+                    error = %error,
+                    "retained PAR2 session merge task panicked; rebuilding the session"
+                );
+                false
+            }
+        }
+    }
+
     /// The retained session owns a snapshot of the validated set. Packet
     /// arrivals update that set first, then make the snapshot stale.
     pub(in crate::pipeline) fn evict_par2_repair_session(
@@ -2304,7 +2402,16 @@ impl Pipeline {
                 set_runtime.set = Some(par2_set);
             }
             self.refresh_par2_checkpoint_plan(job_id);
-            self.evict_par2_repair_session(job_id, set_id);
+            // The session snapshot is now a set behind. A set waiting to repair
+            // gets the volume handed to its session instead, which keeps the
+            // analysis it is about to repair on; every other set rebuilds, as
+            // it always did.
+            if !self
+                .merge_recovery_into_retained_par2_session(job_id, set_id, file_path.clone())
+                .await
+            {
+                self.evict_par2_repair_session(job_id, set_id);
+            }
         }
 
         {
@@ -2848,6 +2955,10 @@ impl Pipeline {
             } else {
                 None
             };
+            // A bootstrapped set is new, so nothing can have been built from
+            // it yet; a merge that inserts nothing leaves everything built from
+            // the set current.
+            let mut set_changed = true;
             let (new_recovery_blocks, total_recovery) = if let Some(recovery_blocks) =
                 bootstrapped_recovery_blocks
             {
@@ -2860,12 +2971,14 @@ impl Pipeline {
                             .and_then(|set_runtime| set_runtime.set.as_mut())
                             .expect("parsed PAR2 recovery set exists"),
                     );
+                    let before = par2_set_merge_shape(par2_set);
                     let merge = par2_set.merge_packets(
                         packet_list
                             .take()
                             .expect("unbootstrapped packets remain available to merge"),
                     );
                     let total_recovery = par2_set.recovery_block_count();
+                    set_changed = par2_set_merge_shape(par2_set) != before;
                     (merge, total_recovery)
                 };
                 match merge_result {
@@ -2882,7 +2995,16 @@ impl Pipeline {
                     }
                 }
             };
-            self.evict_par2_repair_session(job_id, set_id);
+            // Volume replays re-offer packets the set already holds: every
+            // file-complete pass parses a volume twice, once here and once as
+            // metadata, so the arrival that hands a waiting set's session its
+            // new recovery reaches this line with nothing left to give. Holding
+            // the session through a merge that inserted nothing is what lets
+            // that hand-off survive to the repair; every other set rebuilds on
+            // any arrival, as it always did.
+            if set_changed || !self.has_pending_par2_repair(job_id, set_id) {
+                self.evict_par2_repair_session(job_id, set_id);
+            }
             let promoted = self
                 .par2_runtime(job_id)
                 .and_then(|runtime| runtime.files.get(&file_id.file_index))

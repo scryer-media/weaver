@@ -2716,6 +2716,11 @@ impl Pipeline {
             // Identity changed, not the bytes owned by this NzbFileId. The
             // binding resolver revalidates names live; raw grid evidence stays
             // available for every recovery set.
+            //
+            // A parked damaged-path verdict does not survive it: that verdict
+            // names files by path, and a repair standing on it would hand the
+            // post-repair read-back names nothing carries any more.
+            self.clear_pending_par2_repairs_for_job(job_id);
             info!(
                 job_id = job_id.0,
                 renamed = outcome.renamed,
@@ -2849,6 +2854,10 @@ impl Pipeline {
         };
         if let Some((session, newly_opened)) = retained_session {
             if newly_opened {
+                #[cfg(test)]
+                {
+                    self.par2_session_opens += 1;
+                }
                 self.ensure_par2_runtime(job_id)
                     .set_runtime_mut(set_id)
                     .expect("PAR2 session evidence belongs to the active recovery set")
@@ -2902,6 +2911,12 @@ impl Pipeline {
             };
             let retained_outcome = match repair_result {
                 Ok((session, Ok((outcome, admitted_file_ids, retried_source_change)))) => {
+                    #[cfg(test)]
+                    {
+                        self.par2_session_source_scan_passes = self
+                            .par2_session_source_scan_passes
+                            .max(session.diagnostics().source_scan_passes);
+                    }
                     self.restore_par2_repair_session(job_id, set_id, session);
                     let set_runtime = self
                         .ensure_par2_runtime(job_id)
@@ -3102,6 +3117,118 @@ impl Pipeline {
         }
     }
 
+    /// Hold a damaged-path verdict across the wait for targeted recovery.
+    ///
+    /// Called only where the gate has just decided to park: the analysis has
+    /// run, the damage is real, and the one thing standing between this job and
+    /// its repair is recovery still on the wire.
+    pub(in crate::pipeline) fn park_par2_repair_verdict(
+        &mut self,
+        job_id: JobId,
+        par2_set: &par2_rs::Par2FileSet,
+        blocks_needed: u32,
+        damaged: u32,
+        verification: &par2_rs::VerificationResult,
+    ) {
+        if blocks_needed == 0 {
+            return;
+        }
+        let set_id = par2_set.recovery_set_id;
+        let pending = PendingPar2Repair {
+            recovery_set_id: set_id,
+            slice_size: par2_set.slice_size,
+            described_file_ids: par2_set.recovery_file_ids.clone(),
+            blocks_needed,
+            damaged,
+            verification: verification.clone(),
+        };
+        if let Some(set_runtime) = self.ensure_par2_runtime(job_id).set_runtime_mut(set_id) {
+            set_runtime.pending_repair = Some(pending);
+        }
+    }
+
+    /// Whether this set is holding a parked repair verdict.
+    pub(in crate::pipeline) fn has_pending_par2_repair(
+        &self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) -> bool {
+        self.par2_runtime(job_id)
+            .and_then(|runtime| runtime.set_runtime(set_id))
+            .is_some_and(|set_runtime| set_runtime.pending_repair.is_some())
+    }
+
+    /// Drop a parked verdict. Every path that settles, fails, re-analyses or
+    /// re-shapes a set goes through here: a verdict outliving the state it
+    /// describes would put a stale `pre_repair` in front of the post-repair
+    /// read-back, which is the one thing this shortcut must never do.
+    pub(in crate::pipeline) fn clear_pending_par2_repair(
+        &mut self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) {
+        if let Some(set_runtime) = self
+            .par2_runtime
+            .get_mut(&job_id)
+            .and_then(|runtime| runtime.set_runtime_mut(set_id))
+        {
+            set_runtime.pending_repair = None;
+        }
+    }
+
+    /// Every set of this job forgets its parked verdict. Used where the change
+    /// is job-shaped rather than set-shaped — a direct-store demotion rewrites
+    /// which files exist at all.
+    pub(in crate::pipeline) fn clear_pending_par2_repairs_for_job(&mut self, job_id: JobId) {
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
+            for set_runtime in runtime.sets.values_mut() {
+                set_runtime.pending_repair = None;
+            }
+        }
+    }
+
+    /// The parked verdict, if this entry may repair on it instead of analysing
+    /// again.
+    ///
+    /// Three things have to hold. The verdict must still describe the set about
+    /// to be repaired — same recovery set, same slice size, same described
+    /// files, so a metadata merge that changed the protected file set is
+    /// refused. The recovery it waited for must have *landed*: every promoted
+    /// PAR2 file complete and nothing promoted still moving, which is the same
+    /// drain the analysis arm below waits for. And the merged set must now hold
+    /// the blocks the verdict asked for, which is the one number a second
+    /// analysis could have told us and the repair reads off the set directly.
+    ///
+    /// Returned as a borrow; the caller clones the few kilobytes it needs before
+    /// `self` is borrowed mutably for the repair, which is nothing against the
+    /// whole-file read the verdict replaces.
+    fn ready_pending_par2_repair(
+        &self,
+        job_id: JobId,
+        par2_set: &par2_rs::Par2FileSet,
+    ) -> Option<&PendingPar2Repair> {
+        let pending = self
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.set_runtime(par2_set.recovery_set_id))
+            .and_then(|set_runtime| set_runtime.pending_repair.as_ref())?;
+        if pending.recovery_set_id != par2_set.recovery_set_id
+            || pending.slice_size != par2_set.slice_size
+            || pending.described_file_ids != par2_set.recovery_file_ids
+        {
+            return None;
+        }
+        if par2_set.recovery_block_count() < pending.blocks_needed {
+            return None;
+        }
+        let promoted_recovery = self.promoted_recovery_pipeline_state(job_id);
+        if promoted_recovery.incomplete_promoted_par2_files > 0
+            || promoted_recovery.has_pending_work()
+        {
+            return None;
+        }
+        Some(pending)
+    }
+
     async fn analyze_par2_with_repairer(
         &mut self,
         job_id: JobId,
@@ -3109,6 +3236,10 @@ impl Pipeline {
         working_dir: std::path::PathBuf,
         preserve_repairing_status: bool,
     ) -> Result<par2_rs::Par2RepairOutcome, String> {
+        // A fresh read supersedes whatever was parked: from here the gate's
+        // verdict is this pass's, and the old one must not be able to reach a
+        // repair behind it.
+        self.clear_pending_par2_repair(job_id, par2_set.recovery_set_id);
         if !preserve_repairing_status {
             self.transition_postprocessing_status(job_id, JobStatus::Verifying, Some("verifying"));
         } else {
@@ -3638,6 +3769,8 @@ impl Pipeline {
         set_runtime.settled = true;
         set_runtime.failure = None;
         set_runtime.post_verdict_reconcile_attempts = 0;
+        // A settled set owes no repair.
+        set_runtime.pending_repair = None;
         self.mark_par2_verified(job_id).await;
         if let Par2SetSettlementReason::Clean {
             slice_size,
@@ -3673,6 +3806,8 @@ impl Pipeline {
             set_runtime.settled = true;
             set_runtime.failure = Some(message.clone());
             set_runtime.post_verdict_reconcile_attempts = 0;
+            // A failed set owes no repair.
+            set_runtime.pending_repair = None;
         }
         self.recompute_par2_verified(job_id);
         self.note_aggregate_par2_verification_result(job_id);
@@ -7911,6 +8046,86 @@ impl Pipeline {
                         self.schedule_job_completion_check(job_id);
                         return;
                     }
+                    // The entry that finds the parked recovery landed. The
+                    // analysis below already read every damaged file and named
+                    // every damaged slice; a recovery volume carries no source
+                    // bytes, so running it again returns the verdict it already
+                    // returned plus one number — how much recovery is now
+                    // available — which the repair pass reads off the merged set
+                    // for itself.
+                    //
+                    // Fires once, and only after the drain the arm above waits
+                    // for: `ready_pending_par2_repair` requires every promoted
+                    // PAR2 file complete with nothing promoted still moving, and
+                    // the verdict is taken here rather than left standing, so a
+                    // job cannot lap this shortcut.
+                    //
+                    // Correctness does not rest on it. par2-rs proves every
+                    // repair input against the fingerprints its own scan
+                    // recorded and re-scans the set from scratch when one has
+                    // drifted, so the worst a verdict trusted here can cost is
+                    // the read it was trying to save.
+                    let parked_verdict =
+                        self.ready_pending_par2_repair(job_id, &par2_set)
+                            .map(|pending| {
+                                (
+                                    pending.blocks_needed,
+                                    pending.damaged,
+                                    pending.verification.clone(),
+                                )
+                            });
+                    if let Some((blocks_needed, damaged, verification)) = parked_verdict {
+                        info!(
+                            job_id = job_id.0,
+                            damaged,
+                            blocks_needed,
+                            recovery_now = par2_set.recovery_block_count(),
+                            "targeted recovery landed — repairing on the analysis that asked for it"
+                        );
+                        // Left parked if the repair slot is busy: this entry
+                        // repaired nothing, and the queued-repair promotion is
+                        // what brings the job back here.
+                        if !self.maybe_start_repair(job_id).await {
+                            return;
+                        }
+                        self.clear_pending_par2_repair(job_id, par2_set.recovery_set_id);
+                        #[cfg(test)]
+                        {
+                            self.par2_repairs_from_parked_verdict += 1;
+                        }
+                        match self
+                            .run_par2_repairer(
+                                job_id,
+                                Arc::clone(&par2_set),
+                                working_dir.clone(),
+                                true,
+                                Some(&verification),
+                            )
+                            .await
+                        {
+                            Ok(outcome) => {
+                                self.finish_par2_repair(
+                                    job_id,
+                                    Arc::clone(&par2_set),
+                                    working_dir.clone(),
+                                    &verification,
+                                    outcome,
+                                    has_crc_failures,
+                                )
+                                .await;
+                                return;
+                            }
+                            // Covers the recovery that arrived and turned out
+                            // to be unusable: `run_par2_repairer` refuses any
+                            // terminal non-repair status, so an Insufficient or
+                            // ResourceLimited repair lands here rather than
+                            // silently reporting success.
+                            Err(error_msg) => {
+                                self.fail_par2_repair(job_id, error_msg);
+                                return;
+                            }
+                        }
+                    }
                     let repair_analysis = match self
                         .analyze_par2_with_repairer(
                             job_id,
@@ -8200,6 +8415,15 @@ impl Pipeline {
                                 promoted_blocks = promoted,
                                 "waiting for targeted recovery downloads before repair"
                             );
+                            // The verdict this pass paid for, held for the entry
+                            // that finds the recovery landed.
+                            self.park_par2_repair_verdict(
+                                job_id,
+                                &par2_set,
+                                blocks_needed,
+                                damaged,
+                                verification,
+                            );
                             self.transition_postprocessing_status(
                                 job_id,
                                 JobStatus::Downloading,
@@ -8262,6 +8486,15 @@ impl Pipeline {
                             targeted_total,
                             promoted_blocks = promoted,
                             "waiting for targeted recovery downloads before repair"
+                        );
+                        // The verdict this pass paid for, held for the entry
+                        // that finds the recovery landed.
+                        self.park_par2_repair_verdict(
+                            job_id,
+                            &par2_set,
+                            blocks_needed,
+                            damaged,
+                            verification,
                         );
                         self.transition_postprocessing_status(
                             job_id,

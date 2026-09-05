@@ -6984,6 +6984,11 @@ impl Pipeline {
         if reason.is_source_damage() {
             self.note_known_archive_set_damage(job_id, &set_name);
         }
+        // A parked damaged-path verdict goes the way of the post-repair carry
+        // above, and for the same reason: it describes volumes that were
+        // virtual when it was reached and are about to become files the
+        // conventional path writes. The next pass reads the set as it now is.
+        self.clear_pending_par2_repairs_for_job(job_id);
         self.direct_store.begin_materialization(
             job_id,
             set_index,

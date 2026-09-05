@@ -13930,6 +13930,341 @@ async fn a_damaged_job_with_no_in_stream_evidence_still_reads_and_verifies_every
     );
 }
 
+// ---------------------------------------------------------------------------
+// Repairing on the verdict that asked for the recovery.
+// ---------------------------------------------------------------------------
+
+const PARKED_RECOVERY_SLICE_SIZE: u64 = 64;
+const PARKED_RECOVERY_PAYLOAD: &str = "silver.horizon.e04.mkv";
+const PARKED_RECOVERY_INDEX: &str = "silver.horizon.par2";
+const PARKED_RECOVERY_VOLUME: &str = "silver.horizon.vol00+01.par2";
+
+/// A damaged job whose only recovery volume is still parked.
+///
+/// The payload's second slice is zeroed on disk and the set as installed
+/// carries no recovery at all, so the first authoritative pass has to promote
+/// the volume and wait — which is the state this section is about. The volume's
+/// bytes are handed back so the test can land it afterwards.
+struct ParkedRecoveryFixture {
+    payload_path: PathBuf,
+    original_payload: Vec<u8>,
+    recovery_volume: Vec<u8>,
+    recovery_file_id: NzbFileId,
+}
+
+async fn install_parked_recovery_par2_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    job_name: &str,
+) -> ParkedRecoveryFixture {
+    let slice_size = PARKED_RECOVERY_SLICE_SIZE;
+    let slice_bytes = slice_size as usize;
+    let original_payload: Vec<u8> = (0..(2 * slice_bytes) as u32)
+        .map(|value| (value % 251) as u8)
+        .collect();
+    let mut damaged_payload = original_payload.clone();
+    damaged_payload[slice_bytes..].fill(0);
+
+    // Built with its recovery block so the volume's bytes are real, then
+    // installed without it: the set weaver holds is the one an index alone
+    // describes, and the block arrives with the volume.
+    let full_set =
+        build_repairable_par2_set(PARKED_RECOVERY_PAYLOAD, &original_payload, slice_size, 1);
+    let recovery_slice = full_set.recovery_slices[&0]
+        .data
+        .as_bytes()
+        .expect("test recovery slices are built in memory")
+        .to_vec();
+    let recovery_volume = build_test_par2_recovery_volume(
+        *full_set.recovery_set_id.as_bytes(),
+        &[(0, &recovery_slice)],
+    );
+    let par2_bytes = build_test_par2_index(PARKED_RECOVERY_PAYLOAD, &original_payload, slice_size);
+
+    let spec = JobSpec {
+        name: job_name.to_string(),
+        password: None,
+        total_bytes: (original_payload.len() + par2_bytes.len() + recovery_volume.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: PARKED_RECOVERY_PAYLOAD.to_string(),
+                role: FileRole::from_filename(PARKED_RECOVERY_PAYLOAD),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: slice_bytes as u32,
+                        message_id: "silver-horizon-parked-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: slice_bytes as u32,
+                        message_id: "silver-horizon-parked-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: PARKED_RECOVERY_INDEX.to_string(),
+                role: FileRole::from_filename(PARKED_RECOVERY_INDEX),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "silver-horizon-parked-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: PARKED_RECOVERY_VOLUME.to_string(),
+                role: FileRole::from_filename(PARKED_RECOVERY_VOLUME),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: recovery_volume.len() as u32,
+                    message_id: "silver-horizon-parked-volume@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(pipeline, job_id, spec).await;
+
+    tokio::fs::write(working_dir.join(PARKED_RECOVERY_PAYLOAD), &damaged_payload)
+        .await
+        .unwrap();
+    let recovery_file_id = NzbFileId {
+        job_id,
+        file_index: 2,
+    };
+    {
+        let payload_file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+        for segment_number in 0..2 {
+            let file = state.assembly.file_mut(payload_file_id).unwrap();
+            file.record_placement(
+                segment_number,
+                u64::from(segment_number) * slice_size,
+                slice_bytes as u32,
+            );
+            file.commit_segment(segment_number, slice_bytes as u32)
+                .unwrap();
+        }
+        // The volume is in the parked pool, which is exactly where a promotion
+        // has to find it.
+        state.recovery_queue.push(DownloadWork {
+            segment_id: SegmentId {
+                file_id: recovery_file_id,
+                segment_number: 0,
+            },
+            message_id: MessageId::new("silver-horizon-parked-volume@example.com"),
+            groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+            priority: 1000,
+            byte_estimate: recovery_volume.len() as u32,
+            retry_count: 0,
+            is_recovery: true,
+            completion_critical: false,
+            exclude_servers: Vec::new(),
+            avoid_server: None,
+        });
+    }
+    write_and_complete_file(pipeline, job_id, 1, PARKED_RECOVERY_INDEX, &par2_bytes).await;
+
+    let mut installed_set = full_set;
+    installed_set.recovery_slices.clear();
+    install_test_par2_runtime(
+        pipeline,
+        job_id,
+        installed_set,
+        &[
+            (1, PARKED_RECOVERY_INDEX, 0, false),
+            (2, PARKED_RECOVERY_VOLUME, 1, false),
+        ],
+    );
+
+    ParkedRecoveryFixture {
+        payload_path: working_dir.join(PARKED_RECOVERY_PAYLOAD),
+        original_payload,
+        recovery_volume,
+        recovery_file_id,
+    }
+}
+
+/// Land the promoted volume the way the wire does: its work leaves the queue,
+/// its bytes reach the disk, and its packets merge into the set.
+async fn land_parked_recovery_volume(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    fixture: &ParkedRecoveryFixture,
+) {
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+    }
+    write_and_complete_file(
+        pipeline,
+        job_id,
+        fixture.recovery_file_id.file_index,
+        PARKED_RECOVERY_VOLUME,
+        &fixture.recovery_volume,
+    )
+    .await;
+    pipeline
+        .try_load_par2_metadata(job_id, fixture.recovery_file_id)
+        .await;
+}
+
+/// The defect this section exists for: a job whose recovery arrives must not
+/// pay for the damaged-path analysis twice.
+///
+/// The first pass reads the damaged payload, promotes the volume and parks. The
+/// second finds the volume landed and repairs on the verdict the first pass
+/// already reached — one authoritative analysis, one retained session, one scan
+/// of the sources for the whole ladder.
+#[tokio::test]
+async fn a_landed_recovery_volume_repairs_on_the_analysis_that_asked_for_it() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30950);
+    let fixture =
+        install_parked_recovery_par2_job(&mut pipeline, job_id, "Silver Horizon Parked Recovery")
+            .await;
+
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Downloading),
+        "the analysis promoted the volume and parked on it; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert_eq!(
+        pipeline.par2_authoritative_bytes_read.len(),
+        1,
+        "one analysis so far"
+    );
+    assert_eq!(pipeline.par2_repairer_execute_calls, 0);
+
+    land_parked_recovery_volume(&mut pipeline, job_id, &fixture).await;
+
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "the repair ran and the job settled; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert_eq!(
+        pipeline.par2_authoritative_bytes_read.len(),
+        1,
+        "the landed recovery must not buy a second authoritative analysis \
+         (bytes read: {:?})",
+        pipeline.par2_authoritative_bytes_read
+    );
+    assert_eq!(
+        pipeline.par2_repairs_from_parked_verdict, 1,
+        "the repair ran on the parked verdict"
+    );
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
+    assert_eq!(pipeline.par2_repairer_execute_calls, 1);
+    assert_eq!(
+        pipeline.par2_session_recovery_merges, 1,
+        "the landed volume merged into the retained session instead of \
+         rebuilding it"
+    );
+    assert_eq!(
+        pipeline.par2_session_opens, 1,
+        "one retained session covered the whole ladder"
+    );
+    assert_eq!(
+        pipeline.par2_session_source_scan_passes, 1,
+        "that session read its sources exactly once"
+    );
+}
+
+/// The shortcut is an optimisation, not a promise about the disk.
+///
+/// With the retained session forced off — the one-shot shape a session
+/// eviction, open failure or restart leaves behind — the parked verdict reaches
+/// the repair through par2-rs's scan carry, and the carry is stat-gated. Rewrite
+/// the damaged file between the two passes and the gate refuses it: par2-rs
+/// rescans on its own and repairs what is actually there, without weaver ever
+/// running a second analysis of its own.
+#[tokio::test]
+async fn a_damaged_file_rewritten_before_the_parked_repair_is_rescanned_by_par2_rs() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.stateful_par2_session_forced = Some(false);
+    let job_id = JobId(30951);
+    let fixture = install_parked_recovery_par2_job(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon Parked Recovery Rewritten",
+    )
+    .await;
+
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Downloading),
+        "the analysis promoted the volume and parked on it; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    // The same slice is still the damaged one, so the verdict's arithmetic
+    // still holds — but the bytes behind it are not the bytes the analysis
+    // hashed, and nothing weaver holds can tell.
+    let slice_bytes = PARKED_RECOVERY_SLICE_SIZE as usize;
+    let mut rewritten = fixture.original_payload.clone();
+    rewritten[slice_bytes..].fill(0x5A);
+    tokio::fs::write(&fixture.payload_path, &rewritten)
+        .await
+        .unwrap();
+
+    land_parked_recovery_volume(&mut pipeline, job_id, &fixture).await;
+
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "par2-rs rescanned and repaired the file as it now is; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert_eq!(
+        pipeline.par2_authoritative_bytes_read.len(),
+        1,
+        "the rewrite is par2-rs's problem to notice, not a second analysis \
+         (bytes read: {:?})",
+        pipeline.par2_authoritative_bytes_read
+    );
+    assert_eq!(
+        pipeline.par2_repairs_from_parked_verdict, 1,
+        "the repair still ran on the parked verdict"
+    );
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
+    assert_eq!(pipeline.par2_repairer_execute_calls, 1);
+    assert!(
+        pipeline.par2_scan_carry_seeded_calls >= 1,
+        "the parked repair was seeded with the analysis pass's carry"
+    );
+}
+
 /// A path-backed session refuses `FileId`-keyed evidence, so the conventional
 /// pass names a path — and it has to be the name the file now carries, not the
 /// one the NZB gave it.
