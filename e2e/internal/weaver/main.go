@@ -3144,11 +3144,16 @@ func cmdSubmit(slug string) {
 // --- test-all ---
 
 type testJob struct {
-	slug                               string
-	scenario                           *Scenario
-	jobID                              int
-	status                             string // terminal status or "submit_error"/"skip"
-	errMsg                             string
+	slug     string
+	scenario *Scenario
+	jobID    int
+	status   string // terminal status or "submit_error"/"skip"
+	errMsg   string
+	// Wall-clock bounds of the fixture's run: stamped at submission and at
+	// the moment its terminal snapshot is taken, so the summary can show
+	// where the phase's time went instead of only whether it passed.
+	submittedAt                        time.Time
+	resolvedAt                         time.Time
 	fileIdentityRewriteObserved        bool
 	fileIdentityRewriteLastObservation fileIdentityRewriteObservation
 	fileIdentityRewriteLastQueryError  string
@@ -3165,7 +3170,7 @@ type chaosRoundJobArtifact struct {
 }
 
 var functionalRewritePollInterval = 250 * time.Millisecond
-var functionalNormalPollInterval = 2 * time.Second
+var functionalNormalPollInterval = 500 * time.Millisecond
 
 const (
 	functionalFastStatusPollBatchSize = 16
@@ -3180,6 +3185,54 @@ func countResolvedTestJobs(jobs []testJob) int {
 		}
 	}
 	return resolved
+}
+
+// testJobDuration is how long the fixture spent between submission and its
+// terminal snapshot; zero when either bound was never stamped (a fixture
+// that never submitted, or one resolved through a path that does not take a
+// snapshot).
+func testJobDuration(job testJob) time.Duration {
+	if job.submittedAt.IsZero() || job.resolvedAt.IsZero() || job.resolvedAt.Before(job.submittedAt) {
+		return 0
+	}
+	return job.resolvedAt.Sub(job.submittedAt)
+}
+
+func testJobDurationLabel(job testJob) string {
+	d := testJobDuration(job)
+	if d == 0 {
+		return "-"
+	}
+	return d.Round(100 * time.Millisecond).String()
+}
+
+// printSlowestTestJobs names the fixtures that dominated the phase's wall
+// time. The pass/fail table says nothing about where the time went, and a
+// run that "felt slow" is otherwise diagnosed by hand from timestamps.
+func printSlowestTestJobs(jobs []testJob, limit int) {
+	timed := make([]testJob, 0, len(jobs))
+	for _, job := range jobs {
+		if testJobDuration(job) > 0 {
+			timed = append(timed, job)
+		}
+	}
+	if len(timed) == 0 {
+		return
+	}
+	sort.SliceStable(timed, func(a, b int) bool {
+		return testJobDuration(timed[a]) > testJobDuration(timed[b])
+	})
+	if limit > len(timed) {
+		limit = len(timed)
+	}
+	total := time.Duration(0)
+	for _, job := range timed {
+		total += testJobDuration(job)
+	}
+	fmt.Printf("Slowest fixtures (submit to terminal; %d timed, %s summed):\n", len(timed), total.Round(time.Second))
+	for _, job := range timed[:limit] {
+		fmt.Printf("  %-8s %-40s %s\n", testJobDurationLabel(job), job.slug, job.status)
+	}
 }
 
 func observeRuntimeFileIdentityRewrite(job *testJob, dbPath string, queryContext string) {
@@ -3331,6 +3384,7 @@ func functionalStatusPollIndexes(jobs []testJob, fastRewritePolling bool, cursor
 }
 
 func finalizeTestJobFromSnapshot(job *testJob, dbPath string, snapshot facadeItemSnapshot, queryContext string) {
+	job.resolvedAt = time.Now()
 	assertion := job.scenario.fileIdentityRewriteAssertion()
 	observeRuntimeFileIdentityRewrite(job, dbPath, queryContext)
 
@@ -3445,6 +3499,7 @@ func runExclusiveFunctionalJob(
 		return
 	}
 	job.jobID = jobID
+	job.submittedAt = time.Now()
 	log.Printf("  %s: submitted exclusive job=%d", job.slug, jobID)
 	if backupGateFilename != "" {
 		if err := waitForActiveFileComplete(dbPath, jobID, backupGateFilename, 60*time.Second); err != nil {
@@ -3722,16 +3777,30 @@ func runTests(slugs []string) {
 			Detail:  jobs[i].slug,
 		})
 	}
-	regularBatches := functionalRegularBatches(jobs, functionalRegularBatchSize)
+	// Regular fixtures run through a sliding window rather than in fixed
+	// batches. A batch waited for its slowest member before submitting the
+	// next eight, so one 12 s PAR2 fixture idled seven slots for its whole
+	// duration and every batch paid at least one poll interval even when all
+	// eight finished in a hundred milliseconds. Here a fixture is submitted
+	// the moment a slot frees, and each fixture carries its own completion
+	// deadline from the moment it was submitted. The order is the batch order
+	// the unit tests pin, flattened.
+	queue := make([]int, 0, len(jobs))
+	for _, batch := range functionalRegularBatches(jobs, functionalRegularBatchSize) {
+		queue = append(queue, batch...)
+	}
 	weaverDiedMidRun := false
-	for batchNumber, batchIndexes := range regularBatches {
-		log.Printf(
-			"submitting regular functional batch %d/%d (%d jobs)",
-			batchNumber+1,
-			len(regularBatches),
-			len(batchIndexes),
-		)
-		for _, i := range batchIndexes {
+	completionTimeout := functionalCompletionTimeout()
+	inFlight := 0
+	nextQueued := 0
+	log.Printf(
+		"submitting %d regular functional fixture(s) through a window of %d; each has %s to complete",
+		len(queue), functionalRegularBatchSize, completionTimeout,
+	)
+	submitUpToWindow := func() {
+		for inFlight < functionalRegularBatchSize && nextQueued < len(queue) && !weaverDiedMidRun {
+			i := queue[nextQueued]
+			nextQueued++
 			jobs[i].status = ""
 			jobID, err := submitOneNZB(weaverURL, jobs[i].scenario)
 			if err != nil {
@@ -3747,135 +3816,82 @@ func runTests(slugs []string) {
 				})
 				if died, waitErr := managedWeaverDied(); died {
 					weaverDiedMidRun = true
-					log.Printf("FATAL: managed weaver exited during batch submission (%v)", waitErr)
+					log.Printf("FATAL: managed weaver exited during fixture submission (%v)", waitErr)
 					log.Printf("weaver died here:\n%s", managedWeaverDeathReport())
-					break
+					return
 				}
 				continue
 			}
 
 			jobs[i].jobID = jobID
-			log.Printf("[%d/%d] %s — submitted job=%d", i+1, len(jobs), jobs[i].slug, jobID)
-		}
-
-		pending := 0
-		queuedExclusive := 0
-		for _, j := range jobs {
-			if j.status == "" {
-				pending++
-			}
-			if j.status == "queued_exclusive" {
-				queuedExclusive++
-			}
-		}
-		log.Printf(
-			"regular batch %d/%d submissions complete (%d pending, %d queued exclusive, %d already resolved)",
-			batchNumber+1,
-			len(regularBatches),
-			pending,
-			queuedExclusive,
-			countResolvedTestJobs(jobs),
-		)
-
-		completionTimeout := functionalCompletionTimeout()
-		deadline := time.Now().Add(completionTimeout)
-		log.Printf("waiting up to %s for regular functional jobs", completionTimeout)
-		firstPoll := true
-		statusPollCursor := 0
-		for pending > 0 && time.Now().Before(deadline) {
-			// Fail fast on a dead server. Polling on would score every remaining
-			// job as `timeout` — a label that describes the corpse, not the cause —
-			// and burn the whole completion budget doing it.
-			if died, waitErr := managedWeaverDied(); died {
-				weaverDiedMidRun = true
-				log.Printf(
-					"FATAL: managed weaver exited mid-run (%v) with %d job(s) still pending; "+
-						"abandoning the wait — these are not timeouts, there is no server to answer them",
-					waitErr, pending,
-				)
-				log.Printf("weaver died here:\n%s", managedWeaverDeathReport())
-				break
-			}
-			if !firstPoll {
-				mustSleepWithSuspendDetection(functionalPollInterval(jobs), "functional test polling")
-			}
-			firstPoll = false
-
-			fastRewritePolling := functionalHasPendingFileIdentityRewrite(jobs)
-			if fastRewritePolling {
-				observer, err := openFileIdentityRewriteObserver(dbPath)
-				if err != nil {
-					for i := range jobs {
-						if testJobNeedsRuntimeFileIdentityRewrite(&jobs[i]) {
-							jobs[i].fileIdentityRewriteLastQueryError = err.Error()
-						}
-					}
-					log.Printf("  runtime file-identity rewrite query error: %v", err)
-				} else {
-					for i := range jobs {
-						if testJobNeedsRuntimeFileIdentityRewrite(&jobs[i]) {
-							observeRuntimeFileIdentityRewriteWithObserver(&jobs[i], observer, "")
-						}
-					}
-					_ = observer.Close()
-				}
-			}
-
-			for _, i := range functionalStatusPollIndexes(jobs, fastRewritePolling, &statusPollCursor) {
-				snapshot, err := fetchFacadeItemSnapshot(weaverURL, jobs[i].jobID)
-				if err != nil {
-					continue
-				}
-				if !snapshot.Found {
-					continue
-				}
-				s := snapshot.Status
-
-				if s == "COMPLETE" || s == "FAILED" {
-					finalizeTestJobFromSnapshot(&jobs[i], dbPath, snapshot, "")
-					pending--
-					resolved := countResolvedTestJobs(jobs)
-					log.Printf("  %s: %s (health=%.1f%% err=%s) [%d pending]",
-						jobs[i].slug, jobs[i].status, float64(snapshot.Health)/10, jobs[i].errMsg, pending)
-					emitProgressEvent(progressEvent{
-						Kind:    "phase_progress",
-						Current: resolved,
-						Total:   len(jobs),
-						Status:  strings.ToLower(jobs[i].status),
-						Detail:  jobs[i].slug,
-					})
-				}
-			}
-		}
-
-		// Mark remaining as timeout
-		remainingIDs := make([]int, 0, pending)
-		for _, job := range jobs {
-			if job.status == "" && job.jobID > 0 {
-				remainingIDs = append(remainingIDs, job.jobID)
-			}
-		}
-		if weaverDiedMidRun && len(remainingIDs) > 0 {
+			jobs[i].submittedAt = time.Now()
+			inFlight++
 			log.Printf(
-				"skipping final reconciliation for %d job(s): weaver is gone, so the snapshot query can only re-learn that",
-				len(remainingIDs),
+				"[%d/%d] %s — submitted job=%d (%d in flight, %d queued)",
+				i+1, len(jobs), jobs[i].slug, jobID, inFlight, len(queue)-nextQueued,
 			)
-		} else if len(remainingIDs) > 0 {
-			log.Printf("reconciling %d unresolved functional job(s) before timeout scoring", len(remainingIDs))
-			reconciled := reconcileTerminalSnapshots(weaverURL, remainingIDs, 15*time.Second, "functional test final reconciliation")
-			for i := range jobs {
-				if jobs[i].status != "" {
-					continue
+		}
+	}
+	submitUpToWindow()
+
+	firstPoll := true
+	statusPollCursor := 0
+	for inFlight > 0 {
+		// Fail fast on a dead server. Polling on would score every remaining
+		// job as `timeout` — a label that describes the corpse, not the cause —
+		// and burn the whole completion budget doing it.
+		if died, waitErr := managedWeaverDied(); died {
+			weaverDiedMidRun = true
+			log.Printf(
+				"FATAL: managed weaver exited mid-run (%v) with %d job(s) still in flight; "+
+					"abandoning the wait — these are not timeouts, there is no server to answer them",
+				waitErr, inFlight,
+			)
+			log.Printf("weaver died here:\n%s", managedWeaverDeathReport())
+			break
+		}
+		if !firstPoll {
+			mustSleepWithSuspendDetection(functionalPollInterval(jobs), "functional test polling")
+		}
+		firstPoll = false
+
+		fastRewritePolling := functionalHasPendingFileIdentityRewrite(jobs)
+		if fastRewritePolling {
+			observer, err := openFileIdentityRewriteObserver(dbPath)
+			if err != nil {
+				for i := range jobs {
+					if testJobNeedsRuntimeFileIdentityRewrite(&jobs[i]) {
+						jobs[i].fileIdentityRewriteLastQueryError = err.Error()
+					}
 				}
-				snapshot, ok := reconciled[jobs[i].jobID]
-				if !ok {
-					continue
+				log.Printf("  runtime file-identity rewrite query error: %v", err)
+			} else {
+				for i := range jobs {
+					if testJobNeedsRuntimeFileIdentityRewrite(&jobs[i]) {
+						observeRuntimeFileIdentityRewriteWithObserver(&jobs[i], observer, "")
+					}
 				}
-				finalizeTestJobFromSnapshot(&jobs[i], dbPath, snapshot, " during reconciliation")
-				pending--
+				_ = observer.Close()
+			}
+		}
+
+		for _, i := range functionalStatusPollIndexes(jobs, fastRewritePolling, &statusPollCursor) {
+			snapshot, err := fetchFacadeItemSnapshot(weaverURL, jobs[i].jobID)
+			if err != nil {
+				continue
+			}
+			if !snapshot.Found {
+				continue
+			}
+			s := snapshot.Status
+
+			if s == "COMPLETE" || s == "FAILED" {
+				finalizeTestJobFromSnapshot(&jobs[i], dbPath, snapshot, "")
+				inFlight--
 				resolved := countResolvedTestJobs(jobs)
-				log.Printf("  %s: %s after reconciliation (health=%.1f%% err=%s) [%d pending]",
-					jobs[i].slug, jobs[i].status, float64(snapshot.Health)/10, jobs[i].errMsg, pending)
+				log.Printf("  %s: %s (health=%.1f%% err=%s) [%d in flight, %d queued]",
+					jobs[i].slug, jobs[i].status, float64(snapshot.Health)/10, jobs[i].errMsg,
+					inFlight, len(queue)-nextQueued)
 				emitProgressEvent(progressEvent{
 					Kind:    "phase_progress",
 					Current: resolved,
@@ -3886,62 +3902,90 @@ func runTests(slugs []string) {
 			}
 		}
 
-		timedOutRegularJobs := 0
+		// Per-fixture deadlines. A fixture past its budget gets one last
+		// reconciliation query before it is scored as a timeout, then is
+		// cancelled and settled so its slot is genuinely free and the
+		// exclusive scenarios later find a quiet queue.
+		expired := make([]int, 0)
 		for i := range jobs {
-			if jobs[i].status == "" {
-				jobs[i].status = "timeout"
-				timedOutRegularJobs++
-				pending--
-				if weaverDiedMidRun {
-					// Keep the status string — scoring and reconciliation elsewhere
-					// key off "timeout" — but do not let the report imply the
-					// scenario was given its full budget and failed to finish.
-					jobs[i].errMsg = "weaver exited mid-run; scenario never had a server to complete against"
-					log.Printf("  %s: NOT RUN (weaver exited mid-run)", jobs[i].slug)
+			if jobs[i].status == "" && jobs[i].jobID > 0 && !jobs[i].submittedAt.IsZero() &&
+				time.Since(jobs[i].submittedAt) > completionTimeout {
+				expired = append(expired, i)
+			}
+		}
+		if len(expired) > 0 {
+			expiredIDs := make([]int, 0, len(expired))
+			for _, i := range expired {
+				expiredIDs = append(expiredIDs, jobs[i].jobID)
+			}
+			log.Printf("reconciling %d functional job(s) past their %s budget before timeout scoring", len(expiredIDs), completionTimeout)
+			reconciled := reconcileTerminalSnapshots(weaverURL, expiredIDs, 15*time.Second, "functional test final reconciliation")
+			timedOut := make([]int, 0, len(expired))
+			for _, i := range expired {
+				if snapshot, ok := reconciled[jobs[i].jobID]; ok {
+					finalizeTestJobFromSnapshot(&jobs[i], dbPath, snapshot, " during reconciliation")
+					inFlight--
+					log.Printf("  %s: %s after reconciliation (health=%.1f%% err=%s) [%d in flight, %d queued]",
+						jobs[i].slug, jobs[i].status, float64(snapshot.Health)/10, jobs[i].errMsg,
+						inFlight, len(queue)-nextQueued)
 				} else {
+					jobs[i].status = "timeout"
+					inFlight--
+					timedOut = append(timedOut, i)
 					log.Printf("  %s: TIMEOUT after %s", jobs[i].slug, completionTimeout)
 				}
 				emitProgressEvent(progressEvent{
 					Kind:    "phase_progress",
 					Current: countResolvedTestJobs(jobs),
 					Total:   len(jobs),
-					Status:  "timeout",
+					Status:  strings.ToLower(jobs[i].status),
 					Detail:  jobs[i].slug,
 				})
 			}
-		}
-		if weaverDiedMidRun && timedOutRegularJobs > 0 {
-			// This was once the dominant cost of a crashed run: each job's
-			// cancel-settle spends 15s waiting for a reply that cannot come, so
-			// dozens of unrun scenarios turned into a ~17-minute tail. There is
-			// nothing to cancel on a process that has exited.
-			log.Printf(
-				"skipping cancel/settle for %d job(s): weaver is not running, so there is nothing to cancel",
-				timedOutRegularJobs,
-			)
-		} else if timedOutRegularJobs > 0 {
-			log.Printf("canceling %d timed out regular job(s) before the next batch", timedOutRegularJobs)
-			for _, i := range batchIndexes {
-				j := &jobs[i]
-				if j.status != "timeout" || j.jobID == 0 {
-					continue
-				}
-				if err := cancelJobGraphQL(weaverURL, j.jobID); err != nil {
-					log.Printf("  WARNING: cancel timed out job %s (%d): %v", j.slug, j.jobID, err)
-				}
-				if err := waitForJobCancelSettledGraphQL(
-					weaverURL,
-					j.jobID,
-					weaverCancelSettleTimeout,
-					weaverCancelSettlePollInterval,
-				); err != nil {
-					log.Printf("  queue snapshot after failed cancel settle: %s", describeJobsGraphQL(weaverURL))
-					log.Printf("  WARNING: timed out job %s (%d) did not settle before exclusive scenarios: %v", j.slug, j.jobID, err)
+			if len(timedOut) > 0 {
+				log.Printf("canceling %d timed out regular job(s) before refilling the window", len(timedOut))
+				for _, i := range timedOut {
+					j := &jobs[i]
+					if err := cancelJobGraphQL(weaverURL, j.jobID); err != nil {
+						log.Printf("  WARNING: cancel timed out job %s (%d): %v", j.slug, j.jobID, err)
+					}
+					if err := waitForJobCancelSettledGraphQL(
+						weaverURL,
+						j.jobID,
+						weaverCancelSettleTimeout,
+						weaverCancelSettlePollInterval,
+					); err != nil {
+						log.Printf("  queue snapshot after failed cancel settle: %s", describeJobsGraphQL(weaverURL))
+						log.Printf("  WARNING: timed out job %s (%d) did not settle before the window refilled: %v", j.slug, j.jobID, err)
+					}
 				}
 			}
 		}
-		if weaverDiedMidRun {
-			break
+
+		submitUpToWindow()
+	}
+
+	if weaverDiedMidRun {
+		// Jobs that were in flight when the server died are not timeouts: the
+		// scenario never had a server to complete against. Keep the status
+		// string — scoring and reconciliation elsewhere key off "timeout" —
+		// but do not let the report imply the scenario was given its full
+		// budget and failed to finish. There is nothing to cancel on a process
+		// that has exited, so no cancel/settle either.
+		for i := range jobs {
+			if jobs[i].status != "" || jobs[i].jobID == 0 {
+				continue
+			}
+			jobs[i].status = "timeout"
+			jobs[i].errMsg = "weaver exited mid-run; scenario never had a server to complete against"
+			log.Printf("  %s: NOT RUN (weaver exited mid-run)", jobs[i].slug)
+			emitProgressEvent(progressEvent{
+				Kind:    "phase_progress",
+				Current: countResolvedTestJobs(jobs),
+				Total:   len(jobs),
+				Status:  "timeout",
+				Detail:  jobs[i].slug,
+			})
 		}
 	}
 
@@ -3951,7 +3995,7 @@ func runTests(slugs []string) {
 				continue
 			}
 			jobs[i].status = "timeout"
-			jobs[i].errMsg = "weaver exited before this batch was submitted"
+			jobs[i].errMsg = "weaver exited before this fixture was submitted"
 			log.Printf("  %s: NOT RUN (weaver exited before submission)", jobs[i].slug)
 			emitProgressEvent(progressEvent{
 				Kind:    "phase_progress",
@@ -3993,8 +4037,8 @@ func runTests(slugs []string) {
 
 	// Summary
 	fmt.Println()
-	fmt.Printf("%-25s %-22s %-12s %s\n", "FIXTURE", "EXPECTED", "ACTUAL", "RESULT")
-	fmt.Println(strings.Repeat("-", 70))
+	fmt.Printf("%-25s %-22s %-12s %-8s %s\n", "FIXTURE", "EXPECTED", "ACTUAL", "TIME", "RESULT")
+	fmt.Println(strings.Repeat("-", 78))
 	passCount, failCount := 0, 0
 	for _, j := range jobs {
 		passed := false
@@ -4017,10 +4061,11 @@ func runTests(slugs []string) {
 		} else {
 			passCount++
 		}
-		fmt.Printf("%-25s %-22s %-12s %s\n", j.slug, j.scenario.ExpectedOutcome, j.status, label)
+		fmt.Printf("%-25s %-22s %-12s %-8s %s\n", j.slug, j.scenario.ExpectedOutcome, j.status, testJobDurationLabel(j), label)
 	}
-	fmt.Println(strings.Repeat("-", 70))
+	fmt.Println(strings.Repeat("-", 78))
 	fmt.Printf("Total: %d passed, %d failed out of %d\n", passCount, failCount, len(jobs))
+	printSlowestTestJobs(jobs, 8)
 
 	if err := assertDirectStoreEngagement(weaverURL); err != nil {
 		fmt.Printf("DIRECT-STORE ASSERTION FAILED: %v\n", err)
