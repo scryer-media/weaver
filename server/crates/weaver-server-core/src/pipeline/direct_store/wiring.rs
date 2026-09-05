@@ -7948,9 +7948,9 @@ impl Pipeline {
                     .map(|segments| segments.iter().copied().collect())
                     .unwrap_or_default();
                 // The articles the decode seam owns are kept alongside the ones
-                // the sweep verified, but they are *its* bytes: it wrote them
-                // itself while the sweep ran, through the write buffer, and its
-                // own cursor already accounts for them. So they belong in the
+                // the sweep verified, but they are *its* bytes: it holds them in
+                // the write buffer, parked there until this handback seeds the
+                // sweep's extents and drains it. So they belong in the
                 // assembly and out of the requeue, and nowhere near the sparse
                 // seeding below.
                 let handed_off: HashSet<u32> = handoffs
@@ -8023,7 +8023,7 @@ impl Pipeline {
                 // that completed the file. Skipping the seeding on completeness
                 // would leave its bytes in memory and a hole on disk.
                 let has_buffered_writes = self.write_buffers.contains_key(&file_id);
-                if !materialized_extents.is_empty() && (needs_more_bytes || has_buffered_writes) {
+                if has_buffered_writes || (!materialized_extents.is_empty() && needs_more_bytes) {
                     // Reconstruction made these article extents durable without
                     // passing through the conventional writer. Seed its sparse
                     // markers so a later missing article bridges the cursor;
@@ -8036,12 +8036,16 @@ impl Pipeline {
                         write_buf.mark_persisted(offset, len as usize);
                     }
                     // Whatever became writable only now is carried out to be
-                    // written, not dropped. The sweep runs detached, so an
-                    // article that decoded while it was outstanding reached the
-                    // write buffer with the cursor still at zero and had to
-                    // wait there: seeding the sweep's extents is exactly what
-                    // unblocks it, and it is the handed-off article's own bytes
-                    // as often as not.
+                    // written, not dropped. The sweep runs detached, and the
+                    // decode seam parks every conventional article for this
+                    // file while it is: one that decoded in the window sits in
+                    // the write buffer whether its offset was at the cursor or
+                    // not, and it is the handed-off article's own bytes as
+                    // often as not. Seeding the sweep's extents and draining
+                    // here is what writes it — even when the sweep verified
+                    // nothing, since an article at the cursor is writable on
+                    // its own and would otherwise wait for a neighbour that
+                    // may never come.
                     let (ready, contiguous_end) = write_buf.drain_ready_with_contiguous_end();
                     if !ready.is_empty() {
                         unblocked.push((file_id, ready, contiguous_end));

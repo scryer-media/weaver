@@ -3364,6 +3364,196 @@ async fn the_completion_gate_refuses_to_judge_a_job_whose_demotion_sweep_is_outs
     );
 }
 
+/// The handoff that completes a RAR member can be the volume's *first* article,
+/// arriving last: the tail articles were staged as holds, segment zero brought
+/// the headers, the router placed everything, the chain closed, and the
+/// member's CRC refused. That article's offset is already at the write cursor,
+/// so with the sweep detached the seam used to write and commit it on the spot
+/// — completing an assembly whose other articles were routed into the overlay
+/// and existed nowhere else yet — and the whole-file CRC, judged over a file
+/// one article long, failed the job. (Witnessed live as a mixed-grid two-set
+/// posting failing with a yEnc whole-file CRC32 mismatch over 768000 of
+/// 5243027 bytes, three milliseconds after its demotion ticket was submitted.)
+#[tokio::test]
+async fn a_handoff_at_the_write_cursor_waits_for_its_demotion_sweep() {
+    let member_name = "Silver.Horizon.S01E27.mkv";
+    let payload: Vec<u8> = (0..3000u32).map(|index| (index % 173) as u8).collect();
+    let mut volumes = single_member_store_set(member_name, &payload, 1);
+    let articles = 3usize;
+    // Damage in the middle article: every part CRC agrees with what was
+    // posted, so only the member's own CRC — checked when the chain closes,
+    // on the last article to arrive — can refuse the set.
+    let (mid_start, _) = article_extent(volumes[0].1.len(), 1, articles);
+    volumes[0].1[mid_start + 7] ^= 0xFF;
+    let posted_crc = checksum::crc32(&volumes[0].1);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41060);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, articles);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    // Tail first, segment zero last: the headers arrive with the article that
+    // completes the member.
+    let order: Vec<u32> = (1..articles as u32).chain(std::iter::once(0)).collect();
+    for segment_number in order {
+        take_queued_segment(
+            &mut pipeline,
+            job_id,
+            SegmentId {
+                file_id,
+                segment_number,
+            },
+        );
+        let (start, end) = article_extent(volumes[0].1.len(), segment_number, articles);
+        submit_decoded_segment(
+            &mut pipeline,
+            file_id,
+            segment_number,
+            start as u64,
+            &volumes[0].1[start..end],
+            &volumes[0].0,
+            Some(posted_crc),
+        )
+        .await;
+    }
+
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(MemberChecksumMismatch)"),
+        "the whole-member gate should have demoted the set, got {shape}"
+    );
+    let status = pipeline
+        .jobs
+        .get(&job_id)
+        .map(|state| state.status.clone())
+        .expect("the job must still be active");
+    assert!(
+        !matches!(status, JobStatus::Failed { .. }),
+        "the whole-file CRC must be judged over the reconstructed volume, not over \
+         the one article the seam held in hand, got {status:?}"
+    );
+    let (_, first_end) = article_extent(volumes[0].1.len(), 0, articles);
+    assert_eq!(
+        std::fs::read(working_dir.join(&volumes[0].0))
+            .ok()
+            .as_deref(),
+        Some(&volumes[0].1[..first_end]),
+        "the handback must drain exactly the in-hand first article to disk"
+    );
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        let file = state
+            .assembly
+            .file(file_id)
+            .expect("conventional assembly must own the demoted volume");
+        assert!(
+            !file.is_complete(),
+            "a member the store could not verify keeps none of its routed articles, \
+             so the assembly must still be waiting on them"
+        );
+        assert_eq!(
+            file.placement_of(0),
+            Some((0, first_end as u32)),
+            "the in-hand article must restore the placement erased by demotion reset"
+        );
+    }
+    assert!(
+        pipeline
+            .write_buffers
+            .get(&file_id)
+            .is_none_or(|write_buf| write_buf.buffered_len() == 0),
+        "nothing may stay parked once the handback drained the seam's article"
+    );
+    {
+        // Peek without draining: the refetch is dispatched below.
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let queued = state.download_queue.drain_all();
+        let mut numbers: Vec<(u32, u32)> = queued
+            .iter()
+            .map(|work| {
+                (
+                    work.segment_id.file_id.file_index,
+                    work.segment_id.segment_number,
+                )
+            })
+            .collect();
+        numbers.sort_unstable();
+        for work in queued {
+            state.download_queue.push(work);
+        }
+        assert_eq!(
+            numbers,
+            vec![(0, 1), (0, 2)],
+            "the routed articles are refetched conventionally; the in-hand one is not"
+        );
+    }
+
+    // The refetched tail lands conventionally and the whole-file CRC is
+    // judged over the full volume, which is exactly what was posted.
+    for segment_number in 1..articles as u32 {
+        take_queued_segment(
+            &mut pipeline,
+            job_id,
+            SegmentId {
+                file_id,
+                segment_number,
+            },
+        );
+        let (start, end) = article_extent(volumes[0].1.len(), segment_number, articles);
+        submit_decoded_segment(
+            &mut pipeline,
+            file_id,
+            segment_number,
+            start as u64,
+            &volumes[0].1[start..end],
+            &volumes[0].0,
+            Some(posted_crc),
+        )
+        .await;
+    }
+    let status = pipeline
+        .jobs
+        .get(&job_id)
+        .map(|state| state.status.clone())
+        .expect("the job must still be active");
+    assert!(
+        !matches!(status, JobStatus::Failed { .. }),
+        "the completed volume matches its posted CRC, got {status:?}"
+    );
+    assert_eq!(
+        std::fs::read(working_dir.join(&volumes[0].0))
+            .ok()
+            .as_deref(),
+        Some(volumes[0].1.as_slice()),
+        "the refetched articles plus the in-hand first article must reproduce the posted volume"
+    );
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .assembly
+            .file(file_id)
+            .is_some_and(|file| file.is_complete()),
+        "the assembly must complete once the refetched tail lands"
+    );
+    assert!(
+        !pipeline.write_buffers.contains_key(&file_id),
+        "a completed volume must not retain its write buffer"
+    );
+    assert_eq!(
+        queued_segments(&mut pipeline, job_id),
+        Vec::<(u32, u32)>::new(),
+        "nothing should be left to fetch"
+    );
+}
+
 #[tokio::test]
 async fn job_teardown_forgets_an_outstanding_demotion_sweep() {
     let member_name = "Silver.Horizon.S01E26.mkv";

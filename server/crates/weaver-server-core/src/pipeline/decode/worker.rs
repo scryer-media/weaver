@@ -1847,6 +1847,18 @@ impl Pipeline {
 
             let buffered_len = buffered_segment.len_bytes();
 
+            // While a demoted set's reconstruction sweep is outstanding, this
+            // file's conventional bytes are parked, not written. The assembly
+            // still holds every article the direct path routed, and the sweep
+            // is what puts those bytes on disk; an article whose offset is
+            // already at the write cursor — the handoff that completed a RAR
+            // member when it was the *first* article to arrive last — would
+            // otherwise be written and committed now, complete an assembly
+            // whose other bytes exist only in the overlay, and be judged by
+            // the whole-file CRC over a file one article long. The sweep's
+            // handback seeds its extents into this buffer and drains it, which
+            // is the order the inline sweep used to guarantee by construction.
+            let sweep_outstanding = self.demotion_sweep_owns_file(file_id);
             let ready = {
                 let _cpu_scope =
                     crate::runtime::perf_probe::cpu_scope("download.write_buffer.insert_drain");
@@ -1855,7 +1867,11 @@ impl Pipeline {
                     .entry(file_id)
                     .or_insert_with(|| WriteReorderBuffer::new(self.write_buf_max_pending));
                 write_buf.insert(file_offset, buffered_segment);
-                write_buf.drain_ready_with_contiguous_end()
+                if sweep_outstanding {
+                    (Vec::new(), 0)
+                } else {
+                    write_buf.drain_ready_with_contiguous_end()
+                }
             };
             if direct_handoff {
                 self.direct_store.finish_materialization_handoff(segment_id);
@@ -2536,6 +2552,11 @@ impl Pipeline {
         &mut self,
         file_id: NzbFileId,
     ) -> Result<(), SegmentWriteError> {
+        // Same hold as the sequential drain: an out-of-order flush commits
+        // too, and would complete the assembly over the sweep's image.
+        if self.demotion_sweep_owns_file(file_id) {
+            return Ok(());
+        }
         loop {
             let batch = {
                 let Some(write_buf) = self.write_buffers.get_mut(&file_id) else {
@@ -2565,7 +2586,9 @@ impl Pipeline {
             let candidate_file = self
                 .write_buffers
                 .iter()
-                .filter(|(_, write_buf)| write_buf.buffered_len() > 0)
+                .filter(|(file_id, write_buf)| {
+                    write_buf.buffered_len() > 0 && !self.demotion_sweep_owns_file(**file_id)
+                })
                 .max_by_key(|(_, write_buf)| write_buf.buffered_bytes())
                 .map(|(file_id, _)| *file_id);
 
