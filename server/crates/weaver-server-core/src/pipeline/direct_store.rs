@@ -57,12 +57,15 @@
 //!   envelopes and partials are the only copy of the volume image, and the
 //!   verifier needs them. At first that produced verification **verdicts** only,
 //!   and a damaged direct set demoted whole.
-//! - **The bounded small-member tolerance.** A set whose only ineligible
-//!   members are small unencrypted non-solid regular files still routes: their
-//!   packed ranges land in the envelope, and at finalization *only* those
+//! - **The member tolerance.** A set whose ineligible members are unencrypted
+//!   non-solid regular files still routes, *whatever those members weigh*:
+//!   their packed ranges land in the envelope, and at finalization *only* those
 //!   member indices are extracted through
 //!   `unrar_rs::RarArchive::extract_member_streaming` over the hybrid provider.
-//!   Direct `Store` outputs are never re-extracted or overwritten.
+//!   Direct `Store` outputs are never re-extracted or overwritten. Member shape
+//!   is therefore a **member** verdict and never a set one: a store video
+//!   beside a compressed subtitle pack, or a season pack with one compressed
+//!   episode, routes everything routable and stream-extracts the rest.
 //!
 //! Repair-while-direct replaces that last demotion with the other transition.
 //! [`repair`] materializes **only the damaged volumes** into scratch files,

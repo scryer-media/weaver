@@ -27,5 +27,11 @@ pub(crate) use rar::{
 /// same options plumbing as every other RAR member weaver extracts.
 pub(crate) use rar::rar_entry_via;
 
+/// A directory member of a direct set is created at finalization rather than
+/// extracted, and it must end up indistinguishable from one the conventional
+/// extractor produced — same times, same mode, from the same function. One
+/// restore, one stance.
+pub(crate) use rar::apply_rar_member_filesystem_metadata;
+
 #[cfg(test)]
 pub(crate) use rar::RarArchiveSnapshotOpenRequest;

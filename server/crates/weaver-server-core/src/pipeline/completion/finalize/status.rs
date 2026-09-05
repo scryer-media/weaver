@@ -180,6 +180,11 @@ impl Pipeline {
         job_id: JobId,
         reason: &'static str,
     ) {
+        // An in-flight probe both keeps the job in `Checking` (an early return
+        // below) and counts as pending pipeline work, so it would swallow this
+        // drain notification entirely. It has nothing left to say once the
+        // segments have settled.
+        self.retire_health_probe_if_download_pipeline_drained(job_id);
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
@@ -195,6 +200,9 @@ impl Pipeline {
         }
         if self.job_has_pending_download_pipeline_work(job_id)
             || self.direct_post_repair_in_flight.contains_key(&job_id)
+            || self.direct_tolerated_in_flight.contains_key(&job_id)
+            || self.par2_analysis_in_flight.contains_key(&job_id)
+            || self.direct_demotion_in_flight.contains_key(&job_id)
             || self.pending_completion_checks.contains(&job_id)
         {
             return;
@@ -853,6 +861,10 @@ impl Pipeline {
         self.direct_post_repair_in_flight.remove(&job_id);
         self.direct_post_repair_results.remove(&job_id);
         self.direct_post_repair_carry.remove(&job_id);
+        // The retained session this ticket is carrying belongs to a runtime
+        // that is being discarded, so its verdict describes a set that will not
+        // exist when it lands.
+        self.forget_par2_analysis_work(job_id);
         self.shared_state.clear_job_cancellations(job_id);
         self.par2_verified.remove(&job_id);
         self.par2_joined_split_sets.remove(&job_id);

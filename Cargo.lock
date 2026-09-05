@@ -619,22 +619,9 @@ version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
- "aws-lc-sys 0.45.0",
+ "aws-lc-sys",
  "untrusted 0.7.1",
  "zeroize",
-]
-
-[[package]]
-name = "aws-lc-sys"
-version = "0.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09fae7be8bb3174e05c6afdb34199e6dc0c7c04ba9fa237b1967adfbde27483"
-dependencies = [
- "cc",
- "cmake",
- "dunce",
- "fs_extra",
- "pkg-config",
 ]
 
 [[package]]
@@ -1674,7 +1661,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1856,7 +1843,7 @@ checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
 dependencies = [
  "io-lifetimes 2.0.4",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2513,9 +2500,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.14.1"
+version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07aa2048142242915a31d35844fb311e0e53fcca590c3a0a40dcf1b841fa09eb"
+checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
@@ -2588,7 +2575,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3301,11 +3288,11 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "886fc3580c754f2515f7d1af48baeab0e29957fa513c550bdf3ad3c5e43e0d63"
+checksum = "8380fcb1f1ffb23c8c94f43457aaf1ec3442ed7b9caf8efca091268421e58919"
 dependencies = [
- "aws-lc-sys 0.44.0",
+ "aws-lc-sys",
  "bytes",
  "cap-std",
  "crc-fast",
@@ -3673,7 +3660,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4009,7 +3996,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4077,7 +4064,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4829,10 +4816,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5362,12 +5349,12 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.9.1"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d325c756f14bc69ccbdbd53fcf89dfcef166e0360aa5ef698146af571a23727f"
+checksum = "3e5b4b91813b2c122baf13c66e8a2c297abe17de6b350d91130c2974f7ec9111"
 dependencies = [
  "aws-lc-rs",
- "aws-lc-sys 0.45.0",
+ "aws-lc-sys",
  "blake2s_simd",
  "crc-fast",
  "filetime",
@@ -5563,7 +5550,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -5618,14 +5605,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "bytes",
  "criterion",
@@ -5651,7 +5638,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "quick-xml",
  "serde",
@@ -5662,7 +5649,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "aes-gcm 0.11.1",
  "age",
@@ -5700,7 +5687,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -5765,7 +5752,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "cc",
  "crc-fast",
@@ -5876,7 +5863,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6199,7 +6186,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
 dependencies = [
  "bitflags",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

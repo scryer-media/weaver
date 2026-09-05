@@ -2,6 +2,16 @@ const helperImportPattern =
   /import\s*\{([^}]*)\}\s*from\s*["']\.\/helpers["']\s*;?/g;
 const importSourcePattern = /from\s*["']([^"']+)["']/g;
 
+// The only names a browser-owned spec may take from ./helpers: the test
+// fixtures, the route builder, and openNavigation, which drives the visible
+// navigation control (a role lookup and a click) rather than any transport.
+const browserHelperExports = new Set([
+  "expect",
+  "test",
+  "weaverRoute",
+  "openNavigation",
+]);
+
 const sanctionedHelperPrefixes = [
   "./support/setup/",
   "./support/external-control/",
@@ -53,7 +63,7 @@ export function auditBrowserSpec(relativePath, source) {
 
   for (const match of source.matchAll(helperImportPattern)) {
     const forbiddenImports = namedImports(match[1]).filter(
-      (name) => name !== "expect" && name !== "test" && name !== "weaverRoute",
+      (name) => !browserHelperExports.has(name),
     );
     if (forbiddenImports.length > 0) {
       violations.push(

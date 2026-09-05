@@ -59,8 +59,9 @@ use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::pipeline::{
-    BufferedDecodedSegment, DecodedChunk, DirectPostRepairCarry, DirectPostRepairWork,
-    DirectPostRepairWorkDone, Pipeline,
+    BufferedDecodedSegment, DecodedChunk, DirectDemotionWork, DirectDemotionWorkDone,
+    DirectPostRepairCarry, DirectPostRepairWork, DirectPostRepairWorkDone, DirectToleratedWork,
+    DirectToleratedWorkDone, Pipeline,
 };
 
 /// Read chunk for the restart gate re-arm. Matches the reconstruction sweep's:
@@ -576,6 +577,104 @@ impl DestinationSync for PreSyncedDestinations {
     }
 }
 
+/// What one demotion's reconstruction sweep did to the set's volumes.
+///
+/// The two counts are **not** disjoint any more, and that is the point: a
+/// volume that refuses one run is both materialized (for everything the sweep
+/// verified) and refetched (for the articles it did not). The byte totals are
+/// what actually says how much the demotion cost, because a volume count cannot
+/// tell a whole volume off the wire from one missing article.
+#[derive(Debug, Default)]
+struct ReconstructionSummary {
+    /// Volumes that came out of the sweep with a verified contiguous prefix.
+    materialized: usize,
+    /// Volumes the sweep could not rebuild in full, and the first reason each
+    /// refused. Each costs the articles its verified ranges do not back, and
+    /// nothing of its siblings.
+    refetched: Vec<(u32, ReconstructionFailure)>,
+    /// Decoded bytes the sweep verified and handed to the conventional path as
+    /// already on disk. These are the bytes a demotion no longer pays for
+    /// twice.
+    retained_bytes: u64,
+    /// Decoded bytes that were routed once and have to come off the wire again:
+    /// everything a volume had committed that its verified ranges do not back.
+    refetched_bytes: u64,
+}
+
+/// The reconciliation's half of a detached demotion sweep, snapshotted when the
+/// sweep was handed off and carried by the ticket until it lands.
+///
+/// It holds no borrow of the set or the job on purpose: by the time it is read
+/// back, the actor has processed an unbounded number of other messages, and
+/// only the sweep's own outcomes plus this snapshot may decide what the volumes
+/// now contain.
+pub(crate) struct DemotedSweepPlan {
+    set_name: String,
+    /// Carried for the ticket's log lines only. The demotion has already
+    /// recorded the reason everywhere it is acted on.
+    reason: DemotionReason,
+    /// `(volume_index, file_index, filename, sweep plan)`, in the order the
+    /// sweep reports its outcomes.
+    targets: Vec<(u32, u32, String, VolumeReconstruction)>,
+    /// Per volume, the decoded extent of each of its articles — the geometry
+    /// that turns verified ranges into a keep set and a segment-aligned floor.
+    extents_by_volume: HashMap<u32, std::collections::BTreeMap<u32, (u64, u64)>>,
+    /// Every volume of the set as an NZB file, for the completion replay the
+    /// handback ends with.
+    volume_files: Vec<NzbFileId>,
+    /// Articles the decode seam took ownership of at the demotion instant: the
+    /// one that was routing when the set demoted, and any that reached an
+    /// already-demoted set behind it.
+    ///
+    /// Snapshotted here because the seam writes them while the sweep runs and
+    /// clears its own record as soon as it has. The reconciliation must not
+    /// then read their segments as "committed but not verified" and requeue
+    /// them: their bytes are on disk, written by their owner, at the offsets
+    /// the conventional path expects.
+    handoffs: HashSet<SegmentId>,
+}
+
+/// Chunks a demoted volume's handback unblocked in the write buffer: the file
+/// they belong to, the ready `(offset, chunk)` pairs in write order, and the
+/// contiguous end the buffer reports after draining them.
+type UnblockedHandbackWrites = (NzbFileId, Vec<(u64, BufferedDecodedSegment)>, u64);
+
+/// A demotion sweep ready to be handed off: the worker's half (which is moved
+/// into the blocking task and never comes back) and the reconciliation's.
+struct PreparedDemotedSweep {
+    provider: super::provider::HybridVolumeProvider,
+    plans: Vec<VolumeReconstruction>,
+    sparse: super::sparse::SparseMarking,
+    plan: DemotedSweepPlan,
+}
+
+/// One member the member tolerance produces at finalization, with
+/// the two path forms the two arms need.
+struct ToleratedTarget {
+    /// Raw header name, which is what `find_member` is asked for.
+    name: String,
+    /// Absolute destination under the job's staging root.
+    destination: PathBuf,
+    /// The same path relative to that root, for [`ExtractionRoot`].
+    relative: PathBuf,
+    is_directory: bool,
+}
+
+/// What the tolerance produced: the member names, and the directory entries
+/// whose metadata still has to be restored.
+#[derive(Debug, Default)]
+pub(crate) struct ToleratedExtraction {
+    /// Raw header names produced, for `extracted_members`. Directory entries
+    /// are in here too — the conventional extractor reports one the same way,
+    /// and a name in neither list is a name completion cannot account for.
+    members: Vec<String>,
+    /// `(metadata, absolute path)` per directory entry, applied **after** the
+    /// commit loop: every file renamed into a directory bumps that directory's
+    /// mtime, so restoring it before the members land would restore a value the
+    /// next rename overwrites.
+    directories: Vec<(unrar_rs::MemberInfo, PathBuf)>,
+}
+
 /// Everything the authoritative PAR2 pass needs to read a job's direct sets
 /// virtually.
 ///
@@ -681,6 +780,12 @@ pub(crate) enum DirectPar2Resolution {
     /// The post-processing lane owns the post-repair read-back. Its terminal
     /// verdict re-arms this job without holding the queue actor.
     Pending,
+    /// A set left direct mode inside this call and its volumes are being
+    /// materialized. Bytes are moving, so the caller must go round again rather
+    /// than settle anything on a verdict taken over the virtual volumes the set
+    /// no longer has — the same answer [`Self::Repaired`] gets, for the same
+    /// reason.
+    Demoted,
     /// Neither: no live set, no verdict, or a repair that refused. The caller
     /// falls back to demoting for the repairer, which is the earlier behaviour.
     Unresolved,
@@ -780,6 +885,7 @@ impl Pipeline {
         let (admitted, refused) =
             DirectSetPlan::discover(&state.spec, &state.working_dir, &destination_dir);
         let password = state.spec.password.clone();
+        let par2_available = super::plan::spec_carries_par2(&state.spec);
         for (set_name, refusal) in refused {
             crate::runtime::perf_probe::record_owned(
                 format!("direct_store.refused.{}", refusal.metric()),
@@ -866,6 +972,7 @@ impl Pipeline {
                 // with, if any; `refresh_direct_passwords` picks up one that
                 // arrives later. Held in memory only.
                 set.router.set_password(password.as_deref());
+                set.router.note_par2_available(par2_available);
                 set
             })
             .collect();
@@ -1503,9 +1610,14 @@ impl Pipeline {
         self.metrics
             .direct_sets_admitted
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let par2_available = self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| super::plan::spec_carries_par2(&state.spec));
         let mut set = DirectSet::new(job_id, plan);
         self.direct_store.apply_ceilings(&mut set);
         set.router.set_password(password);
+        set.router.note_par2_available(par2_available);
         let sets = self.direct_store.sets.entry(job_id).or_default();
         sets.push(set);
         sets.len() - 1
@@ -2339,6 +2451,29 @@ impl Pipeline {
             })
     }
 
+    /// Whether this file is a volume of a demoted set whose reconstruction
+    /// sweep is still outstanding.
+    ///
+    /// A demoted set fails [`Self::is_direct_source_file`] on purpose — its
+    /// volumes are ordinary files from the demotion on — but for as long as the
+    /// detached sweep runs, those files are half written: the sweep owns them,
+    /// sets their length, and may remove one outright. An article that
+    /// completes such a volume through the conventional path in that window
+    /// must not have the file classified, probed or entered into the archive
+    /// topology over an image the sweep has not finished; the handback replays
+    /// the completion hook for every volume once the ticket lands.
+    pub(crate) fn demotion_sweep_owns_file(&self, file_id: NzbFileId) -> bool {
+        self.direct_demotion_in_flight
+            .get(&file_id.job_id)
+            .is_some_and(|sets| {
+                sets.keys().any(|set_index| {
+                    self.direct_store
+                        .set(file_id.job_id, *set_index)
+                        .is_some_and(|set| set.plan().volume_for_file(file_id.file_index).is_some())
+                })
+            })
+    }
+
     /// The virtual volume behind one direct source file, as a **one-volume**
     /// provider plus its logical length.
     ///
@@ -2988,9 +3123,20 @@ impl Pipeline {
             DirectRepairAnswer::Deferred => return DirectDamageResolution::Deferred,
             DirectRepairAnswer::Declined => {}
         }
+        // Same reason-preserving demotion as the pre-repairer seam: a set that
+        // reached here carrying its own part-checksum mismatch demotes under
+        // that, not under the verdict that merely agreed with it.
+        let part_damage = self
+            .demote_direct_sets_with_unanswered_part_damage(
+                job_id,
+                recovery_set_id,
+                "repair_declined",
+            )
+            .await;
         if self
             .demote_direct_sets_with_par2_damage_for_set(job_id, recovery_set_id, verification)
             .await
+            || part_damage
         {
             DirectDamageResolution::Resolved
         } else {
@@ -3066,6 +3212,27 @@ impl Pipeline {
             };
         };
         if !verification.needs_repair() {
+            // The safety valve for a damaged-volume fact PAR2 cannot answer.
+            //
+            // A part-checksum mismatch parks its set: the member holds its
+            // whole-member gate, so the set never finalizes on its own. That is
+            // right while a repair might still come, and wrong the moment PAR2
+            // reads the very volume and calls it whole — the two checksums
+            // disagree about bytes PAR2 has no reason to touch, which is the
+            // archive itself being wrong rather than the transfer. Nothing here
+            // can improve on that, and the set must not sit on it: it demotes
+            // under the reason the routing gate would have used, and the
+            // conventional path reports the failure it was always going to.
+            if self
+                .demote_direct_sets_with_unanswered_part_damage(
+                    job_id,
+                    recovery_set_id,
+                    "par2_clean",
+                )
+                .await
+            {
+                return DirectPar2Resolution::Demoted;
+            }
             return DirectPar2Resolution::Clean(Box::new(verification));
         }
         match self
@@ -3094,7 +3261,24 @@ impl Pipeline {
                 DirectPar2Resolution::Repaired
             }
             DirectRepairAnswer::Deferred => DirectPar2Resolution::Deferred,
-            DirectRepairAnswer::Declined => DirectPar2Resolution::Unresolved,
+            DirectRepairAnswer::Declined => {
+                // The other end of the safety valve above. The repair refused,
+                // so the parked set has run out of help; it demotes under the
+                // routing gate's own reason rather than under the generic
+                // `par2_damaged` the fall-through demotion would use, so the
+                // metric still says what went wrong.
+                if self
+                    .demote_direct_sets_with_unanswered_part_damage(
+                        job_id,
+                        recovery_set_id,
+                        "repair_declined",
+                    )
+                    .await
+                {
+                    return DirectPar2Resolution::Demoted;
+                }
+                DirectPar2Resolution::Unresolved
+            }
         }
     }
 
@@ -3463,10 +3647,18 @@ impl Pipeline {
                 // is the same full, unconditional read this pass has always
                 // taken post-repair: every described file, standing in for
                 // none of them.
+                // Volumes whose posted bytes an archive checksum already
+                // contradicted. Their grid claims come from the same wire that
+                // vouched for the damage, so they are dropped here and the
+                // volumes are read — which is also what gives the repair a
+                // slice-accurate account of what to rebuild.
+                let suspect = self.direct_suspect_par2_file_ids(job_id, overlay_set_id);
                 let claimed = if post_repair {
                     Vec::new()
                 } else {
-                    self.grid_claimed_file_verifications(job_id, &par2_set)
+                    let mut claimed = self.grid_claimed_file_verifications(job_id, &par2_set);
+                    claimed.retain(|file| !suspect.contains(&file.file_id));
+                    claimed
                 };
                 let claimed_ids: HashSet<par2_rs::FileId> =
                     claimed.iter().map(|file| file.file_id).collect();
@@ -3600,7 +3792,12 @@ impl Pipeline {
                                 else {
                                     continue;
                                 };
-                                if to_read_ids.contains(&par2_file_id) {
+                                // Same refusal as the whole-file claim above,
+                                // per slice: a suspect volume is read slice by
+                                // slice, with nothing proven in advance.
+                                if to_read_ids.contains(&par2_file_id)
+                                    && !suspect.contains(&par2_file_id)
+                                {
                                     proven_slices.insert(par2_file_id, slices);
                                 }
                             }
@@ -3708,6 +3905,44 @@ impl Pipeline {
     /// another decision's side effect is how it lapses silently when that
     /// decision is refactored. One bool is a cheap price for saying it where it
     /// is meant.
+    /// The PAR2 descriptions of live direct volumes carrying a recorded
+    /// part-checksum mismatch.
+    ///
+    /// The bridge between an archive-level fact and a PAR2-level one. A volume
+    /// lands here because RAR's own packed checksum disagreed with bytes the
+    /// wire delivered *and vouched for*, which makes every claim derived from
+    /// that same wire — the retained session's slice evidence, the dual-CRC
+    /// grid's whole-file and per-slice proofs — evidence from the witness whose
+    /// account is in question. So the pass reads these volumes, and nothing
+    /// stands in for them.
+    ///
+    /// Empty for every set with no damage on record, which is every set in
+    /// every healthy job: the claim ladder is untouched for them.
+    pub(crate) fn direct_suspect_par2_file_ids(
+        &self,
+        job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
+    ) -> HashSet<par2_rs::FileId> {
+        let mut suspect: HashSet<par2_rs::FileId> = HashSet::new();
+        for set in self.direct_store.sets_for(job_id) {
+            if set.is_demoted() || set.is_finalized() {
+                continue;
+            }
+            for volume_index in set.router.damaged_volumes() {
+                let Some(file_index) = set.plan().volumes.get(volume_index).copied() else {
+                    continue;
+                };
+                if let Some(binding) = self.resolve_par2_file_binding_in_set(
+                    NzbFileId { job_id, file_index },
+                    recovery_set_id,
+                ) {
+                    suspect.insert(binding.par2_file_id);
+                }
+            }
+        }
+        suspect
+    }
+
     pub(in crate::pipeline) fn direct_sets_repaired_in_place(&self, job_id: JobId) -> bool {
         self.direct_store
             .sets_for(job_id)
@@ -3797,6 +4032,16 @@ impl Pipeline {
         access: &std::sync::Arc<super::par2_access::DirectVolumeFileAccess>,
     ) -> Option<par2_rs::VerificationResult> {
         if overlay_set_id != par2_set.recovery_set_id {
+            return None;
+        }
+        // A volume with an archive-level checksum mismatch on record cannot be
+        // reported from wire evidence, and this session is all-or-nothing: one
+        // suspect volume and the whole pass reads instead. See
+        // [`Self::direct_suspect_par2_file_ids`].
+        if !self
+            .direct_suspect_par2_file_ids(job_id, overlay_set_id)
+            .is_empty()
+        {
             return None;
         }
         if !self.grid_adjudicated_par2_bindings(job_id, par2_set) {
@@ -4617,7 +4862,12 @@ impl Pipeline {
                     .map(|(offset, data)| (volume_index, offset, data))
                     .collect();
                 lead_in.extend(edges);
-                set.route_repaired(volume_index, &staged, &lead_in)
+                set.route_repaired(
+                    volume_index,
+                    &staged,
+                    &lead_in,
+                    volume.rewrote_whole_volume(),
+                )
             };
             drop(spans);
             let routed = match routed {
@@ -4872,6 +5122,55 @@ impl Pipeline {
         };
         self.demote_direct_sets_with_par2_damage_for_set(job_id, set_id, verification)
             .await
+    }
+
+    /// Demotes any live set still holding a part-checksum mismatch that the
+    /// PAR2 pass could not answer — either because it read the volume and
+    /// called it whole, or because it found the damage and had nothing to
+    /// repair it with.
+    ///
+    /// A part-checksum mismatch parks its set: the member holds its
+    /// whole-member gate, so the set never finalizes on its own. That is right
+    /// while a repair might still come and wrong the moment one cannot, and a
+    /// parked set must never be the end state. `verdict` names which of the two
+    /// endings this was, for the log only.
+    ///
+    /// The reason is the routing gate's own, so the metric bucket
+    /// (`part_checksum_mismatch`) counts it exactly where it was always
+    /// counted, and a job whose archive is genuinely wrong reports the same
+    /// failure it reported before any of this existed.
+    async fn demote_direct_sets_with_unanswered_part_damage(
+        &mut self,
+        job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
+        verdict: &'static str,
+    ) -> bool {
+        let stuck: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| self.direct_set_binds_to_par2_set(job_id, set, recovery_set_id))
+            .filter(|(_, set)| {
+                !set.is_demoted() && !set.is_finalized() && !set.router.damaged_volumes().is_empty()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if stuck.is_empty() {
+            return false;
+        }
+        for set_index in stuck {
+            warn!(
+                job_id = job_id.0,
+                set_index,
+                verdict,
+                "a direct set's volume failed its archive part checksum and PAR2 did not put it \
+                 right; demoting so the conventional path owns the archive"
+            );
+            self.demote_direct_set(job_id, set_index, DemotionReason::PartChecksumMismatch)
+                .await;
+        }
+        true
     }
 
     /// Demotes every set of `job_id` that is still routing, because a PAR2
@@ -5721,6 +6020,39 @@ impl Pipeline {
         if self.direct_finalization_waits_for_par2(job_id) {
             return;
         }
+        // Damage on record and no PAR2 verdict left to answer it.
+        //
+        // Reaching here means the job is verified, bypassed, or carries no
+        // recovery set that will ever be parsed — so a set still holding a
+        // part-checksum mismatch is holding a question nothing can answer. It
+        // never becomes ready (the member gate stalls by design), so without
+        // this it would sit routed and uncommitted for the life of the job.
+        // Demoting under the routing gate's own reason hands the archive to the
+        // conventional path, which reads the same bytes and reports the same
+        // CRC failure with the diagnostics that path has always had.
+        let unanswerable: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| {
+                !set.is_demoted()
+                    && !set.is_finalized()
+                    && set.all_volumes_complete()
+                    && !set.router.damaged_volumes().is_empty()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for set_index in unanswerable {
+            warn!(
+                job_id = job_id.0,
+                set_index,
+                "a direct set's volume failed its archive part checksum and no PAR2 verdict \
+                 is coming; demoting so the conventional path owns the archive"
+            );
+            self.demote_direct_set(job_id, set_index, DemotionReason::PartChecksumMismatch)
+                .await;
+        }
         let ready: Vec<usize> = self
             .direct_store
             .sets_for(job_id)
@@ -5970,7 +6302,7 @@ impl Pipeline {
         let extraction_claimed = self.extraction_claimed_members(job_id);
         set.assert_not_extraction_owned(&extraction_claimed);
 
-        // The small-member tolerance, and strictly **before** the commit loop
+        // The member tolerance, and strictly **before** the commit loop
         // below. The extraction reads the *virtual volumes*, which are the
         // envelopes overlaid with the members' `.direct.partial`s — so every
         // one of those files has to still be where the provider says it is.
@@ -5985,12 +6317,18 @@ impl Pipeline {
         // compares `plan().member_output_path` against the tolerated
         // destinations, which is derived from the layout and not from the
         // filesystem. It still has to run before the envelopes are deleted.
-        match self.extract_tolerated_members(job_id, set_index).await {
-            Ok(extracted) => {
-                for name in extracted {
+        let tolerated_directories = match self.extract_tolerated_members(job_id, set_index).await {
+            Ok(Some(extracted)) => {
+                for name in extracted.members {
                     self.record_direct_extracted(job_id, name);
                 }
+                extracted.directories
             }
+            // Detached to a blocking worker. The set stays routed, gated and
+            // uncommitted; the ticket's completion re-enters
+            // `finalize_ready_direct_sets`, which reaches here again with the
+            // result parked and takes it.
+            Ok(None) => return,
             Err(error) => {
                 warn!(
                     job_id = job_id.0,
@@ -6006,7 +6344,7 @@ impl Pipeline {
                 .await;
                 return;
             }
-        }
+        };
 
         // A failure here leaves the set neither committed nor abandoned: its
         // partials still hold every verified byte, but nothing downstream will
@@ -6059,6 +6397,31 @@ impl Pipeline {
                 return;
             }
             self.record_direct_extracted(job_id, name.clone());
+        }
+
+        // The archive's directory metadata, restored **last**. Every rename
+        // above landed a member inside one of these directories and bumped its
+        // mtime, so this is the first moment a restored time survives — and the
+        // conventional extractor reaches the same state for the same reason,
+        // because `rar` writes its directory headers after the files they hold.
+        //
+        // A refusal here is a warning, not a demotion: the directory itself
+        // exists and every member is committed, so throwing the whole set away
+        // to redownload it for a timestamp would cost far more than the
+        // timestamp is worth. The conventional path treats the same failure as
+        // fatal to *that member*, which for a directory is the same nothing.
+        for (info, path) in &tolerated_directories {
+            if let Err(error) =
+                crate::pipeline::extraction::apply_rar_member_filesystem_metadata(info, path)
+            {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    path = %path.display(),
+                    error = %error,
+                    "failed to restore a direct-store directory's archive metadata"
+                );
+            }
         }
 
         for scratch in &repair_scratch {
@@ -6305,9 +6668,20 @@ impl Pipeline {
         }
     }
 
-    /// The bounded small-member tolerance: extracts **only** the tolerated
-    /// member indices, through the hybrid virtual-volume provider, straight to
-    /// their destinations.
+    /// The member tolerance: extracts **only** the tolerated member indices,
+    /// through the hybrid virtual-volume provider, straight to their
+    /// destinations.
+    ///
+    /// # This is the tolerance's whole remaining cost
+    ///
+    /// One blocking task, once, after the set's last article. Nothing here is
+    /// I/O amplification — the tolerated bytes are read once out of the
+    /// envelope they were routed to, and the stored members are not touched at
+    /// all — but it is a *serial tail*, and with the tolerance's size ceiling
+    /// gone the list it walks can be large. The conventional incremental
+    /// scheduler already runs the same decode volume by volume as chains close;
+    /// feeding it this provider instead of files is the seam that would retire
+    /// the tail, and it is not opened here.
     ///
     /// Returns the raw member names that were produced, for
     /// `extracted_members`. The distinction that separates this from the
@@ -6316,27 +6690,90 @@ impl Pipeline {
     /// overwritten here, which is checked rather than assumed — a tolerated
     /// member resolving onto a stored member's destination is refused, and the
     /// set demotes.
+    ///
+    /// # Directory members are created, never extracted
+    ///
+    /// A directory entry is a dataless header. It is created through the same
+    /// [`ExtractionRoot`] the conventional extractor creates one through — same
+    /// path validator, same budget, same "already there is fine, a
+    /// non-directory in the way is not" rule — and never through
+    /// `File::create`, which would leave an empty *file* named like the
+    /// directory the archive describes.
+    ///
+    /// Its **metadata** is not applied here: every later file that lands inside
+    /// it bumps its mtime, and the commit loop that renames this set's stored
+    /// members runs after this call. The [`unrar_rs::MemberInfo`] is carried
+    /// back to [`Self::finalize_direct_set`] instead, which applies it once
+    /// every member is at its destination.
+    ///
+    /// **Off the pipeline task.** The tolerance no longer caps a member's size,
+    /// so this decode can run as long as a conventional extraction of the same
+    /// bytes, and it reads the virtual volumes off disk. The first call for a
+    /// set snapshots everything the decode needs and hands it to a blocking
+    /// worker as a [`DirectToleratedWork`] ticket, returning `Ok(None)`; the
+    /// ticket's completion re-enters [`Self::finalize_ready_direct_sets`], and
+    /// the call that finds its result parked returns `Ok(Some(_))`. One ticket
+    /// per job: a sibling set that is ready at the same time waits its turn,
+    /// which is the same serialization the commit loop imposes anyway.
     async fn extract_tolerated_members(
         &mut self,
         job_id: JobId,
         set_index: usize,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Option<ToleratedExtraction>, String> {
         let (set_name, names) = {
             let Some(set) = self.direct_store.set(job_id, set_index) else {
-                return Ok(Vec::new());
+                return Ok(Some(ToleratedExtraction::default()));
             };
-            (
-                set.set_name().to_string(),
-                set.router.tolerated_member_names(),
-            )
+            (set.set_name().to_string(), set.router.tolerated_members())
         };
         if names.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Some(ToleratedExtraction::default()));
+        }
+        // A finished ticket for this set: the pass that submitted it is this
+        // one, re-entered by the ticket's completion.
+        if let Some((result_set_index, result)) = self.direct_tolerated_results.remove(&job_id) {
+            if result_set_index == set_index {
+                self.direct_tolerated_in_flight.remove(&job_id);
+                let extracted = result?;
+                crate::runtime::perf_probe::record(
+                    "direct_store.tolerated_members_extracted",
+                    std::time::Duration::from_nanos(1),
+                );
+                if !extracted.directories.is_empty() {
+                    crate::runtime::perf_probe::record_value(
+                        "direct_store.tolerated_directories",
+                        extracted.directories.len() as u64,
+                    );
+                }
+                info!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    members = extracted.members.len(),
+                    directories = extracted.directories.len(),
+                    "extracted tolerated members from the virtual volumes"
+                );
+                return Ok(Some(extracted));
+            }
+            self.direct_tolerated_results
+                .insert(job_id, (result_set_index, result));
+        }
+        if let Some(in_flight) = self.direct_tolerated_in_flight.get(&job_id) {
+            // This set's own ticket still running, or a sibling set's whose
+            // result is parked for a pass that has not reached it yet. Either
+            // way this pass waits; the completion that lands re-enters it.
+            debug!(
+                job_id = job_id.0,
+                set_index,
+                in_flight_set_index = in_flight.set_index,
+                work_id = in_flight.work_id,
+                "a direct tolerated extraction is already in flight for this job; waiting"
+            );
+            return Ok(None);
         }
         let staging = self.extraction_staging_dir(job_id);
         let extraction_budget = self.extraction_budget(job_id, &staging)?;
         let Some(set) = self.direct_store.set(job_id, set_index) else {
-            return Ok(Vec::new());
+            return Ok(Some(ToleratedExtraction::default()));
         };
         // An `-hp` set's virtual volumes are as header-encrypted as
         // the posted ones, so this extraction cannot even *open* the archive
@@ -6378,8 +6815,14 @@ impl Pipeline {
             }
         }
 
-        let mut targets: Vec<(String, PathBuf)> = Vec::with_capacity(names.len());
-        for name in &names {
+        let mut targets: Vec<ToleratedTarget> = Vec::with_capacity(names.len());
+        for member in &names {
+            let name = &member.name;
+            // The same validator the conventional extractor refuses an unsafe
+            // member path with, reached through the same resolution a stored
+            // member's destination is: a directory entry whose name escapes the
+            // root is refused here and the set demotes, which is the refusal the
+            // conventional path would reach over the materialized volumes.
             let destination = set
                 .plan()
                 .member_output_path(name)
@@ -6390,12 +6833,28 @@ impl Pipeline {
                     destination.display()
                 ));
             }
-            targets.push((name.clone(), destination));
+            // Root-relative, because `ExtractionRoot` is a `cap-std` directory
+            // handle and every path it takes is relative to it. Derived from the
+            // destination rather than re-sanitized, so the directory this
+            // creates and the file a stored member commits to can never resolve
+            // through two different rules.
+            let relative = destination
+                .strip_prefix(&staging)
+                .map_err(|_| {
+                    format!("tolerated member '{name}' resolved outside the staging root")
+                })?
+                .to_path_buf();
+            targets.push(ToleratedTarget {
+                name: name.clone(),
+                destination,
+                relative,
+                is_directory: member.is_directory,
+            });
         }
         debug_assert!(
             targets
                 .iter()
-                .all(|(_, destination)| !stored_outputs.contains(destination)),
+                .all(|target| !stored_outputs.contains(&target.destination)),
             "a tolerated member of {set_name} would overwrite a direct-store output"
         );
 
@@ -6429,107 +6888,204 @@ impl Pipeline {
             .filter(|volume_index| *volume_index != first_volume)
             .collect();
         let extraction_memory_limit = self.extraction_limits.max_memory_bytes;
+        let extraction_root = staging.clone();
 
-        let extracted = tokio::task::spawn_blocking(move || {
-            let reader = provider
-                .open(first_volume)
-                .ok_or_else(|| format!("virtual volume {first_volume} is not registered"))?;
-            let mut archive = match password.as_deref() {
-                Some(password) => unrar_rs::RarArchive::open_with_password(reader, password),
-                None => unrar_rs::RarArchive::open(reader),
-            }
-            .map_err(|error| format!("failed to open the virtual archive: {error}"))?;
-            // The same decode ceilings the incremental extractor applies. A
-            // tolerated member is small by budget, but the *declared* dictionary
-            // in a hostile header is not bounded by anything the budget checks.
-            let max_dict_bytes =
-                crate::pipeline::extraction::apply_server_rar_limits_with_memory_limit(
-                    &mut archive,
-                    extraction_memory_limit,
-                );
-            for volume_index in other_volumes {
-                let Some(reader) = provider.open(volume_index) else {
-                    continue;
-                };
-                archive
-                    .add_volume(volume_index as usize, Box::new(reader))
-                    .map_err(|error| {
-                        format!("failed to add virtual volume {volume_index}: {error}")
-                    })?;
-            }
-            crate::pipeline::extraction::ensure_rar_dictionary_within_limit(
-                &archive,
-                max_dict_bytes,
-            )
-            .map_err(|error| format!("RAR dictionary admission failed: {error}"))?;
-            let _memory_permit = extraction_budget
-                .reserve_memory_wait(crate::pipeline::extraction::rar_decoder_memory_bytes(
-                    &archive,
-                ))
-                .map_err(|error| format!("RAR decoder memory admission failed: {error}"))?;
-            for (_, destination) in &targets {
-                if let Some(parent) = destination.parent() {
-                    std::fs::create_dir_all(parent).map_err(|error| {
-                        format!(
-                            "failed to create {} for a tolerated member: {error}",
-                            parent.display()
-                        )
-                    })?;
-                }
-            }
-            let options = unrar_rs::ExtractOptions {
-                verify: true,
-                password: password.clone(),
-                restore_owners: false,
-            };
-            let mut produced = Vec::with_capacity(targets.len());
-            for (name, destination) in &targets {
-                let index = archive
-                    .find_member(name)
-                    .ok_or_else(|| format!("tolerated member '{name}' is not in the archive"))?;
-                let mut file = std::fs::File::create(destination).map_err(|error| {
-                    format!("failed to create {}: {error}", destination.display())
-                })?;
-                // The provider is the set's, keyed by the set's own volume
-                // indices, which is what the entry asks for — a member
-                // starting in volume 3 requests volume 3.
-                crate::pipeline::extraction::rar_entry_via(
-                    &mut archive,
-                    index,
-                    &provider,
-                    &options,
-                )
-                .and_then(|entry| entry.copy_to(&mut file))
-                .map_err(|error| format!("failed to extract '{name}': {error}"))?;
-                // The tolerated half of the byte account: everything else a
-                // direct set produces is counted at the router as
-                // `direct_store.bytes.member`, and a set whose tolerated bytes
-                // start rivalling its stored ones is one the tolerance budget
-                // is no longer holding.
-                if let Ok(metadata) = file.metadata() {
-                    crate::runtime::perf_probe::record_value(
-                        "direct_store.bytes.tolerated",
-                        metadata.len(),
-                    );
-                }
-                produced.push(name.clone());
-            }
-            Ok::<Vec<String>, String>(produced)
-        })
-        .await
-        .map_err(|error| format!("tolerated extraction task panicked: {error}"))??;
-
-        crate::runtime::perf_probe::record(
-            "direct_store.tolerated_members_extracted",
-            std::time::Duration::from_nanos(1),
+        self.next_direct_tolerated_work_id = self.next_direct_tolerated_work_id.wrapping_add(1);
+        let work_id = self.next_direct_tolerated_work_id;
+        self.direct_tolerated_in_flight.insert(
+            job_id,
+            DirectToleratedWork {
+                work_id,
+                set_index,
+                submitted_at: Instant::now(),
+            },
         );
         info!(
             job_id = job_id.0,
             set_name = %set_name,
-            members = extracted.len(),
-            "extracted tolerated small members from the virtual volumes"
+            work_id,
+            members = targets.len(),
+            "submitting a direct tolerated-extraction ticket"
         );
-        Ok(extracted)
+        let done_tx = self.direct_tolerated_done_tx.clone();
+        tokio::spawn(async move {
+            let joined = tokio::task::spawn_blocking(move || {
+                let reader = provider
+                    .open(first_volume)
+                    .ok_or_else(|| format!("virtual volume {first_volume} is not registered"))?;
+                let mut archive = match password.as_deref() {
+                    Some(password) => unrar_rs::RarArchive::open_with_password(reader, password),
+                    None => unrar_rs::RarArchive::open(reader),
+                }
+                .map_err(|error| format!("failed to open the virtual archive: {error}"))?;
+                // The same decode ceilings the incremental extractor applies.
+                // Nothing about a tolerated member bounds the *declared* dictionary
+                // in a hostile header, so the same admission runs here.
+                let max_dict_bytes =
+                    crate::pipeline::extraction::apply_server_rar_limits_with_memory_limit(
+                        &mut archive,
+                        extraction_memory_limit,
+                    );
+                for volume_index in other_volumes {
+                    let Some(reader) = provider.open(volume_index) else {
+                        continue;
+                    };
+                    archive
+                        .add_volume(volume_index as usize, Box::new(reader))
+                        .map_err(|error| {
+                            format!("failed to add virtual volume {volume_index}: {error}")
+                        })?;
+                }
+                crate::pipeline::extraction::ensure_rar_dictionary_within_limit(
+                    &archive,
+                    max_dict_bytes,
+                )
+                .map_err(|error| format!("RAR dictionary admission failed: {error}"))?;
+                let _memory_permit = extraction_budget
+                    .reserve_memory_wait(crate::pipeline::extraction::rar_decoder_memory_bytes(
+                        &archive,
+                    ))
+                    .map_err(|error| format!("RAR decoder memory admission failed: {error}"))?;
+                let options = unrar_rs::ExtractOptions {
+                    verify: true,
+                    password: password.clone(),
+                    restore_owners: false,
+                };
+                // Every target goes through the sandboxed root now, files included,
+                // so it is opened unconditionally. It used to be opened only for a
+                // set with a directory entry, and the file arm wrote through a bare
+                // `File::create` with `create_dir_all` parents: that skipped the
+                // path validator, the entry accounting, and — the reason it can no
+                // longer stand — the *byte* budget. While the tolerance carried at
+                // most 256 MiB of declared unpacked size, an unbudgeted write was
+                // bounded by that ceiling; with the ceiling gone, the only thing
+                // that may bound a tolerated decode is the same
+                // `JobExtractionBudget` the conventional extractor writes through.
+                let root = crate::pipeline::extraction::ExtractionRoot::open(&extraction_root)?;
+                let mut produced = Vec::with_capacity(targets.len());
+                let mut directories = Vec::new();
+                for target in &targets {
+                    let name = &target.name;
+                    let index = archive.find_member(name).ok_or_else(|| {
+                        format!("tolerated member '{name}' is not in the archive")
+                    })?;
+                    if target.is_directory {
+                        // The conventional extractor's own directory arm, byte for
+                        // byte: create through the sandboxed root under the
+                        // extraction budget, tolerating a directory that is already
+                        // there — the routed members' parents were created when
+                        // their `.direct.partial`s were prepared, so on an ordinary
+                        // folder-tree set every one of these already exists.
+                        root.create_dir(&target.relative, &extraction_budget)?;
+                        let info = archive.member_info(index).ok_or_else(|| {
+                            format!("tolerated directory '{name}' has no member metadata")
+                        })?;
+                        directories.push((info.clone(), target.destination.clone()));
+                        produced.push(name.clone());
+                        continue;
+                    }
+                    // Budgeted, and through the same root the directory arm uses:
+                    // `create_file` validates the relative path, creates the
+                    // parents as archive entries, and hands back a writer that
+                    // charges every byte against the job's member, job-total and
+                    // free-space limits. A rejection fails the tolerated extraction,
+                    // which demotes the set to a conventional extraction that will
+                    // meet the very same budget.
+                    let mut file = root.create_file(&target.relative, &extraction_budget)?;
+                    // The provider is the set's, keyed by the set's own volume
+                    // indices, which is what the entry asks for — a member
+                    // starting in volume 3 requests volume 3.
+                    let written = crate::pipeline::extraction::rar_entry_via(
+                        &mut archive,
+                        index,
+                        &provider,
+                        &options,
+                    )
+                    .and_then(|entry| entry.copy_to(&mut file))
+                    .map_err(|error| format!("failed to extract '{name}': {error}"))?;
+                    // The tolerated half of the byte account: everything else a
+                    // direct set produces is counted at the router as
+                    // `direct_store.bytes.member`. Read against it to see how much
+                    // of a mixed set the tolerance is carrying.
+                    crate::runtime::perf_probe::record_value(
+                        "direct_store.bytes.tolerated",
+                        written,
+                    );
+                    produced.push(name.clone());
+                }
+                Ok::<ToleratedExtraction, String>(ToleratedExtraction {
+                    members: produced,
+                    directories,
+                })
+            })
+            .await;
+            let result = joined
+                .map_err(|error| format!("tolerated extraction task panicked: {error}"))
+                .and_then(|result| result);
+            let _ = done_tx
+                .send(DirectToleratedWorkDone {
+                    job_id,
+                    work_id,
+                    set_index,
+                    result,
+                })
+                .await;
+        });
+        Ok(None)
+    }
+
+    /// The tolerated-extraction ticket's completion, on the pipeline task.
+    ///
+    /// Parks the result for the finalization pass and re-enters that pass at
+    /// once: the set the ticket belongs to is ready and waiting on nothing but
+    /// this, and the completion check will not judge the job while the ticket
+    /// is outstanding. A ticket the demotion or job-teardown seams already
+    /// forgot is discarded by the fence.
+    pub(in crate::pipeline) async fn handle_direct_tolerated_done(
+        &mut self,
+        done: DirectToleratedWorkDone,
+    ) {
+        let Some(in_flight) = self.direct_tolerated_in_flight.get(&done.job_id) else {
+            return;
+        };
+        if in_flight.work_id != done.work_id || in_flight.set_index != done.set_index {
+            debug!(
+                job_id = done.job_id.0,
+                work_id = done.work_id,
+                "discarding a stale direct tolerated-extraction ticket"
+            );
+            return;
+        }
+        let elapsed = in_flight.submitted_at.elapsed();
+        let outcome = match &done.result {
+            Ok(_) => "extracted",
+            Err(_) => "error",
+        };
+        info!(
+            job_id = done.job_id.0,
+            work_id = done.work_id,
+            set_index = done.set_index,
+            elapsed_ms = elapsed.as_millis() as u64,
+            outcome,
+            "direct tolerated-extraction ticket completed"
+        );
+        crate::runtime::perf_probe::record("direct_store.tolerated_extract", elapsed);
+        if !self.jobs.contains_key(&done.job_id) {
+            self.direct_tolerated_in_flight.remove(&done.job_id);
+            return;
+        }
+        self.direct_tolerated_results
+            .insert(done.job_id, (done.set_index, done.result));
+        self.finalize_ready_direct_sets(done.job_id).await;
+        self.schedule_job_completion_check(done.job_id);
+    }
+
+    /// Forgets a job's tolerated-extraction ticket and any parked result. The
+    /// detached worker keeps running to its end; its done message then finds
+    /// no taker and is discarded by the fence.
+    pub(crate) fn forget_direct_tolerated_work(&mut self, job_id: JobId) {
+        self.direct_tolerated_in_flight.remove(&job_id);
+        self.direct_tolerated_results.remove(&job_id);
     }
 
     /// Abandons direct output for a set and hands its volumes back (the
@@ -6541,11 +7097,21 @@ impl Pipeline {
     ///    envelope plus the member extents, its covered runs are verified against
     ///    the yEnc part-CRC composition, and only then are legacy floors and
     ///    completed-file rows persisted, the coverage row retired, and the
-    ///    partials and envelopes deleted. Covered bytes are never refetched.
-    /// 2. **Refetch** — the conservative form, kept as the fallback for
-    ///    everything reconstruction cannot do: a deleted envelope, a truncated
-    ///    partial, a covered run whose CRC32 disagrees. The routed bytes are
-    ///    thrown away and every article comes back off the wire.
+    ///    partials and envelopes deleted. Verified bytes are never refetched —
+    ///    a volume the demotion caught mid-download comes back to the
+    ///    conventional path with the prefix it had already received already
+    ///    covered, so only the articles that never arrived are scheduled.
+    ///    A run the sweep cannot vouch for costs that run's articles and
+    ///    nothing else: not the rest of its volume, and not its siblings.
+    /// 2. **Refetch** — the conservative form, and by now only for the two
+    ///    refusals that are properties of the whole set and are raised before
+    ///    a byte is swept: a set with no layout at all, and an encrypted set
+    ///    whose posted bytes the overlay cannot reproduce. Neither leaves a
+    ///    single range anything could vouch for, so the routed bytes are thrown
+    ///    away and every article comes back off the wire. Everything that used
+    ///    to reach here — a deleted envelope, a truncated partial, a covered
+    ///    run whose CRC32 disagrees — is now handled inside the sweep, range by
+    ///    range.
     ///
     /// Ordering is normative. Unlike *repair* over checkpoint-covered output —
     /// which deletes the checkpoint row **first**, because it is about to
@@ -6553,6 +7119,17 @@ impl Pipeline {
     /// part of reconciliation, after the legacy state that replaces it is
     /// durable. Retiring first would leave a window where neither the direct
     /// coverage nor the legacy floors describe what is on disk.
+    ///
+    /// **This call does not wait for shape 1.** It marks the set demoted,
+    /// clears the state a demotion invalidates, and hands the sweep to a
+    /// detached worker as a ticket; the reconciliation — floors, rows,
+    /// retirement, deletion, the completion replay — runs in
+    /// [`Self::handle_direct_demotion_done`], on the pipeline task, in exactly
+    /// the order above. Everything that must not observe the job in between is
+    /// held off by the ticket: the completion check refuses to judge a job with
+    /// one outstanding, and the PAR2 gate waits on the materializations this
+    /// call has already begun. Shape 2 has no sweep to detach and finishes
+    /// inline.
     pub(in crate::pipeline) async fn demote_direct_set(
         &mut self,
         job_id: JobId,
@@ -6598,6 +7175,11 @@ impl Pipeline {
         self.direct_post_repair_carry.remove(&job_id);
         self.direct_post_repair_in_flight.remove(&job_id);
         self.direct_post_repair_results.remove(&job_id);
+        // Likewise a tolerated extraction: it was reading the virtual volumes
+        // this demotion is about to reconstruct and delete, and the members it
+        // produced are the conventional extractor's to overwrite now.
+        self.direct_tolerated_in_flight.remove(&job_id);
+        self.direct_tolerated_results.remove(&job_id);
         if reason == DemotionReason::HoldsScratchCeiling {
             debug!(
                 job_id = job_id.0,
@@ -6630,6 +7212,21 @@ impl Pipeline {
                 file_index: *file_index,
             })
             .collect();
+        // Damage established before any recovery set has been asked. Recorded
+        // as the *fact* rather than the reason, because the completion gate
+        // reads it to refuse a stored set's "a clean decode proves integrity"
+        // claim, and that refusal has to survive reasons being added or
+        // retired. Recorded before the materialization below, so the volume
+        // replay at the end of this function — which is what puts these files
+        // in front of the extraction scheduler — cannot get there first.
+        if reason.is_source_damage() {
+            self.note_known_archive_set_damage(job_id, &set_name);
+        }
+        // A parked damaged-path verdict goes the way of the post-repair carry
+        // above, and for the same reason: it describes volumes that were
+        // virtual when it was reached and are about to become files the
+        // conventional path writes. The next pass reads the set as it now is.
+        self.clear_pending_par2_repairs_for_job(job_id);
         self.direct_store.begin_materialization(
             job_id,
             set_index,
@@ -6647,6 +7244,15 @@ impl Pipeline {
             format!("direct_store.demoted.{}", reason.metric()),
             std::time::Duration::from_nanos(1),
         );
+        // Reported, not yet acted on: how many demotions could have been served
+        // by the set's own virtual volumes, split from the ones that genuinely
+        // need files on disk. Every set still materializes below; this is the
+        // measurement that says what keeping the overlay would be worth.
+        let volume_demand = reason.volume_demand();
+        crate::runtime::perf_probe::record_owned(
+            format!("direct_store.demoted.{volume_demand}"),
+            std::time::Duration::from_nanos(1),
+        );
         // Guarded by `claim_demotion` above, so this counts each set exactly
         // once; the per-reason breakdown lives in the perf-probe key and the
         // warn line.
@@ -6657,30 +7263,17 @@ impl Pipeline {
             job_id = job_id.0,
             set_name = %set_name,
             reason = reason.metric(),
+            volumes = %volume_demand,
             "direct-store set demoted"
         );
 
-        match self.reconstruct_demoted_set(job_id, set_index).await {
-            Ok(volumes) => {
-                crate::runtime::perf_probe::record(
-                    "direct_store.demoted.reconstructed",
-                    std::time::Duration::from_nanos(1),
-                );
-                // The other half of the materialization account: a whole-set
-                // demotion materializes *every* volume of the group, and this
-                // is how many that was. Read against
-                // `direct_store.repair.materialized_volumes`, whose whole point
-                // is being much smaller.
-                crate::runtime::perf_probe::record_value(
-                    "direct_store.demote.materialized_volumes",
-                    volumes as u64,
-                );
-                info!(
-                    job_id = job_id.0,
-                    set_name = %set_name,
-                    volumes,
-                    "direct-store set materialized from its own routed bytes"
-                );
+        match self.prepare_demoted_set_sweep(job_id, set_index, &set_name, reason) {
+            Ok(prepared) => {
+                // Handed off, not run here. Everything below this point —
+                // floors, rows, retirement, deletion, the completion replay —
+                // happens on the pipeline task when the ticket lands, in
+                // `apply_demoted_set_reconstruction`.
+                self.submit_demoted_set_sweep(job_id, set_index, prepared);
             }
             Err(failure) => {
                 crate::runtime::perf_probe::record_owned(
@@ -6693,9 +7286,21 @@ impl Pipeline {
                     failure = %failure,
                     "direct-store reconstruction is not possible; refetching the set's volumes"
                 );
+                // Cheap by construction — it retires the row, deletes the
+                // routed output and requeues; there is no sweep to detach — so
+                // it stays on the actor and the handback tail runs at once.
                 self.refetch_demoted_set(job_id, set_index).await;
+                self.finish_demoted_set_handback(job_id, demoted_volume_files)
+                    .await;
             }
         }
+    }
+
+    /// The tail of a demotion, once the set's volumes are files on disk.
+    ///
+    /// Reached from the refetch fallback immediately, and from the detached
+    /// sweep's ticket when it lands.
+    async fn finish_demoted_set_handback(&mut self, job_id: JobId, volume_files: Vec<NzbFileId>) {
         // Re-enter every complete volume into the conventional completion
         // seam. While the set was direct, `refresh_archive_state_for_completed_file`
         // suppressed itself for these files at its own entry — a direct set
@@ -6711,7 +7316,7 @@ impl Pipeline {
         // conventional completion walks (`allow_probe` included), and the
         // hook's own guards skip files that are still incomplete — those
         // complete later through the decode path and get the hook naturally.
-        for file_id in demoted_volume_files {
+        for file_id in volume_files {
             self.refresh_archive_state_for_completed_file(job_id, file_id, true)
                 .await;
         }
@@ -6722,12 +7327,34 @@ impl Pipeline {
         self.release_retained_direct_volumes(job_id).await;
     }
 
-    /// The reconstruction path. `Ok(n)` when `n` volumes were materialized.
-    async fn reconstruct_demoted_set(
+    /// The read-only half of the reconstruction path: everything the sweep and
+    /// its reconciliation need, snapshotted off the set and the job without
+    /// touching either.
+    ///
+    /// `Err` is reserved for the two refusals that are properties of the whole
+    /// set and can be raised before a byte is swept — no layout, and an
+    /// encrypted set whose posted bytes the overlay cannot reproduce. A run
+    /// that fails *during* the sweep is reported inside
+    /// [`ReconstructionSummary`] and costs only the articles its own bytes
+    /// back: the volume keeps everything the sweep verified, and its siblings
+    /// are untouched.
+    fn prepare_demoted_set_sweep(
         &mut self,
         job_id: JobId,
         set_index: usize,
-    ) -> Result<usize, ReconstructionFailure> {
+        set_name: &str,
+        reason: DemotionReason,
+    ) -> Result<PreparedDemotedSweep, ReconstructionFailure> {
+        // Read before the set is borrowed, and used twice below: to stop the
+        // sweep truncating away an article its owner is writing right now, and
+        // to stop the reconciliation requeueing one it already wrote.
+        let handoffs: HashSet<SegmentId> = self
+            .direct_store
+            .pending_materializations(job_id)
+            .into_iter()
+            .find(|(index, _)| *index == set_index)
+            .map(|(_, pending)| pending.handoffs)
+            .unwrap_or_default();
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return Err(ReconstructionFailure::NoLayout);
         };
@@ -6793,13 +7420,29 @@ impl Pipeline {
             // segment that is not wholly backed by an article CRC atom.
             let coverage = crcs.materializable_coverage(&physical_coverage);
             let extents = set.segment_extents(*volume_index);
+            // The sweep sets the file's length before it writes, to cut off a
+            // stale tail an interrupted earlier attempt could have left above
+            // the volume. It runs detached, though, and the decode seam writes
+            // the handed-off article into the same file as soon as this
+            // demotion returns — so the length has to reach that article too,
+            // or whichever of the two goes second decides whether its bytes
+            // survive. The sweep never *writes* the range: the coverage above
+            // excludes it precisely because its owner is elsewhere.
+            let handoff_end = handoffs
+                .iter()
+                .filter(|segment_id| segment_id.file_id == file_id)
+                .filter_map(|segment_id| extents.get(&segment_id.segment_number))
+                .map(|(offset, len)| offset.saturating_add(*len))
+                .max()
+                .unwrap_or(0);
             // A volume that never completed has no authoritative length; its
             // received bytes are the most that can be on disk. A routed range
             // above a hole can end later than that aggregate, though, so its
             // durable coverage is also a lower bound for this sweep.
             let len = set
                 .virtual_volume_len(*volume_index, received)
-                .max(physical_coverage.end());
+                .max(physical_coverage.end())
+                .max(handoff_end);
             lengths.insert(*volume_index, len);
             extents_by_volume.insert(*volume_index, extents);
             let path = working_dir.join(&filename);
@@ -6827,22 +7470,252 @@ impl Pipeline {
         let plans: Vec<VolumeReconstruction> =
             targets.iter().map(|(_, _, _, plan)| plan.clone()).collect();
         let sparse = self.direct_store.sparse_marking();
-        let rebuilt = tokio::task::spawn_blocking(move || {
-            crate::pipeline::direct_store::reconstruct::reconstruct_volumes(
-                &provider, &plans, sparse,
-            )
+        let volume_files: Vec<NzbFileId> = volume_files
+            .iter()
+            .map(|(_, file_index)| NzbFileId {
+                job_id,
+                file_index: *file_index,
+            })
+            .collect();
+        Ok(PreparedDemotedSweep {
+            provider,
+            plans,
+            sparse,
+            plan: DemotedSweepPlan {
+                set_name: set_name.to_string(),
+                reason,
+                targets,
+                extents_by_volume,
+                volume_files,
+                handoffs,
+            },
         })
-        .await
-        .map_err(|error| ReconstructionFailure::WriteFailed {
-            volume_index: u32::MAX,
-            error: error.to_string(),
-        })??;
+    }
 
-        // Everything above is read-only against the job; from here the
-        // reconciliation mutates durable state, in that order: legacy floors
-        // and completed-file rows, then the coverage row, then the direct
-        // outputs.
+    /// Hands a prepared sweep to a detached worker and takes a ticket for it.
+    ///
+    /// The sweep itself is bounded only by the size of the archive, so it runs
+    /// nowhere near the pipeline task: the demotion returns as soon as the
+    /// ticket is recorded, and the job's other articles keep flowing.
+    ///
+    /// **The sweep owns the volume files while it runs.** An article of this
+    /// set that decodes during that window takes the conventional write path —
+    /// its bytes land in the volume file, its segment commits — and the
+    /// reconciliation then resets and requeues it along with everything else
+    /// the sweep did not vouch for. That is one wasted fetch per article that
+    /// happened to be in flight at the demotion instant, and it is deliberate:
+    /// the sweep is the only writer that knows what the rebuilt image contains,
+    /// down to removing a volume file outright when it could vouch for nothing
+    /// in it, so nothing else may claim a range of it.
+    fn submit_demoted_set_sweep(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        prepared: PreparedDemotedSweep,
+    ) {
+        let PreparedDemotedSweep {
+            provider,
+            plans,
+            sparse,
+            plan,
+        } = prepared;
+        self.next_direct_demotion_work_id = self.next_direct_demotion_work_id.wrapping_add(1);
+        let work_id = self.next_direct_demotion_work_id;
+        let volumes = plans.len();
+        let set_name = plan.set_name.clone();
+        let reason = plan.reason.metric();
+        self.direct_demotion_in_flight
+            .entry(job_id)
+            .or_default()
+            .insert(
+                set_index,
+                DirectDemotionWork {
+                    work_id,
+                    submitted_at: Instant::now(),
+                    plan,
+                },
+            );
+        info!(
+            job_id = job_id.0,
+            set_name = %set_name,
+            work_id,
+            volumes,
+            reason,
+            "submitting a direct demotion reconstruction ticket"
+        );
+        let done_tx = self.direct_demotion_done_tx.clone();
+        tokio::spawn(async move {
+            let rebuilt = tokio::task::spawn_blocking(move || {
+                crate::pipeline::direct_store::reconstruct::reconstruct_volumes(
+                    &provider, &plans, sparse,
+                )
+            })
+            .await
+            // A panicked sweep leaves no outcomes at all, which the
+            // reconciliation reads as "every volume kept nothing" — the same
+            // handback a set whose destinations all failed gets, refetch
+            // included. Dropping the ticket instead would wedge the job behind
+            // a completion gate nothing ever clears.
+            .unwrap_or_else(|error| {
+                warn!(
+                    job_id = job_id.0,
+                    work_id,
+                    set_index,
+                    error = %error,
+                    "a direct demotion reconstruction sweep panicked; refetching the set's volumes"
+                );
+                Vec::new()
+            });
+            let _ = done_tx
+                .send(DirectDemotionWorkDone {
+                    job_id,
+                    work_id,
+                    set_index,
+                    rebuilt,
+                })
+                .await;
+        });
+    }
+
+    /// The demotion sweep's ticket, on the pipeline task.
+    ///
+    /// Applies the durable half of the handback and re-enters the completion
+    /// seam the demotion could not reach while the sweep was outstanding. A
+    /// ticket whose job was torn down, or whose set demoted again behind it, is
+    /// discarded by the fence.
+    pub(in crate::pipeline) async fn handle_direct_demotion_done(
+        &mut self,
+        done: DirectDemotionWorkDone,
+    ) {
+        let Some(sets) = self.direct_demotion_in_flight.get_mut(&done.job_id) else {
+            return;
+        };
+        let matches = sets
+            .get(&done.set_index)
+            .is_some_and(|work| work.work_id == done.work_id);
+        if !matches {
+            debug!(
+                job_id = done.job_id.0,
+                work_id = done.work_id,
+                set_index = done.set_index,
+                "discarding a stale direct demotion reconstruction ticket"
+            );
+            return;
+        }
+        let work = sets.remove(&done.set_index).expect("just matched");
+        if sets.is_empty() {
+            self.direct_demotion_in_flight.remove(&done.job_id);
+        }
+        let elapsed = work.submitted_at.elapsed();
+        crate::runtime::perf_probe::record("direct_store.demote.sweep", elapsed);
+        if !self.jobs.contains_key(&done.job_id) {
+            return;
+        }
+        let plan = work.plan;
+        let set_name = plan.set_name.clone();
+        let volume_files = plan.volume_files.clone();
+        let summary = self
+            .apply_demoted_set_reconstruction(done.job_id, done.set_index, plan, &done.rebuilt)
+            .await;
+        crate::runtime::perf_probe::record(
+            "direct_store.demoted.reconstructed",
+            std::time::Duration::from_nanos(1),
+        );
+        // The other half of the materialization account: a whole-set demotion
+        // materializes *every* volume of the group, and this is how many that
+        // was. Read against `direct_store.repair.materialized_volumes`, whose
+        // whole point is being much smaller.
+        let volumes = summary.materialized;
+        crate::runtime::perf_probe::record_value(
+            "direct_store.demote.materialized_volumes",
+            volumes as u64,
+        );
+        // One bucket per volume that refused a run, under the same metric names
+        // the whole-set fallback used — so the reason breakdown reads the same
+        // as before while the *count* is now volumes rather than sets.
+        for (volume_index, failure) in &summary.refetched {
+            crate::runtime::perf_probe::record_owned(
+                format!("direct_store.demote_refetch.{}", failure.metric()),
+                std::time::Duration::from_nanos(1),
+            );
+            warn!(
+                job_id = done.job_id.0,
+                set_name = %set_name,
+                volume_index,
+                failure = %failure,
+                "a demoted volume could not be reconstructed in full; refetching the \
+                 articles it could not vouch for"
+            );
+        }
+        if !summary.refetched.is_empty() {
+            crate::runtime::perf_probe::record_value(
+                "direct_store.demote.refetched_volumes",
+                summary.refetched.len() as u64,
+            );
+        }
+        // The measurement the demotion account was missing: how many of the
+        // bytes this set had already paid for survived the handback, and how
+        // many it is about to pay for a second time. A volume count cannot say
+        // — one refused article and a whole refetched volume both count as one.
+        crate::runtime::perf_probe::record_value(
+            "direct_store.demote.retained_bytes",
+            summary.retained_bytes,
+        );
+        crate::runtime::perf_probe::record_value(
+            "direct_store.demote.refetched_bytes",
+            summary.refetched_bytes,
+        );
+        info!(
+            job_id = done.job_id.0,
+            set_name = %set_name,
+            work_id = done.work_id,
+            elapsed_ms = elapsed.as_millis() as u64,
+            volumes,
+            refetched = summary.refetched.len(),
+            retained_bytes = summary.retained_bytes,
+            refetched_bytes = summary.refetched_bytes,
+            "direct-store set materialized from its own routed bytes"
+        );
+        self.finish_demoted_set_handback(done.job_id, volume_files)
+            .await;
+        self.schedule_job_completion_check(done.job_id);
+    }
+
+    /// Forgets a job's outstanding demotion sweeps. The detached workers keep
+    /// running to their end; their done messages then find no ticket and are
+    /// discarded by the fence.
+    pub(crate) fn forget_direct_demotion_work(&mut self, job_id: JobId) {
+        self.direct_demotion_in_flight.remove(&job_id);
+    }
+
+    /// The durable half of the reconstruction path, on the pipeline task.
+    ///
+    /// Mutates durable state in this order: legacy floors and completed-file
+    /// rows, then the coverage row, then the direct outputs.
+    async fn apply_demoted_set_reconstruction(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        plan: DemotedSweepPlan,
+        rebuilt: &[super::reconstruct::ReconstructedVolume],
+    ) -> ReconstructionSummary {
+        let DemotedSweepPlan {
+            targets,
+            mut extents_by_volume,
+            handoffs,
+            ..
+        } = plan;
         let mut materialized = 0usize;
+        // Volumes the sweep could not rebuild in full, each with the first
+        // reason it refused. A refusal is no longer a write-off: the volume
+        // keeps every run the sweep verified, and only the articles that
+        // `verified` does not back are refetched. A volume whose *destination*
+        // failed comes back with an empty `verified`, so the same code path
+        // gives it the full-refetch treatment — `mark_file_incomplete`
+        // included — that a refused volume used to get unconditionally.
+        let mut refetched: Vec<(u32, ReconstructionFailure)> = Vec::new();
+        let mut retained_bytes = 0u64;
+        let mut refetched_bytes = 0u64;
         let mut keep: HashMap<u32, Vec<u32>> = HashMap::new();
         for (outcome, (volume_index, file_index, filename, plan)) in
             rebuilt.iter().zip(targets.iter())
@@ -6853,11 +7726,33 @@ impl Pipeline {
                 file_index: *file_index,
             };
             let extents = extents_by_volume.remove(volume_index).unwrap_or_default();
+            if let Some(failure) = &outcome.failure {
+                refetched.push((*volume_index, failure.clone()));
+            }
+            // `outcome.verified`, never `plan.covered`: the plan states what the
+            // coverage map claimed, and only the sweep knows which of that it
+            // actually wrote and checked. They agree for a volume that swept end
+            // to end and diverge for one that refused a run, which is precisely
+            // when keeping an article the sweep skipped would leave a hole
+            // nothing ever fetches.
             let (on_disk, floor) = crate::pipeline::direct_store::reconstruct::segments_on_disk(
                 &extents,
-                &plan.covered,
+                &outcome.verified,
                 outcome.contiguous,
             );
+            // The byte account of this volume's handback, article by article,
+            // over the articles the coverage map claimed. Kept ones are the
+            // bytes the demotion no longer pays for twice; the rest were routed
+            // once and come off the wire again.
+            for (segment_number, (offset, len)) in &extents {
+                if !plan.covered.missing(*offset, *len).is_empty() {
+                    continue;
+                }
+                match on_disk.contains(segment_number) {
+                    true => retained_bytes = retained_bytes.saturating_add(*len),
+                    false => refetched_bytes = refetched_bytes.saturating_add(*len),
+                }
+            }
             keep.insert(*file_index, on_disk);
             if outcome.contiguous == 0 {
                 continue;
@@ -6909,7 +7804,7 @@ impl Pipeline {
             warn!(job_id = job_id.0, error = %error, "failed to retire a reconstructed direct-store checkpoint");
         }
         self.delete_direct_outputs(job_id, set_index).await;
-        self.requeue_after_reconstruction(job_id, set_index, &keep)
+        self.requeue_after_reconstruction(job_id, set_index, &keep, &handoffs)
             .await;
         for (outcome, (_, file_index, _, plan)) in rebuilt.iter().zip(targets.iter()) {
             if outcome.complete && outcome.contiguous >= plan.len {
@@ -6919,11 +7814,24 @@ impl Pipeline {
                 });
             }
         }
-        Ok(materialized)
+        ReconstructionSummary {
+            materialized,
+            refetched,
+            retained_bytes,
+            refetched_bytes,
+        }
     }
 
-    /// The last-resort demotion: retire routed storage and requeue only articles
-    /// whose previously committed bytes cannot be reconstructed.
+    /// The last-resort demotion: retire routed storage and requeue every
+    /// article whose bytes went into the routed storage this is about to
+    /// delete.
+    ///
+    /// Whole-set on purpose, and only reachable for the two refusals that are
+    /// whole-set facts — no layout was ever learned, or the re-encrypting
+    /// overlay cannot reproduce the posted bytes. Neither leaves a range any
+    /// composition could vouch for, so there is nothing per-volume or per-range
+    /// to salvage. Every other failure is a property of one run and is handled
+    /// inside the sweep, which keeps the runs around it.
     async fn refetch_demoted_set(&mut self, job_id: JobId, set_index: usize) {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
@@ -6992,6 +7900,7 @@ impl Pipeline {
         job_id: JobId,
         set_index: usize,
         keep: &HashMap<u32, Vec<u32>>,
+        handoffs: &HashSet<SegmentId>,
     ) {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
@@ -7016,6 +7925,9 @@ impl Pipeline {
 
         let mut work = Vec::new();
         let mut fully_reset: Vec<u32> = Vec::new();
+        // Chunks the write buffer could not place until this pass seeded the
+        // sweep's extents into it, drained here and written below.
+        let mut unblocked: Vec<UnblockedHandbackWrites> = Vec::new();
         let write_buf_max_pending = self.write_buf_max_pending;
         {
             let Some(state) = self.jobs.get_mut(&job_id) else {
@@ -7031,10 +7943,22 @@ impl Pipeline {
                     job_id,
                     file_index: *file_index,
                 };
-                let kept: HashSet<u32> = keep
+                let verified: HashSet<u32> = keep
                     .get(file_index)
                     .map(|segments| segments.iter().copied().collect())
                     .unwrap_or_default();
+                // The articles the decode seam owns are kept alongside the ones
+                // the sweep verified, but they are *its* bytes: it wrote them
+                // itself while the sweep ran, through the write buffer, and its
+                // own cursor already accounts for them. So they belong in the
+                // assembly and out of the requeue, and nowhere near the sparse
+                // seeding below.
+                let handed_off: HashSet<u32> = handoffs
+                    .iter()
+                    .filter(|segment_id| segment_id.file_id == file_id)
+                    .map(|segment_id| segment_id.segment_number)
+                    .collect();
+                let kept: HashSet<u32> = verified.union(&handed_off).copied().collect();
                 if kept.is_empty() {
                     fully_reset.push(*file_index);
                 }
@@ -7072,7 +7996,18 @@ impl Pipeline {
                         && file_asm.commit_segment(*segment_number, len as u32).is_ok()
                     {
                         kept_bytes = kept_bytes.saturating_add(len);
-                        materialized_extents.push((offset, len));
+                        if verified.contains(segment_number) {
+                            materialized_extents.push((offset, len));
+                        } else {
+                            // A handed-off article arrived through the ordinary
+                            // writer, which recorded where it landed; the blanket
+                            // reset above erased that record. Put it back from the
+                            // set's own geometry — the same offset the writer used,
+                            // since both derive it from the volume's article
+                            // extents — so a later duplicate re-places at the copy
+                            // already on disk instead of at a cursor-derived offset.
+                            file_asm.record_placement(*segment_number, offset, len as u32);
+                        }
                     }
                 }
                 lost_bytes =
@@ -7081,7 +8016,14 @@ impl Pipeline {
                     .assembly
                     .file(file_id)
                     .is_some_and(|file| !file.is_complete());
-                if !materialized_extents.is_empty() && needs_more_bytes {
+                // A file that needs nothing more can still have a *buffer* that
+                // needs this seeding: the handed-off article is inserted at its
+                // own offset while the sweep is outstanding, so it waits behind
+                // a cursor still at zero — and it is often the very article
+                // that completed the file. Skipping the seeding on completeness
+                // would leave its bytes in memory and a hole on disk.
+                let has_buffered_writes = self.write_buffers.contains_key(&file_id);
+                if !materialized_extents.is_empty() && (needs_more_bytes || has_buffered_writes) {
                     // Reconstruction made these article extents durable without
                     // passing through the conventional writer. Seed its sparse
                     // markers so a later missing article bridges the cursor;
@@ -7093,9 +8035,17 @@ impl Pipeline {
                     for (offset, len) in materialized_extents {
                         write_buf.mark_persisted(offset, len as usize);
                     }
-                    let (unexpected, contiguous_end) = write_buf.drain_ready_with_contiguous_end();
-                    debug_assert!(unexpected.is_empty());
-                    debug_assert!(contiguous_end <= kept_bytes);
+                    // Whatever became writable only now is carried out to be
+                    // written, not dropped. The sweep runs detached, so an
+                    // article that decoded while it was outstanding reached the
+                    // write buffer with the cursor still at zero and had to
+                    // wait there: seeding the sweep's extents is exactly what
+                    // unblocks it, and it is the handed-off article's own bytes
+                    // as often as not.
+                    let (ready, contiguous_end) = write_buf.drain_ready_with_contiguous_end();
+                    if !ready.is_empty() {
+                        unblocked.push((file_id, ready, contiguous_end));
+                    }
                 }
 
                 for segment in &file.segments {
@@ -7127,6 +8077,20 @@ impl Pipeline {
                 }
             }
             state.downloaded_bytes = state.downloaded_bytes.saturating_sub(lost_bytes);
+        }
+
+        for (file_id, ready, contiguous_end) in unblocked {
+            if let Err(error) = self
+                .persist_ready_segments(file_id, ready, contiguous_end)
+                .await
+            {
+                warn!(
+                    job_id = job_id.0,
+                    file_index = file_id.file_index,
+                    error = %error,
+                    "failed to write the articles a demoted volume's handback unblocked"
+                );
+            }
         }
 
         // Only files the sweep rebuilt nothing for: everything else has legacy

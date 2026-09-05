@@ -65,7 +65,7 @@ fn prepare_uu_spool_dir(path: &std::path::Path) -> io::Result<()> {
 }
 
 #[derive(Debug)]
-struct SegmentWriteError {
+pub(in crate::pipeline) struct SegmentWriteError {
     file_id: NzbFileId,
     source: io::Error,
 }
@@ -2445,7 +2445,7 @@ impl Pipeline {
         }
     }
 
-    async fn persist_ready_segments(
+    pub(in crate::pipeline) async fn persist_ready_segments(
         &mut self,
         file_id: NzbFileId,
         ready: Vec<(u64, BufferedDecodedSegment)>,

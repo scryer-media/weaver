@@ -165,6 +165,19 @@ fn scan_completed_par2_packet_groups(path: &Path) -> par2_rs::Result<Vec<ParsedP
     Ok(groups)
 }
 
+/// Everything a packet merge can add to a set: descriptions, slice checksums,
+/// recovery slices and the creator. Two identical readings across a merge mean
+/// the merge inserted nothing, so anything already built from the set — a
+/// retained repair session above all — still describes it exactly.
+fn par2_set_merge_shape(set: &Par2FileSet) -> (usize, usize, usize, bool) {
+    (
+        set.files.len(),
+        set.slice_checksums.len(),
+        set.recovery_slices.len(),
+        set.creator.is_some(),
+    )
+}
+
 fn par2_recovery_packet_size(slice_size: u64) -> u64 {
     let raw = slice_size.saturating_add(PAR2_RECOVERY_PACKET_OVERHEAD);
     let rem = raw % PAR2_PACKET_ALIGNMENT;
@@ -1771,6 +1784,102 @@ impl Pipeline {
         stateful_par2_session_enabled()
     }
 
+    /// The files under this job's working directory that the named recovery
+    /// set's extra scan must not read.
+    ///
+    /// An extra candidate is a file the set does not describe, rolling-scanned
+    /// window by window on the chance that it holds a copy of some slice.
+    /// Finding a renamed or concatenated source that way is the entire point,
+    /// so anything this cannot positively place elsewhere stays discoverable —
+    /// an obfuscated file with no binding at all is exactly what extras exist
+    /// for, and excluding it would be excluding the answer.
+    ///
+    /// Two things can be positively placed elsewhere:
+    ///
+    ///  - A file that binds to a *different* recovery set. The binding
+    ///    resolver refuses a name two sets both answer to, so a binding that
+    ///    names another set is unambiguous: those bytes are that set's
+    ///    payload, and a slice of this set cannot be inside them at any offset.
+    ///  - A complete volume of a RAR set other than the one this recovery set
+    ///    describes. Applied only when at least one file bound to this set
+    ///    carries a RAR classification, because that is what says which
+    ///    archive set the recovery set is for; with nothing to compare against,
+    ///    every volume stays discoverable. Incomplete volumes are left alone: a
+    ///    file still being written is not yet the archive its name claims, and
+    ///    its bytes may still be rearranged.
+    ///
+    /// Without this, a directory holding two recovery sets makes each set read
+    /// the other set's whole payload, once per scanning pass, and match nothing
+    /// both times.
+    pub(crate) fn par2_extra_scan_exclusions(
+        &self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) -> Vec<PathBuf> {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Vec::new();
+        };
+        let file_ids: Vec<NzbFileId> = state.assembly.files().map(|file| file.file_id()).collect();
+        let mut excluded: Vec<PathBuf> = Vec::new();
+        let mut own_paths: HashSet<PathBuf> = HashSet::new();
+        let mut own_rar_sets: HashSet<String> = HashSet::new();
+        let mut unbound_rar: Vec<(NzbFileId, String)> = Vec::new();
+        for file_id in file_ids {
+            let rar_set_name = self
+                .effective_file_identity(job_id, file_id)
+                .and_then(|identity| identity.classification)
+                .and_then(|classification| {
+                    matches!(
+                        classification.kind,
+                        crate::jobs::assembly::DetectedArchiveKind::Rar
+                    )
+                    .then_some(classification.set_name)
+                });
+            match self.resolve_par2_file_binding(file_id) {
+                Some(binding) if binding.recovery_set_id == set_id => {
+                    own_paths.insert(binding.path);
+                    if let Some(set_name) = rar_set_name {
+                        own_rar_sets.insert(set_name);
+                    }
+                }
+                Some(binding) => excluded.push(binding.path),
+                None => {
+                    if let Some(set_name) = rar_set_name {
+                        unbound_rar.push((file_id, set_name));
+                    }
+                }
+            }
+        }
+        if !own_rar_sets.is_empty() {
+            for (file_id, set_name) in unbound_rar {
+                if own_rar_sets.contains(&set_name) {
+                    continue;
+                }
+                let Some(state) = self.jobs.get(&job_id) else {
+                    break;
+                };
+                let Some(file) = state.assembly.file(file_id) else {
+                    continue;
+                };
+                if !file.is_complete() {
+                    continue;
+                }
+                excluded.push(
+                    state
+                        .working_dir
+                        .join(self.current_filename_for_file(job_id, file)),
+                );
+            }
+        }
+        // A path this set itself resolves to is never an exclusion, whatever
+        // else claimed it: the set's own sources are scanned as canonical
+        // candidates and are not extras in the first place.
+        excluded.retain(|path| !own_paths.contains(path));
+        excluded.sort();
+        excluded.dedup();
+        excluded
+    }
+
     pub(crate) async fn take_or_open_par2_repair_session(
         &mut self,
         job_id: JobId,
@@ -1783,6 +1892,11 @@ impl Pipeline {
         if !self.stateful_par2_session_gate() {
             return Ok(None);
         }
+        // Which of this job's files belong to somebody else, computed here so
+        // every consumer of a retained session gets the same answer: a reused
+        // session is re-pointed at the current list, and a fresh one opens with
+        // it already applied.
+        let exclude_paths = self.par2_extra_scan_exclusions(job_id, set_id);
         if let Some(runtime) = self.par2_runtime.get_mut(&job_id)
             && let Some(set_runtime) = runtime.set_runtime_mut(set_id)
             && let Some(mut session) = set_runtime.session.take()
@@ -1798,10 +1912,12 @@ impl Pipeline {
                 match (&source_access, session.is_access_backed()) {
                     (Some(access), true) => {
                         session.set_source_access(std::sync::Arc::clone(access));
+                        session.set_exclude_paths(exclude_paths);
                         set_runtime.session_last_used = Some(Instant::now());
                         return Ok(Some((session, false)));
                     }
                     (None, false) => {
+                        session.set_exclude_paths(exclude_paths);
                         set_runtime.session_last_used = Some(Instant::now());
                         return Ok(Some((session, false)));
                     }
@@ -1835,6 +1951,12 @@ impl Pipeline {
             options.memory_limit = Some(memory_limit);
             options.cancel = Some(cancellation);
             options.progress = progress;
+            // Files this job holds that belong to a *different* recovery set,
+            // or to a different archive set than the one this recovery set
+            // describes. Their bytes cannot contain this set's slices at any
+            // offset, so rolling-scanning them as extra candidates is a
+            // whole-payload read that can only ever find nothing.
+            options.exclude_paths = exclude_paths;
             // The in-stream grid seeds this session with per-slice verdicts, so
             // the analysis need not re-read what those verdicts already account
             // for. Every seeded verdict is admitted only on dual-alignment
@@ -1877,6 +1999,91 @@ impl Pipeline {
         set_runtime.session = Some(session);
         set_runtime.session_last_used = Some(Instant::now());
         self.enforce_par2_retained_session_budget((job_id, set_id));
+    }
+
+    /// Teach the retained session about a recovery volume that just landed,
+    /// instead of throwing the session away for being a set behind.
+    ///
+    /// Only for a set holding a parked damaged-path verdict — the one shape
+    /// where the session is carrying an analysis the job is about to repair on,
+    /// and where losing it means reading every damaged file a second time.
+    /// Everything else keeps the eviction: it is free, and a session rebuilt
+    /// from the merged set is always correct.
+    ///
+    /// par2-rs draws the same distinction internally. Recovery-only packets
+    /// leave the source scan standing, so the repair's analysis re-uses it and
+    /// reads nothing; a volume that turns out to carry *new* descriptions
+    /// rebuilds the source map and costs the scan anyway, which is the right
+    /// answer because the protected file set itself changed.
+    ///
+    /// Returns whether the session may stand. `false` means the caller must
+    /// evict, which is also what every refusal below leaves behind: the session
+    /// has already been taken out of the runtime by then.
+    async fn merge_recovery_into_retained_par2_session(
+        &mut self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+        volume_path: std::path::PathBuf,
+    ) -> bool {
+        if !self.has_pending_par2_repair(job_id, set_id) {
+            return false;
+        }
+        let Some(set_runtime) = self
+            .par2_runtime
+            .get_mut(&job_id)
+            .and_then(|runtime| runtime.set_runtime_mut(set_id))
+        else {
+            return false;
+        };
+        let Some(session) = set_runtime.session.take() else {
+            return false;
+        };
+        // An access-backed session serves volumes that have no path, and this
+        // merge names one. A direct set reaching here is demoted before any
+        // repair anyway, so there is nothing to preserve.
+        if session.is_access_backed() {
+            return false;
+        }
+        let merged = tokio::task::spawn_blocking(move || {
+            let mut session = session;
+            let result = session.merge_recovery_paths([volume_path]);
+            (session, result)
+        })
+        .await;
+        match merged {
+            Ok((session, Ok(result))) => {
+                debug!(
+                    job_id = job_id.0,
+                    recovery_set_id = %set_id,
+                    recovery_blocks_merged = result.new_recovery_slices,
+                    "merged a landed recovery volume into the retained PAR2 session"
+                );
+                #[cfg(test)]
+                {
+                    self.par2_session_recovery_merges += 1;
+                }
+                self.restore_par2_repair_session(job_id, set_id, session);
+                true
+            }
+            Ok((_, Err(error))) => {
+                debug!(
+                    job_id = job_id.0,
+                    recovery_set_id = %set_id,
+                    error = %error,
+                    "retained PAR2 session refused a landed recovery volume; rebuilding it"
+                );
+                false
+            }
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    recovery_set_id = %set_id,
+                    error = %error,
+                    "retained PAR2 session merge task panicked; rebuilding the session"
+                );
+                false
+            }
+        }
     }
 
     /// The retained session owns a snapshot of the validated set. Packet
@@ -1950,6 +2157,10 @@ impl Pipeline {
     /// retained repair session. Drop source locations before that write is
     /// allowed to become observable; parsed PAR2 packets remain reusable.
     pub(crate) fn invalidate_par2_session_for_file_write(&mut self, file_id: NzbFileId) {
+        // A damaged-path analysis reading right now is reading the bytes this
+        // write replaces, so its verdict would name a file state that no longer
+        // exists. Drop the ticket; the completion check submits a fresh read.
+        self.forget_par2_analysis_work(file_id.job_id);
         let Some(runtime) = self.par2_runtime.get_mut(&file_id.job_id) else {
             return;
         };
@@ -1966,6 +2177,11 @@ impl Pipeline {
     /// downloaded bytes. A retained location must nevertheless be discarded:
     /// repair always derives a fresh location from the current identity.
     pub(crate) fn invalidate_par2_session_for_identity_rebind(&mut self, job_id: JobId) {
+        // Same reason a retained location is discarded here: an analysis in
+        // flight was handed the paths the old identities produced, and the
+        // verdict it brings back would decide a repair against names that have
+        // since moved. Forgetting it makes the completion check re-read.
+        self.forget_par2_analysis_work(job_id);
         if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
             for set_runtime in runtime.sets.values_mut() {
                 set_runtime.session_evidence_file_ids.clear();
@@ -2304,7 +2520,16 @@ impl Pipeline {
                 set_runtime.set = Some(par2_set);
             }
             self.refresh_par2_checkpoint_plan(job_id);
-            self.evict_par2_repair_session(job_id, set_id);
+            // The session snapshot is now a set behind. A set waiting to repair
+            // gets the volume handed to its session instead, which keeps the
+            // analysis it is about to repair on; every other set rebuilds, as
+            // it always did.
+            if !self
+                .merge_recovery_into_retained_par2_session(job_id, set_id, file_path.clone())
+                .await
+            {
+                self.evict_par2_repair_session(job_id, set_id);
+            }
         }
 
         {
@@ -2848,6 +3073,10 @@ impl Pipeline {
             } else {
                 None
             };
+            // A bootstrapped set is new, so nothing can have been built from
+            // it yet; a merge that inserts nothing leaves everything built from
+            // the set current.
+            let mut set_changed = true;
             let (new_recovery_blocks, total_recovery) = if let Some(recovery_blocks) =
                 bootstrapped_recovery_blocks
             {
@@ -2860,12 +3089,14 @@ impl Pipeline {
                             .and_then(|set_runtime| set_runtime.set.as_mut())
                             .expect("parsed PAR2 recovery set exists"),
                     );
+                    let before = par2_set_merge_shape(par2_set);
                     let merge = par2_set.merge_packets(
                         packet_list
                             .take()
                             .expect("unbootstrapped packets remain available to merge"),
                     );
                     let total_recovery = par2_set.recovery_block_count();
+                    set_changed = par2_set_merge_shape(par2_set) != before;
                     (merge, total_recovery)
                 };
                 match merge_result {
@@ -2882,7 +3113,16 @@ impl Pipeline {
                     }
                 }
             };
-            self.evict_par2_repair_session(job_id, set_id);
+            // Volume replays re-offer packets the set already holds: every
+            // file-complete pass parses a volume twice, once here and once as
+            // metadata, so the arrival that hands a waiting set's session its
+            // new recovery reaches this line with nothing left to give. Holding
+            // the session through a merge that inserted nothing is what lets
+            // that hand-off survive to the repair; every other set rebuilds on
+            // any arrival, as it always did.
+            if set_changed || !self.has_pending_par2_repair(job_id, set_id) {
+                self.evict_par2_repair_session(job_id, set_id);
+            }
             let promoted = self
                 .par2_runtime(job_id)
                 .and_then(|runtime| runtime.files.get(&file_id.file_index))

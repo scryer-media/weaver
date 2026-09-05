@@ -13,7 +13,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -112,7 +112,7 @@ windows-sys = { version = "0.61", default-features = false }
 #
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
-par2-rs = { version = "0.9", default-features = false, features = ["native-crypto"] }
+par2-rs = { version = "0.10", default-features = false, features = ["native-crypto"] }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x
@@ -126,7 +126,7 @@ par2-rs = { version = "0.9", default-features = false, features = ["native-crypt
 # the `ExtractOptions` weaver still carries. 0.9 also poisons a solid archive
 # whose member failed mid-decode instead of reusing the misaligned dictionary,
 # and 0.9.1 restores `-hp` (header-encrypted) RAR5 sets from `.rev` volumes.
-unrar-rs = { version = "0.9.1", default-features = false, features = ["crypto-aws-lc"] }
+unrar-rs = { version = "0.10.1", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]

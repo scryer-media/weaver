@@ -675,6 +675,46 @@ fn build_test_rar_compressed_file_header(
     )
 }
 
+/// A RAR5 **directory** header: dataless, with a Unix mode and mtime.
+///
+/// The shape every archiver writes a folder as — the DIRECTORY flag set, a zero
+/// data area, a zero unpacked size and no CRC32, because there is nothing to
+/// checksum. That absence is the point: it is what makes the entry ineligible
+/// for direct routing, and what a set of directory headers at the end of a
+/// closing volume used to demote a set for.
+///
+/// `unix_mode` lands in the attributes field and `host_os` is Unix, which is how
+/// [`crate::pipeline::extraction::apply_rar_member_filesystem_metadata`] reads
+/// the mode back out.
+fn build_test_rar_directory_header(name: &str, unix_mode: u32, mtime: u32) -> Vec<u8> {
+    let file_flags: u64 = 0x0001 | 0x0002;
+    let mut type_body = Vec::new();
+    type_body.extend_from_slice(&encode_test_rar_vint(file_flags));
+    type_body.extend_from_slice(&encode_test_rar_vint(0));
+    type_body.extend_from_slice(&encode_test_rar_vint(u64::from(unix_mode)));
+    type_body.extend_from_slice(&mtime.to_le_bytes());
+    type_body.extend_from_slice(&encode_test_rar_vint(0));
+    type_body.extend_from_slice(&encode_test_rar_vint(1));
+    type_body.extend_from_slice(&encode_test_rar_vint(name.len() as u64));
+    type_body.extend_from_slice(name.as_bytes());
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&encode_test_rar_vint(2));
+    body.extend_from_slice(&encode_test_rar_vint(0x0002));
+    body.extend_from_slice(&encode_test_rar_vint(0));
+    body.extend_from_slice(&type_body);
+
+    let header_size = body.len() as u64;
+    let header_size_bytes = encode_test_rar_vint(header_size);
+    let crc = checksum::crc32(&[header_size_bytes.as_slice(), body.as_slice()].concat());
+
+    let mut result = Vec::new();
+    result.extend_from_slice(&crc.to_le_bytes());
+    result.extend_from_slice(&header_size_bytes);
+    result.extend_from_slice(&body);
+    result
+}
+
 /// A RAR5 **service** header (type 3) with a data area.
 ///
 /// Recovery records (`-rr`) and quick-open blocks take exactly this shape: the
@@ -919,6 +959,7 @@ fn dummy_rar_volume_facts(volume_number: u32) -> unrar_rs::RarVolumeFacts {
         has_authenticity_verification: false,
         has_locator: false,
         quick_open_offset: None,
+        headers_from_quick_open: false,
         recovery_record_offset: None,
         original_name: None,
         original_name_raw: None,
@@ -2145,6 +2186,27 @@ async fn submit_decoded_segment_with_segments(
             },
         )
         .await;
+    // A decode can demote a direct set, and a demotion hands its reconstruction
+    // sweep to a detached worker instead of running it inline. In the running
+    // server the select loop picks the ticket up; here nothing does, so the
+    // volumes would never become files and every assertion after the demoting
+    // article would be reading a half-finished handback.
+    settle_direct_demotion_work(pipeline).await;
+}
+
+/// Drives every outstanding demotion reconstruction ticket to its handler, the
+/// way the orchestrator's select loop would.
+async fn settle_direct_demotion_work(pipeline: &mut Pipeline) {
+    while !pipeline.direct_demotion_in_flight.is_empty() {
+        let done = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.direct_demotion_done_rx.recv(),
+        )
+        .await
+        .expect("a detached demotion sweep should finish")
+        .expect("the demotion completion channel should stay open");
+        pipeline.handle_direct_demotion_done(done).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2426,27 +2488,113 @@ fn debug_job_state(pipeline: &Pipeline, job_id: JobId) -> String {
     lines.join("\n")
 }
 
+/// Drives every detached pipeline ticket — direct-store post-repair
+/// read-backs, tolerated extractions, demotion reconstruction sweeps and PAR2
+/// damaged-path analyses — to its handler, the way the orchestrator's select
+/// loop would, until none is in flight.
+///
+/// They are settled in one loop because they chain: an analysis verdict
+/// re-enters the completion check, which can decide on a repair whose
+/// read-back is a direct-store ticket of its own.
 async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
+    enum Ticket {
+        PostRepair(crate::pipeline::DirectPostRepairWorkDone),
+        Tolerated(crate::pipeline::DirectToleratedWorkDone),
+        Demotion(crate::pipeline::DirectDemotionWorkDone),
+        Par2Analysis(crate::pipeline::Par2AnalysisWorkDone),
+    }
     loop {
         pipeline.pump_decode_queue();
         while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
             pipeline.check_job_completion(queued_job).await;
             pipeline.pump_decode_queue();
         }
+        let mut handled_a_ticket = false;
         while let Ok(done) = pipeline.direct_post_repair_done_rx.try_recv() {
             pipeline.handle_direct_post_repair_done(done);
+            handled_a_ticket = true;
         }
-        if pipeline.direct_post_repair_in_flight.is_empty() {
+        while let Ok(done) = pipeline.direct_tolerated_done_rx.try_recv() {
+            pipeline.handle_direct_tolerated_done(done).await;
+            handled_a_ticket = true;
+        }
+        while let Ok(done) = pipeline.direct_demotion_done_rx.try_recv() {
+            pipeline.handle_direct_demotion_done(done).await;
+            handled_a_ticket = true;
+        }
+        while let Ok(done) = pipeline.par2_analysis_done_rx.try_recv() {
+            pipeline.handle_par2_analysis_done(done).await;
+            handled_a_ticket = true;
+        }
+        // A ticket that had already finished by the time this loop looked is
+        // handled here rather than at the wait below, and its handler arms the
+        // completion check that carries the outcome forward. Going back to the
+        // top is what runs that check: deciding the queue is idle now would
+        // strand the outcome, and whether the ticket lands before or after the
+        // look is pure timing.
+        if handled_a_ticket || !pipeline.pending_completion_checks.is_empty() {
+            continue;
+        }
+        let post_repair_pending = !pipeline.direct_post_repair_in_flight.is_empty();
+        let tolerated_pending = !pipeline.direct_tolerated_in_flight.is_empty();
+        let demotion_pending = !pipeline.direct_demotion_in_flight.is_empty();
+        let par2_analysis_pending = !pipeline.par2_analysis_in_flight.is_empty();
+        if !post_repair_pending && !tolerated_pending && !demotion_pending && !par2_analysis_pending
+        {
             return;
         }
+        let post_repair_rx = &mut pipeline.direct_post_repair_done_rx;
+        let tolerated_rx = &mut pipeline.direct_tolerated_done_rx;
+        let demotion_rx = &mut pipeline.direct_demotion_done_rx;
+        let par2_analysis_rx = &mut pipeline.par2_analysis_done_rx;
+        let ticket = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                done = post_repair_rx.recv(), if post_repair_pending => {
+                    Ticket::PostRepair(done.expect("direct post-repair completion channel should stay open"))
+                }
+                done = tolerated_rx.recv(), if tolerated_pending => {
+                    Ticket::Tolerated(done.expect("direct tolerated-extraction channel should stay open"))
+                }
+                done = demotion_rx.recv(), if demotion_pending => {
+                    Ticket::Demotion(done.expect("direct demotion channel should stay open"))
+                }
+                done = par2_analysis_rx.recv(), if par2_analysis_pending => {
+                    Ticket::Par2Analysis(done.expect("PAR2 analysis completion channel should stay open"))
+                }
+            }
+        })
+        .await
+        .expect("a detached pipeline ticket should finish");
+        match ticket {
+            Ticket::PostRepair(done) => pipeline.handle_direct_post_repair_done(done),
+            Ticket::Tolerated(done) => pipeline.handle_direct_tolerated_done(done).await,
+            Ticket::Demotion(done) => pipeline.handle_direct_demotion_done(done).await,
+            Ticket::Par2Analysis(done) => pipeline.handle_par2_analysis_done(done).await,
+        }
+    }
+}
+
+/// Services the outstanding PAR2 damaged-path analysis tickets the way the
+/// orchestrator's select loop would, and then runs only the completion check
+/// each verdict re-arms.
+///
+/// This is the narrow stand-in for what used to be an inline `await`: the
+/// analysis returns and the *same* completion check continues on it. Nothing
+/// further is drained, so a test can assert on the state that check left
+/// behind rather than on the state a fully drained queue eventually reaches.
+async fn settle_par2_analysis_work(pipeline: &mut Pipeline) {
+    while !pipeline.par2_analysis_in_flight.is_empty() {
         let done = tokio::time::timeout(
-            Duration::from_secs(5),
-            pipeline.direct_post_repair_done_rx.recv(),
+            Duration::from_secs(10),
+            pipeline.par2_analysis_done_rx.recv(),
         )
         .await
-        .expect("direct post-repair read-back should finish")
-        .expect("direct post-repair completion channel should stay open");
-        pipeline.handle_direct_post_repair_done(done);
+        .expect("a detached PAR2 damaged-path analysis should finish")
+        .expect("the PAR2 analysis completion channel should stay open");
+        pipeline.handle_par2_analysis_done(done).await;
+        if let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
+            pipeline.check_job_completion(queued_job).await;
+        }
     }
 }
 
