@@ -451,7 +451,7 @@ fn rar_member_unix_output_mode(member: &unrar_rs::MemberInfo) -> Option<u32> {
     }
 }
 
-fn apply_rar_member_filesystem_metadata(
+pub(crate) fn apply_rar_member_filesystem_metadata(
     member: &unrar_rs::MemberInfo,
     out_path: &Path,
 ) -> Result<(), String> {

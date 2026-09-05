@@ -7804,7 +7804,7 @@ impl Pipeline {
                         _ if self.shared_state.is_job_cancellation_requested(job_id) => {
                             return;
                         }
-                        DirectPar2Resolution::Repaired => {
+                        DirectPar2Resolution::Repaired | DirectPar2Resolution::Demoted => {
                             self.schedule_job_completion_check(job_id);
                             return;
                         }

@@ -558,8 +558,12 @@ impl DirectSet {
         volume_index: u32,
         spans: &[super::router::RepairedChunk],
         lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
+        whole_volume: bool,
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
-        match self.router.route_repaired(volume_index, spans, lead_in) {
+        match self
+            .router
+            .route_repaired(volume_index, spans, lead_in, whole_volume)
+        {
             Ok(spans) => {
                 if !spans.is_empty() {
                     self.latched_direct = true;

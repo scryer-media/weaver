@@ -130,12 +130,20 @@ pub(crate) enum DemotionReason {
     /// small-member tolerance does not cover — including a provisional member
     /// that resolved ineligible when its chain closed.
     ///
-    /// Solid, directory, redirection and malformed-chain members always land
+    /// Solid, redirection and malformed-chain members always land
     /// here: the tolerance extracts its members with
     /// `extract_member_streaming`, which needs a per-member non-solid regular
     /// file it can decode on its own, and a solid member is only decodable
     /// against the rest of the solid run. A *compressed* or *BLAKE2sp-only*
     /// member instead rides [`Self::ToleranceBudgetExceeded`]'s budget.
+    ///
+    /// A **directory** member reaches this reason only when the set has nothing
+    /// else to route. Directory entries are dataless headers, so they carry a
+    /// zero tolerance budget and are created — with their archive metadata — at
+    /// finalization; demoting a 6 GiB folder-tree set for the directory
+    /// headers its archiver appends to the last volume cost a full
+    /// reconstruction and a full conventional extraction at the very end of an
+    /// otherwise complete direct route.
     ///
     /// **Encrypted** members land here only when their encryption is not the
     /// one shape direct-store can route. `classify` sends a member
@@ -386,6 +394,20 @@ pub(crate) enum MemberIneligibility {
     Blake2OnlyNoCrc32,
     NoChecksum,
     MalformedChain,
+}
+
+/// One member the bounded small-member tolerance carries to finalization.
+///
+/// Ordered by the same key the list is built with, so the derived `Ord` only
+/// ever breaks a tie between two members at one archive position — which the
+/// destination-collision rule has already refused.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ToleratedMember {
+    /// Raw header name, exactly as the archive states it.
+    pub(crate) name: String,
+    /// The archive describes a directory: a dataless header finalization
+    /// creates as a directory, never extracts and never writes a file for.
+    pub(crate) is_directory: bool,
 }
 
 impl From<IneligibilityReason> for MemberIneligibility {
@@ -1720,6 +1742,39 @@ pub(crate) struct DirectSetRouter {
     /// set that held from one that never had to.
     #[cfg(test)]
     blocks_held: u64,
+    /// Does the job that owns this set carry PAR2 at all?
+    ///
+    /// The one fact that turns a part-checksum mismatch from a verdict into a
+    /// question. With no PAR2 there is nothing that could ever answer it, so
+    /// the mismatch is what it has always been: a demotion, taken immediately,
+    /// so the conventional path gets the set while its bytes are still on disk.
+    ///
+    /// Read from the job's own NZB rather than from a parsed PAR2 index,
+    /// because the mismatch is discovered *while the set is downloading* and
+    /// the index may not have arrived yet. The NZB names its PAR2 files from
+    /// the first moment the job exists, which is the only source that is
+    /// already true when this is consulted. See
+    /// [`super::plan::spec_carries_par2`] for why an index alone counts.
+    par2_available: bool,
+    /// Volumes whose posted bytes failed an archive-level checksum that the
+    /// wire's own yEnc CRC could not see.
+    ///
+    /// A recorded fact, not a verdict. It says three things at once: the set
+    /// stays direct, the PAR2 pass over this volume may not stand on wire
+    /// evidence (the wire is exactly what lied), and any member spanning the
+    /// volume holds its whole-member gate until the repair has had its say.
+    ///
+    /// Empty unless [`Self::par2_available`], and emptied per volume
+    /// by [`Self::route_repaired`] — the repair's answer supersedes the
+    /// question.
+    damaged_volumes: std::collections::BTreeSet<u32>,
+    /// Has a repair already re-routed bytes into this set?
+    ///
+    /// A part mismatch *before* any repair is a question PAR2 can answer. The
+    /// same mismatch on bytes a repair just wrote is the answer, and it is no:
+    /// recording it again would park the set on a question that has already
+    /// been asked and lost, so the second one demotes.
+    repair_rerouted: bool,
     demoted: Option<DemotionReason>,
 }
 
@@ -1765,8 +1820,80 @@ impl DirectSetRouter {
             member_ciphers_builds: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             blocks_held: 0,
+            par2_available: false,
+            damaged_volumes: std::collections::BTreeSet::new(),
+            repair_rerouted: false,
             demoted: None,
         }
+    }
+
+    /// Tells the router whether the job carries any PAR2.
+    ///
+    /// Set once per set, from the NZB, at admission and at restore. See
+    /// [`Self::par2_available`] for why the NZB and not the index.
+    pub(crate) fn note_par2_available(&mut self, available: bool) {
+        self.par2_available = available;
+    }
+
+    /// Volumes carrying a recorded part-checksum mismatch, awaiting PAR2's
+    /// answer. See [`Self::damaged_volumes`].
+    pub(crate) fn damaged_volumes(&self) -> &std::collections::BTreeSet<u32> {
+        &self.damaged_volumes
+    }
+
+    /// Records a failed part checksum as a damaged-volume fact, or refuses.
+    ///
+    /// `true` means the fact was recorded and the set stays direct; `false`
+    /// means the caller must demote, which is what every caller did
+    /// unconditionally before there was anything that could answer the
+    /// question.
+    ///
+    /// The part's composed value is dropped on the way through. That is what
+    /// stalls [`Self::try_verify_member`] rather than failing it: the value
+    /// describes bytes an archive-level checksum has just called wrong, and a
+    /// member composed from it would either demote for the wrong reason
+    /// (`MemberChecksumMismatch`, on damage the repair is about to fix) or —
+    /// worse — verify, if the damage happened to compose back to the expected
+    /// whole-member value.
+    fn record_part_checksum_damage(
+        &mut self,
+        volume_index: u32,
+        member_id: u32,
+        part_position: u32,
+    ) -> bool {
+        if !self.par2_available || self.repair_rerouted {
+            return false;
+        }
+        self.damaged_volumes.insert(volume_index);
+        if let Some(member) = self.member_mut(member_id) {
+            member.checked_parts.remove(&part_position);
+            member.verified = false;
+        }
+        true
+    }
+
+    /// Does any part of this member live in a volume with damage on record?
+    ///
+    /// The whole-member gate's stall condition. Layer 1's own stall — a missing
+    /// `checked_parts` entry — covers the plaintext composition, but the
+    /// encrypted composition deliberately reads plaintext runs instead and
+    /// would sail past it, so the question is asked once, here, in the terms
+    /// both compositions share.
+    fn member_spans_damaged_volume(&self, member_id: u32) -> bool {
+        if self.damaged_volumes.is_empty() {
+            return false;
+        }
+        let Some(layout_index) = self.layout_index_for_member(member_id) else {
+            return false;
+        };
+        self.layout_members()
+            .get(layout_index)
+            .is_some_and(|member| {
+                member
+                    .parts
+                    .iter()
+                    .any(|part| self.damaged_volumes.contains(&part.volume))
+            })
     }
 
     /// Cipher blocks the drain has held for a missing predecessor or a missing
@@ -2615,11 +2742,31 @@ impl DirectSetRouter {
     /// carrying the end record confirmed the volume. That is a real ordering,
     /// not a hypothetical: the article a set loses is often the last one, and it
     /// carries both a member's tail and the record that closes the archive.
+    ///
+    /// # `whole_volume`
+    ///
+    /// The caller states that these chunks are the volume's **entire** posted
+    /// image — the shape a repair takes when the router has no facts for the
+    /// volume at all, because every one of its articles failed and PAR2 rebuilt
+    /// it from recovery. The staged image is then byte-complete, so the parse
+    /// over it is exactly as authoritative as one over a fully downloaded
+    /// volume and the volume may be confirmed from it.
+    ///
+    /// It has to be said rather than inferred, and it must never be said
+    /// loosely. Confirmation is what lets the drain file the trailing region
+    /// into the envelope, and doing that over a *truncated* image files an
+    /// undiscovered member's header and payload as scratch that finalization
+    /// deletes. Without it a wholly absent **last** volume — the one volume
+    /// whose end record carries no `more_volumes` flag to confirm it — would
+    /// hold its trailing region, leave repaired bytes with nowhere to go, and
+    /// demote the set under [`DemotionReason::RepairRerouteFailed`] after the
+    /// recovery had already been downloaded.
     pub(crate) fn route_repaired(
         &mut self,
         volume_index: u32,
         chunks: &[RepairedChunk],
         lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
+        whole_volume: bool,
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
         if let Some(reason) = self.demoted {
             return Err(reason);
@@ -2660,6 +2807,22 @@ impl DirectSetRouter {
             return Ok(Vec::new());
         }
 
+        // Set **before** the parse, exactly as [`Self::note_volume_complete`]
+        // sets it before its own: it is what licenses the parse about to run to
+        // be the confirming one. Only ever true for a rewrite that carries the
+        // whole volume, so the image the parse walks holds every byte the
+        // volume will ever have.
+        if whole_volume && let Some(staging) = self.staging.get_mut(&volume_index) {
+            staging.source_complete = true;
+        }
+        // The repair has had its say about this volume, so the question the
+        // damaged fact stood for is closed. Cleared *before* the drain, because
+        // the drain re-runs the part gates over the repaired bytes: they either
+        // pass — and the member's whole-member gate, no longer stalled,
+        // verifies — or they fail again, and `repair_rerouted` below makes that
+        // second failure the demotion it now is.
+        self.repair_rerouted = true;
+        self.damaged_volumes.remove(&volume_index);
         self.try_parse_volume(volume_index)?;
         // The repaired volume drains **first**, and only then does every staged
         // volume drain in the usual ascending order.
@@ -3730,17 +3893,21 @@ impl DirectSetRouter {
     /// The tolerance is a deliberate weaver extension over the oracle, and it is
     /// bounded three ways, each of which demotes on breach:
     ///
-    /// 1. **By kind.** Only `Compressed` and `Blake2OnlyNoCrc32` are tolerable.
+    /// 1. **By kind.** Only `Compressed`, `Blake2OnlyNoCrc32` and `Directory`
+    ///    are tolerable.
     ///    The library's classification order (malformed → directory →
     ///    redirection → encrypted → solid → compressed) means a `Compressed`
     ///    verdict already proves the member is an unencrypted, non-solid,
     ///    per-member regular file with a well-formed chain, which is exactly
     ///    the tolerance's precondition — so the precondition is read off the
     ///    reason rather than re-derived from flags weaver would have to trust
-    ///    separately.
+    ///    separately. `Directory` is decided *before* every one of those, so it
+    ///    proves nothing about the rest — and needs nothing, because a
+    ///    directory entry has no data area to decode at all.
     /// 2. **By size**, aggregated over every tolerated member:
     ///    `min(64 MiB, 1% of the archive's packed bytes)` packed and 256 MiB
-    ///    unpacked.
+    ///    unpacked. A directory contributes zero to both, so a folder tree's
+    ///    entries can never be what breaches it.
     /// 3. **By the set still being a store set.** A set whose members are *all*
     ///    ineligible has nothing to route and no benefit to gain; it demotes and
     ///    the ordinary extractor produces every member.
@@ -3812,7 +3979,21 @@ impl DirectSetRouter {
                 migrating.push((member_id, reason));
             }
             tolerated += 1;
-            first_tolerated.get_or_insert(reason);
+            // A directory is the *last* reason worth reporting: it is dataless
+            // and free, so a set that has nothing to route is never a set the
+            // directories made unroutable. Any other tolerated reason takes the
+            // slot from it, whichever arrived first — an archiver that writes
+            // its directory headers before the files would otherwise have every
+            // such demotion labelled `member_directory`.
+            match first_tolerated {
+                None => first_tolerated = Some(reason),
+                Some(IneligibilityReason::Directory)
+                    if !matches!(reason, IneligibilityReason::Directory) =>
+                {
+                    first_tolerated = Some(reason);
+                }
+                Some(_) => {}
+            }
             // Saturating rather than checked: the ceilings below are far under
             // `u64::MAX`, so a saturated sum breaches and demotes, which is the
             // fail-closed answer a header claiming impossible sizes deserves.
@@ -4052,6 +4233,12 @@ impl DirectSetRouter {
     /// Members riding the small-member tolerance, by raw header name, in
     /// archive order.
     ///
+    /// A **directory** member rides it too, and is flagged rather than filtered
+    /// out: it is dataless, so finalization creates the directory and applies
+    /// the archive's metadata to it instead of decoding anything. Filtering it
+    /// out here is what would lose the entry — the routed list never contained
+    /// it either.
+    ///
     /// Finalization extracts exactly these and nothing else: the direct-routed
     /// members are already at their destinations, and re-extracting one would
     /// overwrite verified output with a second decode of the same bytes.
@@ -4071,9 +4258,9 @@ impl DirectSetRouter {
     /// (While the set lives that case is unreachable, since admission demotes
     /// the whole set rather than routing around one member; it is written down
     /// because the alternative to writing it down is losing a file.)
-    pub(crate) fn tolerated_member_names(&self) -> Vec<String> {
+    pub(crate) fn tolerated_members(&self) -> Vec<ToleratedMember> {
         let admitted = self.crypt.admitted();
-        let mut names: Vec<(u32, u64, String)> = self
+        let mut names: Vec<(u32, u64, ToleratedMember)> = self
             .layout_members()
             .iter()
             .filter(|member| match member.eligibility {
@@ -4087,11 +4274,21 @@ impl DirectSetRouter {
                     .first()
                     .map(|part| (part.volume, part.data_offset))
                     .unwrap_or((u32::MAX, u64::MAX));
-                (position.0, position.1, member.name.clone())
+                (
+                    position.0,
+                    position.1,
+                    ToleratedMember {
+                        name: member.name.clone(),
+                        is_directory: matches!(
+                            member.eligibility,
+                            MemberEligibility::Ineligible(IneligibilityReason::Directory)
+                        ),
+                    },
+                )
             })
             .collect();
         names.sort_unstable();
-        names.into_iter().map(|(_, _, name)| name).collect()
+        names.into_iter().map(|(_, _, member)| member).collect()
     }
 
     /// Maps and emits every pending byte of one volume whose destination the
@@ -4420,6 +4617,7 @@ impl DirectSetRouter {
             member.checked_parts.insert(part_position, value);
             if let Some(expected) = packed_crc32
                 && expected != value
+                && !self.record_part_checksum_damage(volume_index, member_id, part_position)
             {
                 return Err(self.fail(DemotionReason::PartChecksumMismatch));
             }
@@ -4853,7 +5051,9 @@ impl DirectSetRouter {
                 });
                 // A fold that refuses to answer is a mismatch: `Some(expected)`
                 // is the only value that passes.
-                if composed != Some(expected) {
+                if composed != Some(expected)
+                    && !self.record_part_checksum_damage(volume_index, member_id, part_position)
+                {
                     return Err(self.fail(DemotionReason::PartChecksumMismatch));
                 }
             }
@@ -4930,6 +5130,16 @@ impl DirectSetRouter {
         if self.members.get(&member_id).is_some_and(|member| {
             !member.restart_seeded.is_empty() || !member.stale_gaps.is_empty()
         }) {
+            return Ok(());
+        }
+        // Damage on record in a volume this member spans. The member's own
+        // gate must not fire in either direction while that is true: a
+        // `MemberChecksumMismatch` here would demote the set for damage the
+        // repair is on its way to fix, and a *pass* would be worse still —
+        // vouching for a member over bytes an archive-level checksum has
+        // already called wrong. The gate re-arms when
+        // [`Self::route_repaired`] clears the volume.
+        if self.member_spans_damaged_volume(member_id) {
             return Ok(());
         }
         if unpacked_size == 0 {
@@ -5476,9 +5686,11 @@ impl DirectSetRouter {
                     part.logical_offset.unwrap_or(0),
                     part.data_size,
                     part.packed_crc32,
+                    part.volume,
                 )
             });
-        let Some((part_position, part_logical_offset, part_len, packed_crc32)) = part else {
+        let Some((part_position, part_logical_offset, part_len, packed_crc32, part_volume)) = part
+        else {
             return Err(self.fail(DemotionReason::RestartRearmUnplaceable));
         };
         let Some(member) = self.member_mut(member_id) else {
@@ -5522,6 +5734,7 @@ impl DirectSetRouter {
             member.checked_parts.insert(part_position, value);
             if let Some(expected) = packed_crc32
                 && expected != value
+                && !self.record_part_checksum_damage(part_volume, member_id, part_position)
             {
                 return Err(self.fail(DemotionReason::PartChecksumMismatch));
             }
@@ -5799,9 +6012,24 @@ fn tolerable_member_budget(
                 unpacked_bytes: member.unpacked_size?,
             })
         }
+        // A directory entry, which every archiver writes as a dataless header:
+        // packed and unpacked size are both zero and there is nothing to
+        // decode, so it costs the tolerance **nothing** and is granted a hard
+        // zero budget rather than the header's declared sizes. That is not a
+        // rounding: a directory that consumed budget would make a folder tree's
+        // hundreds of entries breach a ceiling that exists to bound *decoded
+        // bytes*, and a set whose only ineligible members are directories would
+        // then demote for a size it never has.
+        //
+        // Deliberately not a size read off the header. A hostile header can
+        // declare an unpacked size on a directory entry; nothing extracts it,
+        // so nothing would be bounded by charging for it.
+        IneligibilityReason::Directory => Some(ToleratedMemberBudget {
+            packed_bytes: 0,
+            unpacked_bytes: 0,
+        }),
         IneligibilityReason::Encrypted
         | IneligibilityReason::Solid
-        | IneligibilityReason::Directory
         | IneligibilityReason::Redirection
         | IneligibilityReason::NoChecksum
         | IneligibilityReason::MalformedChain(_) => None,

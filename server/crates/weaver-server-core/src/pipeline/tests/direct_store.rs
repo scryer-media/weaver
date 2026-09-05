@@ -186,6 +186,26 @@ fn quick_open_store_set(
     payload: &[u8],
     forged_name: Option<&str>,
 ) -> Vec<(String, Vec<u8>)> {
+    quick_open_store_set_shaped(member_name, payload, forged_name, true)
+}
+
+/// The same fixture, with control over whether the `QO` block is closed by a
+/// cached **end-of-archive** record.
+///
+/// `cached_end_record` is what decides whether the cache is used at all:
+/// unrar's reader adopts a Quick Open list only once it has seen the end record
+/// that proves the list is complete, and drops the whole cache otherwise. Real
+/// archivers do not write one — a `QO` block caches file headers, and the end
+/// header comes after it — so `false` is the shape found in the wild, where the
+/// locator is present, the cache is read and rejected, and the physical walk
+/// supplies the members. `true` is the shape the cross-check tests need, and
+/// the only one in which a forged cache entry can reach anything at all.
+fn quick_open_store_set_shaped(
+    member_name: &str,
+    payload: &[u8],
+    forged_name: Option<&str>,
+    cached_end_record: bool,
+) -> Vec<(String, Vec<u8>)> {
     let member_crc = checksum::crc32(payload);
     let split = payload.len() / 2;
 
@@ -244,11 +264,13 @@ fn quick_open_store_set(
             &build_test_rar_file_header(forged_name, 0, 16, 16, Some(0)),
         ));
     }
-    records.extend_from_slice(&build_test_rar_qopen_record(
-        QOPEN_OFFSET,
-        QOPEN_OFFSET - 32,
-        &build_test_rar_end_header(false),
-    ));
+    if cached_end_record {
+        records.extend_from_slice(&build_test_rar_qopen_record(
+            QOPEN_OFFSET,
+            QOPEN_OFFSET - 32,
+            &build_test_rar_end_header(false),
+        ));
+    }
     second.extend_from_slice(&build_test_rar_service_header("QO", records.len() as u64));
     second.extend_from_slice(&records);
 
@@ -323,6 +345,54 @@ async fn an_honest_quick_open_cache_still_routes() {
     assert!(
         !shape.contains("Demoted"),
         "the cross-check must refuse a *disagreement*, not the presence of a cache, got {shape}"
+    );
+}
+
+#[tokio::test]
+async fn a_rar_shaped_quick_open_cache_is_ignored_and_still_routes() {
+    // The cache shape a real archiver actually writes: file-header records and
+    // nothing else. unrar adopts a Quick Open list only when the list closes
+    // with a cached end-of-archive record, so this one is read and thrown away
+    // and the members come from the physical walk — which is what makes the
+    // other two tests in this section fixtures rather than field reports.
+    //
+    // The forged entry is the proof the cache was dropped rather than merely
+    // agreed with: it names a member no physical header describes, and the
+    // library reports it in `a_forged_quick_open_member_never_reaches_the_router`
+    // where the same block does close with an end record.
+    let member_name = "Silver.Horizon.S01E63.mkv";
+    let forged_name = "Silver.Horizon.S01E63.forged";
+    let payload: Vec<u8> = (0..400u32).map(|index| (index % 251) as u8).collect();
+    let volumes = quick_open_store_set_shaped(member_name, &payload, Some(forged_name), false);
+
+    assert_eq!(
+        library_default_member_names(&volumes[1].1),
+        vec![member_name.to_string()],
+        "an unclosed Quick Open list must be ignored, leaving the physical member alone"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let arrivals = in_order_arrivals(volumes.len());
+    let (shape, _working_dir) =
+        run_direct_store_routing_only(&temp_dir, JobId(41103), &volumes, &arrivals).await;
+
+    assert!(
+        !shape.contains("Demoted"),
+        "a locator whose cache the library never adopted is not a disagreement, got {shape}"
+    );
+    assert!(
+        !direct_partial(&temp_dir, JobId(41103), forged_name).exists(),
+        "and nothing may be created for the entry only the discarded cache claimed"
+    );
+    assert!(
+        !direct_partial(&temp_dir, JobId(41103), member_name).exists(),
+        "the physical member's partial must have been committed, not left behind"
+    );
+    let routed = std::fs::read(payload_root(&temp_dir, JobId(41103)).join(member_name))
+        .expect("the physical member routed to its own destination and committed");
+    assert_eq!(
+        routed, payload,
+        "routing must complete over the physically walked layout"
     );
 }
 
@@ -5501,6 +5571,330 @@ async fn a_solid_ineligible_member_demotes_rather_than_riding_the_tolerance() {
 }
 
 // ---------------------------------------------------------------------------
+// Directory members: dataless, free, and never a reason to demote
+// ---------------------------------------------------------------------------
+
+/// Where a store set's directory entries sit relative to its file members.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectoryPlacement {
+    /// Written into the first volume, ahead of every member header — the shape
+    /// an archiver produces when it walks a tree breadth-first.
+    Leading,
+    /// Written into the **last** volume, after the final part of the last
+    /// member. This is the shape a folder-tree store set really has, and the
+    /// one that used to spend a whole download only to demote on the closing
+    /// volume's last article.
+    Trailing,
+}
+
+/// A store set carrying `members` plus dataless directory entries.
+///
+/// `directories` is `(name, unix mode, mtime)`. The entries carry no data area,
+/// so they cost the set nothing but a header — which is exactly the claim the
+/// zero tolerance budget makes.
+fn store_set_with_directories(
+    members: &[(&str, Vec<u8>)],
+    volume_count: usize,
+    directories: &[(&str, u32, u32)],
+    placement: DirectoryPlacement,
+) -> Vec<(String, Vec<u8>)> {
+    assert!(volume_count >= 1);
+    let total: usize = members.iter().map(|(_, bytes)| bytes.len()).sum();
+    let chunk = total.div_ceil(volume_count);
+
+    let mut spans = Vec::with_capacity(members.len());
+    let mut cursor = 0usize;
+    for (name, bytes) in members {
+        spans.push((*name, bytes.as_slice(), cursor, cursor + bytes.len()));
+        cursor += bytes.len();
+    }
+
+    let directory_headers: Vec<u8> = directories
+        .iter()
+        .flat_map(|(name, mode, mtime)| build_test_rar_directory_header(name, *mode, *mtime))
+        .collect();
+
+    (0..volume_count)
+        .map(|volume| {
+            let window_start = (volume * chunk).min(total);
+            let window_end = ((volume + 1) * chunk).min(total);
+            let is_first = volume == 0;
+            let is_last = volume + 1 == volume_count;
+
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&TEST_RAR5_SIG);
+            bytes.extend_from_slice(&build_test_rar_main_header(
+                if is_first { 0x0001 } else { 0x0001 | 0x0002 },
+                (!is_first).then_some(volume as u64),
+            ));
+            if is_first && placement == DirectoryPlacement::Leading {
+                bytes.extend_from_slice(&directory_headers);
+            }
+
+            for (name, payload, start, end) in &spans {
+                let part_start = (*start).max(window_start);
+                let part_end = (*end).min(window_end);
+                if part_start >= part_end {
+                    continue;
+                }
+                let part = &payload[part_start - start..part_end - start];
+                let mut split_flags = 0u64;
+                if part_start > *start {
+                    split_flags |= 0x0008;
+                }
+                let split_after = part_end < *end;
+                if split_after {
+                    split_flags |= 0x0010;
+                }
+                let data_crc = if split_after {
+                    checksum::crc32(part)
+                } else {
+                    checksum::crc32(payload)
+                };
+                bytes.extend_from_slice(&build_test_rar_file_header(
+                    name,
+                    split_flags,
+                    part.len() as u64,
+                    payload.len() as u64,
+                    Some(data_crc),
+                ));
+                bytes.extend_from_slice(part);
+            }
+
+            if is_last && placement == DirectoryPlacement::Trailing {
+                bytes.extend_from_slice(&directory_headers);
+            }
+            bytes.extend_from_slice(&build_test_rar_end_header(!is_last));
+            (format!("silver.horizon.part{:02}.rar", volume + 1), bytes)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn trailing_directory_headers_never_demote_a_store_set() {
+    // The bench shape, in miniature: a stored member split across four volumes
+    // and a folder tree whose dataless headers all sit at the very end of the
+    // closing volume — so the demotion, if there is one, arrives on the last
+    // article of the last volume with the whole set already routed.
+    let member = "Silver.Horizon.S01E20.mkv";
+    let payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+    let directories: Vec<(&str, u32, u32)> = vec![
+        ("Silver.Horizon.S01E20", 0o755, 1_600_000_000),
+        ("Silver.Horizon.S01E20/subs", 0o755, 1_600_000_100),
+        ("Silver.Horizon.S01E20/subs/forced", 0o700, 1_600_000_200),
+    ];
+    let volumes = store_set_with_directories(
+        &[(member, payload.clone())],
+        4,
+        &directories,
+        DirectoryPlacement::Trailing,
+    );
+
+    let shape = tolerance_shape(JobId(41210), &volumes).await;
+    assert!(
+        !shape.contains("Demoted"),
+        "dataless directory headers must never demote a set, got {shape}"
+    );
+
+    // Leading directories are the same claim from the other side: the position
+    // of the headers is not what decides it.
+    let leading = store_set_with_directories(
+        &[(member, payload)],
+        4,
+        &directories,
+        DirectoryPlacement::Leading,
+    );
+    let leading_shape = tolerance_shape(JobId(41211), &leading).await;
+    assert!(
+        !leading_shape.contains("Demoted"),
+        "directory headers ahead of the members must not demote either, got {leading_shape}"
+    );
+}
+
+#[tokio::test]
+async fn directories_ride_the_tolerance_on_a_zero_budget() {
+    // A member sized to sit just under `min(64 MiB, 1% of packed archive
+    // bytes)` rides the tolerance; the pair below adds *forty* directory
+    // entries beside it. If a directory were charged anything at all — its
+    // header bytes, a notional entry cost — forty of them beside a member
+    // already near the ceiling would push the set over it. The set routing
+    // unchanged is the zero budget, measured.
+    let member = "Silver.Horizon.S01E21.mkv";
+    let extra = "Silver.Horizon.S01E21.nfo";
+    let store_payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+    let extra_payload: Vec<u8> = (0..200u32).map(|index| (index % 97) as u8).collect();
+    let bare = store_set_with_extra_member(
+        member,
+        &store_payload,
+        extra,
+        &extra_payload,
+        4,
+        ToleranceExtra::Blake2OnlyStore,
+    );
+    let bare_shape = tolerance_shape(JobId(41212), &bare).await;
+    assert!(
+        !bare_shape.contains("Demoted"),
+        "the control fixture must ride the tolerance, got {bare_shape}"
+    );
+
+    let names: Vec<String> = (0..40)
+        .map(|index| format!("Silver.Horizon.S01E21/part{index:02}"))
+        .collect();
+    let directories: Vec<(&str, u32, u32)> = names
+        .iter()
+        .map(|name| (name.as_str(), 0o755u32, 1_600_000_000u32))
+        .collect();
+    let crowded = store_set_with_directories(
+        &[(member, store_payload)],
+        4,
+        &directories,
+        DirectoryPlacement::Trailing,
+    );
+    let crowded_shape = tolerance_shape(JobId(41213), &crowded).await;
+    assert!(
+        !crowded_shape.contains("Demoted"),
+        "forty directory entries must cost the tolerance nothing, got {crowded_shape}"
+    );
+}
+
+#[tokio::test]
+async fn a_directory_beside_an_over_budget_member_demotes_on_the_members_own_reason() {
+    // A set whose *only* other ineligible entries are directories still has to
+    // demote when a real member busts the budget — and it has to say so. The
+    // directory is the last reason worth reporting, so the reason the metric
+    // buckets is the one an operator can act on.
+    let member = "Silver.Horizon.S01E22.mkv";
+    let extra = "Silver.Horizon.S01E22.nfo";
+    let store_payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+    // 600 packed bytes against ~30 600 archive bytes is over 1%.
+    let over_payload: Vec<u8> = (0..600u32).map(|index| (index % 97) as u8).collect();
+    let mut volumes = store_set_with_extra_member(
+        member,
+        &store_payload,
+        extra,
+        &over_payload,
+        4,
+        ToleranceExtra::Blake2OnlyStore,
+    );
+    // Directory headers spliced into the closing volume, ahead of its end
+    // record, so the router classifies them in the same walk that resolves the
+    // over-budget member.
+    let last = volumes.len() - 1;
+    let end_header = build_test_rar_end_header(false);
+    let bytes = &mut volumes[last].1;
+    let end_at = bytes.len() - end_header.len();
+    let mut directory_headers = build_test_rar_directory_header("Silver.Horizon.S01E22", 0o755, 1);
+    directory_headers.extend_from_slice(&build_test_rar_directory_header(
+        "Silver.Horizon.S01E22/subs",
+        0o755,
+        2,
+    ));
+    bytes.splice(end_at..end_at, directory_headers);
+
+    let shape = tolerance_shape(JobId(41214), &volumes).await;
+    assert!(
+        shape.contains("Demoted(ToleranceBudgetExceeded)"),
+        "an over-budget member must demote on the budget even with directories \
+         beside it, got {shape}"
+    );
+    assert!(
+        !shape.contains("MemberIneligible(Directory)"),
+        "a directory must never be the reported reason, got {shape}"
+    );
+}
+
+#[tokio::test]
+async fn a_folder_tree_store_set_finalizes_direct_with_its_directories_restored() {
+    // The whole shape the bench found, end to end: a stored member inside a
+    // folder, an *empty* folder beside it, and both directory headers written
+    // after the member's last part in the closing volume. Nothing here may
+    // reconstruct a volume or fall back to the conventional extractor — the
+    // member routes, and the directories are created at finalization from the
+    // archive's own metadata.
+    let member_name = "Silver.Horizon.S01E23/file.bin";
+    let outer = "Silver.Horizon.S01E23";
+    let inner = "Silver.Horizon.S01E23/empty";
+    const OUTER_MTIME: u32 = 1_600_000_000;
+    const INNER_MTIME: u32 = 1_600_050_000;
+    let payload: Vec<u8> = (0..4_000u32).map(|index| (index % 251) as u8).collect();
+    let volumes = store_set_with_directories(
+        &[(member_name, payload.clone())],
+        3,
+        &[(outer, 0o755, OUTER_MTIME), (inner, 0o700, INNER_MTIME)],
+        DirectoryPlacement::Trailing,
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let job_id = JobId(41215);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+        for (filename, _) in &volumes {
+            assert!(
+                !working_dir.join(filename).exists(),
+                "a folder-tree store set must never materialize {filename}"
+            );
+        }
+    }
+
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Finalized"),
+        "the set must finalize direct rather than demote on its directory headers, \
+         got {shape}"
+    );
+
+    let root = payload_root(&temp_dir, job_id);
+    let member_path = crate::pipeline::Pipeline::member_output_paths(&root, member_name).0;
+    assert_eq!(
+        std::fs::read(&member_path).ok(),
+        Some(payload),
+        "the stored member must be committed from its own routed partial"
+    );
+    assert!(
+        !any_direct_partial(&root.join(outer)),
+        "no `.direct.partial` may survive finalization"
+    );
+
+    for (name, mode, mtime) in [
+        (outer, 0o755u32, OUTER_MTIME),
+        (inner, 0o700u32, INNER_MTIME),
+    ] {
+        let path = root.join(name);
+        let metadata = std::fs::symlink_metadata(&path)
+            .unwrap_or_else(|error| panic!("{name} must exist as a directory: {error}"));
+        assert!(
+            metadata.is_dir(),
+            "{name} must be a directory, never an empty file named like one"
+        );
+        assert_eq!(
+            metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_secs()),
+            Some(u64::from(mtime)),
+            "{name} must carry the archive's mtime — applied after the member \
+             renamed into it, or the commit would have overwritten it"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                mode,
+                "{name} must carry the archive's mode"
+            );
+        }
+        let _ = mode;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Review fixes: what a *later* PAR2 pass sees, what an unbindable volume does,
 // and what a mid-download set is protected from.
 // ---------------------------------------------------------------------------
@@ -8081,6 +8475,10 @@ struct RepairGateOutcome {
     /// because a set can finalize, complete its job and be pruned inside one
     /// completion check — so `sets` below may never show the state.
     finalized: usize,
+    /// `(files stood in for, files read)` per direct verification pass, so a
+    /// test can prove a pass read a volume rather than standing in for it on
+    /// wire evidence.
+    verify_read_splits: Vec<(usize, usize)>,
 }
 
 /// Keeps the last non-empty reading of a job's direct sets, and never lets a
@@ -8221,6 +8619,40 @@ async fn run_repairable_par2_gate_with_articles(
     password: Option<&str>,
     articles: usize,
 ) -> RepairGateOutcome {
+    run_repairable_par2_gate_inner(
+        gate,
+        job_id,
+        member_name,
+        volumes,
+        par2_bytes,
+        position,
+        password,
+        articles,
+        None,
+    )
+    .await
+}
+
+/// [`run_repairable_par2_gate_with_articles`] with one volume that never
+/// arrives.
+///
+/// `absent_ordinal` names a volume whose articles are all withheld — the
+/// harness's stand-in for a volume every server answered `430` for. Nothing of
+/// it is ever routed, so it has no envelope content, no covered run and no
+/// staged image: the repair has to create its target from the length PAR2
+/// describes and write every slice of it.
+#[allow(clippy::too_many_arguments)]
+async fn run_repairable_par2_gate_inner(
+    gate: DirectStoreGate,
+    job_id: JobId,
+    member_name: &str,
+    volumes: &[(String, Vec<u8>)],
+    par2_bytes: &[u8],
+    position: IndexPosition,
+    password: Option<&str>,
+    articles: usize,
+    absent_ordinal: Option<u32>,
+) -> RepairGateOutcome {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
@@ -8235,6 +8667,9 @@ async fn run_repairable_par2_gate_with_articles(
         .collect();
     let mut volume_file_seen = false;
     for (ordinal, segment_number) in arrivals {
+        if absent_ordinal == Some(ordinal) {
+            continue;
+        }
         submit_volume_article_indexed_of(
             &mut pipeline,
             job_id,
@@ -8324,6 +8759,7 @@ async fn run_repairable_par2_gate_with_articles(
         sets,
         materialized: pipeline.direct_store.repair_materialized_volumes,
         finalized: pipeline.direct_store.finalized_sets,
+        verify_read_splits: pipeline.direct_verify_read_splits.clone(),
     }
 }
 
@@ -8412,6 +8848,243 @@ async fn par2_damage_in_the_envelope_repairs_while_the_set_stays_direct() {
         "the job must complete, got {:?} with sets {}",
         direct.status,
         direct.sets
+    );
+}
+
+#[tokio::test]
+async fn a_wholly_absent_volume_is_repaired_in_place_and_the_set_stays_direct() {
+    // The bench shape: every article of one middle volume answered 430, so the
+    // set holds no byte of it — no envelope content, no covered run, nothing to
+    // materialize from. The repair target therefore has to be *created* at the
+    // length PAR2 describes and written slice by slice, and the volume that
+    // comes back has never been parsed before, so the re-route has to stage it,
+    // parse it and confirm it from its own repaired image.
+    //
+    // Before the fix the sweep left no file at all and par2's first write
+    // failed with `No such file or directory` at offset 0, which demoted the
+    // whole set and reconstructed four healthy volumes to repair the fifth
+    // conventionally.
+    let member_name = "Silver.Horizon.S01E30.mkv";
+    let payload: Vec<u8> = (0..4000u32).map(|index| (index % 211) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 5);
+    // Enough recovery to rebuild an entire volume from nothing.
+    let par2_bytes = repairable_par2_index(&volumes, 12);
+
+    let direct = run_repairable_par2_gate_inner(
+        DirectStoreGate::Enabled,
+        JobId(41220),
+        member_name,
+        &volumes,
+        &par2_bytes,
+        IndexPosition::Last,
+        None,
+        2,
+        Some(2),
+    )
+    .await;
+
+    assert!(
+        !direct.sets.contains("Demoted"),
+        "a volume nobody posted is repairable in place; the set must not demote, \
+         got {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.member.as_deref(),
+        Some(payload.as_slice()),
+        "the member must verify against its own whole-member CRC32 over bytes \
+         the repair supplied; sets = {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.finalized, 1,
+        "and the set must commit its own partials rather than hand the archive \
+         to the conventional path; sets = {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.materialized, 1,
+        "exactly the absent volume becomes a repair target; the four that \
+         arrived are read virtually as repair sources"
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "no source volume may appear under its own name: the repair target is \
+         scratch, and a file at the volume's name is what demotion produces"
+    );
+    assert_eq!(
+        direct.repair_scratch_left, 0,
+        "the scratch target is deleted once its spans are routed"
+    );
+    assert!(
+        matches!(direct.status, Some(JobStatus::Complete)),
+        "the job must complete, got {:?} with sets {}",
+        direct.status,
+        direct.sets
+    );
+}
+
+#[tokio::test]
+async fn an_absent_closing_volume_is_confirmed_from_its_own_repaired_image() {
+    // The absent volume's harder half. A middle volume is confirmed by the
+    // *next* volume's header facts saying more volumes follow; the closing one
+    // has nothing after it, so its classification frontier can only be closed
+    // by the volume itself — and the set holds no byte of it.
+    //
+    // What licenses closing it here is that the repair rewrote the volume end
+    // to end: the staged image is the whole volume, so the parse walking it is
+    // authoritative. A partial rewrite is not licensed and does not get the
+    // shortcut.
+    let member_name = "Silver.Horizon.S01E31.mkv";
+    let payload: Vec<u8> = (0..4000u32).map(|index| (index % 211) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 5);
+    let par2_bytes = repairable_par2_index(&volumes, 12);
+
+    let direct = run_repairable_par2_gate_inner(
+        DirectStoreGate::Enabled,
+        JobId(41221),
+        member_name,
+        &volumes,
+        &par2_bytes,
+        IndexPosition::Last,
+        None,
+        2,
+        Some(volumes.len() as u32 - 1),
+    )
+    .await;
+
+    assert!(
+        !direct.sets.contains("Demoted"),
+        "the closing volume's repaired image must confirm the set rather than \
+         leave its spans held, got {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.member.as_deref(),
+        Some(payload.as_slice()),
+        "the member's tail comes from the repaired closing volume; sets = {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.finalized, 1,
+        "and the set must finalize on it; sets = {}",
+        direct.sets
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "no source volume may appear under its own name"
+    );
+}
+
+/// Corrupts `len` bytes of one volume's **member payload**, leaving every
+/// header and the end record intact.
+///
+/// The damage the wire cannot see. The harness delivers decoded bytes, so the
+/// yEnc part CRC is computed over what is delivered and always agrees — exactly
+/// as it does for an article a server corrupted before its own CRC was taken.
+/// What disagrees is the archive's packed CRC32 for the part, one layer up.
+fn damage_member_payload(volumes: &mut [(String, Vec<u8>)], volume: usize, len: usize) {
+    let end_header = build_test_rar_end_header(volume + 1 < volumes.len());
+    let bytes = &mut volumes[volume].1;
+    let end = bytes.len() - end_header.len();
+    let start = end - len;
+    for byte in &mut bytes[start..end] {
+        *byte ^= 0xA5;
+    }
+}
+
+#[tokio::test]
+async fn a_part_checksum_mismatch_waits_for_par2_instead_of_demoting() {
+    // 128 bytes of a volume's member payload flipped under a yEnc CRC that
+    // agrees. RAR's own packed CRC32 for that part catches it the moment the
+    // part completes — seconds into the download — and the set used to demote
+    // there and then, reconstructing every other volume so a conventional
+    // repairer could work over real files.
+    //
+    // The mismatch is a *fact* now, not a verdict: the set stays direct, the
+    // volume is read authoritatively by the PAR2 pass rather than stood in for
+    // on the wire evidence that just lied, and the repair puts it right in
+    // place.
+    let member_name = "Silver.Horizon.S01E32.mkv";
+    let payload: Vec<u8> = (0..4000u32).map(|index| (index % 211) as u8).collect();
+    let clean = single_member_store_set(member_name, &payload, 5);
+    // The PAR2 describes the clean volumes; the job downloads a corrupted one.
+    let par2_bytes = repairable_par2_index(&clean, 12);
+    let mut volumes = clean.clone();
+    damage_member_payload(&mut volumes, 2, 128);
+
+    let direct = run_repairable_par2_gate(
+        DirectStoreGate::Enabled,
+        JobId(41230),
+        member_name,
+        &volumes,
+        &par2_bytes,
+    )
+    .await;
+
+    assert!(
+        !direct.sets.contains("Demoted"),
+        "a part-checksum mismatch with recovery behind it must not demote, got {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.member.as_deref(),
+        Some(payload.as_slice()),
+        "the member must verify against its whole-member CRC32 after the repair; \
+         sets = {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.finalized, 1,
+        "and the set must commit its own partials; sets = {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.materialized, 1,
+        "only the suspect volume becomes a repair target"
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "no source volume may appear under its own name"
+    );
+    // The authoritative read, stated as a count: the pre-repair pass stands in
+    // for no file at all, because the only evidence that could have claimed one
+    // is the wire evidence the mismatch contradicted.
+    let first_pass = direct
+        .verify_read_splits
+        .first()
+        .copied()
+        .expect("the pre-repair pass ran");
+    assert_eq!(
+        first_pass.0, 0,
+        "no volume may be stood in for while a part-checksum mismatch is on \
+         record; splits = {:?}",
+        direct.verify_read_splits
+    );
+    assert!(
+        matches!(direct.status, Some(JobStatus::Complete)),
+        "the job must complete, got {:?} with sets {}",
+        direct.status,
+        direct.sets
+    );
+}
+
+#[tokio::test]
+async fn a_part_checksum_mismatch_with_no_recovery_demotes_as_it_always_did() {
+    // The other side of the same fact. Nothing in this job's NZB carries a
+    // recovery block, so there is no answer coming and waiting for one would
+    // park the set forever. The demotion is immediate and under its own reason,
+    // which is what the `part_checksum_mismatch` metric has always counted.
+    let member_name = "Silver.Horizon.S01E33.mkv";
+    let payload: Vec<u8> = (0..4000u32).map(|index| (index % 211) as u8).collect();
+    let mut volumes = single_member_store_set(member_name, &payload, 5);
+    damage_member_payload(&mut volumes, 2, 128);
+
+    let shape = tolerance_shape(JobId(41231), &volumes).await;
+    assert!(
+        shape.contains("Demoted(PartChecksumMismatch)"),
+        "with no recovery to answer it, a part-checksum mismatch demotes exactly \
+         as before, got {shape}"
     );
 }
 
@@ -10272,6 +10945,7 @@ async fn run_lost_article_gate(
         sets,
         materialized: pipeline.direct_store.repair_materialized_volumes,
         finalized: pipeline.direct_store.finalized_sets,
+        verify_read_splits: pipeline.direct_verify_read_splits.clone(),
     }
 }
 
@@ -13899,7 +14573,7 @@ async fn a_tolerated_member_of_a_header_encrypted_set_extracts_with_the_proved_p
     //
     // The extra member is BLAKE2sp-only, which `classify_stored_chain` answers
     // with `Blake2OnlyNoCrc32` on the encrypted path exactly as on the plaintext
-    // one, and `tolerated_member_names` takes any `Ineligible(_)`.
+    // one, and `tolerated_members` takes any `Ineligible(_)`.
     let member_name = "Silver.Horizon.S04E09.mkv";
     let extra_name = "Silver.Horizon.S04E09.nfo";
     // The store member has to be at least 100x the extra for the extra to fit

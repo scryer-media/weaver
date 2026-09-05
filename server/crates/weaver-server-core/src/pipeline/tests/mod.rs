@@ -675,6 +675,46 @@ fn build_test_rar_compressed_file_header(
     )
 }
 
+/// A RAR5 **directory** header: dataless, with a Unix mode and mtime.
+///
+/// The shape every archiver writes a folder as — the DIRECTORY flag set, a zero
+/// data area, a zero unpacked size and no CRC32, because there is nothing to
+/// checksum. That absence is the point: it is what makes the entry ineligible
+/// for direct routing, and what a set of directory headers at the end of a
+/// closing volume used to demote a set for.
+///
+/// `unix_mode` lands in the attributes field and `host_os` is Unix, which is how
+/// [`crate::pipeline::extraction::apply_rar_member_filesystem_metadata`] reads
+/// the mode back out.
+fn build_test_rar_directory_header(name: &str, unix_mode: u32, mtime: u32) -> Vec<u8> {
+    let file_flags: u64 = 0x0001 | 0x0002;
+    let mut type_body = Vec::new();
+    type_body.extend_from_slice(&encode_test_rar_vint(file_flags));
+    type_body.extend_from_slice(&encode_test_rar_vint(0));
+    type_body.extend_from_slice(&encode_test_rar_vint(u64::from(unix_mode)));
+    type_body.extend_from_slice(&mtime.to_le_bytes());
+    type_body.extend_from_slice(&encode_test_rar_vint(0));
+    type_body.extend_from_slice(&encode_test_rar_vint(1));
+    type_body.extend_from_slice(&encode_test_rar_vint(name.len() as u64));
+    type_body.extend_from_slice(name.as_bytes());
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&encode_test_rar_vint(2));
+    body.extend_from_slice(&encode_test_rar_vint(0x0002));
+    body.extend_from_slice(&encode_test_rar_vint(0));
+    body.extend_from_slice(&type_body);
+
+    let header_size = body.len() as u64;
+    let header_size_bytes = encode_test_rar_vint(header_size);
+    let crc = checksum::crc32(&[header_size_bytes.as_slice(), body.as_slice()].concat());
+
+    let mut result = Vec::new();
+    result.extend_from_slice(&crc.to_le_bytes());
+    result.extend_from_slice(&header_size_bytes);
+    result.extend_from_slice(&body);
+    result
+}
+
 /// A RAR5 **service** header (type 3) with a data area.
 ///
 /// Recovery records (`-rr`) and quick-open blocks take exactly this shape: the

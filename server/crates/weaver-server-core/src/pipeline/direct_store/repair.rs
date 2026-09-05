@@ -118,6 +118,42 @@ pub(crate) struct DamagedDirectVolume {
     pub(crate) reconstruction: VolumeReconstruction,
 }
 
+impl DamagedDirectVolume {
+    /// Does the rewrite cover every byte of the volume?
+    ///
+    /// A volume nobody ever posted has no covered run to materialize from, so
+    /// the repair target is created empty at the PAR2-described length and
+    /// **every** slice is written by par2. What comes back is therefore not a
+    /// patch over a volume the wire already established — it is the volume, in
+    /// full, and it is the only image of it that will ever exist.
+    ///
+    /// That distinction is what the re-route needs. A partial rewrite must not
+    /// be allowed to close the classification frontier, because the staged
+    /// image is missing whatever the repair did not touch and a header chain
+    /// that parses through it proves nothing about the bytes beyond. A rewrite
+    /// that covers the volume end to end proves exactly that much: the staged
+    /// image *is* the volume, so a parse over it is authoritative and the
+    /// volume may be confirmed from itself.
+    ///
+    /// Deliberately conservative. Anything short of provable end-to-end
+    /// coverage — a gap, a rewrite list that is not ascending, a zero-length
+    /// volume — answers `false`, which costs only the confirmation shortcut and
+    /// leaves the pre-existing behaviour in place.
+    pub(crate) fn rewrote_whole_volume(&self) -> bool {
+        if self.len == 0 {
+            return false;
+        }
+        let mut cursor = 0u64;
+        for &(offset, len) in &self.rewrite {
+            if offset > cursor {
+                return false;
+            }
+            cursor = cursor.max(offset.saturating_add(len));
+        }
+        cursor >= self.len
+    }
+}
+
 /// Read/stage chunk for the repaired read-back. Matches the reconstruction
 /// sweep's [`super::reconstruct`] chunk: large enough that a big span is a few
 /// hundred iterations, small enough that the transient buffer is never the term
@@ -396,6 +432,9 @@ pub(crate) fn repair_damaged_volumes(
     if let Err(failure) = reconstruct_volumes(provider, &plans, sparse) {
         return Err(cleanup(DirectRepairFailure::Materialization(failure)));
     }
+    if let Err(failure) = create_absent_repair_targets(damaged, sparse) {
+        return Err(cleanup(DirectRepairFailure::Materialization(failure)));
+    }
 
     let materialized: Vec<MaterializedPar2Volume> = damaged
         .iter()
@@ -457,6 +496,59 @@ pub(crate) fn repair_damaged_volumes(
         recovery_blocks_used,
         materialized_volumes: damaged.len(),
     })
+}
+
+/// Gives a **wholly absent** volume the empty file its repair writes into.
+///
+/// The reconstruction sweep produces nothing for a volume with no covered runs:
+/// it has no bytes to write and — on the demotion path it is shared with — no
+/// file it may leave in front of a refetch that publishes no floor over one.
+/// That is right there and wrong here. A volume whose every article failed is
+/// still fully described by PAR2: it knows the length, it knows every slice,
+/// and with enough recovery it can write all of them. What it cannot do is
+/// write them into a file that does not exist — [`DirectVolumeFileAccess`]
+/// opens the materialized path without `create`, so the first slice fails
+/// `ENOENT` at offset 0 and the set demotes *after* the targeted recovery has
+/// already been downloaded, which is the most expensive moment to give up.
+///
+/// So the target is created here, at the **PAR2-described** length, sparse and
+/// wholly holes, and the repair fills it slice by slice. Only volumes the sweep
+/// left no file for are touched, so a volume that really was reconstructed is
+/// never re-marked after its bytes were written — the ordering rule
+/// [`super::sparse`] states.
+fn create_absent_repair_targets(
+    damaged: &[DamagedDirectVolume],
+    sparse: super::sparse::SparseMarking,
+) -> Result<(), ReconstructionFailure> {
+    for volume in damaged {
+        if volume.len == 0 || volume.path.exists() {
+            continue;
+        }
+        let file =
+            super::sparse::create_sparse(&volume.path, &sparse).map_err(|error| match error {
+                super::sparse::SparseCreateError::Open(error) => {
+                    ReconstructionFailure::WriteFailed {
+                        volume_index: volume.volume_index,
+                        error: error.to_string(),
+                    }
+                }
+                super::sparse::SparseCreateError::Mark(error) => {
+                    ReconstructionFailure::SparseMarkFailed {
+                        volume_index: volume.volume_index,
+                        error: error.to_string(),
+                    }
+                }
+            })?;
+        // After the marking and never before it: on Windows the length is what
+        // makes NTFS allocate, so an unmarked file sized here would cost the
+        // whole volume in zeros.
+        file.set_len(volume.len)
+            .map_err(|error| ReconstructionFailure::WriteFailed {
+                volume_index: volume.volume_index,
+                error: error.to_string(),
+            })?;
+    }
+    Ok(())
 }
 
 /// Reads one repaired volume's rewrite spans back off its scratch file, in

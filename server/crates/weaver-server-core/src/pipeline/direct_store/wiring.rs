@@ -576,6 +576,33 @@ impl DestinationSync for PreSyncedDestinations {
     }
 }
 
+/// One member the bounded small-member tolerance produces at finalization, with
+/// the two path forms the two arms need.
+struct ToleratedTarget {
+    /// Raw header name, which is what `find_member` is asked for.
+    name: String,
+    /// Absolute destination under the job's staging root.
+    destination: PathBuf,
+    /// The same path relative to that root, for [`ExtractionRoot`].
+    relative: PathBuf,
+    is_directory: bool,
+}
+
+/// What the tolerance produced: the member names, and the directory entries
+/// whose metadata still has to be restored.
+#[derive(Debug, Default)]
+struct ToleratedExtraction {
+    /// Raw header names produced, for `extracted_members`. Directory entries
+    /// are in here too — the conventional extractor reports one the same way,
+    /// and a name in neither list is a name completion cannot account for.
+    members: Vec<String>,
+    /// `(metadata, absolute path)` per directory entry, applied **after** the
+    /// commit loop: every file renamed into a directory bumps that directory's
+    /// mtime, so restoring it before the members land would restore a value the
+    /// next rename overwrites.
+    directories: Vec<(unrar_rs::MemberInfo, PathBuf)>,
+}
+
 /// Everything the authoritative PAR2 pass needs to read a job's direct sets
 /// virtually.
 ///
@@ -681,6 +708,12 @@ pub(crate) enum DirectPar2Resolution {
     /// The post-processing lane owns the post-repair read-back. Its terminal
     /// verdict re-arms this job without holding the queue actor.
     Pending,
+    /// A set left direct mode inside this call and its volumes are being
+    /// materialized. Bytes are moving, so the caller must go round again rather
+    /// than settle anything on a verdict taken over the virtual volumes the set
+    /// no longer has — the same answer [`Self::Repaired`] gets, for the same
+    /// reason.
+    Demoted,
     /// Neither: no live set, no verdict, or a repair that refused. The caller
     /// falls back to demoting for the repairer, which is the earlier behaviour.
     Unresolved,
@@ -780,6 +813,7 @@ impl Pipeline {
         let (admitted, refused) =
             DirectSetPlan::discover(&state.spec, &state.working_dir, &destination_dir);
         let password = state.spec.password.clone();
+        let par2_available = super::plan::spec_carries_par2(&state.spec);
         for (set_name, refusal) in refused {
             crate::runtime::perf_probe::record_owned(
                 format!("direct_store.refused.{}", refusal.metric()),
@@ -866,6 +900,7 @@ impl Pipeline {
                 // with, if any; `refresh_direct_passwords` picks up one that
                 // arrives later. Held in memory only.
                 set.router.set_password(password.as_deref());
+                set.router.note_par2_available(par2_available);
                 set
             })
             .collect();
@@ -1503,9 +1538,14 @@ impl Pipeline {
         self.metrics
             .direct_sets_admitted
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let par2_available = self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| super::plan::spec_carries_par2(&state.spec));
         let mut set = DirectSet::new(job_id, plan);
         self.direct_store.apply_ceilings(&mut set);
         set.router.set_password(password);
+        set.router.note_par2_available(par2_available);
         let sets = self.direct_store.sets.entry(job_id).or_default();
         sets.push(set);
         sets.len() - 1
@@ -2988,9 +3028,20 @@ impl Pipeline {
             DirectRepairAnswer::Deferred => return DirectDamageResolution::Deferred,
             DirectRepairAnswer::Declined => {}
         }
+        // Same reason-preserving demotion as the pre-repairer seam: a set that
+        // reached here carrying its own part-checksum mismatch demotes under
+        // that, not under the verdict that merely agreed with it.
+        let part_damage = self
+            .demote_direct_sets_with_unanswered_part_damage(
+                job_id,
+                recovery_set_id,
+                "repair_declined",
+            )
+            .await;
         if self
             .demote_direct_sets_with_par2_damage_for_set(job_id, recovery_set_id, verification)
             .await
+            || part_damage
         {
             DirectDamageResolution::Resolved
         } else {
@@ -3066,6 +3117,27 @@ impl Pipeline {
             };
         };
         if !verification.needs_repair() {
+            // The safety valve for a damaged-volume fact PAR2 cannot answer.
+            //
+            // A part-checksum mismatch parks its set: the member holds its
+            // whole-member gate, so the set never finalizes on its own. That is
+            // right while a repair might still come, and wrong the moment PAR2
+            // reads the very volume and calls it whole — the two checksums
+            // disagree about bytes PAR2 has no reason to touch, which is the
+            // archive itself being wrong rather than the transfer. Nothing here
+            // can improve on that, and the set must not sit on it: it demotes
+            // under the reason the routing gate would have used, and the
+            // conventional path reports the failure it was always going to.
+            if self
+                .demote_direct_sets_with_unanswered_part_damage(
+                    job_id,
+                    recovery_set_id,
+                    "par2_clean",
+                )
+                .await
+            {
+                return DirectPar2Resolution::Demoted;
+            }
             return DirectPar2Resolution::Clean(Box::new(verification));
         }
         match self
@@ -3094,7 +3166,24 @@ impl Pipeline {
                 DirectPar2Resolution::Repaired
             }
             DirectRepairAnswer::Deferred => DirectPar2Resolution::Deferred,
-            DirectRepairAnswer::Declined => DirectPar2Resolution::Unresolved,
+            DirectRepairAnswer::Declined => {
+                // The other end of the safety valve above. The repair refused,
+                // so the parked set has run out of help; it demotes under the
+                // routing gate's own reason rather than under the generic
+                // `par2_damaged` the fall-through demotion would use, so the
+                // metric still says what went wrong.
+                if self
+                    .demote_direct_sets_with_unanswered_part_damage(
+                        job_id,
+                        recovery_set_id,
+                        "repair_declined",
+                    )
+                    .await
+                {
+                    return DirectPar2Resolution::Demoted;
+                }
+                DirectPar2Resolution::Unresolved
+            }
         }
     }
 
@@ -3463,10 +3552,18 @@ impl Pipeline {
                 // is the same full, unconditional read this pass has always
                 // taken post-repair: every described file, standing in for
                 // none of them.
+                // Volumes whose posted bytes an archive checksum already
+                // contradicted. Their grid claims come from the same wire that
+                // vouched for the damage, so they are dropped here and the
+                // volumes are read — which is also what gives the repair a
+                // slice-accurate account of what to rebuild.
+                let suspect = self.direct_suspect_par2_file_ids(job_id, overlay_set_id);
                 let claimed = if post_repair {
                     Vec::new()
                 } else {
-                    self.grid_claimed_file_verifications(job_id, &par2_set)
+                    let mut claimed = self.grid_claimed_file_verifications(job_id, &par2_set);
+                    claimed.retain(|file| !suspect.contains(&file.file_id));
+                    claimed
                 };
                 let claimed_ids: HashSet<par2_rs::FileId> =
                     claimed.iter().map(|file| file.file_id).collect();
@@ -3600,7 +3697,12 @@ impl Pipeline {
                                 else {
                                     continue;
                                 };
-                                if to_read_ids.contains(&par2_file_id) {
+                                // Same refusal as the whole-file claim above,
+                                // per slice: a suspect volume is read slice by
+                                // slice, with nothing proven in advance.
+                                if to_read_ids.contains(&par2_file_id)
+                                    && !suspect.contains(&par2_file_id)
+                                {
                                     proven_slices.insert(par2_file_id, slices);
                                 }
                             }
@@ -3708,6 +3810,44 @@ impl Pipeline {
     /// another decision's side effect is how it lapses silently when that
     /// decision is refactored. One bool is a cheap price for saying it where it
     /// is meant.
+    /// The PAR2 descriptions of live direct volumes carrying a recorded
+    /// part-checksum mismatch.
+    ///
+    /// The bridge between an archive-level fact and a PAR2-level one. A volume
+    /// lands here because RAR's own packed checksum disagreed with bytes the
+    /// wire delivered *and vouched for*, which makes every claim derived from
+    /// that same wire — the retained session's slice evidence, the dual-CRC
+    /// grid's whole-file and per-slice proofs — evidence from the witness whose
+    /// account is in question. So the pass reads these volumes, and nothing
+    /// stands in for them.
+    ///
+    /// Empty for every set with no damage on record, which is every set in
+    /// every healthy job: the claim ladder is untouched for them.
+    pub(crate) fn direct_suspect_par2_file_ids(
+        &self,
+        job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
+    ) -> HashSet<par2_rs::FileId> {
+        let mut suspect: HashSet<par2_rs::FileId> = HashSet::new();
+        for set in self.direct_store.sets_for(job_id) {
+            if set.is_demoted() || set.is_finalized() {
+                continue;
+            }
+            for volume_index in set.router.damaged_volumes() {
+                let Some(file_index) = set.plan().volumes.get(volume_index).copied() else {
+                    continue;
+                };
+                if let Some(binding) = self.resolve_par2_file_binding_in_set(
+                    NzbFileId { job_id, file_index },
+                    recovery_set_id,
+                ) {
+                    suspect.insert(binding.par2_file_id);
+                }
+            }
+        }
+        suspect
+    }
+
     pub(in crate::pipeline) fn direct_sets_repaired_in_place(&self, job_id: JobId) -> bool {
         self.direct_store
             .sets_for(job_id)
@@ -3797,6 +3937,16 @@ impl Pipeline {
         access: &std::sync::Arc<super::par2_access::DirectVolumeFileAccess>,
     ) -> Option<par2_rs::VerificationResult> {
         if overlay_set_id != par2_set.recovery_set_id {
+            return None;
+        }
+        // A volume with an archive-level checksum mismatch on record cannot be
+        // reported from wire evidence, and this session is all-or-nothing: one
+        // suspect volume and the whole pass reads instead. See
+        // [`Self::direct_suspect_par2_file_ids`].
+        if !self
+            .direct_suspect_par2_file_ids(job_id, overlay_set_id)
+            .is_empty()
+        {
             return None;
         }
         if !self.grid_adjudicated_par2_bindings(job_id, par2_set) {
@@ -4617,7 +4767,12 @@ impl Pipeline {
                     .map(|(offset, data)| (volume_index, offset, data))
                     .collect();
                 lead_in.extend(edges);
-                set.route_repaired(volume_index, &staged, &lead_in)
+                set.route_repaired(
+                    volume_index,
+                    &staged,
+                    &lead_in,
+                    volume.rewrote_whole_volume(),
+                )
             };
             drop(spans);
             let routed = match routed {
@@ -4872,6 +5027,55 @@ impl Pipeline {
         };
         self.demote_direct_sets_with_par2_damage_for_set(job_id, set_id, verification)
             .await
+    }
+
+    /// Demotes any live set still holding a part-checksum mismatch that the
+    /// PAR2 pass could not answer — either because it read the volume and
+    /// called it whole, or because it found the damage and had nothing to
+    /// repair it with.
+    ///
+    /// A part-checksum mismatch parks its set: the member holds its
+    /// whole-member gate, so the set never finalizes on its own. That is right
+    /// while a repair might still come and wrong the moment one cannot, and a
+    /// parked set must never be the end state. `verdict` names which of the two
+    /// endings this was, for the log only.
+    ///
+    /// The reason is the routing gate's own, so the metric bucket
+    /// (`part_checksum_mismatch`) counts it exactly where it was always
+    /// counted, and a job whose archive is genuinely wrong reports the same
+    /// failure it reported before any of this existed.
+    async fn demote_direct_sets_with_unanswered_part_damage(
+        &mut self,
+        job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
+        verdict: &'static str,
+    ) -> bool {
+        let stuck: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| self.direct_set_binds_to_par2_set(job_id, set, recovery_set_id))
+            .filter(|(_, set)| {
+                !set.is_demoted() && !set.is_finalized() && !set.router.damaged_volumes().is_empty()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if stuck.is_empty() {
+            return false;
+        }
+        for set_index in stuck {
+            warn!(
+                job_id = job_id.0,
+                set_index,
+                verdict,
+                "a direct set's volume failed its archive part checksum and PAR2 did not put it \
+                 right; demoting so the conventional path owns the archive"
+            );
+            self.demote_direct_set(job_id, set_index, DemotionReason::PartChecksumMismatch)
+                .await;
+        }
+        true
     }
 
     /// Demotes every set of `job_id` that is still routing, because a PAR2
@@ -5721,6 +5925,39 @@ impl Pipeline {
         if self.direct_finalization_waits_for_par2(job_id) {
             return;
         }
+        // Damage on record and no PAR2 verdict left to answer it.
+        //
+        // Reaching here means the job is verified, bypassed, or carries no
+        // recovery set that will ever be parsed — so a set still holding a
+        // part-checksum mismatch is holding a question nothing can answer. It
+        // never becomes ready (the member gate stalls by design), so without
+        // this it would sit routed and uncommitted for the life of the job.
+        // Demoting under the routing gate's own reason hands the archive to the
+        // conventional path, which reads the same bytes and reports the same
+        // CRC failure with the diagnostics that path has always had.
+        let unanswerable: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| {
+                !set.is_demoted()
+                    && !set.is_finalized()
+                    && set.all_volumes_complete()
+                    && !set.router.damaged_volumes().is_empty()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for set_index in unanswerable {
+            warn!(
+                job_id = job_id.0,
+                set_index,
+                "a direct set's volume failed its archive part checksum and no PAR2 verdict \
+                 is coming; demoting so the conventional path owns the archive"
+            );
+            self.demote_direct_set(job_id, set_index, DemotionReason::PartChecksumMismatch)
+                .await;
+        }
         let ready: Vec<usize> = self
             .direct_store
             .sets_for(job_id)
@@ -5985,11 +6222,12 @@ impl Pipeline {
         // compares `plan().member_output_path` against the tolerated
         // destinations, which is derived from the layout and not from the
         // filesystem. It still has to run before the envelopes are deleted.
-        match self.extract_tolerated_members(job_id, set_index).await {
+        let tolerated_directories = match self.extract_tolerated_members(job_id, set_index).await {
             Ok(extracted) => {
-                for name in extracted {
+                for name in extracted.members {
                     self.record_direct_extracted(job_id, name);
                 }
+                extracted.directories
             }
             Err(error) => {
                 warn!(
@@ -6006,7 +6244,7 @@ impl Pipeline {
                 .await;
                 return;
             }
-        }
+        };
 
         // A failure here leaves the set neither committed nor abandoned: its
         // partials still hold every verified byte, but nothing downstream will
@@ -6059,6 +6297,31 @@ impl Pipeline {
                 return;
             }
             self.record_direct_extracted(job_id, name.clone());
+        }
+
+        // The archive's directory metadata, restored **last**. Every rename
+        // above landed a member inside one of these directories and bumped its
+        // mtime, so this is the first moment a restored time survives — and the
+        // conventional extractor reaches the same state for the same reason,
+        // because `rar` writes its directory headers after the files they hold.
+        //
+        // A refusal here is a warning, not a demotion: the directory itself
+        // exists and every member is committed, so throwing the whole set away
+        // to redownload it for a timestamp would cost far more than the
+        // timestamp is worth. The conventional path treats the same failure as
+        // fatal to *that member*, which for a directory is the same nothing.
+        for (info, path) in &tolerated_directories {
+            if let Err(error) =
+                crate::pipeline::extraction::apply_rar_member_filesystem_metadata(info, path)
+            {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    path = %path.display(),
+                    error = %error,
+                    "failed to restore a direct-store directory's archive metadata"
+                );
+            }
         }
 
         for scratch in &repair_scratch {
@@ -6316,27 +6579,39 @@ impl Pipeline {
     /// overwritten here, which is checked rather than assumed — a tolerated
     /// member resolving onto a stored member's destination is refused, and the
     /// set demotes.
+    ///
+    /// # Directory members are created, never extracted
+    ///
+    /// A directory entry is a dataless header. It is created through the same
+    /// [`ExtractionRoot`] the conventional extractor creates one through — same
+    /// path validator, same budget, same "already there is fine, a
+    /// non-directory in the way is not" rule — and never through
+    /// `File::create`, which would leave an empty *file* named like the
+    /// directory the archive describes.
+    ///
+    /// Its **metadata** is not applied here: every later file that lands inside
+    /// it bumps its mtime, and the commit loop that renames this set's stored
+    /// members runs after this call. The [`unrar_rs::MemberInfo`] is carried
+    /// back to [`Self::finalize_direct_set`] instead, which applies it once
+    /// every member is at its destination.
     async fn extract_tolerated_members(
         &mut self,
         job_id: JobId,
         set_index: usize,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<ToleratedExtraction, String> {
         let (set_name, names) = {
             let Some(set) = self.direct_store.set(job_id, set_index) else {
-                return Ok(Vec::new());
+                return Ok(ToleratedExtraction::default());
             };
-            (
-                set.set_name().to_string(),
-                set.router.tolerated_member_names(),
-            )
+            (set.set_name().to_string(), set.router.tolerated_members())
         };
         if names.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ToleratedExtraction::default());
         }
         let staging = self.extraction_staging_dir(job_id);
         let extraction_budget = self.extraction_budget(job_id, &staging)?;
         let Some(set) = self.direct_store.set(job_id, set_index) else {
-            return Ok(Vec::new());
+            return Ok(ToleratedExtraction::default());
         };
         // An `-hp` set's virtual volumes are as header-encrypted as
         // the posted ones, so this extraction cannot even *open* the archive
@@ -6378,8 +6653,14 @@ impl Pipeline {
             }
         }
 
-        let mut targets: Vec<(String, PathBuf)> = Vec::with_capacity(names.len());
-        for name in &names {
+        let mut targets: Vec<ToleratedTarget> = Vec::with_capacity(names.len());
+        for member in &names {
+            let name = &member.name;
+            // The same validator the conventional extractor refuses an unsafe
+            // member path with, reached through the same resolution a stored
+            // member's destination is: a directory entry whose name escapes the
+            // root is refused here and the set demotes, which is the refusal the
+            // conventional path would reach over the materialized volumes.
             let destination = set
                 .plan()
                 .member_output_path(name)
@@ -6390,12 +6671,28 @@ impl Pipeline {
                     destination.display()
                 ));
             }
-            targets.push((name.clone(), destination));
+            // Root-relative, because `ExtractionRoot` is a `cap-std` directory
+            // handle and every path it takes is relative to it. Derived from the
+            // destination rather than re-sanitized, so the directory this
+            // creates and the file a stored member commits to can never resolve
+            // through two different rules.
+            let relative = destination
+                .strip_prefix(&staging)
+                .map_err(|_| {
+                    format!("tolerated member '{name}' resolved outside the staging root")
+                })?
+                .to_path_buf();
+            targets.push(ToleratedTarget {
+                name: name.clone(),
+                destination,
+                relative,
+                is_directory: member.is_directory,
+            });
         }
         debug_assert!(
             targets
                 .iter()
-                .all(|(_, destination)| !stored_outputs.contains(destination)),
+                .all(|target| !stored_outputs.contains(&target.destination)),
             "a tolerated member of {set_name} would overwrite a direct-store output"
         );
 
@@ -6429,6 +6726,7 @@ impl Pipeline {
             .filter(|volume_index| *volume_index != first_volume)
             .collect();
         let extraction_memory_limit = self.extraction_limits.max_memory_bytes;
+        let extraction_root = staging.clone();
 
         let extracted = tokio::task::spawn_blocking(move || {
             let reader = provider
@@ -6467,8 +6765,16 @@ impl Pipeline {
                     &archive,
                 ))
                 .map_err(|error| format!("RAR decoder memory admission failed: {error}"))?;
-            for (_, destination) in &targets {
-                if let Some(parent) = destination.parent() {
+            for target in &targets {
+                if target.is_directory {
+                    // `ExtractionRoot::create_dir` owns the parents, and it is
+                    // the arm that must own them: a directory entry is the one
+                    // target whose own path is a directory, so `parent()` would
+                    // create everything above it and leave the entry itself to
+                    // `File::create`.
+                    continue;
+                }
+                if let Some(parent) = target.destination.parent() {
                     std::fs::create_dir_all(parent).map_err(|error| {
                         format!(
                             "failed to create {} for a tolerated member: {error}",
@@ -6482,13 +6788,41 @@ impl Pipeline {
                 password: password.clone(),
                 restore_owners: false,
             };
+            // Opened only for a set that really has a directory entry, so a
+            // plain small-member tolerance pays nothing for this.
+            let root = match targets.iter().any(|target| target.is_directory) {
+                true => Some(crate::pipeline::extraction::ExtractionRoot::open(
+                    &extraction_root,
+                )?),
+                false => None,
+            };
             let mut produced = Vec::with_capacity(targets.len());
-            for (name, destination) in &targets {
+            let mut directories = Vec::new();
+            for target in &targets {
+                let name = &target.name;
                 let index = archive
                     .find_member(name)
                     .ok_or_else(|| format!("tolerated member '{name}' is not in the archive"))?;
-                let mut file = std::fs::File::create(destination).map_err(|error| {
-                    format!("failed to create {}: {error}", destination.display())
+                if target.is_directory {
+                    let root = root
+                        .as_ref()
+                        .expect("a directory target opened the extraction root");
+                    // The conventional extractor's own directory arm, byte for
+                    // byte: create through the sandboxed root under the
+                    // extraction budget, tolerating a directory that is already
+                    // there — the routed members' parents were created when
+                    // their `.direct.partial`s were prepared, so on an ordinary
+                    // folder-tree set every one of these already exists.
+                    root.create_dir(&target.relative, &extraction_budget)?;
+                    let info = archive.member_info(index).ok_or_else(|| {
+                        format!("tolerated directory '{name}' has no member metadata")
+                    })?;
+                    directories.push((info.clone(), target.destination.clone()));
+                    produced.push(name.clone());
+                    continue;
+                }
+                let mut file = std::fs::File::create(&target.destination).map_err(|error| {
+                    format!("failed to create {}: {error}", target.destination.display())
                 })?;
                 // The provider is the set's, keyed by the set's own volume
                 // indices, which is what the entry asks for — a member
@@ -6514,7 +6848,10 @@ impl Pipeline {
                 }
                 produced.push(name.clone());
             }
-            Ok::<Vec<String>, String>(produced)
+            Ok::<ToleratedExtraction, String>(ToleratedExtraction {
+                members: produced,
+                directories,
+            })
         })
         .await
         .map_err(|error| format!("tolerated extraction task panicked: {error}"))??;
@@ -6523,10 +6860,17 @@ impl Pipeline {
             "direct_store.tolerated_members_extracted",
             std::time::Duration::from_nanos(1),
         );
+        if !extracted.directories.is_empty() {
+            crate::runtime::perf_probe::record_value(
+                "direct_store.tolerated_directories",
+                extracted.directories.len() as u64,
+            );
+        }
         info!(
             job_id = job_id.0,
             set_name = %set_name,
-            members = extracted.len(),
+            members = extracted.members.len(),
+            directories = extracted.directories.len(),
             "extracted tolerated small members from the virtual volumes"
         );
         Ok(extracted)
