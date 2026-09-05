@@ -3024,6 +3024,9 @@ async fn complete_direct_payload_with_loaded_par2_does_not_finalize_with_parked_
     );
 
     pipeline.check_job_completion(job_id).await;
+    // Both authoritative passes are detached reads; each one's verdict re-enters
+    // the completion check as a message.
+    settle_par2_analysis_work(&mut pipeline).await;
     settle_inflight_moves(&mut pipeline).await;
 
     assert_eq!(
@@ -3397,6 +3400,8 @@ async fn promoted_recovery_wait_does_not_reverify_until_recovery_finishes() {
     );
 
     pipeline.check_job_completion(job_id).await;
+    // The promotion is decided by the detached read's verdict.
+    settle_par2_analysis_work(&mut pipeline).await;
     assert_eq!(drain_job_verification_started(&mut events, job_id), 1);
     assert!(
         pipeline
@@ -3696,6 +3701,8 @@ async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() 
     );
 
     pipeline.check_job_completion(job_id).await;
+    // The promotion is decided by the detached read's verdict.
+    settle_par2_analysis_work(&mut pipeline).await;
 
     assert!(pipeline.is_promoted_recovery_file(job_id, 2));
     assert!(!pipeline.is_promoted_recovery_file(job_id, 3));
@@ -3708,6 +3715,7 @@ async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() 
 
     pipeline.mark_promoted_recovery_segment_unavailable(first_segment);
     pipeline.check_job_completion(job_id).await;
+    settle_par2_analysis_work(&mut pipeline).await;
 
     assert_eq!(
         job_status_for_assert(&pipeline, job_id),
@@ -3723,6 +3731,7 @@ async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() 
 
     pipeline.mark_promoted_recovery_segment_unavailable(second_segment);
     pipeline.check_job_completion(job_id).await;
+    settle_par2_analysis_work(&mut pipeline).await;
 
     let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {
         panic!("job should fail only after promoted recovery candidates are exhausted");
@@ -3861,6 +3870,8 @@ async fn direct_payload_par2_repair_fails_when_recovery_is_insufficient() {
 
     pipeline.finish_released_download_result_processing(job_id, 512);
     pipeline.check_job_completion(job_id).await;
+    // The fail-fast verdict is what the detached analysis brings back.
+    settle_par2_analysis_work(&mut pipeline).await;
 
     let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {
         panic!("job should have failed when recovery blocks are insufficient");
@@ -4667,6 +4678,11 @@ async fn drain_job_to_completion(pipeline: &mut Pipeline, job_id: JobId) {
         state.refresh_runtime_lanes_from_status();
     }
     pipeline.check_job_completion(job_id).await;
+    // The damaged path hands its authoritative read to a blocking worker and
+    // returns; the verdict arrives as a message the orchestrator's select loop
+    // would service. Draining the detached tickets here is what stands in for
+    // that loop, and without it the job parks in `Verifying` forever.
+    settle_direct_post_repair_work(pipeline).await;
 }
 
 /// A clean two-segment payload plus its index verifies and completes.
@@ -6378,7 +6394,6 @@ async fn partial_quick_evidence_is_reported_and_the_swap_still_settles() {
     }
 
     settle_job_completion(&mut pipeline, job_id).await;
-
     assert_eq!(
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Complete),
@@ -11323,6 +11338,9 @@ async fn a_recovery_set_naming_the_joined_file_retires_the_split_topology() {
     );
 
     pipeline.check_job_completion(job_id).await;
+    // The verdict that vouches for the joined file comes back from a blocking
+    // worker, so the topology is only retired once that message is serviced.
+    settle_par2_analysis_work(&mut pipeline).await;
 
     assert!(
         pipeline.jobs.get(&job_id).is_none_or(|state| state
@@ -11406,6 +11424,9 @@ async fn a_split_part_short_of_articles_does_not_fail_a_rejoined_job() {
     posting.install(&mut pipeline, job_id).await;
 
     pipeline.check_job_completion(job_id).await;
+    // Same detached verdict: the join is only vouched for once the analysis
+    // message lands back on the pipeline task.
+    settle_par2_analysis_work(&mut pipeline).await;
 
     assert!(
         pipeline
@@ -13859,6 +13880,9 @@ async fn a_damaged_job_reads_only_its_damaged_file_when_the_grid_seeded_evidence
     .await;
 
     pipeline.check_job_completion(job_id).await;
+    // The read runs on a blocking worker; the byte count is recorded when its
+    // verdict lands back on the pipeline task.
+    settle_par2_analysis_work(&mut pipeline).await;
 
     let read = *pipeline
         .par2_authoritative_bytes_read
@@ -13894,6 +13918,9 @@ async fn the_one_shot_repairer_reads_every_file_because_it_has_no_seat_for_evide
     .await;
 
     pipeline.check_job_completion(job_id).await;
+    // The read runs on a blocking worker; the byte count is recorded when its
+    // verdict lands back on the pipeline task.
+    settle_par2_analysis_work(&mut pipeline).await;
 
     let read = *pipeline
         .par2_authoritative_bytes_read
@@ -13918,6 +13945,9 @@ async fn a_damaged_job_with_no_in_stream_evidence_still_reads_and_verifies_every
             .await;
 
     pipeline.check_job_completion(job_id).await;
+    // The read runs on a blocking worker; the byte count is recorded when its
+    // verdict lands back on the pipeline task.
+    settle_par2_analysis_work(&mut pipeline).await;
 
     let read = *pipeline
         .par2_authoritative_bytes_read
@@ -14329,11 +14359,13 @@ async fn slice_evidence_is_keyed_to_the_name_a_renamed_file_now_carries() {
 #[tokio::test]
 async fn a_damaged_job_defers_repairer_analysis_until_its_downloads_drain() {
     // The filesystem damaged-path analysis is a whole-directory authoritative
-    // read that holds the pipeline actor. While the job still has wire work in
-    // flight, every completing file would otherwise re-run that pass to
-    // rediscover "still waiting" — the live decay shape: repeated analyses
-    // starving dispatch for the whole queue. The gate parks the pass until the
-    // job's downloads drain; the drain itself is the re-arm.
+    // read. It runs on a blocking worker rather than on the pipeline task, so
+    // it no longer starves dispatch while it runs — but it is still a full
+    // hash of every described file plus a rolling scan of everything else, and
+    // while the job has wire work in flight every completing file would submit
+    // another one only to rediscover "still waiting". The gate parks the
+    // submission until the job's downloads drain; the drain itself is the
+    // re-arm.
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30188);
@@ -14606,5 +14638,295 @@ async fn the_one_shot_repairer_chains_scan_carry_between_analysis_and_repair() {
     assert!(
         pipeline.par2_scan_carry_stashed_calls >= 1,
         "a completed pass must leave its carry behind for the next one"
+    );
+}
+
+/// A damaged, fully-drained job whose next completion check submits a
+/// damaged-path analysis ticket: the payload is on disk with its second block
+/// corrupted, the index and one recovery volume are complete, and no wire work
+/// remains to hold the gate shut.
+async fn insert_damaged_job_ready_for_analysis(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    tag: &str,
+) -> std::path::PathBuf {
+    let payload_filename = "payload.mkv";
+    let index_filename = "repair.par2";
+    let recovery_filename = "repair.vol00+01.par2";
+    let original_payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let mut damaged_payload = original_payload.clone();
+    for byte in &mut damaged_payload[64..128] {
+        *byte = 0;
+    }
+    let par2_bytes = build_test_par2_index(payload_filename, &original_payload, 64);
+    let recovery_bytes = vec![0xAA; 64];
+    let spec = JobSpec {
+        name: format!("Silver Horizon {tag}"),
+        password: None,
+        total_bytes: (original_payload.len() + par2_bytes.len() + recovery_bytes.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: format!("{tag}-payload-0@example.com"),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: format!("{tag}-payload-1@example.com"),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: format!("{tag}-index@example.com"),
+                }],
+            },
+            FileSpec {
+                filename: recovery_filename.to_string(),
+                role: FileRole::from_filename(recovery_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: recovery_bytes.len() as u32,
+                    message_id: format!("{tag}-recovery@example.com"),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(pipeline, job_id, spec).await;
+
+    tokio::fs::write(working_dir.join(payload_filename), &damaged_payload)
+        .await
+        .unwrap();
+    {
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Repairing;
+        state.refresh_runtime_lanes_from_status();
+        state
+            .assembly
+            .file_mut(file_id)
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+        state
+            .assembly
+            .file_mut(file_id)
+            .unwrap()
+            .commit_segment(1, 64)
+            .unwrap();
+    }
+    write_and_complete_file(pipeline, job_id, 1, index_filename, &par2_bytes).await;
+    write_and_complete_file(pipeline, job_id, 2, recovery_filename, &recovery_bytes).await;
+    install_test_par2_runtime(
+        pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &original_payload, 64, 1),
+        &[
+            (1, index_filename, 0, false),
+            (2, recovery_filename, 1, true),
+        ],
+    );
+    working_dir
+}
+
+/// Waits for the detached analysis worker to hand its verdict back, without
+/// letting the pipeline see it. Tests that want the verdict *dropped* need the
+/// message in hand to prove the fence rejects it.
+async fn next_par2_analysis_done(pipeline: &mut Pipeline) -> crate::pipeline::Par2AnalysisWorkDone {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        pipeline.par2_analysis_done_rx.recv(),
+    )
+    .await
+    .expect("the detached analysis should finish")
+    .expect("the analysis completion channel should stay open")
+}
+
+#[tokio::test]
+async fn the_pipeline_task_serves_another_job_while_an_analysis_ticket_runs() {
+    // The point of detaching the read: with a damaged job's authoritative
+    // analysis outstanding, the pipeline task is free. A second job's
+    // completion check runs to its own verdict in the meantime, which is the
+    // thing the inline `await` made impossible — it held `&mut self` for the
+    // whole read, so every other job's message waited behind it.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let damaged_job = JobId(30601);
+    insert_damaged_job_ready_for_analysis(&mut pipeline, damaged_job, "analysis-concurrency").await;
+
+    pipeline.check_job_completion(damaged_job).await;
+    assert!(
+        pipeline.par2_analysis_in_flight.contains_key(&damaged_job),
+        "the damaged path must hand its read to a worker rather than run it here"
+    );
+
+    // A clean job, submitted and decided with the ticket still outstanding.
+    let clean_job = JobId(30602);
+    let payload_filename = "Ivory.Meadow.S01E01.mkv";
+    let index_filename = "Ivory.Meadow.S01E01.par2";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 241) as u8).collect();
+    let par2_bytes = build_test_par2_index(payload_filename, &payload, 64);
+    let spec = split_payload_par2_job_spec(
+        "Ivory Meadow Served Meanwhile",
+        payload_filename,
+        payload.len() as u32,
+        index_filename,
+        par2_bytes.len() as u32,
+    );
+    insert_active_job(&mut pipeline, clean_job, spec).await;
+    submit_par2_index(&mut pipeline, clean_job, index_filename, &par2_bytes).await;
+    submit_split_payload(&mut pipeline, clean_job, payload_filename, &payload).await;
+    {
+        let state = pipeline.jobs.get_mut(&clean_job).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+    }
+    pipeline.check_job_completion(clean_job).await;
+
+    assert!(
+        pipeline.par2_verified.contains(&clean_job),
+        "the second job must reach its own verdict while the first job's read runs"
+    );
+    assert!(
+        pipeline.par2_analysis_in_flight.contains_key(&damaged_job),
+        "the first job's read is still outstanding, so it really did overlap"
+    );
+}
+
+#[tokio::test]
+async fn the_completion_check_does_not_judge_a_job_with_an_analysis_ticket_outstanding() {
+    // A completion check that ran while the read was in flight would be
+    // judging on the pre-analysis picture — no damage counted, no repair
+    // decided — and would settle the job clean. It must instead park, and it
+    // must not start a rival read for the same set.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30603);
+    insert_damaged_job_ready_for_analysis(&mut pipeline, job_id, "analysis-outstanding").await;
+
+    pipeline.check_job_completion(job_id).await;
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
+    assert!(pipeline.par2_analysis_in_flight.contains_key(&job_id));
+
+    // Every re-entry while the ticket runs: no verdict, no second read.
+    for _ in 0..3 {
+        pipeline.check_job_completion(job_id).await;
+    }
+
+    assert_eq!(
+        pipeline.par2_repairer_analyze_calls, 1,
+        "an outstanding ticket must not be joined by a second read for the same set"
+    );
+    assert!(
+        !pipeline.par2_verified.contains(&job_id),
+        "the job must not be declared verified before its read lands"
+    );
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
+        ),
+        "the job must not reach a terminal status while its read is outstanding"
+    );
+
+    // The verdict lands and the job settles, so the park really was a park.
+    settle_par2_analysis_work(&mut pipeline).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+}
+
+#[tokio::test]
+async fn tearing_a_job_down_forgets_its_outstanding_analysis_ticket() {
+    // The retained session the ticket carries belongs to a runtime that is
+    // being discarded, and the working directory the verdict names is about to
+    // go with it. The done message must find no taker.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30604);
+    insert_damaged_job_ready_for_analysis(&mut pipeline, job_id, "analysis-teardown").await;
+
+    pipeline.check_job_completion(job_id).await;
+    assert!(pipeline.par2_analysis_in_flight.contains_key(&job_id));
+
+    pipeline.clear_par2_runtime_state(job_id);
+    assert!(
+        !pipeline.par2_analysis_in_flight.contains_key(&job_id),
+        "teardown must forget the ticket"
+    );
+
+    let done = next_par2_analysis_done(&mut pipeline).await;
+    pipeline.handle_par2_analysis_done(done).await;
+
+    assert!(
+        !pipeline.par2_analysis_results.contains_key(&job_id),
+        "a forgotten ticket's verdict must not be parked for a later check"
+    );
+}
+
+#[tokio::test]
+async fn a_rebind_between_submit_and_done_discards_the_analysis_verdict() {
+    // A verdict names files by path. An identity rewrite between the read
+    // starting and its result landing moves those names, so the verdict
+    // describes a layout that no longer exists — and acting on it would repair
+    // against the wrong file. The rebind forgets the ticket; the completion
+    // check submits a fresh read against the new identities.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30605);
+    insert_damaged_job_ready_for_analysis(&mut pipeline, job_id, "analysis-rebind").await;
+
+    pipeline.check_job_completion(job_id).await;
+    assert!(pipeline.par2_analysis_in_flight.contains_key(&job_id));
+
+    pipeline.invalidate_par2_session_for_identity_rebind(job_id);
+    assert!(
+        !pipeline.par2_analysis_in_flight.contains_key(&job_id),
+        "a rebind must forget the read it invalidated"
+    );
+
+    let done = next_par2_analysis_done(&mut pipeline).await;
+    pipeline.handle_par2_analysis_done(done).await;
+
+    assert!(
+        !pipeline.par2_analysis_results.contains_key(&job_id),
+        "the pre-rebind verdict must not be parked"
+    );
+    assert!(
+        !pipeline.par2_verified.contains(&job_id),
+        "and it must not have settled the job behind the rebind"
+    );
+
+    // The next check starts over rather than standing on the discarded read.
+    pipeline.check_job_completion(job_id).await;
+    assert_eq!(
+        pipeline.par2_repairer_analyze_calls, 2,
+        "a fresh read must be submitted against the rebound identities"
     );
 }

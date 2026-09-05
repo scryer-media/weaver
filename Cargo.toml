@@ -112,7 +112,7 @@ windows-sys = { version = "0.61", default-features = false }
 #
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
-par2-rs = { version = "0.9", default-features = false, features = ["native-crypto"] }
+par2-rs = { version = "0.10", default-features = false, features = ["native-crypto"] }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x

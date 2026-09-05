@@ -535,6 +535,9 @@ impl Pipeline {
         // members are the very bytes being rebuilt over.
         self.direct_store.clear_job(job_id);
         self.forget_direct_tolerated_work(job_id);
+        // A damaged-path verdict names files by path against the assembly
+        // being replaced here, so it cannot be allowed to reach the rebuilt one.
+        self.forget_par2_analysis_work(job_id);
         // The assembly is about to be rebuilt with fresh file indices, so any
         // chase keyed to the old one is describing a job that no longer exists.
         self.direct_unpack_forget_job(job_id);

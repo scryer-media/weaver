@@ -1784,6 +1784,102 @@ impl Pipeline {
         stateful_par2_session_enabled()
     }
 
+    /// The files under this job's working directory that the named recovery
+    /// set's extra scan must not read.
+    ///
+    /// An extra candidate is a file the set does not describe, rolling-scanned
+    /// window by window on the chance that it holds a copy of some slice.
+    /// Finding a renamed or concatenated source that way is the entire point,
+    /// so anything this cannot positively place elsewhere stays discoverable —
+    /// an obfuscated file with no binding at all is exactly what extras exist
+    /// for, and excluding it would be excluding the answer.
+    ///
+    /// Two things can be positively placed elsewhere:
+    ///
+    ///  - A file that binds to a *different* recovery set. The binding
+    ///    resolver refuses a name two sets both answer to, so a binding that
+    ///    names another set is unambiguous: those bytes are that set's
+    ///    payload, and a slice of this set cannot be inside them at any offset.
+    ///  - A complete volume of a RAR set other than the one this recovery set
+    ///    describes. Applied only when at least one file bound to this set
+    ///    carries a RAR classification, because that is what says which
+    ///    archive set the recovery set is for; with nothing to compare against,
+    ///    every volume stays discoverable. Incomplete volumes are left alone: a
+    ///    file still being written is not yet the archive its name claims, and
+    ///    its bytes may still be rearranged.
+    ///
+    /// Without this, a directory holding two recovery sets makes each set read
+    /// the other set's whole payload, once per scanning pass, and match nothing
+    /// both times.
+    pub(crate) fn par2_extra_scan_exclusions(
+        &self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) -> Vec<PathBuf> {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Vec::new();
+        };
+        let file_ids: Vec<NzbFileId> = state.assembly.files().map(|file| file.file_id()).collect();
+        let mut excluded: Vec<PathBuf> = Vec::new();
+        let mut own_paths: HashSet<PathBuf> = HashSet::new();
+        let mut own_rar_sets: HashSet<String> = HashSet::new();
+        let mut unbound_rar: Vec<(NzbFileId, String)> = Vec::new();
+        for file_id in file_ids {
+            let rar_set_name = self
+                .effective_file_identity(job_id, file_id)
+                .and_then(|identity| identity.classification)
+                .and_then(|classification| {
+                    matches!(
+                        classification.kind,
+                        crate::jobs::assembly::DetectedArchiveKind::Rar
+                    )
+                    .then_some(classification.set_name)
+                });
+            match self.resolve_par2_file_binding(file_id) {
+                Some(binding) if binding.recovery_set_id == set_id => {
+                    own_paths.insert(binding.path);
+                    if let Some(set_name) = rar_set_name {
+                        own_rar_sets.insert(set_name);
+                    }
+                }
+                Some(binding) => excluded.push(binding.path),
+                None => {
+                    if let Some(set_name) = rar_set_name {
+                        unbound_rar.push((file_id, set_name));
+                    }
+                }
+            }
+        }
+        if !own_rar_sets.is_empty() {
+            for (file_id, set_name) in unbound_rar {
+                if own_rar_sets.contains(&set_name) {
+                    continue;
+                }
+                let Some(state) = self.jobs.get(&job_id) else {
+                    break;
+                };
+                let Some(file) = state.assembly.file(file_id) else {
+                    continue;
+                };
+                if !file.is_complete() {
+                    continue;
+                }
+                excluded.push(
+                    state
+                        .working_dir
+                        .join(self.current_filename_for_file(job_id, file)),
+                );
+            }
+        }
+        // A path this set itself resolves to is never an exclusion, whatever
+        // else claimed it: the set's own sources are scanned as canonical
+        // candidates and are not extras in the first place.
+        excluded.retain(|path| !own_paths.contains(path));
+        excluded.sort();
+        excluded.dedup();
+        excluded
+    }
+
     pub(crate) async fn take_or_open_par2_repair_session(
         &mut self,
         job_id: JobId,
@@ -1796,6 +1892,11 @@ impl Pipeline {
         if !self.stateful_par2_session_gate() {
             return Ok(None);
         }
+        // Which of this job's files belong to somebody else, computed here so
+        // every consumer of a retained session gets the same answer: a reused
+        // session is re-pointed at the current list, and a fresh one opens with
+        // it already applied.
+        let exclude_paths = self.par2_extra_scan_exclusions(job_id, set_id);
         if let Some(runtime) = self.par2_runtime.get_mut(&job_id)
             && let Some(set_runtime) = runtime.set_runtime_mut(set_id)
             && let Some(mut session) = set_runtime.session.take()
@@ -1811,10 +1912,12 @@ impl Pipeline {
                 match (&source_access, session.is_access_backed()) {
                     (Some(access), true) => {
                         session.set_source_access(std::sync::Arc::clone(access));
+                        session.set_exclude_paths(exclude_paths);
                         set_runtime.session_last_used = Some(Instant::now());
                         return Ok(Some((session, false)));
                     }
                     (None, false) => {
+                        session.set_exclude_paths(exclude_paths);
                         set_runtime.session_last_used = Some(Instant::now());
                         return Ok(Some((session, false)));
                     }
@@ -1848,6 +1951,12 @@ impl Pipeline {
             options.memory_limit = Some(memory_limit);
             options.cancel = Some(cancellation);
             options.progress = progress;
+            // Files this job holds that belong to a *different* recovery set,
+            // or to a different archive set than the one this recovery set
+            // describes. Their bytes cannot contain this set's slices at any
+            // offset, so rolling-scanning them as extra candidates is a
+            // whole-payload read that can only ever find nothing.
+            options.exclude_paths = exclude_paths;
             // The in-stream grid seeds this session with per-slice verdicts, so
             // the analysis need not re-read what those verdicts already account
             // for. Every seeded verdict is admitted only on dual-alignment
@@ -2048,6 +2157,10 @@ impl Pipeline {
     /// retained repair session. Drop source locations before that write is
     /// allowed to become observable; parsed PAR2 packets remain reusable.
     pub(crate) fn invalidate_par2_session_for_file_write(&mut self, file_id: NzbFileId) {
+        // A damaged-path analysis reading right now is reading the bytes this
+        // write replaces, so its verdict would name a file state that no longer
+        // exists. Drop the ticket; the completion check submits a fresh read.
+        self.forget_par2_analysis_work(file_id.job_id);
         let Some(runtime) = self.par2_runtime.get_mut(&file_id.job_id) else {
             return;
         };
@@ -2064,6 +2177,11 @@ impl Pipeline {
     /// downloaded bytes. A retained location must nevertheless be discarded:
     /// repair always derives a fresh location from the current identity.
     pub(crate) fn invalidate_par2_session_for_identity_rebind(&mut self, job_id: JobId) {
+        // Same reason a retained location is discarded here: an analysis in
+        // flight was handed the paths the old identities produced, and the
+        // verdict it brings back would decide a repair against names that have
+        // since moved. Forgetting it makes the completion check re-read.
+        self.forget_par2_analysis_work(job_id);
         if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
             for set_runtime in runtime.sets.values_mut() {
                 set_runtime.session_evidence_file_ids.clear();

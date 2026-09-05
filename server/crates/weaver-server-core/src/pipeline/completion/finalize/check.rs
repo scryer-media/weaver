@@ -41,10 +41,10 @@ struct Par2SessionEvidenceCandidate {
     bound_file_id: Option<par2_rs::FileId>,
 }
 
-type RetainedPar2SessionOutcome = (par2_rs::Par2RepairOutcome, Vec<NzbFileId>, bool);
+pub(crate) type RetainedPar2SessionOutcome = (par2_rs::Par2RepairOutcome, Vec<NzbFileId>, bool);
 
 #[derive(Debug)]
-struct RetainedPar2SessionFailure {
+pub(crate) struct RetainedPar2SessionFailure {
     message: String,
     file_descriptor_exhausted: bool,
 }
@@ -66,7 +66,41 @@ impl RetainedPar2SessionFailure {
     }
 }
 
-type RetainedPar2SessionResult = Result<RetainedPar2SessionOutcome, RetainedPar2SessionFailure>;
+pub(crate) type RetainedPar2SessionResult =
+    Result<RetainedPar2SessionOutcome, RetainedPar2SessionFailure>;
+
+/// What a detached damaged-path analysis hands back to the pipeline task.
+///
+/// The arms mirror the two ways the read can be run — through the retained
+/// session, or through a one-shot repairer — and each carries back everything
+/// the actor has to put away afterwards. The retained session in particular
+/// travels *with* the ticket: it is taken out of the set runtime at submission,
+/// which is also what stops a second pass opening a rival session for the same
+/// set while the read is running, and it is restored when this lands.
+pub(crate) enum Par2AnalysisTicketOutcome {
+    Retained {
+        session: Box<par2_rs::Par2RepairSession>,
+        result: RetainedPar2SessionResult,
+    },
+    OneShot(Result<(par2_rs::Par2RepairOutcome, Option<Arc<par2_rs::ScanCarry>>), String>),
+    /// The worker did not return a result at all.
+    TaskFailed(String),
+}
+
+/// The work one damaged-path analysis ticket carries to its blocking worker.
+///
+/// Everything here is owned: no borrow of pipeline state crosses onto the
+/// worker, which is what makes the read detachable in the first place.
+enum Par2AnalysisWorkPlan {
+    Retained {
+        session: Box<par2_rs::Par2RepairSession>,
+        candidates: Vec<Par2SessionEvidenceCandidate>,
+        slice_evidence: Vec<(std::path::PathBuf, Vec<par2_rs::SliceEvidence>)>,
+    },
+    OneShot {
+        options: Box<par2_rs::Par2RepairerOptions>,
+    },
+}
 
 pub(in crate::pipeline) fn error_chain_has_file_descriptor_exhaustion(
     error: &(dyn std::error::Error + 'static),
@@ -242,6 +276,40 @@ fn run_retained_par2_session(
             .map(|outcome| (outcome, admitted_file_ids, retried_source_change))
             .map_err(RetainedPar2SessionFailure::from_session_error),
     )
+}
+
+/// One damaged-path analysis ticket's blocking work, off the pipeline task.
+///
+/// Nothing here touches pipeline state: the plan owns the session, the evidence
+/// and the options, and the actor picks the whole result up again in
+/// `settle_par2_analysis_ticket`.
+fn run_par2_analysis_work(plan: Par2AnalysisWorkPlan) -> Par2AnalysisTicketOutcome {
+    match plan {
+        Par2AnalysisWorkPlan::Retained {
+            session,
+            candidates,
+            slice_evidence,
+        } => {
+            let (session, result) =
+                run_retained_par2_session(*session, candidates, slice_evidence, false);
+            Par2AnalysisTicketOutcome::Retained {
+                session: Box::new(session),
+                result,
+            }
+        }
+        Par2AnalysisWorkPlan::OneShot { options } => {
+            let repairer = par2_rs::Par2Repairer::new(*options);
+            Par2AnalysisTicketOutcome::OneShot(
+                repairer
+                    .verify_or_repair_carrying()
+                    .map_err(|error| format!("PAR2 repairer failed: {error}"))
+                    .and_then(|(outcome, scan_carry)| {
+                        ensure_par2_repair_completed(&outcome, false)?;
+                        Ok((outcome, scan_carry))
+                    }),
+            )
+        }
+    }
 }
 
 fn should_retry_par2_source_change<T>(
@@ -3018,16 +3086,27 @@ impl Pipeline {
         }
 
         let cancellation = self.par2_cancellation_token(job_id);
+        // Files of this job that provably belong to something else. See
+        // `par2_extra_scan_exclusions`; the retained-session arm above gets the
+        // same list through `take_or_open_par2_repair_session`.
+        let exclude_paths = self.par2_extra_scan_exclusions(job_id, set_id);
         // The carry the previous pass over this set left behind — a repairer
         // analysis, a repair, or this module's own authoritative verification.
         // Seeding it is what keeps analysis → repair (and host verify →
         // analysis) from re-reading bytes the earlier pass already hashed;
         // par2-rs stat-gates the carry and re-checks bytes before mutating,
         // so a stale one degrades to the full scan this call always did.
+        //
+        // Seeded only when the exclusion list has not moved since the carry was
+        // taken: a carry is a complete account of the tree only for a pass that
+        // was allowed to look at the same files, and its locations can name a
+        // file this pass has just been told belongs to something else.
         let carry_set_id = par2_set.recovery_set_id;
+        let carry_exclusions = exclude_paths.clone();
         let seeded_scan_carry = self
             .ensure_par2_runtime(job_id)
             .set_runtime_mut(carry_set_id)
+            .filter(|set_runtime| set_runtime.scan_carry_exclusions == carry_exclusions)
             .and_then(|set_runtime| set_runtime.scan_carry.clone());
         #[cfg(test)]
         if seeded_scan_carry.is_some() {
@@ -3042,6 +3121,7 @@ impl Pipeline {
             options.repair = repair;
             options.memory_limit = Some(memory_limit);
             options.cancel = Some(cancellation);
+            options.exclude_paths = exclude_paths;
             options.scan_carry = seeded_scan_carry;
             if let Some(counters) = phase_counters {
                 options.progress = Some(Arc::new(move |update: par2_rs::ProgressUpdate| {
@@ -3099,6 +3179,7 @@ impl Pipeline {
                     .set_runtime_mut(carry_set_id)
                 {
                     set_runtime.scan_carry = scan_carry;
+                    set_runtime.scan_carry_exclusions = carry_exclusions;
                 }
                 let outcome = Ok(outcome);
                 self.settle_direct_unpack_after_repair(job_id, repair, &outcome);
@@ -3229,43 +3310,67 @@ impl Pipeline {
         Some(pending)
     }
 
+    /// This set's damaged-path analysis, run off the pipeline task.
+    ///
+    /// `Ok(None)` means a ticket is outstanding and the caller must return: the
+    /// read is a whole-directory hash of every described file plus a rolling
+    /// scan of whatever else the directory holds, and awaiting it inline held
+    /// the actor for its entire duration — no other job's articles dispatched,
+    /// no decode result processed, no newly submitted NZB even parsed. The
+    /// ticket's completion re-enters the completion check, which reaches this
+    /// call again and finds the verdict parked.
+    ///
+    /// The one-time prologue — retiring the parked repair verdict, the status
+    /// transition, the verification-started events — runs at submission, not on
+    /// the resuming pass, so a job does not announce that it started verifying
+    /// twice for one read.
     async fn analyze_par2_with_repairer(
         &mut self,
         job_id: JobId,
         par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
         preserve_repairing_status: bool,
-    ) -> Result<par2_rs::Par2RepairOutcome, String> {
-        // A fresh read supersedes whatever was parked: from here the gate's
-        // verdict is this pass's, and the old one must not be able to reach a
-        // repair behind it.
-        self.clear_pending_par2_repair(job_id, par2_set.recovery_set_id);
-        if !preserve_repairing_status {
-            self.transition_postprocessing_status(job_id, JobStatus::Verifying, Some("verifying"));
-        } else {
-            info!(
-                job_id = job_id.0,
-                "rerunning PAR2 analysis while preserving restored repair slot"
-            );
-        }
-        self.emit_job_verification_started(job_id);
-        let _ = self.event_tx.send(PipelineEvent::VerificationStarted {
-            file_id: NzbFileId {
-                job_id,
-                file_index: 0,
-            },
-        });
-
-        self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
-        info!(job_id = job_id.0, "par2 damaged-path analysis started");
-
-        let outcome_result = self
-            .run_par2_repairer(job_id, par2_set, working_dir, false, None)
-            .await;
-
-        self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
-
-        let mut outcome = outcome_result?;
+    ) -> Result<Option<par2_rs::Par2RepairOutcome>, String> {
+        let set_id = par2_set.recovery_set_id;
+        let outcome = match self.take_parked_par2_analysis(job_id, set_id) {
+            Some(result) => result?,
+            None => {
+                if self.par2_analysis_in_flight.contains_key(&job_id) {
+                    debug!(
+                        job_id = job_id.0,
+                        "a PAR2 damaged-path analysis is already in flight for this job; waiting"
+                    );
+                    return Ok(None);
+                }
+                // A fresh read supersedes whatever was parked: from here the
+                // gate's verdict is this pass's, and the old one must not be
+                // able to reach a repair behind it.
+                self.clear_pending_par2_repair(job_id, set_id);
+                if !preserve_repairing_status {
+                    self.transition_postprocessing_status(
+                        job_id,
+                        JobStatus::Verifying,
+                        Some("verifying"),
+                    );
+                } else {
+                    info!(
+                        job_id = job_id.0,
+                        "rerunning PAR2 analysis while preserving restored repair slot"
+                    );
+                }
+                self.emit_job_verification_started(job_id);
+                let _ = self.event_tx.send(PipelineEvent::VerificationStarted {
+                    file_id: NzbFileId {
+                        job_id,
+                        file_index: 0,
+                    },
+                });
+                self.submit_par2_analysis_ticket(job_id, par2_set, working_dir)
+                    .await?;
+                return Ok(None);
+            }
+        };
+        let mut outcome = outcome;
 
         let (skipped_blocks, retained_suspect_blocks) =
             self.apply_eager_delete_exclusions(job_id, &mut outcome.verification);
@@ -3303,7 +3408,301 @@ impl Pipeline {
             passed: !par2_verification_needs_repair(&outcome.verification),
         });
 
-        Ok(outcome)
+        Ok(Some(outcome))
+    }
+
+    /// The verdict a ticket left behind, if it belongs to the set this pass is
+    /// deciding.
+    ///
+    /// A result tagged for another set is put back rather than read as this
+    /// set's own: the gate serves one recovery set at a time, and a verdict
+    /// names files by path against the set that produced it.
+    fn take_parked_par2_analysis(
+        &mut self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) -> Option<Result<par2_rs::Par2RepairOutcome, String>> {
+        let (parked_set_id, result) = self.par2_analysis_results.remove(&job_id)?;
+        if parked_set_id == set_id {
+            return Some(result);
+        }
+        self.par2_analysis_results
+            .insert(job_id, (parked_set_id, result));
+        None
+    }
+
+    /// Snapshot everything this set's analysis needs and hand it to a blocking
+    /// worker.
+    ///
+    /// Returns once the ticket is running. `Err` is reserved for a failure that
+    /// happened *here*, on the actor, before any read started — the ticket does
+    /// not exist in that case and the caller owns the failure.
+    async fn submit_par2_analysis_ticket(
+        &mut self,
+        job_id: JobId,
+        par2_set: Arc<par2_rs::Par2FileSet>,
+        working_dir: std::path::PathBuf,
+    ) -> Result<(), String> {
+        let set_id = par2_set.recovery_set_id;
+        #[cfg(test)]
+        {
+            self.par2_repairer_analyze_calls += 1;
+        }
+        let plan = self
+            .prepare_par2_analysis_work(job_id, par2_set, working_dir)
+            .await?;
+
+        self.next_par2_analysis_work_id = self.next_par2_analysis_work_id.wrapping_add(1);
+        let work_id = self.next_par2_analysis_work_id;
+        self.par2_analysis_in_flight.insert(
+            job_id,
+            Par2AnalysisWork {
+                work_id,
+                recovery_set_id: set_id,
+                submitted_at: Instant::now(),
+            },
+        );
+        self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
+        info!(
+            job_id = job_id.0,
+            work_id,
+            retained_session = matches!(plan, Par2AnalysisWorkPlan::Retained { .. }),
+            "par2 damaged-path analysis started"
+        );
+
+        let done_tx = self.par2_analysis_done_tx.clone();
+        tokio::spawn(async move {
+            let joined = tokio::task::spawn_blocking(move || run_par2_analysis_work(plan)).await;
+            let outcome = joined.unwrap_or_else(|error| {
+                Par2AnalysisTicketOutcome::TaskFailed(format!(
+                    "PAR2 damaged-path analysis task panicked: {error}"
+                ))
+            });
+            let _ = done_tx
+                .send(Par2AnalysisWorkDone {
+                    job_id,
+                    work_id,
+                    recovery_set_id: set_id,
+                    outcome,
+                })
+                .await;
+        });
+        Ok(())
+    }
+
+    /// The actor-side half of starting an analysis: take the retained session,
+    /// collect the evidence the read may stand on, and turn it all into an
+    /// owned plan the worker can run without touching pipeline state.
+    async fn prepare_par2_analysis_work(
+        &mut self,
+        job_id: JobId,
+        par2_set: Arc<par2_rs::Par2FileSet>,
+        working_dir: std::path::PathBuf,
+    ) -> Result<Par2AnalysisWorkPlan, String> {
+        let set_id = par2_set.recovery_set_id;
+        let memory_limit = configured_par2_repair_memory_limit_bytes();
+        let retained_session = match self
+            .take_or_open_par2_repair_session(
+                job_id,
+                set_id,
+                working_dir.clone(),
+                memory_limit,
+                // Analysis reports no repair progress, so it needs no progress
+                // sink; and by this point the repairer reads real files, so any
+                // set still routing here materialized before it arrived.
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                warn!(job_id = job_id.0, error = %error, "retained PAR2 session unavailable; using one-shot repairer");
+                None
+            }
+        };
+        if let Some((session, newly_opened)) = retained_session {
+            if newly_opened {
+                #[cfg(test)]
+                {
+                    self.par2_session_opens += 1;
+                }
+                self.ensure_par2_runtime(job_id)
+                    .set_runtime_mut(set_id)
+                    .expect("PAR2 session evidence belongs to the active recovery set")
+                    .session_evidence_file_ids
+                    .clear();
+            }
+            let candidates = match self
+                .par2_session_evidence_candidates(job_id, set_id, &par2_set)
+                .await
+            {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    // Nothing was read and no ticket exists, so the session
+                    // goes straight back where it came from.
+                    self.restore_par2_repair_session(job_id, set_id, session);
+                    return Err(error);
+                }
+            };
+            let slice_evidence = self.in_stream_slice_evidence_paths_for_set(job_id, set_id);
+            return Ok(Par2AnalysisWorkPlan::Retained {
+                session: Box::new(session),
+                candidates,
+                slice_evidence,
+            });
+        }
+
+        let cancellation = self.par2_cancellation_token(job_id);
+        let exclude_paths = self.par2_extra_scan_exclusions(job_id, set_id);
+        // Seeded only when the exclusion list has not moved since the carry was
+        // taken; see the same gate on the one-shot repair path.
+        let seeded_scan_carry = self
+            .ensure_par2_runtime(job_id)
+            .set_runtime_mut(set_id)
+            .filter(|set_runtime| set_runtime.scan_carry_exclusions == exclude_paths)
+            .and_then(|set_runtime| set_runtime.scan_carry.clone());
+        #[cfg(test)]
+        if seeded_scan_carry.is_some() {
+            self.par2_scan_carry_seeded_calls += 1;
+        }
+        let mut options = par2_rs::Par2RepairerOptions::new(working_dir, Vec::new());
+        options.file_set = Some((*par2_set).clone());
+        options.repair = false;
+        options.memory_limit = Some(memory_limit);
+        options.cancel = Some(cancellation);
+        options.exclude_paths = exclude_paths;
+        options.scan_carry = seeded_scan_carry;
+        Ok(Par2AnalysisWorkPlan::OneShot {
+            options: Box::new(options),
+        })
+    }
+
+    /// A finished analysis ticket, back on the pipeline task.
+    ///
+    /// Puts the retained session away, applies the bookkeeping the inline call
+    /// used to apply on return, parks the verdict for the completion check that
+    /// asked for it, and re-enters that check. A ticket the teardown, cancel or
+    /// rebind seams already forgot is discarded by the fence.
+    pub(in crate::pipeline) async fn handle_par2_analysis_done(
+        &mut self,
+        done: Par2AnalysisWorkDone,
+    ) {
+        let Some(in_flight) = self.par2_analysis_in_flight.get(&done.job_id) else {
+            debug!(
+                job_id = done.job_id.0,
+                work_id = done.work_id,
+                "discarding a PAR2 damaged-path analysis whose ticket was forgotten"
+            );
+            return;
+        };
+        if in_flight.work_id != done.work_id || in_flight.recovery_set_id != done.recovery_set_id {
+            debug!(
+                job_id = done.job_id.0,
+                work_id = done.work_id,
+                "discarding a stale PAR2 damaged-path analysis ticket"
+            );
+            return;
+        }
+        let elapsed = in_flight.submitted_at.elapsed();
+        self.par2_analysis_in_flight.remove(&done.job_id);
+        self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
+
+        let result =
+            self.settle_par2_analysis_ticket(done.job_id, done.recovery_set_id, done.outcome);
+        info!(
+            job_id = done.job_id.0,
+            work_id = done.work_id,
+            elapsed_ms = elapsed.as_millis() as u64,
+            outcome = if result.is_ok() { "analyzed" } else { "error" },
+            "par2 damaged-path analysis ticket completed"
+        );
+        crate::runtime::perf_probe::record("par2.authoritative.analysis", elapsed);
+        if !self.jobs.contains_key(&done.job_id) {
+            return;
+        }
+        self.par2_analysis_results
+            .insert(done.job_id, (done.recovery_set_id, result));
+        self.schedule_job_completion_check(done.job_id);
+    }
+
+    /// Everything the inline analysis did with its raw result before returning
+    /// it: put the session back, record what the session may take on trust next
+    /// time, stash the carry, and refuse a terminal non-repair status.
+    fn settle_par2_analysis_ticket(
+        &mut self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+        outcome: Par2AnalysisTicketOutcome,
+    ) -> Result<par2_rs::Par2RepairOutcome, String> {
+        let result = match outcome {
+            Par2AnalysisTicketOutcome::Retained { session, result } => {
+                #[cfg(test)]
+                {
+                    self.par2_session_source_scan_passes = self
+                        .par2_session_source_scan_passes
+                        .max(session.diagnostics().source_scan_passes);
+                }
+                self.restore_par2_repair_session(job_id, set_id, *session);
+                match result {
+                    Ok((outcome, admitted_file_ids, retried_source_change)) => {
+                        let set_runtime = self
+                            .ensure_par2_runtime(job_id)
+                            .set_runtime_mut(set_id)
+                            .expect("PAR2 session evidence belongs to the active recovery set");
+                        if retried_source_change {
+                            set_runtime.session_evidence_file_ids.clear();
+                        } else {
+                            set_runtime
+                                .session_evidence_file_ids
+                                .extend(admitted_file_ids);
+                        }
+                        ensure_par2_repair_completed(&outcome, false).map(|()| outcome)
+                    }
+                    // The file-descriptor fallback is a repair-only path: an
+                    // analysis opens sources to read them, never the whole
+                    // write set at once, so exhaustion here is an ordinary
+                    // failure with no bounded retry to fall back to.
+                    Err(error) => Err(error.message),
+                }
+            }
+            Par2AnalysisTicketOutcome::OneShot(Ok((outcome, scan_carry))) => {
+                #[cfg(test)]
+                if scan_carry.is_some() {
+                    self.par2_scan_carry_stashed_calls += 1;
+                }
+                let exclusions = self.par2_extra_scan_exclusions(job_id, set_id);
+                if let Some(set_runtime) = self.ensure_par2_runtime(job_id).set_runtime_mut(set_id)
+                {
+                    // Replaced unconditionally: a pass that produced no carry
+                    // may have moved bytes, which makes any older stash a lie
+                    // about the layout on disk.
+                    set_runtime.scan_carry = scan_carry;
+                    set_runtime.scan_carry_exclusions = exclusions;
+                }
+                Ok(outcome)
+            }
+            Par2AnalysisTicketOutcome::OneShot(Err(message))
+            | Par2AnalysisTicketOutcome::TaskFailed(message) => Err(message),
+        };
+        // A no-op for an analysis — nothing was parked under a repair's damage
+        // cap — but called on every exit so the settle rule stays one rule.
+        self.settle_direct_unpack_after_repair(job_id, false, &result);
+        result
+    }
+
+    /// Forgets a job's damaged-path analysis ticket and any parked verdict.
+    ///
+    /// The detached worker keeps running to its end; its done message then
+    /// finds no taker and is discarded by the fence, and the retained session
+    /// it was carrying is dropped with it. That is the point: a verdict names
+    /// files by path, and every caller of this is a seam where those paths, or
+    /// the recovery set behind them, stop meaning what the read assumed.
+    pub(crate) fn forget_par2_analysis_work(&mut self, job_id: JobId) {
+        if self.par2_analysis_in_flight.remove(&job_id).is_some() {
+            self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.par2_analysis_results.remove(&job_id);
     }
 
     async fn verify_par2_with_placement(
@@ -3633,11 +4032,19 @@ impl Pipeline {
                     {
                         self.par2_host_carry_builds += 1;
                     }
+                    // This carry was built from a verification of the set's own
+                    // described files, so it holds no extra-candidate location
+                    // at all and is compatible with any exclusion list. It is
+                    // still stamped with the current one, because the seeding
+                    // gate compares lists rather than reasoning about what a
+                    // carry happens to contain.
+                    let exclusions = self.par2_extra_scan_exclusions(job_id, pass_set_id);
                     if let Some(set_runtime) = self
                         .ensure_par2_runtime(job_id)
                         .set_runtime_mut(pass_set_id)
                     {
                         set_runtime.scan_carry = Some(carry);
+                        set_runtime.scan_carry_exclusions = exclusions;
                     }
                 }
                 Ok((verification, plan))
@@ -7466,6 +7873,12 @@ impl Pipeline {
             // forcing the authoritative pass there loses both.
             && !missing_archive_volume_par2_repair_ready
             && (!described_data_files_incomplete || !download_pipeline_exhausted)
+            // The pass that consumes a parked damaged-path verdict is a second
+            // entry into this gate: the first submitted the read and returned.
+            // The quick pass exists to make the authoritative read unnecessary,
+            // and that read has already happened, so running it again is a
+            // repeat of work whose answer is superseded before it is asked.
+            && !self.par2_analysis_results.contains_key(&job_id)
             && clean_par2_integrity_gate_allows_fast_path;
         let needs_completion_repair_evaluation = has_crc_failures
             || (has_incomplete_data_files && download_pipeline_exhausted)
@@ -8015,14 +8428,15 @@ impl Pipeline {
                 }
                 if run_par2_repairer {
                     // The filesystem analysis below is a whole-directory
-                    // authoritative read, and it holds the pipeline actor for
-                    // its duration. Running it while this job still has wire
+                    // authoritative read, handed to a blocking worker rather
+                    // than run here. Running it while this job still has wire
                     // work in flight buys nothing — a damaged verdict cannot
                     // repair better than the same verdict after the remaining
                     // articles land, and an insufficient-recovery verdict
                     // parks on exactly the drain this gate waits for. Without
                     // the gate every completing recovery volume re-runs the
-                    // full pass, which starves dispatch for the whole queue.
+                    // full pass — many concurrent whole-directory reads, all of them
+                    // answering "still waiting".
                     // The direct-store arm above waits for the same drain in
                     // `direct_sets_ready_for_authoritative_par2`; this is the
                     // conventional path's mirror of it. The re-arm is the
@@ -8143,7 +8557,12 @@ impl Pipeline {
                         )
                         .await
                     {
-                        Ok(outcome) => outcome,
+                        Ok(Some(outcome)) => outcome,
+                        // The read is running on a blocking worker. Its
+                        // completion re-enters this gate, which reaches this
+                        // call again and takes the parked verdict; the job
+                        // stays in Verifying until then.
+                        Ok(None) => return,
                         Err(_) if self.shared_state.is_job_cancellation_requested(job_id) => {
                             return;
                         }

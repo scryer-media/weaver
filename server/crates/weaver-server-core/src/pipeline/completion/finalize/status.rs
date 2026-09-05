@@ -201,6 +201,7 @@ impl Pipeline {
         if self.job_has_pending_download_pipeline_work(job_id)
             || self.direct_post_repair_in_flight.contains_key(&job_id)
             || self.direct_tolerated_in_flight.contains_key(&job_id)
+            || self.par2_analysis_in_flight.contains_key(&job_id)
             || self.pending_completion_checks.contains(&job_id)
         {
             return;
@@ -859,6 +860,10 @@ impl Pipeline {
         self.direct_post_repair_in_flight.remove(&job_id);
         self.direct_post_repair_results.remove(&job_id);
         self.direct_post_repair_carry.remove(&job_id);
+        // The retained session this ticket is carrying belongs to a runtime
+        // that is being discarded, so its verdict describes a set that will not
+        // exist when it lands.
+        self.forget_par2_analysis_work(job_id);
         self.shared_state.clear_job_cancellations(job_id);
         self.par2_verified.remove(&job_id);
         self.par2_joined_split_sets.remove(&job_id);
