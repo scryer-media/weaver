@@ -402,6 +402,7 @@ impl Pipeline {
             inflight_moves: HashSet::new(),
             reserved_complete_destinations: HashMap::new(),
             failed_extractions: HashMap::new(),
+            known_damaged_archive_sets: HashMap::new(),
             eagerly_deleted: HashMap::new(),
             rar_sets: HashMap::new(),
             rar_refresh_state: HashMap::new(),

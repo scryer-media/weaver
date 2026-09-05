@@ -475,6 +475,22 @@ impl Pipeline {
             return;
         }
 
+        // Damage is already on record for this job and the recovery set has
+        // not ruled yet. Opening the archives now reads the whole set to reach
+        // the failure that is already known — and on a slow store that read is
+        // the expensive part, paid twice: once to fail, once again after the
+        // repair. The verdict comes from the completion checkpoint, which the
+        // same fact forces past the stored-set "a clean decode proves
+        // integrity" shortcut; when it lands, the checkpoint restarts idle RAR
+        // work. Clean jobs record nothing and never reach this.
+        if self.archive_extraction_held_for_known_damage(job_id) {
+            debug!(
+                job_id = job_id.0,
+                "deferring RAR extraction — damage on record, waiting for the PAR2 verdict"
+            );
+            return;
+        }
+
         let active_workers = self
             .rar_sets
             .values()

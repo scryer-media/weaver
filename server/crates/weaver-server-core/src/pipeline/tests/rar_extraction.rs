@@ -11363,3 +11363,235 @@ async fn a_source_retry_keeps_a_restored_recovery_volume_registered() {
         "the rebuilt topology counts the restored volume"
     );
 }
+
+#[tokio::test]
+async fn a_par2_repaired_volume_rebuilds_the_set_from_disk_not_the_stale_snapshot() {
+    // A volume whose articles were never posted leaves the set with a hole,
+    // and the header snapshot persisted while that hole was open describes a
+    // set that ends before it. PAR2 recovery recreates the volume, but the
+    // plan rebuild the repair triggers read that snapshot back — so the
+    // member's span stopped at the last volume the snapshot knew, extraction
+    // was handed a truncated volume list, and the decode failed. Only the
+    // re-analysis afterwards saw the whole set.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90231);
+    let job_name = "Silver Horizon Repaired Volume";
+    let payload: Vec<u8> = (0..5120u32)
+        .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let volumes: Vec<(String, Vec<u8>)> =
+        single_member_rar4_old_numbering_set("silver.horizon", "silver.horizon.mkv", &payload, 5)
+            .into_iter()
+            .map(|(filename, bytes)| (filename, with_rar4_header_crcs(bytes)))
+            .collect();
+    assert_eq!(volumes.len(), 5);
+
+    // The NZB carries all five volumes; volume 2's articles answer 430, so
+    // four of them land and the set registers with a hole.
+    insert_active_job(&mut pipeline, job_id, rar_job_spec(job_name, &volumes)).await;
+    for (index, (filename, bytes)) in volumes.iter().enumerate() {
+        if index == 2 {
+            continue;
+        }
+        write_and_complete_rar_volume(&mut pipeline, job_id, index as u32, filename, bytes).await;
+    }
+    let key = (job_id, "silver.horizon".to_string());
+    let stale_snapshot = pipeline
+        .load_rar_snapshot(job_id, "silver.horizon")
+        .expect("the set with the hole persisted a header snapshot");
+
+    // PAR2 repair writes the missing volume and the post-repair refresh
+    // registers it, exactly as `refresh_verified_complete_archive_topologies`
+    // does for each rewritten output.
+    write_and_complete_rar_volume(&mut pipeline, job_id, 2, &volumes[2].0, &volumes[2].1).await;
+    pipeline.invalidate_rar_plans_for_repaired_sets(
+        job_id,
+        std::iter::once("silver.horizon".to_string()).collect(),
+    );
+    assert!(
+        pipeline
+            .load_rar_snapshot(job_id, "silver.horizon")
+            .is_none(),
+        "the pre-repair snapshot must not survive to answer the rebuild"
+    );
+    drain_rar_refreshes(&mut pipeline).await;
+
+    let fresh_snapshot = pipeline
+        .load_rar_snapshot(job_id, "silver.horizon")
+        .expect("the rebuild persists a snapshot of the repaired set");
+    assert_ne!(fresh_snapshot, stale_snapshot);
+
+    let state = pipeline.rar_sets.get(&key).expect("set state");
+    let plan = state.plan.as_ref().expect("plan");
+    assert!(
+        plan.waiting_on_volumes.is_empty(),
+        "nothing is missing once the repair fills the hole: {plan:?}"
+    );
+    let member = plan
+        .topology
+        .members
+        .iter()
+        .find(|member| member.name == "silver.horizon.mkv")
+        .expect("member");
+    assert_eq!(
+        (member.first_volume, member.last_volume),
+        (0, 4),
+        "the first dispatch after the repair must see every volume: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    let volume_paths_map = pipeline.volume_paths_for_rar_set(job_id, "silver.horizon");
+    let dispatched = pipeline.volume_paths_for_rar_members(
+        job_id,
+        "silver.horizon",
+        &["silver.horizon.mkv".to_string()],
+        &volume_paths_map,
+        pipeline
+            .load_rar_snapshot(job_id, "silver.horizon")
+            .is_some(),
+        plan.is_solid,
+    );
+    assert_eq!(
+        dispatched.keys().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4],
+        "extraction is dispatched with the whole repaired set"
+    );
+}
+
+/// Stands up the fixture both extraction-ordering tests share: a five-volume
+/// old-numbering RAR4 set in the NZB, with a recovery set installed over it
+/// **before** any volume completes — the order a real job has, where the small
+/// index lands long before the payload.
+///
+/// The volumes are returned rather than completed, because the ordering under
+/// test is exactly what a completing volume triggers.
+async fn rar_set_with_recovery_awaiting_volumes(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    job_name: &str,
+) -> (String, Vec<(String, Vec<u8>)>) {
+    let payload: Vec<u8> = (0..5120u32)
+        .map(|index| (index.wrapping_mul(1_597_334_677) >> 11) as u8)
+        .collect();
+    let volumes: Vec<(String, Vec<u8>)> =
+        single_member_rar4_old_numbering_set("silver.horizon", "silver.horizon.mkv", &payload, 5)
+            .into_iter()
+            .map(|(filename, bytes)| (filename, with_rar4_header_crcs(bytes)))
+            .collect();
+    insert_active_job(pipeline, job_id, rar_job_spec(job_name, &volumes)).await;
+    install_test_par2_runtime(pipeline, job_id, placement_par2_file_set(&volumes), &[]);
+    assert!(
+        pipeline.par2_set(job_id).is_some(),
+        "the fixture's recovery set must be the thing a verdict can come from"
+    );
+    ("silver.horizon".to_string(), volumes)
+}
+
+async fn complete_rar_volumes(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+) {
+    for (index, (filename, bytes)) in volumes.iter().enumerate() {
+        write_and_complete_rar_volume(pipeline, job_id, index as u32, filename, bytes).await;
+    }
+}
+
+fn extraction_dispatched(pipeline: &Pipeline, job_id: JobId, set_name: &str) -> bool {
+    let set_busy = pipeline
+        .rar_sets
+        .get(&(job_id, set_name.to_string()))
+        .is_some_and(|state| state.active_workers > 0 || !state.in_flight_members.is_empty());
+    set_busy
+        || pipeline
+            .inflight_extractions
+            .get(&job_id)
+            .is_some_and(|sets| !sets.is_empty())
+}
+
+#[tokio::test]
+async fn damage_on_record_holds_extraction_until_the_recovery_set_rules() {
+    // The set's bytes were already found wrong — the direct router's part
+    // CRC32 did not match what it routed — and the recovery set has not been
+    // asked yet. Extraction ran first anyway, read the whole set to reach a
+    // failure that was already known, and only then was PAR2 allowed to
+    // repair, after which the set was read a second time.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90232);
+    let (set_name, volumes) =
+        rar_set_with_recovery_awaiting_volumes(&mut pipeline, job_id, "Silver Horizon Damaged Set")
+            .await;
+
+    // The fact, recorded the way a damage demotion records it, and at the same
+    // point: before the demoted volumes are replayed into the conventional
+    // completion seam. Keyed on the damage rather than on any one reason, so a
+    // seam that repairs a mismatched part in place instead of demoting still
+    // reaches this.
+    pipeline.note_known_archive_set_damage(job_id, &set_name);
+    // The same predicate the completion checkpoint reads to refuse the stored
+    // set's "a clean decode would prove integrity" shortcut, so this asserts
+    // the input to both halves of the gate.
+    assert!(pipeline.archive_extraction_held_for_known_damage(job_id));
+
+    // Every volume lands, and each completion walks the archive-probe door
+    // that dispatches extraction.
+    complete_rar_volumes(&mut pipeline, job_id, &volumes).await;
+    pipeline.try_rar_extraction(job_id).await;
+    assert!(
+        !extraction_dispatched(&pipeline, job_id, &set_name),
+        "extraction must not open a set already known damaged: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    // Asked and answered releases the hold too, even when the answer is one
+    // the pass could not act on: an unrepairable set must not hold its own
+    // undamaged members waiting for a second verdict that is never coming.
+    let set_id = pipeline
+        .par2_served_set_id(job_id)
+        .expect("the fixture serves one recovery set");
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .ensure_set_runtime(set_id)
+        .settled = true;
+    assert!(!pipeline.archive_extraction_held_for_known_damage(job_id));
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .ensure_set_runtime(set_id)
+        .settled = false;
+    assert!(pipeline.archive_extraction_held_for_known_damage(job_id));
+
+    // The verdict lands — a clean pass and the tail of a repair both mark the
+    // job verified — and the hold lifts on the same tick.
+    pipeline.par2_verified.insert(job_id);
+    assert!(!pipeline.archive_extraction_held_for_known_damage(job_id));
+    pipeline.try_rar_extraction(job_id).await;
+    assert!(
+        extraction_dispatched(&pipeline, job_id, &set_name),
+        "with the verdict in hand the same set extracts: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+}
+
+#[tokio::test]
+async fn a_clean_job_extracts_without_waiting_for_a_recovery_verdict() {
+    // The other half of the requirement: nothing on record means nothing
+    // changes. A clean job with recovery data still extracts on the volume
+    // completions themselves, with no verdict and no hash pass in front of it.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90233);
+    let (set_name, volumes) =
+        rar_set_with_recovery_awaiting_volumes(&mut pipeline, job_id, "Silver Horizon Clean Set")
+            .await;
+
+    assert!(!pipeline.archive_extraction_held_for_known_damage(job_id));
+    complete_rar_volumes(&mut pipeline, job_id, &volumes).await;
+    assert!(!pipeline.par2_verified.contains(&job_id));
+    assert!(
+        extraction_dispatched(&pipeline, job_id, &set_name),
+        "a clean job keeps the extract-first path: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+}
