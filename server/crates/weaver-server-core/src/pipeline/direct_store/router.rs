@@ -86,25 +86,26 @@ pub(crate) const DEFAULT_HOLDS_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 /// one fixed ceiling for its lifetime.
 pub(crate) const HOLDS_SCRATCH_CEILING_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// The absolute packed ceiling for the bounded small-member tolerance. The
-/// effective ceiling is `min(this, 1% of the archive's packed bytes)`; the
-/// relative half can only be applied once the archive's packed total is final,
-/// so this one is the guard that holds from the first tolerated byte.
-pub(crate) const TOLERANCE_PACKED_CEILING_BYTES: u64 = 64 * 1024 * 1024;
-
-/// The unpacked ceiling. Read from the headers' declared unpacked size, which
-/// is stated up front rather than accumulated, so this one is checkable the
-/// moment a member turns ineligible.
-pub(crate) const TOLERANCE_UNPACKED_CEILING_BYTES: u64 = 256 * 1024 * 1024;
-
-/// The "1% of packed archive bytes" half of the packed ceiling, as a divisor.
-const TOLERANCE_ARCHIVE_PERCENT: u64 = 100;
-
-/// How much of a migrated member one envelope span carries. The whole migration
-/// is bounded by the tolerance's packed ceiling, so this only bounds the
+/// How much of a migrated member one envelope span carries. The whole
+/// migration is bounded by [`MIGRATION_CEILING_BYTES`], so this only bounds the
 /// *individual* allocation and lets the write fan out across the disk owner
 /// threads the way ordinary routing does.
 const MIGRATION_SPAN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most routed bytes one member migration may move back into the
+/// envelopes.
+///
+/// A migration reads every extent the adopted member routed into its
+/// `.direct.partial` and parks them in memory as [`RoutedSpan`]s until the
+/// entry point on the stack drains them, so the member's whole routed size is
+/// read synchronously on the parsing task and held at once. The tolerance
+/// itself no longer caps a member's size — a compressed member is ineligible
+/// from its first header, so it is never adopted and never migrates — but an
+/// adopted BLAKE2sp-only member that resolves ineligible at chain close can be
+/// as large as the set, and moving it would hold that much memory on the hot
+/// path. Over this, the member keeps the answer it had before migration
+/// existed: its own ineligibility demotes the set.
+pub(crate) const MIGRATION_CEILING_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How much genuine **prefix** — contiguous coverage from offset zero, the
 /// only bytes the header walk can consume — a volume may accumulate without a
@@ -127,19 +128,18 @@ pub(crate) const MAX_HEADER_PREFIX_BYTES: u64 = 4 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DemotionReason {
     /// A member the layout classified `Ineligible` for a reason the
-    /// small-member tolerance does not cover — including a provisional member
+    /// member tolerance does not cover — including a provisional member
     /// that resolved ineligible when its chain closed.
     ///
-    /// Solid, redirection and malformed-chain members always land
-    /// here: the tolerance extracts its members with
-    /// `extract_member_streaming`, which needs a per-member non-solid regular
-    /// file it can decode on its own, and a solid member is only decodable
-    /// against the rest of the solid run. A *compressed* or *BLAKE2sp-only*
-    /// member instead rides [`Self::ToleranceBudgetExceeded`]'s budget.
+    /// Solid, redirection, no-checksum and malformed-chain members always land
+    /// here; see [`member_shape_is_tolerable`] for why each one is a *set*
+    /// verdict rather than a per-member one. A *compressed* or *BLAKE2sp-only*
+    /// member of any size instead rides the tolerance and is stream-extracted
+    /// from the virtual volumes at finalization.
     ///
     /// A **directory** member reaches this reason only when the set has nothing
-    /// else to route. Directory entries are dataless headers, so they carry a
-    /// zero tolerance budget and are created — with their archive metadata — at
+    /// else to route. Directory entries are dataless headers, so nothing is
+    /// decoded for them: they are created — with their archive metadata — at
     /// finalization; demoting a 6 GiB folder-tree set for the directory
     /// headers its archiver appends to the last volume cost a full
     /// reconstruction and a full conventional extraction at the very end of an
@@ -205,15 +205,6 @@ pub(crate) enum DemotionReason {
     /// real files on disk — because a half-answerable set has the pass report
     /// damage that is not there and hand the repairer a volume nobody can write.
     EncryptedPostedBytesUnavailable,
-    /// The ineligible members are individually tolerable but collectively over
-    /// the tolerance budget: `min(64 MiB, 1% of the archive's packed bytes)`
-    /// packed, or 256 MiB unpacked.
-    ///
-    /// Distinct from [`Self::MemberIneligible`] on purpose — "this set has one
-    /// small compressed extra" and "this set is half compressed" are different
-    /// populations, and only the second one says direct-store's reach is
-    /// narrower than the plan assumes.
-    ToleranceBudgetExceeded,
     /// PAR2 verification found damage on one of the set's virtual volumes.
     ///
     /// Verification alone produces **verdicts** only: repairing a virtual
@@ -233,7 +224,7 @@ pub(crate) enum DemotionReason {
     /// pass runs is what keeps that pass looking at either a *fully* bound
     /// virtual set or at real files, never at a half-bound one.
     Par2Unbindable,
-    /// A member riding the small-member tolerance could not be extracted from
+    /// A member riding the member tolerance could not be extracted from
     /// the virtual volumes at finalization. The stored members are correct; the
     /// tolerated one is not produced, so the set is rebuilt the ordinary way.
     ToleratedExtractionFailed,
@@ -382,8 +373,8 @@ pub(crate) enum DemotionReason {
 }
 
 /// The ineligibility reasons this module distinguishes in metrics. The
-/// library's [`IneligibilityReason`] carries byte counts that only the
-/// tolerance budget needs, so this collapses it to the label.
+/// library's [`IneligibilityReason`] carries byte counts no rule reads any
+/// more, so this collapses it to the label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemberIneligibility {
     Compressed,
@@ -396,7 +387,7 @@ pub(crate) enum MemberIneligibility {
     MalformedChain,
 }
 
-/// One member the bounded small-member tolerance carries to finalization.
+/// One member the member tolerance carries to finalization.
 ///
 /// Ordered by the same key the list is built with, so the derived `Ord` only
 /// ever breaks a tie between two members at one archive position — which the
@@ -425,7 +416,154 @@ impl From<IneligibilityReason> for MemberIneligibility {
     }
 }
 
+/// What a demoted set's consumers need under it: the virtual volumes the set
+/// already has, or real files on disk.
+///
+/// The virtual volumes — each source volume's sparse envelope overlaid with the
+/// member `.direct.partial`s that carried its payload away — are a
+/// [`unrar_rs::VolumeProvider`], and the conventional extractor, PAR2
+/// verification and repair-while-direct all already read through one. So a
+/// demotion does **not** imply materialization by itself: it implies it only
+/// when the image the overlay would serve is not the archive that was posted,
+/// or when the consumer that has to run next cannot read an overlay at all.
+///
+/// This is the classification a demotion that keeps its virtual volumes would
+/// switch on. Today every demotion materializes and this answer is *reported*
+/// rather than acted on — see the `layout` field on the demotion warning and
+/// the `direct_store.demoted.virtual`/`.real` probes — so the reasons are
+/// classified, pinned by a test, and ready before any behaviour hangs off them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VolumeDemand {
+    /// The layout the router learned is still the archive's layout and the
+    /// overlay still answers for every byte it claims, so the set's remaining
+    /// work can be done against the virtual volumes.
+    Virtual,
+    /// Real volume files are required: either the layout is wrong (or was never
+    /// learned), or the overlay cannot answer for what it claims, or the
+    /// consumer that runs next is filesystem-bound.
+    Real,
+}
+
+impl VolumeDemand {
+    /// Stable metric suffix.
+    pub(crate) fn metric(self) -> &'static str {
+        match self {
+            Self::Virtual => "virtual",
+            Self::Real => "real",
+        }
+    }
+}
+
+impl std::fmt::Display for VolumeDemand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.metric())
+    }
+}
+
 impl DemotionReason {
+    /// Whether this demotion needs real volume files under it, or could be
+    /// served by the set's own virtual volumes.
+    ///
+    /// Exhaustive on purpose: a new reason must state its answer here rather
+    /// than inherit one.
+    pub(crate) fn volume_demand(self) -> VolumeDemand {
+        match self {
+            // The layout parsed, agreed with itself, and describes the archive.
+            // One member's *shape* is something direct routing cannot carry —
+            // that is a fact about the member, not about the image, and the
+            // overlay serves the whole volume exactly as posted.
+            Self::MemberIneligible(_) => VolumeDemand::Virtual,
+            // The layout is known and the member's posted bytes are in the
+            // envelope; what was refused is key material. The conventional
+            // extractor asks the job's whole password-candidate list — a
+            // superset of the one direct-store is handed — and it can ask it of
+            // the overlay just as well as of a file.
+            Self::EncryptedMemberRefused(_) => VolumeDemand::Virtual,
+            // `-hp`: the headers themselves are sealed, so no layout was ever
+            // learned and there is nothing to overlay. The volume must
+            // materialize byte-exactly for the conventional extractor to open
+            // it with the job's candidate list.
+            Self::HeaderEncryptedRefused(_) => VolumeDemand::Real,
+            // A checkpoint's crypt facts contradict the rebuilt layout. Nothing
+            // here may be read as describing this archive, the layout included.
+            Self::EncryptedFactsDisagree => VolumeDemand::Real,
+            // The re-encrypting overlay itself refuses: a routed encrypted
+            // member with no declared cipher size, or a tail that never arrived
+            // whole. The virtual volume has a block with no byte-exact source,
+            // so it is not the posted image.
+            Self::EncryptedPostedBytesUnavailable => VolumeDemand::Real,
+            // The layout is right and the *bytes* are not. The consumer is what
+            // forces files here: the conventional `Par2Repairer` reads and
+            // writes volumes through `DiskFileAccess`, which an overlay has
+            // none of. `direct_store::repair` already repairs into the virtual
+            // layout for a *live* set, and reusing it for a demoted one is what
+            // would move this answer to `Virtual`.
+            Self::Par2Damaged => VolumeDemand::Real,
+            // The overlay `par2_access` presents is keyed by PAR2 file id, so a
+            // volume with no unambiguous binding cannot be served through it at
+            // all.
+            Self::Par2Unbindable => VolumeDemand::Real,
+            // The tolerated decode already failed against this exact image.
+            // Handing the conventional extractor the same image to fail against
+            // is not a fallback; real files are.
+            Self::ToleratedExtractionFailed => VolumeDemand::Real,
+            // Holds are staged, unrouted bytes: a budget or scratch failure
+            // ends *routing* and says nothing about the layout or about the
+            // bytes already placed.
+            Self::HoldsBudgetExceeded | Self::HoldsScratchFailed | Self::HoldsScratchCeiling => {
+                VolumeDemand::Virtual
+            }
+            // Two parses of one volume disagree. Nothing says which is true, so
+            // no overlay built from either may be read as the archive.
+            Self::ConflictingVolumeFacts => VolumeDemand::Real,
+            // The library's headers and a physical walk of the same image
+            // disagree — a Quick Open cache the format says may be crafted to
+            // lie. Same verdict, same reason.
+            Self::QuickOpenMismatch => VolumeDemand::Real,
+            // The volume's trailing region was never classified, so its part of
+            // the layout is incomplete and the overlay has no answer for it.
+            Self::UnconfirmedRestoredVolume => VolumeDemand::Real,
+            // A restart-seeded run could not be placed into the layout, or
+            // could not be read back out of the partial that is supposed to
+            // hold it. Either way the overlay would answer for a range nothing
+            // vouches for.
+            Self::RestartRearmUnplaceable | Self::RestartRereadFailed => VolumeDemand::Real,
+            // A repaired span the router could not place, or a stale gap it
+            // could not re-read: a hole inside the image with no source.
+            Self::RepairRerouteFailed | Self::RepairGapUnreadable => VolumeDemand::Real,
+            // A uuencode article declares no offset, so nothing was ever routed
+            // and no overlay exists to read.
+            Self::UuencodedSourceVolume => VolumeDemand::Real,
+            // No layout at all.
+            Self::UnparsableVolume | Self::UnsupportedFormat => VolumeDemand::Real,
+            // The routed bytes contradict the archive's own checksums, or the
+            // volume contradicts its yEnc trailer. The overlay would serve
+            // bytes that are provably not what was posted.
+            Self::PartChecksumMismatch | Self::MemberChecksumMismatch | Self::VolumeCrcMismatch => {
+                VolumeDemand::Real
+            }
+            // Two volumes disagree about the archive format, so the layout is
+            // not one archive's.
+            Self::FormatMismatch => VolumeDemand::Real,
+            // The image is truthful; what is refused is a *destination*. The
+            // conventional extractor applies the same path validator and the
+            // same collision rule, and it can apply them reading the overlay.
+            Self::UnsafeDestination | Self::CollidingDestinations => VolumeDemand::Virtual,
+            // A destination write failed, or a destination could not be marked
+            // sparse. The overlay's member half is exactly those files, and the
+            // path to them is the thing that is failing.
+            Self::DestinationWriteFailed | Self::SparseMarkFailed => VolumeDemand::Real,
+            // Finalization got part way: some members are renamed to their
+            // destinations and the overlay's partial map points at paths that
+            // are no longer there.
+            Self::FinalizationFailed => VolumeDemand::Real,
+            // An identity set with a volume no file can claim has no reader for
+            // that volume; one whose headers contradict its binding has a
+            // layout describing a different file.
+            Self::IdentityRosterUnfillable | Self::IdentityVolumeMismatch => VolumeDemand::Real,
+        }
+    }
+
     /// Whether this demotion is *evidence that the posted bytes are wrong,
     /// found before any recovery set was asked* — as opposed to a reason
     /// direct routing could not be used.
@@ -470,7 +608,6 @@ impl DemotionReason {
             Self::HeaderEncryptedRefused(refusal) => refusal.metric(),
             Self::EncryptedFactsDisagree => "encrypted_facts_disagree",
             Self::EncryptedPostedBytesUnavailable => "encrypted_posted_bytes_unavailable",
-            Self::ToleranceBudgetExceeded => "tolerance_budget",
             Self::Par2Damaged => "par2_damaged",
             Self::Par2Unbindable => "par2_unbindable",
             Self::ToleratedExtractionFailed => "tolerated_extraction_failed",
@@ -1727,6 +1864,9 @@ pub(crate) struct DirectSetRouter {
     /// coverage barrier and syncs the envelope before publishing a floor — the
     /// same treatment every other envelope byte gets.
     migrated: Vec<RoutedSpan>,
+    /// [`MIGRATION_CEILING_BYTES`], as a field so a test can lower it below
+    /// what a fixture-sized member routes.
+    migration_ceiling_bytes: u64,
     /// Destinations a migration deleted, waiting to be retired from the coverage
     /// barrier: `(member id, working-directory-relative partial)`.
     ///
@@ -1835,6 +1975,7 @@ impl DirectSetRouter {
             member_ids: HashMap::new(),
             next_member_id: 0,
             routed_extents: BTreeMap::new(),
+            migration_ceiling_bytes: MIGRATION_CEILING_BYTES,
             member_order: Vec::new(),
             member_order_stale: false,
             holds_budget: DEFAULT_HOLDS_BUDGET_BYTES,
@@ -3726,7 +3867,7 @@ impl DirectSetRouter {
         // Collisions are decided over **every member the layout has started**,
         // not just the routable ones, and not pairwise as members are adopted:
         // the second member of a colliding pair may be the one that arrives
-        // first, and the small-member tolerance will keep an ineligible
+        // first, and the member tolerance will keep an ineligible
         // member's bytes inside the set rather than demoting on sight — at
         // which point an ineligible member colliding with a routed one is a
         // member silently overwriting another, exactly what the extractor
@@ -3915,50 +4056,70 @@ impl DirectSetRouter {
     }
 
     /// A provisional member that resolves `Ineligible` at chain close demotes
-    /// the group at that transition — **unless** it fits inside the bounded
-    /// small-member tolerance.
+    /// the group at that transition — **unless** its shape is one the member
+    /// tolerance carries.
     ///
     /// The tolerance is a deliberate weaver extension over the oracle, and it is
-    /// bounded three ways, each of which demotes on breach:
+    /// bounded two ways, each of which demotes on breach:
     ///
-    /// 1. **By kind.** Only `Compressed`, `Blake2OnlyNoCrc32` and `Directory`
-    ///    are tolerable.
-    ///    The library's classification order (malformed → directory →
-    ///    redirection → encrypted → solid → compressed) means a `Compressed`
-    ///    verdict already proves the member is an unencrypted, non-solid,
-    ///    per-member regular file with a well-formed chain, which is exactly
-    ///    the tolerance's precondition — so the precondition is read off the
-    ///    reason rather than re-derived from flags weaver would have to trust
-    ///    separately. `Directory` is decided *before* every one of those, so it
-    ///    proves nothing about the rest — and needs nothing, because a
-    ///    directory entry has no data area to decode at all.
-    /// 2. **By size**, aggregated over every tolerated member:
-    ///    `min(64 MiB, 1% of the archive's packed bytes)` packed and 256 MiB
-    ///    unpacked. A directory contributes zero to both, so a folder tree's
-    ///    entries can never be what breaches it.
-    /// 3. **By the set still being a store set.** A set whose members are *all*
+    /// 1. **By kind**, which is [`member_shape_is_tolerable`]'s whole subject.
+    /// 2. **By the set still being a store set.** A set whose members are *all*
     ///    ineligible has nothing to route and no benefit to gain; it demotes and
     ///    the ordinary extractor produces every member.
     ///
-    /// **Provisional totals.** `packed_bytes` is a running sum over the parts
-    /// seen so far until the member's chain closes (`totals_final`), so an open
-    /// chain's value is a *lower bound*: breaching the budget on a lower bound
-    /// demotes immediately, and staying under it admits only provisionally. The
-    /// relative (1%) half needs the archive's packed total, which is final only
-    /// once every planned volume has been parsed and every chain has closed —
-    /// so it is enforced there, which is the close this rule re-checks at. A
-    /// member whose true total breaches at close demotes exactly then, before
-    /// the set can finalize.
+    /// # There is deliberately no size ceiling
+    ///
+    /// The first shape also bounded the tolerance by size —
+    /// `min(64 MiB, 1% of the archive's packed bytes)` packed, 256 MiB
+    /// unpacked — and demoted the whole set on a breach. That rule made a
+    /// *member's* shape a *set's* verdict, and it cost the whole set the direct
+    /// route for one member it could not route: a store video beside a
+    /// compressed subtitle pack, a season pack with one compressed episode, or
+    /// a 6 GiB folder tree whose closing volume carries a directory header, all
+    /// threw away a complete direct route at the very end of the download and
+    /// paid for a full materialization plus a full conventional extraction.
+    ///
+    /// The ceiling is gone, and the two costs it was standing in for are
+    /// answered where they actually live:
+    ///
+    /// - **Disk.** A tolerated member's packed bytes are routed to the
+    ///   volume's *envelope*, which is a sparse file in the job's working
+    ///   directory. The envelope therefore holds exactly the ineligible
+    ///   members' packed bytes and nothing else, so the set's own working set
+    ///   is `routed member bytes + ineligible packed bytes` — one copy of the
+    ///   posted payload. The conventional path this would demote to writes one
+    ///   copy of the *whole* volume set and then extracts every member out of
+    ///   it, so the tolerated shape is strictly cheaper at any ratio of
+    ///   ineligible to stored bytes. Nothing here touches the holds scratch:
+    ///   [`DemotionReason::HoldsScratchCeiling`] bounds *staged, unrouted*
+    ///   bytes, and a tolerated member's bytes are routed the moment the header
+    ///   walk reaches them.
+    /// - **Output size.** The unpacked ceiling was the only thing bounding what
+    ///   a tolerated decode writes. That bound now comes from the same place
+    ///   the conventional extractor's does — the job's `JobExtractionBudget`,
+    ///   which `extract_tolerated_members` writes through — so a hostile
+    ///   expansion is refused by the budget rather than by a second, weaker
+    ///   ceiling that also happened to demote healthy sets.
+    ///
+    /// One bound on *bytes moved* does remain, and it is not a tolerance rule:
+    /// an adopted member that turns ineligible at chain close is **migrated**
+    /// out of its partial and into the envelopes, and that move reads the
+    /// member's routed bytes into memory on the parsing task. A member with
+    /// more than [`MIGRATION_CEILING_BYTES`] routed demotes on its own reason
+    /// instead, which is the answer it had before migration existed.
+    ///
+    /// What is *not* answered here is tail latency: the tolerated decode still
+    /// runs once, at finalization, rather than incrementally as chains close.
+    /// See [`Self::tolerated_members`].
     fn check_eligibility(&mut self) -> Result<(), DemotionReason> {
-        let mut packed = 0u64;
-        let mut unpacked = 0u64;
         let mut tolerated = 0usize;
         let mut routable = 0usize;
         let mut first_tolerated: Option<IneligibilityReason> = None;
         // Adopted members that must have their routed bytes moved into the
         // envelope before they can ride the tolerance. Collected rather than
         // migrated in place: the loop holds a borrow of the layout, and the
-        // decision is not final until the aggregate budget below has passed.
+        // `routable == 0` verdict below is not reached until every member has
+        // been classified.
         let mut migrating: Vec<(u32, IneligibilityReason)> = Vec::new();
 
         for member in self.layout_members() {
@@ -3985,9 +4146,9 @@ impl DirectSetRouter {
                 }
                 MemberEligibility::Ineligible(reason) => reason,
             };
-            let Some(budget) = tolerable_member_budget(member, reason) else {
+            if !member_shape_is_tolerable(reason) {
                 return Err(self.fail(DemotionReason::MemberIneligible(reason.into())));
-            };
+            }
             // A member the router **adopted** routed bytes into its own
             // `.direct.partial` while it was still `ProvisionallyDirect` — a
             // split BLAKE2sp-only member is the reachable case, since the digest
@@ -4000,9 +4161,10 @@ impl DirectSetRouter {
             // longer has to: the bytes are moved back into the envelope at
             // their true physical offsets, the member is un-adopted, and it is
             // extracted conventionally at finalization exactly like a member
-            // that was never adopted at all. The migration is deferred until
-            // the budget below has passed, because a member that cannot ride
-            // the tolerance must not have been half-moved to find that out.
+            // that was never adopted at all. The migration is still deferred to
+            // the end of this function, because the `routable == 0` verdict
+            // below is a demotion and a member that cannot ride the tolerance
+            // must not have been half-moved to find that out.
             if let Some(member_id) = self.member_ids.get(&member.name).copied() {
                 migrating.push((member_id, reason));
             }
@@ -4022,11 +4184,6 @@ impl DirectSetRouter {
                 }
                 Some(_) => {}
             }
-            // Saturating rather than checked: the ceilings below are far under
-            // `u64::MAX`, so a saturated sum breaches and demotes, which is the
-            // fail-closed answer a header claiming impossible sizes deserves.
-            packed = packed.saturating_add(budget.packed_bytes);
-            unpacked = unpacked.saturating_add(budget.unpacked_bytes);
         }
 
         let Some(first_tolerated) = first_tolerated else {
@@ -4037,31 +4194,18 @@ impl DirectSetRouter {
         if routable == 0 {
             // Nothing to route: every byte would land in the envelope and every
             // member would be extracted conventionally at the end, which is the
-            // conventional path with an extra copy of the volumes in it. Reported
-            // under the member's *own* reason, not the tolerance's — the set is
-            // not over a budget, it is simply not a store set.
+            // conventional path with an extra copy of the volumes in it.
+            // Reported under the member's *own* reason — the set is simply not
+            // a store set.
             return Err(self.fail(DemotionReason::MemberIneligible(first_tolerated.into())));
         }
-        let over_budget = packed > TOLERANCE_PACKED_CEILING_BYTES
-            || unpacked > TOLERANCE_UNPACKED_CEILING_BYTES
-            || (self.archive_totals_final()
-                // `packed * 100 > archive_packed`, without the multiply: a large
-                // archive would overflow it, and the overflowing case is
-                // precisely the one that must not demote.
-                && packed > self.archive_packed_bytes().unwrap_or(u64::MAX)
-                    / TOLERANCE_ARCHIVE_PERCENT);
-        if over_budget {
-            // An **adopted** member over the budget keeps the previous answer,
-            // byte for byte: its own ineligibility is what ends its routing,
-            // and the tolerance ceiling was only ever the permission slip for
-            // moving its bytes. Reporting a budget breach for it instead would
-            // rename a population — "this set has one small compressed extra"
-            // is what `ToleranceBudgetExceeded` means, and a set whose *routed*
-            // member turned out unverifiable is not that.
-            if let Some((_, reason)) = migrating.first() {
+        // Checked over every migrating member before any is moved: the ceiling
+        // is a demotion, and a member that cannot ride the tolerance must not
+        // have been half-moved to find that out.
+        for (member_id, reason) in &migrating {
+            if self.routed_bytes_of(*member_id) > self.migration_ceiling_bytes {
                 return Err(self.fail(DemotionReason::MemberIneligible((*reason).into())));
             }
-            return Err(self.fail(DemotionReason::ToleranceBudgetExceeded));
         }
         for (member_id, reason) in migrating {
             self.migrate_member_to_envelope(member_id, reason)?;
@@ -4069,9 +4213,23 @@ impl DirectSetRouter {
         Ok(())
     }
 
+    /// Bytes the router has routed into one member's partial so far.
+    fn routed_bytes_of(&self, member_id: u32) -> u64 {
+        self.routed_extents
+            .values()
+            .flatten()
+            .filter(|extent| extent.member_id == member_id)
+            .fold(0u64, |total, extent| total.saturating_add(extent.len))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_migration_ceiling_bytes(&mut self, bytes: u64) {
+        self.migration_ceiling_bytes = bytes;
+    }
+
     /// Moves an already-adopted member's routed bytes out of its
     /// `.direct.partial` and into the envelopes, then un-adopts it, so it can
-    /// ride the small-member tolerance instead of demoting the set.
+    /// ride the member tolerance instead of demoting the set.
     ///
     /// # What has to move, and what has to stop claiming
     ///
@@ -4134,8 +4292,9 @@ impl DirectSetRouter {
 
         // Every extent the member ever had bytes written for, by volume, in
         // physical order within each — so the envelope is written the way it is
-        // laid out. The whole move is bounded by the tolerance's packed ceiling;
-        // `MIGRATION_SPAN_BYTES` bounds each individual allocation inside it.
+        // laid out. The whole move is bounded by `MIGRATION_CEILING_BYTES`,
+        // which the caller checked before moving anything; `MIGRATION_SPAN_BYTES`
+        // bounds each individual allocation inside it.
         let extents: Vec<(u32, MemberExtent)> = self
             .routed_extents
             .iter()
@@ -4234,32 +4393,21 @@ impl DirectSetRouter {
         self.member_facts_revision
     }
 
-    /// Whether every planned volume has been parsed and every member's chain has
-    /// closed, so the archive's packed total can no longer grow.
-    fn archive_totals_final(&self) -> bool {
-        self.plan
-            .expected_volume_count()
-            .is_some_and(|expected| self.volume_facts.len() == expected)
-            && self
-                .layout_members()
-                .iter()
-                .all(|member| member.chain_complete)
-    }
-
-    /// Packed bytes over every member of the archive. `None` on overflow, which
-    /// only a hostile header can claim.
-    fn archive_packed_bytes(&self) -> Option<u64> {
-        let mut total = 0u64;
-        for member in self.layout_members() {
-            for part in &member.parts {
-                total = total.checked_add(part.data_size)?;
-            }
-        }
-        Some(total)
-    }
-
-    /// Members riding the small-member tolerance, by raw header name, in
-    /// archive order.
+    /// Members riding the member tolerance, by raw header name, in archive
+    /// order.
+    ///
+    /// # Tail latency, stated where it is paid
+    ///
+    /// Finalization extracts this whole list in one blocking task, after the
+    /// last article of the set has arrived. While the list was bounded to a few
+    /// small extras that was invisible; with the size ceiling gone it is the
+    /// tolerance's one remaining cost, and it is a *serial tail* rather than an
+    /// I/O amplification — the bytes are read once, out of the envelope they
+    /// were routed to. The conventional incremental scheduler
+    /// (`pipeline::extraction::rar::scheduler`) already does the same decode
+    /// incrementally against real volumes as each one completes; feeding it the
+    /// hybrid provider instead of files is the seam that would retire this
+    /// tail, and it is not opened here.
     ///
     /// A **directory** member rides it too, and is flagged rather than filtered
     /// out: it is dataless, so finalization creates the directory and applies
@@ -5982,85 +6130,65 @@ impl DirectSetRouter {
     // that returned.
 }
 
-/// What one ineligible member costs the tolerance budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ToleratedMemberBudget {
-    /// Packed bytes: the member's total when the chain has closed, a lower
-    /// bound over the parts seen so far otherwise.
-    packed_bytes: u64,
-    /// Unpacked bytes the headers declare. Stated up front, never accumulated.
-    unpacked_bytes: u64,
-}
-
-/// The budget cost of one ineligible member, or `None` when the member is not
-/// tolerable at all and the set must demote.
+/// Whether one ineligible member's **shape** is one the member tolerance can
+/// carry to finalization, where it is stream-extracted from the virtual
+/// volumes.
 ///
-/// Fail-closed on every unknown: a packed sum that overflowed `u64`, or a
-/// member whose headers declare no unpacked size, has no budget that can be
-/// checked, and admitting an unbounded member under a bounded rule would make
-/// the rule decorative.
-fn tolerable_member_budget(
-    member: &unrar_rs::StoredMember,
-    reason: IneligibilityReason,
-) -> Option<ToleratedMemberBudget> {
+/// Size is deliberately not an input. The tolerance is a per-member verdict
+/// about what `extract_member_streaming` can decode out of the set's own
+/// virtual volumes; a member whose shape it can decode is carried whatever its
+/// size, and a member whose shape it cannot decode is a set-level demotion
+/// however small it is. `check_eligibility` states why the size ceiling this
+/// replaces is gone.
+///
+/// Every `false` arm is a **set** verdict, and each one for its own reason:
+///
+/// - `Solid` — a solid member is decodable only against the rest of its solid
+///   run. `unrar-rs` will do that (`advance_solid_cursor_to` decodes and
+///   discards every preceding member to rebuild the dictionary), but the
+///   predecessors it has to decode include the *stored* members direct routing
+///   carried away, so extracting one tolerated solid member costs a full decode
+///   of the archive prefix — the conventional extraction, plus an envelope. It
+///   also imposes monotonic member order on the tolerated loop and poisons the
+///   decoder for every later solid member once one fails
+///   (`RarError::SolidStatePoisoned`). Demoting is both cheaper and simpler.
+/// - `Redirection` — a symlink, hardlink, junction or file copy. There are no
+///   bytes to decode; the entry has to be *created* as a link, which is
+///   `extract_member_to_file`'s job and not something the tolerated writer path
+///   does. Until that arm exists (the directory arm is its shape), the
+///   conventional extractor owns it.
+/// - `NoChecksum` — no whole-member checksum at all. The tolerated decode would
+///   produce the member with nothing to check it against, and direct-store's
+///   contract is that every byte it delivers was verified by something.
+/// - `MalformedChain` — the layout does not agree with itself about where the
+///   member's parts are, so nothing here can be trusted to be routing the
+///   member's bytes at all.
+/// - `Encrypted` — reached only for encryption direct-store cannot route
+///   (encrypted *and* compressed, encrypted *and* solid, non-uniform or
+///   unkeyable keying). `EncryptedStore` members never reach this predicate.
+pub(super) fn member_shape_is_tolerable(reason: IneligibilityReason) -> bool {
     match reason {
         // Ordering, stated exactly: `classify` reaches `Compressed` only after
         // the parse-level malformed reason, directory, redirection, encrypted
         // and solid have all been ruled out, so this arm may rely on those five
-        // and on nothing else. The chain's *size* and *completeness* checks —
-        // the `ExceedsDeclaredSize`, `SizeMismatch` and `MissingUnpackedSize`
-        // malformed reasons — come after it and are therefore **not** implied
-        // here: a member reaching this arm is not proven to be a well-formed
-        // chain. That is why both declared totals stay `Option` and why the
-        // caller re-checks the budget at every parse instead of waiting for
-        // `totals_final`.
-        IneligibilityReason::Compressed {
-            packed_bytes,
-            unpacked_bytes,
-            // Read, and deliberately unused as a gate: a non-final total is a
-            // lower bound, and the caller demotes on a lower bound that already
-            // breaches while re-checking at every parse until the chain closes.
-            totals_final: _,
-        } => Some(ToleratedMemberBudget {
-            packed_bytes: packed_bytes?,
-            unpacked_bytes: unpacked_bytes?,
-        }),
+        // and on nothing else — which is exactly the tolerance's precondition:
+        // an unencrypted, non-solid, per-member regular file.
+        IneligibilityReason::Compressed { .. } => true,
         // A stored member with a BLAKE2sp digest and no CRC32. Out-of-order
         // routing cannot verify it, but `extract_member_streaming` feeds the
         // codec in order and checks BLAKE2sp natively — which is exactly why
         // the gate scopes its whole-member-CRC32 requirement to *direct-routed*
         // members and sends this one through the tolerance instead.
-        IneligibilityReason::Blake2OnlyNoCrc32 => {
-            let mut packed_bytes = 0u64;
-            for part in &member.parts {
-                packed_bytes = packed_bytes.checked_add(part.data_size)?;
-            }
-            Some(ToleratedMemberBudget {
-                packed_bytes,
-                unpacked_bytes: member.unpacked_size?,
-            })
-        }
+        IneligibilityReason::Blake2OnlyNoCrc32 => true,
         // A directory entry, which every archiver writes as a dataless header:
-        // packed and unpacked size are both zero and there is nothing to
-        // decode, so it costs the tolerance **nothing** and is granted a hard
-        // zero budget rather than the header's declared sizes. That is not a
-        // rounding: a directory that consumed budget would make a folder tree's
-        // hundreds of entries breach a ceiling that exists to bound *decoded
-        // bytes*, and a set whose only ineligible members are directories would
-        // then demote for a size it never has.
-        //
-        // Deliberately not a size read off the header. A hostile header can
-        // declare an unpacked size on a directory entry; nothing extracts it,
-        // so nothing would be bounded by charging for it.
-        IneligibilityReason::Directory => Some(ToleratedMemberBudget {
-            packed_bytes: 0,
-            unpacked_bytes: 0,
-        }),
+        // there is nothing to decode, and finalization creates it through the
+        // extractor's own sandboxed root.
+        IneligibilityReason::Directory => true,
         IneligibilityReason::Encrypted
         | IneligibilityReason::Solid
         | IneligibilityReason::Redirection
         | IneligibilityReason::NoChecksum
-        | IneligibilityReason::MalformedChain(_) => None,
+        | IneligibilityReason::MalformedChain(_) => false,
     }
 }
 

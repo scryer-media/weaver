@@ -2466,7 +2466,14 @@ fn debug_job_state(pipeline: &Pipeline, job_id: JobId) -> String {
     lines.join("\n")
 }
 
+/// Drives every detached direct-store ticket — post-repair read-backs and
+/// tolerated extractions — to its handler, the way the orchestrator's select
+/// loop would, until none is in flight.
 async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
+    enum Ticket {
+        PostRepair(crate::pipeline::DirectPostRepairWorkDone),
+        Tolerated(crate::pipeline::DirectToleratedWorkDone),
+    }
     loop {
         pipeline.pump_decode_queue();
         while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
@@ -2476,17 +2483,32 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         while let Ok(done) = pipeline.direct_post_repair_done_rx.try_recv() {
             pipeline.handle_direct_post_repair_done(done);
         }
-        if pipeline.direct_post_repair_in_flight.is_empty() {
+        while let Ok(done) = pipeline.direct_tolerated_done_rx.try_recv() {
+            pipeline.handle_direct_tolerated_done(done).await;
+        }
+        let post_repair_pending = !pipeline.direct_post_repair_in_flight.is_empty();
+        let tolerated_pending = !pipeline.direct_tolerated_in_flight.is_empty();
+        if !post_repair_pending && !tolerated_pending {
             return;
         }
-        let done = tokio::time::timeout(
-            Duration::from_secs(5),
-            pipeline.direct_post_repair_done_rx.recv(),
-        )
+        let post_repair_rx = &mut pipeline.direct_post_repair_done_rx;
+        let tolerated_rx = &mut pipeline.direct_tolerated_done_rx;
+        let ticket = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                done = post_repair_rx.recv(), if post_repair_pending => {
+                    Ticket::PostRepair(done.expect("direct post-repair completion channel should stay open"))
+                }
+                done = tolerated_rx.recv(), if tolerated_pending => {
+                    Ticket::Tolerated(done.expect("direct tolerated-extraction channel should stay open"))
+                }
+            }
+        })
         .await
-        .expect("direct post-repair read-back should finish")
-        .expect("direct post-repair completion channel should stay open");
-        pipeline.handle_direct_post_repair_done(done);
+        .expect("a detached direct-store ticket should finish");
+        match ticket {
+            Ticket::PostRepair(done) => pipeline.handle_direct_post_repair_done(done),
+            Ticket::Tolerated(done) => pipeline.handle_direct_tolerated_done(done).await,
+        }
     }
 }
 

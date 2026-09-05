@@ -429,7 +429,16 @@ pub(crate) fn repair_damaged_volumes(
         .iter()
         .map(|volume| volume.reconstruction.clone())
         .collect();
-    if let Err(failure) = reconstruct_volumes(provider, &plans, sparse) {
+    // All or nothing *here*, deliberately, and it is `cleanup` that makes it so:
+    // the repair needs every damaged volume present as a scratch file before a
+    // single slice can be recovered, so one volume that will not materialize
+    // ends the repair and takes the rest of the scratch with it. The sweep
+    // itself now reports per volume, which is what the demotion path wants; this
+    // caller collapses that back to the first failure.
+    if let Some(failure) = reconstruct_volumes(provider, &plans, sparse)
+        .into_iter()
+        .find_map(|volume| volume.failure)
+    {
         return Err(cleanup(DirectRepairFailure::Materialization(failure)));
     }
     if let Err(failure) = create_absent_repair_targets(damaged, sparse) {
