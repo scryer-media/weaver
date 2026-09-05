@@ -177,7 +177,9 @@ func proxy(ctx context.Context, client net.Conn, config listenerConfig, limiter 
 
 	upstreamDone := make(chan struct{})
 	go func() {
-		_, _ = io.Copy(upstream, client)
+		// The client's command stream is relayed byte for byte; the census
+		// only reads a copy of what was forwarded.
+		_, _ = io.Copy(&censusWriter{upstream: upstream, census: nntpshaper.NewCommandCensus(attestation)}, client)
 		closeWrite(upstream)
 		close(upstreamDone)
 	}()
@@ -205,6 +207,22 @@ func copyDownstream(ctx context.Context, destination net.Conn, source net.Conn, 
 			return readErr
 		}
 	}
+}
+
+// censusWriter forwards client bytes upstream and feeds the forwarded prefix
+// to the command census. A short or failed upstream write is reported as-is;
+// only the bytes that actually went upstream are counted as sent commands.
+type censusWriter struct {
+	upstream io.Writer
+	census   *nntpshaper.CommandCensus
+}
+
+func (writer *censusWriter) Write(payload []byte) (int, error) {
+	written, err := writer.upstream.Write(payload)
+	if written > 0 {
+		writer.census.Observe(payload[:written])
+	}
+	return written, err
 }
 
 func writeDownstream(destination net.Conn, payload []byte, attestation *nntpshaper.Attestation, sourceIdentity string) error {

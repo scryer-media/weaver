@@ -134,21 +134,24 @@ type QueueJobResult struct {
 }
 
 type QueueArtifact struct {
-	SchemaVersion                int                 `json:"schema_version"`
-	SuiteID                      string              `json:"suite_id"`
-	SubmissionMode               SubmissionMode      `json:"submission_mode"`
-	Runs                         []Run               `json:"runs"`
-	Status                       string              `json:"status"`
-	AdapterResult                *QueueAdapterResult `json:"adapter_result,omitempty"`
-	ShaperBefore                 *ShaperSnapshot     `json:"shaper_before,omitempty"`
-	ShaperAfter                  *ShaperSnapshot     `json:"shaper_after,omitempty"`
-	ShaperDownstreamBytes        uint64              `json:"shaper_downstream_bytes,omitempty"`
-	StorageAttestation           *StorageAttestation `json:"storage_attestation,omitempty"`
-	Jobs                         []QueueJobArtifact  `json:"jobs,omitempty"`
-	QueueWallClockNanoseconds    int64               `json:"queue_wall_clock_nanoseconds,omitempty"`
-	VerifiedWallClockNanoseconds int64               `json:"verified_wall_clock_nanoseconds,omitempty"`
-	QueueVerifiedAt              *time.Time          `json:"queue_verified_at,omitempty"`
-	Error                        string              `json:"error,omitempty"`
+	SchemaVersion         int                 `json:"schema_version"`
+	SuiteID               string              `json:"suite_id"`
+	SubmissionMode        SubmissionMode      `json:"submission_mode"`
+	Runs                  []Run               `json:"runs"`
+	Status                string              `json:"status"`
+	AdapterResult         *QueueAdapterResult `json:"adapter_result,omitempty"`
+	ShaperBefore          *ShaperSnapshot     `json:"shaper_before,omitempty"`
+	ShaperAfter           *ShaperSnapshot     `json:"shaper_after,omitempty"`
+	ShaperDownstreamBytes uint64              `json:"shaper_downstream_bytes,omitempty"`
+	// ShaperArticleCensus is present when the shaper counted the client's
+	// command lines (attestation schema 3).
+	ShaperArticleCensus          *ShaperArticleCensus `json:"shaper_article_census,omitempty"`
+	StorageAttestation           *StorageAttestation  `json:"storage_attestation,omitempty"`
+	Jobs                         []QueueJobArtifact   `json:"jobs,omitempty"`
+	QueueWallClockNanoseconds    int64                `json:"queue_wall_clock_nanoseconds,omitempty"`
+	VerifiedWallClockNanoseconds int64                `json:"verified_wall_clock_nanoseconds,omitempty"`
+	QueueVerifiedAt              *time.Time           `json:"queue_verified_at,omitempty"`
+	Error                        string               `json:"error,omitempty"`
 }
 
 type QueueJobArtifact struct {
@@ -552,8 +555,14 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 			artifact.Error = "shaper reported zero downstream bytes for the measured client run"
 			return artifact
 		}
+		census, err := ShaperArticleCensusFor(*artifact.ShaperBefore, shaperAfter)
+		if err != nil {
+			artifact.Error = err.Error()
+			return artifact
+		}
 		artifact.ShaperAfter = &shaperAfter
 		artifact.ShaperDownstreamBytes = delivered
+		artifact.ShaperArticleCensus = census
 	}
 	if storage != nil {
 		attestation, storageErr := storage.Finish(parent)
