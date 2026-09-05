@@ -576,7 +576,21 @@ impl DestinationSync for PreSyncedDestinations {
     }
 }
 
-/// One member the bounded small-member tolerance produces at finalization, with
+/// What one demotion's reconstruction sweep did to the set's volumes.
+///
+/// The two counts are disjoint and together cover every volume the set planned:
+/// a volume either kept the bytes the sweep verified for it, or had its file
+/// removed and every committed article requeued.
+#[derive(Debug, Default)]
+struct ReconstructionSummary {
+    /// Volumes that came out of the sweep with a verified contiguous prefix.
+    materialized: usize,
+    /// Volumes the sweep refused, and why. Each costs a refetch of that volume
+    /// alone.
+    refetched: Vec<(u32, ReconstructionFailure)>,
+}
+
+/// One member the member tolerance produces at finalization, with
 /// the two path forms the two arms need.
 struct ToleratedTarget {
     /// Raw header name, which is what `find_member` is asked for.
@@ -6207,7 +6221,7 @@ impl Pipeline {
         let extraction_claimed = self.extraction_claimed_members(job_id);
         set.assert_not_extraction_owned(&extraction_claimed);
 
-        // The small-member tolerance, and strictly **before** the commit loop
+        // The member tolerance, and strictly **before** the commit loop
         // below. The extraction reads the *virtual volumes*, which are the
         // envelopes overlaid with the members' `.direct.partial`s — so every
         // one of those files has to still be where the provider says it is.
@@ -6568,9 +6582,20 @@ impl Pipeline {
         }
     }
 
-    /// The bounded small-member tolerance: extracts **only** the tolerated
-    /// member indices, through the hybrid virtual-volume provider, straight to
-    /// their destinations.
+    /// The member tolerance: extracts **only** the tolerated member indices,
+    /// through the hybrid virtual-volume provider, straight to their
+    /// destinations.
+    ///
+    /// # This is the tolerance's whole remaining cost
+    ///
+    /// One blocking task, once, after the set's last article. Nothing here is
+    /// I/O amplification — the tolerated bytes are read once out of the
+    /// envelope they were routed to, and the stored members are not touched at
+    /// all — but it is a *serial tail*, and with the tolerance's size ceiling
+    /// gone the list it walks can be large. The conventional incremental
+    /// scheduler already runs the same decode volume by volume as chains close;
+    /// feeding it this provider instead of files is the seam that would retire
+    /// the tail, and it is not opened here.
     ///
     /// Returns the raw member names that were produced, for
     /// `extracted_members`. The distinction that separates this from the
@@ -6737,9 +6762,9 @@ impl Pipeline {
                 None => unrar_rs::RarArchive::open(reader),
             }
             .map_err(|error| format!("failed to open the virtual archive: {error}"))?;
-            // The same decode ceilings the incremental extractor applies. A
-            // tolerated member is small by budget, but the *declared* dictionary
-            // in a hostile header is not bounded by anything the budget checks.
+            // The same decode ceilings the incremental extractor applies.
+            // Nothing about a tolerated member bounds the *declared* dictionary
+            // in a hostile header, so the same admission runs here.
             let max_dict_bytes =
                 crate::pipeline::extraction::apply_server_rar_limits_with_memory_limit(
                     &mut archive,
@@ -6765,37 +6790,22 @@ impl Pipeline {
                     &archive,
                 ))
                 .map_err(|error| format!("RAR decoder memory admission failed: {error}"))?;
-            for target in &targets {
-                if target.is_directory {
-                    // `ExtractionRoot::create_dir` owns the parents, and it is
-                    // the arm that must own them: a directory entry is the one
-                    // target whose own path is a directory, so `parent()` would
-                    // create everything above it and leave the entry itself to
-                    // `File::create`.
-                    continue;
-                }
-                if let Some(parent) = target.destination.parent() {
-                    std::fs::create_dir_all(parent).map_err(|error| {
-                        format!(
-                            "failed to create {} for a tolerated member: {error}",
-                            parent.display()
-                        )
-                    })?;
-                }
-            }
             let options = unrar_rs::ExtractOptions {
                 verify: true,
                 password: password.clone(),
                 restore_owners: false,
             };
-            // Opened only for a set that really has a directory entry, so a
-            // plain small-member tolerance pays nothing for this.
-            let root = match targets.iter().any(|target| target.is_directory) {
-                true => Some(crate::pipeline::extraction::ExtractionRoot::open(
-                    &extraction_root,
-                )?),
-                false => None,
-            };
+            // Every target goes through the sandboxed root now, files included,
+            // so it is opened unconditionally. It used to be opened only for a
+            // set with a directory entry, and the file arm wrote through a bare
+            // `File::create` with `create_dir_all` parents: that skipped the
+            // path validator, the entry accounting, and — the reason it can no
+            // longer stand — the *byte* budget. While the tolerance carried at
+            // most 256 MiB of declared unpacked size, an unbudgeted write was
+            // bounded by that ceiling; with the ceiling gone, the only thing
+            // that may bound a tolerated decode is the same
+            // `JobExtractionBudget` the conventional extractor writes through.
+            let root = crate::pipeline::extraction::ExtractionRoot::open(&extraction_root)?;
             let mut produced = Vec::with_capacity(targets.len());
             let mut directories = Vec::new();
             for target in &targets {
@@ -6804,9 +6814,6 @@ impl Pipeline {
                     .find_member(name)
                     .ok_or_else(|| format!("tolerated member '{name}' is not in the archive"))?;
                 if target.is_directory {
-                    let root = root
-                        .as_ref()
-                        .expect("a directory target opened the extraction root");
                     // The conventional extractor's own directory arm, byte for
                     // byte: create through the sandboxed root under the
                     // extraction budget, tolerating a directory that is already
@@ -6821,13 +6828,18 @@ impl Pipeline {
                     produced.push(name.clone());
                     continue;
                 }
-                let mut file = std::fs::File::create(&target.destination).map_err(|error| {
-                    format!("failed to create {}: {error}", target.destination.display())
-                })?;
+                // Budgeted, and through the same root the directory arm uses:
+                // `create_file` validates the relative path, creates the
+                // parents as archive entries, and hands back a writer that
+                // charges every byte against the job's member, job-total and
+                // free-space limits. A rejection fails the tolerated extraction,
+                // which demotes the set to a conventional extraction that will
+                // meet the very same budget.
+                let mut file = root.create_file(&target.relative, &extraction_budget)?;
                 // The provider is the set's, keyed by the set's own volume
                 // indices, which is what the entry asks for — a member
                 // starting in volume 3 requests volume 3.
-                crate::pipeline::extraction::rar_entry_via(
+                let written = crate::pipeline::extraction::rar_entry_via(
                     &mut archive,
                     index,
                     &provider,
@@ -6837,15 +6849,9 @@ impl Pipeline {
                 .map_err(|error| format!("failed to extract '{name}': {error}"))?;
                 // The tolerated half of the byte account: everything else a
                 // direct set produces is counted at the router as
-                // `direct_store.bytes.member`, and a set whose tolerated bytes
-                // start rivalling its stored ones is one the tolerance budget
-                // is no longer holding.
-                if let Ok(metadata) = file.metadata() {
-                    crate::runtime::perf_probe::record_value(
-                        "direct_store.bytes.tolerated",
-                        metadata.len(),
-                    );
-                }
+                // `direct_store.bytes.member`. Read against it to see how much
+                // of a mixed set the tolerance is carrying.
+                crate::runtime::perf_probe::record_value("direct_store.bytes.tolerated", written);
                 produced.push(name.clone());
             }
             Ok::<ToleratedExtraction, String>(ToleratedExtraction {
@@ -7001,6 +7007,15 @@ impl Pipeline {
             format!("direct_store.demoted.{}", reason.metric()),
             std::time::Duration::from_nanos(1),
         );
+        // Reported, not yet acted on: how many demotions could have been served
+        // by the set's own virtual volumes, split from the ones that genuinely
+        // need files on disk. Every set still materializes below; this is the
+        // measurement that says what keeping the overlay would be worth.
+        let volume_demand = reason.volume_demand();
+        crate::runtime::perf_probe::record_owned(
+            format!("direct_store.demoted.{volume_demand}"),
+            std::time::Duration::from_nanos(1),
+        );
         // Guarded by `claim_demotion` above, so this counts each set exactly
         // once; the per-reason breakdown lives in the perf-probe key and the
         // warn line.
@@ -7011,11 +7026,12 @@ impl Pipeline {
             job_id = job_id.0,
             set_name = %set_name,
             reason = reason.metric(),
+            volumes = %volume_demand,
             "direct-store set demoted"
         );
 
         match self.reconstruct_demoted_set(job_id, set_index).await {
-            Ok(volumes) => {
+            Ok(summary) => {
                 crate::runtime::perf_probe::record(
                     "direct_store.demoted.reconstructed",
                     std::time::Duration::from_nanos(1),
@@ -7025,14 +7041,39 @@ impl Pipeline {
                 // is how many that was. Read against
                 // `direct_store.repair.materialized_volumes`, whose whole point
                 // is being much smaller.
+                let volumes = summary.materialized;
                 crate::runtime::perf_probe::record_value(
                     "direct_store.demote.materialized_volumes",
                     volumes as u64,
                 );
+                // One bucket per refused volume, under the same metric names
+                // the whole-set fallback used — so the reason breakdown reads
+                // the same as before while the *count* is now volumes rather
+                // than sets.
+                for (volume_index, failure) in &summary.refetched {
+                    crate::runtime::perf_probe::record_owned(
+                        format!("direct_store.demote_refetch.{}", failure.metric()),
+                        std::time::Duration::from_nanos(1),
+                    );
+                    warn!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        volume_index,
+                        failure = %failure,
+                        "a demoted volume could not be reconstructed; refetching that volume"
+                    );
+                }
+                if !summary.refetched.is_empty() {
+                    crate::runtime::perf_probe::record_value(
+                        "direct_store.demote.refetched_volumes",
+                        summary.refetched.len() as u64,
+                    );
+                }
                 info!(
                     job_id = job_id.0,
                     set_name = %set_name,
                     volumes,
+                    refetched = summary.refetched.len(),
                     "direct-store set materialized from its own routed bytes"
                 );
             }
@@ -7076,12 +7117,18 @@ impl Pipeline {
         self.release_retained_direct_volumes(job_id).await;
     }
 
-    /// The reconstruction path. `Ok(n)` when `n` volumes were materialized.
+    /// The reconstruction path.
+    ///
+    /// `Err` is reserved for the two refusals that are properties of the whole
+    /// set and are raised before a byte is swept — no layout, and an encrypted
+    /// set whose posted bytes the overlay cannot reproduce. A volume that fails
+    /// *during* the sweep is reported inside [`ReconstructionSummary`] and
+    /// refetched on its own; it no longer takes its siblings with it.
     async fn reconstruct_demoted_set(
         &mut self,
         job_id: JobId,
         set_index: usize,
-    ) -> Result<usize, ReconstructionFailure> {
+    ) -> Result<ReconstructionSummary, ReconstructionFailure> {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return Err(ReconstructionFailure::NoLayout);
         };
@@ -7190,13 +7237,20 @@ impl Pipeline {
         .map_err(|error| ReconstructionFailure::WriteFailed {
             volume_index: u32::MAX,
             error: error.to_string(),
-        })??;
+        })?;
 
         // Everything above is read-only against the job; from here the
         // reconciliation mutates durable state, in that order: legacy floors
         // and completed-file rows, then the coverage row, then the direct
         // outputs.
         let mut materialized = 0usize;
+        // Volumes the sweep refused, each with the reason it refused. Their
+        // files are already gone and their `keep` set comes out empty below, so
+        // `requeue_after_reconstruction` gives each one the full-refetch
+        // treatment — `mark_file_incomplete` included — and publishes no floor
+        // over it, which is the same treatment the whole-set fallback used to
+        // give the *entire* group for one bad volume.
+        let mut refetched: Vec<(u32, ReconstructionFailure)> = Vec::new();
         let mut keep: HashMap<u32, Vec<u32>> = HashMap::new();
         for (outcome, (volume_index, file_index, filename, plan)) in
             rebuilt.iter().zip(targets.iter())
@@ -7207,6 +7261,17 @@ impl Pipeline {
                 file_index: *file_index,
             };
             let extents = extents_by_volume.remove(volume_index).unwrap_or_default();
+            if let Some(failure) = &outcome.failure {
+                debug_assert_eq!(outcome.contiguous, 0);
+                // Nothing may be kept for a refused volume, and `segments_on_disk`
+                // must not be asked: it answers "which articles does the
+                // *coverage* claim", which is only the same question as "which
+                // articles did the sweep make durable" for a volume the sweep
+                // actually wrote. This one's file has just been removed.
+                keep.insert(*file_index, Vec::new());
+                refetched.push((*volume_index, failure.clone()));
+                continue;
+            }
             let (on_disk, floor) = crate::pipeline::direct_store::reconstruct::segments_on_disk(
                 &extents,
                 &plan.covered,
@@ -7273,7 +7338,10 @@ impl Pipeline {
                 });
             }
         }
-        Ok(materialized)
+        Ok(ReconstructionSummary {
+            materialized,
+            refetched,
+        })
     }
 
     /// The last-resort demotion: retire routed storage and requeue only articles

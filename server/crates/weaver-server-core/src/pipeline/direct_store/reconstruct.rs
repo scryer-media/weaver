@@ -137,7 +137,7 @@ pub(crate) enum PartialArticle {
 pub(crate) struct ReconstructedVolume {
     pub(crate) volume_index: u32,
     /// Contiguous physical bytes rebuilt from zero. The legacy floor is derived
-    /// from this and nothing else.
+    /// from this and nothing else. Zero for a volume that failed.
     pub(crate) contiguous: u64,
     /// Every byte of `[0, len)` is on disk, so the volume is indistinguishable
     /// from one the conventional path downloaded.
@@ -146,10 +146,23 @@ pub(crate) struct ReconstructedVolume {
     /// the volume came out complete, because that is the only case where it
     /// describes the whole file.
     pub(crate) md5: Option<[u8; 16]>,
+    /// Why this volume could not be rebuilt, when it could not be.
+    ///
+    /// A failed volume reports `contiguous: 0` and has had its file removed, so
+    /// the caller's ordinary "nothing was rebuilt for this file" handling —
+    /// keep nothing, publish no floor, refetch every committed article — is
+    /// already the right treatment for it. The failure is carried so the caller
+    /// can say *which* volume and *why* in its metrics and its log line.
+    pub(crate) failure: Option<ReconstructionFailure>,
 }
 
-/// Why a set could not be demoted by reconstruction. Each is a metric bucket,
-/// and each falls back to refetching.
+/// Why a **volume** could not be rebuilt. Each is a metric bucket, and each
+/// costs a refetch of that volume and nothing else.
+///
+/// [`ReconstructionFailure::NoLayout`] and
+/// [`ReconstructionFailure::EncryptedPostedBytes`] are the two the *caller*
+/// raises before the sweep starts, and they are properties of the whole set
+/// rather than of one volume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReconstructionFailure {
     /// The set has no layout, so no volume can be mapped back at all.
@@ -246,30 +259,46 @@ impl std::fmt::Display for ReconstructionFailure {
 }
 
 /// Rebuilds every volume of a set. Blocking: call it on the blocking pool.
+///
+/// # Per volume, not all or nothing
+///
+/// The first shape deleted **every** volume file of the set and refetched the
+/// whole group the moment one volume hit an `UnverifiableRun`, a `MissingBytes`
+/// or a `ChecksumMismatch`. The reasoning it gave for that is real and it is
+/// what this keeps — a failed volume must not leave a half-written file where
+/// the refetch is about to write, because the refetch publishes no floor and a
+/// stray prefix would be bytes nothing claims, nothing verifies and nothing
+/// overwrites below the first segment it does fetch — but the reasoning is
+/// *per volume*, not per set. A volume that rebuilt and verified is not made
+/// wrong by a sibling that did not.
+///
+/// So the failed volume's own file is removed and the volume is reported with
+/// `contiguous: 0`. Its siblings keep their rebuilt bytes and their floors, and
+/// the caller refetches exactly the one volume — which on a 125-volume set is
+/// the difference between one volume off the wire and 125.
 pub(crate) fn reconstruct_volumes(
     provider: &HybridVolumeProvider,
     volumes: &[VolumeReconstruction],
     sparse: SparseMarking,
-) -> Result<Vec<ReconstructedVolume>, ReconstructionFailure> {
-    let mut rebuilt = Vec::with_capacity(volumes.len());
-    for volume in volumes {
-        match reconstruct_volume(provider, volume, sparse) {
-            Ok(outcome) => rebuilt.push(outcome),
-            Err(failure) => {
-                // All or nothing. The fallback refetches every article of the
-                // set, and it must not find a half-written volume file sitting
-                // where it is about to write: the refetch publishes no floor for
-                // these files, so a stray prefix would be bytes nothing claims,
-                // nothing verifies and nothing overwrites below the first
-                // segment it does fetch.
-                for volume in volumes {
+) -> Vec<ReconstructedVolume> {
+    volumes
+        .iter()
+        .map(
+            |volume| match reconstruct_volume(provider, volume, sparse) {
+                Ok(outcome) => outcome,
+                Err(failure) => {
                     let _ = std::fs::remove_file(&volume.path);
+                    ReconstructedVolume {
+                        volume_index: volume.volume_index,
+                        contiguous: 0,
+                        complete: false,
+                        md5: None,
+                        failure: Some(failure),
+                    }
                 }
-                return Err(failure);
-            }
-        }
-    }
-    Ok(rebuilt)
+            },
+        )
+        .collect()
 }
 
 fn reconstruct_volume(
@@ -283,6 +312,7 @@ fn reconstruct_volume(
             contiguous: 0,
             complete: false,
             md5: None,
+            failure: None,
         });
     }
 
@@ -447,6 +477,7 @@ fn reconstruct_volume(
         contiguous,
         complete,
         md5: complete.then(|| md5.finalize()),
+        failure: None,
     })
 }
 
