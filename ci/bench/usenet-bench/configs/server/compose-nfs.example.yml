@@ -1,0 +1,51 @@
+# The shaped storage topology, brought up beside the server/shaper stack and
+# only when a plan declares an `nfs-*` storage profile. It publishes no ports
+# and lives on its own network, which the benchmark host reaches over the
+# bridge so the Docker daemon can mount the export as a volume.
+#
+# Fill the NFS_* values from `nntpbench storage-env`; they are the same numbers
+# the plan carries, so a run can never be shaped differently from the way it is
+# reported.
+services:
+  nfs:
+    # Build this tag with `docker build -f docker/nfs-server/Dockerfile .`; it
+    # is never pulled or published by this project.
+    image: ${NFS_SERVER_IMAGE:-weaver-nntp-bench-nfs:dev}
+    build:
+      context: ../..
+      dockerfile: docker/nfs-server/Dockerfile
+    pull_policy: never
+    # A kernel NFS server has to mount the `nfsd` filesystem (CAP_SYS_ADMIN
+    # over a filesystem type Docker does not allow selectively), and the shaper
+    # needs CAP_NET_ADMIN plus an ifb device. There is no smaller capability set
+    # that satisfies both, so this one service is privileged. It carries no
+    # published port, no host mount and no data that outlives a run.
+    privileged: true
+    environment:
+      NFS_LINK_BITS_PER_SECOND: "${NFS_LINK_BITS_PER_SECOND:?run nntpbench storage-env first}"
+      NFS_LINK_BURST_BYTES: "${NFS_LINK_BURST_BYTES:?run nntpbench storage-env first}"
+      NFS_RTT_MICROS: "${NFS_RTT_MICROS:?run nntpbench storage-env first}"
+      NFS_EXPORT_OPTIONS: "${NFS_EXPORT_OPTIONS:?run nntpbench storage-env first}"
+    volumes:
+      # The export must be a real filesystem: no kernel NFS server can export
+      # the container's overlay. A named volume also keeps a run's completion
+      # directory off the image layer and lets `docker volume rm` reclaim it.
+      - nfs-export:/export
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/nntpbench-nfs-control", "health"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    networks:
+      benchmark_storage: {}
+
+volumes:
+  nfs-export:
+
+networks:
+  # Pass this network's full Docker name (Compose prefixes the project) to
+  # `nntpbench sequential --nfs-network`. `internal` keeps the export off any
+  # external route; the benchmark host still reaches it over the bridge, which
+  # is what lets the Docker daemon mount the volume.
+  benchmark_storage:
+    internal: true

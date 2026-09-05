@@ -86,6 +86,10 @@ sevenz-rust2 = { workspace = true, features = ["compress"] }
 axum = { workspace = true }
 criterion = "0.8"
 lzma-rust2 = { workspace = true, features = ["encoder"] }
+# The RAR3 recovery-volume tests author their `.rev` fixture in-process with
+# the same RS coder the restorer decodes with. Test-only: the shipped binary
+# only ever restores from recovery volumes, it never writes one.
+reedsolomon-rs = { version = "0.4.3", default-features = false }
 
 [[bench]]
 name = "infrastructure_retry"

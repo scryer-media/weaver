@@ -81,7 +81,15 @@ func runSingle(ctx context.Context, cfg Config) (nativeRun, error) {
 	if err == nil {
 		queueTiming, err = api.QueueWithTiming(ctx, cfg.NZBPath, cfg.ArchivePassword)
 		if err == nil {
-			completion, err = api.WaitCompleteWithObservation(ctx, queueTiming.JobID, cfg.PollInterval, queueTiming.AcceptedAt)
+			// The native lane has no did-not-finish artifact shape; a job that
+			// never reaches a terminal state is bounded here and reported as
+			// the run's error rather than stalling the pass.
+			waitCtx, cancelWait := context.WithTimeout(ctx, cfg.JobTimeout)
+			completion, err = api.WaitCompleteWithObservation(waitCtx, queueTiming.JobID, cfg.PollInterval, queueTiming.AcceptedAt)
+			if err != nil && ctx.Err() == nil && waitCtx.Err() != nil {
+				err = fmt.Errorf("client job %s did not reach a terminal state within %s of acceptance", queueTiming.JobID, cfg.JobTimeout)
+			}
+			cancelWait()
 		}
 	}
 	stopErr := process.stop()
@@ -92,7 +100,7 @@ func runSingle(ctx context.Context, cfg Config) (nativeRun, error) {
 		return nativeRun{}, err
 	}
 	result := benchmark.AdapterResult{
-		SchemaVersion:            5,
+		SchemaVersion:            6,
 		RunID:                    cfg.RunID,
 		Client:                   cfg.Client,
 		ArchiveToolchain:         cfg.ArchiveToolchain,
@@ -102,6 +110,7 @@ func runSingle(ctx context.Context, cfg Config) (nativeRun, error) {
 		TLSValidation:            cfg.TLSValidation,
 		TransportLabel:           cfg.TransportLabel,
 		ServerLink:               cfg.ServerLink,
+		StorageProfile:           cfg.StorageProfile,
 		QueuedAt:                 queueTiming.AcceptedAt,
 		CompletionAt:             completion.ObservedAt,
 		ClientIdentity:           identity,
@@ -121,6 +130,7 @@ func runSingle(ctx context.Context, cfg Config) (nativeRun, error) {
 		TLSValidation:    cfg.TLSValidation,
 		TransportLabel:   cfg.TransportLabel,
 		ServerLink:       cfg.ServerLink,
+		StorageProfile:   cfg.StorageProfile,
 	}); err != nil {
 		return nativeRun{}, fmt.Errorf("validate adapter result: %w", err)
 	}
@@ -179,7 +189,7 @@ func runSequentialQueue(ctx context.Context, cfg Config) error {
 		jobs = append(jobs, job)
 	}
 	result := benchmark.QueueAdapterResult{
-		SchemaVersion:            5,
+		SchemaVersion:            6,
 		SuiteID:                  input.SuiteID,
 		SubmissionMode:           input.SubmissionMode,
 		Client:                   cfg.Client,
@@ -190,6 +200,7 @@ func runSequentialQueue(ctx context.Context, cfg Config) error {
 		TLSValidation:            cfg.TLSValidation,
 		TransportLabel:           cfg.TransportLabel,
 		ServerLink:               cfg.ServerLink,
+		StorageProfile:           cfg.StorageProfile,
 		QueueStartedAt:           queueStartedAt,
 		QueueCompletedAt:         queueCompletedAt,
 		StatusPollIntervalNanos:  cfg.PollInterval.Nanoseconds(),
@@ -230,8 +241,8 @@ func validateNativeSequentialQueueResult(result benchmark.QueueAdapterResult) er
 	if job.FixtureWallClockNanoseconds != job.CompletionAt.Sub(job.QueuedAt).Nanoseconds() || job.SubmissionToTerminalNanoseconds != job.TerminalObservedAt.Sub(job.SubmissionStartedAt).Nanoseconds() || job.TerminalObservationUncertainty != job.TerminalObservedAt.Sub(job.TerminalObservationLowerBound).Nanoseconds() {
 		return fmt.Errorf("native sequential result has inconsistent timing durations")
 	}
-	if job.SubmissionToTerminalNanoseconds <= 0 || job.TerminalObservationUncertainty > job.SubmissionToTerminalNanoseconds/100 {
-		return fmt.Errorf("native sequential result has terminal observation uncertainty above 1%%")
+	if job.SubmissionToTerminalNanoseconds <= 0 || !benchmark.ObservationUncertaintyAcceptable(job.TerminalObservationUncertainty, job.SubmissionToTerminalNanoseconds) {
+		return fmt.Errorf("native sequential result has terminal observation uncertainty above %s", benchmark.ObservationUncertaintyRule)
 	}
 	if job.ResourceMetrics == nil {
 		return fmt.Errorf("native sequential result lacks fixture resource metrics")

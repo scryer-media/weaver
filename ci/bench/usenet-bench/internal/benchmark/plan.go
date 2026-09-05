@@ -68,6 +68,7 @@ type PlanOptions struct {
 	Targets           []ExecutionTarget
 	Profile           string
 	ServerLink        ServerLinkProfile
+	StorageProfile    StorageProfile
 	Repetitions       int
 	Seed              int64
 }
@@ -85,6 +86,7 @@ type Plan struct {
 	ExecutionTargets  []ExecutionTarget  `json:"execution_targets"`
 	Profile           string             `json:"profile"`
 	ServerLink        ServerLinkProfile  `json:"server_link"`
+	StorageProfile    StorageProfile     `json:"storage_profile"`
 	Repetitions       int                `json:"repetitions"`
 	Runs              []Run              `json:"runs"`
 }
@@ -103,6 +105,7 @@ type Run struct {
 	TransportLabel   string            `json:"transport_label"`
 	Profile          string            `json:"profile"`
 	ServerLink       ServerLinkProfile `json:"server_link"`
+	StorageProfile   StorageProfile    `json:"storage_profile"`
 	Repetition       int               `json:"repetition"`
 	FreshClientState bool              `json:"fresh_client_state"`
 	Metric           string            `json:"metric"`
@@ -114,6 +117,9 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 	}
 	if options.ServerLink.ID == "" {
 		options.ServerLink = DefaultServerLinkProfile()
+	}
+	if options.StorageProfile.ID == "" {
+		options.StorageProfile = DefaultStorageProfile()
 	}
 	if len(options.ClientProfiles) == 0 {
 		options.ClientProfiles = DefaultClientProfiles(options.Clients)
@@ -128,7 +134,7 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 		return Plan{}, err
 	}
 	plan := Plan{
-		SchemaVersion:     5,
+		SchemaVersion:     6,
 		Seed:              options.Seed,
 		FixtureIDs:        append([]string(nil), options.FixtureIDs...),
 		Clients:           append([]Client(nil), options.Clients...),
@@ -138,6 +144,7 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 		ExecutionTargets:  append([]ExecutionTarget(nil), options.Targets...),
 		Profile:           options.Profile,
 		ServerLink:        options.ServerLink,
+		StorageProfile:    options.StorageProfile,
 		Repetitions:       options.Repetitions,
 	}
 	type round struct {
@@ -182,6 +189,7 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 				TransportLabel:   transportLabel,
 				Profile:          plan.Profile,
 				ServerLink:       plan.ServerLink,
+				StorageProfile:   plan.StorageProfile,
 				Repetition:       benchmarkRound.repetition,
 				FreshClientState: true,
 				Metric:           PrimaryMetric,
@@ -195,7 +203,7 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 }
 
 func (p Plan) Validate() error {
-	if p.SchemaVersion != 5 {
+	if p.SchemaVersion != 6 {
 		return fmt.Errorf("unsupported benchmark plan schema version %d", p.SchemaVersion)
 	}
 	if err := validateOptions(PlanOptions{
@@ -207,6 +215,7 @@ func (p Plan) Validate() error {
 		Targets:           p.ExecutionTargets,
 		Profile:           p.Profile,
 		ServerLink:        p.ServerLink,
+		StorageProfile:    p.StorageProfile,
 		Repetitions:       p.Repetitions,
 		Seed:              p.Seed,
 	}); err != nil {
@@ -243,6 +252,9 @@ func (p Plan) Validate() error {
 		}
 		if !run.FreshClientState || run.Metric != PrimaryMetric || run.Profile != p.Profile || run.ServerLink != p.ServerLink {
 			return fmt.Errorf("benchmark plan run %s does not use the required verified submission-to-terminal metric", run.ID)
+		}
+		if run.StorageProfile != p.StorageProfile {
+			return fmt.Errorf("benchmark plan run %s does not use the plan's storage profile %q", run.ID, p.StorageProfile.ID)
 		}
 		if !targets[run.ExecutionTarget] {
 			return fmt.Errorf("benchmark plan run %s has an unplanned execution target %q", run.ID, run.ExecutionTarget)
@@ -321,6 +333,9 @@ func validateOptions(options PlanOptions) error {
 		return err
 	}
 	if err := validateExecutionTargets(options.Targets); err != nil {
+		return err
+	}
+	if err := validateStorageProfileTargets(options.StorageProfile, options.Targets); err != nil {
 		return err
 	}
 	if hasDuplicateStrings(options.FixtureIDs) {

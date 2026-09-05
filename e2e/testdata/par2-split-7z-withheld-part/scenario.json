@@ -1,0 +1,13 @@
+{
+  "slug": "par2-split-7z-withheld-part",
+  "title": "Amber.Meridian.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A five-part split 7z with parity over all five parts, posted without its third part. The NZB can never complete the set on its own; the recovery set must rebuild the withheld part in full, and only then can extraction run.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "expectedOutputBLAKE3": {
+    "silver_horizon.mkv": "779fad2c06e827cf1cd4a6793a655a1504119962c8ebfdc0b35d1eab2d84327a"
+  }
+}

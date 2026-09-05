@@ -35,6 +35,21 @@ impl Pipeline {
         lower.contains("checksum") || lower.contains("crc mismatch")
     }
 
+    /// Refusals raised while *opening* the archive, about its structure rather
+    /// than any member's bytes: two members that sanitize to one destination,
+    /// or a member path that escapes the output root. Both come from
+    /// `ensure_unique_sanitized_rar_member_paths` before a single member is
+    /// read, and nothing a retry can bring — a re-download, a PAR2 verdict, a
+    /// header refresh — changes the answer, because the names are the archive.
+    ///
+    /// Matched on the exact message prefixes those two checks produce, and on
+    /// nothing looser: this classification ends the job, so it must never
+    /// catch a member-level failure that a repair could still turn around.
+    pub(in crate::pipeline) fn is_terminal_archive_structure_error(error: &str) -> bool {
+        error.starts_with("RAR archive contains colliding sanitized member path: ")
+            || error.starts_with("unsafe RAR member path: ")
+    }
+
     async fn normalize_extraction_output_tree(
         &self,
         job_id: JobId,
@@ -1370,6 +1385,30 @@ impl Pipeline {
                                 error = %error,
                                 "ignoring stale RAR batch extraction failure for non-current or already extracted members"
                             );
+                        } else if Self::is_terminal_archive_structure_error(&error) {
+                            // The full-set arm already ends the job on this
+                            // error. The batch arm has to as well: latched as
+                            // an ordinary member failure, a job without a
+                            // PAR2 set re-schedules the refused member straight
+                            // back into the same open — the failed-member
+                            // latch only holds while PAR2 owes a verdict — and
+                            // spins extract/refuse/re-schedule.
+                            warn!(
+                                job_id = job_id.0,
+                                set_name = %set_name,
+                                attempted = ?attempted,
+                                error = %error,
+                                "RAR archive refused at open for a structural reason no retry can change; failing the job"
+                            );
+                            self.metrics.job_lifecycle.note_extraction(
+                                crate::operations::instrumentation::StageOutcomeKind::Failed,
+                            );
+                            let _ = self.event_tx.send(PipelineEvent::ExtractionFailed {
+                                job_id,
+                                error: error.clone(),
+                            });
+                            self.fail_job(job_id, error);
+                            return;
                         } else if Self::is_stale_topology_batch_extraction_error(&error) {
                             warn!(
                                 job_id = job_id.0,

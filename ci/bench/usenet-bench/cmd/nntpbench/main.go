@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -29,10 +30,14 @@ func main() {
 	switch os.Args[1] {
 	case "seed":
 		err = seed(os.Args[2:])
+	case "seed-image":
+		err = seedImage(os.Args[2:])
 	case "plan":
 		err = plan(os.Args[2:])
 	case "server-env":
 		err = serverEnv(os.Args[2:])
+	case "storage-env":
+		err = storageEnv(os.Args[2:])
 	case "image":
 		if len(os.Args) < 3 || os.Args[2] != "build" {
 			err = fmt.Errorf("usage: nntpbench image build [options]")
@@ -53,6 +58,8 @@ func main() {
 		err = preflight(os.Args[2:])
 	case "verify-output":
 		err = verifyOutput(os.Args[2:])
+	case "delete-output":
+		err = deleteOutput(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -116,6 +123,7 @@ func plan(args []string) error {
 	flags := flag.NewFlagSet("plan", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	var fixturesCSV, corpusPath, clientsCSV, archiveToolchainsCSV, transportsCSV, targetsCSV, output, profile, serverLink string
+	var storageProfileID, nfsLink string
 	var repetitions int
 	var seed int64
 	var serverEgressBPS, serverBurstBytes uint64
@@ -129,6 +137,8 @@ func plan(args []string) error {
 	flags.StringVar(&serverLink, "server-link", benchmark.LinkUnlimited, "NNTP server aggregate egress profile: unlimited, 1gbit, 10gbit, or custom")
 	flags.Uint64Var(&serverEgressBPS, "server-egress-bps", 0, "required custom server-link egress rate in bits per second")
 	flags.Uint64Var(&serverBurstBytes, "server-burst-bytes", 0, "required custom server-link aggregate burst in bytes")
+	flags.StringVar(&storageProfileID, "storage-profile", benchmark.StorageProfileLocal, "client storage profile: local, nfs-all, or nfs-complete")
+	flags.StringVar(&nfsLink, "nfs-link", "", "required NFS link profile for an nfs storage profile: nas-100mbit, nas-1gbit, or nas-2.5gbit")
 	flags.IntVar(&repetitions, "repetitions", 20, "measured randomized blocks per fixture/client/transport")
 	flags.Int64Var(&seed, "seed", 20260802, "deterministic scheduling seed")
 	flags.StringVar(&output, "output", "", "plan JSON output path")
@@ -169,6 +179,10 @@ func plan(args []string) error {
 	if err != nil {
 		return err
 	}
+	storage, err := resolveStoragePlanProfile(storageProfileID, nfsLink)
+	if err != nil {
+		return err
+	}
 	benchmarkPlan, err := benchmark.BuildPlan(benchmark.PlanOptions{
 		FixtureIDs:        fixtureIDs,
 		Clients:           clients,
@@ -177,6 +191,7 @@ func plan(args []string) error {
 		Targets:           targets,
 		Profile:           profile,
 		ServerLink:        link,
+		StorageProfile:    storage,
 		Repetitions:       repetitions,
 		Seed:              seed,
 	})
@@ -356,6 +371,11 @@ func execute(args []string, command string) error {
 	flags.StringVar(&config.TLSPort, "nntp-tls-port", "563", "implicit TLS NNTP port")
 	flags.StringVar(&config.TLSCAFile, "tls-ca-file", "", "PEM CA file mounted by verified-TLS adapters")
 	flags.StringVar(&config.ShaperControlURL, "shaper-control-url", "", "nntpshaper control-plane base URL; required by shaped plans")
+	flags.StringVar(&config.DockerBinary, "docker", "docker", "Docker executable used for shaped-storage lifecycle and attestation")
+	flags.StringVar(&config.NFSContainer, "nfs-container", "", "shaped NFS server container; required by nfs storage plans")
+	flags.StringVar(&config.NFSNetwork, "nfs-network", "", "Docker network carrying the shaped NFS path; required by nfs storage plans")
+	flags.StringVar(&config.NFSHelperImage, "nfs-helper-image", benchmark.DefaultNFSImage, "locally built image used to mount, verify and clean the NFS export")
+	flags.StringVar(&config.NFSVerifyBinary, "nfs-verify-binary", "", "nntpbench binary, built for the helper container's platform, that verifies and empties the NFS export; required by nfs storage plans")
 	flags.StringVar(&config.NNTPUsername, "username", "", "NNTP username")
 	flags.StringVar(&config.NNTPPassword, "password", "", "NNTP password")
 	flags.StringVar(&passwordFile, "password-file", "", "file containing the NNTP password")
@@ -384,6 +404,12 @@ func execute(args []string, command string) error {
 	config.Plan = plan
 	config.Catalog = catalog
 	config.Target = benchmark.ExecutionTarget(executionTarget)
+	// Adapters run with the suite's artifact directory as their working
+	// directory, so a relative fixtures root would be resolved from there and
+	// point at nothing; the operator's path is anchored to this process's cwd.
+	if fixturesRoot, err = filepath.Abs(fixturesRoot); err != nil {
+		return fmt.Errorf("resolve --fixtures-root: %w", err)
+	}
 	config.FixtureRoot = fixturesRoot
 	config.ArtifactRoot = artifactsRoot
 	if config.Profile == "" {
@@ -414,12 +440,14 @@ func execute(args []string, command string) error {
 		if err := printJSON(artifacts); err != nil {
 			return err
 		}
+		printStorageAttestations(artifacts)
 		return runErr
 	}
 	artifacts, runErr := benchmark.ExecutePlan(ctx, config)
 	if err := printJSON(artifacts); err != nil {
 		return err
 	}
+	printRunStorageAttestations(artifacts)
 	return runErr
 }
 
@@ -487,9 +515,11 @@ func usage() {
 
 Commands:
   seed           Post a generated fixture to an NNTP server and write its NZB
+  seed-image     Cache, inspect, or restore a pre-seeded NNTP article store
   image build    Build the pinned local e2e-nntp image and save its provenance
   plan           Write a randomized, balanced benchmark plan
   server-env     Write an immutable server-side egress-shaper environment file
+  storage-env    Write an immutable shaped-NFS server environment file
   run            Execute cold, one-NZB diagnostic runs through client adapters
   sequential     Run each persisted plan entry through a fresh isolated client
   queue           Execute each client lane as one uninterrupted multi-NZB queue (legacy)
@@ -497,6 +527,7 @@ Commands:
   summarize      Produce paired per-stratum statistics from verified sequential artifacts
   preflight      Check target host and native/Docker executable prerequisites
   verify-output  Verify a client completion directory against fixture hashes
+  delete-output  Empty a verified client completion directory
 
 Run "nntpbench <command> -h" for command-specific options.
 `)

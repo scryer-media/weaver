@@ -23,7 +23,7 @@ func TestBuildSummaryReportRequiresCompleteVerifiedPairs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report.Comparisons) != 1 || report.Comparisons[0].Summary.Count != 20 {
+	if len(report.Comparisons) != 1 || report.Comparisons[0].Summary == nil || report.Comparisons[0].Summary.Count != 20 || report.Comparisons[0].Completion.PairedBlocks != 20 {
 		t.Fatalf("unexpected summary report: %#v", report)
 	}
 
@@ -45,6 +45,51 @@ func TestBuildSummaryReportRejectsIncompletePair(t *testing.T) {
 	}
 	if _, err := buildSummaryReport(artifacts, benchmark.Weaver, benchmark.SABnzbd, 2, 17, 100); err == nil {
 		t.Fatal("summary accepted unpaired randomized blocks")
+	}
+}
+
+func TestBuildSummaryReportCountsDidNotFinishBlocks(t *testing.T) {
+	artifacts := make([]benchmark.QueueArtifact, 0, 40)
+	for repetition := 1; repetition <= 20; repetition++ {
+		artifacts = append(artifacts, summaryTestArtifact(benchmark.Weaver, repetition, int64(100+repetition)))
+		if repetition <= 3 {
+			artifacts = append(artifacts, summaryTestDidNotFinishArtifact(benchmark.SABnzbd, repetition))
+		} else {
+			artifacts = append(artifacts, summaryTestArtifact(benchmark.SABnzbd, repetition, int64(80+repetition)))
+		}
+	}
+	report, err := buildSummaryReport(artifacts, benchmark.SABnzbd, benchmark.Weaver, 17, 17, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Comparisons) != 1 {
+		t.Fatalf("unexpected summary report: %#v", report)
+	}
+	comparison := report.Comparisons[0]
+	if comparison.Summary == nil || comparison.Summary.Count != 17 || comparison.ComparisonWithheld != "" {
+		t.Fatalf("did-not-finish blocks were not excluded from the paired summary: %#v", comparison)
+	}
+	want := completionCounts{BlocksObserved: 20, PairedBlocks: 17, BaselineDidNotFinish: 3, CandidateDidNotFinish: 0}
+	if comparison.Completion != want {
+		t.Fatalf("completion counts = %#v, want %#v", comparison.Completion, want)
+	}
+
+	// Below the minimum because of the failures: the stratum stays in the
+	// report with its counts, and the comparison is withheld rather than the
+	// whole summary failing.
+	report, err = buildSummaryReport(artifacts, benchmark.SABnzbd, benchmark.Weaver, 18, 17, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	comparison = report.Comparisons[0]
+	if comparison.Summary != nil || comparison.ComparisonWithheld == "" || comparison.Completion != want {
+		t.Fatalf("stratum short of pairs through failures was not withheld: %#v", comparison)
+	}
+
+	// A did-not-finish artifact must carry the recorded failure.
+	artifacts[1].Jobs[0].Error = ""
+	if _, err := buildSummaryReport(artifacts, benchmark.SABnzbd, benchmark.Weaver, 17, 17, 1_000); err == nil {
+		t.Fatal("summary accepted a did-not-finish artifact without a recorded job failure")
 	}
 }
 
@@ -120,6 +165,22 @@ func mustRead(t *testing.T, path string) []byte {
 	return contents
 }
 
+// summaryTestDidNotFinishArtifact mirrors what the controller writes when the
+// client reaches a terminal failure: status completed_with_dnf, job outcome
+// dnf with its error, no verification and no measurement.
+func summaryTestDidNotFinishArtifact(client benchmark.Client, repetition int) benchmark.QueueArtifact {
+	artifact := summaryTestArtifact(client, repetition, 0)
+	artifact.Status = "completed_with_dnf"
+	artifact.Error = "1 queue job(s) did not finish"
+	artifact.AdapterResult.Jobs[0].TerminalStatus = "failed"
+	artifact.AdapterResult.Jobs[0].TerminalError = "Failed"
+	artifact.Jobs[0].AdapterResult = artifact.AdapterResult.Jobs[0]
+	artifact.Jobs[0].Outcome = "dnf"
+	artifact.Jobs[0].Verification = nil
+	artifact.Jobs[0].Error = "client terminal failure: Failed"
+	return artifact
+}
+
 func summaryTestArtifact(client benchmark.Client, repetition int, measurement int64) benchmark.QueueArtifact {
 	run := benchmark.Run{
 		ID:               fmt.Sprintf("run-%s-%d", client, repetition),
@@ -132,6 +193,7 @@ func summaryTestArtifact(client benchmark.Client, repetition int, measurement in
 		TransportLabel:   "plaintext",
 		Profile:          benchmark.ProfileStock,
 		ServerLink:       benchmark.DefaultServerLinkProfile(),
+		StorageProfile:   benchmark.DefaultStorageProfile(),
 		Repetition:       repetition,
 	}
 	adapterJob := benchmark.QueueJobResult{
@@ -140,13 +202,13 @@ func summaryTestArtifact(client benchmark.Client, repetition int, measurement in
 		TerminalObservationUncertainty:  measurement / 200,
 	}
 	return benchmark.QueueArtifact{
-		SchemaVersion:  6,
+		SchemaVersion:  7,
 		SuiteID:        run.ID,
 		SubmissionMode: benchmark.SubmissionModeSequential,
 		Runs:           []benchmark.Run{run},
 		Status:         "passed",
 		AdapterResult: &benchmark.QueueAdapterResult{
-			SchemaVersion:            5,
+			SchemaVersion:            6,
 			SuiteID:                  run.ID,
 			SubmissionMode:           benchmark.SubmissionModeSequential,
 			Client:                   run.Client,
@@ -157,6 +219,7 @@ func summaryTestArtifact(client benchmark.Client, repetition int, measurement in
 			TLSValidation:            run.TLSValidation,
 			TransportLabel:           run.TransportLabel,
 			ServerLink:               run.ServerLink,
+			StorageProfile:           run.StorageProfile,
 			Jobs:                     []benchmark.QueueJobResult{adapterJob},
 			ClientIdentity:           "sha256:test-" + string(run.Client),
 			ClientVersion:            "test",

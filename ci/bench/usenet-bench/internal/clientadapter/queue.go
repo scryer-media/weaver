@@ -70,7 +70,7 @@ func runQueue(ctx context.Context, cfg Config) error {
 	if input.SubmissionMode == benchmark.SubmissionModeSequential {
 		jobs, err = runSequentialSubmission(ctx, api, cfg.PollInterval, input.Jobs, cpuSampler{docker: container.docker, name: container.name}, cfg, container)
 	} else {
-		jobs, err = runQueuedSubmission(ctx, api, cfg.PollInterval, input.Jobs)
+		jobs, err = runQueuedSubmission(ctx, api, cfg.PollInterval, cfg.JobTimeout, input.Jobs)
 	}
 	if err != nil {
 		return err
@@ -94,7 +94,7 @@ func runQueue(ctx context.Context, cfg Config) error {
 	}
 	metricsCollected = true
 	result := benchmark.QueueAdapterResult{
-		SchemaVersion:            5,
+		SchemaVersion:            6,
 		SuiteID:                  input.SuiteID,
 		SubmissionMode:           input.SubmissionMode,
 		Client:                   cfg.Client,
@@ -105,6 +105,7 @@ func runQueue(ctx context.Context, cfg Config) error {
 		TLSValidation:            cfg.TLSValidation,
 		TransportLabel:           cfg.TransportLabel,
 		ServerLink:               cfg.ServerLink,
+		StorageProfile:           cfg.StorageProfile,
 		QueueStartedAt:           queueStartedAt,
 		QueueCompletedAt:         queueCompletedAt,
 		StatusPollIntervalNanos:  cfg.PollInterval.Nanoseconds(),
@@ -126,17 +127,20 @@ func runQueue(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-func runQueuedSubmission(ctx context.Context, api productAPI, interval time.Duration, inputJobs []benchmark.QueueInputJob) ([]benchmark.QueueJobResult, error) {
+func runQueuedSubmission(ctx context.Context, api productAPI, interval, jobTimeout time.Duration, inputJobs []benchmark.QueueInputJob) ([]benchmark.QueueJobResult, error) {
 	monitorCtx, cancelMonitor := context.WithCancel(ctx)
 	defer cancelMonitor()
 	registrations := make(chan queuedJob, len(inputJobs))
 	monitorResult := make(chan queueMonitorResult, 1)
 	go func() {
-		jobs, err := monitorQueue(monitorCtx, api, interval, registrations)
+		jobs, err := monitorQueue(monitorCtx, api, interval, jobTimeout, registrations)
 		monitorResult <- queueMonitorResult{jobs: jobs, err: err}
 	}()
 	for _, inputJob := range inputJobs {
-		submissionStartedAt := time.Now()
+		// Round(0) strips the monotonic reading so every duration derived here is
+		// computed from the same wall-clock values the JSON artifact carries; the
+		// controller recomputes them from that JSON and demands equality.
+		submissionStartedAt := time.Now().Round(0)
 		jobID, err := api.queue(ctx, inputJob.NZBPath, inputJob.ArchivePassword, queueOptions{
 			submissionName: inputJob.SubmissionName,
 			forceAccept:    inputJob.ForceAccept,
@@ -145,7 +149,7 @@ func runQueuedSubmission(ctx context.Context, api productAPI, interval time.Dura
 			cancelMonitor()
 			return nil, fmt.Errorf("queue %s: %w", inputJob.RunID, err)
 		}
-		acceptedAt := time.Now()
+		acceptedAt := time.Now().Round(0)
 		registrations <- queuedJob{result: benchmark.QueueJobResult{
 			RunID:               inputJob.RunID,
 			JobID:               jobID,
@@ -171,10 +175,10 @@ func runSequentialSubmission(ctx context.Context, api productAPI, interval time.
 		registrations := make(chan queuedJob, 1)
 		monitorResult := make(chan queueMonitorResult, 1)
 		go func() {
-			observed, err := monitorQueue(monitorCtx, api, interval, registrations)
+			observed, err := monitorQueue(monitorCtx, api, interval, cfg.JobTimeout, registrations)
 			monitorResult <- queueMonitorResult{jobs: observed, err: err}
 		}()
-		submissionStartedAt := time.Now()
+		submissionStartedAt := time.Now().Round(0)
 		jobID, err := api.queue(ctx, inputJob.NZBPath, inputJob.ArchivePassword, queueOptions{
 			submissionName: inputJob.SubmissionName,
 			forceAccept:    inputJob.ForceAccept,
@@ -184,7 +188,7 @@ func runSequentialSubmission(ctx context.Context, api productAPI, interval time.
 			_ = instructions.finish()
 			return nil, fmt.Errorf("queue %s: %w", inputJob.RunID, err)
 		}
-		acceptedAt := time.Now()
+		acceptedAt := time.Now().Round(0)
 		registrations <- queuedJob{result: benchmark.QueueJobResult{
 			RunID:               inputJob.RunID,
 			JobID:               jobID,
@@ -236,13 +240,20 @@ type queueMonitorResult struct {
 type trackedQueueJob struct {
 	result         benchmark.QueueJobResult
 	lastObservedAt time.Time
+	lastStatus     string
 	complete       bool
 }
 
+// monitorQueue polls the client for every registered job until each reaches a
+// terminal state or exceeds jobTimeout after acceptance. A job that exceeds
+// the bound is recorded with terminal status "timed_out": the client's own
+// last reported status is kept as the reason, and the controller treats it as
+// did-not-finish exactly like a client-reported failure.
 func monitorQueue(
 	ctx context.Context,
 	api productAPI,
 	interval time.Duration,
+	jobTimeout time.Duration,
 	registrations <-chan queuedJob,
 ) ([]benchmark.QueueJobResult, error) {
 	ticker := time.NewTicker(interval)
@@ -284,7 +295,7 @@ func monitorQueue(
 			if err != nil {
 				return nil, err
 			}
-			observedAt := time.Now()
+			observedAt := time.Now().Round(0)
 			for _, job := range jobs {
 				if job.complete {
 					continue
@@ -298,11 +309,13 @@ func monitorQueue(
 					continue
 				case jobQueued:
 					job.lastObservedAt = observedAt
+					job.lastStatus = observation.status
 				case jobActive:
 					if job.result.ProcessingStartedAt.IsZero() {
 						job.result.ProcessingStartedAt = observedAt
 					}
 					job.lastObservedAt = observedAt
+					job.lastStatus = observation.status
 				case jobComplete:
 					job.result.TerminalStatus = "succeeded"
 					job.result.CompletionAt = observedAt
@@ -327,6 +340,25 @@ func monitorQueue(
 					job.complete = true
 					completed++
 				}
+			}
+			for _, job := range jobs {
+				// QueuedAt is the acceptance instant (the two are equal by
+				// construction) and is what the fixture wall clock is measured
+				// from, so the bound is measured from it as well.
+				if job.complete || observedAt.Before(job.result.QueuedAt.Add(jobTimeout)) {
+					continue
+				}
+				job.result.TerminalStatus = "timed_out"
+				job.result.TerminalError = fmt.Sprintf("no terminal state within %s of acceptance; last reported status %q", jobTimeout, job.lastStatus)
+				job.result.CompletionAt = observedAt
+				job.result.TerminalObservationLowerBound = job.lastObservedAt
+				job.result.TerminalObservedAt = observedAt
+				job.result.TerminalObservationUncertainty = observedAt.Sub(job.lastObservedAt).Nanoseconds()
+				job.result.SubmissionToTerminalNanoseconds = observedAt.Sub(job.result.SubmissionStartedAt).Nanoseconds()
+				job.result.FixtureWallClockNanoseconds = observedAt.Sub(job.result.QueuedAt).Nanoseconds()
+				finishProcessingTiming(&job.result, observedAt, job.result.TerminalStatus)
+				job.complete = true
+				completed++
 			}
 		}
 	}

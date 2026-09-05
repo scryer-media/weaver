@@ -48,6 +48,17 @@ func renderWeaver(cfg Config) productSpec {
 		"WEAVER_INTERMEDIATE_DIR=" + filepath.Join(cfg.ConfigDir, "incomplete"),
 		"WEAVER_COMPLETE_DIR=" + cfg.OutputDir,
 		"WEAVER_CLEANUP_AFTER_EXTRACT=false",
+		// Direct unpack (in-stream extraction of stored archives) is Weaver's
+		// shipping default from the release these benches accompany. It is
+		// rendered explicitly in BOTH profiles so the pinned client binary
+		// benches the product as shipped, and so the audit record shows it.
+		"WEAVER_DIRECT_UNPACK=on",
+		// Weaver holds fresh posts for five minutes before downloading them
+		// (propagation delay). SABnzbd and NZBGet ship with that delay at zero,
+		// and every benchmark NZB is minutes old by construction, so the hold
+		// would measure the poster's clock rather than the client. Disabled
+		// through the documented environment gate; the audit record shows it.
+		"WEAVER_PROPAGATION_DELAY_SECS=0",
 		"WEAVER_SERVER_1_HOSTNAME=" + cfg.NNTPHost,
 		"WEAVER_SERVER_1_PORT=" + cfg.NNTPPort,
 		"WEAVER_SERVER_1_TLS=" + strconv.FormatBool(cfg.NNTPUseTLS),
@@ -55,6 +66,12 @@ func renderWeaver(cfg Config) productSpec {
 		"WEAVER_SERVER_1_PASSWORD=" + cfg.NNTPPassword,
 		"WEAVER_SERVER_1_CONNECTIONS=" + strconv.Itoa(cfg.Connections),
 		"WEAVER_SERVER_1_ACTIVE=true",
+		// A fresh native install trusts no peer until its first-run wizard is
+		// completed from the machine's own browser; loopback is offered the
+		// wizard, not a session. Pinning loopback as trusted from the
+		// environment settles the access policy at startup so the launcher's
+		// anonymous session on 127.0.0.1 is admitted without any wizard step.
+		"WEAVER_TRUSTED_CIDRS=127.0.0.0/8,::1/128",
 	}
 	if cfg.Transport == benchmark.TLS && cfg.TLSValidation == benchmark.TLSCAVerified {
 		env = append(env, "WEAVER_SERVER_1_TLS_CA_CERT="+cfg.NNTPCAFile)
@@ -127,6 +144,12 @@ func renderSABnzbd(cfg Config, directUnpack bool) productSpec {
 	}
 }
 
+// nzbgetSevenZipCommand is the official 7-Zip console binary a native NZBGet
+// install resolves from PATH. The 7z corpus lane needs it, so it is stated
+// rather than left to NZBGet's built-in default: a host without it then fails
+// loudly instead of quietly skipping every 7z unpack.
+const nzbgetSevenZipCommand = "7z"
+
 func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 	_, apiPort, _ := nativeAPIAddress(cfg.APIEndpoint)
 	encryption := "no"
@@ -167,6 +190,7 @@ func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 		"ParCheck=auto",
 		"ParRepair=yes",
 		"Unpack=yes",
+		"SevenZipCmd=" + nzbgetSevenZipCommand,
 		"Server1.Active=yes",
 		"Server1.Name=benchmark",
 		"Server1.Level=0",
@@ -214,7 +238,7 @@ func renderAuditConfig(cfg Config, spec productSpec) []byte {
 	sortStrings(env)
 	command, _ := json.Marshal(spec.Command)
 	return []byte(strings.Join([]string{
-		"schema_version=1",
+		"schema_version=2",
 		"client=" + string(cfg.Client),
 		"archive_toolchain=" + string(cfg.ArchiveToolchain),
 		"archive_toolchain_identity=stock",
@@ -228,6 +252,18 @@ func renderAuditConfig(cfg Config, spec productSpec) []byte {
 		"server_link_scope=" + cfg.ServerLink.Scope,
 		"server_link_egress_bits_per_second=" + strconv.FormatUint(cfg.ServerLink.EgressBitsPerSecond, 10),
 		"server_link_burst_bytes=" + strconv.FormatUint(cfg.ServerLink.BurstBytes, 10),
+		"storage_profile_id=" + cfg.StorageProfile.ID,
+		"storage_kind=" + string(cfg.StorageProfile.Kind),
+		"storage_nfs_link_id=" + cfg.StorageProfile.NFSLinkID,
+		"storage_intermediate_on_nfs=" + strconv.FormatBool(cfg.StorageProfile.IntermediateOnNFS),
+		"storage_complete_on_nfs=" + strconv.FormatBool(cfg.StorageProfile.CompleteOnNFS),
+		"storage_link_bits_per_second=" + strconv.FormatUint(cfg.StorageProfile.LinkBitsPerSecond, 10),
+		"storage_link_burst_bytes=" + strconv.FormatUint(cfg.StorageProfile.LinkBurstBytes, 10),
+		"storage_rtt_micros=" + strconv.FormatUint(cfg.StorageProfile.RTTMicros, 10),
+		"storage_mount_options=" + cfg.StorageProfile.MountOptions,
+		"storage_export_options=" + cfg.StorageProfile.ExportOptions,
+		"storage_shaper=" + cfg.StorageProfile.Shaper,
+		"storage_attestation_scope=" + cfg.StorageProfile.AttestationScope,
 		"api_endpoint=" + cfg.APIEndpoint,
 		"execution=api_service",
 		"archive_password=" + cfg.ArchivePassword,

@@ -1,0 +1,23 @@
+# Start the NNTP server from a pre-seeded image instead of reposting the
+# corpus. Build that image first with `nntpbench seed-image capture`, which
+# prints the tag to put in NNTP_SEED_IMAGE.
+#
+# Layer this on top of the shaper compose file; it changes only the `nntp`
+# service:
+#
+#   docker compose \
+#     -f configs/server/compose-shaper.example.yml \
+#     -f configs/server/compose-seeded.example.yml \
+#     up -d
+#
+# `volumes: !override` requires Docker Compose v2.24 or newer. The override
+# exists because the pre-seeded articles live in the image at /data/articles,
+# and the named `nntp-data` volume would shadow them with an empty (or, worse,
+# stale) directory. The certificate volume is deliberately kept: TLS material
+# is generated per stack and is not part of the cached corpus.
+services:
+  nntp:
+    image: ${NNTP_SEED_IMAGE:?set NNTP_SEED_IMAGE to a tag from `nntpbench seed-image status`}
+    pull_policy: never
+    volumes: !override
+      - nntp-certs:/certs

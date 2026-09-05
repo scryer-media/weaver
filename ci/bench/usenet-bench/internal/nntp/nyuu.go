@@ -49,6 +49,16 @@ type SeedResult struct {
 	NZBPath   string
 	Files     int
 	Articles  int
+	// NZBOrder and NZBOrderSeed record the posting-order axis this seed
+	// realized, so a run artifact can state it without re-reading the fixture.
+	NZBOrder     fixture.NZBOrder `json:",omitempty"`
+	NZBOrderSeed uint64           `json:",omitempty"`
+	// NZBFileOrder is the file order present in the emitted NZB, which for a
+	// withheld-volume fixture includes the files that were never posted.
+	NZBFileOrder []string `json:",omitempty"`
+	// WithheldFiles are listed in the NZB but were never posted, so every
+	// article a client requests for them is refused.
+	WithheldFiles []string `json:",omitempty"`
 }
 
 func BuildNyuuImage(ctx context.Context, config NyuuImageConfig) error {
@@ -88,6 +98,16 @@ func SeedWithNyuu(ctx context.Context, config NyuuSeedConfig) (SeedResult, error
 		return SeedResult{}, err
 	}
 	if err := verifyArchiveFiles(fixtureDir, manifest.ArchiveFiles); err != nil {
+		return SeedResult{}, err
+	}
+	// Withheld volumes are never posted, but their recorded size decides how
+	// many articles the NZB claims for them, so the bytes on disk still have
+	// to match the manifest.
+	if err := verifyArchiveFiles(fixtureDir, manifest.WithheldFiles); err != nil {
+		return SeedResult{}, err
+	}
+	plan, err := newPostingPlan(manifest)
+	if err != nil {
 		return SeedResult{}, err
 	}
 
@@ -131,8 +151,11 @@ func SeedWithNyuu(ctx context.Context, config NyuuSeedConfig) (SeedResult, error
 	if manifest.Case.RequiresPassword() {
 		args = append(args, "--nzb-password", fixture.FixturePassword)
 	}
-	for _, archive := range manifest.ArchiveFiles {
-		args = append(args, "/work/"+filepath.ToSlash(archive.Path))
+	// Nyuu posts in argv order and writes the NZB in that order, so the
+	// declared posting order is expressed here rather than by rewriting the
+	// document afterwards.
+	for _, posted := range plan.Posted {
+		args = append(args, "/work/"+filepath.ToSlash(posted))
 	}
 	if err := runCommand(ctx, config.DockerBinary, args...); err != nil {
 		return SeedResult{}, fmt.Errorf("post fixture %q with Nyuu: %w", manifest.Case.ID, err)
@@ -145,8 +168,26 @@ func SeedWithNyuu(ctx context.Context, config NyuuSeedConfig) (SeedResult, error
 	if err != nil {
 		return SeedResult{}, fmt.Errorf("parse Nyuu NZB %s: %w", nzbPath, err)
 	}
-	if len(document.Files) != len(manifest.ArchiveFiles) {
-		return SeedResult{}, fmt.Errorf("Nyuu NZB has %d files, expected %d archive volumes", len(document.Files), len(manifest.ArchiveFiles))
+	if err := assertNZBFileOrder(document, plan.Posted); err != nil {
+		return SeedResult{}, fmt.Errorf("Nyuu NZB %s: %w", nzbPath, err)
+	}
+	if len(plan.Withheld) > 0 {
+		if document, err = spliceWithheldFiles(document, plan, config.RunID, manifest.Case.ID, config.SegmentBytes); err != nil {
+			return SeedResult{}, fmt.Errorf("describe withheld volumes for %q: %w", manifest.Case.ID, err)
+		}
+		rewritten, err := MarshalNZB(document.Files)
+		if err != nil {
+			return SeedResult{}, fmt.Errorf("rewrite NZB %s: %w", nzbPath, err)
+		}
+		if err := os.WriteFile(nzbPath, rewritten, 0o644); err != nil {
+			return SeedResult{}, fmt.Errorf("write NZB %s: %w", nzbPath, err)
+		}
+		if document, err = UnmarshalNZB(rewritten); err != nil {
+			return SeedResult{}, fmt.Errorf("parse rewritten NZB %s: %w", nzbPath, err)
+		}
+		if err := assertNZBFileOrder(document, plan.Order); err != nil {
+			return SeedResult{}, fmt.Errorf("rewritten NZB %s: %w", nzbPath, err)
+		}
 	}
 	articles := 0
 	for _, file := range document.Files {
@@ -155,7 +196,16 @@ func SeedWithNyuu(ctx context.Context, config NyuuSeedConfig) (SeedResult, error
 	if articles == 0 {
 		return SeedResult{}, fmt.Errorf("Nyuu NZB contains no article segments")
 	}
-	return SeedResult{FixtureID: manifest.Case.ID, NZBPath: nzbPath, Files: len(document.Files), Articles: articles}, nil
+	return SeedResult{
+		FixtureID:     manifest.Case.ID,
+		NZBPath:       nzbPath,
+		Files:         len(document.Files),
+		Articles:      articles,
+		NZBOrder:      manifest.Case.NZBOrder,
+		NZBOrderSeed:  manifest.NZBOrderSeed,
+		NZBFileOrder:  plan.Order,
+		WithheldFiles: sortedPaths(manifest.WithheldFiles),
+	}, nil
 }
 
 func (c NyuuSeedConfig) withDefaults() NyuuSeedConfig {
@@ -243,6 +293,13 @@ func safeID(value string) string {
 }
 
 func messageID(runID, fixtureID string) string {
+	return MessageIDTemplate(runID, fixtureID)
+}
+
+// MessageIDTemplate is the poster's per-article identifier scheme. It is
+// exported because it decides what every article on the server is called, so
+// anything that caches an already-seeded server has to fingerprint it.
+func MessageIDTemplate(runID, fixtureID string) string {
 	return fmt.Sprintf("bench-%s-%s-{0filenum}-{0part}@nntp-bench", safeID(runID), safeID(fixtureID))
 }
 

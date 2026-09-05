@@ -1,0 +1,11 @@
+{
+  "slug": "rar5-hp-recovery-volume-heavy",
+  "title": "E2E.Test.RAR5.HP.RecoveryVolume.Heavy.2026.1080p-TESTGRP",
+  "description": "Four header-encrypted (-hp) RAR5 volumes posted with two RARLAB recovery volumes; the second and fourth data volumes are absent. Encrypted headers hide the volume number, so the restore has to key its slots from the file names before extraction can decrypt the rebuilt set.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "password": "e2e-test-password",
+  "expectedOutputBLAKE3": {
+    "work/payload/E2E Test RAR5 HP RecoveryVolume Heavy.mkv": "78af8d3d61a5cda66a323f790bafb53f2f1bd60b268be7ea6c8a9a855e6f3802"
+  }
+}

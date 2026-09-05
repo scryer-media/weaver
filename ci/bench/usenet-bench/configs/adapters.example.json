@@ -7,7 +7,7 @@
       "target": "docker-linux",
       "command": ["/scratch/nntp-bench-bin/clientadapter"],
       "environment": {
-        "CLIENT_IMAGE": "ghcr.io/scryer-media/weaver@sha256:REPLACE_WITH_POST_REPORT_RELEASE_DIGEST",
+        "CLIENT_IMAGE": "ghcr.io/scryer-media/weaver@sha256:0017cfa177ea0f99fe8ef18365352dfe9087b28dfed41115251e4e205130b646",
         "CLIENT_NETWORK": "nntp-bench_benchmark",
         "CLIENT_PLATFORM": "linux/amd64"
       }

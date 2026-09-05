@@ -40,7 +40,7 @@ sha1 = { version = "0.11", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.11", default-features = false }
 hmac = { version = "0.13", default-features = false }
 aws-lc-rs = { version = "1.18", default-features = false, features = ["non-fips"] }
-aws-lc-sys = { version = "0.44", default-features = false, features = ["all-bindings"] }
+aws-lc-sys = { version = "0.45", default-features = false, features = ["all-bindings"] }
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "password-hash"] }
 getrandom = { version = "0.4", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["std"] }
@@ -88,7 +88,7 @@ zip = { version = "8", default-features = false, features = ["aes-crypto", "defl
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 brotli = { version = "8", default-features = false, features = ["std"] }
 bzip2 = "0.6"
-lzma-rust2 = { version = "0.20.0", default-features = false, features = ["std", "xz"] }
+lzma-rust2 = { version = "0.20.1", default-features = false, features = ["std", "xz"] }
 liblzma = { version = "0.4.8", default-features = false, features = ["static", "parallel"] }
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 age = { version = "0.12", default-features = false }
@@ -112,13 +112,21 @@ windows-sys = { version = "0.61", default-features = false }
 #
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
-par2-rs = { version = "0.8", default-features = false, features = ["native-crypto"] }
+par2-rs = { version = "0.9", default-features = false, features = ["native-crypto"] }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x
 # collapsed to 0. It also avoids reserving a member's declared expanded size
 # before extraction establishes how much output is actually available.
-unrar-rs = { version = "0.7.0", default-features = false, features = ["crypto-aws-lc"] }
+# 0.8 renamed the crate's runtime tuning knobs from `WEAVER_*` to `UNRAR_RS_*`
+# / `RARPAR_*`; weaver sets none of them, so nothing here had to follow.
+# 0.9 reaches extraction through an `Entry` handle (`by_index` and friends)
+# and deprecates the eight pre-0.9 extraction calls; weaver takes its entries
+# through `rar_entry` / `rar_entry_via` in the extraction module, which apply
+# the `ExtractOptions` weaver still carries. 0.9 also poisons a solid archive
+# whose member failed mid-decode instead of reusing the misaligned dictionary,
+# and 0.9.1 restores `-hp` (header-encrypted) RAR5 sets from `.rev` volumes.
+unrar-rs = { version = "0.9.1", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]

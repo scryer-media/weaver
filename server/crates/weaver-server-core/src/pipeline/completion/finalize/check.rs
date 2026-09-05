@@ -1149,6 +1149,10 @@ pub(crate) struct Par2RarOutputRegistration {
     pub(crate) registered: usize,
     /// The RAR sets those volumes belong to.
     pub(crate) set_names: BTreeSet<String>,
+    /// Split 7z parts the NZB never carried, adopted into their set's
+    /// topology. Counted apart from `registered` because nothing about them
+    /// is a RAR plan to invalidate: the topology *is* their plan.
+    pub(crate) sevenz_parts: usize,
 }
 
 pub(in crate::pipeline) fn par2_repair_write_set(
@@ -1698,6 +1702,106 @@ impl Pipeline {
                             && plan.ready_members.is_empty()
                     })
             })
+    }
+
+    /// Whether a split 7z set of this job is waiting on a part the NZB never
+    /// carried.
+    ///
+    /// The 7z counterpart of [`Self::job_has_live_rar_waiting_for_absent_volumes`].
+    /// A 7z split set has no header chain to learn its hole from, so absence is
+    /// read from two places. Either the topology's numbering has a gap — an
+    /// interior `.7z.NNN` no NZB file was ever registered for — or the served
+    /// recovery set describes a part of this set under a name the assembly has
+    /// never heard of and no such file is on disk, which is how a withheld
+    /// *last* part looks: the topology counted the parts it saw and believes the
+    /// set is whole. Both are the shape only recovery blocks can move. Without
+    /// naming it, the job either waits on readiness forever (interior) or
+    /// extracts a truncated set, fails, and never asks PAR2 for the part (last),
+    /// because the strong-decode fast path settles the set as clean first.
+    ///
+    /// Unlike the RAR predicate, this one does not wait for pipeline-quiet.
+    /// The RAR arm needs quiet because its absence is read from *arrivals*:
+    /// mid-download, a waited volume is absent simply because it has not landed
+    /// yet. Both 7z readings are structural instead. The topology's
+    /// `volume_map` is built from every file the NZB carries, complete or not,
+    /// so a numbering gap in it is a part the posting never had; and the
+    /// described-part reading excludes every name the map knows. A part still
+    /// arriving is in the map and so is never mistaken for a hole. Deferring
+    /// to quiet here was a live defect: the data parts of a small posting all
+    /// landed while its recovery file was still in flight, this answered
+    /// `false`, the strong-decode fast path settled the set as clean, and the
+    /// extraction that followed opened a truncated set and failed the job.
+    pub(crate) fn job_has_sevenz_set_waiting_for_absent_volumes(&self, job_id: JobId) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let served_set = self
+            .par2_served_set_id(job_id)
+            .and_then(|set_id| self.par2_set_for(job_id, set_id));
+        state
+            .assembly
+            .archive_topologies()
+            .iter()
+            .filter(|(_, topology)| {
+                topology.archive_type == crate::jobs::assembly::ArchiveType::SevenZip
+            })
+            .any(|(set_name, topology)| {
+                let numbered: HashSet<u32> = topology.volume_map.values().copied().collect();
+                let interior_hole = topology.expected_volume_count.is_some_and(|expected| {
+                    (0..expected).any(|volume| !numbered.contains(&volume))
+                });
+                if interior_hole {
+                    return true;
+                }
+                served_set.is_some_and(|par2_set| {
+                    !Self::absent_described_sevenz_parts(
+                        &state.working_dir,
+                        set_name,
+                        topology,
+                        par2_set,
+                    )
+                    .is_empty()
+                })
+            })
+    }
+
+    /// The parts of one split 7z set that the recovery set describes, the
+    /// set's topology does not list, and the working directory does not hold —
+    /// `(sanitized filename, volume number)`, in volume order.
+    ///
+    /// Names are compared sanitized on both sides because that is the form
+    /// `volume_map` keys take (they are current download filenames) and the
+    /// form the repairer's outputs land under.
+    fn absent_described_sevenz_parts(
+        working_dir: &Path,
+        set_name: &str,
+        topology: &crate::jobs::assembly::ArchiveTopology,
+        par2_set: &par2_rs::Par2FileSet,
+    ) -> Vec<(String, u32)> {
+        let set_key = sanitize_download_filename(set_name);
+        let known: HashSet<String> = topology
+            .volume_map
+            .keys()
+            .map(|name| sanitize_download_filename(name))
+            .collect();
+        let mut absent: Vec<(String, u32)> = par2_set
+            .files
+            .values()
+            .filter_map(|description| {
+                let filename = sanitize_download_filename(&description.filename);
+                let role = weaver_model::files::FileRole::from_filename(&filename);
+                let weaver_model::files::FileRole::SevenZipSplit { number } = role else {
+                    return None;
+                };
+                let base = weaver_model::files::archive_base_name(&filename, &role)?;
+                if sanitize_download_filename(&base) != set_key || known.contains(&filename) {
+                    return None;
+                }
+                (!working_dir.join(&filename).is_file()).then_some((filename, number))
+            })
+            .collect();
+        absent.sort_unstable_by_key(|(_, number)| *number);
+        absent
     }
 
     /// Whether a job currently owns live download-stage work for queue presentation.
@@ -5490,6 +5594,7 @@ impl Pipeline {
         .await;
         // Outputs the NZB never carried have no file id to travel through the
         // refresh set, so their sets are invalidated from the registration.
+        let adopted_sevenz_parts = registration.sevenz_parts;
         self.invalidate_rar_plans_for_repaired_sets(job_id, registration.set_names);
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.refresh_topologies", stage_start);
@@ -5571,7 +5676,15 @@ impl Pipeline {
         // scheduler after its synchronous refresh. Do that before scheduling
         // another completion check, or a stale WaitingForVolumes plan can
         // re-enter PAR2 forever.
-        if has_crc_failures || self.job_has_live_rar_waiting_for_missing_volumes(job_id) {
+        //
+        // A 7z part the repair rebuilt and the topology just adopted is the
+        // same situation in the other archive's terms: the set was short a
+        // part, now is not, and the extraction that was never attempted (or
+        // failed on the truncated set) is what this job is waiting for.
+        if has_crc_failures
+            || adopted_sevenz_parts > 0
+            || self.job_has_live_rar_waiting_for_missing_volumes(job_id)
+        {
             self.retry_archive_extraction_after_verify_or_repair(job_id)
                 .await;
             note_par2_repair_stage(job_id, "par2_repair.finish.retry_extraction", stage_start);
@@ -6227,8 +6340,20 @@ impl Pipeline {
             }
 
             let role = weaver_model::files::FileRole::from_filename(&file.filename);
-            let weaver_model::files::FileRole::RarVolume { volume_number } = role else {
-                continue;
+            let volume_number = match role {
+                weaver_model::files::FileRole::RarVolume { volume_number } => volume_number,
+                weaver_model::files::FileRole::SevenZipSplit { number } => {
+                    if self.adopt_verified_par2_sevenz_part(
+                        job_id,
+                        &file.filename,
+                        &role,
+                        number,
+                    )? {
+                        registration.sevenz_parts += 1;
+                    }
+                    continue;
+                }
+                _ => continue,
             };
             let Some(set_name) = weaver_model::files::archive_base_name(&file.filename, &role)
             else {
@@ -6282,6 +6407,98 @@ impl Pipeline {
             );
         }
         Ok(registration)
+    }
+
+    /// Adopt a `.7z.NNN` part the recovery set proved Complete into its set's
+    /// topology, when the NZB never carried it.
+    ///
+    /// The RAR arm of [`Self::register_verified_par2_rar_outputs`] persists
+    /// header facts and lets the plan rebuild from them. A 7z split set has no
+    /// header chain: its topology is the numbering of the parts the assembly
+    /// registered, which is exactly what a part the NZB never carried is
+    /// missing from. So the part goes straight into the topology — its name
+    /// into `volume_map`, its number marked complete, and the expected count
+    /// raised when it lies past the end, since a withheld *last* part is one
+    /// the topology never counted. `sevenz_set_part_paths` then hands it to the
+    /// extractor off the same map.
+    ///
+    /// `Ok(false)` when the part belongs to no 7z set this job knows, or the
+    /// set already lists it under this or an NZB file's current name. `Err`
+    /// when the verdict says Complete but the bytes are not where the
+    /// description puts them — the same refusal the RAR arm makes.
+    fn adopt_verified_par2_sevenz_part(
+        &mut self,
+        job_id: JobId,
+        filename: &str,
+        role: &weaver_model::files::FileRole,
+        number: u32,
+    ) -> Result<bool, String> {
+        let Some(set_name) = weaver_model::files::archive_base_name(filename, role) else {
+            return Ok(false);
+        };
+        let set_key = sanitize_download_filename(&set_name);
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Ok(false);
+        };
+        let Some(topology_name) = state
+            .assembly
+            .archive_topologies()
+            .iter()
+            .find(|(name, topology)| {
+                topology.archive_type == crate::jobs::assembly::ArchiveType::SevenZip
+                    && sanitize_download_filename(name) == set_key
+            })
+            .map(|(name, _)| name.clone())
+        else {
+            return Ok(false);
+        };
+        let already_listed = state
+            .assembly
+            .archive_topology_for(&topology_name)
+            .is_some_and(|topology| topology.volume_map.contains_key(filename))
+            || state
+                .assembly
+                .files()
+                .any(|file| self.current_filename_for_file(job_id, file) == filename);
+        if already_listed {
+            return Ok(false);
+        }
+        let path = self
+            .resolve_job_input_path(job_id, filename)
+            .ok_or_else(|| {
+                format!("PAR2 verified 7z part {filename} has no active job directory")
+            })?;
+        if !path.is_file() {
+            return Err(format!(
+                "PAR2 verified 7z part {} is missing from staging",
+                path.display()
+            ));
+        }
+        let Some(topology) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|state| state.assembly.archive_topology_for_mut(&topology_name))
+        else {
+            return Ok(false);
+        };
+        topology.volume_map.insert(filename.to_string(), number);
+        topology.complete_volumes.insert(number);
+        let expected = topology
+            .expected_volume_count
+            .map_or(number + 1, |expected| expected.max(number + 1));
+        topology.expected_volume_count = Some(expected);
+        for member in &mut topology.members {
+            member.last_volume = member.last_volume.max(number);
+        }
+        info!(
+            job_id = job_id.0,
+            set_name = %topology_name,
+            part = %filename,
+            volume = number,
+            expected_volumes = expected,
+            "adopted a PAR2-verified 7z part the NZB never carried"
+        );
+        Ok(true)
     }
 
     /// The archive files whose topology must be rebuilt from what a verdict
@@ -6941,14 +7158,38 @@ impl Pipeline {
                 .jobs
                 .get(&job_id)
                 .is_some_and(|state| state.recovery_queue.has_recovery_work()));
+        // Three: the 7z shape of two. A split 7z set has no header chain, so
+        // the scheduler never parks it as WaitingForVolumes and nothing above
+        // names its hole: an interior part missing leaves the topology short
+        // of ready for good, and a missing last part is not even known to be
+        // missing — the topology counted what it saw, extraction opens a
+        // truncated set and fails, and the strong-decode fast path had already
+        // settled the set as clean. The recovery-availability gate is the RAR
+        // arm's: a set with no blocks to spend is short, not repair-ready.
+        let missing_sevenz_volume_par2_repair_ready = par2_may_still_rule
+            && extraction_settled
+            && self.job_has_sevenz_set_waiting_for_absent_volumes(job_id)
+            && (self.par2_served_set_id(job_id).is_some_and(|set_id| {
+                self.recovery_blocks_available_or_targeted(job_id, set_id) > 0
+            }) || self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| state.recovery_queue.has_recovery_work()));
+        let missing_archive_volume_par2_repair_ready =
+            missing_rar_volume_par2_repair_ready || missing_sevenz_volume_par2_repair_ready;
         // 0.8 only: a direct set still taking articles has holes where its
         // outstanding ranges will go, and PAR2 cannot tell a hole from
         // corruption. Declaring a verdict owed while one is filling walks the
         // job into the authoritative branch, which then defers on exactly this
         // condition and returns — so the pass never runs and the escape has
         // achieved nothing but a later re-check.
+        //
+        // Named for the RAR case it was written for; the 7z absent-part arm
+        // rides the same flag because every consumer below wants the same
+        // answer from it — a verdict is owed on an archive set that is short a
+        // volume nothing but recovery blocks can produce.
         let rar_par2_repair_ready = (failed_rar_par2_repair_ready
-            || missing_rar_volume_par2_repair_ready)
+            || missing_archive_volume_par2_repair_ready)
             && self.direct_sets_ready_for_authoritative_par2(job_id);
 
         let par2_primary_payload_ready =
@@ -7046,7 +7287,7 @@ impl Pipeline {
             // files are all present is a case 0.8's quick pass settles on its
             // own — swap correction, and the eager-delete retry frontier — and
             // forcing the authoritative pass there loses both.
-            && !missing_rar_volume_par2_repair_ready
+            && !missing_archive_volume_par2_repair_ready
             && (!described_data_files_incomplete || !download_pipeline_exhausted)
             && clean_par2_integrity_gate_allows_fast_path;
         let needs_completion_repair_evaluation = has_crc_failures

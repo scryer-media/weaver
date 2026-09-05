@@ -6491,11 +6491,16 @@ impl Pipeline {
                     format!("failed to create {}: {error}", destination.display())
                 })?;
                 // The provider is the set's, keyed by the set's own volume
-                // indices, which is what `extract_member_streaming` asks for —
-                // a member starting in volume 3 requests volume 3.
-                archive
-                    .extract_member_streaming(index, &options, &provider, &mut file)
-                    .map_err(|error| format!("failed to extract '{name}': {error}"))?;
+                // indices, which is what the entry asks for — a member
+                // starting in volume 3 requests volume 3.
+                crate::pipeline::extraction::rar_entry_via(
+                    &mut archive,
+                    index,
+                    &provider,
+                    &options,
+                )
+                .and_then(|entry| entry.copy_to(&mut file))
+                .map_err(|error| format!("failed to extract '{name}': {error}"))?;
                 // The tolerated half of the byte account: everything else a
                 // direct set produces is counted at the router as
                 // `direct_store.bytes.member`, and a set whose tolerated bytes

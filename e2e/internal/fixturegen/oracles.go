@@ -114,6 +114,24 @@ func (env *Env) RAR(ctx context.Context, spec RARSpec) error {
 	return env.Docker.Run(ctx, toolchain, env.Work, stageDir, spec.arguments("../"+outputDir)...)
 }
 
+// RARRename renames one archived member in place with RARLAB's own `rn`
+// command. It exists for a single shape: two members whose stored names
+// differ only by case. No host the generator runs on can be relied upon to
+// stage both names — macOS folds case — but the writer stores the pair
+// without complaint once one of them is renamed inside the archive. Single
+// archives only; RARLAB does not modify volume sets.
+func (env *Env) RARRename(ctx context.Context, toolchainID, archive, from, to string) error {
+	toolchain, err := env.Lock.Find(toolchainID)
+	if err != nil {
+		return err
+	}
+	if err := env.Docker.Prepare(ctx, toolchain); err != nil {
+		return err
+	}
+	env.usedToolchain(toolchainID)
+	return env.Docker.Run(ctx, toolchain, env.Work, outputDir, "rn", "-idq", "-y", archive, from, to)
+}
+
 // RARList returns RARLAB's own technical listing of an archive, which is what
 // the shape checks in the tests and the docs quote.
 func (env *Env) RARList(ctx context.Context, toolchainID, relative, password string) (string, error) {

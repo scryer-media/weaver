@@ -1,6 +1,7 @@
-// fixturegen creates the generated RAR corpus. It deliberately contains no
-// network download of fixture data: Docker obtains only the pinned RARLAB tool
-// archive while the deterministic payload is made locally.
+// fixturegen creates the generated archive corpus. It deliberately contains no
+// network download of fixture data: Docker obtains only the pinned RARLAB,
+// PAR2 and 7-Zip tool archives while the deterministic payload is made
+// locally.
 package main
 
 import (
@@ -32,7 +33,7 @@ func (values *repeatedFlag) Set(value string) error {
 func main() {
 	var config generator.Config
 	var fixtureIDs repeatedFlag
-	var bytesPerFile, multiVolumeBytesPerFile, bluRayLargeFile, bluRaySmallFile, directMKVBytes string
+	var bytesPerFile, multiVolumeBytesPerFile, bluRayLargeFile, bluRayMediumFile, bluRaySmallFile, directMKVBytes string
 	var list, directMKV bool
 
 	flag.StringVar(&config.MatrixPath, "matrix", "fixtures/matrix.json", "fixture matrix JSON path")
@@ -40,18 +41,22 @@ func main() {
 	flag.StringVar(&config.DockerfilePath, "dockerfile", "docker/rarlab/Dockerfile", "RARLAB image Dockerfile path")
 	flag.StringVar(&config.PAR2ToolchainPath, "par2-toolchain", "docker/par2/toolchain.json", "source-locked PAR2 generator JSON path")
 	flag.StringVar(&config.PAR2DockerfilePath, "par2-dockerfile", "docker/par2/Dockerfile", "PAR2 generator image Dockerfile path")
+	flag.StringVar(&config.SevenZipToolchainPath, "sevenzip-toolchain", "docker/sevenzip/toolchain.json", "pinned 7-Zip writer JSON path")
+	flag.StringVar(&config.SevenZipDockerfilePath, "sevenzip-dockerfile", "docker/sevenzip/Dockerfile", "7-Zip writer image Dockerfile path")
 	flag.StringVar(&config.OutputDir, "output", "generated", "directory for generated fixtures (never overwritten)")
 	flag.StringVar(&config.DockerBinary, "docker", "docker", "Docker executable")
 	flag.StringVar(&bytesPerFile, "bytes-per-file", "150MiB", "target size for each ordinary movie file")
 	flag.StringVar(&multiVolumeBytesPerFile, "multi-volume-bytes-per-file", "48MiB", "target size for each movie in the multi-input fixture")
 	flag.StringVar(&bluRayLargeFile, "bluray-large-file-bytes", "5GiB", "large media-stream size for bluray-disc fixtures")
+	flag.StringVar(&bluRayMediumFile, "bluray-medium-file-bytes", "96MiB", "menu/extra media-stream size for bluray-disc fixtures")
+	flag.IntVar(&config.BluRayMediumFileCount, "bluray-medium-file-count", 8, "menu/extra media streams for bluray-disc fixtures")
 	flag.StringVar(&bluRaySmallFile, "bluray-small-file-bytes", "128KiB", "small metadata-file size for bluray-disc fixtures")
 	flag.IntVar(&config.BluRaySmallFileCount, "bluray-small-file-count", 512, "small metadata files for bluray-disc fixtures")
 	flag.IntVar(&config.Workers, "workers", 4, "independent fixtures to generate concurrently")
 	flag.BoolVar(&directMKV, "direct-mkv", false, "generate only the direct 200MiB MKV fixture without Docker")
 	flag.StringVar(&directMKVBytes, "direct-mkv-bytes", "200MiB", "payload size for --direct-mkv")
 	flag.Var(&fixtureIDs, "fixture", "one expanded fixture id to generate (repeatable; defaults to all)")
-	flag.BoolVar(&config.BuildImages, "build-images", true, "build source-locked RARLAB and selected PAR2 images before generation")
+	flag.BoolVar(&config.BuildImages, "build-images", true, "build the pinned RARLAB, PAR2 and 7-Zip writer images before generation")
 	flag.BoolVar(&list, "list", false, "print expanded fixture cases and exit")
 	flag.Parse()
 
@@ -95,6 +100,10 @@ func main() {
 	config.BluRayLargeFileBytes, err = parseBytes(bluRayLargeFile)
 	if err != nil {
 		fatal(fmt.Errorf("parse --bluray-large-file-bytes: %w", err))
+	}
+	config.BluRayMediumFileBytes, err = parseBytes(bluRayMediumFile)
+	if err != nil {
+		fatal(fmt.Errorf("parse --bluray-medium-file-bytes: %w", err))
 	}
 	config.BluRaySmallFileBytes, err = parseBytes(bluRaySmallFile)
 	if err != nil {

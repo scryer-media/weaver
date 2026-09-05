@@ -38,9 +38,19 @@ type ShaperSnapshot struct {
 }
 
 func NewShaperExecutionLeaseID() (string, error) {
+	id, err := newExecutionLeaseID()
+	if err != nil {
+		return "", fmt.Errorf("generate shaper execution lease ID: %w", err)
+	}
+	return id, nil
+}
+
+// newExecutionLeaseID is the shared identity for every exclusive benchmark
+// resource lease. A lease is only meaningful if a second run cannot guess it.
+func newExecutionLeaseID() (string, error) {
 	buffer := make([]byte, 32)
 	if _, err := rand.Read(buffer); err != nil {
-		return "", fmt.Errorf("generate shaper execution lease ID: %w", err)
+		return "", err
 	}
 	return hex.EncodeToString(buffer), nil
 }

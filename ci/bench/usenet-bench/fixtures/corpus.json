@@ -20,11 +20,21 @@
     "rar5-5-store-store-nonsolid-none-incompressible",
     "rar5-6-store-store-nonsolid-none-incompressible",
     "rar5-7-store-store-nonsolid-none-compressible",
-    "rar5-7-bluray-normal-solid-none-incompressible",
+    "sevenzip-store-store-nonsolid-none-incompressible",
+    "sevenzip-headers-store-nonsolid-headers-incompressible",
+    "sevenzip-lzma2-normal-solid-none-compressible",
+    "rar5-7-bluray-store-nonsolid-none-incompressible",
+    "rar5-7-bluray-normal-nonsolid-none-incompressible",
     "repair-rar4-par2-par2-light-normal-solid-none-incompressible",
     "repair-rar5-par2-par2-heavy-normal-solid-data-incompressible",
     "repair-rar4-393-recovery-rar-recovery-volume-light-normal-nonsolid-none-incompressible",
     "repair-rar5-recovery-rar-recovery-volume-heavy-normal-solid-headers-incompressible",
+    "repair-rar5-store-par2-par2-light-store-nonsolid-none-incompressible",
+    "repair-rar5-store-withheld-par2-heavy-withheld-store-nonsolid-headers-incompressible",
+    "repair-rar4-store-recovery-rar-recovery-volume-light-store-nonsolid-none-incompressible",
+    "repair-rar5-store-recovery-rar-recovery-volume-heavy-store-nonsolid-none-incompressible",
+    "repair-sevenzip-store-par2-par2-light-store-nonsolid-none-incompressible",
+    "repair-sevenzip-lzma2-par2-par2-heavy-normal-solid-none-incompressible",
     "direct-mkv-200mb"
   ]
 }

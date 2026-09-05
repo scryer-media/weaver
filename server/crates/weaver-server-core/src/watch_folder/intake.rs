@@ -521,7 +521,6 @@ fn extract_rar_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput,
     }
 
     let mut output = IntakeOutput::default();
-    let options = unrar_rs::ExtractOptions::default();
     let metadata = archive.metadata();
     for (idx, member) in metadata.members.iter().enumerate() {
         if member.is_directory || !member.name.to_ascii_lowercase().ends_with(".nzb") {
@@ -534,40 +533,40 @@ fn extract_rar_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput,
                 continue;
             }
         };
-        let extracted = match archive.extract_member(idx, &options, None) {
-            Ok(extracted) => extracted,
-            Err(error) => match rar_member_error(error) {
-                IntakeError::Transient(reason) => return Err(IntakeError::Transient(reason)),
-                IntakeError::Permanent(reason) => {
-                    output.permanent_errors.push(format!(
-                        "failed to extract RAR NZB member {}: {reason}",
-                        member.name
-                    ));
-                    continue;
-                }
-            },
-        };
-        // Ask the aggregate caps before materialising. `extracted.len()` is
-        // free on both `ExtractedMember` variants, so a member that cannot fit
-        // in the remaining budget is rejected without ever being pulled into
-        // memory — otherwise a crafted archive can charge us one full member
-        // of RAM per rejection, up to the member cap. Same rejection and same
-        // stop-processing behaviour as `push_nzb` below, because it is the
-        // same arithmetic.
-        if let Some(rejection) = output.rejection_for(extracted.len() as u64, limit) {
-            output.permanent_errors.push(rejection);
-            break;
-        }
-        let bytes = match extracted.into_bytes() {
-            Ok(bytes) => bytes,
-            Err(error) => {
+        // The entry decodes the member into the crate's spool — memory below
+        // a threshold, a temporary file above it — and this pulls at most one
+        // byte past the per-member cap out of that spool. A member over the
+        // cap is rejected with only that much of it in memory, so a crafted
+        // archive can charge us no more than the cap per rejection, however
+        // large the member decodes to.
+        let mut bytes = Vec::new();
+        let read = archive
+            .by_index(idx)
+            .map_err(rar_member_error)
+            .and_then(|entry| {
+                entry
+                    .take(limit.saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .map_err(rar_entry_read_error)
+            });
+        match read {
+            Ok(_) => {}
+            Err(IntakeError::Transient(reason)) => return Err(IntakeError::Transient(reason)),
+            Err(IntakeError::Permanent(reason)) => {
                 output.permanent_errors.push(format!(
-                    "failed to read RAR NZB member {}: {error}",
+                    "failed to extract RAR NZB member {}: {reason}",
                     member.name
                 ));
                 continue;
             }
-        };
+        }
+        // Ask the aggregate caps before keeping anything. Same rejection and
+        // same stop-processing behaviour as `push_nzb` below, because it is
+        // the same arithmetic.
+        if let Some(rejection) = output.rejection_for(bytes.len() as u64, limit) {
+            output.permanent_errors.push(rejection);
+            break;
+        }
         if bytes.len() as u64 > limit {
             output.permanent_errors.push(format!(
                 "RAR NZB member {} exceeds {limit} bytes",
@@ -663,6 +662,16 @@ fn archive_volume_number(role: &FileRole) -> u32 {
         FileRole::SevenZipSplit { number } => *number,
         FileRole::SplitFile { number } => *number,
         _ => 0,
+    }
+}
+
+/// A failure while reading an entry arrives as an I/O error wrapping the RAR
+/// error the crate raised. Unwrap it before classifying, so a missing volume
+/// is still the transient it is.
+fn rar_entry_read_error(error: io::Error) -> IntakeError {
+    match error.downcast::<unrar_rs::RarError>() {
+        Ok(error) => rar_member_error(error),
+        Err(error) => rar_member_error(unrar_rs::RarError::Io(error)),
     }
 }
 

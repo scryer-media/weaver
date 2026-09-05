@@ -34,6 +34,7 @@ func startContainer(ctx context.Context, cfg Config, spec ProductSpec) (*running
 			return nil, fmt.Errorf("Docker bind path must not contain a comma: %s", path)
 		}
 	}
+	downloadMounts := downloadMounts(cfg, incompleteDir)
 	if spec.NeedsNZBMount && strings.Contains(cfg.NZBPath, ",") {
 		return nil, fmt.Errorf("Docker NZB bind path must not contain a comma: %s", cfg.NZBPath)
 	}
@@ -45,8 +46,9 @@ func startContainer(ctx context.Context, cfg Config, spec ProductSpec) (*running
 		"--network", cfg.Network,
 		"--label", "com.scryer-media.weaver.nntp-bench.run=" + cfg.RunID,
 		"--mount", mount(cfg.ConfigDir, "/config", false),
-		"--mount", mount(incompleteDir, "/downloads/incomplete", false),
-		"--mount", mount(cfg.OutputDir, "/downloads/complete", false),
+	}
+	for _, downloadMount := range downloadMounts {
+		args = append(args, "--mount", downloadMount)
 	}
 	if spec.ExposeAPI {
 		if spec.APIPort < 1 {
@@ -87,6 +89,26 @@ func (container *runningContainer) resolveEndpoint(ctx context.Context, containe
 	}
 	container.endpoint = endpoint
 	return nil
+}
+
+// downloadMounts places the client's intermediate and completion directories
+// on whatever the plan's storage profile declares. The client is given the
+// same two container paths either way, so no product ever sees a benchmark
+// switch: only the mount behind the path changes.
+func downloadMounts(cfg Config, incompleteDir string) []string {
+	incomplete := mount(incompleteDir, "/downloads/incomplete", false)
+	if cfg.IncompleteVolume != "" {
+		incomplete = volumeMount(cfg.IncompleteVolume, "/downloads/incomplete")
+	}
+	complete := mount(cfg.OutputDir, "/downloads/complete", false)
+	if cfg.CompleteVolume != "" {
+		complete = volumeMount(cfg.CompleteVolume, "/downloads/complete")
+	}
+	return []string{incomplete, complete}
+}
+
+func volumeMount(name, destination string) string {
+	return "type=volume,src=" + name + ",dst=" + destination
 }
 
 func mount(source, destination string, readOnly bool) string {

@@ -34,16 +34,42 @@ type comparisonStratum struct {
 	ServerLinkID     string                     `json:"server_link_id"`
 	ServerEgressBPS  uint64                     `json:"server_egress_bits_per_second"`
 	ServerBurstBytes uint64                     `json:"server_burst_bytes"`
+	// StorageProfileID and its link join the stratum key. A local run and an
+	// NFS run measure different questions, so they are never pooled — the same
+	// rule that keeps transports and toolchains apart.
+	StorageProfileID string `json:"storage_profile_id"`
+	StorageNFSLinkID string `json:"storage_nfs_link_id"`
+	StorageLinkBPS   uint64 `json:"storage_link_bits_per_second"`
+	StorageRTTMicros uint64 `json:"storage_rtt_micros"`
 }
 
 type stratifiedComparison struct {
-	Stratum comparisonStratum       `json:"stratum"`
-	Summary benchmark.PairedSummary `json:"summary"`
+	Stratum    comparisonStratum `json:"stratum"`
+	Completion completionCounts  `json:"completion"`
+	// Summary is absent when the stratum has fewer complete pairs than the
+	// minimum because one client did not finish; ComparisonWithheld then says
+	// so. A client that cannot finish a fixture is a result in itself, and
+	// hiding the whole run behind it would hide that result.
+	Summary            *benchmark.PairedSummary `json:"summary,omitempty"`
+	ComparisonWithheld string                   `json:"comparison_withheld,omitempty"`
+}
+
+// completionCounts records, per stratum, how many randomized blocks each
+// client finished. Blocks where either client did not finish (a terminal
+// failure or an output that failed neutral verification) are excluded from the
+// paired timing summary and counted here instead.
+type completionCounts struct {
+	BlocksObserved        int `json:"blocks_observed"`
+	PairedBlocks          int `json:"paired_blocks"`
+	BaselineDidNotFinish  int `json:"baseline_did_not_finish"`
+	CandidateDidNotFinish int `json:"candidate_did_not_finish"`
 }
 
 type comparisonBlock struct {
-	baseline  *float64
-	candidate *float64
+	baseline     *float64
+	candidate    *float64
+	baselineDNF  bool
+	candidateDNF bool
 }
 
 type summaryProductKey struct {
@@ -101,6 +127,31 @@ func summarize(args []string) error {
 	return printJSON(report)
 }
 
+// validateSummaryStorageEvidence fails a summary closed when a published NFS
+// run cannot prove its shaped link, and when a local run carries storage
+// evidence it should never have had.
+func validateSummaryStorageEvidence(artifact benchmark.QueueArtifact, profile benchmark.StorageProfile) error {
+	if err := profile.Validate(); err != nil {
+		return fmt.Errorf("sequential artifact %s has an invalid storage profile: %w", artifact.SuiteID, err)
+	}
+	if profile.Kind == benchmark.StorageLocal {
+		if artifact.StorageAttestation != nil {
+			return fmt.Errorf("local-storage artifact %s unexpectedly carries an NFS attestation", artifact.SuiteID)
+		}
+		return nil
+	}
+	if artifact.StorageAttestation == nil {
+		return fmt.Errorf("storage-shaped artifact %s lacks its NFS attestation", artifact.SuiteID)
+	}
+	if artifact.StorageAttestation.Profile != profile {
+		return fmt.Errorf("storage attestation for %s does not describe the planned storage profile", artifact.SuiteID)
+	}
+	if err := artifact.StorageAttestation.Validate(); err != nil {
+		return fmt.Errorf("storage-shaped artifact %s: %w", artifact.SuiteID, err)
+	}
+	return nil
+}
+
 func parseSingleClient(value string) (benchmark.Client, error) {
 	clients, err := parseClients(strings.TrimSpace(value))
 	if err != nil {
@@ -140,7 +191,7 @@ func loadSequentialArtifacts(root string) ([]benchmark.QueueArtifact, error) {
 					return fmt.Errorf("sequential artifact %s is not bound to the snapshotted plan", path)
 				}
 			}
-			if artifact.Status != "passed" {
+			if !summarizableSequentialStatus(artifact.Status) {
 				return fmt.Errorf("sequential artifact %s is not publishable: status=%s error=%s", path, artifact.Status, artifact.Error)
 			}
 			artifacts = append(artifacts, artifact)
@@ -154,6 +205,14 @@ func loadSequentialArtifacts(root string) ([]benchmark.QueueArtifact, error) {
 		return nil, fmt.Errorf("artifact root %s contains no passed sequential queue artifacts", root)
 	}
 	return artifacts, nil
+}
+
+// summarizableSequentialStatus admits the two statuses that describe a client
+// outcome: "passed" (verified output) and "completed_with_dnf" (the client
+// reached a terminal failure or its output failed verification). "failed"
+// means the harness itself could not run the suite and stays inadmissible.
+func summarizableSequentialStatus(status string) bool {
+	return status == "passed" || status == "completed_with_dnf"
 }
 
 func loadSummaryExecutionContext(root string) (map[string]benchmark.Run, error) {
@@ -217,15 +276,20 @@ func loadSummaryExecutionContext(root string) (map[string]benchmark.Run, error) 
 func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate benchmark.Client, minimumBlocks int, seed int64, resamples int) (summaryReport, error) {
 	groups := make(map[comparisonStratum]map[int]*comparisonBlock)
 	identities := make(map[summaryProductKey]summaryProductIdentity)
+	// One summary describes one storage stratum. Local and NFS runs answer
+	// different questions, so a directory holding both is an operator mistake
+	// and is refused rather than silently split into two comparisons that look
+	// like one report.
+	var storageProfile *benchmark.StorageProfile
 	for _, artifact := range artifacts {
-		if artifact.SchemaVersion != 6 {
-			return summaryReport{}, fmt.Errorf("summary input %s uses queue artifact schema %d, want 6", artifact.SuiteID, artifact.SchemaVersion)
+		if artifact.SchemaVersion != 7 {
+			return summaryReport{}, fmt.Errorf("summary input %s uses queue artifact schema %d, want 7", artifact.SuiteID, artifact.SchemaVersion)
 		}
-		if artifact.Status != "passed" || artifact.SubmissionMode != benchmark.SubmissionModeSequential {
+		if !summarizableSequentialStatus(artifact.Status) || artifact.SubmissionMode != benchmark.SubmissionModeSequential {
 			return summaryReport{}, fmt.Errorf("summary input contains a non-passed sequential artifact %s", artifact.SuiteID)
 		}
-		if artifact.AdapterResult == nil || artifact.AdapterResult.SchemaVersion != 5 {
-			return summaryReport{}, fmt.Errorf("sequential artifact %s lacks queue adapter result schema 5", artifact.SuiteID)
+		if artifact.AdapterResult == nil || artifact.AdapterResult.SchemaVersion != 6 {
+			return summaryReport{}, fmt.Errorf("sequential artifact %s lacks queue adapter result schema 6", artifact.SuiteID)
 		}
 		if len(artifact.Jobs) != 1 {
 			return summaryReport{}, fmt.Errorf("sequential artifact %s contains %d jobs, want exactly one", artifact.SuiteID, len(artifact.Jobs))
@@ -234,7 +298,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 		if len(artifact.Runs) != 1 || artifact.Runs[0].ID != job.Run.ID || artifact.AdapterResult.SuiteID != artifact.SuiteID || len(artifact.AdapterResult.Jobs) != 1 || artifact.AdapterResult.Jobs[0].RunID != job.Run.ID || !reflect.DeepEqual(artifact.AdapterResult.Jobs[0], job.AdapterResult) {
 			return summaryReport{}, fmt.Errorf("sequential artifact %s has inconsistent run or adapter-result identity", artifact.SuiteID)
 		}
-		if artifact.AdapterResult.Client != job.Run.Client || artifact.AdapterResult.ArchiveToolchain != job.Run.ArchiveToolchain || artifact.AdapterResult.ExecutionTarget != job.Run.ExecutionTarget || artifact.AdapterResult.Transport != job.Run.Transport || artifact.AdapterResult.TLSValidation != job.Run.TLSValidation || artifact.AdapterResult.TransportLabel != job.Run.TransportLabel || artifact.AdapterResult.ServerLink != job.Run.ServerLink {
+		if artifact.AdapterResult.Client != job.Run.Client || artifact.AdapterResult.ArchiveToolchain != job.Run.ArchiveToolchain || artifact.AdapterResult.ExecutionTarget != job.Run.ExecutionTarget || artifact.AdapterResult.Transport != job.Run.Transport || artifact.AdapterResult.TLSValidation != job.Run.TLSValidation || artifact.AdapterResult.TransportLabel != job.Run.TransportLabel || artifact.AdapterResult.ServerLink != job.Run.ServerLink || artifact.AdapterResult.StorageProfile != job.Run.StorageProfile {
 			return summaryReport{}, fmt.Errorf("sequential artifact %s has adapter metadata inconsistent with its planned run", artifact.SuiteID)
 		}
 		if job.Run.ServerLink.EgressBitsPerSecond > 0 {
@@ -255,14 +319,31 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 				return summaryReport{}, fmt.Errorf("shaped sequential artifact %s has invalid shaper byte evidence", artifact.SuiteID)
 			}
 		}
+		if err := validateSummaryStorageEvidence(artifact, job.Run.StorageProfile); err != nil {
+			return summaryReport{}, err
+		}
+		if storageProfile == nil {
+			profile := job.Run.StorageProfile
+			storageProfile = &profile
+		} else if *storageProfile != job.Run.StorageProfile {
+			return summaryReport{}, fmt.Errorf("summary inputs mix storage profiles %q and %q; summarize each storage profile separately",
+				storageProfile.ID, job.Run.StorageProfile.ID)
+		}
 		if job.Run.Client != baseline && job.Run.Client != candidate {
 			continue
 		}
-		if job.Outcome != "completed" || job.Verification == nil || job.AdapterResult.SubmissionToTerminalNanoseconds <= 0 {
-			return summaryReport{}, fmt.Errorf("sequential artifact %s contains an unverified or invalid measurement", artifact.SuiteID)
-		}
-		if job.AdapterResult.TerminalObservationUncertainty > job.AdapterResult.SubmissionToTerminalNanoseconds/100 {
-			return summaryReport{}, fmt.Errorf("sequential artifact %s exceeds the 1%% terminal-observation uncertainty limit", artifact.SuiteID)
+		didNotFinish := artifact.Status == "completed_with_dnf"
+		if didNotFinish {
+			if job.Outcome != "dnf" || job.Error == "" {
+				return summaryReport{}, fmt.Errorf("sequential artifact %s reports did-not-finish without a recorded job failure", artifact.SuiteID)
+			}
+		} else {
+			if job.Outcome != "completed" || job.Verification == nil || job.AdapterResult.SubmissionToTerminalNanoseconds <= 0 {
+				return summaryReport{}, fmt.Errorf("sequential artifact %s contains an unverified or invalid measurement", artifact.SuiteID)
+			}
+			if !benchmark.ObservationUncertaintyAcceptable(job.AdapterResult.TerminalObservationUncertainty, job.AdapterResult.SubmissionToTerminalNanoseconds) {
+				return summaryReport{}, fmt.Errorf("sequential artifact %s exceeds the terminal-observation uncertainty limit (%s)", artifact.SuiteID, benchmark.ObservationUncertaintyRule)
+			}
 		}
 		stratum := comparisonStratum{
 			FixtureID:        job.Run.FixtureID,
@@ -275,6 +356,10 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 			ServerLinkID:     job.Run.ServerLink.ID,
 			ServerEgressBPS:  job.Run.ServerLink.EgressBitsPerSecond,
 			ServerBurstBytes: job.Run.ServerLink.BurstBytes,
+			StorageProfileID: job.Run.StorageProfile.ID,
+			StorageNFSLinkID: job.Run.StorageProfile.NFSLinkID,
+			StorageLinkBPS:   job.Run.StorageProfile.LinkBitsPerSecond,
+			StorageRTTMicros: job.Run.StorageProfile.RTTMicros,
 		}
 		if len(artifact.AdapterResult.RenderedConfigSHA256) != 64 {
 			return summaryReport{}, fmt.Errorf("sequential artifact %s lacks a rendered-config SHA-256", artifact.SuiteID)
@@ -305,15 +390,23 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 		}
 		measurement := float64(job.AdapterResult.SubmissionToTerminalNanoseconds)
 		if job.Run.Client == baseline {
-			if block.baseline != nil {
+			if block.baseline != nil || block.baselineDNF {
 				return summaryReport{}, fmt.Errorf("duplicate baseline observation for %+v repetition %d", stratum, job.Run.Repetition)
 			}
-			block.baseline = &measurement
+			if didNotFinish {
+				block.baselineDNF = true
+			} else {
+				block.baseline = &measurement
+			}
 		} else {
-			if block.candidate != nil {
+			if block.candidate != nil || block.candidateDNF {
 				return summaryReport{}, fmt.Errorf("duplicate candidate observation for %+v repetition %d", stratum, job.Run.Repetition)
 			}
-			block.candidate = &measurement
+			if didNotFinish {
+				block.candidateDNF = true
+			} else {
+				block.candidate = &measurement
+			}
 		}
 	}
 
@@ -323,7 +416,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 	}
 	sort.Slice(strata, func(left, right int) bool { return fmt.Sprint(strata[left]) < fmt.Sprint(strata[right]) })
 	report := summaryReport{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Metric:        benchmark.PrimaryMetric,
 		Baseline:      baseline,
 		Candidate:     candidate,
@@ -338,21 +431,43 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 		}
 		sort.Ints(repetitions)
 		samples := make([]benchmark.PairedSample, 0, len(repetitions))
+		completion := completionCounts{BlocksObserved: len(repetitions)}
 		for _, repetition := range repetitions {
 			block := blocks[repetition]
-			if block.baseline == nil || block.candidate == nil {
+			if block.baselineDNF {
+				completion.BaselineDidNotFinish++
+			}
+			if block.candidateDNF {
+				completion.CandidateDidNotFinish++
+			}
+			if (block.baseline == nil && !block.baselineDNF) || (block.candidate == nil && !block.candidateDNF) {
+				// A block with neither a measurement nor a recorded failure for a
+				// client is a run that never happened: an aborted pass, not a
+				// client outcome.
 				return summaryReport{}, fmt.Errorf("incomplete client pair for %+v repetition %d", stratum, repetition)
+			}
+			if block.baseline == nil || block.candidate == nil {
+				continue
 			}
 			samples = append(samples, benchmark.PairedSample{Baseline: *block.baseline, Candidate: *block.candidate})
 		}
+		completion.PairedBlocks = len(samples)
+		comparison := stratifiedComparison{Stratum: stratum, Completion: completion}
 		if len(samples) < minimumBlocks {
-			return summaryReport{}, fmt.Errorf("stratum %+v has %d complete blocks, want at least %d", stratum, len(samples), minimumBlocks)
+			if completion.BaselineDidNotFinish == 0 && completion.CandidateDidNotFinish == 0 {
+				return summaryReport{}, fmt.Errorf("stratum %+v has %d complete blocks, want at least %d", stratum, len(samples), minimumBlocks)
+			}
+			comparison.ComparisonWithheld = fmt.Sprintf("%d paired blocks, want at least %d: %s did not finish %d of %d blocks, %s did not finish %d of %d",
+				len(samples), minimumBlocks, baseline, completion.BaselineDidNotFinish, completion.BlocksObserved, candidate, completion.CandidateDidNotFinish, completion.BlocksObserved)
+			report.Comparisons = append(report.Comparisons, comparison)
+			continue
 		}
 		summary, err := benchmark.SummarizePaired(samples, seed, resamples)
 		if err != nil {
 			return summaryReport{}, fmt.Errorf("summarize stratum %+v: %w", stratum, err)
 		}
-		report.Comparisons = append(report.Comparisons, stratifiedComparison{Stratum: stratum, Summary: summary})
+		comparison.Summary = &summary
+		report.Comparisons = append(report.Comparisons, comparison)
 	}
 	if len(report.Comparisons) == 0 {
 		return summaryReport{}, fmt.Errorf("no strata contain either requested client")

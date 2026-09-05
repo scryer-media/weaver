@@ -23,7 +23,7 @@ libloading = "0.9"
 # NOT a real dependency -- the yEnc codec must not link the PAR2 library, and
 # the workspace entry carries `metal`/`native-crypto` features this needs none
 # of.
-par2-rs = { version = "0.8", default-features = false }
+par2-rs = { version = "0.9", default-features = false }
 
 [[bench]]
 name = "decode_simd"

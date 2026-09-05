@@ -96,6 +96,7 @@ type QueueAdapterResult struct {
 	TLSValidation            TLSValidation     `json:"tls_validation"`
 	TransportLabel           string            `json:"transport_label"`
 	ServerLink               ServerLinkProfile `json:"server_link"`
+	StorageProfile           StorageProfile    `json:"storage_profile"`
 	QueueStartedAt           time.Time         `json:"queue_started_at"`
 	QueueCompletedAt         time.Time         `json:"queue_completed_at"`
 	StatusPollIntervalNanos  int64             `json:"status_poll_interval_nanoseconds"`
@@ -137,6 +138,7 @@ type QueueArtifact struct {
 	ShaperBefore                 *ShaperSnapshot     `json:"shaper_before,omitempty"`
 	ShaperAfter                  *ShaperSnapshot     `json:"shaper_after,omitempty"`
 	ShaperDownstreamBytes        uint64              `json:"shaper_downstream_bytes,omitempty"`
+	StorageAttestation           *StorageAttestation `json:"storage_attestation,omitempty"`
 	Jobs                         []QueueJobArtifact  `json:"jobs,omitempty"`
 	QueueWallClockNanoseconds    int64               `json:"queue_wall_clock_nanoseconds,omitempty"`
 	VerifiedWallClockNanoseconds int64               `json:"verified_wall_clock_nanoseconds,omitempty"`
@@ -160,6 +162,15 @@ func queueJobOutcome(result QueueJobResult) string {
 		return "dnf"
 	}
 	return "completed"
+}
+
+// terminalFailureDescription words a did-not-finish job for the artifact: a
+// failure the client itself reported, or a job the adapter gave up waiting on.
+func terminalFailureDescription(result QueueJobResult) string {
+	if result.TerminalStatus == "timed_out" {
+		return "client did not reach a terminal state: " + result.TerminalError
+	}
+	return "client terminal failure: " + result.TerminalError
 }
 
 type queueSuite struct {
@@ -191,6 +202,9 @@ func executeQueuePlan(ctx context.Context, config RunConfig, mode SubmissionMode
 	}
 	if err := os.MkdirAll(config.ArtifactRoot, 0o755); err != nil {
 		return nil, fmt.Errorf("create artifact root: %w", err)
+	}
+	if config.Plan.StorageProfile.usesNFS() && mode == SubmissionModeQueueDrain {
+		return nil, fmt.Errorf("storage profile %q is not supported by queue-transition; its duplicate-instance verifier requires a locally walkable output tree", config.Plan.StorageProfile.ID)
 	}
 	var suites []queueSuite
 	if mode == SubmissionModeQueueDrain {
@@ -286,7 +300,7 @@ func verifyQueueTransitionArtifact(suite queueSuite, result QueueAdapterResult, 
 		job := jobsByRun[run.ID]
 		artifact := QueueJobArtifact{Run: run, Repair: manifests[run.ID].Repair, AdapterResult: job, Outcome: queueJobOutcome(job)}
 		if job.TerminalStatus != "succeeded" {
-			artifact.Error = "client terminal failure: " + job.TerminalError
+			artifact.Error = terminalFailureDescription(job)
 		}
 		artifacts = append(artifacts, artifact)
 	}
@@ -365,7 +379,7 @@ func verifyQueueTransitionOutputs(fixtureDir, outputDir string, copies int) ([]O
 }
 
 func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuite, mode SubmissionMode) (artifact QueueArtifact) {
-	artifact = QueueArtifact{SchemaVersion: 6, SuiteID: suite.ID, SubmissionMode: mode, Runs: append([]Run(nil), suite.Runs...), Status: "failed"}
+	artifact = QueueArtifact{SchemaVersion: 7, SuiteID: suite.ID, SubmissionMode: mode, Runs: append([]Run(nil), suite.Runs...), Status: "failed"}
 	suiteDir := filepath.Join(config.ArtifactRoot, suite.ID)
 	if err := os.Mkdir(suiteDir, 0o755); err != nil {
 		artifact.Error = fmt.Sprintf("create queue suite directory: %v", err)
@@ -384,14 +398,27 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 		artifact.Error = fmt.Sprintf("create queue client config directory: %v", err)
 		return artifact
 	}
+	store, storage, err := openOutputStore(parent, config, suite.ID, outputDir)
+	if err != nil {
+		artifact.Error = err.Error()
+		return artifact
+	}
+	if storage != nil {
+		defer func() {
+			if closeErr := storage.Close(context.WithoutCancel(parent)); closeErr != nil {
+				appendArtifactError(&artifact.Error, "close storage session: "+closeErr.Error())
+				artifact.Status = "failed"
+			}
+		}()
+	}
 	input := QueueInput{SchemaVersion: 3, SuiteID: suite.ID, SubmissionMode: mode, Jobs: make([]QueueInputJob, 0, len(suite.Runs))}
 	manifests := make(map[string]fixture.GeneratedManifest, len(suite.Runs))
 	fixtureDirs := make(map[string]string, len(suite.Runs))
 	for index, run := range suite.Runs {
 		fixtureDir := filepath.Join(config.FixtureRoot, run.FixtureID)
-		manifest, err := fixture.LoadGeneratedManifest(filepath.Join(fixtureDir, "fixture-manifest.json"))
-		if err != nil {
-			artifact.Error = err.Error()
+		manifest, manifestErr := fixture.LoadGeneratedManifest(filepath.Join(fixtureDir, "fixture-manifest.json"))
+		if manifestErr != nil {
+			artifact.Error = manifestErr.Error()
 			return artifact
 		}
 		nzbPath, err := fixtureNZBPath(fixtureDir, run.FixtureID)
@@ -452,7 +479,7 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 	}
 	resultPath := filepath.Join(suiteDir, "adapter-result.json")
 	logPath := filepath.Join(suiteDir, "adapter.log")
-	if err := invokeQueueAdapter(parent, config, first, adapter, input.Jobs[0].NZBPath, input.Jobs[0].ArchivePassword, outputDir, configDir, resultPath, logPath, inputPath); err != nil {
+	if err := invokeQueueAdapter(parent, config, first, adapter, input.Jobs[0].NZBPath, input.Jobs[0].ArchivePassword, outputDir, configDir, resultPath, logPath, inputPath, store.Environment()); err != nil {
 		artifact.Error = err.Error()
 		return artifact
 	}
@@ -486,6 +513,14 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 		}
 		artifact.ShaperAfter = &shaperAfter
 		artifact.ShaperDownstreamBytes = delivered
+	}
+	if storage != nil {
+		attestation, storageErr := storage.Finish(parent)
+		if storageErr != nil {
+			artifact.Error = storageErr.Error()
+			return artifact
+		}
+		artifact.StorageAttestation = &attestation
 	}
 	artifact.AdapterResult = &result
 	artifact.QueueWallClockNanoseconds = result.QueueCompletedAt.Sub(result.QueueStartedAt).Nanoseconds()
@@ -525,13 +560,13 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 			Outcome:       queueJobOutcome(adapterResult),
 		}
 		if adapterResult.TerminalStatus != "succeeded" {
-			jobArtifact.Error = "client terminal failure: " + adapterResult.TerminalError
+			jobArtifact.Error = terminalFailureDescription(adapterResult)
 			jobFailures = append(jobFailures, fmt.Sprintf("%s: %s", run.ID, jobArtifact.Error))
 			artifact.Jobs = append(artifact.Jobs, jobArtifact)
 			continue
 		}
 		verificationStartedAt := time.Now()
-		verification, err := VerifyOutput(fixtureDirs[run.ID], outputDir)
+		verification, err := store.Verify(parent, fixtureDirs[run.ID])
 		jobArtifact.VerificationWallClockNanoseconds = time.Since(verificationStartedAt).Nanoseconds()
 		if err != nil {
 			jobArtifact.Outcome = "dnf"
@@ -556,7 +591,7 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 	if len(jobFailures) > 0 {
 		jobFailureError = fmt.Sprintf("%d queue job(s) did not finish: %s", len(jobFailures), strings.Join(jobFailures, "; "))
 	}
-	if err := DeleteOutputFiles(outputDir); err != nil {
+	if err := store.Delete(parent); err != nil {
 		artifact.Error = jobFailureError
 		if artifact.Error != "" {
 			artifact.Error += "; "
@@ -576,12 +611,37 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 	return artifact
 }
 
+// ObservationUncertaintyFloorNanos is the absolute allowance on the width of
+// the terminal-observation window. The relative bound alone assumes the
+// window shrinks with the run, but it cannot: it is set by how long the
+// client's own status API takes to answer one poll, which is a property of
+// the product, not of the fixture. On a fast link a 150 MiB fixture finishes
+// in about three seconds, and a status API that answers in 40 ms would then
+// disqualify every run of that client while a 10 ms API passed — a selection
+// bias against the slower API, not a precision gain. The floor admits both
+// equally; the uncertainty itself stays recorded in every artifact.
+const ObservationUncertaintyFloorNanos int64 = 100_000_000
+
+// ObservationUncertaintyRule states the acceptance rule for error messages
+// and documentation.
+const ObservationUncertaintyRule = "1% of the submission-to-terminal duration or 100 ms, whichever is larger"
+
+// ObservationUncertaintyAcceptable reports whether a terminal-observation
+// window of the given width is admissible for a run of the given duration.
+func ObservationUncertaintyAcceptable(uncertaintyNanos, durationNanos int64) bool {
+	limit := durationNanos / 100
+	if limit < ObservationUncertaintyFloorNanos {
+		limit = ObservationUncertaintyFloorNanos
+	}
+	return uncertaintyNanos <= limit
+}
+
 func (r QueueAdapterResult) ValidateFor(suite queueSuite, mode SubmissionMode) error {
-	if r.SchemaVersion != 5 || r.SuiteID != suite.ID || r.SubmissionMode != mode || len(suite.Runs) == 0 {
+	if r.SchemaVersion != 6 || r.SuiteID != suite.ID || r.SubmissionMode != mode || len(suite.Runs) == 0 {
 		return fmt.Errorf("queue adapter result does not match suite %s", suite.ID)
 	}
 	first := suite.Runs[0]
-	if r.Client != first.Client || r.ArchiveToolchain != first.ArchiveToolchain || r.ExecutionTarget != first.ExecutionTarget || r.Transport != first.Transport || r.TLSValidation != first.TLSValidation || r.TransportLabel != first.TransportLabel || r.ServerLink != first.ServerLink {
+	if r.Client != first.Client || r.ArchiveToolchain != first.ArchiveToolchain || r.ExecutionTarget != first.ExecutionTarget || r.Transport != first.Transport || r.TLSValidation != first.TLSValidation || r.TransportLabel != first.TransportLabel || r.ServerLink != first.ServerLink || r.StorageProfile != first.StorageProfile {
 		return fmt.Errorf("queue adapter result does not match suite %s metadata", suite.ID)
 	}
 	if r.QueueStartedAt.IsZero() || r.QueueCompletedAt.IsZero() || r.QueueCompletedAt.Before(r.QueueStartedAt) {
@@ -620,14 +680,14 @@ func (r QueueAdapterResult) ValidateFor(suite queueSuite, mode SubmissionMode) e
 			if !hasObservationTiming {
 				return fmt.Errorf("sequential adapter result for %s lacks terminal observation timing", suite.ID)
 			}
-			if job.SubmissionToTerminalNanoseconds <= 0 || job.TerminalObservationUncertainty > job.SubmissionToTerminalNanoseconds/100 {
-				return fmt.Errorf("sequential adapter result for %s has terminal observation uncertainty above 1%% of submission-to-terminal duration", suite.ID)
+			if job.SubmissionToTerminalNanoseconds <= 0 || !ObservationUncertaintyAcceptable(job.TerminalObservationUncertainty, job.SubmissionToTerminalNanoseconds) {
+				return fmt.Errorf("sequential adapter result for %s has terminal observation uncertainty above %s", suite.ID, ObservationUncertaintyRule)
 			}
 		}
-		if job.TerminalStatus != "succeeded" && job.TerminalStatus != "failed" {
+		if job.TerminalStatus != "succeeded" && job.TerminalStatus != "failed" && job.TerminalStatus != "timed_out" {
 			return fmt.Errorf("queue adapter result for %s contains invalid terminal status", suite.ID)
 		}
-		if job.TerminalStatus == "failed" && strings.TrimSpace(job.TerminalError) == "" {
+		if job.TerminalStatus != "succeeded" && strings.TrimSpace(job.TerminalError) == "" {
 			return fmt.Errorf("queue adapter result for %s omits a terminal failure reason", suite.ID)
 		}
 		if mode == SubmissionModeSequential {

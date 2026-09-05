@@ -190,6 +190,60 @@ fn resolve_rar_dictionary_limit(
     }
 }
 
+/// Take the member at `index` from `archive`, to be extracted under `options`.
+///
+/// unrar-rs 0.9 moved the extraction settings onto the archive: an
+/// [`unrar_rs::Entry`] extracts under the archive's own `verify` and
+/// `restore_owners`, and a password given to the entry overrides the
+/// archive's. Weaver still carries an [`unrar_rs::ExtractOptions`] through its
+/// extraction contexts, so this applies one to the archive before the handle
+/// is taken. The result is exactly what the pre-0.9 calls did with the same
+/// value: those resolved the password as the options' or else the archive's,
+/// which is the override the entry applies.
+pub(crate) fn rar_entry<'a>(
+    archive: &'a mut unrar_rs::RarArchive,
+    index: usize,
+    options: &unrar_rs::ExtractOptions,
+) -> unrar_rs::RarResult<unrar_rs::Entry<'a>> {
+    apply_rar_extract_options(archive, options);
+    let entry = archive.by_index(index)?;
+    Ok(with_rar_options_password(entry, options))
+}
+
+/// [`rar_entry`] for a member whose volumes come from `provider` rather than
+/// from those attached to the archive.
+///
+/// Volumes are addressed in the set's own numbering: a member whose first
+/// segment lives in volume 3 asks the provider for volume 3.
+pub(crate) fn rar_entry_via<'a>(
+    archive: &'a mut unrar_rs::RarArchive,
+    index: usize,
+    provider: &'a dyn unrar_rs::VolumeProvider,
+    options: &unrar_rs::ExtractOptions,
+) -> unrar_rs::RarResult<unrar_rs::Entry<'a>> {
+    apply_rar_extract_options(archive, options);
+    let entry = archive.by_index_via(index, provider)?;
+    Ok(with_rar_options_password(entry, options))
+}
+
+fn apply_rar_extract_options(
+    archive: &mut unrar_rs::RarArchive,
+    options: &unrar_rs::ExtractOptions,
+) {
+    archive.set_verify(options.verify);
+    archive.set_restore_owners(options.restore_owners);
+}
+
+fn with_rar_options_password<'a>(
+    entry: unrar_rs::Entry<'a>,
+    options: &unrar_rs::ExtractOptions,
+) -> unrar_rs::Entry<'a> {
+    match options.password.clone() {
+        Some(password) => entry.with_password(password),
+        None => entry,
+    }
+}
+
 pub(crate) fn apply_server_rar_limits_with_memory_limit(
     archive: &mut unrar_rs::RarArchive,
     extraction_memory_limit: u64,
@@ -655,22 +709,24 @@ impl Pipeline {
         let chunk_records: Result<Vec<(u32, u64)>, unrar_rs::RarError> = if is_solid {
             let shared_ref = Rc::clone(&shared);
             let checkpoint_ref = Arc::clone(&checkpoint);
-            archive
-                .extract_member_solid_chunked(idx, options, |absolute_volume| {
-                    let absolute_volume = u32::try_from(absolute_volume).map_err(|_| {
-                        unrar_rs::RarError::CorruptArchive {
-                            detail: format!(
-                                "solid chunk volume {absolute_volume} does not fit into u32"
-                            ),
-                        }
-                    })?;
-                    Ok(Box::new(DirectOutputWriter {
-                        shared: Some(Rc::clone(&shared_ref)),
-                        bytes_written: 0,
-                        volume_index: absolute_volume,
-                        checkpoint: Some(Arc::clone(&checkpoint_ref)),
-                        phase_attempt: phase_guard.attempt(),
-                    }) as Box<dyn Write>)
+            rar_entry(archive, idx, options)
+                .and_then(|entry| {
+                    entry.copy_to_volumes(|absolute_volume| {
+                        let absolute_volume = u32::try_from(absolute_volume).map_err(|_| {
+                            unrar_rs::RarError::CorruptArchive {
+                                detail: format!(
+                                    "solid chunk volume {absolute_volume} does not fit into u32"
+                                ),
+                            }
+                        })?;
+                        Ok(Box::new(DirectOutputWriter {
+                            shared: Some(Rc::clone(&shared_ref)),
+                            bytes_written: 0,
+                            volume_index: absolute_volume,
+                            checkpoint: Some(Arc::clone(&checkpoint_ref)),
+                            phase_attempt: phase_guard.attempt(),
+                        }) as Box<dyn Write>)
+                    })
                 })
                 .and_then(|records| {
                     records
@@ -689,8 +745,8 @@ impl Pipeline {
                 })
         } else {
             // Keyed by the set's own volume indices, which is the numbering
-            // `extract_member_streaming_chunked` asks the provider for and
-            // reports its chunks against.
+            // `copy_to_volumes` asks the provider for and reports its chunks
+            // against.
             let mut provider_paths = std::collections::HashMap::new();
             for absolute_volume in first_volume..=last_volume {
                 let Some(path) = volume_paths.get(&absolute_volume) else {
@@ -704,20 +760,24 @@ impl Pipeline {
             let provider = BudgetedRarVolumeProvider::new(&provider, Arc::clone(&budget));
             let shared_ref = Rc::clone(&shared);
             let checkpoint_ref = Arc::clone(&checkpoint);
-            archive
-                .extract_member_streaming_chunked(idx, options, &provider, |absolute_volume| {
-                    let volume_index = u32::try_from(absolute_volume).map_err(|_| {
-                        unrar_rs::RarError::CorruptArchive {
-                            detail: format!("chunk volume {absolute_volume} does not fit into u32"),
-                        }
-                    })?;
-                    Ok(Box::new(DirectOutputWriter {
-                        shared: Some(Rc::clone(&shared_ref)),
-                        bytes_written: 0,
-                        volume_index,
-                        checkpoint: Some(Arc::clone(&checkpoint_ref)),
-                        phase_attempt: phase_guard.attempt(),
-                    }) as Box<dyn Write>)
+            rar_entry_via(archive, idx, &provider, options)
+                .and_then(|entry| {
+                    entry.copy_to_volumes(|absolute_volume| {
+                        let volume_index = u32::try_from(absolute_volume).map_err(|_| {
+                            unrar_rs::RarError::CorruptArchive {
+                                detail: format!(
+                                    "chunk volume {absolute_volume} does not fit into u32"
+                                ),
+                            }
+                        })?;
+                        Ok(Box::new(DirectOutputWriter {
+                            shared: Some(Rc::clone(&shared_ref)),
+                            bytes_written: 0,
+                            volume_index,
+                            checkpoint: Some(Arc::clone(&checkpoint_ref)),
+                            phase_attempt: phase_guard.attempt(),
+                        }) as Box<dyn Write>)
+                    })
                 })
                 .and_then(|records| {
                     records
@@ -1255,14 +1315,16 @@ impl Pipeline {
         if archive.is_solid() {
             // The probe wants the decode, not the bytes: a wrong password is
             // detected by verification failing, so the output goes nowhere.
-            // `skip_member_solid` is that exact operation, and it verifies
-            // slightly more than the chunked sink this replaced — it adds the
-            // legacy RAR1.4 stored-member data-hash check on top of the CRC32
-            // and BLAKE2sp both paths run under `verify`. Strictly more
-            // checking on a path whose whole purpose is to reject bad
-            // passwords.
-            archive
-                .skip_member_solid(idx, &options)
+            // `Entry::skip` is that exact operation for a solid member — it
+            // decodes through a sink — and it verifies slightly more than the
+            // chunked sink this replaced: it adds the legacy RAR1.4
+            // stored-member data-hash check on top of the CRC32 and BLAKE2sp
+            // both paths run under `verify`. Strictly more checking on a path
+            // whose whole purpose is to reject bad passwords. Every member of
+            // a solid archive counts as solid to `skip`, the first one
+            // included, so nothing here is passed over undecoded.
+            rar_entry(archive, idx, &options)
+                .and_then(unrar_rs::Entry::skip)
                 .map(|_| ())
                 .map_err(crate::pipeline::RarPasswordAttemptError::from)?;
             return Ok(());
@@ -1270,8 +1332,8 @@ impl Pipeline {
 
         let first_volume = member.volumes.first_volume as u32;
         let last_volume = member.volumes.last_volume as u32;
-        // Keyed by the set's own volume indices: `extract_member_streaming`
-        // asks for the volumes the member's segments name.
+        // Keyed by the set's own volume indices: the entry asks the provider
+        // for the volumes the member's segments name.
         let mut provider_paths = std::collections::HashMap::new();
         for absolute_volume in first_volume..=last_volume {
             let Some(path) = volume_paths.get(&absolute_volume) else {
@@ -1286,18 +1348,18 @@ impl Pipeline {
         let budgeted_provider =
             budget.map(|budget| BudgetedRarVolumeProvider::new(&provider, Arc::clone(budget)));
         let mut sink = std::io::sink();
-        archive
-            .extract_member_streaming(
-                idx,
-                &options,
-                budgeted_provider
-                    .as_ref()
-                    .map(|provider| provider as &dyn unrar_rs::VolumeProvider)
-                    .unwrap_or(&provider),
-                &mut sink,
-            )
-            .map(|_| ())
-            .map_err(crate::pipeline::RarPasswordAttemptError::from)
+        rar_entry_via(
+            archive,
+            idx,
+            budgeted_provider
+                .as_ref()
+                .map(|provider| provider as &dyn unrar_rs::VolumeProvider)
+                .unwrap_or(&provider),
+            &options,
+        )
+        .and_then(|entry| entry.copy_to(&mut sink))
+        .map(|_| ())
+        .map_err(crate::pipeline::RarPasswordAttemptError::from)
     }
 
     pub(crate) fn try_rar_password_candidates<T, F>(

@@ -5,6 +5,7 @@ package clientadapter
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -34,6 +35,9 @@ type Config struct {
 	TransportLabel   string
 	TLSValidation    benchmark.TLSValidation
 	ServerLink       benchmark.ServerLinkProfile
+	StorageProfile   benchmark.StorageProfile
+	CompleteVolume   string
+	IncompleteVolume string
 	FixtureDir       string
 	NZBPath          string
 	QueueInput       *benchmark.QueueInput
@@ -59,6 +63,10 @@ type Config struct {
 	RarparSHA256     string
 	StartupTimeout   time.Duration
 	PollInterval     time.Duration
+	// JobTimeout bounds how long a submitted job may go without reaching a
+	// terminal state. A client that never finishes is a did-not-finish result,
+	// not a reason for the whole pass to wait forever.
+	JobTimeout time.Duration
 }
 
 // ProductSpec is the rendered, client-specific portion of an otherwise
@@ -114,12 +122,20 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if scope := required(getenv, "BENCH_SERVER_LINK_SCOPE"); scope != link.Scope {
 		return Config{}, fmt.Errorf("BENCH_SERVER_LINK_SCOPE %q does not match profile scope %q", scope, link.Scope)
 	}
+	storage, err := parseStorageProfile(required(getenv, "BENCH_STORAGE_PROFILE"))
+	if err != nil {
+		return Config{}, err
+	}
 
 	startupTimeout, err := parseDurationDefault(getenv("CLIENT_STARTUP_TIMEOUT"), 3*time.Minute, "CLIENT_STARTUP_TIMEOUT")
 	if err != nil {
 		return Config{}, err
 	}
 	pollInterval, err := parseDurationDefault(getenv("CLIENT_POLL_INTERVAL"), 10*time.Millisecond, "CLIENT_POLL_INTERVAL")
+	if err != nil {
+		return Config{}, err
+	}
+	jobTimeout, err := parseDurationDefault(getenv("CLIENT_JOB_TIMEOUT"), DefaultJobTimeout, "CLIENT_JOB_TIMEOUT")
 	if err != nil {
 		return Config{}, err
 	}
@@ -132,6 +148,9 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		TransportLabel:   required(getenv, "BENCH_TRANSPORT_LABEL"),
 		TLSValidation:    benchmark.TLSValidation(required(getenv, "BENCH_TLS_VALIDATION")),
 		ServerLink:       link,
+		StorageProfile:   storage,
+		CompleteVolume:   required(getenv, "BENCH_STORAGE_COMPLETE_VOLUME"),
+		IncompleteVolume: required(getenv, "BENCH_STORAGE_INCOMPLETE_VOLUME"),
 		FixtureDir:       required(getenv, "BENCH_FIXTURE_DIR"),
 		NZBPath:          required(getenv, "BENCH_NZB_PATH"),
 		OutputDir:        required(getenv, "BENCH_OUTPUT_DIR"),
@@ -158,6 +177,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		RarparSHA256:    strings.TrimSpace(getenv("CLIENT_RARPAR_SHA256")),
 		StartupTimeout:  startupTimeout,
 		PollInterval:    pollInterval,
+		JobTimeout:      jobTimeout,
 	}
 	for field, value := range map[string]*string{
 		"BENCH_FIXTURE_DIR":    &cfg.FixtureDir,
@@ -220,8 +240,8 @@ func (c Config) Validate() error {
 	if c.Transport != benchmark.Plaintext && c.Transport != benchmark.TLS {
 		return fmt.Errorf("unsupported transport %q", c.Transport)
 	}
-	if c.Connections < 1 || c.StartupTimeout <= 0 || c.PollInterval <= 0 {
-		return fmt.Errorf("connections, startup timeout, and poll interval must be positive")
+	if c.Connections < 1 || c.StartupTimeout <= 0 || c.PollInterval <= 0 || c.JobTimeout <= 0 {
+		return fmt.Errorf("connections, startup timeout, poll interval, and job timeout must be positive")
 	}
 	if (c.Transport == benchmark.TLS) != c.NNTPUseTLS {
 		return fmt.Errorf("BENCH_NNTP_TLS does not match benchmark transport %q", c.Transport)
@@ -262,6 +282,9 @@ func (c Config) Validate() error {
 	if err := c.ServerLink.Validate(); err != nil {
 		return err
 	}
+	if err := c.validateStorage(); err != nil {
+		return err
+	}
 	if !digestPinnedImage(c.Image) {
 		return fmt.Errorf("CLIENT_IMAGE must be digest-pinned (image@sha256:<64 hex characters>)")
 	}
@@ -284,6 +307,49 @@ func (c Config) Validate() error {
 	} {
 		if strings.ContainsAny(value, "\r\n") {
 			return fmt.Errorf("%s must not contain a line break", field)
+		}
+	}
+	return nil
+}
+
+// parseStorageProfile decodes the plan's exact storage contract. Unknown
+// fields are refused: an adapter that silently ignored part of the declared
+// layout would report a run the plan did not describe.
+func parseStorageProfile(raw string) (benchmark.StorageProfile, error) {
+	var profile benchmark.StorageProfile
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&profile); err != nil {
+		return benchmark.StorageProfile{}, fmt.Errorf("decode BENCH_STORAGE_PROFILE: %w", err)
+	}
+	if err := profile.Validate(); err != nil {
+		return benchmark.StorageProfile{}, err
+	}
+	return profile, nil
+}
+
+// validateStorage keeps the adapter honest about where the client's
+// directories live. The controller owns the export, the volumes, and the
+// attestation; the adapter may only mount exactly what it was given.
+func (c Config) validateStorage() error {
+	if err := c.StorageProfile.Validate(); err != nil {
+		return err
+	}
+	if c.StorageProfile.Kind == benchmark.StorageLocal {
+		if c.CompleteVolume != "" || c.IncompleteVolume != "" {
+			return fmt.Errorf("local storage profile must not receive NFS volumes")
+		}
+		return nil
+	}
+	if c.CompleteVolume == "" {
+		return fmt.Errorf("storage profile %q requires BENCH_STORAGE_COMPLETE_VOLUME", c.StorageProfile.ID)
+	}
+	if c.StorageProfile.IntermediateOnNFS != (c.IncompleteVolume != "") {
+		return fmt.Errorf("storage profile %q does not match the supplied intermediate volume", c.StorageProfile.ID)
+	}
+	for _, volume := range []string{c.CompleteVolume, c.IncompleteVolume} {
+		if strings.ContainsAny(volume, ",\r\n") {
+			return fmt.Errorf("Docker volume name must not contain a comma or line break: %q", volume)
 		}
 	}
 	return nil
@@ -316,6 +382,17 @@ func renderWeaver(c Config, _ bool) ProductSpec {
 		"WEAVER_INTERMEDIATE_DIR=/downloads/incomplete",
 		"WEAVER_COMPLETE_DIR=/downloads/complete",
 		"WEAVER_CLEANUP_AFTER_EXTRACT=false",
+		// Direct unpack (in-stream extraction of stored archives) is Weaver's
+		// shipping default from the release these benches accompany. It is
+		// rendered explicitly in BOTH profiles so the pinned image benches the
+		// product as shipped, and so the audit record shows it.
+		"WEAVER_DIRECT_UNPACK=on",
+		// Weaver holds fresh posts for five minutes before downloading them
+		// (propagation delay). SABnzbd and NZBGet ship with that delay at zero,
+		// and every benchmark NZB is minutes old by construction, so the hold
+		// would measure the poster's clock rather than the client. Disabled
+		// through the documented environment gate; the audit record shows it.
+		"WEAVER_PROPAGATION_DELAY_SECS=0",
 		"WEAVER_SERVER_1_HOSTNAME=" + c.NNTPHost,
 		"WEAVER_SERVER_1_PORT=" + c.NNTPPort,
 		"WEAVER_SERVER_1_TLS=" + strconv.FormatBool(c.NNTPUseTLS),
@@ -323,6 +400,15 @@ func renderWeaver(c Config, _ bool) ProductSpec {
 		"WEAVER_SERVER_1_PASSWORD=" + c.NNTPPassword,
 		"WEAVER_SERVER_1_CONNECTIONS=" + strconv.Itoa(c.Connections),
 		"WEAVER_SERVER_1_ACTIVE=true",
+		// Weaver's first-run access policy hands an anonymous browser session
+		// only to peers on its trusted-network list; without one, an install
+		// with no login serves a setup notice and refuses every GraphQL call.
+		// The adapter reaches the container through a port published on the
+		// host's loopback, so inside the container its peer is the bridge
+		// gateway of the private benchmark network — never loopback. Pinning
+		// the list from the environment settles the policy at startup (no
+		// wizard, no bootstrap login) and is confined to that isolated network.
+		"WEAVER_TRUSTED_CIDRS=0.0.0.0/0,::/0",
 	}
 	// The pinned Weaver image honors PUID/PGID just like the LinuxServer
 	// client images. Keeping its bind mounts owned by the invoking benchmark
@@ -426,6 +512,12 @@ func renderSABnzbd(c Config, directUnpack bool) ProductSpec {
 	return ProductSpec{APIPort: 8080, ExposeAPI: true, ConfigName: "sabnzbd.ini", ConfigContent: []byte(content), Environment: environment}
 }
 
+// nzbgetSevenZipCommand names the official 7-Zip console build the pinned
+// LinuxServer NZBGet image ships. The 7z corpus lane depends on it, and
+// stating the absolute path keeps that lane from silently picking up whichever
+// `7z` happens to come first on PATH inside the image.
+const nzbgetSevenZipCommand = "/usr/bin/7zz"
+
 func renderNZBGet(c Config, directUnpack bool) ProductSpec {
 	encryption := "no"
 	verification := "none"
@@ -473,6 +565,7 @@ func renderNZBGet(c Config, directUnpack bool) ProductSpec {
 		"ParRepair=" + parRepair,
 		"Unpack=" + unpack,
 		"UnrarCmd=" + unrarCommand,
+		"SevenZipCmd=" + nzbgetSevenZipCommand,
 		"Extensions=",
 		"Server1.Active=yes",
 		"Server1.Name=benchmark",
@@ -514,7 +607,7 @@ func renderAuditConfig(c Config, spec ProductSpec) []byte {
 		execution = "api_service"
 	}
 	return []byte(strings.Join([]string{
-		"schema_version=1",
+		"schema_version=2",
 		"client=" + string(c.Client),
 		"archive_toolchain=" + string(c.ArchiveToolchain),
 		"archive_toolchain_identity=" + c.archiveToolchainIdentity(),
@@ -530,6 +623,18 @@ func renderAuditConfig(c Config, spec ProductSpec) []byte {
 		"server_link_scope=" + c.ServerLink.Scope,
 		"server_link_egress_bits_per_second=" + strconv.FormatUint(c.ServerLink.EgressBitsPerSecond, 10),
 		"server_link_burst_bytes=" + strconv.FormatUint(c.ServerLink.BurstBytes, 10),
+		"storage_profile_id=" + c.StorageProfile.ID,
+		"storage_kind=" + string(c.StorageProfile.Kind),
+		"storage_nfs_link_id=" + c.StorageProfile.NFSLinkID,
+		"storage_intermediate_on_nfs=" + strconv.FormatBool(c.StorageProfile.IntermediateOnNFS),
+		"storage_complete_on_nfs=" + strconv.FormatBool(c.StorageProfile.CompleteOnNFS),
+		"storage_link_bits_per_second=" + strconv.FormatUint(c.StorageProfile.LinkBitsPerSecond, 10),
+		"storage_link_burst_bytes=" + strconv.FormatUint(c.StorageProfile.LinkBurstBytes, 10),
+		"storage_rtt_micros=" + strconv.FormatUint(c.StorageProfile.RTTMicros, 10),
+		"storage_mount_options=" + c.StorageProfile.MountOptions,
+		"storage_export_options=" + c.StorageProfile.ExportOptions,
+		"storage_shaper=" + c.StorageProfile.Shaper,
+		"storage_attestation_scope=" + c.StorageProfile.AttestationScope,
 		"archive_password=" + c.ArchivePassword,
 		"api_port=" + strconv.Itoa(spec.APIPort),
 		"api_exposed=" + strconv.FormatBool(spec.ExposeAPI),
@@ -572,6 +677,14 @@ func parseUint(value, name string) (uint64, error) {
 	}
 	return parsed, nil
 }
+
+// DefaultJobTimeout is the default bound on a single job's time to a terminal
+// state. It is generous: the largest fixture (a 6 GiB Blu-ray set) completes
+// on every client in a few minutes at 1 Gbit, including the slowest
+// post-processing path over the throttled NFS profile. It exists to turn a
+// client that never finishes into a recorded did-not-finish instead of a
+// stalled pass.
+const DefaultJobTimeout = 20 * time.Minute
 
 func parseDurationDefault(value string, fallback time.Duration, name string) (time.Duration, error) {
 	if strings.TrimSpace(value) == "" {

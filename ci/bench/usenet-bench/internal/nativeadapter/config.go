@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/clientadapter"
 )
 
 const (
@@ -34,6 +35,7 @@ type Config struct {
 	TransportLabel   string
 	TLSValidation    benchmark.TLSValidation
 	ServerLink       benchmark.ServerLinkProfile
+	StorageProfile   benchmark.StorageProfile
 	FixtureDir       string
 	NZBPath          string
 	QueueInput       *benchmark.QueueInput
@@ -54,6 +56,7 @@ type Config struct {
 	ClientVersion    string
 	WorkingDir       string
 	StartupTimeout   time.Duration
+	JobTimeout       time.Duration
 	PollInterval     time.Duration
 }
 
@@ -85,11 +88,19 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if scope := required(getenv, "BENCH_SERVER_LINK_SCOPE"); scope != link.Scope {
 		return Config{}, fmt.Errorf("BENCH_SERVER_LINK_SCOPE %q does not match profile scope %q", scope, link.Scope)
 	}
+	storage, err := parseStorageProfile(required(getenv, "BENCH_STORAGE_PROFILE"))
+	if err != nil {
+		return Config{}, err
+	}
 	startupTimeout, err := parseDurationDefault(getenv("NATIVE_STARTUP_TIMEOUT"), 3*time.Minute, "NATIVE_STARTUP_TIMEOUT")
 	if err != nil {
 		return Config{}, err
 	}
 	pollInterval, err := parseDurationDefault(getenv("NATIVE_POLL_INTERVAL"), 10*time.Millisecond, "NATIVE_POLL_INTERVAL")
+	if err != nil {
+		return Config{}, err
+	}
+	jobTimeout, err := parseDurationDefault(getenv("NATIVE_JOB_TIMEOUT"), clientadapter.DefaultJobTimeout, "NATIVE_JOB_TIMEOUT")
 	if err != nil {
 		return Config{}, err
 	}
@@ -106,6 +117,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		TransportLabel:   required(getenv, "BENCH_TRANSPORT_LABEL"),
 		TLSValidation:    benchmark.TLSValidation(required(getenv, "BENCH_TLS_VALIDATION")),
 		ServerLink:       link,
+		StorageProfile:   storage,
 		FixtureDir:       required(getenv, "BENCH_FIXTURE_DIR"),
 		NZBPath:          required(getenv, "BENCH_NZB_PATH"),
 		OutputDir:        required(getenv, "BENCH_OUTPUT_DIR"),
@@ -125,6 +137,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		ClientVersion:    required(getenv, "NATIVE_CLIENT_VERSION"),
 		WorkingDir:       strings.TrimSpace(getenv("NATIVE_WORKING_DIR")),
 		StartupTimeout:   startupTimeout,
+		JobTimeout:       jobTimeout,
 		PollInterval:     pollInterval,
 	}
 	for field, value := range map[string]*string{
@@ -217,8 +230,18 @@ func (c Config) Validate() error {
 	if err := c.ServerLink.Validate(); err != nil {
 		return err
 	}
-	if c.Connections < 1 || c.StartupTimeout <= 0 || c.PollInterval <= 0 {
-		return fmt.Errorf("connections, startup timeout, and poll interval must be positive")
+	if err := c.StorageProfile.Validate(); err != nil {
+		return err
+	}
+	// The native lanes are local-storage only. Mounting an NFS export needs
+	// the host kernel and root on the operator's own machine, which this
+	// harness will not do; the plan refuses such a combination first, and this
+	// is the second gate in case a plan is executed by hand.
+	if c.StorageProfile.Kind != benchmark.StorageLocal {
+		return fmt.Errorf("native adapter only supports the %q storage profile, got %q", benchmark.StorageProfileLocal, c.StorageProfile.ID)
+	}
+	if c.Connections < 1 || c.StartupTimeout <= 0 || c.PollInterval <= 0 || c.JobTimeout <= 0 {
+		return fmt.Errorf("connections, startup timeout, poll interval, and job timeout must be positive")
 	}
 	if len(c.LaunchCommand) == 0 || strings.TrimSpace(c.LaunchCommand[0]) == "" {
 		return fmt.Errorf("NATIVE_LAUNCH_COMMAND must contain a program path")
@@ -265,6 +288,22 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// parseStorageProfile decodes the plan's exact storage contract. Unknown
+// fields are refused so a native lane can never quietly ignore part of a
+// declared storage layout.
+func parseStorageProfile(raw string) (benchmark.StorageProfile, error) {
+	var profile benchmark.StorageProfile
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&profile); err != nil {
+		return benchmark.StorageProfile{}, fmt.Errorf("decode BENCH_STORAGE_PROFILE: %w", err)
+	}
+	if err := profile.Validate(); err != nil {
+		return benchmark.StorageProfile{}, err
+	}
+	return profile, nil
 }
 
 func nativeAPIAddress(endpoint string) (string, int, error) {

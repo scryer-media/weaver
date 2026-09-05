@@ -218,7 +218,7 @@ func TestSequentialQueueResultLeavesOutputForNeutralVerification(t *testing.T) {
 		InstructionsRetired: UnavailableMeasurement("client_container", "test", "1", "not collected"),
 	}
 	result := QueueAdapterResult{
-		SchemaVersion:            5,
+		SchemaVersion:            6,
 		SuiteID:                  suite.ID,
 		SubmissionMode:           SubmissionModeSequential,
 		Client:                   run.Client,
@@ -229,6 +229,7 @@ func TestSequentialQueueResultLeavesOutputForNeutralVerification(t *testing.T) {
 		TLSValidation:            run.TLSValidation,
 		TransportLabel:           run.TransportLabel,
 		ServerLink:               run.ServerLink,
+		StorageProfile:           run.StorageProfile,
 		QueueStartedAt:           queuedAt,
 		QueueCompletedAt:         completedAt,
 		StatusPollIntervalNanos:  time.Millisecond.Nanoseconds(),
@@ -256,15 +257,33 @@ func TestSequentialQueueResultLeavesOutputForNeutralVerification(t *testing.T) {
 	if err := result.ValidateFor(suite, SubmissionModeSequential); err != nil {
 		t.Fatalf("sequential result that leaves output for neutral verification was rejected: %v", err)
 	}
-	result.Jobs[0].TerminalObservationLowerBound = completedAt.Add(-20 * time.Millisecond)
-	result.Jobs[0].TerminalObservationUncertainty = (20 * time.Millisecond).Nanoseconds()
+	// The run lasts two seconds, so 1 % would be 20 ms; the 100 ms absolute
+	// floor governs here.
+	result.Jobs[0].TerminalObservationLowerBound = completedAt.Add(-100 * time.Millisecond)
+	result.Jobs[0].TerminalObservationUncertainty = (100 * time.Millisecond).Nanoseconds()
 	if err := result.ValidateFor(suite, SubmissionModeSequential); err != nil {
-		t.Fatalf("sequential result at the 1%% observation uncertainty boundary was rejected: %v", err)
+		t.Fatalf("sequential result at the observation uncertainty floor was rejected: %v", err)
 	}
-	result.Jobs[0].TerminalObservationLowerBound = completedAt.Add(-20*time.Millisecond - time.Nanosecond)
-	result.Jobs[0].TerminalObservationUncertainty = (20*time.Millisecond + time.Nanosecond).Nanoseconds()
+	result.Jobs[0].TerminalObservationLowerBound = completedAt.Add(-100*time.Millisecond - time.Nanosecond)
+	result.Jobs[0].TerminalObservationUncertainty = (100*time.Millisecond + time.Nanosecond).Nanoseconds()
 	if err := result.ValidateFor(suite, SubmissionModeSequential); err == nil {
-		t.Fatal("sequential result above the 1% observation uncertainty boundary was accepted")
+		t.Fatal("sequential result above the observation uncertainty floor was accepted")
+	}
+
+	// A job the adapter gave up waiting on is a recorded did-not-finish, and
+	// like a client-reported failure it must carry its reason.
+	result.Jobs[0].TerminalObservationLowerBound = completedAt.Add(-time.Millisecond)
+	result.Jobs[0].TerminalObservationUncertainty = time.Millisecond.Nanoseconds()
+	result.Jobs[0].TerminalStatus = "timed_out"
+	if err := result.ValidateFor(suite, SubmissionModeSequential); err == nil {
+		t.Fatal("timed-out result without a reason was accepted")
+	}
+	result.Jobs[0].TerminalError = "no terminal state within 20m0s of acceptance"
+	if err := result.ValidateFor(suite, SubmissionModeSequential); err != nil {
+		t.Fatalf("timed-out result with a reason was rejected: %v", err)
+	}
+	if queueJobOutcome(result.Jobs[0]) != "dnf" || !strings.Contains(terminalFailureDescription(result.Jobs[0]), "did not reach a terminal state") {
+		t.Fatalf("timed-out job was not recorded as did-not-finish: %#v", result.Jobs[0])
 	}
 }
 

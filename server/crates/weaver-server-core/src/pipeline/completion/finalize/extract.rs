@@ -1501,6 +1501,7 @@ impl Pipeline {
         let set_filenames: std::collections::HashSet<&str> =
             topo.volume_map.keys().map(|s| s.as_str()).collect();
         let mut parts: Vec<(u32, PathBuf)> = Vec::new();
+        let mut listed: HashSet<String> = HashSet::new();
 
         for file_asm in state.assembly.files() {
             let current_filename = self.current_filename_for_file(job_id, file_asm);
@@ -1508,7 +1509,22 @@ impl Pipeline {
                 let vol = topo.volume_map.get(&current_filename).copied().unwrap_or(0);
                 if let Some(path) = self.resolve_job_input_path(job_id, &current_filename) {
                     parts.push((vol, path));
+                    listed.insert(current_filename);
                 }
+            }
+        }
+        // Parts the topology lists that no NZB file answers to: a part PAR2
+        // rebuilt because the post never carried it, adopted into the map by
+        // `adopt_verified_par2_sevenz_part`. Iterating the assembly alone would
+        // hand the extractor the same truncated set the repair just completed.
+        for (filename, vol) in &topo.volume_map {
+            if listed.contains(filename) {
+                continue;
+            }
+            if let Some(path) = self.resolve_job_input_path(job_id, filename)
+                && path.is_file()
+            {
+                parts.push((*vol, path));
             }
         }
         parts.sort_by_key(|(n, _)| *n);

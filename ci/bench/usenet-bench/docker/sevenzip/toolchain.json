@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "sevenzip-26.02",
+  "image": "weaver-nntp-bench-7zip:26.02",
+  "platform": "linux/amd64",
+  "url": "https://www.7-zip.org/a/7z2602-linux-x64.tar.xz",
+  "sha256": "41aaba7b1235304ab5aa0624530c67ae829496cd29e875925271efdccc28c03e",
+  "binary": "7zz",
+  "version": "26.02"
+}

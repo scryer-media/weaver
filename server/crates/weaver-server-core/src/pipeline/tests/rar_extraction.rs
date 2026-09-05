@@ -6295,6 +6295,481 @@ async fn generic_par2_repair_requeues_extraction_for_7z_and_gzip_payloads() {
     }
 }
 
+/// A split 7z set short one part the NZB never carried is repaired from its
+/// recovery blocks and then extracted — for an interior part and for the last
+/// part alike.
+///
+/// Before this, neither shape ever reached PAR2. The interior hole left the
+/// topology short of ready forever, with no predicate naming the absence the
+/// way the RAR scheduler's `WaitingForVolumes` does; the missing last part was
+/// not even known to be missing, so the strong-decode fast path settled the set
+/// as clean and extraction opened a truncated set. And had a repair somehow
+/// run, the rebuilt part sat on disk under a name the assembly had never heard
+/// of, outside the topology and outside `sevenz_set_part_paths`.
+#[tokio::test]
+async fn par2_rebuilds_a_split_7z_part_the_nzb_never_carried_and_extraction_follows() {
+    for (job_id, withheld) in [(JobId(30084), 2usize), (JobId(30085), 6usize)] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let set_name = "generated_split_store_plain.7z";
+        let parts = sevenz_fixture_bytes(set_name);
+        assert_eq!(parts.len(), 7, "fixture has seven parts");
+        let (withheld_name, withheld_bytes) = parts[withheld].clone();
+        let index_filename = "silver_horizon.par2";
+        let recovery_filename = "silver_horizon.vol00+03.par2";
+        let slice_size = 65_536;
+        let described: Vec<(&str, &[u8])> = parts
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let par2_bytes = build_test_par2_index_for_files(&described, slice_size);
+        let recovery_bytes = vec![0xAA; 64];
+
+        // The NZB carries every part but one.
+        let posted: Vec<(String, Vec<u8>)> = parts
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != withheld)
+            .map(|(_, part)| part.clone())
+            .collect();
+        let mut files = posted.clone();
+        files.push((index_filename.to_string(), par2_bytes.clone()));
+        files.push((recovery_filename.to_string(), recovery_bytes.clone()));
+        let working_dir = insert_active_job(
+            &mut pipeline,
+            job_id,
+            rar_job_spec("Silver Horizon Withheld Part", &files),
+        )
+        .await;
+
+        for (file_index, (filename, bytes)) in posted.iter().enumerate() {
+            write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes)
+                .await;
+        }
+        let index_file = posted.len() as u32;
+        let recovery_file = index_file + 1;
+        write_and_complete_file(
+            &mut pipeline,
+            job_id,
+            index_file,
+            index_filename,
+            &par2_bytes,
+        )
+        .await;
+        write_and_complete_file(
+            &mut pipeline,
+            job_id,
+            recovery_file,
+            recovery_filename,
+            &recovery_bytes,
+        )
+        .await;
+        // A full part spans three 64 KiB slices, so three recovery blocks
+        // cover whichever part is withheld.
+        install_test_par2_runtime(
+            &mut pipeline,
+            job_id,
+            build_repairable_par2_set_for_files(&described, slice_size, 3),
+            &[
+                (index_file, index_filename, 0, false),
+                (recovery_file, recovery_filename, 3, true),
+            ],
+        );
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state.recovery_queue = DownloadQueue::new();
+        }
+
+        assert!(
+            pipeline.job_has_sevenz_set_waiting_for_absent_volumes(job_id),
+            "withheld part {withheld} should read as an absent 7z volume"
+        );
+        assert!(!working_dir.join(&withheld_name).exists());
+
+        pipeline.check_job_completion(job_id).await;
+
+        assert_eq!(
+            pipeline.par2_repairer_execute_calls, 1,
+            "the absent part routes the job to a PAR2 repair"
+        );
+        assert_eq!(
+            std::fs::read(working_dir.join(&withheld_name)).unwrap(),
+            withheld_bytes,
+            "the repair rebuilt the withheld part byte for byte"
+        );
+        {
+            let state = pipeline.jobs.get(&job_id).unwrap();
+            let topology = state
+                .assembly
+                .archive_topology_for(set_name)
+                .expect("7z topology");
+            assert_eq!(
+                topology.volume_map.get(&withheld_name).copied(),
+                Some(withheld as u32),
+                "the rebuilt part is adopted into the topology"
+            );
+            assert_eq!(topology.expected_volume_count, Some(7));
+            assert!(topology.complete_volumes.contains(&(withheld as u32)));
+        }
+        assert!(
+            pipeline
+                .sevenz_set_part_paths(job_id, set_name)
+                .unwrap()
+                .iter()
+                .any(|path| path.ends_with(&withheld_name)),
+            "the extractor is handed the rebuilt part"
+        );
+        assert!(!pipeline.job_has_sevenz_set_waiting_for_absent_volumes(job_id));
+
+        // The repair tail spawns the extraction itself; a queued completion
+        // check is the other road to the same place.
+        for _ in 0..3 {
+            if matches!(
+                job_status_for_assert(&pipeline, job_id),
+                Some(JobStatus::Extracting | JobStatus::QueuedExtract)
+            ) {
+                break;
+            }
+            let queued = pipeline
+                .pending_completion_checks
+                .pop_front()
+                .expect("a completion check should be queued after repair");
+            pipeline.check_job_completion(queued).await;
+        }
+        match next_extraction_done(&mut pipeline).await {
+            ExtractionDone::FullSet {
+                set_name: done_set,
+                result,
+                ..
+            } => {
+                assert_eq!(done_set, set_name);
+                let outcome = result.expect("the whole set extracts");
+                assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+                assert!(!outcome.extracted.is_empty());
+            }
+            _ => panic!("expected full-set extraction after the 7z part was rebuilt"),
+        }
+    }
+}
+
+/// The live ordering of a small posting: every data part and the index land
+/// while the recovery file is still parked, so the completion pass runs with
+/// the download pipeline not yet quiet. The absent part is structural — the
+/// NZB never carried it — so the pass must not settle the set as clean and
+/// hand a truncated archive to the extractor; it has to reach for the
+/// recovery blocks. Then, once the recovery file lands, the part is rebuilt.
+#[tokio::test]
+async fn a_split_7z_short_of_a_part_the_nzb_never_carried_is_not_settled_clean_before_its_recovery_lands()
+ {
+    for (job_id, withheld) in [(JobId(30087), 2usize), (JobId(30088), 6usize)] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let set_name = "generated_split_store_plain.7z";
+        let parts = sevenz_fixture_bytes(set_name);
+        let (withheld_name, withheld_bytes) = parts[withheld].clone();
+        let index_filename = "silver_horizon.par2";
+        let recovery_filename = "silver_horizon.vol00+03.par2";
+        let slice_size = 65_536;
+        let described: Vec<(&str, &[u8])> = parts
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let par2_bytes = build_test_par2_index_for_files(&described, slice_size);
+        let recovery_bytes = vec![0xAA; 64];
+
+        let posted: Vec<(String, Vec<u8>)> = parts
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != withheld)
+            .map(|(_, part)| part.clone())
+            .collect();
+        let mut files = posted.clone();
+        files.push((index_filename.to_string(), par2_bytes.clone()));
+        files.push((recovery_filename.to_string(), recovery_bytes.clone()));
+        let working_dir = insert_active_job(
+            &mut pipeline,
+            job_id,
+            rar_job_spec("Silver Horizon Parked Recovery", &files),
+        )
+        .await;
+
+        for (file_index, (filename, bytes)) in posted.iter().enumerate() {
+            write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes)
+                .await;
+        }
+        let index_file = posted.len() as u32;
+        let recovery_file = index_file + 1;
+        write_and_complete_file(
+            &mut pipeline,
+            job_id,
+            index_file,
+            index_filename,
+            &par2_bytes,
+        )
+        .await;
+        install_test_par2_runtime(
+            &mut pipeline,
+            job_id,
+            build_repairable_par2_set_for_files(&described, slice_size, 3),
+            &[
+                (index_file, index_filename, 0, false),
+                (recovery_file, recovery_filename, 3, false),
+            ],
+        );
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state.recovery_queue = DownloadQueue::new();
+            state.recovery_queue.push(DownloadWork {
+                segment_id: SegmentId {
+                    file_id: NzbFileId {
+                        job_id,
+                        file_index: recovery_file,
+                    },
+                    segment_number: 0,
+                },
+                message_id: MessageId::new("parked-7z-recovery@example.com"),
+                groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+                priority: 1000,
+                byte_estimate: 64,
+                retry_count: 0,
+                is_recovery: true,
+                completion_critical: false,
+                exclude_servers: Vec::new(),
+                avoid_server: None,
+            });
+        }
+        // The pipeline is not quiet: a decode is still in flight.
+        pipeline.active_decodes_by_job.insert(job_id, 1);
+
+        assert!(
+            pipeline.job_has_sevenz_set_waiting_for_absent_volumes(job_id),
+            "withheld part {withheld} is a structural absence, quiet or not"
+        );
+
+        pipeline.check_job_completion(job_id).await;
+
+        assert!(
+            !pipeline.par2_verified.contains(&job_id),
+            "withheld part {withheld}: the set must not be settled clean; {}",
+            debug_job_state(&pipeline, job_id)
+        );
+        assert!(
+            !matches!(
+                job_status_for_assert(&pipeline, job_id),
+                Some(JobStatus::Failed { .. } | JobStatus::Complete)
+            ),
+            "withheld part {withheld}: {}",
+            debug_job_state(&pipeline, job_id)
+        );
+        assert!(
+            !working_dir.join(&withheld_name).exists(),
+            "nothing can rebuild the part before the recovery file lands"
+        );
+        assert_eq!(pipeline.par2_repairer_execute_calls, 0);
+
+        // The recovery file lands and the pipeline goes quiet.
+        pipeline.active_decodes_by_job.remove(&job_id);
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state.recovery_queue = DownloadQueue::new();
+        }
+        write_and_complete_file(
+            &mut pipeline,
+            job_id,
+            recovery_file,
+            recovery_filename,
+            &recovery_bytes,
+        )
+        .await;
+        install_test_par2_runtime(
+            &mut pipeline,
+            job_id,
+            build_repairable_par2_set_for_files(&described, slice_size, 3),
+            &[
+                (index_file, index_filename, 0, false),
+                (recovery_file, recovery_filename, 3, true),
+            ],
+        );
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state.recovery_queue = DownloadQueue::new();
+        }
+
+        pipeline.check_job_completion(job_id).await;
+
+        assert_eq!(
+            pipeline.par2_repairer_execute_calls,
+            1,
+            "withheld part {withheld}: the absent part routes the job to a PAR2 repair; {}",
+            debug_job_state(&pipeline, job_id)
+        );
+        assert_eq!(
+            std::fs::read(working_dir.join(&withheld_name)).unwrap(),
+            withheld_bytes,
+            "the repair rebuilt the withheld part byte for byte"
+        );
+        assert!(!pipeline.job_has_sevenz_set_waiting_for_absent_volumes(job_id));
+    }
+}
+
+/// A four-volume set whose two file members sanitize to one destination
+/// on a case-folding filesystem: `CERTIFICATE/BACKUP/id.bdmv` and
+/// `CERTIFICATE/backup/id.bdmv`.
+fn build_case_colliding_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
+    let first = b"first-of-two-names-for-one-path";
+    let second = b"second-of-two-names-for-one-path";
+    let members = [
+        (
+            "CERTIFICATE/BACKUP/id.bdmv",
+            &first[..],
+            &first[..12],
+            &first[12..],
+        ),
+        (
+            "CERTIFICATE/backup/id.bdmv",
+            &second[..],
+            &second[..12],
+            &second[12..],
+        ),
+    ];
+    let mut volumes = Vec::new();
+    for (member_index, (name, whole, head, tail)) in members.iter().enumerate() {
+        let crc = checksum::crc32(whole);
+        let open_volume = member_index * 2;
+        let close_volume = open_volume + 1;
+
+        let mut open = Vec::new();
+        open.extend_from_slice(&TEST_RAR5_SIG);
+        open.extend_from_slice(&build_test_rar_main_header(
+            if open_volume == 0 {
+                0x0001
+            } else {
+                0x0001 | 0x0002
+            },
+            (open_volume > 0).then_some(open_volume as u64),
+        ));
+        open.extend_from_slice(&build_test_rar_file_header(
+            name,
+            0x0010,
+            head.len() as u64,
+            whole.len() as u64,
+            None,
+        ));
+        open.extend_from_slice(head);
+        open.extend_from_slice(&build_test_rar_end_header(true));
+        volumes.push((format!("show.part{:02}.rar", open_volume + 1), open));
+
+        let last = member_index + 1 == members.len();
+        let mut close = Vec::new();
+        close.extend_from_slice(&TEST_RAR5_SIG);
+        close.extend_from_slice(&build_test_rar_main_header(
+            0x0001 | 0x0002,
+            Some(close_volume as u64),
+        ));
+        close.extend_from_slice(&build_test_rar_file_header(
+            name,
+            0x0008,
+            tail.len() as u64,
+            whole.len() as u64,
+            Some(crc),
+        ));
+        close.extend_from_slice(tail);
+        close.extend_from_slice(&build_test_rar_end_header(!last));
+        volumes.push((format!("show.part{:02}.rar", close_volume + 1), close));
+    }
+    volumes
+}
+
+/// Two file members that sanitize to one destination are refused at open, and
+/// that refusal has to end the job — not send it round again.
+///
+/// The refusal is raised by `ensure_unique_sanitized_rar_member_paths` before
+/// any member is extracted, so the batch worker's error is the archive's
+/// structure, not a member's bytes. Nothing about a retry can change it: no
+/// re-download, no PAR2 verdict, no header refresh. Left classified as an
+/// ordinary member failure, a job with no PAR2 set re-scheduled the same
+/// members straight back into the same open — `set_failed_extraction_member`
+/// only latches a member out while PAR2 still owes a verdict — and spun
+/// extract/refuse/re-schedule as fast as the worker pool allowed.
+#[tokio::test]
+async fn colliding_member_paths_fail_the_job_instead_of_respinning_extraction() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30086);
+    let files = build_case_colliding_multivolume_rar_set();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Silver Horizon Colliding Members", &files),
+    )
+    .await;
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+
+    pipeline.check_job_completion(job_id).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 6).await;
+
+    let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {
+        panic!(
+            "a colliding archive must fail the job\n{}",
+            debug_job_state(&pipeline, job_id)
+        );
+    };
+    assert!(
+        error.contains("colliding sanitized member path"),
+        "the failure names the collision: {error}"
+    );
+    // The first name reaches the disk before the second is even visible:
+    // it becomes extractable once two volumes are down, and an archive opened
+    // at that point has one started member and nothing to collide with. The
+    // second name is what the open refuses, every time.
+    assert!(
+        pipeline
+            .extracted_members
+            .get(&job_id)
+            .is_none_or(|members| !members.contains("CERTIFICATE/backup/id.bdmv")),
+        "the refused member must never have been extracted"
+    );
+}
+
+/// The terminal classification is keyed on the exact prefixes the open-time
+/// checks produce. Anything a retry or a repair could still turn around —
+/// a member CRC, a stale topology, FD pressure, a member whose *name* merely
+/// contains one of the phrases — stays on its existing path.
+#[test]
+fn terminal_archive_structure_classification_matches_only_open_time_refusals() {
+    assert!(Pipeline::is_terminal_archive_structure_error(
+        "RAR archive contains colliding sanitized member path: CERTIFICATE/backup/id.bdmv"
+    ));
+    assert!(Pipeline::is_terminal_archive_structure_error(
+        "unsafe RAR member path: ../escape.mkv"
+    ));
+
+    for error in [
+        "checksum mismatch for member show.mkv",
+        "crc mismatch extracting show.mkv",
+        "member not found in archive: show.mkv",
+        "RAR volume show.part02.rar unavailable",
+        "no on-disk rar volumes for set show",
+        "Too many open files (os error 24)",
+        "failed to extract member colliding sanitized member path.mkv",
+        "failed to extract member unsafe RAR member path.mkv",
+        "",
+    ] {
+        assert!(
+            !Pipeline::is_terminal_archive_structure_error(error),
+            "must stay non-terminal: {error:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn no_par2_retry_reclassifies_obfuscated_rar_redownload_as_7z() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -10565,5 +11040,326 @@ async fn restore_rebuilds_layout_keys_for_an_old_numbering_rar4_set() {
         pipeline.rar_member_refresh_request(job_id, "silver.horizon", "silver.horizon.mkv"),
         None,
         "a restored, fully-present set owes no coverage refresh"
+    );
+}
+
+/// Fill in the CRC16 of every RAR4 block in `bytes`. The shared fixture
+/// builders leave it zero because weaver's own parser only warns on a
+/// mismatch; the recovery restorer's validity probe does not, and a set
+/// written to exercise it has to be one it would accept.
+fn with_rar4_header_crcs(mut bytes: Vec<u8>) -> Vec<u8> {
+    let mut offset = TEST_RAR4_SIG.len();
+    while offset + 7 <= bytes.len() {
+        let flags = u16::from_le_bytes([bytes[offset + 3], bytes[offset + 4]]);
+        let header_size = u16::from_le_bytes([bytes[offset + 5], bytes[offset + 6]]) as usize;
+        let data_size = if flags & 0x8000 != 0 {
+            u32::from_le_bytes([
+                bytes[offset + 7],
+                bytes[offset + 8],
+                bytes[offset + 9],
+                bytes[offset + 10],
+            ]) as usize
+        } else {
+            0
+        };
+        let crc = (checksum::crc32(&bytes[offset + 2..offset + header_size]) & 0xFFFF) as u16;
+        bytes[offset..offset + 2].copy_from_slice(&crc.to_le_bytes());
+        offset += header_size + data_size;
+    }
+    bytes
+}
+
+/// A RAR3 standalone recovery volume for `volumes`: the set's RS parity over
+/// every data volume, padded to the longest, followed by the 7-byte footer
+/// (`data-1`, `rec-1`, `position-1`, CRC32) a new-style `.rev` carries and the
+/// restorer reads its geometry from.
+fn single_recovery_volume_for_rar4_set(volumes: &[&[u8]]) -> Vec<u8> {
+    let width = volumes.iter().map(|volume| volume.len()).max().unwrap_or(0);
+    let coder = reedsolomon_rs::rar3::Rar3RsCoder::new(1).expect("one recovery volume");
+    let mut rev = Vec::with_capacity(width + 7);
+    let mut column = vec![0u8; volumes.len()];
+    let mut parity = [0u8; 1];
+    for position in 0..width {
+        for (slot, volume) in column.iter_mut().zip(volumes) {
+            *slot = volume.get(position).copied().unwrap_or(0);
+        }
+        coder.encode(&column, &mut parity);
+        rev.push(parity[0]);
+    }
+    rev.push((volumes.len() - 1) as u8);
+    rev.push(0);
+    rev.push(0);
+    let crc = checksum::crc32(&rev);
+    rev.extend_from_slice(&crc.to_le_bytes());
+    rev
+}
+
+/// An old-numbering RAR4 set of four volumes whose volume 2 was never posted,
+/// plus one `.rev` that can rebuild it. The job's files are volumes 0, 1 and 3
+/// and the recovery volume, every one of them downloaded and complete, and
+/// the set is left waiting on the hole. Returns the member's payload.
+async fn stage_old_numbering_rar4_set_with_a_recovery_volume(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    job_name: &str,
+) -> Vec<u8> {
+    let payload: Vec<u8> = (0..4096u32)
+        .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let volumes: Vec<(String, Vec<u8>)> =
+        single_member_rar4_old_numbering_set("silver.horizon", "silver.horizon.mkv", &payload, 4)
+            .into_iter()
+            .map(|(filename, bytes)| (filename, with_rar4_header_crcs(bytes)))
+            .collect();
+    let volume_bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let rev = single_recovery_volume_for_rar4_set(&volume_bytes);
+
+    let mut files: Vec<(String, Vec<u8>)> = volumes
+        .iter()
+        .enumerate()
+        .filter(|(volume, _)| *volume != 2)
+        .map(|(_, file)| file.clone())
+        .collect();
+    files.push(("silver.horizon.rev".to_string(), rev));
+    insert_active_job(pipeline, job_id, rar_job_spec(job_name, &files)).await;
+    for (index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(pipeline, job_id, index as u32, filename, bytes).await;
+    }
+
+    let state = pipeline
+        .rar_sets
+        .get(&(job_id, "silver.horizon".to_string()))
+        .expect("the downloaded volumes register the set");
+    assert!(
+        !state.volume_files.contains_key(&2),
+        "volume 2 is the hole this fixture exists for"
+    );
+    assert!(
+        state
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.waiting_on_volumes.contains(&2)),
+        "the set waits on the hole before the restore: {:?}",
+        state.plan
+    );
+    payload
+}
+
+#[tokio::test]
+async fn invalidating_a_rar_snapshot_forgets_the_persisted_copy_too() {
+    // `load_rar_snapshot` falls back to the database when the in-memory copy
+    // is gone. Clearing only `cached_headers` therefore invalidated nothing:
+    // the next recompute quietly rebuilt from the persisted snapshot.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90221);
+    let files = build_multifile_multivolume_rar_set();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Snapshot Invalidation", &files),
+    )
+    .await;
+    for (index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, index as u32, filename, bytes).await;
+    }
+    assert!(pipeline.load_rar_snapshot(job_id, "show").is_some());
+
+    pipeline
+        .rar_sets
+        .get_mut(&(job_id, "show".to_string()))
+        .unwrap()
+        .cached_headers = None;
+    assert!(
+        pipeline.load_rar_snapshot(job_id, "show").is_some(),
+        "dropping the in-memory copy alone still serves the persisted snapshot"
+    );
+
+    pipeline.invalidate_rar_snapshot(job_id, "show");
+    assert!(pipeline.load_rar_snapshot(job_id, "show").is_none());
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .assembly
+            .archive_topology_for("show")
+            .is_some(),
+        "invalidation keeps the topology; only the header view is forgotten"
+    );
+}
+
+#[tokio::test]
+async fn a_recovery_volume_restore_rebuilds_the_set_from_disk_and_extracts_the_member() {
+    // Bench run 2026-09-04, job 10000: the restore wrote volume 2, but the
+    // recompute after it rebuilt from the header snapshot persisted while the
+    // set still had the hole. The plan it produced put the member in volume 0
+    // alone, extraction was handed that one volume, and the decode ran out of
+    // bits at its end. The rebuild after a restore has to read the disk.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90222);
+    let job_name = "Silver Horizon Recovery Volume";
+    let payload =
+        stage_old_numbering_rar4_set_with_a_recovery_volume(&mut pipeline, job_id, job_name).await;
+    let key = (job_id, "silver.horizon".to_string());
+    let stale_snapshot = pipeline
+        .load_rar_snapshot(job_id, "silver.horizon")
+        .expect("the incomplete set persisted a header snapshot");
+
+    // The completion checkpoint is what reaches for the recovery volume once
+    // downloads are exhausted and the set is still waiting on a hole. The
+    // fixture committed its segments directly, so empty the queue the way a
+    // finished download pass would have.
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .drain_all();
+    pipeline.check_job_completion(job_id).await;
+
+    let state = pipeline.rar_sets.get(&key).expect("set state");
+    assert_eq!(
+        state.volume_files.get(&2).map(String::as_str),
+        Some("silver.horizon.r01"),
+        "the restore registers the rebuilt volume under its layout number: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert!(state.facts.contains_key(&2));
+    let fresh_snapshot = pipeline
+        .load_rar_snapshot(job_id, "silver.horizon")
+        .expect("the rebuild after the restore persists a fresh snapshot");
+    assert_ne!(fresh_snapshot, stale_snapshot);
+    let plan = state.plan.as_ref().expect("plan");
+    assert!(
+        plan.waiting_on_volumes.is_empty(),
+        "nothing is missing once the hole is rebuilt: {plan:?}"
+    );
+    let member = plan
+        .topology
+        .members
+        .iter()
+        .find(|member| member.name == "silver.horizon.mkv")
+        .expect("member");
+    assert_eq!(
+        (member.first_volume, member.last_volume),
+        (0, 3),
+        "the rebuilt topology spans every volume, the restored one included"
+    );
+
+    drive_extractions_to_terminal(&mut pipeline, job_id, 8).await;
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        ),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
+    let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(job_name));
+    assert_eq!(
+        std::fs::read(dest.join("silver.horizon.mkv")).unwrap(),
+        payload,
+        "the member extracted through the restored volume is byte-exact"
+    );
+}
+
+#[tokio::test]
+async fn a_source_retry_keeps_a_restored_recovery_volume_registered() {
+    // The second half of the same bench failure: after the botched extraction
+    // the source retry cleared the set, and the rebuild that followed only
+    // saw the assembly's files. The restored volume was still on disk, but
+    // nothing registered it any more — "volume 2 unavailable: not registered"
+    // — and the set went back to waiting on a hole it had already filled.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90223);
+    stage_old_numbering_rar4_set_with_a_recovery_volume(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon Recovery Volume Retry",
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+    assert!(
+        pipeline
+            .try_restore_rar_recovery_volumes(job_id)
+            .await
+            .expect("restore runs"),
+        "the recovery volume rebuilds the hole"
+    );
+    let key = (job_id, "silver.horizon".to_string());
+    assert_eq!(
+        pipeline.rar_sets[&key]
+            .volume_files
+            .get(&2)
+            .map(String::as_str),
+        Some("silver.horizon.r01")
+    );
+
+    pipeline.clear_archive_set_for_source_retry(job_id, "silver.horizon");
+
+    let state = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("the restored volume keeps the set registered across the retry");
+    assert_eq!(
+        state.volume_files.get(&2).map(String::as_str),
+        Some("silver.horizon.r01")
+    );
+    assert!(state.facts.contains_key(&2));
+    assert!(
+        !state.volume_files.contains_key(&0) && !state.volume_files.contains_key(&3),
+        "downloaded volumes are the retry's to re-register: {:?}",
+        state.volume_files
+    );
+    assert!(state.plan.is_none());
+    assert!(
+        pipeline
+            .load_rar_snapshot(job_id, "silver.horizon")
+            .is_none()
+    );
+    assert!(
+        pipeline
+            .volume_paths_for_rar_set(job_id, "silver.horizon")
+            .contains_key(&2),
+        "the rebuild's volume view still reaches the restored file"
+    );
+    let persisted = pipeline.db.load_all_rar_volume_facts(job_id).unwrap();
+    assert_eq!(
+        persisted
+            .get("silver.horizon")
+            .map(|rows| rows.iter().map(|(volume, _)| *volume).collect::<Vec<_>>()),
+        Some(vec![2]),
+        "the restored volume's facts survive the retry's ledger reset"
+    );
+
+    // The retry's re-downloads re-register the NZB volumes one by one; with the
+    // restored volume still known, the set comes back whole rather than waiting
+    // on a hole it already filled.
+    resume_job_downloading_for_test(&mut pipeline, job_id);
+    for file_index in 0..3u32 {
+        pipeline
+            .refresh_archive_state_for_completed_file(
+                job_id,
+                NzbFileId { job_id, file_index },
+                true,
+            )
+            .await;
+        drain_rar_refreshes(&mut pipeline).await;
+    }
+    let plan = pipeline.rar_sets[&key]
+        .plan
+        .as_ref()
+        .expect("re-registration rebuilds the plan");
+    assert!(
+        plan.waiting_on_volumes.is_empty(),
+        "the set is whole again: {plan:?}"
+    );
+    assert_eq!(
+        plan.topology.complete_volumes,
+        HashSet::from([0, 1, 2, 3]),
+        "the rebuilt topology counts the restored volume"
     );
 }
