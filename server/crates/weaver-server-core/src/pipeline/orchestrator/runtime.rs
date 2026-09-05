@@ -278,6 +278,14 @@ impl Pipeline {
             #[cfg(test)]
             par2_authoritative_bytes_read: Vec::new(),
             #[cfg(test)]
+            par2_session_opens: 0,
+            #[cfg(test)]
+            par2_session_source_scan_passes: 0,
+            #[cfg(test)]
+            par2_session_recovery_merges: 0,
+            #[cfg(test)]
+            par2_repairs_from_parked_verdict: 0,
+            #[cfg(test)]
             par2_repairer_execute_calls: 0,
             #[cfg(test)]
             stateful_par2_session_forced: None,

@@ -1542,6 +1542,43 @@ pub(super) struct Par2SetRuntime {
     /// re-reading the whole recovery set on every lap forever. Reset wherever
     /// a verdict is taken or reopened.
     pub(super) post_verdict_reconcile_attempts: u32,
+    /// The damaged-path verdict this set parked on while its targeted recovery
+    /// downloaded, so the entry that finds the recovery landed can repair on it
+    /// instead of paying for the same authoritative read again.
+    ///
+    /// In-memory only, and deliberately so: a restart has no analysis to stand
+    /// on and takes the ordinary path.
+    pub(super) pending_repair: Option<PendingPar2Repair>,
+}
+
+/// A "repair required" verdict held across the wait for targeted recovery.
+///
+/// The analysis that produced it read every damaged file and named every
+/// damaged slice. Recovery arriving afterwards cannot change any of that — a
+/// recovery volume carries no source bytes — so the only number the next pass
+/// would learn is how much recovery is now available, which the repair pass
+/// computes from the merged set itself. Holding the verdict is what lets that
+/// pass be the repair rather than a second read of the same files.
+///
+/// The identity fields are the guard: the verdict describes *this* recovery set
+/// over *these* described files at *this* slice size, and is refused the moment
+/// any of them moves. It says nothing about the bytes on disk, and does not
+/// need to — par2-rs re-proves every repair input against its own scan-time
+/// fingerprints and falls back to a fresh scan when one has drifted, so a
+/// verdict trusted here can cost a re-read but never a wrong repair.
+pub(super) struct PendingPar2Repair {
+    pub(super) recovery_set_id: par2_rs::RecoverySetId,
+    pub(super) slice_size: u64,
+    /// Files the set described when the verdict was reached. A metadata merge
+    /// that adds or drops a description invalidates the verdict.
+    pub(super) described_file_ids: Vec<par2_rs::FileId>,
+    /// Recovery blocks the repair needs, and the damage it answers.
+    pub(super) blocks_needed: u32,
+    pub(super) damaged: u32,
+    /// The analysis result the repair pass is owed: it decides what the repair
+    /// is allowed to leave parked, and which files the post-repair read-back
+    /// has to re-read rather than carry.
+    pub(super) verification: par2_rs::VerificationResult,
 }
 
 /// A positive authoritative binding whose PAR2 slice CRCs make streamed MD5
@@ -2661,6 +2698,25 @@ pub struct Pipeline {
     /// and a perf probe; a test needs it as a number it can bound.
     #[cfg(test)]
     pub(super) par2_authoritative_bytes_read: Vec<u64>,
+    /// Retained PAR2 sessions this pipeline has opened. One session per set for
+    /// a whole verify/repair ladder is the point of retaining them at all, and
+    /// this is the only number that says whether a ladder actually got one.
+    #[cfg(test)]
+    pub(super) par2_session_opens: usize,
+    /// The largest `source_scan_passes` any retained session has reported.
+    /// Together with [`Self::par2_session_opens`] this bounds how many times a
+    /// ladder read its sources: one open reporting one pass is one read.
+    #[cfg(test)]
+    pub(super) par2_session_source_scan_passes: u32,
+    /// Landed recovery volumes merged into a retained session rather than
+    /// rebuilding it, which is what keeps a parked analysis alive across the
+    /// wait for targeted recovery.
+    #[cfg(test)]
+    pub(super) par2_session_recovery_merges: usize,
+    /// Repairs that ran on a parked damaged-path verdict instead of analysing
+    /// the set again.
+    #[cfg(test)]
+    pub(super) par2_repairs_from_parked_verdict: usize,
     /// Forces the retained-session gate on or off for a test, so a
     /// differential can run both arms without mutating a process-global
     /// environment variable while other tests are running.
