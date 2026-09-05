@@ -2092,6 +2092,7 @@ fn clone_nntp_error(error: &NntpError) -> NntpError {
         NntpError::PoolExhausted => NntpError::PoolExhausted,
         NntpError::PoolShutdown => NntpError::PoolShutdown,
         NntpError::SoftTimeout(seconds) => NntpError::SoftTimeout(*seconds),
+        NntpError::AcquireTimeout(seconds) => NntpError::AcquireTimeout(*seconds),
         NntpError::QuotaBlocked(rejection) => NntpError::QuotaBlocked(rejection.clone()),
         NntpError::BodyNotRequestedDueToQuota {
             preceding_rejection,
@@ -2145,6 +2146,7 @@ fn is_transient(err: &NntpError) -> bool {
             | NntpError::TooManyConnections
             | NntpError::PoolExhausted
             | NntpError::SoftTimeout(_)
+            | NntpError::AcquireTimeout(_)
     )
 }
 

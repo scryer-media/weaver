@@ -131,7 +131,102 @@ func TestPlanRejectsWarmOrDuplicateRun(t *testing.T) {
 	}
 }
 
+// TestPlanClientExclusionsDropOnlyTheNamedLane covers a client the plan
+// deliberately does not run on one fixture: its lane disappears from that
+// fixture's blocks and nowhere else, the plan validates against the reduced
+// count, and the exclusion is persisted with its reason.
+func TestPlanClientExclusionsDropOnlyTheNamedLane(t *testing.T) {
+	exclusion := ClientExclusion{Client: SABnzbd, FixtureID: "recovery-volume", Reason: "does not use .rev recovery volumes"}
+	options := PlanOptions{
+		FixtureIDs:        []string{"recovery-volume", "plain"},
+		Clients:           []Client{Weaver, SABnzbd, NZBGet},
+		ArchiveToolchains: []ArchiveToolchain{VanillaArchiveToolchain},
+		Transports:        []Transport{TLS},
+		Targets:           []ExecutionTarget{DockerLinux},
+		Profile:           ProfileStock,
+		Repetitions:       3,
+		Seed:              5,
+		ClientExclusions:  []ClientExclusion{exclusion},
+	}
+	plan, err := BuildPlan(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 3 clients × 2 fixtures × 3 repetitions, minus the 3 excluded blocks.
+	if got, want := len(plan.Runs), 15; got != want {
+		t.Fatalf("runs = %d, want %d", got, want)
+	}
+	perFixtureClient := map[string]map[Client]int{}
+	for _, run := range plan.Runs {
+		if perFixtureClient[run.FixtureID] == nil {
+			perFixtureClient[run.FixtureID] = map[Client]int{}
+		}
+		perFixtureClient[run.FixtureID][run.Client]++
+	}
+	if perFixtureClient["recovery-volume"][SABnzbd] != 0 || perFixtureClient["recovery-volume"][Weaver] != 3 || perFixtureClient["plain"][SABnzbd] != 3 {
+		t.Fatalf("exclusion did not remove exactly the named lane: %#v", perFixtureClient)
+	}
+	if !reflect.DeepEqual(plan.ClientExclusions, []ClientExclusion{exclusion}) {
+		t.Fatalf("exclusion was not persisted: %#v", plan.ClientExclusions)
+	}
+	if err := plan.Validate(); err != nil {
+		t.Fatalf("plan with exclusion rejected: %v", err)
+	}
+	if recorded, ok := ClientExclusionFor(plan.ClientExclusions, SABnzbd, "recovery-volume"); !ok || recorded != exclusion {
+		t.Fatalf("ClientExclusionFor = %#v, %v", recorded, ok)
+	}
+	if _, ok := ClientExclusionFor(plan.ClientExclusions, SABnzbd, "plain"); ok {
+		t.Fatal("ClientExclusionFor matched a fixture that is not excluded")
+	}
+
+	// A plan that schedules an excluded pair anyway, or that lost its
+	// exclusion record, no longer validates.
+	tampered := plan
+	tampered.ClientExclusions = nil
+	if err := tampered.Validate(); err == nil {
+		t.Fatal("plan short of its excluded runs validated without the exclusion record")
+	}
+	scheduled := plan
+	scheduled.Runs = append([]Run(nil), plan.Runs...)
+	for index := range scheduled.Runs {
+		if scheduled.Runs[index].FixtureID == "recovery-volume" && scheduled.Runs[index].Client == Weaver {
+			scheduled.Runs[index].Client = SABnzbd
+			break
+		}
+	}
+	if err := scheduled.Validate(); err == nil {
+		t.Fatal("plan scheduling an excluded client on its fixture validated")
+	}
+
+	for name, bad := range map[string]ClientExclusion{
+		"no reason":          {Client: SABnzbd, FixtureID: "plain"},
+		"undeclared client":  {Client: "other", FixtureID: "plain", Reason: "x"},
+		"undeclared fixture": {Client: SABnzbd, FixtureID: "missing", Reason: "x"},
+	} {
+		options := options
+		options.ClientExclusions = []ClientExclusion{bad}
+		if _, err := BuildPlan(options); err == nil {
+			t.Fatalf("%s exclusion was accepted", name)
+		}
+	}
+	repeated := options
+	repeated.ClientExclusions = []ClientExclusion{exclusion, exclusion}
+	if _, err := BuildPlan(repeated); err == nil {
+		t.Fatal("repeated exclusion was accepted")
+	}
+	everyone := options
+	everyone.ClientExclusions = []ClientExclusion{
+		{Client: Weaver, FixtureID: "plain", Reason: "x"},
+		{Client: SABnzbd, FixtureID: "plain", Reason: "x"},
+		{Client: NZBGet, FixtureID: "plain", Reason: "x"},
+	}
+	if _, err := BuildPlan(everyone); err == nil {
+		t.Fatal("a fixture with every client excluded was accepted")
+	}
+}
+
 func TestDefaultProfilesMakeSABTLSExplicitlyUnverified(t *testing.T) {
+
 	plan, err := BuildPlan(PlanOptions{
 		FixtureIDs:  []string{"fixture"},
 		Clients:     []Client{Weaver, SABnzbd, NZBGet},

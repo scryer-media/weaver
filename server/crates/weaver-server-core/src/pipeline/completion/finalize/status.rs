@@ -180,6 +180,11 @@ impl Pipeline {
         job_id: JobId,
         reason: &'static str,
     ) {
+        // An in-flight probe both keeps the job in `Checking` (an early return
+        // below) and counts as pending pipeline work, so it would swallow this
+        // drain notification entirely. It has nothing left to say once the
+        // segments have settled.
+        self.retire_health_probe_if_download_pipeline_drained(job_id);
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };

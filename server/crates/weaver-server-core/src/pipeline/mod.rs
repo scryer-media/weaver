@@ -1018,9 +1018,12 @@ impl DownloadFailure {
         use weaver_nntp::NntpError;
 
         match error {
-            NntpError::PoolExhausted | NntpError::PoolShutdown | NntpError::TooManyConnections => {
-                Some(DownloadFailureKind::CapacityUnavailable)
-            }
+            NntpError::PoolExhausted
+            | NntpError::PoolShutdown
+            | NntpError::TooManyConnections
+            // Never got a socket before the deadline: local lane capacity, not
+            // a transport fault of the server.
+            | NntpError::AcquireTimeout(_) => Some(DownloadFailureKind::CapacityUnavailable),
             NntpError::AuthenticationFailed
             | NntpError::AuthenticationRejected
             | NntpError::AuthenticationRequired
@@ -1156,6 +1159,10 @@ pub(super) struct PendingDecodeWork {
 /// Progress update from a health probe task.
 pub(super) struct ProbeUpdate {
     pub(super) job_id: JobId,
+    /// The probe round this result belongs to, as handed to the probe task by
+    /// `activate_health_probes`. A result whose round the job is no longer
+    /// waiting on is dropped.
+    pub(super) probe_round: u32,
     /// Total probes attempted so far.
     pub(super) total: usize,
     /// Number of missing articles found so far.
@@ -2958,6 +2965,26 @@ pub struct Pipeline {
     /// Prevents immediate retry during download; cleared after PAR2 repair so
     /// the post-repair extraction path can re-extract them.
     pub(super) failed_extractions: HashMap<JobId, HashSet<String>>,
+    /// Archive sets whose source bytes are already known to be wrong, before
+    /// any recovery set has ruled — keyed by job, holding the set names for
+    /// telemetry.
+    ///
+    /// Read by `archive_extraction_held_for_known_damage`. The two things it
+    /// buys are the same fact seen from opposite ends: extraction must not
+    /// open a set that is known damaged, and the authoritative PAR2 pass must
+    /// not be skipped for it on a *type* claim (a stored RAR set's
+    /// `StrongDecode`, whose whole premise is that nothing yet contradicts a
+    /// clean decode). Both of those need evidence rather than a demotion
+    /// label, so this is recorded by the fact — see
+    /// `DemotionReason::is_source_damage` — and any future seam that learns a
+    /// volume's bytes are wrong records here instead of growing a second,
+    /// near-identical predicate.
+    ///
+    /// Job-keyed on purpose: the verdicts that release it (`par2_verified`,
+    /// `par2_bypassed`) are job-scoped too, so a per-set record would have to
+    /// be released by a job-scoped answer anyway. Cleared with them in
+    /// `clear_job_extraction_runtime`.
+    pub(super) known_damaged_archive_sets: HashMap<JobId, HashSet<String>>,
     /// Filenames eagerly deleted per job after CRC-verified extraction.
     /// Used to distinguish truly-missing files from intentionally-deleted ones
     /// during PAR2 verification.

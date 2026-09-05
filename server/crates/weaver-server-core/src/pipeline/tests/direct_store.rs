@@ -17787,3 +17787,90 @@ async fn an_obfuscated_direct_set_still_reaches_zero_io_grid_adjudication() {
          zero-I/O pass concluded something the job could not act on; got {sets}"
     );
 }
+
+/// One routed article, which is what admits the set: the router is what builds
+/// the set state a demotion acts on, and it is only reached by bytes.
+async fn admit_first_volume_article(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+) {
+    take_queued_segment(
+        pipeline,
+        job_id,
+        SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number: 0,
+        },
+    );
+    submit_volume_article(pipeline, job_id, volumes, 0, 0).await;
+    assert!(
+        pipeline.direct_store.set_mut(job_id, 0).is_some(),
+        "the fixture must have an admitted direct set to demote"
+    );
+}
+
+#[tokio::test]
+async fn a_damage_demotion_puts_the_set_on_record_and_an_ordinary_one_does_not() {
+    // What the completion gate keys on is the *fact* that bytes were found
+    // wrong, not the label the demotion carried, so the two populations have
+    // to stay separable here: "direct routing could not be used" says nothing
+    // about the archive, and must not cost a clean job its extract-first path.
+    let member_name = "Silver.Horizon.S01E11.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let capacity_dir = tempfile::tempdir().unwrap();
+    let (mut capacity_pipeline, _, _) = new_direct_pipeline(&capacity_dir).await;
+    capacity_pipeline
+        .direct_store
+        .set_gate(DirectStoreGate::Enabled);
+    let capacity_job = JobId(41120);
+    insert_active_job(
+        &mut capacity_pipeline,
+        capacity_job,
+        direct_store_job_spec("Silver Horizon Capacity", &volumes),
+    )
+    .await;
+    admit_first_volume_article(&mut capacity_pipeline, capacity_job, &volumes).await;
+    capacity_pipeline
+        .demote_direct_set(capacity_job, 0, DemotionReason::HoldsBudgetExceeded)
+        .await;
+    assert!(
+        !capacity_pipeline.archive_extraction_held_for_known_damage(capacity_job),
+        "a RAM-budget demotion is not evidence about the bytes"
+    );
+    assert!(
+        !capacity_pipeline
+            .known_damaged_archive_sets
+            .contains_key(&capacity_job)
+    );
+
+    let damaged_dir = tempfile::tempdir().unwrap();
+    let (mut damaged_pipeline, _, _) = new_direct_pipeline(&damaged_dir).await;
+    damaged_pipeline
+        .direct_store
+        .set_gate(DirectStoreGate::Enabled);
+    let damaged_job = JobId(41121);
+    insert_active_job(
+        &mut damaged_pipeline,
+        damaged_job,
+        direct_store_job_spec("Silver Horizon Damaged", &volumes),
+    )
+    .await;
+    admit_first_volume_article(&mut damaged_pipeline, damaged_job, &volumes).await;
+    damaged_pipeline
+        .demote_direct_set(damaged_job, 0, DemotionReason::PartChecksumMismatch)
+        .await;
+    assert_eq!(
+        damaged_pipeline
+            .known_damaged_archive_sets
+            .get(&damaged_job)
+            .map(|sets| sets.iter().cloned().collect::<Vec<_>>()),
+        Some(vec!["silver.horizon".to_string()]),
+        "the set the mismatch was found in goes on record by name"
+    );
+}

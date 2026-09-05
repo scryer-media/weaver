@@ -426,6 +426,34 @@ impl From<IneligibilityReason> for MemberIneligibility {
 }
 
 impl DemotionReason {
+    /// Whether this demotion is *evidence that the posted bytes are wrong,
+    /// found before any recovery set was asked* — as opposed to a reason
+    /// direct routing could not be used.
+    ///
+    /// The distinction is what the completion gate needs and the metric label
+    /// cannot give it: `holds_budget` says nothing about the archive, while a
+    /// part CRC32 that does not match the bytes routed for it is a damaged
+    /// volume established from the posting alone. A job carrying one of these
+    /// must not be handed to the extractor on the strength of a *type* claim —
+    /// a stored RAR set's "a clean decode would prove integrity" — because
+    /// that claim has already been contradicted.
+    ///
+    /// [`Self::Par2Damaged`] is deliberately **not** here even though it is
+    /// damage: it is raised *by* the authoritative pass, so the verdict the
+    /// gate would wait for has already been given, and waiting for a second
+    /// one is waiting forever — including for the set that pass could not
+    /// repair, whose undamaged members the conventional path still delivers.
+    ///
+    /// Deliberately keyed on the damage rather than on any single reason: the
+    /// gate has to keep answering correctly as reasons are added, retired, or
+    /// (as with an in-place repair of a mismatched part) stop demoting at all.
+    pub(crate) fn is_source_damage(self) -> bool {
+        matches!(
+            self,
+            Self::PartChecksumMismatch | Self::MemberChecksumMismatch | Self::VolumeCrcMismatch
+        )
+    }
+
     /// Stable metric label. `sets == direct + materialized + mixed` is worth
     /// asserting against these.
     pub(crate) fn metric(self) -> &'static str {

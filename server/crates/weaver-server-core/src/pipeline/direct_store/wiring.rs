@@ -6974,6 +6974,16 @@ impl Pipeline {
                 file_index: *file_index,
             })
             .collect();
+        // Damage established before any recovery set has been asked. Recorded
+        // as the *fact* rather than the reason, because the completion gate
+        // reads it to refuse a stored set's "a clean decode proves integrity"
+        // claim, and that refusal has to survive reasons being added or
+        // retired. Recorded before the materialization below, so the volume
+        // replay at the end of this function — which is what puts these files
+        // in front of the extraction scheduler — cannot get there first.
+        if reason.is_source_damage() {
+            self.note_known_archive_set_damage(job_id, &set_name);
+        }
         self.direct_store.begin_materialization(
             job_id,
             set_index,

@@ -453,6 +453,18 @@ carries all three targets and each host runs only its own.
 `local` and a default plan is byte-for-byte what it was apart from the new
 `storage_profile` field.
 
+`--exclude-client client:fixture-id:reason` (repeatable) leaves one client out
+of one fixture's blocks, with the reason persisted in the plan under
+`client_exclusions`. It exists for the client that deterministically cannot
+finish a fixture — SABnzbd on the RAR recovery-volume (`.rev`) fixtures, which
+it does not use — where re-running the failure every block costs time and
+teaches nothing. The outcome is not dropped: the summarizer counts every
+excluded block as that client not finishing (`baseline_excluded` /
+`candidate_excluded` inside `completion`), reports the reason under the
+comparison's `client_exclusions`, and withholds the paired comparison exactly
+as it would after observed failures. A plan that excludes every client from a
+fixture, names an undeclared client or fixture, or omits the reason is refused.
+
 ### 6. Run the sequential suite
 
 This is the primary measurement. Every persisted run gets fresh client state
@@ -485,6 +497,14 @@ immutable `execution-manifest.json`, plan and catalog snapshots with SHA-256
 digests, the harness-executable digest, a host fingerprint and secret-redacted
 arguments. Use a new artifact root per invocation; nothing is overwritten.
 
+The controller's exit status separates the two ways a pass can end short of
+clean. `0`: every suite passed with verified output. `2`: every suite ran to a
+client outcome, but at least one client did not finish (`completed_with_dnf`
+artifacts) — a recorded result the summarizer admits, not a reason to stop a
+chain of runs. `1`: at least one suite `failed` on the harness side (the
+adapter could not run, an attestation was missing, an artifact could not be
+written), and that root is not publishable until the cause is fixed.
+
 `CLIENT_JOB_TIMEOUT` / `NATIVE_JOB_TIMEOUT` default to `20m` and bound how long
 a submitted job may run without reaching a terminal state. A Docker-lane job
 that exceeds it is recorded with terminal status `timed_out` and the client's
@@ -508,8 +528,13 @@ selection bias against the slower API, not a precision gain.
 Two other modes exist and are labelled apart from the headline:
 
 - `queue-transition` — generate and seed `direct-mkv-200mb`, plan **only** that
-  fixture with 20 runs per lane, and measure first-submission-to-last-terminal
-  wall clock across forced duplicates. It reports no per-job scores.
+  fixture, and measure first-submission-to-last-verified-output wall clock
+  across forced duplicates: the plan's `--repetitions` is the number of copies
+  queued per client lane (at least 2; the original design point was 20). It
+  reports no per-job scores. `summarize --mode queue-drain --artifacts <root>`
+  binds each lane to the snapshotted plan and prints its drain wall clock,
+  copies, product identity and TLS label; a lane with a copy that did not
+  finish is listed with its recorded failure and no time.
 - `run` — a cold, one-NZB diagnostic. Never the headline result.
 
 Independent output verification is also available on its own:
@@ -551,17 +576,24 @@ Only sequential artifacts that describe a client outcome are admitted:
 `passed` (verified output) and `completed_with_dnf` (the client reached a
 terminal failure, or its output failed neutral verification). Clients are
 paired inside the same randomized repetition block, stratified by fixture,
-profile, target, transport / TLS validation, archive toolchain, server link
-and storage profile. Each stratum reports how many blocks each client
+profile, target, transport, archive toolchain, server link and storage
+profile. How each client validated TLS is a property of that client's run, not
+of the block — SABnzbd's TLS runs are `tls-unverified` while the others are
+`tls-ca-verified` — so it is not part of the pairing key; the comparison
+carries each client's validation and label under `transport_policies`, and a
+client whose policy changes inside one stratum is refused as two products
+pooled. Each stratum reports how many blocks each client
 finished, then, over the blocks both clients finished, the raw medians and
 coefficients of variation, the paired geometric-mean ratio and a deterministic
 10 000-resample bootstrap 95 % interval on the log ratio. There is no outlier
 deletion and no pooled score. A block where one client did not finish is
 excluded from the timing comparison and counted under `completion`; a client
 that cannot finish a fixture is a result, and it must not hide the rest of the
-run. When the failures leave a stratum with fewer than the minimum paired
-blocks, that stratum keeps its counts and its comparison is withheld with a
-stated reason. A harness-side `failed` suite, a missing or unverified run, an
+run. A client the plan excluded on a fixture (`--exclude-client`) is counted
+the same way, as not finishing every block, with the plan's reason reported
+under `client_exclusions`. When the failures leave a stratum with fewer than
+the minimum paired blocks, that stratum keeps its counts and its comparison is
+withheld with a stated reason. A harness-side `failed` suite, a missing or unverified run, an
 incomplete pair with no recorded failure, fewer than 20 paired blocks for any
 other reason, or terminal-observation uncertainty above its limit (1 % of the
 run or 100 ms, whichever is larger) still fails the summary closed.
@@ -944,7 +976,11 @@ this harness, so its TLS adapter uses `ssl=1` with `ssl_verify=0` and its
 results are labelled **`tls-unverified`**, never `tls-ca-verified`. This is
 confined to the isolated benchmark network and measures encrypted transport,
 not authenticated TLS; the setting appears in every rendered SABnzbd config and
-result artifact.
+result artifact. The label is reported on every comparison that includes
+SABnzbd, but it is not part of the summarizer's pairing key: a `tls` block
+pairs SABnzbd's `tls-unverified` run with Weaver's `tls-ca-verified` one, and
+the report says so rather than leaving the pair unformed.
+
 
 See [`configs/clients/baseline.json`](configs/clients/baseline.json) for the
 cross-client baseline and

@@ -1844,10 +1844,24 @@ impl Pipeline {
     }
 
     pub(crate) fn job_has_pending_download_pipeline_work(&self, job_id: JobId) -> bool {
+        self.jobs
+            .get(&job_id)
+            .is_some_and(|state| state.health_probing)
+            || self.job_has_pending_download_work_beyond_health_probe(job_id)
+    }
+
+    /// [`Self::job_has_pending_download_pipeline_work`] with the health probe
+    /// taken out: everything that is actually moving bytes.
+    ///
+    /// A probe is an estimate running alongside the download, not work the job
+    /// owes. Once this is false the job's segments have all reached a terminal
+    /// state and the probe has nothing left to tell anyone, which is what
+    /// [`Self::retire_health_probe_if_download_pipeline_drained`] acts on.
+    pub(crate) fn job_has_pending_download_work_beyond_health_probe(&self, job_id: JobId) -> bool {
         let has_queued_work = self
             .jobs
             .get(&job_id)
-            .is_some_and(|state| state.health_probing || !state.download_queue.is_empty());
+            .is_some_and(|state| !state.download_queue.is_empty());
         let has_inflight_downloads = self
             .active_downloads_by_job
             .get(&job_id)
@@ -6093,7 +6107,7 @@ impl Pipeline {
     /// `pending_rar_refresh` arm of the completion gate already defers on. No
     /// new gate: the repaired set becomes pending in the one the extraction path
     /// has always honoured.
-    fn invalidate_rar_plans_for_repaired_sets(
+    pub(in crate::pipeline) fn invalidate_rar_plans_for_repaired_sets(
         &mut self,
         job_id: JobId,
         set_names: BTreeSet<String>,
@@ -6106,6 +6120,15 @@ impl Pipeline {
                 target_completed_volume = target,
                 "rebuilding a repaired RAR set's plan from its repaired headers"
             );
+            // "From its repaired headers" is only true once the pre-repair
+            // snapshot is gone. The rebuild the refresh triggers reads
+            // `load_rar_snapshot` first, and that snapshot was serialized while
+            // the set still had the hole the repair just filled — so the plan
+            // came back describing the old, short set and extraction opened a
+            // member span that ended at the last volume the snapshot knew
+            // about. Same failure the recovery-volume restore hit, same fix:
+            // drop both copies so the recompute reads the volumes on disk.
+            self.invalidate_rar_snapshot(job_id, &set_name);
             self.enqueue_rar_set_refresh(
                 job_id,
                 &set_name,
@@ -7232,7 +7255,18 @@ impl Pipeline {
         // would ever be summoned, and the chase would wait out its whole
         // consumption deadline on vouches that were never coming.
         let direct_unpack_gated_sets = self.direct_unpack_gated_sets(job_id);
+        // Same shape as the gated chase above, from the other seam: a set
+        // whose bytes were already found wrong — a part CRC32 that did not
+        // match what was routed for it, and every later fact of the same kind
+        // — is evidence, and `StrongDecode` is a claim about the archive
+        // *type*. Without this the fast path would refuse both the
+        // authoritative and the quick pass for a stored RAR set (the quick
+        // one is gated on `has_crc_failures`, which nothing has produced yet
+        // because extraction is being held), and the job would sit with its
+        // damage on record and no verdict coming.
+        let known_archive_damage = self.archive_extraction_held_for_known_damage(job_id);
         let authoritative_par2_verification_owed = rar_par2_repair_ready
+            || known_archive_damage
             || has_crc_failures
             || (has_incomplete_data_files && download_pipeline_exhausted)
             || rar_waiting_for_missing_volumes
