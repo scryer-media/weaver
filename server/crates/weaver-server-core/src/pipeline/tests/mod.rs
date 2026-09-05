@@ -2186,6 +2186,27 @@ async fn submit_decoded_segment_with_segments(
             },
         )
         .await;
+    // A decode can demote a direct set, and a demotion hands its reconstruction
+    // sweep to a detached worker instead of running it inline. In the running
+    // server the select loop picks the ticket up; here nothing does, so the
+    // volumes would never become files and every assertion after the demoting
+    // article would be reading a half-finished handback.
+    settle_direct_demotion_work(pipeline).await;
+}
+
+/// Drives every outstanding demotion reconstruction ticket to its handler, the
+/// way the orchestrator's select loop would.
+async fn settle_direct_demotion_work(pipeline: &mut Pipeline) {
+    while !pipeline.direct_demotion_in_flight.is_empty() {
+        let done = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.direct_demotion_done_rx.recv(),
+        )
+        .await
+        .expect("a detached demotion sweep should finish")
+        .expect("the demotion completion channel should stay open");
+        pipeline.handle_direct_demotion_done(done).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2468,17 +2489,18 @@ fn debug_job_state(pipeline: &Pipeline, job_id: JobId) -> String {
 }
 
 /// Drives every detached pipeline ticket — direct-store post-repair
-/// read-backs, tolerated extractions and PAR2 damaged-path analyses — to its
-/// handler, the way the orchestrator's select loop would, until none is in
-/// flight.
+/// read-backs, tolerated extractions, demotion reconstruction sweeps and PAR2
+/// damaged-path analyses — to its handler, the way the orchestrator's select
+/// loop would, until none is in flight.
 ///
-/// The three are settled in one loop because they chain: an analysis verdict
+/// They are settled in one loop because they chain: an analysis verdict
 /// re-enters the completion check, which can decide on a repair whose
 /// read-back is a direct-store ticket of its own.
 async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
     enum Ticket {
         PostRepair(crate::pipeline::DirectPostRepairWorkDone),
         Tolerated(crate::pipeline::DirectToleratedWorkDone),
+        Demotion(crate::pipeline::DirectDemotionWorkDone),
         Par2Analysis(crate::pipeline::Par2AnalysisWorkDone),
     }
     loop {
@@ -2496,6 +2518,10 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
             pipeline.handle_direct_tolerated_done(done).await;
             handled_a_ticket = true;
         }
+        while let Ok(done) = pipeline.direct_demotion_done_rx.try_recv() {
+            pipeline.handle_direct_demotion_done(done).await;
+            handled_a_ticket = true;
+        }
         while let Ok(done) = pipeline.par2_analysis_done_rx.try_recv() {
             pipeline.handle_par2_analysis_done(done).await;
             handled_a_ticket = true;
@@ -2511,12 +2537,15 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         }
         let post_repair_pending = !pipeline.direct_post_repair_in_flight.is_empty();
         let tolerated_pending = !pipeline.direct_tolerated_in_flight.is_empty();
+        let demotion_pending = !pipeline.direct_demotion_in_flight.is_empty();
         let par2_analysis_pending = !pipeline.par2_analysis_in_flight.is_empty();
-        if !post_repair_pending && !tolerated_pending && !par2_analysis_pending {
+        if !post_repair_pending && !tolerated_pending && !demotion_pending && !par2_analysis_pending
+        {
             return;
         }
         let post_repair_rx = &mut pipeline.direct_post_repair_done_rx;
         let tolerated_rx = &mut pipeline.direct_tolerated_done_rx;
+        let demotion_rx = &mut pipeline.direct_demotion_done_rx;
         let par2_analysis_rx = &mut pipeline.par2_analysis_done_rx;
         let ticket = tokio::time::timeout(Duration::from_secs(10), async {
             tokio::select! {
@@ -2525,6 +2554,9 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
                 }
                 done = tolerated_rx.recv(), if tolerated_pending => {
                     Ticket::Tolerated(done.expect("direct tolerated-extraction channel should stay open"))
+                }
+                done = demotion_rx.recv(), if demotion_pending => {
+                    Ticket::Demotion(done.expect("direct demotion channel should stay open"))
                 }
                 done = par2_analysis_rx.recv(), if par2_analysis_pending => {
                     Ticket::Par2Analysis(done.expect("PAR2 analysis completion channel should stay open"))
@@ -2536,6 +2568,7 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         match ticket {
             Ticket::PostRepair(done) => pipeline.handle_direct_post_repair_done(done),
             Ticket::Tolerated(done) => pipeline.handle_direct_tolerated_done(done).await,
+            Ticket::Demotion(done) => pipeline.handle_direct_demotion_done(done).await,
             Ticket::Par2Analysis(done) => pipeline.handle_par2_analysis_done(done).await,
         }
     }

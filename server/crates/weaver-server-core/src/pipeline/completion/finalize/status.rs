@@ -202,6 +202,7 @@ impl Pipeline {
             || self.direct_post_repair_in_flight.contains_key(&job_id)
             || self.direct_tolerated_in_flight.contains_key(&job_id)
             || self.par2_analysis_in_flight.contains_key(&job_id)
+            || self.direct_demotion_in_flight.contains_key(&job_id)
             || self.pending_completion_checks.contains(&job_id)
         {
             return;

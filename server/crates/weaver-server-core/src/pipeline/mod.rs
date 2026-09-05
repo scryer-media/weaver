@@ -1670,6 +1670,42 @@ pub(super) struct Par2AnalysisWorkDone {
     pub(super) outcome: completion::finalize::check::Par2AnalysisTicketOutcome,
 }
 
+/// One demoted set's reconstruction sweep, detached from the actor.
+///
+/// The sweep reads every volume of the set out of the overlay and writes it to
+/// disk: on a large archive that is gigabytes of I/O, and it used to run inside
+/// the demotion — which the actor reaches from the decode of the very article
+/// that triggered it, so the job's every other article waited behind a
+/// materialization it had nothing to do with. Everything the sweep needs is
+/// snapshotted at submission and everything the *reconciliation* needs travels
+/// with the ticket, so the actor keeps only this fence and applies the durable
+/// bookkeeping when the ticket lands.
+///
+/// One ticket per demoted set rather than per job: a job can demote two sets,
+/// and neither may wait on the other's I/O.
+pub(super) struct DirectDemotionWork {
+    pub(super) work_id: u64,
+    pub(super) submitted_at: std::time::Instant,
+    /// The reconciliation's half of the snapshot — the volume targets, their
+    /// article geometry, and the articles the decode seam took ownership of at
+    /// the demotion instant. Owned by the ticket and moved out with it when it
+    /// lands.
+    pub(super) plan: direct_store::wiring::DemotedSweepPlan,
+}
+
+pub(super) struct DirectDemotionWorkDone {
+    pub(super) job_id: JobId,
+    pub(super) work_id: u64,
+    pub(super) set_index: usize,
+    /// One outcome per volume, in the order the plan's targets name them.
+    ///
+    /// Carried as one batch rather than streamed per volume: the volumes are
+    /// judged independently inside the sweep, but the durable bookkeeping is
+    /// not independent — the set's coverage row may only be retired once
+    /// *every* volume's floor is committed, and there is one row for the set.
+    pub(super) rebuilt: Vec<direct_store::reconstruct::ReconstructedVolume>,
+}
+
 /// The pre-repair verdict and the repair's own write set, carried across a
 /// direct-store repair so the post-repair read-back can be selective instead
 /// of re-reading the whole recovery set.
@@ -2954,6 +2990,15 @@ pub struct Pipeline {
     >,
     pub(super) par2_analysis_done_tx: mpsc::Sender<Par2AnalysisWorkDone>,
     pub(super) par2_analysis_done_rx: mpsc::Receiver<Par2AnalysisWorkDone>,
+    /// Monotonic fence for demotion sweeps detached from the actor.
+    pub(super) next_direct_demotion_work_id: u64,
+    /// The demotion sweeps a job has outstanding, keyed by the set each one
+    /// belongs to. Keyed by job at the top so the completion gate — which must
+    /// not judge a job whose volumes are still materializing — answers in one
+    /// lookup.
+    pub(super) direct_demotion_in_flight: HashMap<JobId, HashMap<usize, DirectDemotionWork>>,
+    pub(super) direct_demotion_done_tx: mpsc::Sender<DirectDemotionWorkDone>,
+    pub(super) direct_demotion_done_rx: mpsc::Receiver<DirectDemotionWorkDone>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
     /// Whether the active global pause came from a bandwidth schedule rather
