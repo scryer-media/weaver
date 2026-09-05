@@ -6295,6 +6295,164 @@ async fn generic_par2_repair_requeues_extraction_for_7z_and_gzip_payloads() {
     }
 }
 
+/// A split 7z set short one part the NZB never carried is repaired from its
+/// recovery blocks and then extracted — for an interior part and for the last
+/// part alike.
+///
+/// Before this, neither shape ever reached PAR2. The interior hole left the
+/// topology short of ready forever, with no predicate naming the absence the
+/// way the RAR scheduler's `WaitingForVolumes` does; the missing last part was
+/// not even known to be missing, so the strong-decode fast path settled the set
+/// as clean and extraction opened a truncated set. And had a repair somehow
+/// run, the rebuilt part sat on disk under a name the assembly had never heard
+/// of, outside the topology and outside `sevenz_set_part_paths`.
+#[tokio::test]
+async fn par2_rebuilds_a_split_7z_part_the_nzb_never_carried_and_extraction_follows() {
+    for (job_id, withheld) in [(JobId(30084), 2usize), (JobId(30085), 6usize)] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let set_name = "generated_split_store_plain.7z";
+        let parts = sevenz_fixture_bytes(set_name);
+        assert_eq!(parts.len(), 7, "fixture has seven parts");
+        let (withheld_name, withheld_bytes) = parts[withheld].clone();
+        let index_filename = "silver_horizon.par2";
+        let recovery_filename = "silver_horizon.vol00+03.par2";
+        let slice_size = 65_536;
+        let described: Vec<(&str, &[u8])> = parts
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let par2_bytes = build_test_par2_index_for_files(&described, slice_size);
+        let recovery_bytes = vec![0xAA; 64];
+
+        // The NZB carries every part but one.
+        let posted: Vec<(String, Vec<u8>)> = parts
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != withheld)
+            .map(|(_, part)| part.clone())
+            .collect();
+        let mut files = posted.clone();
+        files.push((index_filename.to_string(), par2_bytes.clone()));
+        files.push((recovery_filename.to_string(), recovery_bytes.clone()));
+        let working_dir = insert_active_job(
+            &mut pipeline,
+            job_id,
+            rar_job_spec("Silver Horizon Withheld Part", &files),
+        )
+        .await;
+
+        for (file_index, (filename, bytes)) in posted.iter().enumerate() {
+            write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes)
+                .await;
+        }
+        let index_file = posted.len() as u32;
+        let recovery_file = index_file + 1;
+        write_and_complete_file(
+            &mut pipeline,
+            job_id,
+            index_file,
+            index_filename,
+            &par2_bytes,
+        )
+        .await;
+        write_and_complete_file(
+            &mut pipeline,
+            job_id,
+            recovery_file,
+            recovery_filename,
+            &recovery_bytes,
+        )
+        .await;
+        // A full part spans three 64 KiB slices, so three recovery blocks
+        // cover whichever part is withheld.
+        install_test_par2_runtime(
+            &mut pipeline,
+            job_id,
+            build_repairable_par2_set_for_files(&described, slice_size, 3),
+            &[
+                (index_file, index_filename, 0, false),
+                (recovery_file, recovery_filename, 3, true),
+            ],
+        );
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state.recovery_queue = DownloadQueue::new();
+        }
+
+        assert!(
+            pipeline.job_has_sevenz_set_waiting_for_absent_volumes(job_id),
+            "withheld part {withheld} should read as an absent 7z volume"
+        );
+        assert!(!working_dir.join(&withheld_name).exists());
+
+        pipeline.check_job_completion(job_id).await;
+
+        assert_eq!(
+            pipeline.par2_repairer_execute_calls, 1,
+            "the absent part routes the job to a PAR2 repair"
+        );
+        assert_eq!(
+            std::fs::read(working_dir.join(&withheld_name)).unwrap(),
+            withheld_bytes,
+            "the repair rebuilt the withheld part byte for byte"
+        );
+        {
+            let state = pipeline.jobs.get(&job_id).unwrap();
+            let topology = state
+                .assembly
+                .archive_topology_for(set_name)
+                .expect("7z topology");
+            assert_eq!(
+                topology.volume_map.get(&withheld_name).copied(),
+                Some(withheld as u32),
+                "the rebuilt part is adopted into the topology"
+            );
+            assert_eq!(topology.expected_volume_count, Some(7));
+            assert!(topology.complete_volumes.contains(&(withheld as u32)));
+        }
+        assert!(
+            pipeline
+                .sevenz_set_part_paths(job_id, set_name)
+                .unwrap()
+                .iter()
+                .any(|path| path.ends_with(&withheld_name)),
+            "the extractor is handed the rebuilt part"
+        );
+        assert!(!pipeline.job_has_sevenz_set_waiting_for_absent_volumes(job_id));
+
+        // The repair tail spawns the extraction itself; a queued completion
+        // check is the other road to the same place.
+        for _ in 0..3 {
+            if matches!(
+                job_status_for_assert(&pipeline, job_id),
+                Some(JobStatus::Extracting | JobStatus::QueuedExtract)
+            ) {
+                break;
+            }
+            let queued = pipeline
+                .pending_completion_checks
+                .pop_front()
+                .expect("a completion check should be queued after repair");
+            pipeline.check_job_completion(queued).await;
+        }
+        match next_extraction_done(&mut pipeline).await {
+            ExtractionDone::FullSet {
+                set_name: done_set,
+                result,
+                ..
+            } => {
+                assert_eq!(done_set, set_name);
+                let outcome = result.expect("the whole set extracts");
+                assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+                assert!(!outcome.extracted.is_empty());
+            }
+            _ => panic!("expected full-set extraction after the 7z part was rebuilt"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn no_par2_retry_reclassifies_obfuscated_rar_redownload_as_7z() {
     let temp_dir = tempfile::tempdir().unwrap();

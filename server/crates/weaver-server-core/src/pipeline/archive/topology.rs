@@ -2383,6 +2383,54 @@ impl Pipeline {
                     }
                 }
 
+                // Parts the NZB never carried but the working directory holds
+                // — a part PAR2 rebuilt before a restart, or before this set's
+                // topology was (re)built. The adoption `finish_par2_repair`
+                // performs lives in the topology alone, so a rebuild from the
+                // assembly's files would silently lose it and the set would go
+                // back to waiting on a part that is sitting right there. The
+                // gaps in the numbering are checked, and then past the end
+                // until the run of names stops; `.7z.NNN` is the whole naming
+                // scheme, so the candidates are exact.
+                let recovered_parts: Vec<(String, u32)> = {
+                    let numbered: std::collections::HashSet<u32> =
+                        volume_map.values().copied().collect();
+                    let candidate = |number: u32| format!("{set_name}.{:03}", number + 1);
+                    let on_disk = |name: &str| state.working_dir.join(name).is_file();
+                    let mut recovered = Vec::new();
+                    for number in 0..max_number {
+                        if numbered.contains(&number) {
+                            continue;
+                        }
+                        let name = candidate(number);
+                        if on_disk(&name) {
+                            recovered.push((name, number));
+                        }
+                    }
+                    let mut number = max_number + 1;
+                    loop {
+                        let name = candidate(number);
+                        if !on_disk(&name) {
+                            break;
+                        }
+                        recovered.push((name, number));
+                        number += 1;
+                    }
+                    recovered
+                };
+                for (name, number) in &recovered_parts {
+                    volume_map.insert(name.clone(), *number);
+                    max_number = max_number.max(*number);
+                }
+                if !recovered_parts.is_empty() {
+                    info!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        parts = ?recovered_parts,
+                        "7z split topology re-adopted parts on disk that the NZB never carried"
+                    );
+                }
+
                 let expected = max_number + 1;
                 let topology = ArchiveTopology {
                     archive_type: ArchiveType::SevenZip,
@@ -2421,6 +2469,9 @@ impl Pipeline {
                     .set_archive_topology(set_name.clone(), topology);
                 for n in completed {
                     state.assembly.mark_volume_complete(&set_name, n);
+                }
+                for (_, number) in &recovered_parts {
+                    state.assembly.mark_volume_complete(&set_name, *number);
                 }
 
                 info!(

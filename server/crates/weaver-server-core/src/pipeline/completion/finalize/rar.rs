@@ -1414,7 +1414,12 @@ impl Pipeline {
             {
                 Ok(report) => report,
                 Err(error) => {
-                    debug!(
+                    // Warn, not debug: a set that carries `.rev` files and
+                    // still cannot rebuild its hole is the one signal an
+                    // operator has that the job is about to fall through to
+                    // PAR2 or fail, and it named the unrar-side refusal that
+                    // hid an encrypted-headers restore bug for a release.
+                    warn!(
                         job_id = job_id.0,
                         set_name = %set_name,
                         error = %error,
