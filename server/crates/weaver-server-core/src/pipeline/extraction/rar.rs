@@ -12,7 +12,9 @@ mod readahead;
 mod scheduler;
 mod source;
 
-pub(crate) use member::{RarArchiveOpenMode, RarExtractionContext, RarExtractionOpenRequest};
+pub(crate) use member::{
+    RarArchiveOpenMode, RarExtractionContext, RarExtractionOpenRequest, rar_entry_via,
+};
 
 pub(crate) use member::validate_sanitized_rar_member_path;
 

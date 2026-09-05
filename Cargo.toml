@@ -120,7 +120,13 @@ par2-rs = { version = "0.9", default-features = false, features = ["native-crypt
 # before extraction establishes how much output is actually available.
 # 0.8 renamed the crate's runtime tuning knobs from `WEAVER_*` to `UNRAR_RS_*`
 # / `RARPAR_*`; weaver sets none of them, so nothing here had to follow.
-unrar-rs = { version = "0.8.0", default-features = false, features = ["crypto-aws-lc"] }
+# 0.9 reaches extraction through an `Entry` handle (`by_index` and friends)
+# and deprecates the eight pre-0.9 extraction calls; weaver takes its entries
+# through `rar_entry` / `rar_entry_via` in the extraction module, which apply
+# the `ExtractOptions` weaver still carries. 0.9 also poisons a solid archive
+# whose member failed mid-decode instead of reusing the misaligned dictionary,
+# and 0.9.1 restores `-hp` (header-encrypted) RAR5 sets from `.rev` volumes.
+unrar-rs = { version = "0.9.1", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]

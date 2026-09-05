@@ -23,5 +23,9 @@ pub(crate) use rar::{
     rar_decoder_memory_bytes,
 };
 
+/// And for the extraction itself: the tolerated members are taken under the
+/// same options plumbing as every other RAR member weaver extracts.
+pub(crate) use rar::rar_entry_via;
+
 #[cfg(test)]
 pub(crate) use rar::RarArchiveSnapshotOpenRequest;
