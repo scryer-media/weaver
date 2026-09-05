@@ -5734,6 +5734,7 @@ dependencies = [
  "pbkdf2 0.13.0",
  "quick-xml",
  "rayon",
+ "reedsolomon-rs",
  "regex",
  "reqwest",
  "rmp-serde",

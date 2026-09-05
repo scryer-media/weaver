@@ -10567,3 +10567,324 @@ async fn restore_rebuilds_layout_keys_for_an_old_numbering_rar4_set() {
         "a restored, fully-present set owes no coverage refresh"
     );
 }
+
+/// Fill in the CRC16 of every RAR4 block in `bytes`. The shared fixture
+/// builders leave it zero because weaver's own parser only warns on a
+/// mismatch; the recovery restorer's validity probe does not, and a set
+/// written to exercise it has to be one it would accept.
+fn with_rar4_header_crcs(mut bytes: Vec<u8>) -> Vec<u8> {
+    let mut offset = TEST_RAR4_SIG.len();
+    while offset + 7 <= bytes.len() {
+        let flags = u16::from_le_bytes([bytes[offset + 3], bytes[offset + 4]]);
+        let header_size = u16::from_le_bytes([bytes[offset + 5], bytes[offset + 6]]) as usize;
+        let data_size = if flags & 0x8000 != 0 {
+            u32::from_le_bytes([
+                bytes[offset + 7],
+                bytes[offset + 8],
+                bytes[offset + 9],
+                bytes[offset + 10],
+            ]) as usize
+        } else {
+            0
+        };
+        let crc = (checksum::crc32(&bytes[offset + 2..offset + header_size]) & 0xFFFF) as u16;
+        bytes[offset..offset + 2].copy_from_slice(&crc.to_le_bytes());
+        offset += header_size + data_size;
+    }
+    bytes
+}
+
+/// A RAR3 standalone recovery volume for `volumes`: the set's RS parity over
+/// every data volume, padded to the longest, followed by the 7-byte footer
+/// (`data-1`, `rec-1`, `position-1`, CRC32) a new-style `.rev` carries and the
+/// restorer reads its geometry from.
+fn single_recovery_volume_for_rar4_set(volumes: &[&[u8]]) -> Vec<u8> {
+    let width = volumes.iter().map(|volume| volume.len()).max().unwrap_or(0);
+    let coder = reedsolomon_rs::rar3::Rar3RsCoder::new(1).expect("one recovery volume");
+    let mut rev = Vec::with_capacity(width + 7);
+    let mut column = vec![0u8; volumes.len()];
+    let mut parity = [0u8; 1];
+    for position in 0..width {
+        for (slot, volume) in column.iter_mut().zip(volumes) {
+            *slot = volume.get(position).copied().unwrap_or(0);
+        }
+        coder.encode(&column, &mut parity);
+        rev.push(parity[0]);
+    }
+    rev.push((volumes.len() - 1) as u8);
+    rev.push(0);
+    rev.push(0);
+    let crc = checksum::crc32(&rev);
+    rev.extend_from_slice(&crc.to_le_bytes());
+    rev
+}
+
+/// An old-numbering RAR4 set of four volumes whose volume 2 was never posted,
+/// plus one `.rev` that can rebuild it. The job's files are volumes 0, 1 and 3
+/// and the recovery volume, every one of them downloaded and complete, and
+/// the set is left waiting on the hole. Returns the member's payload.
+async fn stage_old_numbering_rar4_set_with_a_recovery_volume(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    job_name: &str,
+) -> Vec<u8> {
+    let payload: Vec<u8> = (0..4096u32)
+        .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let volumes: Vec<(String, Vec<u8>)> =
+        single_member_rar4_old_numbering_set("silver.horizon", "silver.horizon.mkv", &payload, 4)
+            .into_iter()
+            .map(|(filename, bytes)| (filename, with_rar4_header_crcs(bytes)))
+            .collect();
+    let volume_bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let rev = single_recovery_volume_for_rar4_set(&volume_bytes);
+
+    let mut files: Vec<(String, Vec<u8>)> = volumes
+        .iter()
+        .enumerate()
+        .filter(|(volume, _)| *volume != 2)
+        .map(|(_, file)| file.clone())
+        .collect();
+    files.push(("silver.horizon.rev".to_string(), rev));
+    insert_active_job(pipeline, job_id, rar_job_spec(job_name, &files)).await;
+    for (index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(pipeline, job_id, index as u32, filename, bytes).await;
+    }
+
+    let state = pipeline
+        .rar_sets
+        .get(&(job_id, "silver.horizon".to_string()))
+        .expect("the downloaded volumes register the set");
+    assert!(
+        !state.volume_files.contains_key(&2),
+        "volume 2 is the hole this fixture exists for"
+    );
+    assert!(
+        state
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.waiting_on_volumes.contains(&2)),
+        "the set waits on the hole before the restore: {:?}",
+        state.plan
+    );
+    payload
+}
+
+#[tokio::test]
+async fn invalidating_a_rar_snapshot_forgets_the_persisted_copy_too() {
+    // `load_rar_snapshot` falls back to the database when the in-memory copy
+    // is gone. Clearing only `cached_headers` therefore invalidated nothing:
+    // the next recompute quietly rebuilt from the persisted snapshot.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90221);
+    let files = build_multifile_multivolume_rar_set();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Snapshot Invalidation", &files),
+    )
+    .await;
+    for (index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, index as u32, filename, bytes).await;
+    }
+    assert!(pipeline.load_rar_snapshot(job_id, "show").is_some());
+
+    pipeline
+        .rar_sets
+        .get_mut(&(job_id, "show".to_string()))
+        .unwrap()
+        .cached_headers = None;
+    assert!(
+        pipeline.load_rar_snapshot(job_id, "show").is_some(),
+        "dropping the in-memory copy alone still serves the persisted snapshot"
+    );
+
+    pipeline.invalidate_rar_snapshot(job_id, "show");
+    assert!(pipeline.load_rar_snapshot(job_id, "show").is_none());
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .assembly
+            .archive_topology_for("show")
+            .is_some(),
+        "invalidation keeps the topology; only the header view is forgotten"
+    );
+}
+
+#[tokio::test]
+async fn a_recovery_volume_restore_rebuilds_the_set_from_disk_and_extracts_the_member() {
+    // Bench run 2026-09-04, job 10000: the restore wrote volume 2, but the
+    // recompute after it rebuilt from the header snapshot persisted while the
+    // set still had the hole. The plan it produced put the member in volume 0
+    // alone, extraction was handed that one volume, and the decode ran out of
+    // bits at its end. The rebuild after a restore has to read the disk.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90222);
+    let job_name = "Silver Horizon Recovery Volume";
+    let payload =
+        stage_old_numbering_rar4_set_with_a_recovery_volume(&mut pipeline, job_id, job_name).await;
+    let key = (job_id, "silver.horizon".to_string());
+    let stale_snapshot = pipeline
+        .load_rar_snapshot(job_id, "silver.horizon")
+        .expect("the incomplete set persisted a header snapshot");
+
+    // The completion checkpoint is what reaches for the recovery volume once
+    // downloads are exhausted and the set is still waiting on a hole. The
+    // fixture committed its segments directly, so empty the queue the way a
+    // finished download pass would have.
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .drain_all();
+    pipeline.check_job_completion(job_id).await;
+
+    let state = pipeline.rar_sets.get(&key).expect("set state");
+    assert_eq!(
+        state.volume_files.get(&2).map(String::as_str),
+        Some("silver.horizon.r01"),
+        "the restore registers the rebuilt volume under its layout number: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert!(state.facts.contains_key(&2));
+    let fresh_snapshot = pipeline
+        .load_rar_snapshot(job_id, "silver.horizon")
+        .expect("the rebuild after the restore persists a fresh snapshot");
+    assert_ne!(fresh_snapshot, stale_snapshot);
+    let plan = state.plan.as_ref().expect("plan");
+    assert!(
+        plan.waiting_on_volumes.is_empty(),
+        "nothing is missing once the hole is rebuilt: {plan:?}"
+    );
+    let member = plan
+        .topology
+        .members
+        .iter()
+        .find(|member| member.name == "silver.horizon.mkv")
+        .expect("member");
+    assert_eq!(
+        (member.first_volume, member.last_volume),
+        (0, 3),
+        "the rebuilt topology spans every volume, the restored one included"
+    );
+
+    drive_extractions_to_terminal(&mut pipeline, job_id, 8).await;
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        ),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
+    let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(job_name));
+    assert_eq!(
+        std::fs::read(dest.join("silver.horizon.mkv")).unwrap(),
+        payload,
+        "the member extracted through the restored volume is byte-exact"
+    );
+}
+
+#[tokio::test]
+async fn a_source_retry_keeps_a_restored_recovery_volume_registered() {
+    // The second half of the same bench failure: after the botched extraction
+    // the source retry cleared the set, and the rebuild that followed only
+    // saw the assembly's files. The restored volume was still on disk, but
+    // nothing registered it any more — "volume 2 unavailable: not registered"
+    // — and the set went back to waiting on a hole it had already filled.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(90223);
+    stage_old_numbering_rar4_set_with_a_recovery_volume(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon Recovery Volume Retry",
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+    assert!(
+        pipeline
+            .try_restore_rar_recovery_volumes(job_id)
+            .await
+            .expect("restore runs"),
+        "the recovery volume rebuilds the hole"
+    );
+    let key = (job_id, "silver.horizon".to_string());
+    assert_eq!(
+        pipeline.rar_sets[&key]
+            .volume_files
+            .get(&2)
+            .map(String::as_str),
+        Some("silver.horizon.r01")
+    );
+
+    pipeline.clear_archive_set_for_source_retry(job_id, "silver.horizon");
+
+    let state = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("the restored volume keeps the set registered across the retry");
+    assert_eq!(
+        state.volume_files.get(&2).map(String::as_str),
+        Some("silver.horizon.r01")
+    );
+    assert!(state.facts.contains_key(&2));
+    assert!(
+        !state.volume_files.contains_key(&0) && !state.volume_files.contains_key(&3),
+        "downloaded volumes are the retry's to re-register: {:?}",
+        state.volume_files
+    );
+    assert!(state.plan.is_none());
+    assert!(
+        pipeline
+            .load_rar_snapshot(job_id, "silver.horizon")
+            .is_none()
+    );
+    assert!(
+        pipeline
+            .volume_paths_for_rar_set(job_id, "silver.horizon")
+            .contains_key(&2),
+        "the rebuild's volume view still reaches the restored file"
+    );
+    let persisted = pipeline.db.load_all_rar_volume_facts(job_id).unwrap();
+    assert_eq!(
+        persisted
+            .get("silver.horizon")
+            .map(|rows| rows.iter().map(|(volume, _)| *volume).collect::<Vec<_>>()),
+        Some(vec![2]),
+        "the restored volume's facts survive the retry's ledger reset"
+    );
+
+    // The retry's re-downloads re-register the NZB volumes one by one; with the
+    // restored volume still known, the set comes back whole rather than waiting
+    // on a hole it already filled.
+    resume_job_downloading_for_test(&mut pipeline, job_id);
+    for file_index in 0..3u32 {
+        pipeline
+            .refresh_archive_state_for_completed_file(
+                job_id,
+                NzbFileId { job_id, file_index },
+                true,
+            )
+            .await;
+        drain_rar_refreshes(&mut pipeline).await;
+    }
+    let plan = pipeline.rar_sets[&key]
+        .plan
+        .as_ref()
+        .expect("re-registration rebuilds the plan");
+    assert!(
+        plan.waiting_on_volumes.is_empty(),
+        "the set is whole again: {plan:?}"
+    );
+    assert_eq!(
+        plan.topology.complete_volumes,
+        HashSet::from([0, 1, 2, 3]),
+        "the rebuilt topology counts the restored volume"
+    );
+}

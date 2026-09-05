@@ -387,6 +387,15 @@ impl Pipeline {
             }
         }
 
+        // Volumes no NZB file accounts for — the ones a standalone `.rev`
+        // restore wrote next to the downloaded volumes — have nothing to
+        // re-queue. Their registration is the only thing that tells the
+        // volume-0 rebuild they exist: `volume_paths_for_rar_set` walks the
+        // set's `volume_files` and the assembly, and the assembly never held
+        // them. Dropping them here left the restored file on disk and the set
+        // waiting on a volume that was already present.
+        let preserved_volumes = self.restored_rar_volumes_to_preserve(job_id, &set_key);
+
         self.clear_rar_snapshot(job_id, set_name);
         if refresh_in_flight {
             let tombstone = RarSetState {
@@ -424,6 +433,92 @@ impl Pipeline {
                 );
             }
         }
+
+        if preserved_volumes.is_empty() {
+            return;
+        }
+        let preserved: Vec<u32> = preserved_volumes
+            .iter()
+            .map(|(volume, _, _)| *volume)
+            .collect();
+        let state = self.rar_sets.entry(set_key).or_default();
+        for (volume, filename, facts) in preserved_volumes {
+            match rmp_serde::to_vec_named(&facts) {
+                Ok(encoded) => {
+                    if let Err(error) = self
+                        .db
+                        .save_rar_volume_facts(job_id, set_name, volume, &encoded)
+                    {
+                        warn!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            volume,
+                            error = %error,
+                            "failed to re-persist restored RAR volume facts across source retry"
+                        );
+                    }
+                }
+                Err(error) => warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    volume,
+                    error = %error,
+                    "failed to encode restored RAR volume facts across source retry"
+                ),
+            }
+            state.volume_files.insert(volume, filename);
+            state.facts.insert(volume, facts);
+        }
+        state.facts_generation = state.facts_generation.wrapping_add(1);
+        info!(
+            job_id = job_id.0,
+            set_name = %set_name,
+            volumes = ?preserved,
+            "kept restored RAR volumes registered across source retry"
+        );
+    }
+
+    /// Registered volumes of a set that no NZB file accounts for — written by
+    /// a standalone `.rev` restore — that are still on disk, with the facts
+    /// parsed from them. A restore that rewrote a downloaded volume in place
+    /// shares that volume's NZB filename and is deliberately not in this list:
+    /// it is a source the retry re-downloads like any other.
+    fn restored_rar_volumes_to_preserve(
+        &self,
+        job_id: JobId,
+        set_key: &(JobId, String),
+    ) -> Vec<(u32, String, unrar_rs::RarVolumeFacts)> {
+        let (Some(rar_state), Some(state)) = (self.rar_sets.get(set_key), self.jobs.get(&job_id))
+        else {
+            return Vec::new();
+        };
+        let nzb_filenames: HashSet<String> = state
+            .spec
+            .files
+            .iter()
+            .map(|file| file.filename.clone())
+            .chain(
+                state
+                    .assembly
+                    .files()
+                    .map(|file| self.current_filename_for_file(job_id, file)),
+            )
+            .collect();
+        rar_state
+            .volume_files
+            .iter()
+            .filter(|(_, filename)| !nzb_filenames.contains(filename.as_str()))
+            .filter(|(_, filename)| {
+                self.resolve_job_input_path(job_id, filename)
+                    .is_some_and(|path| path.exists())
+            })
+            .filter_map(|(volume, filename)| {
+                rar_state
+                    .facts
+                    .get(volume)
+                    .map(|facts| (*volume, filename.clone(), facts.clone()))
+            })
+            .collect()
     }
 
     fn rar_volume_numbers_by_filename(&self, job_id: JobId) -> HashMap<String, u32> {
@@ -1400,8 +1495,14 @@ impl Pipeline {
                     facts,
                 )?;
             }
+            // The header snapshot predates the restored volume: it was built
+            // while the set still had the hole, and its member spans say so.
+            // Rebuilding from it after the restore fed the extractor a member
+            // that "lived" in volume 0 alone, and the decode ran out of bits at
+            // the end of that volume. Invalidating the persisted copy too is
+            // what makes the recompute below read every volume from disk.
+            self.invalidate_rar_snapshot(job_id, &set_name);
             if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
-                set_state.cached_headers = None;
                 for volume_number in restored_volumes {
                     set_state.verified_suspect_volumes.remove(&volume_number);
                 }

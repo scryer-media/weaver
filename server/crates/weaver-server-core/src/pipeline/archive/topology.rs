@@ -1871,13 +1871,28 @@ impl Pipeline {
             })
     }
 
-    pub(in crate::pipeline) fn clear_rar_snapshot(&mut self, job_id: JobId, set_name: &str) {
+    /// Forget a set's header snapshot — the in-memory copy and the persisted
+    /// one — without touching its topology, so the next recompute rebuilds
+    /// from volume 0 instead of a view that no longer describes the files on
+    /// disk.
+    ///
+    /// Both copies have to go: `load_rar_snapshot` falls back to the database
+    /// when the in-memory copy is gone, so clearing only `cached_headers` is
+    /// not an invalidation at all. That is exactly how a recovery-volume
+    /// restore used to lose its restored volume — the recompute after it
+    /// "rebuilt" from the pre-restore snapshot, whose member spans still
+    /// described the set with the hole in it.
+    pub(in crate::pipeline) fn invalidate_rar_snapshot(&mut self, job_id: JobId, set_name: &str) {
         if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.to_string())) {
             state.cached_headers = None;
         }
         if let Err(e) = self.db.delete_archive_headers(job_id, set_name) {
             error!(job_id = job_id.0, set_name, error = %e, "failed to delete cached RAR headers");
         }
+    }
+
+    pub(in crate::pipeline) fn clear_rar_snapshot(&mut self, job_id: JobId, set_name: &str) {
+        self.invalidate_rar_snapshot(job_id, set_name);
         if let Some(state) = self.jobs.get_mut(&job_id)
             && let Some(topology) = state.assembly.archive_topologies_mut().remove(set_name)
         {
