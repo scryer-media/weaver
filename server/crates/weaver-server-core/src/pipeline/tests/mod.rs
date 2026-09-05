@@ -2186,6 +2186,27 @@ async fn submit_decoded_segment_with_segments(
             },
         )
         .await;
+    // A decode can demote a direct set, and a demotion hands its reconstruction
+    // sweep to a detached worker instead of running it inline. In the running
+    // server the select loop picks the ticket up; here nothing does, so the
+    // volumes would never become files and every assertion after the demoting
+    // article would be reading a half-finished handback.
+    settle_direct_demotion_work(pipeline).await;
+}
+
+/// Drives every outstanding demotion reconstruction ticket to its handler, the
+/// way the orchestrator's select loop would.
+async fn settle_direct_demotion_work(pipeline: &mut Pipeline) {
+    while !pipeline.direct_demotion_in_flight.is_empty() {
+        let done = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.direct_demotion_done_rx.recv(),
+        )
+        .await
+        .expect("a detached demotion sweep should finish")
+        .expect("the demotion completion channel should stay open");
+        pipeline.handle_direct_demotion_done(done).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2467,13 +2488,14 @@ fn debug_job_state(pipeline: &Pipeline, job_id: JobId) -> String {
     lines.join("\n")
 }
 
-/// Drives every detached direct-store ticket — post-repair read-backs and
-/// tolerated extractions — to its handler, the way the orchestrator's select
-/// loop would, until none is in flight.
+/// Drives every detached direct-store ticket — post-repair read-backs,
+/// tolerated extractions and demotion reconstruction sweeps — to its handler,
+/// the way the orchestrator's select loop would, until none is in flight.
 async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
     enum Ticket {
         PostRepair(crate::pipeline::DirectPostRepairWorkDone),
         Tolerated(crate::pipeline::DirectToleratedWorkDone),
+        Demotion(crate::pipeline::DirectDemotionWorkDone),
     }
     loop {
         pipeline.pump_decode_queue();
@@ -2487,13 +2509,18 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         while let Ok(done) = pipeline.direct_tolerated_done_rx.try_recv() {
             pipeline.handle_direct_tolerated_done(done).await;
         }
+        while let Ok(done) = pipeline.direct_demotion_done_rx.try_recv() {
+            pipeline.handle_direct_demotion_done(done).await;
+        }
         let post_repair_pending = !pipeline.direct_post_repair_in_flight.is_empty();
         let tolerated_pending = !pipeline.direct_tolerated_in_flight.is_empty();
-        if !post_repair_pending && !tolerated_pending {
+        let demotion_pending = !pipeline.direct_demotion_in_flight.is_empty();
+        if !post_repair_pending && !tolerated_pending && !demotion_pending {
             return;
         }
         let post_repair_rx = &mut pipeline.direct_post_repair_done_rx;
         let tolerated_rx = &mut pipeline.direct_tolerated_done_rx;
+        let demotion_rx = &mut pipeline.direct_demotion_done_rx;
         let ticket = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::select! {
                 done = post_repair_rx.recv(), if post_repair_pending => {
@@ -2502,6 +2529,9 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
                 done = tolerated_rx.recv(), if tolerated_pending => {
                     Ticket::Tolerated(done.expect("direct tolerated-extraction channel should stay open"))
                 }
+                done = demotion_rx.recv(), if demotion_pending => {
+                    Ticket::Demotion(done.expect("direct demotion channel should stay open"))
+                }
             }
         })
         .await
@@ -2509,6 +2539,7 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         match ticket {
             Ticket::PostRepair(done) => pipeline.handle_direct_post_repair_done(done),
             Ticket::Tolerated(done) => pipeline.handle_direct_tolerated_done(done).await,
+            Ticket::Demotion(done) => pipeline.handle_direct_demotion_done(done).await,
         }
     }
 }

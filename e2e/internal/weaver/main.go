@@ -4234,6 +4234,23 @@ var byDesignDirectRefusals = map[string]bool{
 	"tolerance_budget":         true,
 	"unsupported_format":       true,
 	"encrypted_facts_disagree": true,
+	// Refused *destinations* over a truthful image, not a carry failure. The
+	// router classifies both as `VolumeDemand::Virtual`: the archive parsed,
+	// the routed bytes are the posted bytes, and what direct-store refused is
+	// where a member would land — a path the RAR validator rejects, or two
+	// members that sanitize to the same path. The conventional extractor
+	// applies the same two rules and fails the archive the same way, so
+	// demoting is what makes direct routing reproduce the conventional
+	// outcome exactly instead of silently overwriting one member with
+	// another.
+	//
+	// These reach the check at *header* time rather than at admission. Member
+	// names do not exist until a volume's headers are parsed, so a collision
+	// or an unsafe path among members that live under directories can only be
+	// discovered then — and since directory members became admissible, the
+	// `member_directory` refusal no longer fires first and hides them.
+	"colliding_destinations": true,
+	"unsafe_destination":     true,
 }
 
 // Jobs whose fixtures carry deliberately damaged bytes, where a checksum

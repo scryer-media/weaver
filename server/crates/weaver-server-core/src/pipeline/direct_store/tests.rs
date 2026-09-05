@@ -3696,37 +3696,59 @@ fn materialized_segments_above_a_hole_stay_committed_without_advancing_the_floor
 }
 
 #[test]
-fn a_covered_run_with_no_composed_reference_refuses_to_be_rebuilt() {
+fn a_covered_run_with_no_composed_reference_refuses_only_the_articles_it_covers() {
     // "Verify where available" is the wrong default for a sweep that reads
-    // through sparse files. A run with no reference value is refused, and the
-    // fallback refetches — which is always correct — rather than putting bytes
-    // nothing checked under a published floor.
+    // through sparse files: a chunk with no reference value is refused rather
+    // than put under a published floor.
+    //
+    // The refusal is charged to that chunk alone. A covered range is a *merged*
+    // run — on a real volume it is every article the coverage ever abutted — so
+    // charging it to the range would mean one unclosable frontier costing every
+    // article below it. That frontier is exactly the shape a demotion catching a
+    // volume mid-download produces, which is why it must cost the frontier and
+    // nothing else.
     let fixture = provider_fixture(whole_volume_covered());
     let crcs = provider_article_crcs(&fixture.conventional);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("silver.horizon.part01.rar");
 
-    // Ends inside an article, so no composition can vouch for it.
+    // Two whole articles and then a frontier that stops inside a third, which no
+    // composition can vouch for.
     let mut covered = ByteRanges::new();
     covered.insert(0, 250);
 
     let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
-    let failure = sweep_volumes(
+    let rebuilt = super::reconstruct::reconstruct_volumes(
         &provider,
         &[reconstruction_target(&fixture, path.clone(), covered, crcs)],
         super::sparse::SparseMarking::Platform,
-    )
-    .expect_err("a run with no reference must not be written");
+    );
     assert_eq!(
-        failure,
-        super::reconstruct::ReconstructionFailure::UnverifiableRun {
+        rebuilt[0].failure,
+        Some(super::reconstruct::ReconstructionFailure::UnverifiableRun {
             volume_index: 0,
-            offset: 0,
-        }
+            offset: 200,
+        }),
+        "the refusal names the frontier, not the start of the merged run"
+    );
+    assert_eq!(
+        rebuilt[0].verified.ranges(),
+        &[(0, 200)],
+        "the two whole articles below the frontier are still vouched for"
+    );
+    assert_eq!(rebuilt[0].contiguous, 200);
+    assert!(!rebuilt[0].complete);
+
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(
+        &written[..200],
+        &fixture.conventional[..200],
+        "the verified articles are byte-exact"
     );
     assert!(
-        !path.exists(),
-        "a refused reconstruction leaves nothing for the refetch to write around"
+        written[200..250].iter().all(|byte| *byte == 0),
+        "the refused frontier is left as a hole for the refetch rather than bytes \
+         nothing checked"
     );
 }
 
@@ -3827,9 +3849,13 @@ fn a_carried_remainder_must_be_the_prefix_of_one_known_article() {
             offset: 200,
         }
     );
+    // The two articles the composition does know were verified and written on
+    // the way to that refusal; only the remainder past them is left as a hole.
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(&written[..200], &fixture.conventional[..200]);
     assert!(
-        !path.exists(),
-        "a refused reconstruction leaves nothing behind"
+        written[200..].iter().all(|byte| *byte == 0),
+        "a refused remainder leaves a hole rather than bytes no article record accounts for"
     );
 }
 
@@ -3861,7 +3887,10 @@ fn a_carried_remainder_still_verifies_the_articles_before_it() {
             offset: 0,
         }
     );
-    assert!(!path.exists());
+    // The bytes the sweep read before the reference disagreed are on disk. They
+    // are harmless because they are not in `verified`: every article over them
+    // is refetched and overwritten, and no floor is published across them.
+    assert!(path.exists());
 }
 
 #[test]
@@ -3877,7 +3906,7 @@ fn a_rebuilt_run_that_fails_its_reference_falls_back_to_refetching() {
     let path = dir.path().join("silver.horizon.part01.rar");
 
     let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
-    let failure = sweep_volumes(
+    let rebuilt = super::reconstruct::reconstruct_volumes(
         &provider,
         &[reconstruction_target(
             &fixture,
@@ -3886,16 +3915,34 @@ fn a_rebuilt_run_that_fails_its_reference_falls_back_to_refetching() {
             crcs,
         )],
         super::sparse::SparseMarking::Platform,
-    )
-    .expect_err("a run that disagrees with its composed CRC32 must not be trusted");
+    );
     assert!(matches!(
-        failure,
-        super::reconstruct::ReconstructionFailure::ChecksumMismatch {
-            volume_index: 0,
-            ..
-        }
+        rebuilt[0].failure,
+        Some(
+            super::reconstruct::ReconstructionFailure::ChecksumMismatch {
+                volume_index: 0,
+                ..
+            }
+        )
     ));
-    assert!(!path.exists());
+    // The corrupted byte is in the volume's first article, and the cost is that
+    // article. `verified` is the only claim the caller may act on, so what
+    // matters is that it does not name the disagreeing range — and that it does
+    // still name the articles beside it, which is the difference between one
+    // article off the wire and the whole volume.
+    assert!(
+        !rebuilt[0].verified.missing(0, 100).is_empty(),
+        "an article that disagrees with its composed CRC32 must not be trusted"
+    );
+    assert!(
+        rebuilt[0].verified.missing(100, 460).is_empty(),
+        "every article the corruption does not touch is still vouched for"
+    );
+    assert_eq!(
+        rebuilt[0].contiguous, 0,
+        "no floor may be published over a volume whose first article is refused"
+    );
+    assert!(!rebuilt[0].complete);
 }
 
 #[test]

@@ -9,7 +9,7 @@ use super::*;
 use std::path::Path;
 
 use crate::pipeline::direct_store::DirectStoreGate;
-use crate::pipeline::direct_store::router::DemotionReason;
+use crate::pipeline::direct_store::router::{DemotionReason, VolumeDemand};
 use crate::pipeline::direct_store::wiring::MAX_DIRECT_REPAIR_DEFER_WAVES;
 
 /// A real NZB's `<segment bytes=…>` is the yEnc-**encoded** article size, about
@@ -1414,6 +1414,7 @@ async fn demotion_materialization_gate_is_scoped_to_its_bound_par2_set() {
             DemotionReason::MemberChecksumMismatch,
         )
         .await;
+    settle_direct_post_repair_work(&mut pipeline).await;
 
     let first_set_id = pipeline
         .resolve_par2_file_binding(NzbFileId {
@@ -3100,6 +3101,51 @@ async fn demote_mid_download(
     volumes: &[(String, Vec<u8>)],
     before_demotion: impl FnOnce(&mut Pipeline, &std::path::Path),
 ) -> (Pipeline, std::path::PathBuf, u64) {
+    demote_mid_download_for(
+        temp_dir,
+        job_id,
+        volumes,
+        DemotionReason::HoldsBudgetExceeded,
+        before_demotion,
+    )
+    .await
+}
+
+/// [`demote_mid_download`] with the demotion reason spelled out, for the tests
+/// that turn on the reason's [`VolumeDemand`] rather than on the sweep.
+async fn demote_mid_download_for(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    reason: DemotionReason,
+    before_demotion: impl FnOnce(&mut Pipeline, &std::path::Path),
+) -> (Pipeline, std::path::PathBuf, u64) {
+    let (mut pipeline, working_dir, other_file_bytes) =
+        demote_mid_download_leaving_the_sweep_outstanding(
+            temp_dir,
+            job_id,
+            volumes,
+            reason,
+            before_demotion,
+        )
+        .await;
+    // The demotion hands its reconstruction sweep to a detached worker and
+    // returns; every assertion about materialized volumes, floors and requeued
+    // articles is about what the ticket's completion does on the pipeline task.
+    settle_direct_post_repair_work(&mut pipeline).await;
+    (pipeline, working_dir, other_file_bytes)
+}
+
+/// [`demote_mid_download_for`] stopped where the demotion returns, with the
+/// reconstruction sweep still an outstanding ticket. For the tests whose
+/// subject is the detachment itself.
+async fn demote_mid_download_leaving_the_sweep_outstanding(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    reason: DemotionReason,
+    before_demotion: impl FnOnce(&mut Pipeline, &std::path::Path),
+) -> (Pipeline, std::path::PathBuf, u64) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     let spec = direct_store_job_spec("Silver Horizon", volumes);
@@ -3141,10 +3187,229 @@ async fn demote_mid_download(
     );
 
     before_demotion(&mut pipeline, &working_dir);
-    pipeline
-        .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded)
-        .await;
+    pipeline.demote_direct_set(job_id, 0, reason).await;
     (pipeline, working_dir, OTHER_FILE_BYTES)
+}
+
+/// The set the fixtures above demote: one member across three store volumes,
+/// with volume 0 whole, volume 1 half covered and volume 2 not started.
+fn demotion_fixture_volumes(member_name: &str) -> Vec<(String, Vec<u8>)> {
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
+    single_member_store_set(member_name, &payload, 3)
+}
+
+#[tokio::test]
+async fn a_demotion_returns_before_its_reconstruction_sweep_finishes() {
+    let member_name = "Silver.Horizon.S01E24.mkv";
+    let volumes = demotion_fixture_volumes(member_name);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41058);
+    let (mut pipeline, working_dir, _) = demote_mid_download_leaving_the_sweep_outstanding(
+        &temp_dir,
+        job_id,
+        &volumes,
+        DemotionReason::HoldsBudgetExceeded,
+        |_, _| {},
+    )
+    .await;
+
+    // The sweep reads gigabytes on a real archive, and the demotion is reached
+    // from the decode of the article that triggered it. It must be a ticket:
+    // one per demoted set, fenced by the set it belongs to.
+    assert_eq!(
+        pipeline
+            .direct_demotion_in_flight
+            .get(&job_id)
+            .map(|sets| sets.keys().copied().collect::<Vec<_>>()),
+        Some(vec![0]),
+        "the demotion must return with its reconstruction sweep still outstanding"
+    );
+    // Nothing durable has happened yet. The member partial is the sweep's own
+    // input, and it is deleted only once every volume's floor is committed and
+    // the coverage row is retired — all of which is the ticket's work.
+    assert!(
+        direct_partial(&temp_dir, job_id, member_name).exists(),
+        "the routed output the sweep is reading may not be deleted before it lands"
+    );
+
+    settle_direct_post_repair_work(&mut pipeline).await;
+
+    assert!(
+        pipeline.direct_demotion_in_flight.is_empty(),
+        "the ticket is retired by its own completion"
+    );
+    assert_eq!(
+        std::fs::read(working_dir.join(&volumes[0].0))
+            .ok()
+            .as_deref(),
+        Some(volumes[0].1.as_slice()),
+        "and the volume the set had covered end to end is materialized then, byte for byte"
+    );
+    assert!(
+        !direct_partial(&temp_dir, job_id, member_name).exists(),
+        "with the routed output deleted behind it"
+    );
+}
+
+#[tokio::test]
+async fn the_archive_hook_leaves_a_volume_alone_while_its_demotion_sweep_is_outstanding() {
+    // A demoted set's volumes stop being direct source files at the demotion,
+    // so the conventional file-complete hook would otherwise classify and
+    // probe one the moment an in-window article completes it — over an image
+    // the detached sweep is still writing. The guard holds exactly for the
+    // set's own volumes and exactly until the ticket lands; the handback then
+    // replays the hook for every volume itself.
+    let member_name = "Silver.Horizon.S01E25.mkv";
+    let volumes = demotion_fixture_volumes(member_name);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41060);
+    let (mut pipeline, _, _) = demote_mid_download_leaving_the_sweep_outstanding(
+        &temp_dir,
+        job_id,
+        &volumes,
+        DemotionReason::HoldsBudgetExceeded,
+        |_, _| {},
+    )
+    .await;
+
+    let set_volume_files: Vec<NzbFileId> = (0..16u32)
+        .map(|file_index| NzbFileId { job_id, file_index })
+        .filter(|file_id| {
+            pipeline
+                .direct_store
+                .set(job_id, 0)
+                .is_some_and(|set| set.plan().volume_for_file(file_id.file_index).is_some())
+        })
+        .collect();
+    assert_eq!(set_volume_files.len(), volumes.len());
+    for file_id in &set_volume_files {
+        assert!(
+            !pipeline.is_direct_source_file(*file_id),
+            "a demoted set's volume is an ordinary file from the demotion on"
+        );
+        assert!(
+            pipeline.demotion_sweep_owns_file(*file_id),
+            "but the sweep owns it until the ticket lands"
+        );
+    }
+    let other_file = NzbFileId {
+        job_id,
+        file_index: 16,
+    };
+    assert!(!pipeline.demotion_sweep_owns_file(other_file));
+    assert!(!pipeline.demotion_sweep_owns_file(NzbFileId {
+        job_id: JobId(41061),
+        file_index: set_volume_files[0].file_index,
+    }));
+
+    settle_direct_post_repair_work(&mut pipeline).await;
+
+    for file_id in &set_volume_files {
+        assert!(
+            !pipeline.demotion_sweep_owns_file(*file_id),
+            "once the handback has run the hook must see the volume like any other file"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_completion_gate_refuses_to_judge_a_job_whose_demotion_sweep_is_outstanding() {
+    let member_name = "Silver.Horizon.S01E25.mkv";
+    let volumes = demotion_fixture_volumes(member_name);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41059);
+    let (mut pipeline, working_dir, _) = demote_mid_download_leaving_the_sweep_outstanding(
+        &temp_dir,
+        job_id,
+        &volumes,
+        DemotionReason::HoldsBudgetExceeded,
+        |_, _| {},
+    )
+    .await;
+
+    // Non-vacuity: empty the download queue, so the only thing left between this
+    // job and a verdict is the sweep. Without the gate the check would read a
+    // job whose volumes are neither routed nor on disk and call its files
+    // unassemblable.
+    let drained = queued_segments(&mut pipeline, job_id);
+    assert!(
+        !drained.is_empty(),
+        "non-vacuity: the fixture must have had queued work to drain"
+    );
+
+    pipeline.check_job_completion(job_id).await;
+    let status = pipeline
+        .jobs
+        .get(&job_id)
+        .map(|state| state.status.clone())
+        .expect("the job must still be active");
+    assert!(
+        !matches!(status, JobStatus::Failed { .. } | JobStatus::Complete),
+        "a job with a demotion sweep outstanding must not be judged, got {status:?}"
+    );
+
+    // And the state the gate was protecting arrives with the ticket: until it
+    // lands there is no volume on disk and no floor describing one, which is
+    // exactly the reading that would have condemned the job above.
+    settle_direct_post_repair_work(&mut pipeline).await;
+    assert_eq!(
+        std::fs::read(working_dir.join(&volumes[0].0))
+            .ok()
+            .as_deref(),
+        Some(volumes[0].1.as_slice()),
+        "the ticket's completion is what makes the demoted volumes real"
+    );
+}
+
+#[tokio::test]
+async fn job_teardown_forgets_an_outstanding_demotion_sweep() {
+    let member_name = "Silver.Horizon.S01E26.mkv";
+    let volumes = demotion_fixture_volumes(member_name);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41060);
+    let (mut pipeline, _, _) = demote_mid_download_leaving_the_sweep_outstanding(
+        &temp_dir,
+        job_id,
+        &volumes,
+        DemotionReason::HoldsBudgetExceeded,
+        |_, _| {},
+    )
+    .await;
+    assert!(
+        pipeline.direct_demotion_in_flight.contains_key(&job_id),
+        "non-vacuity: there has to be a ticket for the teardown to forget"
+    );
+
+    let queued_before = peek_queued_segments(&mut pipeline, job_id);
+    pipeline.clear_job_progress_floor_runtime(job_id);
+    assert!(
+        pipeline.direct_demotion_in_flight.is_empty(),
+        "job teardown must forget the ticket rather than leave the job's last \
+         reference to a working directory it is about to delete"
+    );
+
+    // The detached worker still runs to its end and still posts its result. It
+    // has to find no taker: the fence is what stops it applying floors, rows and
+    // requeues to a job that no longer has the state they describe.
+    let done = tokio::time::timeout(
+        Duration::from_secs(10),
+        pipeline.direct_demotion_done_rx.recv(),
+    )
+    .await
+    .expect("the forgotten sweep still finishes")
+    .expect("the demotion completion channel should stay open");
+    pipeline.handle_direct_demotion_done(done).await;
+
+    assert!(pipeline.direct_demotion_in_flight.is_empty());
+    assert_eq!(
+        peek_queued_segments(&mut pipeline, job_id),
+        queued_before,
+        "a forgotten ticket must change nothing when it lands"
+    );
 }
 
 #[tokio::test]
@@ -3826,12 +4091,19 @@ async fn direct_store_demotes_when_the_chain_closes_with_a_blake2_only_member() 
     }
 }
 
-/// Every source volume of `volumes` that exists on disk is a byte-exact prefix
-/// of the volume that was posted.
+/// No source volume of `volumes` that exists on disk holds a byte the set never
+/// downloaded.
 ///
 /// The assertion demotion has to satisfy however it goes: a reconstruction
-/// writes the volume, a refetch fallback writes nothing, and neither may leave
-/// bytes that were never downloaded looking like bytes that were.
+/// writes the runs it verified, a refused run leaves its range untouched, a
+/// refetch fallback leaves no file at all, and none of them may leave bytes that
+/// were never downloaded looking like bytes that were.
+///
+/// A rebuilt volume is sparse where the sweep did not write — a run it could not
+/// vouch for, an article that never arrived — so the check is per byte rather
+/// than "a byte-exact prefix": every byte either is the posted volume's, or is a
+/// zero standing for a hole the refetch fills. Only a non-zero byte that
+/// disagrees is fabrication, and that is the failure this exists to catch.
 fn assert_volumes_are_never_fabricated(
     working_dir: &std::path::Path,
     volumes: &[(String, Vec<u8>)],
@@ -3844,11 +4116,20 @@ fn assert_volumes_are_never_fabricated(
             written.len() <= bytes.len(),
             "{filename} was materialized longer than the volume it stands for"
         );
-        assert_eq!(
-            written.as_slice(),
-            &bytes[..written.len()],
-            "{filename} was materialized with bytes the set never downloaded"
-        );
+        if let Some((offset, byte)) =
+            written
+                .iter()
+                .zip(bytes.iter())
+                .enumerate()
+                .find_map(|(offset, (written, posted))| {
+                    (written != posted && *written != 0).then_some((offset, *written))
+                })
+        {
+            panic!(
+                "{filename} was materialized with a byte the set never downloaded: \
+                 {byte:#04x} at {offset}"
+            );
+        }
     }
 }
 
@@ -5028,6 +5309,125 @@ async fn a_partially_covered_volume_that_fails_its_composed_crc_refetches_alone(
         pipeline.jobs.get(&job_id).unwrap().downloaded_bytes,
         other_file_bytes + volumes[0].1.len() as u64,
         "the volume that survived as a real file stays counted; the refused one does not"
+    );
+}
+
+/// A demotion whose reason leaves the image truthful — the router's
+/// [`VolumeDemand::Virtual`] class — must schedule no article the set already
+/// received.
+///
+/// The fetch schedule is the assertion, not a status string: a demotion that
+/// "succeeded" while quietly requeueing a routed article is exactly the excess
+/// this path exists to stop paying, and only the queue can tell the difference.
+#[tokio::test]
+async fn a_virtual_reason_demotion_schedules_nothing_it_already_received() {
+    let member_name = "Silver.Horizon.S01E26.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 179) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    // Two independent members of the Virtual class: a holds-budget refusal says
+    // nothing about the layout, and a refused destination refuses where a member
+    // would land rather than what the volume holds.
+    for (job_id, reason) in [
+        (JobId(41055), DemotionReason::HoldsBudgetExceeded),
+        (JobId(41056), DemotionReason::CollidingDestinations),
+    ] {
+        assert_eq!(
+            reason.volume_demand(),
+            VolumeDemand::Virtual,
+            "{reason:?} is only interesting here because the image stays truthful"
+        );
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _working_dir, _) =
+            demote_mid_download_for(&temp_dir, job_id, &volumes, reason, |_, _| {}).await;
+
+        // Everything `demote_mid_download` routed before demoting. None of it may
+        // come back off the wire.
+        let received = [(0u32, 0u32), (0, 1), (1, 0)];
+        let queued = queued_segments(&mut pipeline, job_id);
+        for article in received {
+            assert!(
+                !queued.contains(&article),
+                "{reason:?}: article {article:?} was already received and must not be \
+                 fetched again, queue was {queued:?}"
+            );
+        }
+        assert_eq!(
+            queued,
+            vec![(1, 1), (2, 0), (2, 1)],
+            "{reason:?}: exactly the articles that never arrived are scheduled"
+        );
+    }
+}
+
+/// A demotion that does need real files under it still refetches only what its
+/// evidence actually contradicts.
+///
+/// One article of one volume disagrees with the yEnc part CRC32 the wire
+/// delivered for it. The covered range it sits in is *merged* — volume 0 was
+/// routed end to end, so the coverage map holds one entry for the whole volume
+/// — and charging the merged range would cost the volume. The article is the
+/// unit the composition can vouch for, so the article is what comes back.
+#[tokio::test]
+async fn a_real_reason_demotion_refetches_only_the_article_that_disagreed() {
+    let member_name = "Silver.Horizon.S01E27.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 181) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    // Volume 0 carries the member's logical bytes 0..800 and arrives as two
+    // articles, so a byte this near the end of its range is under the second
+    // article and outside the first.
+    const CORRUPTED_LOGICAL_OFFSET: u64 = 700;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41057);
+    assert_eq!(
+        DemotionReason::Par2Damaged.volume_demand(),
+        VolumeDemand::Real,
+        "the conventional repairer is filesystem-bound, so this demotion needs files"
+    );
+    let (mut pipeline, working_dir, other_file_bytes) = demote_mid_download_for(
+        &temp_dir,
+        job_id,
+        &volumes,
+        DemotionReason::Par2Damaged,
+        |_, _| {
+            use std::io::{Seek, SeekFrom, Write};
+            let partial = direct_partial(&temp_dir, job_id, member_name);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&partial)
+                .expect("the member partial holds the routed bytes");
+            file.seek(SeekFrom::Start(CORRUPTED_LOGICAL_OFFSET))
+                .unwrap();
+            file.write_all(&[0xFF]).unwrap();
+            file.sync_all().unwrap();
+        },
+    )
+    .await;
+
+    let volume_zero_split = volumes[0].1.len().div_ceil(2);
+    let written = std::fs::read(working_dir.join(&volumes[0].0)).unwrap();
+    assert_eq!(
+        &written[..volume_zero_split],
+        &volumes[0].1[..volume_zero_split],
+        "the article the corruption did not touch is rebuilt byte for byte"
+    );
+    // Above the split the file holds whatever the overlay answered with before
+    // the reference disagreed. Those bytes are claimed by nothing — no floor
+    // reaches them and the article over them is requeued below — so the refetch
+    // overwrites them; what would be wrong is a *claim*, not their presence.
+
+    assert_eq!(
+        queued_segments(&mut pipeline, job_id),
+        vec![(0, 1), (1, 1), (2, 0), (2, 1)],
+        "only the disagreeing article of volume 0 comes back; its neighbour in the \
+         same merged coverage run, and the verified prefix of volume 1, do not"
+    );
+    let volume_one_prefix = volumes[1].1.len().div_ceil(2) as u64;
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().downloaded_bytes,
+        other_file_bytes + volume_zero_split as u64 + volume_one_prefix,
+        "every article that survived stays counted, and only the refused one is given up"
     );
 }
 
@@ -13494,6 +13894,7 @@ async fn an_encrypted_set_that_demotes_rebuilds_byte_exact_posted_volumes() {
     pipeline
         .demote_direct_set(job_id, 0, DemotionReason::HoldsScratchFailed)
         .await;
+    settle_direct_post_repair_work(&mut pipeline).await;
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
         shape.contains("Demoted"),
@@ -16704,6 +17105,7 @@ async fn demoting_a_direct_set_forgets_the_grid_state_its_volumes_carried() {
     pipeline
         .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded)
         .await;
+    settle_direct_post_repair_work(&mut pipeline).await;
 
     assert!(
         verdicts_for(&pipeline, job_id, 0).is_empty(),
@@ -17919,6 +18321,7 @@ async fn demoting_a_carrying_set_clears_the_carry_and_the_ticket_slots() {
     pipeline
         .demote_direct_set(job_id, 0, DemotionReason::UnparsableVolume)
         .await;
+    settle_direct_post_repair_work(&mut pipeline).await;
 
     assert!(
         pipeline.direct_post_repair_carry.is_empty(),
@@ -18261,6 +18664,7 @@ async fn a_damage_demotion_puts_the_set_on_record_and_an_ordinary_one_does_not()
     capacity_pipeline
         .demote_direct_set(capacity_job, 0, DemotionReason::HoldsBudgetExceeded)
         .await;
+    settle_direct_post_repair_work(&mut capacity_pipeline).await;
     assert!(
         !capacity_pipeline.archive_extraction_held_for_known_damage(capacity_job),
         "a RAM-budget demotion is not evidence about the bytes"
@@ -18287,6 +18691,7 @@ async fn a_damage_demotion_puts_the_set_on_record_and_an_ordinary_one_does_not()
     damaged_pipeline
         .demote_direct_set(damaged_job, 0, DemotionReason::PartChecksumMismatch)
         .await;
+    settle_direct_post_repair_work(&mut damaged_pipeline).await;
     assert_eq!(
         damaged_pipeline
             .known_damaged_archive_sets
