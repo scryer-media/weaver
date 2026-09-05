@@ -634,6 +634,11 @@ pub(crate) struct DemotedSweepPlan {
     handoffs: HashSet<SegmentId>,
 }
 
+/// Chunks a demoted volume's handback unblocked in the write buffer: the file
+/// they belong to, the ready `(offset, chunk)` pairs in write order, and the
+/// contiguous end the buffer reports after draining them.
+type UnblockedHandbackWrites = (NzbFileId, Vec<(u64, BufferedDecodedSegment)>, u64);
+
 /// A demotion sweep ready to be handed off: the worker's half (which is moved
 /// into the blocking task and never comes back) and the reconciliation's.
 struct PreparedDemotedSweep {
@@ -7922,7 +7927,7 @@ impl Pipeline {
         let mut fully_reset: Vec<u32> = Vec::new();
         // Chunks the write buffer could not place until this pass seeded the
         // sweep's extents into it, drained here and written below.
-        let mut unblocked: Vec<(NzbFileId, Vec<(u64, BufferedDecodedSegment)>, u64)> = Vec::new();
+        let mut unblocked: Vec<UnblockedHandbackWrites> = Vec::new();
         let write_buf_max_pending = self.write_buf_max_pending;
         {
             let Some(state) = self.jobs.get_mut(&job_id) else {
