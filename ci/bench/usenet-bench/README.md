@@ -129,7 +129,7 @@ Together they cover the RARLAB writer eras and their archive families across:
 | --- | --- |
 | Writer era | RAR 3.93, 4.20, 5.00, 6.24, 7.23 and 7-Zip 26.02 (official upstream Linux releases, SHA-256 verified in the image build) |
 | Archive format | legacy RAR4 (3.93 / 4.20 writers), RAR5 (5.00 / 6.24 / 7.23 writers, explicit `-ma5`), or 7z (official 7-Zip build) |
-| Compression | store (`-m0`) or release-style normal compression (`-m5`, solid where declared, maximum dictionary, RAR5 quick-open disabled) |
+| Compression | store (`-m0`) or release-style normal compression (`-m5`, solid where declared, maximum dictionary, RAR5 quick-open disabled except on the `rar5-7-quickopen` set, which keeps a quick-open record for every header) |
 | Solidity | non-solid, solid |
 | Encryption | none, data encryption, encrypted headers |
 | Input data | incompressible, moderately compressible |

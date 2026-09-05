@@ -1155,6 +1155,7 @@ var canonicalFixtureSlugs = []string{
 	"direct-store-multivolume",
 	"direct-store-par2-repair",
 	"direct-store-post-repair-queue-liveness",
+	"direct-store-quick-open",
 	"direct-store-rar4",
 	"direct-store-rar4-encrypted",
 	"direct-store-rar4-encrypted-par2-repair",

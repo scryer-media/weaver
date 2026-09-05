@@ -20,6 +20,7 @@
     "rar5-5-store-store-nonsolid-none-incompressible",
     "rar5-6-store-store-nonsolid-none-incompressible",
     "rar5-7-store-store-nonsolid-none-compressible",
+    "rar5-7-quickopen-store-nonsolid-none-incompressible",
     "sevenzip-store-store-nonsolid-none-incompressible",
     "sevenzip-headers-store-nonsolid-headers-incompressible",
     "sevenzip-lzma2-normal-solid-none-compressible",
