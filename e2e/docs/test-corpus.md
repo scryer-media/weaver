@@ -185,19 +185,19 @@ which pinned oracles wrote it and which ledger paths it was built from.
 | --- | --- | --- | --- |
 | shared clips | 1 | 5 | ~313 MiB |
 | direct media | 4 | 5 | ~246 MiB |
-| RAR5 | 19 | 39 | ~1475 MiB |
+| RAR5 | 20 | 40 | ~1475 MiB |
 | RAR4 | 9 | 13 | ~712 MiB |
 | nested | 4 | 4 | ~321 MiB |
 | 7z | 6 | 12 | ~479 MiB |
 | obfuscated | 4 | 12 | ~329 MiB |
-| PAR2 | 17 | 92 | ~932 MiB |
+| PAR2 | 18 | 98 | ~933 MiB |
 | zip | 3 | 3 | ~246 MiB |
 | tar | 8 | 8 | ~665 MiB |
 | stream codec | 6 | 6 | ~181 MiB |
 | direct store | 6 | 20 | ~102 MiB |
 | mixed | 1 | 3 | ~85 MiB |
-| RAR recovery volumes | 4 | 15 | ~290 MiB |
-| **total** | **92** | **237** | **~6.2 GiB** |
+| RAR recovery volumes | 5 | 19 | ~378 MiB |
+| **total** | **95** | **248** | **~6.3 GiB** |
 
 Nine further scenario directories own no bytes at all: they stage another
 scenario's assets through `scenario.json`'s `fixtureAssets`, or the harness

@@ -387,6 +387,32 @@ func Recipes() []Recipe {
 		},
 	})
 
+	// Two members whose stored names differ only by case. Extraction folds
+	// case before it writes, so the pair would land on one destination; the
+	// product refuses the archive at open, and what the scenario proves is
+	// that the refusal ends the job instead of being re-scheduled without end.
+	// RARLAB writes the pair through `rn`, because no host the generator runs
+	// on can be relied upon to stage both names side by side.
+	add(Recipe{
+		Slug: "rar5-colliding-member-paths", Family: "RAR5",
+		Notes: "One stored RAR5 whose two members are `CERTIFICATE/BACKUP/id.bdmv` and `CERTIFICATE/backup/id.bdmv`: a case-folding extractor sees one destination for two files, and the open-time refusal has to be terminal.",
+		Build: func(ctx context.Context, env *Env) error {
+			if err := WriteText(env.StagePath("CERTIFICATE/BACKUP/id.bdmv"), "silver horizon disc certificate backup", 4096); err != nil {
+				return err
+			}
+			if err := WriteText(env.StagePath("CERTIFICATE/renamed/id.bdmv"), "silver horizon disc certificate lower-case twin", 4096); err != nil {
+				return err
+			}
+			if err := env.RAR(ctx, RARSpec{
+				Toolchain: RAR5Writer, Format: RAR5, Archive: "archive.rar", Method: "-m0",
+				Members: []string{"CERTIFICATE/BACKUP/id.bdmv", "CERTIFICATE/renamed/id.bdmv"},
+			}); err != nil {
+				return err
+			}
+			return env.RARRename(ctx, RAR5Writer, "archive.rar", "CERTIFICATE/renamed/id.bdmv", "CERTIFICATE/backup/id.bdmv")
+		},
+	})
+
 	add(Recipe{
 		Slug: "unicode-filenames", Family: "RAR5",
 		Notes:  "A RAR5 whose member name is a multi-script invented title, so filename decoding is exercised end to end.",
@@ -572,6 +598,23 @@ func Recipes() []Recipe {
 		Inputs:          []string{sharedClipPath},
 		Build:           recoveryVolumeRAR(RAR4Writer, RAR4, RARSpec{Method: "-m1"}, "22m", 4, 1, "archive.part3.rar"),
 		ExpectedOutputs: sharedClipExpectedOutput("work/payload/movie.mkv"),
+	})
+
+	// The header-encrypted shape. `-hp` hides the volume number the restorer
+	// reads out of the main header, so a `.rev` restore has to key its slots
+	// from the volume file names instead; a reader that trusts the header
+	// alone sees every slot as missing and refuses a set it could rebuild.
+	// The password is the corpus one, so the scenario also proves the
+	// restored volumes decrypt.
+	add(Recipe{
+		Slug: "rar5-hp-recovery-volume-heavy", Family: "RAR recovery volumes",
+		Notes:  "The heavy case with `-hp`: four 22 MiB header-encrypted RAR5 volumes plus two RARLAB recovery volumes, second and fourth data volumes withheld.",
+		Inputs: []string{sharedClipPath},
+		Build:  recoveryVolumeRAR(RAR5Writer, RAR5, RARSpec{Method: "-m1", Dictionary: "-md32m", HeaderPassword: CorpusPassword}, "22m", 4, 2, "archive.part2.rar", "archive.part4.rar"),
+		// Named as the product delivers it — the single media member is
+		// renamed after the posting's title — so a regeneration rewrites the
+		// digest under the key the harness actually asserts on.
+		ExpectedOutputs: sharedClipExpectedOutput("work/payload/E2E Test RAR5 HP RecoveryVolume Heavy.mkv"),
 	})
 
 	// ------------------------------------------------------------- nested
@@ -1011,6 +1054,29 @@ func Recipes() []Recipe {
 			par2(PAR2Spec{Base: "archive.7z.par2", SliceSize: 65536, RecoveryBlocks: 4, Sources: []string{"archive.7z"}}),
 			zeroOutput("archive.7z", 128*65536, 2*65536),
 		),
+	})
+
+	// A split 7z whose PAR2 set describes a part the posting never carried.
+	// The part is not damaged, not short, not slow: it is absent from the NZB
+	// altogether, so nothing in the download can ever complete it, and the
+	// only way to the payload is the recovery set rebuilding the whole part
+	// from parity before extraction runs. The set is small on purpose — every
+	// part is a single article — so the shape, not the size, is the test.
+	add(Recipe{
+		Slug: "par2-split-7z-withheld-part", Family: "PAR2", ByteReproducible: true,
+		Notes: "The LZMA2 codec-matrix 7z cut into five parts with parity over all five, then the third part withheld from the posting; the recovery set has to rebuild it before extraction can run.",
+		Build: sequence(
+			splitSevenZipIntoParts("direct-unpack-lzma2", 5),
+			par2(PAR2Spec{
+				Base: "archive.7z.par2", SliceSize: 16384, RecoveryBlocks: 8, RecoveryFiles: 1,
+				Sources: []string{
+					"archive.7z.001", "archive.7z.002", "archive.7z.003",
+					"archive.7z.004", "archive.7z.005",
+				},
+			}),
+			dropOutput("archive.7z.003"),
+		),
+		ExpectedOutputs: sevenZipCodecBySlug("lzma2").ExpectedOutputs(),
 	})
 
 	add(Recipe{

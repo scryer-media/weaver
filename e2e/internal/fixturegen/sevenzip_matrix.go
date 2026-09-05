@@ -160,6 +160,17 @@ func threeMembers(spec SevenZipSpec) func(context.Context, *Env) error {
 	}
 }
 
+// sevenZipCodecBySlug returns one matrix entry, for a scenario built on a
+// codec's artifact that is not itself part of the matrix.
+func sevenZipCodecBySlug(slug string) sevenZipCodec {
+	for _, codec := range sevenZipCodecMatrix() {
+		if codec.Slug == slug {
+			return codec
+		}
+	}
+	panic("no 7z codec-matrix entry named " + slug)
+}
+
 // sevenZipCodecMatrix is the writable-by-the-oracle, decodable-by-weaver
 // intersection, measured from `7zz i` on the pinned 26.02 build.
 func sevenZipCodecMatrix() []sevenZipCodec {
