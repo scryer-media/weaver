@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/clientadapter"
 )
 
 const (
@@ -55,6 +56,7 @@ type Config struct {
 	ClientVersion    string
 	WorkingDir       string
 	StartupTimeout   time.Duration
+	JobTimeout       time.Duration
 	PollInterval     time.Duration
 }
 
@@ -98,6 +100,10 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	jobTimeout, err := parseDurationDefault(getenv("NATIVE_JOB_TIMEOUT"), clientadapter.DefaultJobTimeout, "NATIVE_JOB_TIMEOUT")
+	if err != nil {
+		return Config{}, err
+	}
 	var launchCommand []string
 	if err := json.Unmarshal([]byte(required(getenv, "NATIVE_LAUNCH_COMMAND")), &launchCommand); err != nil {
 		return Config{}, fmt.Errorf("decode NATIVE_LAUNCH_COMMAND JSON array: %w", err)
@@ -131,6 +137,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		ClientVersion:    required(getenv, "NATIVE_CLIENT_VERSION"),
 		WorkingDir:       strings.TrimSpace(getenv("NATIVE_WORKING_DIR")),
 		StartupTimeout:   startupTimeout,
+		JobTimeout:       jobTimeout,
 		PollInterval:     pollInterval,
 	}
 	for field, value := range map[string]*string{
@@ -233,8 +240,8 @@ func (c Config) Validate() error {
 	if c.StorageProfile.Kind != benchmark.StorageLocal {
 		return fmt.Errorf("native adapter only supports the %q storage profile, got %q", benchmark.StorageProfileLocal, c.StorageProfile.ID)
 	}
-	if c.Connections < 1 || c.StartupTimeout <= 0 || c.PollInterval <= 0 {
-		return fmt.Errorf("connections, startup timeout, and poll interval must be positive")
+	if c.Connections < 1 || c.StartupTimeout <= 0 || c.PollInterval <= 0 || c.JobTimeout <= 0 {
+		return fmt.Errorf("connections, startup timeout, poll interval, and job timeout must be positive")
 	}
 	if len(c.LaunchCommand) == 0 || strings.TrimSpace(c.LaunchCommand[0]) == "" {
 		return fmt.Errorf("NATIVE_LAUNCH_COMMAND must contain a program path")

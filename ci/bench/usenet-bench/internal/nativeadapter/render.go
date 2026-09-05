@@ -53,6 +53,12 @@ func renderWeaver(cfg Config) productSpec {
 		// rendered explicitly in BOTH profiles so the pinned client binary
 		// benches the product as shipped, and so the audit record shows it.
 		"WEAVER_DIRECT_UNPACK=on",
+		// Weaver holds fresh posts for five minutes before downloading them
+		// (propagation delay). SABnzbd and NZBGet ship with that delay at zero,
+		// and every benchmark NZB is minutes old by construction, so the hold
+		// would measure the poster's clock rather than the client. Disabled
+		// through the documented environment gate; the audit record shows it.
+		"WEAVER_PROPAGATION_DELAY_SECS=0",
 		"WEAVER_SERVER_1_HOSTNAME=" + cfg.NNTPHost,
 		"WEAVER_SERVER_1_PORT=" + cfg.NNTPPort,
 		"WEAVER_SERVER_1_TLS=" + strconv.FormatBool(cfg.NNTPUseTLS),

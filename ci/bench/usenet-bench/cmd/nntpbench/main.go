@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -403,6 +404,12 @@ func execute(args []string, command string) error {
 	config.Plan = plan
 	config.Catalog = catalog
 	config.Target = benchmark.ExecutionTarget(executionTarget)
+	// Adapters run with the suite's artifact directory as their working
+	// directory, so a relative fixtures root would be resolved from there and
+	// point at nothing; the operator's path is anchored to this process's cwd.
+	if fixturesRoot, err = filepath.Abs(fixturesRoot); err != nil {
+		return fmt.Errorf("resolve --fixtures-root: %w", err)
+	}
 	config.FixtureRoot = fixturesRoot
 	config.ArtifactRoot = artifactsRoot
 	if config.Profile == "" {

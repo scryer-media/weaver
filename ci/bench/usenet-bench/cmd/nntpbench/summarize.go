@@ -44,13 +44,32 @@ type comparisonStratum struct {
 }
 
 type stratifiedComparison struct {
-	Stratum comparisonStratum       `json:"stratum"`
-	Summary benchmark.PairedSummary `json:"summary"`
+	Stratum    comparisonStratum `json:"stratum"`
+	Completion completionCounts  `json:"completion"`
+	// Summary is absent when the stratum has fewer complete pairs than the
+	// minimum because one client did not finish; ComparisonWithheld then says
+	// so. A client that cannot finish a fixture is a result in itself, and
+	// hiding the whole run behind it would hide that result.
+	Summary            *benchmark.PairedSummary `json:"summary,omitempty"`
+	ComparisonWithheld string                   `json:"comparison_withheld,omitempty"`
+}
+
+// completionCounts records, per stratum, how many randomized blocks each
+// client finished. Blocks where either client did not finish (a terminal
+// failure or an output that failed neutral verification) are excluded from the
+// paired timing summary and counted here instead.
+type completionCounts struct {
+	BlocksObserved        int `json:"blocks_observed"`
+	PairedBlocks          int `json:"paired_blocks"`
+	BaselineDidNotFinish  int `json:"baseline_did_not_finish"`
+	CandidateDidNotFinish int `json:"candidate_did_not_finish"`
 }
 
 type comparisonBlock struct {
-	baseline  *float64
-	candidate *float64
+	baseline     *float64
+	candidate    *float64
+	baselineDNF  bool
+	candidateDNF bool
 }
 
 type summaryProductKey struct {
@@ -172,7 +191,7 @@ func loadSequentialArtifacts(root string) ([]benchmark.QueueArtifact, error) {
 					return fmt.Errorf("sequential artifact %s is not bound to the snapshotted plan", path)
 				}
 			}
-			if artifact.Status != "passed" {
+			if !summarizableSequentialStatus(artifact.Status) {
 				return fmt.Errorf("sequential artifact %s is not publishable: status=%s error=%s", path, artifact.Status, artifact.Error)
 			}
 			artifacts = append(artifacts, artifact)
@@ -186,6 +205,14 @@ func loadSequentialArtifacts(root string) ([]benchmark.QueueArtifact, error) {
 		return nil, fmt.Errorf("artifact root %s contains no passed sequential queue artifacts", root)
 	}
 	return artifacts, nil
+}
+
+// summarizableSequentialStatus admits the two statuses that describe a client
+// outcome: "passed" (verified output) and "completed_with_dnf" (the client
+// reached a terminal failure or its output failed verification). "failed"
+// means the harness itself could not run the suite and stays inadmissible.
+func summarizableSequentialStatus(status string) bool {
+	return status == "passed" || status == "completed_with_dnf"
 }
 
 func loadSummaryExecutionContext(root string) (map[string]benchmark.Run, error) {
@@ -258,7 +285,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 		if artifact.SchemaVersion != 7 {
 			return summaryReport{}, fmt.Errorf("summary input %s uses queue artifact schema %d, want 7", artifact.SuiteID, artifact.SchemaVersion)
 		}
-		if artifact.Status != "passed" || artifact.SubmissionMode != benchmark.SubmissionModeSequential {
+		if !summarizableSequentialStatus(artifact.Status) || artifact.SubmissionMode != benchmark.SubmissionModeSequential {
 			return summaryReport{}, fmt.Errorf("summary input contains a non-passed sequential artifact %s", artifact.SuiteID)
 		}
 		if artifact.AdapterResult == nil || artifact.AdapterResult.SchemaVersion != 6 {
@@ -305,11 +332,18 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 		if job.Run.Client != baseline && job.Run.Client != candidate {
 			continue
 		}
-		if job.Outcome != "completed" || job.Verification == nil || job.AdapterResult.SubmissionToTerminalNanoseconds <= 0 {
-			return summaryReport{}, fmt.Errorf("sequential artifact %s contains an unverified or invalid measurement", artifact.SuiteID)
-		}
-		if job.AdapterResult.TerminalObservationUncertainty > job.AdapterResult.SubmissionToTerminalNanoseconds/100 {
-			return summaryReport{}, fmt.Errorf("sequential artifact %s exceeds the 1%% terminal-observation uncertainty limit", artifact.SuiteID)
+		didNotFinish := artifact.Status == "completed_with_dnf"
+		if didNotFinish {
+			if job.Outcome != "dnf" || job.Error == "" {
+				return summaryReport{}, fmt.Errorf("sequential artifact %s reports did-not-finish without a recorded job failure", artifact.SuiteID)
+			}
+		} else {
+			if job.Outcome != "completed" || job.Verification == nil || job.AdapterResult.SubmissionToTerminalNanoseconds <= 0 {
+				return summaryReport{}, fmt.Errorf("sequential artifact %s contains an unverified or invalid measurement", artifact.SuiteID)
+			}
+			if !benchmark.ObservationUncertaintyAcceptable(job.AdapterResult.TerminalObservationUncertainty, job.AdapterResult.SubmissionToTerminalNanoseconds) {
+				return summaryReport{}, fmt.Errorf("sequential artifact %s exceeds the terminal-observation uncertainty limit (%s)", artifact.SuiteID, benchmark.ObservationUncertaintyRule)
+			}
 		}
 		stratum := comparisonStratum{
 			FixtureID:        job.Run.FixtureID,
@@ -356,15 +390,23 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 		}
 		measurement := float64(job.AdapterResult.SubmissionToTerminalNanoseconds)
 		if job.Run.Client == baseline {
-			if block.baseline != nil {
+			if block.baseline != nil || block.baselineDNF {
 				return summaryReport{}, fmt.Errorf("duplicate baseline observation for %+v repetition %d", stratum, job.Run.Repetition)
 			}
-			block.baseline = &measurement
+			if didNotFinish {
+				block.baselineDNF = true
+			} else {
+				block.baseline = &measurement
+			}
 		} else {
-			if block.candidate != nil {
+			if block.candidate != nil || block.candidateDNF {
 				return summaryReport{}, fmt.Errorf("duplicate candidate observation for %+v repetition %d", stratum, job.Run.Repetition)
 			}
-			block.candidate = &measurement
+			if didNotFinish {
+				block.candidateDNF = true
+			} else {
+				block.candidate = &measurement
+			}
 		}
 	}
 
@@ -374,7 +416,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 	}
 	sort.Slice(strata, func(left, right int) bool { return fmt.Sprint(strata[left]) < fmt.Sprint(strata[right]) })
 	report := summaryReport{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Metric:        benchmark.PrimaryMetric,
 		Baseline:      baseline,
 		Candidate:     candidate,
@@ -389,21 +431,43 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, baseline, candidate
 		}
 		sort.Ints(repetitions)
 		samples := make([]benchmark.PairedSample, 0, len(repetitions))
+		completion := completionCounts{BlocksObserved: len(repetitions)}
 		for _, repetition := range repetitions {
 			block := blocks[repetition]
-			if block.baseline == nil || block.candidate == nil {
+			if block.baselineDNF {
+				completion.BaselineDidNotFinish++
+			}
+			if block.candidateDNF {
+				completion.CandidateDidNotFinish++
+			}
+			if (block.baseline == nil && !block.baselineDNF) || (block.candidate == nil && !block.candidateDNF) {
+				// A block with neither a measurement nor a recorded failure for a
+				// client is a run that never happened: an aborted pass, not a
+				// client outcome.
 				return summaryReport{}, fmt.Errorf("incomplete client pair for %+v repetition %d", stratum, repetition)
+			}
+			if block.baseline == nil || block.candidate == nil {
+				continue
 			}
 			samples = append(samples, benchmark.PairedSample{Baseline: *block.baseline, Candidate: *block.candidate})
 		}
+		completion.PairedBlocks = len(samples)
+		comparison := stratifiedComparison{Stratum: stratum, Completion: completion}
 		if len(samples) < minimumBlocks {
-			return summaryReport{}, fmt.Errorf("stratum %+v has %d complete blocks, want at least %d", stratum, len(samples), minimumBlocks)
+			if completion.BaselineDidNotFinish == 0 && completion.CandidateDidNotFinish == 0 {
+				return summaryReport{}, fmt.Errorf("stratum %+v has %d complete blocks, want at least %d", stratum, len(samples), minimumBlocks)
+			}
+			comparison.ComparisonWithheld = fmt.Sprintf("%d paired blocks, want at least %d: %s did not finish %d of %d blocks, %s did not finish %d of %d",
+				len(samples), minimumBlocks, baseline, completion.BaselineDidNotFinish, completion.BlocksObserved, candidate, completion.CandidateDidNotFinish, completion.BlocksObserved)
+			report.Comparisons = append(report.Comparisons, comparison)
+			continue
 		}
 		summary, err := benchmark.SummarizePaired(samples, seed, resamples)
 		if err != nil {
 			return summaryReport{}, fmt.Errorf("summarize stratum %+v: %w", stratum, err)
 		}
-		report.Comparisons = append(report.Comparisons, stratifiedComparison{Stratum: stratum, Summary: summary})
+		comparison.Summary = &summary
+		report.Comparisons = append(report.Comparisons, comparison)
 	}
 	if len(report.Comparisons) == 0 {
 		return summaryReport{}, fmt.Errorf("no strata contain either requested client")

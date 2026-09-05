@@ -110,6 +110,9 @@ func TestWeaverQueueUsesServiceAndPreservesControllerOwnership(t *testing.T) {
 	if !strings.Contains(environment, "WEAVER_DIRECT_UNPACK=on") {
 		t.Fatalf("queue Weaver environment must render direct unpack on (the shipping default) in every profile: %s", environment)
 	}
+	if !strings.Contains(environment, "WEAVER_PROPAGATION_DELAY_SECS=0") {
+		t.Fatalf("queue Weaver environment must disable the propagation hold; the other clients run with it at zero and every benchmark NZB is freshly posted: %s", environment)
+	}
 }
 
 func TestVerifiedTLSClientMountsCAAndUsesStrictVerification(t *testing.T) {
@@ -429,6 +432,7 @@ func testConfig(t *testing.T, client benchmark.Client, transport benchmark.Trans
 		PerfBinary:       "perf",
 		StartupTimeout:   1,
 		PollInterval:     1,
+		JobTimeout:       1,
 	}
 }
 

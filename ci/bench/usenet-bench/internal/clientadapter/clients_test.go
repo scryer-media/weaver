@@ -64,7 +64,7 @@ func TestMonitorQueueRecordsProcessingWallInsteadOfQueueWait(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	jobs, err := monitorQueue(ctx, api, time.Millisecond, registrations)
+	jobs, err := monitorQueue(ctx, api, time.Millisecond, time.Minute, registrations)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestMonitorQueueMarksTerminalWithoutObservedProcessingUnavailable(t *testin
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	jobs, err := monitorQueue(ctx, api, time.Millisecond, registrations)
+	jobs, err := monitorQueue(ctx, api, time.Millisecond, time.Minute, registrations)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestMonitorQueueRecordsFailureAndContinuesOtherFixtures(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	jobs, err := monitorQueue(ctx, api, time.Millisecond, registrations)
+	jobs, err := monitorQueue(ctx, api, time.Millisecond, time.Minute, registrations)
 	if err != nil {
 		t.Fatal(err)
 	}

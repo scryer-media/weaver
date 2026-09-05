@@ -63,6 +63,10 @@ type Config struct {
 	RarparSHA256     string
 	StartupTimeout   time.Duration
 	PollInterval     time.Duration
+	// JobTimeout bounds how long a submitted job may go without reaching a
+	// terminal state. A client that never finishes is a did-not-finish result,
+	// not a reason for the whole pass to wait forever.
+	JobTimeout time.Duration
 }
 
 // ProductSpec is the rendered, client-specific portion of an otherwise
@@ -131,6 +135,10 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	jobTimeout, err := parseDurationDefault(getenv("CLIENT_JOB_TIMEOUT"), DefaultJobTimeout, "CLIENT_JOB_TIMEOUT")
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		RunID:            required(getenv, "BENCH_RUN_ID"),
 		Client:           benchmark.Client(required(getenv, "BENCH_CLIENT")),
@@ -169,6 +177,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		RarparSHA256:    strings.TrimSpace(getenv("CLIENT_RARPAR_SHA256")),
 		StartupTimeout:  startupTimeout,
 		PollInterval:    pollInterval,
+		JobTimeout:      jobTimeout,
 	}
 	for field, value := range map[string]*string{
 		"BENCH_FIXTURE_DIR":    &cfg.FixtureDir,
@@ -231,8 +240,8 @@ func (c Config) Validate() error {
 	if c.Transport != benchmark.Plaintext && c.Transport != benchmark.TLS {
 		return fmt.Errorf("unsupported transport %q", c.Transport)
 	}
-	if c.Connections < 1 || c.StartupTimeout <= 0 || c.PollInterval <= 0 {
-		return fmt.Errorf("connections, startup timeout, and poll interval must be positive")
+	if c.Connections < 1 || c.StartupTimeout <= 0 || c.PollInterval <= 0 || c.JobTimeout <= 0 {
+		return fmt.Errorf("connections, startup timeout, poll interval, and job timeout must be positive")
 	}
 	if (c.Transport == benchmark.TLS) != c.NNTPUseTLS {
 		return fmt.Errorf("BENCH_NNTP_TLS does not match benchmark transport %q", c.Transport)
@@ -378,6 +387,12 @@ func renderWeaver(c Config, _ bool) ProductSpec {
 		// rendered explicitly in BOTH profiles so the pinned image benches the
 		// product as shipped, and so the audit record shows it.
 		"WEAVER_DIRECT_UNPACK=on",
+		// Weaver holds fresh posts for five minutes before downloading them
+		// (propagation delay). SABnzbd and NZBGet ship with that delay at zero,
+		// and every benchmark NZB is minutes old by construction, so the hold
+		// would measure the poster's clock rather than the client. Disabled
+		// through the documented environment gate; the audit record shows it.
+		"WEAVER_PROPAGATION_DELAY_SECS=0",
 		"WEAVER_SERVER_1_HOSTNAME=" + c.NNTPHost,
 		"WEAVER_SERVER_1_PORT=" + c.NNTPPort,
 		"WEAVER_SERVER_1_TLS=" + strconv.FormatBool(c.NNTPUseTLS),
@@ -662,6 +677,14 @@ func parseUint(value, name string) (uint64, error) {
 	}
 	return parsed, nil
 }
+
+// DefaultJobTimeout is the default bound on a single job's time to a terminal
+// state. It is generous: the largest fixture (a 6 GiB Blu-ray set) completes
+// on every client in a few minutes at 1 Gbit, including the slowest
+// post-processing path over the throttled NFS profile. It exists to turn a
+// client that never finishes into a recorded did-not-finish instead of a
+// stalled pass.
+const DefaultJobTimeout = 20 * time.Minute
 
 func parseDurationDefault(value string, fallback time.Duration, name string) (time.Duration, error) {
 	if strings.TrimSpace(value) == "" {

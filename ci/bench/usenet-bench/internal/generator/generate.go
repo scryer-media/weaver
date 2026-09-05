@@ -598,7 +598,10 @@ func bluRaySmallPath(index int) string {
 	case index == 490:
 		return "CERTIFICATE/BACKUP/id.bdmv"
 	case index == 491:
-		return "CERTIFICATE/backup/00000.cer"
+		// Disc trees are upper-case throughout; a second CERTIFICATE/backup
+		// spelled differently is not something a real disc carries, and it
+		// makes a case-insensitive extractor see two directories as one.
+		return "CERTIFICATE/app.discroot.crt"
 	default:
 		return fmt.Sprintf("BDMV/META/DL/locale-%03d.txt", index-492)
 	}

@@ -164,6 +164,15 @@ func queueJobOutcome(result QueueJobResult) string {
 	return "completed"
 }
 
+// terminalFailureDescription words a did-not-finish job for the artifact: a
+// failure the client itself reported, or a job the adapter gave up waiting on.
+func terminalFailureDescription(result QueueJobResult) string {
+	if result.TerminalStatus == "timed_out" {
+		return "client did not reach a terminal state: " + result.TerminalError
+	}
+	return "client terminal failure: " + result.TerminalError
+}
+
 type queueSuite struct {
 	ID   string
 	Runs []Run
@@ -291,7 +300,7 @@ func verifyQueueTransitionArtifact(suite queueSuite, result QueueAdapterResult, 
 		job := jobsByRun[run.ID]
 		artifact := QueueJobArtifact{Run: run, Repair: manifests[run.ID].Repair, AdapterResult: job, Outcome: queueJobOutcome(job)}
 		if job.TerminalStatus != "succeeded" {
-			artifact.Error = "client terminal failure: " + job.TerminalError
+			artifact.Error = terminalFailureDescription(job)
 		}
 		artifacts = append(artifacts, artifact)
 	}
@@ -551,7 +560,7 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 			Outcome:       queueJobOutcome(adapterResult),
 		}
 		if adapterResult.TerminalStatus != "succeeded" {
-			jobArtifact.Error = "client terminal failure: " + adapterResult.TerminalError
+			jobArtifact.Error = terminalFailureDescription(adapterResult)
 			jobFailures = append(jobFailures, fmt.Sprintf("%s: %s", run.ID, jobArtifact.Error))
 			artifact.Jobs = append(artifact.Jobs, jobArtifact)
 			continue
@@ -602,6 +611,31 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 	return artifact
 }
 
+// ObservationUncertaintyFloorNanos is the absolute allowance on the width of
+// the terminal-observation window. The relative bound alone assumes the
+// window shrinks with the run, but it cannot: it is set by how long the
+// client's own status API takes to answer one poll, which is a property of
+// the product, not of the fixture. On a fast link a 150 MiB fixture finishes
+// in about three seconds, and a status API that answers in 40 ms would then
+// disqualify every run of that client while a 10 ms API passed — a selection
+// bias against the slower API, not a precision gain. The floor admits both
+// equally; the uncertainty itself stays recorded in every artifact.
+const ObservationUncertaintyFloorNanos int64 = 100_000_000
+
+// ObservationUncertaintyRule states the acceptance rule for error messages
+// and documentation.
+const ObservationUncertaintyRule = "1% of the submission-to-terminal duration or 100 ms, whichever is larger"
+
+// ObservationUncertaintyAcceptable reports whether a terminal-observation
+// window of the given width is admissible for a run of the given duration.
+func ObservationUncertaintyAcceptable(uncertaintyNanos, durationNanos int64) bool {
+	limit := durationNanos / 100
+	if limit < ObservationUncertaintyFloorNanos {
+		limit = ObservationUncertaintyFloorNanos
+	}
+	return uncertaintyNanos <= limit
+}
+
 func (r QueueAdapterResult) ValidateFor(suite queueSuite, mode SubmissionMode) error {
 	if r.SchemaVersion != 6 || r.SuiteID != suite.ID || r.SubmissionMode != mode || len(suite.Runs) == 0 {
 		return fmt.Errorf("queue adapter result does not match suite %s", suite.ID)
@@ -646,14 +680,14 @@ func (r QueueAdapterResult) ValidateFor(suite queueSuite, mode SubmissionMode) e
 			if !hasObservationTiming {
 				return fmt.Errorf("sequential adapter result for %s lacks terminal observation timing", suite.ID)
 			}
-			if job.SubmissionToTerminalNanoseconds <= 0 || job.TerminalObservationUncertainty > job.SubmissionToTerminalNanoseconds/100 {
-				return fmt.Errorf("sequential adapter result for %s has terminal observation uncertainty above 1%% of submission-to-terminal duration", suite.ID)
+			if job.SubmissionToTerminalNanoseconds <= 0 || !ObservationUncertaintyAcceptable(job.TerminalObservationUncertainty, job.SubmissionToTerminalNanoseconds) {
+				return fmt.Errorf("sequential adapter result for %s has terminal observation uncertainty above %s", suite.ID, ObservationUncertaintyRule)
 			}
 		}
-		if job.TerminalStatus != "succeeded" && job.TerminalStatus != "failed" {
+		if job.TerminalStatus != "succeeded" && job.TerminalStatus != "failed" && job.TerminalStatus != "timed_out" {
 			return fmt.Errorf("queue adapter result for %s contains invalid terminal status", suite.ID)
 		}
-		if job.TerminalStatus == "failed" && strings.TrimSpace(job.TerminalError) == "" {
+		if job.TerminalStatus != "succeeded" && strings.TrimSpace(job.TerminalError) == "" {
 			return fmt.Errorf("queue adapter result for %s omits a terminal failure reason", suite.ID)
 		}
 		if mode == SubmissionModeSequential {

@@ -436,7 +436,13 @@ separately; neither is a fallback for the other. The profiles differ only for
 SABnzbd (`direct_unpack`) and NZBGet (`DirectWrite` + `DirectUnpack`); Weaver
 is rendered with `WEAVER_DIRECT_UNPACK=on` in both, because that is its
 shipping default and the benchmark measures the product as shipped, so the
-Weaver column is the same run configuration under either profile.
+Weaver column is the same run configuration under either profile. One
+Weaver default is deliberately overridden in both renders:
+`WEAVER_PROPAGATION_DELAY_SECS=0`. Weaver holds a post whose NZB is under
+five minutes old before downloading it; SABnzbd and NZBGet ship with that
+delay at zero, and every benchmark NZB is freshly posted by construction, so
+leaving the hold on would time the poster's clock rather than the client.
+The override is in the audited environment of every Weaver run.
 `archive_toolchain` is a
 first-class plan, adapter, config and result field: `vanilla` is the stock
 benchmark, and the optional `rarpar` Docker lanes (see below) are never pooled
@@ -479,9 +485,25 @@ immutable `execution-manifest.json`, plan and catalog snapshots with SHA-256
 digests, the harness-executable digest, a host fingerprint and secret-redacted
 arguments. Use a new artifact root per invocation; nothing is overwritten.
 
-`CLIENT_POLL_INTERVAL` / `NATIVE_POLL_INTERVAL` default to `10ms` and set the
-terminal-observation precision recorded in every artifact; a run is excluded
-unless that interval is at most 1 % of its submission-to-terminal duration.
+`CLIENT_JOB_TIMEOUT` / `NATIVE_JOB_TIMEOUT` default to `20m` and bound how long
+a submitted job may run without reaching a terminal state. A Docker-lane job
+that exceeds it is recorded with terminal status `timed_out` and the client's
+last reported status as the reason; the controller counts it as did-not-finish
+exactly like a client-reported failure, so a client that hangs on a fixture
+becomes a result rather than a stalled pass. The native lane reports the same
+condition as the run's error.
+
+`CLIENT_POLL_INTERVAL` / `NATIVE_POLL_INTERVAL` default to `10ms`. The width
+of the window in which the terminal state was observed — from the last poll
+that still saw the job running to the poll that saw it finished — is recorded
+in every artifact as `terminal_observation_uncertainty_nanoseconds`. A run is
+excluded when that window exceeds 1 % of its submission-to-terminal duration
+or 100 ms, whichever is larger. The absolute allowance exists because the
+window is set by how long the client's own status API takes to answer one
+poll, not by the fixture: on a 1 Gbit link a 150 MiB fixture finishes in about
+three seconds, and a 1 % bound alone would then reject every run of a client
+whose API answers in 40 ms while admitting one that answers in 10 ms — a
+selection bias against the slower API, not a precision gain.
 
 Two other modes exist and are labelled apart from the headline:
 
@@ -525,15 +547,24 @@ go run ./cmd/nntpbench summarize \
   --artifacts /scratch/runs/artifacts --baseline sabnzbd --candidate weaver --minimum-blocks 20
 ```
 
-Only verified, passed sequential artifacts are admitted. Clients are paired
-inside the same randomized repetition block, stratified by fixture, profile,
-target, transport / TLS validation, archive toolchain, server link and
-storage profile. Each
-stratum reports the raw medians and coefficients of variation, the paired
-geometric-mean ratio and a deterministic 10 000-resample bootstrap 95 %
-interval on the log ratio. There is no outlier deletion and no pooled score. A
-missing, failed or unverified run, an incomplete pair, fewer than 20 complete
-blocks, or terminal-observation uncertainty above 1 % fails the summary closed.
+Only sequential artifacts that describe a client outcome are admitted:
+`passed` (verified output) and `completed_with_dnf` (the client reached a
+terminal failure, or its output failed neutral verification). Clients are
+paired inside the same randomized repetition block, stratified by fixture,
+profile, target, transport / TLS validation, archive toolchain, server link
+and storage profile. Each stratum reports how many blocks each client
+finished, then, over the blocks both clients finished, the raw medians and
+coefficients of variation, the paired geometric-mean ratio and a deterministic
+10 000-resample bootstrap 95 % interval on the log ratio. There is no outlier
+deletion and no pooled score. A block where one client did not finish is
+excluded from the timing comparison and counted under `completion`; a client
+that cannot finish a fixture is a result, and it must not hide the rest of the
+run. When the failures leave a stratum with fewer than the minimum paired
+blocks, that stratum keeps its counts and its comparison is withheld with a
+stated reason. A harness-side `failed` suite, a missing or unverified run, an
+incomplete pair with no recorded failure, fewer than 20 paired blocks for any
+other reason, or terminal-observation uncertainty above its limit (1 % of the
+run or 100 ms, whichever is larger) still fails the summary closed.
 So does an artifact root that mixes storage profiles: a local run and an NFS
 run answer different questions and are summarized separately, never pooled.
 
