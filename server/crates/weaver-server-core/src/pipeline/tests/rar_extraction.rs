@@ -6453,6 +6453,168 @@ async fn par2_rebuilds_a_split_7z_part_the_nzb_never_carried_and_extraction_foll
     }
 }
 
+/// The live ordering of a small posting: every data part and the index land
+/// while the recovery file is still parked, so the completion pass runs with
+/// the download pipeline not yet quiet. The absent part is structural — the
+/// NZB never carried it — so the pass must not settle the set as clean and
+/// hand a truncated archive to the extractor; it has to reach for the
+/// recovery blocks. Then, once the recovery file lands, the part is rebuilt.
+#[tokio::test]
+async fn a_split_7z_short_of_a_part_the_nzb_never_carried_is_not_settled_clean_before_its_recovery_lands()
+ {
+    for (job_id, withheld) in [(JobId(30087), 2usize), (JobId(30088), 6usize)] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let set_name = "generated_split_store_plain.7z";
+        let parts = sevenz_fixture_bytes(set_name);
+        let (withheld_name, withheld_bytes) = parts[withheld].clone();
+        let index_filename = "silver_horizon.par2";
+        let recovery_filename = "silver_horizon.vol00+03.par2";
+        let slice_size = 65_536;
+        let described: Vec<(&str, &[u8])> = parts
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let par2_bytes = build_test_par2_index_for_files(&described, slice_size);
+        let recovery_bytes = vec![0xAA; 64];
+
+        let posted: Vec<(String, Vec<u8>)> = parts
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != withheld)
+            .map(|(_, part)| part.clone())
+            .collect();
+        let mut files = posted.clone();
+        files.push((index_filename.to_string(), par2_bytes.clone()));
+        files.push((recovery_filename.to_string(), recovery_bytes.clone()));
+        let working_dir = insert_active_job(
+            &mut pipeline,
+            job_id,
+            rar_job_spec("Silver Horizon Parked Recovery", &files),
+        )
+        .await;
+
+        for (file_index, (filename, bytes)) in posted.iter().enumerate() {
+            write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes)
+                .await;
+        }
+        let index_file = posted.len() as u32;
+        let recovery_file = index_file + 1;
+        write_and_complete_file(
+            &mut pipeline,
+            job_id,
+            index_file,
+            index_filename,
+            &par2_bytes,
+        )
+        .await;
+        install_test_par2_runtime(
+            &mut pipeline,
+            job_id,
+            build_repairable_par2_set_for_files(&described, slice_size, 3),
+            &[
+                (index_file, index_filename, 0, false),
+                (recovery_file, recovery_filename, 3, false),
+            ],
+        );
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state.recovery_queue = DownloadQueue::new();
+            state.recovery_queue.push(DownloadWork {
+                segment_id: SegmentId {
+                    file_id: NzbFileId {
+                        job_id,
+                        file_index: recovery_file,
+                    },
+                    segment_number: 0,
+                },
+                message_id: MessageId::new("parked-7z-recovery@example.com"),
+                groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+                priority: 1000,
+                byte_estimate: 64,
+                retry_count: 0,
+                is_recovery: true,
+                completion_critical: false,
+                exclude_servers: Vec::new(),
+                avoid_server: None,
+            });
+        }
+        // The pipeline is not quiet: a decode is still in flight.
+        pipeline.active_decodes_by_job.insert(job_id, 1);
+
+        assert!(
+            pipeline.job_has_sevenz_set_waiting_for_absent_volumes(job_id),
+            "withheld part {withheld} is a structural absence, quiet or not"
+        );
+
+        pipeline.check_job_completion(job_id).await;
+
+        assert!(
+            !pipeline.par2_verified.contains(&job_id),
+            "withheld part {withheld}: the set must not be settled clean; {}",
+            debug_job_state(&pipeline, job_id)
+        );
+        assert!(
+            !matches!(
+                job_status_for_assert(&pipeline, job_id),
+                Some(JobStatus::Failed { .. } | JobStatus::Complete)
+            ),
+            "withheld part {withheld}: {}",
+            debug_job_state(&pipeline, job_id)
+        );
+        assert!(
+            !working_dir.join(&withheld_name).exists(),
+            "nothing can rebuild the part before the recovery file lands"
+        );
+        assert_eq!(pipeline.par2_repairer_execute_calls, 0);
+
+        // The recovery file lands and the pipeline goes quiet.
+        pipeline.active_decodes_by_job.remove(&job_id);
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state.recovery_queue = DownloadQueue::new();
+        }
+        write_and_complete_file(
+            &mut pipeline,
+            job_id,
+            recovery_file,
+            recovery_filename,
+            &recovery_bytes,
+        )
+        .await;
+        install_test_par2_runtime(
+            &mut pipeline,
+            job_id,
+            build_repairable_par2_set_for_files(&described, slice_size, 3),
+            &[
+                (index_file, index_filename, 0, false),
+                (recovery_file, recovery_filename, 3, true),
+            ],
+        );
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state.recovery_queue = DownloadQueue::new();
+        }
+
+        pipeline.check_job_completion(job_id).await;
+
+        assert_eq!(
+            pipeline.par2_repairer_execute_calls, 1,
+            "withheld part {withheld}: the absent part routes the job to a PAR2 repair; {}",
+            debug_job_state(&pipeline, job_id)
+        );
+        assert_eq!(
+            std::fs::read(working_dir.join(&withheld_name)).unwrap(),
+            withheld_bytes,
+            "the repair rebuilt the withheld part byte for byte"
+        );
+        assert!(!pipeline.job_has_sevenz_set_waiting_for_absent_volumes(job_id));
+    }
+}
+
 /// A four-volume set whose two file members sanitize to one destination
 /// on a case-folding filesystem: `CERTIFICATE/BACKUP/id.bdmv` and
 /// `CERTIFICATE/backup/id.bdmv`.

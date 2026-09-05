@@ -1705,7 +1705,7 @@ impl Pipeline {
     }
 
     /// Whether a split 7z set of this job is waiting on a part the NZB never
-    /// carried, at pipeline-quiet.
+    /// carried.
     ///
     /// The 7z counterpart of [`Self::job_has_live_rar_waiting_for_absent_volumes`].
     /// A 7z split set has no header chain to learn its hole from, so absence is
@@ -1719,15 +1719,22 @@ impl Pipeline {
     /// extracts a truncated set, fails, and never asks PAR2 for the part (last),
     /// because the strong-decode fast path settles the set as clean first.
     ///
-    /// Quiet is required for the same reason as the RAR predicate: mid-download,
-    /// a part is absent because it has not arrived yet.
+    /// Unlike the RAR predicate, this one does not wait for pipeline-quiet.
+    /// The RAR arm needs quiet because its absence is read from *arrivals*:
+    /// mid-download, a waited volume is absent simply because it has not landed
+    /// yet. Both 7z readings are structural instead. The topology's
+    /// `volume_map` is built from every file the NZB carries, complete or not,
+    /// so a numbering gap in it is a part the posting never had; and the
+    /// described-part reading excludes every name the map knows. A part still
+    /// arriving is in the map and so is never mistaken for a hole. Deferring
+    /// to quiet here was a live defect: the data parts of a small posting all
+    /// landed while its recovery file was still in flight, this answered
+    /// `false`, the strong-decode fast path settled the set as clean, and the
+    /// extraction that followed opened a truncated set and failed the job.
     pub(crate) fn job_has_sevenz_set_waiting_for_absent_volumes(&self, job_id: JobId) -> bool {
         let Some(state) = self.jobs.get(&job_id) else {
             return false;
         };
-        if self.job_has_pending_download_pipeline_work(job_id) {
-            return false;
-        }
         let served_set = self
             .par2_served_set_id(job_id)
             .and_then(|set_id| self.par2_set_for(job_id, set_id));
