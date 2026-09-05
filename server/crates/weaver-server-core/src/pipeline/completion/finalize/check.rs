@@ -7227,6 +7227,16 @@ impl Pipeline {
         if self.direct_tolerated_in_flight.contains_key(&job_id) {
             return;
         }
+        // A demotion sweep detached from the demotion that started it. Its
+        // volumes are half materialized: the routed bytes are still in member
+        // partials, the volume files are being written, and neither the direct
+        // coverage row nor the legacy floors describe the set yet. Judging the
+        // job here would read that intermediate state as "articles are missing"
+        // and fail a job whose bytes are all present. The ticket's completion
+        // applies the bookkeeping and schedules this check again.
+        if self.direct_demotion_in_flight.contains_key(&job_id) {
+            return;
+        }
 
         if let Some(message) = self.aggregate_par2_failure_message(job_id) {
             self.fail_job(job_id, message);

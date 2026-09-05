@@ -135,6 +135,7 @@ impl Pipeline {
             mpsc::channel(32);
         let (direct_post_repair_done_tx, direct_post_repair_done_rx) = mpsc::channel(32);
         let (direct_tolerated_done_tx, direct_tolerated_done_rx) = mpsc::channel(32);
+        let (direct_demotion_done_tx, direct_demotion_done_rx) = mpsc::channel(32);
         let post_processing_settings = db.post_processing_settings().unwrap_or_else(|error| {
             warn!(error = %error, "failed to load post-processing settings; using disabled defaults");
             crate::post_processing::model::PostProcessingSettings::default()
@@ -413,6 +414,10 @@ impl Pipeline {
             direct_tolerated_results: HashMap::new(),
             direct_tolerated_done_tx,
             direct_tolerated_done_rx,
+            next_direct_demotion_work_id: 0,
+            direct_demotion_in_flight: HashMap::new(),
+            direct_demotion_done_tx,
+            direct_demotion_done_rx,
             inflight_moves: HashSet::new(),
             reserved_complete_destinations: HashMap::new(),
             failed_extractions: HashMap::new(),
@@ -792,6 +797,7 @@ impl Pipeline {
         // is being deleted.
         self.direct_store.clear_job(job_id);
         self.forget_direct_tolerated_work(job_id);
+        self.forget_direct_demotion_work(job_id);
         // Same reasoning, one step further: a direct-unpack worker is a
         // *blocking thread* parked on this job's bytes. Left behind it is not
         // merely stale state — it never wakes, and the working directory it
@@ -1091,6 +1097,9 @@ impl Pipeline {
                     }
                     Some(done) = self.direct_tolerated_done_rx.recv() => {
                         self.handle_direct_tolerated_done(done).await;
+                    }
+                    Some(done) = self.direct_demotion_done_rx.recv() => {
+                        self.handle_direct_demotion_done(done).await;
                     }
                     Some(event) = self.terminal_post_processing_done_rx.recv() => {
                         match event {

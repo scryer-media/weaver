@@ -185,6 +185,15 @@ impl Pipeline {
         if self.is_direct_source_file(file_id) {
             return;
         }
+        // A demoted set's volume is a file, but not yet a finished one while
+        // the demotion's detached sweep is writing it. An article that
+        // completes it through the conventional path in that window would
+        // otherwise probe a half-materialized image and hand it to the
+        // extraction planner; the sweep's handback replays this hook for every
+        // volume once the ticket lands, after the image is durable.
+        if self.demotion_sweep_owns_file(file_id) {
+            return;
+        }
         self.classify_completed_file(job_id, file_id, allow_probe)
             .await;
 
