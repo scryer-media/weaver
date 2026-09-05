@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use weaver_server_core::auth as jwt;
 use weaver_server_core::auth::LoginAuthCache;
 use weaver_server_core::runtime::environment::DeploymentEnvironment;
-use weaver_server_core::security::{RuntimeSecurityConfig, ip_is_loopback};
+use weaver_server_core::security::{RuntimeSecurityConfig, canonical_ip, ip_is_loopback};
 
 #[derive(Embed)]
 #[folder = "../../../apps/weaver-web/dist/"]
@@ -173,7 +173,7 @@ fn entry_response(
                 // The operator already answered — a no-login install
                 // answering network-wide is the common case. Nothing is
                 // pending; this browser is simply not admitted.
-                return BROWSER_ACCESS_RESTRICTED_PAGE.response();
+                return BROWSER_ACCESS_RESTRICTED_PAGE.response_for(peer);
             }
             return if matches!(
                 deployment,
@@ -182,10 +182,10 @@ fn entry_response(
                 // Inside a container namespace no outside browser is ever
                 // loopback, so the wizard is unreachable by construction and
                 // first-run setup belongs to the deployment.
-                CONTAINER_SETUP_PAGE.response()
+                CONTAINER_SETUP_PAGE.response_for(peer)
             } else {
                 // Native: the wizard exists and works, just not from here.
-                COMPLETE_SETUP_ON_MACHINE_PAGE.response()
+                COMPLETE_SETUP_ON_MACHINE_PAGE.response_for(peer)
             };
         }
         // Machine's own browser, no credentials: the first-run wizard. No
@@ -345,22 +345,38 @@ const NOTICE_PAGE_STYLE: &str = r#"<style>
 /// the answer here — inside a container namespace an outside browser arrives
 /// from the bridge or the gateway, never loopback — so the page names the two
 /// deployment-level ways in instead of showing a form nobody can submit.
+///
+/// The login comes first because it admits every route into the container.
+/// Trusted networks are judged on the address Weaver sees inside its own
+/// namespace, which is the Docker network for another container and Docker's
+/// gateway for a published port — so a LAN range copied from the operator's
+/// router covers neither, and the page says which address it actually saw.
 const CONTAINER_SETUP_PAGE: NoticePage = NoticePage {
     title: "Set up Weaver",
     subtitle: "First Run",
     body: r#"  <p>
     Weaver has not been set up yet. Inside a container no browser counts as
     the machine itself, so first-run setup happens in the deployment rather
-    than on this page. Add one of these to the container's environment.
+    than on this page. Add one of these to the container's environment, then
+    recreate the container &mdash; a restart alone keeps the old environment.
   </p>
-  <h2>Trusted networks</h2>
-  <code>WEAVER_TRUSTED_CIDRS=192.168.0.0/16</code>
-  <p>Browsers in these networks get full access without a login.</p>
   <h2>Bootstrap login</h2>
   <code>WEAVER_BOOTSTRAP_LOGIN_USERNAME=admin
-WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE=/run/secrets/weaver-login</code>
-  <p>Then sign in normally.</p>
-  <p>Restart the container with either one set and this page goes away.</p>"#,
+WEAVER_BOOTSTRAP_LOGIN_PASSWORD=choose-a-password</code>
+  <p>
+    Creates the login on first start; sign in with it from anywhere that can
+    reach this port. <span class="inline-code">WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE</span>
+    reads the password from a mounted file instead.
+  </p>
+  <h2>Trusted networks</h2>
+  <code>WEAVER_TRUSTED_CIDRS=172.18.0.0/16</code>
+  <p>
+    Browsers arriving from these networks get full access without a login.
+    Weaver judges the address it sees inside the container &mdash; another
+    container's address on the Docker network, or Docker's gateway for traffic
+    through a published port &mdash; not the address your browser has on your
+    LAN. The line below shows what this browser looks like from here.
+  </p>"#,
 };
 
 /// Case (c): a native install reached from somewhere other than its own
@@ -409,12 +425,13 @@ struct NoticePage {
 }
 
 impl NoticePage {
-    fn render(&self) -> String {
+    fn render(&self, peer: Option<SocketAddr>) -> String {
         let Self {
             title,
             subtitle,
             body,
         } = self;
+        let peer_note = peer_note(peer);
         format!(
             r#"<!DOCTYPE html>
 <html lang="en">
@@ -429,14 +446,31 @@ impl NoticePage {
   <h1>{title}</h1>
   <div class="subtitle">{subtitle}</div>
 {body}
-</div>
+{peer_note}</div>
 </body>
 </html>"#
         )
     }
 
-    fn response(&self) -> Response {
-        html_page_response(self.render())
+    fn response_for(&self, peer: Option<SocketAddr>) -> Response {
+        html_page_response(self.render(peer))
+    }
+}
+
+/// The one fact every notice page's reader is missing: the address Weaver
+/// judged. Trust is decided on this address and nothing else — not the
+/// browser's own idea of its IP, not a forwarding header — so it is the value
+/// to put in `WEAVER_TRUSTED_CIDRS` or to recognise as a proxy or gateway.
+/// Canonicalised so a dual-stack listener shows `172.22.0.3`, not
+/// `::ffff:172.22.0.3`. An IP address renders as digits, dots, colons, and hex
+/// only, so it needs no HTML escaping.
+fn peer_note(peer: Option<SocketAddr>) -> String {
+    match peer {
+        Some(peer) => format!(
+            "  <p>This browser reaches Weaver from <span class=\"inline-code\">{}</span>.</p>\n",
+            canonical_ip(peer.ip())
+        ),
+        None => String::new(),
     }
 }
 
@@ -574,11 +608,64 @@ mod tests {
             assert!(body.contains("<title>Set up Weaver</title>"), "{body}");
             assert!(body.contains("WEAVER_TRUSTED_CIDRS"), "{body}");
             assert!(body.contains("WEAVER_BOOTSTRAP_LOGIN_USERNAME"), "{body}");
+            assert!(body.contains("WEAVER_BOOTSTRAP_LOGIN_PASSWORD="), "{body}");
             assert!(
                 body.contains("WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE"),
                 "{body}"
             );
+            // The login admits every route into the container; the trusted
+            // list only admits the addresses Weaver sees inside its own
+            // namespace. The option that always works is offered first.
+            let login_at = body.find("Bootstrap login").expect("login heading");
+            let trust_at = body.find("Trusted networks").expect("trust heading");
+            assert!(login_at < trust_at, "login must be offered first: {body}");
+            // The address that trust is judged on, so the operator copies
+            // the value Weaver saw rather than guessing at a LAN range.
+            assert!(
+                body.contains("reaches Weaver from <span class=\"inline-code\">192.168.1.20</span>"),
+                "{body}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn a_notice_page_without_a_known_peer_omits_the_address_line() {
+        let response = super::entry_response(
+            &HeaderMap::new(),
+            "",
+            "browser-token",
+            &LoginAuthCache::default(),
+            &RuntimeSecurityConfig::default(),
+            None,
+            DeploymentEnvironment::Docker,
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        assert!(body.contains("<title>Set up Weaver</title>"), "{body}");
+        assert!(!body.contains("reaches Weaver from"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_dual_stack_peer_is_shown_in_its_canonical_form() {
+        // What a `[::]` listener reports for an IPv4 client — the operator
+        // must be handed `172.22.0.3`, the form a CIDR list wants.
+        let response = super::entry_response(
+            &HeaderMap::new(),
+            "",
+            "browser-token",
+            &LoginAuthCache::default(),
+            &RuntimeSecurityConfig::default(),
+            Some("[::ffff:172.22.0.3]:49152".parse().unwrap()),
+            DeploymentEnvironment::Docker,
+        );
+
+        let body = body_text(response).await;
+        assert!(
+            body.contains("<span class=\"inline-code\">172.22.0.3</span>"),
+            "{body}"
+        );
+        assert!(!body.contains("::ffff:"), "{body}");
     }
 
     #[tokio::test]
@@ -597,6 +684,9 @@ mod tests {
                 !body.contains("WEAVER_TRUSTED_CIDRS") && !body.contains("first-run wizard"),
                 "a configured install must not describe setup: {body}"
             );
+            // Turned away, but told from where — the address to add to the
+            // trusted list, or to recognise as a proxy's or gateway's.
+            assert!(body.contains("192.168.1.20"), "{body}");
         }
     }
 
