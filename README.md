@@ -67,7 +67,7 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Etc/UTC
+      - TZ=Etc/UTC # log timestamps use this zone and carry its UTC offset
       - UMASK=022 # optional
       - WEAVER_HTTP_ALLOWED_HOSTS=weaver,weaver.example.me # permit the Compose service name and any reverse proxy names
       # First-run setup: pick one of the two blocks below.
