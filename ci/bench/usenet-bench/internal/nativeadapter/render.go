@@ -70,6 +70,10 @@ func renderWeaver(cfg Config) productSpec {
 		"WEAVER_SERVER_1_PASSWORD=" + cfg.NNTPPassword,
 		"WEAVER_SERVER_1_CONNECTIONS=" + strconv.Itoa(cfg.Connections),
 		"WEAVER_SERVER_1_ACTIVE=true",
+		// Seeded servers are never probed for CAPABILITIES; the benchmark
+		// server advertises PIPELINING, so the flag is seeded the way the
+		// probe would have set it (Weaver 0.10.3 or newer).
+		"WEAVER_SERVER_1_PIPELINING=true",
 		// A fresh native install trusts no peer until its first-run wizard is
 		// completed from the machine's own browser; loopback is offered the
 		// wizard, not a session. Pinning loopback as trusted from the

@@ -70,8 +70,8 @@ go run ./cmd/fixturegen --direct-mkv --output /scratch/fixtures
 go run ./cmd/nntpbench image build --version v0.1.0 --tag e2e-nntp:local \
   --provenance /scratch/runs/nntp-image-provenance.json
 
-# 3. Bring up server + shaper at a declared link rate (add --server-rtt 250ms
-#    to both server-env and plan for a provider-distance round trip); keep the test CA.
+# 3. Bring up server + shaper at a declared link rate; keep the test CA. (A
+#    provider-distance round trip is a separate small sweep, see "Fixed round trip".)
 openssl rand -hex 24 > /scratch/runs/nntp-password
 go run ./cmd/nntpbench server-env --server-link 1gbit --output /scratch/runs/server-1gbit.env
 NNTP_BENCH_PASSWORD_FILE=/scratch/runs/nntp-password docker compose -p nntp-bench \
@@ -409,6 +409,20 @@ requires both values. The link profile is persisted in the plan, every run and
 every result. The server sits on a private upstream network; clients resolve
 `nntp` to the shaper on the benchmark network.
 
+The server advertises RFC 4644 `PIPELINING` in its `CAPABILITIES` reply, as
+commercial providers do (`NNTP_BENCH_PIPELINING=0` at `compose up` silences
+it, which is a diagnostic, never a published configuration). The keyword
+matters because the clients treat it differently: Weaver pipelines `BODY`
+requests only against a server that advertises it and picks the depth from
+the measured round trip, SABnzbd 5 sends the two requests per connection its
+own new-server default declares, and NZBGet sends one request per connection.
+A server that stays silent therefore benches every client one article per
+round trip and hides exactly the difference a shaped round trip exists to
+show. The Weaver adapters seed the server's pipelining flag from the
+environment (`WEAVER_SERVER_1_PIPELINING=true`, Weaver 0.10.3 or newer),
+because an environment-seeded server is never probed the way a server added
+through Weaver's UI is.
+
 #### Fixed round trip
 
 The rate cap alone is a link with no distance: a client that opens one
@@ -421,15 +435,50 @@ connection setup, TLS handshake, command pipelining and per-connection window
 all cost what they cost against a real provider. The value is a whole number
 of milliseconds between 1 ms and 5 s; 0 (the default) adds no delay and
 touches no qdisc, so a plan without the flag is byte-for-byte what it was
-apart from the new `rtt_micros` field. The published suite runs each shaped
-link at 0, 250 ms and 500 ms, the range a home connection sees to a
-commercial provider; the round trip is part of the stratum, so those are
-three different comparisons, never pooled.
+apart from the new `rtt_micros` field.
+
+The round trip is not the headline. The published comparison is the full
+fixture matrix at 0 ms, where the link, the decoder, the archive and the
+repair are what differ between clients; a delayed link mostly measures how
+many requests each client keeps in flight per connection, and it costs a
+multiple of the loopback wall clock per run. So the round trip is a **small
+sweep over a few fixtures**: one raw-MKV, one clean RAR, one light PAR2
+repair and one heavy withheld PAR2 repair, at 50, 100 and 250 ms, TLS only,
+five repetitions each. The round trip is part of the stratum, so every
+point of the sweep is its own comparison, never pooled with the 0 ms matrix
+or with another round trip; read the sweep as a curve of the ratio against
+the round trip, alongside the 0 ms matrix as its origin. The 0 ms point of
+the same four fixtures comes from the headline matrix, not from a fourth
+sweep step. Each step restarts only the shaper (the server keeps its corpus
+and its CA) and writes its own plan and artifact root:
 
 ```bash
-go run ./cmd/nntpbench server-env --server-link 1gbit --server-rtt 250ms \
-  --output /scratch/runs/server-1gbit-250ms.env
+SWEEP_FIXTURES=direct-mkv,rar5-7-store-store-nonsolid-none-incompressible,\
+repair-rar5-7-store-par2-par2-light-store-nonsolid-none-incompressible,\
+repair-rar5-7-store-par2-par2-heavy-withheld-store-nonsolid-none-incompressible
+for rtt in 50ms 100ms 250ms; do
+  go run ./cmd/nntpbench server-env --server-link 1gbit --server-rtt $rtt \
+    --output /scratch/runs/server-1gbit-$rtt.env
+  NNTP_BENCH_PASSWORD_FILE=/scratch/runs/nntp-password docker compose -p nntp-bench \
+    --env-file /scratch/runs/server-1gbit-$rtt.env -f configs/server/compose-shaper.example.yml \
+    up -d nntp-shaper
+  go run ./cmd/nntpbench plan --fixtures $SWEEP_FIXTURES --transports tls \
+    --archive-toolchains vanilla --profile equivalent-throughput \
+    --server-link 1gbit --server-rtt $rtt --repetitions 5 --seed 20260802 \
+    --targets docker-linux --output /scratch/runs/plan-rtt-$rtt.json
+  go run ./cmd/nntpbench sequential --plan /scratch/runs/plan-rtt-$rtt.json \
+    --adapters /scratch/runs/adapters.json --target docker-linux \
+    --fixtures-root /scratch/fixtures --artifacts /scratch/runs/artifacts-rtt-$rtt \
+    --nntp-host nntp --shaper-control-url http://127.0.0.1:8080 \
+    --tls-ca-file /scratch/runs/nntp-ca.pem \
+    --username fixture-user --password-file /scratch/runs/nntp-password
+done
 ```
+
+Restore the 0 ms shaper (`up -d nntp-shaper` with the plain link env file)
+before the next headline run; the controller refuses a plan whose declared
+round trip disagrees with the shaper's attestation, so a stale shaper fails
+loudly rather than quietly shifting a stratum.
 
 The env file carries `NNTP_RTT_MICROS`; the Compose service needs
 `cap_add: [NET_ADMIN]` (already in the example topology) so the entrypoint

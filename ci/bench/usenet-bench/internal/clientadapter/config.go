@@ -408,6 +408,13 @@ func renderWeaver(c Config, _ bool) ProductSpec {
 		"WEAVER_SERVER_1_PASSWORD=" + c.NNTPPassword,
 		"WEAVER_SERVER_1_CONNECTIONS=" + strconv.Itoa(c.Connections),
 		"WEAVER_SERVER_1_ACTIVE=true",
+		// A server added through Weaver's UI is probed for CAPABILITIES and
+		// records whether it advertises PIPELINING; an environment-seeded
+		// server is never probed and would stay sequential on every
+		// connection. The benchmark server advertises PIPELINING (see the
+		// server topology), so the flag is seeded the way the probe would
+		// have set it. Weaver 0.10.3 or newer; older images reject the field.
+		"WEAVER_SERVER_1_PIPELINING=true",
 		// Weaver's first-run access policy hands an anonymous browser session
 		// only to peers on its trusted-network list; without one, an install
 		// with no login serves a setup notice and refuses every GraphQL call.
@@ -496,6 +503,12 @@ func renderSABnzbd(c Config, directUnpack bool) ProductSpec {
 		"direct_unpack = " + direct,
 		"pre_check = 0",
 		"pause_on_post_processing = 0",
+		// SABnzbd 5 pipelines two BODY requests per connection for a server
+		// added through its UI but downgrades every server it finds in an
+		// ini older than config conversion 5 to one request per connection.
+		// Stamping the current conversion number keeps the rendered server
+		// exactly as a fresh install would create it.
+		"config_conversion_version = 5",
 		"",
 		"[servers]",
 		"[[benchmark]]",
@@ -504,6 +517,8 @@ func renderSABnzbd(c Config, directUnpack bool) ProductSpec {
 		"username = " + c.NNTPUsername,
 		"password = " + c.NNTPPassword,
 		"connections = " + strconv.Itoa(c.Connections),
+		// SABnzbd's own default for a newly added server (5.0 and later).
+		"pipelining_requests = 2",
 		"ssl = " + ssl,
 		// This is intentional and policy-labelled by the plan. SAB's local CA
 		// support is not reliable in this harness, so verified TLS is never
