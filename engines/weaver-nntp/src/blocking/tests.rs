@@ -1312,3 +1312,180 @@ fn blocking_decoder_preserves_pipelined_leftover() {
     assert_eq!(article.into_data(), b"first");
     assert!(std::str::from_utf8(&input).unwrap().starts_with("222 "));
 }
+
+/// A lane bound to the test server, with its own permit.
+fn test_body_lane(config: &ServerConfig) -> BlockingBodyLane {
+    BlockingBodyLane::connect(
+        ServerId(0),
+        StableServerId(9001),
+        None,
+        config,
+        &[],
+        0,
+        &["alt.test".to_string()],
+        Duration::from_secs(30),
+        crate::pool::BlockingConnectionPermit::for_tests(),
+    )
+    .expect("test lane connects")
+}
+
+fn ring_payload(trace: &DecodedBodyTrace) -> Vec<u8> {
+    trace
+        .result
+        .as_ref()
+        .expect("the test server answers every article")
+        .decoded
+        .iter()
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect()
+}
+
+/// Responses come back in issue order, and the judging window closes once per
+/// depth so a caller that never lets the ring drain still gets the same rung
+/// verdicts the batch API produced per batch.
+#[test]
+fn ring_reads_responses_in_issue_order_and_closes_a_window_per_depth() {
+    let payloads = [
+        vec![0x11; 512],
+        vec![0x22; 512],
+        vec![0x33; 512],
+        vec![0x44; 512],
+    ];
+    let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
+        ("<one@test>", TestArticle::Body(payloads[0].clone())),
+        ("<two@test>", TestArticle::Body(payloads[1].clone())),
+        ("<three@test>", TestArticle::Body(payloads[2].clone())),
+        ("<four@test>", TestArticle::Body(payloads[3].clone())),
+    ]);
+    let mut lane = test_body_lane(&config);
+
+    assert!(
+        lane.ring_read_next().is_none(),
+        "an empty ring owes nothing"
+    );
+    for id in ["<one@test>", "<two@test>", "<three@test>", "<four@test>"] {
+        assert!(matches!(
+            lane.ring_issue(id, 512, 4),
+            RingIssueOutcome::Issued
+        ));
+    }
+    assert_eq!(lane.ring_outstanding(), 4);
+
+    let mut completions = Vec::new();
+    for (index, expected) in payloads.iter().enumerate() {
+        let (trace, meta) = lane.ring_read_next().expect("a response is owed");
+        assert_eq!(
+            &ring_payload(&trace),
+            expected,
+            "response {index} must be the {index}th request's article"
+        );
+        assert_eq!(lane.ring_outstanding(), 3 - index);
+        assert!(meta.batch_clean);
+        assert!(!meta.connection_discarded);
+        completions.push((meta.batch_complete, meta.batch_response_count));
+    }
+
+    assert_eq!(
+        completions,
+        vec![(false, 0), (false, 0), (false, 0), (true, 4)]
+    );
+    lane.park();
+    handle.join().unwrap();
+    let _ = std::fs::remove_file(ca_path);
+}
+
+/// The point of the ring: a request goes out while responses are still
+/// arriving, so the pipe never empties at a batch boundary. Under the batch
+/// API the last response of a batch was read before the next batch's first
+/// command was written, costing a round trip every time.
+#[test]
+fn ring_never_drains_between_batches() {
+    let payloads = [
+        vec![0x51; 256],
+        vec![0x52; 256],
+        vec![0x53; 256],
+        vec![0x54; 256],
+    ];
+    let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
+        ("<a@test>", TestArticle::Body(payloads[0].clone())),
+        ("<b@test>", TestArticle::Body(payloads[1].clone())),
+        ("<c@test>", TestArticle::Body(payloads[2].clone())),
+        ("<d@test>", TestArticle::Body(payloads[3].clone())),
+    ]);
+    let mut lane = test_body_lane(&config);
+    let ids = ["<a@test>", "<b@test>", "<c@test>", "<d@test>"];
+
+    // Fill one pipe of depth 2, then top it back up after every response.
+    for id in &ids[..2] {
+        assert!(matches!(
+            lane.ring_issue(id, 256, 2),
+            RingIssueOutcome::Issued
+        ));
+    }
+    let mut read = 0usize;
+    let mut window_closes = 0usize;
+    for id in &ids[2..] {
+        let (trace, meta) = lane.ring_read_next().expect("a response is owed");
+        assert_eq!(&ring_payload(&trace), &payloads[read]);
+        read += 1;
+        if meta.batch_complete {
+            window_closes += 1;
+        }
+        assert_eq!(
+            lane.ring_outstanding(),
+            1,
+            "one request stays on the wire while its predecessor is decoded"
+        );
+        assert!(matches!(
+            lane.ring_issue(id, 256, 2),
+            RingIssueOutcome::Issued
+        ));
+        assert_eq!(lane.ring_outstanding(), 2);
+    }
+    while let Some((trace, meta)) = lane.ring_read_next() {
+        assert_eq!(&ring_payload(&trace), &payloads[read]);
+        read += 1;
+        if meta.batch_complete {
+            window_closes += 1;
+        }
+    }
+
+    assert_eq!(read, 4);
+    assert_eq!(
+        window_closes, 2,
+        "four responses at depth two are two rung windows"
+    );
+    lane.park();
+    handle.join().unwrap();
+    let _ = std::fs::remove_file(ca_path);
+}
+
+/// Abandoning the ring must poison the connection: the responses to the
+/// commands that were dropped are still in the socket, so it can never go back
+/// to the pool.
+#[test]
+fn ring_abandon_reports_the_dropped_requests_and_poisons_the_lane() {
+    let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
+        ("<x@test>", TestArticle::Body(vec![0x61; 128])),
+        ("<y@test>", TestArticle::Body(vec![0x62; 128])),
+    ]);
+    let mut lane = test_body_lane(&config);
+    for id in ["<x@test>", "<y@test>"] {
+        assert!(matches!(
+            lane.ring_issue(id, 128, 2),
+            RingIssueOutcome::Issued
+        ));
+    }
+
+    assert_eq!(lane.ring_abandon(), 2);
+    assert!(lane.ring_is_closed());
+    assert_eq!(lane.ring_outstanding(), 0);
+    assert!(matches!(
+        lane.ring_issue("<x@test>", 128, 2),
+        RingIssueOutcome::Failed(_)
+    ));
+
+    lane.park();
+    drop(handle);
+    let _ = std::fs::remove_file(ca_path);
+}

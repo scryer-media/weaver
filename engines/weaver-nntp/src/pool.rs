@@ -73,6 +73,20 @@ pub struct BlockingConnectionPermit {
     _permit: OwnedSemaphorePermit,
 }
 
+#[cfg(test)]
+impl BlockingConnectionPermit {
+    /// A permit backed by its own semaphore, for lane tests that never
+    /// contend for a pool slot.
+    pub(crate) fn for_tests() -> Self {
+        let semaphore = Arc::new(Semaphore::new(1));
+        Self {
+            _permit: semaphore
+                .try_acquire_owned()
+                .expect("a fresh semaphore always has its one permit"),
+        }
+    }
+}
+
 /// How long fresh connects to a server pause after the provider answered a
 /// connect with "too many connections". Existing sessions keep running; only
 /// new sockets wait, which is what the provider is actually asking for.

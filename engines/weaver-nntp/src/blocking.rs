@@ -113,6 +113,53 @@ struct RawS2nConnection {
     ptr: NonNull<s2n::s2n_connection>,
 }
 
+/// One BODY command written to the wire whose response has not been read yet.
+struct BodyRingRequest {
+    message_id: String,
+    /// The ring was empty when this went out, so the wait for its status line
+    /// is a clean round-trip sample rather than time spent queued behind
+    /// another article's payload.
+    issued_alone: bool,
+}
+
+/// What [`BlockingBodyLane::ring_issue`] did with a request.
+pub enum RingIssueOutcome {
+    /// The command is on the ring; its response is owed.
+    Issued,
+    /// Nothing was written and the lane is still healthy — the caller owns the
+    /// trace as this article's outcome and may keep reading the ring, but must
+    /// not issue again.
+    Rejected(Box<DecodedBodyTrace>),
+    /// The write failed and the connection is poisoned. Everything still on the
+    /// ring is unanswerable.
+    Failed(Box<DecodedBodyTrace>),
+}
+
+/// A lane's outstanding BODY commands, driven one at a time by the caller.
+///
+/// [`BlockingBodyLane::fetch_decoded_pipeline_with_estimates`] writes a whole
+/// batch and then reads it back, which empties the pipe at every batch edge:
+/// the last response of one batch is read before the first command of the next
+/// is written, so the server sits idle for a round trip. The ring lets the
+/// caller top the pipe up while responses are still arriving, and keep topping
+/// it up across a batch boundary.
+#[derive(Default)]
+struct BodyRing {
+    outstanding: VecDeque<BodyRingRequest>,
+    /// Requests written but not yet pushed to the wire. Batching the flush
+    /// keeps a top-up of several commands in one segment, as the batch writer
+    /// did.
+    unflushed: usize,
+    /// The connection faulted; nothing still on the ring will ever be answered.
+    closed: bool,
+    /// Depth the caller last issued at, and the size of the judging window that
+    /// depth opens.
+    current_depth: usize,
+    window_depth: usize,
+    window_responses: u64,
+    window_clean: bool,
+}
+
 pub struct BlockingBodyLane {
     conn: BlockingNntpConnection,
     checkpoint_plan: CheckpointPlan,
@@ -127,6 +174,9 @@ pub struct BlockingBodyLane {
     /// wire, independent of how far away the server is.
     transfer_ewma: Option<Duration>,
     soft_timeout: Duration,
+    /// Outstanding pipelined BODY commands, when the caller drives the lane
+    /// request-by-request instead of batch-by-batch.
+    ring: BodyRing,
     _permit: BlockingConnectionPermit,
 }
 
@@ -213,6 +263,7 @@ impl BlockingBodyLane {
                 latency_ewma: None,
                 transfer_ewma: None,
                 soft_timeout,
+                ring: BodyRing::default(),
                 _permit: permit,
             });
         }
@@ -230,6 +281,7 @@ impl BlockingBodyLane {
                         latency_ewma: None,
                         transfer_ewma: None,
                         soft_timeout,
+                        ring: BodyRing::default(),
                         _permit: permit,
                     });
                 }
@@ -250,6 +302,7 @@ impl BlockingBodyLane {
                 latency_ewma: None,
                 transfer_ewma: None,
                 soft_timeout,
+                ring: BodyRing::default(),
                 _permit: permit,
             })
         } else {
@@ -482,8 +535,197 @@ impl BlockingBodyLane {
         out
     }
 
+    /// BODY commands written to this lane whose responses have not been read.
+    pub fn ring_outstanding(&self) -> usize {
+        self.ring.outstanding.len()
+    }
+
+    /// The ring faulted: every request still on it is unanswerable and the
+    /// connection must be discarded rather than parked.
+    pub fn ring_is_closed(&self) -> bool {
+        self.ring.closed
+    }
+
+    /// Write one more BODY onto the ring at `depth`.
+    ///
+    /// The command is buffered, not flushed; [`Self::ring_read_next`] pushes it
+    /// before it waits, so a caller that tops the ring up by several requests
+    /// still spends one write on them. `depth` is the pipeline depth in force,
+    /// and sizes the window the lane judges its responses over.
+    pub fn ring_issue(
+        &mut self,
+        message_id: &str,
+        estimated_body_bytes: u64,
+        depth: usize,
+    ) -> RingIssueOutcome {
+        if self.ring.closed || self.conn.poisoned {
+            let trace = self.trace_item(
+                message_id,
+                Duration::ZERO,
+                Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed)),
+            );
+            return RingIssueOutcome::Failed(Box::new(trace));
+        }
+        let depth = depth.max(1);
+        self.ring.current_depth = depth;
+        self.mode = match depth {
+            1 => BodyLaneMode::Sequential,
+            depth => BodyLaneMode::Pipelined {
+                depth: depth.min(u8::MAX as usize) as u8,
+            },
+        };
+        let issued_alone = self.ring.outstanding.is_empty();
+        match self
+            .conn
+            .write_body_request_with_estimate(message_id, estimated_body_bytes)
+        {
+            Ok(()) => {}
+            // The transfer budget refused this article before anything reached
+            // the wire, so the ring and the connection are exactly as they
+            // were and the lane stays usable.
+            Err(error @ NntpError::QuotaBlocked(_)) => {
+                let trace = self.trace_item(
+                    message_id,
+                    Duration::ZERO,
+                    Err(DecodedBodyError::Nntp(error)),
+                );
+                return RingIssueOutcome::Rejected(Box::new(trace));
+            }
+            Err(error) => {
+                self.conn.fail_body_pipeline();
+                self.ring.closed = true;
+                let trace = self.trace_item(
+                    message_id,
+                    Duration::ZERO,
+                    Err(DecodedBodyError::Nntp(error)),
+                );
+                return RingIssueOutcome::Failed(Box::new(trace));
+            }
+        }
+        self.ring.unflushed += 1;
+        self.ring.outstanding.push_back(BodyRingRequest {
+            message_id: message_id.to_string(),
+            issued_alone,
+        });
+        RingIssueOutcome::Issued
+    }
+
+    /// Read the response to the oldest request on the ring, or `None` when the
+    /// ring is empty.
+    ///
+    /// The trace meta is judged over rolling windows of the issuing depth, so
+    /// a caller that never lets the ring drain still gets the same
+    /// `batch_complete` / `batch_clean` verdicts the batch API produced per
+    /// batch. A fault closes the window immediately and reports everything
+    /// still on the ring as unresolved.
+    pub fn ring_read_next(&mut self) -> Option<(DecodedBodyTrace, BodyLaneTraceMeta)> {
+        let request = self.ring.outstanding.pop_front()?;
+        if self.ring.unflushed > 0 && !self.ring.closed {
+            self.ring.unflushed = 0;
+            if let Err(error) = self.conn.flush_commands() {
+                self.conn.fail_body_pipeline();
+                self.ring.closed = true;
+                let trace = self.trace_item(
+                    &request.message_id,
+                    Duration::ZERO,
+                    Err(DecodedBodyError::Nntp(error)),
+                );
+                let meta = self.close_ring_window(false);
+                return Some((trace, meta));
+            }
+        }
+        if self.ring.window_depth == 0 {
+            self.ring.window_depth = self.ring.current_depth.max(1);
+            self.ring.window_clean = true;
+        }
+
+        let started = Instant::now();
+        let result = if self.ring.closed {
+            Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed))
+        } else {
+            self.read_next_decoded_body()
+        };
+        let elapsed = started.elapsed();
+        let policy_elapsed = result.as_ref().map_or(elapsed, |decoded| {
+            elapsed.saturating_sub(decoded.io.throttle_wait)
+        });
+        if result.is_ok() {
+            let response_line_wait = self.conn.take_response_line_wait().min(policy_elapsed);
+            // Only a request issued into an empty ring measures distance;
+            // anything issued behind another article was queued behind its
+            // payload and would read as near zero.
+            if request.issued_alone {
+                self.observe_latency(response_line_wait);
+            }
+            self.observe_transfer(policy_elapsed.saturating_sub(response_line_wait));
+        }
+        if self.conn.poisoned
+            || matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e))
+        {
+            self.ring.closed = true;
+        }
+        let trace = self.trace_item(&request.message_id, policy_elapsed, result);
+        let kept_connection = decoded_result_keeps_connection(&trace.result);
+        self.ring.window_clean &= kept_connection;
+        self.ring.window_responses += 1;
+
+        let meta = if self.ring.closed {
+            self.close_ring_window(false)
+        } else if self.ring.window_responses >= self.ring.window_depth as u64 {
+            self.close_ring_window(true)
+        } else {
+            BodyLaneTraceMeta {
+                batch_complete: false,
+                batch_clean: self.ring.window_clean,
+                batch_response_count: 0,
+                unresolved_count: 0,
+                connection_discarded: false,
+            }
+        };
+        Some((trace, meta))
+    }
+
+    /// Give up on everything still outstanding. The connection is poisoned:
+    /// responses to those commands are still in the socket, so it can never be
+    /// handed back to the pool.
+    pub fn ring_abandon(&mut self) -> usize {
+        let dropped = self.ring.outstanding.len();
+        if dropped > 0 || self.ring.unflushed > 0 {
+            self.conn.fail_body_pipeline();
+        }
+        self.ring.outstanding.clear();
+        self.ring.unflushed = 0;
+        self.ring.closed = true;
+        self.ring.window_depth = 0;
+        self.ring.window_responses = 0;
+        dropped
+    }
+
+    fn close_ring_window(&mut self, healthy: bool) -> BodyLaneTraceMeta {
+        let meta = BodyLaneTraceMeta {
+            batch_complete: true,
+            batch_clean: self.ring.window_clean && healthy,
+            batch_response_count: self.ring.window_responses,
+            unresolved_count: if healthy {
+                0
+            } else {
+                self.ring.outstanding.len() as u64
+            },
+            connection_discarded: !healthy,
+        };
+        self.ring.window_depth = 0;
+        self.ring.window_responses = 0;
+        self.ring.window_clean = true;
+        meta
+    }
+
     pub fn park(mut self) {
-        if self.conn.body_accounting.is_empty() {
+        // An unread response still in the socket makes QUIT meaningless: the
+        // reply read back would be the tail of an article, not the server's.
+        if self.conn.body_accounting.is_empty()
+            && self.ring.outstanding.is_empty()
+            && !self.conn.poisoned
+        {
             let _ = self.conn.quit();
         } else {
             self.conn.fail_body_pipeline();

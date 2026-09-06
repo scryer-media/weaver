@@ -3272,7 +3272,7 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
             }],
             unrequested_works: vec![],
             stats: weaver_nntp::blocking::BlockingLaneStats::default(),
-            ack,
+            ack: Some(ack),
         },
         &mut pending,
     );
@@ -3350,7 +3350,7 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
             results: vec![],
             unrequested_works: vec![tail_work],
             stats: weaver_nntp::blocking::BlockingLaneStats::default(),
-            ack,
+            ack: Some(ack),
         },
         &mut pending,
     );

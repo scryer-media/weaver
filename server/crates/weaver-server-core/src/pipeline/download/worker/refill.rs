@@ -204,7 +204,8 @@ impl Pipeline {
         }
 
         let mut lease = if allow_refill {
-            match self.try_lease_refill_download_batch(job_id, compatibility, pressure) {
+            match self.try_lease_refill_download_batch(job_id, server_idx, compatibility, pressure)
+            {
                 Ok(lease) => lease,
                 Err(DispatchAttempt::StopAll) => {
                     park_reason = LaneParkReason::Pressure;
@@ -224,6 +225,29 @@ impl Pipeline {
             self.metrics
                 .download_lane_refill_parked_total
                 .fetch_add(1, Ordering::Relaxed);
+            // A park is a lost round trip on an established connection, so say
+            // why. The counters alone could not tell a job whose queue is
+            // genuinely empty from one holding thousands of articles the lane
+            // was refused.
+            debug!(
+                job_id = job_id.0,
+                server = server_idx,
+                lane_mode = ?current_mode,
+                reason = ?park_reason,
+                queued = self
+                    .jobs
+                    .get(&job_id)
+                    .map(|state| state.download_queue.len())
+                    .unwrap_or(0),
+                queued_in_class = self
+                    .jobs
+                    .get(&job_id)
+                    .map(|state| state
+                        .download_queue
+                        .len_in_class(batch_class.completion_critical))
+                    .unwrap_or(0),
+                "download lane refill denied; lane parking"
+            );
             let _ = response_tx.send(DownloadLaneRefillResponse {
                 lease: None,
                 park_reason,
@@ -233,6 +257,13 @@ impl Pipeline {
             return;
         };
 
+        // Stage two of the refill may re-open the lease around another work
+        // item's compatibility, so the class booked here is the lease's, not
+        // the request's. Both agree by construction — the class and the
+        // recovery flag a lane is counted under never change while it runs —
+        // and reading it from the lease is what keeps that true if they ever
+        // diverge.
+        let batch_class = DownloadBatchClass::from(&lease.compatibility);
         let activation_items = Self::activation_items(&lease);
         let next_mode = Self::actual_download_lane_mode(
             lease.lane_mode,

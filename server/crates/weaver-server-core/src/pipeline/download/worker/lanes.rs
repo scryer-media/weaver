@@ -27,6 +27,19 @@ impl Pipeline {
         }
     }
 
+    /// Decrement a lane gauge without letting it wrap.
+    ///
+    /// The gauges are balanced by construction — every lane carries the mode it
+    /// was booked under and reports that mode back at each transition and at
+    /// park — but a gauge is a diagnostic, and a diagnostic that reads
+    /// `18446744073709551615` because one path lost a transition is worse than
+    /// one that reads zero.
+    fn release_lane_gauge(gauge: &std::sync::atomic::AtomicUsize) {
+        let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            Some(count.saturating_sub(1))
+        });
+    }
+
     pub(in crate::pipeline) fn note_download_lane_started(&mut self, mode: DownloadLaneMode) {
         debug!(mode = ?mode, "download lane started");
         self.metrics
@@ -43,13 +56,9 @@ impl Pipeline {
         mode: DownloadLaneMode,
         reason: LaneParkReason,
     ) {
-        self.metrics
-            .download_lanes_active
-            .fetch_sub(1, Ordering::Relaxed);
-        self.metrics
-            .download_lanes_issuing_active
-            .fetch_sub(1, Ordering::Relaxed);
-        self.lane_depth_gauge(mode).fetch_sub(1, Ordering::Relaxed);
+        Self::release_lane_gauge(&self.metrics.download_lanes_active);
+        Self::release_lane_gauge(&self.metrics.download_lanes_issuing_active);
+        Self::release_lane_gauge(self.lane_depth_gauge(mode));
         match reason {
             LaneParkReason::NoWork => self
                 .metrics
@@ -636,7 +645,7 @@ impl Pipeline {
             .collect()
     }
 
-    pub(in crate::pipeline::download::worker) fn note_download_lane_mode_changed(
+    pub(in crate::pipeline) fn note_download_lane_mode_changed(
         &mut self,
         previous: DownloadLaneMode,
         next: DownloadLaneMode,
@@ -655,8 +664,7 @@ impl Pipeline {
             );
         }
 
-        self.lane_depth_gauge(previous)
-            .fetch_sub(1, Ordering::Relaxed);
+        Self::release_lane_gauge(self.lane_depth_gauge(previous));
         self.lane_depth_gauge(next).fetch_add(1, Ordering::Relaxed);
     }
 
@@ -727,7 +735,9 @@ impl Pipeline {
                 // backpressure, not completion of per-result ingest. Holding
                 // the ack through ingest serialized every lane behind this
                 // loop at batch boundaries and stalled all downloads at once.
-                let _ = ack.send(());
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
                 crate::runtime::perf_probe::record_value(
                     "download.owned_lane.batch.results",
                     results.len() as u64,
@@ -819,8 +829,26 @@ impl Pipeline {
         self.publish_hot_dispatch_metrics(Instant::now());
     }
 
+    /// Whether a lane park has left the run loop owing a dispatch pass, and
+    /// clears the debt. Consumed by the run loop and by `dispatch_downloads`
+    /// itself, so a pass that has already run cannot be asked for twice.
+    pub(crate) fn take_download_dispatch_wake(&mut self) -> bool {
+        std::mem::take(&mut self.download_dispatch_wake)
+    }
+
     pub(crate) fn handle_download_lane_parked(&mut self, parked: DownloadLaneParked) {
+        debug!(
+            job_id = parked.job_id.0,
+            mode = ?parked.mode,
+            reason = ?parked.reason,
+            completion_critical = parked.completion_critical,
+            released_connection = parked.release_connection_slot,
+            "download lane parked"
+        );
         if parked.release_connection_slot {
+            // The connection is back in the pool now, not at the next turn of
+            // the run loop.
+            self.download_dispatch_wake = true;
             self.note_download_lane_released(parked.mode, parked.reason);
             self.active_download_connections = self.active_download_connections.saturating_sub(1);
             if let Some(kind) = parked.spillover_loan_kind {

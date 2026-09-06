@@ -205,6 +205,7 @@ impl Pipeline {
             hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
             download_lane_runtime: DownloadLaneRuntimeState::default(),
             deferred_lane_refills: std::collections::VecDeque::new(),
+            download_dispatch_wake: false,
             ip_replacement_trial_extra_connections,
             ip_rtt_ewma: HashMap::new(),
             ip_replacement_retired_ips: HashSet::new(),
@@ -931,6 +932,9 @@ impl Pipeline {
             }
 
             self.drain_ready_lane_control_messages();
+            if self.take_download_dispatch_wake() {
+                self.dispatch_downloads();
+            }
 
             let mut processed_results = 0usize;
             while processed_results < Self::DOWNLOAD_RESULTS_PER_TURN {
@@ -939,6 +943,15 @@ impl Pipeline {
                 };
                 self.process_released_download_done(result).await;
                 processed_results += 1;
+                // Ingesting a turn's worth of results is the longest stretch of
+                // a loop turn, and it is exactly when lanes finish their leases
+                // and park. Draining the control channel here and dispatching
+                // on the park hands the freed connection straight back out
+                // instead of holding it until the turn ends.
+                self.drain_ready_lane_control_messages();
+                if self.take_download_dispatch_wake() {
+                    self.dispatch_downloads();
+                }
             }
             if processed_results == 0 {
                 tokio::select! {
