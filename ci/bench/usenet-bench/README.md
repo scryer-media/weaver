@@ -86,7 +86,7 @@ go run ./cmd/nntpbench seed --fixture-dir /scratch/fixtures/rar5-7-store-store-n
 
 # 5. Plan, 6. run, 7. summarize.
 go run ./cmd/nntpbench plan --fixtures rar5-7-store-store-nonsolid-none-incompressible \
-  --archive-toolchains vanilla --profile stock --server-link 1gbit --repetitions 20 --seed 1 \
+  --archive-toolchains vanilla --profile equivalent-throughput --server-link 1gbit --repetitions 20 --seed 1 \
   --targets docker-linux --output /scratch/runs/plan.json
 go build -o /scratch/bin/clientadapter ./cmd/clientadapter
 cp configs/adapters.example.json /scratch/runs/adapters.json   # set the adapter path + network name
@@ -464,7 +464,7 @@ Reposting an unchanged corpus every time is pure overhead. See
 ```bash
 go run ./cmd/nntpbench plan \
   --fixtures rar5-7-store-store-nonsolid-none-incompressible,rar4-store-store-nonsolid-none-incompressible \
-  --archive-toolchains vanilla --profile stock --server-link 10gbit \
+  --archive-toolchains vanilla --profile equivalent-throughput --server-link 10gbit \
   --repetitions 20 --seed 20260802 --output /scratch/runs/plan.json
 ```
 
@@ -480,8 +480,11 @@ profiles keep the full client-by-packaging matrix for every
 | SABnzbd | digest-pinned image, public API | native distributable, public API | native distributable, public API |
 | NZBGet | digest-pinned image, JSON-RPC | native executable, JSON-RPC | native executable, JSON-RPC |
 
-`--profile stock` and `--profile equivalent-throughput` are reported
-separately; neither is a fallback for the other. The profiles differ only for
+The published suite runs `--profile equivalent-throughput` only: SABnzbd
+and NZBGet are compared at their best, with direct unpack on, rather than at
+their shipping defaults. `--profile stock` remains a valid plan for a
+diagnostic and is reported separately when it is run; neither profile is a
+fallback for the other. The profiles differ only for
 SABnzbd (`direct_unpack`) and NZBGet (`DirectUnpack`); NZBGet's `DirectWrite`
 is its shipping default and independent of direct unpack, so it stays `yes`
 in both. Weaver is rendered with `WEAVER_DIRECT_UNPACK=on` and
