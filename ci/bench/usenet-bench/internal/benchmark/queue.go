@@ -419,9 +419,17 @@ func verifyQueueTransitionOutputs(fixtureDir, outputDir string, copies int) ([]O
 		verifications = append(verifications, verification)
 	}
 	for _, candidate := range allCandidates {
-		if !used[candidate.path] {
-			return verifications, copies - 1, fmt.Errorf("verify queue-transition outputs: unexpected unconsumed output file %s", candidate.path)
+		if used[candidate.path] {
+			continue
 		}
+		// A client may leave a dot-prefixed bookkeeping marker beside its
+		// output (an ownership stamp for the directory it created). Fixture
+		// payloads are never hidden files, so a hidden leftover is not an
+		// unconsumed payload copy and must not fail the suite.
+		if strings.HasPrefix(filepath.Base(candidate.path), ".") {
+			continue
+		}
+		return verifications, copies - 1, fmt.Errorf("verify queue-transition outputs: unexpected unconsumed output file %s", candidate.path)
 	}
 	return verifications, -1, nil
 }

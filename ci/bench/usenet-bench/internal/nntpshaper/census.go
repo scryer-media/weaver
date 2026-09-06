@@ -78,11 +78,40 @@ func (census *CommandCensus) flush() {
 		return
 	}
 	verb := strings.ToUpper(fields[0])
+	if !isCommandVerb(verb) {
+		// The tally is keyed by verb and lives for the shaper's lifetime, so
+		// the key space must be bounded. A stream that is not NNTP (a TLS
+		// session relayed through the plaintext listener, a client speaking
+		// garbage) splits into pseudo-lines whose first token is random
+		// bytes; keyed verbatim, every such token became its own counter and
+		// the snapshot grew without bound over a long benchmark chain.
+		census.attestation.ObserveCommand("NONVERB", "")
+		return
+	}
 	argument := ""
 	if len(fields) > 1 {
 		argument = fields[1]
 	}
 	census.attestation.ObserveCommand(verb, argument)
+}
+
+// maxVerbLength bounds a tallied verb. NNTP verbs are short ASCII words
+// (AUTHINFO, XFEATURE, CAPABILITIES); anything longer is not a command.
+const maxVerbLength = 16
+
+// isCommandVerb reports whether an upper-cased first token looks like an NNTP
+// command verb: ASCII letters and digits only, within maxVerbLength.
+func isCommandVerb(verb string) bool {
+	if verb == "" || len(verb) > maxVerbLength {
+		return false
+	}
+	for index := 0; index < len(verb); index++ {
+		char := verb[index]
+		if (char < 'A' || char > 'Z') && (char < '0' || char > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // normalizeMessageID gives bracketed and bare forms of the same message-id one

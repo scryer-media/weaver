@@ -199,8 +199,14 @@ func proxy(ctx context.Context, client net.Conn, config listenerConfig, limiter 
 	upstreamDone := make(chan struct{})
 	go func() {
 		// The client's command stream is relayed byte for byte; the census
-		// only reads a copy of what was forwarded.
-		_, _ = io.Copy(&censusWriter{upstream: upstream, census: nntpshaper.NewCommandCensus(attestation)}, client)
+		// only reads a copy of what was forwarded. The TLS listener relays
+		// ciphertext the shaper cannot read, so it carries no census: parsing
+		// it yielded random pseudo-commands, never an article count.
+		var census *nntpshaper.CommandCensus
+		if config.label != "tls" {
+			census = nntpshaper.NewCommandCensus(attestation)
+		}
+		_, _ = io.Copy(&censusWriter{upstream: upstream, census: census}, client)
 		closeWrite(upstream)
 		close(upstreamDone)
 	}()
@@ -240,7 +246,7 @@ type censusWriter struct {
 
 func (writer *censusWriter) Write(payload []byte) (int, error) {
 	written, err := writer.upstream.Write(payload)
-	if written > 0 {
+	if written > 0 && writer.census != nil {
 		writer.census.Observe(payload[:written])
 	}
 	return written, err

@@ -531,7 +531,12 @@ application bytes, not wire bytes — so a client whose bytes exceed the NZB's
 article bytes either asked for articles twice (repeats > 0) or read past what
 it asked for (repeats = 0). A schema-2 shaper carries no census and the field
 is absent; a schema-2 or schema-3 shaper cannot render a round trip and is
-refused for any plan that declares one.
+refused for any plan that declares one. The census reads only the plaintext
+listener: the TLS listener relays ciphertext the shaper cannot parse, so TLS
+strata carry a zero census and the transfer-evidence table cannot separate
+repeats from over-reading there. Verb keys are bounded to alphanumeric tokens
+(anything else tallies under `NONVERB`), so a long chain of runs cannot grow
+the snapshot without limit.
 
 By default the topology publishes the shaper only on `127.0.0.1`. For a remote
 native lane set `NNTP_PUBLIC_BIND_ADDR` to a specific LAN address, firewall it

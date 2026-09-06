@@ -349,3 +349,17 @@ func TestQueueArtifactWriteFailurePropagates(t *testing.T) {
 		t.Fatalf("artifact write failure was not propagated: %#v", artifact)
 	}
 }
+
+func TestVerifyQueueTransitionOutputsToleratesHiddenClientMarker(t *testing.T) {
+	fixtureDir, outputDir, contents := writeQueueTransitionVerificationFixture(t)
+	for index := 0; index < 20; index++ {
+		writeQueueTransitionOutputCopy(t, outputDir, index, contents)
+	}
+	if err := os.WriteFile(filepath.Join(outputDir, "copy-19", ".client-output-dir"), []byte("owned"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	verifications, failedIndex, err := verifyQueueTransitionOutputs(fixtureDir, outputDir, 20)
+	if err != nil || failedIndex != -1 || len(verifications) != 20 {
+		t.Fatalf("queue transition verification = (%d verifications, failed %d, %v), want a hidden marker to be ignored", len(verifications), failedIndex, err)
+	}
+}
