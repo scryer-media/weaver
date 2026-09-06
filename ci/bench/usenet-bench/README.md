@@ -63,7 +63,7 @@ The Docker-only smoke path, end to end:
 
 ```bash
 # 1. Two fixtures: one clean RAR5 case and one raw-MKV case for the queue benchmark.
-go run ./cmd/fixturegen --fixture rar5-7-headers-normal-solid-headers-compressible --output /scratch/fixtures
+go run ./cmd/fixturegen --fixture rar5-7-store-store-nonsolid-none-incompressible --output /scratch/fixtures
 go run ./cmd/fixturegen --direct-mkv --output /scratch/fixtures
 
 # 2. Build the pinned NNTP server image from the published module.
@@ -80,12 +80,12 @@ NNTP_BENCH_PASSWORD_FILE=/scratch/runs/nntp-password docker compose -p nntp-benc
   cp nntp:/certs/ca.pem /scratch/runs/nntp-ca.pem
 
 # 4. Post the fixture over the private upstream network (never through the shaper).
-go run ./cmd/nntpbench seed --fixture-dir /scratch/fixtures/rar5-7-headers-normal-solid-headers-compressible \
+go run ./cmd/nntpbench seed --fixture-dir /scratch/fixtures/rar5-7-store-store-nonsolid-none-incompressible \
   --run-id smoke-1 --network nntp-bench_nntp_upstream --nntp-host nntp-upstream \
   --username fixture-user --password-file /scratch/runs/nntp-password
 
 # 5. Plan, 6. run, 7. summarize.
-go run ./cmd/nntpbench plan --fixtures rar5-7-headers-normal-solid-headers-compressible \
+go run ./cmd/nntpbench plan --fixtures rar5-7-store-store-nonsolid-none-incompressible \
   --archive-toolchains vanilla --profile stock --server-link 1gbit --repetitions 20 --seed 1 \
   --targets docker-linux --output /scratch/runs/plan.json
 go build -o /scratch/bin/clientadapter ./cmd/clientadapter
@@ -127,7 +127,7 @@ summary:
 | Class | What it stands for | Sets |
 | --- | --- | --- |
 | `headline` | The common shape of a real post: a stored (`-m0`), multi-volume RAR of already-compressed media. One clean set per source-locked RARLAB writer era (3.93, 4.20, 5.00, 6.24, 7.23), each posted clear, with encrypted headers (`-hp`) and with data-only encryption (`-p`), because most real posts are not encrypted and the encrypted forms are measured beside the clear one, never instead of it. PAR2 repair is part of the common case too: the stored form from the 4.20, 5.00 and 7.23 writers is posted in the same three forms with light damage (`par2-light`) and with an interior volume listed in the NZB but never posted (`par2-heavy-withheld`). | 8 sets, 33 fixtures |
-| `breadth` | Shapes a client meets less often and must still handle: release-style compression in both RAR families, a four-movie multi-input set, RAR5 quick-open records, the official 7-Zip 7z container, a stored Blu-ray-shaped topology in scattered NZB order, PAR2 over a solid compressed RAR5 and over 7z, and RAR recovery volumes. | 11 sets, 11 fixtures |
+| `breadth` | Shapes a client meets less often and must still handle: a four-movie stored set with RAR5 quick-open records, the official 7-Zip 7z container, a stored Blu-ray-shaped topology in scattered NZB order, PAR2 over 7z, and RAR recovery volumes. RAR compression is deliberately absent: already-compressed media is not recompressed in the wild, so a compressed lane would measure a shape nobody posts. | 7 sets, 7 fixtures |
 
 The summarizer pools per-fixture results only within a class (see
 [Summarize](#7-summarize)); the headline aggregate is the figure for the common
@@ -159,13 +159,13 @@ Together they cover the RARLAB writer eras and their archive families across:
 | Encryption | none, data encryption, encrypted headers |
 | Input data | incompressible, moderately compressible |
 
-That yields 19 clean RAR fixtures: the 15 headline stored lanes (five writer
-eras, each clear, header-encrypted and data-encrypted), and four breadth
-lanes — RAR 4.20 solid data-encrypted compression,
-RAR 7.23 solid header-encrypted compression over the compressible payload, a
-four-movie non-solid compressed set, and the quick-open set. `writer_era` is
-deliberately separate from `archive_format`: RAR 6 and 7 are writer releases,
-not new on-disk formats.
+That yields 16 clean RAR fixtures: the 15 headline stored lanes (five writer
+eras, each clear, header-encrypted and data-encrypted) and the four-movie
+quick-open set. Every RAR lane is stored: the generator still writes
+release-style `-m5` compression and the compressible payload, but the
+checked-in matrix uses neither, because already-compressed media is not
+recompressed in the wild. `writer_era` is deliberately separate from
+`archive_format`: RAR 6 and 7 are writer releases, not new on-disk formats.
 
 ### The 7z lane
 
@@ -213,14 +213,14 @@ Blu-ray image and not a claim about typical posts.
 
 ### Repair profiles
 
-Seven repair sets add deterministic damage without duplicating the clean
+Six repair sets add deterministic damage without duplicating the clean
 cases. Three are headline: PAR2 over the stored RAR from the 4.20, 5.00 and
 7.23 writers, each posted clear, with encrypted headers and with data
 encryption, under light damage and with the volume withheld, because a repair
-is part of what a real post costs. The other four are breadth: RAR4 and RAR5
-recovery volumes, 7z PAR2 light, and `repair-rar5-par2` over a solid
-data-encrypted compressed RAR5 so a repair that has to run before a
-compressed extract is measured once:
+is part of what a real post costs. The other three are breadth: RAR4 and RAR5
+recovery volumes, and 7z PAR2 light. `par2-heavy` stays defined for a set
+that wants the volume missing from the NZB itself; the checked-in matrix uses
+the withheld form, which is what an incomplete post looks like on a server:
 
 | Profile | Posted repair material | Deliberate fault |
 | --- | --- | --- |
@@ -330,7 +330,7 @@ invocation.
 go run ./cmd/fixturegen --list
 
 # One benchmark-sized movie case (576 MiB compressible payload by default; incompressible cases use 320 MiB).
-go run ./cmd/fixturegen --fixture rar5-7-headers-normal-solid-headers-compressible --output /scratch/fixtures
+go run ./cmd/fixturegen --fixture rar5-7-store-store-nonsolid-none-incompressible --output /scratch/fixtures
 
 # A 7z case, written by the pinned official 7-Zip build.
 go run ./cmd/fixturegen --fixture sevenzip-store-store-nonsolid-none-incompressible --output /scratch/fixtures
@@ -445,7 +445,7 @@ never crosses the shaper:
 
 ```bash
 go run ./cmd/nntpbench seed \
-  --fixture-dir /scratch/fixtures/rar5-7-headers-normal-solid-headers-compressible \
+  --fixture-dir /scratch/fixtures/rar5-7-store-store-nonsolid-none-incompressible \
   --run-id 2026-08-02-a \
   --network nntp-bench_nntp_upstream --nntp-host nntp-upstream \
   --username "${NNTP_BENCH_USERNAME:-fixture-user}" --password-file "$NNTP_BENCH_PASSWORD_FILE"
@@ -463,7 +463,7 @@ Reposting an unchanged corpus every time is pure overhead. See
 
 ```bash
 go run ./cmd/nntpbench plan \
-  --fixtures rar5-7-headers-normal-solid-headers-compressible,rar4-store-store-nonsolid-none-incompressible \
+  --fixtures rar5-7-store-store-nonsolid-none-incompressible,rar4-store-store-nonsolid-none-incompressible \
   --archive-toolchains vanilla --profile stock --server-link 10gbit \
   --repetitions 20 --seed 20260802 --output /scratch/runs/plan.json
 ```
@@ -598,7 +598,7 @@ Independent output verification is also available on its own:
 
 ```bash
 go run ./cmd/nntpbench verify-output \
-  --fixture-dir /scratch/fixtures/rar5-7-headers-normal-solid-headers-compressible \
+  --fixture-dir /scratch/fixtures/rar5-7-store-store-nonsolid-none-incompressible \
   --output-dir /scratch/runs/run-0001/complete
 ```
 
@@ -901,7 +901,7 @@ docker compose --env-file /scratch/runs/storage.env \
 GOOS=linux GOARCH=amd64 go build -o /scratch/bin/nntpbench-linux ./cmd/nntpbench
 
 go run ./cmd/nntpbench plan \
-  --fixtures rar5-7-headers-normal-solid-headers-compressible \
+  --fixtures rar5-7-store-store-nonsolid-none-incompressible \
   --targets docker-linux --storage-profile nfs-complete --nfs-link nas-1gbit \
   --repetitions 20 --seed 20260802 --output /scratch/runs/plan-nfs.json
 
