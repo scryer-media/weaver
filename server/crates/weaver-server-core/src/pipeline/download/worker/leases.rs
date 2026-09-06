@@ -114,15 +114,26 @@ impl Pipeline {
     pub(in crate::pipeline::download::worker) fn pop_download_work_for_batch(
         &mut self,
         job_id: JobId,
-        compatibility: Option<&DownloadBatchCompatibility>,
+        selector: Option<DownloadBatchSelector<'_>>,
     ) -> Option<DownloadWork> {
         self.jobs.get_mut(&job_id).and_then(|state| {
-            if let Some(compatibility) = compatibility {
+            let Some(selector) = selector else {
+                return state.download_queue.pop();
+            };
+            if selector.is_refill() {
+                // A refill must not be turned away by whatever happens to sit
+                // at the head: the head is exactly what it wants, and when the
+                // head is unservable (a differing exclude set) the work behind
+                // it still is. Scanning past the head is the slow path only in
+                // the degenerate case where the whole queue carries exclusions;
+                // ordinary work matches on the first pop.
                 state
                     .download_queue
-                    .pop_next_matching(|work| compatibility.matches(work))
+                    .pop_first_matching(|work| selector.matches(work))
             } else {
-                state.download_queue.pop()
+                state
+                    .download_queue
+                    .pop_next_matching(|work| selector.matches(work))
             }
         })
     }
@@ -206,7 +217,7 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         bootstrap_files: Option<&[u32]>,
-        compatibility: Option<&DownloadBatchCompatibility>,
+        selector: Option<DownloadBatchSelector<'_>>,
         selection: DownloadWorkSelection,
         uu_cursor_ordinals: Option<&HashMap<NzbFileId, u32>>,
     ) -> Option<DownloadWork> {
@@ -214,7 +225,7 @@ impl Pipeline {
             if let Some(uu_cursor_ordinals) = uu_cursor_ordinals {
                 return self.jobs.get_mut(&job_id).and_then(|state| {
                     let matches = |work: &DownloadWork| {
-                        compatibility.is_none_or(|compatibility| compatibility.matches(work))
+                        selector.is_none_or(|selector| selector.matches(work))
                             && selection.matches(work)
                             && Self::uu_work_closes_cursor(uu_cursor_ordinals, work)
                     };
@@ -232,22 +243,31 @@ impl Pipeline {
                 });
             }
             if selection == DownloadWorkSelection::Any {
-                return self.pop_download_work_for_batch(job_id, compatibility);
+                return self.pop_download_work_for_batch(job_id, selector);
             }
             let completion_critical = selection == DownloadWorkSelection::CompletionCritical;
+            let refill = selector.is_some_and(|selector| selector.is_refill());
             return self.jobs.get_mut(&job_id).and_then(|state| {
-                state
-                    .download_queue
-                    .pop_next_matching_in_class(completion_critical, |work| {
-                        compatibility.is_none_or(|compatibility| compatibility.matches(work))
-                    })
+                let matches =
+                    |work: &DownloadWork| selector.is_none_or(|selector| selector.matches(work));
+                if refill {
+                    // See `pop_download_work_for_batch`: a refill takes the
+                    // head of its class, and looks past it rather than parking.
+                    state
+                        .download_queue
+                        .pop_first_matching_in_class(completion_critical, matches)
+                } else {
+                    state
+                        .download_queue
+                        .pop_next_matching_in_class(completion_critical, matches)
+                }
             });
         }
         self.jobs.get_mut(&job_id).and_then(|state| {
             let matches = |work: &DownloadWork| {
                 bootstrap_files
                     .is_none_or(|files| files.contains(&work.segment_id.file_id.file_index))
-                    && compatibility.is_none_or(|compatibility| compatibility.matches(work))
+                    && selector.is_none_or(|selector| selector.matches(work))
                     && selection.matches(work)
                     && uu_cursor_ordinals
                         .is_none_or(|cursors| Self::uu_work_closes_cursor(cursors, work))
@@ -303,7 +323,7 @@ impl Pipeline {
             compatibility,
             first,
             pressure,
-            false,
+            DownloadBatchRule::Initial,
             par2_metadata_bootstrap_files.as_deref(),
         )))
     }
@@ -327,7 +347,7 @@ impl Pipeline {
         compatibility: DownloadBatchCompatibility,
         pressure: DownloadPressure,
     ) -> Option<DownloadBatchLease> {
-        match self.try_lease_refill_download_batch(job_id, compatibility, pressure) {
+        match self.try_lease_refill_download_batch(job_id, 0, compatibility, pressure) {
             Ok(lease) => lease,
             Err(_) => panic!("test lease must not hit a dispatch policy stop"),
         }
@@ -349,9 +369,22 @@ impl Pipeline {
     /// depth on refill: sequential-mode batches add a full round-trip per body,
     /// which costs more than the backlog it protects. The reduced refill runway
     /// (see `download_lane_lease_work_limit`) is the soft-pressure throttle.
+    ///
+    /// Two stages, so a live connection is never sent away while its job has
+    /// work it could serve:
+    ///
+    /// 1. Take the head of the lane's class under the refill rule, which no
+    ///    longer asks about priority or groups.
+    /// 2. If nothing there matched — the queue head carries a different
+    ///    exclude set — re-open the lease around the first queued work this
+    ///    lane's own server is allowed to fetch, with that work's own
+    ///    compatibility. The lane carries the new compatibility forward, so
+    ///    the excludes each result reports stay the ones its article was
+    ///    leased under.
     pub(in crate::pipeline::download::worker) fn try_lease_refill_download_batch(
         &mut self,
         job_id: JobId,
+        server_idx: usize,
         compatibility: DownloadBatchCompatibility,
         pressure: DownloadPressure,
     ) -> Result<Option<DownloadBatchLease>, DispatchAttempt> {
@@ -369,14 +402,33 @@ impl Pipeline {
         } else {
             DownloadWorkSelection::NonCritical
         };
-        let Some(first) = self.pop_download_work_for_par2_bootstrap(
+        let mut compatibility = compatibility;
+        let rule = DownloadBatchRule::Refill {
+            match_groups: self.server_needs_group_prologue(server_idx),
+        };
+        let first = match self.pop_download_work_for_par2_bootstrap(
             job_id,
             par2_metadata_bootstrap_files.as_deref(),
-            Some(&compatibility),
+            Some(DownloadBatchSelector::new(&compatibility, rule)),
             selection,
             uu_cursor_ordinals.as_ref(),
-        ) else {
-            return Ok(None);
+        ) {
+            Some(first) => first,
+            None => {
+                let Some(first) = self.pop_refill_work_servable_by_lane(
+                    job_id,
+                    server_idx,
+                    &compatibility,
+                    rule,
+                    par2_metadata_bootstrap_files.as_deref(),
+                    selection,
+                    uu_cursor_ordinals.as_ref(),
+                ) else {
+                    return Ok(None);
+                };
+                compatibility = DownloadBatchCompatibility::from_work(&first);
+                first
+            }
         };
         if par2_metadata_bootstrap_files.is_some() {
             self.par2_metadata_bootstrap_claims_work(job_id, &first);
@@ -390,9 +442,78 @@ impl Pipeline {
             compatibility,
             first,
             pressure,
-            true,
+            rule,
             par2_metadata_bootstrap_files.as_deref(),
         )))
+    }
+
+    /// Whether `server_idx` has proven it refuses a message-id fetch without
+    /// a selected group, so a lane on it was opened with `GROUP` and may only
+    /// be refilled from that group.
+    fn server_needs_group_prologue(&self, server_idx: usize) -> bool {
+        self.nntp
+            .pool()
+            .server_configs()
+            .get(server_idx)
+            .is_some_and(|config| {
+                weaver_nntp::prologue::prologue_for(&config.host, config.port).group
+            })
+    }
+
+    /// Stage two of a refill: the first queued work of this lane's class that
+    /// `server_idx` is actually allowed to fetch.
+    ///
+    /// The class and the recovery flag still hold — a lane is counted under
+    /// both for its whole life — but the exclude set is allowed to differ,
+    /// because a differing exclude set is a statement about *other* servers.
+    /// The lane's own server must be clear of the work's failure exclusions,
+    /// its rotation hint, and the job's retention exclusions; otherwise this
+    /// lane genuinely cannot serve it and the queue is left alone. The group
+    /// question is the rule's, exactly as in stage one.
+    #[allow(clippy::too_many_arguments)]
+    fn pop_refill_work_servable_by_lane(
+        &mut self,
+        job_id: JobId,
+        server_idx: usize,
+        compatibility: &DownloadBatchCompatibility,
+        rule: DownloadBatchRule,
+        bootstrap_files: Option<&[u32]>,
+        selection: DownloadWorkSelection,
+        uu_cursor_ordinals: Option<&HashMap<NzbFileId, u32>>,
+    ) -> Option<DownloadWork> {
+        let retention_excludes = self.job_retention_excludes(job_id);
+        if retention_excludes.contains(&server_idx) {
+            return None;
+        }
+        let is_recovery = compatibility.is_recovery;
+        let completion_critical = compatibility.completion_critical;
+        let match_groups = matches!(rule, DownloadBatchRule::Refill { match_groups: true });
+        let groups = compatibility.groups.clone();
+        self.jobs.get_mut(&job_id).and_then(|state| {
+            let matches = |work: &DownloadWork| {
+                work.is_recovery == is_recovery
+                    && work.completion_critical == completion_critical
+                    && !work.exclude_servers.contains(&server_idx)
+                    && work.avoid_server != Some(server_idx)
+                    && (!match_groups
+                        || std::sync::Arc::ptr_eq(&work.groups, &groups)
+                        || work.groups == groups)
+                    && bootstrap_files
+                        .is_none_or(|files| files.contains(&work.segment_id.file_id.file_index))
+                    && selection.matches(work)
+                    && uu_cursor_ordinals
+                        .is_none_or(|cursors| Self::uu_work_closes_cursor(cursors, work))
+            };
+            match selection {
+                DownloadWorkSelection::Any => state.download_queue.pop_first_matching(matches),
+                DownloadWorkSelection::CompletionCritical => state
+                    .download_queue
+                    .pop_first_matching_in_class(true, matches),
+                DownloadWorkSelection::NonCritical => state
+                    .download_queue
+                    .pop_first_matching_in_class(false, matches),
+            }
+        })
     }
 
     pub(in crate::pipeline::download::worker) fn try_lease_ip_replacement_trial_batch(
@@ -457,7 +578,7 @@ impl Pipeline {
             let Some(next) = self.pop_download_work_for_par2_bootstrap(
                 job_id,
                 par2_metadata_bootstrap_files.as_deref(),
-                Some(&compatibility),
+                Some(DownloadBatchSelector::initial(&compatibility)),
                 DownloadWorkSelection::NonCritical,
                 None,
             ) else {
@@ -505,10 +626,11 @@ impl Pipeline {
         compatibility: DownloadBatchCompatibility,
         first: DownloadWork,
         pressure: DownloadPressure,
-        refill: bool,
+        rule: DownloadBatchRule,
         par2_metadata_bootstrap_files: Option<&[u32]>,
     ) -> DownloadBatchLease {
         let job_id = first.segment_id.file_id.job_id;
+        let refill = rule.is_refill();
         // Rate reservations are activated after the lease is finalized. Keep
         // limited leases single-work so every subsequent BODY refill observes
         // the updated token balance instead of pre-leasing past the limit.
@@ -549,11 +671,16 @@ impl Pipeline {
         } else {
             DownloadWorkSelection::NonCritical
         };
+        // The rule the lease was opened under has to hold for the whole batch:
+        // a refill that took the head under the refill rule and then filled
+        // under the initial rule would stop at the first priority change, which
+        // is precisely the boundary it exists to cross.
+        let selector = DownloadBatchSelector::new(&compatibility, rule);
         while works.len() < work_limit {
             let Some(next) = self.pop_download_work_for_par2_bootstrap(
                 job_id,
                 par2_metadata_bootstrap_files,
-                Some(&compatibility),
+                Some(selector),
                 selection,
                 None,
             ) else {

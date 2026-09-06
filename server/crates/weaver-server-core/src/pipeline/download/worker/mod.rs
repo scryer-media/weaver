@@ -324,6 +324,9 @@ impl Pipeline {
 
     pub(crate) fn dispatch_downloads(&mut self) {
         let now = Instant::now();
+        // Whatever park asked for this pass is being served by it, including
+        // the passes the run loop starts at the top of a turn.
+        self.download_dispatch_wake = false;
         if self.global_paused || self.rate_limiter.should_wait() {
             self.hot_share_yield_signal.clear();
             if self.active_downloads == 0 {

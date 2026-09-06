@@ -261,6 +261,119 @@ fn park_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) {
     }
 }
 
+/// Everything a downloaded article needs from the lease its work came from.
+///
+/// A lease boundary is no longer a pipeline boundary: the first BODY of the
+/// next lease goes on the wire while the tail of the current one is still
+/// being read, so two leases are in flight at once and a response cannot ask
+/// "what is the current lease" when it lands. The context rides with the work
+/// instead.
+struct LaneLeaseContext {
+    job_id: JobId,
+    runtime_generation: u64,
+    spillover_loan_kind: Option<SpilloverLoanKind>,
+    is_recovery: bool,
+    completion_critical: bool,
+    exclude_servers: Vec<usize>,
+    pressure_clear: bool,
+    mode: DownloadLaneMode,
+    checkpoint_plan: weaver_yenc::CheckpointPlan,
+    compatibility: DownloadBatchCompatibility,
+}
+
+impl LaneLeaseContext {
+    fn from_lease(
+        lease: &DownloadBatchLease,
+        server_idx: usize,
+        supports_pipelining: bool,
+    ) -> Self {
+        Self {
+            job_id: lease.job_id,
+            runtime_generation: lease.runtime_generation,
+            spillover_loan_kind: lease.spillover_loan_kind,
+            is_recovery: lease.compatibility.is_recovery,
+            completion_critical: lease.compatibility.completion_critical,
+            exclude_servers: lease.compatibility.exclude_servers.clone(),
+            pressure_clear: lease.pressure_clear,
+            mode: Pipeline::actual_download_lane_mode(
+                lease.lane_mode,
+                &lease.server_modes,
+                server_idx,
+                supports_pipelining,
+            ),
+            checkpoint_plan: lease.checkpoint_plan.clone(),
+            compatibility: lease.compatibility.clone(),
+        }
+    }
+
+    fn depth(&self) -> usize {
+        self.mode.max_depth().max(1)
+    }
+}
+
+/// Why a lane stopped issuing.
+#[derive(Clone, Copy)]
+enum LaneStop {
+    /// The transport is unusable. Everything still on the ring is unanswerable
+    /// and the connection is discarded.
+    ConnectionLost,
+    /// A quota or unrequested outcome. The socket is exactly where the next
+    /// BODY would expect it, so the ring still drains, but nothing more may be
+    /// issued on it.
+    PolicyBlocked,
+    /// The hot job asked for this connection back.
+    HotShareYield,
+    /// The result or refill channel is gone; the orchestrator is shutting down.
+    Error,
+}
+
+fn lane_stop_park(stop: Option<LaneStop>) -> Option<(LaneParkReason, bool)> {
+    Some(match stop? {
+        LaneStop::ConnectionLost | LaneStop::Error => (LaneParkReason::Error, false),
+        LaneStop::PolicyBlocked => (
+            LaneParkReason::ServerQuota,
+            keep_cached_lane_after_park(LaneParkReason::ServerQuota),
+        ),
+        LaneStop::HotShareYield => (LaneParkReason::HotShareYield, false),
+    })
+}
+
+/// How little unfinished work a lane may still hold before its next lease has
+/// to be in hand.
+///
+/// A refill costs at least one orchestrator turn to answer, and a lane at
+/// depth `d` retires about `d` articles per round trip. One pipe of runway
+/// pays for the answer and a second pays for the ask, plus the article being
+/// read: 3 articles at depth 1, 5 at depth 2, 9 at depth 4. An ordinary lease
+/// is exactly one pipe deep, so it trips this the moment it is adopted and the
+/// ask goes out while the lease's own first article is still on the wire —
+/// which is the zero-gap handoff sequential mode needs. A runway-sized hot
+/// lease trips it two round trips before it runs dry.
+fn refill_deadline(depth: usize) -> usize {
+    2 * depth.max(1) + 1
+}
+
+/// Hand one finished article to the orchestrator on its own, without waiting
+/// for an acknowledgement.
+///
+/// Delivery per article rather than per lease is what lets decode start on the
+/// first article of a lease instead of its last, and what makes a direct-store
+/// volume settle when its final article lands. The bounded event channel is
+/// the backpressure; the acknowledgement is kept for the lane's final event,
+/// where it orders the results ahead of the park message on the other channel.
+fn stream_owned_result(
+    event_tx: &mpsc::Sender<OwnedDownloadLaneEvent>,
+    lane: &weaver_nntp::blocking::BlockingBodyLane,
+    stats_mark: &mut weaver_nntp::blocking::BlockingLaneStats,
+    result: DownloadResult,
+) -> Result<(), ()> {
+    let now = lane.stats();
+    let stats = stats_delta(now, *stats_mark);
+    *stats_mark = now;
+    send_owned_batch(event_tx, vec![result], Vec::new(), stats, false)
+}
+
+#[allow(clippy::too_many_lines)]
 fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, run: OwnedLaneRun) {
     let fetch_started = Instant::now();
     let OwnedLaneRun {
@@ -271,7 +384,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         hot_share_yield_signal,
         initial_lease,
     } = run;
-    let mut lease = initial_lease;
+    let lease = initial_lease;
 
     if cached_lane
         .as_ref()
@@ -316,371 +429,342 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         .as_mut()
         .expect("owned lane cache populated before run")
         .lane;
-    let mut parked_completion_critical: bool;
-    let (park_reason, parked_job_id, parked_mode, parked_spillover_loan_kind, keep_cached_lane) = loop {
-        let stats_before = lane.stats();
-        let DownloadBatchLease {
-            job_id,
-            runtime_generation,
-            lane_mode,
-            spillover_loan_kind,
-            server_modes,
-            compatibility,
-            effective_exclude_servers: _,
-            checkpoint_plan,
-            pressure_clear,
-            works,
-        } = lease;
-        parked_completion_critical = compatibility.completion_critical;
-        let server_idx = lane.server_id().0;
-        let supports_pipelining = lane.supports_pipelining();
-        let actual_mode = Pipeline::actual_download_lane_mode(
-            lane_mode,
-            &server_modes,
-            server_idx,
-            supports_pipelining,
-        );
-        let is_recovery = compatibility.is_recovery;
-        let exclude_servers = compatibility.exclude_servers.clone();
-        // An owned lane outlives its batch, so the immutable checkpoint plan
-        // is re-applied for every batch, including `None` after pooled reuse.
-        lane.set_checkpoint_plan(checkpoint_plan);
+    let server_idx = lane.server_id().0;
+    let supports_pipelining = lane.supports_pipelining();
 
-        // Prefetch the next lease while this batch downloads. The refill
-        // response then overlaps the batch instead of serializing at the
-        // batch boundary behind the orchestrator's result-ingest loop, which
-        // stalled every lane at once when batches completed in lockstep.
-        let mut pending_refill: Option<oneshot::Receiver<DownloadLaneRefillResponse>> = None;
+    // The mode the scheduler booked this lane's depth gauge under. The initial
+    // dispatch booked the requested mode; every granted refill rebooks the
+    // actual one. Reporting the mode the lane is *running* instead would
+    // decrement a gauge it was never counted in.
+    let mut booked_mode = lease.lane_mode;
+    let mut context = Arc::new(LaneLeaseContext::from_lease(
+        &lease,
+        server_idx,
+        supports_pipelining,
+    ));
+    let mut park_context = Arc::clone(&context);
+    let mut pending: VecDeque<(DownloadWork, Arc<LaneLeaseContext>)> = lease
+        .works
+        .into_iter()
+        .map(|work| (work, Arc::clone(&context)))
+        .collect();
+    let mut inflight: VecDeque<(DownloadWork, Arc<LaneLeaseContext>)> = VecDeque::new();
+    let mut pending_refill: Option<oneshot::Receiver<DownloadLaneRefillResponse>> = None;
+    let mut refill_denied = false;
+    let mut stop: Option<LaneStop> = None;
+    let mut stats_mark = lane.stats();
+    let mut completed_since_yield_check = 0usize;
+
+    let (park_reason, keep_cached_lane) = loop {
+        // Adopt an answered refill without waiting for it. Taking it here is
+        // what puts the next lease's first BODY on the wire before the current
+        // lease's last response has been read.
+        if stop.is_none()
+            && let Some(response_rx) = pending_refill.as_mut()
+        {
+            match response_rx.try_recv() {
+                Ok(response) => {
+                    pending_refill = None;
+                    match response.lease {
+                        Some(next_lease) if !next_lease.works.is_empty() => {
+                            booked_mode = Pipeline::actual_download_lane_mode(
+                                next_lease.lane_mode,
+                                &next_lease.server_modes,
+                                server_idx,
+                                supports_pipelining,
+                            );
+                            context = Arc::new(LaneLeaseContext::from_lease(
+                                &next_lease,
+                                server_idx,
+                                supports_pipelining,
+                            ));
+                            park_context = Arc::clone(&context);
+                            pending.extend(
+                                next_lease
+                                    .works
+                                    .into_iter()
+                                    .map(|work| (work, Arc::clone(&context))),
+                            );
+                        }
+                        // Denied mid-flight. The decision was taken while this
+                        // lane's results were still landing, so it gets one
+                        // more chance once the pipe is actually dry; until
+                        // then, do not re-ask and spin.
+                        _ => refill_denied = true,
+                    }
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    pending_refill = None;
+                    refill_denied = true;
+                }
+            }
+        }
+
+        // Top the ring back up to the depth in force.
+        while stop.is_none() && lane.ring_outstanding() < context.depth() {
+            let Some((work, work_context)) = pending.pop_front() else {
+                break;
+            };
+            let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
+            let wire_form = work.message_id.wire_form();
+            let outcome = lane.ring_issue(&wire_form, estimate, work_context.depth());
+            let trace = match outcome {
+                weaver_nntp::blocking::RingIssueOutcome::Issued => {
+                    inflight.push_back((work, work_context));
+                    continue;
+                }
+                weaver_nntp::blocking::RingIssueOutcome::Rejected(trace) => {
+                    stop = Some(LaneStop::PolicyBlocked);
+                    trace
+                }
+                weaver_nntp::blocking::RingIssueOutcome::Failed(trace) => {
+                    stop = Some(LaneStop::ConnectionLost);
+                    trace
+                }
+            };
+            let discarded = matches!(stop, Some(LaneStop::ConnectionLost));
+            let result = result_from_trace(
+                work,
+                work_context.runtime_generation,
+                *trace,
+                DownloadLaneObservation {
+                    server_idx: Some(server_idx),
+                    mode: work_context.mode,
+                    supports_pipelining,
+                    latency: lane.latency_ewma(),
+                    transfer: lane.transfer_ewma(),
+                    payload_bytes: 0,
+                    policy_elapsed: std::time::Duration::ZERO,
+                    pressure_clear: work_context.pressure_clear,
+                    // Nothing was measured, so this must not close a depth
+                    // trial window.
+                    batch_complete: discarded,
+                    batch_clean: !discarded,
+                    unresolved_count: 0,
+                    connection_discarded: discarded,
+                },
+                work_context.is_recovery,
+                &work_context.exclude_servers,
+            );
+            if stream_owned_result(&event_tx, lane, &mut stats_mark, result).is_err() {
+                stop = Some(LaneStop::Error);
+            }
+        }
+
+        // Ask for the next lease before the ring can run dry.
+        let remaining = pending.len() + inflight.len();
+        if stop.is_none()
+            && pending_refill.is_none()
+            && !refill_denied
+            && remaining <= refill_deadline(context.depth())
         {
             let (response_tx, response_rx) = oneshot::channel();
             if refill_tx
                 .blocking_send(DownloadLaneRefillRequest {
-                    job_id,
-                    runtime_generation,
+                    job_id: context.job_id,
+                    runtime_generation: context.runtime_generation,
                     server_idx,
                     remote_ip: lane.remote_ip(),
                     supports_pipelining,
-                    current_mode: actual_mode,
-                    spillover_loan_kind,
-                    compatibility: compatibility.clone(),
+                    current_mode: booked_mode,
+                    spillover_loan_kind: context.spillover_loan_kind,
+                    compatibility: context.compatibility.clone(),
                     response_tx,
                 })
                 .is_ok()
             {
                 pending_refill = Some(response_rx);
+            } else {
+                stop = Some(LaneStop::Error);
             }
         }
 
-        let mut batch_clean_for_refill = true;
-        let mut policy_blocked_for_refill = false;
-        let mut pending_works: VecDeque<DownloadWork> = works.into_iter().collect();
-        let mut results = Vec::with_capacity(pending_works.len());
-        let mut unrequested_works = Vec::new();
-        let mut completed_since_yield_check = 0usize;
-        let mut yielded_for_hot_share = false;
-
-        while let Some(first_work) = pending_works.pop_front() {
-            let batch_depth = actual_mode.max_depth();
-            let mut batch_works = Vec::with_capacity(batch_depth);
-            batch_works.push(first_work);
-            while batch_works.len() < batch_depth {
-                let Some(work) = pending_works.pop_front() else {
-                    break;
-                };
-                batch_works.push(work);
+        if lane.ring_outstanding() == 0 && (pending.is_empty() || stop.is_some()) {
+            if let Some(park) = lane_stop_park(stop) {
+                break park;
             }
 
-            let message_id_handles = lease_message_id_wire_forms(&batch_works);
-            let message_ids = message_id_handles
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<&str>>();
-            let total = batch_works.len();
-            let mut completed = 0usize;
-            let mut works_by_index = batch_works.into_iter().map(Some).collect::<Vec<_>>();
-
-            match actual_mode {
-                DownloadLaneMode::Sequential => {
-                    for (idx, message_id) in message_ids.iter().enumerate() {
-                        let estimate = Pipeline::bandwidth_reservation_estimate(
-                            works_by_index[idx]
-                                .as_ref()
-                                .expect("owned download work exists until its BODY result")
-                                .byte_estimate,
-                        );
-                        let trace =
-                            lane.fetch_decoded_sequential_with_estimate(message_id, estimate);
-                        nntp.record_blocking_attempts(&trace.attempts);
-                        let (payload_bytes, policy_elapsed) =
-                            Pipeline::decoded_trace_throughput_sample(&trace);
-                        completed += 1;
-                        let work = works_by_index[idx]
-                            .take()
-                            .expect("owned lane result emitted once per work item");
-                        let result = result_from_trace(
-                            work,
-                            runtime_generation,
-                            trace,
-                            DownloadLaneObservation {
-                                server_idx: Some(server_idx),
-                                mode: DownloadLaneMode::Sequential,
-                                supports_pipelining,
-                                latency: lane.latency_ewma(),
-                                transfer: lane.transfer_ewma(),
-                                payload_bytes,
-                                policy_elapsed,
-                                pressure_clear,
-                                batch_complete: true,
-                                batch_clean: true,
-                                unresolved_count: 0,
-                                connection_discarded: false,
-                            },
-                            is_recovery,
-                            &exclude_servers,
-                        );
-                        let policy_outcome = matches!(
-                            &result.data,
-                            Err(DownloadError::Fetch(failure))
-                                if matches!(
-                                    failure.kind,
-                                    DownloadFailureKind::ServerQuota
-                                        | DownloadFailureKind::Unrequested
-                                )
-                        );
-                        batch_clean_for_refill &= download_outcome_keeps_connection(&result.data);
-                        policy_blocked_for_refill |= policy_outcome;
-                        results.push(result);
-                    }
-                }
-                DownloadLaneMode::Pipelined { .. } => {
-                    let estimated_body_bytes = works_by_index
-                        .iter()
-                        .map(|work| {
-                            Pipeline::bandwidth_reservation_estimate(
-                                work.as_ref()
-                                    .expect("owned download work exists before BODY issue")
-                                    .byte_estimate,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    for (idx, trace, meta) in lane.fetch_decoded_pipeline_with_estimates(
-                        &message_ids,
-                        &estimated_body_bytes,
-                        actual_mode.max_depth(),
-                    ) {
-                        nntp.record_blocking_attempts(&trace.attempts);
-                        let (payload_bytes, policy_elapsed) =
-                            Pipeline::decoded_trace_throughput_sample(&trace);
-                        completed += 1;
-                        let work = works_by_index[idx]
-                            .take()
-                            .expect("owned lane result emitted once per work item");
-                        let observation = DownloadLaneObservation {
-                            server_idx: Some(server_idx),
-                            mode: actual_mode,
-                            supports_pipelining,
-                            latency: lane.latency_ewma(),
-                            transfer: lane.transfer_ewma(),
-                            payload_bytes,
-                            policy_elapsed,
-                            pressure_clear,
-                            batch_complete: meta.batch_complete,
-                            batch_clean: meta.batch_clean,
-                            unresolved_count: meta.unresolved_count,
-                            connection_discarded: meta.connection_discarded,
-                        };
-                        let result = result_from_trace(
-                            work,
-                            runtime_generation,
-                            trace,
-                            observation,
-                            is_recovery,
-                            &exclude_servers,
-                        );
-                        let policy_outcome = matches!(
-                            &result.data,
-                            Err(DownloadError::Fetch(failure))
-                                if matches!(
-                                    failure.kind,
-                                    DownloadFailureKind::ServerQuota
-                                        | DownloadFailureKind::Unrequested
-                                )
-                        );
-                        batch_clean_for_refill &=
-                            download_outcome_keeps_connection(&result.data) && meta.batch_clean;
-                        policy_blocked_for_refill |= policy_outcome;
-                        results.push(result);
-                    }
-                }
-            }
-
-            let unresolved_count = total.saturating_sub(completed);
-            if unresolved_count > 0 {
-                batch_clean_for_refill = false;
-            }
-            for work in works_by_index.into_iter().flatten() {
-                results.push(unresolved_result(
-                    work,
-                    runtime_generation,
-                    server_idx,
-                    actual_mode,
-                    supports_pipelining,
-                    lane.latency_ewma(),
-                    lane.transfer_ewma(),
-                    pressure_clear,
-                    unresolved_count as u64,
-                    is_recovery,
-                    &exclude_servers,
-                    "batch ended without result",
-                ));
-            }
-
-            if !batch_clean_for_refill || policy_blocked_for_refill {
-                break;
-            }
-
-            completed_since_yield_check = completed_since_yield_check.saturating_add(completed);
-            if completed_since_yield_check >= HOT_SHARE_YIELD_CHECK_ARTICLES {
-                completed_since_yield_check = 0;
-                // A completion-critical batch never yields here — it is the
-                // work the signal exists to make room for.
-                if !parked_completion_critical && hot_share_yield_signal.is_requested() {
-                    yielded_for_hot_share = true;
-                    break;
-                }
-            }
-        }
-
-        unrequested_works.extend(take_unrequested_tail(
-            &mut pending_works,
-            batch_clean_for_refill,
-            yielded_for_hot_share,
-            policy_blocked_for_refill,
-        ));
-
-        let stats = stats_delta(lane.stats(), stats_before);
-        if send_owned_batch(&event_tx, results, unrequested_works, stats).is_err() {
-            drain_pending_refill(pending_refill.take(), &event_tx);
-            break (
-                LaneParkReason::Error,
-                job_id,
-                actual_mode,
-                spillover_loan_kind,
-                false,
-            );
-        }
-
-        if !batch_clean_for_refill {
-            drain_pending_refill(pending_refill.take(), &event_tx);
-            break (
-                LaneParkReason::Error,
-                job_id,
-                actual_mode,
-                spillover_loan_kind,
-                false,
-            );
-        }
-        if policy_blocked_for_refill {
-            drain_pending_refill(pending_refill.take(), &event_tx);
-            break (
-                LaneParkReason::ServerQuota,
-                job_id,
-                actual_mode,
-                spillover_loan_kind,
-                keep_cached_lane_after_park(LaneParkReason::ServerQuota),
-            );
-        }
-        if yielded_for_hot_share {
-            drain_pending_refill(pending_refill.take(), &event_tx);
-            break (
-                LaneParkReason::HotShareYield,
-                job_id,
-                actual_mode,
-                spillover_loan_kind,
-                false,
-            );
-        }
-
-        let Some(response_rx) = pending_refill.take() else {
-            break (
-                LaneParkReason::Error,
-                job_id,
-                actual_mode,
-                spillover_loan_kind,
-                false,
-            );
-        };
-
-        match response_rx.blocking_recv() {
-            Ok(response) => {
-                if let Some(next_lease) = response.lease
-                    && !next_lease.works.is_empty()
-                {
-                    lease = next_lease;
-                    continue;
-                }
-                // The prefetched refill was evaluated mid-batch, where
-                // transient decode/write pressure can deny it. Ask once more
-                // now that this batch's results are delivered — the
-                // pre-prefetch decision point — so a momentary pressure blip
-                // does not park a healthy lane.
+            // The pipe is dry and nothing is queued behind it. Wait for the
+            // answer that is owed, and give a denial one more chance now that
+            // every result this lane produced has been delivered.
+            let mut answer = match pending_refill.take() {
+                Some(response_rx) => match response_rx.blocking_recv() {
+                    Ok(response) => Some(response),
+                    Err(_) => break (LaneParkReason::ProbeYield, false),
+                },
+                None => None,
+            };
+            let answered_with_work = answer.as_ref().is_some_and(|response| {
+                response
+                    .lease
+                    .as_ref()
+                    .is_some_and(|lease| !lease.works.is_empty())
+            });
+            if !answered_with_work {
                 let (retry_tx, retry_rx) = oneshot::channel();
-                let retry_sent = refill_tx
+                if refill_tx
                     .blocking_send(DownloadLaneRefillRequest {
-                        job_id,
-                        runtime_generation,
+                        job_id: context.job_id,
+                        runtime_generation: context.runtime_generation,
                         server_idx,
                         remote_ip: lane.remote_ip(),
                         supports_pipelining,
-                        current_mode: actual_mode,
-                        spillover_loan_kind,
-                        compatibility: compatibility.clone(),
+                        current_mode: booked_mode,
+                        spillover_loan_kind: context.spillover_loan_kind,
+                        compatibility: context.compatibility.clone(),
                         response_tx: retry_tx,
                     })
-                    .is_ok();
-                if retry_sent && let Ok(retry) = retry_rx.blocking_recv() {
-                    if let Some(next_lease) = retry.lease
-                        && !next_lease.works.is_empty()
-                    {
-                        lease = next_lease;
-                        continue;
-                    }
-                    break (
-                        retry.park_reason,
-                        job_id,
-                        actual_mode,
-                        spillover_loan_kind,
-                        keep_cached_lane_after_park(retry.park_reason),
-                    );
+                    .is_err()
+                {
+                    break (LaneParkReason::Error, false);
                 }
-                break (
-                    response.park_reason,
-                    job_id,
-                    actual_mode,
-                    spillover_loan_kind,
-                    keep_cached_lane_after_park(response.park_reason),
-                );
+                match retry_rx.blocking_recv() {
+                    Ok(retry) => answer = Some(retry),
+                    Err(_) => break (LaneParkReason::ProbeYield, false),
+                }
             }
-            Err(_) => {
-                break (
-                    LaneParkReason::ProbeYield,
-                    job_id,
-                    actual_mode,
-                    spillover_loan_kind,
-                    false,
+            let response = answer.expect("refill answer present after the drain-point retry");
+            match response.lease {
+                Some(next_lease) if !next_lease.works.is_empty() => {
+                    booked_mode = Pipeline::actual_download_lane_mode(
+                        next_lease.lane_mode,
+                        &next_lease.server_modes,
+                        server_idx,
+                        supports_pipelining,
+                    );
+                    context = Arc::new(LaneLeaseContext::from_lease(
+                        &next_lease,
+                        server_idx,
+                        supports_pipelining,
+                    ));
+                    park_context = Arc::clone(&context);
+                    pending.extend(
+                        next_lease
+                            .works
+                            .into_iter()
+                            .map(|work| (work, Arc::clone(&context))),
+                    );
+                    refill_denied = false;
+                    continue;
+                }
+                _ => {
+                    let reason = response.park_reason;
+                    break (reason, keep_cached_lane_after_park(reason));
+                }
+            }
+        }
+
+        // The plan is immutable per lease and only read when a response is
+        // decoded, so applying the head request's plan here is what keeps two
+        // leases' geometries apart on one ring.
+        if let Some((_, head_context)) = inflight.front() {
+            lane.set_checkpoint_plan(head_context.checkpoint_plan.clone());
+        }
+        let Some((trace, meta)) = lane.ring_read_next() else {
+            break (LaneParkReason::Error, false);
+        };
+        let Some((work, work_context)) = inflight.pop_front() else {
+            break (LaneParkReason::Error, false);
+        };
+        nntp.record_blocking_attempts(&trace.attempts);
+        let (payload_bytes, policy_elapsed) = Pipeline::decoded_trace_throughput_sample(&trace);
+        let completion_critical = work_context.completion_critical;
+        let result = result_from_trace(
+            work,
+            work_context.runtime_generation,
+            trace,
+            DownloadLaneObservation {
+                server_idx: Some(server_idx),
+                mode: work_context.mode,
+                supports_pipelining,
+                latency: lane.latency_ewma(),
+                transfer: lane.transfer_ewma(),
+                payload_bytes,
+                policy_elapsed,
+                pressure_clear: work_context.pressure_clear,
+                batch_complete: meta.batch_complete,
+                batch_clean: meta.batch_clean,
+                unresolved_count: meta.unresolved_count,
+                connection_discarded: meta.connection_discarded,
+            },
+            work_context.is_recovery,
+            &work_context.exclude_servers,
+        );
+        let keeps_connection = download_outcome_keeps_connection(&result.data);
+        let policy_blocked = matches!(
+            &result.data,
+            Err(DownloadError::Fetch(failure))
+                if matches!(
+                    failure.kind,
+                    DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
+                )
+        );
+        if stream_owned_result(&event_tx, lane, &mut stats_mark, result).is_err() {
+            stop = Some(LaneStop::Error);
+        }
+        if !keeps_connection || meta.connection_discarded || lane.ring_is_closed() {
+            stop.get_or_insert(LaneStop::ConnectionLost);
+        } else if policy_blocked {
+            stop.get_or_insert(LaneStop::PolicyBlocked);
+        }
+
+        if matches!(stop, Some(LaneStop::ConnectionLost)) {
+            let abandoned = lane.ring_abandon();
+            let lost = inflight.drain(..).collect::<Vec<_>>();
+            let unresolved_count = lost.len().max(abandoned) as u64;
+            for (work, work_context) in lost {
+                let result = unresolved_result(
+                    work,
+                    work_context.runtime_generation,
+                    server_idx,
+                    work_context.mode,
+                    supports_pipelining,
+                    lane.latency_ewma(),
+                    lane.transfer_ewma(),
+                    work_context.pressure_clear,
+                    unresolved_count,
+                    work_context.is_recovery,
+                    &work_context.exclude_servers,
+                    "lane pipeline faulted before this article's response",
                 );
+                if stream_owned_result(&event_tx, lane, &mut stats_mark, result).is_err() {
+                    stop = Some(LaneStop::Error);
+                    break;
+                }
+            }
+        }
+
+        completed_since_yield_check = completed_since_yield_check.saturating_add(1);
+        if completed_since_yield_check >= HOT_SHARE_YIELD_CHECK_ARTICLES {
+            completed_since_yield_check = 0;
+            // Completion-critical work never yields here — it is what the
+            // signal exists to make room for.
+            if !completion_critical && hot_share_yield_signal.is_requested() {
+                stop.get_or_insert(LaneStop::HotShareYield);
             }
         }
     };
+
+    drain_pending_refill(pending_refill.take(), &event_tx);
+    let unrequested_works = pending
+        .into_iter()
+        .map(|(work, _)| work)
+        .collect::<Vec<_>>();
+    // The final event is the ordering barrier: its acknowledgement is what
+    // guarantees every streamed result reached the orchestrator before the
+    // park message arrives on the other channel and releases the connection.
+    let stats = stats_delta(lane.stats(), stats_mark);
+    let _ = send_owned_batch(&event_tx, Vec::new(), unrequested_works, stats, true);
 
     if !keep_cached_lane {
         park_cached_lane(cached_lane);
     }
     let _ = parked_tx.blocking_send(DownloadLaneParked {
-        job_id: parked_job_id,
-        mode: parked_mode,
-        spillover_loan_kind: parked_spillover_loan_kind,
-        completion_critical: parked_completion_critical,
+        job_id: park_context.job_id,
+        mode: booked_mode,
+        spillover_loan_kind: park_context.spillover_loan_kind,
+        completion_critical: park_context.completion_critical,
         reason: park_reason,
         release_connection_slot: true,
         release_ip_replacement_burst: false,
@@ -708,20 +792,9 @@ fn drain_pending_refill(
             Vec::new(),
             lease.works,
             weaver_nntp::blocking::BlockingLaneStats::default(),
+            true,
         );
     }
-}
-
-fn take_unrequested_tail(
-    pending_works: &mut VecDeque<DownloadWork>,
-    batch_clean_for_refill: bool,
-    yielded_for_hot_share: bool,
-    policy_blocked_for_refill: bool,
-) -> Vec<DownloadWork> {
-    if batch_clean_for_refill && !yielded_for_hot_share && !policy_blocked_for_refill {
-        return Vec::new();
-    }
-    pending_works.drain(..).collect()
 }
 
 fn keep_cached_lane_after_park(reason: LaneParkReason) -> bool {
@@ -753,16 +826,29 @@ fn stats_delta(
     }
 }
 
+/// Hand results and returned works to the orchestrator.
+///
+/// `acknowledge` turns the send into a rendezvous. A streamed article does not
+/// need one — the bounded event channel already paces the lane, and waiting
+/// per article would put a thread hop on the hot path — but the lane's last
+/// event does: it has to be seen before the park message that follows it on a
+/// different channel.
 fn send_owned_batch(
     event_tx: &mpsc::Sender<OwnedDownloadLaneEvent>,
     results: Vec<DownloadResult>,
     unrequested_works: Vec<DownloadWork>,
     stats: weaver_nntp::blocking::BlockingLaneStats,
+    acknowledge: bool,
 ) -> Result<(), ()> {
-    if results.is_empty() && unrequested_works.is_empty() {
+    if results.is_empty() && unrequested_works.is_empty() && !acknowledge {
         return Ok(());
     }
-    let (ack, ack_rx) = std::sync::mpsc::sync_channel(0);
+    let (ack, ack_rx) = if acknowledge {
+        let (ack, ack_rx) = std::sync::mpsc::sync_channel(0);
+        (Some(ack), Some(ack_rx))
+    } else {
+        (None, None)
+    };
     event_tx
         .blocking_send(OwnedDownloadLaneEvent::BatchComplete {
             results,
@@ -771,7 +857,9 @@ fn send_owned_batch(
             ack,
         })
         .map_err(|_| ())?;
-    ack_rx.recv().map_err(|_| ())?;
+    if let Some(ack_rx) = ack_rx {
+        ack_rx.recv().map_err(|_| ())?;
+    }
     Ok(())
 }
 
@@ -882,6 +970,152 @@ mod tests {
         }
     }
 
+    fn test_lease(
+        job_id: JobId,
+        runtime_generation: u64,
+        exclude_servers: Vec<usize>,
+        works: Vec<DownloadWork>,
+    ) -> DownloadBatchLease {
+        DownloadBatchLease {
+            job_id,
+            runtime_generation,
+            lane_mode: DownloadLaneMode::Pipelined { depth: 4 },
+            spillover_loan_kind: None,
+            server_modes: vec![(0, DownloadLaneMode::Pipelined { depth: 4 })],
+            compatibility: DownloadBatchCompatibility {
+                priority: 10,
+                is_recovery: false,
+                completion_critical: false,
+                groups: Arc::from(vec!["alt.binaries.test".to_string()]),
+                exclude_servers,
+                avoid_server: None,
+            },
+            effective_exclude_servers: Vec::new(),
+            checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+            pressure_clear: true,
+            works,
+        }
+    }
+
+    /// Two leases are on the ring at a lease boundary, so a response has to
+    /// carry its own lease's identity, not whichever lease the lane happens to
+    /// be filling from when it lands.
+    #[test]
+    fn a_result_is_attributed_to_the_lease_its_work_came_from() {
+        let old = Arc::new(LaneLeaseContext::from_lease(
+            &test_lease(JobId(7), 3, vec![1], vec![tail_work(1, 0)]),
+            0,
+            true,
+        ));
+        let new = Arc::new(LaneLeaseContext::from_lease(
+            &test_lease(JobId(7), 4, vec![2, 5], vec![tail_work(2, 0)]),
+            0,
+            true,
+        ));
+
+        let observation = DownloadLaneObservation {
+            server_idx: Some(0),
+            mode: DownloadLaneMode::Pipelined { depth: 4 },
+            supports_pipelining: true,
+            latency: None,
+            transfer: None,
+            payload_bytes: 0,
+            policy_elapsed: std::time::Duration::ZERO,
+            pressure_clear: true,
+            batch_complete: false,
+            batch_clean: true,
+            unresolved_count: 0,
+            connection_discarded: false,
+        };
+        let straggler = result_from_trace(
+            tail_work(1, 0),
+            old.runtime_generation,
+            weaver_nntp::client::DecodedBodyTrace {
+                attempts: Vec::new(),
+                result: Err(weaver_nntp::client::DecodedBodyError::Nntp(
+                    weaver_nntp::error::NntpError::ArticleNotFound,
+                )),
+            },
+            observation,
+            old.is_recovery,
+            &old.exclude_servers,
+        );
+
+        assert_eq!(
+            straggler.runtime_generation, 3,
+            "the tail of the old lease keeps the old generation while the new \
+             lease is already on the wire"
+        );
+        assert_eq!(straggler.exclude_servers, vec![1]);
+        assert_eq!(new.runtime_generation, 4);
+        assert_eq!(new.exclude_servers, vec![2, 5]);
+        assert_eq!(new.depth(), 4);
+    }
+
+    /// Per-article delivery is the point: decode starts on a lease's first
+    /// article instead of its last. Only the lane's closing event waits for an
+    /// acknowledgement, because that is what orders the results ahead of the
+    /// park message on the other channel.
+    #[tokio::test]
+    async fn results_stream_one_article_at_a_time_and_only_the_last_waits() {
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let sender_tx = event_tx.clone();
+        let sender = tokio::task::spawn_blocking(move || {
+            let stats = weaver_nntp::blocking::BlockingLaneStats::default();
+            for segment_number in 0..3u32 {
+                let result = unresolved_result(
+                    tail_work(segment_number, 0),
+                    9,
+                    0,
+                    DownloadLaneMode::Sequential,
+                    false,
+                    None,
+                    None,
+                    true,
+                    0,
+                    false,
+                    &[],
+                    "streamed",
+                );
+                send_owned_batch(&sender_tx, vec![result], Vec::new(), stats, false)?;
+            }
+            send_owned_batch(&sender_tx, Vec::new(), vec![tail_work(9, 0)], stats, true)
+        });
+
+        for segment_number in 0..3u32 {
+            let event = event_rx.recv().await.expect("a streamed article");
+            let OwnedDownloadLaneEvent::BatchComplete { results, ack, .. } = event else {
+                panic!("streamed events are batch completions");
+            };
+            assert_eq!(results.len(), 1, "one article per event");
+            assert_eq!(results[0].segment_id.segment_number, segment_number);
+            assert!(
+                ack.is_none(),
+                "a streamed article must not cost a thread hop on the hot path"
+            );
+        }
+
+        let event = event_rx.recv().await.expect("the closing event");
+        let OwnedDownloadLaneEvent::BatchComplete {
+            results,
+            unrequested_works,
+            ack,
+            ..
+        } = event
+        else {
+            panic!("the closing event is a batch completion");
+        };
+        assert!(results.is_empty());
+        assert_eq!(unrequested_works.len(), 1);
+        let ack = ack.expect("the closing event is the ordering barrier");
+        assert!(
+            !sender.is_finished(),
+            "the lane is still waiting on the barrier"
+        );
+        ack.send(()).unwrap();
+        sender.await.unwrap().unwrap();
+    }
+
     #[test]
     fn leased_message_ids_are_bracketed_for_the_wire() {
         // Both lanes build their BODY arguments here. `DownloadWork` stores
@@ -905,29 +1139,70 @@ mod tests {
     }
 
     #[test]
-    fn owned_hot_lane_yield_returns_unrequested_tail_without_retry() {
-        let mut pending_works = VecDeque::from([tail_work(2, 4), tail_work(3, 7)]);
+    fn owned_hot_lane_yield_discards_the_lane_and_keeps_its_retry_counts() {
+        // Yielding hands the connection back, so the lane is not cached; the
+        // works that were never issued go back to the queue untouched, which
+        // is what keeps a yield from spending a retry.
+        let (reason, keep_cached_lane) =
+            lane_stop_park(Some(LaneStop::HotShareYield)).expect("a stop always parks");
 
-        let tail = take_unrequested_tail(&mut pending_works, true, true, false);
+        assert_eq!(reason, LaneParkReason::HotShareYield);
+        assert!(!keep_cached_lane);
 
-        assert!(pending_works.is_empty());
-        assert_eq!(tail.len(), 2);
-        assert_eq!(tail[0].segment_id.segment_number, 2);
-        assert_eq!(tail[0].retry_count, 4);
-        assert_eq!(tail[1].segment_id.segment_number, 3);
-        assert_eq!(tail[1].retry_count, 7);
+        let pending = VecDeque::from([(tail_work(2, 4), ()), (tail_work(3, 7), ())]);
+        let returned = pending
+            .into_iter()
+            .map(|(work, ())| work)
+            .collect::<Vec<_>>();
+        assert_eq!(returned[0].segment_id.segment_number, 2);
+        assert_eq!(returned[0].retry_count, 4);
+        assert_eq!(returned[1].segment_id.segment_number, 3);
+        assert_eq!(returned[1].retry_count, 7);
     }
 
     #[test]
-    fn owned_quota_park_returns_unrequested_tail_without_dirtying_batch() {
-        let mut pending_works = VecDeque::from([tail_work(4, 2), tail_work(5, 2)]);
+    fn owned_quota_park_keeps_the_cached_lane() {
+        // A quota refusal never reaches the wire, so the socket is clean and
+        // the lane is worth keeping for the next fill.
+        let (reason, keep_cached_lane) =
+            lane_stop_park(Some(LaneStop::PolicyBlocked)).expect("a stop always parks");
 
-        let tail = take_unrequested_tail(&mut pending_works, true, false, true);
+        assert_eq!(reason, LaneParkReason::ServerQuota);
+        assert!(keep_cached_lane);
+    }
 
-        assert!(pending_works.is_empty());
-        assert_eq!(tail.len(), 2);
-        assert_eq!(tail[0].segment_id.segment_number, 4);
-        assert_eq!(tail[1].segment_id.segment_number, 5);
+    #[test]
+    fn owned_transport_fault_parks_as_error_and_drops_the_connection() {
+        for stop in [LaneStop::ConnectionLost, LaneStop::Error] {
+            let (reason, keep_cached_lane) =
+                lane_stop_park(Some(stop)).expect("a stop always parks");
+
+            assert_eq!(reason, LaneParkReason::Error);
+            assert!(!keep_cached_lane);
+        }
+        assert!(lane_stop_park(None).is_none());
+    }
+
+    /// The refill must be asked for while the ring still has runway.
+    ///
+    /// An ordinary lease is exactly one pipe deep, so the deadline has to be
+    /// wider than the lease itself or the ask would land after the pipe is
+    /// already dry — the round-trip gap this path exists to remove.
+    #[test]
+    fn refill_deadline_leaves_runway_at_every_rung() {
+        assert_eq!(refill_deadline(1), 3);
+        assert_eq!(refill_deadline(2), 5);
+        assert_eq!(refill_deadline(4), 9);
+        assert_eq!(refill_deadline(8), 17);
+        // A zero depth is a Sequential lane, not a stalled one.
+        assert_eq!(refill_deadline(0), refill_deadline(1));
+
+        for depth in [1usize, 2, 4, 8] {
+            assert!(
+                refill_deadline(depth) > depth,
+                "a one-pipe lease must trip the deadline as soon as it is adopted"
+            );
+        }
     }
 
     /// A 430 must not tear down the owned lane.
@@ -1002,10 +1277,9 @@ mod tests {
             "the unclean path is the only one that costs a rung"
         );
 
-        // The rest of the leased batch is still requested, not handed back.
-        let mut pending_works = VecDeque::from([tail_work(10, 0), tail_work(11, 0)]);
-        assert!(take_unrequested_tail(&mut pending_works, true, false, false).is_empty());
-        assert_eq!(pending_works.len(), 2);
+        // The rest of the lease is still requested, not handed back: a 430
+        // sets no stop, so the ring keeps being topped up from `pending`.
+        assert!(lane_stop_park(None).is_none());
     }
 
     /// Transport faults must stay dirty. Only the "fully consumed response"

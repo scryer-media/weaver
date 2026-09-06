@@ -285,13 +285,112 @@ impl DownloadBatchCompatibility {
         }
     }
 
+    /// Whether `work` may join the batch this compatibility was cut from at
+    /// **initial dispatch**.
+    ///
+    /// A first lease also decides the connection: the lane is acquired for
+    /// `groups`, and `priority` is what the initial batch was sized around. Two
+    /// works only share that decision when they agree on all of it.
     fn matches(&self, work: &DownloadWork) -> bool {
-        work.priority == self.priority
-            && work.is_recovery == self.is_recovery
+        work.priority == self.priority && self.refill_matches(work, true)
+    }
+
+    /// Whether `work` may join a **refill** of an already-established lane.
+    ///
+    /// A refill inherits a live connection, so the only question it may ask is
+    /// what that connection can serve:
+    ///
+    /// * `exclude_servers` / `avoid_server` — every work in a lease shares one
+    ///   effective exclude set, and each result reports the batch's excludes
+    ///   back into the segment's failure ledger. Mixing them would book one
+    ///   article's exclusions against another's, so these stay equal.
+    /// * `is_recovery` — recovery never rides an owned blocking lane (see
+    ///   `should_use_owned_blocking_lane`) and is accounted separately.
+    /// * `completion_critical` — the class a lane is counted under at start
+    ///   (`active_completion_critical_connections*`) and released under at
+    ///   park. A lane may not change class without changing that protocol, so
+    ///   the split is kept; the critical phase of every dispatch pass takes
+    ///   the connection instead, and item-2 wakes that pass on the park.
+    ///
+    /// `priority` is deliberately **not** asked: it only orders the queue.
+    /// Gating a refill on it pinned each lane inside one direct-store volume
+    /// (`10 + volume_index`), so every lane parked "no work" at each of a
+    /// 125-volume job's boundaries with thousands of articles still queued.
+    ///
+    /// `groups` is asked only when `match_groups` says the lane's server has
+    /// proven it needs a selected group (RFC 3977 serves a message-id fetch
+    /// without one, and such a lane never sent GROUP). On a server that did
+    /// send GROUP at connect, an article from another group is not known to be
+    /// fetchable through that selection, so the refill keeps to the group the
+    /// connection was opened for and the initial rule reconnects for the rest.
+    fn refill_matches(&self, work: &DownloadWork, match_groups: bool) -> bool {
+        work.is_recovery == self.is_recovery
             && work.completion_critical == self.completion_critical
-            && (std::sync::Arc::ptr_eq(&work.groups, &self.groups) || work.groups == self.groups)
             && work.exclude_servers == self.exclude_servers
             && work.avoid_server == self.avoid_server
+            && (!match_groups || self.groups_match(work))
+    }
+
+    fn groups_match(&self, work: &DownloadWork) -> bool {
+        std::sync::Arc::ptr_eq(&work.groups, &self.groups) || work.groups == self.groups
+    }
+}
+
+/// Which of the two compatibility rules a pop is being filtered by.
+///
+/// Kept as a selector rather than two `matches` call sites so the rule a lease
+/// was opened under is carried all the way through its batching loop: a refill
+/// that took the queue head under the refill rule must go on filling under the
+/// same rule, or it stops after one article at the next priority boundary.
+#[derive(Clone, Copy)]
+pub(super) struct DownloadBatchSelector<'a> {
+    compatibility: &'a DownloadBatchCompatibility,
+    rule: DownloadBatchRule,
+}
+
+/// The rule a lease is cut under; see [`DownloadBatchCompatibility::matches`]
+/// and [`DownloadBatchCompatibility::refill_matches`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum DownloadBatchRule {
+    /// A first lease: every work must agree with the head on everything.
+    Initial,
+    /// A refill of a live lane: priority is not asked, and `groups` only when
+    /// the lane's server has proven it needs a selected group.
+    Refill { match_groups: bool },
+}
+
+impl DownloadBatchRule {
+    pub(super) fn is_refill(self) -> bool {
+        matches!(self, Self::Refill { .. })
+    }
+}
+
+impl<'a> DownloadBatchSelector<'a> {
+    pub(super) fn new(
+        compatibility: &'a DownloadBatchCompatibility,
+        rule: DownloadBatchRule,
+    ) -> Self {
+        Self {
+            compatibility,
+            rule,
+        }
+    }
+
+    pub(super) fn initial(compatibility: &'a DownloadBatchCompatibility) -> Self {
+        Self::new(compatibility, DownloadBatchRule::Initial)
+    }
+
+    pub(super) fn matches(&self, work: &DownloadWork) -> bool {
+        match self.rule {
+            DownloadBatchRule::Initial => self.compatibility.matches(work),
+            DownloadBatchRule::Refill { match_groups } => {
+                self.compatibility.refill_matches(work, match_groups)
+            }
+        }
+    }
+
+    pub(super) fn is_refill(&self) -> bool {
+        self.rule.is_refill()
     }
 }
 
@@ -322,6 +421,13 @@ pub(super) struct DownloadLaneRefillRequest {
     pub(super) server_idx: usize,
     pub(super) remote_ip: IpAddr,
     pub(super) supports_pipelining: bool,
+    /// The mode the scheduler last **booked** this lane's depth gauge under —
+    /// not necessarily the one it is running. A lane started on a lease mode
+    /// of `Pipelined { depth: 2 }` that fell back to `Sequential` is still
+    /// counted at depth 2 until a refill moves it, so reporting the running
+    /// mode here decremented a gauge nothing had incremented and underflowed
+    /// `download_lanes_active{mode="sequential"}`. Lanes therefore carry the
+    /// booked mode forward and update it from each granted lease.
     pub(super) current_mode: DownloadLaneMode,
     pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
     pub(super) compatibility: DownloadBatchCompatibility,
@@ -846,7 +952,11 @@ pub(super) enum OwnedDownloadLaneEvent {
         results: Vec<DownloadResult>,
         unrequested_works: Vec<DownloadWork>,
         stats: weaver_nntp::blocking::BlockingLaneStats,
-        ack: std::sync::mpsc::SyncSender<()>,
+        /// Present only on a lane's final event. Streamed per-article events
+        /// carry none: the bounded channel is their backpressure, and the
+        /// rendezvous exists to order this lane's results ahead of the park
+        /// message that follows on `parked_tx`.
+        ack: Option<std::sync::mpsc::SyncSender<()>>,
     },
 }
 
@@ -2664,6 +2774,16 @@ pub struct Pipeline {
     /// Lane refill requests held under hard download pressure, answered as the
     /// backlog drains so lanes resume without a park/redispatch round-trip.
     pub(super) deferred_lane_refills: VecDeque<DownloadLaneRefillRequest>,
+    /// A lane parked and its connection slot came back; the run loop owes a
+    /// dispatch pass.
+    ///
+    /// The loop turns once per pipeline event and dispatches at the top of the
+    /// turn, so a park observed part-way through a turn used to wait out the
+    /// rest of it — up to `DOWNLOAD_RESULTS_PER_TURN` awaited result ingests,
+    /// which measured as a median 340 ms and a worst case of 2.3 s before the
+    /// freed connection was handed back out. Setting this makes the park
+    /// itself the wake, with no timer to poll.
+    pub(super) download_dispatch_wake: bool,
     /// User-enabled over-max burst budget for latent-IP replacement trials.
     pub(super) ip_replacement_trial_extra_connections: u8,
     /// Bounded per-server/per-IP BODY RTT EWMA state.
