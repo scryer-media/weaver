@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -53,6 +54,10 @@ func main() {
 		err = sequential(os.Args[2:])
 	case "queue-transition":
 		err = queueTransition(os.Args[2:])
+	case "pin":
+		err = pin(os.Args[2:])
+	case "chain":
+		err = chain(os.Args[2:])
 	case "summarize":
 		err = summarize(os.Args[2:])
 	case "preflight":
@@ -124,10 +129,44 @@ func seed(args []string) error {
 	return printJSON(result)
 }
 
+// excludeFixtures drops named fixtures from a plan's corpus. An id that is not
+// present is refused: a misspelled exclusion would silently keep the fixture
+// the operator meant to remove, and the run would fail on it hours later.
+func excludeFixtures(fixtureIDs, excluded []string) ([]string, error) {
+	if len(excluded) == 0 {
+		return fixtureIDs, nil
+	}
+	drop := make(map[string]bool, len(excluded))
+	for _, id := range excluded {
+		drop[id] = true
+	}
+	kept := make([]string, 0, len(fixtureIDs))
+	for _, id := range fixtureIDs {
+		if drop[id] {
+			delete(drop, id)
+			continue
+		}
+		kept = append(kept, id)
+	}
+	if len(drop) > 0 {
+		missing := make([]string, 0, len(drop))
+		for id := range drop {
+			missing = append(missing, id)
+		}
+		sort.Strings(missing)
+		return nil, fmt.Errorf("--exclude-fixtures names %d fixture(s) the corpus does not contain: %s",
+			len(missing), strings.Join(missing, ", "))
+	}
+	if len(kept) == 0 {
+		return nil, fmt.Errorf("--exclude-fixtures removed every fixture from the plan")
+	}
+	return kept, nil
+}
+
 func plan(args []string) error {
 	flags := flag.NewFlagSet("plan", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	var fixturesCSV, corpusPath, clientsCSV, archiveToolchainsCSV, transportsCSV, targetsCSV, output, profile, serverLink string
+	var fixturesCSV, excludeFixturesCSV, corpusPath, clientsCSV, archiveToolchainsCSV, transportsCSV, targetsCSV, output, profile, serverLink string
 	var storageProfileID, nfsLink string
 	var repetitions int
 	var seed int64
@@ -135,6 +174,7 @@ func plan(args []string) error {
 	var serverRTT time.Duration
 	var exclusions clientExclusionFlags
 	flags.StringVar(&fixturesCSV, "fixtures", "", "comma-separated generated fixture ids")
+	flags.StringVar(&excludeFixturesCSV, "exclude-fixtures", "", "comma-separated fixture ids to drop from the corpus or from --fixtures; every id must be present, so a typo is refused rather than silently keeping the fixture")
 	flags.Var(&exclusions, "exclude-client", "repeatable; client:fixture-id:reason — do not run this client on this fixture; the summary records every excluded block as that client not finishing, with the reason")
 	flags.StringVar(&corpusPath, "corpus", "fixtures/corpus.json", "declared corpus JSON used when --fixtures is omitted")
 	flags.StringVar(&clientsCSV, "clients", "weaver,sabnzbd,nzbget", "comma-separated clients")
@@ -167,6 +207,10 @@ func plan(args []string) error {
 			return err
 		}
 		fixtureIDs = corpus.FixtureIDs
+	}
+	fixtureIDs, err := excludeFixtures(fixtureIDs, splitCSV(excludeFixturesCSV))
+	if err != nil {
+		return err
 	}
 	clients, err := parseClients(clientsCSV)
 	if err != nil {
@@ -573,6 +617,8 @@ Commands:
   sequential     Run each persisted plan entry through a fresh isolated client
   queue           Execute each client lane as one uninterrupted multi-NZB queue (legacy)
   queue-transition Queue twenty forced duplicates of one direct fixture and report drain time
+  pin            Pin a client image by digest in the adapter catalog and pre-pull it
+  chain          Drive a whole declared session: shaper, phases and summaries
   summarize      Produce paired per-stratum statistics from verified sequential artifacts
   preflight      Check target host and native/Docker executable prerequisites
   verify-output  Verify a client completion directory against fixture hashes

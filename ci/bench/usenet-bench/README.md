@@ -37,6 +37,7 @@ downloaded data and run artifacts are ignored by git and never committed.
   - [5. Write a plan](#5-write-a-plan)
   - [6. Run the sequential suite](#6-run-the-sequential-suite)
   - [7. Summarize](#7-summarize)
+- [Driving a whole session](#driving-a-whole-session)
 - [Pre-seeded NNTP corpus image](#pre-seeded-nntp-corpus-image)
 - [Native macOS and Windows lanes](#native-macos-and-windows-lanes)
 - [Storage profiles (local vs throttled NFS)](#storage-profiles-local-vs-throttled-nfs)
@@ -815,6 +816,81 @@ fast by pulling more than the NZB carries visible next to its wall clock. A
 deterministic client lands within a few bytes of itself from block to block;
 a spread is a finding, and the census says whether the excess was requested
 twice or read past.
+
+## Driving a whole session
+
+A published comparison is not one run. It is a series: several plans, each
+measured under its own link conditions, each summarized against both
+baselines. `nntpbench chain` runs that series from a single JSON description,
+so the same session runs unchanged on Linux, macOS and Windows and nothing
+about it depends on a shell.
+
+```bash
+# Validate the description and every host precondition without measuring.
+nntpbench chain --config runs/latency-series.json --dry-run
+
+# Run it. Re-run one phase by name after fixing whatever broke.
+nntpbench chain --config runs/latency-series.json
+nntpbench chain --config runs/latency-series.json --only C3-rtt100
+```
+
+`configs/chains/latency-series.example.json` is a complete session. Every
+relative path in a chain description resolves against the description's own
+directory, so a chain, its plans and its corpus move between machines as one
+unit.
+
+Each phase names its execution mode, its plan, its corpus and its artifact
+root, and declares the link conditions it must be measured under. The chain
+reconfigures the shaper only when a phase's conditions differ from the phase
+before, and it restores a declared resting state when the session ends, so a
+finished session never leaves a rate limit or an injected round trip behind.
+Phases run out of process: a phase that exhausts memory while rendering its
+artifacts cannot take the session down with it, every phase gets an exit status
+of its own, and the command line each phase ran is in the log, reproducible by
+hand.
+
+A phase may carry a `plan_spec` instead of a plan made by hand. The plan is
+then built from the spec, deterministically in its own seed, so the plan built
+on one machine is the plan built on the next; a plan already on disk is reused
+untouched, because it is the record of what a past session measured. Corpora
+declared under `fixture_sets` are named once and shared by every phase that
+measures them. `exclude_fixtures` drops fixtures from a corpus by id and
+refuses an id the corpus does not contain, so a misspelled exclusion cannot
+silently keep the fixture it was meant to remove.
+
+Preconditions are checked once, before the first measurement:
+
+- every declared fixture root exists;
+- the NNTP service advertises `PIPELINING`;
+- the pinned client image reports the version the session is for;
+- every fixture each plan names has a manifest, posts at least the corpus
+  floor, and — for a phase that asks for a paired summary — declares a
+  headline or breadth class;
+- no phase would measure into an artifact root that already holds suites.
+
+The last two are the expensive mistakes. An undersized fixture fails its suite
+hours into a run, and an unclassified one runs to completion and then
+summarizes to nothing; both are cheap to catch before the shaper is even
+touched. Summaries themselves run only after every phase is finished, so
+summarizing never competes with a measurement for the machine.
+
+The session writes `chain-<name>-result.json`: every phase with its link
+conditions, wall clock, exit status, suite count, log path and summaries. It is
+rewritten after each phase, so an interrupted session still leaves an accurate
+account of what it measured.
+
+Client images are pinned by digest, never by tag:
+
+```bash
+nntpbench pin --adapters runs/adapters.json --template runs/adapters-next.json \
+  --client weaver --image ghcr.io/scryer-media/weaver --version 0.11.0 \
+  --entrypoint /opt/weaver/weaver
+```
+
+`pin` resolves the tag to a digest, saves the previous catalog under a
+timestamped name, rewrites the catalog atomically, pre-pulls every client image
+so the first phase is not charged for a download, and runs the pinned image to
+report the version it actually is.
 
 ## Pre-seeded NNTP corpus image
 
