@@ -386,7 +386,6 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     let _ = reply.send(Ok(NntpRuntimeActivation {
                         generation: 1,
                         configured_connections: 0,
-                        effective_connections: 0,
                     }));
                 }
                 SchedulerCommand::UpdateRuntimePaths { reply, .. } => {

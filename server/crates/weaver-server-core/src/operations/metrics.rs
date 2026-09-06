@@ -503,11 +503,6 @@ pub struct PipelineMetrics {
     pub segments_failed_permanent: AtomicU64,
     pub parked_infrastructure_work: AtomicUsize,
     pub nntp_generation_recovery_requeues: AtomicU64,
-    pub nntp_capacity_probe_attempts_total: AtomicU64,
-    pub nntp_capacity_probe_successes_total: AtomicU64,
-    pub nntp_capacity_probe_rejections_total: AtomicU64,
-    pub nntp_capacity_probe_transport_failures_total: AtomicU64,
-    pub nntp_capacity_probe_stale_generation_total: AtomicU64,
     pub download_failures_article_not_found: AtomicU64,
     pub download_failures_capacity_unavailable: AtomicU64,
     pub download_failures_transient: AtomicU64,
@@ -657,11 +652,6 @@ impl PipelineMetrics {
             segments_failed_permanent: AtomicU64::new(0),
             parked_infrastructure_work: AtomicUsize::new(0),
             nntp_generation_recovery_requeues: AtomicU64::new(0),
-            nntp_capacity_probe_attempts_total: AtomicU64::new(0),
-            nntp_capacity_probe_successes_total: AtomicU64::new(0),
-            nntp_capacity_probe_rejections_total: AtomicU64::new(0),
-            nntp_capacity_probe_transport_failures_total: AtomicU64::new(0),
-            nntp_capacity_probe_stale_generation_total: AtomicU64::new(0),
             download_failures_article_not_found: AtomicU64::new(0),
             download_failures_capacity_unavailable: AtomicU64::new(0),
             download_failures_transient: AtomicU64::new(0),
@@ -1047,21 +1037,6 @@ impl PipelineMetrics {
             nntp_generation_recovery_requeues: self
                 .nntp_generation_recovery_requeues
                 .load(Ordering::Relaxed),
-            nntp_capacity_probe_attempts_total: self
-                .nntp_capacity_probe_attempts_total
-                .load(Ordering::Relaxed),
-            nntp_capacity_probe_successes_total: self
-                .nntp_capacity_probe_successes_total
-                .load(Ordering::Relaxed),
-            nntp_capacity_probe_rejections_total: self
-                .nntp_capacity_probe_rejections_total
-                .load(Ordering::Relaxed),
-            nntp_capacity_probe_transport_failures_total: self
-                .nntp_capacity_probe_transport_failures_total
-                .load(Ordering::Relaxed),
-            nntp_capacity_probe_stale_generation_total: self
-                .nntp_capacity_probe_stale_generation_total
-                .load(Ordering::Relaxed),
             download_failures_article_not_found: self
                 .download_failures_article_not_found
                 .load(Ordering::Relaxed),
@@ -1230,16 +1205,6 @@ pub struct MetricsSnapshot {
     pub parked_infrastructure_work: usize,
     #[serde(default)]
     pub nntp_generation_recovery_requeues: u64,
-    #[serde(default)]
-    pub nntp_capacity_probe_attempts_total: u64,
-    #[serde(default)]
-    pub nntp_capacity_probe_successes_total: u64,
-    #[serde(default)]
-    pub nntp_capacity_probe_rejections_total: u64,
-    #[serde(default)]
-    pub nntp_capacity_probe_transport_failures_total: u64,
-    #[serde(default)]
-    pub nntp_capacity_probe_stale_generation_total: u64,
     pub download_failures_article_not_found: u64,
     pub download_failures_capacity_unavailable: u64,
     pub download_failures_transient: u64,

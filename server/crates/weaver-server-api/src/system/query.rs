@@ -480,7 +480,6 @@ async fn collect_server_health(pool: &NntpPool, runtime_generation: u64) -> Vec<
         port: u16,
         tier: String,
         active: usize,
-        effective: usize,
         configured: usize,
         penalty_until: Option<u64>,
     }
@@ -491,19 +490,18 @@ async fn collect_server_health(pool: &NntpPool, runtime_generation: u64) -> Vec<
         .iter()
         .enumerate()
         .map(|(idx, cfg)| {
-            let (_, effective) = pool.server_load(idx);
+            let (_, max_connections) = pool.server_load(idx);
             let active = pool.active_connections(idx);
             let configured = pool
                 .configured_connections(weaver_nntp::ServerId(idx))
-                .unwrap_or(effective);
-            let penalty_until = pool.capacity_penalty_until_epoch_ms(weaver_nntp::ServerId(idx));
+                .unwrap_or(max_connections);
+            let penalty_until = pool.over_limit_until_epoch_ms(weaver_nntp::ServerId(idx));
             let tier = if idx == 0 { "PRIMARY" } else { "BACKUP" };
             ServerLoadSnapshot {
                 host: cfg.host.clone(),
                 port: cfg.port,
                 tier: tier.to_string(),
                 active,
-                effective,
                 configured,
                 penalty_until,
             }
@@ -528,9 +526,8 @@ async fn collect_server_health(pool: &NntpPool, runtime_generation: u64) -> Vec<
                 tier: snapshot.tier,
                 state: state.to_string(),
                 connections_active: snapshot.active as u32,
-                connections_max: snapshot.effective as u32,
+                connections_max: snapshot.configured as u32,
                 connections_configured: snapshot.configured as u32,
-                connections_effective: snapshot.effective as u32,
                 capacity_penalty_until_epoch_ms: snapshot.penalty_until,
                 runtime_generation,
                 latency_ms: health.latency_ms(idx),

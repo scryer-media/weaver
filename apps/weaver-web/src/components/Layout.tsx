@@ -61,9 +61,16 @@ interface GlobalQueueState {
   };
 }
 
+interface ProviderHoldoff {
+  label: string;
+  untilEpochMs: number;
+}
+
 interface LiveMetricsSnapshot {
   metrics: { currentDownloadSpeed: number };
   globalState: GlobalQueueState["globalState"];
+  /** Only carried by the live subscription; the polled query omits it. */
+  providerHoldoffs?: ProviderHoldoff[];
 }
 
 const EMPTY_JOBS: JobData[] = [];
@@ -85,6 +92,8 @@ const DEFAULT_GLOBAL_STATE: GlobalQueueState["globalState"] = {
   downloadBlock: DEFAULT_DOWNLOAD_BLOCK,
 };
 const RECONNECT_TOAST_ID = "graphql-connection";
+const PROVIDER_HOLDOFF_TOAST_PREFIX = "provider-holdoff:";
+const PROVIDER_HOLDOFF_TOAST_MS = 15_000;
 
 const RoutedOutlet = memo(function RoutedOutlet() {
   return <Outlet />;
@@ -323,6 +332,38 @@ export function Layout() {
   useEffect(() => () => {
     toast.dismiss(RECONNECT_TOAST_ID);
   }, []);
+
+  // One warning per holdoff window per server: the deadline only changes
+  // when the provider rejects again after the previous window expired.
+  const providerHoldoffs = metricsSubscriptionData?.systemMetricsUpdates?.providerHoldoffs;
+  const announcedHoldoffsRef = useRef(new Map<string, number>());
+  useEffect(() => {
+    if (!providerHoldoffs) {
+      return;
+    }
+    const announced = announcedHoldoffsRef.current;
+    const active = new Set<string>();
+    for (const holdoff of providerHoldoffs) {
+      active.add(holdoff.label);
+      if (announced.get(holdoff.label) === holdoff.untilEpochMs) {
+        continue;
+      }
+      announced.set(holdoff.label, holdoff.untilEpochMs);
+      toast.warning(t("connection.serverOverLimitTitle", { server: holdoff.label }), {
+        id: `${PROVIDER_HOLDOFF_TOAST_PREFIX}${holdoff.label}`,
+        description: t("connection.serverOverLimitBody", {
+          time: new Date(holdoff.untilEpochMs).toLocaleTimeString(),
+        }),
+        duration: PROVIDER_HOLDOFF_TOAST_MS,
+        dismissible: true,
+      });
+    }
+    for (const label of announced.keys()) {
+      if (!active.has(label)) {
+        announced.delete(label);
+      }
+    }
+  }, [providerHoldoffs, t]);
 
   const lastTitleUpdate = useRef(0);
   useEffect(() => {

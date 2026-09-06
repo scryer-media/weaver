@@ -4382,11 +4382,6 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         segments_failed_permanent: 18,
         parked_infrastructure_work: 29,
         nntp_generation_recovery_requeues: 30,
-        nntp_capacity_probe_attempts_total: 31,
-        nntp_capacity_probe_successes_total: 32,
-        nntp_capacity_probe_rejections_total: 33,
-        nntp_capacity_probe_transport_failures_total: 34,
-        nntp_capacity_probe_stale_generation_total: 35,
         download_failures_article_not_found: 24,
         download_failures_capacity_unavailable: 25,
         download_failures_transient: 26,
@@ -4470,10 +4465,9 @@ fn sample_server_health() -> metrics::ServerHealthInfo {
         latency_ms: 0.0,
         connections_available: 0,
         connections_active: 0,
-        connections_max: 20,
+        connections_max: 80,
         connections_configured: 80,
         capacity_penalty_until_epoch_ms: 0,
-        capacity_reductions: 60,
         premature_deaths: 0,
     }
 }
@@ -4597,11 +4591,6 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(rendered.contains("weaver_pipeline_download_failures_total{kind=\"permanent\"} 28"));
     assert!(rendered.contains("weaver_pipeline_parked_infrastructure_work 29"));
     assert!(rendered.contains("weaver_nntp_generation_recovery_requeues_total 30"));
-    assert!(rendered.contains("weaver_nntp_capacity_probe_attempts_total 31"));
-    assert!(rendered.contains("weaver_nntp_capacity_probe_successes_total 32"));
-    assert!(rendered.contains("weaver_nntp_capacity_probe_rejections_total 33"));
-    assert!(rendered.contains("weaver_nntp_capacity_probe_transport_failures_total 34"));
-    assert!(rendered.contains("weaver_nntp_capacity_probe_stale_generation_total 35"));
     // The descriptive labels live on the info metric; the value series carry
     // job_id alone so a rename or a status change does not churn their identity.
     assert!(rendered.contains(
@@ -4822,11 +4811,6 @@ fn renders_prometheus_download_observed_limiter_states() {
         segments_failed_permanent: 0,
         parked_infrastructure_work: 0,
         nntp_generation_recovery_requeues: 0,
-        nntp_capacity_probe_attempts_total: 0,
-        nntp_capacity_probe_successes_total: 0,
-        nntp_capacity_probe_rejections_total: 0,
-        nntp_capacity_probe_transport_failures_total: 0,
-        nntp_capacity_probe_stale_generation_total: 0,
         download_failures_article_not_found: 0,
         download_failures_capacity_unavailable: 0,
         download_failures_transient: 0,
@@ -4864,12 +4848,11 @@ fn renders_prometheus_download_observed_limiter_states() {
     assert!(rendered.contains(
         "weaver_server_connections_configured{server_id=\"7\",server=\"news.example:563\"} 80"
     ));
-    assert!(rendered.contains(
-        "weaver_server_connections_effective{server_id=\"7\",server=\"news.example:563\"} 20"
-    ));
-    assert!(rendered.contains(
-        "weaver_server_capacity_reductions_total{server_id=\"7\",server=\"news.example:563\"} 60"
-    ));
+    assert!(
+        rendered.contains(
+            "weaver_server_connections_max{server_id=\"7\",server=\"news.example:563\"} 80"
+        )
+    );
     assert!(rendered.contains(
         "weaver_server_info{server_id=\"7\",server=\"news.example:563\",host=\"news.example\",port=\"563\",tls=\"true\",priority=\"1\",backfill=\"false\"} 1"
     ));

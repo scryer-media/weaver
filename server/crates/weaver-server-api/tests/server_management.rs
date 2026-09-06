@@ -658,7 +658,6 @@ async fn active_connection_reduction_waits_for_new_runtime_generation() {
         Some(weaver_server_core::NntpRuntimeActivation {
             generation: 1,
             configured_connections: 80,
-            effective_connections: 80,
         })
     );
 
@@ -681,7 +680,6 @@ async fn active_connection_reduction_waits_for_new_runtime_generation() {
         Some(weaver_server_core::NntpRuntimeActivation {
             generation: 2,
             configured_connections: 20,
-            effective_connections: 20,
         })
     );
 }

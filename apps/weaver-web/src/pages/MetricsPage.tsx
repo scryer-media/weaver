@@ -41,7 +41,6 @@ interface ServerHealthEntry {
   connectionsActive: number;
   connectionsMax: number;
   connectionsConfigured: number;
-  connectionsEffective: number;
   capacityPenaltyUntilEpochMs: number | null;
   runtimeGeneration: number;
   latencyMs: number;
@@ -321,11 +320,18 @@ export function MetricsPage() {
                   const dotClass = SERVER_STATE_DOT_CLASS[server.state] ?? "bg-muted-foreground";
                   const active = server.connectionsActive > 0 && server.state !== "disabled";
                   const connPct =
-                    server.connectionsEffective > 0
-                      ? (server.connectionsActive / server.connectionsEffective) * 100
+                    server.connectionsConfigured > 0
+                      ? (server.connectionsActive / server.connectionsConfigured) * 100
                       : 0;
-                  const capacityReduced =
-                    server.connectionsEffective < server.connectionsConfigured;
+                  // The provider refused a new connection, so new ones pause
+                  // until this deadline. The connections already open keep
+                  // working, which is why the bar itself is unchanged. The
+                  // server clears the field once the deadline passes, so its
+                  // presence alone means the holdoff is still running.
+                  const overLimitUntil =
+                    server.capacityPenaltyUntilEpochMs !== null
+                      ? new Date(server.capacityPenaltyUntilEpochMs)
+                      : null;
                   const latencyClass =
                     server.latencyMs < 80
                       ? "text-status-completed"
@@ -368,12 +374,14 @@ export function MetricsPage() {
                         <div className="flex items-center justify-between text-[10.5px] text-muted-foreground">
                           <span>{t("metrics.serverConns")}</span>
                           <span className="font-semibold tabular-nums text-foreground">
-                            {server.connectionsActive} / {server.connectionsEffective}
+                            {server.connectionsActive} / {server.connectionsConfigured}
                           </span>
                         </div>
-                        {capacityReduced ? (
+                        {overLimitUntil ? (
                           <div className="mt-0.5 text-right text-[9px] tabular-nums text-status-paused">
-                            configured {server.connectionsConfigured}
+                            {t("metrics.serverOverLimitUntil", {
+                              time: overLimitUntil.toLocaleTimeString(),
+                            })}
                           </div>
                         ) : null}
                         <div className="mt-1.5 h-1.5 overflow-hidden rounded-pill bg-secondary">

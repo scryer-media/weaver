@@ -1,7 +1,5 @@
 use super::*;
 
-const NNTP_ACTIVATION_OVERLAP_GRACE: Duration = Duration::from_secs(30);
-
 impl Pipeline {
     pub(crate) async fn handle_command(&mut self, cmd: SchedulerCommand) {
         match cmd {
@@ -545,10 +543,6 @@ impl Pipeline {
             } => {
                 let result = if let Ok(new_client) = client.downcast::<NntpClient>() {
                     let new_client = Arc::new(*new_client);
-                    new_client
-                        .pool()
-                        .begin_activation_overlap_grace(NNTP_ACTIVATION_OVERLAP_GRACE);
-                    let effective_connections = new_client.pool().effective_connection_capacity();
                     let old_client = std::mem::replace(&mut self.nntp, new_client);
                     // Server indices and retention windows may have changed:
                     // recompute retention and drop queued failure exclusions,
@@ -581,14 +575,12 @@ impl Pipeline {
                     let activation = NntpRuntimeActivation {
                         generation: self.pool_generation,
                         configured_connections: total_connections,
-                        effective_connections,
                     };
                     self.shared_state.set_nntp_runtime_activation(activation);
                     self.publish_snapshot();
                     info!(
                         runtime_generation = activation.generation,
                         configured_connections = activation.configured_connections,
-                        effective_connections = activation.effective_connections,
                         recovery_requeues,
                         max_downloads = self.tuner.params().max_concurrent_downloads,
                         "NNTP runtime generation activated"

@@ -1021,6 +1021,7 @@ impl DownloadFailure {
             NntpError::PoolExhausted
             | NntpError::PoolShutdown
             | NntpError::TooManyConnections
+            | NntpError::ServerOverLimit { .. }
             // Never got a socket before the deadline: local lane capacity, not
             // a transport fault of the server.
             | NntpError::AcquireTimeout(_) => Some(DownloadFailureKind::CapacityUnavailable),
@@ -1172,12 +1173,6 @@ pub(super) struct ProbeUpdate {
     /// True when probe confirmation hit a non-authoritative transport/protocol
     /// failure and the round should be discarded.
     pub(super) inconclusive: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct CapacityProbeCompletion {
-    pub(super) generation: u64,
-    pub(super) outcome: weaver_nntp::CapacityProbeOutcome,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2907,9 +2902,6 @@ pub struct Pipeline {
     /// appears on an article path.
     pub(super) job_stage_started_at:
         HashMap<(JobId, crate::operations::instrumentation::JobStageKind), Instant>,
-    /// Bounded completion path for dedicated adaptive-capacity probes.
-    pub(super) capacity_probe_result_tx: mpsc::Sender<CapacityProbeCompletion>,
-    pub(super) capacity_probe_result_rx: mpsc::Receiver<CapacityProbeCompletion>,
     /// Channel for health probe results: (job_id, total_probes, missed_count).
     pub(super) probe_result_tx: mpsc::Sender<ProbeUpdate>,
     pub(super) probe_result_rx: mpsc::Receiver<ProbeUpdate>,

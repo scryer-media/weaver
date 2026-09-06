@@ -686,14 +686,11 @@ fn spawn_test_scheduler(
                                 "invalid NNTP client type".to_owned(),
                             )
                         })
-                        .map(|client| {
+                        .map(|_client| {
                             nntp_generation = nntp_generation.wrapping_add(1);
                             weaver_server_core::NntpRuntimeActivation {
                                 generation: nntp_generation,
                                 configured_connections: total_connections,
-                                effective_connections: client
-                                    .pool()
-                                    .effective_connection_capacity(),
                             }
                         });
                     if let Ok(activation) = activation {

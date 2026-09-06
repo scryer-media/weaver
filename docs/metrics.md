@@ -383,11 +383,6 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_pipeline_segments_failed_permanent_total` | counter | — | Total segments permanently failed. |
 | `weaver_pipeline_parked_infrastructure_work` | gauge | — | Segments parked while NNTP infrastructure is unavailable. |
 | `weaver_nntp_generation_recovery_requeues_total` | counter | — | Segments requeued after stale NNTP generation failures. |
-| `weaver_nntp_capacity_probe_attempts_total` | counter | — | Adaptive-capacity provider connection probes attempted. |
-| `weaver_nntp_capacity_probe_successes_total` | counter | — | Adaptive-capacity probes that restored one connection. |
-| `weaver_nntp_capacity_probe_rejections_total` | counter | — | Adaptive-capacity probes rejected by provider limits. |
-| `weaver_nntp_capacity_probe_transport_failures_total` | counter | — | Adaptive-capacity probes that failed during transport setup. |
-| `weaver_nntp_capacity_probe_stale_generation_total` | counter | — | Probe results ignored after an NNTP generation replacement. |
 | `weaver_pipeline_download_failures_total` | counter | `kind` | Failed article download attempts by kind. |
 | `weaver_pipeline_articles_not_found_total` | counter | — | Total articles not found. |
 | `weaver_pipeline_decode_errors_total` | counter | — | Total decode errors. |
@@ -488,10 +483,8 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_server_connections_active` | gauge | `server_id`, `server` | Connections currently checked out per server. |
 | `weaver_server_connections_max` | gauge | `server_id`, `server` | Maximum connections per server. |
 | `weaver_server_connections_configured` | gauge | `server_id`, `server` | Operator-configured maximum connections per server. |
-| `weaver_server_connections_effective` | gauge | `server_id`, `server` | Runtime maximum connections after provider capacity adaptation. |
-| `weaver_server_capacity_penalty_until_epoch_ms` | gauge | `server_id`, `server` | Provider capacity penalty deadline in unix epoch milliseconds. **Deprecated — use `weaver_server_capacity_penalty_until_seconds`.** |
-| `weaver_server_capacity_penalty_until_seconds` | gauge | `server_id`, `server` | Provider capacity penalty deadline as a unix timestamp. |
-| `weaver_server_capacity_reductions_total` | counter | `server_id`, `server` | Runtime connection-cap reductions caused by provider rejections. |
+| `weaver_server_capacity_penalty_until_epoch_ms` | gauge | `server_id`, `server` | Provider over-limit holdoff deadline in unix epoch milliseconds. **Deprecated — use `weaver_server_capacity_penalty_until_seconds`.** |
+| `weaver_server_capacity_penalty_until_seconds` | gauge | `server_id`, `server` | Provider over-limit holdoff deadline as a unix timestamp. |
 | `weaver_server_premature_deaths` | gauge | `server_id`, `server` | Recent connections that died before reaching 60s of age. |
 | `weaver_nntp_runtime_generation` | gauge | — | Active NNTP runtime generation. |
 | `weaver_server_download_lifetime_bytes` | counter | `server_id`, `server` | Raw NNTP BODY bytes received per durable server. **Deprecated — use `weaver_server_download_bytes_total`.** |

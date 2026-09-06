@@ -2087,6 +2087,9 @@ fn clone_nntp_error(error: &NntpError) -> NntpError {
         NntpError::ServiceUnavailable => NntpError::ServiceUnavailable,
         NntpError::CommandNotRecognized => NntpError::CommandNotRecognized,
         NntpError::TooManyConnections => NntpError::TooManyConnections,
+        NntpError::ServerOverLimit { until_epoch_ms } => NntpError::ServerOverLimit {
+            until_epoch_ms: *until_epoch_ms,
+        },
         NntpError::AccessDenied => NntpError::AccessDenied,
         NntpError::TlsRequired => NntpError::TlsRequired,
         NntpError::PoolExhausted => NntpError::PoolExhausted,

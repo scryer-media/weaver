@@ -213,8 +213,6 @@ impl Pipeline {
                 total_bytes = total,
                 configured_server_count = self.nntp.pool().server_count(),
                 tuner_max_connections = tuner_max,
-                effective_connection_capacity =
-                    self.effective_download_connection_capacity(tuner_max),
                 "NNTP download pass started"
             );
             self.phase_begin(job_id, JobPhase::Downloading, Some(total));

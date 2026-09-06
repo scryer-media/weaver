@@ -744,7 +744,6 @@ export const SERVER_HEALTH_QUERY = gql`
       connectionsActive
       connectionsMax
       connectionsConfigured
-      connectionsEffective
       capacityPenaltyUntilEpochMs
       runtimeGeneration
       latencyMs
@@ -913,6 +912,10 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
         downloadBlock {
           ...DownloadBlockFields
         }
+      }
+      providerHoldoffs {
+        label
+        untilEpochMs
       }
     }
   }

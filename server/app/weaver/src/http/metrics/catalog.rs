@@ -101,18 +101,6 @@ metric_families! {
     GENERATION_RECOVERY_REQUEUES = ("weaver_nntp_generation_recovery_requeues_total", Counter, [],
         "Segments requeued after stale NNTP generation failures.");
 
-    // ---- adaptive capacity probes ---------------------------------------
-    PROBE_ATTEMPTS = ("weaver_nntp_capacity_probe_attempts_total", Counter, [],
-        "Adaptive-capacity provider connection probes attempted.");
-    PROBE_SUCCESSES = ("weaver_nntp_capacity_probe_successes_total", Counter, [],
-        "Adaptive-capacity probes that restored one connection.");
-    PROBE_REJECTIONS = ("weaver_nntp_capacity_probe_rejections_total", Counter, [],
-        "Adaptive-capacity probes rejected by provider limits.");
-    PROBE_TRANSPORT_FAILURES = ("weaver_nntp_capacity_probe_transport_failures_total", Counter, [],
-        "Adaptive-capacity probes that failed during transport setup.");
-    PROBE_STALE_GENERATION = ("weaver_nntp_capacity_probe_stale_generation_total", Counter, [],
-        "Probe results ignored after an NNTP generation replacement.");
-
     // ---- failures --------------------------------------------------------
     DOWNLOAD_FAILURES = ("weaver_pipeline_download_failures_total", Counter, ["kind"],
         "Failed article download attempts by kind.");
@@ -345,18 +333,12 @@ metric_families! {
         "Maximum connections per server.");
     SERVER_CONNECTIONS_CONFIGURED = ("weaver_server_connections_configured", Gauge,
         ["server_id", "server"], "Operator-configured maximum connections per server.");
-    SERVER_CONNECTIONS_EFFECTIVE = ("weaver_server_connections_effective", Gauge,
-        ["server_id", "server"],
-        "Runtime maximum connections after provider capacity adaptation.");
     SERVER_CAPACITY_PENALTY_MS = ("weaver_server_capacity_penalty_until_epoch_ms", Gauge,
         ["server_id", "server"],
-        "Provider capacity penalty deadline in unix epoch milliseconds.",
+        "Provider over-limit holdoff deadline in unix epoch milliseconds.",
         deprecated_by = "weaver_server_capacity_penalty_until_seconds");
     SERVER_CAPACITY_PENALTY_SECONDS = ("weaver_server_capacity_penalty_until_seconds", Gauge,
-        ["server_id", "server"], "Provider capacity penalty deadline as a unix timestamp.");
-    SERVER_CAPACITY_REDUCTIONS = ("weaver_server_capacity_reductions_total", Counter,
-        ["server_id", "server"],
-        "Runtime connection-cap reductions caused by provider rejections.");
+        ["server_id", "server"], "Provider over-limit holdoff deadline as a unix timestamp.");
     SERVER_PREMATURE_DEATHS = ("weaver_server_premature_deaths", Gauge, ["server_id", "server"],
         "Recent connections that died before reaching 60s of age.");
     NNTP_RUNTIME_GENERATION = ("weaver_nntp_runtime_generation", Gauge, [],

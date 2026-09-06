@@ -401,6 +401,18 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
 pub struct SystemMetricsSnapshot {
     pub metrics: Metrics,
     pub global_state: GlobalQueueState,
+    /// Servers currently refusing new connections as over their limit.
+    pub provider_holdoffs: Vec<ProviderHoldoff>,
+}
+
+/// A server whose provider rejected a fresh connection; weaver stops opening
+/// new connections to it until the deadline while existing ones keep running.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct ProviderHoldoff {
+    /// `host:port` label.
+    pub label: String,
+    /// Epoch milliseconds after which fresh connects resume.
+    pub until_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
@@ -952,13 +964,11 @@ pub struct ServerHealth {
     pub state: String,
     /// Currently in-use connections (max - available permits).
     pub connections_active: u32,
-    /// Runtime effective maximum connections (legacy field).
+    /// Configured maximum connections (legacy field).
     pub connections_max: u32,
     /// Saved operator-configured maximum connections.
     pub connections_configured: u32,
-    /// Runtime maximum after provider capacity adaptation.
-    pub connections_effective: u32,
-    /// End of the current provider-capacity penalty, if one is active.
+    /// End of the current provider over-limit holdoff, if one is active.
     pub capacity_penalty_until_epoch_ms: Option<u64>,
     /// Active NNTP runtime generation.
     pub runtime_generation: u64,

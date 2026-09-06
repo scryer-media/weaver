@@ -329,7 +329,6 @@ async fn activate_nntp_runtime(
         server_id,
         runtime_generation = activation.generation,
         configured_connections = activation.configured_connections,
-        effective_connections = activation.effective_connections,
         "server change activated in NNTP runtime"
     );
     Ok(())

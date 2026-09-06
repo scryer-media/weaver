@@ -66,8 +66,6 @@ pub use codec::StreamChunk;
 pub use connection::{NntpConnection, PipeliningCapability, ServerConfig};
 pub use error::{NntpError, Result};
 pub use health::{CooldownReason, HealthConfig, HealthTracker, ServerHealth, ServerState};
-pub use pool::{
-    CapacityProbeOutcome, NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig,
-};
+pub use pool::{NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig};
 pub use tls::TlsCipherPreference;
 pub use types::{ArticleId, Capabilities, MultiLineResponse, Response, StatusCode};

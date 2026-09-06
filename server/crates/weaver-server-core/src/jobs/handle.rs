@@ -494,7 +494,6 @@ pub enum CancellationOrigin {
 pub struct NntpRuntimeActivation {
     pub generation: u64,
     pub configured_connections: usize,
-    pub effective_connections: usize,
 }
 
 pub enum SchedulerCommand {

@@ -1227,6 +1227,21 @@ input PostProcessingSettingsInput {
 	unacceptableExtensions: [String!]
 }
 
+"""
+A server whose provider rejected a fresh connection; weaver stops opening
+new connections to it until the deadline while existing ones keep running.
+"""
+type ProviderHoldoff {
+	"""
+	`host:port` label.
+	"""
+	label: String!
+	"""
+	Epoch milliseconds after which fresh connects resume.
+	"""
+	untilEpochMs: Int!
+}
+
 type QueryRoot {
 	"""
 	Admin-facing auth status moved to query semantics.
@@ -2070,7 +2085,7 @@ type ServerHealth {
 	"""
 	connectionsActive: Int!
 	"""
-	Runtime effective maximum connections (legacy field).
+	Configured maximum connections (legacy field).
 	"""
 	connectionsMax: Int!
 	"""
@@ -2078,11 +2093,7 @@ type ServerHealth {
 	"""
 	connectionsConfigured: Int!
 	"""
-	Runtime maximum after provider capacity adaptation.
-	"""
-	connectionsEffective: Int!
-	"""
-	End of the current provider-capacity penalty, if one is active.
+	End of the current provider over-limit holdoff, if one is active.
 	"""
 	capacityPenaltyUntilEpochMs: Int
 	"""
@@ -2317,6 +2328,10 @@ type SystemMemoryInfo {
 type SystemMetricsSnapshot {
 	metrics: Metrics!
 	globalState: GlobalQueueState!
+	"""
+	Servers currently refusing new connections as over their limit.
+	"""
+	providerHoldoffs: [ProviderHoldoff!]!
 }
 
 type SystemStatus {

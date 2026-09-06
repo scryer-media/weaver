@@ -410,13 +410,14 @@ async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_chan
     .expect("job should begin downloading before the generation correction");
 
     wait_until(Duration::from_secs(20), || {
-        old_pool.effective_connection_capacity() == 20
+        old_pool.is_over_limit(weaver_nntp::ServerId(0))
     })
     .await
-    .expect("configured 80/provider 20 should converge to effective 20");
+    .expect("configured 80 against a provider limit of 20 should park fresh connects");
+    // The holdoff never edits the operator's configuration.
     assert_eq!(
-        old_pool.capacity_reductions(weaver_nntp::ServerId(0)),
-        Some(60)
+        old_pool.configured_connections(weaver_nntp::ServerId(0)),
+        Some(80)
     );
     assert!(active_connections.load(Ordering::Acquire) <= 20);
     let progress_before_rebuild = harness.handle.get_job(job_id).unwrap().downloaded_bytes;
@@ -430,7 +431,6 @@ async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_chan
         .unwrap();
     assert_eq!(activation.generation, 1);
     assert_eq!(activation.configured_connections, 20);
-    assert_eq!(activation.effective_connections, 20);
     fast_bodies.store(true, Ordering::Release);
 
     wait_until(Duration::from_secs(15), || {
@@ -441,13 +441,9 @@ async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_chan
     })
     .await
     .expect("the same active job should resume within the generation handoff bound");
-    assert_eq!(replacement_pool.effective_connection_capacity(), 20);
+    assert_eq!(replacement_pool.fill_connection_capacity(), 20);
     assert_eq!(
-        replacement_pool.capacity_reductions(weaver_nntp::ServerId(0)),
-        Some(0)
-    );
-    assert_eq!(
-        replacement_pool.capacity_penalty_until_epoch_ms(weaver_nntp::ServerId(0)),
+        replacement_pool.over_limit_until_epoch_ms(weaver_nntp::ServerId(0)),
         None
     );
 
@@ -478,49 +474,63 @@ async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_chan
 }
 
 #[tokio::test]
-async fn stalled_capacity_probe_does_not_block_rar_scheduler_events() {
+async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_by_server = Arc::clone(&accepted);
     let server = tokio::spawn(async move {
-        let (_socket, _) = listener.accept().await.unwrap();
-        let _ = accepted_tx.send(());
-        std::future::pending::<()>().await;
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            accepted_by_server.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let (_reader, mut writer) = socket.into_split();
+                let _ = writer.write_all(b"502 Too Many Connections\r\n").await;
+            });
+        }
     });
 
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let client = capacity_test_client(port, 2);
-    assert!(
-        !client
-            .pool()
-            .record_provider_capacity_rejection(weaver_nntp::ServerId(0))
+    const CONNECTIONS: usize = 8;
+    let client = capacity_test_client(port, CONNECTIONS);
+    let pool = Arc::clone(client.pool());
+    let harness = TestHarness::new_with_nntp(client, CONNECTIONS).await;
+    let job_id = JobId(80_021);
+    let spec = segmented_job_spec("held off provider", "held-off.bin", &vec![1024_u32; 64]);
+
+    harness
+        .handle
+        .add_job(job_id, spec, PathBuf::from("held-off.nzb"), Vec::new())
+        .await
+        .unwrap();
+
+    wait_until(Duration::from_secs(10), || {
+        pool.is_over_limit(weaver_nntp::ServerId(0))
+    })
+    .await
+    .expect("the provider rejection should park fresh connects");
+
+    // Every dispatch inside the window is answered from the deadline, so the
+    // provider sees no further sockets even though lanes keep asking.
+    let accepted_after_holdoff = accepted.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        accepted_after_holdoff,
+        "a held-off server must not be reconnected inside its window"
     );
-    pipeline.nntp = Arc::new(client);
-    pipeline.drive_capacity_probes_at(tokio::time::Instant::now() + Duration::from_secs(10 * 60));
-    accepted_rx.await.unwrap();
 
-    for kind in [
-        RarCapacityRetryKind::Refresh,
-        RarCapacityRetryKind::Extraction,
-        RarCapacityRetryKind::FullSetExtraction,
-    ] {
-        pipeline
-            .rar_capacity_retry_tx
-            .send(RarCapacityRetry {
-                job_id: JobId(1),
-                set_name: "stalled-probe.rar".to_string(),
-                kind,
-            })
-            .await
-            .unwrap();
-        let received = pipeline.rar_capacity_retry_rx.recv().await.unwrap();
-        assert_eq!(received.kind, kind);
-    }
+    // Work waits for the deadline instead of failing the job.
+    let job = harness.handle.get_job(job_id).unwrap();
+    assert!(!matches!(job.status, JobStatus::Failed { .. }));
+    assert_eq!(
+        pool.configured_connections(weaver_nntp::ServerId(0)),
+        Some(CONNECTIONS)
+    );
 
-    pipeline.nntp.shutdown().await;
+    harness.shutdown().await;
     server.abort();
 }
 

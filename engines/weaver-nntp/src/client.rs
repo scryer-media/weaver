@@ -94,7 +94,10 @@ pub enum BlockingBodyLaneAcquireError {
 
 impl BlockingBodyLaneAcquireError {
     fn from_connect_error(error: NntpError) -> Self {
-        if matches!(error, NntpError::TooManyConnections) {
+        if matches!(
+            error,
+            NntpError::TooManyConnections | NntpError::ServerOverLimit { .. }
+        ) {
             Self::ProviderCapacity(error)
         } else {
             Self::Other(error)
@@ -2173,6 +2176,13 @@ impl NntpClient {
         let mut provider_capacity_error = None;
         let mut other_error = None;
         for server in selection.eligible {
+            // Blocking lanes always open a fresh socket, so a held-off server
+            // can only answer with the holdoff error. Skipping it here keeps
+            // surplus lanes parked instead of re-attempting every dispatch.
+            if let Some(until_epoch_ms) = self.pool.over_limit_until_epoch_ms(server) {
+                provider_capacity_error = Some(NntpError::ServerOverLimit { until_epoch_ms });
+                continue;
+            }
             let permit = match self.pool.try_acquire_blocking_permit(server) {
                 Ok(permit) => permit,
                 Err(_) => {
@@ -2238,6 +2248,10 @@ impl NntpClient {
             .eligible
             .into_iter()
             .any(|server| {
+                // Deliberately blind to the holdoff: an owned lane that is
+                // already connected must keep receiving work while its server
+                // refuses new sockets. A worker with no cached lane finds the
+                // holdoff at acquire time and parks there instead.
                 if self.pool.server_load(server.0).1 == 0 {
                     return false;
                 }
@@ -2381,12 +2395,10 @@ impl NntpClient {
 
     fn record_blocking_connect_failure(&self, server_idx: usize, error: &NntpError) {
         if matches!(error, NntpError::TooManyConnections) {
-            // Provider admission pressure belongs to the adaptive connection
-            // limit, not server health. Cooling the whole server here also
-            // blocks already-established healthy lanes from refilling, which
-            // can strand a job after the limit has converged.
-            self.pool
-                .record_provider_capacity_rejection(ServerId(server_idx));
+            // Provider admission pressure parks new sockets, it does not make
+            // the server unhealthy. Cooling the whole server here would also
+            // block already-established healthy lanes from refilling.
+            self.pool.note_provider_over_limit(ServerId(server_idx));
         } else if matches!(
             error,
             NntpError::AuthenticationFailed
@@ -2420,6 +2432,7 @@ impl NntpClient {
         if !matches!(
             error,
             NntpError::TooManyConnections
+                | NntpError::ServerOverLimit { .. }
                 | NntpError::PoolExhausted
                 | NntpError::PoolShutdown
                 // Local capacity: we never reached the server, so this must
@@ -2545,7 +2558,10 @@ impl NntpClient {
                 &mut fill_groups
             };
             let entry = tier.entry(server_groups[idx]).or_default();
-            let ready = self.pool.server_load(idx).0 > 0;
+            // A held-off server can still hand out idle connections, so it
+            // stays eligible — but it ranks behind servers that can also open
+            // new ones.
+            let ready = self.pool.server_load(idx).0 > 0 && !self.pool.is_over_limit(ServerId(idx));
             match health.server(idx).state() {
                 ServerState::Healthy => {
                     if ready {
@@ -2706,7 +2722,13 @@ impl NntpClient {
                     continue;
                 }
                 Err(e) if is_transient(&e) => {
-                    if matches!(e, NntpError::TooManyConnections) {
+                    if matches!(
+                        e,
+                        NntpError::TooManyConnections | NntpError::ServerOverLimit { .. }
+                    ) {
+                        // The holdoff already reported itself once for this
+                        // window; every later article that lands on the same
+                        // server must stay quiet.
                         trace!(
                             server = idx,
                             message_id, "provider capacity rejected connection"
@@ -3194,6 +3216,7 @@ fn is_transient(err: &NntpError) -> bool {
             | NntpError::MalformedMultilineTerminator
             | NntpError::ServiceUnavailable
             | NntpError::TooManyConnections
+            | NntpError::ServerOverLimit { .. }
             | NntpError::PoolExhausted
             | NntpError::SoftTimeout(_)
             | NntpError::AcquireTimeout(_)
@@ -3215,6 +3238,8 @@ fn cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
         | NntpError::ServiceUnavailable
         | NntpError::SoftTimeout(_) => Some(CooldownReason::Transport),
         NntpError::TooManyConnections => None,
+        // The holdoff already answers this locally; nothing reached the server.
+        NntpError::ServerOverLimit { .. } => None,
         NntpError::PoolExhausted => None,
         // Never obtaining a connection is our own capacity, not the server's
         // health: nothing was sent, so the server said nothing wrong. Cooling
@@ -3795,6 +3820,24 @@ mod tests {
     }
 
     #[test]
+    fn blocking_body_lane_candidate_survives_the_over_limit_holdoff() {
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_blocking_s2n_server(1, 2)],
+            max_idle_age: Duration::from_secs(30),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
+        });
+
+        client.pool().note_provider_over_limit(ServerId(0));
+
+        assert!(client.pool().is_over_limit(ServerId(0)));
+        assert!(
+            client.has_blocking_body_lane_candidate(&[]),
+            "a held-off server must keep feeding the owned lanes it already opened"
+        );
+    }
+
+    #[test]
     fn blocking_body_lane_candidate_keeps_backfill_locked_until_fill_excluded() {
         // The fill server is not s2n-capable; the only s2n candidate is a
         // backfill server, which must stay unreachable for ordinary work.
@@ -4151,17 +4194,13 @@ mod tests {
         assert_eq!(health.server(0).failure_count, 0);
         assert_eq!(health.server(0).consecutive_failures, 0);
         drop(health);
-        let reductions = client.pool().capacity_reductions(ServerId(0)).unwrap();
-        assert!(reductions >= 5);
-        assert_eq!(
-            client.pool().effective_connections(ServerId(0)),
-            Some(64 - reductions as usize)
-        );
+        assert_eq!(client.pool().configured_connections(ServerId(0)), Some(64));
+        assert!(client.pool().is_over_limit(ServerId(0)));
         server.abort();
     }
 
     #[tokio::test]
-    async fn blocking_tls_capacity_rejection_reduces_once_without_health_poisoning() {
+    async fn blocking_tls_capacity_rejection_parks_connects_without_health_poisoning() {
         let client = NntpClient::new(NntpClientConfig {
             servers: vec![scripted_blocking_s2n_server(563, 8)],
             max_idle_age: Duration::from_secs(30),
@@ -4171,15 +4210,15 @@ mod tests {
 
         client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
 
-        assert_eq!(client.pool().effective_connections(ServerId(0)), Some(7));
-        assert_eq!(client.pool().capacity_reductions(ServerId(0)), Some(1));
+        assert_eq!(client.pool().configured_connections(ServerId(0)), Some(8));
+        assert!(client.pool().is_over_limit(ServerId(0)));
         let health = client.pool().health().lock().await;
         assert_eq!(health.server(0).failure_count, 0);
         assert_eq!(health.server(0).consecutive_failures, 0);
     }
 
     #[tokio::test]
-    async fn blocking_capacity_floor_never_cools_healthy_server() {
+    async fn blocking_capacity_holdoff_never_cools_healthy_server() {
         let client = NntpClient::new(NntpClientConfig {
             servers: vec![scripted_blocking_s2n_server(563, 2)],
             max_idle_age: Duration::from_secs(30),
@@ -4190,7 +4229,8 @@ mod tests {
         client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
         client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
 
-        assert_eq!(client.pool().effective_connections(ServerId(0)), Some(1));
+        assert_eq!(client.pool().configured_connections(ServerId(0)), Some(2));
+        assert!(client.pool().is_over_limit(ServerId(0)));
         let mut health = client.pool().health().lock().await;
         assert_eq!(health.server(0).state(), &ServerState::Healthy);
         assert!(health.is_available(0));

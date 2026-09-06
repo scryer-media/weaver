@@ -2,7 +2,6 @@ use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -63,8 +62,9 @@ pub struct NntpPool {
     retention_days: Vec<u32>,
     /// Maximum connections per server (parallel to pools/configs).
     max_connections: Vec<usize>,
-    /// Runtime connection limits learned from provider capacity responses.
-    adaptive_connections: Vec<AdaptiveConnectionLimit>,
+    /// Per-server deadline (unix epoch ms, `0` = none) before which fresh
+    /// connects are skipped because the provider refused the last one.
+    over_limit_until: Vec<AtomicU64>,
     retired_ips: Arc<Mutex<HashSet<(usize, IpAddr)>>>,
     connect_cursors: Vec<AtomicUsize>,
 }
@@ -73,216 +73,10 @@ pub struct BlockingConnectionPermit {
     _permit: OwnedSemaphorePermit,
 }
 
-const CAPACITY_PENALTY: Duration = Duration::from_secs(10 * 60);
-const CAPACITY_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapacityProbeOutcome {
-    Succeeded,
-    Rejected,
-    TransportFailure,
-    AuthenticationFailure,
-    NoConfiguredPermit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CapacityChange {
-    pub server: ServerId,
-    pub configured_connections: usize,
-    pub effective_connections: usize,
-    pub effective_delta: isize,
-    pub coalesced_rejections: u64,
-    pub probe_outcome: Option<CapacityProbeOutcome>,
-    pub next_probe_at_epoch_ms: Option<u64>,
-}
-
-#[derive(Debug)]
-struct CapacityRecoveryState {
-    next_probe_at: Option<TokioInstant>,
-    next_probe_at_epoch_ms: Option<u64>,
-    activation_grace_until: Option<TokioInstant>,
-    probe_in_flight: bool,
-    changed: bool,
-    pending_rejections: u64,
-    last_reported_effective: usize,
-    latest_probe_outcome: Option<CapacityProbeOutcome>,
-}
-
-#[derive(Debug)]
-struct AdaptiveConnectionLimit {
-    configured: usize,
-    auth_retry_after: Duration,
-    effective: AtomicUsize,
-    reductions: AtomicU64,
-    recovery: StdMutex<CapacityRecoveryState>,
-}
-
-impl AdaptiveConnectionLimit {
-    fn new(configured: usize, auth_retry_after: Duration) -> Self {
-        Self {
-            configured,
-            auth_retry_after,
-            effective: AtomicUsize::new(configured),
-            reductions: AtomicU64::new(0),
-            recovery: StdMutex::new(CapacityRecoveryState {
-                next_probe_at: None,
-                next_probe_at_epoch_ms: None,
-                activation_grace_until: None,
-                probe_in_flight: false,
-                changed: false,
-                pending_rejections: 0,
-                last_reported_effective: configured,
-                latest_probe_outcome: None,
-            }),
-        }
-    }
-
-    fn effective(&self) -> usize {
-        self.effective.load(Ordering::Acquire)
-    }
-
-    fn admits_normal(&self, active_after_acquire: usize) -> bool {
-        active_after_acquire <= self.effective()
-    }
-
-    fn set_next_probe(recovery: &mut CapacityRecoveryState, delay: Option<Duration>) {
-        recovery.next_probe_at = delay.map(|delay| TokioInstant::now() + delay);
-        recovery.next_probe_at_epoch_ms = delay.map(|delay| {
-            unix_epoch_ms().saturating_add(delay.as_millis().try_into().unwrap_or(u64::MAX))
-        });
-    }
-
-    fn claim_due_probe(&self, now: TokioInstant) -> bool {
-        let mut recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if self.effective() >= self.configured
-            || recovery.probe_in_flight
-            || recovery.next_probe_at.is_none_or(|deadline| now < deadline)
-        {
-            return false;
-        }
-        recovery.probe_in_flight = true;
-        true
-    }
-
-    fn begin_activation_grace(&self, duration: Duration) {
-        let mut recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        recovery.activation_grace_until = Some(TokioInstant::now() + duration);
-    }
-
-    fn record_rejection(&self) -> bool {
-        let mut recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if recovery
-            .activation_grace_until
-            .is_some_and(|until| TokioInstant::now() < until)
-        {
-            recovery.changed = true;
-            recovery.pending_rejections = recovery.pending_rejections.saturating_add(1);
-            recovery.latest_probe_outcome = None;
-            return true;
-        }
-        recovery.activation_grace_until = None;
-
-        let previous = self
-            .effective
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(1).max(1))
-            })
-            .unwrap_or_else(|current| current);
-        let effective = previous.saturating_sub(1).max(1);
-        if effective < previous {
-            self.reductions.fetch_add(1, Ordering::Relaxed);
-        }
-        recovery.probe_in_flight = false;
-        Self::set_next_probe(&mut recovery, Some(CAPACITY_PENALTY));
-        recovery.changed = true;
-        recovery.pending_rejections = recovery.pending_rejections.saturating_add(1);
-        recovery.latest_probe_outcome = None;
-        previous == 1
-    }
-
-    fn finish_probe(&self, outcome: CapacityProbeOutcome) {
-        let mut recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if !recovery.probe_in_flight {
-            return;
-        }
-        recovery.probe_in_flight = false;
-        recovery.changed = true;
-        recovery.latest_probe_outcome = Some(outcome);
-        match outcome {
-            CapacityProbeOutcome::Succeeded => {
-                let previous = self
-                    .effective
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                        (current < self.configured).then_some(current + 1)
-                    })
-                    .unwrap_or_else(|current| current);
-                let effective = previous.saturating_add(1).min(self.configured);
-                Self::set_next_probe(
-                    &mut recovery,
-                    (effective < self.configured).then_some(CAPACITY_RECOVERY_INTERVAL),
-                );
-            }
-            CapacityProbeOutcome::Rejected => {
-                recovery.pending_rejections = recovery.pending_rejections.saturating_add(1);
-                Self::set_next_probe(&mut recovery, Some(CAPACITY_PENALTY));
-            }
-            CapacityProbeOutcome::AuthenticationFailure => {
-                Self::set_next_probe(&mut recovery, Some(self.auth_retry_after));
-            }
-            CapacityProbeOutcome::TransportFailure | CapacityProbeOutcome::NoConfiguredPermit => {
-                Self::set_next_probe(&mut recovery, Some(CAPACITY_RECOVERY_INTERVAL));
-            }
-        }
-    }
-
-    fn take_change(&self, server: ServerId) -> Option<CapacityChange> {
-        let mut recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if !recovery.changed {
-            return None;
-        }
-        recovery.changed = false;
-        let effective = self.effective();
-        let effective_delta = effective as isize - recovery.last_reported_effective as isize;
-        recovery.last_reported_effective = effective;
-        let coalesced_rejections = std::mem::take(&mut recovery.pending_rejections);
-        Some(CapacityChange {
-            server,
-            configured_connections: self.configured,
-            effective_connections: effective,
-            effective_delta,
-            coalesced_rejections,
-            probe_outcome: recovery.latest_probe_outcome,
-            next_probe_at_epoch_ms: recovery.next_probe_at_epoch_ms,
-        })
-    }
-
-    fn penalty_until_epoch_ms(&self) -> Option<u64> {
-        self.recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .next_probe_at_epoch_ms
-            .filter(|deadline| *deadline > unix_epoch_ms())
-    }
-
-    fn reductions(&self) -> u64 {
-        self.reductions.load(Ordering::Relaxed)
-    }
-}
+/// How long fresh connects to a server pause after the provider answered a
+/// connect with "too many connections". Existing sessions keep running; only
+/// new sockets wait, which is what the provider is actually asking for.
+pub const OVER_LIMIT_HOLDOFF: Duration = Duration::from_secs(10 * 60);
 
 fn unix_epoch_ms() -> u64 {
     SystemTime::now()
@@ -362,7 +156,7 @@ impl NntpPool {
         let mut backfill = Vec::with_capacity(server_count);
         let mut retention_days = Vec::with_capacity(server_count);
         let mut max_connections = Vec::with_capacity(server_count);
-        let mut adaptive_connections = Vec::with_capacity(server_count);
+        let mut over_limit_until = Vec::with_capacity(server_count);
         let mut connect_cursors = Vec::with_capacity(server_count);
 
         // A config where every server is backfill has no fill tier to
@@ -386,10 +180,7 @@ impl NntpPool {
             backfill.push(spc.backfill && !all_backfill);
             retention_days.push(spc.retention_days);
             max_connections.push(spc.max_connections);
-            adaptive_connections.push(AdaptiveConnectionLimit::new(
-                spc.max_connections,
-                config.health_config.auth_disable_duration,
-            ));
+            over_limit_until.push(AtomicU64::new(0));
             connect_cursors.push(AtomicUsize::new(0));
             semaphores.push(Arc::new(Semaphore::new(spc.max_connections)));
             configs.push(spc.server.clone());
@@ -424,7 +215,7 @@ impl NntpPool {
             backfill,
             retention_days,
             max_connections,
-            adaptive_connections,
+            over_limit_until,
             retired_ips: Arc::new(Mutex::new(HashSet::new())),
             connect_cursors,
         }
@@ -449,6 +240,7 @@ impl NntpPool {
         excluded_ips: &[IpAddr],
         initial_group: Option<&str>,
     ) -> Result<NntpConnection> {
+        self.check_over_limit(idx)?;
         match self
             .connect_server_excluding_untracked(idx, excluded_ips, initial_group)
             .await
@@ -456,10 +248,10 @@ impl NntpPool {
             Ok(connection) => Ok(connection),
             Err(error) => {
                 if matches!(error, NntpError::TooManyConnections) {
-                    // Keep provider capacity learning independent from health:
-                    // existing authenticated lanes remain usable while the
-                    // adaptive admission ceiling converges.
-                    self.record_provider_capacity_rejection(ServerId(idx));
+                    // The provider is refusing new sockets, not answering for
+                    // the sessions we already hold, so this must stay out of
+                    // health entirely.
+                    self.note_provider_over_limit(ServerId(idx));
                 }
                 Err(error)
             }
@@ -516,12 +308,6 @@ impl NntpPool {
             .await
             .map_err(|_| NntpError::PoolShutdown)?;
 
-        let active_after_acquire =
-            self.max_connections[idx].saturating_sub(self.semaphores[idx].available_permits());
-        if !self.adaptive_connections[idx].admits_normal(active_after_acquire) {
-            return Err(NntpError::PoolExhausted);
-        }
-
         self.acquire_with_permit(idx, Some(permit), initial_group)
             .await
     }
@@ -564,10 +350,6 @@ impl NntpPool {
         if idx >= self.pools.len() {
             return Err(NntpError::PoolExhausted);
         }
-        if self.adaptive_connections[idx].effective() < self.max_connections[idx] {
-            return Err(NntpError::PoolExhausted);
-        }
-
         self.acquire_fresh_with_permit(idx, None, excluded_ips, initial_group)
             .await
     }
@@ -714,116 +496,6 @@ impl NntpPool {
         })
     }
 
-    /// Acquire a connection from any server that has capacity.
-    ///
-    /// Lower-numbered priority groups are exhausted before higher-numbered
-    /// backfill groups are considered. Within a group, healthy servers are
-    /// preferred over degraded ones, and immediately available servers are
-    /// preferred over saturated ones.
-    pub async fn acquire_any(&self) -> Result<PooledConnection> {
-        if self.shutdown.is_cancelled() {
-            return Err(NntpError::PoolShutdown);
-        }
-
-        let ordered = self.acquire_any_order().await;
-
-        // Try non-blocking acquire on each server in group+health order.
-        for idx in &ordered {
-            match self.semaphores[*idx].clone().try_acquire_owned() {
-                Ok(permit) => {
-                    let active_after_acquire = self.max_connections[*idx]
-                        .saturating_sub(self.semaphores[*idx].available_permits());
-                    if !self.adaptive_connections[*idx].admits_normal(active_after_acquire) {
-                        continue;
-                    }
-                    match self.acquire_with_permit(*idx, Some(permit), None).await {
-                        Ok(conn) => return Ok(conn),
-                        Err(e) => {
-                            if matches!(e, NntpError::TooManyConnections) {
-                                trace!(server = idx, "provider capacity rejected connection");
-                            } else {
-                                warn!(server = idx, error = %e, "failed to acquire from server, trying next");
-                            }
-                            continue;
-                        }
-                    }
-                }
-                Err(_) => continue, // No permits available, try next server.
-            }
-        }
-
-        // All available servers at capacity or no available servers;
-        // fall back to blocking on the first available, or the first fill
-        // server if all are disabled — generic callers must never be handed
-        // a backfill connection.
-        if let Some(&first) = ordered.first() {
-            self.acquire(ServerId(first)).await
-        } else {
-            let fallback = self
-                .backfill
-                .iter()
-                .position(|backfill| !*backfill)
-                .unwrap_or(0);
-            self.acquire(ServerId(fallback)).await
-        }
-    }
-
-    async fn acquire_any_order(&self) -> Vec<usize> {
-        #[derive(Default)]
-        struct GroupCandidates {
-            ready_healthy: Vec<usize>,
-            ready_degraded: Vec<usize>,
-            waiting_healthy: Vec<usize>,
-            waiting_degraded: Vec<usize>,
-        }
-
-        let mut health = self.health.lock().await;
-        health.check_reenable_all();
-
-        let mut groups: std::collections::BTreeMap<u32, GroupCandidates> =
-            std::collections::BTreeMap::new();
-        for idx in 0..self.server_count() {
-            if !health.is_available(idx) {
-                continue;
-            }
-            // acquire_any serves ordinary callers with no failure history;
-            // backfill servers are only reachable through the per-request
-            // exclusion ladder (build_server_order).
-            if self.backfill[idx] {
-                continue;
-            }
-            let entry = groups.entry(self.groups[idx]).or_default();
-            let ready = self.semaphores[idx].available_permits() > 0;
-            match health.server(idx).state() {
-                crate::health::ServerState::Healthy => {
-                    if ready {
-                        entry.ready_healthy.push(idx);
-                    } else {
-                        entry.waiting_healthy.push(idx);
-                    }
-                }
-                crate::health::ServerState::Degraded { .. } => {
-                    if ready {
-                        entry.ready_degraded.push(idx);
-                    } else {
-                        entry.waiting_degraded.push(idx);
-                    }
-                }
-                crate::health::ServerState::CoolingDown { .. }
-                | crate::health::ServerState::Disabled { .. } => {}
-            }
-        }
-
-        let mut ordered = Vec::with_capacity(self.server_count());
-        for (_group, candidates) in groups {
-            ordered.extend(candidates.ready_healthy);
-            ordered.extend(candidates.ready_degraded);
-            ordered.extend(candidates.waiting_healthy);
-            ordered.extend(candidates.waiting_degraded);
-        }
-        ordered
-    }
-
     /// Drain all idle connections across all servers.
     ///
     /// Called when a network change is suspected (e.g. I/O errors after an
@@ -934,43 +606,86 @@ impl NntpPool {
         self.backfill.iter().any(|backfill| *backfill)
     }
 
-    /// Total effective connections across fill (non-backfill) servers.
+    /// Total configured connections across fill (non-backfill) servers.
     pub fn fill_connection_capacity(&self) -> usize {
         self.backfill
             .iter()
-            .zip(&self.adaptive_connections)
+            .zip(&self.max_connections)
             .filter(|(backfill, _)| !**backfill)
-            .map(|(_, limit)| limit.effective())
+            .map(|(_, configured)| *configured)
             .sum()
-    }
-
-    pub fn effective_connection_capacity(&self) -> usize {
-        self.adaptive_connections
-            .iter()
-            .map(AdaptiveConnectionLimit::effective)
-            .sum()
-    }
-
-    pub fn effective_connections(&self, server: ServerId) -> Option<usize> {
-        self.adaptive_connections
-            .get(server.0)
-            .map(AdaptiveConnectionLimit::effective)
     }
 
     pub fn configured_connections(&self, server: ServerId) -> Option<usize> {
         self.max_connections.get(server.0).copied()
     }
 
-    pub fn capacity_reductions(&self, server: ServerId) -> Option<u64> {
-        self.adaptive_connections
-            .get(server.0)
-            .map(AdaptiveConnectionLimit::reductions)
+    /// Deadline of this server's active over-limit holdoff, if one is running.
+    pub fn over_limit_until_epoch_ms(&self, server: ServerId) -> Option<u64> {
+        let deadline = self.over_limit_until.get(server.0)?.load(Ordering::Acquire);
+        // Zero is the steady state; skip the clock read on the dispatch path
+        // unless a holdoff was ever armed.
+        if deadline == 0 {
+            return None;
+        }
+        (deadline > unix_epoch_ms()).then_some(deadline)
     }
 
-    pub fn capacity_penalty_until_epoch_ms(&self, server: ServerId) -> Option<u64> {
-        self.adaptive_connections
-            .get(server.0)
-            .and_then(AdaptiveConnectionLimit::penalty_until_epoch_ms)
+    /// Whether fresh connects to this server are currently held off. One
+    /// atomic load, so callers on the dispatch path can ask freely.
+    pub fn is_over_limit(&self, server: ServerId) -> bool {
+        self.over_limit_until_epoch_ms(server).is_some()
+    }
+
+    fn check_over_limit(&self, idx: usize) -> Result<()> {
+        match self.over_limit_until_epoch_ms(ServerId(idx)) {
+            Some(until_epoch_ms) => Err(NntpError::ServerOverLimit { until_epoch_ms }),
+            None => Ok(()),
+        }
+    }
+
+    /// Park fresh connects to `server` after the provider refused one.
+    ///
+    /// A client restart can collect one rejection per configured connection in
+    /// a couple of seconds while the provider still holds the previous
+    /// process's sessions open, so only the first rejection of a window arms
+    /// and reports it; the rest are silent until the deadline passes.
+    pub fn note_provider_over_limit(&self, server: ServerId) {
+        let idx = server.0;
+        let Some(slot) = self.over_limit_until.get(idx) else {
+            return;
+        };
+        let now = unix_epoch_ms();
+        let deadline = now.saturating_add(
+            OVER_LIMIT_HOLDOFF
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        );
+        if slot
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current <= now).then_some(deadline)
+            })
+            .is_err()
+        {
+            trace!(server = idx, "provider refused a connection while held off");
+            return;
+        }
+        let address = self
+            .configs
+            .get(idx)
+            .map(|config| format!("{}:{}", config.host, config.port))
+            .unwrap_or_default();
+        warn!(
+            server = idx,
+            server_address = %address,
+            configured_connections = self.max_connections.get(idx).copied().unwrap_or(0),
+            holdoff_secs = OVER_LIMIT_HOLDOFF.as_secs(),
+            retry_at_epoch_ms = deadline,
+            "provider refused a new connection as over its limit; existing \
+             connections keep running and new ones resume after the holdoff — \
+             lower this server's configured connection count if this repeats"
+        );
     }
 
     /// Inspect BODY eligibility without allocating or ranking server candidates.
@@ -1104,98 +819,7 @@ impl NntpPool {
             .clone()
             .try_acquire_owned()
             .map_err(|_| NntpError::PoolExhausted)?;
-        let active_after_acquire =
-            self.max_connections[idx].saturating_sub(self.semaphores[idx].available_permits());
-        if !self.adaptive_connections[idx].admits_normal(active_after_acquire) {
-            return Err(NntpError::PoolExhausted);
-        }
         Ok(BlockingConnectionPermit { _permit: permit })
-    }
-
-    /// Ignore lasting capacity learning while old-generation provider slots drain.
-    pub fn begin_activation_overlap_grace(&self, duration: Duration) {
-        for limit in &self.adaptive_connections {
-            limit.begin_activation_grace(duration);
-        }
-    }
-
-    pub fn record_provider_capacity_rejection(&self, server: ServerId) -> bool {
-        let Some(limit) = self.adaptive_connections.get(server.0) else {
-            return true;
-        };
-        limit.record_rejection()
-    }
-
-    /// Claim every capacity probe that is due now. Each server can have at
-    /// most one claimed probe until [`run_capacity_probe`](Self::run_capacity_probe)
-    /// records its result.
-    pub fn claim_due_capacity_probes(&self, now: TokioInstant) -> Vec<ServerId> {
-        self.adaptive_connections
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, limit)| limit.claim_due_probe(now).then_some(ServerId(idx)))
-            .collect()
-    }
-
-    /// Open one fresh authenticated provider connection outside the effective
-    /// admission gate. A successful probe is parked in the idle pool for the
-    /// next normal BODY lease; failed probes never reduce known-good capacity.
-    pub async fn run_capacity_probe(&self, server: ServerId) -> CapacityProbeOutcome {
-        let idx = server.0;
-        let Some(limit) = self.adaptive_connections.get(idx) else {
-            return CapacityProbeOutcome::TransportFailure;
-        };
-        if self.shutdown.is_cancelled() {
-            limit.finish_probe(CapacityProbeOutcome::TransportFailure);
-            return CapacityProbeOutcome::TransportFailure;
-        }
-        let Some(semaphore) = self.semaphores.get(idx) else {
-            limit.finish_probe(CapacityProbeOutcome::TransportFailure);
-            return CapacityProbeOutcome::TransportFailure;
-        };
-
-        let permit = match semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                limit.finish_probe(CapacityProbeOutcome::NoConfiguredPermit);
-                return CapacityProbeOutcome::NoConfiguredPermit;
-            }
-        };
-
-        let connect_result = tokio::select! {
-            _ = self.shutdown.cancelled() => Err(NntpError::PoolShutdown),
-            result = self.connect_server_excluding_untracked(idx, &[], None) => result,
-        };
-        let outcome = match connect_result {
-            Ok(connection) if !self.shutdown.is_cancelled() => {
-                self.pools[idx].lock().await.idle.push_back(connection);
-                CapacityProbeOutcome::Succeeded
-            }
-            Ok(_) => CapacityProbeOutcome::TransportFailure,
-            Err(NntpError::TooManyConnections) => CapacityProbeOutcome::Rejected,
-            Err(
-                NntpError::AuthenticationFailed
-                | NntpError::AuthenticationRejected
-                | NntpError::AuthenticationRequired
-                | NntpError::AccessDenied,
-            ) => {
-                self.health.lock().await.record_failure(idx, true);
-                CapacityProbeOutcome::AuthenticationFailure
-            }
-            Err(_) => CapacityProbeOutcome::TransportFailure,
-        };
-        drop(permit);
-        limit.finish_probe(outcome);
-        outcome
-    }
-
-    /// Drain coalesced adaptive-capacity state changes for structured logging.
-    pub fn take_capacity_changes(&self) -> Vec<CapacityChange> {
-        self.adaptive_connections
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, limit)| limit.take_change(ServerId(idx)))
-            .collect()
     }
 
     pub fn blocking_connect_plan(
@@ -1222,18 +846,18 @@ impl NntpPool {
         Ok((self.configs[idx].clone(), exclusions, offset))
     }
 
-    /// Returns `(available_permits, effective_connections)` for the given server.
+    /// Returns `(available_permits, configured_connections)` for the given server.
     ///
     /// This is lock-free — it reads semaphore permits and the pre-stored
     /// max_connections value, so it can be called from synchronous contexts.
     pub fn server_load(&self, idx: usize) -> (usize, usize) {
-        let effective = self.adaptive_connections[idx].effective();
-        let active = self.active_connections(idx);
-        (effective.saturating_sub(active.min(effective)), effective)
+        (
+            self.semaphores[idx].available_permits(),
+            self.max_connections[idx],
+        )
     }
 
-    /// Actual leased connections, which may temporarily exceed the learned
-    /// effective cap while excess lanes from an earlier limit drain.
+    /// Currently leased connections for the given server.
     pub fn active_connections(&self, idx: usize) -> usize {
         self.max_connections[idx].saturating_sub(self.semaphores[idx].available_permits())
     }
@@ -1441,7 +1065,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquire_any_order_skips_backfill_servers() {
+    async fn fill_servers_exhausted_ignores_backfill_servers() {
         let config = PoolConfig {
             servers: vec![
                 ServerPoolConfig {
@@ -1467,11 +1091,6 @@ mod tests {
             ..PoolConfig::default()
         };
         let pool = NntpPool::new(config);
-        assert_eq!(
-            pool.acquire_any_order().await,
-            vec![0],
-            "ordinary callers must never be handed a backfill connection"
-        );
         assert!(pool.fill_servers_exhausted(&[0]));
         assert!(!pool.fill_servers_exhausted(&[]));
     }
@@ -1632,74 +1251,6 @@ mod tests {
         assert_eq!(ordered, vec![0]);
     }
 
-    #[tokio::test]
-    async fn acquire_any_order_keeps_backfill_after_primary_group() {
-        let config = PoolConfig {
-            servers: vec![
-                ServerPoolConfig {
-                    server: ServerConfig {
-                        host: "waiting-primary.example.com".into(),
-                        ..Default::default()
-                    },
-                    max_connections: 0,
-                    group: 0,
-                    ..ServerPoolConfig::default()
-                },
-                ServerPoolConfig {
-                    server: ServerConfig {
-                        host: "ready-backfill.example.com".into(),
-                        ..Default::default()
-                    },
-                    max_connections: 1,
-                    group: 1,
-                    ..ServerPoolConfig::default()
-                },
-            ],
-            max_idle_age: Duration::from_mins(5),
-            health_config: HealthConfig::default(),
-            reconnect_delay: Duration::from_secs(1),
-            stale_check_age: Duration::from_secs(30),
-        };
-        let pool = NntpPool::new(config);
-
-        let ordered = pool.acquire_any_order().await;
-        assert_eq!(ordered, vec![0, 1]);
-    }
-
-    #[tokio::test]
-    async fn acquire_any_order_prefers_ready_servers_within_primary_group() {
-        let config = PoolConfig {
-            servers: vec![
-                ServerPoolConfig {
-                    server: ServerConfig {
-                        host: "waiting-primary.example.com".into(),
-                        ..Default::default()
-                    },
-                    max_connections: 0,
-                    group: 0,
-                    ..ServerPoolConfig::default()
-                },
-                ServerPoolConfig {
-                    server: ServerConfig {
-                        host: "ready-primary.example.com".into(),
-                        ..Default::default()
-                    },
-                    max_connections: 1,
-                    group: 0,
-                    ..ServerPoolConfig::default()
-                },
-            ],
-            max_idle_age: Duration::from_mins(5),
-            health_config: HealthConfig::default(),
-            reconnect_delay: Duration::from_secs(1),
-            stale_check_age: Duration::from_secs(30),
-        };
-        let pool = NntpPool::new(config);
-
-        let ordered = pool.acquire_any_order().await;
-        assert_eq!(ordered, vec![1, 0]);
-    }
-
     #[test]
     fn server_load_initial() {
         let pool = NntpPool::new(test_pool_config(10));
@@ -1749,7 +1300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_connection_cap_converges_without_stopping_accepted_lanes() {
+    async fn provider_rejection_parks_fresh_connects_for_that_server_only() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
 
@@ -1798,6 +1349,15 @@ mod tests {
         config.servers[0].server.host = "127.0.0.1".into();
         config.servers[0].server.port = port;
         config.servers[0].server.tls = false;
+        config.servers.push(ServerPoolConfig {
+            server: ServerConfig {
+                host: "backup.example.com".into(),
+                ..Default::default()
+            },
+            max_connections: 4,
+            group: 0,
+            ..ServerPoolConfig::default()
+        });
         let pool = NntpPool::new(config);
         let attempts = tokio::join!(
             pool.acquire(ServerId(0)),
@@ -1817,58 +1377,47 @@ mod tests {
         .filter_map(Result::ok)
         .collect();
         assert_eq!(accepted_lanes.len(), 2);
+        // The provider refused connections, not the configuration.
         assert_eq!(pool.configured_connections(ServerId(0)), Some(8));
-        assert_eq!(pool.effective_connections(ServerId(0)), Some(2));
-        assert_eq!(pool.capacity_reductions(ServerId(0)), Some(6));
+        assert_eq!(pool.server_load(0), (6, 8));
+        assert!(pool.is_over_limit(ServerId(0)));
 
-        for lane in &mut accepted_lanes {
-            let body = lane.body_by_id_raw("<test>").await.unwrap();
-            assert_eq!(body.data.as_ref(), b"payload\r\n");
-        }
-
-        assert_eq!(
-            pool.claim_due_capacity_probes(TokioInstant::now() + CAPACITY_PENALTY),
-            vec![ServerId(0)]
-        );
-        assert_eq!(
-            pool.run_capacity_probe(ServerId(0)).await,
-            CapacityProbeOutcome::Rejected
-        );
-        assert_eq!(pool.effective_connections(ServerId(0)), Some(2));
-
-        for lane in &mut accepted_lanes {
-            let body = lane.body_by_id_raw("<test>").await.unwrap();
-            assert_eq!(body.data.as_ref(), b"payload\r\n");
-        }
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn adaptive_capacity_is_scoped_to_the_rejecting_server() {
-        let mut config = test_pool_config(8);
-        config.servers.push(ServerPoolConfig {
-            server: ServerConfig {
-                host: "backup.example.com".into(),
-                ..Default::default()
-            },
-            max_connections: 4,
-            group: 0,
-            ..ServerPoolConfig::default()
-        });
-        let pool = NntpPool::new(config);
-
-        for _ in 0..6 {
-            pool.adaptive_connections[0].record_rejection();
-        }
-
-        assert_eq!(pool.effective_connections(ServerId(0)), Some(2));
-        assert_eq!(pool.effective_connections(ServerId(1)), Some(4));
-        assert_eq!(pool.server_load(0), (2, 2));
-        assert_eq!(pool.server_load(1), (4, 4));
+        let accepted_after_rejection = accepted.load(Ordering::SeqCst);
         assert!(matches!(
-            pool.health().lock().await.server(1).state(),
-            crate::health::ServerState::Healthy
+            pool.acquire(ServerId(0)).await,
+            Err(NntpError::ServerOverLimit { .. })
         ));
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            accepted_after_rejection,
+            "a held-off server must not open another socket"
+        );
+
+        // Established lanes are untouched by the holdoff.
+        for lane in &mut accepted_lanes {
+            let body = lane.body_by_id_raw("<test>").await.unwrap();
+            assert_eq!(body.data.as_ref(), b"payload\r\n");
+        }
+
+        // Returning a lane leaves an idle connection, and idle leases never
+        // consult the holdoff.
+        drop(accepted_lanes.pop());
+        for _ in 0..1000 {
+            if !pool.pools[0].lock().await.idle.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let mut reused = pool.acquire(ServerId(0)).await.unwrap();
+        let body = reused.body_by_id_raw("<test>").await.unwrap();
+        assert_eq!(body.data.as_ref(), b"payload\r\n");
+        assert_eq!(accepted.load(Ordering::SeqCst), accepted_after_rejection);
+
+        // A peer server that never rejected anything is unaffected.
+        assert!(!pool.is_over_limit(ServerId(1)));
+        assert_eq!(pool.server_load(1), (4, 4));
+
+        server.abort();
     }
 
     #[tokio::test]
@@ -2049,130 +1598,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn over_limit_holdoff_expires_and_fresh_connects_resume() {
+        let pool = NntpPool::new(test_pool_config(4));
+        pool.note_provider_over_limit(ServerId(0));
+        assert!(pool.is_over_limit(ServerId(0)));
+
+        // Rewind the deadline instead of sleeping ten minutes; the holdoff is
+        // a wall-clock comparison, so this is the same state the pool reaches
+        // on its own when the window ends.
+        pool.over_limit_until[0].store(unix_epoch_ms() - 1, Ordering::Release);
+
+        assert!(!pool.is_over_limit(ServerId(0)));
+        assert_eq!(pool.over_limit_until_epoch_ms(ServerId(0)), None);
+        // Connects are attempted again: the unreachable test host now fails on
+        // the socket rather than on the holdoff.
+        assert!(!matches!(
+            pool.acquire(ServerId(0)).await,
+            Err(NntpError::ServerOverLimit { .. })
+        ));
+    }
+
     #[test]
-    fn capacity_floor_keeps_last_lane_until_provider_rejects_it() {
-        let pool = NntpPool::new(test_pool_config(2));
+    fn repeated_rejections_never_reduce_the_configured_connection_count() {
+        let pool = NntpPool::new(test_pool_config(8));
 
-        assert!(!pool.record_provider_capacity_rejection(ServerId(0)));
-        assert_eq!(pool.effective_connections(ServerId(0)), Some(1));
-        assert!(pool.record_provider_capacity_rejection(ServerId(0)));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn adaptive_capacity_reduces_immediately_and_recovers_additively() {
-        let limit = AdaptiveConnectionLimit::new(8, Duration::from_mins(5));
-
-        for expected in (2..=7).rev() {
-            assert!(!limit.record_rejection());
-            assert_eq!(limit.effective(), expected);
-        }
-        assert_eq!(limit.effective(), 2);
-        assert!(limit.admits_normal(2));
-        assert!(!limit.admits_normal(3));
-        let reduction = limit.take_change(ServerId(0)).unwrap();
-        assert_eq!(reduction.effective_delta, -6);
-        assert_eq!(reduction.coalesced_rejections, 6);
-        assert_eq!(reduction.probe_outcome, None);
-        assert!(limit.take_change(ServerId(0)).is_none());
-
-        tokio::time::advance(CAPACITY_PENALTY - Duration::from_secs(1)).await;
-        assert!(!limit.claim_due_probe(TokioInstant::now()));
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(limit.claim_due_probe(TokioInstant::now()));
-        assert!(!limit.claim_due_probe(TokioInstant::now()));
-        limit.finish_probe(CapacityProbeOutcome::Rejected);
-        assert_eq!(limit.effective(), 2);
-        let rejection = limit.take_change(ServerId(0)).unwrap();
-        assert_eq!(rejection.effective_delta, 0);
-        assert_eq!(rejection.coalesced_rejections, 1);
-        assert_eq!(
-            rejection.probe_outcome,
-            Some(CapacityProbeOutcome::Rejected)
-        );
-
-        tokio::time::advance(CAPACITY_PENALTY).await;
-        assert!(limit.claim_due_probe(TokioInstant::now()));
-        limit.finish_probe(CapacityProbeOutcome::TransportFailure);
-        assert_eq!(limit.effective(), 2);
-        let transport = limit.take_change(ServerId(0)).unwrap();
-        assert_eq!(
-            transport.probe_outcome,
-            Some(CapacityProbeOutcome::TransportFailure)
-        );
-        assert_eq!(transport.effective_delta, 0);
-
-        tokio::time::advance(CAPACITY_RECOVERY_INTERVAL).await;
-        for expected in 3..=8 {
-            assert!(limit.claim_due_probe(TokioInstant::now()));
-            limit.finish_probe(CapacityProbeOutcome::Succeeded);
-            assert_eq!(limit.effective(), expected);
-            let recovery = limit.take_change(ServerId(0)).unwrap();
-            assert_eq!(recovery.effective_delta, 1);
-            assert_eq!(recovery.coalesced_rejections, 0);
-            assert_eq!(
-                recovery.probe_outcome,
-                Some(CapacityProbeOutcome::Succeeded)
-            );
-            assert!(limit.admits_normal(expected));
-            assert!(!limit.admits_normal(expected.saturating_add(1)));
-            if expected < 8 {
-                assert!(!limit.claim_due_probe(TokioInstant::now()));
-                tokio::time::advance(CAPACITY_RECOVERY_INTERVAL).await;
-            }
+        pool.note_provider_over_limit(ServerId(0));
+        let first_deadline = pool.over_limit_until_epoch_ms(ServerId(0)).unwrap();
+        for _ in 0..32 {
+            pool.note_provider_over_limit(ServerId(0));
         }
 
-        assert_eq!(limit.effective(), 8);
-        assert!(!limit.claim_due_probe(TokioInstant::now()));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn authentication_probe_rearms_at_auth_disable_duration() {
-        let auth_retry_after = Duration::from_secs(90);
-        let limit = AdaptiveConnectionLimit::new(3, auth_retry_after);
-        assert!(!limit.record_rejection());
-        assert!(!limit.record_rejection());
-        assert_eq!(limit.effective(), 1);
-
-        tokio::time::advance(CAPACITY_PENALTY).await;
-        assert!(limit.claim_due_probe(TokioInstant::now()));
-        limit.finish_probe(CapacityProbeOutcome::AuthenticationFailure);
-        assert_eq!(limit.effective(), 1);
-        assert!(!limit.claim_due_probe(TokioInstant::now()));
-
-        tokio::time::advance(auth_retry_after - Duration::from_secs(1)).await;
-        assert!(!limit.claim_due_probe(TokioInstant::now()));
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(limit.claim_due_probe(TokioInstant::now()));
-        limit.finish_probe(CapacityProbeOutcome::AuthenticationFailure);
-
-        tokio::time::advance(auth_retry_after).await;
-        assert!(limit.claim_due_probe(TokioInstant::now()));
-        limit.finish_probe(CapacityProbeOutcome::Succeeded);
-        assert_eq!(limit.effective(), 2);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn activation_grace_coalesces_rejections_without_learning_a_lower_cap() {
-        let limit = AdaptiveConnectionLimit::new(8, Duration::from_mins(5));
-        limit.begin_activation_grace(Duration::from_secs(30));
-
-        assert!(limit.record_rejection());
-        assert_eq!(limit.effective(), 8);
-        assert_eq!(limit.reductions(), 0);
-        assert!(limit.penalty_until_epoch_ms().is_none());
-        let first = limit.take_change(ServerId(0)).unwrap();
-        assert_eq!(first.effective_delta, 0);
-        assert_eq!(first.coalesced_rejections, 1);
-
-        tokio::time::advance(Duration::from_secs(29)).await;
-        assert!(limit.record_rejection());
-        assert_eq!(limit.effective(), 8);
-        assert_eq!(limit.reductions(), 0);
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(!limit.record_rejection());
-        assert_eq!(limit.effective(), 7);
-        assert_eq!(limit.reductions(), 1);
-        assert!(limit.penalty_until_epoch_ms().is_some());
+        assert_eq!(pool.configured_connections(ServerId(0)), Some(8));
+        assert_eq!(pool.server_load(0), (8, 8));
+        assert_eq!(pool.fill_connection_capacity(), 8);
+        // Rejections inside an armed window neither extend it nor re-report it.
+        assert_eq!(
+            pool.over_limit_until_epoch_ms(ServerId(0)),
+            Some(first_deadline)
+        );
     }
 }
