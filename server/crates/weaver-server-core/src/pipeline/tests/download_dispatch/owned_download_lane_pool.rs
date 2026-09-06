@@ -954,6 +954,141 @@ async fn hot_lease_work_limit_scales_with_lane_throughput() {
     );
 }
 
+/// Lease one batch per lane the way a dispatch wave does, keeping the two
+/// connection counters the fair-share divisor reads in step with it.
+fn lease_one_wave(pipeline: &mut Pipeline, job_id: JobId, lanes: usize) -> Vec<usize> {
+    let mut leased = Vec::new();
+    for _ in 0..lanes {
+        let pressure = pipeline.refresh_download_pressure();
+        let Some(lease) = pipeline.try_lease_initial_download_batch_for_test(job_id, pressure)
+        else {
+            break;
+        };
+        leased.push(lease.works.len());
+        pipeline.active_download_connections += 1;
+        *pipeline
+            .active_download_connections_by_job
+            .entry(job_id)
+            .or_default() += 1;
+    }
+    leased
+}
+
+/// A job's tail must be split across every lane instead of being handed to
+/// whichever lane leases first.
+///
+/// With a full runway the first lane used to take the whole remainder (up to
+/// 64 articles), so the last lane drained its batch alone at one article per
+/// round trip while the rest of the fleet had already finished. That tail is
+/// invisible at zero latency and costs a large fraction of a second per job
+/// at 100 ms.
+#[tokio::test]
+async fn hot_lease_splits_a_job_tail_across_every_lane() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        8,
+    )
+    .await;
+
+    let job_id = JobId(40143);
+    let files = many_standalone_files("lane-tail", 33);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Lane Tail", &files),
+    )
+    .await;
+    pipeline.hot_dispatch_job = Some(job_id);
+    // Measured throughput, so the runway limit is the full 64-article batch:
+    // the bound under test must be the fair share, not the cold-start clamp.
+    pipeline
+        .hot_dispatch_throughput_window
+        .record(Instant::now(), 240_000_000);
+
+    let leased = lease_one_wave(&mut pipeline, job_id, 8);
+
+    assert_eq!(leased.len(), 8, "every lane must get work: {leased:?}");
+    assert!(
+        leased.iter().all(|count| *count >= 1),
+        "no lane may lease an empty batch: {leased:?}"
+    );
+    let fair_share = 33usize.div_ceil(8);
+    assert!(
+        leased.iter().all(|count| *count <= fair_share),
+        "no lane may take more than one lane's share of the remainder: {leased:?}"
+    );
+    assert!(
+        leased.iter().sum::<usize>() <= 33,
+        "a wave cannot lease more than the queue holds: {leased:?}"
+    );
+}
+
+/// Promoted work is drained by every parked lane, not by whichever lane the
+/// next dispatch pass happens to start first.
+///
+/// A targeted recovery promotion lands as one burst of completion-critical
+/// work while every lane of the job is parked on `NoWork`. Sized by the
+/// runway alone, the first lane leased the entire promoted set and fetched it
+/// serially; the fair share splits it so the whole fleet drains it in
+/// parallel.
+#[tokio::test]
+async fn promoted_completion_critical_work_spreads_across_parked_lanes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        8,
+    )
+    .await;
+
+    let job_id = JobId(40144);
+    let files = many_standalone_files("promoted-recovery", 45);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Promoted Recovery", &files),
+    )
+    .await;
+    let promoted = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .promote_matching_to_completion_critical_with_rank(|_| Some((0, None)));
+    assert_eq!(promoted, 45);
+    pipeline.hot_dispatch_job = Some(job_id);
+    pipeline
+        .hot_dispatch_throughput_window
+        .record(Instant::now(), 240_000_000);
+
+    // Every lane of the job is parked: this is the state a promotion wakes.
+    assert!(pipeline.active_download_connections_by_job.is_empty());
+    assert_eq!(pipeline.active_download_connections, 0);
+
+    let leased = lease_one_wave(&mut pipeline, job_id, 8);
+
+    assert_eq!(
+        leased.len(),
+        8,
+        "the promoted set must reach every lane: {leased:?}"
+    );
+    let fair_share = 45usize.div_ceil(8);
+    assert!(
+        leased.iter().all(|count| (1..=fair_share).contains(count)),
+        "no lane may take the whole promoted set: {leased:?}"
+    );
+}
+
 #[tokio::test]
 async fn shutdown_drain_consumes_inflight_download_results() {
     let temp_dir = tempfile::tempdir().unwrap();

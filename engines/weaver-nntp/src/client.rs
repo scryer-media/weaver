@@ -1000,9 +1000,12 @@ impl NntpClient {
         excluded_ips: &[IpAddr],
     ) -> Result<BodyLaneLease> {
         let deadline = TokioInstant::now() + self.soft_timeout;
-        // A fresh connection to a pipelining server selects the first
-        // candidate group inside its session-setup write; `try_select_group`
-        // then short-circuits on it and only walks further on a miss.
+        // A BODY lane fetches by message-id, which RFC 3977 answers with no
+        // group selected, so the GROUP round trip is pure added latency on
+        // every lane start. The candidate group is still offered to connect:
+        // a server that has proven it insists on one (see `crate::prologue`)
+        // takes it inside the session-setup write, and only such a server
+        // walks the candidate list below.
         let initial_group = groups.first().map(String::as_str);
         let mut conn = if extra {
             match tokio::time::timeout_at(
@@ -1026,6 +1029,20 @@ impl NntpClient {
                 Err(_) => return Err(self.acquire_timeout_error()),
             }
         };
+
+        if !conn.needs_group_prologue() {
+            return Ok(BodyLaneLease {
+                client: self.clone(),
+                server_id: server,
+                remote_ip: conn.remote_ip(),
+                conn: Some(conn),
+                groups: groups.to_vec(),
+                mode: BodyLaneMode::Sequential,
+                latency_ewma: None,
+                transfer_ewma: None,
+                checkpoint_plan: CheckpointPlan::None,
+            });
+        }
 
         match tokio::time::timeout_at(deadline, Self::try_select_group(&mut conn, groups)).await {
             Ok(Ok(_)) => Ok(BodyLaneLease {

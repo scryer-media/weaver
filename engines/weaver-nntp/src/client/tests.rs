@@ -24,16 +24,6 @@ async fn spawn_scripted_server(steps: Vec<ScriptStep>) -> u16 {
     spawn_shared_scripted_server(steps, Duration::ZERO).await
 }
 
-async fn reject_mode_reader(socket: &mut TcpStream) {
-    let mode_reader = read_command_line(socket).await;
-    assert!(mode_reader.starts_with("MODE READER"));
-    socket
-        .write_all(b"500 MODE READER unsupported\r\n")
-        .await
-        .unwrap();
-    socket.flush().await.unwrap();
-}
-
 async fn spawn_trickling_body_server(line_delay: Duration) -> u16 {
     const LINE: &[u8] = b"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\r\n";
 
@@ -43,7 +33,6 @@ async fn spawn_trickling_body_server(line_delay: Duration) -> u16 {
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         socket.write_all(b"200 ready\r\n").await.unwrap();
-        reject_mode_reader(&mut socket).await;
 
         let capabilities = read_command_line(&mut socket).await;
         assert!(capabilities.starts_with("CAPABILITIES"));
@@ -80,7 +69,6 @@ async fn spawn_delayed_body_initial_server(delay: Duration) -> u16 {
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         socket.write_all(b"200 ready\r\n").await.unwrap();
-        reject_mode_reader(&mut socket).await;
 
         let capabilities = read_command_line(&mut socket).await;
         assert!(capabilities.starts_with("CAPABILITIES"));
@@ -110,7 +98,6 @@ async fn spawn_delayed_reauth_server(delay: Duration) -> u16 {
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         socket.write_all(b"200 ready\r\n").await.unwrap();
-        reject_mode_reader(&mut socket).await;
 
         let initial_user = read_command_line(&mut socket).await;
         assert!(initial_user.starts_with("AUTHINFO USER "));
@@ -150,7 +137,6 @@ async fn spawn_unterminated_body_server() -> u16 {
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         socket.write_all(b"200 ready\r\n").await.unwrap();
-        reject_mode_reader(&mut socket).await;
 
         let capabilities = read_command_line(&mut socket).await;
         assert!(capabilities.starts_with("CAPABILITIES"));
@@ -291,7 +277,6 @@ async fn spawn_checkpoint_plan_pipelining_server() -> u16 {
         let (mut socket, _) = listener.accept().await.unwrap();
         socket.write_all(b"200 ready\r\n").await.unwrap();
         socket.flush().await.unwrap();
-        reject_mode_reader(&mut socket).await;
 
         let capabilities = read_command_line(&mut socket).await;
         assert!(capabilities.starts_with("CAPABILITIES"));
@@ -359,7 +344,6 @@ async fn spawn_stat_server(expect_pipelined: bool) -> u16 {
         let (mut socket, _) = listener.accept().await.unwrap();
         socket.write_all(b"200 ready\r\n").await.unwrap();
         socket.flush().await.unwrap();
-        reject_mode_reader(&mut socket).await;
 
         let first = read_command_line(&mut socket).await;
         assert!(first.starts_with("STAT <first@example.com>"));
@@ -2425,7 +2409,6 @@ async fn extra_body_lane_uses_fresh_connection_instead_of_idle_pool() {
             accepted_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             socket.write_all(b"200 ready\r\n").await.unwrap();
             socket.flush().await.unwrap();
-            reject_mode_reader(&mut socket).await;
             let line = read_command_line(&mut socket).await;
             assert!(line.starts_with("CAPABILITIES"));
             socket
@@ -2433,13 +2416,8 @@ async fn extra_body_lane_uses_fresh_connection_instead_of_idle_pool() {
                 .await
                 .unwrap();
             socket.flush().await.unwrap();
-            let line = read_command_line(&mut socket).await;
-            assert!(line.starts_with("GROUP "));
-            socket
-                .write_all(b"211 1 1 1 alt.binaries.test\r\n")
-                .await
-                .unwrap();
-            socket.flush().await.unwrap();
+            // A body lane fetches by message-id, so no GROUP follows: the
+            // connection is ready for the caller's own command here.
         }
     });
 
@@ -2482,7 +2460,6 @@ async fn parked_extra_body_lane_is_not_returned_to_normal_idle_pool() {
             accepted_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             socket.write_all(b"200 ready\r\n").await.unwrap();
             socket.flush().await.unwrap();
-            reject_mode_reader(&mut socket).await;
             let line = read_command_line(&mut socket).await;
             assert!(line.starts_with("CAPABILITIES"));
             socket
@@ -2490,13 +2467,8 @@ async fn parked_extra_body_lane_is_not_returned_to_normal_idle_pool() {
                 .await
                 .unwrap();
             socket.flush().await.unwrap();
-            let line = read_command_line(&mut socket).await;
-            assert!(line.starts_with("GROUP "));
-            socket
-                .write_all(b"211 1 1 1 alt.binaries.test\r\n")
-                .await
-                .unwrap();
-            socket.flush().await.unwrap();
+            // A body lane fetches by message-id, so no GROUP follows: the
+            // connection is ready for the caller's own command here.
         }
     });
 

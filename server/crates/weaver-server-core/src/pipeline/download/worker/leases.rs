@@ -512,17 +512,31 @@ impl Pipeline {
         // Rate reservations are activated after the lease is finalized. Keep
         // limited leases single-work so every subsequent BODY refill observes
         // the updated token balance instead of pre-leasing past the limit.
-        let work_limit = if self.rate_limiter.is_limited() {
-            1
-        } else {
-            self.download_lane_lease_work_limit(
-                job_id,
-                lane_mode,
-                pressure,
-                refill,
-                first.byte_estimate,
-            )
-        };
+        let work_limit =
+            if self.rate_limiter.is_limited() {
+                1
+            } else {
+                let runway = self.download_lane_lease_work_limit(
+                    job_id,
+                    lane_mode,
+                    pressure,
+                    refill,
+                    first.byte_estimate,
+                );
+                if par2_metadata_bootstrap_files.is_some() {
+                    runway
+                } else {
+                    // Runway sizing decides how much work a lane may hold; the
+                    // fair share decides how much of the job's remainder one lane
+                    // may take, so every lane of the job finishes within about an
+                    // article of the others instead of one lane draining the tail
+                    // alone.
+                    runway.min(self.download_lane_fair_share_work_limit(
+                        job_id,
+                        compatibility.completion_critical,
+                    ))
+                }
+            };
         let cap_for_restart_durable_lead = self.should_cap_lease_for_restart_durable_lead(job_id);
         let mut leased_undurable_bytes = if first.is_recovery {
             0
@@ -595,6 +609,87 @@ impl Pipeline {
             pressure_clear: pressure.state == DownloadPressureState::Clear,
             works,
         }
+    }
+
+    /// How many lanes this job's remaining work will actually be spread over.
+    ///
+    /// The count has to anticipate the lanes dispatch is about to start, not
+    /// only the ones already running. At a job's first wave, and at every
+    /// promotion — where every lane of the job is parked on `NoWork` and the
+    /// live count is zero — sizing a lease by the running lanes alone hands
+    /// the whole set to the first lane and leaves the rest parked. That is
+    /// how one connection ended up fetching an entire promoted recovery set
+    /// while seven lanes idled.
+    ///
+    /// Completion-critical work has no lane cap (see
+    /// `dispatch_completion_critical_work`) and the hot job fills every free
+    /// connection in its own phase, so both may count the free capacity
+    /// dispatch is about to hand them. Any other job only keeps the lanes it
+    /// already holds.
+    ///
+    /// The two counts are combined with `max`, never added: a lane that is
+    /// already running holds a share of the remainder, and counting it
+    /// alongside a still-free connection would divide the same remainder
+    /// twice and shrink mid-job leases for no benefit.
+    fn download_lane_fair_share_lanes(&self, job_id: JobId, completion_critical: bool) -> usize {
+        let active = self
+            .active_download_connections_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0);
+        if !completion_critical && self.hot_dispatch_job != Some(job_id) {
+            return active.max(1);
+        }
+        let capacity = self
+            .effective_download_connection_capacity(self.tuner.params().max_concurrent_downloads);
+        // A lane being dispatched has not been counted as active yet, so the
+        // free capacity already includes this lease's own connection.
+        let free = capacity.saturating_sub(self.active_download_connections);
+        active.max(free).max(1)
+    }
+
+    /// Remaining articles this lease's class may still take for `job_id`.
+    ///
+    /// O(1) — a heap length, never a queue scan: leases are cut on every
+    /// refill.
+    fn job_remaining_leasable_work(&self, job_id: JobId, completion_critical: bool) -> usize {
+        self.jobs
+            .get(&job_id)
+            .map(|state| state.download_queue.len_in_class(completion_critical))
+            .unwrap_or(0)
+    }
+
+    /// The tail bound on a lease: one lane's fair share of what the job has
+    /// left.
+    ///
+    /// Runway sizing alone leaves no end-of-job rebalancing, so the lane that
+    /// happens to lease last drains its whole batch alone while every other
+    /// lane of the job has already finished. The spread is invisible at zero
+    /// latency and grows with the round trip; at 100 ms it was seconds of a
+    /// job's tail spent on one connection.
+    ///
+    /// Shrinking a lease never reorders the queue, so the volume-frontier
+    /// ordering `hot_lease_work_limit` protects is untouched: a lane still
+    /// takes the head of the queue, just less of it. The bound only bites
+    /// once the remaining work no longer fills every lane's runway, and going
+    /// below a lane's pipeline depth there costs no round trip — the work
+    /// that would have deepened one lane's batch is in another lane's batch,
+    /// in flight at the same time.
+    ///
+    /// PAR2 index bootstrap is exempt: that window leases only the declared
+    /// explicit indexes, a bounded barrier set that is claimed in one batch so
+    /// the grid publishes before payload leases cut their checkpoints. It is
+    /// not a tail, and splitting it would reopen the barrier, not shorten it.
+    fn download_lane_fair_share_work_limit(
+        &self,
+        job_id: JobId,
+        completion_critical: bool,
+    ) -> usize {
+        let remaining = self.job_remaining_leasable_work(job_id, completion_critical);
+        let lanes = self.download_lane_fair_share_lanes(job_id, completion_critical);
+        // +1: the lease's first work item is already out of the queue and is
+        // part of this lane's share.
+        remaining.saturating_add(1).div_ceil(lanes).max(1)
     }
 
     pub(in crate::pipeline::download::worker) fn download_lane_lease_work_limit(

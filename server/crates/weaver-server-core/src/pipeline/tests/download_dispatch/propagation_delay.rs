@@ -727,7 +727,10 @@ async fn dispatch_downloads_leases_hot_job_batch_before_same_band_spillover() {
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_downloads, 3);
-    assert_eq!(pipeline.active_download_connections, 1);
+    // Both of the hot job's own lanes carry its three articles: a lease is
+    // bounded by one lane's fair share of the job's remainder, so the tail
+    // never lands on a single connection while a second one sits idle.
+    assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
         pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
         0

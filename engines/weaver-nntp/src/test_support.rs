@@ -49,10 +49,10 @@ where
             if let Some(prefix) = step.expected_prefix() {
                 loop {
                     let line = read_command_line(&mut socket).await;
-                    // Production setup always sends MODE READER. Most scripts
-                    // only care about the command under test, so model a
-                    // server that rejects this optional command unless a
-                    // script explicitly asserts it.
+                    // The default prologue sends no MODE READER, but a script
+                    // may drive the learned-fallback path, where a later
+                    // connection does send one. Tolerate it here so only the
+                    // scripts that assert it have to model it.
                     if line.starts_with("MODE READER") && !prefix.starts_with("MODE READER") {
                         socket
                             .write_all(b"500 MODE READER unsupported\r\n")

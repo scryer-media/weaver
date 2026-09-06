@@ -360,6 +360,15 @@ impl DownloadQueue {
         self.completion_critical_heap.is_empty() && self.ordinary_heap.is_empty()
     }
 
+    /// Queued items in one dispatch class, in O(1).
+    ///
+    /// Lease sizing divides the remaining work of the class it is about to
+    /// lease from, so it must never pay for a queue scan: this is a heap
+    /// length, read once per lease.
+    pub fn len_in_class(&self, completion_critical: bool) -> usize {
+        self.heap_for_class(completion_critical).len()
+    }
+
     pub fn has_recovery_work(&self) -> bool {
         self.recovery_work > 0
     }

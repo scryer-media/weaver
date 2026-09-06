@@ -47,6 +47,7 @@ pub mod error;
 pub mod fused_yenc;
 pub mod health;
 pub mod pool;
+pub mod prologue;
 pub mod response;
 pub mod tls;
 pub mod transfer;
