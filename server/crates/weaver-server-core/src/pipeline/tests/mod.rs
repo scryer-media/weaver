@@ -379,7 +379,7 @@ async fn new_direct_pipeline_with(
 /// Everything else here puts `intermediate` and `complete` under one `TempDir`,
 /// which puts them on one filesystem — and the whole class of question this
 /// exists for ("is the publish a rename or a byte copy?") is unobservable there.
-/// The cross-device probe at the end of `direct_store.rs` hands in two roots on
+/// The cross-device probe in `direct_store/scenarios/cross_device.rs` hands in two roots on
 /// genuinely different mounts.
 #[allow(clippy::too_many_arguments)]
 async fn new_direct_pipeline_at_roots(
