@@ -170,6 +170,7 @@ pub struct Metrics {
     pub download_lanes_sequential_active: u32,
     pub download_lanes_depth2_active: u32,
     pub download_lanes_depth4_active: u32,
+    pub download_lanes_depth8_active: u32,
     pub download_lanes_idle_active: u32,
     pub download_lanes_awaiting_work_active: u32,
     pub download_lanes_binding_server_active: u32,
@@ -333,6 +334,7 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             download_lanes_sequential_active: m.download_lanes_sequential_active as u32,
             download_lanes_depth2_active: m.download_lanes_depth2_active as u32,
             download_lanes_depth4_active: m.download_lanes_depth4_active as u32,
+            download_lanes_depth8_active: m.download_lanes_depth8_active as u32,
             download_lanes_idle_active: m.download_lanes_idle_active as u32,
             download_lanes_awaiting_work_active: m.download_lanes_awaiting_work_active as u32,
             download_lanes_binding_server_active: m.download_lanes_binding_server_active as u32,
@@ -974,6 +976,19 @@ pub struct ServerHealth {
     pub runtime_generation: u64,
     /// EWMA request latency in milliseconds.
     pub latency_ms: f64,
+    /// EWMA command-to-status-line wait for BODY fetches, in milliseconds.
+    /// Absent until the download lanes have taken an unbiased sample.
+    pub body_latency_ms: Option<f64>,
+    /// EWMA status-line-to-terminator wait for one article, in milliseconds:
+    /// what the article itself costs on the wire.
+    pub body_transfer_ms: Option<f64>,
+    /// "good", "moderate" or "slow" for `bodyLatencyMs`.
+    pub body_latency_band: Option<String>,
+    /// BODY pipelining depth the lanes currently run at; 1 is sequential.
+    pub body_pipeline_depth: u32,
+    /// Set once the server has twice failed to answer a pipelined batch
+    /// cleanly, which holds it sequential for the rest of the process.
+    pub body_pipelining_pinned_sequential: bool,
     pub success_count: u64,
     pub failure_count: u64,
     pub consecutive_failures: u32,

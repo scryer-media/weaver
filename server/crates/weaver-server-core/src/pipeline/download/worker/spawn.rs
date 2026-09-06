@@ -464,10 +464,13 @@ impl Pipeline {
                                 server_idx: None,
                                 mode,
                                 supports_pipelining: false,
-                                rtt: None,
+                                latency: None,
+                                transfer: None,
+                                payload_bytes: 0,
+                                policy_elapsed: Duration::ZERO,
+                                pressure_clear: false,
                                 batch_complete: true,
                                 batch_clean: policy_outcome,
-                                batch_response_count: 0,
                                 unresolved_count: u64::from(!policy_outcome),
                                 connection_discarded: false,
                             }),
@@ -511,6 +514,7 @@ impl Pipeline {
                     compatibility,
                     effective_exclude_servers: _,
                     checkpoint_plan,
+                    pressure_clear,
                     works,
                 } = lease;
                 current_job_id = job_id;
@@ -566,6 +570,8 @@ impl Pipeline {
                                 let trace = lane
                                     .fetch_decoded_sequential_with_estimate(message_id, estimate)
                                     .await;
+                                let (payload_bytes, policy_elapsed) =
+                                    Self::decoded_trace_throughput_sample(&trace);
                                 completed += 1;
                                 let work = works_by_index[idx]
                                     .take()
@@ -596,10 +602,13 @@ impl Pipeline {
                                     server_idx: Some(server_idx),
                                     mode: DownloadLaneMode::Sequential,
                                     supports_pipelining,
-                                    rtt: lane.rtt_ewma(),
+                                    latency: lane.latency_ewma(),
+                                    transfer: lane.transfer_ewma(),
+                                    payload_bytes,
+                                    policy_elapsed,
+                                    pressure_clear,
                                     batch_complete: true,
                                     batch_clean,
-                                    batch_response_count: 1,
                                     unresolved_count: 0,
                                     connection_discarded: !batch_clean,
                                 };
@@ -622,8 +631,7 @@ impl Pipeline {
                                     .await;
                             }
                         }
-                        DownloadLaneMode::PipelineDepth2 | DownloadLaneMode::PipelineDepth4 => {
-                            let rtt = lane.rtt_ewma();
+                        DownloadLaneMode::Pipelined { depth } => {
                             let tx_for_trace = tx.clone();
                             let exclude_servers_for_trace = exclude_servers.clone();
                             let estimated_body_bytes = works_by_index
@@ -636,12 +644,20 @@ impl Pipeline {
                                     )
                                 })
                                 .collect::<Vec<_>>();
-                            let stats = if actual_mode == DownloadLaneMode::PipelineDepth4 {
-                                lane.fetch_decoded_pipeline_depth4_with_estimates(
+                            // The lane is borrowed for the whole batch, so its
+                            // EWMAs are read once up front; they lag by one
+                            // batch, which the per-server blend absorbs.
+                            let latency = lane.latency_ewma();
+                            let transfer = lane.transfer_ewma();
+                            let stats = lane
+                                .fetch_decoded_pipeline_with_estimates(
                                     &message_ids,
                                     &estimated_body_bytes,
+                                    usize::from(depth),
                                     |idx, trace, meta| {
                                         completed += 1;
+                                        let (payload_bytes, policy_elapsed) =
+                                            Self::decoded_trace_throughput_sample(&trace);
                                         let work = works_by_index[idx].take().expect(
                                             "download lane result emitted once per work item",
                                         );
@@ -664,10 +680,13 @@ impl Pipeline {
                                             server_idx: Some(server_idx),
                                             mode: actual_mode,
                                             supports_pipelining,
-                                            rtt,
+                                            latency,
+                                            transfer,
+                                            payload_bytes,
+                                            policy_elapsed,
+                                            pressure_clear,
                                             batch_complete: meta.batch_complete,
                                             batch_clean: meta.batch_clean,
-                                            batch_response_count: meta.batch_response_count,
                                             unresolved_count: meta.unresolved_count,
                                             connection_discarded: meta.connection_discarded,
                                         };
@@ -694,67 +713,7 @@ impl Pipeline {
                                         }
                                     },
                                 )
-                                .await
-                            } else {
-                                lane.fetch_decoded_pipeline_depth2_with_estimates(
-                                    &message_ids,
-                                    &estimated_body_bytes,
-                                    |idx, trace, meta| {
-                                        completed += 1;
-                                        let work = works_by_index[idx].take().expect(
-                                            "download lane result emitted once per work item",
-                                        );
-                                        let segment_id = work.segment_id;
-                                        let retry_count = work.retry_count;
-                                        let (data, attempts, source_server_idx) =
-                                            Self::download_data_from_decoded_trace(
-                                                segment_id, trace,
-                                            );
-                                        policy_blocked_for_refill |= matches!(
-                                            &data,
-                                            Err(DownloadError::Fetch(failure))
-                                                if matches!(
-                                                    failure.kind,
-                                                    DownloadFailureKind::ServerQuota
-                                                        | DownloadFailureKind::Unrequested
-                                                )
-                                        );
-                                        let observation = DownloadLaneObservation {
-                                            server_idx: Some(server_idx),
-                                            mode: actual_mode,
-                                            supports_pipelining,
-                                            rtt,
-                                            batch_complete: meta.batch_complete,
-                                            batch_clean: meta.batch_clean,
-                                            batch_response_count: meta.batch_response_count,
-                                            unresolved_count: meta.unresolved_count,
-                                            connection_discarded: meta.connection_discarded,
-                                        };
-                                        let tx = tx_for_trace.clone();
-                                        let exclude_servers = exclude_servers_for_trace.clone();
-                                        async move {
-                                            let _ = tx
-                                                .send(DownloadResult {
-                                                    segment_id,
-                                                    runtime_generation,
-                                                    data,
-                                                    attempts,
-                                                    lane_observation: Some(observation),
-                                                    source_server_idx,
-                                                    origin: DownloadResultOrigin::from_work(
-                                                        is_recovery,
-                                                        work.completion_critical,
-                                                    ),
-                                                    retry_count,
-                                                    exclude_servers,
-                                                    release_connection_slot: false,
-                                                })
-                                                .await;
-                                        }
-                                    },
-                                )
-                                .await
-                            };
+                                .await;
 
                             let batch_clean = !stats.connection_discarded
                                 && !stats.response_order_mismatch
@@ -781,10 +740,13 @@ impl Pipeline {
                                     server_idx: Some(server_idx),
                                     mode: actual_mode,
                                     supports_pipelining,
-                                    rtt: lane.rtt_ewma(),
+                                    latency: lane.latency_ewma(),
+                                    transfer: lane.transfer_ewma(),
+                                    payload_bytes: 0,
+                                    policy_elapsed: Duration::ZERO,
+                                    pressure_clear,
                                     batch_complete: true,
                                     batch_clean: false,
-                                    batch_response_count: completed as u64,
                                     unresolved_count: unresolved_count as u64,
                                     connection_discarded: true,
                                 }),
@@ -822,10 +784,13 @@ impl Pipeline {
                                     server_idx: Some(server_idx),
                                     mode: actual_mode,
                                     supports_pipelining,
-                                    rtt: lane.rtt_ewma(),
+                                    latency: lane.latency_ewma(),
+                                    transfer: lane.transfer_ewma(),
+                                    payload_bytes: 0,
+                                    policy_elapsed: Duration::ZERO,
+                                    pressure_clear,
                                     batch_complete: true,
                                     batch_clean: policy_only,
-                                    batch_response_count: 0,
                                     unresolved_count: if policy_only { 0 } else { tail_count },
                                     connection_discarded: !policy_only,
                                 }),

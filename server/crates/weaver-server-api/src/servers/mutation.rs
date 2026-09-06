@@ -51,6 +51,7 @@ impl ServersMutation {
         server.supports_pipelining = probe
             .as_ref()
             .is_some_and(|result| result.supports_pipelining);
+        note_probe_first_byte_latency(handle, id, probe.as_ref());
 
         let added = {
             let persisted_server = server.clone();
@@ -125,6 +126,22 @@ impl ServersMutation {
             .map_or(existing.supports_pipelining, |result| {
                 result.supports_pipelining
             });
+        // A proven depth belongs to a particular endpoint. Editing anything
+        // else about the row keeps it; repointing the server discards it and
+        // lets the lanes rediscover the depth of whatever is there now. The
+        // depth is read back from the database because the download runtime
+        // writes it there directly, leaving the in-memory config behind.
+        server.pipelining_depth = if server.host == existing.host && server.port == existing.port {
+            let db = db.clone();
+            spawn_blocking_db(
+                "servers.mutation.update_server.pipelining_depth",
+                move || db.server_pipelining_depth(id),
+            )
+            .await?
+        } else {
+            None
+        };
+        note_probe_first_byte_latency(handle, id, probe.as_ref());
 
         {
             let db = db.clone();
@@ -274,11 +291,11 @@ impl ServersMutation {
             },
         )
         .await?;
-        Ok(
-            weaver_server_core::servers::probe_server_connection(&server)
-                .await
-                .into(),
-        )
+        let probe = weaver_server_core::servers::probe_server_connection(&server).await;
+        if let Ok(handle) = ctx.data::<SchedulerHandle>() {
+            note_probe_first_byte_latency(handle, id, Some(&probe));
+        }
+        Ok(probe.into())
     }
 
     /// Test connectivity to an NNTP server without saving it.
@@ -295,6 +312,8 @@ impl ServersMutation {
                     success: false,
                     message,
                     latency_ms: None,
+                    first_byte_latency_ms: None,
+                    first_byte_latency_band: None,
                     supports_pipelining: false,
                     adoptable_tls_name_mismatch_certificate: None,
                     tls_cipher_suite: None,
@@ -414,6 +433,7 @@ impl NormalizedServerInput {
             connections: self.connections,
             active: self.active,
             supports_pipelining: false,
+            pipelining_depth: None,
             priority: self.priority as u32,
             backfill: self.backfill,
             retention_days: self.retention_days,
@@ -422,6 +442,19 @@ impl NormalizedServerInput {
             tls_ca_cert: self.tls_ca_cert.clone(),
             tls_name_mismatch_certificate_der: self.tls_name_mismatch_certificate_der.clone(),
         }
+    }
+}
+
+/// Hand a successful probe's first-byte latency to the download runtime, so a
+/// server the lanes have never fetched from starts at a depth that suits the
+/// distance instead of the shallowest rung.
+fn note_probe_first_byte_latency(
+    handle: &SchedulerHandle,
+    server_id: u32,
+    probe: Option<&ServerConnectivityResult>,
+) {
+    if let Some(latency_ms) = probe.and_then(|result| result.first_byte_latency_ms) {
+        handle.note_server_probe_latency(server_id, std::time::Duration::from_millis(latency_ms));
     }
 }
 
@@ -689,6 +722,7 @@ mod tests {
                             connections: 20,
                             active: true,
                             supports_pipelining: true,
+                            pipelining_depth: None,
                             priority: 0,
                             backfill: false,
                             retention_days: 0,

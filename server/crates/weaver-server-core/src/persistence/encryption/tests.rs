@@ -247,6 +247,7 @@ fn persisted_credentials_validate_the_selected_key_before_startup() {
         connections: 1,
         active: true,
         supports_pipelining: false,
+        pipelining_depth: None,
         tls_name_mismatch_certificate_der: None,
         priority: 0,
         backfill: false,

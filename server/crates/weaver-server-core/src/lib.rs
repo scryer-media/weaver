@@ -44,7 +44,7 @@ pub use jobs::{
     SchedulerHandle, SegmentId, SegmentSpec, SemanticCandidateSnapshot, SemanticCandidateSource,
     SemanticCandidateState, SemanticDuplicate, SemanticDuplicateLifecycleEvent,
     SemanticPromotionClaim, SemanticPromotionState, SemanticTerminalCause, ServerId,
-    SharedPipelineState, SubmissionOrigin, classify_semantic_terminal_cause,
+    ServerTransportHealth, SharedPipelineState, SubmissionOrigin, classify_semantic_terminal_cause,
     derive_legacy_job_status, epoch_ms_now, job_status_from_persisted_str,
     normalize_semantic_duplicate_key, record_semantic_duplicate_lifecycle_metric,
     runtime_lanes_from_status_snapshot, semantic_duplicate_lifecycle_metrics_snapshot,

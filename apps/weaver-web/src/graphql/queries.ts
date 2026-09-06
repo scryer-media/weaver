@@ -747,6 +747,11 @@ export const SERVER_HEALTH_QUERY = gql`
       capacityPenaltyUntilEpochMs
       runtimeGeneration
       latencyMs
+      bodyLatencyMs
+      bodyTransferMs
+      bodyLatencyBand
+      bodyPipelineDepth
+      bodyPipeliningPinnedSequential
       successCount
       failureCount
       consecutiveFailures

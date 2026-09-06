@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::servers::ServerConfig;
 
 #[derive(Debug, Clone)]
@@ -5,6 +7,13 @@ pub struct ServerConnectivityResult {
     pub success: bool,
     pub message: String,
     pub latency_ms: Option<u64>,
+    /// Command-to-status-line round trip on the established session, which is
+    /// what BODY pipelining actually has to hide. `latency_ms` above is the
+    /// whole connect — TCP, TLS and authentication — and is far larger.
+    pub first_byte_latency_ms: Option<u64>,
+    /// "good", "moderate" or "slow" for `first_byte_latency_ms`. Descriptive
+    /// only: nothing the operator has to act on follows from it.
+    pub first_byte_latency_band: Option<String>,
     pub supports_pipelining: bool,
     pub adoptable_tls_name_mismatch_certificate_der: Option<Vec<u8>>,
     /// IANA name of the TLS suite negotiated with weaver's CPU-preferred
@@ -34,6 +43,8 @@ pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivit
             success: false,
             message: "We reached the server securely, but its certificate belongs to a different hostname. Review the certificate below only if you recognise this provider.".to_string(),
             latency_ms: None,
+            first_byte_latency_ms: None,
+            first_byte_latency_band: None,
             supports_pipelining: false,
             adoptable_tls_name_mismatch_certificate_der: Some(certificate_der),
             tls_cipher_suite: None,
@@ -58,6 +69,7 @@ pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivit
             let latency = start.elapsed().as_millis() as u64;
             let pipelining = conn.capabilities().supports_pipelining();
             let tls_cipher_suite = conn.negotiated_cipher_suite();
+            let first_byte_latency = measure_first_byte_latency(&mut conn).await;
             let _ = conn.quit().await;
             let tls_honors_client_cipher_order = match tls_cipher_suite.as_deref() {
                 Some(suite) => probe_cipher_order_honoured(&nntp_config, suite, pipelining).await,
@@ -67,6 +79,9 @@ pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivit
                 success: true,
                 message: "Connected successfully".to_string(),
                 latency_ms: Some(latency),
+                first_byte_latency_ms: first_byte_latency.map(|latency| latency.as_millis() as u64),
+                first_byte_latency_band: first_byte_latency
+                    .map(|latency| latency_band_label(latency).to_string()),
                 supports_pipelining: pipelining,
                 adoptable_tls_name_mismatch_certificate_der: None,
                 tls_cipher_suite,
@@ -90,6 +105,8 @@ pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivit
                 success: false,
                 message: user_facing_connection_error(&error),
                 latency_ms: None,
+                first_byte_latency_ms: None,
+                first_byte_latency_band: None,
                 supports_pipelining: false,
                 adoptable_tls_name_mismatch_certificate_der,
                 tls_cipher_suite: None,
@@ -97,6 +114,33 @@ pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivit
             }
         }
     }
+}
+
+/// Time the command-to-status-line round trip on a session that is already
+/// open, using the cheapest single-line command there is. This is the distance
+/// figure the download lanes work against, so the operator sees the same number
+/// the depth explorer does rather than a connect time dominated by TLS.
+///
+/// The best of a few tries is taken: a scheduler hiccup or a coalesced ACK can
+/// only inflate a sample, never shorten one below the real round trip.
+async fn measure_first_byte_latency(conn: &mut weaver_nntp::NntpConnection) -> Option<Duration> {
+    const PROBES: usize = 3;
+    let mut best: Option<Duration> = None;
+    for _ in 0..PROBES {
+        let started = std::time::Instant::now();
+        if conn.ping().await.is_err() {
+            break;
+        }
+        let sample = started.elapsed();
+        best = Some(best.map_or(sample, |best: Duration| best.min(sample)));
+    }
+    best
+}
+
+/// Descriptive label for a first-byte latency, on the same thresholds the
+/// download depth explorer uses.
+fn latency_band_label(latency: Duration) -> &'static str {
+    crate::pipeline::download::transport::LatencyBand::from_latency(latency).label()
 }
 
 /// Reconnect once offering the opposite AEAD family first. A server that

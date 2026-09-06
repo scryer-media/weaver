@@ -328,6 +328,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             compatibility,
             effective_exclude_servers: _,
             checkpoint_plan,
+            pressure_clear,
             works,
         } = lease;
         parked_completion_critical = compatibility.completion_critical;
@@ -410,6 +411,8 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                         let trace =
                             lane.fetch_decoded_sequential_with_estimate(message_id, estimate);
                         nntp.record_blocking_attempts(&trace.attempts);
+                        let (payload_bytes, policy_elapsed) =
+                            Pipeline::decoded_trace_throughput_sample(&trace);
                         completed += 1;
                         let work = works_by_index[idx]
                             .take()
@@ -422,10 +425,13 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                                 server_idx: Some(server_idx),
                                 mode: DownloadLaneMode::Sequential,
                                 supports_pipelining,
-                                rtt: lane.rtt_ewma(),
+                                latency: lane.latency_ewma(),
+                                transfer: lane.transfer_ewma(),
+                                payload_bytes,
+                                policy_elapsed,
+                                pressure_clear,
                                 batch_complete: true,
                                 batch_clean: true,
-                                batch_response_count: 1,
                                 unresolved_count: 0,
                                 connection_discarded: false,
                             },
@@ -446,7 +452,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                         results.push(result);
                     }
                 }
-                DownloadLaneMode::PipelineDepth2 | DownloadLaneMode::PipelineDepth4 => {
+                DownloadLaneMode::Pipelined { .. } => {
                     let estimated_body_bytes = works_by_index
                         .iter()
                         .map(|work| {
@@ -463,6 +469,8 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                         actual_mode.max_depth(),
                     ) {
                         nntp.record_blocking_attempts(&trace.attempts);
+                        let (payload_bytes, policy_elapsed) =
+                            Pipeline::decoded_trace_throughput_sample(&trace);
                         completed += 1;
                         let work = works_by_index[idx]
                             .take()
@@ -471,10 +479,13 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                             server_idx: Some(server_idx),
                             mode: actual_mode,
                             supports_pipelining,
-                            rtt: lane.rtt_ewma(),
+                            latency: lane.latency_ewma(),
+                            transfer: lane.transfer_ewma(),
+                            payload_bytes,
+                            policy_elapsed,
+                            pressure_clear,
                             batch_complete: meta.batch_complete,
                             batch_clean: meta.batch_clean,
-                            batch_response_count: meta.batch_response_count,
                             unresolved_count: meta.unresolved_count,
                             connection_discarded: meta.connection_discarded,
                         };
@@ -514,8 +525,9 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                     server_idx,
                     actual_mode,
                     supports_pipelining,
-                    lane.rtt_ewma(),
-                    completed as u64,
+                    lane.latency_ewma(),
+                    lane.transfer_ewma(),
+                    pressure_clear,
                     unresolved_count as u64,
                     is_recovery,
                     &exclude_servers,
@@ -804,8 +816,9 @@ fn unresolved_result(
     server_idx: usize,
     mode: DownloadLaneMode,
     supports_pipelining: bool,
-    rtt: Option<std::time::Duration>,
-    completed: u64,
+    latency: Option<std::time::Duration>,
+    transfer: Option<std::time::Duration>,
+    pressure_clear: bool,
     unresolved_count: u64,
     is_recovery: bool,
     exclude_servers: &[usize],
@@ -824,10 +837,13 @@ fn unresolved_result(
             server_idx: Some(server_idx),
             mode,
             supports_pipelining,
-            rtt,
+            latency,
+            transfer,
+            payload_bytes: 0,
+            policy_elapsed: std::time::Duration::ZERO,
+            pressure_clear,
             batch_complete: true,
             batch_clean: false,
-            batch_response_count: completed,
             unresolved_count,
             connection_discarded: true,
         }),
@@ -942,12 +958,15 @@ mod tests {
             },
             DownloadLaneObservation {
                 server_idx: Some(0),
-                mode: DownloadLaneMode::PipelineDepth4,
+                mode: DownloadLaneMode::Pipelined { depth: 4 },
                 supports_pipelining: true,
-                rtt: None,
+                latency: None,
+                transfer: None,
+                payload_bytes: 0,
+                policy_elapsed: Duration::ZERO,
+                pressure_clear: true,
                 batch_complete: true,
                 batch_clean: true,
-                batch_response_count: 4,
                 unresolved_count: 0,
                 connection_discarded: false,
             },
@@ -970,18 +989,18 @@ mod tests {
         assert!(!observation.connection_discarded);
         assert!(download_outcome_keeps_connection(&result.data));
 
-        // A clean batch never blocks the server's pipelining proof.
-        let mut proof = crate::pipeline::download::transport::ServerPipelineProof::default();
-        let transition = proof.note_pipeline_batch(
-            Instant::now(),
-            DownloadLaneMode::PipelineDepth4,
-            observation.batch_clean,
-            observation.batch_response_count,
+        // A clean batch is what keeps the rung: only the unclean path drops
+        // one, and a 430 must not reach it.
+        let mut explorer = crate::pipeline::download::transport::ServerPipelineExplorer::seeded(
+            Some(observation.mode.depth()),
+            None,
         );
-        assert!(!matches!(
-            transition,
-            Some(crate::pipeline::download::transport::ServerPipelineState::PipelineBlocked)
-        ));
+        assert_eq!(explorer.current_depth(), 4);
+        assert_eq!(
+            explorer.note_unclean_batch(Instant::now()),
+            Some(crate::pipeline::download::transport::RungChange::Dropped { from: 4, to: 2 }),
+            "the unclean path is the only one that costs a rung"
+        );
 
         // The rest of the leased batch is still requested, not handed back.
         let mut pending_works = VecDeque::from([tail_work(10, 0), tail_work(11, 0)]);
@@ -1040,10 +1059,13 @@ mod tests {
                 server_idx: Some(0),
                 mode: DownloadLaneMode::Sequential,
                 supports_pipelining: true,
-                rtt: None,
+                latency: None,
+                transfer: None,
+                payload_bytes: 0,
+                policy_elapsed: Duration::ZERO,
+                pressure_clear: true,
                 batch_complete: true,
                 batch_clean: true,
-                batch_response_count: 0,
                 unresolved_count: 0,
                 connection_discarded: false,
             },

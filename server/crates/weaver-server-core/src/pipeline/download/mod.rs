@@ -4,7 +4,7 @@ pub(super) mod owned_lane;
 pub mod queue;
 mod rar_unlock;
 mod retention;
-pub(super) mod transport;
+pub(crate) mod transport;
 mod worker;
 
 #[cfg(test)]
@@ -14,9 +14,7 @@ pub(in crate::pipeline) use worker::{
 };
 
 pub use queue::{DownloadQueue, DownloadWork};
-pub(super) use transport::{
-    DownloadLaneMode, DownloadLaneRuntimeState, JobTransportProfile, LaneParkReason,
-};
+pub(super) use transport::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};
 
 /// The NNTP wire arguments for a batch of leased work, in lease order.
 ///

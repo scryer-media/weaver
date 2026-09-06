@@ -121,6 +121,7 @@ fn sample_snapshot(
         download_lanes_sequential_active: 0,
         download_lanes_depth2_active: 0,
         download_lanes_depth4_active: 0,
+        download_lanes_depth8_active: 0,
         download_lanes_idle_active: 0,
         download_lanes_awaiting_work_active: 0,
         download_lanes_binding_server_active: 0,

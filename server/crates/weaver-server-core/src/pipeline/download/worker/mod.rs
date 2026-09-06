@@ -1,7 +1,5 @@
 use super::*;
-use crate::pipeline::download::transport::{
-    JobTransportClass, ServerPipelineProof, ServerPipelineState,
-};
+use crate::pipeline::download::transport::{RungChange, ServerPipelineExplorer};
 use weaver_nntp::client::FetchAttemptOutcome;
 
 mod completion;
@@ -92,7 +90,6 @@ struct DownloadPipelineBacklog {
 const DOWNLOAD_PRESSURE_SOFT_PERCENT: u64 = 70;
 const SOFT_PRESSURE_DISPATCH_MAX_DELAY: Duration = Duration::from_millis(150);
 const SOFT_PRESSURE_DISPATCH_MIN_DELAY: Duration = Duration::from_millis(1);
-const SAB_BODY_PIPELINE_DEPTH: usize = 2;
 const HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
 const HOT_LEASE_TARGET_RUNWAY_SECS: u64 = 2;
 const HOT_LEASE_COLD_START_WORK_LIMIT: usize = 16;

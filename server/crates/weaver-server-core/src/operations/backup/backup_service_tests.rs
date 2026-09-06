@@ -156,6 +156,7 @@ fn sample_server(id: u32) -> crate::servers::ServerConfig {
         connections: 2,
         active: true,
         supports_pipelining: true,
+        pipelining_depth: None,
         tls_name_mismatch_certificate_der: None,
         priority: 0,
         backfill: false,

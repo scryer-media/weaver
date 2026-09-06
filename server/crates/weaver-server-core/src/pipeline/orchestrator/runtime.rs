@@ -203,7 +203,6 @@ impl Pipeline {
             hot_dispatch_expansion_window: HotExpansionWindow::default(),
             hot_dispatch_spillover_loans: SpilloverLoanBook::default(),
             hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
-            job_transport_profiles: HashMap::new(),
             download_lane_runtime: DownloadLaneRuntimeState::default(),
             deferred_lane_refills: std::collections::VecDeque::new(),
             ip_replacement_trial_extra_connections,
@@ -1045,6 +1044,7 @@ impl Pipeline {
                     _ = tune_interval.tick() => {
                         self.flush_quiescent_write_backlog().await;
                         self.refresh_download_pressure();
+                        self.publish_download_transport_health();
 
                         let snapshot = self.metrics.snapshot();
                         let not_found = snapshot.articles_not_found;

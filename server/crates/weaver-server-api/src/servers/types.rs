@@ -349,6 +349,13 @@ pub struct TestConnectionResult {
     pub success: bool,
     pub message: String,
     pub latency_ms: Option<u64>,
+    /// Command-to-status-line round trip on the open session. `latencyMs` is
+    /// the whole connect (TCP, TLS, authentication); this is the distance the
+    /// download lanes have to work against.
+    pub first_byte_latency_ms: Option<u64>,
+    /// "good", "moderate" or "slow" for `firstByteLatencyMs`. Descriptive: the
+    /// download depth is chosen automatically and needs no operator input.
+    pub first_byte_latency_band: Option<String>,
     pub supports_pipelining: bool,
     pub adoptable_tls_name_mismatch_certificate: Option<AdoptableTlsNameMismatchCertificate>,
     /// IANA name of the negotiated TLS suite with weaver's CPU-preferred family offered first.
@@ -363,6 +370,8 @@ impl From<weaver_server_core::servers::ServerConnectivityResult> for TestConnect
             success: result.success,
             message: result.message,
             latency_ms: result.latency_ms,
+            first_byte_latency_ms: result.first_byte_latency_ms,
+            first_byte_latency_band: result.first_byte_latency_band,
             supports_pipelining: result.supports_pipelining,
             adoptable_tls_name_mismatch_certificate: result
                 .adoptable_tls_name_mismatch_certificate_der

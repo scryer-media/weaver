@@ -269,8 +269,9 @@ impl SystemQuery {
         let fallback_pool = ctx
             .data_opt::<Option<Arc<NntpPool>>>()
             .and_then(Clone::clone);
+        let transport = handle.download_transport_health();
         match live_pool.or(fallback_pool) {
-            Some(pool) => Ok(collect_server_health(&pool, runtime_generation).await),
+            Some(pool) => Ok(collect_server_health(&pool, runtime_generation, &transport).await),
             None => Ok(Vec::new()),
         }
     }
@@ -474,7 +475,11 @@ fn filesystem_name(value: &weaver_server_core::runtime::system_profile::Filesyst
 /// emitted by the Prometheus exporter (`collect_server_health` in the app binary), shaped
 /// for the GraphQL monitoring API. The connection pool orders servers by priority, so the
 /// first entry is the primary and the rest are backups.
-async fn collect_server_health(pool: &NntpPool, runtime_generation: u64) -> Vec<ServerHealth> {
+async fn collect_server_health(
+    pool: &NntpPool,
+    runtime_generation: u64,
+    transport: &[weaver_server_core::ServerTransportHealth],
+) -> Vec<ServerHealth> {
     struct ServerLoadSnapshot {
         host: String,
         port: u16,
@@ -513,6 +518,7 @@ async fn collect_server_health(pool: &NntpPool, runtime_generation: u64) -> Vec<
         .enumerate()
         .map(|(idx, snapshot)| {
             let srv = health.server(idx);
+            let body = transport.iter().find(|entry| entry.server_idx == idx);
             let state = match srv.state() {
                 weaver_nntp::ServerState::Healthy => "healthy",
                 weaver_nntp::ServerState::Degraded { .. } => "degraded",
@@ -531,6 +537,14 @@ async fn collect_server_health(pool: &NntpPool, runtime_generation: u64) -> Vec<
                 capacity_penalty_until_epoch_ms: snapshot.penalty_until,
                 runtime_generation,
                 latency_ms: health.latency_ms(idx),
+                body_latency_ms: body.and_then(|entry| entry.latency_ms),
+                body_transfer_ms: body.and_then(|entry| entry.transfer_ms),
+                body_latency_band: body.and_then(|entry| entry.latency_band.clone()),
+                // A server the lanes have not touched yet reads as sequential
+                // rather than as a hole in the card.
+                body_pipeline_depth: body.map_or(1, |entry| entry.pipeline_depth),
+                body_pipelining_pinned_sequential: body
+                    .is_some_and(|entry| entry.pinned_sequential),
                 success_count: srv.success_count,
                 failure_count: srv.failure_count,
                 consecutive_failures: srv.consecutive_failures,

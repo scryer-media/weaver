@@ -66,6 +66,7 @@ pub async fn rebuild_nntp_from_config(
                     pipelining: weaver_nntp::PipeliningCapability::Known(
                         server.supports_pipelining,
                     ),
+                    pipelining_depth: server.pipelining_depth,
                     ..Default::default()
                 },
                 max_connections: server.connections as usize,
@@ -169,6 +170,7 @@ mod tests {
             connections: 2,
             active: true,
             supports_pipelining: true,
+            pipelining_depth: None,
             tls_name_mismatch_certificate_der: None,
             priority: 0,
             backfill: false,

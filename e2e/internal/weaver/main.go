@@ -7786,6 +7786,19 @@ func cmdTcpChaosTest() {
 				})
 			},
 		},
+		{
+			// A far server with plenty of bandwidth: each article costs far
+			// less on the wire than the round trip to ask for it, which is the
+			// shape that drives the BODY depth explorer to its deepest rung.
+			// No bandwidth toxic on purpose — capping the link would make
+			// transfer dominate again and hold the depth shallow.
+			name: "900ms latency, uncapped bandwidth on primary (deep BODY pipelining)",
+			setup: func() {
+				addToxic("nntp1", "latency", "latency", "downstream", map[string]interface{}{
+					"latency": 900, "jitter": 40,
+				})
+			},
+		},
 	}
 
 	onlyRound := 0

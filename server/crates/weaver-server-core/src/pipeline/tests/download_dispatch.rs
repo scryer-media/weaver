@@ -874,6 +874,7 @@ async fn recovery_async_handoff_keeps_owned_lane_caches() {
         compatibility,
         effective_exclude_servers: Vec::new(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+        pressure_clear: true,
         works: vec![work],
     };
 
@@ -896,7 +897,11 @@ async fn hot_lease_work_limit_scales_with_lane_throughput() {
     // No measured throughput yet: cold-start batch, not the full 64 — the
     // first dispatch wave must not blind-lease several volumes on a slow link.
     assert_eq!(
-        pipeline.hot_lease_work_limit(job_id, DownloadLaneMode::PipelineDepth4, article_bytes),
+        pipeline.hot_lease_work_limit(
+            job_id,
+            DownloadLaneMode::Pipelined { depth: 4 },
+            article_bytes
+        ),
         16
     );
 
@@ -908,7 +913,11 @@ async fn hot_lease_work_limit_scales_with_lane_throughput() {
         .hot_dispatch_throughput_window
         .record(Instant::now(), 240_000_000);
     assert_eq!(
-        pipeline.hot_lease_work_limit(job_id, DownloadLaneMode::PipelineDepth4, article_bytes),
+        pipeline.hot_lease_work_limit(
+            job_id,
+            DownloadLaneMode::Pipelined { depth: 4 },
+            article_bytes
+        ),
         30
     );
 
@@ -919,8 +928,27 @@ async fn hot_lease_work_limit_scales_with_lane_throughput() {
         .hot_dispatch_throughput_window
         .record(Instant::now(), 15_000_000);
     assert_eq!(
-        pipeline.hot_lease_work_limit(job_id, DownloadLaneMode::PipelineDepth4, article_bytes),
+        pipeline.hot_lease_work_limit(
+            job_id,
+            DownloadLaneMode::Pipelined { depth: 4 },
+            article_bytes
+        ),
         4
+    );
+
+    // The floor is the lane's own depth, so a deeper rung never leases less
+    // than one full pipeline's worth of work.
+    assert_eq!(
+        pipeline.hot_lease_work_limit(
+            job_id,
+            DownloadLaneMode::Pipelined { depth: 8 },
+            article_bytes
+        ),
+        8
+    );
+    assert_eq!(
+        pipeline.hot_lease_work_limit(job_id, DownloadLaneMode::Sequential, article_bytes),
+        1
     );
 }
 
@@ -1731,12 +1759,15 @@ async fn stale_generation_success_does_not_update_new_lane_health() {
         attempts: Vec::new(),
         lane_observation: Some(DownloadLaneObservation {
             server_idx: Some(0),
-            mode: DownloadLaneMode::PipelineDepth2,
+            mode: DownloadLaneMode::Pipelined { depth: 2 },
             supports_pipelining: true,
-            rtt: Some(Duration::from_millis(5)),
+            latency: Some(Duration::from_millis(5)),
+            transfer: Some(Duration::from_millis(20)),
+            payload_bytes: 7,
+            policy_elapsed: Duration::from_millis(25),
+            pressure_clear: true,
             batch_complete: true,
             batch_clean: true,
-            batch_response_count: 1,
             unresolved_count: 0,
             connection_discarded: false,
         }),
@@ -6696,6 +6727,7 @@ async fn owned_download_lane_capacity_failure_requeues_without_async_fallback() 
         compatibility,
         effective_exclude_servers: Vec::new(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+        pressure_clear: true,
         works: vec![work],
     };
     pipeline
@@ -6782,6 +6814,7 @@ async fn owned_download_lane_selection_contention_requeues_without_async_fallbac
         compatibility,
         effective_exclude_servers: Vec::new(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+        pressure_clear: true,
         works: vec![work],
     };
     pipeline

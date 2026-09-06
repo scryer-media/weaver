@@ -277,6 +277,10 @@ pub struct ServerConfig {
     pub tls_name_mismatch_certificate_der: Option<Vec<u8>>,
     /// Source of the PIPELINING capability for this connection.
     pub pipelining: PipeliningCapability,
+    /// BODY pipelining depth a previous run proved for this server, if any.
+    /// Inert for the connection itself; the download lanes read it to start
+    /// where the last run left off instead of rediscovering the depth.
+    pub pipelining_depth: Option<u8>,
     /// Which AEAD family the TLS ClientHello offers first.
     pub tls_cipher_preference: crate::tls::TlsCipherPreference,
 }
@@ -296,6 +300,7 @@ impl Default for ServerConfig {
             tls_ca_cert: None,
             tls_name_mismatch_certificate_der: None,
             pipelining: PipeliningCapability::Probe,
+            pipelining_depth: None,
             tls_cipher_preference: crate::tls::TlsCipherPreference::Auto,
         }
     }
@@ -339,6 +344,9 @@ pub struct NntpConnection {
     /// pooled across jobs, and checkpoint geometry belongs to a job snapshot,
     /// not to a socket. `None` is deliberately applied per response.
     checkpoint_plan: CheckpointPlan,
+    /// How long the last decoded article waited for its status line. The lane
+    /// takes this to separate distance from transfer cost.
+    last_response_line_wait: Duration,
 }
 
 impl NntpConnection {
@@ -346,6 +354,12 @@ impl NntpConnection {
     /// from now on. See [`Self::checkpoint_plan`].
     pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
         self.checkpoint_plan = checkpoint_plan;
+    }
+
+    /// Consume the last article's status-line wait, so a lane cannot credit
+    /// one response's latency to the next.
+    pub(crate) fn take_response_line_wait(&mut self) -> Duration {
+        std::mem::replace(&mut self.last_response_line_wait, Duration::ZERO)
     }
 
     /// Connect to an NNTP server, perform TLS negotiation and authentication.
@@ -432,6 +446,7 @@ impl NntpConnection {
             transfer_control: None,
             body_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
+            last_response_line_wait: Duration::ZERO,
         };
 
         // 2. Read greeting
@@ -1398,6 +1413,7 @@ impl NntpConnection {
         self.reserve_body(estimated_body_bytes)
             .map_err(NntpError::quota_blocked)?;
         let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
+        let request_started = Instant::now();
         let initial = match await_active_transfer(budget.as_deref(), self.send_command(&cmd)).await
         {
             Ok(initial) => initial,
@@ -1433,6 +1449,7 @@ impl NntpConnection {
         } else {
             initial
         };
+        self.last_response_line_wait = request_started.elapsed();
 
         self.stream_yenc_article_response(initial, budget, on_chunk)
             .await
@@ -1649,6 +1666,7 @@ impl NntpConnection {
     where
         F: FnMut(&[u8]) -> Result<()>,
     {
+        let response_started = Instant::now();
         let initial = match await_active_transfer(budget.as_deref(), self.read_response()).await {
             Ok(initial) => initial,
             Err(error) => {
@@ -1663,6 +1681,7 @@ impl NntpConnection {
             self.current_group = None;
             return Err(NntpError::AuthenticationRequired.into());
         }
+        self.last_response_line_wait = response_started.elapsed();
 
         self.stream_yenc_article_response(initial, budget, on_chunk)
             .await
@@ -1954,6 +1973,7 @@ mod tests {
             transfer_control: None,
             body_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
+            last_response_line_wait: Duration::ZERO,
         }
     }
 

@@ -44,6 +44,11 @@ interface ServerHealthEntry {
   capacityPenaltyUntilEpochMs: number | null;
   runtimeGeneration: number;
   latencyMs: number;
+  bodyLatencyMs: number | null;
+  bodyTransferMs: number | null;
+  bodyLatencyBand: string | null;
+  bodyPipelineDepth: number;
+  bodyPipeliningPinnedSequential: boolean;
   successCount: number;
   failureCount: number;
   consecutiveFailures: number;
@@ -339,6 +344,18 @@ export function MetricsPage() {
                         ? "text-status-paused"
                         : "text-status-failed";
                   const isPrimary = server.tier === "PRIMARY";
+                  const sequential =
+                    server.bodyPipeliningPinnedSequential || server.bodyPipelineDepth <= 1;
+                  const bodyBand = server.bodyLatencyBand
+                    ? t(`metrics.serverLatencyBand.${server.bodyLatencyBand}`)
+                    : null;
+                  // Latency and transfer are the two halves the depth is
+                  // derived from, so they are shown together or not at all.
+                  const bodyTiming =
+                    server.bodyLatencyMs != null && server.bodyTransferMs != null
+                      ? `${Math.round(server.bodyLatencyMs)}/${Math.round(server.bodyTransferMs)} ms`
+                      : null;
+                  const bodyDetail = [bodyBand, bodyTiming].filter(Boolean).join(" · ");
                   return (
                     <div
                       key={server.label}
@@ -398,6 +415,24 @@ export function MetricsPage() {
                         <div className={cn("text-[13px] font-semibold tabular-nums", latencyClass)}>
                           {Math.round(server.latencyMs)} ms
                         </div>
+                      </div>
+                      <div className="hidden w-28 shrink-0 text-right sm:block">
+                        <div className="text-[9px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">
+                          {t("metrics.serverBodyDepth")}
+                        </div>
+                        <div
+                          className={cn(
+                            "text-[13px] font-semibold tabular-nums",
+                            sequential ? "text-muted-foreground" : "text-status-completed",
+                          )}
+                        >
+                          {sequential ? t("metrics.serverBodyDepthSequential") : `x${server.bodyPipelineDepth}`}
+                        </div>
+                        {bodyDetail ? (
+                          <div className="mt-0.5 truncate text-[9px] tabular-nums text-muted-foreground">
+                            {bodyDetail}
+                          </div>
+                        ) : null}
                       </div>
                     </div>
                   );

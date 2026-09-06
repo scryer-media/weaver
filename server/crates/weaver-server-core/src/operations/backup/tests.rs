@@ -40,6 +40,7 @@ fn sample_config() -> Config {
             connections: 20,
             active: true,
             supports_pipelining: true,
+            pipelining_depth: None,
             tls_name_mismatch_certificate_der: Some(vec![0x30, 0x82, 0x01, 0x0a]),
             priority: 0,
             backfill: false,

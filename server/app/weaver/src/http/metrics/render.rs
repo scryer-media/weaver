@@ -551,6 +551,7 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         ("sequential", snapshot.download_lanes_sequential_active),
         ("pipeline_depth2", snapshot.download_lanes_depth2_active),
         ("pipeline_depth4", snapshot.download_lanes_depth4_active),
+        ("pipeline_depth8", snapshot.download_lanes_depth8_active),
     ] {
         out.sample(&f::LANES_ACTIVE_BY_MODE, &[("mode", mode)], value);
     }

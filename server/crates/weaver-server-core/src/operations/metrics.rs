@@ -443,6 +443,7 @@ pub struct PipelineMetrics {
     pub download_lanes_sequential_active: AtomicUsize,
     pub download_lanes_depth2_active: AtomicUsize,
     pub download_lanes_depth4_active: AtomicUsize,
+    pub download_lanes_depth8_active: AtomicUsize,
     pub download_lanes_idle_active: AtomicUsize,
     pub download_lanes_awaiting_work_active: AtomicUsize,
     pub download_lanes_binding_server_active: AtomicUsize,
@@ -598,6 +599,7 @@ impl PipelineMetrics {
             download_lanes_sequential_active: AtomicUsize::new(0),
             download_lanes_depth2_active: AtomicUsize::new(0),
             download_lanes_depth4_active: AtomicUsize::new(0),
+            download_lanes_depth8_active: AtomicUsize::new(0),
             download_lanes_idle_active: AtomicUsize::new(0),
             download_lanes_awaiting_work_active: AtomicUsize::new(0),
             download_lanes_binding_server_active: AtomicUsize::new(0),
@@ -909,6 +911,7 @@ impl PipelineMetrics {
                 .load(Ordering::Relaxed),
             download_lanes_depth2_active: self.download_lanes_depth2_active.load(Ordering::Relaxed),
             download_lanes_depth4_active: self.download_lanes_depth4_active.load(Ordering::Relaxed),
+            download_lanes_depth8_active: self.download_lanes_depth8_active.load(Ordering::Relaxed),
             download_lanes_idle_active: self.download_lanes_idle_active.load(Ordering::Relaxed),
             download_lanes_awaiting_work_active: self
                 .download_lanes_awaiting_work_active
@@ -1150,6 +1153,7 @@ pub struct MetricsSnapshot {
     pub download_lanes_sequential_active: usize,
     pub download_lanes_depth2_active: usize,
     pub download_lanes_depth4_active: usize,
+    pub download_lanes_depth8_active: usize,
     pub download_lanes_idle_active: usize,
     pub download_lanes_awaiting_work_active: usize,
     pub download_lanes_binding_server_active: usize,

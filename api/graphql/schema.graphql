@@ -807,6 +807,7 @@ type Metrics {
 	downloadLanesSequentialActive: Int!
 	downloadLanesDepth2Active: Int!
 	downloadLanesDepth4Active: Int!
+	downloadLanesDepth8Active: Int!
 	downloadLanesIdleActive: Int!
 	downloadLanesAwaitingWorkActive: Int!
 	downloadLanesBindingServerActive: Int!
@@ -2104,6 +2105,29 @@ type ServerHealth {
 	EWMA request latency in milliseconds.
 	"""
 	latencyMs: Float!
+	"""
+	EWMA command-to-status-line wait for BODY fetches, in milliseconds.
+	Absent until the download lanes have taken an unbiased sample.
+	"""
+	bodyLatencyMs: Float
+	"""
+	EWMA status-line-to-terminator wait for one article, in milliseconds:
+	what the article itself costs on the wire.
+	"""
+	bodyTransferMs: Float
+	"""
+	"good", "moderate" or "slow" for `bodyLatencyMs`.
+	"""
+	bodyLatencyBand: String
+	"""
+	BODY pipelining depth the lanes currently run at; 1 is sequential.
+	"""
+	bodyPipelineDepth: Int!
+	"""
+	Set once the server has twice failed to answer a pipelined batch
+	cleanly, which holds it sequential for the rest of the process.
+	"""
+	bodyPipeliningPinnedSequential: Boolean!
 	successCount: Int!
 	failureCount: Int!
 	consecutiveFailures: Int!
@@ -2350,6 +2374,17 @@ type TestConnectionResult {
 	success: Boolean!
 	message: String!
 	latencyMs: Int
+	"""
+	Command-to-status-line round trip on the open session. `latencyMs` is
+	the whole connect (TCP, TLS, authentication); this is the distance the
+	download lanes have to work against.
+	"""
+	firstByteLatencyMs: Int
+	"""
+	"good", "moderate" or "slow" for `firstByteLatencyMs`. Descriptive: the
+	download depth is chosen automatically and needs no operator input.
+	"""
+	firstByteLatencyBand: String
 	supportsPipelining: Boolean!
 	adoptableTlsNameMismatchCertificate: AdoptableTlsNameMismatchCertificate
 	"""

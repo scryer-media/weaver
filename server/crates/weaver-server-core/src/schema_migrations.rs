@@ -22,7 +22,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 44;
+const CURRENT_SCHEMA_VERSION: i64 = 45;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1291,6 +1291,58 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(usage_cascade, 1);
+    }
+
+    /// The proven BODY pipelining depth is optional: a server that has never
+    /// been measured must read back as NULL, not as a depth nobody proved.
+    #[tokio::test]
+    async fn sqlite_v45_upgrade_adds_a_nullable_server_pipelining_depth() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        run_embedded_migrations(&pool, MigrationMode::Apply)
+            .await
+            .unwrap();
+
+        let (count, notnull): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(MAX(\"notnull\"), 0) FROM pragma_table_info('servers')
+             WHERE name = 'pipelining_depth'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(notnull, 0);
+
+        sqlx::query(
+            "INSERT INTO servers (id, host, port, tls, username, password, connections, active,
+                                  supports_pipelining, priority, backfill, retention_days)
+             VALUES (1, 'news.example.com', 563, 1, NULL, NULL, 8, 1, 1, 0, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let depth: Option<i64> =
+            sqlx::query_scalar("SELECT pipelining_depth FROM servers WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(depth, None);
+
+        sqlx::query("UPDATE servers SET pipelining_depth = 8 WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let depth: Option<i64> =
+            sqlx::query_scalar("SELECT pipelining_depth FROM servers WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(depth, Some(8));
     }
 
     #[tokio::test]

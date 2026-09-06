@@ -120,8 +120,12 @@ pub struct BlockingBodyLane {
     stable_server_id: StableServerId,
     remote_ip: IpAddr,
     mode: BodyLaneMode,
-    rtt_ewma: Option<Duration>,
-    rtt_samples: VecDeque<Duration>,
+    /// Command-to-status-line wait. Only sampled when no other request was
+    /// outstanding, so pipelined batches cannot report it as near zero.
+    latency_ewma: Option<Duration>,
+    /// Status-line-to-terminator wait: what the article itself cost on the
+    /// wire, independent of how far away the server is.
+    transfer_ewma: Option<Duration>,
     soft_timeout: Duration,
     _permit: BlockingConnectionPermit,
 }
@@ -143,6 +147,9 @@ pub struct BlockingNntpConnection {
     /// Immutable geometry the next decoded article's CRC pass checkpoints at.
     /// Set per fetch by the lane; never inherited from a prior job.
     checkpoint_plan: CheckpointPlan,
+    /// How long the last decoded article waited for its status line. The lane
+    /// takes this to separate distance from transfer cost.
+    last_response_line_wait: Duration,
 }
 
 impl BlockingBodyLane {
@@ -194,8 +201,8 @@ impl BlockingBodyLane {
                         stable_server_id,
                         remote_ip,
                         mode: BodyLaneMode::Sequential,
-                        rtt_ewma: None,
-                        rtt_samples: VecDeque::with_capacity(16),
+                        latency_ewma: None,
+                        transfer_ewma: None,
                         soft_timeout,
                         _permit: permit,
                     });
@@ -214,8 +221,8 @@ impl BlockingBodyLane {
                 stable_server_id,
                 remote_ip,
                 mode: BodyLaneMode::Sequential,
-                rtt_ewma: None,
-                rtt_samples: VecDeque::with_capacity(16),
+                latency_ewma: None,
+                transfer_ewma: None,
                 soft_timeout,
                 _permit: permit,
             })
@@ -240,8 +247,12 @@ impl BlockingBodyLane {
         self.mode
     }
 
-    pub fn rtt_ewma(&self) -> Option<Duration> {
-        self.rtt_ewma
+    pub fn latency_ewma(&self) -> Option<Duration> {
+        self.latency_ewma
+    }
+
+    pub fn transfer_ewma(&self) -> Option<Duration> {
+        self.transfer_ewma
     }
 
     pub fn supports_pipelining(&self) -> bool {
@@ -269,7 +280,11 @@ impl BlockingBodyLane {
             elapsed.saturating_sub(decoded.io.throttle_wait)
         });
         if result.is_ok() {
-            self.observe_rtt(policy_elapsed);
+            // Nothing else was outstanding, so the status-line wait is a clean
+            // latency sample.
+            let latency = self.conn.take_response_line_wait().min(policy_elapsed);
+            self.observe_latency(latency);
+            self.observe_transfer(policy_elapsed.saturating_sub(latency));
         }
         self.trace_item(message_id, policy_elapsed, result)
     }
@@ -290,8 +305,9 @@ impl BlockingBodyLane {
     ) -> Vec<(usize, DecodedBodyTrace, BodyLaneTraceMeta)> {
         self.mode = match max_depth {
             0 | 1 => BodyLaneMode::Sequential,
-            2 => BodyLaneMode::PipelineDepth2,
-            _ => BodyLaneMode::PipelineDepth4,
+            depth => BodyLaneMode::Pipelined {
+                depth: depth.min(u8::MAX as usize) as u8,
+            },
         };
 
         let offered = message_ids.len().min(max_depth);
@@ -363,7 +379,14 @@ impl BlockingBodyLane {
                 elapsed.saturating_sub(decoded.io.throttle_wait)
             });
             if result.is_ok() {
-                self.observe_rtt(policy_elapsed);
+                let response_line_wait = self.conn.take_response_line_wait().min(policy_elapsed);
+                // Only the head of the batch was issued with nothing else in
+                // flight; later responses are already queued behind it, so
+                // their status-line wait says nothing about distance.
+                if idx == 0 {
+                    self.observe_latency(response_line_wait);
+                }
+                self.observe_transfer(policy_elapsed.saturating_sub(response_line_wait));
             }
             if self.conn.poisoned
                 || matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e))
@@ -541,17 +564,19 @@ impl BlockingBodyLane {
         }
     }
 
-    fn observe_rtt(&mut self, sample: Duration) {
-        let ewma = if let Some(current) = self.rtt_ewma {
-            current.mul_f64(0.75) + sample.mul_f64(0.25)
-        } else {
-            sample
-        };
-        self.rtt_ewma = Some(ewma);
-        if self.rtt_samples.len() == 16 {
-            self.rtt_samples.pop_front();
-        }
-        self.rtt_samples.push_back(sample);
+    fn observe_latency(&mut self, sample: Duration) {
+        self.latency_ewma = Some(blend_ewma(self.latency_ewma, sample));
+    }
+
+    fn observe_transfer(&mut self, sample: Duration) {
+        self.transfer_ewma = Some(blend_ewma(self.transfer_ewma, sample));
+    }
+}
+
+fn blend_ewma(current: Option<Duration>, sample: Duration) -> Duration {
+    match current {
+        Some(current) => current.mul_f64(0.75) + sample.mul_f64(0.25),
+        None => sample,
     }
 }
 
@@ -559,6 +584,12 @@ impl BlockingNntpConnection {
     /// Declare immutable checkpoint geometry for subsequent decoded articles.
     pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
         self.checkpoint_plan = checkpoint_plan;
+    }
+
+    /// Consume the last article's status-line wait, so a lane cannot credit
+    /// one response's latency to the next.
+    fn take_response_line_wait(&mut self) -> Duration {
+        std::mem::replace(&mut self.last_response_line_wait, Duration::ZERO)
     }
 
     pub fn connect_with_ip_policy(
@@ -694,6 +725,7 @@ impl BlockingNntpConnection {
             transfer_control: None,
             body_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
+            last_response_line_wait: Duration::ZERO,
         };
 
         let greeting = conn.read_response()?;
@@ -1146,6 +1178,7 @@ impl BlockingNntpConnection {
     {
         self.reserve_body(estimated_body_bytes)?;
         let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
+        let request_started = Instant::now();
         let initial = match self.send_command_with_active_budget(&cmd, budget.as_deref()) {
             Ok(initial) => initial,
             Err(error) => {
@@ -1179,6 +1212,7 @@ impl BlockingNntpConnection {
         } else {
             initial
         };
+        self.last_response_line_wait = request_started.elapsed();
         self.stream_yenc_article_response(initial, budget, on_chunk)
     }
 
@@ -1215,6 +1249,7 @@ impl BlockingNntpConnection {
     where
         F: FnMut(&[u8]) -> Result<()>,
     {
+        let response_started = Instant::now();
         let initial = match self.read_response_with_active_budget(budget.as_deref()) {
             Ok(initial) => initial,
             Err(error) => {
@@ -1226,6 +1261,7 @@ impl BlockingNntpConnection {
             self.fail_body_pipeline();
             return Err(NntpError::AuthenticationRequired.into());
         }
+        self.last_response_line_wait = response_started.elapsed();
         self.stream_yenc_article_response(initial, budget, on_chunk)
     }
 
@@ -2415,6 +2451,7 @@ mod tests {
             tls_ca_cert: Some(ca_path.clone()),
             tls_name_mismatch_certificate_der: None,
             pipelining: crate::connection::PipeliningCapability::Probe,
+            pipelining_depth: None,
             tls_cipher_preference: TlsCipherPreference::Auto,
         };
         (config, handle, ca_path)

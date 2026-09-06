@@ -445,6 +445,7 @@ impl Pipeline {
                 compatibility,
                 effective_exclude_servers,
                 checkpoint_plan: self.par2_checkpoint_plan(job_id),
+                pressure_clear: false,
                 works: vec![first],
             };
             self.rollback_download_batch_lease(lease);
@@ -487,6 +488,7 @@ impl Pipeline {
             compatibility,
             effective_exclude_servers,
             checkpoint_plan: self.par2_checkpoint_plan(job_id),
+            pressure_clear: false,
             works,
         };
         if lease.works.len() < IP_REPLACEMENT_TRIAL_SAMPLES {
@@ -590,6 +592,7 @@ impl Pipeline {
             compatibility,
             effective_exclude_servers,
             checkpoint_plan: self.par2_checkpoint_plan(job_id),
+            pressure_clear: pressure.state == DownloadPressureState::Clear,
             works,
         }
     }

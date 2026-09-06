@@ -105,6 +105,11 @@ pub struct ServerConfig {
     /// Auto-detected when the server is added or tested.
     #[serde(default)]
     pub supports_pipelining: bool,
+    /// BODY pipelining depth a previous run proved for this server. The
+    /// download lanes rediscover it when absent; persisting it only saves the
+    /// rediscovery.
+    #[serde(default)]
+    pub pipelining_depth: Option<u8>,
     /// Priority group. Lower values tried first within the fill tier.
     #[serde(default)]
     pub priority: u32,

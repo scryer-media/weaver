@@ -58,9 +58,7 @@ use par2_rs::par2_set::Par2FileSet;
 use weaver_nntp::NntpClient;
 
 use self::archive::rar_state::{RarDerivedPlan, RarSetState};
-use self::download::{
-    DownloadLaneMode, DownloadLaneRuntimeState, JobTransportProfile, LaneParkReason,
-};
+use self::download::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};
 use self::extraction::{
     ExtractionLimits, ExtractionRoot, JobExtractionBudget, ProcessMemoryBudget,
 };
@@ -312,6 +310,9 @@ pub(super) struct DownloadBatchLease {
     /// leased. Each response carries this same snapshot through durable commit
     /// so grids admitted later cannot reinterpret old decoder output.
     pub(super) checkpoint_plan: weaver_yenc::CheckpointPlan,
+    /// Byte pressure at lease time. Carried onto every observation this lease
+    /// produces so the depth explorer can discard distorted samples.
+    pub(super) pressure_clear: bool,
     pub(super) works: Vec<DownloadWork>,
 }
 
@@ -924,10 +925,21 @@ pub(super) struct DownloadLaneObservation {
     pub(super) server_idx: Option<usize>,
     pub(super) mode: DownloadLaneMode,
     pub(super) supports_pipelining: bool,
-    pub(super) rtt: Option<Duration>,
+    /// Command-to-status-line wait, present only when the lane could take an
+    /// unbiased sample (nothing else outstanding when the request went out).
+    pub(super) latency: Option<Duration>,
+    /// Status-line-to-terminator wait: what the article cost on the wire.
+    pub(super) transfer: Option<Duration>,
+    /// Decoded payload of this one response, for the depth explorer's
+    /// throughput window.
+    pub(super) payload_bytes: u64,
+    /// This response's elapsed time with deliberate throttle waits removed.
+    pub(super) policy_elapsed: Duration,
+    /// Whether byte pressure was clear when the batch was leased. Samples
+    /// taken under pressure say nothing about the depth under test.
+    pub(super) pressure_clear: bool,
     pub(super) batch_complete: bool,
     pub(super) batch_clean: bool,
-    pub(super) batch_response_count: u64,
     pub(super) unresolved_count: u64,
     pub(super) connection_discarded: bool,
 }
@@ -2646,9 +2658,8 @@ pub struct Pipeline {
     pub(super) hot_dispatch_spillover_loans: SpilloverLoanBook,
     /// Cooperative signal asking owned hot lanes to return their unrequested tail.
     pub(super) hot_share_yield_signal: Arc<HotShareYieldSignal>,
-    /// Runtime-only article transport classification per active job.
-    pub(super) job_transport_profiles: HashMap<JobId, JobTransportProfile>,
-    /// Runtime-only lane/proof state for BODY dispatch.
+    /// Runtime-only per-server BODY depth explorers. Seeded from the persisted
+    /// depth on first observation; the measurements themselves never persist.
     pub(super) download_lane_runtime: DownloadLaneRuntimeState,
     /// Lane refill requests held under hard download pressure, answered as the
     /// backlog drains so lanes resume without a park/redispatch round-trip.

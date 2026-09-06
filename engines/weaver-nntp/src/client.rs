@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -298,8 +297,14 @@ fn retain_earliest_quota_rejection(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyLaneMode {
     Sequential,
-    PipelineDepth2,
-    PipelineDepth4,
+    Pipelined { depth: u8 },
+}
+
+fn blend_ewma(current: Option<Duration>, sample: Duration) -> Duration {
+    match current {
+        Some(current) => current.mul_f64(0.75) + sample.mul_f64(0.25),
+        None => sample,
+    }
 }
 
 fn supports_blocking_tls_body_lane(config: &ServerConfig) -> bool {
@@ -357,8 +362,11 @@ pub struct BodyLaneLease {
     remote_ip: IpAddr,
     groups: Vec<String>,
     mode: BodyLaneMode,
-    rtt_ewma: Option<Duration>,
-    rtt_samples: VecDeque<Duration>,
+    /// Command-to-status-line wait, sampled only when nothing else was
+    /// outstanding on the connection.
+    latency_ewma: Option<Duration>,
+    /// Status-line-to-terminator wait: the article's own cost on the wire.
+    transfer_ewma: Option<Duration>,
     checkpoint_plan: CheckpointPlan,
 }
 
@@ -401,8 +409,12 @@ impl BodyLaneLease {
         &self.groups
     }
 
-    pub fn rtt_ewma(&self) -> Option<Duration> {
-        self.rtt_ewma
+    pub fn latency_ewma(&self) -> Option<Duration> {
+        self.latency_ewma
+    }
+
+    pub fn transfer_ewma(&self) -> Option<Duration> {
+        self.transfer_ewma
     }
 
     pub fn supports_pipelining(&self) -> bool {
@@ -447,7 +459,11 @@ impl BodyLaneLease {
             elapsed.saturating_sub(decoded.io.throttle_wait)
         });
         if result.is_ok() {
-            self.observe_rtt(policy_elapsed);
+            // Nothing else was outstanding, so the status-line wait is a clean
+            // latency sample.
+            let latency = self.take_response_line_wait().min(policy_elapsed);
+            self.observe_latency(latency);
+            self.observe_transfer(policy_elapsed.saturating_sub(latency));
         }
 
         if result.as_ref().is_err_and(
@@ -467,63 +483,42 @@ impl BodyLaneLease {
         .await
     }
 
-    pub async fn fetch_decoded_pipeline_depth2<F, Fut>(
+    pub async fn fetch_decoded_pipeline<F, Fut>(
         &mut self,
         message_ids: &[&str],
+        depth: usize,
         on_trace: F,
     ) -> BodyLaneBatchStats
     where
         F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
         Fut: Future<Output = ()>,
     {
-        self.fetch_decoded_pipeline_depth2_with_estimates(message_ids, &[], on_trace)
+        self.fetch_decoded_pipeline_with_estimates(message_ids, &[], depth, on_trace)
             .await
     }
 
-    pub async fn fetch_decoded_pipeline_depth2_with_estimates<F, Fut>(
-        &mut self,
-        message_ids: &[&str],
-        estimated_body_bytes: &[u64],
-        on_trace: F,
-    ) -> BodyLaneBatchStats
-    where
-        F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        self.mode = BodyLaneMode::PipelineDepth2;
-        self.fetch_decoded_pipeline(message_ids, estimated_body_bytes, 2, on_trace)
-            .await
-    }
-
-    pub async fn fetch_decoded_pipeline_depth4<F, Fut>(
-        &mut self,
-        message_ids: &[&str],
-        on_trace: F,
-    ) -> BodyLaneBatchStats
-    where
-        F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        self.fetch_decoded_pipeline_depth4_with_estimates(message_ids, &[], on_trace)
-            .await
-    }
-
-    pub async fn fetch_decoded_pipeline_depth4_with_estimates<F, Fut>(
+    pub async fn fetch_decoded_pipeline_with_estimates<F, Fut>(
         &mut self,
         message_ids: &[&str],
         estimated_body_bytes: &[u64],
+        depth: usize,
         on_trace: F,
     ) -> BodyLaneBatchStats
     where
         F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
         Fut: Future<Output = ()>,
     {
-        self.mode = BodyLaneMode::PipelineDepth4;
-        self.fetch_decoded_pipeline(message_ids, estimated_body_bytes, 4, on_trace)
+        self.mode = match depth {
+            0 | 1 => BodyLaneMode::Sequential,
+            depth => BodyLaneMode::Pipelined {
+                depth: depth.min(u8::MAX as usize) as u8,
+            },
+        };
+        self.fetch_decoded_pipeline_inner(message_ids, estimated_body_bytes, depth, on_trace)
             .await
     }
 
-    async fn fetch_decoded_pipeline<F, Fut>(
+    async fn fetch_decoded_pipeline_inner<F, Fut>(
         &mut self,
         message_ids: &[&str],
         estimated_body_bytes: &[u64],
@@ -639,7 +634,13 @@ impl BodyLaneLease {
                 elapsed.saturating_sub(decoded.io.throttle_wait)
             });
             if result.is_ok() {
-                self.observe_rtt(policy_elapsed);
+                let response_line_wait = self.take_response_line_wait().min(policy_elapsed);
+                // Only the head of the batch was issued with nothing else in
+                // flight; later responses are already queued behind it.
+                if response_idx == 0 {
+                    self.observe_latency(response_line_wait);
+                }
+                self.observe_transfer(policy_elapsed.saturating_sub(response_line_wait));
             }
             let poisoned = self.conn.as_ref().is_some_and(|conn| conn.is_poisoned());
 
@@ -827,17 +828,20 @@ impl BodyLaneLease {
         }
     }
 
-    fn observe_rtt(&mut self, sample: Duration) {
-        let ewma = if let Some(current) = self.rtt_ewma {
-            current.mul_f64(0.75) + sample.mul_f64(0.25)
-        } else {
-            sample
-        };
-        self.rtt_ewma = Some(ewma);
-        if self.rtt_samples.len() == 16 {
-            self.rtt_samples.pop_front();
-        }
-        self.rtt_samples.push_back(sample);
+    fn observe_latency(&mut self, sample: Duration) {
+        self.latency_ewma = Some(blend_ewma(self.latency_ewma, sample));
+    }
+
+    fn observe_transfer(&mut self, sample: Duration) {
+        self.transfer_ewma = Some(blend_ewma(self.transfer_ewma, sample));
+    }
+
+    /// Consume the last article's status-line wait so one response's latency
+    /// cannot be credited to the next.
+    fn take_response_line_wait(&mut self) -> Duration {
+        self.conn
+            .as_mut()
+            .map_or(Duration::ZERO, |conn| conn.take_response_line_wait())
     }
 
     async fn discard_current(&mut self) {
@@ -1031,8 +1035,8 @@ impl NntpClient {
                 conn: Some(conn),
                 groups: groups.to_vec(),
                 mode: BodyLaneMode::Sequential,
-                rtt_ewma: None,
-                rtt_samples: VecDeque::with_capacity(16),
+                latency_ewma: None,
+                transfer_ewma: None,
                 checkpoint_plan: CheckpointPlan::None,
             }),
             Ok(Err(error)) => {
@@ -3726,8 +3730,9 @@ mod tests {
         ];
         let mut callbacks = Vec::new();
         let stats = lane
-            .fetch_decoded_pipeline_depth2(
+            .fetch_decoded_pipeline(
                 &message_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                2,
                 |index, trace, meta| {
                     callbacks.push((index, trace, meta));
                     std::future::ready(())
@@ -4630,9 +4635,10 @@ mod tests {
         let mut seen = Vec::new();
 
         let stats = lane
-            .fetch_decoded_pipeline_depth4_with_estimates(
+            .fetch_decoded_pipeline_with_estimates(
                 &message_ids,
                 &[0, 0, 0],
+                8,
                 |idx, trace, meta| {
                     seen.push((idx, trace, meta));
                     std::future::ready(())
@@ -4718,9 +4724,10 @@ mod tests {
         let mut seen = Vec::new();
 
         let stats = lane
-            .fetch_decoded_pipeline_depth4_with_estimates(
+            .fetch_decoded_pipeline_with_estimates(
                 &message_ids.iter().map(String::as_str).collect::<Vec<_>>(),
                 &estimates,
+                4,
                 |idx, trace, meta| {
                     seen.push((idx, trace, meta));
                     std::future::ready(())
