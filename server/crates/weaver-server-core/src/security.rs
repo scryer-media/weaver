@@ -4,6 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+use http::HeaderMap;
 use http::uri::Authority;
 use ipnet::IpNet;
 use reqwest::Url;
@@ -19,6 +20,7 @@ pub const ENV_NZB_DECOMPRESSED_LIMIT_BYTES: &str = "WEAVER_NZB_DECOMPRESSED_LIMI
 pub const ENV_RSS_ALLOW_PRIVATE_NETWORK: &str = "WEAVER_RSS_ALLOW_PRIVATE_NETWORK";
 pub const ENV_STRICT_SECURITY: &str = "WEAVER_STRICT_SECURITY";
 pub const ENV_TRUSTED_CIDRS: &str = "WEAVER_TRUSTED_CIDRS";
+pub const ENV_TRUSTED_PROXIES: &str = "WEAVER_TRUSTED_PROXIES";
 
 pub const DEFAULT_HTTP_BIND_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -118,6 +120,22 @@ fn parse_cidr_list(values: &[&str]) -> Vec<IpNet> {
         .iter()
         .filter_map(|value| value.parse::<IpNet>().ok())
         .collect()
+}
+
+/// Parse one trust entry written either as a CIDR (`10.0.0.0/8`) or as a bare
+/// address (`10.0.0.1`), which widens to its single-host network.
+///
+/// The bare form exists because a reverse proxy is one machine, not a network,
+/// and that is what an operator reaches for first. Bare addresses are stored
+/// canonically so `::ffff:10.0.0.1` and `10.0.0.1` name the same host.
+pub fn parse_ip_or_cidr(value: &str) -> Option<IpNet> {
+    let value = value.trim();
+    if let Ok(network) = value.parse::<IpNet>() {
+        return Some(network);
+    }
+    let ip = canonical_ip(value.parse::<IpAddr>().ok()?);
+    let prefix = if ip.is_ipv4() { 32 } else { 128 };
+    IpNet::new(ip, prefix).ok()
 }
 
 /// Parse the stored trusted-network list: a JSON array of CIDR strings.
@@ -341,6 +359,15 @@ pub struct RuntimeSecurityConfig {
     /// True when `WEAVER_TRUSTED_CIDRS` supplied the list, which pins it: the
     /// stored access mode is ignored and the UI shows the policy read-only.
     pub trust_env_pinned: bool,
+    /// Socket peers whose forwarding headers are believed, from
+    /// `WEAVER_TRUSTED_PROXIES`.
+    ///
+    /// Empty by default, and that default is the whole safety argument: a
+    /// forwarded address is judged only where an operator named the box that
+    /// sends it, so a direct deployment behaves exactly as it did before this
+    /// list existed. Unlike the trust list it needs no lock — a reverse proxy
+    /// belongs to the deployment, not to something a wizard edits at runtime.
+    pub trusted_proxies: Vec<IpNet>,
     /// Set when the process could not honor the configured bind address and
     /// fell back to loopback instead of refusing to start. Shown as a banner
     /// so the deviation is impossible to miss from the UI that still works.
@@ -385,6 +412,7 @@ impl RuntimeSecurityConfig {
             rss_allow_private_network: parse_bool_env(ENV_RSS_ALLOW_PRIVATE_NETWORK, true)?,
             strict_security,
             trusted_cidrs: Arc::new(RwLock::new(trusted_cidrs)),
+            trusted_proxies: parse_trusted_proxies_env()?,
             // An env-pinned deployment has already declared its policy, so it
             // is configured before the database is even open. Everything else
             // waits for `apply_stored_trust` to read the stored mode.
@@ -569,19 +597,195 @@ impl RuntimeSecurityConfig {
         None
     }
 
-    /// Returns whether the immediate socket peer is inside an explicitly trusted network.
-    /// Proxy forwarding headers are intentionally not considered here.
+    /// Returns whether the immediate socket peer is inside an explicitly
+    /// trusted network, ignoring forwarding headers entirely.
+    ///
+    /// The raw socket test. Browser admission goes through
+    /// [`Self::is_trusted_client`] instead, which asks the same question about
+    /// the address the request is actually attributed to.
     pub fn is_trusted_peer(&self, peer: Option<SocketAddr>) -> bool {
         let Some(peer) = peer else {
             return false;
         };
-        let ip = canonical_ip(peer.ip());
+        self.trusts_ip(canonical_ip(peer.ip()))
+    }
+
+    /// Returns whether the address this request is attributed to is inside an
+    /// explicitly trusted network.
+    ///
+    /// This is what an operator means when they configure a trusted CIDR: the
+    /// machine the browser is on. Behind no proxy the answer is identical to
+    /// [`Self::is_trusted_peer`], because resolution falls back to the socket
+    /// peer whenever there is nothing trustworthy to prefer over it.
+    pub fn is_trusted_client(&self, peer: Option<SocketAddr>, headers: &HeaderMap) -> bool {
+        let Some(ip) = self.resolve_client_ip(peer, headers) else {
+            return false;
+        };
+        self.trusts_ip(ip)
+    }
+
+    fn trusts_ip(&self, ip: IpAddr) -> bool {
         self.trusted_cidrs
             .read()
             .expect("trusted-network lock poisoned")
             .iter()
             .any(|network| network.contains(&ip))
     }
+
+    /// Returns whether this address is a proxy the operator named in
+    /// `WEAVER_TRUSTED_PROXIES`.
+    pub fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
+        let ip = canonical_ip(ip);
+        self.trusted_proxies
+            .iter()
+            .any(|network| network.contains(&ip))
+    }
+
+    /// The address a request is attributed to: the socket peer, unless that
+    /// peer is a configured proxy, in which case the client its forwarding
+    /// headers name.
+    ///
+    /// Trusted hops are peeled off the RIGHT of `X-Forwarded-For` — the end a
+    /// proxy appends to — so a browser that sends its own header cannot name
+    /// itself: whatever it invents sits to the left of the entry the proxy
+    /// recorded, and the rightmost untrusted hop wins. A chain that is
+    /// missing, malformed, or entirely trusted falls back to the socket peer
+    /// rather than guessing, which is the same answer this returned before
+    /// proxies were configurable at all.
+    pub fn resolve_client_ip(
+        &self,
+        peer: Option<SocketAddr>,
+        headers: &HeaderMap,
+    ) -> Option<IpAddr> {
+        let peer_ip = canonical_ip(peer?.ip());
+        if !self.is_trusted_proxy(peer_ip) {
+            return Some(peer_ip);
+        }
+
+        let Ok(mut chain) = forwarded_for_chain(headers) else {
+            return Some(peer_ip);
+        };
+        if chain.is_empty() {
+            // No `X-Forwarded-For` at all: honor the single-address headers
+            // some proxies send instead. There is no chain to verify, but this
+            // is only ever reached from a box the operator named, so believing
+            // it is the same trust decision they already made.
+            return Some(single_forwarded_ip(headers).unwrap_or(peer_ip));
+        }
+        chain.push(peer_ip);
+        while chain.last().is_some_and(|hop| self.is_trusted_proxy(*hop)) {
+            chain.pop();
+        }
+        Some(chain.last().copied().unwrap_or(peer_ip))
+    }
+
+    /// Returns whether this request carried forwarding headers that were
+    /// deliberately not believed, because its socket peer is not a configured
+    /// proxy.
+    ///
+    /// The one signal that separates "your proxy is not configured" from "your
+    /// address is genuinely outside the trust list". Both look like the same
+    /// refusal from the browser's side, and only the first has a fix the
+    /// operator can act on.
+    pub fn forwarding_headers_ignored(
+        &self,
+        peer: Option<SocketAddr>,
+        headers: &HeaderMap,
+    ) -> bool {
+        has_forwarding_headers(headers)
+            && !peer.is_some_and(|peer| self.is_trusted_proxy(peer.ip()))
+    }
+}
+
+const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+const REAL_IP_HEADER: &str = "x-real-ip";
+
+/// Ceiling on hops read from one request's chain. Real deployments stack a
+/// handful; anything past this is a client behind a trusted proxy trying to
+/// make Weaver allocate on its behalf, and is discarded as malformed.
+const MAX_FORWARDED_HOPS: usize = 32;
+
+/// Every hop named by every `X-Forwarded-For` header, left to right.
+///
+/// `Err` means the chain is malformed. Callers fall back to the socket peer on
+/// that, rather than using the entries they could parse: half a chain cannot
+/// be peeled from the right, and pretending otherwise is how a forged prefix
+/// would be believed.
+fn forwarded_for_chain(headers: &HeaderMap) -> Result<Vec<IpAddr>, ()> {
+    let mut hops = Vec::new();
+    for value in headers.get_all(FORWARDED_FOR_HEADER) {
+        let value = value.to_str().map_err(|_| ())?;
+        for token in value.split(',') {
+            if token.trim().is_empty() {
+                continue;
+            }
+            if hops.len() == MAX_FORWARDED_HOPS {
+                return Err(());
+            }
+            hops.push(parse_forwarded_token(token).ok_or(())?);
+        }
+    }
+    Ok(hops)
+}
+
+/// The client address from the single-hop forwarding headers, for proxies that
+/// send one of those and no `X-Forwarded-For`.
+fn single_forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    if let Some(ip) = headers
+        .get(REAL_IP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_forwarded_token)
+    {
+        return Some(ip);
+    }
+    headers
+        .get(http::header::FORWARDED)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value.split(',').find_map(|entry| {
+                entry.split(';').find_map(|part| {
+                    let (name, raw) = part.split_once('=')?;
+                    if !name.trim().eq_ignore_ascii_case("for") {
+                        return None;
+                    }
+                    parse_forwarded_token(raw)
+                })
+            })
+        })
+}
+
+/// Whether anything in this request looks like it came through a proxy.
+///
+/// Wider than the headers resolution actually reads, because this only decides
+/// whether to tell an operator that a proxy is in the path — a proxy that sets
+/// nothing but `X-Forwarded-Proto` still leaves them stuck on the same page.
+fn has_forwarding_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key(FORWARDED_FOR_HEADER)
+        || headers.contains_key(REAL_IP_HEADER)
+        || headers.contains_key(http::header::FORWARDED)
+        || headers.contains_key("x-forwarded-host")
+        || headers.contains_key("x-forwarded-proto")
+}
+
+/// One forwarding-header address: bare, `host:port`, or bracketed IPv6, which
+/// are the three shapes RFC 7239 and the `X-` headers put in the field.
+/// Returned canonical so an IPv4-mapped hop compares equal to the same address
+/// written plainly.
+fn parse_forwarded_token(raw: &str) -> Option<IpAddr> {
+    let token = raw.trim().trim_matches('"');
+    if token.is_empty() || token.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    let ip = token
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| token.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
+        .or_else(|| {
+            let bracketed = token.strip_prefix('[')?;
+            let end = bracketed.find(']')?;
+            bracketed[..end].parse::<IpAddr>().ok()
+        })?;
+    Some(canonical_ip(ip))
 }
 
 impl Default for RuntimeSecurityConfig {
@@ -599,6 +803,7 @@ impl Default for RuntimeSecurityConfig {
             rss_allow_private_network: true,
             strict_security: false,
             trusted_cidrs: Arc::new(RwLock::new(Vec::new())),
+            trusted_proxies: Vec::new(),
             security_configured: Arc::new(AtomicBool::new(false)),
             trust_env_pinned: false,
             bind_fallback: None,
@@ -687,6 +892,39 @@ fn parse_trusted_cidrs_env() -> Result<Vec<IpNet>, SecurityConfigError> {
             entry.parse::<IpNet>().map_err(|_| {
                 SecurityConfigError::new(format!(
                     "{ENV_TRUSTED_CIDRS} contains invalid CIDR {entry:?}"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Parse `WEAVER_TRUSTED_PROXIES`: a comma-separated list of addresses or
+/// CIDRs naming the proxies whose forwarding headers may be believed.
+///
+/// All-or-nothing like the trust list, and for a louder reason: a typo that
+/// was quietly skipped would leave the operator staring at the same refusal
+/// page with no sign that the variable they set was ignored. Refusing to start
+/// puts the bad entry in front of them instead.
+fn parse_trusted_proxies_env() -> Result<Vec<IpNet>, SecurityConfigError> {
+    let Ok(value) = env::var(ENV_TRUSTED_PROXIES) else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    value
+        .split(',')
+        .map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return Err(SecurityConfigError::new(format!(
+                    "{ENV_TRUSTED_PROXIES} must not contain empty entries"
+                )));
+            }
+            parse_ip_or_cidr(entry).ok_or_else(|| {
+                SecurityConfigError::new(format!(
+                    "{ENV_TRUSTED_PROXIES} contains invalid address or CIDR {entry:?}"
                 ))
             })
         })
@@ -854,6 +1092,7 @@ mod tests {
             ENV_RSS_ALLOW_PRIVATE_NETWORK,
             ENV_STRICT_SECURITY,
             ENV_TRUSTED_CIDRS,
+            ENV_TRUSTED_PROXIES,
         ] {
             unsafe { env::remove_var(name) };
         }
@@ -1454,5 +1693,185 @@ mod tests {
 
         let redirect_url = public_url.join("http://127.0.0.1/private.nzb").unwrap();
         assert!(resolve_fetch_target(&redirect_url, false).await.is_err());
+    }
+
+    fn proxied(trusted_cidrs: &[&str], proxies: &[&str]) -> RuntimeSecurityConfig {
+        let mut config = RuntimeSecurityConfig::default();
+        config.set_trusted_cidrs(parse_cidr_list(trusted_cidrs));
+        config.trusted_proxies = proxies
+            .iter()
+            .map(|entry| parse_ip_or_cidr(entry).expect("valid proxy entry"))
+            .collect();
+        config
+    }
+
+    fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(
+                http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        headers
+    }
+
+    fn peer(value: &str) -> Option<SocketAddr> {
+        Some(value.parse().unwrap())
+    }
+
+    /// The default state, and the one that must not change: with no proxy
+    /// configured, a forwarding header is a string an attacker chose.
+    #[test]
+    fn forwarding_headers_are_ignored_without_a_configured_proxy() {
+        let config = proxied(&["192.168.1.0/24"], &[]);
+        let headers = headers_with(&[("x-forwarded-for", "192.168.1.50")]);
+
+        assert_eq!(
+            config.resolve_client_ip(peer("203.0.113.9:4000"), &headers),
+            Some("203.0.113.9".parse().unwrap())
+        );
+        assert!(!config.is_trusted_client(peer("203.0.113.9:4000"), &headers));
+        assert!(config.forwarding_headers_ignored(peer("203.0.113.9:4000"), &headers));
+    }
+
+    /// The case this exists for: an operator names their reverse proxy, and a
+    /// trusted CIDR then means the browser's machine rather than the proxy's.
+    #[test]
+    fn a_configured_proxy_resolves_the_browser_address() {
+        let config = proxied(&["192.168.1.0/24"], &["172.20.0.5"]);
+        let headers = headers_with(&[("x-forwarded-for", "192.168.1.50")]);
+        let proxy = peer("172.20.0.5:41000");
+
+        assert_eq!(
+            config.resolve_client_ip(proxy, &headers),
+            Some("192.168.1.50".parse().unwrap())
+        );
+        assert!(config.is_trusted_client(proxy, &headers));
+        // The proxy's own address is not the client's, so the socket-level
+        // test still refuses it. Only the resolved answer admits the browser.
+        assert!(!config.is_trusted_peer(proxy));
+        assert!(!config.forwarding_headers_ignored(proxy, &headers));
+    }
+
+    /// Hops are peeled from the right, so a client that forges the header is
+    /// judged on the entry the proxy appended, never on the one it invented.
+    #[test]
+    fn a_forged_prefix_cannot_name_the_client() {
+        let config = proxied(&["192.168.1.0/24"], &["172.20.0.5"]);
+        let headers = headers_with(&[("x-forwarded-for", "192.168.1.50, 203.0.113.9")]);
+        let proxy = peer("172.20.0.5:41000");
+
+        assert_eq!(
+            config.resolve_client_ip(proxy, &headers),
+            Some("203.0.113.9".parse().unwrap())
+        );
+        assert!(!config.is_trusted_client(proxy, &headers));
+    }
+
+    /// A chain of configured proxies peels down to the first hop none of them
+    /// vouched for, across repeated headers as well as one comma list.
+    #[test]
+    fn chained_proxies_peel_to_the_first_untrusted_hop() {
+        let config = proxied(&["10.0.0.0/8"], &["172.20.0.0/16"]);
+        let headers = headers_with(&[
+            ("x-forwarded-for", "10.4.4.4"),
+            ("x-forwarded-for", "172.20.9.9, 172.20.0.5"),
+        ]);
+
+        assert_eq!(
+            config.resolve_client_ip(peer("172.20.0.6:41000"), &headers),
+            Some("10.4.4.4".parse().unwrap())
+        );
+    }
+
+    /// Missing, malformed, and all-trusted chains all fall back to the socket
+    /// peer — the answer this gave before proxies were configurable.
+    #[test]
+    fn unusable_chains_fall_back_to_the_socket_peer() {
+        let config = proxied(&[], &["172.20.0.5"]);
+        let proxy = peer("172.20.0.5:41000");
+        let expected: Option<IpAddr> = Some("172.20.0.5".parse().unwrap());
+
+        assert_eq!(config.resolve_client_ip(proxy, &HeaderMap::new()), expected);
+        assert_eq!(
+            config.resolve_client_ip(proxy, &headers_with(&[("x-forwarded-for", "not-an-ip")])),
+            expected
+        );
+        assert_eq!(
+            config.resolve_client_ip(proxy, &headers_with(&[("x-forwarded-for", "172.20.0.5")])),
+            expected
+        );
+        // A chain long enough to be an allocation lever is malformed, not deep.
+        let long_chain = (0..MAX_FORWARDED_HOPS + 1)
+            .map(|_| "203.0.113.9")
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            config.resolve_client_ip(proxy, &headers_with(&[("x-forwarded-for", &long_chain)])),
+            expected
+        );
+        assert_eq!(config.resolve_client_ip(None, &HeaderMap::new()), None);
+    }
+
+    /// Proxies that send one address instead of a chain are believed too, but
+    /// only in the absence of `X-Forwarded-For`, which stays authoritative.
+    #[test]
+    fn single_address_headers_serve_proxies_that_send_no_chain() {
+        let config = proxied(&["192.168.1.0/24"], &["172.20.0.5"]);
+        let proxy = peer("172.20.0.5:41000");
+
+        assert_eq!(
+            config.resolve_client_ip(proxy, &headers_with(&[("x-real-ip", "192.168.1.50")])),
+            Some("192.168.1.50".parse().unwrap())
+        );
+        assert_eq!(
+            config.resolve_client_ip(
+                proxy,
+                &headers_with(&[("forwarded", "for=\"[2001:db8::1]:5000\";proto=https")])
+            ),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(
+            config.resolve_client_ip(
+                proxy,
+                &headers_with(&[
+                    ("x-forwarded-for", "192.168.1.50"),
+                    ("x-real-ip", "203.0.113.9"),
+                ])
+            ),
+            Some("192.168.1.50".parse().unwrap())
+        );
+    }
+
+    /// Both sides of a comparison are canonicalised, so the dual-stack mapped
+    /// form of an address matches the plain form in either position.
+    #[test]
+    fn proxy_and_client_matching_see_through_the_ipv4_mapped_form() {
+        let config = proxied(&["192.168.1.0/24"], &["172.20.0.5"]);
+        let headers = headers_with(&[("x-forwarded-for", "::ffff:192.168.1.50")]);
+
+        assert!(config.is_trusted_client(peer("[::ffff:172.20.0.5]:41000"), &headers));
+    }
+
+    #[test]
+    fn trusted_proxies_env_accepts_addresses_and_cidrs_and_refuses_typos() {
+        let _guard = env_lock();
+        clear_env();
+
+        unsafe { env::set_var(ENV_TRUSTED_PROXIES, " 172.20.0.5 , 10.8.0.0/16 ") };
+        let config = RuntimeSecurityConfig::from_env().unwrap();
+        assert!(config.is_trusted_proxy("172.20.0.5".parse().unwrap()));
+        assert!(config.is_trusted_proxy("10.8.4.4".parse().unwrap()));
+        assert!(!config.is_trusted_proxy("172.20.0.6".parse().unwrap()));
+
+        unsafe { env::set_var(ENV_TRUSTED_PROXIES, "172.20.0.5, 10.8.0.0/44") };
+        let error = RuntimeSecurityConfig::from_env().unwrap_err().to_string();
+        assert!(error.contains(ENV_TRUSTED_PROXIES), "{error}");
+        assert!(error.contains("10.8.0.0/44"), "{error}");
+
+        clear_env();
+        let config = RuntimeSecurityConfig::from_env().unwrap();
+        assert!(config.trusted_proxies.is_empty());
     }
 }

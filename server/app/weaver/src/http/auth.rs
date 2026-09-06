@@ -83,9 +83,19 @@ impl LoginRateLimiter {
     }
 }
 
-fn login_client_id(headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> String {
-    if let Some(addr) = peer_addr {
-        return addr.ip().to_string();
+/// The address login attempts are metered against.
+///
+/// Resolved the same way trust is, so a deployment behind a configured proxy
+/// meters each browser separately instead of pooling every attempt under the
+/// proxy's own address. Headers are believed only from a configured proxy; a
+/// direct peer is metered on its socket address exactly as before.
+fn login_client_id(
+    security: &RuntimeSecurityConfig,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+) -> String {
+    if let Some(ip) = security.resolve_client_ip(peer_addr, headers) {
+        return ip.to_string();
     }
     for name in ["x-forwarded-for", "x-real-ip"] {
         if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
@@ -284,7 +294,7 @@ pub(super) async fn resolve_caller(
     // enabled, credentials always take precedence over trusted-network access.
     if let BrowserSessionPolicy::TrustedPeer(peer) = browser_session
         && cached_auth.is_none()
-        && security.is_trusted_peer(peer)
+        && security.is_trusted_client(peer, headers)
         && let Some(cookie) = extract_session_cookie(headers)
         && cookie == session_token
     {
@@ -341,7 +351,7 @@ pub(super) async fn login_handler(
             return super::error_response(StatusCode::BAD_REQUEST, "login is not enabled");
         }
     };
-    let client_id = login_client_id(&headers, Some(peer_addr));
+    let client_id = login_client_id(&security, &headers, Some(peer_addr));
 
     if login_limiter.too_many_failures(&body.username, &client_id) {
         return super::error_response(StatusCode::TOO_MANY_REQUESTS, "too many login attempts");
@@ -405,6 +415,7 @@ pub(super) struct SetupRequest {
 /// browser to reach a fresh instance from the machine itself is the operator.
 pub(super) async fn setup_handler(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Extension(db): Extension<Database>,
     Extension(auth_cache): Extension<LoginAuthCache>,
     Extension(security): Extension<RuntimeSecurityConfig>,
@@ -419,9 +430,14 @@ pub(super) async fn setup_handler(
     if auth_cache.snapshot().is_some() {
         return super::error_response(StatusCode::CONFLICT, "setup is already complete");
     }
-    // Canonical loopback: on a dual-stack listener the machine's own browser
-    // arrives as `::ffff:127.0.0.1`, which must not be refused as remote.
-    if !ip_is_loopback(peer_addr.ip()) && !security.is_trusted_peer(Some(peer_addr)) {
+    // Judged on the resolved client, not the socket peer, so a machine-local
+    // browser reaching Weaver through a configured reverse proxy is still the
+    // machine's own browser. Canonical loopback: on a dual-stack listener that
+    // browser arrives as `::ffff:127.0.0.1`, which must not read as remote.
+    let client_ip = security.resolve_client_ip(Some(peer_addr), &headers);
+    if !client_ip.is_some_and(ip_is_loopback)
+        && !security.is_trusted_client(Some(peer_addr), &headers)
+    {
         return super::error_response(
             StatusCode::FORBIDDEN,
             "setup must be completed from the machine Weaver runs on",
@@ -602,7 +618,7 @@ pub(super) async fn setup_handler(
     // browser session cookie the next page load would hand it anyway. The
     // wizard's remaining calls are made from THIS page, which never reloads
     // when the operator restarts Weaver from it.
-    if credentials.is_none() && security.is_trusted_peer(Some(peer_addr)) {
+    if credentials.is_none() && security.is_trusted_client(Some(peer_addr), &headers) {
         response_headers.push((
             header::SET_COOKIE,
             session_cookie_value(session_token.0.as_str(), &security),
@@ -742,6 +758,7 @@ mod tests {
 
     #[test]
     fn login_client_id_prefers_peer_address_then_forwarded_headers() {
+        let security = RuntimeSecurityConfig::default();
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
@@ -750,8 +767,33 @@ mod tests {
         headers.insert("x-real-ip", "198.51.100.12".parse().unwrap());
 
         let peer: SocketAddr = "203.0.113.9:51234".parse().unwrap();
-        assert_eq!(login_client_id(&headers, Some(peer)), "203.0.113.9");
-        assert_eq!(login_client_id(&headers, None), "198.51.100.10");
+        assert_eq!(
+            login_client_id(&security, &headers, Some(peer)),
+            "203.0.113.9"
+        );
+        assert_eq!(login_client_id(&security, &headers, None), "198.51.100.10");
+    }
+
+    /// Metering follows the same resolution trust does: a browser behind a
+    /// configured proxy is rate-limited on its own address, so one attacker
+    /// cannot lock out every other browser sharing that proxy.
+    #[test]
+    fn login_client_id_meters_the_client_behind_a_configured_proxy() {
+        let mut security = RuntimeSecurityConfig::default();
+        security.trusted_proxies = vec!["10.8.0.2/32".parse().unwrap()];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.10".parse().unwrap());
+
+        let proxy: SocketAddr = "10.8.0.2:51234".parse().unwrap();
+        let stranger: SocketAddr = "203.0.113.9:51234".parse().unwrap();
+        assert_eq!(
+            login_client_id(&security, &headers, Some(proxy)),
+            "198.51.100.10"
+        );
+        assert_eq!(
+            login_client_id(&security, &headers, Some(stranger)),
+            "203.0.113.9"
+        );
     }
 
     #[tokio::test]
@@ -796,7 +838,7 @@ pub(super) async fn auth_status_handler(
         false
     };
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
-    let trusted_peer = security.is_trusted_peer(peer);
+    let trusted_peer = security.is_trusted_client(peer, &headers);
     // Setup is offered to exactly the browsers that could complete it:
     // `setup_handler` admits loopback-or-trusted, and a trusted peer skips
     // the wizard entirely (it is already admitted), which leaves loopback.
@@ -808,7 +850,9 @@ pub(super) async fn auth_status_handler(
     // already-configured install.
     let setup_required = creds.is_none()
         && !trusted_peer
-        && peer.is_some_and(|peer| weaver_server_core::security::ip_is_loopback(peer.ip()));
+        && security
+            .resolve_client_ip(peer, &headers)
+            .is_some_and(weaver_server_core::security::ip_is_loopback);
 
     let mut status = serde_json::json!({
         "enabled": creds.is_some(),

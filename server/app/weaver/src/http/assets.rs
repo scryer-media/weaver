@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use weaver_server_core::auth as jwt;
 use weaver_server_core::auth::LoginAuthCache;
 use weaver_server_core::runtime::environment::DeploymentEnvironment;
-use weaver_server_core::security::{RuntimeSecurityConfig, canonical_ip, ip_is_loopback};
+use weaver_server_core::security::{RuntimeSecurityConfig, ip_is_loopback};
 
 #[derive(Embed)]
 #[folder = "../../../apps/weaver-web/dist/"]
@@ -142,7 +142,7 @@ fn entry_response(
     // Trusted-network sessions only apply while login protection is disabled.
     // When login is enabled, returning the SPA shell would make it repeatedly
     // receive GraphQL 401s instead of serving the sign-in page.
-    let trusted_peer = cached_auth.is_none() && security.is_trusted_peer(peer);
+    let trusted_peer = cached_auth.is_none() && security.is_trusted_client(peer, headers);
     let has_valid_jwt = cached_auth.as_ref().is_some_and(|auth| {
         super::auth::extract_jwt_cookie(headers)
             .is_some_and(|token| jwt::verify_jwt(&token, &auth.jwt_secret).is_ok())
@@ -165,7 +165,10 @@ fn entry_response(
         // `trusted_peer` alone would turn the operator away. This mirrors
         // `setup_handler`'s admission rule: the form goes to exactly the
         // browsers that could submit it.)
-        if !peer.is_some_and(|peer| ip_is_loopback(peer.ip())) {
+        if !security
+            .resolve_client_ip(peer, headers)
+            .is_some_and(ip_is_loopback)
+        {
             // A browser the wizard endpoint would refuse must not be handed
             // the form on every visit forever. Three situations share this
             // shape; each gets the page that tells it the truth.
@@ -173,7 +176,8 @@ fn entry_response(
                 // The operator already answered — a no-login install
                 // answering network-wide is the common case. Nothing is
                 // pending; this browser is simply not admitted.
-                return BROWSER_ACCESS_RESTRICTED_PAGE.response_for(peer);
+                return BROWSER_ACCESS_RESTRICTED_PAGE
+                    .response_for(security, peer, headers, deployment);
             }
             return if matches!(
                 deployment,
@@ -182,10 +186,10 @@ fn entry_response(
                 // Inside a container namespace no outside browser is ever
                 // loopback, so the wizard is unreachable by construction and
                 // first-run setup belongs to the deployment.
-                CONTAINER_SETUP_PAGE.response_for(peer)
+                CONTAINER_SETUP_PAGE.response_for(security, peer, headers, deployment)
             } else {
                 // Native: the wizard exists and works, just not from here.
-                COMPLETE_SETUP_ON_MACHINE_PAGE.response_for(peer)
+                COMPLETE_SETUP_ON_MACHINE_PAGE.response_for(security, peer, headers, deployment)
             };
         }
         // Machine's own browser, no credentials: the first-run wizard. No
@@ -376,6 +380,12 @@ WEAVER_BOOTSTRAP_LOGIN_PASSWORD=choose-a-password</code>
     container's address on the Docker network, or Docker's gateway for traffic
     through a published port &mdash; not the address your browser has on your
     LAN. The line below shows what this browser looks like from here.
+  </p>
+  <p>
+    Behind a reverse proxy, add
+    <span class="inline-code">WEAVER_TRUSTED_PROXIES</span> with the proxy's
+    address so the networks above are matched against the browser the proxy
+    reports rather than against the proxy itself.
   </p>"#,
 };
 
@@ -425,13 +435,19 @@ struct NoticePage {
 }
 
 impl NoticePage {
-    fn render(&self, peer: Option<SocketAddr>) -> String {
+    fn render(
+        &self,
+        security: &RuntimeSecurityConfig,
+        peer: Option<SocketAddr>,
+        headers: &HeaderMap,
+        deployment: DeploymentEnvironment,
+    ) -> String {
         let Self {
             title,
             subtitle,
             body,
         } = self;
-        let peer_note = peer_note(peer);
+        let peer_note = peer_note(security, peer, headers, deployment);
         format!(
             r#"<!DOCTYPE html>
 <html lang="en">
@@ -452,26 +468,68 @@ impl NoticePage {
         )
     }
 
-    fn response_for(&self, peer: Option<SocketAddr>) -> Response {
-        html_page_response(self.render(peer))
+    fn response_for(
+        &self,
+        security: &RuntimeSecurityConfig,
+        peer: Option<SocketAddr>,
+        headers: &HeaderMap,
+        deployment: DeploymentEnvironment,
+    ) -> Response {
+        html_page_response(self.render(security, peer, headers, deployment))
     }
 }
 
 /// The one fact every notice page's reader is missing: the address Weaver
-/// judged. Trust is decided on this address and nothing else — not the
-/// browser's own idea of its IP, not a forwarding header — so it is the value
-/// to put in `WEAVER_TRUSTED_CIDRS` or to recognise as a proxy or gateway.
-/// Canonicalised so a dual-stack listener shows `172.22.0.3`, not
+/// judged. Trust is decided on this address and nothing else, so it is the
+/// value to put in `WEAVER_TRUSTED_CIDRS` or to recognise as a proxy or
+/// gateway. Canonicalised so a dual-stack listener shows `172.22.0.3`, not
 /// `::ffff:172.22.0.3`. An IP address renders as digits, dots, colons, and hex
 /// only, so it needs no HTML escaping.
-fn peer_note(peer: Option<SocketAddr>) -> String {
-    match peer {
-        Some(peer) => format!(
-            "  <p>This browser reaches Weaver from <span class=\"inline-code\">{}</span>.</p>\n",
-            canonical_ip(peer.ip())
-        ),
-        None => String::new(),
+///
+/// A request that arrived with forwarding headers from a peer Weaver was not
+/// told to trust gets a second line. That is the case where the judged address
+/// belongs to a proxy rather than to the reader, and it is otherwise
+/// indistinguishable from simply being outside the trust list — the operator
+/// would go on widening `WEAVER_TRUSTED_CIDRS` at an address that was never
+/// their browser's.
+fn peer_note(
+    security: &RuntimeSecurityConfig,
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+    deployment: DeploymentEnvironment,
+) -> String {
+    let Some(judged) = security.resolve_client_ip(peer, headers) else {
+        return String::new();
+    };
+    let mut note = format!(
+        "  <p>This browser reaches Weaver from <span class=\"inline-code\">{judged}</span>.</p>\n"
+    );
+    if security.forwarding_headers_ignored(peer, headers) {
+        note.push_str(&format!(
+            "  <p>The request also carried forwarding headers, so \
+<span class=\"inline-code\">{judged}</span> is most likely a proxy rather than this browser. \
+List it in <span class=\"inline-code\">WEAVER_TRUSTED_PROXIES</span> for Weaver to judge the \
+address the proxy reports instead.</p>\n"
+        ));
+    } else if matches!(
+        deployment,
+        DeploymentEnvironment::Docker | DeploymentEnvironment::Container
+    ) {
+        // Stated as a test the reader can run rather than as a claim, because
+        // nothing in the request distinguishes the collapsed case from an
+        // ordinary out-of-range browser: under Docker's userland proxy every
+        // browser arrives as the same gateway address and no header records
+        // which one it was. An operator who does not notice widens the trust
+        // list at that address and admits everything that reaches the port.
+        note.push_str(
+            "  <p>If every browser you try reports this same address, it is the container's \
+gateway rather than any of them, and no trusted network can tell them apart. Use host \
+networking, or set <span class=\"inline-code\">userland-proxy</span> to false in the Docker \
+daemon configuration, or put a reverse proxy in front and name it in \
+<span class=\"inline-code\">WEAVER_TRUSTED_PROXIES</span>.</p>\n",
+        );
     }
+    note
 }
 
 fn html_page_response(html: impl Into<axum::body::Body>) -> Response {
@@ -522,6 +580,29 @@ mod tests {
             security,
             Some("192.168.1.20:49152".parse().unwrap()),
             deployment,
+        )
+    }
+
+    fn entry_with_headers(
+        security: &RuntimeSecurityConfig,
+        peer: &str,
+        header_pairs: &[(&str, &str)],
+    ) -> Response {
+        let mut headers = HeaderMap::new();
+        for (name, value) in header_pairs {
+            headers.append(
+                header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        super::entry_response(
+            &headers,
+            "",
+            "browser-token",
+            &LoginAuthCache::default(),
+            security,
+            Some(peer.parse().unwrap()),
+            DeploymentEnvironment::Docker,
         )
     }
 
@@ -744,5 +825,79 @@ mod tests {
             assert!(cookie.contains("HttpOnly"));
             assert!(cookie.contains("SameSite=Strict"));
         }
+    }
+
+    /// The deployment this was built for: Weaver in a container behind a
+    /// reverse proxy, where every socket peer is the proxy and a trusted CIDR
+    /// would otherwise never match anything.
+    #[tokio::test]
+    async fn a_configured_proxy_admits_the_browser_it_forwards_for() {
+        let mut security = no_login_configured();
+        security.set_trusted_cidrs(vec!["192.168.1.0/24".parse().unwrap()]);
+        security.trusted_proxies = vec!["172.20.0.5/32".parse().unwrap()];
+
+        let admitted = entry_with_headers(
+            &security,
+            "172.20.0.5:41000",
+            &[("x-forwarded-for", "192.168.1.20")],
+        );
+        assert_eq!(admitted.status(), StatusCode::OK);
+        let body = body_text(admitted).await;
+        assert!(
+            !body.contains("Browser Access Restricted"),
+            "the browser behind the configured proxy must reach the app: {body}"
+        );
+
+        // The same proxy forwarding for an address outside the trust list is
+        // still refused, so naming a proxy widens nothing on its own.
+        let refused = entry_with_headers(
+            &security,
+            "172.20.0.5:41000",
+            &[("x-forwarded-for", "203.0.113.9")],
+        );
+        let body = body_text(refused).await;
+        assert!(body.contains("Browser Access Restricted"), "{body}");
+        assert!(body.contains("203.0.113.9"), "{body}");
+    }
+
+    /// The refusal an operator with an unconfigured proxy actually sees. It
+    /// has to say that the address shown is not their browser's, or they will
+    /// keep widening the trust list at a proxy that was never the client.
+    #[tokio::test]
+    async fn an_unconfigured_proxy_is_named_on_the_refusal_page() {
+        let security = no_login_configured();
+
+        let response = entry_with_headers(
+            &security,
+            "172.20.0.5:41000",
+            &[("x-forwarded-for", "192.168.1.20")],
+        );
+        let body = body_text(response).await;
+        assert!(body.contains("Browser Access Restricted"), "{body}");
+        // Judged on the socket peer, because nothing said to believe the header.
+        assert!(body.contains("172.20.0.5"), "{body}");
+        assert!(!body.contains("192.168.1.20"), "{body}");
+        assert!(body.contains("WEAVER_TRUSTED_PROXIES"), "{body}");
+
+        // A native install has no gateway to collapse behind and no headers
+        // to explain, so it gets the address line and nothing else.
+        let direct = untrusted_entry(&security, DeploymentEnvironment::Native);
+        let body = body_text(direct).await;
+        assert!(body.contains("192.168.1.20"), "{body}");
+        assert!(!body.contains("WEAVER_TRUSTED_PROXIES"), "{body}");
+    }
+
+    /// Under Docker's userland proxy every browser arrives as the bridge
+    /// gateway with no header naming it, so the refusal page cannot say which
+    /// browser this is — only how to find out, before the operator trusts an
+    /// address that is really every address.
+    #[tokio::test]
+    async fn a_container_refusal_names_the_collapsed_source_case() {
+        let response = untrusted_entry(&no_login_configured(), DeploymentEnvironment::Docker);
+        let body = body_text(response).await;
+
+        assert!(body.contains("Browser Access Restricted"), "{body}");
+        assert!(body.contains("every browser you try"), "{body}");
+        assert!(body.contains("userland-proxy"), "{body}");
     }
 }
