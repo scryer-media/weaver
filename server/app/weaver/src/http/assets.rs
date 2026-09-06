@@ -622,7 +622,9 @@ mod tests {
             // The address that trust is judged on, so the operator copies
             // the value Weaver saw rather than guessing at a LAN range.
             assert!(
-                body.contains("reaches Weaver from <span class=\"inline-code\">192.168.1.20</span>"),
+                body.contains(
+                    "reaches Weaver from <span class=\"inline-code\">192.168.1.20</span>"
+                ),
                 "{body}"
             );
         }
