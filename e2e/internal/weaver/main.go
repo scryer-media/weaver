@@ -4444,15 +4444,17 @@ func directStoreEnabledForPhase() bool {
 	}
 }
 
-// directUnpackEnabledForPhase reports whether this harness process was launched
-// with the 7z direct-unpack gate on, the same way directStoreEnabledForPhase
-// does: the phase's extraEnv reaches weaver and this process alike.
+// directUnpackEnabledForPhase reports whether weaver ran this phase with the 7z
+// direct-unpack gate on. The phase's extraEnv reaches weaver and this process
+// alike, so the harness reads the same switch the product read — but unlike
+// direct-store the product default is ON, so an unset or unrecognised value
+// means the gate was up. Only an explicit off reading turns it off.
 func directUnpackEnabledForPhase() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("WEAVER_DIRECT_UNPACK"))) {
-	case "1", "true", "on", "yes":
-		return true
-	default:
+	case "0", "false", "off", "no":
 		return false
+	default:
+		return true
 	}
 }
 

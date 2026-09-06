@@ -2,8 +2,9 @@
 //!
 //! Precedence is **environment, then config, then default** — the same rule and
 //! the same vocabulary as direct-store, so an operator who has learned one knob
-//! has learned both. The default is **off**: the feature stays dark until a
-//! release decision turns it on, not a config-default change.
+//! has learned both. The default is **on**: the feature shipped dark as a
+//! preview and was switched on once the direct-unpack e2e corpus held, so the
+//! only remaining knob is the opt-out.
 
 use std::sync::OnceLock;
 
@@ -26,11 +27,11 @@ pub fn env_override() -> Option<bool> {
 /// Resolved gate value, passed explicitly so callers and tests do not race the
 /// process-wide `OnceLock`.
 ///
-/// **Defaults off.**
+/// **Defaults on.**
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DirectUnpackGate {
-    Enabled,
     #[default]
+    Enabled,
     Disabled,
 }
 
@@ -64,7 +65,7 @@ impl DirectUnpackSettings {
     /// The precedence rule itself, with the environment passed in so it is
     /// testable without mutating process state.
     pub fn resolve_parts(config_enabled: Option<bool>, env_enabled: Option<bool>) -> Self {
-        let enabled = env_enabled.or(config_enabled).unwrap_or(false);
+        let enabled = env_enabled.or(config_enabled).unwrap_or(true);
         Self {
             gate: if enabled {
                 DirectUnpackGate::Enabled
@@ -85,9 +86,9 @@ mod tests {
     }
 
     #[test]
-    fn the_default_is_off() {
-        assert_eq!(gate(None, None), DirectUnpackGate::Disabled);
-        assert!(!DirectUnpackSettings::default().gate.is_enabled());
+    fn the_default_is_on() {
+        assert_eq!(gate(None, None), DirectUnpackGate::Enabled);
+        assert!(DirectUnpackSettings::default().gate.is_enabled());
     }
 
     #[test]
@@ -150,9 +151,8 @@ mod tests {
             return;
         }
 
-        // An absent table is "every default", and the default is OFF: the
-        // feature ships dark until a release decision says otherwise.
-        assert!(!DirectUnpackSettings::resolve(&config).gate.is_enabled());
+        // An absent table is "every default", and the default is ON.
+        assert!(DirectUnpackSettings::resolve(&config).gate.is_enabled());
 
         config.direct_unpack = Some(DirectUnpackOverrides {
             enabled: Some(true),
